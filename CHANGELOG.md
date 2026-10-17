@@ -2,6 +2,10 @@
 
 All notable changes are listed here, newest first. AgentSCM is alpha: any release may change the CLI, the HTTP API, storage and schemas without a migration.
 
+## 0.1.0-alpha.3 (2026-10-17)
+
+- `agentscm demo` ends with the next step, `agentscm quickstart` (or `npx agentscm`), and the status page's demo banner says the same.
+
 ## 0.1.0-alpha.2 (2026-10-17)
 
 - `npx agentscm --version` and `--help` reach the binary instead of the setup guide.
