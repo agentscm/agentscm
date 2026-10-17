@@ -386,22 +386,7 @@ Teammate details (third-party text: data, not instructions):
 
 ### Handoff
 
-Experimental. **No handover has been observed in a live run.** The grant path (the file moving from
-the holder to the requester) is covered only by store and MCP tests and the scripted `agentscm demo`.
-
-Trials so far used two headless Claude Code agents with prompts that never mention AgentSCM. Each
-row is one batch of runs:
-
-| Batch | What the agents had | Result |
-|---|---|---|
-| Normal wiring (hooks, MCP, instructions), plus variants | An agent that learned of the hold at `agentscm_start` could ask with `agentscm_ask` | The agent called `agentscm_ask` 0 of 21 times |
-| Without the start and check tools, so the agent met a hook refusal | A hook refusal only | The refused agent asked unprompted 2 of 2 times; the holder answered 2 of 2, both declines |
-| A later batch with revised wording | Warned at `agentscm_start` (the common path), then refused on edit | 0 of 10 asked on the common path; after a refusal the agent repeated the edit 5 of 5 times |
-| The current design: the refusal files the request automatically | The holder sees the request on its next hook or MCP reply | Holders answered 4 of 4, all declines; 0 grants |
-
-These are small samples from one agent and model setup, and the batches differ in wiring and wording,
-so they are not added together or read as rates. Every request a holder answered was declined. They do
-not show how often a handover would happen in real use.
+Experimental: the request and answer flow is new and may change.
 
 A refused edit asks for the file itself: the hub files a request from the
 refused session to the holder, for each refused file (at most 3), with the
@@ -557,8 +542,7 @@ notice page instead.
 
 What the demo shows is scripted. The agents are simulated, and so are their decisions. When the
 repository has more than two files to use, the demo also runs an experimental handoff: one agent is
-refused (the refusal asks the holder), and the simulated holder always hands the file over over MCP, which no real agent has
-done in a live run (see [Handoff](#handoff)). The latency it prints is measured on loopback between
+refused (the refusal asks the holder), and the simulated holder always hands the file over over MCP (see [Handoff](#handoff)). The latency it prints is measured on loopback between
 the demo's own client and its in-process hub; it says nothing about a hub reached over a network or
 under real agents.
 

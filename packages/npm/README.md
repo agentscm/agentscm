@@ -13,6 +13,7 @@ writes it, and can be undone with `agentscm uninstall`.
 ```sh
 npx agentscm              # starts the setup guide (`agentscm quickstart`)
 npx agentscm --yes        # passes flags to `agentscm quickstart`
+npx agentscm --version    # prints the version (`--help` also passes through)
 npx agentscm uninstall    # runs any other subcommand as given
 ```
 
