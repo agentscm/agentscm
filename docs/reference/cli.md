@@ -126,7 +126,7 @@ Flags: `--yes`, `--init` (also run `init-repo`; with `--yes` it is skipped unles
 agentscm demo [--no-open]
 ```
 
-`demo` simulates three agents against a throwaway local hub, using file names from the Git repository you are in, and prints a link to its status page. It never writes to the repository. Its last line, and the status page banner, name the next step: `npx agentscm` for the guided setup. `--no-open` does not open a browser.
+`demo` simulates three agents against a throwaway local hub, using file names from the Git repository you are in, and prints a link to its status page. It never writes to the repository. Its last line, and the status page banner, name the next step: `agentscm quickstart` (or `npx agentscm`) for the guided setup. `--no-open` does not open a browser.
 
 ## Agent wiring
 

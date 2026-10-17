@@ -40,8 +40,8 @@ const HEARTBEAT: Duration = Duration::from_secs(60);
 /// Heartbeats between session renewals: 25 minutes, inside the hub's 30-minute hold cap.
 const RENEW_EVERY: u32 = 25;
 const HISTORY_COMMITS: &str = "400";
-/// Printed last: `npx` leaves no `agentscm` command installed, so the step names `npx agentscm`.
-const NEXT_STEP: &str = "To set it up for real, run npx agentscm: guided setup that tells you what it will change before it does.";
+/// Printed last. Names both forms: installs without Node have no `npx`, and `npx` puts no `agentscm` on `PATH`.
+const NEXT_STEP: &str = "To set it up for real, run agentscm quickstart (or npx agentscm): guided setup that tells you what it will change before it does.";
 
 #[derive(Debug, Args)]
 pub struct DemoArgs {

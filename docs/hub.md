@@ -539,7 +539,7 @@ get-url`, `git log` and `git ls-files`; the hub's database lives in a private te
 that is removed after the hub stops, on exit, Ctrl-C, SIGTERM or SIGHUP. The tokens it mints are
 valid for seven days but die with the process. A binary built without the `ui` feature shows the
 notice page instead. Its last line, and the status page banner, point to
-`npx agentscm` for the guided setup.
+`agentscm quickstart` (or `npx agentscm`) for the guided setup.
 
 What the demo shows is scripted. The agents are simulated, and so are their decisions. When the
 repository has more than two files to use, the demo also runs an experimental handoff: one agent is

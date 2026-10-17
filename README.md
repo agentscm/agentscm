@@ -72,7 +72,7 @@ agents editing your most-changed files through the real hook endpoint, shows the
 second agent's first edit of a file the first agent holds and letting the repeat through, and
 opens the status page signed in with a read-only token. No account, Docker or forge, and nothing
 is written to your repository. Press Ctrl-C to stop; the hub and its data go with it. To set it
-up for real, run `npx agentscm` (see [Quickstart](#quickstart)).
+up for real, run `agentscm quickstart` (or `npx agentscm`; see [Quickstart](#quickstart)).
 
 The demo is scripted: the agents, their decisions and the experimental handoff, in which the
 simulated holder always hands the file over, are all simulated. The hook latency it prints is measured on loopback against its in-process hub.

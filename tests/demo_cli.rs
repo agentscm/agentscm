@@ -70,7 +70,7 @@ fn check_demo(busiest: &str) {
         stdout
             .lines()
             .last()
-            .is_some_and(|line| line.starts_with("To set it up for real, run npx agentscm")),
+            .is_some_and(|line| line.contains("agentscm quickstart")),
         "{stdout}"
     );
     // The repository has three files, so the handoff beat runs.
