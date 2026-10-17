@@ -4,7 +4,7 @@ name: Release
 # pushes it to GHCR by digest with a version tag (no `latest` during alpha), attests its build
 # provenance, builds attested release binaries (Linux and macOS, plus Windows x86_64), and creates a GitHub prerelease whose body is the
 # CHANGELOG entry. It then publishes the `agentscm` npm package unless the tag contains `-dry`
-# (for example v0.2.0-dry1); any other tag fails if the NPM_TOKEN secret is unset.
+# (for example v0.2.0-dry1); any other tag publishes with npm trusted publishing.
 # Anyone who can push a `v*` tag can start this workflow, so protect `v*` tags with a repository ruleset
 # (maintainers only) and keep the `npm` environment's required reviewers set.
 on:
@@ -254,23 +254,27 @@ jobs:
     needs: release
     # Only the public repository publishes: the image name, the attestation and the docs assume it.
     if: ${{ github.repository == 'counterbranch/agentscm' && !github.event.repository.private }}
-    # The maintainer configures required reviewers on the `npm` environment. Once the package exists,
-    # prefer npm trusted publishing (OIDC, no token) over NPM_TOKEN.
+    # The maintainer configures required reviewers on the `npm` environment. npm trusts this
+    # workflow and environment (trusted publishing), so the job publishes with an OIDC token, not a secret.
     environment: npm
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
-      id-token: write # npm provenance
+      id-token: write # npm trusted publishing and provenance
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22
+          node-version: 24 # bundles npm 11, which trusted publishing needs
           registry-url: https://registry.npmjs.org
           package-manager-cache: false # never restore a cache in a publishing job
+      - name: Check npm supports trusted publishing
+        run: |
+          v=$(npm --version)
+          printf '11.5.1\n%s\n' "$v" | sort -V -C || { echo "npm $v is older than 11.5.1, which trusted publishing needs" >&2; exit 1; }
       - name: Check the package version matches the tag
         env:
           TAG: ${{ github.ref_name }}
@@ -291,12 +295,9 @@ jobs:
       - name: Publish to npm
         working-directory: packages/npm
         env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
           case "$TAG" in *-dry*) echo "dry-run tag $TAG: not publishing to npm"; exit 0 ;; esac
-          [ -n "$NPM_TOKEN" ] || { echo "NPM_TOKEN is not set" >&2; exit 1; }
           for f in LICENSE NOTICE THIRD_PARTY_NOTICES.md SHA256SUMS; do [ -s "$f" ] || { echo "packages/npm/$f is missing" >&2; exit 1; }; done
           # shortcut: every release is a prerelease, so it takes `latest` for `npx agentscm`; use `next` for prereleases after the first stable release
           npm publish --provenance --access public --ignore-scripts --tag latest
