@@ -2,6 +2,10 @@
 
 All notable changes are listed here, newest first. AgentSCM is alpha: any release may change the CLI, the HTTP API, storage and schemas without a migration.
 
+## 0.1.0-dry1 (release workflow dry run)
+
+A dry run of the release workflow on the 0.1.0-alpha.1 tree. Its artifacts are not for use and are removed after the run.
+
 ## 0.1.0-alpha.1 (unreleased)
 
 First alpha. **Not for production.** Tested against in-process fake GitHub and GitLab servers plus a single real local install; no scale, high-availability or security audit yet.
