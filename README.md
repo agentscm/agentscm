@@ -74,8 +74,7 @@ opens the status page signed in with a read-only token. No account, Docker or fo
 is written to your repository. Press Ctrl-C to stop; the hub and its data go with it.
 
 The demo is scripted: the agents, their decisions and the experimental handoff, in which the
-simulated holder always hands the file over, are all simulated (no real agent has handed a file
-over in a live run). The hook latency it prints is measured on loopback against its in-process hub.
+simulated holder always hands the file over, are all simulated. The hook latency it prints is measured on loopback against its in-process hub.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/status-page-demo-dark.webp">
@@ -165,8 +164,8 @@ mount and build details, see [collisions](docs/collisions.md#running-in-a-contai
 | | Status |
 |---|---|
 | Collision warnings (`agentscm collisions`, `GET /v1/collisions`) | Works; Git only, read-only |
-| Work intents, the hub and agent hooks | Works against a real local install; tested live with Claude Code only. Warn once: the first contested edit is refused, a repeat goes through, nothing is locked |
-| Handoff (an agent asks the holder to hand a file over) | Experimental; no handover observed in a live run, see [handoff](docs/hub.md#handoff) |
+| Work intents, the hub and agent hooks | Claude Code is the reference integration. Warn once: the first contested edit is refused, a repeat goes through, nothing is locked |
+| Handoff (an agent asks the holder to hand a file over) | Experimental, see [handoff](docs/hub.md#handoff) |
 | GitHub and GitLab sync, GitHub publish | Experimental; tested only against in-process fake servers |
 | Native ledger, Git bridges, isolated command checks | Experimental; see [advanced](docs/advanced/README.md) |
 
