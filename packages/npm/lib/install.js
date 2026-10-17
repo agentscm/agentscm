@@ -38,7 +38,10 @@ const installNames = (version, platform) => platform === 'win32'
 const urlFor = (version, asset) => `https://github.com/${REPO}/releases/download/v${version}/${asset}`;
 
 // A bare `npx agentscm` or a leading flag starts the setup guide; any other first argument is a subcommand.
-const launchArgs = (args) => (args.length === 0 || args[0].startsWith('-') ? ['quickstart', ...args] : args);
+// The binary's own top-level flags pass through; any other leading flag goes to the setup guide.
+const TOP_LEVEL_FLAGS = new Set(['--version', '-V', '--help', '-h']);
+const launchArgs = (args) =>
+  args.length === 0 || (args[0].startsWith('-') && !TOP_LEVEL_FLAGS.has(args[0])) ? ['quickstart', ...args] : args;
 
 // Strict: every line must be `<64 lowercase hex>  agentscm-<target>[.exe]`, and the asset appears exactly once.
 function parseSums(text, target) {

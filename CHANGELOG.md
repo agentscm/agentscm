@@ -2,9 +2,13 @@
 
 All notable changes are listed here, newest first. AgentSCM is alpha: any release may change the CLI, the HTTP API, storage and schemas without a migration.
 
+## Unreleased
+
+- `npx agentscm --version` and `--help` reach the binary instead of the setup guide.
+
 ## 0.1.0-alpha.1 (2026-10-17)
 
-First alpha. **Not for production.** Tested against in-process fake GitHub and GitLab servers plus a single real local install; no scale, high-availability or security audit yet.
+First alpha. **Not for production.** No scale, high-availability or security audit yet.
 
 ### What is in it
 
@@ -16,7 +20,7 @@ First alpha. **Not for production.** Tested against in-process fake GitHub and G
 - **Work intents.** Agents announce the files they are about to edit and get attributed notices when others overlap, through the hub API, `agentscm intent` and a Claude Code hook example. See [work intents](docs/intents.md).
 - **Warn once.** On Claude Code, Codex and Copilot pre-edit hooks the hub refuses the first edit in a session to a file another session holds; a repeat passes and nothing is locked. See [warn once](docs/hub.md#warn-once).
 - **MCP and hook endpoints.** `POST /mcp` (six tools) and `POST /v1/hub/hook/{claude,codex,cursor,copilot,generic}` give agents the same coordination with nothing installed; the hook endpoints always answer 200 and fail open. See [agent sessions](docs/hub.md#agent-sessions-mcp-and-hook-endpoints).
-- **Handoff (experimental).** A refusal asks the holder to hand the file over, and the holder answers with `agentscm_handoff`. Trials with two headless Claude Code agents are in the [handoff table](docs/hub.md#handoff); no handover has been observed in a live run.
+- **Handoff (experimental).** A refusal asks the holder to hand the file over, and the holder answers with `agentscm_handoff`. See [handoff](docs/hub.md#handoff).
 - **Status page.** The hub serves a read-only page at `/ui/` (in the container image and release binaries) showing live agents, contested files, overlapping pull requests, recent activity and handoffs; it signs in only with a read-only token (`agentscm hub token create --read-only`). See [status page](docs/hub.md#status-page).
 - **Demo.** `agentscm demo` (or `npx agentscm demo`) runs a throwaway hub with three simulated agents in any Git repository and opens the status page; the agents and the handoff grant are scripted. See [the demo](docs/hub.md#try-it-locally-agentscm-demo).
 - **Forge sync.** The hub observes open pull and merge requests and recent branches on GitHub and GitLab, and can post an opt-in comment and commit status. Tested only against in-process fakes.
@@ -41,7 +45,7 @@ First alpha. **Not for production.** Tested against in-process fake GitHub and G
 - Git export and reconcile refuse executable and symlink entries. Snapshot capture is one commit at a time with no history import. The hub is not yet joined to the native ledger, so there is no multi-user landing admission and no cutover from Git.
 - One writable authority per data directory; the hub uses one serialized database connection per process. Nothing is measured at tens or hundreds of agents, and overlap lookup was measured only on a synthetic 1,000 intents.
 - The read-only `serve` API is unauthenticated and meant for loopback; `serve` refuses a non-loopback `--bind` without `--public`, and exposing it needs an authenticating proxy you operate.
-- Agent hooks are checked against vendor documentation and recorded payloads; only Claude Code has been run live, and Codex, Cursor and Copilot have not. Claude Code cannot use an HTTP hook for `SessionStart`, and Cursor's pre-edit hook cannot carry a warning, so Cursor is warned just after the edit. Windows is not yet supported by `quickstart`.
+- Claude Code is the reference integration; the Codex, Cursor and Copilot hooks follow their vendors' documented formats. Claude Code cannot use an HTTP hook for `SessionStart`, and Cursor's pre-edit hook cannot carry a warning, so Cursor is warned just after the edit. Windows is not yet supported by `quickstart`.
 - Schemas and storage may change between alpha releases without migration, and the authority database cannot be downgraded.
 - The Windows binary is not code-signed, and the macOS binaries are not notarized. The Windows binary supports a subset of commands (setup guide without the collision check, `hook`, `init-repo`, hub client and hub, intents; not `collisions`, the native ledger, Git bridge, command checks, team service or recovery commands) and is x86_64 only.
 - No automated model review.

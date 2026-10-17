@@ -75,6 +75,10 @@ test('release URL for the Windows asset', () => {
 test('launch arguments', () => {
   assert.deepEqual(launchArgs([]), ['quickstart']);
   assert.deepEqual(launchArgs(['--yes']), ['quickstart', '--yes']);
+  assert.deepEqual(launchArgs(['--version']), ['--version']);
+  assert.deepEqual(launchArgs(['-V']), ['-V']);
+  assert.deepEqual(launchArgs(['--help']), ['--help']);
+  assert.deepEqual(launchArgs(['-h']), ['-h']);
   assert.deepEqual(launchArgs(['uninstall']), ['uninstall']);
   assert.deepEqual(launchArgs(['hub', 'serve', '--x']), ['hub', 'serve', '--x']);
 });
