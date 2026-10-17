@@ -1,0 +1,58 @@
+name: Windows
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "examples/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/windows.yml"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ github.event.action == 'labeled' && 'label' || 'code' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    # Gate for cost and abuse control, not isolation: fork code can run on any hosted runner, which is
+    # ephemeral and has a read-only token and no secrets. Same-repository pull requests, pushes and
+    # manual runs always pass. A fork pull request runs this job only when a maintainer adds the
+    # `ci-extended` label, once per labelling and against the head at that moment; pushing again
+    # does not re-run it. Remove and re-add the label to run it again.
+    if: ${{ github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'ci-extended') || (github.event.action != 'labeled' && github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: windows-2025
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash # Git Bash on the Windows runner
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install # reads rust-toolchain.toml
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo build --locked --release
+      - run: target/release/agentscm.exe --version
+      - name: Test
+        env:
+          # This job has no PostgreSQL: the postgres variants skip instead of failing under CI=true.
+          CI: "false"
+          # Integration tests that build and are meaningful on Windows; the rest use Unix-only APIs.
+          TESTS: "cli context_contract hook_cli hook_end_to_end init_repo hub_gitlab hub_hooks hub_intents hub_login hub_mcp hub_sessions fake_github_smoke fake_gitlab_smoke"
+        run: |
+          args=()
+          for t in $TESTS; do args+=(--test "$t"); done
+          cargo test --locked --no-fail-fast --lib --bin agentscm "${args[@]}"

@@ -1,0 +1,590 @@
+{
+  "format": "agentscm.native-bundle/v2",
+  "packager_declaration": {
+    "package_version": "0.0.0-fixture",
+    "operating_system": "fixture-os",
+    "architecture": "fixture-arch",
+    "debug_assertions": false
+  },
+  "assurance": {
+    "inventory_basis": "copied_bytes",
+    "metadata_basis": "packager_build_declaration",
+    "publisher_authentication": "not_established",
+    "build_provenance": "not_established",
+    "license_completeness": "not_established",
+    "release_support": "not_established"
+  },
+  "files": [
+    {
+      "path": "agentscm",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": true
+    },
+    {
+      "path": "LICENSE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "THIRD_PARTY_NOTICES.md",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "Cargo.lock",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/agentscm-portable-verifier",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": true
+    },
+    {
+      "path": "verifier/Cargo.lock",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/Cargo.toml",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/DEPENDENCIES.md",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/LICENSE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/NOTICE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/README.md",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/THIRD_PARTY_NOTICES.md",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/base64ct-1.8.3/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/base64ct-1.8.3/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/block-buffer-0.10.4/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/block-buffer-0.10.4/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/cfg-if-1.0.5/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/cfg-if-1.0.5/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/const-oid-0.9.6/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/const-oid-0.9.6/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/cpufeatures-0.2.17/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/cpufeatures-0.2.17/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/crypto-common-0.1.7/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/crypto-common-0.1.7/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/curve25519-dalek-4.1.3/LICENSE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/curve25519-dalek-derive-0.1.1/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/curve25519-dalek-derive-0.1.1/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/der-0.7.10/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/der-0.7.10/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/digest-0.10.7/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/digest-0.10.7/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/ed25519-2.2.3/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/ed25519-2.2.3/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/ed25519-dalek-2.2.0/LICENSE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/fiat-crypto-0.2.9/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/fiat-crypto-0.2.9/LICENSE-BSD-1",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/fiat-crypto-0.2.9/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/generic-array-0.14.7/LICENSE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/getrandom-0.2.17/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/getrandom-0.2.17/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/inventory.json",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/itoa-1.0.18/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/itoa-1.0.18/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/libc-0.2.189/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/libc-0.2.189/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/memchr-2.8.3/COPYING",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/memchr-2.8.3/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/pkcs8-0.10.2/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/pkcs8-0.10.2/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/proc-macro2-1.0.107/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/proc-macro2-1.0.107/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/quote-1.0.47/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/quote-1.0.47/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/rand_core-0.6.4/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/rand_core-0.6.4/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/rustc_version-0.4.1/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/rustc_version-0.4.1/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/semver-1.0.28/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/semver-1.0.28/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/serde-1.0.228/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/serde-1.0.228/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/serde_core-1.0.228/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/serde_core-1.0.228/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/serde_derive-1.0.228/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/serde_derive-1.0.228/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/serde_json-1.0.151/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/serde_json-1.0.151/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/sha2-0.10.9/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/sha2-0.10.9/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/signature-2.2.0/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/signature-2.2.0/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/spki-0.7.3/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/spki-0.7.3/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/subtle-2.6.1/LICENSE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/syn-2.0.119/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/syn-2.0.119/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/typenum-1.20.1/LICENSE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/typenum-1.20.1/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/typenum-1.20.1/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/unicode-ident-1.0.26/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/unicode-ident-1.0.26/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/unicode-ident-1.0.26/LICENSE-UNICODE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/version_check-0.9.5/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/version_check-0.9.5/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/wasi-0.11.1+wasi-snapshot-preview1/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/wasi-0.11.1+wasi-snapshot-preview1/LICENSE-Apache-2.0_WITH_LLVM-exception",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/wasi-0.11.1+wasi-snapshot-preview1/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/zeroize-1.9.0/LICENSE-APACHE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/zeroize-1.9.0/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/licenses/zmij-1.0.23/LICENSE-MIT",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/protocol/evidence-v1/profile.md",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/protocol/evidence-v1/vectors.json",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/rust-toolchain.toml",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "verifier/sbom.cdx.json",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    }
+  ],
+  "verifier": {
+    "executable": "verifier/agentscm-portable-verifier",
+    "material_prefix": "verifier/",
+    "metadata_basis": "compiled_source_materials",
+    "executable_material_linkage": "not_established",
+    "target_compatibility": "not_established"
+  }
+}

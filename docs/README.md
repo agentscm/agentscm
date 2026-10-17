@@ -1,0 +1,37 @@
+# Documentation
+
+> **Alpha: not for production.** APIs, CLI, storage and schemas may change without migration. See the [README](../README.md) for status and the [changelog](../CHANGELOG.md) for known limits.
+
+## Start here
+
+- [README](../README.md): what AgentSCM is, a local demo and the quickstart (a team hub takes about fifteen minutes to set up)
+- [Install options](install.md): npx, a release binary, `install.sh` or the container
+- [Two agents, one warning](two-agent-demo.md): run a hub and see an agent warned about another's edit
+- [Concepts in plain English](concepts.md): the glossary
+
+## Guides
+
+- [Guided setup: `agentscm quickstart`](setup-guide.md)
+- [Early collision warnings](collisions.md)
+- [Autopsy: how often your own sessions collided](autopsy.md)
+- [Work intents](intents.md) and the Claude Code hook
+- [Supported coding agents](agents.md): Claude Code, Codex, Cursor, Copilot and others; `agentscm init-repo` and `agentscm hook`
+- [Multi-user coordination hub](hub.md), including [what the hub stores](hub.md#data-the-hub-stores)
+- [Deployment](deployment.md)
+
+## Reference
+
+- [HTTP API](api.md)
+- [Native CLI reference](reference/cli.md)
+- [Specification (draft)](spec/agentic-scm.md) and [architecture](architecture.md)
+- [Roadmap](roadmap.md)
+
+## Advanced and experimental
+
+The immutable ledger, Git bridges and isolated command checks: see the [advanced index](advanced/README.md).
+
+## For contributors and maintainers
+
+- [Contributing](../CONTRIBUTING.md), [security policy](../SECURITY.md) and [code of conduct](../CODE_OF_CONDUCT.md)
+- [Local source install helper](setup.md)
+- [Releasing](releasing.md)

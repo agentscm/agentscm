@@ -1,0 +1,2 @@
+# Sources, fixtures and embedded material are byte-exact: check out LF on every platform, including Windows.
+* text=auto eol=lf

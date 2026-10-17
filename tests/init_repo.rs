@@ -1,0 +1,105 @@
+//! The real binary's `init-repo`, with a temporary HOME so no real configuration is read.
+use std::path::Path;
+use std::process::{Command, Output, Stdio};
+
+use tempfile::TempDir;
+
+fn init_repo(dir: &Path, home: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_agentscm"))
+        .arg("init-repo")
+        .args(args)
+        .current_dir(dir)
+        .env_clear()
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("APPDATA", home.join("config"))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
+fn stdout(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn stderr(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+fn checkout() -> (TempDir, TempDir) {
+    let repo = TempDir::new().unwrap();
+    std::fs::create_dir(repo.path().join(".git")).unwrap();
+    (repo, TempDir::new().unwrap())
+}
+
+#[test]
+fn without_a_terminal_it_needs_yes_and_says_which_flags() {
+    let (repo, home) = checkout();
+    let out = init_repo(
+        repo.path(),
+        home.path(),
+        &["--hub-url", "https://hub.example.test"],
+    );
+    assert!(!out.status.success());
+    let message = stderr(&out);
+    for flag in ["--yes", "--hub-url", "--agents"] {
+        assert!(message.contains(flag), "{message}");
+    }
+    assert!(!repo.path().join("AGENTS.md").exists());
+}
+
+#[test]
+fn yes_writes_from_a_subdirectory_and_a_second_run_writes_nothing() {
+    let (repo, home) = checkout();
+    let sub = repo.path().join("src/deep");
+    std::fs::create_dir_all(&sub).unwrap();
+    let args = [
+        "--yes",
+        "--hub-url",
+        "https://hub.example.test/",
+        "--agents",
+        "claude,gemini",
+    ];
+    let first = init_repo(&sub, home.path(), &args);
+    assert!(first.status.success(), "{}", stderr(&first));
+    for path in [
+        ".mcp.json",
+        ".claude/settings.json",
+        "CLAUDE.md",
+        "GEMINI.md",
+        "AGENTS.md",
+    ] {
+        assert!(repo.path().join(path).exists(), "{path}");
+    }
+    assert!(!repo.path().join(".codex").exists());
+    let mcp = std::fs::read_to_string(repo.path().join(".mcp.json")).unwrap();
+    assert!(mcp.contains("https://hub.example.test/mcp"), "{mcp}");
+    assert!(mcp.contains("${AGENTSCM_HUB_TOKEN}"));
+    assert!(stdout(&first).contains("export AGENTSCM_HUB_TOKEN="));
+
+    let second = init_repo(&sub, home.path(), &args);
+    assert!(second.status.success());
+    let text = stdout(&second);
+    assert!(text.contains("Nothing to write"), "{text}");
+    assert!(
+        !text.contains("  create ") && !text.contains("  update "),
+        "{text}"
+    );
+}
+
+#[test]
+fn yes_without_a_hub_url_or_a_repository_is_an_error() {
+    let (repo, home) = checkout();
+    let out = init_repo(repo.path(), home.path(), &["--yes"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("--hub-url"), "{}", stderr(&out));
+
+    let elsewhere = TempDir::new().unwrap();
+    let out = init_repo(
+        elsewhere.path(),
+        home.path(),
+        &["--yes", "--hub-url", "https://hub.example.test"],
+    );
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("Git repository"), "{}", stderr(&out));
+}

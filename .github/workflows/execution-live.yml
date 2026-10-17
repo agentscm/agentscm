@@ -1,0 +1,73 @@
+name: Execution live
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+    paths: &paths
+      - src/execution.rs
+      - src/execution/**
+      - src/checks.rs
+      - src/authority.rs
+      - src/context.rs
+      - src/lib.rs
+      - src/store.rs
+      - src/model.rs
+      - src/error.rs
+      - tests/execution.rs
+      - tests/command_checks.rs
+      - tests/execution_canaries.rs
+      - tests/common/fake_docker.rs
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/execution-live.yml
+  push:
+    branches: [main]
+    paths: *paths
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: execution-live-${{ github.ref }}-${{ github.event.action == 'labeled' && 'label' || 'code' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # busybox:1.37.0 multi-platform index, pinned; nothing else is pulled.
+  BUSYBOX: busybox@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+
+jobs:
+  # Runs the opt-in real-runtime execution tests against the runner's own Docker daemon.
+  # Synthetic source only; no credentials, registries or providers beyond the pinned image pull.
+  oci:
+    # Gate for cost and abuse control, not isolation: fork code can run on any hosted runner, which is
+    # ephemeral and has a read-only token and no secrets. Same-repository pull requests, pushes and
+    # manual runs always pass. A fork pull request runs this job only when a maintainer adds the
+    # `ci-extended` label, once per labelling and against the head at that moment; pushing again
+    # does not re-run it. Remove and re-add the label to run it again.
+    if: ${{ github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'ci-extended') || (github.event.action != 'labeled' && github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install # reads rust-toolchain.toml
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Acquire pinned image
+        run: |
+          docker pull --quiet "$BUSYBOX"
+          echo "AGENTSCM_OCI_IMAGE=$(docker image inspect --format '{{.Id}}' "$BUSYBOX")" >> "$GITHUB_ENV"
+      - name: Record runtime identity
+        shell: bash
+        run: |
+          set -o pipefail
+          docker version
+          docker info --format '{{json .}}' | jq '{ServerVersion, KernelVersion, OperatingSystem, CgroupVersion, DefaultRuntime, SecurityOptions}'
+      - name: Live execution tests
+        env:
+          AGENTSCM_DOCKER: /usr/bin/docker
+          AGENTSCM_DOCKER_SOCKET: /var/run/docker.sock
+        run: cargo test --locked --no-fail-fast --test execution --test command_checks --test execution_canaries -- --ignored --test-threads=1 --nocapture

@@ -1,0 +1,16 @@
+{
+  "session_id": "11111111-2222-3333-4444-555555555555",
+  "transcript_path": "/work/.claude/projects/-work-acme-widgets/11111111-2222-3333-4444-555555555555.jsonl",
+  "cwd": "/work/acme-widgets",
+  "permission_mode": "default",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "NotebookEdit",
+  "tool_input": {
+    "notebook_path": "/work/acme-widgets/notebooks/explore.ipynb",
+    "cell_id": "cell-1",
+    "new_source": "print('hello')",
+    "cell_type": "code",
+    "edit_mode": "replace"
+  },
+  "tool_use_id": "toolu_01SYNTHETIC0000000003"
+}

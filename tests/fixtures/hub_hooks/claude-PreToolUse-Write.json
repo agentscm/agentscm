@@ -1,0 +1,14 @@
+{
+  "session_id": "11111111-2222-3333-4444-555555555555",
+  "prompt_id": "550e8400-e29b-41d4-a716-446655440000",
+  "transcript_path": "/work/.claude/projects/-work-acme-widgets/11111111-2222-3333-4444-555555555555.jsonl",
+  "cwd": "/work/acme-widgets",
+  "permission_mode": "default",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Write",
+  "tool_input": {
+    "file_path": "/work/acme-widgets/src/widget.rs",
+    "content": "pub fn widget() -> u32 { 1 }\n"
+  },
+  "tool_use_id": "toolu_01SYNTHETIC0000000001"
+}

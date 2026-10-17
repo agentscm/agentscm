@@ -1,0 +1,47 @@
+{
+  "name": "agentscm-status-ui",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Read-only status page served by the AgentSCM coordination hub at /ui/.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "eslint . && node scripts/check-derive.mjs",
+    "notices": "node scripts/notices.mjs"
+  },
+  "dependencyNotes": {
+    "react": "UI runtime. 18.x because antd 5 supports React 16 to 18.",
+    "react-dom": "DOM renderer for React.",
+    "antd": "Component library (cards, tags, tooltips, dropdown, segmented, skeleton) and theme tokens for light/dark.",
+    "@ant-design/icons": "Icon set used by antd and the header, rows and timeline.",
+    "vite": "Dev server and bundler producing dist/index.html, app.js, app.css. Built-in JSX transform, so no React plugin.",
+    "typescript": "Strict type checking (tsc -b). Held below 6.1 for typescript-eslint.",
+    "@types/react": "Types for React.",
+    "@types/react-dom": "Types for react-dom.",
+    "@types/node": "Types for vite.config.ts and the Node scripts.",
+    "eslint": "Linter.",
+    "@eslint/js": "ESLint recommended rules.",
+    "typescript-eslint": "TypeScript parser and rules for ESLint.",
+    "eslint-plugin-react-hooks": "Hooks rules.",
+    "globals": "Browser and Node global names for the flat ESLint config."
+  },
+  "dependencies": {
+    "@ant-design/icons": "^5.6.1",
+    "antd": "~5.29.3",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^22.20.5",
+    "@types/react": "18.3.12",
+    "@types/react-dom": "18.3.1",
+    "eslint": "^10.13.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "globals": "^17.13.0",
+    "typescript": "~6.0.3",
+    "typescript-eslint": "^8.71.2",
+    "vite": "^8.3.4"
+  }
+}

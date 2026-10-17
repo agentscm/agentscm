@@ -1,0 +1,21 @@
+# agentscm
+
+```
+npx agentscm downloads the AgentSCM release binary for your platform from
+GitHub Releases, verifies its SHA-256 checksum and build provenance, and then
+starts the setup guide. It does not run install scripts, send telemetry or
+change anything without asking. Everything it writes is listed before it
+writes it, and can be undone with `agentscm uninstall`.
+```
+
+## Usage
+
+```sh
+npx agentscm              # starts the setup guide (`agentscm quickstart`)
+npx agentscm --yes        # passes flags to `agentscm quickstart`
+npx agentscm uninstall    # runs any other subcommand as given
+```
+
+The binary is kept in `~/.agentscm/bin` (`%USERPROFILE%\.agentscm\bin` on Windows). The checksum is always verified; provenance is verified when the GitHub CLI (`gh`) is installed and signed in, and otherwise the script says it was not checked. Supported: Linux and macOS on x64 and arm64, and Windows on x64 (a subset of commands). Elsewhere, use Docker.
+
+Details, manual verification and Docker: [docs/install.md](https://github.com/counterbranch/agentscm/blob/main/docs/install.md). Source and license (FSL-1.1-ALv2): https://github.com/counterbranch/agentscm

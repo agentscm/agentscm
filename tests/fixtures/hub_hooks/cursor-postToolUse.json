@@ -1,0 +1,13 @@
+{
+  "conversation_id": "11111111-2222-3333-4444-555555555555",
+  "generation_id": "gen-00000000-0000-0000-0000-000000000001",
+  "hook_event_name": "postToolUse",
+  "cursor_version": "2.0.0",
+  "workspace_roots": ["/work/acme-widgets"],
+  "transcript_path": null,
+  "tool_name": "Write",
+  "tool_input": { "file_path": "/work/acme-widgets/src/widget.rs", "contents": "pub fn widget() {}\n" },
+  "tool_output": "{}",
+  "tool_use_id": "tool-SYNTHETIC-0002",
+  "cwd": "/work/acme-widgets"
+}

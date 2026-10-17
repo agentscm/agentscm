@@ -1,0 +1,1300 @@
+//! Human sign-in through GitHub or GitLab, in-memory sessions, and the routes
+//! that let a signed-in person mint, list and revoke agent tokens.
+use std::collections::HashMap;
+use std::fmt;
+use std::io::Read;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+use axum::Router;
+use axum::extract::{FromRequestParts, Path, RawQuery, State};
+use axum::http::request::Parts;
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Json, Response};
+use axum::routing::{delete, get, post};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use reqwest::Url;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+
+use super::forge_http::{Forge, check_base_url};
+use super::http::{ApiError, JsonBody, bearer, blocking};
+use super::store::{
+    ForgeIdentity, MAX_AGENT_TOKEN_TTL_SECONDS, User, mint_bound_agent_token, unix_now,
+    validate_agent_name, validate_login, validate_repository,
+};
+use super::{HubError, HubState, Result};
+use crate::team::auth::{generate_secret, token_digest};
+
+const SESSION_DIGEST_DOMAIN: &[u8] = b"agentscm.hub.session.v1\0";
+const COOKIE: &str = "__Host-agentscm_login";
+const SESSION_SECONDS: i64 = 8 * 60 * 60;
+const BROWSER_LOGIN_SECONDS: i64 = 600;
+const HANDOFF_SECONDS: i64 = 60;
+const MAX_DEVICE_SECONDS: i64 = 900;
+const MAX_ENTRIES: usize = 1024;
+const MAX_SESSIONS_PER_USER: usize = 8;
+const MAX_SECRET_FILE_BYTES: u64 = 4096;
+/// Connected repositories a sign-in tries before it gives up.
+const MAX_SIGN_IN_PROBES: usize = 200;
+const GITLAB_REPORTER: i64 = 20;
+const GITLAB_DEVELOPER: i64 = 30;
+
+// shortcut: sessions and pending logins live in hub memory, so a restart or a second hub replica signs everyone out; move them to the store when the hub runs replicated
+
+struct Provider {
+    name: &'static str,
+    client_id: String,
+    client_secret: String,
+    web: String,
+    api: String,
+    /// Identity host: the web URL's host, with the port when not the default.
+    host: String,
+}
+
+impl fmt::Debug for Provider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Provider")
+            .field("name", &self.name)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"[REDACTED]")
+            .field("web", &self.web)
+            .field("api", &self.api)
+            .field("host", &self.host)
+            .finish()
+    }
+}
+
+impl Provider {
+    fn is_gitlab(&self) -> bool {
+        self.name == "gitlab"
+    }
+
+    fn token_url(&self) -> String {
+        let path = if self.is_gitlab() {
+            "/oauth/token"
+        } else {
+            "/login/oauth/access_token"
+        };
+        format!("{}{path}", self.web)
+    }
+}
+
+#[derive(Debug)]
+pub struct LoginConfig {
+    public_url: String,
+    providers: Vec<Provider>,
+    admins: Vec<Entry>,
+    /// Who may sign in besides the admins; empty means admins only.
+    allowed: Vec<Entry>,
+}
+
+#[derive(Debug)]
+enum Who {
+    /// Lowercase.
+    Login(String),
+    Id(i64),
+}
+
+/// `provider:login` or `provider:#id`.
+#[derive(Debug)]
+struct Entry {
+    provider: String,
+    who: Who,
+}
+
+fn entry(var: &str, text: &str) -> Result<Entry> {
+    let bad = || {
+        HubError::Invalid(format!(
+            "{var} must be provider:login or provider:#id, comma separated, for github or gitlab"
+        ))
+    };
+    let (provider, who) = text.trim().split_once(':').ok_or_else(bad)?;
+    if !matches!(provider, "github" | "gitlab") {
+        return Err(bad());
+    }
+    let who = match who.strip_prefix('#') {
+        Some(id) if id.bytes().all(|b| b.is_ascii_digit()) => {
+            Who::Id(id.parse().ok().filter(|id| *id > 0).ok_or_else(bad)?)
+        }
+        Some(_) => return Err(bad()),
+        None if validate_login(who).is_ok() && !who.contains(char::is_whitespace) => {
+            Who::Login(who.to_ascii_lowercase())
+        }
+        None => return Err(bad()),
+    };
+    Ok(Entry {
+        provider: provider.to_owned(),
+        who,
+    })
+}
+
+fn listed(list: &[Entry], provider: &str, id: i64, login: &str) -> bool {
+    list.iter().any(|entry| {
+        entry.provider == provider
+            && match &entry.who {
+                Who::Id(listed) => *listed == id,
+                Who::Login(listed) => listed.eq_ignore_ascii_case(login),
+            }
+    })
+}
+
+impl LoginConfig {
+    /// Reads `AGENTSCM_{GITHUB,GITLAB}_*`, `AGENTSCM_ADMINS` and
+    /// `AGENTSCM_ALLOWED_USERS` through `lookup`. A `login` entry matches the
+    /// login the forge returns at sign-in, on the provider's configured host,
+    /// so a renamed or re-registered account changes who matches; `#id` entries
+    /// match the forge's numeric user id and are the safe form.
+    pub fn from_lookup(public_url: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let lookup = |name: &str| lookup(name).filter(|value| !value.trim().is_empty());
+        let providers: Vec<_> = [
+            provider("github", "GITHUB", "https://github.com", &lookup)?,
+            provider("gitlab", "GITLAB", "https://gitlab.com", &lookup)?,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        // Only a hub with login needs a usable public URL.
+        let public_url = if providers.is_empty() {
+            String::new()
+        } else {
+            check_base_url(public_url).map_err(|_| {
+                HubError::Invalid(
+                    "the hub's public URL is not usable (https://host, or http:// on a \
+                     loopback IP); set --public-url"
+                        .into(),
+                )
+            })?
+        };
+        let list = |var: &str| -> Result<Vec<Entry>> {
+            lookup(var).map_or(Ok(Vec::new()), |list| {
+                list.split(',').map(|text| entry(var, text)).collect()
+            })
+        };
+        Ok(Self {
+            public_url,
+            providers,
+            admins: list("AGENTSCM_ADMINS")?,
+            allowed: list("AGENTSCM_ALLOWED_USERS")?,
+        })
+    }
+}
+
+fn provider(
+    name: &'static str,
+    prefix: &str,
+    default_web: &str,
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<Provider>> {
+    let var = |suffix: &str| format!("AGENTSCM_{prefix}_{suffix}");
+    let Some(client_id) = lookup(&var("CLIENT_ID")) else {
+        return Ok(None);
+    };
+    let client_secret = optional_secret(lookup, &var("CLIENT_SECRET_FILE"), &var("CLIENT_SECRET"))?
+        .ok_or_else(|| {
+            HubError::Invalid(format!(
+                "{} or {} is required with {}",
+                var("CLIENT_SECRET_FILE"),
+                var("CLIENT_SECRET"),
+                var("CLIENT_ID")
+            ))
+        })?;
+    let ForgeUrls { web, api, host } = forge_urls(name, prefix, default_web, lookup)?;
+    Ok(Some(Provider {
+        name,
+        client_id,
+        client_secret,
+        web,
+        api,
+        host,
+    }))
+}
+
+/// A forge's web and API URLs and the identity host, from `AGENTSCM_<prefix>_URL`
+/// and `_API_URL` or their defaults. Shared by sign-in and GitHub sync.
+pub(super) struct ForgeUrls {
+    pub web: String,
+    pub api: String,
+    pub host: String,
+}
+
+pub(super) fn forge_urls(
+    name: &'static str,
+    prefix: &str,
+    default_web: &str,
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Result<ForgeUrls> {
+    let var = |suffix: &str| format!("AGENTSCM_{prefix}_{suffix}");
+    let web = check_base_url(&lookup(&var("URL")).unwrap_or_else(|| default_web.to_owned()))?;
+    let api = match lookup(&var("API_URL")) {
+        Some(api) => check_base_url(&api)?,
+        None if name == "gitlab" => format!("{web}/api/v4"),
+        None if web == "https://github.com" => "https://api.github.com".to_owned(),
+        None => format!("{web}/api/v3"),
+    };
+    let url = Url::parse(&web).map_err(|_| HubError::Invalid("invalid forge URL".into()))?;
+    let host = match (url.host_str(), url.port()) {
+        (Some(host), Some(port)) => format!("{host}:{port}"),
+        (Some(host), None) => host.to_owned(),
+        _ => return Err(HubError::Invalid("invalid forge URL".into())),
+    };
+    ForgeIdentity {
+        provider: name.into(),
+        host: host.clone(),
+        user_id: 1,
+    }
+    .validate()?;
+    Ok(ForgeUrls { web, api, host })
+}
+
+/// A secret from `file_var` (a private regular file) or `var`; both set is an error.
+pub(super) fn optional_secret(
+    lookup: &impl Fn(&str) -> Option<String>,
+    file_var: &str,
+    var: &str,
+) -> Result<Option<String>> {
+    match (lookup(file_var), lookup(var)) {
+        (Some(_), Some(_)) => Err(HubError::Invalid(format!(
+            "set only one of {file_var} and {var}"
+        ))),
+        (Some(path), None) => read_secret_file(&path, file_var).map(Some),
+        (None, secret) => Ok(secret),
+    }
+}
+
+/// A regular file, not readable by group or others, holding the secret.
+pub(super) fn read_secret_file(path: &str, var: &str) -> Result<String> {
+    let bad = |why: &str| HubError::Invalid(format!("{var} {why}"));
+    // Check before opening so a FIFO cannot block startup.
+    let meta = std::fs::metadata(path).map_err(|_| bad("cannot be read"))?;
+    if !meta.is_file() {
+        return Err(bad("must be a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o077 != 0 {
+            return Err(bad("must not be accessible by group or others"));
+        }
+    }
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .and_then(|file| {
+            file.take(MAX_SECRET_FILE_BYTES + 1)
+                .read_to_string(&mut text)
+        })
+        .map_err(|_| bad("cannot be read"))?;
+    if text.len() as u64 > MAX_SECRET_FILE_BYTES {
+        return Err(bad("is too large"));
+    }
+    let secret = text.trim_end_matches(['\r', '\n']);
+    if secret.is_empty() {
+        return Err(bad("is empty"));
+    }
+    Ok(secret.to_owned())
+}
+
+/// An in-memory table of entries that expire. When full, expired entries go
+/// first, then the earliest-expiring one, so a flood cannot lock real users out.
+pub(super) struct Table<T>(HashMap<String, (i64, T)>);
+
+impl<T> Default for Table<T> {
+    fn default() -> Self {
+        Self(HashMap::new())
+    }
+}
+
+impl<T> Table<T> {
+    pub(super) fn insert(&mut self, key: String, expires_at: i64, value: T, now: i64) {
+        if self.0.len() >= MAX_ENTRIES {
+            self.0.retain(|_, (expires_at, _)| *expires_at > now);
+        }
+        if self.0.len() >= MAX_ENTRIES {
+            let oldest = self.0.iter().min_by_key(|(_, (at, _))| *at);
+            if let Some(oldest) = oldest.map(|(key, _)| key.clone()) {
+                self.0.remove(&oldest);
+            }
+        }
+        self.0.insert(key, (expires_at, value));
+    }
+
+    pub(super) fn get(&self, key: &str, now: i64) -> Option<&T> {
+        self.0
+            .get(key)
+            .filter(|(expires_at, _)| *expires_at > now)
+            .map(|(_, value)| value)
+    }
+
+    pub(super) fn take(&mut self, key: &str, now: i64) -> Option<T> {
+        self.0
+            .remove(key)
+            .filter(|(expires_at, _)| *expires_at > now)
+            .map(|(_, value)| value)
+    }
+}
+
+impl Table<Human> {
+    /// At most `MAX_SESSIONS_PER_USER` live sessions per person: the earliest-expiring goes.
+    fn insert_session(&mut self, key: String, expires_at: i64, human: Human, now: i64) {
+        let mut mine: Vec<_> = self
+            .0
+            .iter()
+            .filter(|(_, (at, other))| *at > now && other.user.id == human.user.id)
+            .map(|(key, (at, _))| (*at, key.clone()))
+            .collect();
+        mine.sort();
+        let excess = (mine.len() + 1).saturating_sub(MAX_SESSIONS_PER_USER);
+        for (_, key) in mine.into_iter().take(excess) {
+            self.0.remove(&key);
+        }
+        self.insert(key, expires_at, human, now);
+    }
+}
+
+struct BrowserLogin {
+    provider: String,
+    verifier: String,
+    cli_port: u16,
+    cli_challenge: String,
+}
+
+struct DeviceLogin {
+    provider: String,
+    device_code: String,
+    interval: i64,
+}
+
+struct Handoff {
+    challenge: String,
+    signed: Signed,
+}
+
+/// A signed-in person. The forge token is only used server-side.
+#[derive(Clone)]
+pub(super) struct Human {
+    /// Digest of the session secret: its key in the table.
+    key: String,
+    pub(super) user: User,
+    admin: bool,
+    forge_token: String,
+    expires_at: i64,
+}
+
+#[derive(Clone)]
+struct Signed {
+    secret: String,
+    expires_at: i64,
+    user: User,
+    admin: bool,
+}
+
+#[derive(Default)]
+struct Pending {
+    browser: Table<BrowserLogin>,
+    device: Table<DeviceLogin>,
+    handoffs: Table<Handoff>,
+    sessions: Table<Human>,
+}
+
+pub struct Login {
+    config: LoginConfig,
+    /// Some when any provider is enabled.
+    forge: Option<Forge>,
+    pending: Mutex<Pending>,
+}
+
+impl Login {
+    pub fn new(config: LoginConfig) -> Result<Self> {
+        let forge = if config.providers.is_empty() {
+            None
+        } else {
+            Some(Forge::new()?)
+        };
+        Ok(Self {
+            config,
+            forge,
+            pending: Mutex::new(Pending::default()),
+        })
+    }
+
+    pub fn unconfigured() -> Self {
+        Self {
+            config: LoginConfig {
+                public_url: String::new(),
+                providers: Vec::new(),
+                admins: Vec::new(),
+                allowed: Vec::new(),
+            },
+            forge: None,
+            pending: Mutex::new(Pending::default()),
+        }
+    }
+
+    /// The configured sign-in providers; empty when none is.
+    pub fn enabled(&self) -> Vec<&'static str> {
+        self.config.providers.iter().map(|p| p.name).collect()
+    }
+
+    /// Never held across an await.
+    fn pending(&self) -> MutexGuard<'_, Pending> {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn provider(&self, name: &str) -> Option<(&Provider, &Forge)> {
+        let provider = self.config.providers.iter().find(|p| p.name == name)?;
+        Some((provider, self.forge.as_ref()?))
+    }
+
+    fn redirect_uri(&self, provider: &str) -> String {
+        format!(
+            "{}/v1/hub/login/{provider}/callback",
+            self.config.public_url
+        )
+    }
+
+    fn is_admin(&self, provider: &str, id: i64, login: &str) -> bool {
+        listed(&self.config.admins, provider, id, login)
+    }
+
+    fn has_allow_list(&self) -> bool {
+        !self.config.allowed.is_empty()
+    }
+
+    fn is_allowed(&self, provider: &str, id: i64, login: &str) -> bool {
+        listed(&self.config.allowed, provider, id, login)
+    }
+
+    fn session(&self, digest: &str) -> Option<Human> {
+        self.pending().sessions.get(digest, unix_now()).cloned()
+    }
+
+    fn drop_sessions_of(&self, user: &str) {
+        self.pending()
+            .sessions
+            .0
+            .retain(|_, (_, human)| human.user.id != user);
+    }
+}
+
+pub(super) fn random_hex() -> Result<String> {
+    generate_secret()
+        .map(|secret| secret.expose().to_owned())
+        .map_err(|_| HubError::Unavailable("random source".into()))
+}
+
+fn session_digest(raw: &str) -> Result<String> {
+    token_digest(SESSION_DIGEST_DOMAIN, raw).map_err(|_| HubError::Unauthorized)
+}
+
+fn pkce_challenge(verifier: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
+fn failed() -> ApiError {
+    ApiError::new(StatusCode::BAD_REQUEST, "login_failed")
+}
+
+fn forbidden() -> ApiError {
+    ApiError::new(StatusCode::FORBIDDEN, "forbidden")
+}
+
+fn not_found() -> ApiError {
+    ApiError::new(StatusCode::NOT_FOUND, "not_found")
+}
+
+/// A valid human session, from `Authorization: Bearer <session secret>`. Agent
+/// tokens never match here, and sessions never authenticate as agents.
+pub struct HumanSession(Human);
+
+impl FromRequestParts<HubState> for HumanSession {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &HubState,
+    ) -> std::result::Result<Self, ApiError> {
+        let digest = session_digest(bearer(parts)?)?;
+        state
+            .login
+            .session(&digest)
+            .map(Self)
+            .ok_or_else(ApiError::unauthorized)
+    }
+}
+
+impl HumanSession {
+    pub(super) fn admin(&self) -> std::result::Result<&Human, ApiError> {
+        if self.0.admin {
+            Ok(&self.0)
+        } else {
+            Err(forbidden())
+        }
+    }
+}
+
+pub fn routes() -> Router<HubState> {
+    Router::new()
+        .route("/v1/hub/login/exchange", post(exchange))
+        .route("/v1/hub/login/device/poll", post(device_poll))
+        .route("/v1/hub/login/{provider}", get(browser_start))
+        .route("/v1/hub/login/{provider}/callback", get(callback))
+        .route("/v1/hub/login/{provider}/device", post(device_start))
+        .route("/v1/hub/tokens", post(create_token).get(list_tokens))
+        .route("/v1/hub/tokens/{id}", delete(revoke_token))
+        .route("/v1/hub/session", get(session).delete(logout))
+        .route("/v1/hub/users", get(list_users))
+        .route("/v1/hub/users/{id}/disable", post(disable))
+        .route("/v1/hub/users/{id}/enable", post(enable))
+}
+
+type ApiResult<T> = std::result::Result<T, ApiError>;
+
+fn user_json(user: &User) -> Value {
+    json!({"id": user.id, "provider": user.identity.provider, "host": user.identity.host,
+        "user_id": user.identity.user_id, "login": user.login})
+}
+
+impl Signed {
+    fn json(&self) -> Value {
+        json!({"session": self.secret, "expires_at": self.expires_at,
+            "user": user_json(&self.user), "admin": self.admin})
+    }
+}
+
+fn query(raw: Option<String>) -> HashMap<String, String> {
+    Url::parse("http://x/")
+        .map(|mut url| {
+            url.set_query(raw.as_deref());
+            url.query_pairs().into_owned().collect()
+        })
+        .unwrap_or_default()
+}
+
+fn found(location: &str, cookie: String) -> ApiResult<Response> {
+    let location = HeaderValue::from_str(location).map_err(|_| ApiError::invalid())?;
+    let cookie = HeaderValue::from_str(&cookie).map_err(|_| ApiError::invalid())?;
+    let mut response = StatusCode::FOUND.into_response();
+    response.headers_mut().insert(header::LOCATION, location);
+    response.headers_mut().insert(header::SET_COOKIE, cookie);
+    Ok(response)
+}
+
+fn cookie_attributes(value: &str, max_age: u32) -> String {
+    format!("{COOKIE}={value}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={max_age}")
+}
+
+/// True when the request carries exactly one login cookie and it equals `state`.
+fn cookie_matches(headers: &HeaderMap, state: &str) -> bool {
+    let mut found = headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|cookie| cookie.trim().strip_prefix(COOKIE)?.strip_prefix('='));
+    matches!((found.next(), found.next()), (Some(value), None) if value == state)
+}
+
+async fn browser_start(
+    State(state): State<HubState>,
+    Path(name): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> ApiResult<Response> {
+    let (provider, _) = state.login.provider(&name).ok_or_else(not_found)?;
+    let params = query(raw);
+    let cli_port = params
+        .get("cli_port")
+        .and_then(|port| port.parse::<u16>().ok())
+        .filter(|port| *port >= 1024)
+        .ok_or_else(ApiError::invalid)?;
+    let cli_challenge = params
+        .get("cli_challenge")
+        .filter(|c| {
+            c.len() == 43
+                && c.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+        })
+        .ok_or_else(ApiError::invalid)?
+        .clone();
+    let (csrf, verifier) = (random_hex()?, random_hex()?);
+    let mut url = Url::parse(&format!(
+        "{}{}",
+        provider.web,
+        if provider.is_gitlab() {
+            "/oauth/authorize"
+        } else {
+            "/login/oauth/authorize"
+        }
+    ))
+    .map_err(|_| HubError::Unavailable("authorize URL".into()))?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("client_id", &provider.client_id);
+        pairs.append_pair("redirect_uri", &state.login.redirect_uri(provider.name));
+        if provider.is_gitlab() {
+            pairs.append_pair("response_type", "code");
+            pairs.append_pair("scope", "read_api");
+        }
+        pairs.append_pair("state", &csrf);
+        pairs.append_pair("code_challenge", &pkce_challenge(&verifier));
+        pairs.append_pair("code_challenge_method", "S256");
+    }
+    let now = unix_now();
+    let login = BrowserLogin {
+        provider: name,
+        verifier,
+        cli_port,
+        cli_challenge,
+    };
+    state
+        .login
+        .pending()
+        .browser
+        .insert(csrf.clone(), now + BROWSER_LOGIN_SECONDS, login, now);
+    found(
+        url.as_str(),
+        cookie_attributes(&csrf, BROWSER_LOGIN_SECONDS as u32),
+    )
+}
+
+async fn callback(
+    State(state): State<HubState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let mut response = match callback_inner(&state, &name, &headers, query(raw)).await {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    };
+    // The success redirect already clears it.
+    if !response.headers().contains_key(header::SET_COOKIE)
+        && let Ok(clear) = HeaderValue::from_str(&cookie_attributes("", 0))
+    {
+        response.headers_mut().insert(header::SET_COOKIE, clear);
+    }
+    response
+}
+
+async fn callback_inner(
+    state: &HubState,
+    name: &str,
+    headers: &HeaderMap,
+    params: HashMap<String, String>,
+) -> ApiResult<Response> {
+    let (provider, forge) = state.login.provider(name).ok_or_else(not_found)?;
+    let csrf = params.get("state").ok_or_else(failed)?;
+    // Single use: the entry goes on any attempt.
+    let pending = state.login.pending().browser.take(csrf, unix_now());
+    let pending = pending
+        .filter(|p| p.provider == name && cookie_matches(headers, csrf))
+        .ok_or_else(failed)?;
+    if let Some(error) = params.get("error") {
+        return Err(if error == "access_denied" {
+            ApiError::new(StatusCode::FORBIDDEN, "login_denied")
+        } else {
+            failed()
+        });
+    }
+    let code = params.get("code").ok_or_else(failed)?;
+    let redirect = state.login.redirect_uri(name);
+    let mut form = vec![
+        ("client_id", provider.client_id.as_str()),
+        ("client_secret", provider.client_secret.as_str()),
+        ("code", code.as_str()),
+        ("redirect_uri", redirect.as_str()),
+        ("code_verifier", pending.verifier.as_str()),
+    ];
+    if provider.is_gitlab() {
+        form.push(("grant_type", "authorization_code"));
+    }
+    let (_, body) = forge.post_form(&provider.token_url(), &form).await?;
+    if !body["access_token"].is_string() {
+        log_forge_error("code exchange failed", &body);
+    }
+    let signed = sign_in(state, provider, forge, "browser", &body).await?;
+    let now = unix_now();
+    let handoff = random_hex()?;
+    let location = format!(
+        "http://127.0.0.1:{}/callback?code={handoff}",
+        pending.cli_port
+    );
+    let value = Handoff {
+        challenge: pending.cli_challenge,
+        signed,
+    };
+    state
+        .login
+        .pending()
+        .handoffs
+        .insert(handoff, now + HANDOFF_SECONDS, value, now);
+    found(&location, cookie_attributes("", 0))
+}
+
+/// Logs the forge's `error` code only: its description or body may echo secrets.
+fn log_forge_error(context: &str, body: &Value) {
+    let code = body["error"].as_str().filter(|code| {
+        code.len() <= 64
+            && code
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    });
+    if let Some(code) = code {
+        eprintln!("hub: {context}: forge error {code}");
+    }
+}
+
+/// A public repository (the reply says `private: false`) lets in only people who can write
+/// to it, since anyone can read it; a private one needs only the read the reply already proves.
+/// A GitLab project needs Reporter (20) on the project or its group, so Guest and Minimal
+/// Access are refused; one that is not private (public, internal or unstated) needs Developer
+/// (30). Missing permissions deny.
+fn may_use(provider: &Provider, reply: &Value) -> bool {
+    if provider.is_gitlab() {
+        let level = |scope: &str| reply["permissions"][scope]["access_level"].as_i64();
+        let needed = if reply["visibility"] == json!("private") {
+            GITLAB_REPORTER
+        } else {
+            GITLAB_DEVELOPER
+        };
+        return level("project_access").max(level("group_access")) >= Some(needed);
+    }
+    reply["private"] != json!(false)
+        || ["push", "triage", "maintain", "admin"]
+            .iter()
+            .any(|level| reply["permissions"][level] == json!(true))
+}
+
+/// Whether the person's forge token can read a connected repository on the provider's host.
+async fn reads_connected(
+    state: &HubState,
+    provider: &Provider,
+    forge: &Forge,
+    token: &str,
+) -> ApiResult<bool> {
+    let (store, host) = (state.store.clone(), provider.host.clone());
+    let repos = blocking(state, move || {
+        store.repositories_on(&host, MAX_SIGN_IN_PROBES)
+    })
+    .await?;
+    for repo in repos {
+        let url = if provider.is_gitlab() {
+            format!("{}/projects/{}", provider.api, repo.repository_id)
+        } else {
+            format!("{}/repos/{}", provider.api, repo.full_name)
+        };
+        let (status, body) = forge.get_json(&url, Some(token)).await?;
+        // The id guards against a name that now belongs to another repository.
+        if status == 200
+            && body["id"].as_i64() == Some(repo.repository_id)
+            && may_use(provider, &body)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Turn a forge token reply into a hub session for the person it belongs to.
+async fn sign_in(
+    state: &HubState,
+    provider: &Provider,
+    forge: &Forge,
+    method: &'static str,
+    grant: &Value,
+) -> ApiResult<Signed> {
+    let token = grant["access_token"]
+        .as_str()
+        .filter(|token| !token.is_empty())
+        .ok_or_else(failed)?;
+    let (status, body) = forge
+        .get_json(&format!("{}/user", provider.api), Some(token))
+        .await?;
+    let login_field = if provider.is_gitlab() {
+        "username"
+    } else {
+        "login"
+    };
+    let (id, login) = match (body["id"].as_i64(), body[login_field].as_str()) {
+        (Some(id), Some(login)) if status == 200 && id > 0 => (id, login.to_owned()),
+        _ => return Err(failed()),
+    };
+    let identity = ForgeIdentity {
+        provider: provider.name.into(),
+        host: provider.host.clone(),
+        user_id: id,
+    };
+    let admin = state.login.is_admin(provider.name, id, &login);
+    // Nothing is stored for anyone refused.
+    if !admin {
+        let listed_ok =
+            !state.login.has_allow_list() || state.login.is_allowed(provider.name, id, &login);
+        if !listed_ok || !reads_connected(state, provider, forge, token).await? {
+            return Err(ApiError::new(StatusCode::FORBIDDEN, "not_allowed"));
+        }
+    }
+    let store = state.store.clone();
+    let user = blocking(state, move || {
+        let user = store.upsert_user(&identity, &login)?;
+        if !user.disabled {
+            store.record_sign_in(&user.id, method, admin)?;
+        }
+        Ok(user)
+    })
+    .await?;
+    if user.disabled {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "user_disabled"));
+    }
+    let now = unix_now();
+    let lifetime = grant["expires_in"]
+        .as_i64()
+        .filter(|seconds| *seconds > 0)
+        .map_or(SESSION_SECONDS, |seconds| seconds.min(SESSION_SECONDS));
+    let (secret, expires_at) = (random_hex()?, now + lifetime);
+    let key = session_digest(&secret)?;
+    let human = Human {
+        key: key.clone(),
+        user: user.clone(),
+        admin,
+        forge_token: token.to_owned(),
+        expires_at,
+    };
+    state
+        .login
+        .pending()
+        .sessions
+        .insert_session(key, expires_at, human, now);
+    Ok(Signed {
+        secret,
+        expires_at,
+        user,
+        admin,
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExchangeBody {
+    code: String,
+    verifier: String,
+}
+
+async fn exchange(
+    State(state): State<HubState>,
+    JsonBody(body): JsonBody<ExchangeBody>,
+) -> ApiResult<Json<Value>> {
+    let handoff = state.login.pending().handoffs.take(&body.code, unix_now());
+    handoff
+        .filter(|h| body.verifier.len() <= 128 && pkce_challenge(&body.verifier) == h.challenge)
+        .map(|h| Json(h.signed.json()))
+        .ok_or_else(failed)
+}
+
+async fn device_start(
+    State(state): State<HubState>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let (provider, forge) = state.login.provider(&name).ok_or_else(not_found)?;
+    let unavailable = || ApiError::new(StatusCode::CONFLICT, "device_flow_unavailable");
+    let (url, scope) = if provider.is_gitlab() {
+        (
+            format!("{}/oauth/authorize_device", provider.web),
+            Some("read_api"),
+        )
+    } else {
+        (format!("{}/login/device/code", provider.web), None)
+    };
+    let mut form = vec![("client_id", provider.client_id.as_str())];
+    form.extend(scope.map(|scope| ("scope", scope)));
+    let (status, body) = forge.post_form(&url, &form).await?;
+    let (Some(device_code), Some(user_code), Some(uri)) = (
+        body["device_code"].as_str(),
+        body["user_code"].as_str(),
+        body["verification_uri"].as_str(),
+    ) else {
+        return Err(unavailable());
+    };
+    if status != 200 {
+        return Err(unavailable());
+    }
+    let expires_in = body["expires_in"]
+        .as_i64()
+        .filter(|seconds| *seconds > 0)
+        .map_or(MAX_DEVICE_SECONDS, |seconds| {
+            seconds.min(MAX_DEVICE_SECONDS)
+        });
+    let interval = body["interval"]
+        .as_i64()
+        .filter(|s| (1..=60).contains(s))
+        .unwrap_or(5);
+    let (handle, now) = (random_hex()?, unix_now());
+    let login = DeviceLogin {
+        provider: name,
+        device_code: device_code.to_owned(),
+        interval,
+    };
+    state
+        .login
+        .pending()
+        .device
+        .insert(handle.clone(), now + expires_in, login, now);
+    Ok(Json(
+        json!({"handle": handle, "user_code": user_code, "verification_uri": uri,
+        "interval": interval, "expires_in": expires_in}),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PollBody {
+    handle: String,
+}
+
+async fn device_poll(
+    State(state): State<HubState>,
+    JsonBody(body): JsonBody<PollBody>,
+) -> ApiResult<Json<Value>> {
+    let (name, device_code, interval) = {
+        let pending = state.login.pending();
+        let device = pending
+            .device
+            .get(&body.handle, unix_now())
+            .ok_or_else(failed)?;
+        (
+            device.provider.clone(),
+            device.device_code.clone(),
+            device.interval,
+        )
+    };
+    let (provider, forge) = state.login.provider(&name).ok_or_else(failed)?;
+    let form = [
+        ("client_id", provider.client_id.as_str()),
+        ("device_code", device_code.as_str()),
+        ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+    ];
+    let (status, reply) = forge.post_form(&provider.token_url(), &form).await?;
+    let remove = || state.login.pending().device.take(&body.handle, unix_now());
+    if reply["access_token"].is_string() {
+        remove();
+        let signed = sign_in(&state, provider, forge, "device", &reply).await?;
+        let mut out = signed.json();
+        out["status"] = json!("signed_in");
+        return Ok(Json(out));
+    }
+    // No token and no error code (or a forge failure): keep the handle and let the caller retry.
+    if status >= 500 || reply["error"].as_str().is_none() {
+        return Err(HubError::Unavailable("forge device poll gave no usable reply".into()).into());
+    }
+    Ok(Json(match reply["error"].as_str() {
+        Some("authorization_pending") => json!({"status": "pending", "interval": interval}),
+        Some("slow_down") => {
+            let interval = reply["interval"]
+                .as_i64()
+                .filter(|s| (1..=60).contains(s))
+                .unwrap_or(interval + 5);
+            if let Some((_, device)) = state.login.pending().device.0.get_mut(&body.handle) {
+                device.interval = interval;
+            }
+            json!({"status": "slow_down", "interval": interval})
+        }
+        Some("expired_token") => {
+            remove();
+            json!({"status": "expired"})
+        }
+        Some("access_denied") => {
+            remove();
+            json!({"status": "denied"})
+        }
+        _ => {
+            log_forge_error("device poll failed", &reply);
+            remove();
+            return Err(failed());
+        }
+    }))
+}
+
+async fn session(HumanSession(human): HumanSession) -> Json<Value> {
+    Json(json!({"user": user_json(&human.user), "admin": human.admin,
+        "expires_at": human.expires_at}))
+}
+
+async fn logout(State(state): State<HubState>, HumanSession(human): HumanSession) -> StatusCode {
+    state.login.pending().sessions.0.remove(&human.key);
+    StatusCode::NO_CONTENT
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewToken {
+    name: String,
+    repository: String,
+    ttl_seconds: i64,
+    #[serde(default)]
+    read_only: bool,
+}
+
+async fn create_token(
+    State(state): State<HubState>,
+    HumanSession(human): HumanSession,
+    JsonBody(body): JsonBody<NewToken>,
+) -> ApiResult<Response> {
+    validate_agent_name(&body.name)?;
+    validate_repository(&body.repository)?;
+    if !(1..=MAX_AGENT_TOKEN_TTL_SECONDS).contains(&body.ttl_seconds) {
+        return Err(ApiError::invalid());
+    }
+    let (provider, forge) = state
+        .login
+        .provider(&human.user.identity.provider)
+        .ok_or_else(ApiError::unauthorized)?;
+    let url = if provider.is_gitlab() {
+        format!(
+            "{}/projects/{}",
+            provider.api,
+            body.repository.replace('/', "%2F")
+        )
+    } else if body.repository.split('/').count() == 2 {
+        format!("{}/repos/{}", provider.api, body.repository)
+    } else {
+        return Err(ApiError::invalid());
+    };
+    let (status, reply) = forge.get_json(&url, Some(&human.forge_token)).await?;
+    // The forge's own spelling is what gets stored, whatever case was asked for.
+    let canonical = reply[if provider.is_gitlab() {
+        "path_with_namespace"
+    } else {
+        "full_name"
+    }]
+    .as_str();
+    if status == 200 && !may_use(provider, &reply) {
+        return Err(forbidden());
+    }
+    let (repository_id, repository) = match (status, reply["id"].as_i64(), canonical) {
+        (200, Some(id), Some(name)) if id > 0 && validate_repository(name).is_ok() => {
+            (id, name.to_owned())
+        }
+        (300..=399 | 403 | 404, ..) => return Err(forbidden()),
+        (401, ..) => return Err(ApiError::unauthorized()),
+        _ => return Err(HubError::Unavailable("forge repository lookup failed".into()).into()),
+    };
+    // Only connected repositories get tokens, and the name must still be the connected repository.
+    let (store, host, named) = (
+        state.store.clone(),
+        provider.host.clone(),
+        repository.clone(),
+    );
+    match blocking(&state, move || store.repository_named(&host, &named)).await? {
+        None => return Err(ApiError::new(StatusCode::FORBIDDEN, "not_connected")),
+        Some(connected) if connected.repository_id != repository_id => return Err(forbidden()),
+        Some(_) => {}
+    }
+    let store = state.store.clone();
+    let (owner, name, stored) = (human.user.id, body.name.clone(), repository.clone());
+    let (id, secret, expires_at) = blocking(&state, move || {
+        let (id, secret, expires_at) = mint_bound_agent_token(
+            &*store,
+            &owner,
+            &name,
+            &stored,
+            repository_id,
+            body.ttl_seconds,
+            body.read_only,
+        )?;
+        Ok((id, secret.expose().to_owned(), expires_at))
+    })
+    .await?;
+    let reply = json!({"id": id, "token": secret, "name": body.name,
+        "repository": repository, "repository_id": repository_id, "expires_at": expires_at,
+        "read_only": body.read_only});
+    Ok((StatusCode::CREATED, Json(reply)).into_response())
+}
+
+async fn list_tokens(
+    State(state): State<HubState>,
+    HumanSession(human): HumanSession,
+) -> ApiResult<Json<Value>> {
+    let store = state.store.clone();
+    let tokens = blocking(&state, move || store.list_agent_tokens(&human.user.id)).await?;
+    let tokens: Vec<_> = tokens
+        .iter()
+        .map(|t| {
+            json!({"id": t.id, "name": t.name, "repository": t.repository,
+            "repository_id": t.repository_id, "expires_at": t.expires_at,
+            "revoked": t.revoked, "read_only": t.read_only, "created_at": t.created_at})
+        })
+        .collect();
+    Ok(Json(json!({"tokens": tokens})))
+}
+
+async fn revoke_token(
+    State(state): State<HubState>,
+    HumanSession(human): HumanSession,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    let store = state.store.clone();
+    let revoked = blocking(&state, move || {
+        store.revoke_owned_agent_token(&human.user.id, &id)
+    })
+    .await?;
+    if revoked {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(not_found())
+    }
+}
+
+async fn list_users(State(state): State<HubState>, human: HumanSession) -> ApiResult<Json<Value>> {
+    human.admin()?;
+    let store = state.store.clone();
+    let users = blocking(&state, move || store.list_users()).await?;
+    let users: Vec<_> = users
+        .iter()
+        .map(|u| {
+            let mut json = user_json(u);
+            json["disabled"] = json!(u.disabled);
+            json
+        })
+        .collect();
+    Ok(Json(json!({"users": users})))
+}
+
+async fn set_disabled(
+    state: HubState,
+    human: HumanSession,
+    user: String,
+    disabled: bool,
+) -> ApiResult<StatusCode> {
+    let actor = human.admin()?.user.id.clone();
+    if disabled && actor == user {
+        return Err(ApiError::invalid());
+    }
+    let store = state.store.clone();
+    let target = user.clone();
+    // After the actor is vetted, the store refuses only an unknown target.
+    match blocking(&state, move || {
+        store.set_user_disabled_by(&actor, &target, disabled)
+    })
+    .await
+    {
+        Err(HubError::Invalid(_)) => return Err(not_found()),
+        result => result?,
+    }
+    if disabled {
+        state.login.drop_sessions_of(&user);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn disable(
+    State(state): State<HubState>,
+    human: HumanSession,
+    Path(user): Path<String>,
+) -> ApiResult<StatusCode> {
+    set_disabled(state, human, user, true).await
+}
+
+async fn enable(
+    State(state): State<HubState>,
+    human: HumanSession,
+    Path(user): Path<String>,
+) -> ApiResult<StatusCode> {
+    set_disabled(state, human, user, false).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn human(user: &str) -> Human {
+        Human {
+            key: String::new(),
+            user: User {
+                id: user.into(),
+                identity: ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 1,
+                },
+                login: "x".into(),
+                disabled: false,
+            },
+            admin: false,
+            forge_token: String::new(),
+            expires_at: 0,
+        }
+    }
+
+    #[test]
+    fn entries_expire_by_explicit_time() {
+        let mut table = Table::<u8>::default();
+        table.insert("a".into(), 100, 1, 0);
+        assert_eq!(table.get("a", 99), Some(&1));
+        assert_eq!(table.get("a", 100), None);
+        assert_eq!(table.take("a", 100), None);
+        assert!(table.0.is_empty(), "take removes even an expired entry");
+        table.insert("b".into(), 100, 2, 0);
+        assert_eq!(table.take("b", 50), Some(2));
+        assert_eq!(table.take("b", 50), None);
+    }
+
+    #[test]
+    fn a_full_table_drops_expired_then_the_earliest_expiring() {
+        let mut table = Table::<usize>::default();
+        for i in 0..MAX_ENTRIES {
+            table.insert(format!("k{i}"), 1000 + i as i64, i, 0);
+        }
+        // Full of live entries: the earliest-expiring (k0) is evicted.
+        table.insert("new".into(), 5000, 0, 10);
+        assert_eq!(table.0.len(), MAX_ENTRIES);
+        assert!(table.get("k0", 10).is_none() && table.get("k1", 10).is_some());
+        assert!(table.get("new", 10).is_some());
+        // Full with some expired: those go instead of a live entry.
+        table.insert("newer".into(), 6000, 0, 1005);
+        assert!(table.get("k5", 1005).is_none() && table.get("k6", 1005).is_some());
+        assert!(table.get("newer", 1005).is_some() && table.get("new", 1005).is_some());
+        assert!(table.0.len() < MAX_ENTRIES);
+    }
+
+    #[test]
+    fn a_person_keeps_at_most_eight_live_sessions() {
+        let mut sessions = Table::<Human>::default();
+        for i in 0..MAX_SESSIONS_PER_USER {
+            sessions.insert_session(format!("a{i}"), 100 + i as i64, human("usr_a"), 0);
+        }
+        sessions.insert_session("b".into(), 100, human("usr_b"), 0);
+        sessions.insert_session("a8".into(), 200, human("usr_a"), 0);
+        let live = |user: &str| {
+            sessions
+                .0
+                .values()
+                .filter(|(_, h)| h.user.id == user)
+                .count()
+        };
+        assert_eq!((live("usr_a"), live("usr_b")), (MAX_SESSIONS_PER_USER, 1));
+        assert!(sessions.get("a0", 0).is_none() && sessions.get("a1", 0).is_some());
+        // Expired sessions do not count against the cap.
+        sessions.insert_session("a9".into(), 300, human("usr_a"), 150);
+        assert!(sessions.get("a1", 0).is_some() && sessions.get("a9", 150).is_some());
+    }
+
+    #[test]
+    fn list_entries_match_by_login_or_id() {
+        let list: Vec<_> = ["github:Alice", "gitlab:#42"]
+            .iter()
+            .map(|text| entry("X", text).unwrap())
+            .collect();
+        assert!(listed(&list, "github", 1, "ALICE"));
+        assert!(!listed(&list, "gitlab", 1, "alice"));
+        assert!(listed(&list, "gitlab", 42, "anyone"));
+        assert!(!listed(&list, "github", 42, "anyone"));
+        for bad in [
+            "github:#0",
+            "github:#x",
+            "github:#-1",
+            "github:#",
+            "github:",
+        ] {
+            assert!(entry("X", bad).is_err(), "{bad}");
+        }
+    }
+}

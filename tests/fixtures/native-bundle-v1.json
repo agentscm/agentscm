@@ -1,0 +1,43 @@
+{
+  "format": "agentscm.native-bundle/v1",
+  "packager_declaration": {
+    "package_version": "0.0.0-fixture",
+    "operating_system": "fixture-os",
+    "architecture": "fixture-arch",
+    "debug_assertions": false
+  },
+  "assurance": {
+    "inventory_basis": "copied_bytes",
+    "metadata_basis": "packager_build_declaration",
+    "publisher_authentication": "not_established",
+    "build_provenance": "not_established",
+    "license_completeness": "not_established",
+    "release_support": "not_established"
+  },
+  "files": [
+    {
+      "path": "agentscm",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": true
+    },
+    {
+      "path": "LICENSE",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "THIRD_PARTY_NOTICES.md",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    },
+    {
+      "path": "Cargo.lock",
+      "bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": false
+    }
+  ]
+}

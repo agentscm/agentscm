@@ -1,0 +1,34 @@
+[package]
+name = "agentscm-portable-verifier"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "FSL-1.1-ALv2"
+description = "Standalone descriptive verifier for AgentSCM portable evidence v1"
+publish = false
+include = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    "LICENSE",
+    "NOTICE",
+    "README.md",
+    "DEPENDENCIES.md",
+    "THIRD_PARTY_NOTICES.md",
+    "sbom.cdx.json",
+    "src/**",
+    "tests/**",
+    "protocol/evidence-v1/profile.md",
+    "protocol/evidence-v1/vectors.json",
+    "licenses/**",
+]
+
+[dependencies]
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std", "zeroize"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.151"
+sha2 = "=0.10.9"
+
+[profile.release]
+overflow-checks = true
+strip = true

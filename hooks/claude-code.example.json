@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {"hooks": [{"type": "command", "command": "agentscm intent start --hook claude"}]}
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [{"type": "command", "command": "agentscm intent check --hook claude", "timeout": 10}]
+      }
+    ],
+    "SessionEnd": [
+      {"hooks": [{"type": "command", "command": "agentscm intent done --hook claude", "timeout": 5}]}
+    ]
+  }
+}

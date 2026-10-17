@@ -1,0 +1,26 @@
+services:
+  agentscm:
+    build:
+      context: .
+    command: ["--data-dir", "/data", "serve", "--bind", "0.0.0.0:7331", "--public", "--max-concurrency", "1", "--collisions-repo", "/repo"]
+    ports:
+      - "127.0.0.1:7331:7331"
+    volumes:
+      - agentscm-data:/data
+      # Read-write: `git merge-tree` writes unreferenced objects (`git gc` removes them); nothing else is written.
+      # Set AGENTSCM_REPO to your own checkout.
+      - ${AGENTSCM_REPO:-.}:/repo
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1.0
+    restart: unless-stopped
+
+volumes:
+  agentscm-data:

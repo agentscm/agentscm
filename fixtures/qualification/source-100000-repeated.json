@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "files": 100000,
+  "content": "repeated",
+  "file_bytes": 32,
+  "batch_files": 256,
+  "history_edits": 1000,
+  "read_repetitions": 10000,
+  "max_wall_seconds": 1800,
+  "max_retained_bytes": 4294967296
+}

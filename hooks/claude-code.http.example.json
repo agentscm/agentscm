@@ -1,0 +1,31 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "https://hub.example.com/v1/hub/hook/claude?repo=acme/widgets",
+            "headers": {"Authorization": "Bearer $AGENTSCM_HUB_TOKEN"},
+            "allowedEnvVars": ["AGENTSCM_HUB_TOKEN"],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "https://hub.example.com/v1/hub/hook/claude?repo=acme/widgets",
+            "headers": {"Authorization": "Bearer $AGENTSCM_HUB_TOKEN"},
+            "allowedEnvVars": ["AGENTSCM_HUB_TOKEN"],
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

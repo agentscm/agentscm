@@ -1,0 +1,8 @@
+{
+  "sessionId": "11111111-2222-3333-4444-555555555555",
+  "timestamp": 1790000002000,
+  "cwd": "/work/acme-widgets",
+  "toolName": "edit",
+  "toolArgs": "{\"path\":\"/work/acme-widgets/src/widget.rs\",\"old_str\":\"a\",\"new_str\":\"b\"}",
+  "toolResult": { "resultType": "success", "textResultForLlm": "edited" }
+}

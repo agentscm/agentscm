@@ -1,0 +1,41 @@
+name: Dependency audit
+
+on:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - "tools/portable-verifier/Cargo.toml"
+      - "tools/portable-verifier/Cargo.lock"
+      - ".github/workflows/deny.yml"
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 5 * * 1" # weekly: new advisories appear without any change here
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deny-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          rust-version: 1.96.0
+          arguments: --all-features --config deny.toml
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          rust-version: 1.96.0
+          manifest-path: tools/portable-verifier/Cargo.toml
+          arguments: --all-features

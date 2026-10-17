@@ -1,0 +1,58 @@
+# Test-only services for .github/hub-e2e.sh, merged after compose.hub.yaml. Never use outside tests.
+
+x-seed: &seed
+  build:
+    context: .
+    target: e2e-seed
+  image: agentscm-seed:local
+
+x-client: &client
+  image: agentscm:local
+  entrypoint: ["sh", "-c"]
+  volumes:
+    - e2e-tokens:/tokens:ro
+  tmpfs:
+    - /work:mode=1777
+  environment:
+    HOME: /work
+    XDG_CONFIG_HOME: /work/.config
+    AGENTSCM_HUB_URL: http://127.0.0.1:7332
+
+services:
+  seed:
+    <<: *seed
+    profiles: [default]
+    volumes:
+      - hub-data:/data
+      - e2e-tokens:/tokens
+    environment:
+      AGENTSCM_SEED_DIR: /tokens
+
+  seed-postgres:
+    <<: *seed
+    profiles: [postgres]
+    network_mode: service:hub-postgres
+    depends_on:
+      - hub-postgres
+    volumes:
+      - e2e-tokens:/tokens
+    environment:
+      AGENTSCM_SEED_DIR: /tokens
+      AGENTSCM_DATABASE_URL: postgres://postgres:${AGENTSCM_PG_PASSWORD:-agentscm-dev}@postgres:5432/postgres?sslmode=disable
+      AGENTSCM_SEED_S3_BUCKET: agentscm
+      AGENTSCM_S3_ENDPOINT: http://127.0.0.1:7070
+      AGENTSCM_S3_ACCESS_KEY_ID: ${AGENTSCM_S3_ACCESS_KEY_ID:-agentscm-dev}
+      AGENTSCM_S3_SECRET_ACCESS_KEY: ${AGENTSCM_S3_SECRET_ACCESS_KEY:-agentscm-dev-secret-0123456789}
+
+  client:
+    <<: *client
+    profiles: [default]
+    network_mode: service:hub
+
+  client-postgres:
+    <<: *client
+    profiles: [postgres]
+    network_mode: service:hub-postgres
+
+volumes:
+  e2e-tokens:

@@ -1,0 +1,11 @@
+AgentSCM portable evidence verifier
+Copyright 2026 DUVATL, Inc. Licensed under FSL-1.1-ALv2; see LICENSE.
+
+This product includes third-party Rust crates. Their exact locked versions,
+declared license expressions, and bundled upstream license files are listed in
+THIRD_PARTY_NOTICES.md and licenses/. The machine-readable inventory is
+sbom.cdx.json.
+
+This verifier reports descriptive evidence facts. It does not authenticate the
+selected issuer registry or make an admission, approval, or qualification
+decision.

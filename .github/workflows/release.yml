@@ -1,0 +1,302 @@
+name: Release
+
+# Runs only when a maintainer pushes a `v*` tag. It builds the container image, smoke-tests it,
+# pushes it to GHCR by digest with a version tag (no `latest` during alpha), attests its build
+# provenance, builds attested release binaries (Linux and macOS, plus Windows x86_64), and creates a GitHub prerelease whose body is the
+# CHANGELOG entry. It then publishes the `agentscm` npm package unless the tag contains `-dry`
+# (for example v0.2.0-dry1); any other tag fails if the NPM_TOKEN secret is unset.
+# Anyone who can push a `v*` tag can start this workflow, so protect `v*` tags with a repository ruleset
+# (maintainers only) and keep the `npm` environment's required reviewers set.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  image:
+    # Only the public repository publishes: the image name, the attestation and the docs assume it.
+    if: ${{ github.repository == 'counterbranch/agentscm' && !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Check the tag matches Cargo.toml and is on main
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          [ "$TAG" = "v$version" ] || { echo "tag $TAG does not match Cargo.toml version $version" >&2; exit 1; }
+          # Fail before anything is pushed: the npm package copies them into the published tarball.
+          [ -f NOTICE ] && [ -f THIRD_PARTY_NOTICES.md ] || { echo "NOTICE and THIRD_PARTY_NOTICES.md are required before releasing" >&2; exit 1; }
+          # Fail before anything is pushed if the release notes are missing.
+          awk -v v="$version" '
+            /^## / { if (found) exit; if ($0 == "## " v || index($0, "## " v " ") == 1) found = 1 }
+            found { print }
+          ' CHANGELOG.md | wc -l | awk '$1 > 2 { ok = 1 } END { exit !ok }' || { echo "no CHANGELOG entry for $version" >&2; exit 1; }
+          git merge-base --is-ancestor HEAD origin/main || { echo "tag $TAG is not on main" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build and smoke test
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          push: false
+          tags: agentscm:release-check
+      - run: .github/docker-smoke.sh agentscm:release-check
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=false
+          tags: type=raw,value=${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.licenses=FSL-1.1-ALv2
+            org.opencontainers.image.source=https://github.com/counterbranch/agentscm
+            org.opencontainers.image.vendor=DUVATL, Inc.
+      - name: Push by digest
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: true
+          sbom: true
+          provenance: false # build provenance is attested below
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  ui:
+    # The status page, built once and embedded into every binary below with `--features ui`.
+    if: ${{ github.repository == 'counterbranch/agentscm' && !github.event.repository.private }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          package-manager-cache: false # never restore a cache into a release build
+      - run: npm ci --ignore-scripts && npm run build
+        working-directory: ui
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ui-dist
+          path: |
+            ui/dist/index.html
+            ui/dist/app.js
+            ui/dist/app.css
+          if-no-files-found: error
+
+  binaries:
+    # Builds only: no OIDC token or attestation rights here, so build-time code cannot sign anything.
+    # Runs in parallel with the image once the UI is built; `attest` waits for both.
+    needs: ui
+    if: ${{ github.repository == 'counterbranch/agentscm' && !github.event.repository.private }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - {target: x86_64-unknown-linux-musl, os: ubuntu-24.04, musl: true, native: true, exe: ""}
+          - {target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, musl: true, native: true, exe: ""}
+          - {target: aarch64-apple-darwin, os: macos-15, musl: false, native: true, exe: ""}
+          - {target: x86_64-apple-darwin, os: macos-15, musl: false, native: false, exe: ""} # cross-compiled on the arm runner
+          - {target: x86_64-pc-windows-msvc, os: windows-2025, musl: false, native: true, exe: .exe}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      TARGET: ${{ matrix.target }}
+    defaults:
+      run:
+        shell: bash # Git Bash on the Windows runner; the steps below use bash syntax
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install # reads rust-toolchain.toml
+      - run: rustup target add "$TARGET"
+      - name: Install musl-tools
+        if: ${{ matrix.musl }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          # ring and bundled SQLite compile C; cc-rs only guesses musl-gcc for x86_64.
+          echo "CC_${TARGET//-/_}=musl-gcc" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ui-dist
+          path: ui/dist
+      - run: cargo build --locked --release --features ui --target "$TARGET"
+        env:
+          # Static CRT: the .exe needs no VC++ redistributable. Affects only the Windows target.
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+      - name: Smoke test
+        if: ${{ matrix.native }}
+        run: '"target/$TARGET/release/agentscm${{ matrix.exe }}" --version'
+      - name: Stage the binary
+        run: |
+          mkdir dist
+          cp "target/$TARGET/release/agentscm${{ matrix.exe }}" "dist/agentscm-$TARGET${{ matrix.exe }}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: agentscm-${{ matrix.target }}
+          path: dist/agentscm-${{ matrix.target }}${{ matrix.exe }}
+          if-no-files-found: error
+
+  attest:
+    # Waits for `image` so the tag has been checked against Cargo.toml and main before anything is attested.
+    needs: [image, binaries]
+    if: ${{ github.repository == 'counterbranch/agentscm' && !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: agentscm-*
+          merge-multiple: true
+          path: dist
+      - name: Pin install.sh to this release
+        env:
+          VERSION: ${{ needs.image.outputs.version }}
+        run: |
+          sed "s/^AGENTSCM_DEFAULT_VERSION=\"\"/AGENTSCM_DEFAULT_VERSION=\"$VERSION\"/" install.sh > dist/install.sh
+          grep -q "^AGENTSCM_DEFAULT_VERSION=\"$VERSION\"" dist/install.sh || { echo "install.sh version marker not found" >&2; exit 1; }
+      # Made here, before the attestation, so SHA256SUMS is attested with the binaries and the
+      # release and npm jobs both take it from this artifact, never from the release assets.
+      - name: Write SHA256SUMS
+        run: (cd dist && sha256sum agentscm-* > SHA256SUMS)
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-dist
+          path: dist
+          if-no-files-found: error
+
+  release:
+    needs: [image, attest]
+    # Only the public repository publishes: the image name, the attestation and the docs assume it.
+    if: ${{ github.repository == 'counterbranch/agentscm' && !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-dist
+          path: dist
+      - name: Create the prerelease from the CHANGELOG entry
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.image.outputs.version }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+          IMAGE: ${{ env.IMAGE }}
+        run: |
+          awk -v v="$VERSION" '
+            /^## / { if (found) exit; if ($0 == "## " v || index($0, "## " v " ") == 1) found = 1 }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          [ "$(wc -l < notes.md)" -gt 2 ] || { echo "no CHANGELOG entry for $VERSION" >&2; exit 1; }
+          printf '\nImage: `%s:%s` (digest `%s`)\n' "$IMAGE" "$VERSION" "$DIGEST" >> notes.md
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file notes.md --prerelease --verify-tag \
+            dist/agentscm-* dist/SHA256SUMS dist/install.sh LICENSE NOTICE THIRD_PARTY_NOTICES.md
+
+  npm:
+    needs: release
+    # Only the public repository publishes: the image name, the attestation and the docs assume it.
+    if: ${{ github.repository == 'counterbranch/agentscm' && !github.event.repository.private }}
+    # The maintainer configures required reviewers on the `npm` environment. Once the package exists,
+    # prefer npm trusted publishing (OIDC, no token) over NPM_TOKEN.
+    environment: npm
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write # npm provenance
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false # never restore a cache in a publishing job
+      - name: Check the package version matches the tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(node -p "require('./packages/npm/package.json').version")
+          [ "$TAG" = "v$version" ] || { echo "tag $TAG does not match packages/npm version $version" >&2; exit 1; }
+      # The package ships the attested build's checksums, taken from the workflow artifact and
+      # never from the release assets, which anyone with contents:write can replace after the
+      # release job; so `npx agentscm` does not trust the release.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-dist
+          path: dist
+      - name: Stage checksums and license files
+        run: |
+          cp dist/SHA256SUMS packages/npm/
+          cp LICENSE NOTICE THIRD_PARTY_NOTICES.md packages/npm/
+      - name: Publish to npm
+        working-directory: packages/npm
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          case "$TAG" in *-dry*) echo "dry-run tag $TAG: not publishing to npm"; exit 0 ;; esac
+          [ -n "$NPM_TOKEN" ] || { echo "NPM_TOKEN is not set" >&2; exit 1; }
+          for f in LICENSE NOTICE THIRD_PARTY_NOTICES.md SHA256SUMS; do [ -s "$f" ] || { echo "packages/npm/$f is missing" >&2; exit 1; }; done
+          # shortcut: every release is a prerelease, so it takes `latest` for `npx agentscm`; use `next` for prereleases after the first stable release
+          npm publish --provenance --access public --ignore-scripts --tag latest

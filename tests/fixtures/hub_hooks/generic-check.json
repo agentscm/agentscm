@@ -1,0 +1,1 @@
+{ "agent": "my-bot", "session": "run-1", "event": "check", "tool": "write", "cwd": "/work/acme-widgets", "paths": ["/work/acme-widgets/src/widget.rs"] }

@@ -1,0 +1,109 @@
+# The multi-user hub (docs/hub.md, "Running in containers"). Run exactly one profile at a time:
+#   docker compose -f compose.hub.yaml --profile default up -d   # SQLite and local object files
+#   docker compose -f compose.hub.yaml --profile postgres up -d  # PostgreSQL and an S3-compatible store
+# Both publish 127.0.0.1:7332. The credentials below are local-trial defaults: set your own
+# AGENTSCM_PG_PASSWORD, AGENTSCM_S3_ACCESS_KEY_ID and AGENTSCM_S3_SECRET_ACCESS_KEY (the
+# password must be URL-safe) before storing anything you care about.
+
+x-hub: &hub
+  build: .
+  image: agentscm:local # other services reuse this image
+  # Sign-in needs a public URL on a loopback IP or https://; see docs/hub.md.
+  command: ["hub", "serve", "--bind", "0.0.0.0:7332", "--public", "--public-url", "${AGENTSCM_PUBLIC_URL:-http://127.0.0.1:7332}", "--poll-seconds", "${AGENTSCM_POLL_SECONDS:-300}"]
+  ports:
+    - "127.0.0.1:7332:7332"
+  # Empty means not configured. Sign-in needs a client id and secret; see docs/hub.md.
+  environment: &signin
+    AGENTSCM_GITHUB_CLIENT_ID: ${AGENTSCM_GITHUB_CLIENT_ID:-}
+    AGENTSCM_GITHUB_CLIENT_SECRET: ${AGENTSCM_GITHUB_CLIENT_SECRET:-}
+    AGENTSCM_GITHUB_CLIENT_SECRET_FILE: ${AGENTSCM_GITHUB_CLIENT_SECRET_FILE:-}
+    AGENTSCM_GITHUB_PAT: ${AGENTSCM_GITHUB_PAT:-}
+    AGENTSCM_GITHUB_PAT_FILE: ${AGENTSCM_GITHUB_PAT_FILE:-}
+    AGENTSCM_GITHUB_PAT_WEBHOOK_SECRET: ${AGENTSCM_GITHUB_PAT_WEBHOOK_SECRET:-}
+    AGENTSCM_GITHUB_PAT_WEBHOOK_SECRET_FILE: ${AGENTSCM_GITHUB_PAT_WEBHOOK_SECRET_FILE:-}
+    AGENTSCM_GITHUB_APP_NAME: ${AGENTSCM_GITHUB_APP_NAME:-}
+    AGENTSCM_GITHUB_APP_ORG: ${AGENTSCM_GITHUB_APP_ORG:-}
+    AGENTSCM_GITLAB_URL: ${AGENTSCM_GITLAB_URL:-}
+    AGENTSCM_GITLAB_CLIENT_ID: ${AGENTSCM_GITLAB_CLIENT_ID:-}
+    AGENTSCM_GITLAB_CLIENT_SECRET: ${AGENTSCM_GITLAB_CLIENT_SECRET:-}
+    AGENTSCM_GITLAB_CLIENT_SECRET_FILE: ${AGENTSCM_GITLAB_CLIENT_SECRET_FILE:-}
+    AGENTSCM_GITLAB_TOKEN: ${AGENTSCM_GITLAB_TOKEN:-}
+    AGENTSCM_GITLAB_TOKEN_FILE: ${AGENTSCM_GITLAB_TOKEN_FILE:-}
+    AGENTSCM_GITLAB_WEBHOOK_SECRET: ${AGENTSCM_GITLAB_WEBHOOK_SECRET:-}
+    AGENTSCM_GITLAB_WEBHOOK_SECRET_FILE: ${AGENTSCM_GITLAB_WEBHOOK_SECRET_FILE:-}
+    AGENTSCM_ADMINS: ${AGENTSCM_ADMINS:-}
+    AGENTSCM_ALLOWED_USERS: ${AGENTSCM_ALLOWED_USERS:-}
+  # Prefer the *_FILE forms: plain secret env vars show in `docker inspect`. To pass files, mount
+  # a directory read-only and point the *_FILE variables at it; each file must be mode 0600 and
+  # owned by uid 10001 (`chown 10001 f && chmod 600 f`). Add under the service's own volumes:
+  #   - ./secrets:/run/agentscm-secrets:ro
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp:size=16m,mode=1777
+  pids_limit: 128
+  mem_limit: 512m
+  cpus: 1.0
+  restart: unless-stopped
+
+services:
+  hub:
+    <<: *hub
+    profiles: [default]
+    volumes:
+      - hub-data:/data # SQLite at /data/hub.sqlite, objects at /data/objects
+
+  postgres:
+    profiles: [postgres]
+    image: postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+    environment:
+      POSTGRES_PASSWORD: ${AGENTSCM_PG_PASSWORD:-agentscm-dev}
+    volumes:
+      - pg-data:/var/lib/postgresql
+    healthcheck:
+      # Over TCP: the entrypoint's temporary init server answers on the socket only.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  hub-postgres:
+    <<: *hub
+    profiles: [postgres]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - hub-postgres-data:/data # app secrets and the first-run link under /data/secrets
+    environment:
+      <<: *signin
+      # sslmode=disable: this build has no TLS, and the database is on the private compose network.
+      AGENTSCM_DATABASE_URL: postgres://postgres:${AGENTSCM_PG_PASSWORD:-agentscm-dev}@postgres:5432/postgres?sslmode=disable
+      AGENTSCM_OBJECTS_URL: s3://agentscm
+      AGENTSCM_S3_ENDPOINT: http://127.0.0.1:7070
+      AGENTSCM_S3_ACCESS_KEY_ID: ${AGENTSCM_S3_ACCESS_KEY_ID:-agentscm-dev}
+      AGENTSCM_S3_SECRET_ACCESS_KEY: ${AGENTSCM_S3_SECRET_ACCESS_KEY:-agentscm-dev-secret-0123456789}
+
+  # The hub only talks plain http:// to a loopback address, so the S3 server shares the hub's
+  # network namespace. It is therefore reachable at 127.0.0.1:7070 from the hub only.
+  s3:
+    profiles: [postgres]
+    image: versity/versitygw@sha256:30292fc2eeacc67a36993b01f7a7a5e3361a19cced0e80c1d71cfa2a4b0a2499
+    network_mode: service:hub-postgres
+    command: ["--port", ":7070", "--iam-dir", "/vgw", "posix", "/vgw"]
+    environment:
+      ROOT_ACCESS_KEY: ${AGENTSCM_S3_ACCESS_KEY_ID:-agentscm-dev}
+      ROOT_SECRET_KEY: ${AGENTSCM_S3_SECRET_ACCESS_KEY:-agentscm-dev-secret-0123456789}
+    volumes:
+      - s3-data:/vgw
+    restart: unless-stopped
+
+volumes:
+  hub-data:
+  hub-postgres-data:
+  pg-data:
+  s3-data:

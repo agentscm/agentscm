@@ -1,0 +1,61 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "serialNumber": "urn:uuid:5ff33f6c-11df-4d5f-9684-4f45f978a8de",
+  "version": 1,
+  "metadata": {
+    "component": {
+      "type": "application",
+      "bom-ref": "pkg:cargo/agentscm-portable-verifier@0.1.0",
+      "name": "agentscm-portable-verifier",
+      "version": "0.1.0",
+      "licenses": [{"license": {"id": "FSL-1.1-ALv2"}}],
+      "purl": "pkg:cargo/agentscm-portable-verifier@0.1.0"
+    },
+    "properties": [
+      {"name": "agentscm:inventory-scope", "value": "complete Cargo.lock closure"},
+      {"name": "agentscm:resolution", "value": "offline"}
+    ]
+  },
+  "components": [
+    {"type":"library","bom-ref":"pkg:cargo/base64ct@1.8.3","name":"base64ct","version":"1.8.3","licenses":[{"expression":"Apache-2.0 OR MIT"}],"purl":"pkg:cargo/base64ct@1.8.3"},
+    {"type":"library","bom-ref":"pkg:cargo/block-buffer@0.10.4","name":"block-buffer","version":"0.10.4","licenses":[{"expression":"MIT OR Apache-2.0"}],"purl":"pkg:cargo/block-buffer@0.10.4"},
+    {"type":"library","bom-ref":"pkg:cargo/cfg-if@1.0.5","name":"cfg-if","version":"1.0.5","licenses":[{"expression":"MIT OR Apache-2.0"}],"purl":"pkg:cargo/cfg-if@1.0.5"},
+    {"type":"library","bom-ref":"pkg:cargo/const-oid@0.9.6","name":"const-oid","version":"0.9.6","licenses":[{"expression":"Apache-2.0 OR MIT"}],"purl":"pkg:cargo/const-oid@0.9.6"},
+    {"type":"library","bom-ref":"pkg:cargo/cpufeatures@0.2.17","name":"cpufeatures","version":"0.2.17","licenses":[{"expression":"MIT OR Apache-2.0"}],"purl":"pkg:cargo/cpufeatures@0.2.17"},
+    {"type":"library","bom-ref":"pkg:cargo/crypto-common@0.1.7","name":"crypto-common","version":"0.1.7","licenses":[{"expression":"MIT OR Apache-2.0"}],"purl":"pkg:cargo/crypto-common@0.1.7"},
+    {"type":"library","bom-ref":"pkg:cargo/curve25519-dalek@4.1.3","name":"curve25519-dalek","version":"4.1.3","licenses":[{"license":{"id":"BSD-3-Clause"}}],"purl":"pkg:cargo/curve25519-dalek@4.1.3"},
+    {"type":"library","bom-ref":"pkg:cargo/curve25519-dalek-derive@0.1.1","name":"curve25519-dalek-derive","version":"0.1.1","licenses":[{"expression":"MIT OR Apache-2.0"}],"purl":"pkg:cargo/curve25519-dalek-derive@0.1.1"},
+    {"type":"library","bom-ref":"pkg:cargo/der@0.7.10","name":"der","version":"0.7.10","licenses":[{"expression":"Apache-2.0 OR MIT"}],"purl":"pkg:cargo/der@0.7.10"},
+    {"type":"library","bom-ref":"pkg:cargo/digest@0.10.7","name":"digest","version":"0.10.7","licenses":[{"expression":"MIT OR Apache-2.0"}],"purl":"pkg:cargo/digest@0.10.7"},
+    {"type":"library","bom-ref":"pkg:cargo/ed25519@2.2.3","name":"ed25519","version":"2.2.3","licenses":[{"expression":"Apache-2.0 OR MIT"}],"purl":"pkg:cargo/ed25519@2.2.3"},
+    {"type":"library","bom-ref":"pkg:cargo/ed25519-dalek@2.2.0","name":"ed25519-dalek","version":"2.2.0","licenses":[{"license":{"id":"BSD-3-Clause"}}],"purl":"pkg:cargo/ed25519-dalek@2.2.0"},
+    {"type":"library","bom-ref":"pkg:cargo/fiat-crypto@0.2.9","name":"fiat-crypto","version":"0.2.9","licenses":[{"expression":"MIT OR Apache-2.0 OR BSD-1-Clause"}],"purl":"pkg:cargo/fiat-crypto@0.2.9"},
+    {"type":"library","bom-ref":"pkg:cargo/generic-array@0.14.7","name":"generic-array","version":"0.14.7","licenses":[{"license":{"id":"MIT"}}],"purl":"pkg:cargo/generic-array@0.14.7"},
+    {"type":"library","bom-ref":"pkg:cargo/getrandom@0.2.17","name":"getrandom","version":"0.2.17","licenses":[{"expression":"MIT OR Apache-2.0"}],"purl":"pkg:cargo/getrandom@0.2.17"},
+    {"type":"library","bom-ref":"pkg:cargo/itoa@1.0.18","name":"itoa","version":"1.0.18","licenses":[{"expression":"MIT OR Apache-2.0"}],"purl":"pkg:cargo/itoa@1.0.18"},
+    {"type":"library","bom-ref":"pkg:cargo/libc@0.2.189","name":"libc","version":"0.2.189","licenses":[{"expression":"MIT OR Apache-2.0"}],"purl":"pkg:cargo/libc@0.2.189"},
+    {"type":"library","bom-ref":"pkg:cargo/memchr@2.8.3","name":"memchr","version":"2.8.3","licenses":[{"expression":"Unlicense OR MIT"}],"purl":"pkg:cargo/memchr@2.8.3"},
+    {"type":"library","bom-ref":"pkg:cargo/pkcs8@0.10.2","name":"pkcs8","version":"0.10.2","licenses":[{"expression":"Apache-2.0 OR MIT"}],"purl":"pkg:cargo/pkcs8@0.10.2"},
+    {"type":"library","bom-ref":"pkg:cargo/proc-macro2@1.0.107","name":"proc-macro2","version":"1.0.107","licenses":[{"expression":"MIT OR Apache-2.0"}],"purl":"pkg:cargo/proc-macro2@1.0.107"},
+    {"type":"library","bom-ref":"pkg:cargo/quote@1.0.47","name":"quote","version":"1.0.47","licenses":[{"expression":"MIT OR Apache-2.0"}],"purl":"pkg:cargo/quote@1.0.47"},
+    {"type":"library","bom-ref":"pkg:cargo/rand_core@0.6.4","name":"rand_core","version":"0.6.4","licenses":[{"expression":"MIT OR Apache-2.0"}],"purl":"pkg:cargo/rand_core@0.6.4"},
+    {"type":"library","bom-ref":"pkg:cargo/rustc_version@0.4.1","name":"rustc_version","version":"0.4.1","licenses":[{"expression":"MIT OR Apache-2.0"}],"purl":"pkg:cargo/rustc_version@0.4.1"},
+    {"type":"library","bom-ref":"pkg:cargo/semver@1.0.28","name":"semver","version":"1.0.28","licenses":[{"expression":"MIT OR Apache-2.0"}],"purl":"pkg:cargo/semver@1.0.28"},
+    {"type":"library","bom-ref":"pkg:cargo/serde@1.0.228","name":"serde","version":"1.0.228","licenses":[{"expression":"MIT OR Apache-2.0"}],"purl":"pkg:cargo/serde@1.0.228"},
+    {"type":"library","bom-ref":"pkg:cargo/serde_core@1.0.228","name":"serde_core","version":"1.0.228","licenses":[{"expression":"MIT OR Apache-2.0"}],"purl":"pkg:cargo/serde_core@1.0.228"},
+    {"type":"library","bom-ref":"pkg:cargo/serde_derive@1.0.228","name":"serde_derive","version":"1.0.228","licenses":[{"expression":"MIT OR Apache-2.0"}],"purl":"pkg:cargo/serde_derive@1.0.228"},
+    {"type":"library","bom-ref":"pkg:cargo/serde_json@1.0.151","name":"serde_json","version":"1.0.151","licenses":[{"expression":"MIT OR Apache-2.0"}],"purl":"pkg:cargo/serde_json@1.0.151"},
+    {"type":"library","bom-ref":"pkg:cargo/sha2@0.10.9","name":"sha2","version":"0.10.9","licenses":[{"expression":"MIT OR Apache-2.0"}],"purl":"pkg:cargo/sha2@0.10.9"},
+    {"type":"library","bom-ref":"pkg:cargo/signature@2.2.0","name":"signature","version":"2.2.0","licenses":[{"expression":"Apache-2.0 OR MIT"}],"purl":"pkg:cargo/signature@2.2.0"},
+    {"type":"library","bom-ref":"pkg:cargo/spki@0.7.3","name":"spki","version":"0.7.3","licenses":[{"expression":"Apache-2.0 OR MIT"}],"purl":"pkg:cargo/spki@0.7.3"},
+    {"type":"library","bom-ref":"pkg:cargo/subtle@2.6.1","name":"subtle","version":"2.6.1","licenses":[{"license":{"id":"BSD-3-Clause"}}],"purl":"pkg:cargo/subtle@2.6.1"},
+    {"type":"library","bom-ref":"pkg:cargo/syn@2.0.119","name":"syn","version":"2.0.119","licenses":[{"expression":"MIT OR Apache-2.0"}],"purl":"pkg:cargo/syn@2.0.119"},
+    {"type":"library","bom-ref":"pkg:cargo/typenum@1.20.1","name":"typenum","version":"1.20.1","licenses":[{"expression":"MIT OR Apache-2.0"}],"purl":"pkg:cargo/typenum@1.20.1"},
+    {"type":"library","bom-ref":"pkg:cargo/unicode-ident@1.0.26","name":"unicode-ident","version":"1.0.26","licenses":[{"expression":"(MIT OR Apache-2.0) AND Unicode-3.0"}],"purl":"pkg:cargo/unicode-ident@1.0.26"},
+    {"type":"library","bom-ref":"pkg:cargo/version_check@0.9.5","name":"version_check","version":"0.9.5","licenses":[{"expression":"MIT OR Apache-2.0"}],"purl":"pkg:cargo/version_check@0.9.5"},
+    {"type":"library","bom-ref":"pkg:cargo/wasi@0.11.1%2Bwasi-snapshot-preview1","name":"wasi","version":"0.11.1+wasi-snapshot-preview1","licenses":[{"expression":"Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"}],"purl":"pkg:cargo/wasi@0.11.1%2Bwasi-snapshot-preview1"},
+    {"type":"library","bom-ref":"pkg:cargo/zeroize@1.9.0","name":"zeroize","version":"1.9.0","licenses":[{"expression":"Apache-2.0 OR MIT"}],"purl":"pkg:cargo/zeroize@1.9.0"},
+    {"type":"library","bom-ref":"pkg:cargo/zmij@1.0.23","name":"zmij","version":"1.0.23","licenses":[{"license":{"id":"MIT"}}],"purl":"pkg:cargo/zmij@1.0.23"}
+  ]
+}

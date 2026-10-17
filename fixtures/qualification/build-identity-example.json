@@ -1,0 +1,9 @@
+{
+  "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "source_tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "source_clean": false,
+  "rustc_verbose": "EXAMPLE ONLY: replace with observed rustc --version --verbose",
+  "profile": "dev fixture only",
+  "flags": "EXAMPLE ONLY: record exact CARGO/RUSTFLAGS and build command",
+  "host": "EXAMPLE ONLY: record operating system, architecture and hardware"
+}

@@ -1,0 +1,289 @@
+//! Multi-user coordination hub: storage and authenticated HTTP.
+pub mod advice;
+pub mod connection;
+pub mod forge_api;
+pub mod forge_http;
+pub mod github;
+pub mod gitlab;
+pub mod handoff;
+pub mod hook;
+pub mod http;
+pub mod intent;
+pub mod login;
+pub mod mcp;
+pub mod publish;
+pub mod session;
+pub mod store;
+mod store_pg;
+mod store_sqlite;
+pub mod sync;
+mod ui;
+
+use std::fmt;
+use std::path::Path;
+use std::sync::Arc;
+
+use axum::Router;
+use axum::extract::DefaultBodyLimit;
+use tokio::sync::Semaphore;
+
+use crate::backend::{ImmutableBackend, LocalBackend};
+use crate::backend_s3::{S3Backend, S3Config};
+
+pub use store::{ForgeIdentity, HubEvent, NewAgentToken, Principal, Store, TokenDigest, User};
+
+const MAX_BODY_BYTES: usize = 64 * 1024;
+const MAX_CONCURRENT_STORE_CALLS: usize = 32;
+
+#[derive(Debug)]
+pub enum HubError {
+    Invalid(String),
+    Unauthorized,
+    /// Too many concurrent store operations; the request is not queued.
+    Busy,
+    /// Internal detail for the operator's stderr only; never sent to a client.
+    Unavailable(String),
+}
+
+pub type Result<T> = std::result::Result<T, HubError>;
+
+impl fmt::Display for HubError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid(message) => write!(f, "invalid: {message}"),
+            Self::Unauthorized => write!(f, "authentication required"),
+            Self::Busy => write!(f, "busy"),
+            Self::Unavailable(message) => write!(f, "unavailable: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for HubError {}
+
+impl From<rusqlite::Error> for HubError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Unavailable(error.to_string())
+    }
+}
+
+impl From<postgres::Error> for HubError {
+    fn from(error: postgres::Error) -> Self {
+        Self::Unavailable(error.to_string())
+    }
+}
+
+impl From<std::io::Error> for HubError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Unavailable(error.to_string())
+    }
+}
+
+impl From<crate::Error> for HubError {
+    fn from(error: crate::Error) -> Self {
+        Self::Unavailable(error.to_string())
+    }
+}
+
+#[derive(Clone)]
+pub struct HubState {
+    pub store: Arc<dyn Store>,
+    pub objects: Arc<dyn ImmutableBackend>,
+    /// Bounds concurrent blocking store work for the whole process.
+    permits: Arc<Semaphore>,
+    login: Arc<login::Login>,
+    sync: Arc<sync::Sync>,
+    /// Set by `agentscm demo`; health says so, for the status page.
+    demo: bool,
+}
+
+impl HubState {
+    pub fn new(store: Arc<dyn Store>, objects: Arc<dyn ImmutableBackend>) -> Self {
+        Self {
+            store,
+            objects,
+            permits: Arc::new(Semaphore::new(MAX_CONCURRENT_STORE_CALLS)),
+            login: Arc::new(login::Login::unconfigured()),
+            sync: Arc::new(sync::Sync::unconfigured()),
+            demo: false,
+        }
+    }
+
+    pub fn with_login(mut self, login: login::Login) -> Self {
+        self.login = Arc::new(login);
+        self
+    }
+
+    pub fn with_demo(mut self) -> Self {
+        self.demo = true;
+        self
+    }
+
+    pub fn with_sync(mut self, sync: sync::Sync) -> Self {
+        self.sync = Arc::new(sync);
+        self
+    }
+}
+
+/// S3 when `AGENTSCM_OBJECTS_URL` is set, else the local directory. Blocking:
+/// run it off the async runtime.
+pub fn open_objects(local: &Path) -> Result<Arc<dyn ImmutableBackend>> {
+    let lookup = |name: &str| std::env::var(name).ok();
+    Ok(match s3_config(&lookup)? {
+        Some(config) => {
+            eprintln!("objects: s3");
+            Arc::new(S3Backend::open(config)?)
+        }
+        None => {
+            eprintln!("objects: local");
+            Arc::new(LocalBackend::open(local)?)
+        }
+    })
+}
+
+const S3_SETTINGS: [&str; 5] = [
+    "AGENTSCM_S3_ENDPOINT",
+    "AGENTSCM_S3_REGION",
+    "AGENTSCM_S3_ACCESS_KEY_ID",
+    "AGENTSCM_S3_SECRET_ACCESS_KEY",
+    "AGENTSCM_S3_SECRET_ACCESS_KEY_FILE",
+];
+
+/// `AGENTSCM_OBJECTS_URL=s3://bucket[/prefix]` plus `AGENTSCM_S3_*`. Secrets come
+/// from the environment or a file, never a flag; errors never echo values.
+fn s3_config(lookup: &impl Fn(&str) -> Option<String>) -> Result<Option<S3Config>> {
+    // Fail closed: a blank URL or stray S3 settings must not silently mean local disk.
+    let url = match lookup("AGENTSCM_OBJECTS_URL") {
+        Some(url) if url.is_empty() => {
+            return Err(HubError::Invalid("AGENTSCM_OBJECTS_URL is empty".into()));
+        }
+        Some(url) => url,
+        None if S3_SETTINGS.iter().any(|name| lookup(name).is_some()) => {
+            return Err(HubError::Invalid(
+                "AGENTSCM_S3_* settings need AGENTSCM_OBJECTS_URL".into(),
+            ));
+        }
+        None => return Ok(None),
+    };
+    let lookup = |name: &str| lookup(name).filter(|value| !value.trim().is_empty());
+    let rest = url.strip_prefix("s3://").ok_or_else(|| {
+        HubError::Invalid("AGENTSCM_OBJECTS_URL must be s3://bucket[/prefix]".into())
+    })?;
+    let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
+    let region = lookup("AGENTSCM_S3_REGION").unwrap_or_else(|| "us-east-1".into());
+    let secret_access_key = match (
+        lookup("AGENTSCM_S3_SECRET_ACCESS_KEY_FILE"),
+        lookup("AGENTSCM_S3_SECRET_ACCESS_KEY"),
+    ) {
+        (Some(_), Some(_)) => {
+            return Err(HubError::Invalid(
+                "set only one of AGENTSCM_S3_SECRET_ACCESS_KEY_FILE and AGENTSCM_S3_SECRET_ACCESS_KEY".into(),
+            ));
+        }
+        (Some(path), None) => login::read_secret_file(&path, "AGENTSCM_S3_SECRET_ACCESS_KEY_FILE")?,
+        (None, Some(secret)) => secret,
+        (None, None) => {
+            return Err(HubError::Invalid(
+                "AGENTSCM_S3_SECRET_ACCESS_KEY_FILE or AGENTSCM_S3_SECRET_ACCESS_KEY is required with AGENTSCM_OBJECTS_URL".into(),
+            ));
+        }
+    };
+    let config = S3Config {
+        endpoint: lookup("AGENTSCM_S3_ENDPOINT")
+            .unwrap_or_else(|| format!("https://s3.{region}.amazonaws.com")),
+        access_key_id: lookup("AGENTSCM_S3_ACCESS_KEY_ID").ok_or_else(|| {
+            HubError::Invalid(
+                "AGENTSCM_S3_ACCESS_KEY_ID is required with AGENTSCM_OBJECTS_URL".into(),
+            )
+        })?,
+        region,
+        bucket: bucket.to_owned(),
+        prefix: prefix.trim_end_matches('/').to_owned(),
+        secret_access_key,
+    };
+    config.validate()?;
+    Ok(Some(config))
+}
+
+pub fn router(state: HubState) -> Router {
+    Router::new()
+        .merge(http::routes())
+        .merge(intent::routes())
+        .merge(hook::routes())
+        .merge(login::routes())
+        .merge(mcp::routes())
+        .merge(publish::routes())
+        .merge(sync::routes())
+        .merge(ui::routes())
+        .fallback(http::not_found)
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    fn config(extra: &[(&str, &str)]) -> Result<Option<S3Config>> {
+        let mut vars: HashMap<String, String> = [
+            ("AGENTSCM_OBJECTS_URL", "s3://objects/team/a"),
+            ("AGENTSCM_S3_ACCESS_KEY_ID", "key-id"),
+            ("AGENTSCM_S3_SECRET_ACCESS_KEY", "secret-value"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        for (name, value) in extra {
+            if value.is_empty() {
+                vars.remove(*name);
+            } else {
+                vars.insert((*name).to_owned(), (*value).to_owned());
+            }
+        }
+        s3_config(&|name| vars.get(name).cloned())
+    }
+
+    #[test]
+    fn parses_the_s3_url_and_defaults() {
+        let config = config(&[]).unwrap().unwrap();
+        assert_eq!(
+            (
+                config.bucket.as_str(),
+                config.prefix.as_str(),
+                config.region.as_str()
+            ),
+            ("objects", "team/a", "us-east-1")
+        );
+        assert_eq!(config.endpoint, "https://s3.us-east-1.amazonaws.com");
+        let config = self::config(&[("AGENTSCM_OBJECTS_URL", "s3://objects/")])
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.prefix, "");
+        assert!(s3_config(&|_| None).unwrap().is_none());
+        let stray = self::config(&[("AGENTSCM_OBJECTS_URL", "")]).err().unwrap();
+        assert!(stray.to_string().contains("need AGENTSCM_OBJECTS_URL"));
+        let blank = |name: &str| (name == "AGENTSCM_OBJECTS_URL").then(String::new);
+        assert!(s3_config(&blank).is_err());
+    }
+
+    #[test]
+    fn refuses_unsafe_or_incomplete_s3_settings() {
+        for (name, value) in [
+            ("AGENTSCM_OBJECTS_URL", "https://objects"),
+            ("AGENTSCM_OBJECTS_URL", "s3://Bad_Bucket"),
+            ("AGENTSCM_OBJECTS_URL", "s3://objects/a/../b"),
+            ("AGENTSCM_S3_ENDPOINT", "http://s3.example.com"),
+            ("AGENTSCM_S3_SECRET_ACCESS_KEY", ""),
+            ("AGENTSCM_S3_ACCESS_KEY_ID", ""),
+        ] {
+            let error = config(&[(name, value)]).err().unwrap().to_string();
+            assert!(
+                !error.contains("secret-value") && !error.contains("Bad_Bucket"),
+                "{error}"
+            );
+        }
+        let both = config(&[("AGENTSCM_S3_SECRET_ACCESS_KEY_FILE", "/nonexistent")]);
+        assert!(both.err().unwrap().to_string().contains("only one of"));
+    }
+}

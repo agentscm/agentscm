@@ -1,0 +1,29 @@
+# Roadmap
+
+> **Alpha: not for production.** APIs, CLI, storage and schemas may change without migration. See the [README](../README.md) for status and the [changelog](../CHANGELOG.md) for known limits.
+
+What AgentSCM does today and what is planned, in terms of what a user can do. Nothing here is a delivery date or a commitment, and nothing has been measured at tens or hundreds of concurrent agents.
+
+Status labels follow the [specification](spec/agentic-scm.md), plus **Experimental** as a stricter qualifier on rows the specification calls Implemented:
+
+- **Implemented**: in this repository's code and tests. The native ledger rows are the trusted-local, single-operator profile; hub rows are a multi-user service that is alpha. Not a production or scale claim.
+- **Experimental**: implemented, but exercised only against fakes or a narrow environment; the limits are named in the row. Treat it as less settled than **Implemented**.
+- **Partial**: some of the behavior exists; the gap is named.
+- **Proposed**: described, with no implementation yet.
+
+| Capability | What a user gets | Status |
+|---|---|---|
+| Early collision warnings | See which branches and worktrees touch the same files before a merge, from the CLI or `GET /v1/collisions`. Git only, read-only, bounded by a deadline and output budget in the service. It sees only what is in the scanned repository. See [collisions](collisions.md). | Implemented |
+| Immutable ledger | An append-only record of exact revisions, review contexts, approvals and protected-target moves, with durable retries. Local SQLite, one operator. Revisions carry regular, executable and symlink entries. | Implemented (experimental; local, one operator) |
+| Git shadow workflow | Capture a clean Git commit, work and land natively, reconcile with Git and export to a local mirror you own. Git stays authoritative; nothing is pushed. | Implemented (experimental; local, one operator; one-way snapshot; export and reconcile refuse executable and symlink entries) |
+| Deterministic checks | A built-in source-path check bound to the exact revision and review context. | Implemented (experimental; local, one operator) |
+| Isolated command checks | Run a declared command against an exact revision in a locked-down container, bind the result to approval, cancel or recover a run, and turn a successful agent run's output into a candidate revision. See [execution](advanced/execution.md). | Experimental (trusted-local, Unix with Docker): hostile-boundary canaries qualify only the runtime they run on; no unattended recovery after a controller crash; records are unsigned; not a sandbox for arbitrary hostile code |
+| Multi-user coordination hub | `agentscm hub serve` on SQLite or PostgreSQL, with local or S3-compatible object storage: sign-in with GitHub or GitLab (gated by the person's access to a connected repository), owner-scoped expiring agent tokens and an append-only event log. See [hub](hub.md). | Implemented (alpha): sessions live in memory; the hub does not terminate TLS and has no TLS to PostgreSQL; not joined to the native ledger |
+| Declared work intent and notices | Agents announce the files they are about to edit; overlapping agents get attributed notices across machines, from the hub API, `agentscm intent`, a Claude Code hook, the hub's MCP endpoint or its per-agent hook endpoints (Claude Code, Codex, Cursor, Copilot). See [intents](intents.md). | Implemented (alpha): advisory, except that the first contested edit per session and file is refused once on Claude Code, Codex and Copilot hooks (a repeat passes); notices are collected by long-poll or on the next call, not pushed; only announced work is visible; the hook endpoints are tested with fixture payloads built from each agent's documentation, not in live agent sessions |
+| Two-way forge coordination | Observe open pull or merge requests and branches from GitHub and GitLab; optionally post a comment and a status (off by default). | Experimental: GitHub and GitLab, tested only against in-process fakes |
+| Publish branch and pull request | Turn a native revision exported to a mirror into a GitHub branch and pull request, through the hub. | Experimental: GitHub only and not yet verified against live GitHub; GitLab merge requests are not implemented |
+| One container, two machines | The hub as a container with shared object storage, with an end-to-end test of two agents on two machine names. | Implemented as compose profiles and an end-to-end test on one host; a test on two real machines is still needed |
+| Authenticated team profile | PostgreSQL-backed scoped identities and draft publication through the `agentscm team` commands. | Partial: no approval or landing admission |
+| Automated model review | A bounded review adapter that records coverage and findings against the exact reviewed bytes. | Proposed: only a finite library exists |
+| Optional native authority per target | Exact commit-to-revision and pull-request-to-change mappings in the ledger, a verified round trip back to Git and a recorded decision per target, so a team that chooses to can make the ledger the landing authority for one target while Git and the forge stay fully supported. Optional and reversible; most teams can stay on Git. See the [path to cutover](spec/agentic-scm.md#7-path-to-cutover). | Proposed |
+| Measured scale | Published capacity, latency and cost at tens to hundreds of agents. | Proposed: not measured |

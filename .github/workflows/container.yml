@@ -1,0 +1,32 @@
+name: Container
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: container-${{ github.ref }}-${{ github.event.action == 'labeled' && 'label' || 'code' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  docker:
+    # Gate for cost and abuse control, not isolation: fork code can run on any hosted runner, which is
+    # ephemeral and has a read-only token and no secrets. Same-repository pull requests, pushes and
+    # manual runs always pass. A fork pull request runs this job only when a maintainer adds the
+    # `ci-extended` label, once per labelling and against the head at that moment; pushing again
+    # does not re-run it. Remove and re-add the label to run it again.
+    if: ${{ github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'ci-extended') || (github.event.action != 'labeled' && github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: docker build -t agentscm:ci .
+      - run: .github/docker-smoke.sh agentscm:ci # build and smoke test only; nothing is pushed

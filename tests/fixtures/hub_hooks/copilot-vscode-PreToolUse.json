@@ -1,0 +1,12 @@
+{
+  "hook_event_name": "PreToolUse",
+  "session_id": "11111111-2222-3333-4444-555555555555",
+  "timestamp": "2026-10-16T12:00:01.000Z",
+  "cwd": "/work/acme-widgets",
+  "tool_name": "Edit",
+  "tool_input": {
+    "path": "/work/acme-widgets/src/widget.rs",
+    "old_str": "pub fn widget() -> u32 { 1 }",
+    "new_str": "pub fn widget() -> u32 { 2 }"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "sessionId": "11111111-2222-3333-4444-555555555555",
+  "timestamp": 1790000000000,
+  "cwd": "/work/acme-widgets",
+  "source": "new",
+  "initialPrompt": "Add a gadget module"
+}

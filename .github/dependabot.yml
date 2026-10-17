@@ -1,0 +1,35 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      cargo:
+        patterns: ["*"]
+  - package-ecosystem: cargo
+    directory: "/tools/portable-verifier"
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      cargo-verifier:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7

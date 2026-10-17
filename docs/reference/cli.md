@@ -1,0 +1,193 @@
+# Native CLI reference
+
+> **Experimental (alpha).** The native ledger commands below are not part of the main path, may change without migration, and have had limited testing. See the [advanced index](../advanced/README.md). The everyday commands (`quickstart`, `uninstall`, `demo`, `init-repo`, `hook`, `collisions`, `autopsy`, `intent`, `hub`) are described in the [README](../../README.md), the [setup guide](../setup-guide.md), [collisions](../collisions.md), [autopsy](../autopsy.md), [intents](../intents.md) and [hub](../hub.md).
+
+`workflow`, `recovery`, `team` and `package-native` are internal to the alpha, hidden from `agentscm --help` and not documented here. The other native commands are marked "[experimental]" in `agentscm --help`.
+
+## Commands
+
+Every command accepts `--data-dir`; its default is `.agentscm`. Most commands print one JSON value on standard output on success, and one JSON value (`{"ok":false,"error":...}`) on standard error with a nonzero exit on failure. The exceptions are:
+
+- `--help` and `--version` print plain text.
+- `serve`, `hub serve` and `team serve` print nothing on standard output; they log to standard error.
+- `hub` subcommands are text-oriented: `login`, `logout`, `token revoke`, `connections outbound` and `connections add-repo` report on standard error; `token create` prints only the secret on standard output; `token list`, `connections list` and `connections refresh` print text lines; `github setup` prints only the setup URL.
+- `hub publish` prints a multi-line JSON value, and on an incomplete or rejected publication also exits nonzero.
+- `intent` prints plain text (or nothing) by default and a hook JSON object with `--hook`; it deliberately exits 0 on coordination errors so that it never blocks an agent. `intent watch` runs until stopped.
+- `setup` reports its errors as a structured JSON object.
+- `hook` reads an agent's hook JSON on standard input and prints that agent's reply; it always exits 0, even on usage errors, and prints a valid "no information" reply when the hub cannot be consulted. `init-repo` prints plain text, shows a diff and asks before writing; without a terminal it needs `--yes`. See [supported agents](../agents.md).
+- `quickstart` and `uninstall` are guided and print plain text. Without a terminal they need `--yes`; otherwise they refuse and list their flags. `uninstall` exits nonzero when it could not undo something, and keeps its record of it.
+
+```sh
+agentscm --data-dir ./agentscm-data init
+
+agentscm --data-dir ./agentscm-data checkpoint checkpoint.json
+agentscm --data-dir ./agentscm-data read REVISION path/to/file
+agentscm --data-dir ./agentscm-data diff LEFT RIGHT --limit 1000
+
+agentscm --data-dir ./agentscm-data start context.json
+agentscm --data-dir ./agentscm-data show REPOSITORY_ID CHANGE_ID
+agentscm --data-dir ./agentscm-data context EXPECTED_VERSION context.json
+agentscm --data-dir ./agentscm-data review-context CONTEXT_DIGEST
+
+agentscm --data-dir ./agentscm-data approve approval.json
+agentscm --data-dir ./agentscm-data revoke APPROVAL_ID
+agentscm --data-dir ./agentscm-data policy
+agentscm --data-dir ./agentscm-data policy --advance EXPECTED_EPOCH
+agentscm --data-dir ./agentscm-data target main
+agentscm --data-dir ./agentscm-data integrate integration.json
+agentscm --data-dir ./agentscm-data initialize-target initialize.json
+agentscm --data-dir ./agentscm-data prepare-landing landing.json
+agentscm --data-dir ./agentscm-data events --after 0 --limit 100
+```
+
+Use `-` or omit the input filename for JSON on standard input. A checkpoint request contains an optional parent and changes. File content is an array of byte values; `null` deletes a path.
+
+```json
+{
+  "parent": null,
+  "changes": [
+    {"path": "README.md", "content": [104, 101, 108, 108, 111]}
+  ]
+}
+```
+
+`init` returns the immutable local repository identity. Start a change with a [review context](../advanced/review-context.md), then use the returned digest and generation in approvals. `show` displays the current context; `review-context` reads an exact historical one. Updating a context requires its expected generation and invalidates earlier approvals, even when source bytes are identical.
+
+An approval is a local human administrative claim. It binds the repository/change, current change generation, protected target, exact revision, retained review-context SHA-256 digest, and policy epoch. It is not proof that a model or test ran. Unknown required inputs or capabilities and declared omissions prevent approval.
+
+A context requiring `agentscm.checks.source-paths/v1` also needs a successful controller attempt for its exact subject before approval or integration. This built-in check reads declared source paths and checks their hashes; it does not execute candidate tests or a model. See [checks and evidence](../advanced/checks.md) for the recipe and attempt lifecycle.
+
+`initialize-target` takes the `integrate` request shape with `expected_target` set to `null` and a change binding. It accepts a head with any number of parents, such as an imported snapshot head or the tip of a chain, after qualifying its complete source closure. It consumes the approval and journals an event with `kind` `initialize`. An existing target is rejected; there is no adoption or replacement. `integrate` still accepts only a parentless revision for an absent target.
+
+`prepare-landing` builds the exact revision for landing offline work on a moved or existing target. The request carries a full review context for the work: its revision is `source_tip`, its base is `expected_target`, its target is `target`, and its `change_version` is the Change's current version plus one.
+
+```json
+{
+  "operation_id": "prepare-1",
+  "target": "main",
+  "expected_target": {"revision": "TARGET_SHA256", "version": 1},
+  "source_tip": "TIP_SHA256",
+  "change_version": 2,
+  "context": {"...": "full review context"}
+}
+```
+
+The tip's first-parent chain must reach the expected target; otherwise the command fails with a conflict naming the diverged base, and nothing changes. It performs no three-way merge. It publishes a landing revision with parents `[target, source_tip]` and the tip's tree, qualifies its closure, and in one transaction checks that the target is unchanged, rebinds the context to the landing revision and advances the Change. A target that moved fails the check as a conflict. If the tip is the target or has the same tree, the result is `already_current`, nothing remains to land, and the Change is untouched. Otherwise the result is `prepared` with the landing `revision` and new Change state. It never approves or moves the target: approve the landing revision with the returned change version and context digest, then run `integrate` with `expected_target` set to the base. An approval for the source tip cannot authorize the landing revision. An identical retry returns the stored outcome; reusing an operation ID with different input, or one used by `integrate` or `initialize-target`, is a conflict.
+
+The library also provides [portable signed evidence](../advanced/evidence.md) and
+[installed policy assessment](../advanced/policy.md). These bounded interfaces assess
+supplied records; authenticated installation, durable current-attempt admission,
+retention enforcement and live execution qualification remain required.
+
+```json
+{
+  "approval_id": "approval-1",
+  "target": "main",
+  "revision": "REVISION_SHA256",
+  "context_digest": "REVIEW_CONTEXT_SHA256",
+  "change": {"repository": "REPOSITORY_ID", "id": "change-1"},
+  "change_version": 1,
+  "policy_epoch": 0
+}
+```
+
+Integration additionally binds an operation ID, protected target, expected target state, and the same exact subject fields. Against the intact local authority, retrying an identical operation ID returns its durable result; reusing it with different input is a conflict.
+
+```json
+{
+  "operation_id": "operation-1",
+  "target": "main",
+  "expected_target": null,
+  "revision": "REVISION_SHA256",
+  "context_digest": "REVIEW_CONTEXT_SHA256",
+  "approval_id": "approval-1",
+  "change": {"repository": "REPOSITORY_ID", "id": "change-1"},
+  "change_version": 1,
+  "policy_epoch": 0
+}
+```
+
+## Guided setup
+
+`agentscm quickstart` (what `npx agentscm` runs) detects the repository, Docker, a hub and Claude Code, runs collisions, sets up live warnings (a local hub with Docker, an existing hub, or none), signs in, mints an agent token for the repository and merges the Claude Code hooks. Every file it writes is announced first and recorded in `~/.config/agentscm/quickstart.json`; `agentscm uninstall` removes exactly those. Details and limits: [setup guide](../setup-guide.md).
+
+```sh
+agentscm quickstart                     # interactive
+agentscm quickstart --yes --hub existing --hub-url https://hub.example.com \
+  --agent-token-file ~/.config/agentscm/tokens/acme-widgets.token --hook project
+agentscm uninstall                      # asks first; --yes, --remove-hub-data
+```
+
+Flags: `--yes`, `--init` (also run `init-repo`; with `--yes` it is skipped unless passed), `--hub local|existing|skip`, `--hub-url URL`, `--provider github|gitlab`, `--agent-token-file PATH` (skip sign-in and minting), `--github-login LOGIN` (required with `--yes --hub local` unless `gh` is signed in), `--agent-name NAME`, `--ttl 30d`, `--hook user|project|none`, `--no-collisions`.
+
+## Demo
+
+```sh
+agentscm demo [--no-open]
+```
+
+`demo` simulates three agents against a throwaway local hub, using file names from the Git repository you are in, and prints a link to its status page. It never writes to the repository. `--no-open` does not open a browser.
+
+## Agent wiring
+
+```sh
+agentscm init-repo [--agents claude,codex,cursor,copilot,gemini] [--hub-url URL] [--repo OWNER/NAME] [--yes]
+agentscm hook <claude|codex|cursor|copilot|generic> [--hub-url URL]   # called by agents, not by people
+```
+
+`init-repo` writes the committed MCP, hook and instruction files for the chosen agents (all five by default) into the Git repository you are in. It needs no data directory, is idempotent and never writes a token. (`init` is the unrelated command that prepares a data directory.) `--repo` names the repository as `owner/name` (default: from the `origin` remote). `hook` takes the token from `AGENTSCM_HUB_TOKEN` or `AGENTSCM_HUB_TOKEN_FILE`, else `hub.json`. Details, the file list and limits: [supported agents](../agents.md).
+
+## Serving
+
+```sh
+agentscm --data-dir ./agentscm-data serve [--bind ADDR] [--max-concurrency N] [--collisions-repo PATH] [--public]
+```
+
+`serve` serves collision warnings (`GET /v1/collisions`) for the trusted Git checkout named by `--collisions-repo`, and the experimental read-only native API for the data directory. `--bind` defaults to `127.0.0.1:7331`. A non-loopback `--bind` is refused unless `--public` is passed. The container image passes `--public` itself; publish the port on loopback only, or put authentication in front of it.
+
+## Local workspaces and offline exchange
+
+Keep the initialized repository data directory outside the working directory. Start a Change for `REVISION` before creating its workspace. Workspace checkpoints advance the local workspace base; updating the Change's review context remains an explicit operation.
+
+```sh
+agentscm --data-dir ./agentscm-data workspace create ./work CHANGE_ID REVISION
+agentscm --data-dir ./agentscm-data workspace status ./work
+agentscm --data-dir ./agentscm-data workspace checkpoint ./work OPERATION_ID 0
+agentscm --data-dir ./agentscm-data workspace state ./work
+
+# Sender creates an offer; receiver requests its missing objects.
+agentscm --data-dir ./agentscm-data sync offer offer.json REVISION
+agentscm --data-dir ./receiver-data init
+agentscm --data-dir ./receiver-data sync request offer.json request.json
+agentscm --data-dir ./agentscm-data sync bundle offer.json request.json source.bundle
+agentscm --data-dir ./receiver-data sync import source.bundle ./transfer-state
+```
+
+Offer, request and bundle output paths must be new. Imports preserve source identities and validate complete source/history closure. They do not import approvals, protected targets, policy or review contexts. Transfer state and workspaces can contain private source; keep them outside the product checkout and back them up or remove them according to your own retention needs.
+
+Durable trusted-local [native merge sessions](../advanced/merge.md) retain divergent
+conflicts, bounded same-file text merges and generation-checked workspace
+application. See [workspaces](../advanced/workspace.md) and [offline exchange](../advanced/sync.md).
+
+## Git snapshot bridge
+
+Capture one explicit, clean Git commit as a single native root revision. This is a one-way snapshot, not Git history import, and it never writes to the Git repository. The receipt path must be new, or byte-identical from an earlier run of the same capture, and outside the checkout, its Git directory and the data directory.
+
+```sh
+agentscm --data-dir ./agentscm-data git-snapshot preflight --repository ./checkout --revision COMMIT
+agentscm --data-dir ./agentscm-data git-snapshot capture --repository ./checkout --revision COMMIT --receipt ./receipts/snapshot.json
+```
+
+`capture` writes `progress: ` lines to standard error when it is a terminal or when `--progress` is given (at most one line per file read chunk and per batch, plus one when the revision is published); standard output stays one JSON value, and on failure the error JSON is the last line of standard error. `preflight` is read-only and never opens the data directory. Unsupported entries (gitlinks, symlinks whose target is not an in-tree relative path, non-portable paths and others), uncommitted tracked changes (including edits hidden by skip-worktree or assume-unchanged) and configured Git filters make a tree ineligible; no partial snapshot is written. See [the Git snapshot guide](../advanced/git-snapshot.md) for the profile, receipt, Git invocation and limits.
+
+## Limits
+
+- Paths use portable ASCII, at most 1,024 bytes per path and 255 bytes per component. A checkpoint accepts at most 4,096 changed paths and 16,384 directory prefixes summed across those paths. This aggregate work limit is checked before publishing objects; it is not a latency guarantee.
+- The local SQLite profile trusts its operator and filesystem. The optional `agentscm team` profile adds scoped identity and explicit roles but requires a trusted local PostgreSQL/filesystem and separately configured HTTPS proxy; it provides no hostile-code sandbox.
+- `initialize-target` and `prepare-landing` re-qualify the full reachable history of the head or landing revision on every call, so cost grows with history. Qualification fails with a limit error beyond 100,000 reachable objects or 1,000,000 qualification visits, and `prepare-landing` walks at most 100,000 first-parent steps. This is a current limit; incremental qualification from an admitted target is not implemented.
+- SQLite is one local writable authority. Starting more containers does not scale or safely replicate it.
+- Integrated, qualified candidate execution and automated model review, authenticated network sync, Git history import, continuous Git synchronization, automatic failover, service quotas, retention leases, and garbage collection remain incomplete. Local source bundles, merge sessions and workspace recovery remain bounded primitives. The Git snapshot bridge captures only one committed tree, without history. Executable files and in-tree symlinks are captured as entry kinds under profile `agentscm-git-snapshot/v2`; other permission bits are not preserved.
+- Objects remain until the operator removes the data directory. Operators must back up the data directory consistently and provide their own recovery procedure.
+- Service bounds are alpha limits, not measured capacity claims or service-level objectives.
+
+The authority upgrades schema v1, v2, v3, v4 or v5 to v6 transactionally on open. The v1 migration retains historical events and exact completed-operation retries, labels their semantics as legacy, and revokes unconsumed opaque approvals. The v3 schema adds controller check attempts and evidence. The v4 schema adds the integration event kind and the landing preparation journal. The v5 schema adds isolated `command/v1` check attempts and records. The v6 schema adds command check cleanup custody. Legacy context hashes never become retained review evidence. Older binaries reject newer schemas; there is no downgrade path. Use an independently verified consistent backup before upgrading valuable data. The trusted-local recovery command requires physical quiescence, old-writer isolation and explicit external-state reconciliation; it does not provide automatic failover.

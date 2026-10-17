@@ -1,0 +1,8 @@
+{
+  "session_id": "11111111-2222-3333-4444-555555555555",
+  "cwd": "/work/acme-widgets",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": { "command": "cargo test" },
+  "tool_use_id": "toolu_01SYNTHETIC0000000004"
+}
