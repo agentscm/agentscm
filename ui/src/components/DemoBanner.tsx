@@ -8,7 +8,7 @@ export function DemoBanner() {
         <PlayCircleOutlined />
       </span>
       <p>
-        <strong>Demo hub</strong> — simulated agents working on your repository's file names. Nothing is written to your repository; this page stops when <code>agentscm demo</code> does.
+        <strong>Demo hub</strong> — simulated agents working on your repository's file names. Nothing is written to your repository; this page stops when <code>agentscm demo</code> does. To set it up for real, stop the demo and run <code>npx agentscm</code>.
       </p>
     </aside>
   )

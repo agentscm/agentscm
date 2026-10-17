@@ -40,6 +40,8 @@ const HEARTBEAT: Duration = Duration::from_secs(60);
 /// Heartbeats between session renewals: 25 minutes, inside the hub's 30-minute hold cap.
 const RENEW_EVERY: u32 = 25;
 const HISTORY_COMMITS: &str = "400";
+/// Printed last: `npx` leaves no `agentscm` command installed, so the step names `npx agentscm`.
+const NEXT_STEP: &str = "To set it up for real, run npx agentscm: guided setup that tells you what it will change before it does.";
 
 #[derive(Debug, Args)]
 pub struct DemoArgs {
@@ -479,6 +481,7 @@ async fn scenario(
     }
     if args.once {
         println!("Done; nothing was written to your repository.");
+        println!("{NEXT_STEP}");
         return Ok(());
     }
     if open {
@@ -486,6 +489,7 @@ async fn scenario(
         println!("Opened in your browser; if it did not open, use the link above.");
     }
     println!("Press Ctrl-C to stop; nothing was written to your repository.");
+    println!("{NEXT_STEP}");
 
     // The hub caps a hold at 30 minutes, so every 25 minutes each agent ends its session and
     // starts a fresh one that replays its edits; the refused agent has none to replay.
