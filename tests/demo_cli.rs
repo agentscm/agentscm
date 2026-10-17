@@ -66,6 +66,13 @@ fn check_demo(busiest: &str) {
         .unwrap_or_else(|| panic!("no refusal in {stdout}"));
     assert!(refusal.contains(busiest), "{refusal}");
     assert!(stdout.contains("let through"), "{stdout}");
+    assert!(
+        stdout
+            .lines()
+            .last()
+            .is_some_and(|line| line.contains("agentscm quickstart")),
+        "{stdout}"
+    );
     // The repository has three files, so the handoff beat runs.
     assert!(
         stdout.lines().any(|line| line.starts_with("5. demo-riley (codex) is refused on ")
