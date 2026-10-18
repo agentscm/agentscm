@@ -194,9 +194,11 @@ on no others:
 - `GET /v1/hub/repos/{repo}/work`
 - `GET /v1/hub/repos/{repo}/activity`
 - `GET /v1/hub/health`, which needs no token
+- `GET /v1/hub/skill-workflows/{run_id}` for an operator-mapped native repository
+- MCP `initialize`, `ping`, `tools/list`, and `agentscm_workflow_status`
 
 Every other route that takes an agent token (announcing, renewing and releasing intents, `notices`,
-publications, `POST /mcp` with any tool, including `agentscm_status`, which also renews a hold)
+publications, and the six coordination MCP tools, including `agentscm_status`, which also renews a hold)
 answers 403 `{"error":"read_only"}` and writes nothing. `POST /v1/hub/hook/{agent}` treats a
 read-only token as an unknown one: the same "token not accepted" reply, and no session or event.
 Routes for human sessions still answer 401 to any agent token. `tests/hub_read_only.rs` walks every
@@ -461,9 +463,12 @@ is 64 KiB. Tools:
 | `agentscm_done` | `session?` | Releases the session's files. |
 | `agentscm_ask` | `path`, `note?` (at most 200 characters), `session?` | Asks the agent that holds a file to hand it over to this session (see [Handoff](#handoff)). |
 | `agentscm_handoff` | `path`, `accept`, `reason?` (at most 200 characters, with `accept` false), `session?` | Answers a request for a file this session holds: `true` hands it over, `false` keeps it. |
+| `agentscm_workflow_status` | `run_id` | Reads a retained skill workflow from the operator-mapped native repository, with historical state and present applicability separate. |
 
-Paths are repo-relative specs, as for intents. Every reply also carries the
-session's new notices. Bad arguments and hub errors are tool results with
+The six coordination tools use repo-relative path specs and carry the session's new notices.
+The workflow read uses no session and writes no coordination events. Read-only tokens discover
+only that tool; operator mapping and availability are described in the
+[workflow hub guide](advanced/skill-workflow-hub.md). Bad arguments and hub errors are tool results with
 `isError: true` and the "coordination unknown" text.
 
 ### `POST /v1/hub/hook/{agent}`

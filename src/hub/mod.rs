@@ -13,6 +13,7 @@ pub mod login;
 pub mod mcp;
 pub mod publish;
 pub mod session;
+pub mod skill_workflow;
 pub mod store;
 mod store_pg;
 mod store_sqlite;
@@ -92,6 +93,7 @@ pub struct HubState {
     permits: Arc<Semaphore>,
     login: Arc<login::Login>,
     sync: Arc<sync::Sync>,
+    skill_workflows: Arc<skill_workflow::SkillWorkflowRegistry>,
     /// Set by `agentscm demo`; health says so, for the status page.
     demo: bool,
 }
@@ -104,6 +106,7 @@ impl HubState {
             permits: Arc::new(Semaphore::new(MAX_CONCURRENT_STORE_CALLS)),
             login: Arc::new(login::Login::unconfigured()),
             sync: Arc::new(sync::Sync::unconfigured()),
+            skill_workflows: Arc::new(skill_workflow::SkillWorkflowRegistry::unconfigured()),
             demo: false,
         }
     }
@@ -120,6 +123,11 @@ impl HubState {
 
     pub fn with_sync(mut self, sync: sync::Sync) -> Self {
         self.sync = Arc::new(sync);
+        self
+    }
+
+    pub fn with_skill_workflows(mut self, registry: skill_workflow::SkillWorkflowRegistry) -> Self {
+        self.skill_workflows = Arc::new(registry);
         self
     }
 }

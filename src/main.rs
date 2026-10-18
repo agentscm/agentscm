@@ -55,6 +55,7 @@ mod server;
 mod setup;
 #[cfg(unix)]
 mod setup_cli;
+mod skill_workflow_cli;
 mod team_cli;
 #[cfg(unix)]
 mod workflow_cli;
@@ -80,6 +81,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// [experimental] Run bounded repository skill workflows on immutable local source.
+    SkillWorkflow {
+        #[command(subcommand)]
+        command: skill_workflow_cli::SkillWorkflowCommand,
+    },
     /// [experimental] Initialize or inspect an explicitly owned local native installation.
     #[cfg(unix)]
     Setup {
@@ -428,6 +434,9 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::SkillWorkflow { command } => {
+            skill_workflow_cli::run(&cli.data_dir, command)?;
+        }
         #[cfg(unix)]
         Command::Setup { command } => match setup_cli::run(command) {
             Ok(value) => print_json(&value),

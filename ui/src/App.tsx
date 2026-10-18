@@ -48,7 +48,7 @@ function Authed({ token, pref, onPref, onUnauthorized, onForget }: { token: stri
   return (
     <>
       <Header whoami={data.whoami} lastOk={data.lastOk} failing={data.failing} pref={pref} onPref={onPref} onForget={onForget} />
-      <Dashboard data={data} />
+      <Dashboard data={data} token={token} />
     </>
   )
 }

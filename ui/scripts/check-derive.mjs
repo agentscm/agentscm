@@ -1,12 +1,57 @@
 // Zero-dependency self-check for src/derive.ts (Node strips the types).
 import assert from 'node:assert/strict'
 import { derive, notable, overlaps, specKey } from '../src/derive.ts'
+import { InvalidSkillWorkflowResponse, decodeSkillWorkflowEnvelope, validSkillWorkflowRunId, validSkillWorkflowStepId } from '../src/skillWorkflow.ts'
 import { fragmentTokenAllowed } from '../src/storage.ts'
 
 // A `#token=` link may replace a stored token only on the demo hub.
 assert.ok(fragmentTokenAllowed(null, false), 'nothing stored: adopt')
 assert.ok(fragmentTokenAllowed('tok_stored', true), 'demo hub: adopt')
 assert.ok(!fragmentTokenAllowed('tok_stored', false), 'a stored token stays outside the demo')
+
+// The workflow decoder keeps historical status, applicability and admission distinct.
+const workflow = {
+  version: 1,
+  availability: 'available',
+  projection: {
+    version: 1,
+    run: {
+      version: 1,
+      run_id: 'run-1',
+      plan_digest: `sha256:${'c'.repeat(64)}`,
+      skill_digest: `sha256:${'d'.repeat(64)}`,
+      source: { repository: '0123456789abcdef0123456789abcdef', revision: 'a'.repeat(64), policy_epoch: 4 },
+      state: 'completed_with_omissions',
+      steps: [
+        { id: 'lint/rust', required: true, state: 'succeeded', observations: [{ path: 'src/lib.rs', sha256: 'b'.repeat(64), bytes: 42 }], detail: 'source paths matched' },
+        { id: 'verify:source', required: false, state: 'blocked', observations: [], detail: 'capability unavailable' },
+      ],
+      admission: 'not_assessed',
+    },
+    present_applicability: { basis: 'current_authority_repository_policy_epoch_and_immutable_revision', state: 'stale', reason: 'policy epoch changed' },
+  },
+}
+const decodedWorkflow = decodeSkillWorkflowEnvelope(workflow)
+assert.equal(decodedWorkflow.availability, 'available')
+assert.equal(decodedWorkflow.projection.run.state, 'completed_with_omissions', 'omissions never collapse into success')
+assert.equal(decodedWorkflow.projection.run.steps[1].state, 'blocked', 'blocked optional work stays visible')
+assert.equal(decodedWorkflow.projection.present_applicability.state, 'stale', 'current applicability stays separate from historical state')
+assert.equal(decodedWorkflow.projection.run.admission, 'not_assessed', 'the read surface does not manufacture admission')
+assert.deepEqual(decodeSkillWorkflowEnvelope({ version: 1, availability: 'unavailable', reason: 'native_workflow_not_configured' }), {
+  version: 1,
+  availability: 'unavailable',
+  reason: 'native_workflow_not_configured',
+})
+assert.throws(() => decodeSkillWorkflowEnvelope({ ...workflow, projection: { ...workflow.projection, run: { ...workflow.projection.run, admission: 'approved' } } }), InvalidSkillWorkflowResponse)
+assert.throws(() => decodeSkillWorkflowEnvelope({ ...workflow, projection: { ...workflow.projection, run: { ...workflow.projection.run, steps: Array(33).fill(workflow.projection.run.steps[0]) } } }), InvalidSkillWorkflowResponse)
+assert.throws(() => decodeSkillWorkflowEnvelope({ ...workflow, projection: { ...workflow.projection, present_applicability: { ...workflow.projection.present_applicability, basis: 'unknown' } } }), InvalidSkillWorkflowResponse)
+assert.throws(() => decodeSkillWorkflowEnvelope(workflow, 'another-run'), InvalidSkillWorkflowResponse)
+assert.ok(validSkillWorkflowRunId('run-1.ok'))
+assert.ok(!validSkillWorkflowRunId('../run'))
+assert.ok(!validSkillWorkflowRunId('a'.repeat(65)))
+assert.ok(validSkillWorkflowStepId('lint/rust'))
+assert.ok(validSkillWorkflowStepId('verify:source'))
+assert.ok(!validSkillWorkflowStepId('lint step'))
 
 assert.equal(specKey('src/dir/**'), 'src/dir/')
 assert.equal(specKey('src/a.rs'), 'src/a.rs')
