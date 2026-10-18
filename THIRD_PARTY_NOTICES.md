@@ -9356,16 +9356,19 @@ Production dependencies of the status page that are compiled into `app.js`. Buil
 | @rc-component/async-validator | 5.1.2 | MIT | notice-509eabacb9ef4e7b |
 | @rc-component/color-picker | 2.0.1 | MIT | notice-aa9ce8bad1af7244 |
 | @rc-component/context | 1.4.0 | MIT | notice-509eabacb9ef4e7b |
+| @rc-component/mini-decimal | 1.1.4 | MIT | notice-8781f0ca19205733 |
 | @rc-component/portal | 1.1.2 | MIT | notice-8781f0ca19205733 |
 | @rc-component/trigger | 2.3.1 | MIT | notice-fc54f50dbda2f75b |
 | antd | 5.29.3 | MIT | notice-f696794c35873d9b |
 | classnames | 2.5.1 | MIT | notice-bedcfd7e502f5429 |
+| compute-scroll-into-view | 3.1.1 | MIT | notice-b58c311d6fa4d272 |
 | copy-to-clipboard | 3.3.3 | MIT | notice-5149051aed807f78 |
 | rc-checkbox | 3.5.0 | MIT | notice-3fefe89002bfade4 |
 | rc-collapse | 3.9.0 | MIT | notice-509eabacb9ef4e7b |
 | rc-dropdown | 4.2.1 | MIT | notice-fc54f50dbda2f75b |
 | rc-field-form | 2.7.1 | MIT | notice-8781f0ca19205733 |
 | rc-input | 1.8.0 | MIT | notice-e3be4577f9f03567 |
+| rc-input-number | 9.5.0 | MIT | notice-509eabacb9ef4e7b |
 | rc-menu | 9.16.1 | MIT | notice-509eabacb9ef4e7b |
 | rc-motion | 2.9.5 | MIT | notice-e3be4577f9f03567 |
 | rc-overflow | 1.5.0 | MIT | notice-e3be4577f9f03567 |
@@ -9386,6 +9389,7 @@ Production dependencies of the status page that are compiled into `app.js`. Buil
 | react-is | 18.3.1 | MIT | notice-a80c79b8f80e824c |
 | resize-observer-polyfill | 1.5.1 | MIT | notice-ed9d31ab88a49256 |
 | scheduler | 0.23.2 | MIT | notice-a80c79b8f80e824c |
+| scroll-into-view-if-needed | 3.1.0 | MIT | notice-96f25b41a87abdf7 |
 | stylis | 4.4.0 | MIT | notice-6821b85df4724cdd |
 | throttle-debounce | 5.0.2 | MIT | notice-7c6cea49d80c4c20 |
 | toggle-selection | 1.0.6 | MIT | none shipped |
@@ -9521,7 +9525,7 @@ SOFTWARE.
 
 ### notice-509eabacb9ef4e7b
 
-Applies to: @rc-component/async-validator 5.1.2 / LICENSE.md; @rc-component/context 1.4.0 / LICENSE.md; rc-collapse 3.9.0 / LICENSE.md; rc-menu 9.16.1 / LICENSE.md; rc-pagination 5.1.0 / LICENSE.md; rc-tabs 15.7.0 / LICENSE.md
+Applies to: @rc-component/async-validator 5.1.2 / LICENSE.md; @rc-component/context 1.4.0 / LICENSE.md; rc-collapse 3.9.0 / LICENSE.md; rc-input-number 9.5.0 / LICENSE.md; rc-menu 9.16.1 / LICENSE.md; rc-pagination 5.1.0 / LICENSE.md; rc-tabs 15.7.0 / LICENSE.md
 
 ```text
 The MIT License (MIT)
@@ -9553,7 +9557,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 ### notice-8781f0ca19205733
 
-Applies to: @rc-component/portal 1.1.2 / LICENSE; rc-field-form 2.7.1 / LICENSE
+Applies to: @rc-component/mini-decimal 1.1.4 / LICENSE; @rc-component/portal 1.1.2 / LICENSE; rc-field-form 2.7.1 / LICENSE
 
 ```text
 MIT License
@@ -9616,6 +9620,34 @@ Applies to: classnames 2.5.1 / LICENSE
 The MIT License (MIT)
 
 Copyright (c) 2018 Jed Watson
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### notice-b58c311d6fa4d272
+
+Applies to: compute-scroll-into-view 3.1.1 / LICENSE
+
+```text
+MIT License
+
+Copyright (c) 2025 Cody Olsen
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -9832,6 +9864,34 @@ Applies to: resize-observer-polyfill 1.5.1 / LICENSE
 The MIT License (MIT)
 
 Copyright (c) 2016 Denis Rul
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### notice-96f25b41a87abdf7
+
+Applies to: scroll-into-view-if-needed 3.1.0 / LICENSE
+
+```text
+MIT License
+
+Copyright (c) 2023 Cody Olsen
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
