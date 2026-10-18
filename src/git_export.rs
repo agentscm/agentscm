@@ -24,7 +24,9 @@ pub use seed::SeedMetadata;
 
 /// Written to mirrors and commit bodies; independent of the snapshot capture
 /// profile so that profile can change without invalidating existing mirrors.
-pub const PROFILE: &str = "agentscm-git-snapshot/v1";
+pub const PROFILE: &str = "agentscm-git-snapshot/v2";
+const LEGACY_PROFILE: &str = "agentscm-git-snapshot/v1";
+
 const REF: &str = "refs/heads/agentscm";
 const OWNER: &str = "agentscm-mirror.json";
 const JOURNAL: &str = "agentscm-export.sqlite";
@@ -197,7 +199,7 @@ impl Mirror {
             )?;
         }
         let owner = Ownership {
-            version: if seed.is_some() { 2 } else { 1 },
+            version: 3,
             profile: PROFILE.into(),
             repository: repository.into(),
             target: target.into(),
@@ -288,12 +290,14 @@ impl Mirror {
                 .prepare("SELECT result_id,event_sequence,record FROM external_checks LIMIT 0")?;
         }
         let supported_owner = matches!(
-            (self.owner.version, self.owner.seed.is_some()),
-            (1, false) | (2, true)
+            (
+                self.owner.version,
+                self.owner.profile.as_str(),
+                self.owner.seed.is_some()
+            ),
+            (1, LEGACY_PROFILE, false) | (2, LEGACY_PROFILE, true) | (3, PROFILE, _)
         );
-        if !supported_owner
-            || self.owner.profile != PROFILE
-            || fs::read(self.owner.destination.join("config"))? != self.owner.config
+        if !supported_owner || fs::read(self.owner.destination.join("config"))? != self.owner.config
         {
             return Err(Error::Conflict("mirror ownership/config changed".into()));
         }
@@ -507,7 +511,7 @@ impl Mirror {
                 ));
             }
             let record = ExportRecord {
-                profile: PROFILE.into(),
+                profile: self.owner.profile.clone(),
                 repository: self.owner.repository.clone(),
                 event,
                 request: request.clone(),
@@ -575,7 +579,12 @@ impl Mirror {
             self.git
                 .verify_closure(parent, None, git::MAX_CLOSURE_OBJECTS)?;
         }
-        let tree = tree::build_and_verify(&self.git, engine, &record.event.after.revision)?;
+        let tree = tree::build_and_verify(
+            &self.git,
+            engine,
+            &record.event.after.revision,
+            &self.owner.profile,
+        )?;
         let metadata = &record.request.metadata;
         let parent = record
             .request
@@ -588,8 +597,12 @@ impl Mirror {
             metadata.name, metadata.email, metadata.timestamp
         );
         let body = format!(
-            "tree {tree}\n{parent}author {identity}\ncommitter {identity}\n\n{}\n\nNative-Repository: {}\nNative-Revision: {}\nNative-Event: {}\nSnapshot-Profile: {PROFILE}\n",
-            metadata.message, record.repository, record.event.after.revision, record.event.sequence
+            "tree {tree}\n{parent}author {identity}\ncommitter {identity}\n\n{}\n\nNative-Repository: {}\nNative-Revision: {}\nNative-Event: {}\nSnapshot-Profile: {}\n",
+            metadata.message,
+            record.repository,
+            record.event.after.revision,
+            record.event.sequence,
+            record.profile
         );
         let commit = self.git.write_object("commit", body.as_bytes())?;
         if record.commit.as_ref().is_some_and(|old| old != &commit)
@@ -692,7 +705,7 @@ fn retained_sequence(key: i64) -> Result<u64> {
 }
 
 fn validate_record(record: &ExportRecord, owner: &Ownership) -> Result<()> {
-    if record.profile != PROFILE
+    if record.profile != owner.profile
         || record.repository != owner.repository
         || record.repository.len() != 32
         || !record

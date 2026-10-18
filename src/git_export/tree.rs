@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use super::git::Git;
 use crate::git_path_profile::{PortableSpellings, uses_reserved_namespace};
+use crate::model::EntryKind;
 use crate::store::{Engine, MAX_CHECKPOINT_BYTES, MAX_FILE_BYTES, validate_path};
 use crate::{Error, Result};
 
@@ -11,12 +12,12 @@ const TREE_OUTPUT: u64 = 128 * 1024 * 1024;
 
 #[derive(Default)]
 struct Directory {
-    files: BTreeMap<String, String>,
+    files: BTreeMap<String, (&'static str, String)>,
     directories: BTreeMap<String, Directory>,
 }
 
 impl Directory {
-    fn insert(&mut self, path: &str, oid: String) -> Result<()> {
+    fn insert(&mut self, path: &str, mode: &'static str, oid: String) -> Result<()> {
         if let Some((first, rest)) = path.split_once('/') {
             if self.files.contains_key(first) {
                 return Err(Error::Invalid("file/directory conflict".into()));
@@ -24,9 +25,10 @@ impl Directory {
             self.directories
                 .entry(first.into())
                 .or_default()
-                .insert(rest, oid)
+                .insert(rest, mode, oid)
         } else {
-            if self.directories.contains_key(path) || self.files.insert(path.into(), oid).is_some()
+            if self.directories.contains_key(path)
+                || self.files.insert(path.into(), (mode, oid)).is_some()
             {
                 return Err(Error::Invalid("duplicate or conflicting path".into()));
             }
@@ -36,8 +38,8 @@ impl Directory {
 
     fn write(&self, git: &Git) -> Result<String> {
         let mut input = Vec::new();
-        for (name, oid) in &self.files {
-            input.extend_from_slice(format!("100644 blob {oid}\t{name}\0").as_bytes());
+        for (name, (mode, oid)) in &self.files {
+            input.extend_from_slice(format!("{mode} blob {oid}\t{name}\0").as_bytes());
         }
         for (name, directory) in &self.directories {
             let oid = directory.write(git)?;
@@ -54,7 +56,15 @@ impl Directory {
 
 /// No index, checkout, attributes, filters or source commands are involved.
 /// The complete listing is compared, then every blob is read back byte for byte.
-pub(super) fn build_and_verify(git: &Git, engine: &Engine, revision: &str) -> Result<String> {
+pub(super) fn build_and_verify(
+    git: &Git,
+    engine: &Engine,
+    revision: &str,
+    profile: &str,
+) -> Result<String> {
+    if !matches!(profile, super::LEGACY_PROFILE | super::PROFILE) {
+        return Err(Error::Invalid("unsupported export profile".into()));
+    }
     engine.load_revision(revision)?;
     let mut directory = Directory::default();
     let mut manifest = BTreeMap::new();
@@ -64,7 +74,14 @@ pub(super) fn build_and_verify(git: &Git, engine: &Engine, revision: &str) -> Re
     loop {
         let page = engine.list_files(revision, cursor.as_deref(), 4096)?;
         for entry in page.entries {
-            crate::store::require_regular_entry("Git export", &entry.path, entry.kind)?;
+            if profile == super::LEGACY_PROFILE {
+                crate::store::require_regular_entry("Git export", &entry.path, entry.kind)?;
+            }
+            let mode = match entry.kind {
+                EntryKind::Regular => "100644",
+                EntryKind::Executable => "100755",
+                EntryKind::Symlink => "120000",
+            };
             validate_path(&entry.path)?;
             if entry.path.bytes().filter(|b| *b == b'/').count() > MAX_DEPTH {
                 return Err(Error::Limit("snapshot depth exceeds 128".into()));
@@ -83,6 +100,9 @@ pub(super) fn build_and_verify(git: &Git, engine: &Engine, revision: &str) -> Re
                 ));
             }
             let bytes = engine.read_file(revision, &entry.path)?;
+            if entry.kind == EntryKind::Symlink {
+                crate::store::validate_symlink_target(&entry.path, &bytes)?;
+            }
             total = total
                 .checked_add(bytes.len())
                 .ok_or_else(|| Error::Limit("snapshot size overflow".into()))?;
@@ -95,8 +115,8 @@ pub(super) fn build_and_verify(git: &Git, engine: &Engine, revision: &str) -> Re
                 ));
             }
             let oid = git.write_object("blob", &bytes)?;
-            directory.insert(&entry.path, oid.clone())?;
-            if manifest.insert(entry.path, oid).is_some() {
+            directory.insert(&entry.path, mode, oid.clone())?;
+            if manifest.insert(entry.path, (mode, oid)).is_some() {
                 return Err(Error::Invalid("duplicate native path".into()));
             }
         }
@@ -112,15 +132,15 @@ pub(super) fn build_and_verify(git: &Git, engine: &Engine, revision: &str) -> Re
         TREE_OUTPUT,
     )?;
     let mut expected = Vec::new();
-    for (path, oid) in &manifest {
-        expected.extend_from_slice(format!("100644 blob {oid}\t{path}\0").as_bytes());
+    for (path, (mode, oid)) in &manifest {
+        expected.extend_from_slice(format!("{mode} blob {oid}\t{path}\0").as_bytes());
     }
     if listing != expected {
         return Err(Error::Conflict(
             "complete Git tree differs from native manifest".into(),
         ));
     }
-    for (path, oid) in &manifest {
+    for (path, (_, oid)) in &manifest {
         let bytes = git.run(
             &["cat-file", "blob", oid],
             None,

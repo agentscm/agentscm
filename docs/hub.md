@@ -816,10 +816,7 @@ Events, each with the exact revision, commit, ref and pull request number and no
 Limits:
 
 - GitHub only. Publishing merge requests to GitLab is not implemented.
-- File modes and symlinks go only as far as git-export does. The export writes regular
-  `100644` files only (no executable bit, symlink or submodule), so that is what is
-  published today. The hub and client also accept `100755` and `120000` entries and
-  deletions in a manifest; a submodule or any other entry is refused before any upload.
+- Existing Git export profile v1 mirrors write regular `100644` files only. New mirrors use v2, which also preserves executable `100755` entries and symbolic links as `120000` target blobs. The hub and client accept these modes and deletions in a manifest; submodules and other entry kinds are refused before upload. Live GitHub publication of v2 exports remains unqualified.
 - At most 1000 changed paths, 8 MiB per file and 64 MiB in total. An upload over a cap is
   refused with a clear error and never truncated. GitHub's own limits (blob, file and
   repository size, path rules such as no `.git` component) apply on top, and a refusal
