@@ -480,6 +480,79 @@ fn pg18_authentication_roles_revocation_atomicity_and_manifest_reads() {
 
 #[test]
 #[ignore = "requires explicit AGENTSCM_PG_BIN_DIR; fresh isolated PostgreSQL18 only"]
+fn pg18_publication_mutations_require_the_reserving_principal() {
+    let cluster = Cluster::new();
+    let admin_secret = generate_secret().unwrap();
+    bootstrap(&cluster.config, "repo-a", admin_secret.expose());
+    let mut admin = service(&cluster.config, "repo-a", admin_secret.expose());
+    let mut contributors = Vec::new();
+    for id in ["alice", "bob"] {
+        let secret = generate_secret().unwrap();
+        admin
+            .provision(&ProvisionRequest {
+                authority_generation: 1,
+                operation: format!("provision-{id}"),
+                principal: id.into(),
+                credential: secret.expose().into(),
+                roles: vec![Role::Reader, Role::Contributor],
+            })
+            .unwrap();
+        contributors.push(service(&cluster.config, "repo-a", secret.expose()));
+    }
+    let mut bob = contributors.pop().unwrap();
+    let mut alice = contributors.pop().unwrap();
+
+    let fixture = tempfile::tempdir().unwrap();
+    let engine = Engine::open(fixture.path().join("source")).unwrap();
+    let backend = LocalBackend::open(fixture.path().join("backend")).unwrap();
+    let root = engine
+        .checkpoint(
+            None,
+            &[FileChange {
+                path: "a.rs".into(),
+                content: Some(b"fn main(){}".to_vec()),
+            }],
+        )
+        .unwrap();
+    let reservation = |publication: &str| ReserveRequest {
+        generation: 1,
+        publication: publication.into(),
+        root: root.clone(),
+        byte_limit: 1_000_000,
+        object_limit: 1000,
+        lease_seconds: 60,
+    };
+    alice.reserve(&reservation("owned")).unwrap();
+    alice.reserve(&reservation("dropped")).unwrap();
+    // Qualification is controller-only; the owner check applies to credentials.
+    let mut controller = cluster.config.open(scope("repo-a")).unwrap();
+    let manifest = controller
+        .upload_and_qualify(1, "owned", &engine, &backend, &fixture.path().join("offer"))
+        .unwrap();
+    let complete = CompleteRequest {
+        generation: 1,
+        publication: "owned".into(),
+        operation: "complete-owned".into(),
+        manifest_digest: manifest,
+    };
+
+    assert!(matches!(
+        bob.reserve(&reservation("owned")),
+        Err(TeamError::Denied)
+    ));
+    assert!(matches!(bob.complete(&complete), Err(TeamError::Denied)));
+    assert!(matches!(bob.abandon(1, "owned"), Err(TeamError::Denied)));
+    assert!(matches!(bob.abandon(1, "dropped"), Err(TeamError::Denied)));
+    assert_eq!(alice.inspect(1, "owned").unwrap().state, "qualifying");
+    assert_eq!(alice.inspect(1, "dropped").unwrap().state, "reserved");
+
+    alice.complete(&complete).unwrap();
+    alice.abandon(1, "dropped").unwrap();
+    assert_eq!(alice.inspect(1, "dropped").unwrap().state, "abandoned");
+}
+
+#[test]
+#[ignore = "requires explicit AGENTSCM_PG_BIN_DIR; fresh isolated PostgreSQL18 only"]
 fn pg18_schema_upgrade_preserves_existing_publication_records() {
     let cluster = Cluster::new();
     let mut sql = cluster.admin();
@@ -510,7 +583,7 @@ fn pg18_schema_upgrade_preserves_existing_publication_records() {
         .query_one("SELECT version FROM team_schema", &[])
         .unwrap()
         .get(0);
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let retired: bool = sql
         .query_one(
             "SELECT retired FROM team_repositories WHERE repository='legacy'",
