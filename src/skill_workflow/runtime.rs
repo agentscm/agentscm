@@ -601,7 +601,7 @@ fn advance_inner(
                     backend.work_dir,
                     backend.cancellation,
                 );
-                journal = Journal::open(data_dir, OpenMode::Write)?;
+                journal = Journal::open_after_dispatch(data_dir)?;
                 match result {
                     Ok(record) => record,
                     Err(error) => {
@@ -668,7 +668,7 @@ fn advance_inner(
                 attempt.run_generation,
                 executor.cancellation,
             )?;
-            journal = Journal::open(data_dir, OpenMode::Write)?;
+            journal = Journal::open_after_dispatch(data_dir)?;
             let current = journal.view(run_id)?;
             if matches!(
                 current
@@ -872,6 +872,25 @@ fn cancel_inner(
 }
 
 impl Journal {
+    // External work has already run. Brief contention with cancellation must
+    // not discard its observation or cause another dispatch. Only lease
+    // acquisition is retried; all state/generation checks still run afterward.
+    #[cfg(unix)]
+    fn open_after_dispatch(data_dir: &Path) -> Result<Self> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            match Self::open(data_dir, OpenMode::Write) {
+                Err(Error::Conflict(message))
+                    if message.starts_with("workflow journal is active:")
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                result => return result,
+            }
+        }
+    }
+
     fn open(data_dir: &Path, mode: OpenMode) -> Result<Self> {
         let access = crate::local_recovery::AccessGuard::shared_existing(data_dir)?;
         // The operator-selected native root may use a platform alias such as
@@ -1740,6 +1759,46 @@ fn parse_step_state(value: &str) -> Result<StepState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn post_dispatch_writer_waits_for_a_brief_observer_without_replaying_work() {
+        let (root, _) = result_fixture();
+        let observer = Journal::open(root.path(), OpenMode::Read).unwrap();
+        let path = root.path().to_path_buf();
+        let (send, receive) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            send.send(Journal::open_after_dispatch(&path).map(drop))
+                .unwrap();
+        });
+        assert!(matches!(
+            receive.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(observer);
+        receive
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        writer.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_dispatch_writer_reports_persistent_contention_and_unrelated_errors() {
+        let (root, _) = result_fixture();
+        let observer = Journal::open(root.path(), OpenMode::Read).unwrap();
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            Journal::open_after_dispatch(root.path()),
+            Err(Error::Conflict(_))
+        ));
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        drop(observer);
+        let absent = root.path().join("absent");
+        assert!(Journal::open_after_dispatch(&absent).is_err());
+        assert!(!absent.exists());
+    }
 
     fn result_fixture() -> (tempfile::TempDir, CompiledPlan) {
         let root = tempfile::tempdir().unwrap();

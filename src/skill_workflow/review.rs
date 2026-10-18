@@ -134,7 +134,7 @@ impl ReviewJournal for Calls<'_> {
         ticket: &CallTicket,
         observation: &ModelCallObservation,
     ) -> Result<()> {
-        let journal = Journal::open(self.data_dir, OpenMode::Write)?;
+        let journal = Journal::open_after_dispatch(self.data_dir)?;
         if ticket.run_generation != self.generation || journal.connection.execute(
             "UPDATE workflow_review_calls SET observation_json=?1 WHERE run_id=?2 AND step_id=?3
              AND reservation_digest=?4 AND observation_json IS NULL",
@@ -335,7 +335,7 @@ pub(super) fn execute(
         result
     });
     let record = result?;
-    let journal = Journal::open(data_dir, OpenMode::Write)?;
+    let journal = Journal::open_after_dispatch(data_dir)?;
     let bytes = serde_json::to_vec(&record)?;
     journal.connection.execute(
         "INSERT INTO workflow_reviews(run_id,step_id,record_digest,record_json) VALUES(?1,?2,?3,?4)",
