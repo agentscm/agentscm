@@ -28,7 +28,10 @@
 
 ## Advanced and experimental
 
-The immutable ledger, Git bridges and isolated command checks: see the [advanced index](advanced/README.md).
+The immutable ledger, Git bridges, isolated command checks and
+[source-bound skill workflows](advanced/skill-workflows.md): see the [advanced index](advanced/README.md).
+Skill workflows currently run through the local CLI; the hub, MCP and dashboard inspect retained
+runs. Agent-triggered execution and whole-workflow admission remain planned.
 
 ## For contributors and maintainers
 

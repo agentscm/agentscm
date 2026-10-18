@@ -20,11 +20,11 @@ The multi-user [coordination hub](hub.md) is a separate alpha service with its o
 ## Review context
 A stable Change stores identity and a Change-version-checked current-context pointer. Immutable ReviewContext records alone own intent, acceptance criteria, scope, exclusions, omissions and declared evidence boundaries. Source revisions do not include review context. Registration permits structurally valid incomplete contexts for inspection; approval and integration reject them. Both operations transactionally check repository, current change/context, target/base and policy bindings. New operations use context semantics version 2; migrated historical events remain version 1.
 
-Context digests attest to canonical bytes, not execution truth. The local owner can still supply all administrative claims. Independent check collection, model execution and authorization are subsequent required work. See [review context format](advanced/review-context.md).
+Context digests attest to canonical bytes, not execution truth. The local owner can still supply all administrative claims. Built-in source-path and isolated command collectors can provide evidence for a requesting current context. Operational model review, authenticated portable execution evidence and broader policy integration remain required. See [review context format](advanced/review-context.md).
 
 ## Local workflow continuation
 
-Ordinary filesystem workspaces use a separate durable journal and local generation counter. Checkpoints publish captured bytes; undo/recovery preserve divergent user edits. Offline bundles (see [offline sync](advanced/sync.md)) exchange exact source objects, qualify their closure and publish revisions only after their dependencies. They transfer no authority. Controller-built-in source-path checks bind immutable recipes and exact current review subjects, and a requesting context cannot be approved or integrated without matching successful evidence. These are trusted-local primitives; full command/model execution, merge convergence and authenticated transfer remain required.
+Ordinary filesystem workspaces use a separate durable journal and local generation counter. Checkpoints publish captured bytes; undo/recovery preserve divergent user edits. Offline bundles (see [offline sync](advanced/sync.md)) exchange exact source objects, qualify their closure and publish revisions only after their dependencies. They transfer no authority. Controller-built-in source-path checks bind immutable recipes and exact current review subjects, and a requesting context cannot be approved or integrated without matching successful evidence. These are trusted-local primitives. The isolated [command collector](advanced/execution.md) runs declared recipes with durable attempts and explicit recovery; a context requesting its capability needs successful evidence for that exact subject before approval or integration. Model execution, authenticated transfer and unattended service recovery remain incomplete.
 
 Immutable reads also accept bounded controller-supplied encoded-object streams
 through a shared [source reader](advanced/source-reader.md). Authorization, manifest
@@ -37,8 +37,20 @@ actual candidate closure before a terminal outcome; opaque completion receipts
 bind separate staged workspace application. Local journal references are not
 collector-visible retention pins or protected admission authority.
 
+## Skill workflows
+
+The local [skill workflow runner](advanced/skill-workflows.md) compiles a bounded graph from an
+immutable `SKILL.md` package and explicit resources. It runs source-path checks and, on Unix,
+pinned command recipes through the existing container collector. Its journal retains progress;
+command attempts fence concurrent claims, cancellation and recovery. A workflow result is an
+observation, not approval of the whole graph.
+
+The native API and operator-mapped hub/MCP/dashboard expose retained run status. Existing agent
+hooks coordinate file edits; they do not start or enforce skill workflows. Automatic triggers,
+authenticated execution tools, agent/provider adapters and whole-workflow admission are planned.
+
 ## Planned capabilities
-The following are not yet implemented; see the [roadmap](roadmap.md). Operational automated-review adapter with independent trusted check collection, full offline sync/workspace lifecycle, privacy/retention/GC and leases, authenticated multi-user APIs, PostgreSQL/object-store authority and caches, Git history import and a verified round trip back to Git, backup/failover and measured scale qualification remain planned. Advanced semantic merge, transparent virtual filesystems, cross-region active-active writes and blockchain anchoring are optional extensions.
+The following are not yet implemented; see the [roadmap](roadmap.md). Operational agent/model review, authenticated multi-user native APIs, PostgreSQL/object-store authority and caches, full offline sync/workspace lifecycle, privacy/retention/GC and leases, Git history import and live authority cutover, automatic recovery/failover and measured scale qualification remain planned. Bounded local source exchange, merge, Git export and offline recovery primitives already exist; they do not complete those operational capabilities. Advanced semantic merge, transparent virtual filesystems, cross-region active-active writes and blockchain anchoring are optional extensions.
 
 ## Deployment
-Distribute an OCI container (the supported install) and, for contributors, a native binary. A local/small-team single writer uses SQLite on a durable local volume. Never multiply SQLite authority containers over a shared directory. Later workers/read caches scale separately from fenced PostgreSQL authority. Keep candidate execution separate from controller credentials; no mounted host container socket by default. Containers simplify installation, not database consistency.
+Install a published binary through `npx`, the release install script or a manual download, or run a versioned OCI container; see [install options](install.md). Contributors can build from source. A local/small-team single writer uses SQLite on a durable local volume. Never multiply SQLite authority containers over a shared directory. Later workers/read caches scale separately from fenced PostgreSQL authority. Keep candidate execution separate from controller credentials; no mounted host container socket by default. Containers simplify installation, not database consistency.

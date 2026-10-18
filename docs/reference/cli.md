@@ -145,6 +145,31 @@ agentscm --data-dir ./agentscm-data serve [--bind ADDR] [--max-concurrency N] [-
 
 `serve` serves collision warnings (`GET /v1/collisions`) for the trusted Git checkout named by `--collisions-repo`, and the experimental read-only native API for the data directory. `--bind` defaults to `127.0.0.1:7331`. A non-loopback `--bind` is refused unless `--public` is passed. The container image passes `--public` itself; publish the port on loopback only, or put authentication in front of it.
 
+## Skill workflows
+
+`skill-workflow` is the experimental local runner for a graph of checks on one immutable native
+revision. It is separate from the hidden guided `workflow` command mentioned above. Prepare an
+existing native data directory, a packaged `SKILL.md` and a strict JSON definition as described in
+[skill workflows](../advanced/skill-workflows.md).
+
+```sh
+agentscm --data-dir ./agentscm-data skill-workflow plan workflow.json
+agentscm --data-dir ./agentscm-data skill-workflow run local-run-1 workflow.json
+agentscm --data-dir ./agentscm-data skill-workflow status local-run-1
+agentscm --data-dir ./agentscm-data skill-workflow resume local-run-1 --max-steps 1
+agentscm --data-dir ./agentscm-data skill-workflow cancel local-run-1
+```
+
+Those commands work as shown for source-only workflows. Command steps require a current Change
+and `command/v1` review context plus paired `--docker` and `--docker-socket` flags on `run` and
+`resume`. Cancelling a running command needs the backend flags too. Use
+`skill-workflow recover RUN_ID STEP_ID --docker PATH --docker-socket SOCKET` to reconcile an
+interrupted command without replaying it. See the guide for recipe binding and cleanup limits.
+
+Execution and recovery are local CLI operations. The native API, operator-mapped hub/MCP and
+dashboard inspect retained runs. Agent hooks do not start or require workflows. A successful run
+is not a whole-workflow admission decision.
+
 ## Local workspaces and offline exchange
 
 Keep the initialized repository data directory outside the working directory. Start a Change for `REVISION` before creating its workspace. Workspace checkpoints advance the local workspace base; updating the Change's review context remains an explicit operation.

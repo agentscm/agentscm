@@ -5,7 +5,7 @@
   </picture>
 </h1>
 
-> **Alpha (0.1.0-alpha.1): try it, don't depend on it.** Collision warnings and
+> **Alpha: try it, don't depend on it.** Collision warnings and
 > agent intents work today; the CLI, API and storage formats may change without
 > migration, and nothing has been tested at scale or security-audited. AgentSCM
 > is provided "as is", without warranties or liability, as described in
@@ -60,6 +60,10 @@ AgentSCM starts with the first problem and keeps an append-only ledger for the o
 is optional, reversible and per target; Git and your forge stay fully supported. Terms are
 explained in [concepts](docs/concepts.md); the model is in the
 [draft specification](docs/spec/agentic-scm.md).
+
+Packaged versions and release notes are listed in [Releases](https://github.com/counterbranch/agentscm/releases).
+These docs describe the branch or tag you are viewing. Features added on `main` may need a source
+build until the next release; use the documentation at your release tag for a packaged binary.
 
 ## Try it
 
@@ -127,15 +131,9 @@ A near-miss means the hub would have warned you, not that anything would have br
 reads Claude Code logs only (other agents are not included), prints the paths it read from, and
 `--no-paths` hides your file paths. Details: [autopsy](docs/autopsy.md), [collisions](docs/collisions.md).
 
-Prefer no install? The container does the same collision scan. Run it from your main checkout:
-
-```sh
-docker run --rm --network none --user "$(id -u):$(id -g)" -v "$PWD:/repo" \
-  ghcr.io/counterbranch/agentscm:0.1.0-alpha.1 collisions --git-dir /repo --worktrees
-```
-
-Only run it on repositories you trust, from the main checkout rather than a linked worktree. Why
-the mount is read-write, and what is not covered: [collisions](docs/collisions.md#running-in-a-container).
+Prefer the container? Follow [running collision checks in a container](docs/collisions.md#running-in-a-container)
+with a versioned image from [Releases](https://github.com/counterbranch/agentscm/releases). The guide
+covers repository trust, ownership and mount limits.
 
 ### 2. Warn agents across machines
 
@@ -169,6 +167,7 @@ mount and build details, see [collisions](docs/collisions.md#running-in-a-contai
 | Handoff (an agent asks the holder to hand a file over) | Experimental, see [handoff](docs/hub.md#handoff) |
 | GitHub and GitLab sync, GitHub publish | Experimental; tested only against in-process fake servers |
 | Native ledger, Git bridges, isolated command checks | Experimental; see [advanced](docs/advanced/README.md) |
+| Source-bound skill workflows | Experimental local CLI: exact-file checks and packaged container commands, retained results, cancellation and recovery. Hub/MCP/dashboard access is read-only; see [skill workflows](docs/advanced/skill-workflows.md) |
 
 The [roadmap](docs/roadmap.md) lists what exists and what is planned, and the [changelog](CHANGELOG.md)
 lists the known limits. Want a hosted hub or help running it? Tell us: support@counterbranch.com.
@@ -184,12 +183,12 @@ AgentSCM is licensed under FSL-1.1-ALv2. See [LICENSE](LICENSE).
 
 ## Stability and contributing
 
-AgentSCM is alpha (`0.1.0-alpha.1`): any release may change the CLI, the HTTP API and the on-disk
-storage format, and no migrations are promised. The Rust toolchain pinned in `rust-toolchain.toml`
+AgentSCM is alpha: any release may change the CLI, the HTTP API and the on-disk
+storage format, and no migrations are promised. The Rust toolchain pinned in [rust-toolchain.toml](rust-toolchain.toml)
 is also the minimum supported version. Maintained by the [Counterbranch](https://counterbranch.com)
 maintainers. See [CONTRIBUTING](CONTRIBUTING.md), [SECURITY](SECURITY.md) and the
 [Code of Conduct](CODE_OF_CONDUCT.md). Building from source is for contributors: `cargo build --locked`
-with Rust 1.96.0 and `git` 2.45.0 or newer; `agentscm collisions` itself needs Git 2.43 or newer.
+with that toolchain and `git` 2.45.0 or newer; `agentscm collisions` itself needs Git 2.43 or newer.
 
 AgentSCM and Counterbranch are trademarks of DUVATL, Inc. The license does not
 grant permission to use these names or logos; see TRADEMARKS.md.

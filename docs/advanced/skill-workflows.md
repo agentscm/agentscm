@@ -26,6 +26,45 @@ capability blocks the run. An optional unavailable capability remains visible as
 does not become a success; after all required work succeeds, the run reports
 `completed_with_omissions`.
 
+## What this is useful for
+
+Use a workflow when a checkpoint needs the same ordered set of checks each time. The definition
+names the exact revision, packaged resources and dependencies. The runner records what finished,
+what failed and what was unavailable, so a restart does not turn an unknown command result into a
+new execution or a success claim.
+
+An operator or an agent acting through the local CLI starts it explicitly:
+
+```mermaid
+flowchart LR
+  A[Explicit local CLI call] --> B[Compile source and skill package]
+  B --> C[Run ordered check or command steps]
+  C --> D[Retain run and command results]
+  D --> E[CLI, API, MCP and dashboard inspection]
+```
+
+`SKILL.md` describes the skill; it is packaged input. A command step also needs the strict recipe
+and actual review-context binding described below. Arbitrary skill prose is not an instruction to
+launch an agent, install a package or execute a shell command.
+
+## Agent hooks, execution and admission
+
+The current agent hooks coordinate file contention. They can warn about an overlapping edit or
+refuse its first attempt, depending on the agent. They do not select, launch or require a skill
+workflow. The MCP workflow tool reads status; it does not start, resume or cancel a run. The
+bundled [example skill](../../skills/native-workflow/SKILL.md) covers source-path checks only.
+
+A command step uses the existing durable `command/v1` check collector. Native approval and
+integration already require successful matching evidence when a review context requests that
+check. There is no policy requiring every required step of a workflow graph to pass before
+integration: the run still reports `admission: "not_assessed"`.
+
+Automatic lifecycle triggers, authenticated execution tools, agent/provider adapters and a skill
+catalog installer are planned. They are not enabled by installing the hook. Any future required
+workflow gate must be checked at the controlled landing or publication boundary; an advisory
+hook or an instruction to the agent is not enforcement. File edits would invalidate results for
+older source rather than silently treating them as checks of new bytes.
+
 ## Definition
 
 Definitions are strict JSON: unknown fields are rejected. The repository ID comes from the
@@ -192,3 +231,21 @@ is unavailable. This is logical read-only access, rather than a zero-filesystem-
 
 Library callers using `advance(..., 0)` execute no new steps, but may reconcile an already
 recorded all-terminal run outcome. The CLI accepts step budgets from 1 to 32.
+
+## What the tests establish
+
+The [workflow tests](../../tests/skill_workflow.rs) and
+[command workflow tests](../../tests/command_checks/skill_workflows.rs) cover source and recipe
+binding, graph dependencies, retained progress, failure propagation, context and policy drift,
+concurrent-controller cancellation, lost-result recovery without replay, unknown cleanup and CLI
+signal handling. Ordinary command cases use a fake Docker transport.
+
+The opt-in `live_runtime_executes_the_exact_native_revision` test executes a fixed command through
+the real container collector and verifies the native source bytes it sees. It needs an explicitly
+selected Docker executable, socket and pre-acquired immutable image. The existing
+[execution qualification](execution.md#qualification) covers the collector's tested isolation and
+cleanup controls for its selected runtime.
+
+These tests do not exercise a live coding agent completing a full edit, workflow, fix and landing
+loop. There is no end-to-end qualification of online model review, catalog installation, workflow
+admission or deployment.
