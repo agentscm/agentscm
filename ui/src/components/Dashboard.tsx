@@ -8,8 +8,9 @@ import { HealthCard } from './Health.tsx'
 import { Hero } from './Hero.tsx'
 import { LiveAgents } from './LiveAgents.tsx'
 import { PullRequests } from './PullRequests.tsx'
+import { SkillWorkflow } from './SkillWorkflow.tsx'
 
-export function Dashboard({ data }: { data: HubData }) {
+export function Dashboard({ data, token }: { data: HubData; token: string }) {
   const { work, activity } = data
   // Entrance motion runs once per page load: the intro class is dropped shortly after the first card starts
   // animating, so theme switches, polls and re-renders never replay it.
@@ -34,7 +35,8 @@ export function Dashboard({ data }: { data: HubData }) {
         </div>
         <div className="col col-side">
           <ContestedFiles d={d} index={1} />
-          <HealthCard health={data.health} index={5} />
+          <SkillWorkflow key={data.whoami?.token.repository ?? 'loading'} token={token} repository={data.whoami?.token.repository ?? null} index={5} />
+          <HealthCard health={data.health} index={6} />
         </div>
       </div>
     </main>

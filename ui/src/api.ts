@@ -1,6 +1,7 @@
 // The page only ever issues GETs. Responses are coerced defensively because
 // every string in them is teammate-supplied.
-import type { Activity, Health, HubEvent, Intent, Session, Whoami, Work } from './types.ts'
+import { decodeSkillWorkflowEnvelope } from './skillWorkflow.ts'
+import type { Activity, Health, HubEvent, Intent, Session, SkillWorkflowEnvelope, Whoami, Work } from './types.ts'
 
 export const AGENT_TOKEN_MESSAGE = 'This is an agent token, which can change coordination. The status page needs a read-only token.'
 
@@ -21,6 +22,48 @@ async function getJson(path: string, signal: AbortSignal, token?: string): Promi
   })
   if (!res.ok) throw new ApiError(res.status, `HTTP ${res.status}`)
   return res.json()
+}
+
+const MAX_SKILL_WORKFLOW_RESPONSE_BYTES = 4 * 1024 * 1024
+
+async function getBoundedJson(path: string, signal: AbortSignal, token: string): Promise<unknown> {
+  const res = await fetch(path, {
+    signal,
+    cache: 'no-store',
+    credentials: 'omit',
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  if (!res.ok) throw new ApiError(res.status, `HTTP ${res.status}`)
+  const declared = Number(res.headers.get('content-length'))
+  if (Number.isFinite(declared) && declared > MAX_SKILL_WORKFLOW_RESPONSE_BYTES) {
+    await res.body?.cancel()
+    throw new Error('Skill workflow response is too large')
+  }
+  if (!res.body) throw new Error('Skill workflow response has no body')
+  const reader = res.body.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  try {
+    while (true) {
+      const next = await reader.read()
+      if (next.done) break
+      total += next.value.byteLength
+      if (total > MAX_SKILL_WORKFLOW_RESPONSE_BYTES) {
+        await reader.cancel()
+        throw new Error('Skill workflow response is too large')
+      }
+      chunks.push(next.value)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  const bytes = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return JSON.parse(new TextDecoder().decode(bytes)) as unknown
 }
 
 const rec = (v: unknown): Record<string, unknown> => (v && typeof v === 'object' ? (v as Record<string, unknown>) : {})
@@ -140,4 +183,9 @@ export async function fetchHealth(signal: AbortSignal): Promise<Health> {
     if (e instanceof ApiError && e.status === 503) return { status: 'unavailable' }
     throw e
   }
+}
+
+export async function fetchSkillWorkflow(runId: string, token: string, signal: AbortSignal): Promise<SkillWorkflowEnvelope> {
+  const value = await getBoundedJson(`/v1/hub/skill-workflows/${encodeURIComponent(runId)}`, signal, token)
+  return decodeSkillWorkflowEnvelope(value, runId)
 }

@@ -900,6 +900,26 @@ impl Engine {
         ReadObjects::read_entry_impl(self, revision, path)
     }
 
+    /// Resolve membership before reading a regular blob within a payload allowance.
+    /// `None` is a size refusal, never a successful or qualified source observation.
+    pub(crate) fn read_regular_file_bounded(
+        &self,
+        revision: &str,
+        path: &str,
+        allowance: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        validate_path(path)?;
+        let revision = self.load_revision_impl(revision)?;
+        let (exact, _, _) = self.load_tree(&revision.tree)?;
+        let key = key_for(path.as_bytes());
+        let leaf = self
+            .lookup(Some(&exact), Namespace::Exact, &key)?
+            .filter(|leaf| leaf.path == path)
+            .ok_or_else(|| Error::NotFound(format!("path: {path}")))?;
+        require_regular_entry("bounded source read", path, leaf.kind)?;
+        self.blob_by_digest_bounded(&leaf.value, allowance)
+    }
+
     /// Refuse a blob outside the caller's payload allowance before allocating
     /// its body. None is an unverified size refusal, never object qualification.
     /// In-bound bytes use one retained FD and full canonical blob/hash checks.
@@ -3483,6 +3503,56 @@ mod blob_reference_tests {
 #[cfg(test)]
 mod bounded_blob_tests {
     use super::*;
+
+    #[test]
+    fn bounded_regular_file_checks_membership_and_refuses_before_reading_large_payload() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let engine = Engine::open(temp.path()).unwrap();
+        let revision = engine
+            .checkpoint_entries(
+                None,
+                &[
+                    EntryChange {
+                        path: "src/large".into(),
+                        content: Some(vec![b'x'; 1024 * 1024]),
+                        kind: EntryKind::Regular,
+                    },
+                    EntryChange {
+                        path: "src/small".into(),
+                        content: Some(b"abc".to_vec()),
+                        kind: EntryKind::Regular,
+                    },
+                    EntryChange {
+                        path: "src/link".into(),
+                        content: Some(b"large".to_vec()),
+                        kind: EntryKind::Symlink,
+                    },
+                ],
+            )
+            .unwrap();
+        let (scoped, budget) = engine.with_read_budget(64 * 1024);
+        assert_eq!(
+            scoped
+                .read_regular_file_bounded(&revision, "src/large", 1)
+                .unwrap(),
+            None
+        );
+        budget.finish(Ok(())).unwrap();
+        assert_eq!(
+            engine
+                .read_regular_file_bounded(&revision, "src/small", 3)
+                .unwrap(),
+            Some(b"abc".to_vec())
+        );
+        assert!(matches!(
+            engine.read_regular_file_bounded(&revision, "src/missing", 3),
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            engine.read_regular_file_bounded(&revision, "src/link", 3),
+            Err(Error::Invalid(_))
+        ));
+    }
 
     #[test]
     fn bounded_blob_exact_zero_and_oversize_use_real_read_budget() {

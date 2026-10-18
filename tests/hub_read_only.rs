@@ -1,5 +1,6 @@
-//! A read-only token (the status page's) reaches the four read routes and nothing else: every
-//! other hub route refuses it and writes nothing. Add a row to `routes()` for each new route.
+//! A read-only token (the status page's) reaches read routes and the side-effect-free MCP
+//! negotiation/read methods. Every mutating route refuses it and writes nothing. Add a row to
+//! `routes()` for each new route.
 use std::sync::Arc;
 
 use agentscm::backend::LocalBackend;
@@ -52,6 +53,7 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&get, format!("{REPO}/intents"), "".into(), Allowed);
     row(&get, format!("{REPO}/work"), "".into(), Allowed);
     row(&get, format!("{REPO}/activity"), "".into(), Allowed);
+    row(&get, "/v1/hub/skill-workflows/missing".into(), "".into(), Allowed);
     // Agent-token routes.
     row(&post, format!("{REPO}/intents"), announce.to_string(), AgentOnly);
     row(&post, format!("{REPO}/intents/{intent}/renew"), r#"{"ttl_s":60}"#.into(), AgentOnly);
@@ -62,16 +64,22 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&get, format!("{REPO}/publications/{id}"), "".into(), AgentOnly);
     row(&put, format!("{REPO}/publications/{id}/blobs/{hash}"), "x".into(), AgentOnly);
     row(&post, format!("{REPO}/publications/{id}/run"), "{}".into(), AgentOnly);
-    // /mcp: every tool, including status, which also heartbeats.
+    // /mcp: negotiation and the repository-scoped workflow read are side-effect-free.
+    row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{}}}"#.into(), Allowed);
+    row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.into(), Allowed);
+    row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#.into(), Allowed);
+    row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_workflow_status","arguments":{"run_id":"missing"}}}"#.into(), Allowed);
+    // The six coordination tools may start or mutate session state.
     for tool in [
         "agentscm_start",
         "agentscm_check",
         "agentscm_status",
         "agentscm_done",
+        "agentscm_ask",
+        "agentscm_handoff",
     ] {
         row(&post, "/mcp".into(), rpc(tool), AgentOnly);
     }
-    row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.into(), AgentOnly);
     // Hooks answer as for an unknown token.
     for agent in ["claude", "codex", "cursor", "copilot", "generic"] {
         let body = if agent == "generic" {

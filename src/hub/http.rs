@@ -2,7 +2,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use axum::extract::{FromRequest, FromRequestParts, Json, Request, State};
+use axum::extract::{FromRequest, FromRequestParts, Json, Path, RawQuery, Request, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -12,6 +12,7 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 
 use super::login::{Login, LoginConfig};
+use super::skill_workflow::{ReadError as SkillWorkflowReadError, SkillWorkflowRegistry};
 use super::store::{self, Principal, agent_token_digest, unix_now};
 use super::sync::{self, Sync as GithubSync, SyncConfig};
 use super::{HubError, HubState, Result, open_objects, router};
@@ -36,6 +37,7 @@ pub fn routes() -> Router<HubState> {
     Router::new()
         .route("/v1/hub/health", get(health))
         .route("/v1/hub/whoami", get(whoami))
+        .route("/v1/hub/skill-workflows/{run_id}", get(skill_workflow))
 }
 
 /// Run blocking store work off the async runtime, bounded process-wide: with
@@ -63,6 +65,9 @@ pub async fn serve(config: HubConfig) -> Result<()> {
             "binding a non-loopback address requires --public".into(),
         ));
     }
+    let workflows = tokio::task::spawn_blocking(SkillWorkflowRegistry::from_env)
+        .await
+        .map_err(|_| HubError::Unavailable("startup task failed".into()))??;
     let url = config.database_url;
     let store = tokio::task::spawn_blocking(move || store::open(&url))
         .await
@@ -110,7 +115,8 @@ pub async fn serve(config: HubConfig) -> Result<()> {
     )?)?;
     let state = HubState::new(store, objects)
         .with_login(login)
-        .with_sync(github);
+        .with_sync(github)
+        .with_skill_workflows(workflows);
     sync::start(&state).await?;
     if let Err(error) = sync::bootstrap(&state, signin, |name| std::env::var(name).ok()).await {
         eprintln!("hub: first-run setup link not created: {error}");
@@ -306,6 +312,26 @@ async fn whoami(Reader(principal): Reader) -> Json<serde_json::Value> {
             "login": owner.login,
         },
     }))
+}
+
+async fn skill_workflow(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+    Path(run_id): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> std::result::Result<Response, ApiError> {
+    if raw.as_deref().is_some_and(|raw| !raw.is_empty()) {
+        return Err(ApiError::invalid());
+    }
+    let registry = state.skill_workflows.clone();
+    let repository = principal.repository;
+    let outcome = blocking(&state, move || Ok(registry.read(&repository, &run_id))).await?;
+    match outcome {
+        Ok(envelope) => Ok(Json(envelope).into_response()),
+        Err(SkillWorkflowReadError::InvalidRunId) => Err(ApiError::invalid()),
+        Err(SkillWorkflowReadError::NotFound) => Err(ApiError::not_found()),
+        Err(SkillWorkflowReadError::Internal(detail)) => Err(HubError::Unavailable(detail).into()),
+    }
 }
 
 #[cfg(test)]

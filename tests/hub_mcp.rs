@@ -140,6 +140,12 @@ async fn protocol_basics() {
                 .unwrap()
                 .contains("agentscm_ask asks that agent to hand it over")
         );
+        assert!(
+            body["result"]["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("agentscm_workflow_status reads a retained native workflow run")
+        );
     }
 
     let ping = hub
@@ -168,9 +174,11 @@ async fn protocol_basics() {
             "agentscm_status",
             "agentscm_done",
             "agentscm_ask",
-            "agentscm_handoff"
+            "agentscm_handoff",
+            "agentscm_workflow_status"
         ]
     );
+    assert_eq!(names.len(), 7);
     assert_eq!(
         listed["result"]["tools"][4]["inputSchema"]["required"],
         json!(["path"])
@@ -180,6 +188,18 @@ async fn protocol_basics() {
         json!(["path", "accept"])
     );
     assert!(listed["result"]["tools"][1]["inputSchema"]["required"] == json!(["paths"]));
+    assert_eq!(
+        listed["result"]["tools"][6]["inputSchema"]["required"],
+        json!(["run_id"])
+    );
+    assert_eq!(
+        listed["result"]["tools"][6]["inputSchema"]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        listed["result"]["tools"][6]["annotations"]["readOnlyHint"],
+        true
+    );
 
     // Notifications and client responses are accepted without a body.
     for message in [

@@ -23,6 +23,7 @@ const MAX_CONCURRENCY: usize = 256;
 const MAX_QUERY_BYTES: usize = 4 * 1024;
 const MAX_SOURCE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DIFF_LIMIT: usize = 10_000;
+const MAX_SKILL_WORKFLOW_BYTES: usize = 4 * 1024 * 1024;
 const RESPONSE_CHUNK_BYTES: usize = 16 * 1024;
 
 #[derive(Clone)]
@@ -111,6 +112,7 @@ pub async fn serve(
         .route("/v1/workflow", get(workflow_status))
         .route("/v1/collisions", get(collisions_status))
         .route("/v1/workflow/inspection", get(workflow_inspection))
+        .route("/v1/skill-workflows/{run_id}", get(skill_workflow))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     eprintln!("listening on {}", listener.local_addr()?);
@@ -118,6 +120,55 @@ pub async fn serve(
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(Error::Io)
+}
+
+async fn skill_workflow(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    if raw.as_deref().is_some_and(|raw| !raw.is_empty()) {
+        return read_error(
+            ApiError::limit("skill workflow reads accept no query fields"),
+            "skill workflow",
+        );
+    }
+    if let Err(error) = agentscm::skill_workflow_service::validate_run_id(&run_id) {
+        return read_error(ApiError::from(error), "skill workflow");
+    }
+
+    let data_dir = state.data_dir.clone();
+    let permit = match reserve_work(&state) {
+        Ok(permit) => permit,
+        Err(error) => return read_error(error, "skill workflow"),
+    };
+    let result = blocking_reserved(state, permit, move |engine| {
+        let projected = (|| {
+            let view = agentscm::skill_workflow_service::read(&data_dir, &engine, &run_id)?;
+            let body = serde_json::to_string(&view)?;
+            if body.len() > MAX_SKILL_WORKFLOW_BYTES {
+                Err(Error::Limit(format!(
+                    "skill workflow response exceeds {MAX_SKILL_WORKFLOW_BYTES} bytes"
+                )))
+            } else {
+                Ok(body)
+            }
+        })();
+        projected.map_err(|error| match error {
+            Error::Invalid(message) | Error::Limit(message) => Error::Io(std::io::Error::other(
+                format!("skill workflow projection validation failed: {message}"),
+            )),
+            error => error,
+        })
+    })
+    .await;
+    match result {
+        Ok((body, permit)) => guard_response(
+            api_response(StatusCode::OK, body, "application/json"),
+            permit,
+        ),
+        Err(error) => read_error(error, "skill workflow"),
+    }
 }
 
 async fn workflow_status(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
@@ -648,6 +699,30 @@ mod tests {
         drop(permit);
         assert_eq!(state.work.available_permits(), 1);
         assert!(!directory.path().join("workflow.sqlite").exists());
+    }
+
+    #[tokio::test]
+    async fn skill_workflow_reads_preserve_the_existing_work_limit_response() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState {
+            data_dir: directory.path().to_path_buf(),
+            engine: Engine::open(directory.path()).unwrap(),
+            work: Arc::new(Semaphore::new(1)),
+            collisions: None,
+        };
+        let permit = reserve_work(&state).unwrap();
+        let response = skill_workflow(
+            State(state.clone()),
+            Path("retained-run".into()),
+            RawQuery(None),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(state.work.available_permits(), 0);
+        drop(permit);
+        assert_eq!(state.work.available_permits(), 1);
+        assert!(!directory.path().join("skill-workflows").exists());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
