@@ -4,6 +4,7 @@
 mod external;
 mod git;
 pub mod publish;
+pub mod remote;
 mod seed;
 mod tree;
 

@@ -1,3 +1,4 @@
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -36,6 +37,10 @@ impl Git {
         })
     }
 
+    pub(super) fn executable(&self) -> PathBuf {
+        self.executable.clone()
+    }
+
     pub(super) fn run(
         &self,
         args: &[&str],
@@ -53,8 +58,43 @@ impl Git {
         budget: u64,
         one_ok: bool,
     ) -> Result<(i32, Vec<u8>)> {
+        self.run_code_with_timeout(args, input, budget, one_ok, Duration::from_secs(60))
+    }
+
+    fn run_code_with_timeout(
+        &self,
+        args: &[&str],
+        input: Option<Vec<u8>>,
+        budget: u64,
+        one_ok: bool,
+        timeout: Duration,
+    ) -> Result<(i32, Vec<u8>)> {
+        let mut command = self.command();
+        command.args(args);
+        let output = capture_with_input(
+            &mut command,
+            input,
+            timeout,
+            budget,
+            &Cancellation::default(),
+        )?;
+        if output.stop.is_some() || !(output.code == Some(0) || (one_ok && output.code == Some(1)))
+        {
+            return Err(Error::Invalid(format!(
+                "Git {} failed ({:?}, {:?}): {}",
+                args.first().unwrap_or(&""),
+                output.code,
+                output.stop,
+                String::from_utf8_lossy(&output.stderr[..output.stderr.len().min(512)])
+            )));
+        }
+        Ok((output.code.unwrap_or_default(), output.stdout))
+    }
+
+    fn command(&self) -> Command {
         let mut command = Command::new(&self.executable);
         command
+            .process_group(0)
             .env_clear()
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -83,26 +123,37 @@ impl Git {
                 "core.fsync=loose-object,reference",
                 "-c",
                 "core.fsyncMethod=fsync",
-            ])
+            ]);
+        command
+    }
+
+    // Network peers can echo credentials in arbitrary diagnostics. Never return
+    // their stderr or raw command text as a public error or journal field.
+    pub(super) fn transport(
+        &self,
+        args: &[&str],
+        config: &[(String, String)],
+        environment: &[(String, String)],
+        budget: u64,
+    ) -> Result<Vec<u8>> {
+        let mut command = self.command();
+        for (key, value) in config {
+            command.args(["-c", &format!("{key}={value}")]);
+        }
+        command
+            .envs(environment.iter().map(|(key, value)| (key, value)))
             .args(args);
         let output = capture_with_input(
             &mut command,
-            input,
+            None,
             Duration::from_secs(60),
             budget,
             &Cancellation::default(),
         )?;
-        if output.stop.is_some() || !(output.code == Some(0) || (one_ok && output.code == Some(1)))
-        {
-            return Err(Error::Invalid(format!(
-                "Git {} failed ({:?}, {:?}): {}",
-                args.first().unwrap_or(&""),
-                output.code,
-                output.stop,
-                String::from_utf8_lossy(&output.stderr[..output.stderr.len().min(512)])
-            )));
+        if output.stop.is_some() || output.code != Some(0) {
+            return Err(Error::SourceIndeterminate);
         }
-        Ok((output.code.unwrap_or_default(), output.stdout))
+        Ok(output.stdout)
     }
 
     pub(super) fn text(&self, args: &[&str]) -> Result<String> {
@@ -307,6 +358,61 @@ pub(super) fn validate_oid(oid: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::validate_closure_listing;
+
+    fn descendants_stop_with_git(output_limit: bool) {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("late-write");
+        let script = root.path().join("git-fixture");
+        let quote =
+            |path: &std::path::Path| format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"));
+        let tail = if output_limit {
+            "while :; do printf '0123456789012345678901234567890123456789\\n'; done"
+        } else {
+            "/bin/sleep 2"
+        };
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n(/bin/sleep 0.4; /usr/bin/touch {}) &\n{tail}\n",
+                quote(&marker)
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let git = super::Git::new(&script, root.path().to_path_buf()).unwrap();
+        let result = git.run_code_with_timeout(
+            &["fixture"],
+            None,
+            if output_limit { 64 } else { 8192 },
+            false,
+            if output_limit {
+                Duration::from_secs(2)
+            } else {
+                Duration::from_millis(100)
+            },
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains(if output_limit { "Output" } else { "Timeout" }),
+            "{error}"
+        );
+        std::thread::sleep(Duration::from_millis(650));
+        assert!(!marker.exists(), "Git descendant survived termination");
+    }
+
+    #[test]
+    fn timeout_terminates_git_descendants_before_they_can_write() {
+        descendants_stop_with_git(false);
+    }
+
+    #[test]
+    fn output_limit_terminates_git_descendants_before_they_can_write() {
+        descendants_stop_with_git(true);
+    }
 
     #[test]
     fn closure_listing_honors_the_selected_inclusive_limit() {
