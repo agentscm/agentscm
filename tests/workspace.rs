@@ -303,6 +303,37 @@ fn reserved_names_in_the_working_tree_block_checkpoints_without_staging() {
 }
 
 #[test]
+fn second_handle_cannot_undo_another_writers_dirty_bytes_or_stale_generation() {
+    let (directory, engine, base, change) = fixture();
+    let root = directory.path().join("workspace");
+    let mut first = Workspace::create(&engine, &root, change, &base).unwrap();
+    let mut second = Workspace::open(&root).unwrap();
+    let stale_generation = second.state().unwrap().generation;
+    fs::write(root.join("a.txt"), b"first writer checkpoint").unwrap();
+    first.checkpoint(&engine, "first-checkpoint", 0).unwrap();
+    fs::write(root.join("a.txt"), b"first writer unfinished edit").unwrap();
+
+    assert!(matches!(
+        second.undo(&engine, "stale-undo", stale_generation, "first-checkpoint"),
+        Err(Error::Conflict(_))
+    ));
+    assert_eq!(
+        second
+            .undo(&engine, "current-undo", 1, "first-checkpoint")
+            .unwrap(),
+        OperationOutcome::Blocked {
+            paths: vec!["a.txt".into()]
+        }
+    );
+    assert_eq!(
+        fs::read(root.join("a.txt")).unwrap(),
+        b"first writer unfinished edit"
+    );
+    assert_eq!(first.state().unwrap().generation, 1);
+    assert!(first.state().unwrap().pending.is_none());
+}
+
+#[test]
 fn undo_refuses_dirty_affected_paths_without_writing() {
     let (directory, engine, base, change) = fixture();
     let root = directory.path().join("workspace");

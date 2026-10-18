@@ -10,6 +10,8 @@ import {
 } from '@ant-design/icons'
 import { Alert, Breadcrumb, Button, Collapse, Empty, Input, Select, Skeleton, Table, Tabs, Tag } from 'antd'
 import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
+import { workspaceError, workspaceRequest, type WorkspaceRun } from '../workspace.ts'
+import { decodeSkillWorkflowEnvelope } from '../skillWorkflow.ts'
 import { ApiError, fetchSkillWorkflow, fetchSkillWorkflows } from '../api.ts'
 import { InvalidSkillWorkflowResponse, validSkillWorkflowRunId, validSkillWorkflowStepId } from '../skillWorkflow.ts'
 import type {
@@ -177,7 +179,7 @@ const routeFromHash = (): WorkflowRoute => {
   return stepId && validSkillWorkflowStepId(stepId) ? { kind: 'step', runId, stepId } : { kind: 'run', runId }
 }
 
-const runHref = (runId: string): string => `#workflows/runs/${encodeURIComponent(runId)}`
+const runHref = (runId: string): string => window.location.hash.startsWith('#workspace/workflow/') ? window.location.hash.split('/').slice(0, 4).join('/') : `#workflows/runs/${encodeURIComponent(runId)}`
 const stepHref = (runId: string, stepId: string): string => `${runHref(runId)}/steps/${encodeURIComponent(stepId)}`
 
 function WorkflowBreadcrumb({ repository, route }: { repository: string; route: WorkflowRoute }) {
@@ -469,7 +471,7 @@ function RunSummary({ projection, refresh }: { projection: SkillWorkflowProjecti
     <>
       <div className="workflow-page-heading workflow-run-heading">
         <div>
-          <Button className="workflow-back" type="link" href="#workflows" icon={<ArrowLeftOutlined />}>All runs</Button>
+          <Button className="workflow-back" type="link" href={window.location.hash.startsWith('#workspace/') ? '#workspace/repositories' : '#workflows'} icon={<ArrowLeftOutlined />}>All runs</Button>
           <h1><code>{run.run_id}</code></h1>
           <p>Revision <code title={run.source.revision}>{run.source.revision.slice(0, 12)}</code> · policy epoch {run.source.policy_epoch}</p>
         </div>
@@ -654,4 +656,31 @@ export function SkillWorkflow({ token, repository }: { token: string; repository
       {route.kind === 'list' ? <WorkflowList token={token} /> : <WorkflowRun token={token} route={route} />}
     </section>
   )
+}
+
+/** Reuses the retained workflow drilldown through a cookie-authorized workspace scope. */
+export function WorkspaceWorkflow({ repository, workspaceRunId }: { repository: string; workspaceRunId: string }) {
+  const [lookup, setLookup] = useState<RunLookup>({ kind: 'loading', runId: workspaceRunId })
+  const [refresh, setRefresh] = useState(0)
+  const [stepId, setStepId] = useState<string | null>(() => window.location.hash.split('/')[4] === 'steps' ? safeDecode(window.location.hash.split('/')[5] ?? '') : null)
+  useEffect(() => { const changed = () => { const parts = window.location.hash.split('/'); setStepId(parts[4] === 'steps' ? safeDecode(parts[5] ?? '') : null) }; window.addEventListener('hashchange', changed); return () => window.removeEventListener('hashchange', changed) }, [])
+  useEffect(() => {
+    const controller = new AbortController()
+    const path = `/repositories/${encodeURIComponent(repository)}/runs/${encodeURIComponent(workspaceRunId)}`
+    void workspaceRequest<WorkspaceRun>(path, { signal: controller.signal }).then(async run => {
+      const value = await workspaceRequest<unknown>(`${path}/workflow`, { signal: controller.signal })
+      const envelope = decodeSkillWorkflowEnvelope(value, run.native_run_id ?? '')
+      if (!controller.signal.aborted) setLookup({ kind: 'result', runId: workspaceRunId, envelope })
+    }).catch(error => { if (!controller.signal.aborted) setLookup({ kind: 'error', runId: workspaceRunId, message: workspaceError(error) }) })
+    return () => controller.abort()
+  }, [repository, workspaceRunId, refresh])
+  const reload = () => { setLookup({ kind: 'loading', runId: workspaceRunId }); setRefresh(value => value + 1) }
+  if (lookup.kind === 'loading') return <Skeleton active paragraph={{ rows: 10 }} />
+  if (lookup.kind === 'error') return <Alert type="warning" showIcon message="Retained workflow is not available" description={lookup.message} action={<Button onClick={reload}>Retry</Button>} />
+  if (lookup.envelope.availability === 'unavailable') return <Alert type="warning" showIcon message="Retained workflow is not available yet" description="A queued run may not have written its native journal. Refresh after execution starts." action={<Button onClick={reload}>Refresh</Button>} />
+  const projection = lookup.envelope.projection
+  const step = stepId ? projection.run.steps.find(step => step.id === stepId) : null
+  return <>
+    {stepId ? step ? <StepDetail runId={projection.run.run_id} step={step} /> : <Alert type="error" message="This retained step was not found." /> : <RunSummary projection={projection} refresh={reload} />}
+  </>
 }

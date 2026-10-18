@@ -1,4 +1,4 @@
-import { LockOutlined } from '@ant-design/icons'
+import { LockOutlined, TeamOutlined } from '@ant-design/icons'
 import { Alert, Button, Checkbox, Input, Typography } from 'antd'
 import { useState, type CSSProperties, type FormEvent } from 'react'
 import { AGENT_TOKEN_MESSAGE, ApiError, fetchWhoami } from '../api.ts'
@@ -40,7 +40,7 @@ export function SignIn({ notice, onSignedIn }: { notice: string | null; onSigned
       <form className="signin-card rise" onSubmit={submit} style={{ '--i': 0 } as CSSProperties}>
         <Logo height={44} />
         <h1 className="signin-title">Who is touching what, right now.</h1>
-        <p className="signin-lead">Paste a read-only token for the repository to open its live status. This page only reads; it never changes anything on the hub.</p>
+        <p className="signin-lead">Paste a read-only token for the repository to open its live status. Repository status uses this token only for reading. Workspace actions use a separate forge sign-in.</p>
         {notice && <Alert type="info" showIcon message={notice} className="signin-alert" />}
         <label htmlFor="token" className="field-label">
           Read-only token
@@ -57,6 +57,7 @@ export function SignIn({ notice, onSignedIn }: { notice: string | null; onSigned
         <Button type="primary" size="large" htmlType="submit" loading={busy} block>
           Open status
         </Button>
+        <Button size="large" icon={<TeamOutlined />} href="#workspace" block>Sign in to workspace</Button>
         <div className="signin-help">
           <p>Create a token with</p>
           <Typography.Text code copyable>

@@ -1045,6 +1045,27 @@ impl Store for SqliteStore {
         Ok(users)
     }
 
+    fn user_by_id(&self, id: &str) -> Result<Option<User>> {
+        Ok(self.conn().query_row(
+            "SELECT id, provider, host, forge_user_id, login, disabled FROM hub_users WHERE id = ?1",
+            [id],
+            |row| Ok(User {
+                id: row.get(0)?,
+                identity: ForgeIdentity { provider: row.get(1)?, host: row.get(2)?, user_id: row.get(3)? },
+                login: row.get(4)?, disabled: row.get(5)?,
+            }),
+        ).optional()?)
+    }
+
+    fn user_for_identity(&self, identity: &ForgeIdentity) -> Result<Option<User>> {
+        identity.validate()?;
+        Ok(self.conn().query_row(
+            "SELECT id, provider, host, forge_user_id, login, disabled FROM hub_users WHERE provider=?1 AND host=?2 AND forge_user_id=?3",
+            params![identity.provider,identity.host,identity.user_id],
+            |row| Ok(User { id:row.get(0)?, identity:ForgeIdentity {provider:row.get(1)?,host:row.get(2)?,user_id:row.get(3)?}, login:row.get(4)?,disabled:row.get(5)? }),
+        ).optional()?)
+    }
+
     fn record_sign_in(&self, user: &str, method: &str, admin: bool) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;

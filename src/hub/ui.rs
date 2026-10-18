@@ -1,5 +1,4 @@
-//! The read-only status page: a built single-page app served at `/ui/`. It signs in with an
-//! agent token sent as `Authorization: Bearer`; there are no cookies and no server-side session.
+//! The Hub UI at `/ui/`: read-only status tokens and opt-in workspace sessions.
 use axum::Router;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Redirect};

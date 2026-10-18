@@ -1,4 +1,5 @@
-// Dev-only: answers the hub's read-only status endpoints from synthetic fixtures.
+// Dev-only: answers status and workspace GET endpoints from synthetic fixtures.
+// Workspace fixtures are visibly labelled; mutations return 501 and never execute.
 // Used by `MOCK=1 npm run dev`; never imported by app code.
 //   MOCK=1      acme/widgets with live agents, open PRs and retained workflows
 //   MOCK=empty  a connected-nothing repository: no agents, events or PRs, no forge connection
@@ -257,6 +258,27 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
           if (scenario === 'empty') return send(200, { status: 'ok', storage: 'sqlite', coordination: { denied: 0, repeated: 0, rate_limited: 0, fail_open: 0, hook_p95_ms: 0 } })
           if (scenario === 'demo') return send(200, { status: 'ok', storage: 'sqlite', demo: true, coordination: { denied: 2, repeated: 0, rate_limited: 0, fail_open: 0, hook_p95_ms: 4 } })
           return send(200, { status: 'ok', storage: 'sqlite', coordination: { denied: 14, repeated: 9, rate_limited: 1, fail_open: 2, hook_p95_ms: 38 + Math.round(Math.random() * 30) } })
+        }
+        // Synthetic workspace viewing only. Production uses forge sessions and CSRF.
+        if (url.pathname.startsWith('/workspace')) {
+          if (down) return send(503, { error: 'unavailable' })
+          if (req.method !== 'GET') return send(501, { error: 'synthetic_fixture_does_not_execute_mutations' })
+          const settings = { id: 'synthetic-workspace', name: 'Synthetic workspace', generation: 1, max_concurrent_runs: 1 }
+          const identity = { provider: 'github', host: 'github.com', user_id: 1001 }
+          const subject = { change_id: 'change-invoice-rounding', change_version: 3, context_digest: 'c'.repeat(64), revision: '2'.repeat(64), requirement_digest: 'd'.repeat(64) }
+          const run = { run_id: 'synthetic-workspace-run', repository_id: REPO, profile_id: 'quality-gate', actor_id: 'synthetic-member', generation: 3, state: 'succeeded', subject, native_run_id: 'claude-review-passed', receipt: 'synthetic-receipt', detail: 'Synthetic retained run for interface development; no execution occurred.' }
+          if (url.pathname === '/workspace/login') return send(200, { providers: [] })
+          if (url.pathname === '/workspace/session') return send(200, { workspace: settings, actor: { user: { id: 'synthetic-member', identity, login: 'synthetic-maintainer' }, roles: ['reader', 'contributor', 'administrator'], repository_ids: ['*'], generation: 1 }, capabilities: { manage_workspace: true, read_repositories: true, execute_workflows: true }, csrf_token: 'synthetic-csrf-no-authority', login_providers: [], synthetic_fixture: true })
+          if (url.pathname === '/workspace/settings') return send(200, settings)
+          if (url.pathname === '/workspace/members') return send(200, { members: [{ identity, roles: ['reader', 'contributor', 'administrator'], repository_ids: ['*'], enabled: true, generation: 1 }, { identity: { ...identity, user_id: 1002 }, roles: ['reader', 'reviewer'], repository_ids: [REPO], enabled: true, generation: 1 }], generation: 1, next_cursor: null })
+          if (url.pathname === '/workspace/repositories') return send(200, { repositories: scenario === 'empty' ? [] : [{ repository_id: REPO, profiles: [{ profile_id: 'quality-gate', target: 'main', requirement_digest: subject.requirement_digest, readiness: 'configured', limitations: 'Synthetic profile for interface development only.' }] }] })
+          const base = `/workspace/repositories/${encodeURIComponent(REPO)}`
+          if (url.pathname === `${base}/profiles/quality-gate/subjects`) return send(200, { subjects: [subject], next_cursor: null })
+          if (url.pathname === `${base}/profiles/quality-gate/subject`) return send(200, { subject })
+          if (url.pathname === `${base}/runs`) return send(200, { runs: scenario === 'empty' ? [] : [run, { ...run, run_id: 'synthetic-unknown-run', generation: 4, state: 'unknown', receipt: null, detail: 'Synthetic unknown outcome; requires operator inspection.' }], next_cursor: null })
+          if (url.pathname === `${base}/runs/synthetic-workspace-run`) return send(200, run)
+          if (url.pathname === `${base}/runs/synthetic-workspace-run/workflow`) return send(200, workflow(run.native_run_id))
+          return send(404, { error: 'synthetic_workspace_route_not_found' })
         }
         const token = /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1]
         if (!token || token === 'expired') return send(401, { error: 'unauthorized' })

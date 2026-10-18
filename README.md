@@ -167,7 +167,8 @@ mount and build details, see [collisions](docs/collisions.md#running-in-a-contai
 | Handoff (an agent asks the holder to hand a file over) | Experimental, see [handoff](docs/hub.md#handoff) |
 | GitHub and GitLab sync, GitHub publish | Experimental; tested only against in-process fake servers |
 | Native ledger, Git bridges, isolated command checks | Experimental; see [advanced](docs/advanced/README.md) |
-| Source-bound skill workflows | Experimental local CLI: packaged tests, Claude Code review, failure/fix feedback and exact-revision native landing requirements. Hub/MCP/dashboard access is read-only; see the [Claude Code loop](docs/advanced/claude-code-workflows.md) |
+| Source-bound skill workflows | Experimental: packaged tests, Claude Code review, failure/fix feedback and exact-revision native landing requirements; see the [Claude Code loop](docs/advanced/claude-code-workflows.md) |
+| Community workspace | Opt-in single-server pilot: forge sign-in, persistent members/settings, independent permissions and a shared workflow queue. Explicit human approval and native landing; see [setup and limits](docs/advanced/community-workspace.md). The legacy token dashboard and MCP remain inspection-only |
 
 The workflow UI is an early UX prototype for testing the basic flow. Pagination,
 large run histories, filtering/search, and navigation still need substantial refinement.

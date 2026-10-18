@@ -3,6 +3,7 @@ import {
   BranchesOutlined,
   HeartOutlined,
   HistoryOutlined,
+  TeamOutlined,
 } from '@ant-design/icons'
 import { Tabs } from 'antd'
 import { useEffect, useMemo, useRef, useState, type AnimationEvent } from 'react'
@@ -15,19 +16,21 @@ import { HealthCard } from './Health.tsx'
 import { Hero } from './Hero.tsx'
 import { LiveAgents } from './LiveAgents.tsx'
 import { PullRequests } from './PullRequests.tsx'
+import { Workspace } from './Workspace.tsx'
 import { SkillWorkflow } from './SkillWorkflow.tsx'
 
-type HubSection = 'coordination' | 'workflows' | 'activity' | 'health'
+type HubSection = 'coordination' | 'workflows' | 'activity' | 'health' | 'workspace'
 
 const sectionFromHash = (): HubSection => {
   const section = window.location.hash.slice(1).split('/')[0]
-  return section === 'workflows' || section === 'activity' || section === 'health' ? section : 'coordination'
+  return section === 'workflows' || section === 'activity' || section === 'health' || section === 'workspace' ? section : 'coordination'
 }
 
 const navigation = [
   { key: 'coordination', label: <span><ApartmentOutlined /> Coordination</span> },
   { key: 'workflows', label: <span><BranchesOutlined /> Workflows</span> },
   { key: 'activity', label: <span><HistoryOutlined /> Activity</span> },
+  { key: 'workspace', label: <span><TeamOutlined /> Workspace</span> },
   { key: 'health', label: <span><HeartOutlined /> Health</span> },
 ]
 
@@ -85,6 +88,8 @@ export function Dashboard({ data, token }: { data: HubData; token: string }) {
           repository={data.whoami?.token.repository ?? null}
         />
       )}
+
+      {section === 'workspace' && <Workspace />}
 
       {section === 'activity' && (
         <div className="hub-section hub-section-narrow" aria-label="Activity">

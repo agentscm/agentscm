@@ -2,6 +2,7 @@ import { ConfigProvider, theme } from 'antd'
 import { useCallback, useEffect, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from 'react'
 import { Dashboard } from './components/Dashboard.tsx'
 import { Header } from './components/Header.tsx'
+import { WorkspaceEntrance } from './components/Workspace.tsx'
 import { SignIn } from './components/SignIn.tsx'
 import { clearToken, loadTheme, loadToken, saveTheme, saveToken, type ThemePref } from './storage.ts'
 import { useHub } from './useHub.ts'
@@ -55,6 +56,8 @@ function Authed({ token, pref, onPref, onUnauthorized, onForget }: { token: stri
 
 export default function App() {
   const [token, setToken] = useState<string | null>(loadToken)
+  const [workspace, setWorkspace] = useState(() => window.location.hash.startsWith('#workspace'))
+  useEffect(() => { const listener = () => setWorkspace(window.location.hash.startsWith('#workspace')); window.addEventListener('hashchange', listener); return () => window.removeEventListener('hashchange', listener) }, [])
   const [notice, setNotice] = useState<string | null>(null)
   const [pref, setPref] = useState<ThemePref>(loadTheme)
   const prefersDark = useSyncExternalStore(subscribeDark, systemDark)
@@ -99,6 +102,8 @@ export default function App() {
       <Tokens>
         {token ? (
           <Authed key={token} token={token} pref={pref} onPref={changePref} onUnauthorized={onUnauthorized} onForget={onForget} />
+        ) : workspace ? (
+          <WorkspaceEntrance pref={pref} onPref={changePref} onBack={() => { window.location.hash = 'coordination' }} />
         ) : (
           <SignIn
             notice={notice}

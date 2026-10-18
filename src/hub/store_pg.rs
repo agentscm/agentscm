@@ -1150,6 +1150,29 @@ impl Store for PgStore {
         })
     }
 
+    fn user_by_id(&self, id: &str) -> Result<Option<User>> {
+        self.run(true, |client| {
+            Ok(client.query_opt(
+                "SELECT id, provider, host, forge_user_id, login, disabled FROM hub_users WHERE id = $1",
+                &[&id],
+            )?.map(|row| User {
+                id: row.get(0),
+                identity: ForgeIdentity { provider: row.get(1), host: row.get(2), user_id: row.get(3) },
+                login: row.get(4), disabled: row.get(5),
+            }))
+        })
+    }
+
+    fn user_for_identity(&self, identity: &ForgeIdentity) -> Result<Option<User>> {
+        identity.validate()?;
+        self.run(true, |client| {
+            Ok(client.query_opt(
+                "SELECT id, provider, host, forge_user_id, login, disabled FROM hub_users WHERE provider=$1 AND host=$2 AND forge_user_id=$3",
+                &[&identity.provider,&identity.host,&identity.user_id],
+            )?.map(|row|User { id:row.get(0),identity:ForgeIdentity{provider:row.get(1),host:row.get(2),user_id:row.get(3)},login:row.get(4),disabled:row.get(5) }))
+        })
+    }
+
     fn record_sign_in(&self, user: &str, method: &str, admin: bool) -> Result<()> {
         self.run(false, |client| {
             let mut tx = client.transaction()?;

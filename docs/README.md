@@ -31,8 +31,10 @@
 The immutable ledger, Git bridges, isolated command checks and
 [source-bound skill workflows](advanced/skill-workflows.md): see the [advanced index](advanced/README.md).
 The [Claude Code workflow loop](advanced/claude-code-workflows.md) adds an opt-in local trigger,
-isolated tests, bounded model review and exact-revision native requirements. The hub, MCP and
-dashboard inspect retained runs; workspace settings and mutation controls remain planned.
+isolated tests, bounded model review and exact-revision native requirements. The opt-in
+[Community workspace pilot](advanced/community-workspace.md) adds persistent membership,
+settings, a shared execution queue and explicit approval/native landing controls. The legacy
+token dashboard and MCP inspect retained runs.
 
 ## For contributors and maintainers
 

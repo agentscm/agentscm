@@ -1,4 +1,4 @@
-import { DesktopOutlined, DownOutlined, GithubOutlined, GitlabOutlined, LogoutOutlined, MoonOutlined, SunOutlined } from '@ant-design/icons'
+import { DesktopOutlined, DownOutlined, GithubOutlined, GitlabOutlined, LogoutOutlined, MoonOutlined, SunOutlined, TeamOutlined } from '@ant-design/icons'
 import { Dropdown, Segmented } from 'antd'
 import logo from '../assets/logo.png'
 import type { ThemePref } from '../storage.ts'
@@ -27,6 +27,7 @@ function Live({ lastOk, failing }: { lastOk: number | null; failing: boolean }) 
 }
 
 interface Props {
+  workspaceMode?: boolean
   whoami: Whoami | null
   lastOk: number | null
   failing: boolean
@@ -35,7 +36,7 @@ interface Props {
   onForget: () => void
 }
 
-export function Header({ whoami, lastOk, failing, pref, onPref, onForget }: Props) {
+export function Header({ whoami, lastOk, failing, pref, onPref, onForget, workspaceMode = false }: Props) {
   const gitlab = whoami?.owner.provider === 'gitlab'
   return (
     <header className="topbar">
@@ -43,6 +44,7 @@ export function Header({ whoami, lastOk, failing, pref, onPref, onForget }: Prop
         <div className="brand">
           <Logo />
         </div>
+        {workspaceMode && <span className="repo-pill"><TeamOutlined /> Workspace</span>}
         {whoami && (
           <span className="repo-pill" title={whoami.token.repository}>
             {gitlab ? <GitlabOutlined /> : <GithubOutlined />}
@@ -50,7 +52,7 @@ export function Header({ whoami, lastOk, failing, pref, onPref, onForget }: Prop
           </span>
         )}
         <div className="topbar-right">
-          <Live lastOk={lastOk} failing={failing} />
+          {!workspaceMode && <Live lastOk={lastOk} failing={failing} />}
           <Segmented
             className="theme-seg"
             value={pref}

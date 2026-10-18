@@ -468,6 +468,7 @@ pub fn advance(data_dir: &Path, run_id: &str, max_steps: usize) -> Result<RunVie
         None,
         #[cfg(unix)]
         None,
+        None,
     )
 }
 
@@ -478,7 +479,7 @@ pub fn advance_with_executor(
     max_steps: usize,
     executor: &CommandExecutor<'_>,
 ) -> Result<RunView> {
-    advance_inner(data_dir, run_id, max_steps, Some(executor), None)
+    advance_inner(data_dir, run_id, max_steps, Some(executor), None, None)
 }
 
 #[cfg(unix)]
@@ -489,7 +490,23 @@ pub fn advance_with_backends(
     command: Option<&CommandExecutor<'_>>,
     claude: Option<&ClaudeExecutor<'_>>,
 ) -> Result<RunView> {
-    advance_inner(data_dir, run_id, max_steps, command, claude)
+    advance_inner(data_dir, run_id, max_steps, command, claude, None)
+}
+
+/// A server's current authorization check. Called before each external step and
+/// each model call reservation; it cannot select or modify the compiled plan.
+pub type DispatchGuard<'a> = dyn Fn() -> Result<()> + Send + Sync + 'a;
+
+#[cfg(unix)]
+pub fn advance_guarded(
+    data_dir: &Path,
+    run_id: &str,
+    max_steps: usize,
+    command: Option<&CommandExecutor<'_>>,
+    claude: Option<&ClaudeExecutor<'_>>,
+    guard: &DispatchGuard<'_>,
+) -> Result<RunView> {
+    advance_inner(data_dir, run_id, max_steps, command, claude, Some(guard))
 }
 
 fn advance_inner(
@@ -498,6 +515,7 @@ fn advance_inner(
     max_steps: usize,
     #[cfg(unix)] executor: Option<&CommandExecutor<'_>>,
     #[cfg(unix)] claude: Option<&ClaudeExecutor<'_>>,
+    guard: Option<&DispatchGuard<'_>>,
 ) -> Result<RunView> {
     validate_run_id(run_id)?;
     if max_steps > MAX_ADVANCE_STEPS {
@@ -579,6 +597,10 @@ fn advance_inner(
             )));
         }
 
+        if let Some(guard) = guard {
+            guard()?;
+        }
+
         #[cfg(unix)]
         if matches!(step.action, StepAction::ClaudeCodeReview { .. }) {
             let backend = claude.ok_or_else(|| {
@@ -592,15 +614,7 @@ fn advance_inner(
             } else {
                 journal.begin_step(run_id, &step.id)?;
                 drop(journal);
-                let result = review::execute(
-                    data_dir,
-                    run_id,
-                    &plan,
-                    &step.id,
-                    backend.executable,
-                    backend.work_dir,
-                    backend.cancellation,
-                );
+                let result = review::execute(data_dir, run_id, &plan, &step.id, backend, guard);
                 journal = Journal::open_after_dispatch(data_dir)?;
                 match result {
                     Ok(record) => record,
@@ -660,6 +674,9 @@ fn advance_inner(
             // controller's cancel/recovery must remain available. The authority
             // generation CAS fences concurrent claims and late finishers.
             drop(journal);
+            if let Some(guard) = guard {
+                guard()?;
+            }
             let attempt = authority.run_command_attempt(
                 &engine,
                 executor.backend,

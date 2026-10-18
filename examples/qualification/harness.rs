@@ -510,6 +510,8 @@ mod tests {
             path: path(0),
             before: Some(before.clone()),
             after: Some(after.clone()),
+            before_kind: Some(agentscm::model::EntryKind::Regular),
+            after_kind: Some(agentscm::model::EntryKind::Regular),
         };
         validate_diff_entry(&entry, &path(0), &before, &after).unwrap();
         std::mem::swap(&mut entry.before, &mut entry.after);

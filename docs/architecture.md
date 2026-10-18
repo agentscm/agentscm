@@ -15,7 +15,7 @@ AgentSCM is a native Rust source-control system for concurrent human and agent w
 ## Alpha status
 The current version is a local native alpha: immutable blobs, persistent manifest trie, incremental revisions, selective reads/diff, a SQLite integration authority, bound local human approvals, durable journal/idempotency, CLI, read-only source HTTP API and container packaging. The local owner is trusted; no multi-tenant or production network-security claim is made. No garbage collector runs yet, so objects persist until the operator removes the store. The current object encoding and API are experimental; a stable interoperable protocol requires conformance and migration work that is not yet done (see the [roadmap](roadmap.md)).
 
-The multi-user [coordination hub](hub.md) is a separate alpha service with its own database (SQLite or PostgreSQL), forge sign-in, agent tokens, intents and an append-only event log. It is not yet joined to the native ledger.
+The multi-user [coordination hub](hub.md) has its own database (SQLite or PostgreSQL), forge sign-in, agent tokens, intents and an append-only event log. The opt-in [Community workspace](advanced/community-workspace.md) adds SQLite membership, settings and a durable execution queue. Operator-owned profiles join permitted Hub repositories to selected native stores and installed workflow requirements. This is a single-server trusted-team pilot, not a general multi-tenant native API.
 
 ## Review context
 A stable Change stores identity and a Change-version-checked current-context pointer. Immutable ReviewContext records alone own intent, acceptance criteria, scope, exclusions, omissions and declared evidence boundaries. Source revisions do not include review context. Registration permits structurally valid incomplete contexts for inspection; approval and integration reject them. Both operations transactionally check repository, current change/context, target/base and policy bindings. New operations use context semantics version 2; migrated historical events remain version 1.
@@ -50,10 +50,14 @@ exact-subject receipt in the authority database before approval or native landin
 The native API and operator-mapped hub/MCP/dashboard inspect retained status and current binding.
 The [Claude Code Stop loop](advanced/claude-code-workflows.md) is an opt-in local trigger; the
 authority independently enforces installed native target requirements. The existing file-edit
-hooks retain contention-only behavior. Remote execution mutations and other adapters remain planned.
+hooks retain contention-only behavior. The optional Community workspace exposes authenticated
+queue/cancel, explicit human approval and native landing through operator-pinned profiles.
+Current membership and repository permissions are checked at request, dispatch and finalization;
+the native authority independently enforces exact-subject admission. Source upload, remote
+checkpoint/context management, other agent adapters and automatic failover remain planned.
 
 ## Planned capabilities
-The following are not yet implemented; see the [roadmap](roadmap.md). Broader agent/model adapters, authenticated multi-user native APIs, PostgreSQL/object-store authority and caches, full offline sync/workspace lifecycle, privacy/retention/GC and leases, Git history import and live authority cutover, automatic recovery/failover and measured scale qualification remain planned. Bounded local source exchange, merge, Git export and offline recovery primitives already exist; they do not complete those operational capabilities. Advanced semantic merge, transparent virtual filesystems, cross-region active-active writes and blockchain anchoring are optional extensions.
+The following are not yet implemented; see the [roadmap](roadmap.md). Broader agent/model adapters, general authenticated multi-user native source APIs, PostgreSQL/object-store authority and caches, full offline sync/workspace lifecycle, privacy/retention/GC and distributed leases, Git history import and live authority cutover, automatic recovery/failover and measured scale qualification remain planned. Bounded local source exchange, merge, Git export, shared workflow execution and offline recovery primitives already exist; they do not complete those operational capabilities. Advanced semantic merge, transparent virtual filesystems, cross-region active-active writes and blockchain anchoring are optional extensions.
 
 ## Deployment
 Install a published binary through `npx`, the release install script or a manual download, or run a versioned OCI container; see [install options](install.md). Contributors can build from source. A local/small-team single writer uses SQLite on a durable local volume. Never multiply SQLite authority containers over a shared directory. Later workers/read caches scale separately from fenced PostgreSQL authority. Keep candidate execution separate from controller credentials; no mounted host container socket by default. Containers simplify installation, not database consistency.

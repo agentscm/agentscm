@@ -2112,3 +2112,64 @@ a {
   min-width: 0;
   overflow-wrap: anywhere;
 }
+
+/* Workspace uses the same task surface and navigation as workflow inspection. */
+.workspace-page .ant-alert { margin-bottom: 16px; }
+.workspace-section { display: flex; flex-direction: column; gap: 16px; }
+.workspace-section h2 { margin: 6px 0; font-size: 20px; }
+.workspace-section h3 { margin: 0 0 16px; font-size: 16px; }
+.workspace-section p, .workspace-subtitle { margin: 4px 0 0; color: var(--cb-text-2); max-width: 72ch; }
+.workspace-toolbar { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; margin: 8px 0; }
+.workspace-editor, .workspace-run-form { border-block: 1px solid var(--cb-border); padding-block: 24px; }
+.workspace-editor .ant-form, .workspace-settings-form { max-width: 760px; }
+.workspace-form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; }
+.workspace-form-grid .ant-select { width: 100%; }
+.workspace-note { color: var(--cb-text-2); font-size: 13px; overflow-wrap: anywhere; }
+.workspace-run-form > .field-label { display: block; margin-top: 24px; }
+.workspace-subject-control { display: flex; gap: 12px; max-width: 760px; }
+.workspace-subject { padding-top: 24px; }
+.workspace-subject dl { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 12px 20px; margin-bottom: 24px; }
+.workspace-subject dt { color: var(--cb-text-2); }
+.workspace-subject dd { margin: 0; overflow-wrap: anywhere; }
+.workspace-login { max-width: 620px; margin: 32px auto; }
+.workspace-login h2 { margin: 12px 0; font-size: 24px; }
+.workspace-login > p { line-height: 1.6; color: var(--cb-text-2); margin-bottom: 24px; }
+.workspace-login-icon { font-size: 28px; color: var(--cb-primary); }
+.workspace-entrance-nav { max-width: 1440px; margin: 24px auto 0; padding-inline: 32px; }
+.signin-card > .ant-btn + .ant-btn { margin-top: 12px; }
+.workspace-page code, .workspace-page .ant-input-number { font-variant-numeric: tabular-nums; }
+.workspace-page .ant-table-cell { overflow-wrap: anywhere; }
+@media (max-width: 640px) {
+  .workspace-toolbar { flex-direction: column; gap: 12px; }
+  .workspace-form-grid { grid-template-columns: 1fr; }
+  .workspace-subject-control { flex-direction: column; }
+  .workspace-subject dl { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+  .workspace-subject dd { margin-bottom: 12px; }
+  .workspace-entrance-nav { padding-inline: 16px; }
+  .workspace-page .workflow-page-heading { flex-wrap: wrap; }
+}
+.workspace-change-picker { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; margin-top: 24px; }
+.workspace-change-picker .ant-select { width: min(100%, 760px); }
+.workspace-admission { border-top: 1px solid var(--cb-border); margin-top: 24px; padding-top: 24px; }
+.workspace-admission > p { margin-bottom: 20px; }
+.workspace-admission-actions { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(0, 2fr); gap: 32px; max-width: 760px; }
+.workspace-admission-actions .ant-btn { margin-block: 12px; }
+@media (max-width: 640px) { .workspace-admission-actions { grid-template-columns: minmax(0, 1fr); gap: 20px; } }
+/* Mobile rows expose their status and primary action without horizontal discovery. */
+.workspace-mobile-list { display: none; }
+.workspace-composer .ant-collapse-content-box > p { margin-bottom: 20px; }
+.workspace-composer .workspace-run-form { border: 0; padding-top: 0; }
+.workspace-repository-picker { max-width: 600px; }
+.workspace-repository-picker > .ant-select { width: 100%; }
+@media (max-width: 640px) {
+  .workspace-desktop-table { display: none; }
+  .workspace-mobile-list { display: block; }
+  .workspace-mobile-list ul { list-style: none; padding: 0; margin: 0; }
+  .workspace-mobile-list li { display: flex; flex-direction: column; align-items: stretch; gap: 12px; padding-block: 20px; border-bottom: 1px solid var(--cb-border); overflow-wrap: anywhere; }
+  .workspace-mobile-list li:first-child { border-top: 1px solid var(--cb-border); }
+  .workspace-mobile-list li > .ant-btn { align-self: flex-start; }
+  .workspace-mobile-row-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+  .workspace-mobile-row-heading > :first-child { min-width: 0; }
+  .workspace-mobile-row-heading > .ant-tag { flex-shrink: 0; margin-inline-end: 0; }
+  .workspace-mobile-list li > p { margin: 0; }
+}

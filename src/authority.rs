@@ -247,6 +247,46 @@ impl Authority {
             .ok_or_else(|| Error::NotFound(format!("change {}", id.id)))
     }
 
+    /// Bounded current Change pointers, ordered by ID within this authority.
+    pub fn list_changes(&self, limit: usize, after: Option<&str>) -> Result<Vec<ChangeState>> {
+        if !(1..=100).contains(&limit) {
+            return Err(Error::Invalid(
+                "change page limit must be 1 through 100".into(),
+            ));
+        }
+        if let Some(after) = after {
+            validate_identifier("change cursor", after)?;
+        }
+        let repository = self.repository_id()?;
+        let mut statement = self.connection.prepare(
+            "SELECT change_id, version, context_digest FROM changes \
+             WHERE repository = ?1 AND (?2 IS NULL OR change_id > ?2) \
+             ORDER BY change_id LIMIT ?3",
+        )?;
+        let rows = statement.query_map(params![repository, after, limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, version, context_digest) = row?;
+            let id = ChangeId {
+                repository: repository.clone(),
+                id,
+            };
+            id.validate()?;
+            validate_digest("context digest", &context_digest)?;
+            Ok(ChangeState {
+                id,
+                version: sql_u64("change version", version)?,
+                context_digest,
+            })
+        })
+        .collect()
+    }
+
     pub fn review_context(&self, digest: &str) -> Result<ReviewContext> {
         validate_digest("context digest", digest)?;
         read_review_context(&self.connection, digest)?
@@ -411,20 +451,49 @@ impl Authority {
     }
 
     pub fn approve(&mut self, approval: &Approval) -> Result<()> {
+        self.register_approval(approval, false)
+    }
+
+    /// Return an already registered, exactly equal approval on a retry. This
+    /// reports its historical registration; it never unrevokes or renews it.
+    pub fn approve_idempotent(&mut self, approval: &Approval) -> Result<()> {
+        self.register_approval(approval, true)
+    }
+
+    /// Inspect an exact historical registration without writing or reviving it.
+    /// A reused approval ID with a different subject is a conflict.
+    pub fn approval_retry(&self, approval: &Approval) -> Result<bool> {
+        matching_approval(&self.connection, approval)
+    }
+
+    /// Inspect an exact retained integration result without applying current
+    /// state gates or changing authority. New operations return None.
+    pub fn integration_retry(
+        &self,
+        request: &IntegrateRequest,
+    ) -> Result<Option<IntegrationEvent>> {
+        validate_identifier("operation ID", &request.operation_id)?;
+        if request.change.is_some() != request.change_version.is_some() {
+            return Err(Error::Invalid(
+                "change identity and version must be supplied together".into(),
+            ));
+        }
+        let digest = integration_request_digest(request);
+        lookup_operation(&self.connection, &request.operation_id)?
+            .map(|(stored, event)| matching_retry(&request.operation_id, &digest, stored, event))
+            .transpose()
+    }
+
+    fn register_approval(&mut self, approval: &Approval, matching_retry: bool) -> Result<()> {
         self.require_writable()?;
-        validate_identifier("approval ID", &approval.approval_id)?;
-        validate_identifier("target name", &approval.target)?;
-        validate_id(&approval.revision)?;
-        validate_digest("context digest", &approval.context_digest)?;
-        let policy_epoch = sql_i64("policy epoch", approval.policy_epoch)?;
-        let (change, change_version) = require_change_binding(
-            approval.change.as_ref(),
-            approval.change_version,
-            "new approval",
-        )?;
+        let (policy_epoch, change, change_version) = validate_approval_request(approval)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if matching_retry && matching_approval(&tx, approval)? {
+            tx.commit()?;
+            return Ok(());
+        }
         validate_current_context(
             &tx,
             change,
@@ -1527,6 +1596,36 @@ fn hash_request_prefix(hasher: &mut Sha256, request: &IntegrateRequest) {
 fn hash_field(hasher: &mut Sha256, field: &[u8]) {
     hasher.update((field.len() as u64).to_be_bytes());
     hasher.update(field);
+}
+
+fn validate_approval_request(approval: &Approval) -> Result<(i64, &ChangeId, u64)> {
+    validate_identifier("approval ID", &approval.approval_id)?;
+    validate_identifier("target name", &approval.target)?;
+    validate_id(&approval.revision)?;
+    validate_digest("context digest", &approval.context_digest)?;
+    let policy_epoch = sql_i64("policy epoch", approval.policy_epoch)?;
+    let (change, change_version) = require_change_binding(
+        approval.change.as_ref(),
+        approval.change_version,
+        "new approval",
+    )?;
+    Ok((policy_epoch, change, change_version))
+}
+
+fn matching_approval(connection: &Connection, approval: &Approval) -> Result<bool> {
+    let (policy_epoch, change, change_version) = validate_approval_request(approval)?;
+    let existing=connection.query_row(
+        "SELECT target=?2 AND revision=?3 AND context_digest=?4 AND policy_epoch=?5 AND change_repository=?6 AND change_id=?7 AND change_version=?8 AND semantics_version=2 FROM approvals WHERE approval_id=?1",
+        params![approval.approval_id,approval.target,approval.revision,approval.context_digest,policy_epoch,change.repository,change.id,sql_i64("change version",change_version)?],
+        |row|row.get::<_,bool>(0),
+    ).optional()?;
+    match existing {
+        Some(true) => Ok(true),
+        Some(false) => Err(Error::Conflict(
+            "approval ID was used for a different subject".into(),
+        )),
+        None => Ok(false),
+    }
 }
 
 fn matching_retry(
