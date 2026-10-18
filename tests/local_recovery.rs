@@ -1,8 +1,12 @@
 use agentscm::authority::Authority;
+use agentscm::checks::SourcePathExpectation;
 use agentscm::context::{ChangeId, InputIdentity, ReviewContext};
 use agentscm::local_recovery::{self, AccessGuard};
 use agentscm::model::{Approval, FileChange, IntegrateRequest};
-use agentscm::store::Engine;
+use agentscm::skill_workflow::{
+    RunState, SkillReference, StepAction, StepDefinition, WorkflowDefinition, WorkflowSource,
+};
+use agentscm::store::{Engine, digest};
 use agentscm::workspace::Workspace;
 use std::fs;
 use std::path::Path;
@@ -120,6 +124,58 @@ fn populated(root: &Path) -> (String, String, ReviewContext, Approval) {
     };
     authority.approve(&approval).unwrap();
     (repository, revision, context, approval)
+}
+
+fn populated_with_workflow(root: &Path, run_id: &str) {
+    let (repository, revision, _, _) = populated(root);
+    let skill_path = "skills/recovery/SKILL.md";
+    let source_path = "src/recovery.rs";
+    let source_bytes = b"pub fn recovered() -> bool { true }\n";
+    let engine = Engine::open(root).unwrap();
+    let revision = engine
+        .checkpoint(
+            Some(&revision),
+            &[
+                FileChange {
+                    path: skill_path.into(),
+                    content: Some(b"# Recovery workflow\n".to_vec()),
+                },
+                FileChange {
+                    path: source_path.into(),
+                    content: Some(source_bytes.to_vec()),
+                },
+            ],
+        )
+        .unwrap();
+    drop(engine);
+    let definition = WorkflowDefinition {
+        version: 1,
+        name: "recovery-schema-validation".into(),
+        source: WorkflowSource {
+            repository,
+            revision,
+            policy_epoch: 0,
+        },
+        skill: SkillReference {
+            entrypoint: skill_path.into(),
+            resources: vec![],
+        },
+        steps: vec![StepDefinition {
+            id: "source".into(),
+            needs: vec![],
+            required: true,
+            action: StepAction::SourcePaths {
+                expectations: vec![SourcePathExpectation {
+                    path: source_path.into(),
+                    sha256: digest(source_bytes),
+                }],
+            },
+        }],
+    };
+    let plan = agentscm::skill_workflow::compile(root, &definition).unwrap();
+    agentscm::skill_workflow::start(root, run_id, &plan).unwrap();
+    let view = agentscm::skill_workflow::advance(root, run_id, 1).unwrap();
+    assert_eq!(view.state, RunState::Succeeded);
 }
 
 #[test]
@@ -377,6 +433,60 @@ fn corrupt_truncated_extra_and_wrong_schema_backups_never_touch_destination() {
     fs::write(destination.join("unrelated"), b"keep").unwrap();
     assert!(local_recovery::restore(&backup, &destination).is_err());
     assert_eq!(fs::read(destination.join("unrelated")).unwrap(), b"keep");
+}
+
+#[test]
+fn current_authority_backup_rejects_missing_workflow_tables() {
+    for table in ["workflow_requirements", "workflow_receipts"] {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        populated(&data);
+        let connection = rusqlite::Connection::open(data.join("state.sqlite")).unwrap();
+        connection
+            .execute_batch(&format!("DROP TABLE {table}"))
+            .unwrap();
+        drop(connection);
+
+        let output = temp.path().join("backup");
+        assert!(local_recovery::backup(&data, &output, &[], &[], true).is_err());
+        assert!(!output.exists());
+    }
+}
+
+#[test]
+fn current_skill_workflow_backup_rejects_missing_review_tables() {
+    for table in ["workflow_review_calls", "workflow_reviews"] {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        populated_with_workflow(&data, "schema-check");
+        let connection =
+            rusqlite::Connection::open(data.join("skill-workflows/state.sqlite")).unwrap();
+        connection
+            .execute_batch(&format!("DROP TABLE {table}"))
+            .unwrap();
+        drop(connection);
+
+        let output = temp.path().join("backup");
+        assert!(local_recovery::backup(&data, &output, &[], &[], true).is_err());
+        assert!(!output.exists());
+    }
+}
+
+#[test]
+fn current_skill_workflow_journal_survives_backup_and_restore() {
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    populated_with_workflow(&data, "restored-workflow");
+    let backup = temp.path().join("backup");
+    local_recovery::backup(&data, &backup, &[], &[], true).unwrap();
+    local_recovery::verify(&backup).unwrap();
+
+    let restored = temp.path().join("restored");
+    local_recovery::restore(&backup, &restored).unwrap();
+    local_recovery::activate(&restored, true, true).unwrap();
+    let view =
+        agentscm::skill_workflow::status(&restored.join("data"), "restored-workflow").unwrap();
+    assert_eq!(view.state, RunState::Succeeded);
 }
 
 #[test]

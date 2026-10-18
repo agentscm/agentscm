@@ -53,6 +53,7 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&get, format!("{REPO}/intents"), "".into(), Allowed);
     row(&get, format!("{REPO}/work"), "".into(), Allowed);
     row(&get, format!("{REPO}/activity"), "".into(), Allowed);
+    row(&get, "/v1/hub/skill-workflows".into(), "".into(), Allowed);
     row(&get, "/v1/hub/skill-workflows/missing".into(), "".into(), Allowed);
     // Agent-token routes.
     row(&post, format!("{REPO}/intents"), announce.to_string(), AgentOnly);

@@ -16,6 +16,30 @@ const MAX_DEFINITION_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Subcommand)]
 pub enum SkillWorkflowCommand {
+    /// Install an immutable workflow requirement for a native target (operator action).
+    Require { target: String, input: PathBuf },
+    /// Configure the first required test command and Claude review for an existing Change.
+    #[cfg(unix)]
+    Configure {
+        change: String,
+        /// Native path of the pinned review SKILL.md.
+        #[arg(long)]
+        skill: String,
+        /// Native path of a CommandRecipe JSON within the skill directory.
+        #[arg(long)]
+        runner: String,
+        /// Explicit native source path disclosed to Claude (repeatable).
+        #[arg(long, required = true)]
+        review_path: Vec<String>,
+        #[arg(long, default_value = "sonnet")]
+        model: String,
+    },
+    /// Checkpoint optional workspace edits, run the installed test/review graph, and qualify landing.
+    #[cfg(unix)]
+    Check(crate::skill_workflow_loop::LoopArgs),
+    /// Opt-in Claude Code Stop hook. Native landing is independently enforced by the authority.
+    #[cfg(unix)]
+    ClaudeStop(crate::skill_workflow_loop::LoopArgs),
     /// Validate and pin a workflow against an existing native source revision.
     Plan {
         /// JSON definition, or - for standard input.
@@ -74,6 +98,43 @@ pub enum SkillWorkflowCommand {
 
 pub fn run(data_dir: &Path, command: SkillWorkflowCommand) -> Result<()> {
     match command {
+        #[cfg(unix)]
+        SkillWorkflowCommand::Configure {
+            change,
+            skill,
+            runner,
+            review_path,
+            model,
+        } => configure(data_dir, &change, &skill, &runner, review_path, model),
+        SkillWorkflowCommand::Require { target, input } => {
+            let definition = read_definition(&input)?;
+            let plan = skill_workflow::compile(data_dir, &definition)?;
+            let requirement =
+                agentscm::authority::workflows::WorkflowRequirement::from_plan(&target, &plan)?;
+            let mut authority = agentscm::authority::Authority::open(data_dir)?;
+            let digest = authority.install_workflow_requirement(&requirement)?;
+            crate::print_json(
+                &serde_json::json!({"requirement_digest":digest,"policy_epoch":authority.policy_epoch()?,"target":target}),
+            );
+            Ok(())
+        }
+        #[cfg(unix)]
+        SkillWorkflowCommand::Check(args) => {
+            let value = crate::skill_workflow_loop::check(data_dir, args)?;
+            let passed = value
+                .get("receipt")
+                .is_some_and(|receipt| receipt.is_string());
+            crate::print_json(&value);
+            if passed {
+                Ok(())
+            } else {
+                Err(Error::Invalid("required workflow did not qualify the current revision; fix the reported failures and check again".into()))
+            }
+        }
+        #[cfg(unix)]
+        SkillWorkflowCommand::ClaudeStop(args) => {
+            crate::skill_workflow_loop::claude_stop(data_dir, args)
+        }
         SkillWorkflowCommand::Plan { input } => {
             let definition = read_definition(&input)?;
             let plan = skill_workflow::compile(data_dir, &definition)?;
@@ -135,6 +196,131 @@ pub fn run(data_dir: &Path, command: SkillWorkflowCommand) -> Result<()> {
             docker_socket,
         )?),
     }
+}
+
+#[cfg(unix)]
+fn configure(
+    data_dir: &Path,
+    change: &str,
+    skill: &str,
+    runner: &str,
+    paths: Vec<String>,
+    model: String,
+) -> Result<()> {
+    use agentscm::authority::{Authority, workflows::WorkflowRequirement};
+    use agentscm::context::{ChangeId, InputIdentity, RequiredEvidence};
+    use agentscm::execution::{COMMAND_CAPABILITY, COMMAND_EVIDENCE};
+    use agentscm::skill_workflow::{SkillReference, StepAction, StepDefinition, WorkflowSource};
+    let mut authority = Authority::open(data_dir)?;
+    let id = ChangeId {
+        repository: authority.repository_id()?,
+        id: change.into(),
+    };
+    let state = authority.change(&id)?;
+    let mut context = authority.review_context(&state.context_digest)?;
+    if authority.workflow_requirement(&context.target)?.is_some() {
+        return Err(Error::Conflict("target already has an immutable workflow requirement; check the installed workflow instead".into()));
+    }
+    let recipe =
+        skill_workflow::compiler::read_command_recipe(data_dir, &context.revision, runner)?;
+    // The existing context supports one primary command recipe. Do not silently
+    // replace a separately requested source check with a command check.
+    if context
+        .required_capabilities
+        .iter()
+        .any(|cap| cap == agentscm::checks::SOURCE_PATHS_CAPABILITY)
+    {
+        return Err(Error::Invalid(
+            "configure requires a context without a separate source-path recipe".into(),
+        ));
+    }
+    let recipe_digest = recipe.digest()?;
+    context.recipe = InputIdentity::Digest {
+        sha256: recipe_digest.clone(),
+    };
+    context.toolchain = InputIdentity::Digest {
+        sha256: recipe.toolchain_sha256,
+    };
+    context.environment = InputIdentity::Digest {
+        sha256: recipe.environment_sha256,
+    };
+    context
+        .required_evidence
+        .retain(|item| item.identity != COMMAND_EVIDENCE);
+    context.required_evidence.push(RequiredEvidence {
+        identity: COMMAND_EVIDENCE.into(),
+        digest: InputIdentity::Digest {
+            sha256: recipe_digest,
+        },
+    });
+    if !context
+        .required_capabilities
+        .iter()
+        .any(|cap| cap == COMMAND_CAPABILITY)
+    {
+        context
+            .required_capabilities
+            .push(COMMAND_CAPABILITY.into());
+    }
+    context.change_version = context
+        .change_version
+        .checked_add(1)
+        .ok_or_else(|| Error::Limit("change generation exhausted".into()))?;
+    context.policy_epoch = authority.policy_epoch()?;
+    let root = skill
+        .rsplit_once('/')
+        .map(|(root, _)| format!("{root}/"))
+        .unwrap_or_default();
+    let relative = runner
+        .strip_prefix(&root)
+        .ok_or_else(|| Error::Invalid("runner must be in the skill directory".into()))?;
+    let definition = WorkflowDefinition {
+        version: 1,
+        name: "claude-code-checks".into(),
+        source: WorkflowSource {
+            repository: id.repository.clone(),
+            revision: context.revision.clone(),
+            policy_epoch: context.policy_epoch,
+        },
+        skill: SkillReference {
+            entrypoint: skill.into(),
+            resources: vec![runner.into()],
+        },
+        steps: vec![
+            StepDefinition {
+                id: "tests".into(),
+                needs: vec![],
+                required: true,
+                action: StepAction::Command {
+                    runner: relative.into(),
+                    change: id,
+                    change_version: context.change_version,
+                    context_digest: context.digest()?,
+                },
+            },
+            StepDefinition {
+                id: "review".into(),
+                needs: vec!["tests".into()],
+                required: true,
+                action: StepAction::ClaudeCodeReview { paths, model },
+            },
+        ],
+    };
+    // Validate structural and source inputs before publishing a new context.
+    // The context-dependent compile follows its compare-and-swap update.
+    skill_workflow::compiler::validate_sources(data_dir, &definition)?;
+    authority.update_change_context(state.version, &context)?;
+    let plan = skill_workflow::compile(data_dir, &definition)?;
+    let requirement = WorkflowRequirement::from_plan(&context.target, &plan)?;
+    let digest = authority.install_workflow_requirement(&requirement)?;
+    context.change_version += 1;
+    context.policy_epoch = authority.policy_epoch()?;
+    authority.update_change_context(context.change_version - 1, &context)?;
+    crate::print_json(
+        &serde_json::json!({"requirement_digest":digest,"context":context,
+        "next_action":"Run skill-workflow check with the native workspace and operator-selected Docker/Claude executables."}),
+    );
+    Ok(())
 }
 
 fn advance(

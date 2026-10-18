@@ -17,8 +17,10 @@ use crate::model::{
 use crate::store::{Engine, create_directory_durable, validate_id};
 use crate::{Error, Result};
 
+pub mod workflows;
+
 const APPLICATION_ID: i64 = 0x4153_434d;
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const CURRENT_SEMANTICS_VERSION: i64 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IDENTIFIER_BYTES: usize = 128;
@@ -116,22 +118,7 @@ impl Authority {
         {
             return Err(Error::Invalid("invalid current authority state".into()));
         }
-        // Prepare the current read/admission records without creating missing tables.
-        for sql in [
-            "SELECT digest,version,canonical_json FROM review_contexts LIMIT 0",
-            "SELECT repository,change_id,version,context_digest FROM changes LIMIT 0",
-            "SELECT approval_id,revision,revoked,consumed_event,semantics_version FROM approvals LIMIT 0",
-            "SELECT name,revision,version FROM targets LIMIT 0",
-            "SELECT operation_id,request_digest,event_sequence FROM operations LIMIT 0",
-            "SELECT sequence,operation_id,kind,semantics_version,after_revision,context_digest FROM integration_events LIMIT 0",
-            "SELECT operation_id,request_digest,outcome_json FROM landing_preparations LIMIT 0",
-            "SELECT attempt_id,state,run_generation,evidence_digest FROM check_attempts LIMIT 0",
-            "SELECT digest,attempt_id,canonical_json FROM check_evidence LIMIT 0",
-            "SELECT attempt_id,state,run_generation,record_digest,custody_json FROM command_attempts LIMIT 0",
-            "SELECT digest,attempt_id,canonical_json FROM command_evidence LIMIT 0",
-        ] {
-            connection.prepare(sql)?;
-        }
+        validate_current_tables(&connection)?;
         let authority = Self {
             connection,
             _access: access,
@@ -866,6 +853,28 @@ impl Authority {
     }
 }
 
+/// Required table shapes for read-only opens and consistent local recovery.
+pub(crate) fn validate_current_tables(connection: &Connection) -> Result<()> {
+    for sql in [
+        "SELECT digest,version,canonical_json FROM review_contexts LIMIT 0",
+        "SELECT repository,change_id,version,context_digest FROM changes LIMIT 0",
+        "SELECT approval_id,revision,revoked,consumed_event,semantics_version FROM approvals LIMIT 0",
+        "SELECT name,revision,version FROM targets LIMIT 0",
+        "SELECT operation_id,request_digest,event_sequence FROM operations LIMIT 0",
+        "SELECT sequence,operation_id,kind,semantics_version,after_revision,context_digest FROM integration_events LIMIT 0",
+        "SELECT operation_id,request_digest,outcome_json FROM landing_preparations LIMIT 0",
+        "SELECT attempt_id,state,run_generation,evidence_digest FROM check_attempts LIMIT 0",
+        "SELECT digest,attempt_id,canonical_json FROM check_evidence LIMIT 0",
+        "SELECT attempt_id,state,run_generation,record_digest,custody_json FROM command_attempts LIMIT 0",
+        "SELECT digest,attempt_id,canonical_json FROM command_evidence LIMIT 0",
+        "SELECT target,digest,installed_policy_epoch,canonical_json FROM workflow_requirements LIMIT 0",
+        "SELECT digest,requirement_digest,run_id,plan_digest,skill_digest,repository,revision,target,policy_epoch,change_repository,change_id,change_version,context_digest,canonical_json FROM workflow_receipts LIMIT 0",
+    ] {
+        connection.prepare(sql)?;
+    }
+    Ok(())
+}
+
 fn initialize_schema(connection: &mut Connection) -> Result<()> {
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let application_id: i64 = tx.pragma_query_value(None, "application_id", |row| row.get(0))?;
@@ -877,6 +886,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
             create_schema_v4(&tx)?;
             create_schema_v5(&tx)?;
             create_schema_v6(&tx)?;
+            workflows::create_schema_v7(&tx)?;
         }
         (APPLICATION_ID, 1) => {
             migrate_v1_to_v2(&tx)?;
@@ -884,23 +894,31 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
             create_schema_v4(&tx)?;
             create_schema_v5(&tx)?;
             create_schema_v6(&tx)?;
+            workflows::create_schema_v7(&tx)?;
         }
         (APPLICATION_ID, 2) => {
             checks::create_schema_v3(&tx)?;
             create_schema_v4(&tx)?;
             create_schema_v5(&tx)?;
             create_schema_v6(&tx)?;
+            workflows::create_schema_v7(&tx)?;
         }
         (APPLICATION_ID, 3) => {
             create_schema_v4(&tx)?;
             create_schema_v5(&tx)?;
             create_schema_v6(&tx)?;
+            workflows::create_schema_v7(&tx)?;
         }
         (APPLICATION_ID, 4) => {
             create_schema_v5(&tx)?;
             create_schema_v6(&tx)?;
+            workflows::create_schema_v7(&tx)?;
         }
-        (APPLICATION_ID, 5) => create_schema_v6(&tx)?,
+        (APPLICATION_ID, 5) => {
+            create_schema_v6(&tx)?;
+            workflows::create_schema_v7(&tx)?;
+        }
+        (APPLICATION_ID, 6) => workflows::create_schema_v7(&tx)?,
         (APPLICATION_ID, SCHEMA_VERSION) => {
             tx.commit()?;
             return Ok(());
@@ -1060,6 +1078,28 @@ fn validate_context_authority(tx: &Transaction<'_>, context: &ReviewContext) -> 
 }
 
 fn validate_current_context(
+    tx: &Transaction<'_>,
+    change: &ChangeId,
+    change_version: u64,
+    digest: &str,
+    target: &str,
+    revision: &str,
+    policy_epoch: i64,
+) -> Result<ReviewContext> {
+    let context = validate_current_context_without_workflow(
+        tx,
+        change,
+        change_version,
+        digest,
+        target,
+        revision,
+        policy_epoch,
+    )?;
+    workflows::require_current_success(tx, &context)?;
+    Ok(context)
+}
+
+pub(super) fn validate_current_context_without_workflow(
     tx: &Transaction<'_>,
     change: &ChangeId,
     change_version: u64,

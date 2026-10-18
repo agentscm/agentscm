@@ -490,7 +490,7 @@ fn unknown_or_mismatched_context_binding_blocks_creation() {
 }
 
 #[test]
-fn schema_v2_upgrades_to_v6_without_losing_change_history() {
+fn schema_v2_upgrades_to_v7_without_losing_change_history() {
     let temporary = TempDir::new().expect("tempdir");
     let path = temporary.path().join("authority");
     let (repository, state) = {
@@ -518,6 +518,8 @@ fn schema_v2_upgrades_to_v6_without_losing_change_history() {
              DROP INDEX command_success_subject;
              DROP TABLE command_evidence;
              DROP TABLE command_attempts;
+             DROP TABLE workflow_receipts;
+             DROP TABLE workflow_requirements;
              PRAGMA user_version = 2;",
         )
         .expect("make v2 fixture");
@@ -532,11 +534,11 @@ fn schema_v2_upgrades_to_v6_without_losing_change_history() {
         .expect("database")
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .expect("version");
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
 }
 
 #[test]
-fn schema_v1_upgrades_to_v6_and_preserves_legacy_event() {
+fn schema_v1_upgrades_to_v7_and_preserves_legacy_event() {
     let temporary = TempDir::new().expect("tempdir");
     create_v1_database(temporary.path());
     let authority = Authority::open(temporary.path()).expect("migrate v1");
@@ -548,7 +550,7 @@ fn schema_v1_upgrades_to_v6_and_preserves_legacy_event() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .expect("version");
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     let tables: i64 = connection
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('check_attempts', 'check_evidence', 'command_attempts', 'command_evidence')",

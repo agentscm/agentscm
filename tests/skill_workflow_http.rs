@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
@@ -7,6 +8,11 @@ use std::time::Duration;
 
 use agentscm::authority::Authority;
 use agentscm::checks::SourcePathExpectation;
+use agentscm::context::{ChangeId, InputIdentity, RequiredEvidence, ReviewContext};
+use agentscm::execution::{
+    COMMAND_CAPABILITY, COMMAND_EVIDENCE, CommandRecipe, ExecutionLimits, SyscallPolicy,
+    environment_digest,
+};
 use agentscm::model::FileChange;
 use agentscm::skill_workflow::{
     SkillReference, StepAction, StepDefinition, WorkflowDefinition, WorkflowSource, advance,
@@ -20,6 +26,9 @@ use tempfile::TempDir;
 const SKILL_PATH: &str = "skills/http/SKILL.md";
 const SOURCE_PATH: &str = "src/example.rs";
 const SOURCE_BYTES: &[u8] = b"pub fn answer() -> u8 { 42 }\n";
+const RUNNER_PATH: &str = "skills/http/runner.json";
+const IMAGE: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+const TOOLCHAIN: &str = "2222222222222222222222222222222222222222222222222222222222222222";
 
 struct Server {
     child: Child,
@@ -180,6 +189,113 @@ fn retain(data: &Path, run_id: &str, definition: &WorkflowDefinition) {
     advance(data, run_id, 32).unwrap();
 }
 
+fn command_recipe() -> CommandRecipe {
+    let environment = BTreeMap::new();
+    CommandRecipe {
+        version: 1,
+        image: format!("sha256:{IMAGE}"),
+        argv: vec!["/bin/true".into()],
+        environment_sha256: environment_digest(&environment).unwrap(),
+        environment,
+        toolchain_sha256: TOOLCHAIN.into(),
+        limits: ExecutionLimits {
+            timeout_ms: 5_000,
+            max_output_bytes: 16 * 1024,
+            memory_bytes: 64 * 1024 * 1024,
+            scratch_bytes: 4 * 1024 * 1024,
+            pids: 16,
+            cpu_millis: 1_000,
+        },
+        syscall_policy: SyscallPolicy::DockerBuiltin,
+        no_new_privileges: true,
+    }
+}
+
+fn context(repository: &str, revision: &str, recipe: &CommandRecipe) -> ReviewContext {
+    let digest = |sha256: &str| InputIdentity::Digest {
+        sha256: sha256.into(),
+    };
+    let recipe_digest = recipe.digest().unwrap();
+    ReviewContext {
+        version: 1,
+        change: ChangeId {
+            repository: repository.into(),
+            id: "change-http".into(),
+        },
+        change_version: 1,
+        revision: revision.into(),
+        base: None,
+        target: "main".into(),
+        policy_epoch: 0,
+        intent: "exercise a retained landing binding".into(),
+        acceptance_criteria: vec!["the command is bound to the immutable source".into()],
+        scope: vec![SOURCE_PATH.into()],
+        exclusions: vec![],
+        omissions: vec![],
+        dependencies: vec![],
+        recipe: digest(&recipe_digest),
+        toolchain: digest(&recipe.toolchain_sha256),
+        environment: digest(&recipe.environment_sha256),
+        required_evidence: vec![RequiredEvidence {
+            identity: COMMAND_EVIDENCE.into(),
+            digest: digest(&recipe_digest),
+        }],
+        required_capabilities: vec![
+            "agentscm.review-context/v1".into(),
+            COMMAND_CAPABILITY.into(),
+        ],
+    }
+}
+
+fn retained_command_binding() -> (TempDir, ReviewContext) {
+    let data = TempDir::new().unwrap();
+    let recipe = command_recipe();
+    let engine = Engine::open(data.path()).unwrap();
+    let revision = engine
+        .checkpoint(
+            None,
+            &[
+                put(SKILL_PATH, b"# HTTP workflow\n"),
+                put(RUNNER_PATH, &serde_json::to_vec(&recipe).unwrap()),
+                put(SOURCE_PATH, SOURCE_BYTES),
+            ],
+        )
+        .unwrap();
+    let mut authority = Authority::open(data.path()).unwrap();
+    let repository = authority.repository_id().unwrap();
+    let context = context(&repository, &revision, &recipe);
+    authority.start_change(&context).unwrap();
+    let definition = WorkflowDefinition {
+        version: 1,
+        name: "bound-http".into(),
+        source: WorkflowSource {
+            repository,
+            revision,
+            policy_epoch: 0,
+        },
+        skill: SkillReference {
+            entrypoint: SKILL_PATH.into(),
+            resources: vec![RUNNER_PATH.into()],
+        },
+        steps: vec![StepDefinition {
+            id: "tests".into(),
+            needs: vec![],
+            required: true,
+            action: StepAction::Command {
+                runner: "runner.json".into(),
+                change: context.change.clone(),
+                change_version: 1,
+                context_digest: context.digest().unwrap(),
+            },
+        }],
+    };
+    let plan = compile(data.path(), &definition).unwrap();
+    start(data.path(), "bound", &plan).unwrap();
+    drop(authority);
+    drop(engine);
+    (data, context)
+}
+
 #[test]
 fn projects_completed_blocked_and_omitted_runs_without_admission_claims() {
     let (data, repository, revision) = initialized_native();
@@ -220,6 +336,7 @@ fn projects_completed_blocked_and_omitted_runs_without_admission_claims() {
         );
         assert_eq!(view["present_applicability"]["state"], "current");
         assert_eq!(view["present_applicability"]["reason"], Value::Null);
+        assert_eq!(view["present_landing_binding"], Value::Null);
     }
 }
 
@@ -245,6 +362,35 @@ fn unavailable_current_authority_does_not_rewrite_historical_success() {
         view["present_applicability"]["reason"],
         "current native authority is unavailable"
     );
+}
+
+#[test]
+fn projects_current_and_stale_change_context_target_bindings_separately() {
+    let (data, context) = retained_command_binding();
+    let server = Server::start(data.path());
+    let current = response_json(&server.get("/v1/skill-workflows/bound"), "HTTP/1.1 200");
+    let binding = &current["present_landing_binding"];
+    assert_eq!(binding["state"], "current");
+    assert_eq!(binding["change_id"], "change-http");
+    assert_eq!(binding["change_version"], 1);
+    assert_eq!(binding["context_digest"], context.digest().unwrap());
+    assert_eq!(binding["target"], "main");
+    assert_eq!(current["run"]["admission"], "not_assessed");
+
+    let mut next = context;
+    next.change_version = 2;
+    next.intent = "updated after the retained run".into();
+    Authority::open(data.path())
+        .unwrap()
+        .update_change_context(1, &next)
+        .unwrap();
+    let stale = response_json(&server.get("/v1/skill-workflows/bound"), "HTTP/1.1 200");
+    assert_eq!(stale["present_landing_binding"]["state"], "stale");
+    assert_eq!(
+        stale["present_landing_binding"]["reason"],
+        "the Change or its review context changed after this run"
+    );
+    assert_eq!(stale["run"]["admission"], "not_assessed");
 }
 
 #[test]

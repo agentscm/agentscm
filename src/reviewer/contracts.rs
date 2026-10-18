@@ -369,6 +369,7 @@ impl ReviewUsage {
 pub enum UsageBasis {
     Fixture,
     ServerReportedChatCompletionsV1,
+    ClaudeCodeResultV1,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -404,6 +405,7 @@ pub struct ModelReply {
 pub enum TransportBasis {
     Fixture,
     LocalHttpUnqualified,
+    ClaudeCode,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -487,6 +489,7 @@ impl ModelCallObservation {
                                 TransportBasis::LocalHttpUnqualified,
                                 UsageBasis::ServerReportedChatCompletionsV1
                             )
+                            | (TransportBasis::ClaudeCode, UsageBasis::ClaudeCodeResultV1)
                     )
                     && reply
                         .system_fingerprint
@@ -508,6 +511,15 @@ impl ModelCallObservation {
                                 && serde_json::to_vec(&reply.decision)
                                     .is_ok_and(|bytes| hash_bytes(&bytes) == reply.content_sha256)
                         }
+                        #[cfg(unix)]
+                        TransportBasis::ClaudeCode => super::claude_code::decode_reply(
+                            &self.captured_response,
+                            &call.expected_model,
+                            call.max_output_tokens,
+                        )
+                        .is_ok_and(|decoded| decoded == *reply),
+                        #[cfg(not(unix))]
+                        TransportBasis::ClaudeCode => false,
                     }
             }
         }

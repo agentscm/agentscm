@@ -220,6 +220,8 @@ impl ScriptedFixtureTransport {
         )
         .expect("review input JSON");
         assert_eq!(input["protocol"], "agentscm.model-review/v1");
+        assert!(input.get("subject").is_none());
+        assert!(!input.to_string().contains("change-1"));
         assert!(!input.to_string().contains(HOST_ONLY_SENTINEL));
         for row in input["catalog"].as_array().expect("catalog") {
             let selector = row["selector"].as_object().expect("wire location");
@@ -493,6 +495,38 @@ async fn seeded_defect_is_recorded_after_the_cited_row_is_delivered() {
     assert_eq!(record.calls.len(), 2);
     assert_eq!(harness.source.reads.len(), 1);
     assert_eq!(transport.invocation_count(), 2);
+}
+
+#[tokio::test]
+async fn provider_request_omits_local_subject_and_change_identity() {
+    let mut harness = Harness::new(&[false]);
+    let private_change_id = harness.request.subject.change.id.clone();
+    let transport = ScriptedFixtureTransport::new(
+        harness.approved_rows.clone(),
+        vec![step(Vec::new(), acknowledged(finish(Vec::new()), 8, 2))],
+    );
+    let mut journal = FixtureJournal::default();
+
+    ReviewController::run(
+        harness.request,
+        &mut harness.source,
+        &mut journal,
+        &transport,
+        &ReviewCancellation::default(),
+    )
+    .await
+    .expect("synthetic review");
+
+    let request_body = &journal.reservations[0].request_body;
+    assert!(!String::from_utf8_lossy(request_body).contains(&private_change_id));
+    let body: Value = serde_json::from_slice(request_body).expect("prepared request JSON");
+    let input: Value = serde_json::from_str(
+        body["messages"][1]["content"]
+            .as_str()
+            .expect("serialized review input"),
+    )
+    .expect("review input JSON");
+    assert!(input.get("subject").is_none());
 }
 
 #[tokio::test]

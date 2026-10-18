@@ -167,8 +167,9 @@ and `command/v1` review context plus paired `--docker` and `--docker-socket` fla
 interrupted command without replaying it. See the guide for recipe binding and cleanup limits.
 
 Execution and recovery are local CLI operations. The native API, operator-mapped hub/MCP and
-dashboard inspect retained runs. Agent hooks do not start or require workflows. A successful run
-is not a whole-workflow admission decision.
+dashboard inspect retained runs. The optional [Claude Code loop](../advanced/claude-code-workflows.md)
+adds `skill-workflow configure`, `check`, `claude-stop` and `require`. Configured native targets
+require an exact-current finalized graph receipt; a standalone successful run is not an approval.
 
 ## Local workspaces and offline exchange
 
@@ -215,4 +216,4 @@ agentscm --data-dir ./agentscm-data git-snapshot capture --repository ./checkout
 - Objects remain until the operator removes the data directory. Operators must back up the data directory consistently and provide their own recovery procedure.
 - Service bounds are alpha limits, not measured capacity claims or service-level objectives.
 
-The authority upgrades schema v1, v2, v3, v4 or v5 to v6 transactionally on open. The v1 migration retains historical events and exact completed-operation retries, labels their semantics as legacy, and revokes unconsumed opaque approvals. The v3 schema adds controller check attempts and evidence. The v4 schema adds the integration event kind and the landing preparation journal. The v5 schema adds isolated `command/v1` check attempts and records. The v6 schema adds command check cleanup custody. Legacy context hashes never become retained review evidence. Older binaries reject newer schemas; there is no downgrade path. Use an independently verified consistent backup before upgrading valuable data. The trusted-local recovery command requires physical quiescence, old-writer isolation and explicit external-state reconciliation; it does not provide automatic failover.
+The authority upgrades schema v1 through v6 to v7 transactionally on open. The v1 migration retains historical events and exact completed-operation retries, labels their semantics as legacy, and revokes unconsumed opaque approvals. The v3 schema adds controller check attempts and evidence. The v4 schema adds the integration event kind and the landing preparation journal. The v5 schema adds isolated `command/v1` check attempts and records. The v6 schema adds command check cleanup custody. The v7 schema adds immutable target workflow requirements and exact-subject receipts. Legacy context hashes never become retained review evidence. Older binaries reject newer schemas; there is no downgrade path. Use an independently verified consistent backup before upgrading valuable data. The trusted-local recovery command requires physical quiescence, old-writer isolation and explicit external-state reconciliation; it does not provide automatic failover.

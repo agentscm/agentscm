@@ -37,6 +37,7 @@ pub fn routes() -> Router<HubState> {
     Router::new()
         .route("/v1/hub/health", get(health))
         .route("/v1/hub/whoami", get(whoami))
+        .route("/v1/hub/skill-workflows", get(skill_workflows))
         .route("/v1/hub/skill-workflows/{run_id}", get(skill_workflow))
 }
 
@@ -326,6 +327,36 @@ async fn skill_workflow(
     let registry = state.skill_workflows.clone();
     let repository = principal.repository;
     let outcome = blocking(&state, move || Ok(registry.read(&repository, &run_id))).await?;
+    match outcome {
+        Ok(envelope) => Ok(Json(envelope).into_response()),
+        Err(SkillWorkflowReadError::InvalidRunId) => Err(ApiError::invalid()),
+        Err(SkillWorkflowReadError::NotFound) => Err(ApiError::not_found()),
+        Err(SkillWorkflowReadError::Internal(detail)) => Err(HubError::Unavailable(detail).into()),
+    }
+}
+
+async fn skill_workflows(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+    RawQuery(raw): RawQuery,
+) -> std::result::Result<Response, ApiError> {
+    let before = match raw.as_deref().filter(|raw| !raw.is_empty()) {
+        None => None,
+        Some(raw) => {
+            let value = raw.strip_prefix("before=").ok_or_else(ApiError::invalid)?;
+            if value.is_empty()
+                || value.len() > 19
+                || value.starts_with('0')
+                || !value.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Err(ApiError::invalid());
+            }
+            Some(value.parse::<i64>().map_err(|_| ApiError::invalid())?)
+        }
+    };
+    let registry = state.skill_workflows.clone();
+    let repository = principal.repository;
+    let outcome = blocking(&state, move || Ok(registry.page(&repository, before))).await?;
     match outcome {
         Ok(envelope) => Ok(Json(envelope).into_response()),
         Err(SkillWorkflowReadError::InvalidRunId) => Err(ApiError::invalid()),

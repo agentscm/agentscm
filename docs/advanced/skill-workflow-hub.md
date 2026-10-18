@@ -31,6 +31,7 @@ journal.
 An authenticated agent or read-only token can request:
 
 ```text
+GET /v1/hub/skill-workflows
 GET /v1/hub/skill-workflows/{run_id}
 ```
 
@@ -38,6 +39,12 @@ No query fields are accepted. The hub uses the token's repository as the only ma
 each journal read it reopens the native authority and compares its identity with the configured
 identity. A missing, unreadable or replaced authority returns an unavailable envelope without a
 retained projection. The retained run must also name the configured native identity.
+
+The collection route returns at most 16 summaries, newest-created first. Each summary contains
+only `run_id`, immutable source `revision` and retained `state`; it does not invent an update time
+or project a run's steps. The status page uses this list to open the newest run automatically and
+lets the reader select another recent run without knowing its identifier. A configured native
+store with no workflow journal returns an empty list without creating one.
 
 An available response has the same projection used by the trusted-local native read service:
 

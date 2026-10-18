@@ -30,8 +30,9 @@
 
 The immutable ledger, Git bridges, isolated command checks and
 [source-bound skill workflows](advanced/skill-workflows.md): see the [advanced index](advanced/README.md).
-Skill workflows currently run through the local CLI; the hub, MCP and dashboard inspect retained
-runs. Agent-triggered execution and whole-workflow admission remain planned.
+The [Claude Code workflow loop](advanced/claude-code-workflows.md) adds an opt-in local trigger,
+isolated tests, bounded model review and exact-revision native requirements. The hub, MCP and
+dashboard inspect retained runs; workspace settings and mutation controls remain planned.
 
 ## For contributors and maintainers
 

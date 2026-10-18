@@ -84,6 +84,18 @@ export interface Health {
 export type SkillWorkflowRunState = 'pending' | 'running' | 'succeeded' | 'completed_with_omissions' | 'failed' | 'blocked' | 'cancelled'
 export type SkillWorkflowStepState = 'pending' | 'running' | 'succeeded' | 'failed' | 'blocked' | 'cancelled'
 export type SkillWorkflowApplicabilityState = 'current' | 'stale' | 'unavailable'
+export type SkillWorkflowReviewStatus = 'succeeded' | 'failed' | 'blocked' | 'cancelled'
+export type SkillWorkflowReviewSeverity = 'note' | 'warning' | 'error'
+
+export interface SkillWorkflowLandingBinding {
+  basis: 'current_change_version_review_context_target_and_policy_epoch'
+  state: SkillWorkflowApplicabilityState
+  reason: string | null
+  change_id: string | null
+  change_version: number | null
+  context_digest: string | null
+  target: string | null
+}
 
 export interface SkillWorkflowObservation {
   path: string
@@ -91,12 +103,43 @@ export interface SkillWorkflowObservation {
   bytes: number
 }
 
+export interface SkillWorkflowCommandExecution {
+  attempt_id: string
+  generation: number
+  state: string
+  outcome: string | null
+  record_digest: string | null
+  failure: string | null
+}
+
+export interface SkillWorkflowReviewFinding {
+  path: string | null
+  start_line: number | null
+  end_line: number | null
+  title: string
+  detail: string
+  severity: SkillWorkflowReviewSeverity
+}
+
+export interface SkillWorkflowReview {
+  model_requested: string
+  model_observed: string | null
+  status: SkillWorkflowReviewStatus
+  stop: string | null
+  findings: SkillWorkflowReviewFinding[]
+  unresolved: string[]
+  covered_paths: string[]
+}
+
 export interface SkillWorkflowStep {
   id: string
+  needs: string[]
   required: boolean
   state: SkillWorkflowStepState
   observations: SkillWorkflowObservation[]
   detail: string | null
+  execution: SkillWorkflowCommandExecution | null
+  review: SkillWorkflowReview | null
 }
 
 export interface SkillWorkflowProjection {
@@ -116,7 +159,20 @@ export interface SkillWorkflowProjection {
     state: SkillWorkflowApplicabilityState
     reason: string | null
   }
+  present_landing_binding: SkillWorkflowLandingBinding | null
 }
+
+export interface SkillWorkflowRunSummary {
+  run_id: string
+  revision: string
+  state: SkillWorkflowRunState
+  name: string
+  sequence: string
+}
+
+export type SkillWorkflowListEnvelope =
+  | { version: 1; availability: 'available'; runs: SkillWorkflowRunSummary[]; next_cursor: string | null }
+  | { version: 1; availability: 'unavailable'; reason: string }
 
 export type SkillWorkflowEnvelope =
   | { version: 1; availability: 'available'; projection: SkillWorkflowProjection }

@@ -167,7 +167,10 @@ mount and build details, see [collisions](docs/collisions.md#running-in-a-contai
 | Handoff (an agent asks the holder to hand a file over) | Experimental, see [handoff](docs/hub.md#handoff) |
 | GitHub and GitLab sync, GitHub publish | Experimental; tested only against in-process fake servers |
 | Native ledger, Git bridges, isolated command checks | Experimental; see [advanced](docs/advanced/README.md) |
-| Source-bound skill workflows | Experimental local CLI: exact-file checks and packaged container commands, retained results, cancellation and recovery. Hub/MCP/dashboard access is read-only; see [skill workflows](docs/advanced/skill-workflows.md) |
+| Source-bound skill workflows | Experimental local CLI: packaged tests, Claude Code review, failure/fix feedback and exact-revision native landing requirements. Hub/MCP/dashboard access is read-only; see the [Claude Code loop](docs/advanced/claude-code-workflows.md) |
+
+The workflow UI is an early UX prototype for testing the basic flow. Pagination,
+large run histories, filtering/search, and navigation still need substantial refinement.
 
 The [roadmap](docs/roadmap.md) lists what exists and what is planned, and the [changelog](CHANGELOG.md)
 lists the known limits. Want a hosted hub or help running it? Tell us: support@counterbranch.com.

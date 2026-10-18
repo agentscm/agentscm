@@ -229,6 +229,12 @@ fn registry(data_dir: &Path, native_repository: &str) -> SkillWorkflowRegistry {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn valid_run_has_the_same_envelope_over_http_and_mcp_for_a_read_only_token() {
     let native = Native::initialized();
+    let definition =
+        agentscm::skill_workflow::runtime::retained_definition(native.dir.path(), "run-1").unwrap();
+    let plan = compile(native.dir.path(), &definition).unwrap();
+    for index in 2..=18 {
+        start(native.dir.path(), &format!("run-{index}"), &plan).unwrap();
+    }
     let hub = Hub::start(native.registry()).await;
     let (token, principal) = hub.token(HUB_REPOSITORY, true);
     let events = hub.store.events_after(0, 1000).unwrap().len();
@@ -278,12 +284,35 @@ async fn valid_run_has_the_same_envelope_over_http_and_mcp_for_a_read_only_token
     assert_eq!(workflow_tool["name"], "agentscm_workflow_status");
     assert_eq!(workflow_tool["annotations"]["readOnlyHint"], true);
 
+    let (status, recent) = hub.get("/v1/hub/skill-workflows", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(recent["availability"], "available");
+    assert_eq!(recent["runs"].as_array().unwrap().len(), 16);
+    assert_eq!(recent["runs"][0]["run_id"], "run-18");
+    assert_eq!(recent["runs"][0]["state"], "pending");
+    assert_eq!(recent["runs"][0]["revision"], definition.source.revision);
+    assert_eq!(recent["runs"][15]["run_id"], "run-3");
+    assert_eq!(recent["runs"][0]["name"], "review");
+    assert_eq!(recent["runs"][0]["sequence"], "18");
+    assert_eq!(recent["next_cursor"], "3");
+    let (status, older) = hub.get("/v1/hub/skill-workflows?before=3", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(older["runs"].as_array().unwrap().len(), 2);
+    assert_eq!(older["runs"][0]["run_id"], "run-2");
+    assert_eq!(older["runs"][1]["run_id"], "run-1");
+    assert_eq!(older["next_cursor"], Value::Null);
+    let (status, empty) = hub.get("/v1/hub/skill-workflows?before=1", &token).await;
+    assert_eq!(status, 200);
+    assert!(empty["runs"].as_array().unwrap().is_empty());
+    assert_eq!(empty["next_cursor"], Value::Null);
+
     let (status, http) = hub.get("/v1/hub/skill-workflows/run-1", &token).await;
     assert_eq!(status, 200);
     assert_eq!(http["availability"], "available");
     assert_eq!(http["projection"]["run"]["run_id"], "run-1");
     assert_eq!(http["projection"]["run"]["state"], "succeeded");
     assert_eq!(http["projection"]["run"]["admission"], "not_assessed");
+    assert_eq!(http["projection"]["present_landing_binding"], Value::Null);
 
     let mcp = hub
         .workflow_tool("/mcp", &token, json!({"run_id": "run-1"}))
@@ -339,6 +368,11 @@ async fn repository_scope_and_unconfigured_hubs_never_return_another_mapping() {
     let other_envelope: Value =
         serde_json::from_str(other_mcp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(other_envelope, body);
+    let (status, list) = hub.get("/v1/hub/skill-workflows", &other).await;
+    assert_eq!(status, 200);
+    assert_eq!(list["availability"], "unavailable");
+    assert_eq!(list["reason"], "native_workflow_not_configured");
+    assert!(list.get("runs").is_none());
 
     let unconfigured = Hub::start(SkillWorkflowRegistry::unconfigured()).await;
     let (token, _) = unconfigured.token(HUB_REPOSITORY, true);
@@ -368,6 +402,14 @@ async fn malformed_http_and_mcp_requests_are_bounded_errors() {
     let (token, _) = hub.token(HUB_REPOSITORY, true);
 
     for path in [
+        "/v1/hub/skill-workflows?limit=1",
+        "/v1/hub/skill-workflows?before=0",
+        "/v1/hub/skill-workflows?before=03",
+        "/v1/hub/skill-workflows?before=-1",
+        "/v1/hub/skill-workflows?before=abc",
+        "/v1/hub/skill-workflows?before=9223372036854775808",
+        "/v1/hub/skill-workflows?before=3&before=2",
+        "/v1/hub/skill-workflows?before=3&repo=acme%2Fother",
         "/v1/hub/skill-workflows/run-1?limit=1",
         "/v1/hub/skill-workflows/bad%20id",
     ] {
@@ -420,6 +462,11 @@ async fn changed_native_authority_suppresses_the_retained_payload() {
     assert_eq!(body["availability"], "unavailable");
     assert_eq!(body["reason"], "native_workflow_binding_replaced");
     assert!(body.get("projection").is_none());
+    let (status, list) = hub.get("/v1/hub/skill-workflows", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(list["availability"], "unavailable");
+    assert_eq!(list["reason"], "native_workflow_binding_replaced");
+    assert!(list.get("runs").is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -428,6 +475,11 @@ async fn absent_journals_and_missing_configured_stores_are_never_initialized() {
     assert!(!native.dir.path().join("skill-workflows").exists());
     let hub = Hub::start(native.registry()).await;
     let (token, _) = hub.token(HUB_REPOSITORY, true);
+    let (status, list) = hub.get("/v1/hub/skill-workflows", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(list["availability"], "available");
+    assert_eq!(list["runs"], json!([]));
+    assert!(!native.dir.path().join("skill-workflows").exists());
     let (status, body) = hub.get("/v1/hub/skill-workflows/missing", &token).await;
     assert_eq!(status, 404, "{body}");
     assert!(!native.dir.path().join("skill-workflows").exists());

@@ -26,9 +26,13 @@ use crate::lease::Lease;
 use crate::store::{Engine, create_directory_durable};
 use crate::{Error, Result};
 
+#[path = "review.rs"]
+mod review;
+pub use review::{ClaudeReviewFinding, ClaudeReviewView};
+
 const VIEW_VERSION: u32 = 1;
 const APPLICATION_ID: i64 = 0x4153_5746;
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const MAX_RUN_ID_BYTES: usize = 64;
 const MAX_DEFINITION_BYTES: usize = 256 * 1024;
 const MAX_DETAIL_BYTES: usize = 4 * 1024;
@@ -66,12 +70,16 @@ pub enum StepState {
 #[serde(deny_unknown_fields)]
 pub struct StepView {
     pub id: String,
+    #[serde(default)]
+    pub needs: Vec<String>,
     pub required: bool,
     pub state: StepState,
     pub observations: Vec<PathObservation>,
     pub detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<CommandStepView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ClaudeReviewView>,
 }
 
 /// A projection of the retained authority attempt, never worker-supplied evidence.
@@ -92,6 +100,13 @@ pub struct CommandExecutor<'a> {
     pub cancellation: &'a Cancellation,
 }
 
+#[cfg(unix)]
+pub struct ClaudeExecutor<'a> {
+    pub executable: &'a Path,
+    pub work_dir: &'a Path,
+    pub cancellation: &'a crate::reviewer::ReviewCancellation,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RunView {
@@ -103,6 +118,16 @@ pub struct RunView {
     pub state: RunState,
     pub steps: Vec<StepView>,
     pub admission: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RunSummary {
+    pub run_id: String,
+    pub name: String,
+    pub sequence: String,
+    pub revision: String,
+    pub state: RunState,
 }
 
 struct Journal {
@@ -441,6 +466,8 @@ pub fn advance(data_dir: &Path, run_id: &str, max_steps: usize) -> Result<RunVie
         max_steps,
         #[cfg(unix)]
         None,
+        #[cfg(unix)]
+        None,
     )
 }
 
@@ -451,7 +478,18 @@ pub fn advance_with_executor(
     max_steps: usize,
     executor: &CommandExecutor<'_>,
 ) -> Result<RunView> {
-    advance_inner(data_dir, run_id, max_steps, Some(executor))
+    advance_inner(data_dir, run_id, max_steps, Some(executor), None)
+}
+
+#[cfg(unix)]
+pub fn advance_with_backends(
+    data_dir: &Path,
+    run_id: &str,
+    max_steps: usize,
+    command: Option<&CommandExecutor<'_>>,
+    claude: Option<&ClaudeExecutor<'_>>,
+) -> Result<RunView> {
+    advance_inner(data_dir, run_id, max_steps, command, claude)
 }
 
 fn advance_inner(
@@ -459,6 +497,7 @@ fn advance_inner(
     run_id: &str,
     max_steps: usize,
     #[cfg(unix)] executor: Option<&CommandExecutor<'_>>,
+    #[cfg(unix)] claude: Option<&ClaudeExecutor<'_>>,
 ) -> Result<RunView> {
     validate_run_id(run_id)?;
     if max_steps > MAX_ADVANCE_STEPS {
@@ -541,6 +580,66 @@ fn advance_inner(
         }
 
         #[cfg(unix)]
+        if matches!(step.action, StepAction::ClaudeCodeReview { .. }) {
+            let backend = claude.ok_or_else(|| {
+                Error::Invalid(
+                    "Claude review requires an operator-selected --claude executable".into(),
+                )
+            })?;
+            let record = if states.get(step.id.as_str()) == Some(&StepState::Running) {
+                review::read_record(&journal.connection,run_id,&step.id)?.ok_or_else(||
+                    Error::Conflict("review dispatch was interrupted; cancel this run and explicitly refresh the context, never replay the call".into()))?
+            } else {
+                journal.begin_step(run_id, &step.id)?;
+                drop(journal);
+                let result = review::execute(
+                    data_dir,
+                    run_id,
+                    &plan,
+                    &step.id,
+                    backend.executable,
+                    backend.work_dir,
+                    backend.cancellation,
+                );
+                journal = Journal::open_after_dispatch(data_dir)?;
+                match result {
+                    Ok(record) => record,
+                    Err(error) => {
+                        let current = journal.view(run_id)?;
+                        if current
+                            .steps
+                            .iter()
+                            .any(|view| view.id == step.id && view.state == StepState::Running)
+                        {
+                            journal.finish_step(run_id,step,StepResult {state:StepState::Blocked,observations:Vec::new(),
+                                detail:"Claude review did not complete; inspect local diagnostics and refresh context before retrying".into()})?;
+                            journal.refresh_run_state(run_id)?;
+                        }
+                        return Err(error);
+                    }
+                }
+            };
+            let current = journal.view(run_id)?;
+            if current
+                .steps
+                .iter()
+                .any(|view| view.id == step.id && view.state == StepState::Running)
+            {
+                journal.finish_step(
+                    run_id,
+                    step,
+                    StepResult {
+                        state: review::state(&record),
+                        observations: Vec::new(),
+                        detail: format!("Claude review: {}", serde_json::to_value(record.stop)?),
+                    },
+                )?;
+                journal.refresh_run_state(run_id)?;
+            }
+            continue;
+        }
+
+        #[cfg(unix)]
         if matches!(step.action, StepAction::Command { .. }) {
             let executor = executor.ok_or_else(|| {
                 Error::Invalid("command skill step requires --docker and --docker-socket".into())
@@ -569,7 +668,7 @@ fn advance_inner(
                 attempt.run_generation,
                 executor.cancellation,
             )?;
-            journal = Journal::open(data_dir, OpenMode::Write)?;
+            journal = Journal::open_after_dispatch(data_dir)?;
             let current = journal.view(run_id)?;
             if matches!(
                 current
@@ -600,6 +699,87 @@ fn advance_inner(
 pub fn status(data_dir: &Path, run_id: &str) -> Result<RunView> {
     validate_run_id(run_id)?;
     Journal::open(data_dir, OpenMode::Read)?.view(run_id)
+}
+
+/// Historical declaration for read-only clients; not an executable plan.
+pub fn retained_definition(data_dir: &Path, run_id: &str) -> Result<WorkflowDefinition> {
+    validate_run_id(run_id)?;
+    Ok(Journal::open(data_dir, OpenMode::Read)?
+        .stored_run(run_id)?
+        .definition)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RunPage {
+    pub runs: Vec<RunSummary>,
+    pub next_cursor: Option<String>,
+}
+
+pub fn list_runs(data_dir: &Path, limit: usize) -> Result<Vec<RunSummary>> {
+    Ok(list_run_page(data_dir, limit, None)?.runs)
+}
+
+/// Newest-created runs using a bounded keyset cursor, never an unbounded scan.
+pub fn list_run_page(data_dir: &Path, limit: usize, before: Option<i64>) -> Result<RunPage> {
+    if !(1..=16).contains(&limit) || before.is_some_and(|value| value <= 0) {
+        return Err(Error::Limit(
+            "workflow list requires 1..16 runs and a positive cursor".into(),
+        ));
+    }
+    let journal = Journal::open(data_dir, OpenMode::Read)?;
+    let mut statement = journal.connection.prepare(
+        "SELECT run_id,rowid FROM workflow_runs WHERE rowid<=?1 ORDER BY rowid DESC LIMIT ?2",
+    )?;
+    let mut ids = statement
+        .query_map(
+            params![before.map_or(i64::MAX, |value| value - 1), limit + 1],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let more = ids.len() > limit;
+    ids.truncate(limit);
+    let runs = ids
+        .into_iter()
+        .map(|(run_id, sequence)| {
+            validate_run_id(&run_id)?;
+            if sequence <= 0 {
+                return Err(Error::Invalid("invalid workflow creation sequence".into()));
+            }
+            let run = journal.stored_run(&run_id)?;
+            Ok(RunSummary {
+                run_id,
+                name: run.definition.name,
+                sequence: sequence.to_string(),
+                revision: run.definition.source.revision,
+                state: run.state,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let next_cursor = if more {
+        runs.last().map(|run| run.sequence.clone())
+    } else {
+        None
+    };
+    Ok(RunPage { runs, next_cursor })
+}
+
+/// Revalidate the entire retained graph before publishing an authority receipt.
+pub fn finalize(
+    data_dir: &Path,
+    run_id: &str,
+    context: &crate::context::ReviewContext,
+) -> Result<String> {
+    validate_run_id(run_id)?;
+    let journal = Journal::open(data_dir, OpenMode::Read)?;
+    let stored = journal.stored_run(run_id)?;
+    let plan = compile(data_dir, &stored.definition)?;
+    let view = journal.view(run_id)?;
+    let mut authority = crate::authority::Authority::open(data_dir)?;
+    let requirement = authority
+        .workflow_requirement(&context.target)?
+        .ok_or_else(|| Error::Invalid("target has no installed workflow requirement".into()))?;
+    authority.record_workflow_success(&requirement, &plan, &view, context)
 }
 
 pub fn cancel(data_dir: &Path, run_id: &str) -> Result<RunView> {
@@ -692,6 +872,25 @@ fn cancel_inner(
 }
 
 impl Journal {
+    // External work has already run. Brief contention with cancellation must
+    // not discard its observation or cause another dispatch. Only lease
+    // acquisition is retried; all state/generation checks still run afterward.
+    #[cfg(unix)]
+    fn open_after_dispatch(data_dir: &Path) -> Result<Self> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            match Self::open(data_dir, OpenMode::Write) {
+                Err(Error::Conflict(message))
+                    if message.starts_with("workflow journal is active:")
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                result => return result,
+            }
+        }
+    }
+
     fn open(data_dir: &Path, mode: OpenMode) -> Result<Self> {
         let access = crate::local_recovery::AccessGuard::shared_existing(data_dir)?;
         // The operator-selected native root may use a platform alias such as
@@ -811,11 +1010,13 @@ impl Journal {
             validate_step_record(declared, state, &observations, detail.as_deref())?;
             steps.push(StepView {
                 id,
+                needs: declared.needs.clone(),
                 required,
                 state,
                 observations,
                 detail,
                 execution: command_projection(&self.data_dir, run_id, &run, declared, state)?,
+                review: review_projection(&self.connection, run_id, &run, declared, state)?,
             });
         }
         if steps.len() != run.ordered_steps.len() {
@@ -983,6 +1184,10 @@ fn initialize_schema(connection: &mut Connection, create: bool) -> Result<()> {
              ) STRICT;",
         )?;
         tx.pragma_update(None, "application_id", APPLICATION_ID)?;
+        review::create_schema(&tx)?;
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    } else if application == APPLICATION_ID && version == 1 {
+        review::create_schema(&tx)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     } else if application != APPLICATION_ID || version != SCHEMA_VERSION {
         return Err(Error::Invalid(
@@ -993,11 +1198,11 @@ fn initialize_schema(connection: &mut Connection, create: bool) -> Result<()> {
     Ok(())
 }
 
-fn validate_schema(connection: &Connection) -> Result<()> {
+pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
     let application: i64 =
         connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if application != APPLICATION_ID || version != SCHEMA_VERSION {
+    if application != APPLICATION_ID || !(1..=SCHEMA_VERSION).contains(&version) {
         return Err(Error::Invalid(
             "unsupported workflow journal identity or version".into(),
         ));
@@ -1007,6 +1212,12 @@ fn validate_schema(connection: &Connection) -> Result<()> {
         "SELECT run_id,position,step_id,required,state,operation_id,generation,observations_json,detail FROM workflow_steps LIMIT 0",
     ] {
         connection.prepare(query)?;
+    }
+    if version >= 2 {
+        connection.prepare("SELECT run_id,step_id,call_index,reservation_digest,reservation_json,observation_json FROM workflow_review_calls LIMIT 0")?;
+        connection.prepare(
+            "SELECT run_id,step_id,record_digest,record_json FROM workflow_reviews LIMIT 0",
+        )?;
     }
     Ok(())
 }
@@ -1095,7 +1306,7 @@ fn validate_step_record(
         ));
     }
     match &definition.action {
-        StepAction::Command { .. } => {
+        StepAction::Command { .. } | StepAction::ClaudeCodeReview { .. } => {
             if !observations.is_empty() {
                 return Err(Error::Invalid(
                     "command step contains source-path observations".into(),
@@ -1175,6 +1386,83 @@ fn validate_step_record(
     Ok(())
 }
 
+fn review_projection(
+    connection: &Connection,
+    run_id: &str,
+    run: &StoredRun,
+    step: &StepDefinition,
+    state: StepState,
+) -> Result<Option<ClaudeReviewView>> {
+    let Some(record) = review::read_record(connection, run_id, &step.id)? else {
+        if matches!(step.action, StepAction::ClaudeCodeReview { .. })
+            && matches!(state, StepState::Succeeded | StepState::Failed)
+        {
+            return Err(Error::Invalid(
+                "completed review step has no retained controller record".into(),
+            ));
+        }
+        return Ok(None);
+    };
+    let StepAction::ClaudeCodeReview { paths, model } = &step.action else {
+        return Err(Error::Invalid(
+            "review record attached to a non-review step".into(),
+        ));
+    };
+    let command = run
+        .definition
+        .steps
+        .iter()
+        .find_map(|step| match &step.action {
+            StepAction::Command {
+                change,
+                change_version,
+                context_digest,
+                ..
+            } => Some((change, change_version, context_digest)),
+            _ => None,
+        })
+        .ok_or_else(|| Error::Invalid("retained review lacks exact command context".into()))?;
+    let subject = &record.request.subject;
+    let mut expected_paths = paths.clone();
+    expected_paths.sort();
+    let mut actual_paths = record
+        .request
+        .recipe
+        .source
+        .iter()
+        .map(|row| row.path.clone())
+        .collect::<Vec<_>>();
+    actual_paths.sort();
+    if subject.repository != run.definition.source.repository
+        || subject.revision != run.definition.source.revision
+        || subject.change != *command.0
+        || subject.change_version != *command.1
+        || subject.context_digest != *command.2
+        || record.request.attempt_id != command_attempt_id(run_id, &run.plan_digest, &step.id)
+        || record.request.recipe.model != *model
+        || record.request.recipe.policy_epoch != run.definition.source.policy_epoch
+        || record.request.recipe.installed_policy_sha256
+            != run
+                .plan_digest
+                .strip_prefix("sha256:")
+                .unwrap_or(&run.plan_digest)
+        || actual_paths != expected_paths
+        || (matches!(state, StepState::Succeeded | StepState::Failed)
+            && review::state(&record) != state)
+    {
+        return Err(Error::Invalid(
+            "review record does not bind its workflow source, context and result".into(),
+        ));
+    }
+    let mut projection = review::projection(&record);
+    // Cancellation belongs to the workflow even when the last controller
+    // observation was incomplete. Retain its stop reason for inspection.
+    if state == StepState::Cancelled {
+        projection.status = step_state_name(state).into();
+    }
+    Ok(Some(projection))
+}
+
 fn validate_dependency_results(definitions: &[StepDefinition], steps: &[StepView]) -> Result<()> {
     let states = steps
         .iter()
@@ -1198,7 +1486,7 @@ fn validate_dependency_results(definitions: &[StepDefinition], steps: &[StepView
 
 fn execute_step(engine: &Engine, source: &WorkflowSource, step: &StepDefinition) -> StepResult {
     match &step.action {
-        StepAction::Command { .. } => StepResult {
+        StepAction::Command { .. } | StepAction::ClaudeCodeReview { .. } => StepResult {
             state: StepState::Blocked,
             observations: Vec::new(),
             detail: "command executor unavailable on this platform".into(),
@@ -1472,6 +1760,46 @@ fn parse_step_state(value: &str) -> Result<StepState> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn post_dispatch_writer_waits_for_a_brief_observer_without_replaying_work() {
+        let (root, _) = result_fixture();
+        let observer = Journal::open(root.path(), OpenMode::Read).unwrap();
+        let path = root.path().to_path_buf();
+        let (send, receive) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            send.send(Journal::open_after_dispatch(&path).map(drop))
+                .unwrap();
+        });
+        assert!(matches!(
+            receive.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(observer);
+        receive
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        writer.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_dispatch_writer_reports_persistent_contention_and_unrelated_errors() {
+        let (root, _) = result_fixture();
+        let observer = Journal::open(root.path(), OpenMode::Read).unwrap();
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            Journal::open_after_dispatch(root.path()),
+            Err(Error::Conflict(_))
+        ));
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        drop(observer);
+        let absent = root.path().join("absent");
+        assert!(Journal::open_after_dispatch(&absent).is_err());
+        assert!(!absent.exists());
+    }
+
     fn result_fixture() -> (tempfile::TempDir, CompiledPlan) {
         let root = tempfile::tempdir().unwrap();
         let engine = Engine::open(root.path()).unwrap();
@@ -1577,12 +1905,14 @@ mod tests {
 
     fn step(required: bool, state: StepState) -> StepView {
         StepView {
+            needs: vec![],
             id: "step".into(),
             required,
             state,
             observations: Vec::new(),
             detail: None,
             execution: None,
+            review: None,
         }
     }
 

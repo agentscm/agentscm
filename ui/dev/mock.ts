@@ -1,6 +1,6 @@
 // Dev-only: answers the hub's read-only status endpoints from synthetic fixtures.
 // Used by `MOCK=1 npm run dev`; never imported by app code.
-//   MOCK=1      acme/widgets with live agents, a contested file and open PRs
+//   MOCK=1      acme/widgets with live agents, open PRs and retained workflows
 //   MOCK=empty  a connected-nothing repository: no agents, events or PRs, no forge connection
 //   MOCK=down   the hub is failing: health 503, work and activity 503
 //   MOCK=demo   `agentscm demo` hub: health.demo true, simulated agents, no forge connection, no PRs
@@ -107,6 +107,131 @@ function activity() {
   }
 }
 
+const WORKFLOW_NAMES = [
+  'Claude code quality gate',
+  'Billing change verification',
+  'Release readiness',
+  'Dependency review',
+  'Documentation checks',
+]
+const WORKFLOW_STATES = ['succeeded', 'failed', 'running', 'blocked', 'completed_with_omissions', 'cancelled', 'pending'] as const
+const WORKFLOW_RUNS = Array.from({ length: 45 }, (_, index) => {
+  const special = [
+    { run_id: 'claude-review-failed', state: 'failed', name: 'Claude code quality gate' },
+    { run_id: 'claude-review-stale', state: 'succeeded', name: 'Billing change verification' },
+    { run_id: 'claude-review-passed', state: 'succeeded', name: 'Claude code quality gate' },
+  ][index]
+  return {
+    run_id: special?.run_id ?? `retained-run-${String(45 - index).padStart(3, '0')}`,
+    revision: (index % 16).toString(16).repeat(64),
+    state: special?.state ?? WORKFLOW_STATES[index % WORKFLOW_STATES.length],
+    name: special?.name ?? WORKFLOW_NAMES[index % WORKFLOW_NAMES.length],
+    sequence: String(5000 - index),
+  }
+})
+
+function workflow(runId: string): Record<string, unknown> | null {
+  const summary = WORKFLOW_RUNS.find((run) => run.run_id === runId)
+  if (!summary) return null
+  const failedReview = runId === 'claude-review-failed'
+  const stale = runId === 'claude-review-stale'
+  const passed = summary.state === 'succeeded' || summary.state === 'completed_with_omissions'
+  const failed = summary.state === 'failed'
+  const blocked = summary.state === 'blocked'
+  const running = summary.state === 'running'
+  const pending = summary.state === 'pending'
+  const cancelled = summary.state === 'cancelled'
+  const stateFor = (id: string) => {
+    if (passed) return id === 'optional-docs' && summary.state === 'completed_with_omissions' ? 'cancelled' : 'succeeded'
+    if (failedReview) return id === 'claude-review' ? 'failed' : ['evidence-bundle', 'landing-readiness'].includes(id) ? 'blocked' : 'succeeded'
+    if (failed) return id === 'unit-tests' ? 'failed' : ['integration-tests', 'package-check', 'evidence-bundle', 'landing-readiness'].includes(id) ? 'blocked' : 'succeeded'
+    if (blocked) return ['policy-check', 'evidence-bundle', 'landing-readiness'].includes(id) ? 'blocked' : 'succeeded'
+    if (running) return ['source-snapshot', 'lint'].includes(id) ? 'succeeded' : id === 'unit-tests' ? 'running' : 'pending'
+    if (cancelled) return id === 'source-snapshot' ? 'succeeded' : 'cancelled'
+    return pending ? 'pending' : summary.state
+  }
+  const execution = (id: string) => {
+    const state = stateFor(id)
+    if (state === 'blocked' || state === 'pending' || state === 'cancelled') return null
+    return {
+      attempt_id: `attempt-${summary.sequence}-${id}`,
+      generation: 1,
+      state: state === 'running' ? 'running' : 'finished',
+      outcome: state === 'succeeded' ? 'success' : state === 'failed' ? 'failure' : null,
+      record_digest: state === 'running' ? null : (Number(summary.sequence) % 16).toString(16).repeat(64),
+    }
+  }
+  const reviewState = stateFor('claude-review')
+  const review = reviewState === 'succeeded' || reviewState === 'failed' ? {
+    model_requested: 'sonnet',
+    model_observed: 'claude-sonnet-synthetic',
+    status: reviewState,
+    stop: 'finish',
+    findings: failedReview ? [{
+      path: 'src/billing.rs', start_line: 118, end_line: 121, severity: 'error',
+      title: 'Preserve the currency-specific rounding mode',
+      detail: 'This fallback applies the default rounding mode after the currency lookup fails, which can change an existing invoice total. Return the lookup error or retain the invoice currency before computing the total.',
+    }, {
+      path: 'tests/billing_test.rs', start_line: 44, end_line: 44, severity: 'note',
+      title: 'Add a regression example',
+      detail: 'A focused case for an unsupported currency would make the intended failure behavior explicit.',
+    }] : [],
+    unresolved: failedReview ? ['The unsupported-currency behavior is not covered by the current test result.'] : [],
+    covered_paths: ['src/billing.rs', 'src/invoice/totals.rs', 'tests/billing_test.rs', 'tests/integration/invoice.rs'],
+  } : null
+  const step = (id: string, needs: string[], required = true, extra: Record<string, unknown> = {}) => ({
+    id, needs, required, state: stateFor(id), observations: [], detail: null, execution: null, review: null, ...extra,
+  })
+  const source = { repository: '0123456789abcdef0123456789abcdef', revision: summary.revision, policy_epoch: 4 }
+  const binding = {
+    basis: 'current_change_version_review_context_target_and_policy_epoch',
+    state: 'current', reason: null, change_id: 'change-invoice-rounding', change_version: 3,
+    context_digest: 'c'.repeat(64), target: 'main',
+  }
+  const applicability = {
+    basis: 'current_authority_repository_policy_epoch_and_immutable_revision', state: 'current', reason: null,
+  }
+  return {
+    version: 1,
+    availability: 'available',
+    projection: {
+      version: 1,
+      run: {
+        version: 1,
+        run_id: runId,
+        plan_digest: `sha256:${'d'.repeat(64)}`,
+        skill_digest: `sha256:${'e'.repeat(64)}`,
+        source,
+        state: summary.state,
+        steps: [
+          step('source-snapshot', [], true, {
+            observations: [
+              { path: 'src/billing.rs', sha256: 'f'.repeat(64), bytes: 1842 },
+              { path: 'tests/billing_test.rs', sha256: 'a'.repeat(64), bytes: 3920 },
+            ],
+            detail: 'Required source paths matched the retained revision.',
+          }),
+          step('lint', ['source-snapshot'], true, { execution: execution('lint'), detail: 'The packaged lint command completed.' }),
+          step('unit-tests', ['source-snapshot'], true, {
+            execution: execution('unit-tests'),
+            detail: failed && !failedReview ? 'The packaged unit test command reported a failure.' : 'The packaged unit test command completed.',
+          }),
+          step('integration-tests', ['unit-tests'], true, { execution: execution('integration-tests'), detail: stateFor('integration-tests') === 'blocked' ? 'Did not run because unit-tests did not succeed.' : 'Integration checks use the retained unit-test result.' }),
+          step('package-check', ['lint', 'unit-tests'], true, { execution: execution('package-check'), detail: stateFor('package-check') === 'blocked' ? 'Did not run because a required test step did not succeed.' : 'Package checks completed against the retained revision.' }),
+          step('claude-review', ['source-snapshot'], true, { review, detail: review === null ? 'No structured review result is retained yet.' : failedReview ? 'The structured review returned a blocking finding.' : 'The structured review completed.' }),
+          step('policy-check', ['source-snapshot'], true, { detail: blocked ? 'A required native capability is unavailable.' : 'Required native capabilities were present.' }),
+          step('optional-docs', ['source-snapshot'], false, { execution: execution('optional-docs'), detail: 'Optional documentation checks are retained separately.' }),
+          step('evidence-bundle', ['integration-tests', 'package-check', 'claude-review', 'policy-check'], true, { detail: stateFor('evidence-bundle') === 'blocked' ? 'Did not complete because a required predecessor did not succeed.' : 'Required predecessor results are bound into the retained run.' }),
+          step('landing-readiness', ['evidence-bundle'], true, { detail: stateFor('landing-readiness') === 'blocked' ? 'Did not complete because the evidence bundle is blocked.' : 'This step records workflow readiness; native landing revalidates independently.' }),
+        ],
+        admission: 'not_assessed',
+      },
+      present_applicability: stale ? { ...applicability, state: 'stale', reason: 'the current policy epoch no longer matches this run' } : applicability,
+      present_landing_binding: stale ? { ...binding, state: 'stale', reason: 'the Change or its review context changed after this run' } : binding,
+    },
+  }
+}
+
 export type Scenario = 'full' | 'empty' | 'down' | 'demo'
 
 export function mockHub(scenario: Scenario = 'full'): Plugin {
@@ -140,6 +265,24 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
         }
         if (down) return send(503, { error: 'unavailable' })
         const empty = scenario === 'empty'
+        if (url.pathname === '/skill-workflows') {
+          if (empty || scenario === 'demo') return send(200, { version: 1, availability: 'available', runs: [], next_cursor: null })
+          const before = url.searchParams.get('before')
+          if (before !== null && !/^[1-9][0-9]{0,18}$/.test(before)) return send(400, { error: 'invalid before cursor' })
+          const candidates = before === null ? WORKFLOW_RUNS : WORKFLOW_RUNS.filter((run) => BigInt(run.sequence) < BigInt(before))
+          const runs = candidates.slice(0, 16)
+          return send(200, {
+            version: 1,
+            availability: 'available',
+            runs,
+            next_cursor: candidates.length > runs.length ? runs.at(-1)?.sequence ?? null : null,
+          })
+        }
+        if (url.pathname.startsWith('/skill-workflows/')) {
+          const runId = decodeURIComponent(url.pathname.slice('/skill-workflows/'.length))
+          const retained = workflow(runId)
+          return retained ? send(200, retained) : send(404, { error: 'not found' })
+        }
         if (url.pathname === `/repos/${encodeURIComponent(REPO)}/work`) {
           if (scenario === 'demo') return send(200, { ...work(), pull_requests: [], connected: false })
           return send(200, empty ? { intents: [], intents_truncated: false, pull_requests: [], branches: [], connected: false, truncated: {} } : work())
