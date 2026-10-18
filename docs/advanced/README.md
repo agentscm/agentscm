@@ -14,9 +14,9 @@ AgentSCM also contains an immutable ledger for exact revisions, their review con
 
 ## Git bridges (shadow workflow)
 
-Capture a Git commit, work and land natively, reconcile with Git and export to a local mirror you own. Nothing is pushed.
+Capture a Git commit, work and land natively, reconcile with Git and export to a local mirror you own. Explicit local-bare remote exchange is a separate opt-in command.
 
-- [Git snapshot capture](git-snapshot.md), [Git reconciliation](git-reconcile.md) and [Git export](git-export.md)
+- [Git snapshot capture](git-snapshot.md), [Git reconciliation](git-reconcile.md), [Git export](git-export.md) and [local Git remote exchange](git-remote.md) and [authenticated network transport](git-remote-network.md)
 
 ## Isolated command checks
 

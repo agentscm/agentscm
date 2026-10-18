@@ -36,6 +36,8 @@ mod git_export_cli;
 #[cfg(unix)]
 mod git_reconcile_cli;
 #[cfg(unix)]
+mod git_remote_cli;
+#[cfg(unix)]
 mod git_snapshot_cli;
 #[cfg(unix)]
 mod guided_cli;
@@ -180,6 +182,13 @@ enum Command {
         #[arg(default_value = "-")]
         input: PathBuf,
     },
+    /// [experimental] Explicit Git fetch and recoverable ref publication.
+    #[cfg(unix)]
+    GitRemote(git_remote_cli::GitRemoteArgs),
+    /// Internal scoped credential helper; never used for interactive sign-in.
+    #[command(hide = true)]
+    #[cfg(unix)]
+    GitRemoteCredential { operation: String },
     /// [experimental] Show a change and its exact current review context.
     Show { repository: String, change: String },
     /// [experimental] Replace a change's context only at the expected generation.
@@ -452,6 +461,14 @@ async fn run(cli: Cli) -> Result<()> {
         #[cfg(unix)]
         Command::GitExport { command } => {
             print_json(&git_export_cli::run(command, &cli.data_dir)?);
+        }
+        #[cfg(unix)]
+        Command::GitRemoteCredential { operation } => {
+            git_remote_cli::credential(&operation)?;
+        }
+        #[cfg(unix)]
+        Command::GitRemote(args) => {
+            print_json(&git_remote_cli::run(args, &cli.data_dir)?);
         }
         #[cfg(unix)]
         Command::GitReconcile { command } => {

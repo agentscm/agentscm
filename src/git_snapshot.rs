@@ -190,7 +190,7 @@ fn git_command(git: &Path, repository: &Path) -> Result<Command> {
     Ok(command)
 }
 
-fn git_version(git: &Path) -> Result<String> {
+pub(crate) fn git_version(git: &Path) -> Result<String> {
     if !git.is_absolute() {
         return Err(Error::Invalid(
             "git executable path must be absolute".into(),
