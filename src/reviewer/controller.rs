@@ -64,13 +64,14 @@ impl ReviewController {
                 break;
             }
             let remaining_ms = timeout.saturating_sub(started.elapsed()).as_millis().max(1) as u32;
-            let mut call = match prepare_call(&record.request, &rows, remaining_ms) {
-                Ok(call) => call,
-                Err(_) => {
-                    record.stop = ReviewStop::RequestLimit;
-                    break;
-                }
-            };
+            let mut call =
+                match prepare_call(&record.request, &rows, remaining_ms, transport.basis()) {
+                    Ok(call) => call,
+                    Err(_) => {
+                        record.stop = ReviewStop::RequestLimit;
+                        break;
+                    }
+                };
             request_bytes = request_bytes.saturating_add(call.body().len());
             if request_bytes > record.request.recipe.limits.max_total_request_bytes as usize {
                 record.stop = ReviewStop::RequestLimit;

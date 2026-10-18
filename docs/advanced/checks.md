@@ -77,7 +77,7 @@ To require this check, the ReviewContext must include:
 }
 ```
 
-The required-evidence digest names the recipe, not a future outcome. AgentSCM rejects missing, unknown or mismatched recipe/evidence identities. A context requesting the capability cannot be approved or integrated until the authority transaction finds exact current `success` evidence for every binding above. Updating the context generation invalidates the earlier success even when the source revision and recipe are unchanged. Contexts that do not request this capability retain the current trusted-human approval behavior; there is no general installed-policy evaluator yet.
+The required-evidence digest names the recipe, not a future outcome. AgentSCM rejects missing, unknown or mismatched recipe/evidence identities. A context requesting the capability cannot be approved or integrated until the authority transaction finds exact current `success` evidence for every binding above. Updating the context generation invalidates the earlier success even when the source revision and recipe are unchanged. Contexts that do not request this capability retain the current trusted-human approval behavior; there is no general installed-policy evaluator yet. An independently installed [workflow requirement](claude-code-workflows.md) additionally requires a current whole-workflow receipt, even if a Change omits the command capability.
 
 ## CLI flow
 

@@ -20,7 +20,7 @@ The multi-user [coordination hub](hub.md) is a separate alpha service with its o
 ## Review context
 A stable Change stores identity and a Change-version-checked current-context pointer. Immutable ReviewContext records alone own intent, acceptance criteria, scope, exclusions, omissions and declared evidence boundaries. Source revisions do not include review context. Registration permits structurally valid incomplete contexts for inspection; approval and integration reject them. Both operations transactionally check repository, current change/context, target/base and policy bindings. New operations use context semantics version 2; migrated historical events remain version 1.
 
-Context digests attest to canonical bytes, not execution truth. The local owner can still supply all administrative claims. Built-in source-path and isolated command collectors can provide evidence for a requesting current context. Operational model review, authenticated portable execution evidence and broader policy integration remain required. See [review context format](advanced/review-context.md).
+Context digests attest to canonical bytes, not execution truth. The local owner can still supply all administrative claims. Built-in source-path and isolated command collectors can provide evidence for a requesting current context. A bounded Claude Code adapter supports the local workflow loop; authenticated portable execution evidence and broader policy integration remain required. See [review context format](advanced/review-context.md).
 
 ## Local workflow continuation
 
@@ -42,15 +42,18 @@ collector-visible retention pins or protected admission authority.
 The local [skill workflow runner](advanced/skill-workflows.md) compiles a bounded graph from an
 immutable `SKILL.md` package and explicit resources. It runs source-path checks and, on Unix,
 pinned command recipes through the existing container collector. Its journal retains progress;
-command attempts fence concurrent claims, cancellation and recovery. A workflow result is an
-observation, not approval of the whole graph.
+command attempts fence concurrent claims, cancellation and recovery. Claude Code review uses
+the finite review controller with durable dispatch reservations and no candidate tools. A run
+remains an observation; an installed target requirement additionally needs a controller-finalized
+exact-subject receipt in the authority database before approval or native landing.
 
-The native API and operator-mapped hub/MCP/dashboard expose retained run status. Existing agent
-hooks coordinate file edits; they do not start or enforce skill workflows. Automatic triggers,
-authenticated execution tools, agent/provider adapters and whole-workflow admission are planned.
+The native API and operator-mapped hub/MCP/dashboard inspect retained status and current binding.
+The [Claude Code Stop loop](advanced/claude-code-workflows.md) is an opt-in local trigger; the
+authority independently enforces installed native target requirements. The existing file-edit
+hooks retain contention-only behavior. Remote execution mutations and other adapters remain planned.
 
 ## Planned capabilities
-The following are not yet implemented; see the [roadmap](roadmap.md). Operational agent/model review, authenticated multi-user native APIs, PostgreSQL/object-store authority and caches, full offline sync/workspace lifecycle, privacy/retention/GC and leases, Git history import and live authority cutover, automatic recovery/failover and measured scale qualification remain planned. Bounded local source exchange, merge, Git export and offline recovery primitives already exist; they do not complete those operational capabilities. Advanced semantic merge, transparent virtual filesystems, cross-region active-active writes and blockchain anchoring are optional extensions.
+The following are not yet implemented; see the [roadmap](roadmap.md). Broader agent/model adapters, authenticated multi-user native APIs, PostgreSQL/object-store authority and caches, full offline sync/workspace lifecycle, privacy/retention/GC and leases, Git history import and live authority cutover, automatic recovery/failover and measured scale qualification remain planned. Bounded local source exchange, merge, Git export and offline recovery primitives already exist; they do not complete those operational capabilities. Advanced semantic merge, transparent virtual filesystems, cross-region active-active writes and blockchain anchoring are optional extensions.
 
 ## Deployment
 Install a published binary through `npx`, the release install script or a manual download, or run a versioned OCI container; see [install options](install.md). Contributors can build from source. A local/small-team single writer uses SQLite on a durable local volume. Never multiply SQLite authority containers over a shared directory. Later workers/read caches scale separately from fenced PostgreSQL authority. Keep candidate execution separate from controller credentials; no mounted host container socket by default. Containers simplify installation, not database consistency.

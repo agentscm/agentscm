@@ -194,6 +194,7 @@ on no others:
 - `GET /v1/hub/repos/{repo}/work`
 - `GET /v1/hub/repos/{repo}/activity`
 - `GET /v1/hub/health`, which needs no token
+- `GET /v1/hub/skill-workflows` for recent runs in an operator-mapped native repository
 - `GET /v1/hub/skill-workflows/{run_id}` for an operator-mapped native repository
 - MCP `initialize`, `ping`, `tools/list`, and `agentscm_workflow_status`
 
@@ -466,7 +467,9 @@ is 64 KiB. Tools:
 | `agentscm_workflow_status` | `run_id` | Reads a retained skill workflow from the operator-mapped native repository, with historical state and present applicability separate. |
 
 The six coordination tools use repo-relative path specs and carry the session's new notices.
-The workflow read uses no session and writes no coordination events. Read-only tokens discover
+The workflow reads use no session and write no coordination events. `GET /v1/hub/skill-workflows`
+lists up to 16 newest-created retained runs for selection in the status page; the existing
+`GET /v1/hub/skill-workflows/{run_id}` returns one full retained projection. Read-only tokens discover
 only that tool; operator mapping and availability are described in the
 [workflow hub guide](advanced/skill-workflow-hub.md). Bad arguments and hub errors are tool results with
 `isError: true` and the "coordination unknown" text.
@@ -520,7 +523,8 @@ The page signs in with a [read-only token](#read-only-tokens) for the repository
 `Authorization: Bearer`, and refuses an agent token, so the browser never holds a token that can
 write. The token is kept in the browser's session storage, or in its local storage if "keep me
 signed in" is ticked. There are no cookies and no sign-in route of its own. It polls every few
-seconds and only reads `whoami`, `work`, `activity` and `health`. Mint a token only for this, so it
+seconds and reads `whoami`, `work`, `activity` and `health`; the workflow panel also reads the
+bounded recent-run list once and an individual run when selected. Mint a token only for this, so it
 can be revoked on its own:
 
 ```sh

@@ -3,6 +3,9 @@
 #[path = "command_checks/skill_workflows.rs"]
 mod skill_workflows;
 
+#[path = "command_checks/claude_cancellation.rs"]
+mod claude_cancellation;
+
 #[path = "common/fake_docker.rs"]
 mod fake_docker;
 

@@ -1,7 +1,7 @@
 // Zero-dependency self-check for src/derive.ts (Node strips the types).
 import assert from 'node:assert/strict'
 import { derive, notable, overlaps, specKey } from '../src/derive.ts'
-import { InvalidSkillWorkflowResponse, decodeSkillWorkflowEnvelope, validSkillWorkflowRunId, validSkillWorkflowStepId } from '../src/skillWorkflow.ts'
+import { InvalidSkillWorkflowResponse, decodeSkillWorkflowEnvelope, decodeSkillWorkflowListEnvelope, validSkillWorkflowRunId, validSkillWorkflowStepId } from '../src/skillWorkflow.ts'
 import { fragmentTokenAllowed } from '../src/storage.ts'
 
 // A `#token=` link may replace a stored token only on the demo hub.
@@ -23,19 +23,34 @@ const workflow = {
       source: { repository: '0123456789abcdef0123456789abcdef', revision: 'a'.repeat(64), policy_epoch: 4 },
       state: 'completed_with_omissions',
       steps: [
-        { id: 'lint/rust', required: true, state: 'succeeded', observations: [{ path: 'src/lib.rs', sha256: 'b'.repeat(64), bytes: 42 }], detail: 'source paths matched' },
-        { id: 'verify:source', required: false, state: 'blocked', observations: [], detail: 'capability unavailable' },
+        {
+          id: 'lint/rust', needs: [], required: true, state: 'succeeded', observations: [{ path: 'src/lib.rs', sha256: 'b'.repeat(64), bytes: 42 }], detail: 'source paths matched',
+          execution: { attempt_id: 'attempt-1', generation: 2, state: 'finished', outcome: 'success', record_digest: 'e'.repeat(64) },
+          review: {
+            model_requested: 'fable', model_observed: 'claude-fable-5-1', status: 'failed', stop: 'findings', covered_paths: ['src/lib.rs'], unresolved: ['error path is untested'],
+            findings: [{ path: 'src/lib.rs', start_line: 12, end_line: 13, title: 'Lost error context', detail: 'Preserve the original error before returning.', severity: 'error' }],
+          },
+        },
+        { id: 'verify:source', needs: ['lint/rust'], required: false, state: 'blocked', observations: [], detail: 'capability unavailable' },
       ],
       admission: 'not_assessed',
     },
     present_applicability: { basis: 'current_authority_repository_policy_epoch_and_immutable_revision', state: 'stale', reason: 'policy epoch changed' },
+    present_landing_binding: {
+      basis: 'current_change_version_review_context_target_and_policy_epoch', state: 'current', reason: null,
+      change_id: 'change-1', change_version: 3, context_digest: 'f'.repeat(64), target: 'main',
+    },
   },
 }
 const decodedWorkflow = decodeSkillWorkflowEnvelope(workflow)
 assert.equal(decodedWorkflow.availability, 'available')
 assert.equal(decodedWorkflow.projection.run.state, 'completed_with_omissions', 'omissions never collapse into success')
 assert.equal(decodedWorkflow.projection.run.steps[1].state, 'blocked', 'blocked optional work stays visible')
+assert.equal(decodedWorkflow.projection.run.steps[0].execution.outcome, 'success', 'command result remains a distinct controller observation')
+assert.equal(decodedWorkflow.projection.run.steps[0].review.model_observed, 'claude-fable-5-1')
+assert.equal(decodedWorkflow.projection.run.steps[0].review.findings[0].start_line, 12)
 assert.equal(decodedWorkflow.projection.present_applicability.state, 'stale', 'current applicability stays separate from historical state')
+assert.equal(decodedWorkflow.projection.present_landing_binding.target, 'main', 'landing binding is decoded separately from source freshness')
 assert.equal(decodedWorkflow.projection.run.admission, 'not_assessed', 'the read surface does not manufacture admission')
 assert.deepEqual(decodeSkillWorkflowEnvelope({ version: 1, availability: 'unavailable', reason: 'native_workflow_not_configured' }), {
   version: 1,
@@ -44,8 +59,32 @@ assert.deepEqual(decodeSkillWorkflowEnvelope({ version: 1, availability: 'unavai
 })
 assert.throws(() => decodeSkillWorkflowEnvelope({ ...workflow, projection: { ...workflow.projection, run: { ...workflow.projection.run, admission: 'approved' } } }), InvalidSkillWorkflowResponse)
 assert.throws(() => decodeSkillWorkflowEnvelope({ ...workflow, projection: { ...workflow.projection, run: { ...workflow.projection.run, steps: Array(33).fill(workflow.projection.run.steps[0]) } } }), InvalidSkillWorkflowResponse)
+assert.throws(() => decodeSkillWorkflowEnvelope({ ...workflow, projection: { ...workflow.projection, run: { ...workflow.projection.run, steps: [{ ...workflow.projection.run.steps[0], review: { ...workflow.projection.run.steps[0].review, findings: Array(65).fill(workflow.projection.run.steps[0].review.findings[0]) } }] } } }), InvalidSkillWorkflowResponse)
+assert.throws(() => decodeSkillWorkflowEnvelope({ ...workflow, projection: { ...workflow.projection, run: { ...workflow.projection.run, steps: [{ ...workflow.projection.run.steps[0], review: { ...workflow.projection.run.steps[0].review, findings: [{ ...workflow.projection.run.steps[0].review.findings[0], start_line: 13, end_line: 12 }] } }] } } }), InvalidSkillWorkflowResponse)
+assert.throws(() => decodeSkillWorkflowEnvelope({ ...workflow, projection: { ...workflow.projection, run: { ...workflow.projection.run, steps: [{ ...workflow.projection.run.steps[0], review: { ...workflow.projection.run.steps[0].review, status: 'unknown' } }] } } }), InvalidSkillWorkflowResponse)
+assert.throws(() => decodeSkillWorkflowEnvelope({ ...workflow, projection: { ...workflow.projection, run: { ...workflow.projection.run, steps: [{ ...workflow.projection.run.steps[0], review: { ...workflow.projection.run.steps[0].review, findings: [{ ...workflow.projection.run.steps[0].review.findings[0], severity: 'critical' }] } }] } } }), InvalidSkillWorkflowResponse)
 assert.throws(() => decodeSkillWorkflowEnvelope({ ...workflow, projection: { ...workflow.projection, present_applicability: { ...workflow.projection.present_applicability, basis: 'unknown' } } }), InvalidSkillWorkflowResponse)
+assert.throws(() => decodeSkillWorkflowEnvelope({ ...workflow, projection: { ...workflow.projection, present_landing_binding: { ...workflow.projection.present_landing_binding, context_digest: 'not-a-digest' } } }), InvalidSkillWorkflowResponse)
 assert.throws(() => decodeSkillWorkflowEnvelope(workflow, 'another-run'), InvalidSkillWorkflowResponse)
+const recentWorkflows = decodeSkillWorkflowListEnvelope({ version: 1, availability: 'available', runs: [
+  { run_id: 'run-new', revision: 'a'.repeat(64), state: 'failed', name: 'Required review', sequence: '9223372036854775807' },
+  { run_id: 'run-old', revision: 'b'.repeat(64), state: 'succeeded', name: 'Required review', sequence: '9223372036854775806' },
+], next_cursor: '9223372036854775806' })
+assert.equal(recentWorkflows.availability, 'available')
+assert.equal(recentWorkflows.runs[0].run_id, 'run-new')
+assert.equal(recentWorkflows.next_cursor, '9223372036854775806')
+assert.throws(() => decodeSkillWorkflowListEnvelope({ version: 1, availability: 'available', runs: Array(17).fill({ run_id: 'run', revision: 'a'.repeat(64), state: 'succeeded', name: 'Review', sequence: '1' }), next_cursor: null }), InvalidSkillWorkflowResponse)
+assert.throws(() => decodeSkillWorkflowListEnvelope({ version: 1, availability: 'available', runs: [
+  { run_id: 'duplicate', revision: 'a'.repeat(64), state: 'succeeded', name: 'Review', sequence: '2' },
+  { run_id: 'duplicate', revision: 'b'.repeat(64), state: 'failed', name: 'Review', sequence: '1' },
+], next_cursor: null }), InvalidSkillWorkflowResponse)
+assert.throws(() => decodeSkillWorkflowListEnvelope({ version: 1, availability: 'available', runs: [
+  { run_id: 'run', revision: 'a'.repeat(64), state: 'succeeded', name: 'Review', sequence: '01' },
+], next_cursor: null }), InvalidSkillWorkflowResponse)
+assert.throws(() => decodeSkillWorkflowListEnvelope({ version: 1, availability: 'available', runs: [], next_cursor: '0' }), InvalidSkillWorkflowResponse)
+assert.throws(() => decodeSkillWorkflowListEnvelope({ version: 1, availability: 'available', runs: [], next_cursor: '9223372036854775808' }), InvalidSkillWorkflowResponse)
+assert.throws(() => decodeSkillWorkflowListEnvelope({ version: 1, availability: 'available', runs: [{ run_id: 'run', revision: 'a'.repeat(64), state: 'succeeded', name: 'Review', sequence: '9999999999999999999' }], next_cursor: null }), InvalidSkillWorkflowResponse)
+assert.throws(() => decodeSkillWorkflowEnvelope({ ...workflow, projection: { ...workflow.projection, run: { ...workflow.projection.run, steps: [workflow.projection.run.steps[0], { ...workflow.projection.run.steps[1], needs: ['missing'] }] } } }), InvalidSkillWorkflowResponse)
 assert.ok(validSkillWorkflowRunId('run-1.ok'))
 assert.ok(!validSkillWorkflowRunId('../run'))
 assert.ok(!validSkillWorkflowRunId('a'.repeat(65)))

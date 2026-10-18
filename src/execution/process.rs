@@ -26,6 +26,21 @@ pub(crate) enum Stop {
 
 const INPUT_CHUNK: usize = 16 * 1024;
 
+struct CaptureSettings {
+    input_chunk: usize,
+    // A deterministic test seam: hold output reads until exit is observed.
+    reader_gate: Option<Arc<AtomicBool>>,
+}
+
+impl CaptureSettings {
+    fn new(input_chunk: usize) -> Self {
+        Self {
+            input_chunk,
+            reader_gate: None,
+        }
+    }
+}
+
 struct InputPump {
     stream: UnixStream,
     bytes: Vec<u8>,
@@ -90,7 +105,7 @@ pub(crate) fn capture_with_input(
         timeout,
         limit,
         cancel,
-        INPUT_CHUNK,
+        CaptureSettings::new(INPUT_CHUNK),
         |_, _| {},
     )
 }
@@ -101,7 +116,7 @@ fn capture_with_input_inner(
     timeout: Duration,
     limit: u64,
     cancel: &Cancellation,
-    input_chunk: usize,
+    settings: CaptureSettings,
     inspect_input_pair: impl FnOnce(&UnixStream, &UnixStream),
 ) -> std::io::Result<Capture> {
     if cancel.is_cancelled() {
@@ -166,10 +181,27 @@ fn capture_with_input_inner(
     let seen = Arc::new(AtomicU64::new(0));
     let overflow = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
-    let stdout = reader(out_reader, &seen, &overflow, &done, limit);
-    let stderr = reader(err_reader, &seen, &overflow, &done, limit);
+    let stdout = reader(
+        out_reader,
+        &seen,
+        &overflow,
+        &done,
+        limit,
+        settings.reader_gate.clone(),
+    );
+    let stderr = reader(
+        err_reader,
+        &seen,
+        &overflow,
+        &done,
+        limit,
+        settings.reader_gate.clone(),
+    );
     let mut stop = None;
-    let status = loop {
+    let mut wait_error = None;
+    let mut owns_child = true;
+    let mut group_signalled = false;
+    loop {
         if cancel.is_cancelled() {
             stop = Some(Stop::Cancelled);
         } else if overflow.load(Ordering::Acquire) {
@@ -177,51 +209,83 @@ fn capture_with_input_inner(
         } else if started.elapsed() >= timeout {
             stop = Some(Stop::Timeout);
         }
+        let exited = match child_exited_without_reaping(&child) {
+            Ok(exited) => exited,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                // An external reaper may have removed our PID reservation.
+                // Never signal that process group after ownership is lost.
+                owns_child = error.raw_os_error() != Some(libc::ECHILD);
+                wait_error = Some(error);
+                break;
+            }
+        };
         if stop.is_some() {
             drop(input_pump.take());
             kill_group(&child);
+            group_signalled = true;
             let _ = child.kill();
-            break child.wait();
+            break;
         }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if input_pump.take().is_some() {
-                    stop = Some(Stop::Io);
-                }
-                break Ok(status);
+        if exited {
+            if input_pump.take().is_some() {
+                stop = Some(Stop::Io);
             }
-            Ok(None) => {}
-            Err(error) => {
-                kill_group(&child);
-                let _ = child.kill();
-                let _ = child.wait();
-                break Err(error);
-            }
+            break;
         }
         if let Some(pump) = input_pump.as_mut() {
-            match pump.write_chunk(input_chunk) {
+            match pump.write_chunk(settings.input_chunk) {
                 InputProgress::Pending => {}
                 InputProgress::Complete => input_pump = None,
                 InputProgress::Failed => {
                     drop(input_pump.take());
                     stop = Some(Stop::Io);
                     kill_group(&child);
+                    group_signalled = true;
                     let _ = child.kill();
-                    break child.wait();
+                    break;
                 }
             }
         }
         thread::sleep(Duration::from_millis(5));
-    };
+    }
     done.store(true, Ordering::Release);
+    if let Some(gate) = settings.reader_gate {
+        gate.store(true, Ordering::Release);
+    }
     // Bounded receive also handles a broken trusted CLI retaining a pipe. Such a
     // capture cannot produce successful evidence. Docker/container cleanup is separate.
     let (stdout, out_ok) = receive(stdout);
     let (stderr, err_ok) = receive(stderr);
-    if !out_ok || !err_ok || status.is_err() {
+    if stop.is_none() {
+        if cancel.is_cancelled() {
+            stop = Some(Stop::Cancelled);
+        } else if overflow.load(Ordering::Acquire) {
+            stop = Some(Stop::Output);
+        } else if started.elapsed() >= timeout {
+            stop = Some(Stop::Timeout);
+        }
+    }
+    if !out_ok || !err_ok || wait_error.is_some() {
         stop = Some(Stop::Io);
-    } else if overflow.load(Ordering::Acquire) && stop.is_none() {
-        stop = Some(Stop::Output);
+    }
+    // Even after a fast normal exit, late reader overflow or incomplete drain
+    // must terminate descendants while the leader is still waitable. Reaping
+    // happens only after this final decision, so its PID cannot be reused.
+    if stop.is_some() && owns_child && !group_signalled {
+        kill_group(&child);
+        let _ = child.kill();
+    }
+    let status = if let Some(error) = wait_error {
+        if owns_child {
+            let _ = child.wait();
+        }
+        Err(error)
+    } else {
+        child.wait()
+    };
+    if status.is_err() {
+        stop = Some(Stop::Io);
     }
     Ok(Capture {
         code: status.ok().and_then(|status| status.code()),
@@ -229,6 +293,28 @@ fn capture_with_input_inner(
         stderr,
         stop,
     })
+}
+
+// Observe terminal status without consuming it. si_signo is a portable POSIX
+// siginfo field; no platform-specific child-pid union accessor is required.
+fn child_exited_without_reaping(child: &std::process::Child) -> std::io::Result<bool> {
+    // SAFETY: zero is a valid empty siginfo_t; waitid initializes it on an event.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: info is writable for the call. P_PID selects our live Child and
+    // WNOWAIT preserves its waitable status/PID reservation until Child::wait.
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id() as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(info.si_signo == libc::SIGCHLD)
+    }
 }
 
 /// Also kills what a child spawned with `process_group(0)` started (merge drivers,
@@ -249,12 +335,18 @@ fn reader(
     overflow: &Arc<AtomicBool>,
     done: &Arc<AtomicBool>,
     limit: u64,
+    gate: Option<Arc<AtomicBool>>,
 ) -> std::sync::mpsc::Receiver<(Vec<u8>, bool)> {
     let seen = Arc::clone(seen);
     let overflow = Arc::clone(overflow);
     let done = Arc::clone(done);
     let (send, receive) = std::sync::mpsc::sync_channel(1);
     thread::spawn(move || {
+        if let Some(gate) = gate {
+            while !gate.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
         let result = (|| {
             let mut retained = Vec::new();
             let mut buffer = [0u8; 4096];
@@ -350,7 +442,7 @@ mod tests {
             timeout,
             limit,
             cancel,
-            1,
+            CaptureSettings::new(1),
             |input_writer, input_reader| {
                 input_writer
                     .set_write_timeout(Some(Duration::from_secs(1)))
@@ -390,6 +482,52 @@ mod tests {
                 Err(error) => panic!("input reader cleanup failed: {error}"),
             }
         }
+    }
+
+    #[test]
+    fn fast_exit_overflow_terminates_descendants_before_reaping_the_leader() {
+        use std::os::unix::process::CommandExt;
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("late-write");
+        let mut command = Command::new("/usr/bin/python3");
+        command
+            .process_group(0)
+            .args([
+                "-c",
+                "import os,sys,time
+child=os.fork()
+if child == 0:
+ os.close(1); os.close(2); time.sleep(0.4)
+ open(sys.argv[1], 'w').write('late')
+ os._exit(0)
+os.write(1,b'x'*128)
+os._exit(0)
+",
+            ])
+            .arg(&marker);
+        let result = capture_with_input_inner(
+            &mut command,
+            None,
+            Duration::from_secs(2),
+            64,
+            &Cancellation::default(),
+            CaptureSettings {
+                input_chunk: INPUT_CHUNK,
+                reader_gate: Some(Arc::new(AtomicBool::new(false))),
+            },
+            |_, _| {},
+        )
+        .unwrap();
+        // Readers cannot sample overflow until the leader is known to have
+        // exited. The descendant closes both streams, so this is Output, not Io.
+        assert_eq!(result.code, Some(0));
+        assert_eq!(result.stop, Some(Stop::Output));
+        assert_eq!(result.stdout.len(), 64);
+        thread::sleep(Duration::from_millis(650));
+        assert!(
+            !marker.exists(),
+            "descendant survived a late overflow result"
+        );
     }
 
     #[test]
@@ -515,7 +653,7 @@ mod tests {
             Duration::from_secs(2),
             256,
             &Cancellation::default(),
-            1,
+            CaptureSettings::new(1),
             |input_writer, _| {
                 input_writer
                     .set_write_timeout(Some(Duration::from_secs(1)))
@@ -542,7 +680,7 @@ mod tests {
             Duration::from_millis(50),
             256,
             &Cancellation::default(),
-            INPUT_CHUNK,
+            CaptureSettings::new(INPUT_CHUNK),
             |input_writer, input_reader| {
                 accepted_filler = fill_input_socket_to_backpressure(input_writer);
                 let mut blocked_pump = InputPump {
@@ -632,7 +770,7 @@ mod tests {
             Duration::from_secs(2),
             256,
             &Cancellation::default(),
-            INPUT_CHUNK,
+            CaptureSettings::new(INPUT_CHUNK),
             |_, input_reader| retained_reader = Some(input_reader.try_clone().unwrap()),
         );
         assert_eq!(result.err().unwrap().kind(), std::io::ErrorKind::NotFound);

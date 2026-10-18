@@ -1062,3 +1062,385 @@ fn required_absolute_env(name: &str) -> PathBuf {
     assert!(path.is_absolute(), "{name} must be absolute");
     path
 }
+
+const FAKE_CLAUDE: &str = r##"#!/usr/bin/env python3
+import json, pathlib, sys
+if sys.argv[1:] == ['--version']:
+ print('2.1.300 (Claude Code)'); sys.exit(0)
+if sys.argv[1:] == ['auth','status']:
+ print(json.dumps({'loggedIn':True,'authMethod':'claude.ai'})); sys.exit(0)
+assert '--safe-mode' in sys.argv and '--restricted' in sys.argv
+assert sys.argv[sys.argv.index('--tools')+1] == ''
+body=json.load(sys.stdin)
+rows=body['supplied_rows']
+if not rows:
+ decision={'action':'request_rows','row_ids':[r['row_id'] for r in body['catalog']]}
+else:
+ findings=[]
+ for row in rows:
+  if 'unsafe_answer' in row['text']:
+   findings.append({'title':'Use the safe answer','detail':'The unsafe answer must be replaced before landing.','severity':'error','citations':[{'row_id':row['row_id'],'start_line':1,'end_line':1}]})
+ decision={'action':'finish','findings':findings,'unresolved':[]}
+print(json.dumps({'type':'result','subtype':'success','is_error':False,'num_turns':1,'session_id':'synthetic-review','usage':{'input_tokens':50,'output_tokens':30,'cache_creation_input_tokens':0,'cache_read_input_tokens':0},'modelUsage':{'claude-sonnet-fixture':{'inputTokens':50,'outputTokens':30}},'structured_output':decision}))
+"##;
+
+fn fake_claude(fixture: &Fixture) -> PathBuf {
+    let executable = fixture.root.path().join("fake-claude.py");
+    fs::write(&executable, FAKE_CLAUDE).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    executable
+}
+
+fn required_profile(fixture: &mut Fixture) -> agentscm::authority::workflows::WorkflowRequirement {
+    use agentscm::authority::workflows::WorkflowRequirement;
+    let definition = fixture.definition(vec![
+        fixture.command_step("tests", &[], true),
+        StepDefinition {
+            id: "review".into(),
+            needs: vec!["tests".into()],
+            required: true,
+            action: StepAction::ClaudeCodeReview {
+                paths: vec![SOURCE_PATH.into()],
+                model: "sonnet".into(),
+            },
+        },
+    ]);
+    let plan = compile(fixture.data_dir(), &definition).unwrap();
+    let requirement = WorkflowRequirement::from_plan("main", &plan).unwrap();
+    fixture
+        .authority()
+        .install_workflow_requirement(&requirement)
+        .unwrap();
+    let previous = fixture.context.change_version;
+    fixture.context.change_version += 1;
+    fixture.context.policy_epoch = fixture.authority().policy_epoch().unwrap();
+    fixture
+        .authority()
+        .update_change_context(previous, &fixture.context)
+        .unwrap();
+    requirement
+}
+
+async fn run_full_loop(
+    fixture: &Fixture,
+    requirement: &agentscm::authority::workflows::WorkflowRequirement,
+    run: &str,
+) -> agentscm::skill_workflow::RunView {
+    use agentscm::reviewer::ReviewCancellation;
+    use agentscm::skill_workflow::runtime::{ClaudeExecutor, advance_with_backends};
+    let executable = fake_claude(fixture);
+    let cwd = fixture.root.path().join(format!("claude-{run}"));
+    fs::create_dir(&cwd).unwrap();
+    private(&cwd);
+    let definition = requirement.instantiate(&fixture.context).unwrap();
+    let plan = compile(fixture.data_dir(), &definition).unwrap();
+    start(fixture.data_dir(), run, &plan).unwrap();
+    let cancellation = ReviewCancellation::default();
+    let claude = ClaudeExecutor {
+        executable: &executable,
+        work_dir: &cwd,
+        cancellation: &cancellation,
+    };
+    tokio::task::block_in_place(|| {
+        advance_with_backends(
+            fixture.data_dir(),
+            run,
+            32,
+            Some(&fixture.executor()),
+            Some(&claude),
+        )
+    })
+    .unwrap()
+}
+
+fn approval(fixture: &Fixture, id: &str) -> agentscm::model::Approval {
+    agentscm::model::Approval {
+        approval_id: id.into(),
+        target: "main".into(),
+        revision: fixture.context.revision.clone(),
+        context_digest: fixture.context.digest().unwrap(),
+        policy_epoch: fixture.context.policy_epoch,
+        change: Some(fixture.context.change.clone()),
+        change_version: Some(fixture.context.change_version),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn whole_workflow_gate_requires_current_tests_and_review_not_just_command_success() {
+    use agentscm::skill_workflow::runtime::finalize;
+    let mut fixture = Fixture::fake();
+    let requirement = required_profile(&mut fixture);
+    let view = run_full_loop(&fixture, &requirement, "full-pass").await;
+    assert_eq!(view.state, RunState::Succeeded, "{view:#?}");
+    assert_eq!(
+        view.steps[1].review.as_ref().unwrap().covered_paths,
+        vec![SOURCE_PATH]
+    );
+    // Individual command success alone is insufficient until full graph finalization.
+    assert!(
+        fixture
+            .authority()
+            .approve(&approval(&fixture, "too-early"))
+            .is_err()
+    );
+    let receipt = finalize(fixture.data_dir(), "full-pass", &fixture.context).unwrap();
+    assert_eq!(
+        receipt,
+        finalize(fixture.data_dir(), "full-pass", &fixture.context).unwrap()
+    );
+    fixture
+        .authority()
+        .approve(&approval(&fixture, "current"))
+        .unwrap();
+    let request = agentscm::model::IntegrateRequest {
+        operation_id: "land-current".into(),
+        target: "main".into(),
+        expected_target: None,
+        revision: fixture.context.revision.clone(),
+        approval_id: "current".into(),
+        context_digest: fixture.context.digest().unwrap(),
+        policy_epoch: fixture.context.policy_epoch,
+        change: Some(fixture.context.change.clone()),
+        change_version: Some(fixture.context.change_version),
+    };
+    let engine = Engine::open(fixture.data_dir()).unwrap();
+    fixture.authority().integrate(&engine, &request).unwrap();
+    assert_eq!(
+        fixture
+            .authority()
+            .target("main")
+            .unwrap()
+            .unwrap()
+            .revision,
+        fixture.revision
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observation_write_failure_stays_readable_without_replay_or_admission() {
+    use agentscm::reviewer::{ReviewCancellation, ReviewCompletion, ReviewRecord, ReviewStop};
+    use agentscm::skill_workflow::runtime::{ClaudeExecutor, advance_with_backends, finalize};
+
+    let mut fixture = Fixture::fake();
+    let requirement = required_profile(&mut fixture);
+    for cancel_first in [false, true] {
+        let run = if cancel_first {
+            "journal-cancel"
+        } else {
+            "journal-block"
+        };
+        assert_eq!(
+            run_full_loop(&fixture, &requirement, run).await.state,
+            RunState::Succeeded
+        );
+        let db = Connection::open(fixture.data_dir().join("skill-workflows/state.sqlite")).unwrap();
+        let bytes: Vec<u8> = db
+            .query_row(
+                "SELECT record_json FROM workflow_reviews WHERE run_id=?1 AND step_id='review'",
+                [run],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut record: ReviewRecord = serde_json::from_slice(&bytes).unwrap();
+        record.completion = ReviewCompletion::Incomplete;
+        record.stop = ReviewStop::Journal;
+        let call_index = record.calls.last().unwrap().reservation.call_index;
+        record.calls.last_mut().unwrap().journal_recorded = false;
+        let observation = serde_json::to_vec(&record.calls.last().unwrap().observation).unwrap();
+        let retain = |record: &ReviewRecord, observation: Option<&[u8]>| {
+            let bytes = serde_json::to_vec(record).unwrap();
+            db.execute("UPDATE workflow_reviews SET record_digest=?1,record_json=?2 WHERE run_id=?3 AND step_id='review'",
+                params![digest(&bytes), bytes, run]).unwrap();
+            db.execute("UPDATE workflow_review_calls SET observation_json=?1 WHERE run_id=?2 AND step_id='review' AND call_index=?3",
+                params![observation, run, call_index]).unwrap();
+        };
+        // Reproduce the durable state between retaining an incomplete controller
+        // record and finalizing the workflow step, without a timing-dependent lock.
+        retain(&record, None);
+        db.execute("UPDATE workflow_steps SET state='running',detail=NULL WHERE run_id=?1 AND step_id='review'", [run]).unwrap();
+        db.execute(
+            "UPDATE workflow_runs SET state='running' WHERE run_id=?1",
+            [run],
+        )
+        .unwrap();
+        let inspect = status(fixture.data_dir(), run).unwrap();
+        assert_eq!(inspect.steps[1].review.as_ref().unwrap().status, "blocked");
+        assert_eq!(
+            inspect.steps[1].review.as_ref().unwrap().stop.as_deref(),
+            Some("journal")
+        );
+
+        // Neither a false success claim nor mismatched retained observations
+        // can use the incomplete-record exception.
+        let mut invalid = record.clone();
+        invalid.calls.last_mut().unwrap().journal_recorded = true;
+        retain(&invalid, None);
+        assert!(status(fixture.data_dir(), run).is_err());
+        invalid = record.clone();
+        invalid.completion = ReviewCompletion::FinishedObservations;
+        invalid.stop = ReviewStop::ModelFinished;
+        retain(&invalid, Some(&observation));
+        assert!(status(fixture.data_dir(), run).is_err());
+        retain(&record, Some(b"{}"));
+        assert!(status(fixture.data_dir(), run).is_err());
+        retain(&record, Some(&observation));
+        assert!(status(fixture.data_dir(), run).is_ok());
+        retain(&record, None);
+
+        assert!(finalize(fixture.data_dir(), run, &fixture.context).is_err());
+        assert!(
+            fixture
+                .authority()
+                .approve(&approval(&fixture, "journal-approval"))
+                .is_err()
+        );
+        let cwd = fixture.root.path().join(format!("claude-{run}"));
+        let marker = cwd.join("unexpected-provider-call");
+        let executable = fixture.root.path().join("fake-claude.py");
+        fs::write(&executable, FAKE_CLAUDE.replace("body=json.load(sys.stdin)",
+            "pathlib.Path('unexpected-provider-call').write_text('unexpected')\nbody=json.load(sys.stdin)")).unwrap();
+        if cancel_first {
+            let cancelled = agentscm::skill_workflow::cancel(fixture.data_dir(), run).unwrap();
+            assert_eq!(cancelled.state, RunState::Cancelled);
+            assert_eq!(
+                cancelled.steps[1].review.as_ref().unwrap().status,
+                "cancelled"
+            );
+            assert_eq!(
+                cancelled.steps[1].review.as_ref().unwrap().stop.as_deref(),
+                Some("journal")
+            );
+        }
+        let cancellation = ReviewCancellation::default();
+        let claude = ClaudeExecutor {
+            executable: &executable,
+            work_dir: &cwd,
+            cancellation: &cancellation,
+        };
+        let after = tokio::task::block_in_place(|| {
+            advance_with_backends(fixture.data_dir(), run, 32, None, Some(&claude))
+        })
+        .unwrap();
+        assert_eq!(
+            after.state,
+            if cancel_first {
+                RunState::Cancelled
+            } else {
+                RunState::Blocked
+            }
+        );
+        assert_eq!(
+            after.steps[1].review.as_ref().unwrap().status,
+            if cancel_first { "cancelled" } else { "blocked" }
+        );
+        assert!(
+            !marker.exists(),
+            "an uncertain provider call must not be replayed"
+        );
+        assert!(status(fixture.data_dir(), run).is_ok());
+        assert!(agentscm::skill_workflow::cancel(fixture.data_dir(), run).is_ok());
+        assert!(finalize(fixture.data_dir(), run, &fixture.context).is_err());
+        assert!(
+            fixture
+                .authority()
+                .approve(&approval(&fixture, "journal-approval"))
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_failure_returns_findings_fix_needs_fresh_revision_and_context() {
+    use agentscm::skill_workflow::runtime::finalize;
+    let mut fixture = Fixture::fake();
+    let engine = Engine::open(fixture.data_dir()).unwrap();
+    fixture.revision = engine
+        .checkpoint(
+            Some(&fixture.revision),
+            &[put(SOURCE_PATH, b"unsafe_answer\n")],
+        )
+        .unwrap();
+    fixture.context.revision = fixture.revision.clone();
+    fixture.context.change_version += 1;
+    fixture
+        .authority()
+        .update_change_context(fixture.context.change_version - 1, &fixture.context)
+        .unwrap();
+    let requirement = required_profile(&mut fixture);
+    let failed = run_full_loop(&fixture, &requirement, "review-fail").await;
+    assert_eq!(failed.state, RunState::Failed, "{failed:#?}");
+    assert_eq!(
+        failed.steps[1].review.as_ref().unwrap().findings[0]
+            .path
+            .as_deref(),
+        Some(SOURCE_PATH)
+    );
+    assert!(finalize(fixture.data_dir(), "review-fail", &fixture.context).is_err());
+    assert!(
+        fixture
+            .authority()
+            .approve(&approval(&fixture, "failed"))
+            .is_err()
+    );
+    fixture.revision = engine
+        .checkpoint(Some(&fixture.revision), &[put(SOURCE_PATH, SOURCE_BYTES)])
+        .unwrap();
+    fixture.context.revision = fixture.revision.clone();
+    fixture.context.change_version += 1;
+    fixture
+        .authority()
+        .update_change_context(fixture.context.change_version - 1, &fixture.context)
+        .unwrap();
+    assert!(
+        fixture
+            .authority()
+            .approve(&approval(&fixture, "old-run"))
+            .is_err()
+    );
+    let passed = run_full_loop(&fixture, &requirement, "review-fixed").await;
+    assert_eq!(passed.state, RunState::Succeeded);
+    finalize(fixture.data_dir(), "review-fixed", &fixture.context).unwrap();
+    fixture
+        .authority()
+        .approve(&approval(&fixture, "fixed"))
+        .unwrap();
+    // A context-only change also invalidates the workflow receipt.
+    fixture.context.change_version += 1;
+    fixture.context.intent = "Updated acceptance intent".into();
+    fixture
+        .authority()
+        .update_change_context(fixture.context.change_version - 1, &fixture.context)
+        .unwrap();
+    assert!(
+        fixture
+            .authority()
+            .approve(&approval(&fixture, "stale-context"))
+            .is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn installed_requirement_cannot_be_dropped_from_candidate_context_or_weakened_graph() {
+    use agentscm::skill_workflow::runtime::finalize;
+    let mut fixture = Fixture::fake();
+    let requirement = required_profile(&mut fixture);
+    let mut weaker = requirement.instantiate(&fixture.context).unwrap();
+    weaker.steps.pop();
+    let plan = compile(fixture.data_dir(), &weaker).unwrap();
+    start(fixture.data_dir(), "weaker", &plan).unwrap();
+    advance_with_executor(fixture.data_dir(), "weaker", 32, &fixture.executor()).unwrap();
+    assert!(finalize(fixture.data_dir(), "weaker", &fixture.context).is_err());
+    fixture.context.change_version += 1;
+    fixture.context.required_capabilities = vec!["agentscm.review-context/v1".into()];
+    fixture.context.required_evidence.clear();
+    fixture
+        .authority()
+        .update_change_context(fixture.context.change_version - 1, &fixture.context)
+        .unwrap();
+    assert!(
+        fixture
+            .authority()
+            .approve(&approval(&fixture, "omitted-workflow"))
+            .is_err()
+    );
+}

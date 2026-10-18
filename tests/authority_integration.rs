@@ -709,7 +709,7 @@ fn rejects_unknown_schema_version() {
     drop(Authority::open(&path).expect("authority"));
     let connection = rusqlite::Connection::open(path.join("state.sqlite")).expect("database");
     connection
-        .pragma_update(None, "user_version", 7)
+        .pragma_update(None, "user_version", 8)
         .expect("version");
     drop(connection);
     assert!(
@@ -1149,7 +1149,7 @@ fn concurrent_initialization_has_one_winner() {
 }
 
 #[test]
-fn v3_database_migrates_to_v6_and_keeps_events_as_integrate() {
+fn v3_database_migrates_to_v7_and_keeps_events_as_integrate() {
     let temporary = TempDir::new().unwrap();
     let (engine, mut authority) = open_pair(temporary.path());
     let repository = authority.repository_id().unwrap();
@@ -1171,6 +1171,8 @@ fn v3_database_migrates_to_v6_and_keeps_events_as_integrate() {
              DROP INDEX command_success_subject;
              DROP TABLE command_evidence;
              DROP TABLE command_attempts;
+             DROP TABLE workflow_receipts;
+             DROP TABLE workflow_requirements;
              PRAGMA user_version = 3;",
         )
         .unwrap();
@@ -1181,7 +1183,7 @@ fn v3_database_migrates_to_v6_and_keeps_events_as_integrate() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     let insert = |operation_id: &str, kind: &str| {
         connection.execute(
             "INSERT INTO integration_events(operation_id, target, after_revision, after_version, approval_id, context_digest, policy_epoch, semantics_version, kind) VALUES (?1, 't', ?2, 1, 'base', ?2, 0, 2, ?3)",
@@ -1754,6 +1756,8 @@ fn v4_database_gains_command_check_tables() {
             "DROP INDEX command_success_subject;
              DROP TABLE command_evidence;
              DROP TABLE command_attempts;
+             DROP TABLE workflow_receipts;
+             DROP TABLE workflow_requirements;
              PRAGMA user_version = 4;",
         )
         .unwrap();
@@ -1763,7 +1767,7 @@ fn v4_database_gains_command_check_tables() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     let tables: i64 = connection
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE name IN ('command_attempts', 'command_evidence', 'command_success_subject')",
@@ -1784,6 +1788,8 @@ fn v5_database_gains_command_check_custody() {
     connection
         .execute_batch(
             "ALTER TABLE command_attempts DROP COLUMN custody_json;
+             DROP TABLE workflow_receipts;
+             DROP TABLE workflow_requirements;
              PRAGMA user_version = 5;",
         )
         .unwrap();
@@ -1793,7 +1799,7 @@ fn v5_database_gains_command_check_custody() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     connection
         .prepare("SELECT custody_json FROM command_attempts LIMIT 0")
         .unwrap();
@@ -1815,6 +1821,8 @@ fn v5_database_with_a_running_command_attempt_refuses_to_upgrade() {
                  environment_sha256, recipe_json, state, run_generation)
              VALUES ('v5-run', '{digest}', 'r', 'c', 1, '{digest}', '{digest}', '{digest}',
                  '{digest}', '{digest}', X'00', 'running', 1);
+             DROP TABLE workflow_receipts;
+             DROP TABLE workflow_requirements;
              PRAGMA user_version = 5;"
         ))
         .unwrap();

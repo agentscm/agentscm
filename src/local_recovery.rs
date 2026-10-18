@@ -887,6 +887,10 @@ fn validate_journal(
         Some(
             "SELECT base_revision FROM workspace_state UNION SELECT before_revision FROM operations UNION SELECT after_revision FROM operations WHERE after_revision IS NOT NULL UNION SELECT merge_left FROM operations WHERE merge_left IS NOT NULL UNION SELECT merge_revision FROM operations WHERE merge_revision IS NOT NULL",
         )
+    } else if kind == DbKind::SkillWorkflow {
+        Some(
+            "SELECT json_extract(CAST(definition_json AS TEXT), '$.source.revision') FROM workflow_runs",
+        )
     } else if kind == DbKind::Merge {
         crate::merge::validate_recovery(db, repository, source)?;
         None
@@ -932,6 +936,7 @@ enum DbKind {
     Workspace,
     Merge,
     Workflow,
+    SkillWorkflow,
     Export,
     GitReconcile,
     Issue,
@@ -949,10 +954,11 @@ fn validate_database(db: &Connection, kind: DbKind) -> Result<()> {
     let app: i64 = db.pragma_query_value(None, "application_id", |row| row.get(0))?;
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
     let supported = match kind {
-        DbKind::Authority => (app, version) == (0x4153_434d, 6),
+        DbKind::Authority => (app, version) == (0x4153_434d, 7),
         DbKind::Workspace => app == 0x4153_574b && matches!(version, 2 | 3),
         DbKind::Merge => (app, version) == (0x4147_4d47, 1),
         DbKind::Workflow => (app, version) == (0x4153_4746, 1),
+        DbKind::SkillWorkflow => app == 0x4153_5746 && matches!(version, 1 | 2),
         DbKind::Export => app == 1095190616 && matches!(version, 1 | 2),
         DbKind::GitReconcile => (app, version) == (0x4153_4752, 1),
         DbKind::Issue => return Ok(()),
@@ -965,6 +971,12 @@ fn validate_database(db: &Connection, kind: DbKind) -> Result<()> {
     // Match the export reader's required relations before preserving this as a
     // typed journal. Pragmas and physical integrity alone do not prove that the
     // declared schema can be opened after recovery.
+    if kind == DbKind::Authority {
+        crate::authority::validate_current_tables(db)?;
+    }
+    if kind == DbKind::SkillWorkflow {
+        crate::skill_workflow::runtime::validate_schema(db)?;
+    }
     if kind == DbKind::Export {
         db.prepare("SELECT sequence,record FROM exports LIMIT 0")?;
         if version == 2 {
@@ -1229,6 +1241,7 @@ fn database_paths(
             ("state.sqlite", DbKind::Authority),
             ("merges/state.sqlite", DbKind::Merge),
             ("workflow.sqlite", DbKind::Workflow),
+            ("skill-workflows/state.sqlite", DbKind::SkillWorkflow),
             ("git-reconcile.sqlite", DbKind::GitReconcile),
         ]
     } else if destination.starts_with("workspaces/") {
@@ -1251,7 +1264,10 @@ fn database_paths(
                 if e.kind() == std::io::ErrorKind::NotFound
                     && matches!(
                         *kind,
-                        DbKind::Merge | DbKind::Workflow | DbKind::GitReconcile
+                        DbKind::Merge
+                            | DbKind::Workflow
+                            | DbKind::SkillWorkflow
+                            | DbKind::GitReconcile
                     ) => {}
             Err(e) => return Err(e.into()),
         }

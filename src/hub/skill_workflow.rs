@@ -11,6 +11,7 @@ use super::store::validate_repository;
 use super::{HubError, Result};
 use crate::Error;
 use crate::authority::Authority;
+use crate::skill_workflow::runtime::RunSummary;
 use crate::skill_workflow_service::{self, SkillWorkflowProjection};
 use crate::store::Engine;
 
@@ -20,6 +21,7 @@ const ENVELOPE_VERSION: u32 = 1;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_BINDINGS: usize = 32;
 const MAX_DATA_DIR_BYTES: usize = 4096;
+const MAX_RECENT_RUNS: usize = 16;
 
 #[derive(Clone)]
 struct Binding {
@@ -68,6 +70,19 @@ pub struct SkillWorkflowEnvelope {
     pub reason: Option<&'static str>,
 }
 
+/// A bounded discovery result. Summaries contain no step output or timestamps.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SkillWorkflowListEnvelope {
+    pub version: u32,
+    pub availability: Availability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runs: Option<Vec<RunSummary>>,
+    pub next_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+}
+
 #[derive(Debug)]
 pub enum ReadError {
     InvalidRunId,
@@ -90,6 +105,28 @@ impl SkillWorkflowEnvelope {
             version: ENVELOPE_VERSION,
             availability: Availability::Unavailable,
             projection: None,
+            reason: Some(reason),
+        }
+    }
+}
+
+impl SkillWorkflowListEnvelope {
+    fn available(page: crate::skill_workflow::runtime::RunPage) -> Self {
+        Self {
+            version: ENVELOPE_VERSION,
+            availability: Availability::Available,
+            runs: Some(page.runs),
+            next_cursor: page.next_cursor,
+            reason: None,
+        }
+    }
+
+    fn unavailable(reason: &'static str) -> Self {
+        Self {
+            version: ENVELOPE_VERSION,
+            availability: Availability::Unavailable,
+            runs: None,
+            next_cursor: None,
             reason: Some(reason),
         }
     }
@@ -174,35 +211,10 @@ impl SkillWorkflowRegistry {
         run_id: &str,
     ) -> std::result::Result<SkillWorkflowEnvelope, ReadError> {
         skill_workflow_service::validate_run_id(run_id).map_err(|_| ReadError::InvalidRunId)?;
-        let Some(binding) = self.bindings.get(hub_repository) else {
-            return Ok(SkillWorkflowEnvelope::unavailable(
-                "native_workflow_not_configured",
-            ));
+        let (binding, _authority) = match self.current_binding(hub_repository) {
+            Ok(current) => current,
+            Err(reason) => return Ok(SkillWorkflowEnvelope::unavailable(reason)),
         };
-
-        // Hold the current authority open and confirm its identity before the journal read.
-        // A missing or replaced authority never permits a retained payload to be returned.
-        let authority = match Authority::open_read_only(&binding.data_dir) {
-            Ok(authority) => authority,
-            Err(_) => {
-                return Ok(SkillWorkflowEnvelope::unavailable(
-                    "native_workflow_binding_unavailable",
-                ));
-            }
-        };
-        let current_repository = match authority.repository_id() {
-            Ok(repository) => repository,
-            Err(_) => {
-                return Ok(SkillWorkflowEnvelope::unavailable(
-                    "native_workflow_binding_unavailable",
-                ));
-            }
-        };
-        if current_repository != binding.native_repository {
-            return Ok(SkillWorkflowEnvelope::unavailable(
-                "native_workflow_binding_replaced",
-            ));
-        }
 
         let projection = skill_workflow_service::read(&binding.data_dir, &binding.engine, run_id)
             .map_err(read_error)?;
@@ -213,28 +225,73 @@ impl SkillWorkflowRegistry {
         }
         // Reopen by configured path after projection so an observed database replacement cannot
         // turn into an available response. The local operator and filesystem remain trusted.
-        let current = match Authority::open_read_only(&binding.data_dir) {
-            Ok(authority) => authority,
-            Err(_) => {
-                return Ok(SkillWorkflowEnvelope::unavailable(
-                    "native_workflow_binding_unavailable",
-                ));
-            }
+        if let Err(reason) = binding.current() {
+            return Ok(SkillWorkflowEnvelope::unavailable(reason));
+        }
+        Ok(SkillWorkflowEnvelope::available(projection))
+    }
+
+    /// Lists recent runs only from the authenticated repository's operator binding.
+    pub fn list(
+        &self,
+        hub_repository: &str,
+    ) -> std::result::Result<SkillWorkflowListEnvelope, ReadError> {
+        self.page(hub_repository, None)
+    }
+
+    pub fn page(
+        &self,
+        hub_repository: &str,
+        before: Option<i64>,
+    ) -> std::result::Result<SkillWorkflowListEnvelope, ReadError> {
+        let (binding, _authority) = match self.current_binding(hub_repository) {
+            Ok(current) => current,
+            Err(reason) => return Ok(SkillWorkflowListEnvelope::unavailable(reason)),
         };
-        match current.repository_id() {
-            Ok(repository) if repository == binding.native_repository => {}
-            Ok(_) => {
-                return Ok(SkillWorkflowEnvelope::unavailable(
+        let page = skill_workflow_service::list_page(&binding.data_dir, MAX_RECENT_RUNS, before)
+            .map_err(read_error)?;
+        for run in &page.runs {
+            let definition =
+                crate::skill_workflow::runtime::retained_definition(&binding.data_dir, &run.run_id)
+                    .map_err(read_error)?;
+            if definition.source.repository != binding.native_repository {
+                return Ok(SkillWorkflowListEnvelope::unavailable(
                     "native_workflow_binding_replaced",
                 ));
             }
-            Err(_) => {
-                return Ok(SkillWorkflowEnvelope::unavailable(
-                    "native_workflow_binding_unavailable",
-                ));
-            }
         }
-        Ok(SkillWorkflowEnvelope::available(projection))
+        if let Err(reason) = binding.current() {
+            return Ok(SkillWorkflowListEnvelope::unavailable(reason));
+        }
+        Ok(SkillWorkflowListEnvelope::available(page))
+    }
+
+    fn current_binding(
+        &self,
+        hub_repository: &str,
+    ) -> std::result::Result<(&Binding, Authority), &'static str> {
+        let binding = self
+            .bindings
+            .get(hub_repository)
+            .ok_or("native_workflow_not_configured")?;
+        let authority = binding.open_current()?;
+        Ok((binding, authority))
+    }
+}
+
+impl Binding {
+    fn open_current(&self) -> std::result::Result<Authority, &'static str> {
+        let authority = Authority::open_read_only(&self.data_dir)
+            .map_err(|_| "native_workflow_binding_unavailable")?;
+        match authority.repository_id() {
+            Ok(repository) if repository == self.native_repository => Ok(authority),
+            Ok(_) => Err("native_workflow_binding_replaced"),
+            Err(_) => Err("native_workflow_binding_unavailable"),
+        }
+    }
+
+    fn current(&self) -> std::result::Result<(), &'static str> {
+        self.open_current().map(drop)
     }
 }
 

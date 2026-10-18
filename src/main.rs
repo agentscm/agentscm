@@ -56,6 +56,8 @@ mod setup;
 #[cfg(unix)]
 mod setup_cli;
 mod skill_workflow_cli;
+#[cfg(unix)]
+mod skill_workflow_loop;
 mod team_cli;
 #[cfg(unix)]
 mod workflow_cli;
@@ -600,7 +602,7 @@ async fn run(cli: Cli) -> Result<()> {
             let engine = Engine::open(&cli.data_dir)?;
             let mut authority = Authority::open(&cli.data_dir)?;
             let work_dir = private_execution_dir(&cli.data_dir)?;
-            let config = DockerConfig::create(&work_dir)?;
+            let config = PrivateExecutionDirectory::create(&work_dir)?;
             let backend = OciBackend::new(&docker, &docker_socket, &config.0)?;
             // The collector then kills and removes the container and the run finishes cancelled.
             let cancel = Cancellation::default();
@@ -877,18 +879,18 @@ fn private_execution_dir(data_dir: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// A fresh empty Docker configuration directory, removed on drop.
+/// A fresh empty private controller directory, removed on drop.
 #[cfg(unix)]
-struct DockerConfig(PathBuf);
+struct PrivateExecutionDirectory(PathBuf);
 
 #[cfg(unix)]
-impl DockerConfig {
+impl PrivateExecutionDirectory {
     fn create(work_dir: &Path) -> Result<Self> {
         let mut random = [0u8; 16];
         getrandom::fill(&mut random)
             .map_err(|error| Error::Invalid(format!("randomness unavailable: {error}")))?;
         let path = work_dir.join(format!(
-            "docker-config-{}",
+            "controller-{}",
             random
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
@@ -900,7 +902,7 @@ impl DockerConfig {
 }
 
 #[cfg(unix)]
-impl Drop for DockerConfig {
+impl Drop for PrivateExecutionDirectory {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
@@ -911,11 +913,11 @@ fn optional_backend(
     docker: Option<PathBuf>,
     socket: Option<PathBuf>,
     work_dir: &Path,
-) -> Result<Option<(DockerConfig, OciBackend)>> {
+) -> Result<Option<(PrivateExecutionDirectory, OciBackend)>> {
     docker
         .zip(socket)
         .map(|(docker, socket)| {
-            let config = DockerConfig::create(work_dir)?;
+            let config = PrivateExecutionDirectory::create(work_dir)?;
             let backend = OciBackend::new(&docker, &socket, &config.0)?;
             Ok((config, backend))
         })

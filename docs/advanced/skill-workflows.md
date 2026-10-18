@@ -49,21 +49,18 @@ launch an agent, install a package or execute a shell command.
 
 ## Agent hooks, execution and admission
 
-The current agent hooks coordinate file contention. They can warn about an overlapping edit or
-refuse its first attempt, depending on the agent. They do not select, launch or require a skill
-workflow. The MCP workflow tool reads status; it does not start, resume or cancel a run. The
-bundled [example skill](../../skills/native-workflow/SKILL.md) covers source-path checks only.
+The existing file-edit hooks coordinate contention and remain warn-once/fail-open. The optional
+[Claude Code Stop loop](claude-code-workflows.md) separately checkpoints source, runs isolated
+tests and bounded review, returns failure feedback, and records a current completion receipt.
+The MCP workflow tool reads status; it does not start, resume or cancel a run. The bundled
+[example skill](../../skills/native-workflow/SKILL.md) still covers source-path checks only.
 
-A command step uses the existing durable `command/v1` check collector. Native approval and
-integration already require successful matching evidence when a review context requests that
-check. There is no policy requiring every required step of a workflow graph to pass before
-integration: the run still reports `admission: "not_assessed"`.
-
-Automatic lifecycle triggers, authenticated execution tools, agent/provider adapters and a skill
-catalog installer are planned. They are not enabled by installing the hook. Any future required
-workflow gate must be checked at the controlled landing or publication boundary; an advisory
-hook or an instruction to the agent is not enforcement. File edits would invalidate results for
-older source rather than silently treating them as checks of new bytes.
+Individual command evidence satisfies a requesting command context. An operator-installed
+native target workflow requirement additionally requires every required step to pass, including
+review, before approval or landing. This is checked in the authority transaction. A standalone
+run remains an observation with `admission: "not_assessed"`; it is never an approval itself.
+Catalog installation, other agent adapters and authenticated remote execution controls remain
+planned. The native gate does not protect arbitrary Git or forge merge operations.
 
 ## Definition
 
@@ -203,7 +200,8 @@ the same as the underlying [`command/v1` collector](execution.md).
 The JSON status includes `admission: "not_assessed"`. A successful workflow means only that its
 implemented steps reached their declared success conditions. It does not approve, integrate,
 merge, deploy or authorize the revision. The local owner, controller and Docker daemon remain
-trusted, and this profile does not join hub or native authority domains.
+trusted. The optional required-target loop revalidates the graph and copies an exact-subject
+receipt into native authority; read-only hub projections do not grant authority.
 
 The compiler rejects more than 63 explicitly selected resources before source access; the automatic
 `SKILL.md` makes 64 package entries. Relative package paths are limited to 512 bytes.
@@ -246,6 +244,6 @@ selected Docker executable, socket and pre-acquired immutable image. The existin
 [execution qualification](execution.md#qualification) covers the collector's tested isolation and
 cleanup controls for its selected runtime.
 
-These tests do not exercise a live coding agent completing a full edit, workflow, fix and landing
-loop. There is no end-to-end qualification of online model review, catalog installation, workflow
-admission or deployment.
+The [Claude Code loop](claude-code-workflows.md) adds targeted failure/fix and native admission
+tests. Fixture protocols alone do not qualify a live model or hostile execution. Catalog
+installation, other agent adapters and deployment are not qualified by this profile.

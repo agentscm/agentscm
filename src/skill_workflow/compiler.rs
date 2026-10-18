@@ -28,6 +28,9 @@ const MAX_STEPS: usize = 32;
 const MAX_DEPENDENCIES: usize = 32;
 const MAX_EXPECTATIONS: usize = 32;
 const MAX_IDENTIFIER_BYTES: usize = 64;
+const MAX_CLAUDE_REVIEW_SKILL_BYTES: usize = 4_096;
+const MAX_CLAUDE_REVIEW_SOURCE_BYTES: usize = crate::reviewer::MAX_ROW_BYTES;
+const MAX_CLAUDE_REVIEW_AGGREGATE_BYTES: usize = 64 * 1024;
 const MAX_SKILL_COMPILATION_READ_BYTES: u64 = (MAX_SKILL_RESOURCE_BYTES as u64) * 16;
 
 /// A validated workflow plan bound to an immutable skill bundle.
@@ -79,6 +82,19 @@ struct CanonicalPlan<'a> {
 pub fn compile(data_dir: &Path, definition: &WorkflowDefinition) -> Result<CompiledPlan> {
     validate_definition_size(definition)?;
     let ordered_steps = validate_definition(definition)?;
+    if definition
+        .steps
+        .iter()
+        .any(|step| matches!(step.action, StepAction::ClaudeCodeReview { .. }))
+        && !definition
+            .steps
+            .iter()
+            .any(|step| matches!(step.action, StepAction::Command { .. }))
+    {
+        return Err(Error::Invalid(
+            "Claude review requires an exact command review context".into(),
+        ));
+    }
 
     // Open authority first so a nonexistent or incomplete root is not created by
     // the engine. Both handles are then rooted in the same operator-selected path.
@@ -88,8 +104,11 @@ pub fn compile(data_dir: &Path, definition: &WorkflowDefinition) -> Result<Compi
     let (source, budget) = engine.with_read_budget(MAX_SKILL_COMPILATION_READ_BYTES);
     let bundle = budget.finish((|| {
         source.load_revision(&definition.source.revision)?;
-        resolve_skill(&source, definition)
+        let bundle = resolve_skill(&source, definition)?;
+        validate_claude_review_sources(&source, definition)?;
+        Ok(bundle)
     })())?;
+    validate_claude_review_skill(definition, &bundle)?;
     #[cfg(unix)]
     let command_recipes = compile_command_recipes(&authority, definition, &bundle)?;
     validate_authority(&authority, definition)?;
@@ -115,6 +134,36 @@ pub fn verify_current(data_dir: &Path, plan: &CompiledPlan) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Preflight immutable source and structural inputs before updating a Change.
+/// This does not create an executable plan or authorize a model call.
+pub fn validate_sources(data_dir: &Path, definition: &WorkflowDefinition) -> Result<()> {
+    validate_definition_size(definition)?;
+    validate_definition(definition)?;
+    let engine = Engine::open(data_dir)?;
+    let (source, budget) = engine.with_read_budget(MAX_SKILL_COMPILATION_READ_BYTES);
+    let bundle = budget.finish((|| {
+        source.load_revision(&definition.source.revision)?;
+        let bundle = resolve_skill(&source, definition)?;
+        validate_claude_review_sources(&source, definition)?;
+        Ok(bundle)
+    })())?;
+    validate_claude_review_skill(definition, &bundle)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+pub fn read_command_recipe(data_dir: &Path, revision: &str, path: &str) -> Result<CommandRecipe> {
+    validate_path(path)?;
+    let engine = Engine::open(data_dir)?;
+    let (source, budget) = engine.with_read_budget(2 * 1024 * 1024);
+    let bytes = budget
+        .finish(source.read_regular_file_bounded(revision, path, 256 * 1024))?
+        .ok_or_else(|| Error::Limit("command recipe exceeds 256 KiB".into()))?;
+    let recipe: CommandRecipe = serde_json::from_slice(&bytes)?;
+    recipe.validate()?;
+    Ok(recipe)
 }
 
 /// Validates retained structure and identity without requiring current applicability.
@@ -259,6 +308,26 @@ fn validate_step(step: &StepDefinition) -> Result<()> {
         StepAction::RequireCapability { capability } => {
             validate_identifier("required capability", capability)?;
         }
+        StepAction::ClaudeCodeReview { paths, model } => {
+            if paths.is_empty() || paths.len() > 32 {
+                return Err(Error::Limit(
+                    "Claude review requires 1..32 explicit source paths".into(),
+                ));
+            }
+            let mut unique = HashSet::new();
+            for path in paths {
+                validate_path(path)?;
+                if !unique.insert(path) {
+                    return Err(Error::Invalid("duplicate Claude review source path".into()));
+                }
+            }
+            #[cfg(unix)]
+            crate::reviewer::validate_requested_model_selector(model)?;
+            #[cfg(not(unix))]
+            return Err(Error::Invalid(
+                "Claude review is unsupported on this platform".into(),
+            ));
+        }
         StepAction::Command {
             runner,
             change,
@@ -394,6 +463,75 @@ fn resolve_skill(engine: &Engine, definition: &WorkflowDefinition) -> Result<Ski
         )?);
     }
     SkillBundle::new(resources)
+}
+
+fn validate_claude_review_skill(
+    definition: &WorkflowDefinition,
+    bundle: &SkillBundle,
+) -> Result<()> {
+    if !definition
+        .steps
+        .iter()
+        .any(|step| matches!(step.action, StepAction::ClaudeCodeReview { .. }))
+    {
+        return Ok(());
+    }
+    let bytes = bundle
+        .resource("SKILL.md")
+        .ok_or_else(|| Error::Invalid("Claude review SKILL.md is missing".into()))?;
+    if bytes.len() > MAX_CLAUDE_REVIEW_SKILL_BYTES {
+        return Err(Error::Limit(format!(
+            "Claude review SKILL.md exceeds {MAX_CLAUDE_REVIEW_SKILL_BYTES} bytes"
+        )));
+    }
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| Error::Invalid("Claude review SKILL.md must be UTF-8".into()))?;
+    if text.trim().is_empty() {
+        return Err(Error::Invalid(
+            "Claude review SKILL.md must contain review instructions".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_claude_review_sources(engine: &Engine, definition: &WorkflowDefinition) -> Result<()> {
+    for step in &definition.steps {
+        let StepAction::ClaudeCodeReview { paths, .. } = &step.action else {
+            continue;
+        };
+        let mut aggregate_bytes = 0usize;
+        for path in paths {
+            let bytes = engine
+                .read_regular_file_bounded(
+                    &definition.source.revision,
+                    path,
+                    MAX_CLAUDE_REVIEW_SOURCE_BYTES,
+                )?
+                .ok_or_else(|| {
+                    Error::Limit(format!(
+                        "Claude review source {path} exceeds {MAX_CLAUDE_REVIEW_SOURCE_BYTES} bytes"
+                    ))
+                })?;
+            let text = std::str::from_utf8(&bytes).map_err(|_| {
+                Error::Invalid(format!("Claude review source {path} must be UTF-8"))
+            })?;
+            let lines = text.lines().count();
+            if lines == 0 || lines > 16_384 {
+                return Err(Error::Limit(format!(
+                    "Claude review source {path} has unsupported line count"
+                )));
+            }
+            aggregate_bytes = aggregate_bytes.checked_add(bytes.len()).ok_or_else(|| {
+                Error::Limit("Claude review source aggregate size overflowed".into())
+            })?;
+            if aggregate_bytes > MAX_CLAUDE_REVIEW_AGGREGATE_BYTES {
+                return Err(Error::Limit(format!(
+                    "Claude review source exceeds the {MAX_CLAUDE_REVIEW_AGGREGATE_BYTES} byte aggregate profile"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -887,6 +1025,226 @@ mod tests {
             r#"{"kind":"require_capability","capability":"model","extra":true}"#,
         );
         assert!(action.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_review_skill_profile_is_preflighted_by_compile_and_source_validation() {
+        for (skill, expect_limit) in [
+            (b" \n\t".to_vec(), false),
+            (vec![0xff], false),
+            (vec![b'x'; MAX_CLAUDE_REVIEW_SKILL_BYTES + 1], true),
+        ] {
+            let (root, mut definition, recipe) = command_fixture();
+            definition.steps.push(StepDefinition {
+                id: "review".into(),
+                needs: vec!["run".into()],
+                required: true,
+                action: StepAction::ClaudeCodeReview {
+                    paths: vec!["src/lib.rs".into()],
+                    model: "sonnet".into(),
+                },
+            });
+            let engine = Engine::open(root.path()).unwrap();
+            definition.source.revision = engine
+                .checkpoint_entries(
+                    None,
+                    &[
+                        EntryChange {
+                            path: "skills/a/SKILL.md".into(),
+                            content: Some(skill),
+                            kind: EntryKind::Regular,
+                        },
+                        EntryChange {
+                            path: "skills/a/runner.json".into(),
+                            content: Some(serde_json::to_vec(&recipe).unwrap()),
+                            kind: EntryKind::Regular,
+                        },
+                        EntryChange {
+                            path: "src/lib.rs".into(),
+                            content: Some(b"fn example() {}\n".to_vec()),
+                            kind: EntryKind::Regular,
+                        },
+                    ],
+                )
+                .unwrap();
+            drop(engine);
+
+            for error in [
+                compile(root.path(), &definition).unwrap_err(),
+                validate_sources(root.path(), &definition).unwrap_err(),
+            ] {
+                match (expect_limit, error) {
+                    (true, Error::Limit(message)) | (false, Error::Invalid(message)) => {
+                        assert!(message.contains("Claude review SKILL.md"));
+                    }
+                    (_, other) => panic!("unexpected Claude review skill error: {other}"),
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_review_source_profile_is_preflighted_by_compile_and_source_validation() {
+        let cases = [
+            (
+                "missing",
+                Vec::<EntryChange>::new(),
+                vec!["src/missing.rs".to_owned()],
+                "src/missing.rs",
+            ),
+            (
+                "empty",
+                vec![EntryChange {
+                    path: "src/review.rs".into(),
+                    content: Some(Vec::new()),
+                    kind: EntryKind::Regular,
+                }],
+                vec!["src/review.rs".to_owned()],
+                "unsupported line count",
+            ),
+            (
+                "non-utf8",
+                vec![EntryChange {
+                    path: "src/review.rs".into(),
+                    content: Some(vec![0xff]),
+                    kind: EntryKind::Regular,
+                }],
+                vec!["src/review.rs".to_owned()],
+                "must be UTF-8",
+            ),
+            (
+                "oversized",
+                vec![EntryChange {
+                    path: "src/review.rs".into(),
+                    content: Some(vec![b'x'; MAX_CLAUDE_REVIEW_SOURCE_BYTES + 1]),
+                    kind: EntryKind::Regular,
+                }],
+                vec!["src/review.rs".to_owned()],
+                "exceeds",
+            ),
+            (
+                "non-regular",
+                vec![EntryChange {
+                    path: "src/review.rs".into(),
+                    content: Some(b"target".to_vec()),
+                    kind: EntryKind::Symlink,
+                }],
+                vec!["src/review.rs".to_owned()],
+                "regular",
+            ),
+        ];
+
+        for (label, review_entries, paths, expected) in cases {
+            let (root, mut definition, recipe) = command_fixture();
+            definition.steps.push(StepDefinition {
+                id: "review".into(),
+                needs: vec!["run".into()],
+                required: true,
+                action: StepAction::ClaudeCodeReview {
+                    paths,
+                    model: "sonnet".into(),
+                },
+            });
+            let engine = Engine::open(root.path()).unwrap();
+            let mut entries = vec![
+                EntryChange {
+                    path: "skills/a/SKILL.md".into(),
+                    content: Some(b"# Review skill\n".to_vec()),
+                    kind: EntryKind::Regular,
+                },
+                EntryChange {
+                    path: "skills/a/runner.json".into(),
+                    content: Some(serde_json::to_vec(&recipe).unwrap()),
+                    kind: EntryKind::Regular,
+                },
+            ];
+            entries.extend(review_entries);
+            definition.source.revision = engine.checkpoint_entries(None, &entries).unwrap();
+            drop(engine);
+
+            for error in [
+                compile(root.path(), &definition).unwrap_err(),
+                validate_sources(root.path(), &definition).unwrap_err(),
+            ] {
+                assert!(
+                    error.to_string().contains(expected),
+                    "{label} preflight returned unexpected error: {error}"
+                );
+            }
+        }
+
+        let (root, mut definition, recipe) = command_fixture();
+        let mut paths = Vec::new();
+        let mut entries = vec![
+            EntryChange {
+                path: "skills/a/SKILL.md".into(),
+                content: Some(b"# Review skill\n".to_vec()),
+                kind: EntryKind::Regular,
+            },
+            EntryChange {
+                path: "skills/a/runner.json".into(),
+                content: Some(serde_json::to_vec(&recipe).unwrap()),
+                kind: EntryKind::Regular,
+            },
+        ];
+        for index in 0..5 {
+            let path = format!("src/review-{index}.rs");
+            paths.push(path.clone());
+            entries.push(EntryChange {
+                path,
+                content: Some(vec![b'x'; 14_000]),
+                kind: EntryKind::Regular,
+            });
+        }
+        definition.steps.push(StepDefinition {
+            id: "review".into(),
+            needs: vec!["run".into()],
+            required: true,
+            action: StepAction::ClaudeCodeReview {
+                paths,
+                model: "sonnet".into(),
+            },
+        });
+        let engine = Engine::open(root.path()).unwrap();
+        definition.source.revision = engine.checkpoint_entries(None, &entries).unwrap();
+        drop(engine);
+        for error in [
+            compile(root.path(), &definition).unwrap_err(),
+            validate_sources(root.path(), &definition).unwrap_err(),
+        ] {
+            assert!(
+                error.to_string().contains("aggregate profile"),
+                "aggregate preflight returned unexpected error: {error}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_review_rejects_unsupported_model_before_source_access() {
+        let (root, mut definition, _) = command_fixture();
+        definition.steps.push(StepDefinition {
+            id: "review".into(),
+            needs: vec!["run".into()],
+            required: true,
+            action: StepAction::ClaudeCodeReview {
+                paths: vec!["src/lib.rs".into()],
+                model: "latest".into(),
+            },
+        });
+        definition.source.revision = "0".repeat(64);
+
+        for error in [
+            compile(root.path(), &definition).unwrap_err(),
+            validate_sources(root.path(), &definition).unwrap_err(),
+        ] {
+            assert!(
+                error.to_string().contains("Claude review model"),
+                "unsupported model returned unexpected error: {error}"
+            );
+        }
     }
 
     #[cfg(unix)]

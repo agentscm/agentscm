@@ -62,4 +62,11 @@ pub enum StepAction {
         change_version: u64,
         context_digest: String,
     },
+    /// Assess explicit native source paths using the pinned skill instructions.
+    /// The Claude executable and subscription are selected by the operator,
+    /// outside candidate source. The model has no tools or landing authority.
+    ClaudeCodeReview {
+        paths: Vec<String>,
+        model: String,
+    },
 }
