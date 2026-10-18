@@ -109,6 +109,7 @@ impl Fixture {
         let owner = browser_actor(&root, &workspace, &*store, &identity);
         let config = ExecutionConfig {
             version: 1,
+            source_profiles: vec![],
             profiles: vec![ExecutionProfile {
                 repository_id: REPO.into(),
                 profile_id: "checks".into(),

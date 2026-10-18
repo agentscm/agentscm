@@ -40,6 +40,15 @@ pub enum SkillWorkflowCommand {
     /// Opt-in Claude Code Stop hook. Native landing is independently enforced by the authority.
     #[cfg(unix)]
     ClaudeStop(crate::skill_workflow_loop::LoopArgs),
+    /// Create an empty laptop workspace from an operator-enabled hosted source profile.
+    #[cfg(unix)]
+    RemoteInit(crate::hosted_workflow_client::HostedWorkflowArgs),
+    /// Synchronize local bytes and run the exact hosted workflow without approving or landing.
+    #[cfg(unix)]
+    RemoteCheck(crate::hosted_workflow_client::HostedWorkflowArgs),
+    /// Opt-in Claude Code Stop hook using the hosted source and workflow queue.
+    #[cfg(unix)]
+    RemoteStop(crate::hosted_workflow_client::HostedWorkflowArgs),
     /// Validate and pin a workflow against an existing native source revision.
     Plan {
         /// JSON definition, or - for standard input.
@@ -96,7 +105,7 @@ pub enum SkillWorkflowCommand {
     },
 }
 
-pub fn run(data_dir: &Path, command: SkillWorkflowCommand) -> Result<()> {
+pub async fn run(data_dir: &Path, command: SkillWorkflowCommand) -> Result<()> {
     match command {
         #[cfg(unix)]
         SkillWorkflowCommand::Configure {
@@ -134,6 +143,35 @@ pub fn run(data_dir: &Path, command: SkillWorkflowCommand) -> Result<()> {
         #[cfg(unix)]
         SkillWorkflowCommand::ClaudeStop(args) => {
             crate::skill_workflow_loop::claude_stop(data_dir, args)
+        }
+        #[cfg(unix)]
+        SkillWorkflowCommand::RemoteInit(args) => {
+            let value = crate::hosted_workflow_client::initialize(data_dir, &args).await?;
+            crate::print_json(&value);
+            Ok(())
+        }
+        #[cfg(unix)]
+        SkillWorkflowCommand::RemoteCheck(args) => {
+            let value = crate::hosted_workflow_client::check(data_dir, &args).await?;
+            let passed = value
+                .get("receipt")
+                .is_some_and(serde_json::Value::is_string)
+                && value
+                    .get("workspace_changed_during_run")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(false);
+            crate::print_json(&value);
+            if passed {
+                Ok(())
+            } else {
+                Err(Error::Invalid(
+                    "the hosted workflow did not qualify the current laptop bytes".into(),
+                ))
+            }
+        }
+        #[cfg(unix)]
+        SkillWorkflowCommand::RemoteStop(args) => {
+            crate::hosted_workflow_client::claude_stop(data_dir, args).await
         }
         SkillWorkflowCommand::Plan { input } => {
             let definition = read_definition(&input)?;

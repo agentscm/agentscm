@@ -14,6 +14,8 @@ AgentSCM also contains an immutable ledger for exact revisions, their review con
 - [Claude Code workflow loop](claude-code-workflows.md): an opt-in local Stop trigger, tests/review, failure feedback and exact-current native landing requirements. Existing edit hooks remain contention-only.
 - [Community workspace pilot](community-workspace.md): persistent members/settings, independent roles, shared execution and explicit approval/native landing on one server. The legacy token dashboard and MCP remain inspection-only.
 
+- [Laptop-to-hosted workflows](hosted-laptop-workflows.md): bounded source/context exchange and a remote Claude Code Stop hook under installed server policy.
+
 ## Git bridges (shadow workflow)
 
 Capture a Git commit, work and land natively, reconcile with Git and export to a local mirror you own. Explicit local-bare remote exchange is a separate opt-in command.
