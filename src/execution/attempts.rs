@@ -200,6 +200,19 @@ pub(crate) fn run_command_attempt(
             &attempt.subject.context_digest,
             &attempt.subject.revision,
         )?;
+        // Compilation and attempt creation may precede a policy revocation.
+        // Compare inside the claim transaction so a revoked context cannot
+        // authorize a new execution after that revocation commits.
+        let policy: i64 = tx.query_row(
+            "SELECT policy_epoch FROM authority_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if sql_u64("policy epoch", policy)? != context.policy_epoch {
+            return Err(Error::Conflict(
+                "command review context no longer matches the current policy epoch".into(),
+            ));
+        }
         if subject_from_context(&context, &recipe)? != attempt.subject {
             return Err(Error::Conflict(
                 "command subject no longer matches the current review context".to_owned(),

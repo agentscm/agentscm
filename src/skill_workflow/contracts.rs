@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::checks::SourcePathExpectation;
+use crate::context::ChangeId;
 
 /// A complete workflow declaration supplied by a trusted local controller.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -51,5 +52,14 @@ pub enum StepAction {
     },
     RequireCapability {
         capability: String,
+    },
+    /// Run an explicitly selected packaged command through an existing
+    /// `command/v1` review context. `runner` is a relative skill-resource
+    /// path; `SKILL.md` prose is never interpreted as an executable recipe.
+    Command {
+        runner: String,
+        change: ChangeId,
+        change_version: u64,
+        context_digest: String,
     },
 }

@@ -4,16 +4,22 @@
 > schema and storage may change without migration. It runs against an existing native AgentSCM
 > data directory owned by the local operator.
 
-A skill workflow binds a small directed graph of built-in checks to one immutable native source
-revision and one packaged `SKILL.md`. The package may include explicitly named resources below
-the skill directory. AgentSCM preserves those bytes and includes their identity in the compiled
-plan; it does not interpret the skill prose as authority or as a successful check result.
+A skill workflow binds a small directed graph of checks to one immutable native source revision
+and one packaged `SKILL.md`. The package may include explicitly named resources below the skill
+directory. AgentSCM preserves those bytes and includes their identity in the compiled plan; it
+does not interpret the skill prose as authority, shell text or a successful check result.
 
-The initial profile implements one executable action: `source_paths`. It reads exact files from
-the selected native revision and compares their bytes with declared lowercase SHA-256 digests.
-This establishes source identity for those paths. It does not execute the source or demonstrate
-application behavior, permissions, deployment safety, model review, command isolation, hosted
-execution, or user-interface behavior.
+The profile implements `source_paths` and, on Unix, `command`. `source_paths` reads exact files
+from the selected native revision and compares their bytes with declared lowercase SHA-256
+digests. This establishes source identity for those paths. It does not execute the source or
+demonstrate application behavior.
+
+A `command` action names a strict `CommandRecipe` JSON resource packaged beside `SKILL.md`. The
+compiler loads that exact resource from the immutable revision and requires a real, existing,
+current Change and `command/v1` ReviewContext that bind the same revision, policy epoch, recipe,
+toolchain and environment. The runtime creates a deterministic durable command attempt and sends
+it through the existing isolated OCI collector. It does not derive a command from skill prose,
+install packages, run `npx`, fetch an image, expose model-provider keys or enable network egress.
 
 `require_capability` records an operation the profile cannot perform. A required unavailable
 capability blocks the run. An optional unavailable capability remains visible as an omission and
@@ -62,6 +68,42 @@ The entrypoint must end in the exact filename `SKILL.md`. Resource paths must be
 within its parent directory. The entrypoint is included automatically. AgentSCM reads every
 declared skill file from the immutable revision, so it does not follow host filesystem paths.
 
+For a command step, declare the recipe using its full native source path in `skill.resources`,
+then use its path relative to the skill directory as `action.runner`. For example, a package with
+`skills/native-workflow/SKILL.md` and `skills/native-workflow/runner.json` uses:
+
+```json
+{
+  "skill": {
+    "entrypoint": "skills/native-workflow/SKILL.md",
+    "resources": ["skills/native-workflow/runner.json"]
+  },
+  "steps": [
+    {
+      "id": "run-command",
+      "needs": [],
+      "required": true,
+      "action": {
+        "kind": "command",
+        "runner": "runner.json",
+        "change": {
+          "repository": "0123456789abcdef0123456789abcdef",
+          "id": "change-1"
+        },
+        "change_version": 1,
+        "context_digest": "0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    }
+  ]
+}
+```
+
+Those `skill` and `steps` members belong inside the complete definition shown above. Replace all
+placeholder identities with the current values from the same native data directory. Prepare the
+strict recipe and ReviewContext as described in [isolated command execution](execution.md) and
+[review contexts](review-context.md). One ReviewContext has one recipe binding; a workflow that
+needs a different command recipe needs a separately bound current context.
+
 Workflows contain 1 to 32 steps. Each step may name at most 32 dependencies, and a
 `source_paths` action contains 1 to 32 expectations with an 8 MiB aggregate file-content limit and a separate 16 MiB encoded-object read ceiling. Step and
 workflow identifiers are bounded canonical ASCII. Dependencies must exist, be unique and form an
@@ -88,10 +130,41 @@ Run IDs are idempotency keys. Reusing an ID with the same plan returns retained 
 for a different plan is a conflict. Each completed step is persisted, so reopening the local data
 directory preserves progress. Cancellation is terminal and leaves recorded observations intact.
 
+Source-only workflows use the commands above unchanged. A workflow that can reach a `command`
+step requires both trusted runtime flags on `run` and `resume`:
+
+```sh
+agentscm --data-dir ./agentscm-data skill-workflow run local-run-1 workflow.json \
+  --docker /usr/local/bin/docker --docker-socket /var/run/docker.sock
+agentscm --data-dir ./agentscm-data skill-workflow resume local-run-1 --max-steps 1 \
+  --docker /usr/local/bin/docker --docker-socket /var/run/docker.sock
+```
+
+The flags are accepted only as a pair. Command execution is unavailable on non-Unix platforms;
+source-only workflows remain portable. `SIGINT` and `SIGTERM` request collector cancellation and
+cleanup. A process crash can still leave a running durable attempt. `status` exposes the command
+attempt ID, generation, state, outcome and record digest under the step's `execution` member;
+inspect its full record with the existing command-check CLI:
+
+```sh
+agentscm --data-dir ./agentscm-data check-command-show ATTEMPT_ID
+agentscm --data-dir ./agentscm-data skill-workflow cancel local-run-1 \
+  --docker /usr/local/bin/docker --docker-socket /var/run/docker.sock
+agentscm --data-dir ./agentscm-data skill-workflow recover local-run-1 run-command \
+  --docker /usr/local/bin/docker --docker-socket /var/run/docker.sock
+```
+
+Use `recover` only for an interrupted command step; its backend flags are required. Recovery
+reconciles the retained container custody before finalizing the attempt and does not rerun the
+command. While a command runs, other controllers can inspect its status. Cancellation and recovery
+hold the workflow journal lease while reconciling container cleanup; concurrent journal operations
+may return `workflow journal is active` during that bounded operation. Cancellation can omit the flags only when no command attempt is running. All command limits, isolation checks, cancellation behavior and recovery uncertainty are
+the same as the underlying [`command/v1` collector](execution.md).
+
 The JSON status includes `admission: "not_assessed"`. A successful workflow means only that its
-implemented source checks matched. It does not approve, integrate, merge, deploy or authorize the
-revision. The local owner and controller remain trusted, and this profile does not join hub or
-native authority domains.
+implemented steps reached their declared success conditions. It does not approve, integrate,
+merge, deploy or authorize the revision. The local owner, controller and Docker daemon remain
+trusted, and this profile does not join hub or native authority domains.
 
 The compiler rejects more than 63 explicitly selected resources before source access; the automatic
 `SKILL.md` makes 64 package entries. Relative package paths are limited to 512 bytes.

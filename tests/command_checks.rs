@@ -1,5 +1,8 @@
 #![cfg(unix)]
 
+#[path = "command_checks/skill_workflows.rs"]
+mod skill_workflows;
+
 #[path = "common/fake_docker.rs"]
 mod fake_docker;
 
