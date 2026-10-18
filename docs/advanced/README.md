@@ -10,7 +10,7 @@ AgentSCM also contains an immutable ledger for exact revisions, their review con
 - [Checks](checks.md), [evidence](evidence.md), the [portable evidence verifier](evidence-verifier.md) and [installed policy](policy.md)
 - [Workspaces](workspace.md), [merge sessions](merge.md), [offline sync](sync.md), [source history](source-history.md) and the [source reader](source-reader.md)
 - [Native CLI reference](../reference/cli.md)
-- [Source-bound skill workflows](skill-workflows.md): compile a bounded local check graph against an immutable revision and packaged skill; inspect, resume or cancel its recorded run
+- [Source-bound skill workflows](skill-workflows.md): run exact-file checks and explicit packaged container commands against an immutable revision; inspect, resume, cancel or recover the run. Agent hooks do not start these workflows; hub/MCP/dashboard access is read-only.
 
 ## Git bridges (shadow workflow)
 

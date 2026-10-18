@@ -2,6 +2,15 @@
 
 > **Alpha: not for production.** APIs, CLI, storage and schemas may change without migration. See the [README](../README.md) for status and the [changelog](../CHANGELOG.md) for known limits.
 
+Choose a version from [Releases](https://github.com/counterbranch/agentscm/releases). In the examples
+below, replace `<version>` with that version without its leading `v`. Container images are
+versioned; alpha releases do not publish a `latest` image tag. For reproducible installs, keep the
+selected version or image digest in your deployment configuration.
+
+These docs describe the branch or tag you are viewing. A command present on `main` may not be in
+a published binary yet. Use the documentation at the matching release tag, or
+[build from source](../CONTRIBUTING.md#set-up) to try unreleased features.
+
 Three ways to get AgentSCM. The first two download the release binary, check it, keep it in `~/.agentscm/bin` (`%USERPROFILE%\.agentscm\bin` on Windows) and start the setup guide (`agentscm quickstart`).
 
 ## npx

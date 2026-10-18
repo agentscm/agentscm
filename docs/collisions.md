@@ -103,11 +103,13 @@ One JSON value on stdout, `{"ok": true, "collisions": {...}}`. The exit status i
 
 ## Running in a container
 
-The published image runs the same scan, so nothing needs installing. Run it from your main checkout:
+The published image runs the same scan, so nothing needs installing. Choose a version from
+[Releases](https://github.com/counterbranch/agentscm/releases), replace `<version>` below with its
+version without the leading `v`, and run from your main checkout:
 
 ```sh
 docker run --rm --network none --user "$(id -u):$(id -g)" -v "$PWD:/repo" \
-  ghcr.io/counterbranch/agentscm:0.1.0-alpha.1 collisions --git-dir /repo --worktrees
+  "ghcr.io/counterbranch/agentscm:<version>" collisions --git-dir /repo --worktrees
 ```
 
 - Only run it on repositories you trust: Git runs the repository's configured filters and merge drivers.
