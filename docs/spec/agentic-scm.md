@@ -141,7 +141,7 @@ Status: per row.
 | Record | Identity | Contents | Status |
 |---|---|---|---|
 | Repository | Random 128-bit ID fixed at `init` | Scopes Changes, contexts, approvals, targets and events; revisions and blobs are repository-independent and keep their IDs when copied | Implemented |
-| Revision | SHA-256 of a canonical native encoding | Ordered parents, persistent path manifest, file bytes as content-addressed blobs | Implemented (entries are regular, executable or symlink; Git capture accepts them, but Git export and reconcile still refuse executable and symlink entries; submodules are unsupported) |
+| Revision | SHA-256 of a canonical native encoding | Ordered parents, persistent path manifest, file bytes as content-addressed blobs | Implemented (entries are regular, executable or symlink; Git capture accepts them, but Git export v2 preserves them; legacy export v1 and reconcile refuse executable and symlink entries; submodules are unsupported) |
 | Change | Repository ID + caller-chosen Change ID | Stable identity of one line of work, plus a pointer to its current review context and a version number | Implemented |
 | Review context | SHA-256 digest of canonical JSON | Intent, acceptance criteria, scope, exclusions, omissions, dependencies, revision, base, target, policy epoch, required evidence and capabilities | Implemented ([format](../advanced/review-context.md)) |
 | Approval | Caller-chosen approval ID | Target, revision, context digest, Change + Change version, policy epoch; single-use | Implemented (local administrative claim, not signed) |
@@ -397,7 +397,7 @@ native landing, a local mirror export, a remote branch and an accepted forge
 merge are four different outcomes, and tools MUST NOT report one as another.
 
 Snapshot limits today: no submodules, one commit at a time, no history import;
-export and reconcile refuse executable and symlink entries.
+export v2 preserves executable and symlink entries, while legacy export v1 and reconcile refuse them.
 
 ## 6. Conformance levels
 

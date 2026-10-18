@@ -1191,14 +1191,13 @@ fn owned_mirror(root: &Path) -> Result<bool> {
     let seed_valid = owner.seed.as_ref().is_some_and(|seed| {
         seed.object_format == "sha1" && lowercase_sha1(&seed.commit) && lowercase_sha1(&seed.tree)
     });
-    if owner.profile != "agentscm-git-snapshot/v1"
-        || !repository_valid
-        || !matches!(
-            (owner.version, owner.seed.is_some()),
-            (1, false) | (2, true)
-        )
-        || (owner.version == 2 && !seed_valid)
-    {
+    let supported_owner = matches!(
+        (owner.version, owner.profile.as_str(), owner.seed.is_some()),
+        (1, "agentscm-git-snapshot/v1", false)
+            | (2, "agentscm-git-snapshot/v1", true)
+            | (3, "agentscm-git-snapshot/v2", _)
+    );
+    if !supported_owner || !repository_valid || (owner.seed.is_some() && !seed_valid) {
         return Err(Error::Invalid("unsupported mirror ownership record".into()));
     }
     // These fields are required by the ownership schema, but the recorded

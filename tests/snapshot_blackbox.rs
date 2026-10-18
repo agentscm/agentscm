@@ -467,7 +467,7 @@ fn exact_commit(
     assert_eq!(record["event"], *event);
     assert_eq!(record["repository"], *repository);
     assert_eq!(record["request"], export_request(event, previous, label));
-    assert_eq!(record["profile"], "agentscm-git-snapshot/v1");
+    assert_eq!(record["profile"], "agentscm-git-snapshot/v2");
     assert_eq!(record["state"], "mirrored");
     assert_eq!(status["ref_matches"], true);
     assert!(status["object_error"].is_null());
@@ -483,7 +483,7 @@ fn exact_commit(
         .unwrap_or_default();
     let identity = "Synthetic operator <synthetic@example.invalid> 1780000000 +0000";
     let expected = format!(
-        "tree {tree}\n{parent}author {identity}\ncommitter {identity}\n\n{label}\n\nNative-Repository: {}\nNative-Revision: {}\nNative-Event: {}\nSnapshot-Profile: agentscm-git-snapshot/v1\n",
+        "tree {tree}\n{parent}author {identity}\ncommitter {identity}\n\n{label}\n\nNative-Repository: {}\nNative-Revision: {}\nNative-Event: {}\nSnapshot-Profile: agentscm-git-snapshot/v2\n",
         text(repository),
         text(&event["after"]["revision"]),
         event["sequence"].as_u64().unwrap()

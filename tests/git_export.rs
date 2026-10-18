@@ -1207,12 +1207,13 @@ fn recovery_validates_seeded_mirror_ownership_lease_and_journal() {
     for (index, changed) in [
         {
             let mut value = original_owner.clone();
-            value["version"] = 3.into();
+            value["version"] = 4.into();
             value
         },
         {
             let mut value = original_owner.clone();
             value.as_object_mut().unwrap().remove("seed");
+            value["version"] = 2.into();
             value
         },
         {
@@ -2080,7 +2081,15 @@ fn export_history_and_lookup_share_a_finite_cumulative_payload_budget() {
 #[test]
 fn export_refuses_executable_and_symlink_entries_instead_of_flattening() {
     for kind in [EntryKind::Executable, EntryKind::Symlink] {
-        let (_root, engine, mut authority, _path, mut mirror) = setup();
+        let (_root, engine, mut authority, path, mirror) = setup();
+        drop(mirror);
+        let owner_path = path.join("agentscm-mirror.json");
+        let mut owner: serde_json::Value =
+            serde_json::from_slice(&fs::read(&owner_path).unwrap()).unwrap();
+        owner["version"] = 1.into();
+        owner["profile"] = "agentscm-git-snapshot/v1".into();
+        fs::write(owner_path, serde_json::to_vec(&owner).unwrap()).unwrap();
+        let mut mirror = Mirror::open(&git(), &path, &authority.repository_id().unwrap()).unwrap();
         let revision = engine
             .checkpoint_entries(
                 None,
@@ -2112,5 +2121,358 @@ fn export_refuses_executable_and_symlink_entries_instead_of_flattening() {
 
 #[test]
 fn export_profile_string_is_fixed() {
-    assert_eq!(agentscm::git_export::PROFILE, "agentscm-git-snapshot/v1");
+    assert_eq!(agentscm::git_export::PROFILE, "agentscm-git-snapshot/v2");
+}
+
+fn entry(path: &str, kind: EntryKind, bytes: Option<&[u8]>) -> EntryChange {
+    EntryChange {
+        path: path.into(),
+        content: bytes.map(Vec::from),
+        kind,
+    }
+}
+
+fn assert_git_entries(path: &Path, tree: &str, expected: &[(&str, &str, &[u8])]) {
+    let listing = run(path, &["ls-tree", "-r", "-z", "--full-tree", tree]);
+    let rows: Vec<_> = listing
+        .split(|byte| *byte == 0)
+        .filter(|r| !r.is_empty())
+        .collect();
+    assert_eq!(rows.len(), expected.len());
+    for (row, (name, mode, content)) in rows.iter().zip(expected) {
+        let row = std::str::from_utf8(row).unwrap();
+        let (meta, actual_path) = row.split_once('\t').unwrap();
+        let parts: Vec<_> = meta.split(' ').collect();
+        assert_eq!(actual_path, *name);
+        assert_eq!(parts[0], *mode);
+        assert_eq!(parts[1], "blob");
+        assert_eq!(run(path, &["cat-file", "blob", parts[2]]), *content);
+    }
+}
+
+#[test]
+fn v2_exports_exact_entry_kinds_across_changes_retries_and_recovery() {
+    for seeded in [false, true] {
+        let root = TempDir::new().unwrap();
+        let data = root.path().join("data");
+        let engine = Engine::open(&data).unwrap();
+        let mut authority = Authority::open(&data).unwrap();
+        let repository = authority.repository_id().unwrap();
+        let path = root.path().join("mirror.git");
+        let source = root.path().join("seed");
+        let seed = seeded.then(|| seed_repository(&source).1);
+        let mut mirror = match &seed {
+            Some(seed) => {
+                Mirror::initialize_with_seed(&git(), &path, &repository, "main", &source, seed)
+            }
+            None => Mirror::initialize(&git(), &path, &repository, "main"),
+        }
+        .unwrap();
+        let revision = engine
+            .checkpoint_entries(
+                None,
+                &[
+                    entry("binary", EntryKind::Regular, Some(&[0, 255, 1])),
+                    entry("dangling", EntryKind::Symlink, Some(b"absent")),
+                    entry("dir/link", EntryKind::Symlink, Some(b"../script")),
+                    entry("empty", EntryKind::Regular, Some(b"")),
+                    entry("plain", EntryKind::Regular, Some(b"text")),
+                    entry(
+                        "script",
+                        EntryKind::Executable,
+                        Some(b"#!/bin/sh\nexit 0\n"),
+                    ),
+                ],
+            )
+            .unwrap();
+        let first = integrate_revision(&engine, &mut authority, None, revision);
+        let first_request = request(&first, seed.clone());
+        let one = mirror.export(&engine, &authority, &first_request).unwrap();
+        assert_eq!(one.record.profile, agentscm::git_export::PROFILE);
+        assert!(one.ref_matches && one.object_error.is_none());
+        assert_git_entries(
+            &path,
+            one.record.tree.as_deref().unwrap(),
+            &[
+                ("binary", "100644", &[0, 255, 1]),
+                ("dangling", "120000", b"absent"),
+                ("dir/link", "120000", b"../script"),
+                ("empty", "100644", b""),
+                ("plain", "100644", b"text"),
+                ("script", "100755", b"#!/bin/sh\nexit 0\n"),
+            ],
+        );
+        let raw_commit = run(
+            &path,
+            &["cat-file", "commit", one.record.commit.as_deref().unwrap()],
+        );
+        assert!(String::from_utf8(raw_commit).unwrap().contains(&format!(
+            "Snapshot-Profile: {}\n",
+            agentscm::git_export::PROFILE
+        )));
+        assert!(!path.join("dir/link").exists());
+        drop(mirror);
+        let mut mirror = Mirror::open(&git(), &path, &repository).unwrap();
+        assert_eq!(
+            mirror
+                .export(&engine, &authority, &first_request)
+                .unwrap()
+                .record,
+            one.record
+        );
+        assert_eq!(
+            mirror.lookup_revision(&first.after.revision).unwrap(),
+            vec![one.record.clone()]
+        );
+        let revision = engine
+            .checkpoint_entries(
+                Some(&first.after.revision),
+                &[
+                    entry("binary", EntryKind::Executable, Some(&[0, 255, 1])),
+                    entry("dangling", EntryKind::Regular, None),
+                    entry("dir/link", EntryKind::Symlink, Some(b"../empty")),
+                    entry("plain", EntryKind::Symlink, Some(b"script")),
+                    entry("script", EntryKind::Regular, Some(b"#!/bin/sh\nexit 0\n")),
+                ],
+            )
+            .unwrap();
+        let before = authority.target("main").unwrap();
+        let second = integrate_revision(&engine, &mut authority, before, revision);
+        let second_request = request(&second, one.record.commit.clone());
+        let two = mirror.export(&engine, &authority, &second_request).unwrap();
+        assert_git_entries(
+            &path,
+            two.record.tree.as_deref().unwrap(),
+            &[
+                ("binary", "100755", &[0, 255, 1]),
+                ("dir/link", "120000", b"../empty"),
+                ("empty", "100644", b""),
+                ("plain", "120000", b"script"),
+                ("script", "100644", b"#!/bin/sh\nexit 0\n"),
+            ],
+        );
+        // Publication projection preserves the same modes without contacting a forge.
+        let publication = mirror.publication(second.sequence).unwrap();
+        assert!(
+            publication
+                .changes
+                .iter()
+                .any(|c| c.path == "binary" && c.mode == "100755")
+        );
+        assert!(
+            publication
+                .changes
+                .iter()
+                .any(|c| c.path == "plain" && c.mode == "120000")
+        );
+        assert!(mirror.export(&engine, &authority, &first_request).is_err());
+        let mut stale = second_request.clone();
+        stale.expected_oid = None;
+        assert!(mirror.export(&engine, &authority, &stale).is_err());
+        mirror
+            .record_external_check(&ExternalCheckRequest {
+                event_sequence: second.sequence,
+                result_id: "v2-observation".into(),
+                tested_oid: two.record.commit.clone().unwrap(),
+                outcome: ExternalCheckOutcome::Passed,
+                details: None,
+            })
+            .unwrap();
+        let revision = engine
+            .checkpoint_entries(
+                Some(&second.after.revision),
+                &[
+                    entry("binary", EntryKind::Regular, None),
+                    entry("dir/link", EntryKind::Regular, None),
+                    entry("empty", EntryKind::Regular, None),
+                    entry("plain", EntryKind::Regular, None),
+                    entry("script", EntryKind::Regular, None),
+                ],
+            )
+            .unwrap();
+        let before = authority.target("main").unwrap();
+        let third = integrate_revision(&engine, &mut authority, before, revision);
+        let three = mirror
+            .export(
+                &engine,
+                &authority,
+                &request(&third, two.record.commit.clone()),
+            )
+            .unwrap();
+        assert_git_entries(&path, three.record.tree.as_deref().unwrap(), &[]);
+        let owner = fs::read(path.join("agentscm-mirror.json")).unwrap();
+        drop(mirror);
+        drop(authority);
+        drop(engine);
+        let backup = root.path().join("backup");
+        local_recovery::backup(&data, &backup, &[], std::slice::from_ref(&path), true).unwrap();
+        local_recovery::verify(&backup).unwrap();
+        let restored = root.path().join("restored");
+        local_recovery::restore(&backup, &restored).unwrap();
+        local_recovery::activate(&restored, true, true).unwrap();
+        let restored_mirror = restored.join("attachments/0");
+        assert_eq!(
+            fs::read(restored_mirror.join("agentscm-mirror.json")).unwrap(),
+            owner
+        );
+        assert_git_entries(
+            &restored_mirror,
+            two.record.tree.as_deref().unwrap(),
+            &[
+                ("binary", "100755", &[0, 255, 1]),
+                ("dir/link", "120000", b"../empty"),
+                ("empty", "100644", b""),
+                ("plain", "120000", b"script"),
+                ("script", "100644", b"#!/bin/sh\nexit 0\n"),
+            ],
+        );
+        assert!(Mirror::open(&git(), &restored_mirror, &repository).is_err());
+        let retained = Mirror::open(&git(), &path, &repository).unwrap();
+        assert_eq!(
+            retained.status(third.sequence).unwrap().unwrap().record,
+            three.record
+        );
+        assert_eq!(
+            retained
+                .external_checks(Some(second.sequence))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}
+
+#[test]
+fn default_cli_preserves_entry_kinds_and_rejects_mismatched_ownership_and_records() {
+    let root = TempDir::new().unwrap();
+    let data = root.path().join("data");
+    let engine = Engine::open(&data).unwrap();
+    let mut authority = Authority::open(&data).unwrap();
+    let repository = authority.repository_id().unwrap();
+    let revision = engine
+        .checkpoint_entries(
+            None,
+            &[entry(
+                "run",
+                EntryKind::Executable,
+                Some(b"synthetic executable"),
+            )],
+        )
+        .unwrap();
+    let event = integrate_revision(&engine, &mut authority, None, revision);
+    let path = root.path().join("mirror.git");
+    let output = agentscm(
+        root.path(),
+        &[
+            "--data-dir",
+            data.to_str().unwrap(),
+            "git-export",
+            "init",
+            "--destination",
+            path.to_str().unwrap(),
+        ],
+    );
+    assert!(output.status.success(), "{:?}", output);
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["profile"], agentscm::git_export::PROFILE);
+    let input = root.path().join("request.json");
+    fs::write(&input, serde_json::to_vec(&request(&event, None)).unwrap()).unwrap();
+    let output = agentscm(
+        root.path(),
+        &[
+            "--data-dir",
+            data.to_str().unwrap(),
+            "git-export",
+            "export",
+            "--destination",
+            path.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ],
+    );
+    assert!(output.status.success(), "{:?}", output);
+    let owner_path = path.join("agentscm-mirror.json");
+    let owner = fs::read(&owner_path).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&owner).unwrap();
+    assert_eq!(value["version"], 3);
+    for (version, profile) in [
+        (1, agentscm::git_export::PROFILE),
+        (3, "agentscm-git-snapshot/v1"),
+    ] {
+        value["version"] = version.into();
+        value["profile"] = profile.into();
+        fs::write(&owner_path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(Mirror::open(&git(), &path, &repository).is_err());
+    }
+    fs::write(&owner_path, owner).unwrap();
+    let mirror = Mirror::open(&git(), &path, &repository).unwrap();
+    let mut record = mirror.status(event.sequence).unwrap().unwrap().record;
+    let original_ref = run(&path, &["rev-parse", "refs/heads/agentscm"]);
+    record.profile = "agentscm-git-snapshot/v1".into();
+    let db = rusqlite::Connection::open(path.join("agentscm-export.sqlite")).unwrap();
+    set_export_payload(&db, event.sequence, &serde_json::to_vec(&record).unwrap());
+    assert!(mirror.status(event.sequence).is_err());
+    assert_eq!(
+        run(&path, &["rev-parse", "refs/heads/agentscm"]),
+        original_ref
+    );
+}
+
+#[test]
+fn existing_v1_mirrors_reopen_and_retry_without_changing_commit_identity() {
+    for seeded in [false, true] {
+        let root = TempDir::new().unwrap();
+        let data = root.path().join("data");
+        let engine = Engine::open(&data).unwrap();
+        let mut authority = Authority::open(&data).unwrap();
+        let repository = authority.repository_id().unwrap();
+        let path = root.path().join("mirror.git");
+        let source = root.path().join("seed");
+        let seed = seeded.then(|| seed_repository(&source).1);
+        let mirror = match &seed {
+            Some(seed) => {
+                Mirror::initialize_with_seed(&git(), &path, &repository, "main", &source, seed)
+            }
+            None => Mirror::initialize(&git(), &path, &repository, "main"),
+        }
+        .unwrap();
+        drop(mirror);
+        // Exact ownership layouts emitted by the earlier regular-file exporter.
+        let owner_path = path.join("agentscm-mirror.json");
+        let mut owner: serde_json::Value =
+            serde_json::from_slice(&fs::read(&owner_path).unwrap()).unwrap();
+        owner["version"] = (if seeded { 2 } else { 1 }).into();
+        owner["profile"] = "agentscm-git-snapshot/v1".into();
+        let owner = serde_json::to_vec(&owner).unwrap();
+        fs::write(&owner_path, &owner).unwrap();
+        let first = publish(&engine, &mut authority, vec![change("plain", Some(b"one"))]);
+        let fixed = request(&first, seed);
+        let mut mirror = Mirror::open(&git(), &path, &repository).unwrap();
+        let original = mirror.export(&engine, &authority, &fixed).unwrap().record;
+        assert_eq!(original.profile, "agentscm-git-snapshot/v1");
+        let body = run(
+            &path,
+            &["cat-file", "commit", original.commit.as_deref().unwrap()],
+        );
+        assert!(
+            String::from_utf8(body)
+                .unwrap()
+                .contains("Snapshot-Profile: agentscm-git-snapshot/v1\n")
+        );
+        drop(mirror);
+        let mut mirror = Mirror::open(&git(), &path, &repository).unwrap();
+        assert_eq!(
+            mirror.export(&engine, &authority, &fixed).unwrap().record,
+            original
+        );
+        assert_eq!(fs::read(owner_path).unwrap(), owner);
+        let second = publish(&engine, &mut authority, vec![change("plain", Some(b"two"))]);
+        assert_eq!(
+            mirror
+                .export(&engine, &authority, &request(&second, original.commit))
+                .unwrap()
+                .record
+                .profile,
+            "agentscm-git-snapshot/v1"
+        );
+    }
 }
