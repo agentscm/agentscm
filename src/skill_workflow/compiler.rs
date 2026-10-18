@@ -1,5 +1,7 @@
 //! Validation and immutable-source compilation for skill workflows.
 
+#[cfg(unix)]
+use std::collections::BTreeMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
@@ -8,6 +10,10 @@ use sha2::{Digest, Sha256};
 
 use super::contracts::{StepAction, StepDefinition, WorkflowDefinition};
 use crate::authority::Authority;
+#[cfg(unix)]
+use crate::checks::required_binding;
+#[cfg(unix)]
+use crate::execution::{COMMAND_CAPABILITY, COMMAND_EVIDENCE, CommandRecipe};
 use crate::skill_bundle::{
     MAX_SKILL_RESOURCE_BYTES, MAX_SKILL_RESOURCE_PATH_BYTES, MAX_SKILL_RESOURCES, SkillBundle,
     SkillResource,
@@ -35,6 +41,9 @@ pub struct CompiledPlan {
     pub(crate) digest: String,
     pub(crate) skill_digest: String,
     pub(crate) ordered_steps: Vec<StepDefinition>,
+    #[cfg(unix)]
+    #[serde(skip)]
+    command_recipes: BTreeMap<String, CommandRecipe>,
 }
 
 impl CompiledPlan {
@@ -52,6 +61,11 @@ impl CompiledPlan {
 
     pub fn ordered_steps(&self) -> &[StepDefinition] {
         &self.ordered_steps
+    }
+
+    #[cfg(unix)]
+    pub(super) fn command_recipe(&self, step_id: &str) -> Option<&CommandRecipe> {
+        self.command_recipes.get(step_id)
     }
 }
 
@@ -76,6 +90,8 @@ pub fn compile(data_dir: &Path, definition: &WorkflowDefinition) -> Result<Compi
         source.load_revision(&definition.source.revision)?;
         resolve_skill(&source, definition)
     })())?;
+    #[cfg(unix)]
+    let command_recipes = compile_command_recipes(&authority, definition, &bundle)?;
     validate_authority(&authority, definition)?;
     let skill_digest = bundle.identity().as_str().to_owned();
     let digest = plan_digest(definition, &skill_digest)?;
@@ -85,6 +101,8 @@ pub fn compile(data_dir: &Path, definition: &WorkflowDefinition) -> Result<Compi
         digest,
         skill_digest,
         ordered_steps,
+        #[cfg(unix)]
+        command_recipes,
     })
 }
 
@@ -158,9 +176,40 @@ fn validate_definition(definition: &WorkflowDefinition) -> Result<Vec<StepDefini
             )));
         }
         validate_step(step)?;
+        validate_step_binding(definition, step)?;
     }
 
     stable_topological_order(&definition.steps, &indexes)
+}
+
+fn validate_step_binding(definition: &WorkflowDefinition, step: &StepDefinition) -> Result<()> {
+    let StepAction::Command { runner, change, .. } = &step.action else {
+        return Ok(());
+    };
+    if change.repository != definition.source.repository {
+        return Err(Error::Conflict(format!(
+            "command step {} change repository does not match workflow source",
+            step.id
+        )));
+    }
+    if runner.len() > MAX_SKILL_RESOURCE_PATH_BYTES {
+        return Err(Error::Limit(format!(
+            "command runner path exceeds {MAX_SKILL_RESOURCE_PATH_BYTES} relative bytes"
+        )));
+    }
+    let root = skill_root(&definition.skill.entrypoint);
+    if !definition
+        .skill
+        .resources
+        .iter()
+        .any(|path| relative_skill_path(path, root) == runner)
+    {
+        return Err(Error::Invalid(format!(
+            "command step {} runner is not an explicitly declared skill resource: {runner}",
+            step.id
+        )));
+    }
+    Ok(())
 }
 
 fn validate_step(step: &StepDefinition) -> Result<()> {
@@ -209,6 +258,30 @@ fn validate_step(step: &StepDefinition) -> Result<()> {
         }
         StepAction::RequireCapability { capability } => {
             validate_identifier("required capability", capability)?;
+        }
+        StepAction::Command {
+            runner,
+            change,
+            change_version,
+            context_digest,
+        } => {
+            validate_path(runner)?;
+            if runner == "SKILL.md" {
+                return Err(Error::Invalid(
+                    "command runner must be an explicitly declared skill resource".into(),
+                ));
+            }
+            change.validate()?;
+            if change_version == &0 || *change_version > i64::MAX as u64 {
+                return Err(Error::Invalid(
+                    "command change version must be a positive signed 64-bit integer".into(),
+                ));
+            }
+            validate_sha256("command context digest", context_digest)?;
+            #[cfg(not(unix))]
+            return Err(Error::Invalid(
+                "command workflow steps are unsupported on this platform".into(),
+            ));
         }
     }
     Ok(())
@@ -323,6 +396,80 @@ fn resolve_skill(engine: &Engine, definition: &WorkflowDefinition) -> Result<Ski
     SkillBundle::new(resources)
 }
 
+#[cfg(unix)]
+fn compile_command_recipes(
+    authority: &Authority,
+    definition: &WorkflowDefinition,
+    bundle: &SkillBundle,
+) -> Result<BTreeMap<String, CommandRecipe>> {
+    let mut recipes = BTreeMap::new();
+    for step in &definition.steps {
+        let StepAction::Command {
+            runner,
+            change,
+            change_version,
+            context_digest,
+        } = &step.action
+        else {
+            continue;
+        };
+        // Structural validation already checked repository and explicit resource
+        // membership. Here resolve the declared bytes and current authority.
+        let bytes = bundle.resource(runner).ok_or_else(|| {
+            Error::Invalid(format!(
+                "command step {} runner is missing from the resolved skill bundle: {runner}",
+                step.id
+            ))
+        })?;
+        let recipe: CommandRecipe = serde_json::from_slice(bytes).map_err(|error| {
+            Error::Invalid(format!(
+                "command step {} runner is not a valid command recipe: {error}",
+                step.id
+            ))
+        })?;
+        recipe.validate()?;
+
+        let state = authority.change(change)?;
+        if state.version != *change_version || state.context_digest != *context_digest {
+            return Err(Error::Conflict(format!(
+                "command step {} change no longer matches version {change_version} and context {context_digest}",
+                step.id
+            )));
+        }
+        let context = authority.review_context(context_digest)?;
+        if context.change != *change
+            || context.change_version != *change_version
+            || context.revision != definition.source.revision
+            || context.policy_epoch != definition.source.policy_epoch
+            || context.digest()? != *context_digest
+        {
+            return Err(Error::Conflict(format!(
+                "command step {} review context does not bind the workflow source",
+                step.id
+            )));
+        }
+        let Some((recipe_digest, toolchain_digest, environment_digest)) =
+            required_binding(&context, COMMAND_CAPABILITY, COMMAND_EVIDENCE)?
+        else {
+            return Err(Error::Invalid(format!(
+                "command step {} review context does not request capability {COMMAND_CAPABILITY}",
+                step.id
+            )));
+        };
+        if recipe.digest()? != recipe_digest
+            || recipe.toolchain_sha256 != toolchain_digest
+            || recipe.environment_sha256 != environment_digest
+        {
+            return Err(Error::Conflict(format!(
+                "command step {} recipe, toolchain or environment does not match its review context",
+                step.id
+            )));
+        }
+        recipes.insert(step.id.clone(), recipe);
+    }
+    Ok(recipes)
+}
+
 fn read_skill_resource(
     engine: &Engine,
     revision: &str,
@@ -429,10 +576,20 @@ fn relative_skill_path<'a>(path: &'a str, root: &str) -> &'a str {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::collections::BTreeMap;
+
     use tempfile::tempdir;
 
     use super::*;
     use crate::checks::SourcePathExpectation;
+    #[cfg(unix)]
+    use crate::context::{ChangeId, InputIdentity, RequiredEvidence, ReviewContext};
+    #[cfg(unix)]
+    use crate::execution::{
+        COMMAND_CAPABILITY, COMMAND_EVIDENCE, CommandRecipe, ExecutionLimits, SyscallPolicy,
+        environment_digest,
+    };
     use crate::model::{EntryChange, EntryKind};
 
     fn fixture() -> (tempfile::TempDir, WorkflowDefinition) {
@@ -499,6 +656,121 @@ mod tests {
             ],
         };
         (root, definition)
+    }
+
+    #[cfg(unix)]
+    fn command_recipe() -> CommandRecipe {
+        let environment = BTreeMap::new();
+        CommandRecipe {
+            version: 1,
+            image: format!("sha256:{}", "b".repeat(64)),
+            argv: vec!["/bin/true".into()],
+            environment_sha256: environment_digest(&environment).unwrap(),
+            environment,
+            toolchain_sha256: "a".repeat(64),
+            limits: ExecutionLimits {
+                timeout_ms: 1_000,
+                max_output_bytes: 4_096,
+                memory_bytes: 64 * 1024 * 1024,
+                scratch_bytes: 4 * 1024 * 1024,
+                pids: 16,
+                cpu_millis: 1_000,
+            },
+            syscall_policy: SyscallPolicy::DockerBuiltin,
+            no_new_privileges: true,
+        }
+    }
+
+    #[cfg(unix)]
+    fn command_fixture() -> (tempfile::TempDir, WorkflowDefinition, CommandRecipe) {
+        let root = tempdir().unwrap();
+        let engine = Engine::open(root.path()).unwrap();
+        let mut authority = Authority::open(root.path()).unwrap();
+        let repository = authority.repository_id().unwrap();
+        let recipe = command_recipe();
+        let revision = engine
+            .checkpoint_entries(
+                None,
+                &[
+                    EntryChange {
+                        path: "skills/a/SKILL.md".into(),
+                        content: Some(b"# Command skill\n".to_vec()),
+                        kind: EntryKind::Regular,
+                    },
+                    EntryChange {
+                        path: "skills/a/runner.json".into(),
+                        content: Some(serde_json::to_vec(&recipe).unwrap()),
+                        kind: EntryKind::Regular,
+                    },
+                    EntryChange {
+                        path: "src/lib.rs".into(),
+                        content: Some(b"fn example() {}\n".to_vec()),
+                        kind: EntryKind::Regular,
+                    },
+                ],
+            )
+            .unwrap();
+        let digest = |sha256: &str| InputIdentity::Digest {
+            sha256: sha256.to_owned(),
+        };
+        let context = ReviewContext {
+            version: 1,
+            change: ChangeId {
+                repository: repository.clone(),
+                id: "workflow-command".into(),
+            },
+            change_version: 1,
+            revision: revision.clone(),
+            base: None,
+            target: "main".into(),
+            policy_epoch: 0,
+            intent: "run the declared packaged command".into(),
+            acceptance_criteria: vec!["command exits successfully".into()],
+            scope: vec!["src/lib.rs".into()],
+            exclusions: vec![],
+            omissions: vec![],
+            dependencies: vec![],
+            recipe: digest(&recipe.digest().unwrap()),
+            toolchain: digest(&recipe.toolchain_sha256),
+            environment: digest(&recipe.environment_sha256),
+            required_evidence: vec![RequiredEvidence {
+                identity: COMMAND_EVIDENCE.into(),
+                digest: digest(&recipe.digest().unwrap()),
+            }],
+            required_capabilities: vec![
+                "agentscm.review-context/v1".into(),
+                COMMAND_CAPABILITY.into(),
+            ],
+        };
+        let context_digest = context.digest().unwrap();
+        authority.start_change(&context).unwrap();
+        let definition = WorkflowDefinition {
+            version: 1,
+            name: "command-workflow".into(),
+            source: super::super::contracts::WorkflowSource {
+                repository,
+                revision,
+                policy_epoch: 0,
+            },
+            skill: super::super::contracts::SkillReference {
+                entrypoint: "skills/a/SKILL.md".into(),
+                resources: vec!["skills/a/runner.json".into()],
+            },
+            steps: vec![StepDefinition {
+                id: "run".into(),
+                needs: vec![],
+                required: true,
+                action: StepAction::Command {
+                    runner: "runner.json".into(),
+                    change: context.change,
+                    change_version: 1,
+                    context_digest,
+                },
+            }],
+        };
+        drop(authority);
+        drop(engine);
+        (root, definition, recipe)
     }
 
     #[test]
@@ -615,5 +887,111 @@ mod tests {
             r#"{"kind":"require_capability","capability":"model","extra":true}"#,
         );
         assert!(action.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compiles_exact_packaged_command_against_current_review_context() {
+        let (root, definition, recipe) = command_fixture();
+        let plan = compile(root.path(), &definition).unwrap();
+
+        assert_eq!(plan.command_recipe("run"), Some(&recipe));
+        assert!(plan.command_recipe("missing").is_none());
+        assert_eq!(
+            recipe.digest().unwrap(),
+            plan.command_recipe("run").unwrap().digest().unwrap()
+        );
+        assert!(
+            !serde_json::to_string(&plan)
+                .unwrap()
+                .contains("command_recipes")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_undeclared_or_invalid_packaged_command_runner() {
+        let (root, mut definition, _) = command_fixture();
+        definition.skill.resources.clear();
+        assert!(matches!(
+            compile(root.path(), &definition),
+            Err(Error::Invalid(_))
+        ));
+
+        let (root, mut definition, _) = command_fixture();
+        let engine = Engine::open(root.path()).unwrap();
+        definition.source.revision = engine
+            .checkpoint_entries(
+                None,
+                &[
+                    EntryChange {
+                        path: "skills/a/SKILL.md".into(),
+                        content: Some(b"# Command skill\n".to_vec()),
+                        kind: EntryKind::Regular,
+                    },
+                    EntryChange {
+                        path: "skills/a/runner.json".into(),
+                        content: Some(b"{\"version\":1,\"unexpected\":true}".to_vec()),
+                        kind: EntryKind::Regular,
+                    },
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            compile(root.path(), &definition),
+            Err(Error::Invalid(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_stale_or_mismatched_command_binding() {
+        let (root, mut definition, _) = command_fixture();
+        let StepAction::Command { change_version, .. } = &mut definition.steps[0].action else {
+            unreachable!();
+        };
+        *change_version = 2;
+        assert!(matches!(
+            compile(root.path(), &definition),
+            Err(Error::Conflict(_))
+        ));
+
+        let (root, mut definition, _) = command_fixture();
+        let StepAction::Command { change, .. } = &mut definition.steps[0].action else {
+            unreachable!();
+        };
+        change.repository = "0".repeat(32);
+        assert!(matches!(
+            compile(root.path(), &definition),
+            Err(Error::Conflict(_))
+        ));
+
+        let (root, mut definition, _) = command_fixture();
+        let StepAction::Command {
+            change,
+            change_version,
+            context_digest,
+            ..
+        } = &mut definition.steps[0].action
+        else {
+            unreachable!();
+        };
+        let mut authority = Authority::open(root.path()).unwrap();
+        let state = authority.change(change).unwrap();
+        let mut context = authority.review_context(&state.context_digest).unwrap();
+        let wrong_recipe = InputIdentity::Digest {
+            sha256: "c".repeat(64),
+        };
+        context.change_version = 2;
+        context.recipe = wrong_recipe.clone();
+        context.required_evidence[0].digest = wrong_recipe;
+        let changed = authority.update_change_context(1, &context).unwrap();
+        *change_version = changed.version;
+        *context_digest = changed.context_digest;
+        drop(authority);
+        assert!(matches!(
+            compile(root.path(), &definition),
+            Err(Error::Conflict(_))
+        ));
     }
 }

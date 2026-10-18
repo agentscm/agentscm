@@ -1,13 +1,12 @@
 //! Durable trusted-local execution for compiled skill workflows.
 //!
 //! The journal records intent before each step and its terminal observation in
-//! a later transaction. This initial runtime executes only immutable native
-//! source reads. Skill text and imported JSON are data: neither can authorize
-//! an effect or manufacture a successful observation.
+//! a later transaction. Explicit command actions reuse the authority's durable
+//! command attempts; skill prose cannot authorize execution or admission.
 
 use std::collections::BTreeMap;
 use std::fs::{OpenOptions, symlink_metadata};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
@@ -16,7 +15,13 @@ use sha2::{Digest, Sha256};
 
 use super::compiler::{CompiledPlan, compile, validate_retained_definition, verify_current};
 use super::contracts::{StepAction, StepDefinition, WorkflowDefinition, WorkflowSource};
+#[cfg(unix)]
+use crate::authority::Authority;
 use crate::checks::PathObservation;
+#[cfg(unix)]
+use crate::execution::{
+    Cancellation, CommandAttempt, CommandCheckRequest, CommandState, ExecutionOutcome, OciBackend,
+};
 use crate::lease::Lease;
 use crate::store::{Engine, create_directory_durable};
 use crate::{Error, Result};
@@ -65,6 +70,26 @@ pub struct StepView {
     pub state: StepState,
     pub observations: Vec<PathObservation>,
     pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<CommandStepView>,
+}
+
+/// A projection of the retained authority attempt, never worker-supplied evidence.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CommandStepView {
+    pub attempt_id: String,
+    pub generation: u64,
+    pub state: String,
+    pub outcome: Option<String>,
+    pub record_digest: Option<String>,
+}
+
+#[cfg(unix)]
+pub struct CommandExecutor<'a> {
+    pub backend: &'a OciBackend,
+    pub work_dir: &'a Path,
+    pub cancellation: &'a Cancellation,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -81,6 +106,7 @@ pub struct RunView {
 }
 
 struct Journal {
+    data_dir: PathBuf,
     connection: Connection,
     _access: crate::local_recovery::AccessGuard,
     _lease: Lease,
@@ -183,7 +209,257 @@ fn ensure_same_plan(run_id: &str, stored: &StoredRun, plan: &CompiledPlan) -> Re
     Ok(())
 }
 
+/// Domain-separated identity prevents another workflow or plan sharing an attempt.
+pub fn command_attempt_id(run_id: &str, plan_digest: &str, step_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"agentscm.skill-workflow.command.v1\0");
+    for field in [run_id, plan_digest, step_id] {
+        hash_field(&mut hasher, field.as_bytes());
+    }
+    format!("workflow-{:x}", hasher.finalize())
+}
+
+#[cfg(unix)]
+fn command_request(
+    run_id: &str,
+    plan: &CompiledPlan,
+    step: &StepDefinition,
+) -> Result<CommandCheckRequest> {
+    let StepAction::Command {
+        change,
+        change_version,
+        context_digest,
+        ..
+    } = &step.action
+    else {
+        return Err(Error::Invalid("step is not a command".into()));
+    };
+    Ok(CommandCheckRequest {
+        attempt_id: command_attempt_id(run_id, plan.digest(), &step.id),
+        change: change.clone(),
+        change_version: *change_version,
+        context_digest: context_digest.clone(),
+        revision: plan.definition().source.revision.clone(),
+        recipe: plan
+            .command_recipe(&step.id)
+            .ok_or_else(|| Error::Invalid("compiled command recipe missing".into()))?
+            .clone(),
+    })
+}
+
+#[cfg(unix)]
+fn command_result(attempt: &CommandAttempt) -> Result<StepResult> {
+    if attempt.state != CommandState::Finished || attempt.record_digest.is_none() {
+        return Err(Error::Conflict(
+            "command has no terminal execution record; recovery required".into(),
+        ));
+    }
+    let outcome = attempt
+        .outcome
+        .ok_or_else(|| Error::Invalid("finished command is missing outcome".into()))?;
+    let state = match outcome {
+        ExecutionOutcome::Success => StepState::Succeeded,
+        ExecutionOutcome::Failed | ExecutionOutcome::TimedOut | ExecutionOutcome::OutputLimit => {
+            StepState::Failed
+        }
+        ExecutionOutcome::Cancelled => StepState::Cancelled,
+        ExecutionOutcome::Unavailable
+        | ExecutionOutcome::Incomplete
+        | ExecutionOutcome::Indeterminate => StepState::Blocked,
+    };
+    Ok(StepResult {
+        state,
+        observations: Vec::new(),
+        detail: format!(
+            "command {}: {}; record {}",
+            attempt.attempt_id,
+            serde_json::to_value(outcome)?.as_str().unwrap_or("unknown"),
+            attempt.record_digest.as_deref().expect("checked record")
+        ),
+    })
+}
+
+fn command_projection(
+    data_dir: &Path,
+    run_id: &str,
+    run: &StoredRun,
+    step: &StepDefinition,
+    state: StepState,
+) -> Result<Option<CommandStepView>> {
+    let StepAction::Command {
+        change,
+        change_version,
+        context_digest,
+        ..
+    } = &step.action
+    else {
+        return Ok(None);
+    };
+    #[cfg(not(unix))]
+    {
+        let _ = (
+            data_dir,
+            run_id,
+            run,
+            state,
+            change,
+            change_version,
+            context_digest,
+        );
+        Err(Error::Invalid(
+            "command workflow history requires Unix authority support".into(),
+        ))
+    }
+    #[cfg(unix)]
+    {
+        let authority = Authority::open_read_only(data_dir)?;
+        let id = command_attempt_id(run_id, &run.plan_digest, &step.id);
+        let attempt = match authority.command_attempt(&id) {
+            Ok(attempt) => attempt,
+            Err(Error::NotFound(_))
+                if !matches!(state, StepState::Succeeded | StepState::Failed) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        if attempt.subject.change != *change
+            || attempt.subject.change_version != *change_version
+            || attempt.subject.repository != run.definition.source.repository
+            || attempt.subject.context_digest != *context_digest
+            || attempt.subject.revision != run.definition.source.revision
+        {
+            return Err(Error::Invalid(
+                "workflow command attempt does not match its retained definition".into(),
+            ));
+        }
+        if let Some(digest) = &attempt.record_digest {
+            let record = authority.command_record(digest)?;
+            // Recovery records retain the execution generation whose custody
+            // was reconciled. The terminal attempt has a later fencing generation.
+            // Observed command results must instead match the generation exactly.
+            let fenced_recovery = !record.isolation_observed
+                && matches!(
+                    record.outcome,
+                    ExecutionOutcome::Cancelled
+                        | ExecutionOutcome::Incomplete
+                        | ExecutionOutcome::Indeterminate
+                )
+                && record.request.run_generation < attempt.run_generation;
+            if record.request.attempt_id != id
+                || record.request.subject != attempt.subject
+                || Some(record.outcome) != attempt.outcome
+                || (record.request.run_generation != attempt.run_generation && !fenced_recovery)
+            {
+                return Err(Error::Invalid(
+                    "workflow command record does not match its attempt".into(),
+                ));
+            }
+        }
+        if !matches!(state, StepState::Pending | StepState::Running)
+            && command_result(&attempt)?.state != state
+        {
+            return Err(Error::Invalid(
+                "workflow command state does not match observed execution".into(),
+            ));
+        }
+        Ok(Some(CommandStepView {
+            attempt_id: id,
+            generation: attempt.run_generation,
+            state: serde_json::to_value(attempt.state)?
+                .as_str()
+                .unwrap_or("unknown")
+                .into(),
+            outcome: attempt
+                .outcome
+                .map(|outcome| {
+                    serde_json::to_value(outcome)
+                        .map(|value| value.as_str().unwrap_or("unknown").to_owned())
+                })
+                .transpose()?,
+            record_digest: attempt.record_digest,
+        }))
+    }
+}
+
+/// Fence and reconcile a running command. Recovery never retries its effect.
+#[cfg(unix)]
+pub fn recover_command(
+    data_dir: &Path,
+    run_id: &str,
+    step_id: &str,
+    executor: &CommandExecutor<'_>,
+) -> Result<RunView> {
+    validate_run_id(run_id)?;
+    let mut journal = Journal::open(data_dir, OpenMode::Write)?;
+    let current = journal.view(run_id)?;
+    let stored = journal.stored_run(run_id)?;
+    let step = stored
+        .ordered_steps
+        .iter()
+        .find(|step| step.id == step_id && matches!(step.action, StepAction::Command { .. }))
+        .ok_or_else(|| Error::Invalid("recovery requires a declared command step".into()))?;
+    if !current
+        .steps
+        .iter()
+        .any(|view| view.id == step_id && view.state == StepState::Running)
+    {
+        return Err(Error::Conflict(
+            "only a running workflow command needs recovery".into(),
+        ));
+    }
+    let mut authority = Authority::open(data_dir)?;
+    let id = command_attempt_id(run_id, &stored.plan_digest, step_id);
+    let attempt = authority.command_attempt(&id)?;
+    let attempt = match attempt.state {
+        CommandState::Finished => attempt,
+        CommandState::Pending => authority.cancel_command_attempt(
+            Some(executor.backend),
+            executor.work_dir,
+            &id,
+            attempt.run_generation,
+            "workflow recovered before execution",
+        )?,
+        CommandState::Running => authority.recover_command_attempt(
+            Some(executor.backend),
+            executor.work_dir,
+            &id,
+            attempt.run_generation,
+            false,
+            "workflow command recovered by operator",
+        )?,
+    };
+    journal.finish_step(run_id, step, command_result(&attempt)?)?;
+    journal.refresh_run_state(run_id)?;
+    journal.view(run_id)
+}
+
 pub fn advance(data_dir: &Path, run_id: &str, max_steps: usize) -> Result<RunView> {
+    advance_inner(
+        data_dir,
+        run_id,
+        max_steps,
+        #[cfg(unix)]
+        None,
+    )
+}
+
+#[cfg(unix)]
+pub fn advance_with_executor(
+    data_dir: &Path,
+    run_id: &str,
+    max_steps: usize,
+    executor: &CommandExecutor<'_>,
+) -> Result<RunView> {
+    advance_inner(data_dir, run_id, max_steps, Some(executor))
+}
+
+fn advance_inner(
+    data_dir: &Path,
+    run_id: &str,
+    max_steps: usize,
+    #[cfg(unix)] executor: Option<&CommandExecutor<'_>>,
+) -> Result<RunView> {
     validate_run_id(run_id)?;
     if max_steps > MAX_ADVANCE_STEPS {
         return Err(Error::Limit(format!(
@@ -264,6 +540,53 @@ pub fn advance(data_dir: &Path, run_id: &str, max_steps: usize) -> Result<RunVie
             )));
         }
 
+        #[cfg(unix)]
+        if matches!(step.action, StepAction::Command { .. }) {
+            let executor = executor.ok_or_else(|| {
+                Error::Invalid("command skill step requires --docker and --docker-socket".into())
+            })?;
+            let mut authority = Authority::open(data_dir)?;
+            let request = command_request(run_id, &plan, step)?;
+            // Creation and workflow intent share the journal lease. Cancellation
+            // cannot pass between these writes and miss the pending attempt.
+            let attempt = authority.create_command_attempt(&request)?;
+            if attempt.state == CommandState::Running {
+                return Err(Error::Conflict(format!(
+                    "workflow command {} is running; inspect it or recover the step, never rerun it",
+                    attempt.attempt_id
+                )));
+            }
+            journal.begin_step(run_id, &step.id)?;
+            // Do not hold the journal lease during execution: status and a second
+            // controller's cancel/recovery must remain available. The authority
+            // generation CAS fences concurrent claims and late finishers.
+            drop(journal);
+            let attempt = authority.run_command_attempt(
+                &engine,
+                executor.backend,
+                executor.work_dir,
+                &attempt.attempt_id,
+                attempt.run_generation,
+                executor.cancellation,
+            )?;
+            journal = Journal::open(data_dir, OpenMode::Write)?;
+            let current = journal.view(run_id)?;
+            if matches!(
+                current
+                    .steps
+                    .iter()
+                    .find(|view| view.id == step.id)
+                    .map(|view| view.state),
+                Some(StepState::Pending | StepState::Running)
+            ) {
+                journal.finish_step(run_id, step, command_result(&attempt)?)?;
+                journal.refresh_run_state(run_id)?;
+            }
+            if is_terminal_run(journal.stored_run(run_id)?.state) {
+                break;
+            }
+            continue;
+        }
         journal.begin_step(run_id, &step.id)?;
         let result = execute_step(&engine, &plan.definition().source, step);
         journal.finish_step(run_id, step, result)?;
@@ -280,6 +603,28 @@ pub fn status(data_dir: &Path, run_id: &str) -> Result<RunView> {
 }
 
 pub fn cancel(data_dir: &Path, run_id: &str) -> Result<RunView> {
+    cancel_inner(
+        data_dir,
+        run_id,
+        #[cfg(unix)]
+        None,
+    )
+}
+
+#[cfg(unix)]
+pub fn cancel_with_executor(
+    data_dir: &Path,
+    run_id: &str,
+    executor: &CommandExecutor<'_>,
+) -> Result<RunView> {
+    cancel_inner(data_dir, run_id, Some(executor))
+}
+
+fn cancel_inner(
+    data_dir: &Path,
+    run_id: &str,
+    #[cfg(unix)] executor: Option<&CommandExecutor<'_>>,
+) -> Result<RunView> {
     validate_run_id(run_id)?;
     let mut journal = Journal::open(data_dir, OpenMode::Write)?;
     let current = journal.view(run_id)?;
@@ -293,6 +638,42 @@ pub fn cancel(data_dir: &Path, run_id: &str) -> Result<RunView> {
     {
         journal.refresh_run_state(run_id)?;
         return journal.view(run_id);
+    }
+    #[cfg(unix)]
+    {
+        let stored = journal.stored_run(run_id)?;
+        for (step, view) in stored.ordered_steps.iter().zip(&current.steps) {
+            if !matches!(step.action, StepAction::Command { .. })
+                || !matches!(view.state, StepState::Pending | StepState::Running)
+            {
+                continue;
+            }
+            let mut authority = Authority::open(data_dir)?;
+            let id = command_attempt_id(run_id, &stored.plan_digest, &step.id);
+            let attempt = match authority.command_attempt(&id) {
+                Ok(attempt) => attempt,
+                Err(Error::NotFound(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            let attempt = if attempt.state == CommandState::Finished {
+                attempt
+            } else {
+                if attempt.state == CommandState::Running && executor.is_none() {
+                    return Err(Error::Invalid(
+                        "cancelling a running workflow command requires --docker and --docker-socket"
+                            .into(),
+                    ));
+                }
+                authority.cancel_command_attempt(
+                    executor.map(|e| e.backend),
+                    executor.map_or(data_dir, |e| e.work_dir),
+                    &id,
+                    attempt.run_generation,
+                    "workflow cancelled by operator",
+                )?
+            };
+            journal.finish_step(run_id, step, command_result(&attempt)?)?;
+        }
     }
     let tx = journal
         .connection
@@ -376,6 +757,7 @@ impl Journal {
             initialize_schema(&mut connection, matches!(mode, OpenMode::Create))?;
         }
         Ok(Self {
+            data_dir: canonical_data_dir,
             connection,
             _access: access,
             _lease: lease,
@@ -433,6 +815,7 @@ impl Journal {
                 state,
                 observations,
                 detail,
+                execution: command_projection(&self.data_dir, run_id, &run, declared, state)?,
             });
         }
         if steps.len() != run.ordered_steps.len() {
@@ -712,6 +1095,15 @@ fn validate_step_record(
         ));
     }
     match &definition.action {
+        StepAction::Command { .. } => {
+            if !observations.is_empty() {
+                return Err(Error::Invalid(
+                    "command step contains source-path observations".into(),
+                ));
+            }
+            // Terminal command state is additionally checked against the durable
+            // authority record by command_projection, including on historical reads.
+        }
         StepAction::RequireCapability { .. } => {
             if !observations.is_empty() || state != StepState::Blocked {
                 return Err(Error::Invalid(
@@ -806,6 +1198,11 @@ fn validate_dependency_results(definitions: &[StepDefinition], steps: &[StepView
 
 fn execute_step(engine: &Engine, source: &WorkflowSource, step: &StepDefinition) -> StepResult {
     match &step.action {
+        StepAction::Command { .. } => StepResult {
+            state: StepState::Blocked,
+            observations: Vec::new(),
+            detail: "command executor unavailable on this platform".into(),
+        },
         StepAction::RequireCapability { capability } => StepResult {
             state: StepState::Blocked,
             observations: Vec::new(),
@@ -1185,6 +1582,7 @@ mod tests {
             state,
             observations: Vec::new(),
             detail: None,
+            execution: None,
         }
     }
 
