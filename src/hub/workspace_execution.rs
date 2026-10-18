@@ -2,7 +2,10 @@
 //!
 //! Configuration is trusted startup input. HTTP requests select only registered
 //! identifiers and an exact existing native subject; they never supply programs,
-//! directories, provider endpoints, recipes or source bytes.
+//! directories, provider endpoints or recipes. Source transfer is separately opted
+//! in through operator-pinned profiles in the source module.
+
+pub mod source;
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -35,6 +38,8 @@ const MAX_PROFILES: usize = 32;
 pub struct ExecutionConfig {
     pub version: u32,
     pub profiles: Vec<ExecutionProfile>,
+    #[serde(default)]
+    pub source_profiles: Vec<source::SourceProfile>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -163,6 +168,8 @@ struct Queue {
 pub struct ExecutionService {
     queue: Mutex<Queue>,
     profiles: BTreeMap<(String, String), ExecutionProfile>,
+    source_profiles: BTreeMap<(String, String), source::SourceProfile>,
+    source_worker: Mutex<()>,
     workspace: Arc<Workspace>,
     // Prevent a second server from recovering or dispatching the same queue.
     _lease: Lease,
@@ -171,7 +178,10 @@ pub struct ExecutionService {
 
 impl ExecutionService {
     pub fn open(path: &Path, config: ExecutionConfig, workspace: Arc<Workspace>) -> Result<Self> {
-        if config.version != 1 || config.profiles.len() > MAX_PROFILES {
+        if config.version != 1
+            || config.profiles.len() > MAX_PROFILES
+            || config.source_profiles.len() > MAX_PROFILES
+        {
             return Err(HubError::Invalid(
                 "unsupported execution configuration".into(),
             ));
@@ -208,6 +218,23 @@ impl ExecutionService {
                 return Err(HubError::Invalid("duplicate execution profile".into()));
             }
         }
+        let mut source_profiles = BTreeMap::new();
+        for source in config.source_profiles {
+            let key = (source.repository_id.clone(), source.profile_id.clone());
+            let profile = profiles.get(&key).ok_or_else(|| {
+                HubError::Invalid("source profile has no execution profile".into())
+            })?;
+            let authority = profile.stable_mapping()?;
+            let template = authority.review_context(&source.template_context_digest)?;
+            if template.change.repository != profile.native_repository
+                || template.target != profile.target
+                || source_profiles.insert(key, source).is_some()
+            {
+                return Err(HubError::Invalid(
+                    "invalid or duplicate source profile".into(),
+                ));
+            }
+        }
         OpenOptions::new()
             .read(true)
             .write(true)
@@ -236,6 +263,8 @@ impl ExecutionService {
                 run_json BLOB NOT NULL, PRIMARY KEY(actor_id,request_id)
             ) STRICT;",
         )?;
+        source::initialize_source_schema(&db)?;
+        source::recover_source_transfers(&db)?;
         let mut queue = Queue { db };
         // A server interruption cannot prove whether an external call started or
         // whether its result reached durable native storage. Never replay it.
@@ -249,6 +278,8 @@ impl ExecutionService {
         Ok(Self {
             queue: Mutex::new(queue),
             profiles,
+            source_profiles,
+            source_worker: Mutex::new(()),
             workspace,
             _lease: lease,
             worker: Mutex::new(()),
@@ -285,7 +316,7 @@ impl ExecutionService {
                 profile_id: profile.profile_id.clone(), target: profile.target.clone(),
                 requirement_digest: profile.requirement_digest.clone(),
                 readiness: if profile.current_requirement().is_ok() { "configured" } else { "unavailable" },
-                limitations: "Source and Change context must already exist in the server native store. This endpoint does not upload or synchronize source. Runtime availability is checked on execution.",
+                limitations: if self.source_profiles.contains_key(&(profile.repository_id.clone(), profile.profile_id.clone())) { "Opt-in laptop source/context sync is enabled. Use the remote workflow CLI and Stop hook; runtime availability is checked on execution." } else { "Source and Change context must already exist in the server native store. Source sync is not enabled for this profile. Runtime availability is checked on execution." },
             });
         }
         Ok(RepositoryPage {
@@ -742,18 +773,27 @@ impl ExecutionService {
         let work = private_directory(&profile.data_dir.join("execution"))?;
         let docker_config = PrivateDirectory::create(&work)?;
         let claude_work = PrivateDirectory::create(&work)?;
-        let backend = match OciBackend::new(&profile.docker, &profile.docker_socket, &docker_config.0) {
-            Ok(backend) => backend,
-            Err(_) => return Ok((ExecutionState::Failed,
-                "The operator-configured container runtime is unavailable; no workflow command or review was dispatched.".into())),
+        let needs_container = plan
+            .definition()
+            .steps
+            .iter()
+            .any(|step| matches!(step.action, skill_workflow::StepAction::Command { .. }));
+        let backend = if needs_container {
+            match OciBackend::new(&profile.docker, &profile.docker_socket, &docker_config.0) {
+                Ok(backend) => Some(backend),
+                Err(_) => return Ok((ExecutionState::Failed,
+                    "The operator-configured container runtime is unavailable; no workflow command or review was dispatched.".into())),
+            }
+        } else {
+            None
         };
         let command_cancel = Cancellation::default();
         let review_cancel = ReviewCancellation::default();
-        let command = CommandExecutor {
-            backend: &backend,
+        let command = backend.as_ref().map(|backend| CommandExecutor {
+            backend,
             work_dir: &work,
             cancellation: &command_cancel,
-        };
+        });
         let claude = ClaudeExecutor {
             executable: &profile.claude,
             work_dir: &claude_work.0,
@@ -776,7 +816,7 @@ impl ExecutionService {
                 &profile.data_dir,
                 &run.native_run_id,
                 32,
-                Some(&command),
+                command.as_ref(),
                 Some(&claude),
                 &check,
             );

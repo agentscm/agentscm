@@ -24,6 +24,8 @@ pub mod workspace;
 pub mod workspace_execution;
 #[cfg(unix)]
 pub mod workspace_http;
+#[cfg(unix)]
+pub mod workspace_source_http;
 
 use std::fmt;
 use std::path::Path;
@@ -239,7 +241,9 @@ fn s3_config(lookup: &impl Fn(&str) -> Option<String>) -> Result<Option<S3Config
 
 pub fn router(state: HubState) -> Router {
     #[cfg(unix)]
-    let workspace_routes = workspace::routes().merge(workspace_http::routes());
+    let workspace_routes = workspace::routes()
+        .merge(workspace_http::routes())
+        .merge(workspace_source_http::routes());
     #[cfg(not(unix))]
     let workspace_routes = workspace::routes();
     Router::new()

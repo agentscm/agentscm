@@ -31,6 +31,7 @@ async fn execution_env(
             &queue,
             ExecutionConfig {
                 version: 1,
+                source_profiles: vec![],
                 profiles: vec![profile],
             },
             workspace,

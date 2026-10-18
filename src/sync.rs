@@ -140,6 +140,19 @@ pub fn write_offer(
     roots: &[String],
     output: &Path,
 ) -> Result<SourceOffer> {
+    let offer = source_offer(store, origin_repository, roots)?;
+    let bytes = serde_json::to_vec(&offer)?;
+    write_new(output, |file| file.write_all(&bytes))?;
+    Ok(offer)
+}
+
+/// Builds the same bounded immutable-source offer as [`write_offer`] without
+/// choosing an output path. Transport and authorization remain caller-owned.
+pub fn source_offer(
+    store: &Engine,
+    origin_repository: &str,
+    roots: &[String],
+) -> Result<SourceOffer> {
     validate_origin(origin_repository)?;
     let qualified = qualify_source(store, roots)?;
     let offer = SourceOffer {
@@ -154,7 +167,6 @@ pub fn write_offer(
     if bytes.len() as u64 > MAX_OFFER_BYTES {
         return Err(Error::Limit("sync offer exceeds size limit".into()));
     }
-    write_new(output, |file| file.write_all(&bytes))?;
     Ok(offer)
 }
 
@@ -212,6 +224,28 @@ where
 
 pub fn write_request(store: &Engine, offer: &Path, output: &Path) -> Result<SourceRequest> {
     let (offer_bytes, offer) = read_offer(offer)?;
+    let request = request_for_offer_bytes(store, &offer, &offer_bytes)?;
+    let bytes = serde_json::to_vec(&request)?;
+    write_new(output, |file| file.write_all(&bytes))?;
+    Ok(request)
+}
+
+/// Computes the receiver's bounded missing-object request for a canonical
+/// in-memory offer. The resulting digest binds `serde_json::to_vec(offer)`.
+pub fn request_for_offer(store: &Engine, offer: &SourceOffer) -> Result<SourceRequest> {
+    validate_offer(offer)?;
+    let offer_bytes = serde_json::to_vec(offer)?;
+    if offer_bytes.len() as u64 > MAX_OFFER_BYTES {
+        return Err(Error::Limit("sync offer exceeds size limit".into()));
+    }
+    request_for_offer_bytes(store, offer, &offer_bytes)
+}
+
+fn request_for_offer_bytes(
+    store: &Engine,
+    offer: &SourceOffer,
+    offer_bytes: &[u8],
+) -> Result<SourceRequest> {
     let mut missing = Vec::new();
     for object in &offer.objects {
         if !store.has_verified_object(&object.id)? {
@@ -220,21 +254,60 @@ pub fn write_request(store: &Engine, offer: &Path, output: &Path) -> Result<Sour
     }
     let request = SourceRequest {
         version: 1,
-        offer_sha256: digest(&offer_bytes),
+        offer_sha256: digest(offer_bytes),
         missing,
     };
     let bytes = serde_json::to_vec(&request)?;
     if bytes.len() as u64 > MAX_REQUEST_BYTES {
         return Err(Error::Limit("sync request exceeds size limit".into()));
     }
-    write_new(output, |file| file.write_all(&bytes))?;
     Ok(request)
 }
 
 pub fn write_bundle(store: &Engine, offer: &Path, request: &Path, output: &Path) -> Result<()> {
+    write_bundle_checked(
+        store,
+        offer,
+        request,
+        output,
+        MAX_BUNDLE_BYTES,
+        MAX_SYNC_OBJECTS,
+    )
+}
+
+/// Writes a negotiated bundle only when it fits tighter controller bounds.
+pub fn write_bundle_bound(
+    store: &Engine,
+    offer: &Path,
+    request: &Path,
+    output: &Path,
+    max_bundle_bytes: u64,
+    max_objects: usize,
+) -> Result<()> {
+    if max_bundle_bytes > MAX_BUNDLE_BYTES || max_objects > MAX_SYNC_OBJECTS {
+        return Err(Error::Invalid(
+            "bound bundle limits exceed sync protocol limits".into(),
+        ));
+    }
+    write_bundle_checked(store, offer, request, output, max_bundle_bytes, max_objects)
+}
+
+fn write_bundle_checked(
+    store: &Engine,
+    offer: &Path,
+    request: &Path,
+    output: &Path,
+    max_bundle_bytes: u64,
+    max_objects: usize,
+) -> Result<()> {
     let (offer_bytes, offer) = read_offer(offer)?;
     let (request_bytes, request) = read_request(request)?;
     validate_request(&request, &offer, &offer_bytes)?;
+    if offer.objects.len() > max_objects || request.missing.len() > max_objects {
+        return Err(Error::Limit(
+            "sync bundle object count exceeds controller limit".into(),
+        ));
+    }
     let descriptors: BTreeMap<&str, u64> = offer
         .objects
         .iter()
@@ -249,8 +322,8 @@ pub fn write_bundle(store: &Engine, offer: &Path, request: &Path, output: &Path)
             .and_then(|value| value.checked_add(descriptors[id.as_str()]))
             .ok_or_else(|| Error::Limit("sync bundle byte count overflow".into()))?;
     }
-    if total > MAX_BUNDLE_BYTES {
-        return Err(Error::Limit("sync bundle exceeds size limit".into()));
+    if total > max_bundle_bytes {
+        return Err(Error::Limit("sync bundle exceeds controller limit".into()));
     }
 
     write_new(output, |file| {
@@ -278,18 +351,89 @@ pub fn import_bundle(
     bundle: &Path,
     state_directory: &Path,
 ) -> Result<ImportOutcome> {
+    import_bundle_checked(store, bundle, state_directory, None)
+}
+
+/// Imports a bundle only when its embedded offer and request exactly match the
+/// controller-authorized negotiation and the tighter transport bounds.
+pub fn import_bundle_bound(
+    store: &Engine,
+    bundle: &Path,
+    state_directory: &Path,
+    expected_offer: &SourceOffer,
+    expected_request: &SourceRequest,
+    max_bundle_bytes: u64,
+    max_objects: usize,
+) -> Result<ImportOutcome> {
+    if max_bundle_bytes > MAX_BUNDLE_BYTES || max_objects > MAX_SYNC_OBJECTS {
+        return Err(Error::Invalid(
+            "bound import limits exceed sync protocol limits".into(),
+        ));
+    }
+    import_bundle_checked(
+        store,
+        bundle,
+        state_directory,
+        Some(BoundImport {
+            offer: expected_offer,
+            request: expected_request,
+            max_bundle_bytes,
+            max_objects,
+        }),
+    )
+}
+
+struct BoundImport<'a> {
+    offer: &'a SourceOffer,
+    request: &'a SourceRequest,
+    max_bundle_bytes: u64,
+    max_objects: usize,
+}
+
+fn import_bundle_checked(
+    store: &Engine,
+    bundle: &Path,
+    state_directory: &Path,
+    bound: Option<BoundImport<'_>>,
+) -> Result<ImportOutcome> {
     let mut file = File::open(bundle)?;
     let length = file.metadata()?.len();
     if length > MAX_BUNDLE_BYTES {
         return Err(Error::Limit("sync bundle exceeds size limit".into()));
     }
+    if bound
+        .as_ref()
+        .is_some_and(|bound| length > bound.max_bundle_bytes)
+    {
+        return Err(Error::Limit("sync bundle exceeds controller limit".into()));
+    }
     expect(&mut file, BUNDLE_MAGIC, "sync bundle magic")?;
     let offer_bytes = read_bytes(&mut file, MAX_OFFER_BYTES, "offer")?;
     let offer: SourceOffer = serde_json::from_slice(&offer_bytes)?;
     validate_offer(&offer)?;
+    if let Some(bound) = &bound {
+        if offer != *bound.offer {
+            return Err(Error::Conflict(
+                "sync bundle offer differs from authorized offer".into(),
+            ));
+        }
+        if offer.objects.len() > bound.max_objects {
+            return Err(Error::Limit(
+                "sync bundle object count exceeds controller limit".into(),
+            ));
+        }
+    }
     let request_bytes = read_bytes(&mut file, MAX_REQUEST_BYTES, "request")?;
     let request: SourceRequest = serde_json::from_slice(&request_bytes)?;
     validate_request(&request, &offer, &offer_bytes)?;
+    if bound
+        .as_ref()
+        .is_some_and(|bound| request != *bound.request)
+    {
+        return Err(Error::Conflict(
+            "sync bundle request differs from authorized request".into(),
+        ));
+    }
     let record_count = read_u32(&mut file)? as usize;
     if record_count != request.missing.len() {
         return Err(Error::Invalid(

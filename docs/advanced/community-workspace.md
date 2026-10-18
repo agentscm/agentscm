@@ -3,7 +3,9 @@
 > **Experimental, single-server alpha.** This opt-in workspace adds member and
 > settings management and shared execution of existing native workflows. It is
 > intended for a small trusted team. It does not provide managed hosting,
-> automatic failover, a workflow marketplace or source synchronization.
+> automatic failover or a workflow marketplace. Laptop source/context sync and a
+remote Claude Code Stop hook are separately opt-in; see the
+[laptop-to-hosted guide](hosted-laptop-workflows.md).
 
 The workspace reuses Hub GitHub/GitLab identities, repository-scoped agent
 tokens, the existing independent team roles, and the native workflow engine.
@@ -120,10 +122,11 @@ provider endpoints, model credentials or a replacement skill/recipe. Candidate
 commands still use the existing isolated runner; the Docker socket belongs to
 the trusted controller and is not mounted into candidate containers.
 
-The server must already have the immutable source and current Change context.
-This API does not upload laptop files, import Git history, checkpoint a remote
-working directory or automatically refresh a stale context. Continue using
-the existing native CLI and source/Git bridges for those operations.
+By default, the server must already have the immutable source and current
+Change context. To enable bounded source/context exchange from laptops, add an
+operator-pinned source profile as described in the
+[laptop-to-hosted guide](hosted-laptop-workflows.md). Git history import remains
+a separate operation through the existing source/Git bridges.
 
 ## Run, inspect, approve and land
 

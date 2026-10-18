@@ -118,11 +118,14 @@ Informational notes remain visible. A model cannot submit an approval or its own
 model identity are observations, not independent provider attestations or a hard monetary cap.
 Safe/restricted mode still trusts installed CLI software and managed policy.
 
-The [hub](skill-workflow-hub.md) remains repository-scoped and read-only. It shows recent runs,
+The legacy [hub dashboard](skill-workflow-hub.md) remains repository-scoped and read-only. It shows recent runs,
 command outcomes, structured review findings, and separate source and landing-binding
 freshness. Historical success and current applicability are not admission decisions.
-Workspace membership, authorization/settings and skill/workflow editing are tracked separately
-in [issue #20](https://github.com/counterbranch/agentscm/issues/20).
+The opt-in [Community workspace](community-workspace.md) adds members, permissions,
+settings and shared execution. Its [laptop-to-hosted flow](hosted-laptop-workflows.md)
+synchronizes source/context and runs this loop remotely. Skill/workflow editing
+and broader management remain tracked in
+[issue #20](https://github.com/counterbranch/agentscm/issues/20).
 
 Unknown external outcomes retain their reservation. Inspect/cancel an interrupted run, then
 explicitly refresh its context before trying again; the controller does not replay uncertain

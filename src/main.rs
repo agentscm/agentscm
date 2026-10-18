@@ -42,6 +42,8 @@ mod git_snapshot_cli;
 #[cfg(unix)]
 mod guided_cli;
 mod hook_cli;
+#[cfg(unix)]
+mod hosted_workflow_client;
 mod hub_cli;
 mod init_cli;
 mod intent_cli;
@@ -446,7 +448,7 @@ async fn main() {
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::SkillWorkflow { command } => {
-            skill_workflow_cli::run(&cli.data_dir, command)?;
+            skill_workflow_cli::run(&cli.data_dir, command).await?;
         }
         #[cfg(unix)]
         Command::Setup { command } => match setup_cli::run(command) {
