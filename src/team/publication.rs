@@ -199,7 +199,11 @@ impl PublicationAuthority {
             tx.batch_execute(include_str!("source-schema.sql"))?;
             version = 3;
         }
-        if version != 3 {
+        if version == 3 {
+            tx.batch_execute(include_str!("publication-owner-schema.sql"))?;
+            version = 4;
+        }
+        if version != 4 {
             return Err(Error::Invalid("unsupported team schema".into()).into());
         }
         tx.commit()?;
@@ -267,18 +271,21 @@ impl PublicationAuthority {
             digest(&serde_json::to_vec(&(&self.scope, request)).map_err(Error::from)?)
         };
         let mut tx = self.client.transaction()?;
-        fence_authorized(
+        let principal = fence_authorized(
             &mut tx,
             &self.scope,
             request.generation,
             self.credentials.as_ref(),
         )?;
-        if let Some(row) = tx.query_opt("SELECT request_digest,state,expires_at > clock_timestamp(),source_profile FROM team_publications WHERE trust_domain=$1 AND repository=$2 AND generation=$3 AND publication=$4", &[&self.scope.trust_domain,&self.scope.repository,&request.generation,&request.publication])? {
+        if let Some(row) = tx.query_opt("SELECT request_digest,state,expires_at > clock_timestamp(),source_profile,owner FROM team_publications WHERE trust_domain=$1 AND repository=$2 AND generation=$3 AND publication=$4", &[&self.scope.trust_domain,&self.scope.repository,&request.generation,&request.publication])? {
             if row.get::<_,String>(0) != request_digest
                 || row.get::<_,String>(1) == "abandoned"
                 || row.get::<_,String>(3) != namespace.as_str()
             {
                 return Err(TeamError::Conflict("publication ID reused".into()));
+            }
+            if row.get::<_,String>(1) != "complete" {
+                require_owner(principal.as_deref(), row.get::<_,Option<String>>(4).as_deref())?;
             }
             if row.get::<_,String>(1) != "complete" && !row.get::<_,bool>(2) {
                 return Err(TeamError::Expired);
@@ -289,7 +296,7 @@ impl PublicationAuthority {
         if updated != 1 {
             return Err(Error::Limit("repository reservation quota exceeded".into()).into());
         }
-        tx.execute("INSERT INTO team_publications(trust_domain,repository,generation,publication,request_digest,request,state,expires_at,source_profile) VALUES($1,$2,$3,$4,$5,$6,'reserved',clock_timestamp()+$7::integer * interval '1 second',$8)", &[&self.scope.trust_domain,&self.scope.repository,&request.generation,&request.publication,&request_digest,&canonical,&request.lease_seconds,&namespace.as_str()])?;
+        tx.execute("INSERT INTO team_publications(trust_domain,repository,generation,publication,request_digest,request,state,expires_at,source_profile,owner) VALUES($1,$2,$3,$4,$5,$6,'reserved',clock_timestamp()+$7::integer * interval '1 second',$8,$9)", &[&self.scope.trust_domain,&self.scope.repository,&request.generation,&request.publication,&request_digest,&canonical,&request.lease_seconds,&namespace.as_str(),&principal])?;
         tx.commit()?;
         Ok(())
     }
@@ -309,8 +316,15 @@ impl PublicationAuthority {
         identifier(publication)?;
         let (request, namespace) = {
             let mut tx = self.client.transaction()?;
-            fence_authorized(&mut tx, &self.scope, generation, self.credentials.as_ref())?;
-            let row = active_publication(&mut tx, &self.scope, generation, publication)?;
+            let principal =
+                fence_authorized(&mut tx, &self.scope, generation, self.credentials.as_ref())?;
+            let row = active_publication(
+                &mut tx,
+                &self.scope,
+                generation,
+                publication,
+                principal.as_deref(),
+            )?;
             if row.get::<_, String>(1) == "complete" {
                 return Err(TeamError::Conflict("publication already complete".into()));
             }
@@ -343,8 +357,15 @@ impl PublicationAuthority {
         // A concurrent abandon can win here; it must prevent all later writes.
         {
             let mut tx = self.client.transaction()?;
-            fence_authorized(&mut tx, &self.scope, generation, self.credentials.as_ref())?;
-            let row = active_publication(&mut tx, &self.scope, generation, publication)?;
+            let principal =
+                fence_authorized(&mut tx, &self.scope, generation, self.credentials.as_ref())?;
+            let row = active_publication(
+                &mut tx,
+                &self.scope,
+                generation,
+                publication,
+                principal.as_deref(),
+            )?;
             if SourceNamespace::parse(&row.get::<_, String>(4))? != namespace {
                 return Err(TeamError::Conflict(
                     "publication source profile changed".into(),
@@ -395,8 +416,15 @@ impl PublicationAuthority {
         })?;
         let manifest_digest = digest(manifest.as_bytes());
         let mut tx = self.client.transaction()?;
-        fence_authorized(&mut tx, &self.scope, generation, self.credentials.as_ref())?;
-        let row = active_publication(&mut tx, &self.scope, generation, publication)?;
+        let principal =
+            fence_authorized(&mut tx, &self.scope, generation, self.credentials.as_ref())?;
+        let row = active_publication(
+            &mut tx,
+            &self.scope,
+            generation,
+            publication,
+            principal.as_deref(),
+        )?;
         let state: String = row.get(1);
         if state == "complete" {
             return Err(TeamError::Conflict("publication already complete".into()));
@@ -424,7 +452,7 @@ impl PublicationAuthority {
             digest(&serde_json::to_vec(&(&self.scope, request)).map_err(Error::from)?);
         let mut tx = self.client.transaction()?;
         let current = lock_repository(&mut tx, &self.scope)?;
-        authorize_publication(&mut tx, &self.scope, self.credentials.as_ref())?;
+        let principal = authorize_publication(&mut tx, &self.scope, self.credentials.as_ref())?;
         if let Some(row) = tx.query_opt("SELECT request_digest,outcome,kind FROM team_outcomes WHERE trust_domain=$1 AND repository=$2 AND generation=$3 AND operation=$4", &[&self.scope.trust_domain,&self.scope.repository,&request.generation,&request.operation])? {
             if row.get::<_,String>(0) != request_digest || row.get::<_,String>(2) != "publication" {
                 return Err(TeamError::Conflict("operation ID reused".into()));
@@ -439,6 +467,7 @@ impl PublicationAuthority {
             &self.scope,
             request.generation,
             &request.publication,
+            principal.as_deref(),
         )?;
         if row.get::<_, String>(1) != "qualifying"
             || row.get::<_, Option<String>>(3).as_deref() != Some(request.manifest_digest.as_str())
@@ -506,8 +535,9 @@ impl PublicationAuthority {
     pub fn abandon(&mut self, generation: i64, publication: &str) -> Result<()> {
         identifier(publication)?;
         let mut tx = self.client.transaction()?;
-        fence_authorized(&mut tx, &self.scope, generation, self.credentials.as_ref())?;
-        let row = tx.query_opt("SELECT request,state FROM team_publications WHERE trust_domain=$1 AND repository=$2 AND generation=$3 AND publication=$4 FOR UPDATE", &[&self.scope.trust_domain,&self.scope.repository,&generation,&publication])?.ok_or_else(|| Error::NotFound("publication".into()))?;
+        let principal =
+            fence_authorized(&mut tx, &self.scope, generation, self.credentials.as_ref())?;
+        let row = tx.query_opt("SELECT request,state,owner FROM team_publications WHERE trust_domain=$1 AND repository=$2 AND generation=$3 AND publication=$4 FOR UPDATE", &[&self.scope.trust_domain,&self.scope.repository,&generation,&publication])?.ok_or_else(|| Error::NotFound("publication".into()))?;
         match row.get::<_, String>(1).as_str() {
             "complete" => {
                 return Err(TeamError::Conflict(
@@ -517,6 +547,10 @@ impl PublicationAuthority {
             "abandoned" => return Ok(()),
             _ => {}
         }
+        require_owner(
+            principal.as_deref(),
+            row.get::<_, Option<String>>(2).as_deref(),
+        )?;
         let request: ReserveRequest = parse(&row.get::<_, String>(0))?;
         // Once uploading started, bytes may remain durable even if a reply
         // was lost. Retain the conservative charge until authorized deletion
@@ -535,27 +569,40 @@ fn fence_authorized(
     scope: &RepositoryScope,
     generation: i64,
     credentials: Option<&Credentials>,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let current = lock_repository(tx, scope).map_err(|error| match error {
         TeamError::Storage(Error::NotFound(_)) if credentials.is_some() => TeamError::Unauthorized,
         error => error,
     })?;
-    authorize_publication(tx, scope, credentials)?;
+    let principal = authorize_publication(tx, scope, credentials)?;
     if current != generation {
         return Err(TeamError::Conflict("authority generation rejected".into()));
     }
-    Ok(())
+    Ok(principal)
 }
 
 fn authorize_publication(
     tx: &mut Transaction<'_>,
     scope: &RepositoryScope,
     credentials: Option<&Credentials>,
-) -> Result<()> {
-    if let Some(credentials) = credentials {
-        auth::authorize(tx, scope, credentials, Some(Role::Contributor), true)?;
+) -> Result<Option<String>> {
+    credentials
+        .map(|credentials| {
+            auth::authorize(tx, scope, credentials, Some(Role::Contributor), true)
+                .map(|state| state.principal)
+        })
+        .transpose()
+}
+
+/// Credentialed callers may mutate only publications they reserved; the
+/// trusted operator (no credentials) is not restricted. A row reserved before
+/// owners were recorded has none; it keeps the old any-contributor rule until its
+/// lease expires, so its contributor can still abandon it and free the quota.
+fn require_owner(principal: Option<&str>, owner: Option<&str>) -> Result<()> {
+    match (principal, owner) {
+        (Some(principal), Some(owner)) if owner != principal => Err(TeamError::Denied),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 pub(super) fn lock_repository(tx: &mut Transaction<'_>, scope: &RepositoryScope) -> Result<i64> {
@@ -571,8 +618,12 @@ fn active_publication(
     scope: &RepositoryScope,
     generation: i64,
     publication: &str,
+    principal: Option<&str>,
 ) -> Result<postgres::Row> {
-    let row = tx.query_opt("SELECT request,state,expires_at > clock_timestamp(),manifest_digest,source_profile FROM team_publications WHERE trust_domain=$1 AND repository=$2 AND generation=$3 AND publication=$4 FOR UPDATE", &[&scope.trust_domain,&scope.repository,&generation,&publication])?.ok_or_else(|| Error::NotFound("publication".into()))?;
+    let row = tx.query_opt("SELECT request,state,expires_at > clock_timestamp(),manifest_digest,source_profile,owner FROM team_publications WHERE trust_domain=$1 AND repository=$2 AND generation=$3 AND publication=$4 FOR UPDATE", &[&scope.trust_domain,&scope.repository,&generation,&publication])?.ok_or_else(|| Error::NotFound("publication".into()))?;
+    if row.get::<_, String>(1) != "complete" {
+        require_owner(principal, row.get::<_, Option<String>>(5).as_deref())?;
+    }
     if row.get::<_, String>(1) == "abandoned" {
         return Err(TeamError::Conflict("publication abandoned".into()));
     }

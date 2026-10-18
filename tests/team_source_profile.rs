@@ -327,7 +327,7 @@ fn pg18_schema_v1_and_v2_upgrade_preserves_rows_as_default_v1() {
             .query_one("SELECT version FROM team_schema", &[])
             .unwrap()
             .get(0);
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         let publication = sql
             .query_one("SELECT request_digest,request,state,source_profile FROM team_publications WHERE repository='legacy'", &[])
             .unwrap();
