@@ -87,7 +87,7 @@ export function section() {
 
 function split(file) {
   const body = existsSync(file) ? readFileSync(file, 'utf8') : ''
-  const m = new RegExp(`^${HEADING.replace(/[()]/g, '\\$&')}[ \\t]*$`, 'm').exec(body)
+  const m = new RegExp(`^${HEADING.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[ \\t]*$`, 'm').exec(body)
   return m ? { before: body.slice(0, m.index), current: body.slice(m.index) } : { before: body, current: null }
 }
 
