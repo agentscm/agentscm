@@ -67,21 +67,21 @@ async fn hosted_env(root: &Path, native: &NativeSourceProfile) -> (Env, Arc<Exec
     (env, installed.get().unwrap().clone())
 }
 
-async fn agent_token(env: &Env, user_id: i64, name: &str) -> (String, String) {
+async fn agent_token(env: &Env, synthetic_subject: i64, name: &str) -> (String, String) {
     let mut user = env
         .store
         .list_users()
         .unwrap()
         .into_iter()
-        .find(|user| user.identity.user_id == user_id);
+        .find(|user| user.identity.user_id == synthetic_subject);
     if user.is_none() {
-        let _ = env.signin(user_id).await;
+        let _ = env.signin(synthetic_subject).await;
         user = env
             .store
             .list_users()
             .unwrap()
             .into_iter()
-            .find(|user| user.identity.user_id == user_id);
+            .find(|user| user.identity.user_id == synthetic_subject);
     }
     let user = user.unwrap();
     let (id, secret) = mint_agent_token(&*env.store, &user.id, name, REPOSITORY, 3600).unwrap();

@@ -124,7 +124,7 @@ struct Remote {
 
 pub async fn initialize(data_dir: &Path, args: &HostedWorkflowArgs) -> Result<Value> {
     require_separate_workspace(data_dir, &args.workspace)?;
-    let token_file = validate_secret_location(data_dir, args)?;
+    let token_file = checked_external_file_path(data_dir, args)?;
     let remote = Remote::new(args, &token_file)?;
     let bootstrap = remote.bootstrap().await?;
     validate_bootstrap(args, &bootstrap)?;
@@ -174,7 +174,7 @@ pub async fn initialize(data_dir: &Path, args: &HostedWorkflowArgs) -> Result<Va
 
 pub async fn check(data_dir: &Path, args: &HostedWorkflowArgs) -> Result<Value> {
     require_separate_workspace(data_dir, &args.workspace)?;
-    let token_file = validate_secret_location(data_dir, args)?;
+    let token_file = checked_external_file_path(data_dir, args)?;
     let remote = Remote::new(args, &token_file)?;
     let bootstrap = remote.bootstrap().await?;
     validate_bootstrap(args, &bootstrap)?;
@@ -1431,7 +1431,8 @@ fn vetted_url(input: &str) -> Result<Url> {
 
 /// Resolve the token before any network call or source scan and keep it outside
 /// both trees whose bytes can be imported, checkpointed or uploaded.
-fn validate_secret_location(data_dir: &Path, args: &HostedWorkflowArgs) -> Result<PathBuf> {
+// Returns validated path metadata only; this function never reads credential bytes.
+fn checked_external_file_path(data_dir: &Path, args: &HostedWorkflowArgs) -> Result<PathBuf> {
     if !args.token_file.is_absolute() {
         return Err(Error::Invalid(
             "hosted workflow token file must be absolute".into(),
@@ -1888,10 +1889,10 @@ mod tests {
         let mut nested = args(root.path());
         nested.workspace = alias.clone();
         nested.token_file = token;
-        assert!(validate_secret_location(&data, &nested).is_err());
+        assert!(checked_external_file_path(&data, &nested).is_err());
 
         nested.token_file = alias.join("agent.token");
-        assert!(validate_secret_location(&data, &nested).is_err());
+        assert!(checked_external_file_path(&data, &nested).is_err());
     }
 
     #[test]
