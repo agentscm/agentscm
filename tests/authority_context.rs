@@ -65,6 +65,50 @@ fn assert_conflict<T: std::fmt::Debug>(value: agentscm::Result<T>) {
 }
 
 #[test]
+fn current_changes_page_by_stable_id_with_validated_bounds() {
+    let root = TempDir::new().unwrap();
+    let mut authority = Authority::open(root.path()).unwrap();
+    let repository = authority.repository_id().unwrap();
+    for id in ["z-last", "a-first", "m-middle"] {
+        authority
+            .start_change(&complete_context(&repository, id, 1))
+            .unwrap();
+    }
+    let mut updated = complete_context(&repository, "a-first", 2);
+    updated.intent = "Updated intent".into();
+    let current = authority.update_change_context(1, &updated).unwrap();
+    let first = authority.list_changes(2, None).unwrap();
+    assert_eq!(
+        first
+            .iter()
+            .map(|change| change.id.id.as_str())
+            .collect::<Vec<_>>(),
+        ["a-first", "m-middle"]
+    );
+    assert_eq!(first[0], current);
+    let next = authority.list_changes(2, Some(&first[1].id.id)).unwrap();
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].id.id, "z-last");
+    assert!(
+        authority
+            .list_changes(2, Some("z-last"))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(authority.list_changes(0, None).is_err());
+    assert!(authority.list_changes(101, None).is_err());
+    assert!(authority.list_changes(2, Some("invalid cursor")).is_err());
+    drop(authority);
+    assert_eq!(
+        Authority::open_read_only(root.path())
+            .unwrap()
+            .list_changes(1, None)
+            .unwrap(),
+        vec![current]
+    );
+}
+
+#[test]
 fn repository_identity_and_context_history_survive_reopen() {
     let temporary = TempDir::new().expect("tempdir");
     let path = temporary.path().join("authority");
@@ -425,4 +469,55 @@ fn create_v1_fixture(path: &Path, request: &IntegrateRequest) {
         .expect("target");
     connection.execute("INSERT INTO integration_events(sequence, operation_id, target, before_revision, before_version, after_revision, after_version, approval_id, context_digest, policy_epoch) VALUES (1, 'legacy-operation', 'main', NULL, NULL, ?1, 1, 'legacy-approval', ?2, 0)", params![REVISION, LEGACY_CONTEXT]).expect("event");
     connection.execute("INSERT INTO operations(operation_id, request_digest, event_sequence) VALUES ('legacy-operation', ?1, 1)", [legacy_digest(request)]).expect("operation");
+}
+
+#[test]
+fn readonly_approval_retry_preserves_strict_duplicate_and_revocation_semantics() {
+    let root = TempDir::new().unwrap();
+    let mut authority = Authority::open(root.path()).unwrap();
+    let repository = authority.repository_id().unwrap();
+    let context = complete_context(&repository, "retry-context", 1);
+    let change = authority.start_change(&context).unwrap();
+    let request = approval("retained-approval", &change);
+    assert!(
+        !Authority::open_read_only(root.path())
+            .unwrap()
+            .approval_retry(&request)
+            .unwrap()
+    );
+    authority.approve_idempotent(&request).unwrap();
+    assert_conflict(authority.approve(&request));
+    let readonly = Authority::open_read_only(root.path()).unwrap();
+    assert!(readonly.approval_retry(&request).unwrap());
+    let mut changed = request.clone();
+    changed.revision = "f".repeat(64);
+    assert_conflict(readonly.approval_retry(&changed));
+    authority.revoke_approval(&request.approval_id).unwrap();
+    assert!(readonly.approval_retry(&request).unwrap());
+    authority.approve_idempotent(&request).unwrap();
+    let revoked: bool = Connection::open(root.path().join("state.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT revoked FROM approvals WHERE approval_id=?1",
+            [&request.approval_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        revoked,
+        "retry must report history without reviving the approval"
+    );
+    let unknown = IntegrateRequest {
+        operation_id: "not-applied".into(),
+        target: request.target.clone(),
+        expected_target: None,
+        revision: request.revision.clone(),
+        context_digest: request.context_digest.clone(),
+        approval_id: request.approval_id.clone(),
+        policy_epoch: request.policy_epoch,
+        change: request.change.clone(),
+        change_version: request.change_version,
+    };
+    assert!(readonly.integration_retry(&unknown).unwrap().is_none());
+    assert!(readonly.target("main").unwrap().is_none());
 }

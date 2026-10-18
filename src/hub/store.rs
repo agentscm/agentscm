@@ -50,6 +50,18 @@ pub struct User {
 pub struct TokenDigest(String);
 
 impl TokenDigest {
+    /// Restore a digest from a trusted controller record, never a request credential.
+    pub(super) fn from_persisted(value: &str) -> Result<Self> {
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(HubError::Unauthorized);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
     pub(super) fn as_str(&self) -> &str {
         &self.0
     }
@@ -156,6 +168,10 @@ pub trait Store: Send + Sync {
     fn set_user_disabled_by(&self, actor: &str, user: &str, disabled: bool) -> Result<()>;
     /// Oldest first, at most 1000.
     fn list_users(&self) -> Result<Vec<User>>;
+    /// Exact identity lookup; authorization must not depend on a bounded user list.
+    fn user_by_id(&self, id: &str) -> Result<Option<User>>;
+    /// Exact numeric forge identity lookup, including disabled users.
+    fn user_for_identity(&self, identity: &ForgeIdentity) -> Result<Option<User>>;
     /// `method` is `browser` or `device`. Unknown user is `Invalid`.
     fn record_sign_in(&self, user: &str, method: &str, admin: bool) -> Result<()>;
     /// None if unknown, revoked, expired, or the owner is disabled.

@@ -84,6 +84,36 @@ impl ReviewSource for NativeSource {
     }
 }
 
+// The reservation check is durable; this additional check is immediately before
+// each actual model invocation, including subsequent source-retrieval calls.
+#[cfg(unix)]
+struct GuardedTransport<'a> {
+    inner: &'a ClaudeCodeTransport,
+    guard: Option<&'a super::DispatchGuard<'a>>,
+}
+#[cfg(unix)]
+impl ModelTransport for GuardedTransport<'_> {
+    fn scope_sha256(&self) -> String {
+        self.inner.scope_sha256()
+    }
+    fn basis(&self) -> TransportBasis {
+        self.inner.basis()
+    }
+    fn invoke<'a>(
+        &'a self,
+        call: &'a PreparedModelCall,
+        cancel: &'a ReviewCancellation,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ModelCallObservation> + Send + 'a>>
+    {
+        Box::pin(async move {
+            if self.guard.is_some_and(|guard| guard().is_err()) {
+                return ModelCallObservation::not_started(self.basis(), ModelFailure::Cancelled);
+            }
+            self.inner.invoke(call, cancel).await
+        })
+    }
+}
+
 #[cfg(unix)]
 struct Calls<'a> {
     data_dir: &'a Path,
@@ -91,11 +121,15 @@ struct Calls<'a> {
     run_id: &'a str,
     step_id: &'a str,
     generation: u64,
+    guard: Option<&'a super::DispatchGuard<'a>>,
 }
 
 #[cfg(unix)]
 impl ReviewJournal for Calls<'_> {
     fn reserve_call(&mut self, reservation: &CallReservation) -> Result<ReservationOutcome> {
+        if let Some(guard) = self.guard {
+            guard()?;
+        }
         let mut journal = Journal::open(self.data_dir, OpenMode::Write)?;
         super::verify_current(self.data_dir, self.plan)?;
         let tx = journal
@@ -150,10 +184,12 @@ pub(super) fn execute(
     run_id: &str,
     plan: &CompiledPlan,
     step_id: &str,
-    executable: &Path,
-    work_dir: &Path,
-    cancellation: &ReviewCancellation,
+    executor: &super::ClaudeExecutor<'_>,
+    guard: Option<&super::DispatchGuard<'_>>,
 ) -> Result<ReviewRecord> {
+    let executable = executor.executable;
+    let work_dir = executor.work_dir;
+    let cancellation = executor.cancellation;
     let journal = Journal::open(data_dir, OpenMode::Read)?;
     let generation: u64 = journal.connection.query_row(
         "SELECT generation FROM workflow_steps WHERE run_id=?1 AND step_id=?2",
@@ -184,7 +220,14 @@ pub(super) fn execute(
         .ok_or_else(|| Error::Invalid("review has no exact command context".into()))?;
     let authority = crate::authority::Authority::open_read_only(data_dir)?;
     let context = authority.review_context(command.2)?;
-    let transport = ClaudeCodeTransport::new(executable, work_dir)?;
+    if let Some(guard) = guard {
+        guard()?;
+    }
+    let native_transport = ClaudeCodeTransport::new(executable, work_dir)?;
+    let transport = GuardedTransport {
+        inner: &native_transport,
+        guard,
+    };
     let engine = Engine::open(data_dir)?;
     let (source, budget) = engine.with_read_budget(4 * 1024 * 1024);
     let (objective, rows, catalog) = budget.finish((|| {
@@ -291,6 +334,7 @@ pub(super) fn execute(
         run_id,
         step_id,
         generation,
+        guard,
     };
     // A cancellation from another CLI process is durable state, not this
     // process's signal token. Retain a validated read-only connection and the

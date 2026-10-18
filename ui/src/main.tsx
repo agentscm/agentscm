@@ -8,8 +8,9 @@ import { fragmentTokenAllowed, loadToken, saveToken } from './storage.ts'
 
 /** `#token=…` (from `agentscm demo`), removed from the address bar before anything else runs. */
 function takeFragmentToken(): string | null {
-  const token = new URLSearchParams(window.location.hash.slice(1)).get('token')
-  if (window.location.hash) history.replaceState(null, '', window.location.pathname + window.location.search)
+  const fragment = new URLSearchParams(window.location.hash.slice(1))
+  const token = fragment.get('token')
+  if (fragment.has('token')) history.replaceState(null, '', window.location.pathname + window.location.search)
   return token
 }
 

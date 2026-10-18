@@ -7,7 +7,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "lint": "eslint . && node scripts/check-derive.mjs",
+    "lint": "eslint . && node --experimental-strip-types scripts/check-derive.mjs && npm run test:workspace",
+    "test:workspace": "node --experimental-strip-types scripts/check-workspace.mjs",
     "notices": "node scripts/notices.mjs"
   },
   "dependencyNotes": {

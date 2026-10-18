@@ -357,6 +357,7 @@ struct BrowserLogin {
     verifier: String,
     cli_port: u16,
     cli_challenge: String,
+    workspace: bool,
 }
 
 struct DeviceLogin {
@@ -602,20 +603,32 @@ async fn browser_start(
 ) -> ApiResult<Response> {
     let (provider, _) = state.login.provider(&name).ok_or_else(not_found)?;
     let params = query(raw);
-    let cli_port = params
-        .get("cli_port")
-        .and_then(|port| port.parse::<u16>().ok())
-        .filter(|port| *port >= 1024)
-        .ok_or_else(ApiError::invalid)?;
-    let cli_challenge = params
-        .get("cli_challenge")
-        .filter(|c| {
-            c.len() == 43
-                && c.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
-        })
-        .ok_or_else(ApiError::invalid)?
-        .clone();
+    let workspace = params.get("workspace").is_some_and(|value| value == "1");
+    if workspace && state.workspace.is_none() {
+        return Err(not_found());
+    }
+    let cli_port = if workspace {
+        0
+    } else {
+        params
+            .get("cli_port")
+            .and_then(|port| port.parse::<u16>().ok())
+            .filter(|port| *port >= 1024)
+            .ok_or_else(ApiError::invalid)?
+    };
+    let cli_challenge = if workspace {
+        String::new()
+    } else {
+        params
+            .get("cli_challenge")
+            .filter(|c| {
+                c.len() == 43
+                    && c.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+            })
+            .ok_or_else(ApiError::invalid)?
+            .clone()
+    };
     let (csrf, verifier) = (random_hex()?, random_hex()?);
     let mut url = Url::parse(&format!(
         "{}{}",
@@ -645,6 +658,7 @@ async fn browser_start(
         verifier,
         cli_port,
         cli_challenge,
+        workspace,
     };
     state
         .login
@@ -712,7 +726,35 @@ async fn callback_inner(
     if !body["access_token"].is_string() {
         log_forge_error("code exchange failed", &body);
     }
-    let signed = sign_in(state, provider, forge, "browser", &body).await?;
+    let method = if pending.workspace {
+        "workspace"
+    } else {
+        "browser"
+    };
+    let signed = sign_in(state, provider, forge, method, &body).await?;
+    if pending.workspace {
+        // The browser receives a separate short-lived HttpOnly cookie, never the
+        // CLI human bearer or an agent token. Forge credentials stay server-side.
+        state
+            .login
+            .pending()
+            .sessions
+            .0
+            .remove(&session_digest(&signed.secret)?);
+        let workspace = state.workspace.clone().ok_or_else(not_found)?;
+        let cookie = blocking(state, move || workspace.issue_session(&signed.user))
+            .await
+            .map_err(super::workspace::api_error)?;
+        let mut response = found("/ui/#workspace", cookie_attributes("", 0))?;
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            HeaderValue::from_str(&cookie).map_err(|_| ApiError::invalid())?,
+        );
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return Ok(response);
+    }
     let now = unix_now();
     let handoff = random_hex()?;
     let location = format!(
@@ -826,7 +868,13 @@ async fn sign_in(
     };
     let admin = state.login.is_admin(provider.name, id, &login);
     // Nothing is stored for anyone refused.
-    if !admin {
+    if method == "workspace" {
+        let workspace = state.workspace.clone().ok_or_else(not_found)?;
+        let candidate = identity.clone();
+        if !blocking(state, move || workspace.allows_sign_in(&candidate)).await? {
+            return Err(ApiError::new(StatusCode::FORBIDDEN, "not_allowed"));
+        }
+    } else if !admin {
         let listed_ok =
             !state.login.has_allow_list() || state.login.is_allowed(provider.name, id, &login);
         if !listed_ok || !reads_connected(state, provider, forge, token).await? {
@@ -837,7 +885,15 @@ async fn sign_in(
     let user = blocking(state, move || {
         let user = store.upsert_user(&identity, &login)?;
         if !user.disabled {
-            store.record_sign_in(&user.id, method, admin)?;
+            store.record_sign_in(
+                &user.id,
+                if method == "workspace" {
+                    "browser"
+                } else {
+                    method
+                },
+                admin,
+            )?;
         }
         Ok(user)
     })
@@ -1132,8 +1188,13 @@ async fn revoke_token(
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
     let store = state.store.clone();
+    let workspace = state.workspace.clone();
     let revoked = blocking(&state, move || {
-        store.revoke_owned_agent_token(&human.user.id, &id)
+        let operation = || store.revoke_owned_agent_token(&human.user.id, &id);
+        match workspace {
+            Some(workspace) => workspace.with_identity_change(operation),
+            None => operation(),
+        }
     })
     .await?;
     if revoked {
@@ -1170,12 +1231,20 @@ async fn set_disabled(
     }
     let store = state.store.clone();
     let target = user.clone();
+    let workspace = state.workspace.clone();
     // After the actor is vetted, the store refuses only an unknown target.
     match blocking(&state, move || {
-        store.set_user_disabled_by(&actor, &target, disabled)
+        let operation = || store.set_user_disabled_by(&actor, &target, disabled);
+        match workspace {
+            Some(workspace) => workspace.with_user_change(&actor, &target, disabled, operation),
+            None => operation(),
+        }
     })
     .await
     {
+        Err(HubError::Invalid(code)) if code == "workspace_last_administrator" => {
+            return Err(super::workspace::api_error(HubError::Invalid(code)));
+        }
         Err(HubError::Invalid(_)) => return Err(not_found()),
         result => result?,
     }

@@ -114,19 +114,68 @@ pub async fn serve(config: HubConfig) -> Result<()> {
         config.activity_days,
         |name| std::env::var(name).ok(),
     )?)?;
-    let state = HubState::new(store, objects)
+    let mut state = HubState::new(store.clone(), objects)
         .with_login(login)
         .with_sync(github)
         .with_skill_workflows(workflows);
+    if let Some(path) = std::env::var_os("AGENTSCM_WORKSPACE_FILE") {
+        let config = super::workspace::WorkspaceConfig::from_file(PathBuf::from(path).as_path())?;
+        #[cfg(unix)]
+        let execution_database = config.database.with_extension("execution.sqlite");
+        let workspace =
+            tokio::task::spawn_blocking(move || super::workspace::Workspace::open(config, store))
+                .await
+                .map_err(|_| HubError::Unavailable("workspace startup failed".into()))??;
+        state = state.with_workspace(workspace);
+        #[cfg(unix)]
+        if let Some(path) = std::env::var_os(super::workspace_execution::CONFIG_ENV) {
+            let config = super::workspace_execution::ExecutionConfig::from_file(
+                PathBuf::from(path).as_path(),
+            )?;
+            let workspace = state
+                .workspace
+                .clone()
+                .ok_or_else(|| HubError::Unavailable("workspace startup failed".into()))?;
+            let execution = tokio::task::spawn_blocking(move || {
+                super::workspace_execution::ExecutionService::open(
+                    &execution_database,
+                    config,
+                    workspace,
+                )
+            })
+            .await
+            .map_err(|_| HubError::Unavailable("execution startup failed".into()))??;
+            state = state.with_workspace_execution(std::sync::Arc::new(execution));
+        }
+    } else if std::env::var_os("AGENTSCM_WORKSPACE_EXECUTION_FILE").is_some() {
+        return Err(HubError::Invalid(
+            "workspace execution requires AGENTSCM_WORKSPACE_FILE".into(),
+        ));
+    }
+    #[cfg(not(unix))]
+    if std::env::var_os("AGENTSCM_WORKSPACE_EXECUTION_FILE").is_some() {
+        return Err(HubError::Invalid(
+            "workspace execution is unsupported on this platform".into(),
+        ));
+    }
     sync::start(&state).await?;
     if let Err(error) = sync::bootstrap(&state, signin, |name| std::env::var(name).ok()).await {
         eprintln!("hub: first-run setup link not created: {error}");
     }
     tokio::spawn(sync::poll_loop(state.clone(), config.poll_seconds));
+    #[cfg(unix)]
+    let execution_worker = state
+        .workspace_execution
+        .as_ref()
+        .map(|execution| execution.clone().spawn_worker());
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(crate::Error::Io)?;
+    #[cfg(unix)]
+    if let Some(worker) = execution_worker {
+        worker.abort();
+    }
     Ok(())
 }
 

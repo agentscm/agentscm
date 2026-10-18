@@ -19,6 +19,11 @@ mod store_pg;
 mod store_sqlite;
 pub mod sync;
 mod ui;
+pub mod workspace;
+#[cfg(unix)]
+pub mod workspace_execution;
+#[cfg(unix)]
+pub mod workspace_http;
 
 use std::fmt;
 use std::path::Path;
@@ -96,6 +101,9 @@ pub struct HubState {
     skill_workflows: Arc<skill_workflow::SkillWorkflowRegistry>,
     /// Set by `agentscm demo`; health says so, for the status page.
     demo: bool,
+    workspace: Option<Arc<workspace::Workspace>>,
+    #[cfg(unix)]
+    workspace_execution: Option<Arc<workspace_execution::ExecutionService>>,
 }
 
 impl HubState {
@@ -108,6 +116,9 @@ impl HubState {
             sync: Arc::new(sync::Sync::unconfigured()),
             skill_workflows: Arc::new(skill_workflow::SkillWorkflowRegistry::unconfigured()),
             demo: false,
+            workspace: None,
+            #[cfg(unix)]
+            workspace_execution: None,
         }
     }
 
@@ -128,6 +139,20 @@ impl HubState {
 
     pub fn with_skill_workflows(mut self, registry: skill_workflow::SkillWorkflowRegistry) -> Self {
         self.skill_workflows = Arc::new(registry);
+        self
+    }
+
+    pub fn with_workspace(mut self, workspace: impl Into<Arc<workspace::Workspace>>) -> Self {
+        self.workspace = Some(workspace.into());
+        self
+    }
+
+    #[cfg(unix)]
+    pub fn with_workspace_execution(
+        mut self,
+        execution: Arc<workspace_execution::ExecutionService>,
+    ) -> Self {
+        self.workspace_execution = Some(execution);
         self
     }
 }
@@ -213,6 +238,10 @@ fn s3_config(lookup: &impl Fn(&str) -> Option<String>) -> Result<Option<S3Config
 }
 
 pub fn router(state: HubState) -> Router {
+    #[cfg(unix)]
+    let workspace_routes = workspace::routes().merge(workspace_http::routes());
+    #[cfg(not(unix))]
+    let workspace_routes = workspace::routes();
     Router::new()
         .merge(http::routes())
         .merge(intent::routes())
@@ -222,6 +251,7 @@ pub fn router(state: HubState) -> Router {
         .merge(publish::routes())
         .merge(sync::routes())
         .merge(ui::routes())
+        .merge(workspace_routes)
         .fallback(http::not_found)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
