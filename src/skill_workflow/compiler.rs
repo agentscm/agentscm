@@ -324,9 +324,12 @@ fn validate_step(step: &StepDefinition) -> Result<()> {
             #[cfg(unix)]
             crate::reviewer::validate_requested_model_selector(model)?;
             #[cfg(not(unix))]
-            return Err(Error::Invalid(
-                "Claude review is unsupported on this platform".into(),
-            ));
+            {
+                let _ = model;
+                return Err(Error::Invalid(
+                    "Claude review is unsupported on this platform".into(),
+                ));
+            }
         }
         StepAction::Command {
             runner,

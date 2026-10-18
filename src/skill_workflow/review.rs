@@ -1,15 +1,25 @@
 //! Controller-owned review calls. Source bytes are data, never host commands.
+#[cfg(unix)]
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::path::Path;
 
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+#[cfg(unix)]
+use rusqlite::TransactionBehavior;
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+#[cfg(unix)]
 use super::{Journal, OpenMode};
+#[cfg(unix)]
 use crate::checks::CheckSubject;
 use crate::reviewer::*;
-use crate::skill_workflow::{CompiledPlan, StepAction, StepState};
-use crate::store::{Engine, digest};
+use crate::skill_workflow::StepState;
+#[cfg(unix)]
+use crate::skill_workflow::{CompiledPlan, StepAction};
+#[cfg(unix)]
+use crate::store::Engine;
+use crate::store::digest;
 use crate::{Error, Result};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
