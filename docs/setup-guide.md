@@ -28,6 +28,8 @@
 
 If the hub isn't answering, quickstart reports the failure and the final live-warning status. Explicitly requested hub setup that remains incomplete exits non-zero.
 
+Quickstart and uninstall share one lock for the user configuration directory. An overlapping run stops with a retry message before changing installed state. The private `quickstart.lock` file remains after uninstall so later runs use the same lock.
+
 ## Running without a terminal (CI)
 
 Without a terminal quickstart refuses unless you pass `--yes`, which takes the recommended answer to every question. Choose with flags:

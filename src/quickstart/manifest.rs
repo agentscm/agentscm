@@ -1,8 +1,10 @@
 //! `~/.config/agentscm/quickstart.json`: everything quickstart wrote, so `uninstall`
 //! can take back exactly that and nothing else.
+use std::fs::{OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 
 use agentscm::hub::store::unix_now;
+use agentscm::lease::Lease;
 use agentscm::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -90,6 +92,74 @@ pub(crate) fn path() -> Result<PathBuf> {
     Ok(config_dir()?.join("agentscm").join("quickstart.json"))
 }
 
+/// A process-wide quickstart/uninstall lease. The stable lock file is deliberately outside every
+/// recorded install target and survives uninstall, so concurrent processes always lock one inode.
+pub(crate) fn acquire_lease() -> Result<Lease> {
+    let lock = path()?.with_file_name("quickstart.lock");
+    let directory = lock
+        .parent()
+        .ok_or_else(|| Error::Invalid("quickstart lock has no parent directory".into()))?;
+    super::private_dir(directory)?;
+    acquire_lease_at(&lock)
+}
+
+fn acquire_lease_at(lock: &Path) -> Result<Lease> {
+    if let Ok(metadata) = lock.symlink_metadata()
+        && (!metadata.is_file() || metadata.file_type().is_symlink())
+    {
+        return Err(Error::Invalid(format!(
+            "{} is not a regular quickstart lock file; refusing to follow it",
+            lock.display()
+        )));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(lock).map_err(|error| {
+        Error::Invalid(format!(
+            "cannot open quickstart lock {}: {error}",
+            lock.display()
+        ))
+    })?;
+    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        return Err(Error::Invalid(format!(
+            "{} is not a regular quickstart lock file",
+            lock.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| {
+                Error::Invalid(format!(
+                    "cannot make quickstart lock {} private: {error}",
+                    lock.display()
+                ))
+            })?;
+    }
+    let lease = match Lease::try_exclusive(file) {
+        Ok(lease) => lease,
+        Err(TryLockError::WouldBlock) => {
+            return Err(Error::Invalid(
+                "another agentscm quickstart or uninstall is running; wait for it to finish, then retry"
+                    .into(),
+            ));
+        }
+        Err(TryLockError::Error(error)) => {
+            return Err(Error::Invalid(format!(
+                "cannot lock {}: {error}",
+                lock.display()
+            )));
+        }
+    };
+    Ok(lease)
+}
+
 pub(crate) fn sha_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -150,5 +220,47 @@ impl Manifest {
             && self.local_hub.is_none()
             && self.native_hub.is_none()
             && self.bin_dir.is_none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quickstart_lease_is_exclusive_and_reusable() {
+        let directory = tempfile::tempdir().unwrap();
+        let lock = directory.path().join("quickstart.lock");
+        let lease = acquire_lease_at(&lock).unwrap();
+        let busy = acquire_lease_at(&lock).unwrap_err().to_string();
+        assert!(busy.contains("another agentscm quickstart or uninstall is running"));
+        drop(lease);
+        acquire_lease_at(&lock).expect("the same stable lock file is reusable after release");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(lock.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn quickstart_lease_rejects_nonregular_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let lock = directory.path().join("quickstart.lock");
+        std::fs::create_dir(&lock).unwrap();
+        assert!(acquire_lease_at(&lock).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quickstart_lease_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        std::fs::write(&target, "").unwrap();
+        let lock = directory.path().join("quickstart.lock");
+        symlink(&target, &lock).unwrap();
+        assert!(acquire_lease_at(&lock).is_err());
     }
 }

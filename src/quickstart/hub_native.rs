@@ -1,7 +1,5 @@
 //! A per-user macOS Hub managed by launchd.
 use std::collections::BTreeMap;
-#[cfg(unix)]
-use std::fs::File;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -257,40 +255,6 @@ struct NativeRuntime<'a> {
     manifest: &'a mut Manifest,
 }
 
-#[cfg(unix)]
-struct InstallLock {
-    _file: File,
-}
-
-#[cfg(unix)]
-fn install_lock(config_dir: &Path) -> Result<InstallLock, String> {
-    super::private_dir(config_dir).map_err(|error| error.to_string())?;
-    let path = config_dir.join("install.lock");
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(&path)
-        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::OpenOptionsExt;
-    // SAFETY: flock only observes the valid descriptor owned by `file`; the descriptor stays
-    // alive in InstallLock until the operation finishes.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err("Another native Hub install or uninstall is already running.".into());
-    }
-    Ok(InstallLock { _file: file })
-}
-
-#[cfg(not(unix))]
-struct InstallLock;
-
-#[cfg(not(unix))]
-fn install_lock(_config_dir: &Path) -> Result<InstallLock, String> {
-    Err("native Hub service locking is available only on Unix".into())
-}
-
 impl NativeRuntime<'_> {
     fn kickstart(&self) -> Result<(), String> {
         launchctl(&[
@@ -508,7 +472,6 @@ pub(crate) async fn start(
         options.port,
         record.executable.display()
     );
-    let _install_lock = install_lock(&record.config_dir)?;
     super::private_dir(&record.data_dir).map_err(|error| error.to_string())?;
     let environment = if record.environment.is_empty() {
         base_environment(&record)
@@ -674,7 +637,6 @@ pub(crate) fn uninstall(record: &Record, home: &Path, wipe: bool) -> Result<(), 
     reject_symlink(&home.join("Library/LaunchAgents"), "LaunchAgents directory")?;
     reject_symlink(&record.config_dir, "configuration directory")?;
     reject_symlink(&record.data_dir, "data directory")?;
-    let _uninstall_lock = install_lock(&record.config_dir)?;
     if !wipe {
         let receipt = Receipt {
             project: record.project.clone(),
@@ -781,7 +743,10 @@ mod tests {
         let environment = BTreeMap::from([
             (
                 "AGENTSCM_DATABASE_URL".into(),
-                format!("sqlite://{}", config.join("data/hub.sqlite").display()),
+                format!(
+                    "sqlite://{}",
+                    config.join("data").join("hub.sqlite").display()
+                ),
             ),
             ("AGENTSCM_ADMINS".into(), "github:octocat".into()),
         ]);

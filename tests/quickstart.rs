@@ -1161,6 +1161,87 @@ fn unused_port() -> u16 {
         .port()
 }
 
+fn run_with_hub_port_retry<F>(run: F) -> Output
+where
+    F: FnMut(&str) -> Output,
+{
+    run_with_hub_port_retry_using(unused_port, run)
+}
+
+fn run_with_hub_port_retry_using<S, F>(mut select_port: S, mut run: F) -> Output
+where
+    S: FnMut() -> u16,
+    F: FnMut(&str) -> Output,
+{
+    const MAX_ATTEMPTS: usize = 3;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let port = select_port().to_string();
+        let output = run(&port);
+        let preflight = format!(
+            "127.0.0.1:{port} is already in use; choose another --hub-port. No existing service was stopped."
+        );
+        let stdout_has_preflight = out(&output).lines().any(|line| line == preflight);
+        if output.status.code() != Some(1) || !stdout_has_preflight || attempt + 1 == MAX_ATTEMPTS {
+            return output;
+        }
+    }
+
+    unreachable!("the bounded hub port retry loop always returns")
+}
+
+#[test]
+fn hub_port_retry_reaches_docker_failure_after_an_occupied_first_port() {
+    let machine = Machine::new();
+    let repo = machine.repo();
+    fake_docker(&machine);
+    let held_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let held_port = held_listener.local_addr().unwrap().port();
+    let mut first_attempt = true;
+    let mut attempts = 0;
+    let output = run_with_hub_port_retry_using(
+        || {
+            if first_attempt {
+                first_attempt = false;
+                held_port
+            } else {
+                unused_port()
+            }
+        },
+        |port| {
+            attempts += 1;
+            machine
+                .command(
+                    repo.path(),
+                    &[
+                        "quickstart",
+                        "--yes",
+                        "--hub",
+                        "local",
+                        "--hub-runtime",
+                        "docker",
+                        "--hub-port",
+                        port,
+                        "--github-login",
+                        "octo",
+                        "--hook",
+                        "none",
+                        "--no-collisions",
+                    ],
+                )
+                .output()
+                .unwrap()
+        },
+    );
+    drop(held_listener);
+    assert!((2..=3).contains(&attempts));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(out(&output).contains("Docker could not pull"), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("registry denied pull"));
+    assert!(!machine.home.path().join(".agentscm/hub").exists());
+    assert!(!machine.config().join("quickstart.json").exists());
+}
+
 fn fake_docker(machine: &Machine) {
     let docker = machine.bin.path().join("docker");
     std::fs::write(
@@ -1309,29 +1390,30 @@ fn failed_hub_pull_leaves_no_setup_files_or_record_and_honors_platform() {
         let machine = Machine::new();
         let repo = machine.repo();
         fake_docker(&machine);
-        let port = unused_port().to_string();
-        let mut command = machine.command(
-            repo.path(),
-            &[
-                "quickstart",
-                "--yes",
-                "--hub",
-                "local",
-                "--hub-runtime",
-                "docker",
-                "--hub-port",
-                &port,
-                "--github-login",
-                "octo",
-                "--hook",
-                "none",
-                "--no-collisions",
-            ],
-        );
-        if let Some(platform) = platform {
-            command.env("DOCKER_DEFAULT_PLATFORM", platform);
-        }
-        let result = command.output().unwrap();
+        let result = run_with_hub_port_retry(|port| {
+            let mut command = machine.command(
+                repo.path(),
+                &[
+                    "quickstart",
+                    "--yes",
+                    "--hub",
+                    "local",
+                    "--hub-runtime",
+                    "docker",
+                    "--hub-port",
+                    port,
+                    "--github-login",
+                    "octo",
+                    "--hook",
+                    "none",
+                    "--no-collisions",
+                ],
+            );
+            if let Some(platform) = platform {
+                command.env("DOCKER_DEFAULT_PLATFORM", platform);
+            }
+            command.output().unwrap()
+        });
         assert_eq!(result.status.code(), Some(1), "{result:?}");
         let said = out(&result);
         assert!(said.contains("Docker could not pull"), "{said}");
@@ -1439,29 +1521,30 @@ fn malformed_custom_image_never_reaches_image_inspect_or_pull() {
         let machine = Machine::new();
         let repo = machine.repo();
         fake_docker(&machine);
-        let port = unused_port().to_string();
-        let output = machine
-            .command(
-                repo.path(),
-                &[
-                    "quickstart",
-                    "--yes",
-                    "--hub",
-                    "local",
-                    "--hub-runtime",
-                    "docker",
-                    "--hub-port",
-                    &port,
-                    "--github-login",
-                    "octo",
-                    "--hook",
-                    "none",
-                    "--no-collisions",
-                ],
-            )
-            .env("AGENTSCM_HUB_IMAGE", image)
-            .output()
-            .unwrap();
+        let output = run_with_hub_port_retry(|port| {
+            machine
+                .command(
+                    repo.path(),
+                    &[
+                        "quickstart",
+                        "--yes",
+                        "--hub",
+                        "local",
+                        "--hub-runtime",
+                        "docker",
+                        "--hub-port",
+                        port,
+                        "--github-login",
+                        "octo",
+                        "--hook",
+                        "none",
+                        "--no-collisions",
+                    ],
+                )
+                .env("AGENTSCM_HUB_IMAGE", image)
+                .output()
+                .unwrap()
+        });
         assert_eq!(output.status.code(), Some(1), "{output:?}");
         let said = out(&output);
         assert!(
@@ -1484,34 +1567,35 @@ fn custom_image_drops_previous_platform_choice_and_failed_pull_preserves_existin
     let machine = Machine::new();
     let repo = machine.repo();
     fake_docker(&machine);
-    let port = unused_port().to_string();
     let dir = machine.home.path().join(".agentscm/hub");
     std::fs::create_dir_all(&dir).unwrap();
     let old_env = "DOCKER_DEFAULT_PLATFORM=linux/amd64\nAGENTSCM_ADMINS=github:octo\n";
     std::fs::write(dir.join(".env"), old_env).unwrap();
     std::fs::write(dir.join("compose.yaml"), "previous compose\n").unwrap();
-    let output = machine
-        .command(
-            repo.path(),
-            &[
-                "quickstart",
-                "--yes",
-                "--hub",
-                "local",
-                "--hub-runtime",
-                "docker",
-                "--hub-port",
-                &port,
-                "--github-login",
-                "octo",
-                "--hook",
-                "none",
-                "--no-collisions",
-            ],
-        )
-        .env("AGENTSCM_HUB_IMAGE", "example.invalid/custom:arm64")
-        .output()
-        .unwrap();
+    let output = run_with_hub_port_retry(|port| {
+        machine
+            .command(
+                repo.path(),
+                &[
+                    "quickstart",
+                    "--yes",
+                    "--hub",
+                    "local",
+                    "--hub-runtime",
+                    "docker",
+                    "--hub-port",
+                    port,
+                    "--github-login",
+                    "octo",
+                    "--hook",
+                    "none",
+                    "--no-collisions",
+                ],
+            )
+            .env("AGENTSCM_HUB_IMAGE", "example.invalid/custom:arm64")
+            .output()
+            .unwrap()
+    });
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     let said = out(&output);
     let commands = std::fs::read_to_string(machine.home.path().join("docker.log")).unwrap();
@@ -1757,34 +1841,35 @@ fn docker_platform_and_context_selection_use_the_effective_local_daemon() {
         let machine = Machine::new();
         let repo = machine.repo();
         fake_docker(&machine);
-        let port = unused_port().to_string();
-        let output = machine
-            .command(
-                repo.path(),
-                &[
-                    "quickstart",
-                    "--yes",
-                    "--hub",
-                    "local",
-                    "--hub-runtime",
-                    "docker",
-                    "--hub-port",
-                    &port,
-                    "--github-login",
-                    "octo",
-                    "--hook",
-                    "none",
-                    "--no-collisions",
-                ],
-            )
-            .env("FAKE_DOCKER_PLATFORM", platform)
-            .env("FAKE_DOCKER_ENDPOINT", endpoint)
-            .env("DOCKER_HOST", host)
-            .env("DOCKER_CONTEXT", context)
-            .env("AGENTSCM_HUB_IMAGE", "example.invalid/fixture:custom")
-            .env("FAKE_DOCKER_IMAGE_PRESENT", "1")
-            .output()
-            .unwrap();
+        let output = run_with_hub_port_retry(|port| {
+            machine
+                .command(
+                    repo.path(),
+                    &[
+                        "quickstart",
+                        "--yes",
+                        "--hub",
+                        "local",
+                        "--hub-runtime",
+                        "docker",
+                        "--hub-port",
+                        port,
+                        "--github-login",
+                        "octo",
+                        "--hook",
+                        "none",
+                        "--no-collisions",
+                    ],
+                )
+                .env("FAKE_DOCKER_PLATFORM", platform)
+                .env("FAKE_DOCKER_ENDPOINT", endpoint)
+                .env("DOCKER_HOST", host)
+                .env("DOCKER_CONTEXT", context)
+                .env("AGENTSCM_HUB_IMAGE", "example.invalid/fixture:custom")
+                .env("FAKE_DOCKER_IMAGE_PRESENT", "1")
+                .output()
+                .unwrap()
+        });
         assert_eq!(output.status.code(), Some(1), "{output:?}");
         let calls = std::fs::read_to_string(machine.home.path().join("docker.log")).unwrap();
         let text = format!(
@@ -1892,5 +1977,152 @@ fn forged_native_dot_projects_cannot_delete_the_native_root_or_parent() {
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "preserve");
         assert_eq!(std::fs::read_to_string(&native_marker).unwrap(), "preserve");
         assert!(!machine.home.path().join("launchctl.log").exists());
+    }
+}
+
+#[test]
+fn overlapping_install_and_uninstall_preserve_ownership_and_release_after_exit() {
+    use std::io::{Read, Write};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let machine = Machine::new();
+    let first_repo = machine.repo();
+    let second_repo = machine.repo_at("git@github.com:acme/other.git");
+    let args = [
+        "quickstart",
+        "--yes",
+        "--hub",
+        "skip",
+        "--hook",
+        "project",
+        "--no-collisions",
+    ];
+    // The first child pauses in status after loading its ownership record. A second
+    // installer must be refused before it can load and later overwrite stale state.
+    let pause = |machine: &Machine| {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            stream.read_exact(&mut [0; 1]).unwrap();
+            entered_tx.send(()).unwrap();
+            let _ = resume_rx.recv_timeout(Duration::from_secs(30));
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}",
+            );
+        });
+        let child = machine
+            .command(first_repo.path(), &args)
+            .env("AGENTSCM_HUB_URL", url)
+            .env(
+                "AGENTSCM_HUB_TOKEN_FILE",
+                machine.home.path().join("absent.token"),
+            )
+            .spawn()
+            .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        (child, resume_tx, server)
+    };
+    let (first, resume, server) = pause(&machine);
+    let record = machine.config().join("quickstart.json");
+    let record_before = std::fs::read(&record).ok();
+    let second = machine.run(second_repo.path(), &args);
+    let uninstall = machine.run(first_repo.path(), &["uninstall", "--yes"]);
+    let record_while_paused = std::fs::read(&record).ok();
+    let hooks_while_paused = second_repo.path().join(SETTINGS).exists();
+    resume.send(()).unwrap();
+    let first_output = first.wait_with_output().unwrap();
+    server.join().unwrap();
+    for output in [&second, &uninstall] {
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("another agentscm quickstart or uninstall is running"),
+            "{output:?}"
+        );
+    }
+    assert_eq!(record_before, record_while_paused);
+    assert!(!hooks_while_paused);
+    ok(&first_output);
+    assert_eq!(json_file(&record)["hooks"].as_array().unwrap().len(), 1);
+    ok(&machine.run(second_repo.path(), &args));
+    assert_eq!(json_file(&record)["hooks"].as_array().unwrap().len(), 2);
+
+    // A killed owner releases the operating-system lock; the stable lock file is
+    // reused, rather than removed and recreated while another process may hold it.
+    let lock_path = machine.config().join("quickstart.lock");
+    let lock_inode = {
+        use std::os::unix::fs::MetadataExt;
+        lock_path.metadata().unwrap().ino()
+    };
+    let (mut killed, resume, server) = pause(&machine);
+    killed.kill().unwrap();
+    killed.wait().unwrap();
+    let _ = resume.send(());
+    server.join().unwrap();
+    ok(&machine.run(first_repo.path(), &["uninstall", "--yes"]));
+    assert!(!record.exists());
+    assert!(!first_repo.path().join(SETTINGS).exists());
+    assert!(!second_repo.path().join(SETTINGS).exists());
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(lock_path.metadata().unwrap().ino(), lock_inode);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn native_program_repairs_are_reported_but_true_noop_preserves_record() {
+    for missing in ["link", "versioned"] {
+        let (machine, hub) = (Machine::new(), Hub::start());
+        let repo = machine.repo();
+        let (plist, executable) = native_fixture(&machine, &hub);
+        let token = hub.token_file(machine.home.path());
+        let args = [
+            "quickstart",
+            "--yes",
+            "--hub",
+            "local",
+            "--hub-runtime",
+            "native",
+            "--github-login",
+            "octo",
+            "--agent-token-file",
+            token.to_str().unwrap(),
+            "--hook",
+            "none",
+            "--no-collisions",
+        ];
+        let run = || {
+            machine
+                .command(repo.path(), &args)
+                .env("FAKE_PLIST", &plist)
+                .output()
+                .unwrap()
+        };
+        ok(&run());
+        let record = machine.config().join("quickstart.json");
+        let before = std::fs::read(&record).unwrap();
+        let stable = machine.bin_dir().join("agentscm");
+        std::fs::remove_file(if missing == "link" {
+            &stable
+        } else {
+            &executable
+        })
+        .unwrap();
+        let repaired = ok(&run());
+        assert!(stable.is_file(), "{missing}");
+        assert!(
+            !repaired.contains("No changes made."),
+            "{missing}: {repaired}"
+        );
+        assert_eq!(std::fs::read(&record).unwrap(), before, "{missing}");
+        let noop = ok(&run());
+        assert!(noop.contains("No changes made."), "{missing}: {noop}");
+        assert_eq!(std::fs::read(&record).unwrap(), before, "{missing}");
     }
 }

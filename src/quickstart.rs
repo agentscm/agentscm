@@ -378,6 +378,7 @@ pub async fn run(args: QuickstartArgs) -> Result<u8> {
     }
     let ui = Ui { yes: args.yes };
     let home = home_dir()?;
+    let _quickstart_lease = manifest::acquire_lease()?;
     let cwd = std::env::current_dir()?;
     let found = detect::detect(&cwd, &home);
     let mut cx = Cx {
@@ -400,6 +401,7 @@ pub async fn run(args: QuickstartArgs) -> Result<u8> {
         cx.home.join(".agentscm/hub/.env"),
     ];
     let original_hub_files = hub_files.each_ref().map(|path| file_hash(path));
+    let original_program = program_fingerprint(&cx.home);
     // Running from the install directory is undoable even if nothing else is written.
     if let Some((binary::Program::InstallDir(_), _)) = program_plan(&cx.home) {
         cx.manifest.bin_dir = Some(binary::bin_dir(&cx.home));
@@ -425,6 +427,7 @@ pub async fn run(args: QuickstartArgs) -> Result<u8> {
     }
     let changed = record_fingerprint(&record_path) != original_record
         || hub_files.each_ref().map(|path| file_hash(path)) != original_hub_files
+        || program_fingerprint(&cx.home) != original_program
         || !cx.init_written.is_empty();
     summary(&cx, changed);
     let command = cli_command(&cx);
@@ -458,6 +461,52 @@ fn record_fingerprint(path: &Path) -> (Option<String>, Option<u32>) {
     #[cfg(not(unix))]
     let mode = None;
     (file_hash(path), mode)
+}
+
+type ProgramFileFingerprint = (PathBuf, Option<String>, Option<PathBuf>, Option<u32>);
+
+/// Stable managed-program state. The symlink target catches link repair while the digest catches
+/// Windows link-copy repair and replacement of a versioned executable with the same filename.
+fn program_fingerprint(home: &Path) -> (Option<u32>, Vec<ProgramFileFingerprint>) {
+    let directory = binary::bin_dir(home);
+    #[cfg(unix)]
+    let directory_mode = directory
+        .metadata()
+        .ok()
+        .map(|metadata| metadata.permissions().mode() & 0o777);
+    #[cfg(not(unix))]
+    let directory_mode = None;
+    let files = [
+        directory.join(binary::LINK),
+        directory.join(format!(
+            "agentscm-{}{}",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::EXE_SUFFIX
+        )),
+    ]
+    .into_iter()
+    .map(|path| {
+        let metadata = path.symlink_metadata().ok();
+        let target = metadata
+            .as_ref()
+            .filter(|metadata| metadata.file_type().is_symlink())
+            .and_then(|_| std::fs::read_link(&path).ok());
+        #[cfg(unix)]
+        let mode = path
+            .metadata()
+            .ok()
+            .map(|metadata| metadata.permissions().mode() & 0o777);
+        #[cfg(not(unix))]
+        let mode = None;
+        let digest = path
+            .metadata()
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .and_then(|_| file_hash(&path));
+        (path, digest, target, mode)
+    })
+    .collect();
+    (directory_mode, files)
 }
 
 async fn status(cx: &Cx<'_>) {
@@ -1882,6 +1931,7 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
         ));
     }
     let ui = Ui { yes: args.yes };
+    let _quickstart_lease = manifest::acquire_lease()?;
     let Some(m) = Manifest::load()? else {
         println!("Nothing to undo: quickstart hasn't installed anything here.");
         return Ok(());
