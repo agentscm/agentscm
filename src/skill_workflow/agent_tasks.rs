@@ -16,9 +16,12 @@ use super::{Journal, OpenMode};
 use crate::authority::Authority;
 use crate::context::ReviewContext;
 use crate::model::TargetState;
+use crate::model::{Approval, IntegrateRequest, IntegrationEvent};
+use crate::skill_workflow::collector_transfer::*;
 use crate::skill_workflow::compiler::{CompiledPlan, compile};
 use crate::skill_workflow::contracts::{StepAction, StepDefinition};
 use crate::skill_workflow::task_contracts::*;
+use crate::skill_workflow::{RunState, StepState};
 use crate::store::Engine;
 use crate::{Error, Result};
 
@@ -46,6 +49,44 @@ pub trait TaskAuthorizationGuard: Send + Sync {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CollectorAction {
+    Submit,
+    Finalize,
+    Approve,
+    Integrate,
+}
+
+/// One atomic authorization boundary: actor/action and ALL originating grants, then
+/// journal, then native authority. Workspace implementations must override this with
+/// one held authorization lock; never compose nested callbacks over the same mutex.
+pub trait CollectorOriginAuthorizationGuard: TaskAuthorizationGuard {
+    fn with_current_collector_authorization(
+        &self,
+        actor: &AuthenticatedAgentIdentity,
+        action: CollectorAction,
+        origins: &[OriginGrantBinding],
+        repository: &str,
+        transition: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()>;
+}
+
+/// Non-deserializable proof object created only while the configured origin guard is held.
+pub struct LiveImportedOrigins {
+    repository: String,
+    origins: Vec<OriginGrantBinding>,
+}
+
+impl LiveImportedOrigins {
+    pub(crate) fn matches_repository(&self, repository: &str) -> bool {
+        self.repository == repository
+    }
+
+    pub(crate) fn permits(&self, origin: &OriginGrantBinding) -> bool {
+        self.origins.contains(origin)
+    }
+}
+
 pub trait TaskClock: Send + Sync {
     fn now_ms(&self) -> Result<u64>;
 }
@@ -67,6 +108,8 @@ pub struct TaskAttemptView {
     pub effective_expires_at_ms: u64,
     pub state: AgentAttemptState,
     pub assertion_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collector_transfer_digest: Option<String>,
     pub superseding_fence: Option<u64>,
     /// Always true in phase 2: retained agent material is not an admission receipt.
     pub admission_nonpassing: bool,
@@ -117,10 +160,22 @@ impl TaskAttemptView {
         if let Some(digest) = &self.assertion_digest {
             validate_raw_digest(digest)?;
         }
+        if let Some(digest) = &self.collector_transfer_digest {
+            validate_raw_digest(digest)?;
+        }
+        if self.assertion_digest.is_some() && self.collector_transfer_digest.is_some() {
+            return Err(Error::Invalid(
+                "task attempt cannot contain assertion and collector completions".into(),
+            ));
+        }
         match self.state {
-            AgentAttemptState::Finished if self.assertion_digest.is_none() => Err(Error::Invalid(
-                "finished task attempt is missing its retained assertion".into(),
-            )),
+            AgentAttemptState::Finished
+                if self.assertion_digest.is_none() && self.collector_transfer_digest.is_none() =>
+            {
+                Err(Error::Invalid(
+                    "finished task attempt is missing retained evidence".into(),
+                ))
+            }
             AgentAttemptState::Replaced if self.superseding_fence.is_none() => Err(Error::Invalid(
                 "replaced task attempt is missing its superseding fence".into(),
             )),
@@ -131,9 +186,12 @@ impl TaskAttemptView {
                     "replacement fence is not strictly monotonic".into(),
                 ))
             }
-            _ if self.state != AgentAttemptState::Finished && self.assertion_digest.is_some() => {
+            _ if self.state != AgentAttemptState::Finished
+                && (self.assertion_digest.is_some()
+                    || self.collector_transfer_digest.is_some()) =>
+            {
                 Err(Error::Invalid(
-                    "non-finished task attempt cannot retain an assertion".into(),
+                    "non-finished task attempt cannot retain completion evidence".into(),
                 ))
             }
             _ => Ok(()),
@@ -147,6 +205,7 @@ pub struct AgentTaskService<'a> {
     profile: &'a str,
     clock: &'a dyn TaskClock,
     authorize: &'a dyn TaskAuthorizationGuard,
+    collector_authorize: Option<&'a dyn CollectorOriginAuthorizationGuard>,
 }
 
 impl<'a> AgentTaskService<'a> {
@@ -162,7 +221,98 @@ impl<'a> AgentTaskService<'a> {
             profile,
             clock,
             authorize,
+            collector_authorize: None,
         })
+    }
+
+    pub fn new_with_collector_authorization(
+        data_dir: &'a Path,
+        profile: &'a str,
+        clock: &'a dyn TaskClock,
+        collector_authorize: &'a dyn CollectorOriginAuthorizationGuard,
+    ) -> Result<Self> {
+        let mut service = Self::new(data_dir, profile, clock, collector_authorize)?;
+        service.collector_authorize = Some(collector_authorize);
+        Ok(service)
+    }
+
+    fn with_combined_authorization(
+        &self,
+        actor: &AuthenticatedAgentIdentity,
+        action: CollectorAction,
+        origins: &[OriginGrantBinding],
+        repository: &str,
+        transition: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        if let Some(guard) = self.collector_authorize {
+            guard.with_current_collector_authorization(
+                actor, action, origins, repository, transition,
+            )
+        } else if origins.is_empty() {
+            self.authorize
+                .with_current_authorization(actor, repository, transition)
+        } else {
+            Err(Error::Conflict(
+                "imported workflow requires combined live authorization".into(),
+            ))
+        }
+    }
+
+    pub fn approve_with_live_imported_origins(
+        &self,
+        actor: &AuthenticatedAgentIdentity,
+        context: &ReviewContext,
+        approval: &Approval,
+    ) -> Result<()> {
+        let origins =
+            Authority::open_read_only(self.data_dir)?.imported_workflow_origins(context)?;
+        let mut result = None;
+        self.with_combined_authorization(
+            actor,
+            CollectorAction::Approve,
+            &origins,
+            &context.change.repository,
+            &mut || {
+                let live = LiveImportedOrigins {
+                    repository: context.change.repository.clone(),
+                    origins: origins.clone(),
+                };
+                Authority::open(self.data_dir)?.approve_with_imported_origins(approval, &live)?;
+                result = Some(());
+                Ok(())
+            },
+        )?;
+        result.ok_or_else(|| Error::Invalid("authorization callback was not invoked".into()))
+    }
+
+    pub fn integrate_with_live_imported_origins(
+        &self,
+        actor: &AuthenticatedAgentIdentity,
+        context: &ReviewContext,
+        engine: &Engine,
+        request: &IntegrateRequest,
+    ) -> Result<IntegrationEvent> {
+        let origins =
+            Authority::open_read_only(self.data_dir)?.imported_workflow_origins(context)?;
+        let mut result = None;
+        self.with_combined_authorization(
+            actor,
+            CollectorAction::Integrate,
+            &origins,
+            &context.change.repository,
+            &mut || {
+                let live = LiveImportedOrigins {
+                    repository: context.change.repository.clone(),
+                    origins: origins.clone(),
+                };
+                result = Some(
+                    Authority::open(self.data_dir)?
+                        .integrate_with_imported_origins(engine, request, &live)?,
+                );
+                Ok(())
+            },
+        )?;
+        result.ok_or_else(|| Error::Invalid("authorization callback was not invoked".into()))
     }
 
     /// Derives installed logical tasks without creating or migrating a journal.
@@ -188,9 +338,7 @@ impl<'a> AgentTaskService<'a> {
         let current = self.current(context)?;
         let states = self.read_task_states(&current.tasks)?;
         for (index, step) in current.plan.ordered_steps().iter().enumerate() {
-            if states[index] != LogicalState::Pending
-                || require_observation_task(&current.tasks[index]).is_err()
-            {
+            if states[index] != LogicalState::Pending {
                 continue;
             }
             let ready = step.needs.iter().all(|dependency| {
@@ -323,12 +471,68 @@ impl<'a> AgentTaskService<'a> {
         })
     }
 
+    pub fn claim_collector(
+        &self,
+        context: &ReviewContext,
+        request: &CollectorClaimRequest,
+    ) -> Result<TaskAttemptView> {
+        self.authorize
+            .authorize(&request.claim.agent, &context.change.repository)?;
+        if let Some(view) = self.retained_retry(
+            context,
+            &request.claim.agent,
+            &request.claim.request_id,
+            "collector_claim",
+            &request.digest()?,
+        )? {
+            return Ok(view);
+        }
+        let current = self.current(context)?;
+        let task = exact_task(
+            &current.tasks,
+            &request.claim.task_id,
+            &request.claim.task_digest,
+        )?;
+        let authority = Authority::open_read_only(self.data_dir)?;
+        let profile = authority.require_current_collector_profile(
+            &request.collector_profile_id,
+            task,
+            &request.claim.executor,
+        )?;
+        validate_profile_action(task, &current.plan, &profile)?;
+        self.with_authorized(&request.claim.agent, context, || {
+            self.claim_current_with_collector(context, request, &current, &profile)
+        })
+    }
+
     fn claim_current(
         &self,
         context: &ReviewContext,
         request: &TaskClaimRequest,
         current: &CurrentTasks,
     ) -> Result<TaskAttemptView> {
+        self.claim_current_bound(context, request, current, None)
+    }
+
+    fn claim_current_bound(
+        &self,
+        context: &ReviewContext,
+        request: &TaskClaimRequest,
+        current: &CurrentTasks,
+        collector_profile: Option<&CollectorProfile>,
+    ) -> Result<TaskAttemptView> {
+        let (kind, request_digest) = if let Some(profile) = collector_profile {
+            (
+                "collector_claim",
+                CollectorClaimRequest {
+                    claim: request.clone(),
+                    collector_profile_id: profile.profile_id.clone(),
+                }
+                .digest()?,
+            )
+        } else {
+            ("claim", request.digest()?)
+        };
         let task = exact_task(&current.tasks, &request.task_id, &request.task_digest)?;
         let authority = Authority::open_read_only(self.data_dir)?;
         let registration =
@@ -346,14 +550,16 @@ impl<'a> AgentTaskService<'a> {
             &tx,
             &request.agent,
             &request.request_id,
-            "claim",
-            &request.digest()?,
+            kind,
+            &request_digest,
         )? {
             let view = self.retry_applicability(&tx, context, view)?;
             tx.commit()?;
             return Ok(view);
         }
-        require_observation_task(task)?;
+        if collector_profile.is_none() {
+            require_observation_task(task)?;
+        }
         let reused: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM agent_workflow_attempts WHERE execution_operation_id=?1)",
             [&request.execution_operation_id],
@@ -413,15 +619,22 @@ impl<'a> AgentTaskService<'a> {
             effective_expires_at_ms: expires,
             state: AgentAttemptState::Leased,
             assertion_digest: None,
+            collector_transfer_digest: None,
             superseding_fence: None,
             admission_nonpassing: true,
             currently_applicable: true,
         };
         let attempt_bytes = view.attempt.canonical_bytes()?;
         tx.execute(
-            "INSERT INTO agent_workflow_attempts(attempt_id,task_id,fence,lease_expires_at,state,superseding_fence,assertion_digest,attempt_json,execution_operation_id) VALUES(?1,?2,?3,?4,'leased',NULL,NULL,?5,?6)",
+            "INSERT INTO agent_workflow_attempts(attempt_id,task_id,fence,lease_expires_at,state,superseding_fence,assertion_digest,collector_transfer_digest,attempt_json,execution_operation_id) VALUES(?1,?2,?3,?4,'leased',NULL,NULL,NULL,?5,?6)",
             params![view.attempt.attempt_id, view.attempt.task_id, fence, to_i64("task lease expiry", expires)?, attempt_bytes, view.attempt.execution_operation_id],
         )?;
+        if let Some(profile) = collector_profile {
+            tx.execute(
+                "INSERT INTO agent_workflow_collector_claims(attempt_id,profile_id,profile_digest) VALUES(?1,?2,?3)",
+                params![view.attempt.attempt_id, profile.profile_id, profile.digest()?],
+            )?;
+        }
         tx.execute(
             "UPDATE agent_workflow_tasks SET next_fence=?1 WHERE task_id=?2 AND next_fence=?3",
             params![
@@ -436,11 +649,33 @@ impl<'a> AgentTaskService<'a> {
             &tx,
             &request.agent,
             &request.request_id,
-            "claim",
-            &request.digest()?,
+            kind,
+            &request_digest,
             &view,
         )?;
         self.commit_fenced(tx, context, task, &request.executor, false)?;
+        Ok(view)
+    }
+
+    fn claim_current_with_collector(
+        &self,
+        context: &ReviewContext,
+        request: &CollectorClaimRequest,
+        current: &CurrentTasks,
+        profile: &CollectorProfile,
+    ) -> Result<TaskAttemptView> {
+        let view = self.claim_current_bound(context, &request.claim, current, Some(profile))?;
+        let journal = Journal::open(self.data_dir, OpenMode::Read)?;
+        let retained: (String, String) = journal.connection.query_row(
+            "SELECT profile_id,profile_digest FROM agent_workflow_collector_claims WHERE attempt_id=?1",
+            [&view.attempt.attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if retained != (profile.profile_id.clone(), profile.digest()?) {
+            return Err(Error::Conflict(
+                "claim request is already bound to different collector authority".into(),
+            ));
+        }
         Ok(view)
     }
 
@@ -578,6 +813,7 @@ impl<'a> AgentTaskService<'a> {
             effective_expires_at_ms: view.effective_expires_at_ms,
             state: AgentAttemptState::Finished,
             assertion_digest: Some(assertion_digest),
+            collector_transfer_digest: None,
             superseding_fence: None,
             admission_nonpassing: true,
             currently_applicable: true,
@@ -592,6 +828,350 @@ impl<'a> AgentTaskService<'a> {
         )?;
         self.commit_fenced(tx, context, task, &assertion.executor, false)?;
         Ok(finished)
+    }
+
+    pub async fn submit_collector_transfer(
+        &self,
+        context: &ReviewContext,
+        transfer: &CollectorTransfer,
+    ) -> Result<TaskAttemptView> {
+        let transfer_digest = transfer.digest()?;
+        let mut retry = None;
+        self.with_combined_authorization(
+            &transfer.header.origin.actor,
+            CollectorAction::Submit,
+            std::slice::from_ref(&transfer.header.origin),
+            &context.change.repository,
+            &mut || {
+                retry = self.retained_retry(
+                    context,
+                    &transfer.header.origin.actor,
+                    &transfer.header.transfer_request_id,
+                    "collector_transfer",
+                    &transfer_digest,
+                )?;
+                Ok(())
+            },
+        )?;
+        if let Some(view) = retry {
+            return Ok(view);
+        }
+        let current = self.current(context)?;
+        let task = exact_task(
+            &current.tasks,
+            &transfer.header.task_id,
+            &transfer.header.task_digest,
+        )?;
+        let journal = Journal::open(self.data_dir, OpenMode::Read)?;
+        let view = read_attempt(
+            &journal.connection,
+            &transfer.header.attempt_id,
+            self.clock.now_ms()?,
+        )?
+        .ok_or_else(|| Error::NotFound(format!("task attempt {}", transfer.header.attempt_id)))?;
+        let (profile_id, claimed_digest): (String, String) = journal.connection.query_row(
+            "SELECT profile_id,profile_digest FROM agent_workflow_collector_claims WHERE attempt_id=?1",
+            [&view.attempt.attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        drop(journal);
+        let authority = Authority::open_read_only(self.data_dir)?;
+        let profile = authority.require_current_collector_profile(
+            &profile_id,
+            task,
+            &view.attempt.executor,
+        )?;
+        if profile.digest()? != claimed_digest {
+            return Err(Error::Invalid(
+                "collector claim profile failed retained digest validation".into(),
+            ));
+        }
+        transfer.validate_for(
+            task,
+            &view.attempt,
+            &profile,
+            &authority.repository_id()?,
+            &transfer.header.origin,
+        )?;
+        let registration =
+            authority.require_current_workflow_executor(&task.subject, &view.attempt.executor)?;
+        transfer.verify_signature(&registration.public_key_hex)?;
+        validate_profile_action(task, &current.plan, &profile)?;
+        match &transfer.payload {
+            CollectorPayload::Command { request, record } => {
+                let expected =
+                    expected_command_request(&current.plan, task, &view.attempt, &profile)?;
+                if request != &expected {
+                    return Err(Error::Conflict(
+                        "transferred command request differs from authority-derived request".into(),
+                    ));
+                }
+                validate_command_record(&expected, record)?;
+            }
+            CollectorPayload::Review { request, record } => {
+                let mut descriptor = expected_review_descriptor(
+                    self.data_dir,
+                    &current.plan,
+                    task,
+                    &view.attempt,
+                    &profile,
+                )?;
+                if request != &descriptor.request {
+                    return Err(Error::Conflict(
+                        "transferred review request differs from authority-derived request".into(),
+                    ));
+                }
+                let expected_request = descriptor.request.clone();
+                crate::reviewer::validate_replayed_record(
+                    &expected_request,
+                    &mut descriptor,
+                    record,
+                )
+                .await?;
+            }
+        }
+        let bytes = transfer.canonical_bytes()?;
+        let transfer_digest = transfer.digest()?;
+        let mut result = None;
+        self.with_combined_authorization(
+            &transfer.header.origin.actor,
+            CollectorAction::Submit,
+            std::slice::from_ref(&transfer.header.origin),
+            &context.change.repository,
+            &mut || {
+                result = Some(self.retain_collector_transfer(
+                    context,
+                    task,
+                    transfer,
+                    &profile,
+                    &bytes,
+                    &transfer_digest,
+                )?);
+                Ok(())
+            },
+        )?;
+        let result = result.ok_or_else(|| {
+            Error::Invalid("origin authorization callback was not invoked".into())
+        })?;
+        self.try_finalize_imported(context, &current, &transfer.header.origin.actor)?;
+        Ok(result)
+    }
+
+    /// Reconcile retained validated evidence only; never dispatches a collector.
+    pub fn reconcile_collector_finalization(
+        &self,
+        actor: &AuthenticatedAgentIdentity,
+        context: &ReviewContext,
+    ) -> Result<Option<String>> {
+        self.authorize
+            .authorize(actor, &context.change.repository)?;
+        let current = self.current(context)?;
+        self.try_finalize_imported(context, &current, actor)
+    }
+
+    fn try_finalize_imported(
+        &self,
+        context: &ReviewContext,
+        current: &CurrentTasks,
+        actor: &AuthenticatedAgentIdentity,
+    ) -> Result<Option<String>> {
+        let journal = Journal::open(self.data_dir, OpenMode::Read)?;
+        let engine = Engine::open(self.data_dir)?;
+        let mut dependencies = Vec::new();
+        let mut native_steps = Vec::new();
+        let mut omitted = false;
+        for (step, task) in current.plan.ordered_steps().iter().zip(&current.tasks) {
+            match &step.action {
+                StepAction::SourcePaths { .. } => {
+                    let result =
+                        super::execute_step(&engine, &current.plan.definition().source, step);
+                    if result.state == StepState::Succeeded {
+                        native_steps.push(step.id.clone());
+                    } else if step.required {
+                        return Ok(None);
+                    } else {
+                        omitted = true;
+                    }
+                }
+                StepAction::RequireCapability { .. } => {
+                    if step.required {
+                        return Ok(None);
+                    }
+                    omitted = true;
+                }
+                StepAction::Command { .. } | StepAction::ClaudeCodeReview { .. } => {
+                    let attempt_id: Option<String> = journal
+                        .connection
+                        .query_row(
+                            "SELECT attempt_id FROM agent_workflow_attempts WHERE task_id=?1 ORDER BY fence DESC LIMIT 1",
+                            [&task.task_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    let Some(attempt_id) = attempt_id else {
+                        if step.required {
+                            return Ok(None);
+                        }
+                        omitted = true;
+                        continue;
+                    };
+                    let Some(view) = read_attempt(&journal.connection, &attempt_id, 0)? else {
+                        return Err(Error::Invalid(
+                            "collector workflow attempt disappeared".into(),
+                        ));
+                    };
+                    if view.state != AgentAttemptState::Finished
+                        || view.collector_transfer_digest.is_none()
+                    {
+                        if step.required {
+                            return Ok(None);
+                        }
+                        omitted = true;
+                        continue;
+                    }
+                    let transfer = read_collector_transfer(&journal.connection, task, &view)?;
+                    if !collector_transfer_succeeded(&transfer) {
+                        if step.required {
+                            return Ok(None);
+                        }
+                        omitted = true;
+                        continue;
+                    }
+                    dependencies.push(ImportedStepDependency::from_transfer(&transfer, task)?);
+                }
+            }
+        }
+        drop(journal);
+        if dependencies.is_empty() {
+            return Ok(None);
+        }
+        let run_state = if omitted {
+            RunState::CompletedWithOmissions
+        } else {
+            RunState::Succeeded
+        };
+        let origins = dependencies
+            .iter()
+            .map(|dependency| dependency.origin.clone())
+            .collect::<Vec<_>>();
+        let mut validated = Some(crate::authority::workflows::ValidatedImportedWorkflow {
+            dependencies,
+            native_steps,
+            run_state,
+        });
+        let mut receipt = None;
+        self.with_combined_authorization(
+            actor,
+            CollectorAction::Finalize,
+            &origins,
+            &context.change.repository,
+            &mut || {
+                let mut journal = Journal::open(self.data_dir, OpenMode::Read)?;
+                let snapshot = journal.connection.transaction()?;
+                let live = LiveImportedOrigins {
+                    repository: context.change.repository.clone(),
+                    origins: origins.clone(),
+                };
+                let mut authority = Authority::open(self.data_dir)?;
+                let requirement = authority
+                    .workflow_requirement(&context.target)?
+                    .ok_or_else(|| Error::Conflict("target has no workflow requirement".into()))?;
+                receipt =
+                    Some(authority.record_imported_workflow_success(
+                        &requirement,
+                        &current.plan,
+                        context,
+                        validated.take().ok_or_else(|| {
+                            Error::Invalid("authorization callback repeated".into())
+                        })?,
+                        &live,
+                        &mut |dependency| {
+                            read_transfer_bytes(&snapshot, &dependency.transfer_digest)
+                        },
+                    )?);
+                Ok(())
+            },
+        )?;
+        Ok(receipt)
+    }
+
+    fn retain_collector_transfer(
+        &self,
+        context: &ReviewContext,
+        task: &WorkflowTask,
+        transfer: &CollectorTransfer,
+        profile: &CollectorProfile,
+        bytes: &[u8],
+        transfer_digest: &str,
+    ) -> Result<TaskAttemptView> {
+        let mut journal = Journal::open(self.data_dir, OpenMode::Write)?;
+        let tx = journal
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(view) = operation_retry(
+            &tx,
+            &transfer.header.origin.actor,
+            &transfer.header.transfer_request_id,
+            "collector_transfer",
+            transfer_digest,
+        )? {
+            return Ok(view);
+        }
+        let mut view = read_attempt(&tx, &transfer.header.attempt_id, self.clock.now_ms()?)?
+            .ok_or_else(|| {
+                Error::NotFound(format!("task attempt {}", transfer.header.attempt_id))
+            })?;
+        if view.state != AgentAttemptState::Leased {
+            return Err(Error::Conflict(
+                "collector transfer is not for the current live attempt generation".into(),
+            ));
+        }
+        transfer.validate_for(
+            task,
+            &view.attempt,
+            profile,
+            &task.subject.repository,
+            &transfer.header.origin,
+        )?;
+        tx.execute(
+            "INSERT INTO agent_workflow_collector_transfers(digest,attempt_id,transfer_request_id,origin_owner_id,origin_agent_id,origin_grant_id,origin_grant_generation,profile_digest,canonical_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                transfer_digest,
+                view.attempt.attempt_id,
+                transfer.header.transfer_request_id,
+                transfer.header.origin.actor.owner_id,
+                transfer.header.origin.actor.agent_id,
+                transfer.header.origin.grant_id,
+                to_i64("origin grant generation", transfer.header.origin.grant_generation)?,
+                profile.digest()?,
+                bytes,
+            ],
+        )?;
+        if tx.execute(
+            "UPDATE agent_workflow_attempts SET state='finished',collector_transfer_digest=?1 WHERE attempt_id=?2 AND state='leased' AND fence=?3",
+            params![
+                transfer_digest,
+                view.attempt.attempt_id,
+                to_i64("task fence", view.attempt.lease.fence)?
+            ],
+        )? != 1
+        {
+            return Err(Error::Conflict(
+                "task attempt changed before collector transfer retention".into(),
+            ));
+        }
+        view.state = AgentAttemptState::Finished;
+        view.collector_transfer_digest = Some(transfer_digest.into());
+        store_operation(
+            &tx,
+            &transfer.header.origin.actor,
+            &transfer.header.transfer_request_id,
+            "collector_transfer",
+            transfer_digest,
+            &view,
+        )?;
+        self.commit_fenced(tx, context, task, &view.attempt.executor, false)?;
+        Ok(view)
     }
 
     /// Exact-attempt read. Missing journals and pre-v3 journals are ordinary not-found results.
@@ -930,6 +1510,24 @@ impl<'a> AgentTaskService<'a> {
         else {
             return Ok(None);
         };
+        let historical;
+        let context = if kind == "collector_transfer" || kind == "collector_claim" {
+            let task = read_task(&journal.connection, &view.attempt.task_id)?;
+            if task.subject.repository != context.change.repository
+                || task.subject.change != context.change
+                || task.subject.profile != self.profile
+                || task.subject.target != context.target
+            {
+                return Err(Error::Conflict(
+                    "collector retry belongs to another subject scope".into(),
+                ));
+            }
+            historical = Authority::open_read_only(self.data_dir)?
+                .review_context(&task.subject.context_digest)?;
+            &historical
+        } else {
+            context
+        };
         Ok(Some(self.retry_applicability(
             &journal.connection,
             context,
@@ -955,6 +1553,7 @@ impl<'a> AgentTaskService<'a> {
         let mut view = self.applicability(context, &task, view)?;
         view.currently_applicable &= view.state == now.state
             && view.effective_expires_at_ms == now.effective_expires_at_ms
+            && view.collector_transfer_digest == now.collector_transfer_digest
             && view.assertion_digest == now.assertion_digest
             && view.superseding_fence == now.superseding_fence;
         Ok(view)
@@ -980,6 +1579,14 @@ fn read_task_states(connection: &Connection, tasks: &[WorkflowTask]) -> Result<V
         }
         if view.state == AgentAttemptState::Replaced { return Ok(LogicalState::Pending); }
         if view.state != AgentAttemptState::Finished { return Ok(LogicalState::TerminalNonpassing); }
+        if view.collector_transfer_digest.is_some() {
+            let transfer = read_collector_transfer(connection, task, &view)?;
+            return Ok(if collector_transfer_succeeded(&transfer) {
+                LogicalState::CompletedObservation
+            } else {
+                LogicalState::TerminalNonpassing
+            });
+        }
         let assertion = read_assertion(connection, task, &view)?;
         Ok(if require_observation_task(task).is_ok()
             && assertion.trust_class == EvidenceTrustClass::RegisteredExecutorObservation
@@ -1014,6 +1621,100 @@ fn read_assertion(
     }
     assertion.validate_for_task_attempt(task, &view.attempt)?;
     Ok(assertion)
+}
+
+fn read_transfer_bytes(connection: &Connection, digest: &str) -> Result<Vec<u8>> {
+    let length: i64 = connection.query_row(
+        "SELECT length(canonical_json) FROM agent_workflow_collector_transfers WHERE digest=?1",
+        [digest],
+        |row| row.get(0),
+    )?;
+    if length < 0 || length > MAX_COLLECTOR_TRANSFER_BYTES as i64 {
+        return Err(Error::Limit("collector transfer exceeds 16 MiB".into()));
+    }
+    Ok(connection.query_row(
+        "SELECT canonical_json FROM agent_workflow_collector_transfers WHERE digest=?1",
+        [digest],
+        |row| row.get(0),
+    )?)
+}
+
+fn read_collector_transfer(
+    connection: &Connection,
+    task: &WorkflowTask,
+    view: &TaskAttemptView,
+) -> Result<CollectorTransfer> {
+    let digest = view.collector_transfer_digest.as_ref().ok_or_else(|| {
+        Error::Invalid("finished collector attempt is missing its transfer digest".into())
+    })?;
+    let bytes = read_transfer_bytes(connection, digest)?;
+    let (attempt_id, profile_digest): (String, String) = connection.query_row(
+        "SELECT attempt_id,profile_digest FROM agent_workflow_collector_transfers WHERE digest=?1",
+        [digest],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let transfer = CollectorTransfer::from_slice(&bytes)?;
+    if transfer.digest()? != *digest
+        || attempt_id != view.attempt.attempt_id
+        || transfer.header.task_id != task.task_id
+        || transfer.header.task_digest != task.digest()?
+        || transfer.header.attempt_digest != view.attempt.digest()?
+        || transfer.header.collector_profile_digest != profile_digest
+    {
+        return Err(Error::Invalid(
+            "retained collector transfer failed identity validation".into(),
+        ));
+    }
+    Ok(transfer)
+}
+
+fn collector_transfer_succeeded(transfer: &CollectorTransfer) -> bool {
+    match &transfer.payload {
+        CollectorPayload::Command { record, .. } => command_record_succeeded(record),
+        CollectorPayload::Review { record, .. } => {
+            super::review::state(record) == StepState::Succeeded
+        }
+    }
+}
+
+fn validate_profile_action(
+    task: &WorkflowTask,
+    plan: &CompiledPlan,
+    profile: &CollectorProfile,
+) -> Result<()> {
+    let step = plan
+        .ordered_steps()
+        .iter()
+        .find(|step| step.id == task.subject.step_id)
+        .ok_or_else(|| Error::Invalid("collector task step is absent from plan".into()))?;
+    match (&step.action, &profile.action) {
+        (StepAction::Command { .. }, CollectorProfileAction::Command { recipe, .. })
+            if plan.command_recipe(&step.id) == Some(recipe) =>
+        {
+            Ok(())
+        }
+        (
+            StepAction::ClaudeCodeReview { paths, model },
+            CollectorProfileAction::FiniteReview {
+                required_paths,
+                model: installed_model,
+                installed_policy_sha256,
+                ..
+            },
+        ) if paths == required_paths
+            && model == installed_model
+            && installed_policy_sha256
+                == plan
+                    .skill_digest()
+                    .strip_prefix("sha256:")
+                    .unwrap_or(plan.skill_digest()) =>
+        {
+            Ok(())
+        }
+        _ => Err(Error::Conflict(
+            "collector profile action differs from installed workflow step".into(),
+        )),
+    }
 }
 
 fn dependencies_ready(current: &CurrentTasks, states: &[LogicalState], index: usize) -> bool {
@@ -1081,21 +1782,39 @@ pub(super) fn create_schema(tx: &Transaction<'_>) -> Result<()> {
             state TEXT NOT NULL CHECK(state IN ('leased','finished','cancelled','replaced')),
             superseding_fence INTEGER CHECK(superseding_fence IS NULL OR superseding_fence>fence),
             assertion_digest TEXT UNIQUE CHECK(assertion_digest IS NULL OR length(assertion_digest)=64),
+            collector_transfer_digest TEXT UNIQUE CHECK(collector_transfer_digest IS NULL OR length(collector_transfer_digest)=64),
             attempt_json BLOB NOT NULL CHECK(length(attempt_json)<=262144),
             UNIQUE(task_id,fence),
             CHECK((state='replaced')=(superseding_fence IS NOT NULL)),
-            CHECK((state='finished')=(assertion_digest IS NOT NULL))
+            CHECK(NOT(assertion_digest IS NOT NULL AND collector_transfer_digest IS NOT NULL)),
+            CHECK((state='finished')=((assertion_digest IS NOT NULL) OR (collector_transfer_digest IS NOT NULL)))
          ) STRICT;
          CREATE TABLE agent_workflow_assertions(
             digest TEXT PRIMARY KEY CHECK(length(digest)=64),
             attempt_id TEXT NOT NULL UNIQUE REFERENCES agent_workflow_attempts(attempt_id),
             canonical_json BLOB NOT NULL CHECK(length(canonical_json)<=262144)
          ) STRICT;
+         CREATE TABLE agent_workflow_collector_claims(
+            attempt_id TEXT PRIMARY KEY REFERENCES agent_workflow_attempts(attempt_id),
+            profile_id TEXT NOT NULL CHECK(length(profile_id) BETWEEN 1 AND 128),
+            profile_digest TEXT NOT NULL CHECK(length(profile_digest)=64)
+         ) STRICT;
+         CREATE TABLE agent_workflow_collector_transfers(
+            digest TEXT PRIMARY KEY CHECK(length(digest)=64),
+            attempt_id TEXT NOT NULL UNIQUE REFERENCES agent_workflow_attempts(attempt_id),
+            transfer_request_id TEXT NOT NULL CHECK(length(transfer_request_id) BETWEEN 1 AND 128),
+            origin_owner_id TEXT NOT NULL,
+            origin_agent_id TEXT NOT NULL,
+            origin_grant_id TEXT NOT NULL,
+            origin_grant_generation INTEGER NOT NULL CHECK(origin_grant_generation>0),
+            profile_digest TEXT NOT NULL CHECK(length(profile_digest)=64),
+            canonical_json BLOB NOT NULL CHECK(length(canonical_json)<=16777216)
+         ) STRICT;
          CREATE TABLE agent_workflow_operations(
             owner_id TEXT NOT NULL,
             agent_id TEXT NOT NULL,
             request_id TEXT NOT NULL,
-            kind TEXT NOT NULL CHECK(kind IN ('claim','heartbeat','cancel','reconcile','result')),
+            kind TEXT NOT NULL CHECK(kind IN ('claim','heartbeat','cancel','reconcile','result','collector_transfer','collector_claim')),
             request_digest TEXT NOT NULL CHECK(length(request_digest)=64),
             outcome_json BLOB NOT NULL CHECK(length(outcome_json)<=524288),
             PRIMARY KEY(owner_id,agent_id,request_id)
@@ -1104,12 +1823,96 @@ pub(super) fn create_schema(tx: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn validate_schema(connection: &Connection) -> Result<()> {
+pub(super) fn migrate_v3_to_v4(tx: &Transaction<'_>) -> Result<()> {
+    let deferred: bool = tx.pragma_query_value(None, "defer_foreign_keys", |row| row.get(0))?;
+    tx.pragma_update(None, "defer_foreign_keys", true)?;
+    tx.execute_batch(
+        "CREATE TABLE agent_workflow_attempts_v4(
+            attempt_id TEXT PRIMARY KEY CHECK(length(attempt_id) BETWEEN 1 AND 128),
+            execution_operation_id TEXT NOT NULL UNIQUE CHECK(length(execution_operation_id) BETWEEN 1 AND 128),
+            task_id TEXT NOT NULL REFERENCES agent_workflow_tasks(task_id),
+            fence INTEGER NOT NULL CHECK(fence>0),
+            lease_expires_at INTEGER NOT NULL CHECK(lease_expires_at>0),
+            state TEXT NOT NULL CHECK(state IN ('leased','finished','cancelled','replaced')),
+            superseding_fence INTEGER CHECK(superseding_fence IS NULL OR superseding_fence>fence),
+            assertion_digest TEXT UNIQUE CHECK(assertion_digest IS NULL OR length(assertion_digest)=64),
+            collector_transfer_digest TEXT UNIQUE CHECK(collector_transfer_digest IS NULL OR length(collector_transfer_digest)=64),
+            attempt_json BLOB NOT NULL CHECK(length(attempt_json)<=262144),
+            UNIQUE(task_id,fence),
+            CHECK((state='replaced')=(superseding_fence IS NOT NULL)),
+            CHECK(NOT(assertion_digest IS NOT NULL AND collector_transfer_digest IS NOT NULL)),
+            CHECK((state='finished')=((assertion_digest IS NOT NULL) OR (collector_transfer_digest IS NOT NULL)))
+         ) STRICT;
+         INSERT INTO agent_workflow_attempts_v4(
+            attempt_id,execution_operation_id,task_id,fence,lease_expires_at,state,
+            superseding_fence,assertion_digest,collector_transfer_digest,attempt_json
+         )
+         SELECT attempt_id,execution_operation_id,task_id,fence,lease_expires_at,state,
+                superseding_fence,assertion_digest,NULL,attempt_json
+         FROM agent_workflow_attempts;
+         DROP TABLE agent_workflow_attempts;
+         ALTER TABLE agent_workflow_attempts_v4 RENAME TO agent_workflow_attempts;
+         CREATE TABLE agent_workflow_collector_claims(
+            attempt_id TEXT PRIMARY KEY REFERENCES agent_workflow_attempts(attempt_id),
+            profile_id TEXT NOT NULL CHECK(length(profile_id) BETWEEN 1 AND 128),
+            profile_digest TEXT NOT NULL CHECK(length(profile_digest)=64)
+         ) STRICT;
+         CREATE TABLE agent_workflow_collector_transfers(
+            digest TEXT PRIMARY KEY CHECK(length(digest)=64),
+            attempt_id TEXT NOT NULL UNIQUE REFERENCES agent_workflow_attempts(attempt_id),
+            transfer_request_id TEXT NOT NULL CHECK(length(transfer_request_id) BETWEEN 1 AND 128),
+            origin_owner_id TEXT NOT NULL,
+            origin_agent_id TEXT NOT NULL,
+            origin_grant_id TEXT NOT NULL,
+            origin_grant_generation INTEGER NOT NULL CHECK(origin_grant_generation>0),
+            profile_digest TEXT NOT NULL CHECK(length(profile_digest)=64),
+            canonical_json BLOB NOT NULL CHECK(length(canonical_json)<=16777216)
+         ) STRICT;
+         CREATE TABLE agent_workflow_operations_v4(
+            owner_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN ('claim','heartbeat','cancel','reconcile','result','collector_transfer','collector_claim')),
+            request_digest TEXT NOT NULL CHECK(length(request_digest)=64),
+            outcome_json BLOB NOT NULL CHECK(length(outcome_json)<=524288),
+            PRIMARY KEY(owner_id,agent_id,request_id)
+         ) STRICT;
+         INSERT INTO agent_workflow_operations_v4(
+            owner_id,agent_id,request_id,kind,request_digest,outcome_json
+         )
+         SELECT owner_id,agent_id,request_id,kind,request_digest,outcome_json
+         FROM agent_workflow_operations;
+         DROP TABLE agent_workflow_operations;
+         ALTER TABLE agent_workflow_operations_v4 RENAME TO agent_workflow_operations;",
+    )?;
+    if tx.prepare("PRAGMA foreign_key_check")?.exists([])? {
+        return Err(Error::Invalid(
+            "workflow journal v3 to v4 migration failed foreign-key validation".into(),
+        ));
+    }
+    tx.pragma_update(None, "defer_foreign_keys", deferred)?;
+    Ok(())
+}
+
+/// Parent task relations shared by v3 recovery and current runtime validation.
+pub(super) fn validate_v3_schema(connection: &Connection) -> Result<()> {
     for query in [
         "SELECT task_id,task_digest,step_id,next_fence,canonical_json FROM agent_workflow_tasks LIMIT 0",
         "SELECT attempt_id,task_id,fence,lease_expires_at,state,superseding_fence,assertion_digest,attempt_json,execution_operation_id FROM agent_workflow_attempts LIMIT 0",
         "SELECT digest,attempt_id,canonical_json FROM agent_workflow_assertions LIMIT 0",
         "SELECT owner_id,agent_id,request_id,kind,request_digest,outcome_json FROM agent_workflow_operations LIMIT 0",
+    ] {
+        connection.prepare(query)?;
+    }
+    Ok(())
+}
+
+pub(super) fn validate_schema(connection: &Connection) -> Result<()> {
+    validate_v3_schema(connection)?;
+    for query in [
+        "SELECT collector_transfer_digest FROM agent_workflow_attempts LIMIT 0",
+        "SELECT attempt_id,profile_id,profile_digest FROM agent_workflow_collector_claims LIMIT 0",
+        "SELECT digest,attempt_id,transfer_request_id,origin_owner_id,origin_agent_id,origin_grant_id,origin_grant_generation,profile_digest,canonical_json FROM agent_workflow_collector_transfers LIMIT 0",
     ] {
         connection.prepare(query)?;
     }
@@ -1392,7 +2195,7 @@ fn read_attempt(
 ) -> Result<Option<TaskAttemptView>> {
     let row = connection
         .query_row(
-            "SELECT lease_expires_at,state,superseding_fence,assertion_digest,attempt_json,task_id,fence,execution_operation_id FROM agent_workflow_attempts WHERE attempt_id=?1",
+            "SELECT lease_expires_at,state,superseding_fence,assertion_digest,collector_transfer_digest,attempt_json,task_id,fence,execution_operation_id FROM agent_workflow_attempts WHERE attempt_id=?1",
             [attempt_id],
             |row| {
                 Ok((
@@ -1400,10 +2203,11 @@ fn read_attempt(
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<i64>>(2)?,
                     row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Vec<u8>>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, i64>(6)?,
-                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, String>(8)?,
                 ))
             },
         )
@@ -1414,6 +2218,7 @@ fn read_attempt(
             state,
             superseding,
             assertion_digest,
+            collector_transfer_digest,
             bytes,
             task_id,
             fence,
@@ -1446,6 +2251,7 @@ fn read_attempt(
                 effective_expires_at_ms,
                 state,
                 assertion_digest,
+                collector_transfer_digest,
                 superseding_fence: superseding
                     .map(|value| to_u64("superseding task fence", value))
                     .transpose()?,
@@ -1453,8 +2259,10 @@ fn read_attempt(
                 currently_applicable: true,
             };
             view.validate()?;
-            if view.state == AgentAttemptState::Finished {
+            if view.state == AgentAttemptState::Finished && view.assertion_digest.is_some() {
                 read_assertion(connection, &task, &view)?;
+            } else if view.state == AgentAttemptState::Finished {
+                read_collector_transfer(connection, &task, &view)?;
             }
             Ok(view)
         },
@@ -2438,6 +3246,7 @@ mod tests {
             effective_expires_at_ms: 1100,
             state: AgentAttemptState::Leased,
             assertion_digest: None,
+            collector_transfer_digest: None,
             superseding_fence: None,
             admission_nonpassing: true,
             currently_applicable: true,
@@ -2692,7 +3501,7 @@ mod tests {
         let plan = fixture.service().current(&fixture.context).unwrap().plan;
         let before = super::super::start(fixture.root.path(), "prior-run", &plan).unwrap();
         let journal = Journal::open(fixture.root.path(), OpenMode::Create).unwrap();
-        journal.connection.execute_batch("DROP TABLE agent_workflow_operations; DROP TABLE agent_workflow_assertions; DROP TABLE agent_workflow_attempts; DROP TABLE agent_workflow_tasks; PRAGMA user_version=2;").unwrap();
+        journal.connection.execute_batch("DROP TABLE agent_workflow_operations; DROP TABLE agent_workflow_collector_transfers; DROP TABLE agent_workflow_collector_claims; DROP TABLE agent_workflow_assertions; DROP TABLE agent_workflow_attempts; DROP TABLE agent_workflow_tasks; PRAGMA user_version=2;").unwrap();
         drop(journal);
         let journal = Journal::open(fixture.root.path(), OpenMode::Create).unwrap();
         assert_eq!(
@@ -2700,7 +3509,7 @@ mod tests {
                 .connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            3
+            4
         );
         assert_eq!(journal.view("prior-run").unwrap(), before);
         drop(journal);
@@ -2709,7 +3518,7 @@ mod tests {
         let change = authority.change(&fixture.context.change).unwrap();
         drop(authority);
         let db = Connection::open(fixture.root.path().join("state.sqlite")).unwrap();
-        db.execute_batch("DROP TABLE workflow_executor_revocations; DROP TABLE workflow_executor_enrollments; PRAGMA user_version=7;").unwrap();
+        db.execute_batch("DROP TABLE workflow_imported_evidence; DROP TABLE workflow_collector_profiles; DROP TABLE workflow_executor_revocations; DROP TABLE workflow_executor_enrollments; PRAGMA user_version=7;").unwrap();
         drop(db);
         let authority = Authority::open(fixture.root.path()).unwrap();
         assert_eq!(authority.workflow_requirement("main").unwrap(), requirement);
@@ -2728,8 +3537,418 @@ mod tests {
         assert_eq!(
             db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            8
+            9
         );
+    }
+
+    #[test]
+    fn populated_parent_v3_journal_migrates_atomically_to_v4() {
+        exercise_parent_v3_migration(false);
+    }
+
+    #[test]
+    fn parent_v8_v3_recovery_preserves_history_before_writable_migration() {
+        exercise_parent_v3_migration(true);
+    }
+
+    fn exercise_parent_v3_migration(recover: bool) {
+        let fixture = Fixture::configured(true, 0);
+        let service = fixture.service();
+        let tasks = service
+            .requirements(&fixture.context, &fixture.agent("reader"))
+            .unwrap();
+        let first_claim = fixture.claim(&tasks[0], fixture.agent("first"));
+        let first = service.claim(&fixture.context, &first_claim).unwrap();
+        let reconcile = mutation(&first, "reconcile-first", TaskMutationAction::Reconcile {});
+        let replaced = service
+            .reconcile_attempt(&fixture.context, &reconcile)
+            .unwrap();
+        let second_claim = fixture.claim(&tasks[0], fixture.agent("second"));
+        let second = service.claim(&fixture.context, &second_claim).unwrap();
+        let assertion = signed_result(&tasks[0], &second);
+        let finished = service.submit_result(&fixture.context, &assertion).unwrap();
+        let third_claim = fixture.claim(&tasks[1], fixture.agent("third"));
+        let leased = service.claim(&fixture.context, &third_claim).unwrap();
+        assert_eq!(replaced.state, AgentAttemptState::Replaced);
+        assert_eq!(finished.state, AgentAttemptState::Finished);
+        assert_eq!(leased.state, AgentAttemptState::Leased);
+
+        type AttemptRow = (
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            String,
+            Option<i64>,
+            Option<String>,
+            Vec<u8>,
+        );
+        type AssertionRow = (String, String, Vec<u8>);
+        type OperationRow = (String, String, String, String, String, Vec<u8>);
+        let journal = Journal::open(fixture.root.path(), OpenMode::Read).unwrap();
+        let attempts = journal
+            .connection
+            .prepare("SELECT attempt_id,execution_operation_id,task_id,fence,lease_expires_at,state,superseding_fence,assertion_digest,attempt_json FROM agent_workflow_attempts ORDER BY attempt_id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<AttemptRow>>>()
+            .unwrap();
+        let assertions = journal
+            .connection
+            .prepare("SELECT digest,attempt_id,canonical_json FROM agent_workflow_assertions ORDER BY digest")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<AssertionRow>>>()
+            .unwrap();
+        let operations = journal
+            .connection
+            .prepare("SELECT owner_id,agent_id,request_id,kind,request_digest,outcome_json FROM agent_workflow_operations ORDER BY owner_id,agent_id,request_id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<OperationRow>>>()
+            .unwrap();
+        drop(journal);
+
+        let mut connection =
+            Connection::open(fixture.root.path().join("skill-workflows/state.sqlite")).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", false)
+            .unwrap();
+        let tx = connection.transaction().unwrap();
+        tx.execute_batch(
+            "DROP TABLE agent_workflow_collector_transfers;
+             DROP TABLE agent_workflow_collector_claims;
+             DROP TABLE agent_workflow_operations;
+             DROP TABLE agent_workflow_assertions;
+             DROP TABLE agent_workflow_attempts;
+             CREATE TABLE agent_workflow_attempts(
+                attempt_id TEXT PRIMARY KEY CHECK(length(attempt_id) BETWEEN 1 AND 128),
+                execution_operation_id TEXT NOT NULL UNIQUE CHECK(length(execution_operation_id) BETWEEN 1 AND 128),
+                task_id TEXT NOT NULL REFERENCES agent_workflow_tasks(task_id),
+                fence INTEGER NOT NULL CHECK(fence>0),
+                lease_expires_at INTEGER NOT NULL CHECK(lease_expires_at>0),
+                state TEXT NOT NULL CHECK(state IN ('leased','finished','cancelled','replaced')),
+                superseding_fence INTEGER CHECK(superseding_fence IS NULL OR superseding_fence>fence),
+                assertion_digest TEXT UNIQUE CHECK(assertion_digest IS NULL OR length(assertion_digest)=64),
+                attempt_json BLOB NOT NULL CHECK(length(attempt_json)<=262144),
+                UNIQUE(task_id,fence),
+                CHECK((state='replaced')=(superseding_fence IS NOT NULL)),
+                CHECK((state='finished')=(assertion_digest IS NOT NULL))
+             ) STRICT;
+             CREATE TABLE agent_workflow_assertions(
+                digest TEXT PRIMARY KEY CHECK(length(digest)=64),
+                attempt_id TEXT NOT NULL UNIQUE REFERENCES agent_workflow_attempts(attempt_id),
+                canonical_json BLOB NOT NULL CHECK(length(canonical_json)<=262144)
+             ) STRICT;
+             CREATE TABLE agent_workflow_operations(
+                owner_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('claim','heartbeat','cancel','reconcile','result')),
+                request_digest TEXT NOT NULL CHECK(length(request_digest)=64),
+                outcome_json BLOB NOT NULL CHECK(length(outcome_json)<=524288),
+                PRIMARY KEY(owner_id,agent_id,request_id)
+             ) STRICT;",
+        )
+        .unwrap();
+        for row in &attempts {
+            tx.execute(
+                "INSERT INTO agent_workflow_attempts VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8
+                ],
+            )
+            .unwrap();
+        }
+        for row in &assertions {
+            tx.execute(
+                "INSERT INTO agent_workflow_assertions VALUES(?1,?2,?3)",
+                params![row.0, row.1, row.2],
+            )
+            .unwrap();
+        }
+        for row in &operations {
+            tx.execute(
+                "INSERT INTO agent_workflow_operations VALUES(?1,?2,?3,?4,?5,?6)",
+                params![row.0, row.1, row.2, row.3, row.4, row.5],
+            )
+            .unwrap();
+        }
+        tx.pragma_update(None, "user_version", 3).unwrap();
+        tx.commit().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        assert!(
+            !connection
+                .prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .exists([])
+                .unwrap()
+        );
+        drop(connection);
+
+        assert!(matches!(
+            Journal::open(fixture.root.path(), OpenMode::Read),
+            Err(Error::Invalid(message)) if message.contains("requires a writable migration")
+        ));
+        let recovery_parent = tempfile::tempdir().unwrap();
+        let backup = recovery_parent.path().join("backup");
+        let restored = recovery_parent.path().join("restored");
+        let mut retained_manifest = None;
+        let root = if recover {
+            // Authority v9 is purely additive: removing its two relations restores
+            // the unchanged parent v8 DDL, including its populated v8 registry.
+            let authority = Connection::open(fixture.root.path().join("state.sqlite")).unwrap();
+            authority
+                .execute_batch(
+                    "DROP TABLE workflow_imported_evidence;
+                 DROP TABLE workflow_collector_profiles;
+                 PRAGMA user_version=8;",
+                )
+                .unwrap();
+            drop(authority);
+
+            // Version labels alone must never admit incomplete parent schemas.
+            for (database, table) in [
+                ("state.sqlite", "workflow_executor_revocations"),
+                ("skill-workflows/state.sqlite", "agent_workflow_tasks"),
+                ("skill-workflows/state.sqlite", "agent_workflow_attempts"),
+                ("skill-workflows/state.sqlite", "agent_workflow_assertions"),
+                ("skill-workflows/state.sqlite", "agent_workflow_operations"),
+            ] {
+                let path = fixture.root.path().join(database);
+                let db = Connection::open(&path).unwrap();
+                db.execute_batch(&format!(
+                    "ALTER TABLE {table} RENAME TO missing_parent_relation"
+                ))
+                .unwrap();
+                drop(db);
+                let error = crate::local_recovery::backup(
+                    fixture.root.path(),
+                    &recovery_parent.path().join(table),
+                    &[],
+                    &[],
+                    true,
+                )
+                .unwrap_err();
+                assert!(error.to_string().contains(table), "{error}");
+                let db = Connection::open(&path).unwrap();
+                db.execute_batch(&format!(
+                    "ALTER TABLE missing_parent_relation RENAME TO {table}"
+                ))
+                .unwrap();
+            }
+
+            let manifest =
+                crate::local_recovery::backup(fixture.root.path(), &backup, &[], &[], true)
+                    .unwrap();
+            let manifest_bytes = std::fs::read(backup.join("recovery-manifest.json")).unwrap();
+            assert_eq!(crate::local_recovery::verify(&backup).unwrap(), manifest);
+            assert_eq!(
+                std::fs::read(backup.join("recovery-manifest.json")).unwrap(),
+                manifest_bytes
+            );
+            for entry in &manifest.entries {
+                if !entry.directory {
+                    assert_eq!(
+                        sha256(&std::fs::read(backup.join("payload").join(&entry.path)).unwrap()),
+                        entry.sha256
+                    );
+                }
+            }
+            crate::local_recovery::restore(&backup, &restored).unwrap();
+            let data = restored.join("data");
+            assert!(
+                matches!(Authority::open(&data), Err(Error::Conflict(message)) if message.contains("explicit recovery activation"))
+            );
+            assert!(Journal::open(&data, OpenMode::Create).is_err());
+            assert_eq!(
+                crate::local_recovery::activate(&restored, true, true).unwrap(),
+                manifest.policy_epoch + 1
+            );
+            // Backup, verification, restore and activation must not migrate either DB.
+            for base in [fixture.root.path(), &data] {
+                for (database, version) in
+                    [("state.sqlite", 8), ("skill-workflows/state.sqlite", 3)]
+                {
+                    let db = Connection::open_with_flags(
+                        base.join(database),
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                            .unwrap(),
+                        version
+                    );
+                    assert!(
+                        !db.prepare("PRAGMA foreign_key_check")
+                            .unwrap()
+                            .exists([])
+                            .unwrap()
+                    );
+                }
+            }
+            assert!(
+                matches!(Journal::open(&data, OpenMode::Read), Err(Error::Invalid(message)) if message.contains("requires a writable migration"))
+            );
+            let authority = Authority::open(&data).unwrap();
+            assert_eq!(
+                authority
+                    .review_context(&fixture.context.digest().unwrap())
+                    .unwrap(),
+                fixture.context
+            );
+            assert_eq!(
+                authority
+                    .workflow_executor_registration(&fixture.enrollment.registration_id)
+                    .unwrap()
+                    .unwrap()
+                    .enrollment,
+                fixture.enrollment
+            );
+            drop(authority);
+            let db = Connection::open_with_flags(
+                data.join("state.sqlite"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            assert_eq!(
+                db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                9
+            );
+            assert!(
+                !db.prepare("PRAGMA foreign_key_check")
+                    .unwrap()
+                    .exists([])
+                    .unwrap()
+            );
+            retained_manifest = Some((manifest, manifest_bytes));
+            data
+        } else {
+            fixture.root.path().to_path_buf()
+        };
+        let service = AgentTaskService::new(&root, "trusted-local", &fixture, &fixture).unwrap();
+        let migrated = Journal::open(&root, OpenMode::Create).unwrap();
+        for task in &tasks {
+            assert_eq!(
+                read_task(&migrated.connection, &task.task_id).unwrap(),
+                *task
+            );
+        }
+        assert_eq!(
+            migrated
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            4
+        );
+        assert!(
+            !migrated
+                .connection
+                .prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .exists([])
+                .unwrap()
+        );
+        let migrated_attempts = migrated
+            .connection
+            .prepare("SELECT attempt_id,execution_operation_id,task_id,fence,lease_expires_at,state,superseding_fence,assertion_digest,attempt_json FROM agent_workflow_attempts ORDER BY attempt_id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<AttemptRow>>>()
+            .unwrap();
+        let migrated_assertions = migrated
+            .connection
+            .prepare("SELECT digest,attempt_id,canonical_json FROM agent_workflow_assertions ORDER BY digest")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<AssertionRow>>>()
+            .unwrap();
+        let migrated_operations = migrated
+            .connection
+            .prepare("SELECT owner_id,agent_id,request_id,kind,request_digest,outcome_json FROM agent_workflow_operations ORDER BY owner_id,agent_id,request_id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<OperationRow>>>()
+            .unwrap();
+        assert_eq!(migrated_attempts, attempts);
+        assert_eq!(migrated_assertions, assertions);
+        assert_eq!(migrated_operations, operations);
+        drop(migrated);
+
+        let mut historical_first = first.clone();
+        historical_first.currently_applicable = false;
+        let mut replaced = replaced;
+        let mut finished = finished;
+        let mut leased = leased;
+        if recover {
+            // Activation advances policy; retained retries remain historical outcomes.
+            replaced.currently_applicable = false;
+            finished.currently_applicable = false;
+            leased.currently_applicable = false;
+        }
+        assert_eq!(
+            service.claim(&fixture.context, &first_claim).unwrap(),
+            historical_first
+        );
+        assert_eq!(
+            service
+                .reconcile_attempt(&fixture.context, &reconcile)
+                .unwrap(),
+            replaced
+        );
+        assert_eq!(
+            service.submit_result(&fixture.context, &assertion).unwrap(),
+            finished
+        );
+        assert_eq!(
+            service.claim(&fixture.context, &third_claim).unwrap(),
+            leased
+        );
+        assert_eq!(
+            service.read_task_states(&tasks).unwrap(),
+            vec![
+                LogicalState::CompletedObservation,
+                LogicalState::TerminalNonpassing
+            ]
+        );
+
+        if let Some((manifest, manifest_bytes)) = retained_manifest {
+            assert_eq!(crate::local_recovery::verify(&backup).unwrap(), manifest);
+            assert_eq!(
+                std::fs::read(backup.join("recovery-manifest.json")).unwrap(),
+                manifest_bytes
+            );
+            for entry in &manifest.entries {
+                if !entry.directory {
+                    assert_eq!(
+                        sha256(&std::fs::read(backup.join("payload").join(&entry.path)).unwrap()),
+                        entry.sha256
+                    );
+                }
+            }
+        } else {
+            crate::local_recovery::backup(&root, &backup, &[], &[], true).unwrap();
+            crate::local_recovery::verify(&backup).unwrap();
+        }
     }
 
     #[test]
@@ -2906,5 +4125,34 @@ mod tests {
         drop(journal);
         let mut writer = Authority::open(fixture.root.path()).unwrap();
         writer.advance_policy(fixture.context.policy_epoch).unwrap();
+    }
+    #[test]
+    fn retained_transfer_length_is_checked_before_blob_decoding() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("CREATE TABLE agent_workflow_collector_transfers(digest TEXT, canonical_json BLOB);").unwrap();
+        connection
+            .execute(
+                "INSERT INTO agent_workflow_collector_transfers VALUES('oversized',zeroblob(?1))",
+                [MAX_COLLECTOR_TRANSFER_BYTES + 1],
+            )
+            .unwrap();
+        assert!(matches!(
+            read_transfer_bytes(&connection, "oversized"),
+            Err(Error::Limit(_))
+        ));
+        for i in 0..32 {
+            connection
+                .execute(
+                    "INSERT INTO agent_workflow_collector_transfers VALUES(?1,?2)",
+                    params![i.to_string(), vec![i as u8; 1024]],
+                )
+                .unwrap();
+        }
+        for i in 0..32 {
+            assert_eq!(
+                read_transfer_bytes(&connection, &i.to_string()).unwrap(),
+                vec![i as u8; 1024]
+            );
+        }
     }
 }

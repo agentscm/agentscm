@@ -9,10 +9,13 @@ use sha2::{Digest, Sha256};
 
 use super::{Authority, read_policy, sql_i64, sql_u64};
 use crate::policy::issuer_key_id;
-use crate::skill_workflow::{ExecutorBinding, ExecutorEnrollment, ExecutorRevocation};
+use crate::skill_workflow::{
+    CollectorProfile, ExecutorBinding, ExecutorEnrollment, ExecutorRevocation,
+};
 use crate::{Error, Result};
 
 const MAX_REGISTRATIONS: i64 = 4_096;
+const MAX_COLLECTOR_PROFILES: i64 = 4_096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CurrentExecutorRegistration {
@@ -260,6 +263,109 @@ impl Authority {
         read_current_registration(&self.connection, registration_id)
     }
 
+    /// Installs immutable operator-owned collector authority for one already-enrolled step.
+    /// Existing enrollments remain observation-only unless this separate profile exists.
+    pub fn install_workflow_collector_profile(
+        &mut self,
+        profile: &CollectorProfile,
+    ) -> Result<String> {
+        self.require_writable()?;
+        let canonical = profile.canonical_bytes()?;
+        let digest = profile.digest()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((stored_digest, stored)) = tx
+            .query_row(
+                "SELECT digest,canonical_json FROM workflow_collector_profiles WHERE profile_id=?1",
+                [&profile.profile_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?
+        {
+            if stored_digest == digest && stored == canonical {
+                tx.commit()?;
+                return Ok(digest);
+            }
+            return Err(Error::Conflict(format!(
+                "collector profile {} is already bound to different bytes",
+                profile.profile_id
+            )));
+        }
+        let registration = read_current_registration(&tx, &profile.registration_id)?
+            .ok_or_else(|| Error::Conflict("collector executor is not enrolled".into()))?;
+        let binding = registration.enrollment.binding()?;
+        if registration.revocation.is_some()
+            || registration.enrollment.repository != profile.repository
+            || !registration.enrollment.step_ids.contains(&profile.step_id)
+            || binding.registration_epoch != profile.registration_epoch
+            || binding.verification_key_id != profile.verification_key_id
+        {
+            return Err(Error::Conflict(
+                "collector profile does not match a current exact-step enrollment".into(),
+            ));
+        }
+        let repository: String = tx.query_row(
+            "SELECT repository_id FROM authority_state WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if profile.repository != repository {
+            return Err(Error::Conflict(
+                "collector profile repository is not this authority".into(),
+            ));
+        }
+        let count: i64 = tx.query_row(
+            "SELECT count(*) FROM workflow_collector_profiles",
+            [],
+            |row| row.get(0),
+        )?;
+        if count >= MAX_COLLECTOR_PROFILES {
+            return Err(Error::Limit("collector profile inventory is full".into()));
+        }
+        // The immutable profile is subordinate to this exact registration epoch. Installing it
+        // grants no repository authority on its own; enrollment/re-enrollment and revocation are
+        // the policy-epoch transitions. This keeps one pinned profile usable across revisions.
+        let current = read_policy(&tx)?;
+        tx.execute(
+            "INSERT INTO workflow_collector_profiles(profile_id,digest,registration_id,registration_epoch,repository,step_id,installed_policy_epoch,canonical_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                profile.profile_id,
+                digest,
+                profile.registration_id,
+                sql_i64("registration epoch", profile.registration_epoch)?,
+                profile.repository,
+                profile.step_id,
+                current,
+                canonical,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(digest)
+    }
+
+    pub fn workflow_collector_profile(&self, profile_id: &str) -> Result<Option<CollectorProfile>> {
+        if profile_id.is_empty() || profile_id.len() > 128 {
+            return Err(Error::Invalid("invalid collector profile ID".into()));
+        }
+        read_collector_profile(&self.connection, profile_id)
+    }
+
+    pub fn require_current_collector_profile(
+        &self,
+        profile_id: &str,
+        task: &crate::skill_workflow::WorkflowTask,
+        binding: &ExecutorBinding,
+    ) -> Result<CollectorProfile> {
+        let profile = self
+            .workflow_collector_profile(profile_id)?
+            .ok_or_else(|| Error::Conflict("collector profile is not installed".into()))?;
+        let audience = self.repository_id()?;
+        profile.validate_for(task, binding, &audience)?;
+        self.require_current_workflow_executor(&task.subject, binding)?;
+        Ok(profile)
+    }
+
     /// Loads authoritative key and revocation state, then checks exact scope and binding.
     pub fn require_current_workflow_executor(
         &self,
@@ -302,6 +408,70 @@ pub(super) fn create_schema_v8(tx: &Transaction<'_>) -> Result<()> {
          ) STRICT;",
     )?;
     Ok(())
+}
+
+pub(super) fn create_schema_v9(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE workflow_collector_profiles(
+            profile_id TEXT PRIMARY KEY CHECK(length(profile_id) BETWEEN 1 AND 128),
+            digest TEXT NOT NULL UNIQUE CHECK(length(digest)=64),
+            registration_id TEXT NOT NULL REFERENCES workflow_executor_enrollments(registration_id),
+            registration_epoch INTEGER NOT NULL CHECK(registration_epoch>0),
+            repository TEXT NOT NULL CHECK(length(repository)=32),
+            step_id TEXT NOT NULL CHECK(length(step_id) BETWEEN 1 AND 128),
+            installed_policy_epoch INTEGER NOT NULL CHECK(installed_policy_epoch>0),
+            canonical_json BLOB NOT NULL CHECK(length(canonical_json)<=524288),
+            UNIQUE(registration_id,registration_epoch,repository,step_id)
+         ) STRICT;",
+    )?;
+    super::workflows::create_schema_v9(tx)?;
+    Ok(())
+}
+
+pub(super) fn read_collector_profile(
+    connection: &rusqlite::Connection,
+    profile_id: &str,
+) -> Result<Option<CollectorProfile>> {
+    let row = connection
+        .query_row(
+            "SELECT digest,registration_id,registration_epoch,repository,step_id,canonical_json FROM workflow_collector_profiles WHERE profile_id=?1",
+            [profile_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(digest, registration_id, registration_epoch, repository, step_id, bytes)| {
+            if bytes.len() > 512 * 1024 {
+                return Err(Error::Limit(
+                    "stored collector profile exceeds 512 KiB".into(),
+                ));
+            }
+            let profile: CollectorProfile = serde_json::from_slice(&bytes)?;
+            if profile.profile_id != profile_id
+                || profile.registration_id != registration_id
+                || profile.registration_epoch != sql_u64("registration epoch", registration_epoch)?
+                || profile.repository != repository
+                || profile.step_id != step_id
+                || profile.canonical_bytes()? != bytes
+                || profile.digest()? != digest
+            {
+                return Err(Error::Invalid(
+                    "stored collector profile failed integrity validation".into(),
+                ));
+            }
+            Ok(profile)
+        },
+    )
+    .transpose()
 }
 
 pub(super) fn read_current_registration(

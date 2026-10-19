@@ -954,11 +954,11 @@ fn validate_database(db: &Connection, kind: DbKind) -> Result<()> {
     let app: i64 = db.pragma_query_value(None, "application_id", |row| row.get(0))?;
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
     let supported = match kind {
-        DbKind::Authority => (app, version) == (0x4153_434d, 8),
+        DbKind::Authority => app == 0x4153_434d && matches!(version, 8 | 9),
         DbKind::Workspace => app == 0x4153_574b && matches!(version, 2..=4),
         DbKind::Merge => (app, version) == (0x4147_4d47, 1),
         DbKind::Workflow => (app, version) == (0x4153_4746, 1),
-        DbKind::SkillWorkflow => app == 0x4153_5746 && matches!(version, 1..=3),
+        DbKind::SkillWorkflow => app == 0x4153_5746 && matches!(version, 1..=4),
         DbKind::Export => app == 1095190616 && matches!(version, 1 | 2),
         DbKind::GitReconcile => (app, version) == (0x4153_4752, 1),
         DbKind::Issue => return Ok(()),
@@ -973,10 +973,14 @@ fn validate_database(db: &Connection, kind: DbKind) -> Result<()> {
     // declared schema can be opened after recovery. Authority and skill-workflow checks
     // are shape-only; canonical task/attempt/registry payloads are validated by runtime readers.
     if kind == DbKind::Authority {
-        crate::authority::validate_current_tables(db)?;
+        if version == 8 {
+            crate::authority::validate_v8_tables(db)?;
+        } else {
+            crate::authority::validate_current_tables(db)?;
+        }
     }
     if kind == DbKind::SkillWorkflow {
-        crate::skill_workflow::runtime::validate_schema(db)?;
+        crate::skill_workflow::runtime::validate_recovery_schema(db)?;
     }
     #[cfg(unix)]
     if kind == DbKind::Workspace && version == 4 {
@@ -1469,7 +1473,7 @@ fn create_private_root(path: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn create_private_directory(path: &Path) -> Result<()> {
+pub(crate) fn create_private_directory(path: &Path) -> Result<()> {
     if path.exists() {
         require_directory(path)?;
         return Ok(());
