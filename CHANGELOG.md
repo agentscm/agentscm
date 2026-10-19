@@ -2,6 +2,11 @@
 
 All notable changes are listed here, newest first. AgentSCM is alpha: any release may change the CLI, the HTTP API, storage and schemas without a migration.
 
+## Unreleased
+
+- Workspace capture honors exclusion rules. Status, checkpoint and the other workspace scans leave out untracked paths matched by `.gitignore`, a root `.agentscmignore`, the private `.agentscm-workspace/exclude` and, with a root `.git`, Git's global and `info/exclude` rules; base-revision paths are always captured. A root `.git` is skipped as metadata but needs a working `git` that accepts the repository. `agentscm workspace preview` lists included and excluded paths with the deciding rule, and `workspace status` reports `excluded_total`. Undo, merge application and refresh block rather than overwrite an excluded local file. Local backup still copies ignored files. See [source selection](docs/advanced/workspace.md#source-selection).
+- A hosted laptop check counts as changed if the workspace base moves during the run.
+
 ## 0.1.0-alpha.3 (2026-10-17)
 
 - `agentscm demo` ends with the next step, `agentscm quickstart` (or `npx agentscm`), and the status page's demo banner says the same.

@@ -97,9 +97,14 @@ new empty directory. The local store is opened with `store::Engine`; no local
 server repository identity remains a separate pinned authority identity.
 
 This is a native source workspace, not an attached Git checkout. Checkpoint scans
-include untracked source files and do not apply `.gitignore`; keep credentials and
-build/dependency output outside it. For local Rust builds, set `CARGO_TARGET_DIR`
-to a separate directory. Git capture/export remains an explicit bridge operation.
+include untracked source files unless an exclusion rule leaves them out
+(`.gitignore`, a root `.agentscmignore`, the private `.agentscm-workspace/exclude`
+and, with a root `.git`, Git's global and `info/exclude` rules). Tracked paths are
+always captured. Run `agentscm workspace preview` on the initialized workspace
+before the first `remote-check` to see what will be sent. Ignore handling is not a
+credential scanner: keep credentials outside the workspace. See
+[source selection](workspace.md#source-selection). For local Rust builds, set
+`CARGO_TARGET_DIR` to a separate directory. Git capture/export remains an explicit bridge operation.
 
 The laptop records protocol progress below its data directory with owner-only
 permissions. Keep that state with the object store and workspace journal. Deleting
@@ -131,8 +136,9 @@ The hub queues the installed workflow against the exact imported revision. Faile
 source checks return bounded observations and an action for the agent. Fix the
 workspace and run `remote-check` again. A success is reported only after the client
 observes a successful receipt for the exact current subject and then confirms that
-the local workspace is still clean with the same bytes. Editing during a run causes
-the client to withhold success.
+the local workspace is still clean with the same bytes. Editing during a run, or the
+workspace base moving during the run, counts as a change and causes the client to
+withhold success.
 
 A successful check does not approve or land a revision. Human review, explicit
 approval and explicit native integration remain separate hub actions with their own

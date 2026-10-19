@@ -2,9 +2,9 @@
 
 > **Experimental (alpha).** This part of AgentSCM is not part of the main path, may change without migration, and has had limited testing. See the [advanced index](README.md).
 
-AgentSCM workspaces are ordinary directories materialized from an immutable native revision. They use `store::Engine`; Git is not invoked. The local alpha supports workspace creation, status, checkpoint, undo, completed native merge application and interrupted-operation recovery. See [durable merge sessions](merge.md) for local divergence and conflict resolution. Authenticated remote synchronization and the remaining gates below are not yet implemented.
+AgentSCM workspaces are ordinary directories materialized from an immutable native revision. They use `store::Engine`. Git is run only to read exclusion settings when the workspace root has a `.git` (see [source selection](#source-selection)). The local alpha supports workspace creation, status, checkpoint, undo, completed native merge application and interrupted-operation recovery. See [durable merge sessions](merge.md) for local divergence and conflict resolution. Authenticated remote synchronization and the remaining gates below are not yet implemented.
 
-Every workspace contains a reserved `.agentscm-workspace` directory. It stores a SQLite journal, exact staged checkpoint bytes and recovery files. The whole namespace is excluded from status and checkpoints. A source revision, or a working-tree file, with any path component equal to `.git`, `.agentscm`, `.agentscm-workspace` or `agentscm-data`, ignoring ASCII case, is rejected: on a case-insensitive filesystem a variant such as `.AGENTSCM-WORKSPACE` would otherwise resolve into this directory, and Git metadata never belongs in native source. A `.git` directory inside a workspace therefore blocks checkpoints. Do not edit this directory.
+Every workspace contains a reserved `.agentscm-workspace` directory. It stores a SQLite journal, exact staged checkpoint bytes and recovery files. The whole namespace is excluded from status and checkpoints. A source revision, or a working-tree file, with any path component equal to `.git`, `.agentscm`, `.agentscm-workspace` or `agentscm-data`, ignoring ASCII case, is rejected: on a case-insensitive filesystem a variant such as `.AGENTSCM-WORKSPACE` would otherwise resolve into this directory, and Git metadata never belongs in native source. A `.git` directory or `gitdir` file at the workspace root is skipped as metadata and never captured; a `.git` anywhere deeper blocks status and checkpoint unless a rule excludes it. Do not edit this directory.
 
 The CLI data directory must be an initialized AgentSCM repository outside the workspace root. The CLI verifies that the workspace's repository identity matches that authority. Library callers must provide the corresponding trusted `Engine`; a matching revision digest alone is not repository authorization.
 
@@ -48,6 +48,48 @@ agentscm --data-dir ./agentscm-data workspace undo ./work undo-1 1 checkpoint-1
 ```
 
 Undo restores the prior base only when every affected path still matches one of the journaled states. A later edit, untracked occupant, directory collision, link or special file blocks the operation without overwriting that path. Unrelated untracked files, modified files and empty directories remain unchanged. Tracked file-to-directory and directory-to-file transitions remove known staged files first, prune only empty staged ancestors and then install replacement files with a non-overwriting hard link. Replacement bytes are fully written and synced in the metadata namespace before mutation. The base and workspace generation move only after all affected paths reach the prior state.
+
+## Source selection
+
+Status, checkpoint, undo, merge application and recovery capture the working tree through one selection. Preview is a read-only report of that selection.
+
+**What is selected.** Every path in the base revision is always selected, so a rule can never hide an edit to a tracked file or its deletion; to remove a tracked file, delete it. Untracked files and directories are selected unless a rule excludes them. An excluded directory is not entered. A tracked file inside an excluded directory is still selected; untracked files beside it stay excluded.
+
+**Rule sources.** Rules use gitignore syntax. From lowest to highest precedence:
+
+1. Global Git excludes: `core.excludesFile`, else `$XDG_CONFIG_HOME/git/ignore` or `~/.config/git/ignore`. An empty `core.excludesFile` means no global file. Read only when the workspace root has a `.git`.
+2. `$GIT_DIR/info/exclude`, which beats the global file. Read only when the workspace root has a `.git`.
+3. `.gitignore` files, always, including in a workspace with no Git. A deeper file beats a shallower one.
+4. `.agentscmignore` at the workspace root. It is an ordinary workspace file, captured like any other and read from the working tree whether or not it is in the base revision. A higher rule or a `.gitignore` entry can keep it out of the revision.
+5. `.agentscm-workspace/exclude`. It is private to this workspace and never transferred.
+
+The highest source with a matching rule decides. Within one file the last matching rule wins, and `!pattern` re-includes. A path inside an excluded directory cannot be re-included; re-include the directory itself.
+
+**Matching.** The matcher is original code, tested against `git check-ignore`. Case sensitivity follows `core.ignorecase` for a Git root and a probe of the workspace filesystem otherwise. Files with CRLF line endings work.
+
+Limits:
+
+- Unsupported patterns are `Invalid` errors that name the file and line: a run of two or more stars other than a whole `**` path segment (a leading `**/`, `/**/`, a trailing `/**`, or the whole pattern `**`; so `a**/b`, `a/***/b`, `***`, `k**` and `**` before an escaped slash are refused), a NUL byte in a rule, a pattern over 4,096 bytes, and a character class whose range end is not ASCII.
+- Case folding is ASCII only.
+- Budgets are `Limit` errors that name the file; shorten the file or exclude its directory. A rule file may be at most 64 KiB. One scan may read at most 8 MiB and 100,000 patterns of rules in total, with at most 1 MiB and 10,000 patterns resident at once (the `.gitignore` files of the directories being walked plus the fixed sources). Matching work in one scan is capped at 3x10^9 units, a few seconds of matching.
+- A `.gitignore` that is a symbolic link inside the tree is ignored as a rule source. `.agentscmignore` and the private exclude must be regular files.
+- Non-UTF-8 bytes in a rule file are decoded lossily.
+
+**Git at the root.** When the root has a `.git`, status and checkpoint run `git` to read its exclusion settings. This needs a working `git` (2.31 or later, for `--path-format`) and a repository Git accepts (ownership and `safe.directory` apply) whose top level is exactly the workspace root; otherwise they fail with an explicit error and capture nothing. Git configuration includes are honored. The user's `PATH`, `HOME` and Git configuration environment are trusted. Every scan (status, checkpoint, preview, undo, merge application, recovery) runs three Git commands, one `rev-parse` and two `config` reads, each with a 10 second timeout and bounded output. Without a root `.git`, Git is not run; the scan instead writes a short-lived case-probe file in `.agentscm-workspace` and removes it.
+
+**Preview.** Before the first hosted `skill-workflow remote-check` or any other transfer, list what will be sent (`remote-init` creates the workspace, so preview applies after it):
+
+```sh
+agentscm --data-dir ./agentscm-data workspace preview ./work --limit 1000
+```
+
+The JSON `preview` object has `base_revision`, `generation`, `included` (captured files and links, each with `path` and, if a `!` rule re-included it, `rule`), `excluded` (each with `path`, `directory` and the deciding `rule` as `source` and `pattern`), `included_total`, `excluded_total`, `complete` and, if an operation is pending, `pending`. `included` lists files and symbolic links only. Lists are sorted by path and cut at `--limit` (default 1000); `--limit 0` is an error. Recording is capped at 10,000 entries per list, and truncated rule attribution also makes `complete` false. `complete` is false when a list was cut short. A workspace that is not ready, or whose scan hit a traversal limit, returns empty lists with `complete: false`. Preview takes the same write transaction as the other scans, so it waits for a concurrent operation on the workspace. Preview shows paths and rules, never file contents. Excluded counts are top-level entries: an excluded directory counts once and its contents are not visited or counted. `workspace status` reports the same count as `excluded_total`.
+
+**Excluded is not deleted.** Undo, merge application and refresh never overwrite or delete a local file that a rule excludes. If an incoming path collides with such a file and the current base does not track it, the operation is blocked and nothing is written.
+
+**Not a credential scanner.** Untracked files that no rule excludes are captured, and tracked secrets stay captured. Review the preview and keep credentials out of the workspace.
+
+**Not covered.** Offline local backup (`src/local_recovery.rs`) still copies the whole workspace, ignored files included. Full attached-Git synchronization (commit mapping, refresh and publication) is separate future work; this change only honors Git's exclusion rules during native capture.
 
 ## Executable files and symbolic links
 

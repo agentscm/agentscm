@@ -25,6 +25,12 @@ pub enum WorkspaceCommand {
         #[arg(long, default_value_t = 1000)]
         limit: usize,
     },
+    /// List what would be captured and what exclusion rules leave out, with the rule for each.
+    Preview {
+        root: PathBuf,
+        #[arg(long, default_value_t = 1000)]
+        limit: usize,
+    },
     Checkpoint {
         root: PathBuf,
         operation_id: String,
@@ -109,6 +115,7 @@ pub fn workspace(data_dir: &Path, command: WorkspaceCommand) -> Result<Value> {
         WorkspaceCommand::Create { root, .. }
         | WorkspaceCommand::State { root }
         | WorkspaceCommand::Status { root, .. }
+        | WorkspaceCommand::Preview { root, .. }
         | WorkspaceCommand::Checkpoint { root, .. }
         | WorkspaceCommand::Undo { root, .. }
         | WorkspaceCommand::Recover { root, .. } => root,
@@ -171,6 +178,9 @@ pub fn workspace(data_dir: &Path, command: WorkspaceCommand) -> Result<Value> {
         WorkspaceCommand::State { .. } => Ok(json!({"ok":true,"workspace":workspace.state()?})),
         WorkspaceCommand::Status { limit, .. } => {
             Ok(json!({"ok":true,"status":workspace.status(&engine, limit)?}))
+        }
+        WorkspaceCommand::Preview { limit, .. } => {
+            Ok(json!({"ok":true,"preview":workspace.preview(&engine, limit)?}))
         }
         WorkspaceCommand::Checkpoint {
             operation_id,

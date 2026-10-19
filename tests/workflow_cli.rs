@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use serde_json::{Value, json};
@@ -334,4 +334,301 @@ fn target_initialization_and_landing_preparation_work_without_git() {
     let landed = success(&data, &["integrate", path.to_str().unwrap()])["event"].clone();
     assert_eq!(landed["kind"], "integrate");
     assert_eq!(landed["after"], json!({"revision":revision,"version":2}));
+}
+
+/// The Git these tests drive, resolved as in tests/git_snapshot.rs. A missing Git fails the test.
+fn test_git() -> PathBuf {
+    let path = PathBuf::from(
+        std::env::var("AGENTSCM_TEST_GIT").unwrap_or_else(|_| "/usr/bin/git".to_owned()),
+    );
+    assert!(
+        path.exists(),
+        "git not found at {}; set AGENTSCM_TEST_GIT to an absolute git path",
+        path.display()
+    );
+    path
+}
+
+/// Git with a cleared environment and an isolated, test-controlled configuration.
+fn isolated_git(directory: &Path, home: &Path, args: &[&str]) {
+    let git = test_git();
+    let output = Command::new(&git)
+        .env_clear()
+        .env("PATH", git.parent().unwrap())
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join("xdg"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(args)
+        .current_dir(directory)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn create_workspace(temp: &Path, data: &Path, name: &str) -> PathBuf {
+    let (repository, revision) = initialize(data);
+    let context_path = temp.join("context.json");
+    input(&context_path, &context(&repository, &revision));
+    success(data, &["start", context_path.to_str().unwrap()]);
+    let workspace = temp.join(name);
+    success(
+        data,
+        &[
+            "workspace",
+            "create",
+            workspace.to_str().unwrap(),
+            "work",
+            &revision,
+        ],
+    );
+    workspace
+}
+
+/// `workspace preview` with a cleared environment; Git configuration is test-controlled.
+fn preview_output(
+    data: &Path,
+    workspace: &Path,
+    home: &Path,
+    gitconfig: &Path,
+    path_env: &std::ffi::OsStr,
+) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_agentscm"))
+        .arg("--data-dir")
+        .arg(data)
+        .args(["workspace", "preview", workspace.to_str().unwrap()])
+        .env_clear()
+        .env("PATH", path_env)
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join("xdg"))
+        .env("GIT_CONFIG_GLOBAL", gitconfig)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn workspace_preview_resolves_global_git_excludes_through_git_only_with_a_root_git() {
+    let git = test_git();
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("repo");
+    let workspace = create_workspace(temp.path(), &data, "work");
+    // Isolated Git configuration: nothing here reads the real user's.
+    let home = temp.path().join("home");
+    fs::create_dir_all(home.join("dir with space")).unwrap();
+    fs::write(home.join("dir with space/ignore"), "*.globalonly\n").unwrap();
+    let included = home.join("included-config");
+    fs::write(&included, "[core]\n\tignorecase = true\n").unwrap();
+    let gitconfig = home.join("gitconfig");
+    fs::write(
+        &gitconfig,
+        format!(
+            "[core]\n\texcludesFile = \"{}\"\n[include]\n\tpath = {}\n",
+            home.join("dir with space/ignore").display(),
+            included.display()
+        ),
+    )
+    .unwrap();
+    let preview = |path_env: &std::ffi::OsStr| -> Value {
+        let output = preview_output(&data, &workspace, &home, &gitconfig, path_env);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    fs::write(workspace.join("x.globalonly"), b"x").unwrap();
+    // No root .git: Git is never started (PATH is empty) and global excludes do not apply.
+    let without_git = preview(std::ffi::OsStr::new(""));
+    assert!(
+        without_git["preview"]["excluded"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    isolated_git(&workspace, &home, &["init", "-q"]);
+    let with_git = preview(git.parent().unwrap().as_os_str());
+    let excluded = with_git["preview"]["excluded"].as_array().unwrap();
+    assert_eq!(excluded.len(), 1, "{with_git}");
+    assert_eq!(excluded[0]["path"], "x.globalonly");
+    assert_eq!(excluded[0]["rule"]["source"], "global-excludes");
+    assert_eq!(excluded[0]["rule"]["pattern"], "*.globalonly");
+    assert_eq!(with_git["ok"], true);
+
+    // A configuration Git cannot parse is a typed error, not a silent fallback.
+    let broken = home.join("broken-config");
+    fs::write(&broken, "[core\nexcludesFile = \n").unwrap();
+    let output = preview_output(
+        &data,
+        &workspace,
+        &home,
+        &broken,
+        git.parent().unwrap().as_os_str(),
+    );
+    assert!(!output.status.success());
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert!(error["error"].as_str().unwrap().contains("Git refused"));
+}
+
+#[test]
+fn a_root_git_that_is_not_the_workspace_repository_is_refused() {
+    let git = test_git();
+    let path_env = git.parent().unwrap().as_os_str().to_owned();
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let gitconfig = home.join("gitconfig");
+    fs::write(&gitconfig, "").unwrap();
+    let error_of = |data: &Path, workspace: &Path| -> String {
+        let output = preview_output(data, workspace, &home, &gitconfig, &path_env);
+        assert!(!output.status.success());
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        error["error"].as_str().unwrap().to_owned()
+    };
+
+    // An empty `.git` directory is not a repository: Git refuses it.
+    let data = temp.path().join("repo-a");
+    let workspace = create_workspace(temp.path(), &data, "work-a");
+    fs::create_dir(workspace.join(".git")).unwrap();
+    assert!(error_of(&data, &workspace).contains("Git refused"));
+
+    // Inside another repository, Git finds that one instead: the `.git` does not own the root.
+    let outer = temp.path().join("outer");
+    fs::create_dir(&outer).unwrap();
+    isolated_git(&outer, &home, &["init", "-q"]);
+    let data = temp.path().join("repo-b");
+    let workspace = create_workspace(&outer, &data, "work-b");
+    fs::create_dir(workspace.join(".git")).unwrap();
+    assert!(error_of(&data, &workspace).contains("does not own"));
+}
+
+#[test]
+fn info_exclude_is_found_through_git_for_separate_and_linked_git_directories() {
+    let git = test_git();
+    let path_env = git.parent().unwrap().as_os_str().to_owned();
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let gitconfig = home.join("gitconfig");
+    fs::write(&gitconfig, "").unwrap();
+    let excluded_paths = |data: &Path, workspace: &Path| -> Vec<(String, String)> {
+        let output = preview_output(data, workspace, &home, &gitconfig, &path_env);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        value["preview"]["excluded"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                (
+                    entry["path"].as_str().unwrap().to_owned(),
+                    entry["rule"]["source"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    };
+
+    // A separate git directory whose name ends in a space, reached through a `.git` pointer.
+    let data = temp.path().join("repo-a");
+    let workspace = create_workspace(temp.path(), &data, "work-a");
+    let separate = temp.path().join("metadata ");
+    isolated_git(
+        &workspace,
+        &home,
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            separate.to_str().unwrap(),
+            workspace.to_str().unwrap(),
+        ],
+    );
+    assert!(workspace.join(".git").is_file());
+    fs::create_dir_all(separate.join("info")).unwrap();
+    fs::write(separate.join("info/exclude"), "from-info.txt\n").unwrap();
+    fs::write(workspace.join("from-info.txt"), b"x").unwrap();
+    assert_eq!(
+        excluded_paths(&data, &workspace),
+        [("from-info.txt".to_owned(), "info/exclude".to_owned())]
+    );
+
+    // A linked worktree resolves the main repository's info/exclude through the common dir.
+    let main = temp.path().join("main");
+    fs::create_dir(&main).unwrap();
+    isolated_git(&main, &home, &["init", "-q"]);
+    fs::write(main.join("tracked.txt"), b"x").unwrap();
+    isolated_git(&main, &home, &["add", "tracked.txt"]);
+    isolated_git(
+        &main,
+        &home,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ],
+    );
+    let linked = temp.path().join("linked");
+    isolated_git(
+        &main,
+        &home,
+        &["worktree", "add", "-q", linked.to_str().unwrap()],
+    );
+    fs::write(main.join(".git/info/exclude"), "from-main.txt\n").unwrap();
+    let data = temp.path().join("repo-b");
+    let workspace = create_workspace(temp.path(), &data, "work-b");
+    fs::copy(linked.join(".git"), workspace.join(".git")).unwrap();
+    fs::write(workspace.join("from-main.txt"), b"x").unwrap();
+    assert_eq!(
+        excluded_paths(&data, &workspace),
+        [("from-main.txt".to_owned(), "info/exclude".to_owned())]
+    );
+}
+
+#[test]
+fn an_empty_core_excludes_file_means_no_global_file() {
+    let git = test_git();
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("repo");
+    let workspace = create_workspace(temp.path(), &data, "work");
+    let home = temp.path().join("home");
+    fs::create_dir_all(home.join("xdg/git")).unwrap();
+    // Git's default location would exclude this file if the empty setting were ignored.
+    fs::write(home.join("xdg/git/ignore"), "x.default\n").unwrap();
+    fs::write(workspace.join("x.default"), b"x").unwrap();
+    isolated_git(&workspace, &home, &["init", "-q"]);
+    let gitconfig = home.join("gitconfig");
+    let excluded = |config: &str| -> usize {
+        fs::write(&gitconfig, config).unwrap();
+        let output = preview_output(
+            &data,
+            &workspace,
+            &home,
+            &gitconfig,
+            git.parent().unwrap().as_os_str(),
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        value["preview"]["excluded"].as_array().unwrap().len()
+    };
+    assert_eq!(excluded(""), 1);
+    assert_eq!(excluded("[core]\n\texcludesFile =\n"), 0);
 }
