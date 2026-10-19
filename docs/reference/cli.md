@@ -2,7 +2,7 @@
 
 > **Experimental (alpha).** The native ledger commands below are not part of the main path, may change without migration, and have had limited testing. See the [advanced index](../advanced/README.md). The everyday commands (`quickstart`, `uninstall`, `demo`, `init-repo`, `hook`, `collisions`, `autopsy`, `intent`, `hub`) are described in the [README](../../README.md), the [setup guide](../setup-guide.md), [collisions](../collisions.md), [autopsy](../autopsy.md), [intents](../intents.md) and [hub](../hub.md).
 
-`workflow`, `recovery`, `team` and `package-native` are internal to the alpha, hidden from `agentscm --help` and not documented here. The other native commands are marked "[experimental]" in `agentscm --help`.
+`workflow`, `recovery`, `team` and `package-native` are internal to the alpha and hidden from `agentscm --help`. The trusted-local task-workspace entry through `workflow` is documented below; the other hidden commands are not documented here. Other native commands are marked "[experimental]" in `agentscm --help`.
 
 ## Commands
 
@@ -21,8 +21,12 @@ Every command accepts `--data-dir`; its default is `.agentscm`. Most commands pr
 agentscm --data-dir ./agentscm-data init
 
 agentscm --data-dir ./agentscm-data checkpoint checkpoint.json
+agentscm --data-dir ./agentscm-data files REVISION --limit 1000
+agentscm --data-dir ./agentscm-data files REVISION --prefix src --contains parser --limit 1000
+agentscm --data-dir ./agentscm-data stat REVISION path/to/file
 agentscm --data-dir ./agentscm-data read REVISION path/to/file
 agentscm --data-dir ./agentscm-data diff LEFT RIGHT --limit 1000
+agentscm --data-dir ./agentscm-data history REVISION --limit 100
 
 agentscm --data-dir ./agentscm-data start context.json
 agentscm --data-dir ./agentscm-data show REPOSITORY_ID CHANGE_ID
@@ -41,6 +45,8 @@ agentscm --data-dir ./agentscm-data events --after 0 --limit 100
 ```
 
 Use `-` or omit the input filename for JSON on standard input. A checkpoint request contains an optional parent and changes. File content is an array of byte values; `null` deletes a path.
+
+`files` scans one immutable manifest page and returns entry metadata, `scanned`, `next` and `complete`. `--prefix PATH` and the literal, case-sensitive `--contains TEXT` filter that page after scanning it; search text must contain 1 to 1024 bytes. A filtered page can have no entries and still return `next`; save that JSON cursor string in a file and pass `--cursor FILE` until `next` is null. `stat` checks exact manifest membership without reading the file blob: `present` does not prove the blob is locally available, while `nonexistent` means the complete manifest has no such path. Missing source objects, denied/indeterminate reads and limits remain distinct failures with a typed top-level `error_kind`. `read` retrieves entry kind and bytes.
 
 ```json
 {
@@ -145,6 +151,27 @@ agentscm --data-dir ./agentscm-data serve [--bind ADDR] [--max-concurrency N] [-
 
 `serve` serves collision warnings (`GET /v1/collisions`) for the trusted Git checkout named by `--collisions-repo`, and the experimental read-only native API for the data directory. `--bind` defaults to `127.0.0.1:7331`. A non-loopback `--bind` is refused unless `--public` is passed. The container image passes `--public` itself; publish the port on loopback only, or put authentication in front of it.
 
+## Trusted-local task workflow
+
+`workflow start` is the integrated local entry for a task that will continue through checkpoint, inspection, checks, approval and landing. The command is hidden from general help because its schema remains experimental.
+
+```sh
+agentscm --data-dir ./agentscm-data workflow start \
+  --change task-1 --workspace ./work --revision REVISION --issue task-1 \
+  --intent "Update the example parser" \
+  --criterion "The parser accepts the new form" \
+  --scope crates/example \
+  --path Cargo.toml --path Cargo.lock --path crates/example \
+  --recipe RECIPE_SHA256 --toolchain TOOLCHAIN_SHA256 \
+  --environment ENVIRONMENT_SHA256
+
+agentscm --data-dir ./agentscm-data workspace expand ./work expand-1 0 \
+  --path crates/shared
+agentscm --data-dir ./agentscm-data workflow checkpoint checkpoint-1 1
+```
+
+Repeated `--path` values select the ordinary files materialized into the workspace. They are independent from repeated `--scope` values, which declare the review-context boundary. Expansion advances only the workspace generation; `workflow checkpoint` at that new generation advances the workspace base and updates the guided Change context. Omit `--path` for a full workspace, or use a sole `--path .` as an explicit full-tree selection. See [task-scoped source and workspaces](../advanced/task-workspaces.md) for the full flow and boundaries.
+
 ## Skill workflows
 
 `skill-workflow` is the experimental local runner for a graph of checks on one immutable native
@@ -177,6 +204,9 @@ Keep the initialized repository data directory outside the working directory. St
 
 ```sh
 agentscm --data-dir ./agentscm-data workspace create ./work CHANGE_ID REVISION
+agentscm --data-dir ./agentscm-data workspace create ./work CHANGE_ID REVISION --path src --path Cargo.toml
+agentscm --data-dir ./agentscm-data workspace expand ./work EXPAND_OPERATION EXPECTED_GENERATION --path tests
+agentscm --data-dir ./agentscm-data workspace path-state ./work path/to/file
 agentscm --data-dir ./agentscm-data workspace status ./work
 agentscm --data-dir ./agentscm-data workspace preview ./work --limit 1000
 agentscm --data-dir ./agentscm-data workspace checkpoint ./work OPERATION_ID 0
@@ -192,7 +222,9 @@ agentscm --data-dir ./receiver-data sync import source.bundle ./transfer-state
 
 Offer, request and bundle output paths must be new. Imports preserve source identities and validate complete source/history closure. They do not import approvals, protected targets, policy or review contexts. Transfer state and workspaces can contain private source; keep them outside the product checkout and back them up or remove them according to your own retention needs.
 
-`workspace preview` lists the files a checkpoint would capture and the paths that `.gitignore`, `.agentscmignore`, the private `.agentscm-workspace/exclude` or (with a root `.git`) Git's own exclude files leave out, each with its deciding rule; it never prints contents. Paths in the base revision are always captured. See [source selection](../advanced/workspace.md#source-selection).
+`workspace preview` lists the files a checkpoint would capture and the paths that `.gitignore`, `.agentscmignore`, the private `.agentscm-workspace/exclude` or (with a root `.git`) Git's own exclude files leave out, each with its deciding rule; it never prints contents. Base paths are always captured within the effective scope; out-of-scope base paths remain inherited unchanged. See [source selection](../advanced/workspace.md#source-selection).
+
+Without `--path`, `workspace create` retains full-workspace behavior. Repeated `--path` values select exact base paths and descendants; `--path .` selects the full tree. Each scope construction accepts at most 256 roots and 65,536 total path bytes before canonicalization. `workspace expand` durably adds roots under an operation ID and expected workspace generation. It preserves dirty paths already in scope but refuses newly selected local occupants; move an out-of-scope occupant aside, expand, then reapply its edit. `path-state` distinguishes `materialized`, `missing_local`, `unmaterialized`, `outside_scope_local` and `nonexistent`. Scoped checkpoint overlays only materialized scope on the complete base: a missing tracked in-scope path is deleted, while an unmaterialized base path is preserved. See [task-scoped workspaces](../advanced/task-workspaces.md).
 
 Durable trusted-local [native merge sessions](../advanced/merge.md) retain divergent
 conflicts, bounded same-file text merges and generation-checked workspace

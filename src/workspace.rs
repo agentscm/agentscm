@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -14,14 +14,16 @@ use sha2::{Digest, Sha256};
 
 use crate::context::ChangeId;
 use crate::model::{EntryChange, EntryKind};
-use crate::store::{Engine, digest, validate_id, validate_symlink_target};
+use crate::store::{Engine, SourceReader, digest, validate_id, validate_symlink_target};
 use crate::sync;
 use crate::{Error, Result};
 
 mod git_config;
 mod glob;
+mod scope;
 mod selection;
 
+use scope::Scope;
 pub use selection::Rule;
 use selection::{Classified, Selection, Selector, Settings, Tracked};
 
@@ -29,7 +31,7 @@ pub const METADATA_DIRECTORY: &str = crate::local_recovery::WORKSPACE_METADATA_D
 
 const DATABASE_FILE: &str = "state.sqlite";
 const APPLICATION_ID: i64 = 0x4153_574b;
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const LIST_PAGE_SIZE: usize = 4_096;
 const MAX_ENTRIES: usize = 100_000;
@@ -40,6 +42,7 @@ const MAX_TOTAL_BYTES: usize = 128 * 1024 * 1024;
 const MAX_DEPTH: usize = 128;
 const MAX_CHECKPOINT_CHANGES: usize = 4_096;
 const MAX_OPERATION_ID_BYTES: usize = 128;
+const MAX_SCOPE_JSON_BYTES: usize = 128 * 1024;
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct WorkspaceState {
@@ -47,6 +50,10 @@ pub struct WorkspaceState {
     pub base_revision: String,
     pub generation: u64,
     pub ready: bool,
+    /// Canonical effective path roots for a sparse workspace. `None` means the
+    /// legacy whole-tree workspace profile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending: Option<PendingOperation>,
 }
@@ -63,6 +70,7 @@ pub enum OperationKind {
     Checkpoint,
     Undo,
     Apply,
+    Expand,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -128,9 +136,20 @@ pub enum OperationOutcome {
     Checkpointed { revision: String, generation: u64 },
     Undone { revision: String, generation: u64 },
     Applied { revision: String, generation: u64 },
+    Expanded { generation: u64 },
     Recovered { generation: u64 },
     Cancelled { generation: u64 },
     Blocked { paths: Vec<String> },
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspacePathState {
+    Materialized,
+    MissingLocal,
+    Unmaterialized,
+    OutsideScopeLocal,
+    Nonexistent,
 }
 
 #[derive(Clone, Debug)]
@@ -146,6 +165,27 @@ impl Workspace {
         change: ChangeId,
         revision: &str,
     ) -> Result<Self> {
+        Self::create_inner(engine, root, change, revision, None)
+    }
+
+    pub fn create_scoped(
+        engine: &Engine,
+        root: impl AsRef<Path>,
+        change: ChangeId,
+        revision: &str,
+        paths: &[String],
+    ) -> Result<Self> {
+        let requested = Scope::from_requested(paths)?;
+        Self::create_inner(engine, root, change, revision, requested)
+    }
+
+    fn create_inner(
+        engine: &Engine,
+        root: impl AsRef<Path>,
+        change: ChangeId,
+        revision: &str,
+        requested_scope: Option<Scope>,
+    ) -> Result<Self> {
         change.validate()?;
         validate_id(revision)?;
         let root = absolute_path(root.as_ref())?;
@@ -154,7 +194,18 @@ impl Workspace {
             .parent()
             .ok_or_else(|| Error::Invalid("workspace root has no parent".to_owned()))?;
         require_directory(parent, "workspace parent")?;
-        let snapshot = require_complete_snapshot(source_snapshot(engine, revision)?)?;
+        let inventory = require_complete_inventory(source_inventory(engine, revision)?)?;
+        let scope = requested_scope
+            .map(|scope| {
+                scope.with_selection_dependencies(inventory.entries.keys().map(String::as_str))
+            })
+            .transpose()?;
+        let snapshot = require_complete_snapshot(snapshot_from_inventory(
+            engine,
+            revision,
+            &inventory,
+            scope.as_ref(),
+        )?)?;
         fs::create_dir(&root).map_err(|error| {
             if error.kind() == ErrorKind::AlreadyExists {
                 Error::Conflict(format!(
@@ -185,6 +236,7 @@ impl Workspace {
             "INSERT INTO workspace_state(singleton, lifecycle, repository, change_id, base_revision, generation) VALUES (1, 'initializing', ?1, ?2, ?3, 0)",
             params![change.repository, change.id, revision],
         )?;
+        write_scope(&connection, scope.as_ref())?;
         drop(connection);
 
         let workspace = Self {
@@ -216,6 +268,206 @@ impl Workspace {
         state_with_pending(&connection)
     }
 
+    /// Resolve a creation request to effective roots without creating a workspace.
+    /// Empty paths or a sole '.' select the full revision.
+    pub fn scope_for_revision(
+        engine: &Engine,
+        revision: &str,
+        paths: &[String],
+    ) -> Result<Option<Vec<String>>> {
+        validate_id(revision)?;
+        engine.load_revision(revision)?;
+        let requested = if paths.is_empty() {
+            None
+        } else {
+            Scope::from_requested(paths)?
+        };
+        if let Some(requested) = requested {
+            let inventory = require_complete_inventory(source_inventory(engine, revision)?)?;
+            Ok(Some(
+                requested
+                    .with_selection_dependencies(inventory.entries.keys().map(String::as_str))?
+                    .roots()
+                    .to_vec(),
+            ))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Resolve and fully qualify a creation projection without reserving a
+    /// destination. The returned roots are canonical and selected blobs have
+    /// passed the same aggregate limits used by workspace creation.
+    pub fn preflight_creation_scope(
+        engine: &Engine,
+        revision: &str,
+        paths: &[String],
+    ) -> Result<Option<Vec<String>>> {
+        validate_id(revision)?;
+        engine.load_revision(revision)?;
+        let requested = if paths.is_empty() {
+            None
+        } else {
+            Scope::from_requested(paths)?
+        };
+        let inventory = require_complete_inventory(source_inventory(engine, revision)?)?;
+        let scope = requested
+            .map(|scope| {
+                scope.with_selection_dependencies(inventory.entries.keys().map(String::as_str))
+            })
+            .transpose()?;
+        require_complete_snapshot(snapshot_from_inventory(
+            engine,
+            revision,
+            &inventory,
+            scope.as_ref(),
+        )?)?;
+        Ok(scope.map(|scope| scope.roots().to_vec()))
+    }
+
+    /// Compare the persisted projection with a creation request, including exact-base
+    /// selection dependencies. This is used to fence interrupted task creation.
+    pub fn scope_matches(&self, engine: &Engine, paths: &[String]) -> Result<bool> {
+        let mut connection = self.connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let state = read_state(&tx)?;
+        let actual = read_scope(&tx)?.map(|scope| scope.roots().to_vec());
+        Ok(actual == Self::scope_for_revision(engine, &state.base_revision, paths)?)
+    }
+
+    pub fn path_state(&self, engine: &Engine, path: &str) -> Result<WorkspacePathState> {
+        validate_workspace_path(path)?;
+        let mut connection = self.connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let state = read_state(&tx)?;
+        let scope = read_scope(&tx)?;
+        let source_entry = SourceReader::new(engine).stat_file(&state.base_revision, path)?;
+        reject_symlink_ancestors(&self.root, path)?;
+        let local = match fs::symlink_metadata(self.root.join(path)) {
+            Ok(_) => true,
+            Err(error)
+                if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) =>
+            {
+                false
+            }
+            Err(error) => return Err(Error::Io(error)),
+        };
+        if scope.as_ref().is_some_and(|scope| !scope.includes(path)) {
+            return Ok(if local {
+                WorkspacePathState::OutsideScopeLocal
+            } else if source_entry.is_some() {
+                WorkspacePathState::Unmaterialized
+            } else {
+                WorkspacePathState::Nonexistent
+            });
+        }
+        if local {
+            Ok(WorkspacePathState::Materialized)
+        } else {
+            Ok(if source_entry.is_some() {
+                WorkspacePathState::MissingLocal
+            } else {
+                WorkspacePathState::Nonexistent
+            })
+        }
+    }
+
+    pub fn expand(
+        &mut self,
+        engine: &Engine,
+        operation_id: &str,
+        expected_generation: u64,
+        paths: &[String],
+    ) -> Result<OperationOutcome> {
+        validate_operation_id(operation_id)?;
+        let additions = Scope::from_requested(paths)?;
+        let request_digest = scope_expansion_digest(
+            operation_id,
+            expected_generation,
+            additions.as_ref().map(Scope::roots),
+        );
+        let mut connection = self.connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = matching_scope_expansion(&tx, operation_id, &request_digest)? {
+            let pending = existing.is_none();
+            drop(tx);
+            return if pending {
+                self.finish_expansion(operation_id, RecoveryChoice::Complete)
+            } else {
+                self.cleanup_expansion(operation_id)?;
+                Ok(existing.expect("completed outcome"))
+            };
+        }
+        ensure_no_pending(&tx)?;
+        let state = read_state(&tx)?;
+        require_ready_generation(&state, expected_generation)?;
+        let current = read_scope(&tx)?.ok_or_else(|| {
+            Error::Invalid("a whole-tree workspace cannot expand its scope".into())
+        })?;
+        let requested = match additions {
+            Some(additions) => current.expanded(additions.roots())?,
+            None => None,
+        };
+        let inventory =
+            require_complete_inventory(source_inventory(engine, &state.base_revision)?)?;
+        let target = requested
+            .map(|scope| {
+                scope.with_selection_dependencies(inventory.entries.keys().map(String::as_str))
+            })
+            .transpose()?;
+        if target.as_ref().is_some_and(|scope| scope == &current) {
+            return Err(Error::Invalid("scope expansion adds no paths".into()));
+        }
+        // Validate the complete projected immutable base against the workspace
+        // limits before journaling. Only newly scoped entries are staged, so
+        // dirty edits and deletions under the old scope remain untouched.
+        let target_snapshot = require_complete_snapshot(snapshot_from_inventory(
+            engine,
+            &state.base_revision,
+            &inventory,
+            target.as_ref(),
+        )?)?;
+        let staged: BTreeMap<String, Stage> = target_snapshot
+            .files
+            .iter()
+            .filter(|(path, _)| !current.includes(path))
+            .map(|(path, item)| {
+                (
+                    path.clone(),
+                    Stage {
+                        before: None,
+                        after: Some(item.clone()),
+                    },
+                )
+            })
+            .collect();
+        let target_tracked = Tracked::from_paths(staged.keys().map(String::as_str));
+        let (working, report) = require_complete_scan(scan_workspace_full_scoped(
+            &self.root,
+            &target_tracked,
+            target.as_ref(),
+        )?)?;
+        let mut occupants = newly_scoped_occupants(&working, &current, target.as_ref());
+        occupants.extend(excluded_occupants(&report, &staged, &BTreeMap::new()));
+        occupants.sort();
+        occupants.dedup();
+        if !occupants.is_empty() {
+            return Ok(OperationOutcome::Blocked { paths: occupants });
+        }
+        require_staged_support(&self.root, &staged)?;
+        insert_scope_expansion(
+            &tx,
+            operation_id,
+            &request_digest,
+            expected_generation,
+            &current,
+            target.as_ref(),
+            &staged,
+        )?;
+        tx.commit()?;
+        self.finish_expansion(operation_id, RecoveryChoice::Complete)
+    }
+
     pub fn status(&self, engine: &Engine, limit: usize) -> Result<Status> {
         if limit == 0 {
             return Err(Error::Limit(
@@ -225,6 +477,7 @@ impl Workspace {
         let mut connection = self.connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let state = state_with_pending(&tx)?;
+        let scope = read_scope(&tx)?;
         let status = if !state.ready {
             Status {
                 base_revision: state.base_revision,
@@ -234,9 +487,13 @@ impl Workspace {
                 excluded_total: 0,
                 pending: state.pending,
             }
-        } else if let Some(base) = source_snapshot(engine, &state.base_revision)? {
+        } else if let Some(base) =
+            source_snapshot_scoped(engine, &state.base_revision, scope.as_ref())?
+        {
             let tracked = Tracked::from_paths(base.files.keys().map(String::as_str));
-            if let Some((working, report)) = scan_workspace_full(&self.root, &tracked)? {
+            if let Some((working, report)) =
+                scan_workspace_full_scoped(&self.root, &tracked, scope.as_ref())?
+            {
                 let mut changes = changes_between(&base.files, &working.files);
                 let complete = changes.len() <= limit;
                 changes.truncate(limit);
@@ -284,6 +541,7 @@ impl Workspace {
         let mut connection = self.connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let state = state_with_pending(&tx)?;
+        let scope = read_scope(&tx)?;
         let mut preview = Preview {
             base_revision: state.base_revision.clone(),
             generation: state.generation,
@@ -295,10 +553,13 @@ impl Workspace {
             pending: state.pending,
         };
         if state.ready
-            && let Some(base) = source_snapshot(engine, &state.base_revision)?
+            && let Some(base) =
+                source_snapshot_scoped(engine, &state.base_revision, scope.as_ref())?
         {
             let tracked = Tracked::from_paths(base.files.keys().map(String::as_str));
-            if let Some((working, mut report)) = scan_workspace_full(&self.root, &tracked)? {
+            if let Some((working, mut report)) =
+                scan_workspace_full_scoped(&self.root, &tracked, scope.as_ref())?
+            {
                 preview.included_total = working.files.len();
                 preview.excluded_total = report.excluded_total;
                 preview.complete = working.files.len() <= limit
@@ -348,9 +609,18 @@ impl Workspace {
         ensure_no_pending(&tx)?;
         let state = read_state(&tx)?;
         require_ready_generation(&state, expected_generation)?;
-        let base = require_complete_snapshot(source_snapshot(engine, &state.base_revision)?)?;
+        let scope = read_scope(&tx)?;
+        let base = require_complete_snapshot(source_snapshot_scoped(
+            engine,
+            &state.base_revision,
+            scope.as_ref(),
+        )?)?;
         let tracked = Tracked::from_paths(base.files.keys().map(String::as_str));
-        let working = require_complete_snapshot(scan_workspace(&self.root, &tracked)?)?;
+        let working = require_complete_snapshot(scan_workspace_scoped(
+            &self.root,
+            &tracked,
+            scope.as_ref(),
+        )?)?;
         let staged = staged_between(&base.files, &working.files);
         if staged.is_empty() {
             return Err(Error::Invalid(
@@ -402,14 +672,23 @@ impl Workspace {
         ensure_no_pending(&tx)?;
         let state = read_state(&tx)?;
         require_ready_generation(&state, expected_generation)?;
+        let scope = read_scope(&tx)?;
         let (before_revision, after_revision) = completed_checkpoint(&tx, checkpoint_operation_id)?;
         if after_revision != state.base_revision {
             return Err(Error::Conflict(format!(
                 "checkpoint operation {checkpoint_operation_id} is not the current workspace base"
             )));
         }
-        let current = require_complete_snapshot(source_snapshot(engine, &after_revision)?)?;
-        let target = require_complete_snapshot(source_snapshot(engine, &before_revision)?)?;
+        let current = require_complete_snapshot(source_snapshot_scoped(
+            engine,
+            &after_revision,
+            scope.as_ref(),
+        )?)?;
+        let target = require_complete_snapshot(source_snapshot_scoped(
+            engine,
+            &before_revision,
+            scope.as_ref(),
+        )?)?;
         let tracked = Tracked::from_paths(
             current
                 .files
@@ -417,7 +696,11 @@ impl Workspace {
                 .chain(target.files.keys())
                 .map(String::as_str),
         );
-        let (working, report) = require_complete_scan(scan_workspace_full(&self.root, &tracked)?)?;
+        let (working, report) = require_complete_scan(scan_workspace_full_scoped(
+            &self.root,
+            &tracked,
+            scope.as_ref(),
+        )?)?;
         let staged = staged_between(&current.files, &target.files);
         let mut blocked = blocked_paths(&working, &staged, &self.root, operation_id, true)?;
         blocked.extend(excluded_occupants(&report, &staged, &current.files));
@@ -472,12 +755,22 @@ impl Workspace {
         ensure_no_pending(&tx)?;
         let state = read_state(&tx)?;
         require_ready_generation(&state, expected_generation)?;
+        let scope = read_scope(&tx)?;
         validate_completion_binding(&state, completion)?;
+        require_scope_selection_dependencies(engine, &completion.revision, scope.as_ref())?;
         next_generation(state.generation)?;
         qualify_merge_candidate(engine, completion)?;
 
-        let current = require_complete_snapshot(source_snapshot(engine, &state.base_revision)?)?;
-        let target = require_complete_snapshot(source_snapshot(engine, &completion.revision)?)?;
+        let current = require_complete_snapshot(source_snapshot_scoped(
+            engine,
+            &state.base_revision,
+            scope.as_ref(),
+        )?)?;
+        let target = require_complete_snapshot(source_snapshot_scoped(
+            engine,
+            &completion.revision,
+            scope.as_ref(),
+        )?)?;
         let tracked = Tracked::from_paths(
             current
                 .files
@@ -485,7 +778,11 @@ impl Workspace {
                 .chain(target.files.keys())
                 .map(String::as_str),
         );
-        let (working, report) = require_complete_scan(scan_workspace_full(&self.root, &tracked)?)?;
+        let (working, report) = require_complete_scan(scan_workspace_full_scoped(
+            &self.root,
+            &tracked,
+            scope.as_ref(),
+        )?)?;
         let staged = staged_between(&current.files, &target.files);
         let mut blocked = blocked_paths(&working, &staged, &self.root, operation_id, true)?;
         blocked.extend(excluded_occupants(&report, &staged, &current.files));
@@ -544,6 +841,10 @@ impl Workspace {
                 drop(tx);
                 self.finish_apply(engine, &pending.operation_id, choice)
             }
+            OperationKind::Expand => {
+                drop(tx);
+                self.finish_expansion(&pending.operation_id, choice)
+            }
         }
     }
 
@@ -561,7 +862,12 @@ impl Workspace {
         if state.ready {
             return Ok(());
         }
-        let snapshot = require_complete_snapshot(source_snapshot(engine, &state.base_revision)?)?;
+        let scope = read_scope(&connection)?;
+        let snapshot = require_complete_snapshot(source_snapshot_scoped(
+            engine,
+            &state.base_revision,
+            scope.as_ref(),
+        )?)?;
         self.finish_initialization_snapshot(snapshot)
     }
 
@@ -572,8 +878,13 @@ impl Workspace {
         if state.ready {
             return Ok(());
         }
+        let scope = read_scope(&tx)?;
         let tracked = Tracked::from_paths(snapshot.files.keys().map(String::as_str));
-        let working = require_complete_snapshot(scan_workspace(&self.root, &tracked)?)?;
+        let working = require_complete_snapshot(scan_workspace_scoped(
+            &self.root,
+            &tracked,
+            scope.as_ref(),
+        )?)?;
         let staged = snapshot
             .files
             .into_iter()
@@ -660,6 +971,108 @@ impl Workspace {
         Ok(outcome)
     }
 
+    fn finish_expansion(
+        &self,
+        operation_id: &str,
+        choice: RecoveryChoice,
+    ) -> Result<OperationOutcome> {
+        let mut connection = self.connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let expansion = read_scope_expansion(&tx, operation_id)?
+            .ok_or_else(|| Error::NotFound(format!("workspace scope expansion {operation_id}")))?;
+        if let Some(outcome) = expansion.outcome {
+            drop(tx);
+            self.cleanup_expansion(operation_id)?;
+            return Ok(outcome);
+        }
+        let state = read_state(&tx)?;
+        require_ready_generation(&state, expansion.expected_generation)?;
+        let current = read_scope(&tx)?.ok_or_else(|| {
+            Error::Invalid("pending scope expansion belongs to a whole-tree workspace".into())
+        })?;
+        if current.roots() != expansion.before.roots() {
+            return Err(Error::Conflict(
+                "workspace scope changed while expansion was pending".into(),
+            ));
+        }
+        let staged = read_scope_expansion_staged(&tx, operation_id)?;
+        let target = expansion.after.as_ref();
+        let tracked = Tracked::from_paths(staged.keys().map(String::as_str));
+        let (working, report) =
+            require_complete_scan(scan_workspace_full_scoped(&self.root, &tracked, target)?)?;
+        let desired_after = choice == RecoveryChoice::Complete;
+        let mut blocked =
+            blocked_paths(&working, &staged, &self.root, operation_id, desired_after)?;
+        blocked.extend(
+            newly_scoped_occupants(&working, &current, target)
+                .into_iter()
+                .filter(|path| !staged.contains_key(path)),
+        );
+        blocked.extend(excluded_occupants(&report, &staged, &BTreeMap::new()));
+        blocked.extend(unproven_expansion_targets(
+            &self.root,
+            operation_id,
+            &staged,
+        )?);
+        blocked.sort();
+        blocked.dedup();
+        if !blocked.is_empty() {
+            return Ok(OperationOutcome::Blocked { paths: blocked });
+        }
+        apply_expansion_staged(&self.root, operation_id, &staged, desired_after)?;
+        if choice == RecoveryChoice::RollBack {
+            let outcome = OperationOutcome::Cancelled {
+                generation: state.generation,
+            };
+            complete_scope_expansion(&tx, operation_id, "cancelled", &outcome)?;
+            tx.commit()?;
+            self.cleanup_expansion(operation_id)?;
+            return Ok(outcome);
+        }
+        let generation = next_generation(state.generation)?;
+        tx.execute("DELETE FROM workspace_scope WHERE singleton = 1", [])?;
+        write_scope(&tx, target)?;
+        if tx.execute(
+            "UPDATE workspace_state SET generation = ?1 WHERE singleton = 1 AND generation = ?2",
+            params![
+                sql_i64("workspace generation", generation)?,
+                sql_i64("workspace generation", state.generation)?
+            ],
+        )? != 1
+        {
+            return Err(Error::Conflict(
+                "workspace changed while scope expansion was completing".into(),
+            ));
+        }
+        let outcome = OperationOutcome::Expanded { generation };
+        complete_scope_expansion(&tx, operation_id, "completed", &outcome)?;
+        tx.commit()?;
+        self.cleanup_expansion(operation_id)?;
+        Ok(outcome)
+    }
+
+    fn cleanup_expansion(&self, operation_id: &str) -> Result<()> {
+        let mut connection = self.connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let expansion = read_scope_expansion(&tx, operation_id)?
+            .ok_or_else(|| Error::NotFound(format!("workspace scope expansion {operation_id}")))?;
+        if expansion.outcome.is_none() {
+            return Err(Error::Conflict(format!(
+                "workspace scope expansion {operation_id} is still pending"
+            )));
+        }
+        let staged = read_scope_expansion_staged(&tx, operation_id)?;
+        cleanup_expansion_witnesses(&self.root, operation_id, &staged).map_err(|error| {
+            Error::Conflict(format!("workspace expansion has a durable outcome but metadata cleanup failed: {error}; inspect state and retry the same operation"))
+        })?;
+        tx.execute(
+            "DELETE FROM scope_expansion_paths WHERE operation_id = ?1",
+            [operation_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     fn finish_apply(
         &self,
         engine: &Engine,
@@ -684,6 +1097,7 @@ impl Workspace {
             ))
         })?;
         let state = read_state(&tx)?;
+        let scope = read_scope(&tx)?;
         require_ready_generation(&state, operation.expected_generation)?;
         validate_stored_completion_binding(&state, operation_id, &operation, &completion)?;
         let next = if choice == RecoveryChoice::Complete {
@@ -696,7 +1110,11 @@ impl Workspace {
 
         let staged = read_staged_allow_empty(&tx, operation_id)?;
         let tracked = Tracked::from_paths(staged.keys().map(String::as_str));
-        let working = require_complete_snapshot(scan_workspace(&self.root, &tracked)?)?;
+        let working = require_complete_snapshot(scan_workspace_scoped(
+            &self.root,
+            &tracked,
+            scope.as_ref(),
+        )?)?;
         let desired_after = choice == RecoveryChoice::Complete;
         let blocked = blocked_paths(&working, &staged, &self.root, operation_id, desired_after)?;
         if !blocked.is_empty() {
@@ -777,6 +1195,20 @@ struct Item {
 struct Snapshot {
     files: BTreeMap<String, Item>,
     directories: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug)]
+struct SourceInventory {
+    entries: BTreeMap<String, EntryKind>,
+    directories: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug)]
+struct StoredScopeExpansion {
+    expected_generation: u64,
+    before: Scope,
+    after: Option<Scope>,
+    outcome: Option<OperationOutcome>,
 }
 
 type OperationRow = (
@@ -894,6 +1326,30 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
                 CHECK (after_kind IN ('regular', 'executable', 'symlink')),
             PRIMARY KEY(operation_id, path),
             FOREIGN KEY(operation_id) REFERENCES operations(operation_id)
+         ) STRICT;
+         CREATE TABLE workspace_scope (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            roots_json BLOB NOT NULL
+         ) STRICT;
+         CREATE TABLE scope_expansions (
+            operation_id TEXT PRIMARY KEY,
+            request_digest TEXT NOT NULL CHECK (length(request_digest) = 64),
+            status TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'cancelled')),
+            expected_generation INTEGER NOT NULL CHECK (expected_generation >= 0),
+            before_roots_json BLOB NOT NULL,
+            after_roots_json BLOB NOT NULL,
+            outcome_json BLOB,
+            CHECK ((status = 'pending') = (outcome_json IS NULL))
+         ) STRICT;
+         CREATE UNIQUE INDEX one_pending_scope_expansion
+            ON scope_expansions(status) WHERE status = 'pending';
+         CREATE TABLE scope_expansion_paths (
+            operation_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            after_content BLOB NOT NULL,
+            after_kind TEXT NOT NULL CHECK (after_kind IN ('regular', 'executable', 'symlink')),
+            PRIMARY KEY(operation_id, path),
+            FOREIGN KEY(operation_id) REFERENCES scope_expansions(operation_id)
          ) STRICT;",
     )?;
     tx.pragma_update(None, "application_id", APPLICATION_ID)?;
@@ -907,7 +1363,7 @@ fn migrate_schema(connection: &mut Connection) -> Result<()> {
         connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
     let schema_version: i64 =
         connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if application_id != APPLICATION_ID || !matches!(schema_version, 1 | 2) {
+    if application_id != APPLICATION_ID || !matches!(schema_version, 1..=3) {
         return Ok(());
     }
 
@@ -920,7 +1376,7 @@ fn migrate_schema(connection: &mut Connection) -> Result<()> {
         tx.commit()?;
         return Ok(());
     }
-    if locked_application_id != APPLICATION_ID || !matches!(locked_schema_version, 1 | 2) {
+    if locked_application_id != APPLICATION_ID || !matches!(locked_schema_version, 1..=3) {
         return Err(Error::Invalid(format!(
             "workspace schema changed during migration ({locked_application_id}/{locked_schema_version})"
         )));
@@ -928,12 +1384,41 @@ fn migrate_schema(connection: &mut Connection) -> Result<()> {
     if locked_schema_version == 1 {
         migrate_v1_to_v2(&tx)?;
     }
-    // v3 adds the entry kind of each staged side; existing rows are regular files.
+    if locked_schema_version <= 2 {
+        // v3 adds the entry kind of each staged side; existing rows are regular files.
+        tx.execute_batch(
+            "ALTER TABLE staged_paths ADD COLUMN before_kind TEXT NOT NULL DEFAULT 'regular'
+                CHECK (before_kind IN ('regular', 'executable', 'symlink'));
+             ALTER TABLE staged_paths ADD COLUMN after_kind TEXT NOT NULL DEFAULT 'regular'
+                CHECK (after_kind IN ('regular', 'executable', 'symlink'));",
+        )?;
+    }
+    // v4 adds optional sparse scope and a separate durable expansion journal.
     tx.execute_batch(
-        "ALTER TABLE staged_paths ADD COLUMN before_kind TEXT NOT NULL DEFAULT 'regular'
-            CHECK (before_kind IN ('regular', 'executable', 'symlink'));
-         ALTER TABLE staged_paths ADD COLUMN after_kind TEXT NOT NULL DEFAULT 'regular'
-            CHECK (after_kind IN ('regular', 'executable', 'symlink'));",
+        "CREATE TABLE workspace_scope (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            roots_json BLOB NOT NULL
+         ) STRICT;
+         CREATE TABLE scope_expansions (
+            operation_id TEXT PRIMARY KEY,
+            request_digest TEXT NOT NULL CHECK (length(request_digest) = 64),
+            status TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'cancelled')),
+            expected_generation INTEGER NOT NULL CHECK (expected_generation >= 0),
+            before_roots_json BLOB NOT NULL,
+            after_roots_json BLOB NOT NULL,
+            outcome_json BLOB,
+            CHECK ((status = 'pending') = (outcome_json IS NULL))
+         ) STRICT;
+         CREATE UNIQUE INDEX one_pending_scope_expansion
+            ON scope_expansions(status) WHERE status = 'pending';
+         CREATE TABLE scope_expansion_paths (
+            operation_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            after_content BLOB NOT NULL,
+            after_kind TEXT NOT NULL CHECK (after_kind IN ('regular', 'executable', 'symlink')),
+            PRIMARY KEY(operation_id, path),
+            FOREIGN KEY(operation_id) REFERENCES scope_expansions(operation_id)
+         ) STRICT;",
     )?;
     let foreign_key_violation = {
         let mut statement = tx.prepare("PRAGMA foreign_key_check")?;
@@ -1065,32 +1550,160 @@ fn read_state(connection: &Connection) -> Result<StoredState> {
     })
 }
 
+fn write_scope(connection: &Connection, scope: Option<&Scope>) -> Result<()> {
+    if let Some(scope) = scope {
+        connection.execute(
+            "INSERT INTO workspace_scope(singleton, roots_json) VALUES (1, ?1)",
+            [serde_json::to_vec(scope.roots())?],
+        )?;
+    }
+    Ok(())
+}
+
+fn read_scope(connection: &Connection) -> Result<Option<Scope>> {
+    let row: Option<(i64, Option<Vec<u8>>)> = connection
+        .query_row(
+            "SELECT length(roots_json), CASE WHEN length(roots_json) <= ?1 THEN roots_json END
+             FROM workspace_scope WHERE singleton = 1",
+            [MAX_SCOPE_JSON_BYTES as i64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((length, bytes)) = row else {
+        return Ok(None);
+    };
+    if length < 0 || length as usize > MAX_SCOPE_JSON_BYTES {
+        return Err(Error::Limit("workspace scope metadata is too large".into()));
+    }
+    let bytes = bytes.ok_or_else(|| Error::Invalid("workspace scope metadata is null".into()))?;
+    decode_required_scope(&bytes).map(Some)
+}
+
+fn encode_optional_scope(scope: Option<&Scope>) -> Result<Vec<u8>> {
+    Ok(match scope {
+        Some(scope) => serde_json::to_vec(scope.roots())?,
+        None => serde_json::to_vec(&Option::<Vec<String>>::None)?,
+    })
+}
+
+fn decode_optional_scope(bytes: &[u8]) -> Result<Option<Scope>> {
+    if bytes.len() > MAX_SCOPE_JSON_BYTES {
+        return Err(Error::Limit("workspace scope metadata is too large".into()));
+    }
+    let roots: Option<Vec<String>> = serde_json::from_slice(bytes)?;
+    roots.map(Scope::from_effective).transpose()
+}
+
+fn decode_required_scope(bytes: &[u8]) -> Result<Scope> {
+    if bytes.len() > MAX_SCOPE_JSON_BYTES {
+        return Err(Error::Limit("workspace scope metadata is too large".into()));
+    }
+    Scope::from_effective(serde_json::from_slice(bytes)?)
+}
+
+/// Validate the workspace-specific portion of a schema-v4 recovery database
+/// without migrating it or touching the working tree.
+pub(crate) fn validate_recovery_schema(connection: &Connection) -> Result<()> {
+    connection.prepare("SELECT singleton, roots_json FROM workspace_scope LIMIT 0")?;
+    connection.prepare(
+        "SELECT operation_id, request_digest, status, expected_generation,
+                before_roots_json, after_roots_json, outcome_json
+         FROM scope_expansions LIMIT 0",
+    )?;
+    connection.prepare(
+        "SELECT operation_id, path, after_content, after_kind
+         FROM scope_expansion_paths LIMIT 0",
+    )?;
+    let state = read_state(connection)?;
+    let scope = read_scope(connection)?;
+    let pending = pending_operation(connection)?;
+    if let Some(PendingOperation {
+        operation_id,
+        kind: OperationKind::Expand,
+    }) = pending
+    {
+        let expansion = read_scope_expansion(connection, &operation_id)?.ok_or_else(|| {
+            Error::Invalid("pending workspace expansion is missing its journal".into())
+        })?;
+        if expansion.outcome.is_some() || expansion.expected_generation != state.generation {
+            return Err(Error::Invalid(
+                "pending workspace expansion has inconsistent generation or outcome".into(),
+            ));
+        }
+        let current = scope.ok_or_else(|| {
+            Error::Invalid("whole-tree workspace has a pending scope expansion".into())
+        })?;
+        if current != expansion.before {
+            return Err(Error::Invalid(
+                "pending workspace expansion does not match the retained scope".into(),
+            ));
+        }
+        let staged = read_scope_expansion_staged(connection, &operation_id)?;
+        for (path, stage) in staged {
+            if stage.before.is_some()
+                || stage.after.is_none()
+                || expansion
+                    .after
+                    .as_ref()
+                    .is_some_and(|scope| !scope.includes(&path))
+                || current.includes(&path)
+            {
+                return Err(Error::Invalid(
+                    "pending workspace expansion has an invalid staged projection".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn state_with_pending(connection: &Connection) -> Result<WorkspaceState> {
     let state = read_state(connection)?;
+    let scope = read_scope(connection)?;
     Ok(WorkspaceState {
         change: state.change,
         base_revision: state.base_revision,
         generation: state.generation,
         ready: state.ready,
+        scope: scope.map(|scope| scope.roots().to_vec()),
         pending: pending_operation(connection)?,
     })
 }
 
 fn pending_operation(connection: &Connection) -> Result<Option<PendingOperation>> {
-    let row: Option<(String, String)> = connection
+    let ordinary: Option<(String, String)> = connection
         .query_row(
             "SELECT operation_id, kind FROM operations WHERE status = 'pending'",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    row.map(|(operation_id, kind)| {
-        Ok(PendingOperation {
+    let expansion: Option<String> = connection
+        .query_row(
+            "SELECT operation_id FROM scope_expansions WHERE status = 'pending'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if ordinary.is_some() && expansion.is_some() {
+        return Err(Error::Invalid(
+            "workspace has more than one pending operation".into(),
+        ));
+    }
+    if let Some(operation_id) = expansion {
+        return Ok(Some(PendingOperation {
             operation_id,
-            kind: parse_operation_kind(&kind)?,
+            kind: OperationKind::Expand,
+        }));
+    }
+    ordinary
+        .map(|(operation_id, kind)| {
+            Ok(PendingOperation {
+                operation_id,
+                kind: parse_operation_kind(&kind)?,
+            })
         })
-    })
-    .transpose()
+        .transpose()
 }
 
 fn parse_operation_kind(value: &str) -> Result<OperationKind> {
@@ -1109,6 +1722,7 @@ fn operation_kind_name(kind: OperationKind) -> &'static str {
         OperationKind::Checkpoint => "checkpoint",
         OperationKind::Undo => "undo",
         OperationKind::Apply => "apply",
+        OperationKind::Expand => "expand",
     }
 }
 
@@ -1221,6 +1835,19 @@ fn matching_operation(
     operation_id: &str,
     request_digest: &str,
 ) -> Result<Option<Option<OperationOutcome>>> {
+    if connection
+        .query_row(
+            "SELECT 1 FROM scope_expansions WHERE operation_id = ?1",
+            [operation_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some()
+    {
+        return Err(Error::Conflict(format!(
+            "workspace operation ID {operation_id} belongs to a scope expansion"
+        )));
+    }
     let row: Option<(String, String, Option<Vec<u8>>)> = connection
         .query_row(
             "SELECT request_digest, status, outcome_json FROM operations WHERE operation_id = ?1",
@@ -1243,6 +1870,263 @@ fn matching_operation(
             "workspace operation {operation_id} has inconsistent status"
         ))),
     }
+}
+
+fn scope_expansion_digest(
+    operation_id: &str,
+    expected_generation: u64,
+    additions: Option<&[String]>,
+) -> String {
+    let mut bytes = b"AGSCM-WORKSPACE-SCOPE-EXPANSION1\0".to_vec();
+    push_field(&mut bytes, operation_id.as_bytes());
+    bytes.extend_from_slice(&expected_generation.to_be_bytes());
+    match additions {
+        Some(additions) => {
+            bytes.push(1);
+            for path in additions {
+                push_field(&mut bytes, path.as_bytes());
+            }
+        }
+        None => bytes.push(0),
+    }
+    digest(&bytes)
+}
+
+fn matching_scope_expansion(
+    connection: &Connection,
+    operation_id: &str,
+    request_digest: &str,
+) -> Result<Option<Option<OperationOutcome>>> {
+    if connection
+        .query_row(
+            "SELECT 1 FROM operations WHERE operation_id = ?1",
+            [operation_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some()
+    {
+        return Err(Error::Conflict(format!(
+            "workspace operation ID {operation_id} belongs to another operation"
+        )));
+    }
+    let stored_digest: Option<String> = connection
+        .query_row(
+            "SELECT request_digest FROM scope_expansions WHERE operation_id = ?1",
+            [operation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(stored_digest) = stored_digest else {
+        return Ok(None);
+    };
+    if stored_digest != request_digest {
+        return Err(Error::Conflict(format!(
+            "workspace operation ID {operation_id} was reused with different input"
+        )));
+    }
+    let expansion = read_scope_expansion(connection, operation_id)?
+        .ok_or_else(|| Error::Invalid("scope expansion disappeared".into()))?;
+    Ok(Some(expansion.outcome))
+}
+
+fn insert_scope_expansion(
+    connection: &Connection,
+    operation_id: &str,
+    request_digest: &str,
+    expected_generation: u64,
+    before: &Scope,
+    after: Option<&Scope>,
+    staged: &BTreeMap<String, Stage>,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO scope_expansions(
+            operation_id, request_digest, status, expected_generation,
+            before_roots_json, after_roots_json
+         ) VALUES (?1, ?2, 'pending', ?3, ?4, ?5)",
+        params![
+            operation_id,
+            request_digest,
+            sql_i64("workspace generation", expected_generation)?,
+            serde_json::to_vec(before.roots())?,
+            encode_optional_scope(after)?,
+        ],
+    )?;
+    let mut statement = connection.prepare(
+        "INSERT INTO scope_expansion_paths(operation_id, path, after_content, after_kind)
+         VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for (path, stage) in staged {
+        let item = stage
+            .after
+            .as_ref()
+            .ok_or_else(|| Error::Invalid("scope expansion cannot stage a deletion".into()))?;
+        if stage.before.is_some() {
+            return Err(Error::Invalid(
+                "scope expansion cannot replace a materialized path".into(),
+            ));
+        }
+        statement.execute(params![
+            operation_id,
+            path,
+            &item.content,
+            item.kind.as_str()
+        ])?;
+    }
+    Ok(())
+}
+
+fn read_scope_expansion(
+    connection: &Connection,
+    operation_id: &str,
+) -> Result<Option<StoredScopeExpansion>> {
+    let mut statement = connection.prepare(
+        "SELECT expected_generation, before_roots_json, after_roots_json,
+                status, outcome_json FROM scope_expansions WHERE operation_id = ?1",
+    )?;
+    let mut rows = statement.query([operation_id])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let generation: i64 = row.get(0)?;
+    let before = bounded_journal_blob(row, 1, MAX_SCOPE_JSON_BYTES)?
+        .ok_or_else(|| Error::Invalid("missing prior workspace scope".into()))?;
+    let after = bounded_journal_blob(row, 2, MAX_SCOPE_JSON_BYTES)?
+        .ok_or_else(|| Error::Invalid("missing new workspace scope".into()))?;
+    let status: String = row.get(3)?;
+    let outcome_json = bounded_journal_blob(row, 4, 4096)?;
+    let outcome = match (status.as_str(), outcome_json) {
+        ("pending", None) => None,
+        ("completed" | "cancelled", Some(bytes)) => Some(serde_json::from_slice(&bytes)?),
+        _ => {
+            return Err(Error::Invalid(format!(
+                "workspace scope expansion {operation_id} has inconsistent status"
+            )));
+        }
+    };
+    let generation = sql_u64("workspace generation", generation)?;
+    let before = decode_required_scope(&before)?;
+    let after = decode_optional_scope(&after)?;
+    if after.as_ref().is_some_and(|after| {
+        after == &before || before.roots().iter().any(|root| !after.includes(root))
+    }) {
+        return Err(Error::Invalid(
+            "retained scope expansion does not extend its prior scope".into(),
+        ));
+    }
+    if let Some(outcome) = &outcome {
+        let valid = match (status.as_str(), outcome) {
+            ("completed", OperationOutcome::Expanded { generation: done }) => {
+                *done == next_generation(generation)?
+            }
+            ("cancelled", OperationOutcome::Cancelled { generation: done }) => *done == generation,
+            _ => false,
+        };
+        if !valid {
+            return Err(Error::Invalid(
+                "scope expansion has an inconsistent terminal outcome".into(),
+            ));
+        }
+    }
+    Ok(Some(StoredScopeExpansion {
+        expected_generation: generation,
+        before,
+        after,
+        outcome,
+    }))
+}
+
+/// Inspect SQLite's borrowed value before allocating controller-owned bytes.
+fn bounded_journal_blob(
+    row: &rusqlite::Row<'_>,
+    column: usize,
+    maximum: usize,
+) -> Result<Option<Vec<u8>>> {
+    match row.get_ref(column)? {
+        rusqlite::types::ValueRef::Null => Ok(None),
+        rusqlite::types::ValueRef::Blob(bytes) => {
+            if bytes.len() > maximum {
+                return Err(Error::Limit(
+                    "workspace journal bytes exceed their limit".into(),
+                ));
+            }
+            Ok(Some(bytes.to_vec()))
+        }
+        _ => Err(Error::Invalid(
+            "workspace journal field is not a blob".into(),
+        )),
+    }
+}
+
+fn read_scope_expansion_staged(
+    connection: &Connection,
+    operation_id: &str,
+) -> Result<BTreeMap<String, Stage>> {
+    let mut statement = connection.prepare(
+        "SELECT path, after_content, after_kind FROM scope_expansion_paths
+         WHERE operation_id = ?1 ORDER BY path",
+    )?;
+    let mut rows = statement.query([operation_id])?;
+    let mut staged = BTreeMap::new();
+    let mut total_bytes = 0usize;
+    while let Some(row) = rows.next()? {
+        if staged.len() == MAX_ENTRIES {
+            return Err(Error::Limit(
+                "scope expansion has too many staged paths".into(),
+            ));
+        }
+        let path = match row.get_ref(0)? {
+            rusqlite::types::ValueRef::Text(bytes) if bytes.len() <= 1024 => {
+                std::str::from_utf8(bytes)
+                    .map_err(|_| Error::Invalid("workspace path is not UTF-8".into()))?
+                    .to_owned()
+            }
+            _ => return Err(Error::Invalid("invalid staged workspace path".into())),
+        };
+        validate_workspace_path(&path)?;
+        let allowance = MAX_TOTAL_BYTES
+            .saturating_sub(total_bytes)
+            .min(MAX_FILE_BYTES);
+        let content = bounded_journal_blob(row, 1, allowance)?
+            .ok_or_else(|| Error::Invalid("missing expansion content".into()))?;
+        total_bytes += content.len();
+        let kind: String = row.get(2)?;
+        let item = stored_item(Some(content), &kind)?.expect("content is present");
+        if staged
+            .insert(
+                path,
+                Stage {
+                    before: None,
+                    after: Some(item),
+                },
+            )
+            .is_some()
+        {
+            return Err(Error::Invalid(
+                "scope expansion has duplicate staged paths".into(),
+            ));
+        }
+    }
+    Ok(staged)
+}
+
+fn complete_scope_expansion(
+    connection: &Connection,
+    operation_id: &str,
+    status: &str,
+    outcome: &OperationOutcome,
+) -> Result<()> {
+    if connection.execute(
+        "UPDATE scope_expansions SET status = ?1, outcome_json = ?2
+         WHERE operation_id = ?3 AND status = 'pending'",
+        params![status, serde_json::to_vec(outcome)?, operation_id],
+    )? != 1
+    {
+        return Err(Error::Conflict(format!(
+            "workspace scope expansion {operation_id} is no longer pending"
+        )));
+    }
+    Ok(())
 }
 
 fn ensure_no_pending(connection: &Connection) -> Result<()> {
@@ -1455,11 +2339,10 @@ fn completed_checkpoint(connection: &Connection, operation_id: &str) -> Result<(
     Ok((before, after))
 }
 
-fn source_snapshot(engine: &Engine, revision: &str) -> Result<Option<Snapshot>> {
-    let mut files = BTreeMap::new();
+fn source_inventory(engine: &Engine, revision: &str) -> Result<Option<SourceInventory>> {
+    let mut entries = BTreeMap::new();
     let mut directories = BTreeSet::new();
     let mut cursor = None;
-    let mut total_bytes = 0usize;
     let mut seen_cursors = BTreeSet::new();
     loop {
         let page = engine.list_files(revision, cursor.as_deref(), LIST_PAGE_SIZE)?;
@@ -1475,7 +2358,8 @@ fn source_snapshot(engine: &Engine, revision: &str) -> Result<Option<Snapshot>> 
                     entry.path
                 )));
             }
-            if files.contains_key(&entry.path) {
+            validate_workspace_path(&entry.path)?;
+            if entries.contains_key(&entry.path) {
                 return Err(Error::Invalid(
                     "source listing returned a duplicate path".to_owned(),
                 ));
@@ -1487,26 +2371,10 @@ fn source_snapshot(engine: &Engine, revision: &str) -> Result<Option<Snapshot>> 
             for (separator, _) in entry.path.match_indices('/') {
                 directories.insert(entry.path[..separator].to_owned());
             }
-            if files.len() + directories.len() >= MAX_ENTRIES {
+            if entries.len() + directories.len() >= MAX_ENTRIES {
                 return Ok(None);
             }
-            let content = engine.read_file(revision, &entry.path)?;
-            if content.len() > MAX_FILE_BYTES {
-                return Ok(None);
-            }
-            total_bytes = total_bytes
-                .checked_add(content.len())
-                .ok_or_else(|| Error::Limit("workspace byte count overflow".to_owned()))?;
-            if total_bytes > MAX_TOTAL_BYTES {
-                return Ok(None);
-            }
-            files.insert(
-                entry.path,
-                Item {
-                    kind: entry.kind,
-                    content,
-                },
-            );
+            entries.insert(entry.path, entry.kind);
         }
         match page.next {
             Some(next) => {
@@ -1520,7 +2388,122 @@ fn source_snapshot(engine: &Engine, revision: &str) -> Result<Option<Snapshot>> 
             None => break,
         }
     }
+    Ok(Some(SourceInventory {
+        entries,
+        directories,
+    }))
+}
+
+fn require_complete_inventory(inventory: Option<SourceInventory>) -> Result<SourceInventory> {
+    inventory.ok_or_else(|| {
+        Error::Limit(format!(
+            "source inventory exceeds {MAX_ENTRIES} entries or {MAX_DEPTH} path components"
+        ))
+    })
+}
+
+fn snapshot_from_inventory(
+    engine: &Engine,
+    revision: &str,
+    inventory: &SourceInventory,
+    scope: Option<&Scope>,
+) -> Result<Option<Snapshot>> {
+    snapshot_from_inventory_where(
+        engine,
+        revision,
+        inventory,
+        |path| scope.is_none_or(|scope| scope.includes(path)),
+        |path| scope.is_none_or(|scope| scope.traverses(path)),
+    )
+}
+
+fn snapshot_from_inventory_where(
+    engine: &Engine,
+    revision: &str,
+    inventory: &SourceInventory,
+    mut selected: impl FnMut(&str) -> bool,
+    mut traversed: impl FnMut(&str) -> bool,
+) -> Result<Option<Snapshot>> {
+    let mut files = BTreeMap::new();
+    let mut directories = BTreeSet::new();
+    let mut total_bytes = 0usize;
+    for (path, kind) in &inventory.entries {
+        if !selected(path) {
+            continue;
+        }
+        let content = engine.read_file(revision, path)?;
+        if content.len() > MAX_FILE_BYTES {
+            return Ok(None);
+        }
+        total_bytes = total_bytes
+            .checked_add(content.len())
+            .ok_or_else(|| Error::Limit("workspace byte count overflow".to_owned()))?;
+        if total_bytes > MAX_TOTAL_BYTES || files.len() + directories.len() >= MAX_ENTRIES {
+            return Ok(None);
+        }
+        for (separator, _) in path.match_indices('/') {
+            let directory = &path[..separator];
+            if traversed(directory) {
+                directories.insert(directory.to_owned());
+            }
+        }
+        files.insert(
+            path.clone(),
+            Item {
+                kind: *kind,
+                content,
+            },
+        );
+    }
+    for directory in &inventory.directories {
+        if traversed(directory) {
+            directories.insert(directory.clone());
+        }
+    }
     Ok(Some(Snapshot { files, directories }))
+}
+
+fn source_snapshot_scoped(
+    engine: &Engine,
+    revision: &str,
+    scope: Option<&Scope>,
+) -> Result<Option<Snapshot>> {
+    let Some(inventory) = source_inventory(engine, revision)? else {
+        return Ok(None);
+    };
+    snapshot_from_inventory(engine, revision, &inventory, scope)
+}
+
+fn require_scope_selection_dependencies(
+    engine: &Engine,
+    revision: &str,
+    scope: Option<&Scope>,
+) -> Result<()> {
+    let Some(scope) = scope else {
+        return Ok(());
+    };
+    let inventory = require_complete_inventory(source_inventory(engine, revision)?)?;
+    let required =
+        scope.with_selection_dependencies(inventory.entries.keys().map(String::as_str))?;
+    let missing: Vec<_> = required
+        .roots()
+        .iter()
+        .filter(|path| !scope.includes(path))
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Conflict(format!(
+            "workspace scope must expand to include target selection dependencies: {}",
+            missing.join(", ")
+        )))
+    }
+}
+
+#[cfg(test)]
+fn source_snapshot(engine: &Engine, revision: &str) -> Result<Option<Snapshot>> {
+    source_snapshot_scoped(engine, revision, None)
 }
 
 /// Bound on the excluded-path bookkeeping kept for preview, so a huge ignored tree cannot grow
@@ -1578,6 +2561,7 @@ impl ScanReport {
 
 struct Scan<'a> {
     selector: Selector<'a>,
+    scope: Option<&'a Scope>,
     snapshot: Snapshot,
     portable: BTreeMap<String, String>,
     total_bytes: usize,
@@ -1595,20 +2579,25 @@ struct Candidate {
     relative_path: PathBuf,
 }
 
-/// Walk the working tree, selecting paths with the exclusion rules. Paths in `tracked` are
-/// always selected so tracked edits and deletions stay observable. Git settings come from the
-/// environment and, for a root with `.git`, from running `git config`.
-fn scan_workspace(root: &Path, tracked: &Tracked) -> Result<Option<Snapshot>> {
-    Ok(scan_workspace_full(root, tracked)?.map(|(snapshot, _)| snapshot))
+fn scan_workspace_scoped(
+    root: &Path,
+    tracked: &Tracked,
+    scope: Option<&Scope>,
+) -> Result<Option<Snapshot>> {
+    Ok(scan_workspace_full_scoped(root, tracked, scope)?.map(|(snapshot, _)| snapshot))
 }
 
-fn scan_workspace_full(root: &Path, tracked: &Tracked) -> Result<Option<(Snapshot, ScanReport)>> {
+fn scan_workspace_full_scoped<'a>(
+    root: &Path,
+    tracked: &'a Tracked,
+    scope: Option<&'a Scope>,
+) -> Result<Option<(Snapshot, ScanReport)>> {
     let metadata = root.join(METADATA_DIRECTORY);
     // Kinds are recorded from file modes, so a mount that reports every file
     // executable must be refused rather than reported as phantom changes.
     require_executable_support(&metadata)?;
     let settings = git_config::ambient_settings(root, || probe_case_insensitive(&metadata))?;
-    scan_with_settings(root, tracked, &settings)
+    scan_with_settings_scoped(root, tracked, &settings, scope)
 }
 
 #[cfg(test)]
@@ -1623,13 +2612,24 @@ fn scan_workspace_report(
     scan_with_settings(root, tracked, settings)
 }
 
+#[cfg(test)]
 fn scan_with_settings(
     root: &Path,
     tracked: &Tracked,
     settings: &Settings,
 ) -> Result<Option<(Snapshot, ScanReport)>> {
+    scan_with_settings_scoped(root, tracked, settings, None)
+}
+
+fn scan_with_settings_scoped<'a>(
+    root: &Path,
+    tracked: &'a Tracked,
+    settings: &'a Settings,
+    scope: Option<&'a Scope>,
+) -> Result<Option<(Snapshot, ScanReport)>> {
     let mut scan = Scan {
         selector: Selector::open(root, tracked, settings)?,
+        scope,
         snapshot: Snapshot {
             files: BTreeMap::new(),
             directories: BTreeSet::new(),
@@ -1694,6 +2694,18 @@ impl Scan<'_> {
             }
             self.visited += 1;
             let relative_path = prefix.join(entry.file_name());
+            let Some(relative_text) = relative_path.to_str() else {
+                if self.scope.is_some() {
+                    continue;
+                }
+                return Err(Error::Invalid("workspace path is not UTF-8".to_owned()));
+            };
+            if self
+                .scope
+                .is_some_and(|scope| !scope.traverses(relative_text))
+            {
+                continue;
+            }
             let metadata = fs::symlink_metadata(entry.path())?;
             let is_dir = metadata.file_type().is_dir();
             // Selection comes first: an excluded path is never validated, opened or read, so
@@ -1758,6 +2770,11 @@ impl Scan<'_> {
                 )));
             }
             if file_type.is_symlink() {
+                if self.scope.is_some_and(|scope| !scope.includes(&relative)) {
+                    return Err(Error::Conflict(format!(
+                        "workspace scope crosses a symbolic link: {relative}"
+                    )));
+                }
                 // Never followed: the link itself is the entry, so a link to a
                 // directory is not descended into.
                 let item = read_symlink_item(&path, &relative)?;
@@ -1772,6 +2789,8 @@ impl Scan<'_> {
                 continue;
             }
             if file_type.is_dir() {
+                // Scoped scans retain traversed ancestors as structural state,
+                // even though files outside the exact roots stay invisible.
                 self.snapshot.directories.insert(relative.clone());
                 if !self.directory(
                     &path,
@@ -1786,6 +2805,11 @@ impl Scan<'_> {
             if !file_type.is_file() {
                 return Err(Error::Invalid(format!(
                     "workspace contains a special file: {relative}"
+                )));
+            }
+            if self.scope.is_some_and(|scope| !scope.includes(&relative)) {
+                return Err(Error::Conflict(format!(
+                    "workspace scope crosses a non-directory entry: {relative}"
                 )));
             }
             if metadata.len() > MAX_FILE_BYTES as u64 {
@@ -1950,6 +2974,7 @@ fn finish_undo(
     }
     let state = read_state(&tx)?;
     require_ready_generation(&state, operation.expected_generation)?;
+    let scope = read_scope(&tx)?;
     if state.base_revision != operation.before_revision {
         return Err(Error::Conflict(
             "workspace base changed while undo was pending".to_owned(),
@@ -1958,7 +2983,8 @@ fn finish_undo(
     let staged = read_staged(&tx, operation_id)?;
     let desired_after = choice == RecoveryChoice::Complete;
     let tracked = Tracked::from_paths(staged.keys().map(String::as_str));
-    let working = require_complete_snapshot(scan_workspace(root, &tracked)?)?;
+    let working =
+        require_complete_snapshot(scan_workspace_scoped(root, &tracked, scope.as_ref())?)?;
     let blocked = blocked_paths(&working, &staged, root, operation_id, desired_after)?;
     if !blocked.is_empty() {
         return Ok(OperationOutcome::Blocked { paths: blocked });
@@ -2009,6 +3035,19 @@ fn excluded_occupants(
     staged
         .keys()
         .filter(|path| report.overridden.contains(*path) && !current.contains_key(*path))
+        .cloned()
+        .collect()
+}
+
+fn newly_scoped_occupants(
+    working: &Snapshot,
+    current: &Scope,
+    target: Option<&Scope>,
+) -> Vec<String> {
+    working
+        .files
+        .keys()
+        .filter(|path| !current.includes(path) && target.is_none_or(|scope| scope.includes(path)))
         .cloned()
         .collect()
 }
@@ -2127,6 +3166,250 @@ fn has_staged_descendant(path: &str, staged: &BTreeMap<String, Stage>) -> bool {
         .range(prefix.clone()..)
         .next()
         .is_some_and(|(candidate, _)| candidate.starts_with(&prefix))
+}
+
+const EXPANSION_WITNESSES_DIRECTORY: &str = "expansion-witnesses";
+
+fn expansion_witness_path(root: &Path, operation_id: &str, path: &str, item: &Item) -> PathBuf {
+    let operation = digest(operation_id.as_bytes());
+    let mut identity = Sha256::new();
+    identity.update(b"AGSCM-WORKSPACE-EXPANSION-WITNESS1\0");
+    identity.update((path.len() as u64).to_be_bytes());
+    identity.update(path.as_bytes());
+    identity.update((item.kind.as_str().len() as u64).to_be_bytes());
+    identity.update(item.kind.as_str().as_bytes());
+    identity.update((item.content.len() as u64).to_be_bytes());
+    identity.update(&item.content);
+    root.join(METADATA_DIRECTORY)
+        .join(EXPANSION_WITNESSES_DIRECTORY)
+        .join(operation)
+        .join(format!("{:x}", identity.finalize()))
+}
+
+fn read_expansion_item(path: &Path, relative: &str) -> Result<Item> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        read_symlink_item(path, relative)
+    } else if metadata.file_type().is_file() {
+        read_regular_file(path, relative)
+    } else {
+        Err(Error::Conflict(format!(
+            "workspace expansion path is not a file: {relative}"
+        )))
+    }
+}
+
+fn expansion_target_is_witnessed(
+    root: &Path,
+    operation_id: &str,
+    path: &str,
+    item: &Item,
+) -> Result<bool> {
+    reject_symlink_ancestors(root, path)?;
+    let target = root.join(path);
+    let target_metadata = match fs::symlink_metadata(&target) {
+        Ok(metadata) => metadata,
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            return Ok(false);
+        }
+        Err(error) => return Err(Error::Io(error)),
+    };
+    let witness = expansion_witness_path(root, operation_id, path, item);
+    let witness_metadata = match fs::symlink_metadata(&witness) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(Error::Io(error)),
+    };
+    if target_metadata.dev() != witness_metadata.dev()
+        || target_metadata.ino() != witness_metadata.ino()
+    {
+        return Ok(false);
+    }
+    Ok(read_expansion_item(&target, path)? == *item
+        && read_expansion_item(&witness, path)? == *item)
+}
+
+fn unproven_expansion_targets(
+    root: &Path,
+    operation_id: &str,
+    staged: &BTreeMap<String, Stage>,
+) -> Result<Vec<String>> {
+    let mut blocked = Vec::new();
+    for (path, stage) in staged {
+        let item = stage
+            .after
+            .as_ref()
+            .ok_or_else(|| Error::Invalid("scope expansion staged a deletion".into()))?;
+        match fs::symlink_metadata(root.join(path)) {
+            Ok(_) if !expansion_target_is_witnessed(root, operation_id, path, item)? => {
+                blocked.push(path.clone());
+            }
+            Ok(_) => {}
+            Err(error)
+                if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {}
+            Err(error) => return Err(Error::Io(error)),
+        }
+    }
+    Ok(blocked)
+}
+
+fn prepare_expansion_witness(
+    root: &Path,
+    operation_id: &str,
+    path: &str,
+    item: &Item,
+) -> Result<PathBuf> {
+    let witness = expansion_witness_path(root, operation_id, path, item);
+    let directory = witness
+        .parent()
+        .ok_or_else(|| Error::Invalid("workspace expansion witness has no parent".into()))?;
+    fs::create_dir_all(directory)?;
+    require_directory(directory, "workspace expansion witness directory")?;
+    let witness_parent = directory
+        .parent()
+        .expect("workspace expansion witness directory has a parent");
+    sync_directory(&root.join(METADATA_DIRECTORY))?;
+    sync_directory(witness_parent)?;
+    sync_directory(directory)?;
+    match fs::symlink_metadata(&witness) {
+        Ok(_) => {
+            if read_expansion_item(&witness, path)? != *item {
+                return Err(Error::Conflict(format!(
+                    "workspace expansion witness diverged: {path}"
+                )));
+            }
+            return Ok(witness);
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(Error::Io(error)),
+    }
+    if item.kind == EntryKind::Symlink {
+        validate_symlink_target(path, &item.content)?;
+        symlink(std::ffi::OsStr::from_bytes(&item.content), &witness)?;
+    } else {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        if item.kind == EntryKind::Executable {
+            options.mode(0o777);
+        }
+        let mut file = options.open(&witness)?;
+        file.write_all(&item.content)?;
+        file.sync_all()?;
+        if item.kind == EntryKind::Executable
+            && kind_of_mode(file.metadata()?.permissions().mode()) != EntryKind::Executable
+        {
+            return Err(Error::Invalid(format!(
+                "process umask clears the owner execute bit for executable: {path}"
+            )));
+        }
+    }
+    sync_directory(directory)?;
+    Ok(witness)
+}
+
+fn apply_expansion_staged(
+    root: &Path,
+    operation_id: &str,
+    staged: &BTreeMap<String, Stage>,
+    desired_after: bool,
+) -> Result<()> {
+    if desired_after {
+        require_staged_support(root, staged)?;
+    }
+    for (path, stage) in staged {
+        let item = stage
+            .after
+            .as_ref()
+            .ok_or_else(|| Error::Invalid("scope expansion staged a deletion".into()))?;
+        reject_symlink_ancestors(root, path)?;
+        let target = root.join(path);
+        match fs::symlink_metadata(&target) {
+            Ok(_) => {
+                if !expansion_target_is_witnessed(root, operation_id, path, item)? {
+                    return Err(Error::Conflict(format!(
+                        "workspace expansion target is not an installed journal entry: {path}"
+                    )));
+                }
+                if !desired_after {
+                    fs::remove_file(&target)?;
+                    sync_directory(target.parent().expect("workspace file has parent"))?;
+                }
+                continue;
+            }
+            Err(error)
+                if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {}
+            Err(error) => return Err(Error::Io(error)),
+        }
+        if !desired_after {
+            continue;
+        }
+        let witness = prepare_expansion_witness(root, operation_id, path, item)?;
+        create_parent_directories(root, path)?;
+        match fs::hard_link(&witness, &target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                return Err(Error::Conflict(format!(
+                    "workspace path appeared before expansion installation: {path}"
+                )));
+            }
+            Err(error) => return Err(Error::Io(error)),
+        }
+        sync_directory(target.parent().expect("workspace file has parent"))?;
+    }
+    sync_directory(root)
+}
+
+fn cleanup_expansion_witnesses(
+    root: &Path,
+    operation_id: &str,
+    staged: &BTreeMap<String, Stage>,
+) -> Result<()> {
+    let parent = root
+        .join(METADATA_DIRECTORY)
+        .join(EXPANSION_WITNESSES_DIRECTORY);
+    let directory = parent.join(digest(operation_id.as_bytes()));
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(Error::Invalid(
+                "workspace expansion witness path is not a directory".into(),
+            ));
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(Error::Io(error)),
+    }
+    for (path, stage) in staged {
+        let item = stage
+            .after
+            .as_ref()
+            .ok_or_else(|| Error::Invalid("scope expansion staged a deletion".into()))?;
+        let witness = expansion_witness_path(root, operation_id, path, item);
+        match fs::symlink_metadata(&witness) {
+            Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
+                // Only terminal operations reach cleanup. The retained journal owns this
+                // metadata name; unlinking it never removes or opens the working path.
+                // Its bytes/mode may have changed through a legitimate edit of the other
+                // hard link after the scope transaction committed.
+                fs::remove_file(&witness)?;
+            }
+            Ok(_) => {
+                return Err(Error::Conflict(format!(
+                    "workspace expansion witness is not a removable metadata file: {path}"
+                )));
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(Error::Io(error)),
+        }
+    }
+    sync_directory(&directory)?;
+    fs::remove_dir(&directory).map_err(|error| {
+        if error.kind() == ErrorKind::DirectoryNotEmpty {
+            Error::Conflict("workspace expansion witness directory has unexpected entries".into())
+        } else {
+            Error::Io(error)
+        }
+    })?;
+    sync_directory(&parent)
 }
 
 fn apply_staged(
@@ -2962,6 +4245,58 @@ mod tests {
             path: path.to_owned(),
             content: None,
         }
+    }
+
+    #[test]
+    fn scoped_creation_reads_fewer_encoded_source_bytes_than_full_creation() {
+        const BUDGET: u64 = 1 << 40;
+        let fixtures = TempDir::new().unwrap();
+        let engine = Engine::open(fixtures.path().join("store")).unwrap();
+        let mut changes = vec![put("task/small.txt", b"task")];
+        let unrelated: Vec<Vec<u8>> = (0..32)
+            .map(|index| {
+                let mut bytes = vec![index as u8; 64 * 1024];
+                bytes[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                bytes
+            })
+            .collect();
+        for (index, bytes) in unrelated.iter().enumerate() {
+            changes.push(put(&format!("unrelated/{index:02}.bin"), bytes));
+        }
+        let revision = engine.checkpoint(None, &changes).unwrap();
+        let change = || ChangeId {
+            repository: "repository-read-measure".to_owned(),
+            id: "change-read-measure".to_owned(),
+        };
+
+        let (full_engine, full_budget) = engine.with_read_budget(BUDGET);
+        Workspace::create(
+            &full_engine,
+            fixtures.path().join("full"),
+            change(),
+            &revision,
+        )
+        .unwrap();
+        full_budget.finish(Ok(())).unwrap();
+        let full_bytes = BUDGET - full_budget.remaining();
+
+        let (scoped_engine, scoped_budget) = engine.with_read_budget(BUDGET);
+        Workspace::create_scoped(
+            &scoped_engine,
+            fixtures.path().join("scoped"),
+            change(),
+            &revision,
+            &["task".to_owned()],
+        )
+        .unwrap();
+        scoped_budget.finish(Ok(())).unwrap();
+        let scoped_bytes = BUDGET - scoped_budget.remaining();
+
+        eprintln!("workspace encoded source bytes: full={full_bytes}, scoped={scoped_bytes}");
+        assert!(
+            scoped_bytes < full_bytes,
+            "scoped creation must avoid unrelated blob reads"
+        );
     }
 
     struct ActualApplyFixture {

@@ -1322,3 +1322,207 @@ fn guided_inspection_follows_unchanged_scan_pages_before_exact_approval_and_land
         }
     }
 }
+
+#[test]
+fn scoped_guided_workflow_expands_checkpoints_and_lands_complete_source() {
+    let dir = TempDir::new().unwrap();
+    let data = dir.path().join("data");
+    fs::create_dir(&data).unwrap();
+    ok(&data, &["init"]);
+    let engine = Engine::open(&data).unwrap();
+    let revision = engine
+        .checkpoint(
+            None,
+            &[
+                FileChange {
+                    path: "a.txt".into(),
+                    content: Some(b"initial".to_vec()),
+                },
+                FileChange {
+                    path: "dependency.txt".into(),
+                    content: Some(b"dependency".to_vec()),
+                },
+                FileChange {
+                    path: "unseen.txt".into(),
+                    content: Some(b"preserved".to_vec()),
+                },
+            ],
+        )
+        .unwrap();
+    let work = dir.path().join("work");
+    start(&data, &work, "scoped", &revision, &["--path", "a.txt"]);
+    assert!(work.join("a.txt").is_file());
+    assert!(!work.join("dependency.txt").exists());
+    assert!(!work.join("unseen.txt").exists());
+    let expanded = ok(
+        &data,
+        &[
+            "workspace",
+            "expand",
+            work.to_str().unwrap(),
+            "dependencies",
+            "0",
+            "--path",
+            "dependency.txt",
+        ],
+    );
+    assert_eq!(expanded["outcome"]["status"], "expanded");
+    assert_eq!(expanded["outcome"]["generation"], 1);
+    fs::write(work.join("a.txt"), b"edited").unwrap();
+    ok(&data, &["workflow", "checkpoint", "edited", "1"]);
+    ok(&data, &["workflow", "prepare", "prepare"]);
+    let inspection = approve(&data, "approved");
+    let outcome = ok(
+        &data,
+        &["workflow", "integrate", "land", "--inspection", &inspection],
+    );
+    assert_eq!(outcome["ok"], true);
+    let target = Authority::open(&data)
+        .unwrap()
+        .target("main")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        engine.read_file(&target.revision, "a.txt").unwrap(),
+        b"edited"
+    );
+    assert_eq!(
+        engine
+            .read_file(&target.revision, "dependency.txt")
+            .unwrap(),
+        b"dependency"
+    );
+    assert_eq!(
+        engine.read_file(&target.revision, "unseen.txt").unwrap(),
+        b"preserved"
+    );
+    assert!(!work.join("unseen.txt").exists());
+}
+
+#[test]
+fn interrupted_scoped_start_only_reattaches_the_requested_projection() {
+    use agentscm::workspace::Workspace;
+    let dir = TempDir::new().unwrap();
+    let data = dir.path().join("data");
+    fs::create_dir(&data).unwrap();
+    let base = initialize(&data);
+    let engine = Engine::open(&data).unwrap();
+    let revision = engine
+        .checkpoint(
+            Some(&base),
+            &[
+                FileChange {
+                    path: ".gitignore".into(),
+                    content: Some(b"ignored\n".to_vec()),
+                },
+                FileChange {
+                    path: "other.txt".into(),
+                    content: Some(b"other".to_vec()),
+                },
+            ],
+        )
+        .unwrap();
+    let work = dir.path().join("requested");
+    start(
+        &data,
+        &work,
+        "recover-scoped",
+        &revision,
+        &["--path", "a.txt"],
+    );
+    let mut retained = session(&data);
+    retained["pending"] = json!({"kind":"Start"});
+    retained["workspace_binding"] = Value::Null;
+    retained["workspace_identity"] = Value::Null;
+    save_session(&data, &retained);
+    let context: ReviewContext = serde_json::from_value(retained["context"].clone()).unwrap();
+    let full = dir.path().join("full");
+    Workspace::create(&engine, &full, context.change.clone(), &revision).unwrap();
+    fail(
+        &data,
+        &["workflow", "resume", "--workspace", full.to_str().unwrap()],
+    );
+    let other = dir.path().join("other");
+    Workspace::create_scoped(
+        &engine,
+        &other,
+        context.change,
+        &revision,
+        &["other.txt".into()],
+    )
+    .unwrap();
+    fail(
+        &data,
+        &["workflow", "resume", "--workspace", other.to_str().unwrap()],
+    );
+    ok(
+        &data,
+        &["workflow", "resume", "--workspace", work.to_str().unwrap()],
+    );
+    assert!(session(&data)["pending"].is_null());
+    assert!(work.join(".gitignore").is_file());
+    assert!(!work.join("other.txt").exists());
+}
+
+#[test]
+fn invalid_scoped_start_does_not_reserve_a_session_or_change() {
+    let dir = TempDir::new().unwrap();
+    let data = dir.path().join("data");
+    fs::create_dir(&data).unwrap();
+    let revision = initialize(&data);
+    let work = dir.path().join("work");
+    // Build a valid command once using the same arguments as the start helper.
+    let args = [
+        "workflow",
+        "start",
+        "--change",
+        "invalid-scope",
+        "--workspace",
+        work.to_str().unwrap(),
+        "--revision",
+        &revision,
+        "--issue",
+        "synthetic-task",
+        "--intent",
+        "Test rejected scope",
+        "--criterion",
+        "No durable start on invalid input",
+        "--scope",
+        "a.txt",
+        "--recipe",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--toolchain",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "--environment",
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "--path",
+        ".agentscm-workspace/secret",
+    ];
+    fail(&data, &args);
+    assert!(!work.exists());
+    let db = Connection::open(data.join("workflow.sqlite")).unwrap();
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM session", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    let authority = Authority::open(&data).unwrap();
+    let change = agentscm::context::ChangeId {
+        repository: authority.repository_id().unwrap(),
+        id: "invalid-scope".into(),
+    };
+    assert!(matches!(
+        authority.change(&change),
+        Err(agentscm::Error::NotFound(_))
+    ));
+    drop(authority);
+    drop(db);
+    start(
+        &data,
+        &work,
+        "invalid-scope",
+        &revision,
+        &["--path", "a.txt"],
+    );
+}

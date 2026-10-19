@@ -29,6 +29,10 @@ pub struct StartArgs {
     change: String,
     #[arg(long)]
     workspace: PathBuf,
+    /// Materialize this path and its descendants; repeat for tool/configuration dependencies.
+    /// Omit to create the complete supported workspace. Independent of review-context --scope.
+    #[arg(long = "path")]
+    workspace_paths: Vec<String>,
     #[arg(long)]
     revision: String,
     #[arg(long)]
@@ -121,6 +125,8 @@ struct Session {
     version: u32,
     issue: String,
     workspace: PathBuf,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    workspace_paths: Vec<String>,
     workspace_binding: Option<Value>,
     #[serde(default)]
     workspace_identity: Option<Value>,
@@ -264,7 +270,7 @@ pub fn run(data: &Path, command: WorkflowCommand) -> Result<Value> {
                 "one active workflow already exists; use workflow resume".into(),
             ));
         }
-        let mut s = start_session(&data, &authority, *args)?;
+        let mut s = start_session(&data, &authority, &engine, *args)?;
         s.restored_workspace_ack = restored_root.clone();
         s.restored_instance_ack = restored_instance.clone();
         engine.load_revision(&s.context.revision)?;
@@ -533,7 +539,16 @@ pub fn run(data: &Path, command: WorkflowCommand) -> Result<Value> {
     summary(&authority, &engine, &s)
 }
 
-fn start_session(data: &Path, authority: &Authority, a: StartArgs) -> Result<Session> {
+fn start_session(
+    data: &Path,
+    authority: &Authority,
+    engine: &Engine,
+    mut a: StartArgs,
+) -> Result<Session> {
+    // Reject irreparable request errors before retaining a start or creating a Change.
+    a.workspace_paths =
+        Workspace::preflight_creation_scope(engine, &a.revision, &a.workspace_paths)?
+            .unwrap_or_default();
     let parent = a
         .workspace
         .parent()
@@ -635,6 +650,7 @@ fn start_session(data: &Path, authority: &Authority, a: StartArgs) -> Result<Ses
         version: 1,
         issue: a.issue,
         workspace,
+        workspace_paths: a.workspace_paths,
         workspace_binding: None,
         workspace_identity: None,
         restored_workspace_ack: None,
@@ -681,7 +697,11 @@ fn finish(
             if s.workspace.exists() {
                 let w = Workspace::open(&s.workspace)?;
                 let state = w.state()?;
-                if state.change != s.context.change || state.base_revision != s.context.revision {
+                if state.change != s.context.change
+                    || state.base_revision != s.context.revision
+                    || state.generation != 0
+                    || !w.scope_matches(e, &s.workspace_paths)?
+                {
                     return Err(Error::Conflict(
                         "existing workspace differs from recorded start".into(),
                     ));
@@ -696,6 +716,7 @@ fn finish(
                         root: s.workspace.clone(),
                         change: s.context.change.id.clone(),
                         revision: s.context.revision.clone(),
+                        paths: s.workspace_paths.clone(),
                     },
                 )?;
             }
@@ -793,6 +814,11 @@ fn validate_reattachment(e: &Engine, s: &Session, root: &Path) -> Result<()> {
     if state.change != s.context.change {
         return Err(Error::Conflict(
             "reattached workspace belongs to another Change".into(),
+        ));
+    }
+    if matches!(s.pending, Some(Pending::Start)) && !w.scope_matches(e, &s.workspace_paths)? {
+        return Err(Error::Conflict(
+            "reattached workspace scope differs from the retained start request".into(),
         ));
     }
     let binding = serde_json::to_value(&state)?;
@@ -1082,9 +1108,11 @@ mod tests {
         let mut session = start_session(
             &data,
             &authority,
+            &engine,
             StartArgs {
                 change: "snapshot".into(),
                 workspace: temp.path().join("work"),
+                workspace_paths: Vec::new(),
                 revision,
                 issue: "https://example.invalid/issues/23".into(),
                 intent: "Check exact displayed evidence".into(),

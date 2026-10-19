@@ -955,7 +955,7 @@ fn validate_database(db: &Connection, kind: DbKind) -> Result<()> {
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
     let supported = match kind {
         DbKind::Authority => (app, version) == (0x4153_434d, 7),
-        DbKind::Workspace => app == 0x4153_574b && matches!(version, 2 | 3),
+        DbKind::Workspace => app == 0x4153_574b && matches!(version, 2..=4),
         DbKind::Merge => (app, version) == (0x4147_4d47, 1),
         DbKind::Workflow => (app, version) == (0x4153_4746, 1),
         DbKind::SkillWorkflow => app == 0x4153_5746 && matches!(version, 1 | 2),
@@ -976,6 +976,10 @@ fn validate_database(db: &Connection, kind: DbKind) -> Result<()> {
     }
     if kind == DbKind::SkillWorkflow {
         crate::skill_workflow::runtime::validate_schema(db)?;
+    }
+    #[cfg(unix)]
+    if kind == DbKind::Workspace && version == 4 {
+        crate::workspace::validate_recovery_schema(db)?;
     }
     if kind == DbKind::Export {
         db.prepare("SELECT sequence,record FROM exports LIMIT 0")?;

@@ -8,7 +8,7 @@ AgentSCM also contains an immutable ledger for exact revisions, their review con
 
 - [Review contexts](review-context.md): the brief a revision is reviewed against
 - [Checks](checks.md), [evidence](evidence.md), the [portable evidence verifier](evidence-verifier.md) and [installed policy](policy.md)
-- [Workspaces](workspace.md), [merge sessions](merge.md), [offline sync](sync.md), [source history](source-history.md) and the [source reader](source-reader.md)
+- [Workspaces](workspace.md), [task-scoped source and workspaces](task-workspaces.md), [merge sessions](merge.md), [offline sync](sync.md), [source history](source-history.md) and the [source reader](source-reader.md)
 - [Native CLI reference](../reference/cli.md)
 - [Source-bound skill workflows](skill-workflows.md): run exact-file checks and explicit packaged container commands against an immutable revision; inspect, resume, cancel or recover the run.
 - [Claude Code workflow loop](claude-code-workflows.md): an opt-in local Stop trigger, tests/review, failure feedback and exact-current native landing requirements. Existing edit hooks remain contention-only.
