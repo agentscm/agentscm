@@ -356,7 +356,12 @@ impl Hub {
         })
     }
 
-    async fn call(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
+    pub(crate) async fn call(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Value> {
         let mut request = self
             .client
             .request(method, format!("{}{path}", self.base))

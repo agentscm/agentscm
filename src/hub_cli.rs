@@ -213,6 +213,9 @@ pub(crate) fn map_hub_error(error: HubError) -> Error {
         HubError::Invalid(message) => Error::Invalid(message),
         HubError::Unauthorized => Error::Invalid("hub authentication required".into()),
         HubError::Busy => Error::Invalid("hub busy".into()),
+        HubError::WorkCapacity => Error::Invalid(
+            "repository work storage capacity reached; operator compaction required".into(),
+        ),
         HubError::Unavailable(message) => Error::Invalid(format!("hub unavailable: {message}")),
     }
 }

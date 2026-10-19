@@ -125,7 +125,7 @@ from a flag. A half-configured provider stops startup.
   user restores the unexpired, unrevoked ones.
 - User and token ids are random and portable (`usr_...`, `tok_...`). Every
   change also appends an event (`evt_...`) to an append-only log in the same
-  transaction; the database refuses updates and deletes of events. Events
+  transaction; the database refuses updates and deletes of these events. Events
   never contain token secrets or digests.
 
 ## Signing in and agent tokens
@@ -196,10 +196,11 @@ on no others:
 - `GET /v1/hub/health`, which needs no token
 - `GET /v1/hub/skill-workflows` for recent runs in an operator-mapped native repository
 - `GET /v1/hub/skill-workflows/{run_id}` for an operator-mapped native repository
-- MCP `initialize`, `ping`, `tools/list`, and `agentscm_workflow_status`
+- `GET /v1/hub/standup/briefing` and `GET /v1/hub/standup/work/{id}` for the token's repository
+- MCP `initialize`, `ping`, `tools/list`, `agentscm_workflow_status`, and `agentscm_work_briefing`
 
 Every other route that takes an agent token (announcing, renewing and releasing intents, `notices`,
-publications, and the six coordination MCP tools, including `agentscm_status`, which also renews a hold)
+publications, and coordination MCP mutation tools, including `agentscm_status`, which also renews a hold)
 answers 403 `{"error":"read_only"}` and writes nothing. `POST /v1/hub/hook/{agent}` treats a
 read-only token as an unknown one: the same "token not accepted" reply, and no session or event.
 Routes for human sessions still answer 401 to any agent token. `tests/hub_read_only.rs` walks every
@@ -987,7 +988,9 @@ The container test does not include a forge. Pull-request overlaps (webhook and 
 - At most 32 store calls run at once per process; extra requests get 503
   `busy` rather than queueing.
 - Event appends are serialized (SQLite write lock; a PostgreSQL advisory
-  lock), so `seq` order is commit order and `events_after` cursors miss nothing.
+  lock), so `seq` order is commit order. `events_after` returns retained events;
+  compacted stand-up work events can leave gaps. Use the stand-up briefing API
+  for its explicit retained-history boundary.
 - The hub does not terminate TLS; put it behind a proxy.
 - Not production-ready. Overlap lookup is measured only on a synthetic set of
   1,000 live intents of 50 paths each (a 50-path announce, and one directory
@@ -1103,3 +1106,7 @@ is an event with its actor. Every GitHub observation is an event too: the forge
 repository id and full name, the pull request number and node id with its head
 SHA and, once closed, its merge commit SHA, and each branch name with its SHA.
 Nothing here prevents a later round trip between Git and native revisions.
+
+Stand-up work has a separate [retention policy](standup.md#storage-maintenance).
+Its four coordination event kinds can be compacted by a local operator; this
+exception does not permit updates or deletion of the general Hub events above.

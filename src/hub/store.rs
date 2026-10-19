@@ -14,6 +14,10 @@ use super::publish::{Create, NewPublication, Publication, Update};
 use super::session::{SessionCall, Touched};
 use super::store_pg::PgStore;
 use super::store_sqlite::SqliteStore;
+use super::work::{
+    Briefing, BriefingAck, BriefingQuery, WorkCheckpoint, WorkCheckpointResult, WorkCompaction,
+    WorkItem, WorkRepositoryScope, WorkStart, WorkStartResult,
+};
 use super::{HubError, Result};
 use crate::team::auth::{Secret, generate_secret, lower_hex, token_digest};
 
@@ -106,7 +110,8 @@ pub struct AgentToken {
     pub created_at: i64,
 }
 
-/// One row of the append-only event log; `data` is canonical JSON.
+/// One row of the Hub event log; `data` is canonical JSON.
+/// General events are append-only. Stand-up work events permit operator compaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HubEvent {
     pub seq: i64,
@@ -316,7 +321,34 @@ pub trait Store: Send + Sync {
     /// Applies one forge fact (see [`Update`]); an event only when the state changes. Unknown id is `Invalid`.
     fn update_publication(&self, id: &str, update: &Update, now: i64) -> Result<Publication>;
     /// Events with `seq` greater than the argument, oldest first, at most 1000.
+    /// Retained events in sequence order; operator-compacted work events can leave gaps.
     fn events_after(&self, seq: i64, limit: usize) -> Result<Vec<HubEvent>>;
+    fn work_start(&self, token: &str, start: &WorkStart, now: i64) -> Result<WorkStartResult>;
+    /// Atomic compatibility start: reuse this session's unfinished lead work, or create one.
+    fn work_start_auto(&self, token: &str, start: &WorkStart, now: i64) -> Result<WorkStartResult>;
+    fn work_checkpoint(
+        &self,
+        token: &str,
+        checkpoint: &WorkCheckpoint,
+        now: i64,
+    ) -> Result<WorkCheckpointResult>;
+    fn work_get(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkItem>>;
+    /// The token/session's one unfinished lead claim. Multiple matches are invalid.
+    fn work_for_session(&self, token: &str, session: &str, now: i64) -> Result<Option<WorkItem>>;
+    /// Resolve the explicit or most recently touched session without touching it.
+    fn session_name_for(&self, token: &str, session: Option<&str>, now: i64) -> Result<String>;
+    fn work_briefing(&self, token: &str, query: &BriefingQuery, now: i64) -> Result<Briefing>;
+    /// Side-effect-free current page for hooks and implicit contexts; never ackable.
+    fn work_briefing_preview(&self, token: &str, limit: usize, now: i64) -> Result<Briefing>;
+    fn work_ack(&self, token: &str, ack: &BriefingAck, now: i64) -> Result<()>;
+    /// Local operator maintenance. `apply = false` is a side-effect-free preview.
+    fn work_compact(
+        &self,
+        scope: &WorkRepositoryScope,
+        before: i64,
+        apply: bool,
+        now: i64,
+    ) -> Result<WorkCompaction>;
 }
 
 /// On Windows the database path may be a drive path: `C:\x`, `C:/x`, or `/C:/x` in URL form.
@@ -658,6 +690,11 @@ const MIGRATIONS: &[Migration] = &[
         sqlite: include_str!("migrations/0009_handoffs.sqlite.sql"),
         postgres: include_str!("migrations/0009_handoffs.pg.sql"),
     },
+    Migration {
+        version: 10,
+        sqlite: include_str!("migrations/0010_work.sqlite.sql"),
+        postgres: include_str!("migrations/0010_work.pg.sql"),
+    },
 ];
 
 /// Migrations not yet applied. The registry must be numbered 1..n and the
@@ -696,11 +733,12 @@ mod tests {
 
     #[test]
     fn pending_requires_an_applied_prefix() {
-        assert_eq!(pending(&[]).unwrap().len(), 9);
-        assert_eq!(pending(&[1]).unwrap().len(), 8);
-        assert_eq!(pending(&[1, 2, 3]).unwrap().len(), 6);
-        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap().len(), 1);
-        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap().len(), 0);
+        assert_eq!(pending(&[]).unwrap().len(), 10);
+        assert_eq!(pending(&[1]).unwrap().len(), 9);
+        assert_eq!(pending(&[1, 2, 3]).unwrap().len(), 7);
+        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap().len(), 2);
+        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap().len(), 1);
+        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]).unwrap().len(), 0);
         assert!(pending(&[2]).is_err());
         let newer = pending(&[1, 999]).err().unwrap().to_string();
         assert!(newer.contains("newer than this binary"), "{newer}");

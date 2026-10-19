@@ -9,6 +9,8 @@ AgentSCM warns an agent when another agent already holds a file it is about to e
 
 The read-only `agentscm_workflow_status` MCP tool inspects a retained native skill workflow when the operator has configured a repository mapping. It preserves recorded outcomes, current source applicability and unavailable capabilities as separate facts. See [skill workflows in the hub](advanced/skill-workflow-hub.md).
 
+The [asynchronous stand-up](standup.md) adds durable engineering work and checkpoint handovers alongside file intents. Its agent-authenticated CLI and MCP surfaces can retrieve current unfinished work and a bounded catch-up before a task, then create or reuse an explicit work item and report meaningful changes. `agentscm_work_briefing` reads the briefing; `agentscm_start` resolves and claims explicit work; `agentscm_work_checkpoint` records a meaningful change; and `agentscm_work_ack` deliberately advances a completely delivered writer briefing. A supported session-start hook can render the bounded briefing, and a safely linked end hook can record pause or handover. Hooks do not create a goal, acknowledge delivery, infer decisions or meaningful progress, or claim completion as accepted or landed. A model can also skip an MCP call. A reported checkpoint is coordination context, not trusted execution or landing evidence.
+
 Nothing is locked: a refusal happens once per session and file, a repeat always passes, and any failure lets the edit through. Cursor's hook cannot refuse, so Cursor gets a note just after the edit, and an agent that only has MCP gets advice only. Details: [warn once](hub.md#warn-once).
 
 ## Support tiers
@@ -87,6 +89,7 @@ The cost is that failures are quiet. If warnings never appear, run `agentscm int
 - Where the edited file path sits in Cursor, Copilot and Codex payloads is only partly documented; the hub reads the fields that vendor documents and ignores the rest.
 - The hub is trusted. Its replies go into each agent's context, and the URL that decides which hub that is sits in committed config: a hook's `--hub-url` and the MCP server URL. Whoever controls that URL controls the text the agents using the config see, and receives their token and hook payloads. Review changes to those files, and treat the hub as trusted.
 - Coverage depends on every agent on the team being wired. An unwired agent is invisible. A pull-request check as a backstop is planned, not built.
+- Stand-up claims persist across agent sessions, but only reported checkpoints are visible. A stale or unknown claim remains claimed; inspect the work and use the explicit takeover flow instead of assuming it is available.
 
 ## Recipes for other agents
 

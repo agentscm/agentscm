@@ -26,6 +26,7 @@ use super::session::{
     SessionCall, announce_for, check_name, count_fail_open, done_for, others_for, record_hook_ms,
 };
 use super::store::{Principal, agent_token_digest, unix_now};
+use super::work::{Briefing, CheckpointKind, WorkCheckpoint, WorkState};
 use super::{HubError, HubState};
 
 /// Write payloads carry file contents.
@@ -246,6 +247,7 @@ fn root_header(headers: &HeaderMap) -> Option<&str> {
 fn reason(error: HubError) -> &'static str {
     match error {
         HubError::Busy => "hub busy",
+        HubError::WorkCapacity => "work storage capacity reached",
         HubError::Unauthorized => DENIED,
         HubError::Invalid(_) => "invalid hook payload",
         HubError::Unavailable(detail) => {
@@ -385,6 +387,12 @@ impl Call {
             }
             Kind::Start => {
                 let principal = authenticate(state, token, repo).await?;
+                let store = state.store.clone();
+                let token = principal.token_id.clone();
+                let briefing = blocking(state, move || {
+                    store.work_briefing_preview(&token, 20, unix_now())
+                })
+                .await;
                 let advice = announce_for(state, &principal, call(Vec::new()))
                     .await
                     .map_err(reason)?;
@@ -394,11 +402,19 @@ impl Call {
                     .await
                     .unwrap_or_else(|_| unknown("other agents could not be listed"));
                 let status = Outcome::advice(advice.text.clone(), advice.stop).status;
-                let text = if advice.text.is_empty() {
+                let mut text = if advice.text.is_empty() {
                     listing
                 } else {
                     format!("{}\n{listing}", advice.text)
                 };
+                text.push('\n');
+                text.push_str(&match briefing {
+                    Ok(briefing) => render_briefing(&briefing),
+                    Err(_) => format!(
+                        "{} Call agentscm_work_briefing before planning meaningful work. Once the user intent is known, call agentscm_start with a stable work_id, canonical forge source or request_key before taking coordinated paths.",
+                        unknown("shared work could not be listed")
+                    ),
+                });
                 Ok(Outcome {
                     text,
                     status,
@@ -410,6 +426,9 @@ impl Call {
                 done_for(state, &principal, self.session.clone())
                     .await
                     .map_err(reason)?;
+                if let Some(session) = self.session.clone() {
+                    pause_known_work(state, &principal, session, &self.via).await;
+                }
                 Ok(Outcome::clean())
             }
         }
@@ -454,6 +473,117 @@ impl Call {
             (Shape::Camel, _) => json!({"additionalContext": text}),
             (Shape::Silent | Shape::Pre | Shape::Unreadable, _) => json!({}),
         }
+    }
+}
+
+fn render_briefing(briefing: &Briefing) -> String {
+    const SHOWN_ITEMS: usize = 5;
+    const SHOWN_EVENTS: usize = 5;
+    let mut lines = vec![format!(
+        "AgentSCM shared work: {} unfinished item(s), {} change event(s) in this bounded page.",
+        briefing.items.len(),
+        briefing.events.len()
+    )];
+    for item in briefing.items.iter().take(SHOWN_ITEMS) {
+        lines.push(format!(
+            "- {} [{:?}, claim {:?}]: {} (third-party text)",
+            item.id,
+            item.state,
+            item.claim_status,
+            bounded_hook_text(&item.title, 120)
+        ));
+    }
+    for event in briefing.events.iter().take(SHOWN_EVENTS) {
+        lines.push(format!(
+            "- change {} for {}: {}",
+            event.seq,
+            event.work_id,
+            bounded_hook_text(&event.kind, 40)
+        ));
+    }
+    if briefing.items.len() > SHOWN_ITEMS
+        || briefing.events.len() > SHOWN_EVENTS
+        || !briefing.complete
+    {
+        lines.push(
+            "This bounded hook preview omits shared-work records and created no delivery. Call agentscm_work_briefing to begin durable pagination of the full snapshot and delta; acknowledge only after deliberately delivering its complete page sequence."
+                .to_owned(),
+        );
+    }
+    lines.push(
+        "Once the user intent is known, call agentscm_start with a stable work_id, canonical forge source or request_key before taking coordinated paths. A branch name alone is not a work identity."
+            .to_owned(),
+    );
+    lines.join("\n")
+}
+
+fn bounded_hook_text(text: &str, max: usize) -> String {
+    let mut out: String = text
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(max)
+        .collect();
+    if text.chars().count() > max {
+        out.push('…');
+    }
+    out
+}
+
+async fn pause_known_work(state: &HubState, principal: &Principal, session: String, via: &str) {
+    let store = state.store.clone();
+    let token = principal.token_id.clone();
+    let lookup_session = session.clone();
+    let item = match blocking(state, move || {
+        store.work_for_session(&token, &lookup_session, unix_now())
+    })
+    .await
+    {
+        Ok(Some(item)) => item,
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!("hub: work lookup at session end: {error}");
+            return;
+        }
+    };
+    if matches!(
+        item.state,
+        WorkState::Paused | WorkState::Blocked | WorkState::Handover | WorkState::Finished
+    ) {
+        return;
+    }
+    let checkpoint = WorkCheckpoint {
+        work_id: item.id,
+        operation_id: format!("{via}-done-{}-{}", item.generation, item.updated_seq),
+        generation: item.generation,
+        expected_updated_seq: Some(item.updated_seq),
+        session,
+        kind: CheckpointKind::Pause,
+        summary: "Session ended without a reported final work outcome.".into(),
+        next_action: item
+            .next_action
+            .or_else(|| Some("Resume or deliberately hand over this unfinished work.".into())),
+        scope: None,
+        branch: None,
+        worktree: None,
+        resolve_blocker: false,
+        source_refs: Vec::new(),
+        depends_on: item.depends_on,
+        related_work: item.related_work,
+    };
+    let store = state.store.clone();
+    let token = principal.token_id.clone();
+    if let Err(error) = blocking(state, move || {
+        store.work_checkpoint(&token, &checkpoint, unix_now())
+    })
+    .await
+    {
+        eprintln!("hub: pause checkpoint at session end: {error}");
     }
 }
 

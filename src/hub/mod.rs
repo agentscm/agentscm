@@ -19,6 +19,8 @@ mod store_pg;
 mod store_sqlite;
 pub mod sync;
 mod ui;
+pub mod work;
+pub mod work_http;
 pub mod workspace;
 #[cfg(unix)]
 pub mod workspace_execution;
@@ -49,6 +51,8 @@ pub enum HubError {
     Unauthorized,
     /// Too many concurrent store operations; the request is not queued.
     Busy,
+    /// The repository's retained work budget needs operator maintenance.
+    WorkCapacity,
     /// Internal detail for the operator's stderr only; never sent to a client.
     Unavailable(String),
 }
@@ -61,6 +65,10 @@ impl fmt::Display for HubError {
             Self::Invalid(message) => write!(f, "invalid: {message}"),
             Self::Unauthorized => write!(f, "authentication required"),
             Self::Busy => write!(f, "busy"),
+            Self::WorkCapacity => write!(
+                f,
+                "repository work storage capacity reached; operator compaction required"
+            ),
             Self::Unavailable(message) => write!(f, "unavailable: {message}"),
         }
     }
@@ -248,6 +256,7 @@ pub fn router(state: HubState) -> Router {
     let workspace_routes = workspace::routes();
     Router::new()
         .merge(http::routes())
+        .merge(work_http::routes())
         .merge(intent::routes())
         .merge(hook::routes())
         .merge(login::routes())

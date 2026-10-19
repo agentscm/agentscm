@@ -227,6 +227,10 @@ impl From<HubError> for ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 code: "busy",
             },
+            HubError::WorkCapacity => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "work_storage_capacity",
+            },
             HubError::Unavailable(detail) => {
                 eprintln!("hub error: {detail}");
                 Self {
@@ -441,5 +445,18 @@ mod tests {
         assert!(parse(r#"{"name":"a"}"#).await.is_ok());
         let error = parse(r#"{"name":"a","extra":1}"#).await.err().unwrap();
         assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn work_capacity_has_an_actionable_public_error_code() {
+        let response = ApiError::from(HubError::WorkCapacity).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            json!({"error": "work_storage_capacity"})
+        );
     }
 }

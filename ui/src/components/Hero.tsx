@@ -6,7 +6,7 @@ import { clock } from './bits.tsx'
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`
 
 function headline(repo: string, d: Derived): string {
-  if (d.agents.length === 0) return `All quiet in ${repo}.`
+  if (d.agents.length === 0) return `No live file-intent activity in ${repo}.`
   const verb = d.agents.length === 1 ? 'is' : 'are'
   const c = d.contested.length
   const tail = c === 0 ? 'No files are contested.' : `${plural(c, 'file', 'files')} ${c === 1 ? 'is' : 'are'} contested.`
@@ -31,7 +31,7 @@ function keyFact(d: Derived): string {
   const w = p?.with[0]
   if (p && w) return `PR #${p.pr.number} touches files that ${w.agent.owner}'s ${w.agent.name} is working on.`
   if (d.agents.length > 0) return 'Agents are working on separate files.'
-  return 'Agents that connect to this repository will appear here within seconds.'
+  return 'Live file-intent activity for this repository will appear here within seconds.'
 }
 
 function Sparkle() {

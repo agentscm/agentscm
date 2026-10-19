@@ -152,7 +152,7 @@ Status: per row.
 | Agent candidate | Native revision ID | Revision derived from a successful isolated run's output, parented on the run's exact subject | Implemented (derived on request and content-addressed, so not stored separately) |
 | Hub user | `usr_…`; unique forge provider + host + numeric user ID | Cached login, disabled flag; administrators come from configuration, not the record | Implemented |
 | Agent token | `tok_…`; only a digest of the secret is stored | Owner, one repository (with the forge's stable repository ID when minted through sign-in), name, fixed expiry of at most 30 days, revoked flag | Implemented |
-| Hub event | `evt_…` and a commit-ordered sequence | Kind, subject, data (most kinds name the acting user or token); never secrets | Implemented (append-only, enforced by the database) |
+| Hub event | `evt_…` and a commit-ordered sequence | Kind, subject, data (most kinds name the acting user or token); never secrets | Implemented (database-enforced append-only for general events; [stand-up work retention](../standup.md#storage-maintenance) permits operator deletion of four coordination kinds) |
 | Work intent | `int_…` chosen by the client | Task, paths, optional branch/base/machine, expiry; attributed to its token and owner | Implemented on the hub (section 4.3) |
 | Overlap notice | Hub event sequence | The announcing agent and owner, their paths, the recipient's paths | Implemented on the hub (section 4.3) |
 
@@ -441,7 +441,9 @@ fully usable if the team decides against it or reverses it.
   repository ID on agent tokens minted through sign-in, and an append-only event
   log of sign-ins, token changes, intents and notices, each with a stable ID.
   Most events name the acting user or token; renewals and releases are
-  attributable only through the intent's token.
+  attributable only through the intent's token. Stand-up work events have
+  explicit [operator retention](../standup.md#storage-maintenance), separate
+  from native execution and approval evidence.
 - Isolated check attempts and evidence bound to exact subjects (section 4.4).
 
 **Still needed.**

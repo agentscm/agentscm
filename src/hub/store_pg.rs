@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use postgres::config::{Host, SslMode};
 use postgres::{Client, Config, IsolationLevel, NoTls};
+use serde_json::json;
 
 use super::connection::{
     CONNECTION_SELECT, ConnectedRepository, Connection as ForgeConnection, DELIVERY_KEEP_SECONDS,
@@ -32,6 +33,14 @@ use super::store::{
     NewAgentToken, Principal, SessionView, Store, TokenDigest, User, event_limit, new_id, pending,
     session_key, unix_now, validate_login,
 };
+use super::work::{
+    Briefing, BriefingAck, BriefingQuery, CLAIM_STALE_SECONDS, Checkpoint, CheckpointReceipt,
+    ClaimStatus, MAX_BRIEFING_BYTES, SourceRef, WORK_DELIVERY_RESERVATION_BYTES,
+    WORK_PAYLOAD_CAPACITY_BYTES, WorkCheckpoint, WorkCheckpointResult, WorkCompaction,
+    WorkConflictKind, WorkEvent, WorkItem, WorkParticipant, WorkRepositoryScope, WorkRole,
+    WorkSource, WorkStart, WorkStartConflict, WorkStartResult, WorkState, WorkWho,
+    check_work_delivery_page, check_work_payload_capacity, work_payload_row_bytes,
+};
 use super::{HubError, Result};
 
 /// Held for the whole migration transaction so hubs starting together serialize.
@@ -43,6 +52,10 @@ const INTENT_LOCK_CLASS: i32 = 0x6167_656e;
 /// First key of the advisory lock that serializes publication creates per token, so the
 /// open-publication cap holds across hub processes.
 const PUBLICATION_LOCK_CLASS: i32 = 0x6167_6570;
+/// Serializes briefing delivery creation and acknowledgements per owner and repository scope.
+const WORK_DELIVERY_LOCK_CLASS: i32 = 0x6167_6578;
+/// Serializes every payload-growing effect in a complete repository identity.
+const WORK_CAPACITY_LOCK_CLASS: i32 = 0x6167_6579;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TCP_USER_TIMEOUT: Duration = Duration::from_secs(15);
 const KEEPALIVES_IDLE: Duration = Duration::from_secs(30);
@@ -235,10 +248,11 @@ fn migrate(client: &mut Client) -> Result<()> {
     Ok(tx.commit()?)
 }
 
-fn append(tx: &mut postgres::Transaction<'_>, event: &Event) -> Result<()> {
+fn append(tx: &mut postgres::Transaction<'_>, event: &Event) -> Result<i64> {
     tx.execute("SELECT pg_advisory_xact_lock($1)", &[&EVENT_LOCK])?;
-    tx.execute(
-        "INSERT INTO hub_events (id, at, kind, subject, data) VALUES ($1, $2, $3, $4, $5)",
+    let row = tx.query_one(
+        "INSERT INTO hub_events (id, at, kind, subject, data) VALUES ($1, $2, $3, $4, $5)
+         RETURNING seq",
         &[
             &event.id,
             &event.at,
@@ -247,7 +261,7 @@ fn append(tx: &mut postgres::Transaction<'_>, event: &Event) -> Result<()> {
             &event.data,
         ],
     )?;
-    Ok(())
+    Ok(row.get(0))
 }
 
 /// Appends `events` in order with one statement, so a wide fan-out is one round trip.
@@ -273,6 +287,911 @@ fn append_all(tx: &mut postgres::Transaction<'_>, events: &[Event]) -> Result<()
         ],
     )?;
     Ok(())
+}
+
+fn work_who(tx: &mut postgres::Transaction<'_>, token: &str, now: i64) -> Result<WorkWho> {
+    let row = tx
+        .query_opt(
+            "SELECT t.repository, t.repository_id, t.name, t.read_only,
+                    u.id, u.provider, u.host, u.forge_user_id, u.login
+             FROM hub_agent_tokens t JOIN hub_users u ON u.id = t.owner
+             WHERE t.id = $1 AND NOT t.revoked AND t.expires_at > $2 AND NOT u.disabled
+             FOR SHARE",
+            &[&token, &now],
+        )?
+        .ok_or(HubError::Unauthorized)?;
+    Ok(WorkWho {
+        token: token.to_owned(),
+        repository: row.get(0),
+        repository_id: row.get(1),
+        agent: row.get(2),
+        read_only: row.get(3),
+        owner: User {
+            id: row.get(4),
+            identity: ForgeIdentity {
+                provider: row.get(5),
+                host: row.get(6),
+                user_id: row.get(7),
+            },
+            login: row.get(8),
+            disabled: false,
+        },
+    })
+}
+
+fn role_name(role: WorkRole) -> &'static str {
+    match role {
+        WorkRole::Lead => "lead",
+        WorkRole::Helper => "helper",
+        WorkRole::Reviewer => "reviewer",
+    }
+}
+
+fn state_name(state: WorkState) -> &'static str {
+    match state {
+        WorkState::Active => "active",
+        WorkState::Blocked => "blocked",
+        WorkState::Paused => "paused",
+        WorkState::Finished => "finished",
+        WorkState::Handover => "handover",
+    }
+}
+
+fn json_string<T: serde::Serialize>(value: &T) -> Result<String> {
+    serde_json::to_string(value).map_err(|error| HubError::Unavailable(error.to_string()))
+}
+
+fn json_value<T: serde::de::DeserializeOwned>(value: &str) -> Result<T> {
+    serde_json::from_str(value).map_err(|error| HubError::Unavailable(error.to_string()))
+}
+
+fn project_claim(tx: &mut postgres::Transaction<'_>, item: &mut WorkItem, now: i64) -> Result<()> {
+    if now < item.last_checkin_at {
+        item.claim_status = ClaimStatus::Unknown;
+        return Ok(());
+    }
+    let active = tx
+        .query_opt(
+            "SELECT 1 FROM hub_agent_tokens t JOIN hub_users u ON u.id = t.owner
+             WHERE t.id = $1 AND NOT t.revoked AND t.expires_at > $2 AND NOT u.disabled",
+            &[&item.lead_token, &now],
+        )?
+        .is_some();
+    item.claim_status = if active && item.last_checkin_at >= now - CLAIM_STALE_SECONDS {
+        ClaimStatus::Active
+    } else {
+        ClaimStatus::Stale
+    };
+    Ok(())
+}
+
+fn scoped_work(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    id: &str,
+    now: i64,
+    lock: bool,
+) -> Result<Option<WorkItem>> {
+    let tail = if lock { " FOR UPDATE" } else { "" };
+    let row = tx.query_opt(
+        &format!(
+            "SELECT snapshot FROM hub_work_items
+             WHERE id = $1 AND provider = $2 AND host = $3 AND repository = $4
+               AND repository_id IS NOT DISTINCT FROM $5{tail}"
+        ),
+        &[
+            &id,
+            &who.owner.identity.provider,
+            &who.owner.identity.host,
+            &who.repository,
+            &who.repository_id,
+        ],
+    )?;
+    row.map(|row| {
+        let snapshot: String = row.get(0);
+        let mut item: WorkItem = json_value(&snapshot)?;
+        project_claim(tx, &mut item, now)?;
+        Ok(item)
+    })
+    .transpose()
+}
+
+fn relation_targets(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    ids: &[String],
+) -> Result<()> {
+    for id in ids {
+        if scoped_work(tx, who, id, 0, false)?.is_none() {
+            return Err(HubError::Invalid(format!(
+                "related work {id} is outside the repository or unknown"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn work_event(kind: &'static str, item: &WorkItem) -> Result<Event> {
+    let mut event = Event::new(
+        kind,
+        &item.id,
+        json!({"generation": item.generation, "owner": item.owner,
+            "repository": item.repository, "state": state_name(item.state)}),
+    )?;
+    event.at = item.updated_at;
+    Ok(event)
+}
+
+fn save_work_version(tx: &mut postgres::Transaction<'_>, item: &WorkItem, seq: i64) -> Result<()> {
+    let snapshot = json_string(item)?;
+    let current = item.current.as_ref().map(json_string).transpose()?;
+    let scope = json_string(&item.scope)?;
+    tx.execute(
+        "UPDATE hub_work_items SET lead_token = $2, lead_agent = $3, lead_session = $4,
+             generation = $5, state = $6, next_action = $7, current_checkpoint = $8,
+             snapshot = $9, updated_at = $10, updated_seq = $11, scope = $12,
+             branch = $13, worktree = $14 WHERE id = $1",
+        &[
+            &item.id,
+            &item.lead_token,
+            &item.lead_agent,
+            &item.lead_session,
+            &item.generation,
+            &state_name(item.state),
+            &item.next_action,
+            &current,
+            &snapshot,
+            &item.updated_at,
+            &seq,
+            &scope,
+            &item.branch,
+            &item.worktree,
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO hub_work_versions (work, event_seq, state, snapshot)
+         VALUES ($1, $2, $3, $4)",
+        &[&item.id, &seq, &state_name(item.state), &snapshot],
+    )?;
+    Ok(())
+}
+
+fn work_payload_bytes(
+    tx: &mut postgres::Transaction<'_>,
+    provider: &str,
+    host: &str,
+    repository: &str,
+    repository_id: Option<i64>,
+) -> Result<i64> {
+    Ok(tx
+        .query_one(
+            "SELECT COALESCE(SUM(bytes), 0)::bigint FROM (
+                 SELECT octet_length(snapshot)::bigint + 256 AS bytes FROM hub_work_items
+                  WHERE provider = $1 AND host = $2 AND repository = $3
+                    AND repository_id IS NOT DISTINCT FROM $4
+                 UNION ALL
+                 SELECT octet_length(v.snapshot)::bigint + 256 FROM hub_work_versions v
+                  JOIN hub_work_items w ON w.id = v.work
+                  WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+                    AND w.repository_id IS NOT DISTINCT FROM $4
+                 UNION ALL
+                 SELECT octet_length(o.request)::bigint + 256 FROM hub_work_checkpoint_ops o
+                  JOIN hub_work_items w ON w.id = o.work
+                  WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+                    AND w.repository_id IS NOT DISTINCT FROM $4
+                 UNION ALL
+                 SELECT CASE WHEN NOT acknowledged THEN 4194304::bigint
+                             ELSE octet_length(page)::bigint + 256 END
+                   FROM hub_work_deliveries
+                  WHERE provider = $1 AND host = $2 AND repository = $3
+                    AND repository_id IS NOT DISTINCT FROM $4
+                 UNION ALL
+                 SELECT octet_length(e.data)::bigint + octet_length(e.kind)::bigint
+                        + octet_length(e.subject)::bigint + 256
+                   FROM hub_events e JOIN hub_work_items w ON w.id = e.subject
+                  WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+                    AND w.repository_id IS NOT DISTINCT FROM $4
+                    AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint')
+             ) payloads",
+            &[
+                &provider,
+                &host,
+                &repository,
+                &repository_id,
+            ],
+        )?
+        .get(0))
+}
+
+fn work_event_payload_bytes(event: &Event) -> Result<i64> {
+    work_payload_row_bytes(
+        event
+            .data
+            .len()
+            .saturating_add(event.kind.len())
+            .saturating_add(event.subject.len()),
+    )
+}
+
+fn work_transition_payload_bytes(snapshot: &str, event: &Event) -> Result<i64> {
+    let snapshot = work_payload_row_bytes(snapshot.len())?;
+    let event = work_event_payload_bytes(event)?;
+    snapshot
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(event))
+        .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))
+}
+
+fn stored_work_item_bytes(tx: &mut postgres::Transaction<'_>, id: &str) -> Result<i64> {
+    Ok(tx
+        .query_one(
+            "SELECT octet_length(snapshot)::bigint + 256 FROM hub_work_items WHERE id = $1",
+            &[&id],
+        )?
+        .get(0))
+}
+
+fn adjust_work_payload_capacity(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    delta: i64,
+    now: i64,
+) -> Result<()> {
+    let used: Option<i64> = tx
+        .query_opt(
+            "SELECT charged_bytes FROM hub_work_usage
+             WHERE provider = $1 AND host = $2 AND repository = $3
+               AND repository_id IS NOT DISTINCT FROM $4 FOR UPDATE",
+            &[
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                &who.repository_id,
+            ],
+        )?
+        .map(|row| row.get(0));
+    let used = used.unwrap_or(0);
+    check_work_payload_capacity(used, delta, WORK_PAYLOAD_CAPACITY_BYTES)?;
+    let charged = used
+        .checked_add(delta)
+        .filter(|charged| *charged >= 0)
+        .ok_or_else(|| HubError::Unavailable("work payload accounting is inconsistent".into()))?;
+    let changed = tx.execute(
+        "UPDATE hub_work_usage SET charged_bytes = $5, updated_at = $6
+         WHERE provider = $1 AND host = $2 AND repository = $3
+           AND repository_id IS NOT DISTINCT FROM $4",
+        &[
+            &who.owner.identity.provider,
+            &who.owner.identity.host,
+            &who.repository,
+            &who.repository_id,
+            &charged,
+            &now,
+        ],
+    )?;
+    if changed == 0 {
+        tx.execute(
+            "INSERT INTO hub_work_usage
+                (provider, host, repository, repository_id, charged_bytes, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+            &[
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                &who.repository_id,
+                &charged,
+                &now,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn work_retention_floors(tx: &mut postgres::Transaction<'_>, who: &WorkWho) -> Result<(i64, i64)> {
+    Ok(tx
+        .query_opt(
+            "SELECT event_floor_seq, snapshot_floor_seq FROM hub_work_retention
+             WHERE provider = $1 AND host = $2 AND repository = $3
+               AND repository_id IS NOT DISTINCT FROM $4",
+            &[
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                &who.repository_id,
+            ],
+        )?
+        .map_or((0, 0), |row| (row.get(0), row.get(1))))
+}
+
+fn replace_relations(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    work: &str,
+    depends_on: &[String],
+    related: &[String],
+) -> Result<()> {
+    relation_targets(tx, who, depends_on)?;
+    relation_targets(tx, who, related)?;
+    if depends_on.iter().chain(related).any(|id| id == work) {
+        return Err(HubError::Invalid("work cannot relate to itself".into()));
+    }
+    tx.execute("DELETE FROM hub_work_relations WHERE work = $1", &[&work])?;
+    for (kind, ids) in [("depends_on", depends_on), ("related", related)] {
+        for id in ids {
+            tx.execute(
+                "INSERT INTO hub_work_relations (work, related, kind) VALUES ($1, $2, $3)",
+                &[&work, id, &kind],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn unfinished_for_session(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    session: &str,
+    now: i64,
+) -> Result<Option<WorkItem>> {
+    let rows = tx.query(
+        "SELECT snapshot FROM hub_work_items
+         WHERE provider = $1 AND host = $2 AND repository = $3
+           AND repository_id IS NOT DISTINCT FROM $4 AND lead_token = $5
+           AND lead_session = $6 AND state <> 'finished'
+         ORDER BY id LIMIT 2",
+        &[
+            &who.owner.identity.provider,
+            &who.owner.identity.host,
+            &who.repository,
+            &who.repository_id,
+            &who.token,
+            &session,
+        ],
+    )?;
+    if rows.len() > 1 {
+        return Err(HubError::Invalid(
+            "session is lead for more than one unfinished work item".into(),
+        ));
+    }
+    rows.first()
+        .map(|row| {
+            let snapshot: String = row.get(0);
+            let mut item: WorkItem = json_value(&snapshot)?;
+            project_claim(tx, &mut item, now)?;
+            Ok(item)
+        })
+        .transpose()
+}
+
+fn resolve_work(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    start: &WorkStart,
+    now: i64,
+) -> Result<Option<WorkItem>> {
+    if let Some(id) = &start.work_id {
+        return scoped_work(tx, who, id, now, true);
+    }
+    let row = if let Some(source) = &start.source {
+        tx.query_opt(
+            "SELECT snapshot FROM hub_work_items
+             WHERE provider = $1 AND host = $2 AND repository = $3
+               AND repository_id IS NOT DISTINCT FROM $4 AND source_provider = $5
+               AND source_host = $6 AND source_repository = $7 AND source_issue = $8
+             FOR UPDATE",
+            &[
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                &who.repository_id,
+                &source.provider,
+                &source.host,
+                &source.repository,
+                &source.issue,
+            ],
+        )?
+    } else {
+        tx.query_opt(
+            "SELECT snapshot FROM hub_work_items
+             WHERE provider = $1 AND host = $2 AND repository = $3
+               AND repository_id IS NOT DISTINCT FROM $4 AND owner = $5 AND request_key = $6
+             FOR UPDATE",
+            &[
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                &who.repository_id,
+                &who.owner.id,
+                &start.request_key,
+            ],
+        )?
+    };
+    row.map(|row| {
+        let snapshot: String = row.get(0);
+        let mut item: WorkItem = json_value(&snapshot)?;
+        project_claim(tx, &mut item, now)?;
+        Ok(item)
+    })
+    .transpose()
+}
+
+fn start_in(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    start: &WorkStart,
+    now: i64,
+) -> Result<WorkStartResult> {
+    if who.read_only {
+        return Err(HubError::Unauthorized);
+    }
+    let scope = start.validate(who)?;
+    if let Some(mut item) = resolve_work(tx, who, start, now)? {
+        if start.role != WorkRole::Lead {
+            let previous_item_bytes = stored_work_item_bytes(tx, &item.id)?;
+            if let Some(existing) = item
+                .participants
+                .iter()
+                .find(|p| p.token == who.token && p.session == start.session)
+            {
+                if existing.role == WorkRole::Lead {
+                    return Err(HubError::Invalid(
+                        "the lead role can only change through takeover".into(),
+                    ));
+                }
+                if existing.role == start.role {
+                    return Ok(WorkStartResult {
+                        item,
+                        created: false,
+                        joined: false,
+                        took_over: false,
+                        conflict: None,
+                    });
+                }
+                item.participants
+                    .retain(|p| p.token != who.token || p.session != start.session);
+            } else if item.participants.len() >= 100 {
+                return Err(HubError::Invalid(
+                    "work has the maximum of 100 participants".into(),
+                ));
+            }
+            item.participants.push(WorkParticipant {
+                owner: who.owner.id.clone(),
+                login: who.owner.login.clone(),
+                token: who.token.clone(),
+                agent: who.agent.clone(),
+                session: start.session.clone(),
+                role: start.role,
+            });
+            item.participants.sort_by(|a, b| {
+                (&a.owner, &a.token, &a.session).cmp(&(&b.owner, &b.token, &b.session))
+            });
+            item.updated_at = now;
+            let event = work_event("work_joined", &item)?;
+            let seq = append(tx, &event)?;
+            item.updated_seq = seq;
+            tx.execute(
+                "INSERT INTO hub_work_participants
+                    (work, token, owner, agent, session, role, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+                 ON CONFLICT (work, token, session) DO UPDATE SET role = excluded.role,
+                    agent = excluded.agent, updated_at = excluded.updated_at",
+                &[
+                    &item.id,
+                    &who.token,
+                    &who.owner.id,
+                    &who.agent,
+                    &start.session,
+                    &role_name(start.role),
+                    &now,
+                ],
+            )?;
+            save_work_version(tx, &item, seq)?;
+            let snapshot = json_string(&item)?;
+            let delta = work_transition_payload_bytes(&snapshot, &event)?
+                .checked_sub(previous_item_bytes)
+                .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+            adjust_work_payload_capacity(tx, who, delta, now)?;
+            return Ok(WorkStartResult {
+                item,
+                created: false,
+                joined: true,
+                took_over: false,
+                conflict: None,
+            });
+        }
+        if item.lead_token == who.token && item.lead_session == start.session {
+            if item.title != start.title
+                || item.scope != scope
+                || item.branch != start.branch
+                || item.worktree != start.worktree
+                || item.next_action != start.next_action
+                || item.depends_on != start.depends_on
+                || item.related_work != start.related_work
+            {
+                return Ok(WorkStartResult {
+                    conflict: Some(WorkStartConflict {
+                        kind: WorkConflictKind::MetadataChanged,
+                        current_generation: item.generation,
+                    }),
+                    item,
+                    created: false,
+                    joined: false,
+                    took_over: false,
+                });
+            }
+            return Ok(WorkStartResult {
+                item,
+                created: false,
+                joined: false,
+                took_over: false,
+                conflict: None,
+            });
+        }
+        if start.takeover_generation != Some(item.generation) {
+            let kind = if start.takeover_generation.is_some() {
+                WorkConflictKind::GenerationChanged
+            } else if item.claim_status == ClaimStatus::Stale {
+                WorkConflictKind::StaleTakeoverRequired
+            } else {
+                WorkConflictKind::ClaimHeld
+            };
+            return Ok(WorkStartResult {
+                conflict: Some(WorkStartConflict {
+                    kind,
+                    current_generation: item.generation,
+                }),
+                item,
+                created: false,
+                joined: false,
+                took_over: false,
+            });
+        }
+        if item.claim_status != ClaimStatus::Stale && item.state != WorkState::Handover {
+            return Ok(WorkStartResult {
+                conflict: Some(WorkStartConflict {
+                    kind: WorkConflictKind::ClaimHeld,
+                    current_generation: item.generation,
+                }),
+                item,
+                created: false,
+                joined: false,
+                took_over: false,
+            });
+        }
+        let previous_item_bytes = stored_work_item_bytes(tx, &item.id)?;
+        for participant in &mut item.participants {
+            if participant.role == WorkRole::Lead {
+                participant.role = WorkRole::Helper;
+            }
+        }
+        if !item.participants.iter().any(|participant| {
+            participant.token == who.token && participant.session == start.session
+        }) && item.participants.len() >= 100
+        {
+            return Err(HubError::Invalid(
+                "work has the maximum of 100 participants".into(),
+            ));
+        }
+        item.participants.retain(|participant| {
+            participant.token != who.token || participant.session != start.session
+        });
+        item.participants.push(WorkParticipant {
+            owner: who.owner.id.clone(),
+            login: who.owner.login.clone(),
+            token: who.token.clone(),
+            agent: who.agent.clone(),
+            session: start.session.clone(),
+            role: WorkRole::Lead,
+        });
+        item.lead_token = who.token.clone();
+        item.lead_agent = who.agent.clone();
+        item.lead_session = start.session.clone();
+        item.generation += 1;
+        item.state = WorkState::Active;
+        item.claim_status = ClaimStatus::Active;
+        item.last_checkin_at = now;
+        item.updated_at = now;
+        let event = work_event("work_takeover", &item)?;
+        let seq = append(tx, &event)?;
+        item.updated_seq = seq;
+        tx.execute(
+            "UPDATE hub_work_participants SET role = 'helper', updated_at = $2
+             WHERE work = $1 AND role = 'lead'",
+            &[&item.id, &now],
+        )?;
+        tx.execute(
+            "INSERT INTO hub_work_participants
+                (work, token, owner, agent, session, role, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, 'lead', $6, $6)
+             ON CONFLICT (work, token, session) DO UPDATE SET role = 'lead',
+                owner = excluded.owner, agent = excluded.agent, updated_at = excluded.updated_at",
+            &[
+                &item.id,
+                &who.token,
+                &who.owner.id,
+                &who.agent,
+                &start.session,
+                &now,
+            ],
+        )?;
+        save_work_version(tx, &item, seq)?;
+        let snapshot = json_string(&item)?;
+        let delta = work_transition_payload_bytes(&snapshot, &event)?
+            .checked_sub(previous_item_bytes)
+            .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+        adjust_work_payload_capacity(tx, who, delta, now)?;
+        return Ok(WorkStartResult {
+            item,
+            created: false,
+            joined: false,
+            took_over: true,
+            conflict: None,
+        });
+    }
+    if start.work_id.is_some() {
+        return Err(HubError::Invalid("unknown work item".into()));
+    }
+    relation_targets(tx, who, &start.depends_on)?;
+    relation_targets(tx, who, &start.related_work)?;
+    let id = new_id("wrk")?;
+    let source = match (&start.source, &start.request_key) {
+        (Some(source), None) => WorkSource::Forge {
+            provider: source.provider.clone(),
+            host: source.host.clone(),
+            repository: source.repository.clone(),
+            issue: source.issue.clone(),
+        },
+        (None, Some(request_key)) => WorkSource::Native {
+            request_key: request_key.clone(),
+        },
+        _ => return Err(HubError::Invalid("invalid work resolver".into())),
+    };
+    let mut item = WorkItem {
+        id: id.clone(),
+        repository: who.repository.clone(),
+        owner: who.owner.id.clone(),
+        owner_login: who.owner.login.clone(),
+        source,
+        title: start.title.clone(),
+        state: WorkState::Active,
+        claim_status: ClaimStatus::Active,
+        last_checkin_at: now,
+        generation: 1,
+        lead_token: who.token.clone(),
+        lead_agent: who.agent.clone(),
+        lead_session: start.session.clone(),
+        participants: vec![WorkParticipant {
+            owner: who.owner.id.clone(),
+            login: who.owner.login.clone(),
+            token: who.token.clone(),
+            agent: who.agent.clone(),
+            session: start.session.clone(),
+            role: WorkRole::Lead,
+        }],
+        scope,
+        branch: start.branch.clone(),
+        worktree: start.worktree.clone(),
+        next_action: start.next_action.clone(),
+        current: None,
+        blocker: None,
+        depends_on: start.depends_on.clone(),
+        related_work: start.related_work.clone(),
+        created_at: now,
+        updated_at: now,
+        created_seq: 0,
+        updated_seq: 0,
+    };
+    let event = work_event("work_started", &item)?;
+    let seq = append(tx, &event)?;
+    item.created_seq = seq;
+    item.updated_seq = seq;
+    let (source_provider, source_host, source_repository, source_issue, request_key) =
+        match &item.source {
+            WorkSource::Native { request_key } => (None, None, None, None, Some(request_key)),
+            WorkSource::Forge {
+                provider,
+                host,
+                repository,
+                issue,
+            } => (
+                Some(provider),
+                Some(host),
+                Some(repository),
+                Some(issue),
+                None,
+            ),
+        };
+    let scope_json = json_string(&item.scope)?;
+    let snapshot = json_string(&item)?;
+    tx.execute(
+        "INSERT INTO hub_work_items
+            (id, provider, host, repository, repository_id, owner, lead_token, lead_agent,
+             lead_session, generation, source_provider, source_host, source_repository,
+             source_issue, request_key, title, state, scope, branch, worktree, next_action,
+             current_checkpoint, snapshot, created_at, updated_at, created_seq, updated_seq)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, $10, $11, $12, $13, $14,
+                 $15, 'active', $16, $17, $18, $19, NULL, $20, $21, $21, $22, $22)",
+        &[
+            &item.id,
+            &who.owner.identity.provider,
+            &who.owner.identity.host,
+            &who.repository,
+            &who.repository_id,
+            &who.owner.id,
+            &who.token,
+            &who.agent,
+            &start.session,
+            &source_provider,
+            &source_host,
+            &source_repository,
+            &source_issue,
+            &request_key,
+            &item.title,
+            &scope_json,
+            &item.branch,
+            &item.worktree,
+            &item.next_action,
+            &snapshot,
+            &now,
+            &seq,
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO hub_work_participants
+            (work, token, owner, agent, session, role, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, 'lead', $6, $6)",
+        &[
+            &id,
+            &who.token,
+            &who.owner.id,
+            &who.agent,
+            &start.session,
+            &now,
+        ],
+    )?;
+    replace_relations(tx, who, &id, &item.depends_on, &item.related_work)?;
+    tx.execute(
+        "INSERT INTO hub_work_versions (work, event_seq, state, snapshot)
+         VALUES ($1, $2, 'active', $3)",
+        &[&id, &seq, &snapshot],
+    )?;
+    adjust_work_payload_capacity(
+        tx,
+        who,
+        work_transition_payload_bytes(&snapshot, &event)?,
+        now,
+    )?;
+    Ok(WorkStartResult {
+        item,
+        created: true,
+        joined: false,
+        took_over: false,
+        conflict: None,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn briefing_page(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    delivery: Option<String>,
+    from: i64,
+    through: i64,
+    after: i64,
+    work_after: Option<String>,
+    work_done: bool,
+    limit: usize,
+    now: i64,
+) -> Result<Briefing> {
+    if after < from || after > through {
+        return Err(HubError::Invalid(
+            "briefing event cursor is outside its delivery".into(),
+        ));
+    }
+    let (event_floor, snapshot_floor) = work_retention_floors(tx, who)?;
+    if through < snapshot_floor {
+        return Err(HubError::Invalid(
+            "briefing watermark is older than retained work history".into(),
+        ));
+    }
+    let mut items = Vec::new();
+    let mut more_work = false;
+    let mut bytes = 0_usize;
+    if !work_done {
+        let rows = tx.query(
+            "SELECT v.snapshot FROM hub_work_items w JOIN hub_work_versions v ON v.work = w.id
+             WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+               AND w.repository_id IS NOT DISTINCT FROM $4 AND w.id > $5
+               AND v.event_seq = (SELECT MAX(v2.event_seq) FROM hub_work_versions v2
+                   WHERE v2.work = w.id AND v2.event_seq <= $6)
+               AND v.state <> 'finished'
+             ORDER BY w.id LIMIT $7",
+            &[
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                &who.repository_id,
+                &work_after.as_deref().unwrap_or(""),
+                &through,
+                &((limit + 1) as i64),
+            ],
+        )?;
+        more_work = rows.len() > limit;
+        for row in rows.iter().take(limit) {
+            let snapshot: String = row.get(0);
+            if !items.is_empty() && bytes.saturating_add(snapshot.len()) > MAX_BRIEFING_BYTES {
+                more_work = true;
+                break;
+            }
+            bytes = bytes.saturating_add(snapshot.len());
+            let mut item: WorkItem = json_value(&snapshot)?;
+            project_claim(tx, &mut item, now)?;
+            items.push(item);
+        }
+    }
+    let next_work_after = items
+        .last()
+        .map(|item| item.id.clone())
+        .or_else(|| work_after.clone());
+    let next_work_done = work_done || !more_work;
+    let rows = tx.query(
+        "SELECT e.seq, e.at, e.kind, e.subject, v.snapshot
+         FROM hub_events e JOIN hub_work_versions v ON v.event_seq = e.seq
+         JOIN hub_work_items w ON w.id = v.work
+         WHERE e.seq > $1 AND e.seq <= $2 AND w.provider = $3 AND w.host = $4
+           AND w.repository = $5 AND w.repository_id IS NOT DISTINCT FROM $6
+         ORDER BY e.seq LIMIT $7",
+        &[
+            &after,
+            &through,
+            &who.owner.identity.provider,
+            &who.owner.identity.host,
+            &who.repository,
+            &who.repository_id,
+            &((limit + 1) as i64),
+        ],
+    )?;
+    let mut more_events = rows.len() > limit;
+    let mut events = Vec::new();
+    for row in rows.iter().take(limit) {
+        let snapshot: String = row.get(4);
+        if !events.is_empty() && bytes.saturating_add(snapshot.len()) > MAX_BRIEFING_BYTES {
+            more_events = true;
+            break;
+        }
+        bytes = bytes.saturating_add(snapshot.len());
+        let mut item: WorkItem = json_value(&snapshot)?;
+        project_claim(tx, &mut item, now)?;
+        events.push(WorkEvent {
+            seq: row.get(0),
+            at: row.get(1),
+            kind: row.get(2),
+            work_id: row.get(3),
+            item,
+        });
+    }
+    let next_after = if more_events {
+        events.last().map_or(after, |event| event.seq)
+    } else {
+        through
+    };
+    let minimum: Option<i64> = tx.query_one("SELECT MIN(seq) FROM hub_events", &[])?.get(0);
+    let retention_gap =
+        from < event_floor || minimum.is_some_and(|minimum| from < minimum.saturating_sub(1));
+    Ok(Briefing {
+        delivery,
+        from,
+        through,
+        after,
+        work_after,
+        next_after,
+        next_work_after,
+        next_work_done,
+        items,
+        events,
+        retention_gap,
+        complete: next_after == through && next_work_done,
+    })
 }
 
 /// Rechecks inside the write transaction that the token is still usable; the
@@ -462,6 +1381,61 @@ fn lock_repository(tx: &mut postgres::Transaction<'_>, repository: &str) -> Resu
         &[&INTENT_LOCK_CLASS, &repository],
     )?;
     Ok(())
+}
+
+fn lock_work_delivery(tx: &mut postgres::Transaction<'_>, who: &WorkWho) -> Result<()> {
+    let scope = json_string(&(
+        &who.owner.id,
+        &who.owner.identity.provider,
+        &who.owner.identity.host,
+        &who.repository,
+        who.repository_id,
+    ))?;
+    tx.execute(
+        "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+        &[&WORK_DELIVERY_LOCK_CLASS, &scope],
+    )?;
+    Ok(())
+}
+
+fn lock_work_repository(
+    tx: &mut postgres::Transaction<'_>,
+    provider: &str,
+    host: &str,
+    repository: &str,
+    repository_id: Option<i64>,
+) -> Result<()> {
+    let scope = json_string(&(provider, host, repository, repository_id))?;
+    tx.execute(
+        "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+        &[&WORK_CAPACITY_LOCK_CLASS, &scope],
+    )?;
+    Ok(())
+}
+
+fn lock_work_repository_shared(
+    tx: &mut postgres::Transaction<'_>,
+    provider: &str,
+    host: &str,
+    repository: &str,
+    repository_id: Option<i64>,
+) -> Result<()> {
+    let scope = json_string(&(provider, host, repository, repository_id))?;
+    tx.execute(
+        "SELECT pg_advisory_xact_lock_shared($1, hashtext($2))",
+        &[&WORK_CAPACITY_LOCK_CLASS, &scope],
+    )?;
+    Ok(())
+}
+
+fn lock_work_capacity(tx: &mut postgres::Transaction<'_>, who: &WorkWho) -> Result<()> {
+    lock_work_repository(
+        tx,
+        &who.owner.identity.provider,
+        &who.owner.identity.host,
+        &who.repository,
+        who.repository_id,
+    )
 }
 
 /// The announce of `intent` (validated into `keys`) inside the caller's transaction.
@@ -2120,6 +3094,939 @@ impl Store for PgStore {
             }
             tx.commit()?;
             Ok(p)
+        })
+    }
+
+    fn work_start(&self, token: &str, start: &WorkStart, now: i64) -> Result<WorkStartResult> {
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            lock_work_capacity(&mut tx, &who)?;
+            let resolver = match (&start.work_id, &start.source, &start.request_key) {
+                (Some(id), None, None) => vec!["work", id],
+                (None, Some(source), None) => vec![
+                    "forge",
+                    &source.provider,
+                    &source.host,
+                    &source.repository,
+                    &source.issue,
+                ],
+                (None, None, Some(key)) => vec!["native", &who.owner.id, key],
+                _ => vec!["invalid"],
+            };
+            let lock = json_string(&(
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                who.repository_id,
+                &who.repository,
+                resolver,
+            ))?;
+            tx.execute(
+                "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+                &[&0x6167_6577_i32, &lock],
+            )?;
+            let result = start_in(&mut tx, &who, start, now)?;
+            tx.commit()?;
+            Ok(result)
+        })
+    }
+
+    fn work_start_auto(&self, token: &str, start: &WorkStart, now: i64) -> Result<WorkStartResult> {
+        if start.work_id.is_some() || start.source.is_some() || start.request_key.is_some() {
+            return Err(HubError::Invalid(
+                "automatic start does not accept a work resolver".into(),
+            ));
+        }
+        if start.role != WorkRole::Lead || start.takeover_generation.is_some() {
+            return Err(HubError::Invalid(
+                "automatic start requires a new lead without takeover".into(),
+            ));
+        }
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            if who.read_only {
+                return Err(HubError::Unauthorized);
+            }
+            lock_work_capacity(&mut tx, &who)?;
+            let mut planned = start.clone();
+            planned.request_key = Some("automatic-session-start".into());
+            let planned_scope = planned.validate(&who)?;
+            let lock = json_string(&(token, &start.session))?;
+            tx.execute(
+                "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+                &[&0x6167_6577_i32, &lock],
+            )?;
+            if let Some(item) = unfinished_for_session(&mut tx, &who, &start.session, now)? {
+                let changed = item.title != start.title
+                    || item.scope != planned_scope
+                    || item.branch != start.branch
+                    || item.worktree != start.worktree
+                    || item.next_action != start.next_action
+                    || item.depends_on != start.depends_on
+                    || item.related_work != start.related_work;
+                let conflict = changed.then_some(WorkStartConflict {
+                    kind: WorkConflictKind::SessionGoalChanged,
+                    current_generation: item.generation,
+                });
+                tx.commit()?;
+                return Ok(WorkStartResult {
+                    item,
+                    created: false,
+                    joined: false,
+                    took_over: false,
+                    conflict,
+                });
+            }
+            let mut created = start.clone();
+            created.request_key = Some(new_id("req")?);
+            let result = start_in(&mut tx, &who, &created, now)?;
+            tx.commit()?;
+            Ok(result)
+        })
+    }
+
+    fn work_checkpoint(
+        &self,
+        token: &str,
+        checkpoint: &WorkCheckpoint,
+        now: i64,
+    ) -> Result<WorkCheckpointResult> {
+        checkpoint.validate()?;
+        let request = json_string(checkpoint)?;
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            if who.read_only {
+                return Err(HubError::Unauthorized);
+            }
+            lock_work_capacity(&mut tx, &who)?;
+            let mut item = scoped_work(&mut tx, &who, &checkpoint.work_id, now, true)?
+                .ok_or_else(|| HubError::Invalid("unknown work item".into()))?;
+            if let Some(row) = tx.query_opt(
+                "SELECT o.request, v.snapshot, o.event_seq FROM hub_work_checkpoint_ops o
+                 JOIN hub_work_versions v ON v.work = o.work AND v.event_seq = o.event_seq
+                 WHERE o.work = $1 AND o.operation_id = $2",
+                &[&checkpoint.work_id, &checkpoint.operation_id],
+            )? {
+                let previous: String = row.get(0);
+                if previous != request {
+                    return Err(HubError::Invalid(
+                        "checkpoint operation_id was already used for another request".into(),
+                    ));
+                }
+                let snapshot: String = row.get(1);
+                let committed: WorkItem = json_value(&snapshot)?;
+                if committed.lead_token != token
+                    || committed.lead_session != checkpoint.session
+                    || committed.generation != checkpoint.generation
+                {
+                    return Err(HubError::Invalid(
+                        "checkpoint operation belongs to another lead session".into(),
+                    ));
+                }
+                let event_seq: i64 = row.get(2);
+                tx.commit()?;
+                return Ok(WorkCheckpointResult {
+                    item,
+                    receipt: CheckpointReceipt {
+                        work_id: checkpoint.work_id.clone(),
+                        operation_id: checkpoint.operation_id.clone(),
+                        generation: committed.generation,
+                        event_seq,
+                        replayed: true,
+                    },
+                });
+            }
+            if item.generation != checkpoint.generation {
+                return Err(HubError::Invalid(format!(
+                    "checkpoint generation is fenced; current generation is {}",
+                    item.generation
+                )));
+            }
+            if item.lead_token != token || item.lead_session != checkpoint.session {
+                return Err(HubError::Invalid(
+                    "only the current lead session may checkpoint work".into(),
+                ));
+            }
+            let expected = checkpoint.expected_updated_seq.ok_or_else(|| {
+                HubError::Invalid("expected_updated_seq is required for a new checkpoint".into())
+            })?;
+            if expected != item.updated_seq {
+                return Err(HubError::Invalid(format!(
+                    "checkpoint receipt expired or work changed; current updated_seq is {}",
+                    item.updated_seq
+                )));
+            }
+            let previous_item_bytes = stored_work_item_bytes(&mut tx, &item.id)?;
+            let referenced = checkpoint
+                .source_refs
+                .iter()
+                .filter_map(|source| match source {
+                    SourceRef::Work { work_id } => Some(work_id.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            relation_targets(&mut tx, &who, &referenced)?;
+            replace_relations(
+                &mut tx,
+                &who,
+                &item.id,
+                &checkpoint.depends_on,
+                &checkpoint.related_work,
+            )?;
+            item.state = checkpoint.state();
+            item.claim_status = ClaimStatus::Active;
+            item.last_checkin_at = now;
+            item.next_action = checkpoint.next_action.clone();
+            if let Some(scope) = checkpoint.normalized_scope()? {
+                item.scope = scope;
+            }
+            if checkpoint.branch.is_some() {
+                item.branch = checkpoint.branch.clone();
+            }
+            if checkpoint.worktree.is_some() {
+                item.worktree = checkpoint.worktree.clone();
+            }
+            let current = Checkpoint {
+                kind: checkpoint.kind,
+                summary: checkpoint.summary.clone(),
+                next_action: checkpoint.next_action.clone(),
+                source_refs: checkpoint.source_refs.clone(),
+                at: now,
+                token: token.to_owned(),
+                agent: who.agent.clone(),
+                session: checkpoint.session.clone(),
+                generation: checkpoint.generation,
+            };
+            if checkpoint.kind == super::work::CheckpointKind::Blocker {
+                item.blocker = Some(current.clone());
+            } else if checkpoint.resolve_blocker {
+                item.blocker = None;
+            }
+            item.current = Some(current);
+            item.depends_on = checkpoint.depends_on.clone();
+            item.related_work = checkpoint.related_work.clone();
+            item.updated_at = now;
+            let event = work_event("work_checkpoint", &item)?;
+            let seq = append(&mut tx, &event)?;
+            item.updated_seq = seq;
+            save_work_version(&mut tx, &item, seq)?;
+            tx.execute(
+                "INSERT INTO hub_work_checkpoint_ops
+                    (work, operation_id, request, event_seq)
+                 VALUES ($1, $2, $3, $4)",
+                &[&item.id, &checkpoint.operation_id, &request, &seq],
+            )?;
+            let snapshot = json_string(&item)?;
+            let request_bytes = work_payload_row_bytes(request.len())?;
+            let delta = work_transition_payload_bytes(&snapshot, &event)?
+                .checked_sub(previous_item_bytes)
+                .and_then(|bytes| bytes.checked_add(request_bytes))
+                .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+            adjust_work_payload_capacity(&mut tx, &who, delta, now)?;
+            tx.commit()?;
+            Ok(WorkCheckpointResult {
+                item,
+                receipt: CheckpointReceipt {
+                    work_id: checkpoint.work_id.clone(),
+                    operation_id: checkpoint.operation_id.clone(),
+                    generation: checkpoint.generation,
+                    event_seq: seq,
+                    replayed: false,
+                },
+            })
+        })
+    }
+
+    fn work_get(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkItem>> {
+        self.run(true, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            let item = scoped_work(&mut tx, &who, id, now, false)?;
+            tx.commit()?;
+            Ok(item)
+        })
+    }
+
+    fn work_for_session(&self, token: &str, session: &str, now: i64) -> Result<Option<WorkItem>> {
+        super::intent::text("session", session, 255)?;
+        self.run(true, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            let item = unfinished_for_session(&mut tx, &who, session, now)?;
+            tx.commit()?;
+            Ok(item)
+        })
+    }
+
+    fn session_name_for(&self, token: &str, session: Option<&str>, now: i64) -> Result<String> {
+        self.run(true, |client| {
+            let mut tx = client.transaction()?;
+            work_who(&mut tx, token, now)?;
+            let name = session_name(&mut tx, token, session, now)?;
+            tx.commit()?;
+            Ok(name)
+        })
+    }
+
+    fn work_briefing(&self, token: &str, query: &BriefingQuery, now: i64) -> Result<Briefing> {
+        query.validate()?;
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            if who.read_only {
+                lock_work_repository_shared(
+                    &mut tx,
+                    &who.owner.identity.provider,
+                    &who.owner.identity.host,
+                    &who.repository,
+                    who.repository_id,
+                )?;
+            } else {
+                lock_work_capacity(&mut tx, &who)?;
+                lock_work_delivery(&mut tx, &who)?;
+            }
+            let ack_cursor = tx
+                .query_opt(
+                    "SELECT cursor FROM hub_work_acks
+                     WHERE owner = $1 AND provider = $2 AND host = $3 AND repository = $4
+                       AND repository_id IS NOT DISTINCT FROM $5",
+                    &[
+                        &who.owner.id,
+                        &who.owner.identity.provider,
+                        &who.owner.identity.host,
+                        &who.repository,
+                        &who.repository_id,
+                    ],
+                )?
+                .map_or(0, |row| row.get(0));
+            if who.read_only {
+                if query.delivery.is_some() {
+                    return Err(HubError::Invalid(
+                        "read-only briefing does not accept a delivery".into(),
+                    ));
+                }
+                let after = query.after.unwrap_or(ack_cursor);
+                if query.after.is_none() && (query.work_after.is_some() || query.work_done) {
+                    return Err(HubError::Invalid(
+                        "first briefing page cannot have a work cursor".into(),
+                    ));
+                }
+                let through = match query.through {
+                    Some(through) => through,
+                    None => tx
+                        .query_one("SELECT COALESCE(MAX(seq), 0) FROM hub_events", &[])?
+                        .get(0),
+                };
+                let page = briefing_page(
+                    &mut tx,
+                    &who,
+                    None,
+                    after,
+                    through,
+                    after,
+                    query.work_after.clone(),
+                    query.work_done,
+                    query.limit,
+                    now,
+                )?;
+                tx.commit()?;
+                return Ok(page);
+            }
+            if let Some(delivery) = &query.delivery {
+                let row = tx
+                    .query_opt(
+                        "SELECT from_seq, through_seq, page_after, page_work_after, page_work_done,
+                                next_after, next_work_after, next_work_done, page, complete
+                         FROM hub_work_deliveries WHERE id = $1 AND owner = $2 AND provider = $3
+                           AND host = $4 AND repository = $5
+                           AND repository_id IS NOT DISTINCT FROM $6 FOR UPDATE",
+                        &[
+                            &delivery,
+                            &who.owner.id,
+                            &who.owner.identity.provider,
+                            &who.owner.identity.host,
+                            &who.repository,
+                            &who.repository_id,
+                        ],
+                    )?
+                    .ok_or_else(|| HubError::Invalid("unknown briefing delivery".into()))?;
+                let from: i64 = row.get(0);
+                let through: i64 = row.get(1);
+                let page_after: i64 = row.get(2);
+                let page_work_after: Option<String> = row.get(3);
+                let page_work_done: bool = row.get(4);
+                let next_after: i64 = row.get(5);
+                let next_work_after: Option<String> = row.get(6);
+                let next_work_done: bool = row.get(7);
+                let cached: String = row.get(8);
+                let complete: bool = row.get(9);
+                if query.through != Some(through) || query.after.is_none() {
+                    return Err(HubError::Invalid(
+                        "delivery requires its exact through and cursors".into(),
+                    ));
+                }
+                let after = query.after.unwrap_or_default();
+                if after == page_after
+                    && query.work_after == page_work_after
+                    && query.work_done == page_work_done
+                {
+                    let page = json_value(&cached)?;
+                    tx.commit()?;
+                    return Ok(page);
+                }
+                if complete
+                    || after != next_after
+                    || query.work_after != next_work_after
+                    || query.work_done != next_work_done
+                {
+                    return Err(HubError::Invalid(
+                        "briefing cursors must retry the previous page or continue exactly".into(),
+                    ));
+                }
+                let page = briefing_page(
+                    &mut tx,
+                    &who,
+                    Some(delivery.clone()),
+                    from,
+                    through,
+                    after,
+                    query.work_after.clone(),
+                    query.work_done,
+                    query.limit,
+                    now,
+                )?;
+                let page_json = json_string(&page)?;
+                check_work_delivery_page(&page_json)?;
+                tx.execute(
+                    "UPDATE hub_work_deliveries SET page_after = $2, page_work_after = $3,
+                         page_work_done = $4, next_after = $5, next_work_after = $6,
+                         next_work_done = $7, page = $8, complete = $9, updated_at = $10
+                     WHERE id = $1",
+                    &[
+                        &delivery,
+                        &page.after,
+                        &page.work_after,
+                        &query.work_done,
+                        &page.next_after,
+                        &page.next_work_after,
+                        &page.next_work_done,
+                        &page_json,
+                        &page.complete,
+                        &now,
+                    ],
+                )?;
+                tx.commit()?;
+                return Ok(page);
+            }
+            if query.through.is_some()
+                || query.work_after.is_some()
+                || query.work_done
+                || query.after.is_some_and(|after| after != ack_cursor)
+            {
+                return Err(HubError::Invalid(
+                    "a new delivery starts at the acknowledged cursor without paging cursors"
+                        .into(),
+                ));
+            }
+            let released: i64 = tx
+                .query_one(
+                    "SELECT COALESCE(SUM(CASE WHEN NOT acknowledged THEN 4194304::bigint
+                                ELSE octet_length(page)::bigint + 256 END), 0)::bigint
+                     FROM hub_work_deliveries WHERE updated_at < $1
+                       AND provider = $2 AND host = $3 AND repository = $4
+                       AND repository_id IS NOT DISTINCT FROM $5",
+                    &[
+                        &now.saturating_sub(86_400),
+                        &who.owner.identity.provider,
+                        &who.owner.identity.host,
+                        &who.repository,
+                        &who.repository_id,
+                    ],
+                )?
+                .get(0);
+            tx.execute(
+                "DELETE FROM hub_work_deliveries WHERE updated_at < $1
+                   AND provider = $2 AND host = $3 AND repository = $4
+                   AND repository_id IS NOT DISTINCT FROM $5",
+                &[
+                    &now.saturating_sub(86_400),
+                    &who.owner.identity.provider,
+                    &who.owner.identity.host,
+                    &who.repository,
+                    &who.repository_id,
+                ],
+            )?;
+            let open: i64 = tx
+                .query_one(
+                    "SELECT COUNT(*) FROM hub_work_deliveries
+                     WHERE owner = $1 AND provider = $2 AND host = $3 AND repository = $4
+                       AND repository_id IS NOT DISTINCT FROM $5 AND NOT acknowledged",
+                    &[
+                        &who.owner.id,
+                        &who.owner.identity.provider,
+                        &who.owner.identity.host,
+                        &who.repository,
+                        &who.repository_id,
+                    ],
+                )?
+                .get(0);
+            if open >= 8 {
+                return Err(HubError::Invalid(
+                    "too many unacknowledged briefing deliveries".into(),
+                ));
+            }
+            let through: i64 = tx
+                .query_one("SELECT COALESCE(MAX(seq), 0) FROM hub_events", &[])?
+                .get(0);
+            let delivery = new_id("dlv")?;
+            let page = briefing_page(
+                &mut tx,
+                &who,
+                Some(delivery.clone()),
+                ack_cursor,
+                through,
+                ack_cursor,
+                None,
+                false,
+                query.limit,
+                now,
+            )?;
+            let page_json = json_string(&page)?;
+            check_work_delivery_page(&page_json)?;
+            tx.execute(
+                "INSERT INTO hub_work_deliveries
+                    (id, owner, provider, host, repository, repository_id, from_seq, through_seq,
+                     page_after, page_work_after, page_work_done, next_after, next_work_after,
+                     next_work_done, page, complete, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $7, NULL, FALSE, $9, $10, $11,
+                         $12, $13, $14, $14)",
+                &[
+                    &delivery,
+                    &who.owner.id,
+                    &who.owner.identity.provider,
+                    &who.owner.identity.host,
+                    &who.repository,
+                    &who.repository_id,
+                    &ack_cursor,
+                    &through,
+                    &page.next_after,
+                    &page.next_work_after,
+                    &page.next_work_done,
+                    &page_json,
+                    &page.complete,
+                    &now,
+                ],
+            )?;
+            adjust_work_payload_capacity(
+                &mut tx,
+                &who,
+                WORK_DELIVERY_RESERVATION_BYTES
+                    .checked_sub(released)
+                    .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?,
+                now,
+            )?;
+            tx.commit()?;
+            Ok(page)
+        })
+    }
+
+    fn work_ack(&self, token: &str, ack: &BriefingAck, now: i64) -> Result<()> {
+        ack.validate()?;
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            if who.read_only {
+                return Err(HubError::Unauthorized);
+            }
+            lock_work_capacity(&mut tx, &who)?;
+            lock_work_delivery(&mut tx, &who)?;
+            let row = tx
+                .query_opt(
+                    "SELECT through_seq, page, acknowledged FROM hub_work_deliveries
+                     WHERE id = $1 AND owner = $2 AND provider = $3 AND host = $4
+                       AND repository = $5 AND repository_id IS NOT DISTINCT FROM $6
+                       AND complete FOR UPDATE",
+                    &[
+                        &ack.delivery,
+                        &who.owner.id,
+                        &who.owner.identity.provider,
+                        &who.owner.identity.host,
+                        &who.repository,
+                        &who.repository_id,
+                    ],
+                )?
+                .ok_or_else(|| HubError::Invalid("delivery is unknown or incomplete".into()))?;
+            let through: i64 = row.get(0);
+            let page: String = row.get(1);
+            let acknowledged: bool = row.get(2);
+            let changed = tx.execute(
+                "UPDATE hub_work_acks SET cursor = GREATEST(cursor, $6), updated_at = $7
+                 WHERE owner = $1 AND provider = $2 AND host = $3 AND repository = $4
+                   AND repository_id IS NOT DISTINCT FROM $5",
+                &[
+                    &who.owner.id,
+                    &who.owner.identity.provider,
+                    &who.owner.identity.host,
+                    &who.repository,
+                    &who.repository_id,
+                    &through,
+                    &now,
+                ],
+            )?;
+            if changed == 0 {
+                tx.execute(
+                    "INSERT INTO hub_work_acks
+                        (owner, provider, host, repository, repository_id, cursor, updated_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                    &[
+                        &who.owner.id,
+                        &who.owner.identity.provider,
+                        &who.owner.identity.host,
+                        &who.repository,
+                        &who.repository_id,
+                        &through,
+                        &now,
+                    ],
+                )?;
+            }
+            tx.execute(
+                "UPDATE hub_work_deliveries SET acknowledged = TRUE, updated_at = $2
+                 WHERE id = $1",
+                &[&ack.delivery, &now],
+            )?;
+            if !acknowledged {
+                adjust_work_payload_capacity(
+                    &mut tx,
+                    &who,
+                    work_payload_row_bytes(page.len())?
+                        .checked_sub(WORK_DELIVERY_RESERVATION_BYTES)
+                        .ok_or_else(|| {
+                            HubError::Invalid("work payload size is too large".into())
+                        })?,
+                    now,
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    fn work_compact(
+        &self,
+        scope: &WorkRepositoryScope,
+        before: i64,
+        apply: bool,
+        now: i64,
+    ) -> Result<WorkCompaction> {
+        scope.validate()?;
+        if before < 0 || before > now.saturating_sub(86_400) {
+            return Err(HubError::Invalid(
+                "work compaction cutoff must be at least 24 hours old".into(),
+            ));
+        }
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            lock_work_repository(
+                &mut tx,
+                &scope.provider,
+                &scope.host,
+                &scope.repository,
+                scope.repository_id,
+            )?;
+            let active_deliveries: i64 = tx
+                .query_one(
+                    "SELECT COUNT(*) FROM hub_work_deliveries
+                     WHERE provider = $1 AND host = $2 AND repository = $3
+                       AND repository_id IS NOT DISTINCT FROM $4
+                       AND NOT acknowledged AND updated_at >= $5",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &scope.repository,
+                        &scope.repository_id,
+                        &now.saturating_sub(86_400),
+                    ],
+                )?
+                .get(0);
+            if active_deliveries > 0 {
+                return Err(HubError::Invalid(
+                    "work compaction is blocked by an unacknowledged briefing delivery".into(),
+                ));
+            }
+            let operations: i64 = tx
+                .query_one(
+                    "SELECT COUNT(*) FROM hub_work_checkpoint_ops o
+                     JOIN hub_work_items w ON w.id = o.work
+                     JOIN hub_events e ON e.seq = o.event_seq
+                     WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+                       AND w.repository_id IS NOT DISTINCT FROM $4 AND e.at < $5",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &scope.repository,
+                        &scope.repository_id,
+                        &before,
+                    ],
+                )?
+                .get(0);
+            let versions: i64 = tx
+                .query_one(
+                    "SELECT COUNT(*) FROM hub_work_versions v
+                     JOIN hub_work_items w ON w.id = v.work
+                     JOIN hub_events e ON e.seq = v.event_seq
+                     WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+                       AND w.repository_id IS NOT DISTINCT FROM $4 AND e.at < $5
+                       AND v.event_seq <> (SELECT MAX(v2.event_seq) FROM hub_work_versions v2
+                           JOIN hub_events e2 ON e2.seq = v2.event_seq
+                           WHERE v2.work = v.work AND e2.at < $5)",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &scope.repository,
+                        &scope.repository_id,
+                        &before,
+                    ],
+                )?
+                .get(0);
+            let candidate_snapshot_floor: Option<i64> = tx
+                .query_one(
+                    "SELECT MAX(baseline) FROM (
+                         SELECT v.work, MAX(v.event_seq) AS baseline, COUNT(*) AS versions
+                         FROM hub_work_versions v JOIN hub_work_items w ON w.id = v.work
+                         JOIN hub_events e ON e.seq = v.event_seq
+                         WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+                           AND w.repository_id IS NOT DISTINCT FROM $4 AND e.at < $5
+                         GROUP BY v.work HAVING COUNT(*) > 1
+                     ) compacted",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &scope.repository,
+                        &scope.repository_id,
+                        &before,
+                    ],
+                )?
+                .get(0);
+            let (current_event_floor, current_snapshot_floor): (i64, i64) = tx
+                .query_opt(
+                    "SELECT event_floor_seq, snapshot_floor_seq FROM hub_work_retention
+                     WHERE provider = $1 AND host = $2 AND repository = $3
+                       AND repository_id IS NOT DISTINCT FROM $4",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &scope.repository,
+                        &scope.repository_id,
+                    ],
+                )?
+                .map_or((0, 0), |row| (row.get(0), row.get(1)));
+            let retention_floor =
+                candidate_snapshot_floor.map_or(current_snapshot_floor, |floor| {
+                    floor.max(current_snapshot_floor)
+                });
+            if apply {
+                tx.execute(
+                    "DELETE FROM hub_work_deliveries
+                     WHERE provider = $1 AND host = $2 AND repository = $3
+                       AND repository_id IS NOT DISTINCT FROM $4 AND updated_at < $5",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &scope.repository,
+                        &scope.repository_id,
+                        &now.saturating_sub(86_400),
+                    ],
+                )?;
+                tx.execute(
+                    "DELETE FROM hub_work_checkpoint_ops AS o USING hub_work_items AS w, hub_events AS e
+                     WHERE w.id = o.work AND e.seq = o.event_seq
+                       AND w.provider = $1 AND w.host = $2 AND w.repository = $3
+                       AND w.repository_id IS NOT DISTINCT FROM $4 AND e.at < $5",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &scope.repository,
+                        &scope.repository_id,
+                        &before,
+                    ],
+                )?;
+                tx.execute(
+                    "DELETE FROM hub_work_versions AS v USING hub_work_items AS w, hub_events AS e
+                     WHERE w.id = v.work AND e.seq = v.event_seq
+                       AND w.provider = $1 AND w.host = $2 AND w.repository = $3
+                       AND w.repository_id IS NOT DISTINCT FROM $4 AND e.at < $5
+                       AND v.event_seq <> (SELECT MAX(v2.event_seq) FROM hub_work_versions v2
+                           JOIN hub_events e2 ON e2.seq = v2.event_seq
+                           WHERE v2.work = v.work AND e2.at < $5)",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &scope.repository,
+                        &scope.repository_id,
+                        &before,
+                    ],
+                )?;
+                let removed_event_floor: Option<i64> = tx
+                    .query_one(
+                        "SELECT MAX(e.seq) FROM hub_events e
+                         JOIN hub_work_items w ON w.id = e.subject
+                         WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+                           AND w.repository_id IS NOT DISTINCT FROM $4 AND e.at < $5
+                           AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint')
+                           AND NOT EXISTS (SELECT 1 FROM hub_work_versions v WHERE v.event_seq = e.seq)
+                           AND NOT EXISTS (SELECT 1 FROM hub_work_checkpoint_ops o WHERE o.event_seq = e.seq)",
+                        &[
+                            &scope.provider,
+                            &scope.host,
+                            &scope.repository,
+                            &scope.repository_id,
+                            &before,
+                        ],
+                    )?
+                    .get(0);
+                tx.execute(
+                    "DELETE FROM hub_events AS e USING hub_work_items AS w
+                     WHERE w.id = e.subject
+                       AND w.provider = $1 AND w.host = $2 AND w.repository = $3
+                       AND w.repository_id IS NOT DISTINCT FROM $4 AND e.at < $5
+                       AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint')
+                       AND NOT EXISTS (SELECT 1 FROM hub_work_versions v WHERE v.event_seq = e.seq)
+                       AND NOT EXISTS (SELECT 1 FROM hub_work_checkpoint_ops o WHERE o.event_seq = e.seq)",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &scope.repository,
+                        &scope.repository_id,
+                        &before,
+                    ],
+                )?;
+                let event_floor = removed_event_floor.map_or(current_event_floor, |floor| {
+                    floor.max(current_event_floor)
+                });
+                if candidate_snapshot_floor.is_some() || removed_event_floor.is_some() {
+                    let changed = tx.execute(
+                        "UPDATE hub_work_retention
+                         SET event_floor_seq = GREATEST(event_floor_seq, $5),
+                             snapshot_floor_seq = GREATEST(snapshot_floor_seq, $6),
+                             updated_at = $7
+                         WHERE provider = $1 AND host = $2 AND repository = $3
+                           AND repository_id IS NOT DISTINCT FROM $4",
+                        &[
+                            &scope.provider,
+                            &scope.host,
+                            &scope.repository,
+                            &scope.repository_id,
+                            &event_floor,
+                            &retention_floor,
+                            &now,
+                        ],
+                    )?;
+                    if changed == 0 {
+                        tx.execute(
+                            "INSERT INTO hub_work_retention
+                                (provider, host, repository, repository_id, event_floor_seq,
+                                 snapshot_floor_seq, updated_at)
+                             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                            &[
+                                &scope.provider,
+                                &scope.host,
+                                &scope.repository,
+                                &scope.repository_id,
+                                &event_floor,
+                                &retention_floor,
+                                &now,
+                            ],
+                        )?;
+                    }
+                }
+                let charged = work_payload_bytes(
+                    &mut tx,
+                    &scope.provider,
+                    &scope.host,
+                    &scope.repository,
+                    scope.repository_id,
+                )?;
+                let changed = tx.execute(
+                    "UPDATE hub_work_usage SET charged_bytes = $5, updated_at = $6
+                     WHERE provider = $1 AND host = $2 AND repository = $3
+                       AND repository_id IS NOT DISTINCT FROM $4",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &scope.repository,
+                        &scope.repository_id,
+                        &charged,
+                        &now,
+                    ],
+                )?;
+                if changed == 0 {
+                    tx.execute(
+                        "INSERT INTO hub_work_usage
+                            (provider, host, repository, repository_id, charged_bytes, updated_at)
+                         VALUES ($1, $2, $3, $4, $5, $6)",
+                        &[
+                            &scope.provider,
+                            &scope.host,
+                            &scope.repository,
+                            &scope.repository_id,
+                            &charged,
+                            &now,
+                        ],
+                    )?;
+                }
+            }
+            tx.commit()?;
+            Ok(WorkCompaction {
+                scope: scope.clone(),
+                before,
+                applied: apply,
+                deleted_operations: operations as u64,
+                deleted_versions: versions as u64,
+                retention_floor,
+            })
+        })
+    }
+
+    fn work_briefing_preview(&self, token: &str, limit: usize, now: i64) -> Result<Briefing> {
+        BriefingQuery {
+            limit,
+            ..BriefingQuery::default()
+        }
+        .validate()?;
+        self.run(true, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            lock_work_repository_shared(
+                &mut tx,
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                who.repository_id,
+            )?;
+            let after = tx
+                .query_opt(
+                    "SELECT cursor FROM hub_work_acks
+                     WHERE owner = $1 AND provider = $2 AND host = $3 AND repository = $4
+                       AND repository_id IS NOT DISTINCT FROM $5",
+                    &[
+                        &who.owner.id,
+                        &who.owner.identity.provider,
+                        &who.owner.identity.host,
+                        &who.repository,
+                        &who.repository_id,
+                    ],
+                )?
+                .map_or(0, |row| row.get(0));
+            let through: i64 = tx
+                .query_one("SELECT COALESCE(MAX(seq), 0) FROM hub_events", &[])?
+                .get(0);
+            let page = briefing_page(
+                &mut tx, &who, None, after, through, after, None, false, limit, now,
+            )?;
+            tx.commit()?;
+            Ok(page)
         })
     }
 

@@ -18,6 +18,7 @@ import { LiveAgents } from './LiveAgents.tsx'
 import { PullRequests } from './PullRequests.tsx'
 import { Workspace } from './Workspace.tsx'
 import { SkillWorkflow } from './SkillWorkflow.tsx'
+import { Standup } from './Standup.tsx'
 
 type HubSection = 'coordination' | 'workflows' | 'activity' | 'health' | 'workspace'
 
@@ -69,6 +70,7 @@ export function Dashboard({ data, token }: { data: HubData; token: string }) {
       {section === 'coordination' && (
         <div className="hub-section" aria-label="Coordination">
           <Hero repo={repo} d={d} failing={data.failing} />
+          <Standup token={token} repository={repo} />
           <div className="grid">
             <div className="col">
               <LiveAgents d={d} truncated={work?.intents_truncated ?? false} index={1} />

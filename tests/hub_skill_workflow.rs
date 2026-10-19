@@ -279,10 +279,20 @@ async fn valid_run_has_the_same_envelope_over_http_and_mcp_for_a_read_only_token
         .await;
     assert_eq!(status, 200);
     let tools = listed["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 1);
-    let workflow_tool = &tools[0];
-    assert_eq!(workflow_tool["name"], "agentscm_workflow_status");
-    assert_eq!(workflow_tool["annotations"]["readOnlyHint"], true);
+    let mut tool_names = tools
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    tool_names.sort_unstable();
+    assert_eq!(
+        tool_names,
+        ["agentscm_work_briefing", "agentscm_workflow_status"]
+    );
+    assert!(
+        tools
+            .iter()
+            .all(|tool| tool["annotations"]["readOnlyHint"] == true)
+    );
 
     let (status, recent) = hub.get("/v1/hub/skill-workflows", &token).await;
     assert_eq!(status, 200);
