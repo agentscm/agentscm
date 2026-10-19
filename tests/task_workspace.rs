@@ -24,6 +24,311 @@ fn put(path: &str, kind: EntryKind, content: &[u8]) -> EntryChange {
     }
 }
 
+#[test]
+fn scoped_start_and_expansion_retain_applicable_agent_instructions() {
+    let fixture = TempDir::new().unwrap();
+    let engine = Engine::open(fixture.path().join("store")).unwrap();
+    let base = engine
+        .checkpoint_entries(
+            None,
+            &[
+                put("AGENTS.md", EntryKind::Regular, b"root instructions"),
+                put("AGENTS.override.md", EntryKind::Regular, b"higher priority"),
+                put(
+                    ".cursor/rules/agentscm.mdc",
+                    EntryKind::Regular,
+                    b"cursor instructions",
+                ),
+                put(
+                    ".github/copilot-instructions.md",
+                    EntryKind::Regular,
+                    b"copilot instructions",
+                ),
+                put("CLAUDE.md", EntryKind::Symlink, b"AGENTS.md"),
+                put("src/AGENTS.md", EntryKind::Regular, b"source instructions"),
+                put("src/task/input.txt", EntryKind::Regular, b"before"),
+                put(
+                    "deps/GEMINI.md",
+                    EntryKind::Regular,
+                    b"dependency instructions",
+                ),
+                put("deps/value.txt", EntryKind::Regular, b"dependency"),
+                put(
+                    "unseen/AGENTS.md",
+                    EntryKind::Regular,
+                    b"unrelated instructions",
+                ),
+                put("unseen/keep.txt", EntryKind::Regular, b"preserve"),
+            ],
+        )
+        .unwrap();
+    let root = fixture.path().join("workspace");
+    let mut workspace = Workspace::create_scoped(
+        &engine,
+        &root,
+        change("agent-instructions"),
+        &base,
+        &["src/task/input.txt".into()],
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read(root.join("AGENTS.md")).unwrap(),
+        b"root instructions"
+    );
+    assert_eq!(
+        fs::read_link(root.join("CLAUDE.md")).unwrap(),
+        Path::new("AGENTS.md")
+    );
+    assert!(root.join("src/AGENTS.md").is_file());
+    assert_eq!(
+        fs::read(root.join("AGENTS.override.md")).unwrap(),
+        b"higher priority"
+    );
+    assert!(root.join(".cursor/rules/agentscm.mdc").is_file());
+    assert!(root.join(".github/copilot-instructions.md").is_file());
+    assert!(!root.join("deps/GEMINI.md").exists());
+    assert!(!root.join("unseen/AGENTS.md").exists());
+    workspace
+        .expand(&engine, "add-dependency", 0, &["deps/value.txt".into()])
+        .unwrap();
+    assert_eq!(
+        fs::read(root.join("deps/GEMINI.md")).unwrap(),
+        b"dependency instructions"
+    );
+    let scope = workspace.state().unwrap().scope.unwrap();
+    for path in ["AGENTS.md", "CLAUDE.md", "src/AGENTS.md", "deps/GEMINI.md"] {
+        assert!(scope.iter().any(|root| root == path), "{scope:?}");
+    }
+    fs::write(root.join("src/task/input.txt"), b"after").unwrap();
+    let revision = match workspace.checkpoint(&engine, "save", 1).unwrap() {
+        OperationOutcome::Checkpointed { revision, .. } => revision,
+        other => panic!("unexpected checkpoint: {other:?}"),
+    };
+    assert_eq!(
+        engine.read_file(&revision, "unseen/keep.txt").unwrap(),
+        b"preserve"
+    );
+    assert_eq!(
+        engine.read_file(&revision, "unseen/AGENTS.md").unwrap(),
+        b"unrelated instructions"
+    );
+}
+
+#[test]
+fn instruction_links_require_selected_targets_and_reject_cycles_before_creation() {
+    let fixture = TempDir::new().unwrap();
+    let engine = Engine::open(fixture.path().join("store")).unwrap();
+    let base = engine
+        .checkpoint_entries(
+            None,
+            &[
+                put("CLAUDE.md", EntryKind::Symlink, b"policy/link"),
+                put("policy/link", EntryKind::Symlink, b"claude.md"),
+                put(
+                    "policy/claude.md",
+                    EntryKind::Regular,
+                    b"actual instructions",
+                ),
+                put("task/input.txt", EntryKind::Regular, b"before"),
+            ],
+        )
+        .unwrap();
+    let root = fixture.path().join("workspace");
+    assert!(
+        matches!(Workspace::create_scoped(&engine, &root, change("links"), &base,
+        &["task".into()]), Err(Error::Conflict(message)) if message.contains("policy/link"))
+    );
+    assert!(!root.exists());
+    let workspace = Workspace::create_scoped(
+        &engine,
+        &root,
+        change("links"),
+        &base,
+        &["task".into(), "policy".into()],
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read(root.join("CLAUDE.md")).unwrap(),
+        b"actual instructions"
+    );
+    let target = engine
+        .checkpoint_entries(
+            Some(&base),
+            &[put("policy/claude.md", EntryKind::Symlink, b"link")],
+        )
+        .unwrap();
+    let other = fixture.path().join("cycle");
+    assert!(
+        matches!(Workspace::create_scoped(&engine, &other, change("cycle"), &target,
+        &["task".into(), "policy".into()]), Err(Error::Invalid(message)) if message.contains("cycle"))
+    );
+    assert!(!other.exists());
+    // Expansion uses the same qualification and preserves the old state on failure.
+    let clean = engine
+        .checkpoint_entries(
+            None,
+            &[
+                put("task/input.txt", EntryKind::Regular, b"before"),
+                put("deps/CLAUDE.md", EntryKind::Symlink, b"../policy/claude.md"),
+                put("deps/value.txt", EntryKind::Regular, b"dependency"),
+                put("policy/claude.md", EntryKind::Regular, b"instructions"),
+            ],
+        )
+        .unwrap();
+    let expand_root = fixture.path().join("expand");
+    drop(workspace);
+    let mut workspace = Workspace::create_scoped(
+        &engine,
+        &expand_root,
+        change("expand-links"),
+        &clean,
+        &["task".into()],
+    )
+    .unwrap();
+    assert!(
+        matches!(workspace.expand(&engine, "add-deps", 0, &["deps/value.txt".into()]),
+        Err(Error::Conflict(message)) if message.contains("policy/claude.md"))
+    );
+    assert_eq!(workspace.state().unwrap().generation, 0);
+    assert!(!expand_root.join("deps").exists());
+    workspace
+        .expand(
+            &engine,
+            "add-deps-with-policy",
+            0,
+            &["deps/value.txt".into(), "policy/claude.md".into()],
+        )
+        .unwrap();
+    assert_eq!(
+        fs::read(expand_root.join("deps/CLAUDE.md")).unwrap(),
+        b"instructions"
+    );
+}
+
+#[test]
+fn scoped_checkpoint_with_deleted_instruction_target_can_be_inspected_and_repaired() {
+    let fixture = TempDir::new().unwrap();
+    let engine = Engine::open(fixture.path().join("store")).unwrap();
+    let base = engine
+        .checkpoint_entries(
+            None,
+            &[
+                put("CLAUDE.md", EntryKind::Symlink, b"policy/claude.md"),
+                put("policy/claude.md", EntryKind::Regular, b"instructions"),
+                put("task/input.txt", EntryKind::Regular, b"input"),
+            ],
+        )
+        .unwrap();
+    let root = fixture.path().join("workspace");
+    let mut workspace = Workspace::create_scoped(
+        &engine,
+        &root,
+        change("repair-instruction-link"),
+        &base,
+        &["policy".into(), "task".into()],
+    )
+    .unwrap();
+
+    fs::remove_file(root.join("policy/claude.md")).unwrap();
+    let broken = match workspace
+        .checkpoint(&engine, "delete-instruction-target", 0)
+        .unwrap()
+    {
+        OperationOutcome::Checkpointed {
+            revision,
+            generation: 1,
+        } => revision,
+        other => panic!("unexpected checkpoint: {other:?}"),
+    };
+    assert!(
+        engine
+            .stat_file(&broken, "policy/claude.md")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(workspace.status(&engine, 32).unwrap().generation, 1);
+    assert_eq!(workspace.preview(&engine, 32).unwrap().generation, 1);
+
+    fs::write(root.join("policy/claude.md"), b"repaired instructions").unwrap();
+    let repaired = match workspace
+        .checkpoint(&engine, "restore-instruction-target", 1)
+        .unwrap()
+    {
+        OperationOutcome::Checkpointed {
+            revision,
+            generation: 2,
+        } => revision,
+        other => panic!("unexpected repair checkpoint: {other:?}"),
+    };
+    assert_eq!(
+        engine.read_file(&repaired, "policy/claude.md").unwrap(),
+        b"repaired instructions"
+    );
+}
+
+#[test]
+fn legacy_initialization_with_unselected_instruction_target_can_complete() {
+    let fixture = TempDir::new().unwrap();
+    let engine = Engine::open(fixture.path().join("store")).unwrap();
+    let base = engine
+        .checkpoint_entries(
+            None,
+            &[
+                put("CLAUDE.md", EntryKind::Symlink, b"policy/claude.md"),
+                put("policy/claude.md", EntryKind::Regular, b"instructions"),
+                put("task/input.txt", EntryKind::Regular, b"input"),
+            ],
+        )
+        .unwrap();
+    let legacy = engine
+        .checkpoint_entries(
+            Some(&base),
+            &[EntryChange {
+                path: "policy/claude.md".into(),
+                kind: EntryKind::Regular,
+                content: None,
+            }],
+        )
+        .unwrap();
+    let root = fixture.path().join("workspace");
+    let workspace = Workspace::create_scoped(
+        &engine,
+        &root,
+        change("legacy-initialization"),
+        &base,
+        &["policy".into(), "task".into()],
+    )
+    .unwrap();
+    drop(workspace);
+
+    fs::remove_file(root.join("CLAUDE.md")).unwrap();
+    fs::remove_file(root.join("policy/claude.md")).unwrap();
+    fs::remove_file(root.join("task/input.txt")).unwrap();
+    let connection = Connection::open(root.join(METADATA_DIRECTORY).join("state.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE workspace_state SET lifecycle = 'initializing', base_revision = ?1 WHERE singleton = 1",
+            [&legacy],
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut workspace = Workspace::open(&root).unwrap();
+    assert_eq!(
+        workspace
+            .recover(&engine, RecoveryChoice::Complete)
+            .unwrap(),
+        OperationOutcome::Recovered { generation: 0 }
+    );
+    assert!(workspace.state().unwrap().ready);
+    assert_eq!(
+        fs::read_link(root.join("CLAUDE.md")).unwrap(),
+        Path::new("policy/claude.md")
+    );
+    assert!(!root.join("policy/claude.md").exists());
+    assert_eq!(fs::read(root.join("task/input.txt")).unwrap(), b"input");
+}
+
 fn change(id: &str) -> ChangeId {
     ChangeId {
         repository: "task-workspace-repository".into(),
@@ -60,6 +365,48 @@ fn seed_pending_expansion(
             )
             .unwrap();
     }
+}
+
+fn seed_pending_apply(
+    root: &Path,
+    operation: &str,
+    base: &str,
+    target: &str,
+    session: &str,
+    merge_generation: u64,
+) {
+    let mut request = b"AGSCM-WORKSPACE-APPLY1\0".to_vec();
+    push_digest_field(&mut request, operation);
+    request.extend_from_slice(&0_u64.to_be_bytes());
+    push_digest_field(&mut request, "task-workspace-repository");
+    push_digest_field(&mut request, session);
+    request.extend_from_slice(&merge_generation.to_be_bytes());
+    push_digest_field(&mut request, base);
+    push_digest_field(&mut request, target);
+    let connection = Connection::open(root.join(METADATA_DIRECTORY).join("state.sqlite")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO operations(
+                operation_id, kind, request_digest, status, expected_generation,
+                before_revision, after_revision, merge_repository, merge_session,
+                merge_generation, merge_left, merge_revision
+             ) VALUES (?1, 'apply', ?2, 'pending', 0, ?3, ?4, ?5, ?6, ?7, ?3, ?4)",
+            params![
+                operation,
+                digest(&request),
+                base,
+                target,
+                "task-workspace-repository",
+                session,
+                merge_generation,
+            ],
+        )
+        .unwrap();
+}
+
+fn push_digest_field(output: &mut Vec<u8>, value: &str) {
+    output.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    output.extend_from_slice(value.as_bytes());
 }
 
 fn expansion_witness(
@@ -262,6 +609,54 @@ fn pending_expansion_can_roll_back_after_reopen_without_changing_scope() {
         workspace.path_state(&engine, "later.txt").unwrap(),
         WorkspacePathState::Unmaterialized
     );
+}
+
+#[test]
+fn legacy_pending_expansion_revalidates_instruction_links_only_on_complete() {
+    let fixture = TempDir::new().unwrap();
+    let engine = Engine::open(fixture.path().join("store")).unwrap();
+    let base = engine
+        .checkpoint_entries(
+            None,
+            &[
+                put("task/input.txt", EntryKind::Regular, b"input"),
+                put("deps/CLAUDE.md", EntryKind::Symlink, b"../policy/claude.md"),
+                put("policy/claude.md", EntryKind::Regular, b"instructions"),
+            ],
+        )
+        .unwrap();
+    let root = fixture.path().join("workspace");
+    let workspace = Workspace::create_scoped(
+        &engine,
+        &root,
+        change("legacy-expand"),
+        &base,
+        &["task".into()],
+    )
+    .unwrap();
+    drop(workspace);
+    seed_pending_expansion(
+        &root,
+        "legacy-expand",
+        &["task"],
+        Some(&["deps", "task"]),
+        &[("deps/CLAUDE.md", EntryKind::Symlink, b"../policy/claude.md")],
+    );
+
+    let mut workspace = Workspace::open(&root).unwrap();
+    assert!(matches!(
+        workspace.recover(&engine, RecoveryChoice::Complete),
+        Err(Error::Conflict(message)) if message.contains("policy/claude.md")
+    ));
+    assert_eq!(workspace.state().unwrap().scope, Some(vec!["task".into()]));
+    assert!(!root.join("deps/CLAUDE.md").exists());
+    assert_eq!(
+        workspace
+            .recover(&engine, RecoveryChoice::RollBack)
+            .unwrap(),
+        OperationOutcome::Cancelled { generation: 0 }
+    );
+    assert_eq!(workspace.state().unwrap().scope, Some(vec!["task".into()]));
 }
 
 #[test]
@@ -479,6 +874,77 @@ fn witnessed_partial_full_fallback_can_roll_back_without_pruning_directories() {
 
 #[test]
 fn apply_requires_explicit_scope_for_new_target_selection_dependency() {
+    for dependency in [".gitignore", "AGENTS.md", "task/CLAUDE.md"] {
+        let fixture = TempDir::new().unwrap();
+        let engine = Engine::open(fixture.path().join("store")).unwrap();
+        let base = engine
+            .checkpoint_entries(None, &[put("task/file.txt", EntryKind::Regular, b"base")])
+            .unwrap();
+        let target = engine
+            .checkpoint_entries(
+                Some(&base),
+                &[put(dependency, EntryKind::Regular, b"task/file.txt\n")],
+            )
+            .unwrap();
+        let root = fixture.path().join("workspace");
+        let mut workspace = Workspace::create_scoped(
+            &engine,
+            &root,
+            change("target-ignore"),
+            &base,
+            &["task/file.txt".into()],
+        )
+        .unwrap();
+        let mut journal = agentscm::merge::MergeJournal::open(
+            fixture.path().join("merge"),
+            "task-workspace-repository",
+        )
+        .unwrap();
+        let (session, generation) = match journal
+            .begin(&engine, "begin-target", &base, &target)
+            .unwrap()
+        {
+            agentscm::merge::MergeOutcome::Prepared {
+                session,
+                generation,
+                ..
+            } => (session, generation),
+            other => panic!("unexpected merge preparation: {other:?}"),
+        };
+        let generation = match journal
+            .complete(&engine, &session, "complete-target", generation)
+            .unwrap()
+        {
+            agentscm::merge::MergeOutcome::Completed { generation, .. } => generation,
+            other => panic!("unexpected merge completion: {other:?}"),
+        };
+        let completion = journal.completion(&session, generation).unwrap();
+        let target = completion.revision().to_owned();
+        assert!(matches!(
+            workspace.apply(&engine, "apply-target", 0, &completion),
+            Err(Error::Conflict(message)) if message.contains("selection dependencies")
+        ));
+        assert_eq!(
+            workspace
+                .expand(&engine, "expand-target-ignore", 0, &[dependency.into()])
+                .unwrap(),
+            OperationOutcome::Expanded { generation: 1 }
+        );
+        assert_eq!(
+            workspace
+                .apply(&engine, "apply-target", 1, &completion)
+                .unwrap(),
+            OperationOutcome::Applied {
+                revision: target,
+                generation: 2
+            }
+        );
+        assert_eq!(fs::read(root.join(dependency)).unwrap(), b"task/file.txt\n");
+    }
+}
+
+#[test]
+fn legacy_pending_apply_revalidates_target_dependencies_only_on_complete() {
     let fixture = TempDir::new().unwrap();
     let engine = Engine::open(fixture.path().join("store")).unwrap();
     let base = engine
@@ -487,66 +953,35 @@ fn apply_requires_explicit_scope_for_new_target_selection_dependency() {
     let target = engine
         .checkpoint_entries(
             Some(&base),
-            &[put(".gitignore", EntryKind::Regular, b"task/file.txt\n")],
+            &[put("AGENTS.md", EntryKind::Regular, b"instructions")],
         )
         .unwrap();
     let root = fixture.path().join("workspace");
-    let mut workspace = Workspace::create_scoped(
+    let workspace = Workspace::create_scoped(
         &engine,
         &root,
-        change("target-ignore"),
+        change("legacy-apply"),
         &base,
         &["task/file.txt".into()],
     )
     .unwrap();
-    let mut journal = agentscm::merge::MergeJournal::open(
-        fixture.path().join("merge"),
-        "task-workspace-repository",
-    )
-    .unwrap();
-    let (session, generation) = match journal
-        .begin(&engine, "begin-target", &base, &target)
-        .unwrap()
-    {
-        agentscm::merge::MergeOutcome::Prepared {
-            session,
-            generation,
-            ..
-        } => (session, generation),
-        other => panic!("unexpected merge preparation: {other:?}"),
-    };
-    let generation = match journal
-        .complete(&engine, &session, "complete-target", generation)
-        .unwrap()
-    {
-        agentscm::merge::MergeOutcome::Completed { generation, .. } => generation,
-        other => panic!("unexpected merge completion: {other:?}"),
-    };
-    let completion = journal.completion(&session, generation).unwrap();
-    let target = completion.revision().to_owned();
+    drop(workspace);
+    seed_pending_apply(&root, "legacy-apply", &base, &target, &"a".repeat(64), 1);
+
+    let mut workspace = Workspace::open(&root).unwrap();
     assert!(matches!(
-        workspace.apply(&engine, "apply-target", 0, &completion),
+        workspace.recover(&engine, RecoveryChoice::Complete),
         Err(Error::Conflict(message)) if message.contains("selection dependencies")
     ));
+    assert_eq!(workspace.state().unwrap().base_revision, base);
+    assert!(!root.join("AGENTS.md").exists());
     assert_eq!(
         workspace
-            .expand(&engine, "expand-target-ignore", 0, &[".gitignore".into()])
+            .recover(&engine, RecoveryChoice::RollBack)
             .unwrap(),
-        OperationOutcome::Expanded { generation: 1 }
+        OperationOutcome::Cancelled { generation: 0 }
     );
-    assert_eq!(
-        workspace
-            .apply(&engine, "apply-target", 1, &completion)
-            .unwrap(),
-        OperationOutcome::Applied {
-            revision: target,
-            generation: 2
-        }
-    );
-    assert_eq!(
-        fs::read(root.join(".gitignore")).unwrap(),
-        b"task/file.txt\n"
-    );
+    assert_eq!(workspace.state().unwrap().base_revision, base);
 }
 
 #[test]

@@ -206,6 +206,9 @@ impl Workspace {
             &inventory,
             scope.as_ref(),
         )?)?;
+        if scope.is_some() {
+            require_instruction_targets(&snapshot)?;
+        }
         fs::create_dir(&root).map_err(|error| {
             if error.kind() == ErrorKind::AlreadyExists {
                 Error::Conflict(format!(
@@ -316,12 +319,15 @@ impl Workspace {
                 scope.with_selection_dependencies(inventory.entries.keys().map(String::as_str))
             })
             .transpose()?;
-        require_complete_snapshot(snapshot_from_inventory(
+        let snapshot = require_complete_snapshot(snapshot_from_inventory(
             engine,
             revision,
             &inventory,
             scope.as_ref(),
         )?)?;
+        if scope.is_some() {
+            require_instruction_targets(&snapshot)?;
+        }
         Ok(scope.map(|scope| scope.roots().to_vec()))
     }
 
@@ -392,7 +398,7 @@ impl Workspace {
             let pending = existing.is_none();
             drop(tx);
             return if pending {
-                self.finish_expansion(operation_id, RecoveryChoice::Complete)
+                self.finish_expansion(engine, operation_id, RecoveryChoice::Complete)
             } else {
                 self.cleanup_expansion(operation_id)?;
                 Ok(existing.expect("completed outcome"))
@@ -427,6 +433,9 @@ impl Workspace {
             &inventory,
             target.as_ref(),
         )?)?;
+        if target.is_some() {
+            require_instruction_targets(&target_snapshot)?;
+        }
         let staged: BTreeMap<String, Stage> = target_snapshot
             .files
             .iter()
@@ -465,7 +474,7 @@ impl Workspace {
             &staged,
         )?;
         tx.commit()?;
-        self.finish_expansion(operation_id, RecoveryChoice::Complete)
+        self.finish_expansion(engine, operation_id, RecoveryChoice::Complete)
     }
 
     pub fn status(&self, engine: &Engine, limit: usize) -> Result<Status> {
@@ -843,7 +852,7 @@ impl Workspace {
             }
             OperationKind::Expand => {
                 drop(tx);
-                self.finish_expansion(&pending.operation_id, choice)
+                self.finish_expansion(engine, &pending.operation_id, choice)
             }
         }
     }
@@ -973,6 +982,7 @@ impl Workspace {
 
     fn finish_expansion(
         &self,
+        engine: &Engine,
         operation_id: &str,
         choice: RecoveryChoice,
     ) -> Result<OperationOutcome> {
@@ -997,6 +1007,9 @@ impl Workspace {
         }
         let staged = read_scope_expansion_staged(&tx, operation_id)?;
         let target = expansion.after.as_ref();
+        if choice == RecoveryChoice::Complete {
+            require_scope_selection_dependencies(engine, &state.base_revision, target)?;
+        }
         let tracked = Tracked::from_paths(staged.keys().map(String::as_str));
         let (working, report) =
             require_complete_scan(scan_workspace_full_scoped(&self.root, &tracked, target)?)?;
@@ -1102,6 +1115,7 @@ impl Workspace {
         validate_stored_completion_binding(&state, operation_id, &operation, &completion)?;
         let next = if choice == RecoveryChoice::Complete {
             let generation = next_generation(state.generation)?;
+            require_scope_selection_dependencies(engine, &completion.revision, scope.as_ref())?;
             qualify_stored_merge_candidate(engine, &completion)?;
             Some(generation)
         } else {
@@ -2417,6 +2431,49 @@ fn snapshot_from_inventory(
     )
 }
 
+/// Do not start a fresh agent with a dangling instruction link. Imported text
+/// resources remain explicit inputs; this only qualifies filesystem links.
+fn require_instruction_targets(snapshot: &Snapshot) -> Result<()> {
+    for path in snapshot
+        .files
+        .keys()
+        .filter(|path| scope::is_agent_instruction(path))
+    {
+        let mut current = path.clone();
+        let mut visited = BTreeSet::new();
+        loop {
+            let Some(item) = snapshot.files.get(&current) else {
+                return Err(Error::Conflict(format!(
+                    "instruction symlink target is not selected: {current}; include it with --path before starting the workspace"
+                )));
+            };
+            if item.kind != EntryKind::Symlink {
+                break;
+            }
+            if !visited.insert(current.clone()) || visited.len() > MAX_DEPTH {
+                return Err(Error::Invalid(format!(
+                    "instruction symlink cycle or depth limit: {path}"
+                )));
+            }
+            validate_symlink_target(&current, &item.content)?;
+            let target = std::str::from_utf8(&item.content)
+                .map_err(|_| Error::Invalid("instruction symlink target is not UTF-8".into()))?;
+            let mut parts: Vec<&str> = current.split('/').collect();
+            parts.pop();
+            for component in target.split('/') {
+                if component == ".." {
+                    parts.pop();
+                } else {
+                    parts.push(component);
+                }
+            }
+            let target = parts.join("/");
+            current = target;
+        }
+    }
+    Ok(())
+}
+
 fn snapshot_from_inventory_where(
     engine: &Engine,
     revision: &str,
@@ -2492,7 +2549,13 @@ fn require_scope_selection_dependencies(
         .cloned()
         .collect();
     if missing.is_empty() {
-        Ok(())
+        let snapshot = require_complete_snapshot(snapshot_from_inventory(
+            engine,
+            revision,
+            &inventory,
+            Some(scope),
+        )?)?;
+        require_instruction_targets(&snapshot)
     } else {
         Err(Error::Conflict(format!(
             "workspace scope must expand to include target selection dependencies: {}",

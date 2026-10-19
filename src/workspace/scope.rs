@@ -114,7 +114,17 @@ impl Scope {
     ) -> Result<Self> {
         let available: BTreeSet<&str> = base_paths.into_iter().collect();
         let mut roots = self.roots.clone();
-        for candidate in [".gitignore", ".agentscmignore"] {
+        for candidate in [
+            ".gitignore",
+            ".agentscmignore",
+            "AGENTS.md",
+            "AGENTS.override.md",
+            "CLAUDE.md",
+            "CLAUDE.local.md",
+            "GEMINI.md",
+            ".cursor/rules/agentscm.mdc",
+            ".github/copilot-instructions.md",
+        ] {
             if available.contains(candidate) {
                 roots.push(candidate.to_owned());
             }
@@ -122,15 +132,34 @@ impl Scope {
         for root in &self.roots {
             let mut prefix = root.as_str();
             while let Some((parent, _)) = prefix.rsplit_once('/') {
-                let candidate = format!("{parent}/.gitignore");
-                if available.contains(candidate.as_str()) {
-                    roots.push(candidate);
+                for name in [
+                    ".gitignore",
+                    "AGENTS.md",
+                    "AGENTS.override.md",
+                    "CLAUDE.md",
+                    "CLAUDE.local.md",
+                    "GEMINI.md",
+                ] {
+                    let candidate = format!("{parent}/{name}");
+                    if available.contains(candidate.as_str()) {
+                        roots.push(candidate);
+                    }
                 }
                 prefix = parent;
             }
         }
         Self::from_effective(roots)
     }
+}
+
+pub(super) fn is_agent_instruction(path: &str) -> bool {
+    matches!(
+        path.rsplit('/').next(),
+        Some("AGENTS.md" | "AGENTS.override.md" | "CLAUDE.md" | "CLAUDE.local.md" | "GEMINI.md")
+    ) || matches!(
+        path,
+        ".cursor/rules/agentscm.mdc" | ".github/copilot-instructions.md"
+    )
 }
 
 fn contains(root: &str, path: &str) -> bool {

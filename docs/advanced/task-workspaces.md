@@ -6,6 +6,10 @@ A task can inspect one immutable revision before creating a working directory, t
 
 Use this profile when a task has a known starting scope but still needs ordinary editors, compilers and other filesystem tools. Use a full workspace when the repository is already small or its tools require most of the tree.
 
+Agents should choose this at task start, then expand before editing newly needed files. The
+[agent source workflow](agent-source-workflow.md) connects instruction loading, native selection,
+safe sparse Git worktrees and occasional measured reports. It does not require a Hub screen.
+
 ## Explore without a workspace
 
 The local source commands read immutable metadata and bytes directly from `--data-dir`:
@@ -94,7 +98,7 @@ operation; cleanup never reverses the committed scope or edits working files.
 
 `workspace path-state ROOT PATH` does not read the source blob. `materialized` means the path is in scope and exists locally, including an addition or modification; `missing_local` means an in-scope base entry is absent and would be deleted by checkpoint; `unmaterialized` means the base contains the path outside the current scope; `outside_scope_local` means a local occupant exists outside scope; `nonexistent` means neither the base nor the projected working tree contains the path.
 
-`.gitignore`, `.agentscmignore` and private workspace exclusions still control working-tree capture inside the projected scope. They are convenience rules, not task permissions. Ancestor ignore files needed to evaluate a selected descendant can become effective workspace scope and should be inspected in workspace state/preview before checkpointing.
+`.gitignore`, `.agentscmignore` and private workspace exclusions still control working-tree capture inside the projected scope. They are convenience rules, not task permissions. Tracked root and ancestor `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, `CLAUDE.local.md` and `GEMINI.md` files are also retained with selected paths, alongside the applicable ignore files and generated Cursor/Copilot instructions. Instruction symlinks require their in-tree target chains in the selection; missing targets and cycles block scoped creation/expansion. Inspect effective workspace state/preview and read the applicable instructions before editing. Imported instruction resources or other agent configuration must be explicitly selected when needed; this does not discover imports or grant repository text authority over trusted instructions.
 
 ## Checkpoint semantics
 
@@ -123,7 +127,7 @@ A checkpoint advances only the workspace base and generation. Continue through t
 4. Approve that prepared subject, then `integrate` with the expected target state.
 5. If Git remains the external authority, use the existing reconcile/export/remote publication flow and observe the accepted forge result separately.
 
-If applying a revision would introduce an ancestor ignore file outside the persisted scope,
+If applying a revision would introduce an ancestor ignore or agent-instruction file outside the persisted scope,
 expand that path explicitly before retrying application. This keeps the selection configuration
 visible in the workspace rather than silently changing capture rules.
 
