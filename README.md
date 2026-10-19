@@ -5,16 +5,31 @@
   </picture>
 </h1>
 
+**Shared workflows, revision-bound evidence and workspace permissions in the Hub.**
+
+<a href="docs/assets/hub-workflow.jpg">
+  <img src="docs/assets/hub-tour.gif" alt="Animated tour of the running AgentSCM Hub: shared runs, a source-check workflow, retained evidence and member permissions" width="1000">
+</a>
+
+<sub>Four screenshots from a running local Hub with synthetic users and repository data.
+The example run checks source paths; it does not demonstrate model review, CI/CD or a native landing decision.
+The workspace UI is an experimental alpha.</sub>
+
+Full-size stills: [Runs](docs/assets/hub-workspace.jpg) ·
+[Workflow](docs/assets/hub-workflow.jpg) · [Evidence](docs/assets/hub-evidence.jpg) ·
+[Members](docs/assets/hub-members.jpg).
+
 > **Alpha: try it, don't depend on it.** Collision warnings and
 > agent intents work today; the CLI, API and storage formats may change without
 > migration, and nothing has been tested at scale or security-audited. AgentSCM
 > is provided "as is", without warranties or liability, as described in
 > LICENSE. See the [changelog](CHANGELOG.md) for known limits.
 
-**What is this?** AgentSCM is source control coordination for many coding agents working on
-one repository at once. It sits next to your Git repository and your forge, which stay in
-charge. It warns an agent when another agent, on any machine, is already editing the same
-files, before the two of them collide at merge time.
+**What is this?** AgentSCM adds coordination for coding agents alongside your existing
+Git repository and GitHub or GitLab workflow. Start with collision warnings and shared
+work intents; keep your editor, agents and repository host. An experimental native engine
+adds source-bound workflows, review evidence and explicit approval/landing controls for
+teams that opt in. You do not have to migrate a repository to use coordination.
 
 Example output from a small example repository, copied from real runs:
 
@@ -42,23 +57,40 @@ The refusal is the hub's reply to an agent hook ([warn once](docs/hub.md#warn-on
 `same-file` is a warning, not proof of conflict; `conflict` means Git itself reports a merge
 conflict. `--json` prints the full report, described in [collisions](docs/collisions.md).
 
-**Why?** Git does a lot well: immutable commits, cheap branches, offline work, atomic ref
-updates, merge queues and a huge ecosystem. It was built for people, though, and we expect
-these to break down at tens to hundreds of concurrent agents:
+## Why
 
-- **No visibility of in-flight work.** Nobody sees what an agent in another clone or on
-  another machine is editing until it is pushed, so collisions surface at merge time. Two
-  people each running a few agents is already enough to collide.
-- **Ref contention.** `main` is one pointer; every landing races for it, and the losers
-  rebase and rerun checks.
-- **Review is not bound to exact bytes.** The commit that lands is often a new merge or
-  squash object no reviewer saw.
-- **No durable record** of which exact source, brief and approval moved a branch.
+**Start with the Git workflow your team already uses.** You should not need to replace
+your repository host or build a frontier lab's development infrastructure to coordinate
+coding agents. AgentSCM works alongside Git, GitHub and GitLab; your existing Git and
+forge controls remain in charge of their merge path.
 
-AgentSCM starts with the first problem and keeps an append-only ledger for the others (see
-[advanced](docs/advanced/README.md)). Moving authority from Git to the ledger is a longer arc and
-is optional, reversible and per target; Git and your forge stay fully supported. Terms are
-explained in [concepts](docs/concepts.md); the model is in the
+The native engine is an opt-in path. Existing experimental bridges capture clean Git
+commits, reconcile changes, export native source to Git mirrors, and exchange with Git
+remotes over authenticated HTTPS or SSH. Those primitives are implemented; the joined-up
+attached-checkout lifecycle and live forge qualification are still in progress. See
+[Git exchange](docs/advanced/git-remote-network.md) and the [roadmap](docs/roadmap.md).
+Git export preserves source, not native workflow/approval state; retain a separate
+[consistent backup](docs/advanced/community-workspace.md#operations-and-recovery).
+
+### Useful with a few agents today
+
+- **See overlap before a merge.** Read-only collision checks compare branches and
+  worktrees. Connected agents announce what they are editing; supported hooks refuse
+  the first contested edit once and return the reason. A repeat passes, and hooks fail open.
+- **Coordinate across machines.** The self-hosted Hub brings announced work, contested
+  files, handoff requests and overlapping PRs into one view. It sees reported work;
+  it does not detect every semantic conflict or unannounced shell edit.
+- **Bind native checks to the revision being landed.** Opt-in workflows run pinned
+  tests and bounded Claude Code review, return failures for fixes, and require current
+  qualifying evidence at controlled native landing. This does not enforce raw Git merges.
+- **Share the workflow with explicit permissions.** The experimental Community workspace
+  provides persistent members/settings, independent roles, a serial execution queue,
+  retained run/step evidence, and separate human approval and native integration actions.
+
+The longer-term direction is source control designed around concurrent agents, with an
+append-only record of exact source, context, evidence and approvals. Moving authority from
+Git to the ledger is a separate, proposed per-target cutover; it is not required for today's
+coordination. See [concepts](docs/concepts.md) and the
 [draft specification](docs/spec/agentic-scm.md).
 
 Packaged versions and release notes are listed in [Releases](https://github.com/counterbranch/agentscm/releases).
