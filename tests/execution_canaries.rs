@@ -408,11 +408,8 @@ fn memory_exhaustion_is_killed_not_success() {
         brief(&record)
     );
     assert_eq!(record.exit_code, Some(137), "{}", brief(&record));
-    assert!(
-        String::from_utf8_lossy(&record.stderr).contains("Killed"),
-        "{}",
-        brief(&record)
-    );
+    // Shell diagnostics are not guaranteed when a process is killed. The retained outcome and
+    // exit code above must still identify SIGKILL without depending on stderr text.
 }
 
 #[test]
