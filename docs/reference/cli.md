@@ -178,6 +178,7 @@ Keep the initialized repository data directory outside the working directory. St
 ```sh
 agentscm --data-dir ./agentscm-data workspace create ./work CHANGE_ID REVISION
 agentscm --data-dir ./agentscm-data workspace status ./work
+agentscm --data-dir ./agentscm-data workspace preview ./work --limit 1000
 agentscm --data-dir ./agentscm-data workspace checkpoint ./work OPERATION_ID 0
 agentscm --data-dir ./agentscm-data workspace state ./work
 
@@ -190,6 +191,8 @@ agentscm --data-dir ./receiver-data sync import source.bundle ./transfer-state
 ```
 
 Offer, request and bundle output paths must be new. Imports preserve source identities and validate complete source/history closure. They do not import approvals, protected targets, policy or review contexts. Transfer state and workspaces can contain private source; keep them outside the product checkout and back them up or remove them according to your own retention needs.
+
+`workspace preview` lists the files a checkpoint would capture and the paths that `.gitignore`, `.agentscmignore`, the private `.agentscm-workspace/exclude` or (with a root `.git`) Git's own exclude files leave out, each with its deciding rule; it never prints contents. Paths in the base revision are always captured. See [source selection](../advanced/workspace.md#source-selection).
 
 Durable trusted-local [native merge sessions](../advanced/merge.md) retain divergent
 conflicts, bounded same-file text merges and generation-checked workspace
