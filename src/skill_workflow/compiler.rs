@@ -1,8 +1,6 @@
 //! Validation and immutable-source compilation for skill workflows.
 
-#[cfg(unix)]
-use std::collections::BTreeMap;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use serde::Serialize;
@@ -44,6 +42,9 @@ pub struct CompiledPlan {
     pub(crate) digest: String,
     pub(crate) skill_digest: String,
     pub(crate) ordered_steps: Vec<StepDefinition>,
+    /// Exact resource hashes from the already bounded, verified compilation read.
+    #[serde(skip)]
+    pub(crate) instruction_sha256: BTreeMap<String, String>,
     #[cfg(unix)]
     #[serde(skip)]
     command_recipes: BTreeMap<String, CommandRecipe>,
@@ -115,7 +116,19 @@ pub fn compile(data_dir: &Path, definition: &WorkflowDefinition) -> Result<Compi
     let skill_digest = bundle.identity().as_str().to_owned();
     let digest = plan_digest(definition, &skill_digest)?;
 
+    let root = skill_root(&definition.skill.entrypoint);
+    let instruction_sha256 = std::iter::once(&definition.skill.entrypoint)
+        .chain(definition.skill.resources.iter())
+        .map(|path| {
+            let relative = relative_skill_path(path, root);
+            let bytes = bundle
+                .resource(relative)
+                .ok_or_else(|| Error::Invalid("compiled skill resource missing".into()))?;
+            Ok((path.clone(), format!("{:x}", Sha256::digest(bytes))))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
     Ok(CompiledPlan {
+        instruction_sha256,
         definition: definition.clone(),
         digest,
         skill_digest,

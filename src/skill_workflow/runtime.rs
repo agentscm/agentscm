@@ -30,9 +30,13 @@ use crate::{Error, Result};
 mod review;
 pub use review::{ClaudeReviewFinding, ClaudeReviewView};
 
+#[path = "agent_tasks.rs"]
+mod agent_tasks;
+pub use agent_tasks::*;
+
 const VIEW_VERSION: u32 = 1;
 const APPLICATION_ID: i64 = 0x4153_5746;
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const MAX_RUN_ID_BYTES: usize = 64;
 const MAX_DEFINITION_BYTES: usize = 256 * 1024;
 const MAX_DETAIL_BYTES: usize = 4 * 1024;
@@ -1202,9 +1206,14 @@ fn initialize_schema(connection: &mut Connection, create: bool) -> Result<()> {
         )?;
         tx.pragma_update(None, "application_id", APPLICATION_ID)?;
         review::create_schema(&tx)?;
+        agent_tasks::create_schema(&tx)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     } else if application == APPLICATION_ID && version == 1 {
         review::create_schema(&tx)?;
+        agent_tasks::create_schema(&tx)?;
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    } else if application == APPLICATION_ID && version == 2 {
+        agent_tasks::create_schema(&tx)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     } else if application != APPLICATION_ID || version != SCHEMA_VERSION {
         return Err(Error::Invalid(
@@ -1235,6 +1244,9 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
         connection.prepare(
             "SELECT run_id,step_id,record_digest,record_json FROM workflow_reviews LIMIT 0",
         )?;
+    }
+    if version >= 3 {
+        agent_tasks::validate_schema(connection)?;
     }
     Ok(())
 }
