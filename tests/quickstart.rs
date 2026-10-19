@@ -280,7 +280,7 @@ fn end_to_end_with_a_given_token_then_the_hook_works() {
             .any(|l| l == "The agent token is valid for acme/widgets."),
         "{said}"
     );
-    assert!(said.contains("agentscm uninstall"), "{said}");
+    assert!(said.contains(" uninstall`"), "{said}");
     assert_eq!(
         last_line(&output),
         format!("Live warnings: on (hub {}, repo acme/widgets)", hub.url)
@@ -320,6 +320,16 @@ fn end_to_end_with_a_given_token_then_the_hook_works() {
     assert_eq!(mode(&versioned), 0o755);
     assert_eq!(mode(&bin), 0o700);
     assert_eq!(names_in(&bin).len(), 2);
+    assert!(
+        said.contains(&format!("Run AgentSCM commands with: {}", link.display())),
+        "{said}"
+    );
+    assert!(
+        said.contains(&format!("export PATH={}:\"$PATH\"", bin.display())),
+        "{said}"
+    );
+    let command_help = Command::new(&link).arg("--help").output().unwrap();
+    assert!(command_help.status.success());
 
     let settings = machine.home.path().join(".claude/settings.json");
     assert_eq!(mode(&settings), 0o600);
@@ -1046,27 +1056,267 @@ fn an_existing_world_readable_settings_file_becomes_private_with_its_backup() {
 }
 
 #[test]
-fn init_writes_the_repository_config_only_when_asked_and_uninstall_leaves_it() {
+fn local_hub_never_generates_team_repository_config_even_with_init() {
     let (hub, machine) = (Hub::start(), Machine::new());
-    let (plain, asked) = (machine.repo(), machine.repo());
+    let repo = machine.repo();
+    let instructions = "@AGENTS.md\nKeep the project's instructions.\n";
+    std::fs::write(repo.path().join("CLAUDE.md"), instructions).unwrap();
     let token = hub.token_file(machine.home.path());
-    let base = ["--hook", "none", "--no-collisions"];
-    let said = ok(&machine.run(plain.path(), &quick(&hub.url, &token, &base)));
-    assert!(!plain.path().join("AGENTS.md").exists());
-    assert!(!said.contains("Repository files"), "{said}");
-
-    let mut flags = base.to_vec();
-    flags.push("--init");
-    let said = ok(&machine.run(asked.path(), &quick(&hub.url, &token, &flags)));
+    let said = ok(&machine.run(
+        repo.path(),
+        &quick(
+            &hub.url,
+            &token,
+            &["--hook", "none", "--no-collisions", "--init"],
+        ),
+    ));
     for file in [".mcp.json", ".claude/settings.json", "AGENTS.md"] {
-        assert!(asked.path().join(file).exists(), "{file}");
+        assert!(!repo.path().join(file).exists(), "{file}");
     }
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("CLAUDE.md")).unwrap(),
+        instructions
+    );
+    assert!(said.contains("Skipping repository agent config"), "{said}");
     assert!(
-        said.contains("Repository files to review and commit")
-            && said.contains("`agentscm uninstall` does not remove them"),
+        !said.contains("Repository files to review and commit"),
         "{said}"
     );
-    assert!(said.contains("  AGENTS.md"), "{said}");
-    ok(&machine.run(asked.path(), &["uninstall", "--yes"]));
-    assert!(asked.path().join("AGENTS.md").exists());
+}
+
+#[test]
+fn worktree_sessions_default_to_user_hooks_and_resolve_repository_token() {
+    let (hub, machine) = (Hub::start(), Machine::new());
+    let repo = machine.repo();
+    machine.git(repo.path(), &["commit", "--allow-empty", "-qm", "fixture"]);
+    let tree = repo.path().join(".claude/worktrees/agent");
+    machine.git(
+        repo.path(),
+        &["worktree", "add", "-qb", "agent", tree.to_str().unwrap()],
+    );
+    std::fs::create_dir_all(machine.home.path().join(".claude")).unwrap();
+    let token = hub.token_file(machine.home.path());
+    let said = ok(&machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"])));
+    let settings = machine.home.path().join(".claude/settings.json");
+    assert!(settings.exists(), "{said}");
+    assert!(!repo.path().join(SETTINGS).exists());
+    assert!(!tree.join(SETTINGS).exists());
+    assert!(json_file(&settings)["hooks"]["PreToolUse"].is_array());
+    ok(&edit(&machine, &tree, "worktree-session", "src/lib.rs"));
+    assert_eq!(live_paths(&hub, REPO), vec![vec!["src/lib.rs".to_owned()]]);
+}
+
+#[test]
+fn no_op_run_explicitly_reports_no_changes_and_writes_no_record() {
+    let machine = Machine::new();
+    let repo = machine.repo();
+    let said = ok(&machine.run(
+        repo.path(),
+        &[
+            "quickstart",
+            "--yes",
+            "--hub",
+            "skip",
+            "--hook",
+            "none",
+            "--no-collisions",
+        ],
+    ));
+    assert!(said.contains("No changes made."), "{said}");
+    assert!(!machine.config().join("quickstart.json").exists());
+}
+
+fn fake_docker(machine: &Machine) {
+    let docker = machine.bin.path().join("docker");
+    std::fs::write(
+        &docker,
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$HOME/docker.log"
+case "$1 $2" in
+  'version '*|'compose version') exit 0 ;;
+  'image inspect') exit 1 ;;
+  'pull '*) echo 'fixture: registry denied pull' >&2; exit 17 ;;
+  'compose -p') exit 0 ;;
+esac
+exit 1
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn failed_hub_pull_leaves_no_setup_files_or_record_and_honors_platform() {
+    for platform in [None, Some("linux/arm64")] {
+        let machine = Machine::new();
+        let repo = machine.repo();
+        fake_docker(&machine);
+        let mut command = machine.command(
+            repo.path(),
+            &[
+                "quickstart",
+                "--yes",
+                "--hub",
+                "local",
+                "--github-login",
+                "octo",
+                "--hook",
+                "none",
+                "--no-collisions",
+            ],
+        );
+        if let Some(platform) = platform {
+            command.env("DOCKER_DEFAULT_PLATFORM", platform);
+        }
+        let result = command.output().unwrap();
+        let said = ok(&result);
+        assert!(said.contains("Docker could not pull"), "{said}");
+        assert!(said.contains("No changes made."), "{said}");
+        assert!(String::from_utf8_lossy(&result.stderr).contains("registry denied pull"));
+        assert!(!machine.home.path().join(".agentscm/hub").exists());
+        assert!(!machine.config().join("quickstart.json").exists());
+        let commands = std::fs::read_to_string(machine.home.path().join("docker.log")).unwrap();
+        assert!(
+            commands.contains(&format!(
+                "pull --platform {} ghcr.io/counterbranch/agentscm:",
+                platform.unwrap_or("linux/amd64")
+            )),
+            "{commands}"
+        );
+        assert!(!commands.contains("up -d"), "{commands}");
+    }
+}
+
+#[test]
+fn uninstall_explains_app_retention_and_keeps_hub_data_by_default() {
+    let machine = Machine::new();
+    let repo = machine.repo();
+    fake_docker(&machine);
+    let hub = machine.home.path().join(".agentscm/hub");
+    std::fs::create_dir_all(&hub).unwrap();
+    std::fs::write(hub.join("compose.yaml"), "fixture").unwrap();
+    std::fs::create_dir_all(machine.config()).unwrap();
+    std::fs::write(
+        machine.config().join("quickstart.json"),
+        json!({
+            "local_hub": {"dir": hub, "project": "agentscm-hub"}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let said = ok(&machine.run(repo.path(), &["uninstall", "--yes"]));
+    assert!(said.contains("will be kept for reinstall"), "{said}");
+    assert!(
+        said.contains("GitHub App and its installations stay on GitHub"),
+        "{said}"
+    );
+    assert!(hub.join("compose.yaml").exists());
+    let commands = std::fs::read_to_string(machine.home.path().join("docker.log")).unwrap();
+    assert!(commands.contains("down"));
+    assert!(!commands.contains("down -v"));
+}
+
+#[test]
+fn no_op_rerun_keeps_manifest_bytes_and_reports_no_changes() {
+    let machine = Machine::new();
+    let repo = machine.repo();
+    let args = [
+        "quickstart",
+        "--yes",
+        "--hub",
+        "skip",
+        "--hook",
+        "user",
+        "--no-collisions",
+    ];
+    ok(&machine.run(repo.path(), &args));
+    let record = machine.config().join("quickstart.json");
+    let before = std::fs::read(&record).unwrap();
+    let said = ok(&machine.run(repo.path(), &args));
+    assert!(said.contains("No changes made."), "{said}");
+    assert!(said.contains("Quickstart's recorded setup:"), "{said}");
+    assert_eq!(std::fs::read(record).unwrap(), before);
+}
+
+#[test]
+fn malformed_custom_image_never_reaches_image_inspect_or_pull() {
+    for image in ["--help", "-q", "bad image", "bad\nimage", "${IMAGE}"] {
+        let machine = Machine::new();
+        let repo = machine.repo();
+        fake_docker(&machine);
+        let output = machine
+            .command(
+                repo.path(),
+                &[
+                    "quickstart",
+                    "--yes",
+                    "--hub",
+                    "local",
+                    "--github-login",
+                    "octo",
+                    "--hook",
+                    "none",
+                    "--no-collisions",
+                ],
+            )
+            .env("AGENTSCM_HUB_IMAGE", image)
+            .output()
+            .unwrap();
+        let said = ok(&output);
+        assert!(
+            said.contains("AGENTSCM_HUB_IMAGE must be an image reference"),
+            "{said}"
+        );
+        assert!(said.contains("No changes made."), "{said}");
+        let commands = std::fs::read_to_string(machine.home.path().join("docker.log")).unwrap();
+        assert!(
+            !commands.contains("image inspect") && !commands.contains("pull"),
+            "{commands}"
+        );
+        assert!(!machine.home.path().join(".agentscm/hub").exists());
+        assert!(!machine.config().join("quickstart.json").exists());
+    }
+}
+
+#[test]
+fn custom_image_drops_previous_platform_choice_and_failed_pull_preserves_existing_files() {
+    let machine = Machine::new();
+    let repo = machine.repo();
+    fake_docker(&machine);
+    let dir = machine.home.path().join(".agentscm/hub");
+    std::fs::create_dir_all(&dir).unwrap();
+    let old_env = "DOCKER_DEFAULT_PLATFORM=linux/amd64\nAGENTSCM_ADMINS=github:octo\n";
+    std::fs::write(dir.join(".env"), old_env).unwrap();
+    std::fs::write(dir.join("compose.yaml"), "previous compose\n").unwrap();
+    let said = ok(&machine
+        .command(
+            repo.path(),
+            &[
+                "quickstart",
+                "--yes",
+                "--hub",
+                "local",
+                "--github-login",
+                "octo",
+                "--hook",
+                "none",
+                "--no-collisions",
+            ],
+        )
+        .env("AGENTSCM_HUB_IMAGE", "example.invalid/custom:arm64")
+        .output()
+        .unwrap());
+    let commands = std::fs::read_to_string(machine.home.path().join("docker.log")).unwrap();
+    assert!(
+        commands.contains("pull example.invalid/custom:arm64"),
+        "{commands}"
+    );
+    assert!(!commands.contains("pull --platform"), "{commands}");
+    assert_eq!(std::fs::read_to_string(dir.join(".env")).unwrap(), old_env);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("compose.yaml")).unwrap(),
+        "previous compose\n"
+    );
+    assert!(said.contains("No changes made."), "{said}");
+    assert!(!machine.config().join("quickstart.json").exists());
 }

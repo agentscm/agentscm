@@ -119,6 +119,8 @@ pub(crate) struct Detected {
     pub(crate) repo_root: Option<PathBuf>,
     /// The origin URL as Git reports it, parsed.
     pub(crate) remote: Option<Remote>,
+    /// More than one registered Git worktree (including the current checkout).
+    pub(crate) worktrees: bool,
     pub(crate) docker: bool,
     pub(crate) claude: bool,
 }
@@ -138,6 +140,19 @@ pub(crate) fn detect(cwd: &Path, home: &Path) -> Detected {
             let url = capture(git, &["remote", "get-url", "origin"], Some(root), QUICK)?;
             parse_remote(&url)
         });
+    let worktrees = git
+        .as_ref()
+        .zip(repo_root.as_ref())
+        .is_some_and(|((git, _), root)| {
+            capture(git, &["worktree", "list", "--porcelain"], Some(root), QUICK).is_some_and(
+                |text| {
+                    text.lines()
+                        .filter(|line| line.starts_with("worktree "))
+                        .count()
+                        > 1
+                },
+            )
+        });
     let docker = which("docker").is_some_and(|docker| {
         capture(&docker, &["version"], None, QUICK).is_some()
             && capture(&docker, &["compose", "version"], None, QUICK).is_some()
@@ -147,6 +162,7 @@ pub(crate) fn detect(cwd: &Path, home: &Path) -> Detected {
         git,
         repo_root,
         remote,
+        worktrees,
         docker,
         claude,
     }

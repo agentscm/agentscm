@@ -86,7 +86,7 @@ pub struct QuickstartArgs {
     #[arg(long)]
     no_collisions: bool,
     /// Also write the repository's agent config (agentscm init-repo); with --yes it is
-    /// skipped unless this is passed.
+    /// skipped unless this is passed. Loopback hubs never generate repository config.
     #[arg(long)]
     init: bool,
 }
@@ -300,12 +300,19 @@ struct Live {
     /// The repository whose token and hub settings were saved.
     repo: Option<String>,
     hooks: bool,
+    pending_local: Option<String>,
 }
 
 impl Live {
     /// The last line of every run.
     fn line(&self) -> String {
         let off = |reason: &str, todo: &str| format!("Live warnings: off — {reason} ({todo})");
+        if let Some(command) = &self.pending_local {
+            return off(
+                "the local hub is waiting for GitHub App setup",
+                &format!("finish creating and installing the app, then run `{command}`"),
+            );
+        }
         match (&self.hub, &self.repo) {
             (None, _) => off(
                 "no hub chosen",
@@ -363,6 +370,13 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
         live: Live::default(),
         init_written: Vec::new(),
     };
+    let original_manifest = serde_json::to_value(&cx.manifest)
+        .map_err(|_| invalid("cannot inspect quickstart's record"))?;
+    let hub_files = [
+        cx.home.join(".agentscm/hub/compose.yaml"),
+        cx.home.join(".agentscm/hub/.env"),
+    ];
+    let original_hub_files = hub_files.each_ref().map(|path| file_hash(path));
     // Running from the install directory is undoable even if nothing else is written.
     if let Some((binary::Program::InstallDir(_), _)) = program_plan(&cx.home) {
         cx.manifest.bin_dir = Some(binary::bin_dir(&cx.home));
@@ -386,7 +400,20 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
     if !cx.manifest.is_empty() {
         cx.manifest.save()?;
     }
-    summary(&cx);
+    let changed = serde_json::to_value(&cx.manifest)
+        .map_err(|_| invalid("cannot inspect quickstart's record"))?
+        != original_manifest
+        || hub_files.each_ref().map(|path| file_hash(path)) != original_hub_files
+        || !cx.init_written.is_empty();
+    summary(&cx, changed);
+    let command = cli_command(&cx);
+    println!("Run AgentSCM commands with: {command}");
+    if let Some(dir) = &cx.manifest.bin_dir {
+        println!(
+            r#"To use `agentscm` in this shell: export PATH={}:"$PATH""#,
+            binary::quote(dir)
+        );
+    }
     println!("{}", cx.live.line());
     Ok(())
 }
@@ -576,7 +603,8 @@ async fn choose_hub(cx: &mut Cx<'_>) -> Option<String> {
             }
             HubChoice::Existing => return existing_hub(cx, current.map(|c| c.url)),
             HubChoice::Local => match local_hub(cx).await {
-                Ok(()) => return Some(hub_local::URL.to_owned()),
+                Ok(true) => return Some(hub_local::URL.to_owned()),
+                Ok(false) => return None,
                 Err(message) => {
                     println!("{message}");
                     if cx.ui.yes {
@@ -636,7 +664,7 @@ fn existing_hub(cx: &Cx<'_>, configured: Option<String>) -> Option<String> {
     }
 }
 
-async fn local_hub(cx: &mut Cx<'_>) -> std::result::Result<(), String> {
+async fn local_hub(cx: &mut Cx<'_>) -> std::result::Result<bool, String> {
     if let Some(remote) = &cx.found.remote
         && remote.forge != Forge::Github
     {
@@ -658,7 +686,11 @@ async fn local_hub(cx: &mut Cx<'_>) -> std::result::Result<(), String> {
     )
     .await?;
     cx.install_url = started.install_url;
-    Ok(())
+    if started.pending {
+        cx.live.pending_local = Some(format!("{} quickstart --hub local", cli_command(cx)));
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 // ---- sign-in and token ----
@@ -1158,6 +1190,14 @@ fn program_plan(home: &Path) -> Option<(binary::Program, PathBuf)> {
     Some((binary::plan(home, &exe, on_path.as_deref(), &temp), exe))
 }
 
+fn recommended_hook_scope(found: &Detected) -> HookScope {
+    if found.repo_root.is_some() && !found.worktrees {
+        HookScope::Project
+    } else {
+        HookScope::User
+    }
+}
+
 fn hook_stage(cx: &mut Cx<'_>) {
     let root = cx.found.repo_root.clone();
     let scope = match cx.args.hook {
@@ -1170,7 +1210,7 @@ fn hook_stage(cx: &mut Cx<'_>) {
         }
         None if cx.ui.yes => {
             if cx.live.repo.is_some() && root.is_some() {
-                HookScope::Project
+                recommended_hook_scope(&cx.found)
             } else {
                 println!(
                     "Not adding the Claude Code hooks: live warnings are off, so they would have nothing to report. Use --hook project to add them anyway."
@@ -1184,7 +1224,16 @@ fn hook_stage(cx: &mut Cx<'_>) {
                 "Every project (~/.claude/settings.json)",
                 "Skip the hooks",
             ];
-            let default = if root.is_some() { 0 } else { 1 };
+            if cx.found.worktrees {
+                println!(
+                    "Git worktrees detected. Every project is recommended so sessions in worktrees receive the hooks too."
+                );
+            }
+            let default = if recommended_hook_scope(&cx.found) == HookScope::Project {
+                0
+            } else {
+                1
+            };
             [HookScope::Project, HookScope::User, HookScope::None][cx.ui.choose(
                 "Where should Claude Code's hooks go?",
                 &options,
@@ -1465,18 +1514,18 @@ fn init_stage(cx: &mut Cx<'_>) {
         }
         return;
     };
-    let local = is_loopback(&hub);
+    if is_loopback(&hub) {
+        println!(
+            "Skipping repository agent config: this hub runs on this machine. When you have a shared hub, run `agentscm init-repo --hub-url URL`."
+        );
+        return;
+    }
     let go = if cx.ui.yes {
         cx.args.init
     } else {
-        if local {
-            println!(
-                "This hub runs on this machine, so teammates can't use it; for them the files need your team's hub URL (`agentscm init-repo --hub-url URL`)."
-            );
-        }
         cx.ui.confirm(
             "Also add AgentSCM to this repository's agent config (MCP, hooks and instructions for Claude Code, Codex, Cursor and Copilot)? It writes files you can commit.",
-            !local,
+            true,
         )
     };
     if !go {
@@ -1488,10 +1537,22 @@ fn init_stage(cx: &mut Cx<'_>) {
     }
 }
 
-fn summary(cx: &Cx<'_>) {
+fn cli_command(cx: &Cx<'_>) -> String {
+    if let Some(dir) = &cx.manifest.bin_dir {
+        return binary::quote(&dir.join(binary::LINK));
+    }
+    std::env::current_exe()
+        .map(|path| binary::quote(&path))
+        .unwrap_or_else(|_| "npx agentscm".to_owned())
+}
+
+fn summary(cx: &Cx<'_>, changed: bool) {
     let m = &cx.manifest;
     let home = &cx.home;
-    println!("\nWhat quickstart wrote or changed:");
+    if !changed {
+        println!("\nNo changes made.");
+    }
+    println!("\nQuickstart's recorded setup:");
     let mut any = false;
     let mut line = |text: String| {
         any = true;
@@ -1549,14 +1610,14 @@ fn summary(cx: &Cx<'_>) {
         ));
     }
     if !any && cx.init_written.is_empty() {
-        println!("  nothing; no files were changed.");
+        println!("  nothing recorded.");
     } else if !any {
         println!("  nothing that `agentscm uninstall` undoes.");
     } else {
         if let Ok(path) = manifest::path() {
             println!("  {}: a record of the above", shown(&path, home));
         }
-        println!("Undo all of this with `agentscm uninstall`.");
+        println!("Undo all of this with `{} uninstall`.", cli_command(cx));
     }
     if !cx.init_written.is_empty() {
         println!(
@@ -1682,6 +1743,22 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
         );
     }
     println!("  - delete quickstart's own record, if everything above could be undone");
+    let remove_hub_data = m.local_hub.is_some()
+        && (args.remove_hub_data
+            || (!args.yes && ui.confirm("Also delete the local hub's data (its Docker volume and ~/.agentscm/hub)? This can't be undone.", false)));
+    if m.local_hub.is_some() {
+        println!(
+            "Local hub data: {}.",
+            if remove_hub_data {
+                "will be deleted"
+            } else {
+                "will be kept for reinstall"
+            }
+        );
+        println!(
+            "The GitHub App and its installations stay on GitHub. Remove them in GitHub Settings if you no longer need them; keeping hub data lets reinstall reuse the app."
+        );
+    }
     if !ui.confirm("Go ahead?", true) {
         println!("Nothing changed.");
         return Ok(());
@@ -1792,7 +1869,7 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
         }
     }
     if let Some(local) = &m.local_hub
-        && let Err(command) = undo_local_hub(&args, &ui, local, &home)
+        && let Err(command) = undo_local_hub(remove_hub_data, local, &home)
     {
         manual.push(command);
         left.local_hub = Some(local.clone());
@@ -1841,17 +1918,10 @@ async fn revoke(token: &TokenRecord) {
 
 /// `Err` carries the command to finish by hand.
 fn undo_local_hub(
-    args: &UninstallArgs,
-    ui: &Ui,
+    wipe: bool,
     local: &manifest::LocalHubRecord,
     home: &Path,
 ) -> std::result::Result<(), String> {
-    let wipe = args.remove_hub_data
-        || (!args.yes
-            && ui.confirm(
-                "Also delete the local hub's data (its Docker volume and ~/.agentscm/hub)? This can't be undone.",
-                false,
-            ));
     let compose = format!(
         "docker compose -p {} -f {}/compose.yaml down{}",
         local.project,
@@ -1882,6 +1952,18 @@ fn undo_local_hub(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_local_setup_names_the_resume_command_instead_of_token_setup() {
+        let live = Live {
+            pending_local: Some("/opt/agentscm quickstart --hub local".into()),
+            ..Live::default()
+        };
+        let line = live.line();
+        assert!(line.contains("finish creating and installing the app"));
+        assert!(line.contains("`/opt/agentscm quickstart --hub local`"));
+        assert!(!line.contains("agent-token-file"));
+    }
 
     #[test]
     fn not_connected_is_told_apart_from_other_refusals() {

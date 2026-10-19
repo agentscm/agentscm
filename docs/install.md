@@ -50,6 +50,10 @@ Use this on platforms without a binary. The image's default command serves on al
 - Build provenance, only when the GitHub CLI (`gh`) is installed and signed in (`gh auth status` succeeds). The binary must be attested by this repository's `release.yml` for the matching tag, or it is deleted and not run. If `gh` is missing or not signed in, the installer says why and that it checked the checksum only.
 - To make a missing or signed-out `gh` an error, set `AGENTSCM_REQUIRE_PROVENANCE=1`.
 
+Successful installer verification prints one summary line. To include the verification
+command's details, set `AGENTSCM_INSTALL_VERBOSE=1`. Verification failures always show
+diagnostics and stop installation.
+
 Checks run before anything is installed or linked.
 
 ## Where files go
@@ -57,6 +61,11 @@ Checks run before anything is installed or linked.
 On Linux and macOS, `~/.agentscm/bin/agentscm-<version>` is the binary, and `~/.agentscm/bin/agentscm` is a symlink to the latest installed one.
 
 On Windows, `%USERPROFILE%\.agentscm\bin\agentscm-<version>.exe` is the binary, and `agentscm.exe` in the same directory is a copy of the latest installed one, not a symlink (symlinks need extra privileges on Windows). If `agentscm.exe` is running when you install a newer version, it cannot be replaced; the installer warns, keeps the old copy and runs the new versioned binary.
+
+Quickstart prints the installed executable's full path, so it works before `agentscm`
+is on PATH. On macOS or Linux, use `export PATH="$HOME/.agentscm/bin:$PATH"` in the
+current shell, or add that line to your shell's startup file for future terminals.
+You can also keep using `npx agentscm <subcommand>`.
 
 Remove them with `agentscm uninstall`.
 

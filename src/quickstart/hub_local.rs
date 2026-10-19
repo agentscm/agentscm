@@ -23,11 +23,38 @@ pub(crate) fn default_image() -> String {
     )
 }
 
-fn image() -> String {
-    std::env::var("AGENTSCM_HUB_IMAGE")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(default_image)
+const PUBLISHED_PLATFORM: &str = "linux/amd64";
+
+fn env_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    text.lines().find_map(|line| {
+        let (found, value) = line.split_once('=')?;
+        (found.trim() == key && !value.is_empty()).then_some(value)
+    })
+}
+
+/// The release image is currently published for amd64. An explicit process setting wins,
+/// followed by the platform quickstart persisted on an earlier run. Custom images keep Docker's
+/// native platform selection unless the user chose one.
+fn selected_platform(
+    process_platform: Option<String>,
+    existing_env: &str,
+    custom_image: bool,
+) -> Option<String> {
+    process_platform
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            (!custom_image)
+                .then(|| env_value(existing_env, "DOCKER_DEFAULT_PLATFORM").map(str::to_owned))
+                .flatten()
+        })
+        .or_else(|| (!custom_image).then(|| PUBLISHED_PLATFORM.to_owned()))
+}
+
+fn platform_ok(platform: &str) -> bool {
+    !platform.is_empty()
+        && platform
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/_.-".contains(&byte))
 }
 
 /// The default profile of compose.hub.yaml, run from a published image.
@@ -35,6 +62,7 @@ const COMPOSE: &str = r#"# Written by `agentscm quickstart`: the default profile
 services:
   hub:
     image: ${AGENTSCM_HUB_IMAGE:-@IMAGE@}
+@PLATFORM@
     command: ["hub", "serve", "--bind", "0.0.0.0:7332", "--public", "--public-url", "${AGENTSCM_PUBLIC_URL:-http://127.0.0.1:7332}", "--poll-seconds", "${AGENTSCM_POLL_SECONDS:-300}"]
     ports:
       - "127.0.0.1:7332:7332"
@@ -78,8 +106,18 @@ volumes:
 
 const FORCE_RECREATE: [&str; 5] = ["up", "-d", "--pull", "never", "--force-recreate"];
 
+#[cfg(test)]
 pub(crate) fn compose_text() -> String {
-    COMPOSE.replace("@IMAGE@", &default_image())
+    compose_text_for(Some(PUBLISHED_PLATFORM))
+}
+
+fn compose_text_for(platform: Option<&str>) -> String {
+    let platform = platform
+        .map(|value| format!("    platform: \"{value}\""))
+        .unwrap_or_default();
+    COMPOSE
+        .replace("@IMAGE@", &default_image())
+        .replace("@PLATFORM@", &platform)
 }
 
 /// `KEY=value` lines, in order, with `updates` replacing or appending. Values must be
@@ -166,6 +204,7 @@ fn login_ok(login: &str) -> bool {
 pub(crate) struct Started {
     /// Where to install the hub's GitHub App, when known.
     pub(crate) install_url: Option<String>,
+    pub(crate) pending: bool,
 }
 
 fn docker() -> Result<PathBuf, String> {
@@ -183,6 +222,54 @@ fn run_visible(args: &[String]) -> Result<bool, String> {
 fn run_capture(args: &[String], limit: Duration) -> Option<String> {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     capture(&docker().ok()?, &args, None, limit)
+}
+
+fn matches_platform(found: &str, requested: &str) -> bool {
+    found == requested
+        || (requested.split('/').count() == 2
+            && found
+                .strip_prefix(requested)
+                .is_some_and(|rest| rest.starts_with('/')))
+        || (requested == "linux/arm64/v8" && found == "linux/arm64")
+}
+
+fn acquire_image(image: &str, platform: Option<&str>) -> Result<(), String> {
+    let mut inspect = vec!["image".to_owned(), "inspect".to_owned()];
+    if let Some(platform) = platform {
+        inspect.extend([
+            "--format".into(),
+            "{{.Os}}/{{.Architecture}}{{if .Variant}}/{{.Variant}}{{end}}".into(),
+        ]);
+        inspect.push(image.to_owned());
+        if run_capture(&inspect, QUICK).is_some_and(|found| matches_platform(&found, platform)) {
+            return Ok(());
+        }
+    } else {
+        inspect.push(image.to_owned());
+        if run_capture(&inspect, QUICK).is_some() {
+            return Ok(());
+        }
+    }
+
+    println!(
+        "Pulling {image}{} ...",
+        platform.map_or(String::new(), |value| format!(" for {value}"))
+    );
+    let mut pull = vec!["pull".to_owned()];
+    if let Some(platform) = platform {
+        pull.extend(["--platform".into(), platform.to_owned()]);
+    }
+    pull.push(image.to_owned());
+    if run_visible(&pull)? {
+        Ok(())
+    } else {
+        let platform = platform
+            .map(|value| format!(" for platform {value}"))
+            .unwrap_or_default();
+        Err(format!(
+            "Docker could not pull the hub image {image}{platform}. Check the Docker error above, set AGENTSCM_HUB_IMAGE to a usable image, or connect to an existing hub."
+        ))
+    }
 }
 
 fn write(path: &Path, text: &str) -> Result<(), String> {
@@ -249,33 +336,61 @@ pub(crate) async fn start(
         return Err("Skipped the local hub.".into());
     }
     let existing_env = std::fs::read_to_string(&env).unwrap_or_default();
+    let configured_image = std::env::var("AGENTSCM_HUB_IMAGE")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let selected_image = configured_image.clone().unwrap_or_else(default_image);
+    let requested_platform = std::env::var("DOCKER_DEFAULT_PLATFORM")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let platform = selected_platform(
+        requested_platform.clone(),
+        &existing_env,
+        configured_image.is_some(),
+    );
+    if platform.as_deref().is_some_and(|value| !platform_ok(value)) {
+        return Err("DOCKER_DEFAULT_PLATFORM isn't a valid Docker platform.".into());
+    }
+    if configured_image.is_none() && platform.as_deref() == Some(PUBLISHED_PLATFORM) {
+        println!(
+            "The published hub image uses linux/amd64; Docker Desktop runs it through emulation on Apple Silicon."
+        );
+    }
+
+    // Reject malformed image references before Docker can interpret one as an option.
+    if selected_image.starts_with('-')
+        || selected_image
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || "\"'$\\`".contains(c))
+    {
+        return Err("AGENTSCM_HUB_IMAGE must be an image reference without leading hyphens, whitespace or shell interpolation.".into());
+    }
+    // Do not leave setup files or an uninstall record behind when image acquisition fails.
+    acquire_image(&selected_image, platform.as_deref())?;
+
     // The image goes into .env only when the user chose one; a stale one we wrote is dropped.
     let mut updates = Vec::new();
     let mut stale = vec![];
-    let image = std::env::var("AGENTSCM_HUB_IMAGE").unwrap_or_default();
-    if image.is_empty() {
-        stale.push("AGENTSCM_HUB_IMAGE");
+    if let Some(image) = configured_image.as_deref() {
+        updates.push(("AGENTSCM_HUB_IMAGE", image));
     } else {
-        updates.push(("AGENTSCM_HUB_IMAGE", image.as_str()));
+        stale.push("AGENTSCM_HUB_IMAGE");
     }
-    write(&compose, &compose_text())?;
-    write(&env, &env_text(&existing_env, &updates, &stale)?)?;
+    if let Some(platform) = requested_platform.as_deref() {
+        updates.push(("DOCKER_DEFAULT_PLATFORM", platform));
+    } else if configured_image.is_some() {
+        stale.push("DOCKER_DEFAULT_PLATFORM");
+    }
+    let rendered_env = env_text(&existing_env, &updates, &stale)?;
+    let rendered_compose = compose_text_for(platform.as_deref());
+    write(&compose, &rendered_compose)?;
+    write(&env, &rendered_env)?;
     manifest.local_hub = Some(LocalHubRecord {
         dir: dir.clone(),
         project: PROJECT.into(),
     });
     manifest.save().map_err(|e| e.to_string())?;
 
-    let image = self::image();
-    let inspect = ["image".to_owned(), "inspect".to_owned(), image.clone()];
-    if run_capture(&inspect, QUICK).is_none() {
-        println!("Pulling {image} ...");
-        if !run_visible(&["pull".into(), image.clone()])? {
-            return Err(format!(
-                "The hub image {image} isn't available yet. Set AGENTSCM_HUB_IMAGE, or connect to an existing hub."
-            ));
-        }
-    }
     let up = compose_args(&dir, &["up", "-d", "--pull", "never"]);
     if !run_visible(&up)? {
         return Err("Docker could not start the hub (is port 7332 already in use?).".into());
@@ -305,8 +420,17 @@ pub(crate) async fn start(
         println!(
             "Create the app on GitHub, then on the success page click Install and choose your repository."
         );
-        if tty {
+        if tty && !ui.yes {
             open_url(&link);
+        }
+        if ui.yes {
+            println!(
+                "Non-interactive setup will not wait for the browser. Finish creating and installing the app, then run quickstart again."
+            );
+            return Ok(Started {
+                install_url: None,
+                pending: true,
+            });
         }
         let deadline = Instant::now() + Duration::from_secs(600);
         while connection.is_empty() {
@@ -322,7 +446,10 @@ pub(crate) async fn start(
         ));
     }
     let Some(con) = connection.first() else {
-        return Ok(Started { install_url: None });
+        return Ok(Started {
+            install_url: None,
+            pending: false,
+        });
     };
     let app: Value = run_capture(
         &exec_args(&dir, &["cat", &format!("{SECRETS}/{con}.json")]),
@@ -360,7 +487,10 @@ pub(crate) async fn start(
         }
         wait_healthy().await?;
     }
-    Ok(Started { install_url })
+    Ok(Started {
+        install_url,
+        pending: false,
+    })
 }
 
 async fn wait_healthy() -> Result<(), String> {
@@ -397,6 +527,40 @@ mod tests {
         );
         assert!(!default_image().contains(":v") && !default_image().ends_with("latest"));
         assert!(compose_text().contains(&format!("${{AGENTSCM_HUB_IMAGE:-{}}}", default_image())));
+        assert!(compose_text().contains("    platform: \"linux/amd64\"\n"));
+    }
+
+    #[test]
+    fn platform_selection_respects_explicit_and_persisted_choices() {
+        assert_eq!(
+            selected_platform(
+                Some("linux/arm64".into()),
+                "DOCKER_DEFAULT_PLATFORM=linux/amd64\n",
+                false
+            ),
+            Some("linux/arm64".into())
+        );
+        assert_eq!(
+            selected_platform(None, "DOCKER_DEFAULT_PLATFORM=linux/arm64/v8\n", false),
+            Some("linux/arm64/v8".into())
+        );
+        assert_eq!(
+            selected_platform(None, "", false),
+            Some("linux/amd64".into())
+        );
+        assert_eq!(selected_platform(None, "", true), None);
+        assert_eq!(
+            selected_platform(None, "DOCKER_DEFAULT_PLATFORM=linux/amd64\n", true),
+            None
+        );
+        assert!(matches_platform("linux/arm64", "linux/arm64/v8"));
+        assert!(matches_platform("linux/arm64/v8", "linux/arm64"));
+        assert!(!matches_platform("linux/arm/v6", "linux/arm/v7"));
+        assert!(platform_ok("linux/arm64/v8"));
+        assert!(!platform_ok("linux/amd64\ncommand: nope"));
+        assert!(!platform_ok("linux:${ARCH}"));
+        assert!(!compose_text_for(None).contains("platform:"));
+        assert!(compose_text_for(Some("linux/arm64")).contains("    platform: \"linux/arm64\"\n"));
     }
 
     #[test]

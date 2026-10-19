@@ -114,10 +114,17 @@ impl Manifest {
     }
 
     pub(crate) fn save(&mut self) -> Result<()> {
+        let path = path()?;
+        let unchanged = serde_json::to_string_pretty(self)
+            .map_err(|_| Error::Invalid("cannot record quickstart.json".into()))?
+            + "\n";
+        if std::fs::read_to_string(&path).ok().as_deref() == Some(unchanged.as_str()) {
+            return Ok(());
+        }
         self.updated_at = unix_now();
         let text = serde_json::to_string_pretty(self)
             .map_err(|_| Error::Invalid("cannot record quickstart.json".into()))?;
-        write_private(&path()?, &format!("{text}\n"))
+        write_private(&path, &format!("{text}\n"))
     }
 
     pub(crate) fn is_empty(&self) -> bool {
