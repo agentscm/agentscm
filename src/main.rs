@@ -490,7 +490,12 @@ async fn run(cli: Cli) -> Result<()> {
         Command::InitRepo(args) => init_cli::run(args)?,
         Command::Intent { command } => intent_cli::run(command).await?,
         Command::Demo(args) => demo_cli::run(args).await?,
-        Command::Quickstart(args) => quickstart::run(args).await?,
+        Command::Quickstart(args) => {
+            let code = quickstart::run(args).await?;
+            if code != 0 {
+                std::process::exit(i32::from(code));
+            }
+        }
         Command::Uninstall(args) => quickstart::uninstall(args).await?,
         #[cfg(unix)]
         Command::GitSnapshot { command } => {

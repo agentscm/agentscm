@@ -6,6 +6,74 @@ use std::time::{Duration, Instant};
 
 use crate::intent_cli::valid_repo;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DockerDaemon {
+    pub(crate) os: String,
+    pub(crate) arch: String,
+    pub(crate) endpoint: String,
+}
+
+fn docker_arch(value: &str) -> Option<&'static str> {
+    match value {
+        "amd64" | "x86_64" => Some("amd64"),
+        "arm64" | "aarch64" => Some("arm64"),
+        _ => None,
+    }
+}
+
+/// The daemon platform and endpoint used by the active Docker context. A local Hub publishes a
+/// loopback port on this machine, so remote SSH/TCP contexts are deliberately not accepted.
+pub(crate) fn docker_daemon() -> Result<DockerDaemon, String> {
+    let docker = which("docker").ok_or("Docker was not found on PATH.")?;
+    let platform = capture(
+        &docker,
+        &["info", "--format", "{{.OSType}}/{{.Architecture}}"],
+        None,
+        QUICK,
+    )
+    .ok_or("Docker did not report its daemon platform.")?;
+    let (os, arch) = platform
+        .split_once('/')
+        .ok_or("Docker reported an invalid daemon platform.")?;
+    // Docker gives DOCKER_CONTEXT precedence over DOCKER_HOST. Inspect that context's
+    // endpoint rather than accepting a local-looking host override for a remote daemon.
+    let context_override =
+        std::env::var_os("DOCKER_CONTEXT").is_some_and(|value| !value.is_empty());
+    let endpoint = (!context_override)
+        .then(|| {
+            std::env::var("DOCKER_HOST")
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
+        .flatten()
+        .or_else(|| {
+            capture(
+                &docker,
+                &[
+                    "context",
+                    "inspect",
+                    "--format",
+                    "{{(index .Endpoints \"docker\").Host}}",
+                ],
+                None,
+                QUICK,
+            )
+        })
+        .ok_or("Docker did not report its active context endpoint.")?;
+    if !(endpoint.starts_with("unix://") || endpoint.starts_with("npipe://")) {
+        return Err(format!(
+            "The active Docker context uses {endpoint}; a local Hub requires a local Docker context so 127.0.0.1 reaches this machine."
+        ));
+    }
+    Ok(DockerDaemon {
+        os: os.to_owned(),
+        arch: docker_arch(arch)
+            .ok_or_else(|| format!("Docker reported unsupported architecture {arch}."))?
+            .to_owned(),
+        endpoint,
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Forge {
     Github,
@@ -216,5 +284,14 @@ mod tests {
         ] {
             assert_eq!(remote(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn normalizes_supported_docker_architectures() {
+        assert_eq!(docker_arch("aarch64"), Some("arm64"));
+        assert_eq!(docker_arch("arm64"), Some("arm64"));
+        assert_eq!(docker_arch("x86_64"), Some("amd64"));
+        assert_eq!(docker_arch("amd64"), Some("amd64"));
+        assert_eq!(docker_arch("armv7"), None);
     }
 }

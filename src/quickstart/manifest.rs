@@ -57,6 +57,12 @@ pub(crate) struct HubJsonRecord {
 pub(crate) struct LocalHubRecord {
     pub(crate) dir: PathBuf,
     pub(crate) project: String,
+    #[serde(default = "default_hub_port")]
+    pub(crate) port: u16,
+}
+
+fn default_hub_port() -> u16 {
+    7332
 }
 
 /// Quickstart signed in and created `hub-session.json` (it was not there before).
@@ -75,6 +81,7 @@ pub(crate) struct Manifest {
     pub(crate) hub_json: Option<HubJsonRecord>,
     pub(crate) session: Option<SessionRecord>,
     pub(crate) local_hub: Option<LocalHubRecord>,
+    pub(crate) native_hub: Option<super::hub_native::Record>,
     /// `~/.agentscm/bin` holds the program the hooks call.
     pub(crate) bin_dir: Option<PathBuf>,
 }
@@ -118,7 +125,15 @@ impl Manifest {
         let unchanged = serde_json::to_string_pretty(self)
             .map_err(|_| Error::Invalid("cannot record quickstart.json".into()))?
             + "\n";
-        if std::fs::read_to_string(&path).ok().as_deref() == Some(unchanged.as_str()) {
+        #[cfg(unix)]
+        let private = {
+            use std::os::unix::fs::PermissionsExt;
+            path.metadata()
+                .is_ok_and(|meta| meta.permissions().mode() & 0o777 == 0o600)
+        };
+        #[cfg(not(unix))]
+        let private = true;
+        if private && std::fs::read_to_string(&path).ok().as_deref() == Some(unchanged.as_str()) {
             return Ok(());
         }
         self.updated_at = unix_now();
@@ -133,6 +148,7 @@ impl Manifest {
             && self.hub_json.is_none()
             && self.session.is_none()
             && self.local_hub.is_none()
+            && self.native_hub.is_none()
             && self.bin_dir.is_none()
     }
 }

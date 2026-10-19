@@ -9,7 +9,11 @@
 1. **Looks around** and prints what it found: whether you are in a Git repository, its `origin` (GitHub, GitLab or other) and `owner/name`, the Git version, whether Docker and `docker compose` work, whether a hub is already configured and answering, and whether Claude Code is installed. Nothing is changed.
 2. **Checks for collisions now** (default yes). It runs the [collision check](collisions.md) with worktrees and prints, for example, `7 branches/worktrees checked: 2 would conflict, 3 touch the same files.` and the top three pairs with the files they share. Old Git or a missing `origin/HEAD` gets one plain sentence and setup continues.
 3. **Live warnings** (optional): a hub is a small shared server that lets agents on different machines see each other's work as it happens. Choose one:
-   - **Local hub with Docker.** GitHub repositories only. Acquires the hub image before writing `~/.agentscm/hub/compose.yaml` and `~/.agentscm/hub/.env` (0600), then starts it as the Docker Compose project `agentscm-hub` on `127.0.0.1:7332`. On first run it opens the hub's one-time link so you can create a GitHub App; click **Install** on the success page and choose your repository. It then asks for your GitHub login (offered from `gh` or `git config github.user`), makes that account the hub's administrator, and restarts the hub with sign-in enabled.
+   - **Local hub.** GitHub repositories only. On Apple Silicon macOS with `launchctl`, the default runs the installed native binary as a per-user LaunchAgent. Its plist is in `~/Library/LaunchAgents`, with private configuration and data in `~/.agentscm/hub-native/<project>`. It starts at login and restarts after a crash. Persistent service output goes to `/dev/null`; startup failures include bounded `launchctl` diagnostics. Other hosts can explicitly choose the Docker fallback (`--hub-runtime docker`), which requires a running local Linux Docker Engine and Docker Compose. Docker selects the daemon's native ARM64 or AMD64 image and acquires it before writing `~/.agentscm/hub/compose.yaml` and `.env` (0600).
+
+     Both runtimes bind to `127.0.0.1:7332` by default. `--hub-port` selects another port; `--hub-project` selects an instance name. The default name incorporates the home directory, so isolated installations do not share a service or volume. Resume reuses the recorded runtime, port and project. Quickstart refuses to switch an existing instance's runtime or identity. Port, authentication, configuration and startup failures are reported without switching runtimes.
+
+     On first run it opens the hub's one-time link so you can create a GitHub App; click **Install** on the success page and choose your repository. It then asks for your GitHub login (offered from `gh` or `git config github.user`), makes that account the hub's administrator, and restarts the hub with sign-in enabled.
    - **An existing hub.** A hub your team already runs; give its URL.
    - **Skip.** Only the collision check and hooks; run quickstart again later to add a hub.
 4. **Sign-in and agent token.** It signs you in through your browser (device code if the hub offers it), creates an agent token for this repository (a key that lets agents on this machine use the hub for that one repository; named `claude-<host>`, valid 30 days), and writes it to `~/.config/agentscm/tokens/<owner>__<name>.token` (0600). A token file that is already there and wasn't made by quickstart is backed up first and never deleted by `uninstall`. It then writes `~/.config/agentscm/hub.json` with the hub URL, a default token file and this repository's entry in a per-repository `tokens` map. If the hub's GitHub App is not installed on the repository yet, it tells you exactly what to click and waits for Enter.
@@ -22,7 +26,7 @@
 
 **Several repositories, one hub.** Run quickstart in each repository. Every repository gets its own token and its own entry in `hub.json`'s `tokens` map; other repositories' entries and files are never touched. If `hub.json` points at a different hub, quickstart shows it and asks before switching (a backup is kept), and says other repositories will move with it.
 
-If the hub isn't answering at any point, quickstart says so and carries on with the remaining steps; live warnings start working once it is back.
+If the hub isn't answering, quickstart reports the failure and the final live-warning status. Explicitly requested hub setup that remains incomplete exits non-zero.
 
 ## Running without a terminal (CI)
 
@@ -31,6 +35,8 @@ Without a terminal quickstart refuses unless you pass `--yes`, which takes the r
 | Flag | Meaning |
 | --- | --- |
 | `--hub local\|existing\|skip` | How to get live warnings (with `--yes` and no flag, an already configured hub is kept, otherwise skip). |
+| `--hub-runtime native\|docker` | Local runtime. Native is the default on supported Apple Silicon macOS hosts; Docker must be selected explicitly elsewhere with `--yes`. |
+| `--hub-port PORT`, `--hub-project NAME` | Isolated local instance; defaults to port 7332 and a home-specific name. Resume reuses the record. |
 | `--hub-url URL` | The hub for `--hub existing`. |
 | `--agent-token-file PATH` | Use this agent token instead of signing in; it is checked against the hub and used where it is. |
 | `--agent-name NAME`, `--ttl 30d` | Name and lifetime of the token quickstart creates. |
@@ -40,7 +46,7 @@ Without a terminal quickstart refuses unless you pass `--yes`, which takes the r
 | `--init` | Also run `agentscm init-repo` for this repository with a shared hub (with `--yes`, it is otherwise skipped; loopback hubs always skip it). |
 | `--no-collisions` | Skip the collision check. |
 
-Without a terminal quickstart never starts a browser or device sign-in: pass `--agent-token-file` for non-interactive setup. A new local hub still requires GitHub App setup in a browser; `--yes` prints the link and returns without waiting. Finish that step, then resume with the printed `quickstart --hub local` command.
+Without a terminal quickstart never starts a browser or device sign-in: pass `--agent-token-file` for non-interactive setup. A new local hub still requires GitHub App setup in a browser; `--yes` prints the link and returns exit status **3** without waiting. Finish that step, then resume with the printed command, which includes the runtime, port and project. Exit status **0** means the requested setup completed; other failures exit non-zero.
 
 Example: `agentscm quickstart --yes --hub existing --hub-url https://hub.example.com --agent-token-file ~/hub.token --hook project`.
 
@@ -54,7 +60,7 @@ It reads `quickstart.json`, shows exactly what it will remove, and asks (or `--y
 - The sign-in session quickstart created is ended (the hub is told, best effort) and its file removed.
 - The program files directly in `~/.agentscm/bin` named `agentscm` or `agentscm-*` are removed, even ones quickstart didn't create; the confirmation list names them first. Nothing else there, and no directories, are touched.
 - `hub.json` is deleted (or the previous copy restored) only if it is unchanged since quickstart wrote it; otherwise it is left and the reason is shown.
-- The local hub is stopped (`docker compose -p agentscm-hub down`). Its data and `~/.agentscm/hub` are kept unless you choose deletion before the final confirmation, or pass `--remove-hub-data`. The GitHub App and installations remain on GitHub; delete them in GitHub Settings if no longer needed. Keeping hub data lets reinstall reuse the app.
+- The local hub is stopped using its recorded runtime and identity. A native LaunchAgent is removed before its executable. Its data (or the Docker volume and setup files) are kept unless you choose deletion before the final confirmation, or pass `--remove-hub-data`. Changed service files are retained with their record for manual review. The GitHub App and installations remain on GitHub; delete them in GitHub Settings if no longer needed. Keeping hub data lets reinstall reuse the app. Native installs retain a private ownership receipt alongside that data. Uninstall refuses symlinked managed configuration roots; restore the recorded paths before retrying.
 - Finally `quickstart.json` is deleted (see above). If it doesn't exist, nothing was installed by quickstart and uninstall says so.
 - A file is put back from its backup only when it is byte-identical to what quickstart last wrote; otherwise only quickstart's own entries are removed and your later edits stay.
 
@@ -62,9 +68,9 @@ Backup files stay next to the files they protect.
 
 ## Limits
 
-- The release image currently uses `linux/amd64`. Quickstart selects and saves that platform explicitly, so Docker Desktop uses emulation on Apple Silicon. `DOCKER_DEFAULT_PLATFORM` overrides it; custom `AGENTSCM_HUB_IMAGE` values use Docker's native selection unless `DOCKER_DEFAULT_PLATFORM` is explicitly set in the current environment. Quickstart's automatic default lives in Compose; it does not become a saved user override.
-- The local hub needs Docker and the published image `ghcr.io/counterbranch/agentscm:<version>` (the version of this binary, without a `v`). Images are published with each release from 0.1.0-alpha.1. To use another image, set `AGENTSCM_HUB_IMAGE`; quickstart saves it in the hub's `.env`. If the image can't be pulled, quickstart says so and offers an existing hub or skipping.
+- The release workflow builds and tests native `linux/amd64` and `linux/arm64` children before assembling the versioned image index. Older published images may contain only AMD64. Quickstart does not silently enable emulation: an operator can explicitly choose `DOCKER_DEFAULT_PLATFORM=linux/amd64`, subject to the Docker runtime supporting it. Emulation is slower and is not universal. Remote Docker contexts are refused because their loopback port would not reach this machine.
+- The Docker fallback needs Docker Engine, Compose and the published image `ghcr.io/counterbranch/agentscm:<version>` (the version of this binary, without a `v`). Images are published with each release from 0.1.0-alpha.1. To use another image, set `AGENTSCM_HUB_IMAGE`; quickstart saves it in the hub's `.env`. If the image can't be pulled, quickstart says so and offers an existing hub or skipping.
 - The local hub's first-run setup is GitHub only today. For a GitLab repository connect to an existing hub.
-- Platform selection and generated Docker files have unit coverage; fake-Docker integration tests verify failed pulls write no setup files and uninstall keeps data by default. Live image acquisition, emulation and first-run GitHub App creation need separate validation. The remaining setup is tested with the real binary against an in-process hub.
-- The hooks are verified with recorded Claude Code hook input, not with a live Claude Code session. They are advisory: a hub problem is reported as "coordination unknown" and never blocks the agent.
+- Platform selection and generated Docker files have unit coverage; fake-Docker integration tests verify failed pulls write no setup files and uninstall keeps data by default. Matching-image acquisition, runtime lifecycle, GitHub App setup and sign-in require live qualification before release. Emulation needs its own runtime-specific qualification.
+- Live Claude Code sessions with isolated hook settings have exercised collision warnings and session cleanup in a primary checkout and Git worktree on Apple Silicon macOS. Other hosts and clients need their own live qualification. The hooks are advisory: a hub problem is reported as "coordination unknown" and never blocks the agent.
 - Sign-in through a browser is covered by the existing [hub](hub.md) sign-in tests, not by a quickstart end-to-end test.

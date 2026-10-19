@@ -25,6 +25,10 @@ struct Hub {
 
 impl Hub {
     fn start() -> Self {
+        Self::start_with_health_guard(None)
+    }
+
+    fn start_with_health_guard(marker: Option<PathBuf>) -> Self {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}", dir.path().join("hub.sqlite").display());
         let store = store::open(&url).unwrap();
@@ -34,7 +38,27 @@ impl Hub {
             .enable_all()
             .build()
             .unwrap();
-        let app = router(HubState::new(store.clone(), Arc::new(objects)));
+        let app = router(HubState::new(store.clone(), Arc::new(objects))).layer(
+            axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let marker = marker.clone();
+                    async move {
+                        if request.uri().path() == "/v1/hub/health"
+                            && marker.as_ref().is_some_and(|path| {
+                                std::fs::read(path).ok().as_deref() == Some(b"broken")
+                            })
+                        {
+                            axum::response::Response::builder()
+                                .status(503)
+                                .body(axum::body::Body::empty())
+                                .unwrap()
+                        } else {
+                            next.run(request).await
+                        }
+                    }
+                },
+            ),
+        );
         let address = runtime.block_on(async {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
@@ -781,7 +805,7 @@ fn several_repositories_share_one_hub_with_their_own_tokens() {
 }
 
 #[test]
-fn a_hub_that_is_down_does_not_stop_the_hook() {
+fn a_requested_hub_that_is_down_fails_but_keeps_the_planned_hook() {
     let machine = Machine::new();
     let repo = machine.repo();
     let url = closed_port_url();
@@ -799,7 +823,8 @@ fn a_hub_that_is_down_does_not_stop_the_hook() {
             "--no-collisions",
         ],
     );
-    let said = ok(&output);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let said = out(&output);
     assert!(
         said.contains(&format!(
             "The hub at {url} isn't answering; live warnings will start working once it is."
@@ -818,10 +843,12 @@ fn a_hub_that_is_down_does_not_stop_the_hook() {
     // With a token the user supplies, the settings are written even though it cannot be checked.
     let token = machine.home.path().join("t.token");
     std::fs::write(&token, "tok\n").unwrap();
-    let said = ok(&machine.run(
+    let output = machine.run(
         repo.path(),
         &quick(&url, &token, &["--hook", "none", "--no-collisions"]),
-    ));
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let said = out(&output);
     assert!(said.contains("hub isn't answering"), "{said}");
     assert_eq!(
         json_file(&machine.config().join("hub.json"))["url"],
@@ -1126,6 +1153,14 @@ fn no_op_run_explicitly_reports_no_changes_and_writes_no_record() {
     assert!(!machine.config().join("quickstart.json").exists());
 }
 
+fn unused_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
 fn fake_docker(machine: &Machine) {
     let docker = machine.bin.path().join("docker");
     std::fs::write(
@@ -1134,9 +1169,19 @@ fn fake_docker(machine: &Machine) {
 printf '%s\n' "$*" >> "$HOME/docker.log"
 case "$1 $2" in
   'version '*|'compose version') exit 0 ;;
-  'image inspect') exit 1 ;;
+  'info --format') echo "${FAKE_DOCKER_PLATFORM:-linux/amd64}"; exit 0 ;;
+  'context inspect') echo "${FAKE_DOCKER_ENDPOINT:-unix:///var/run/docker.sock}"; exit 0 ;;
+  'image inspect')
+    if [ "${FAKE_DOCKER_IMAGE_PRESENT:-}" = 1 ]; then echo 'linux/amd64'; exit 0; fi
+    exit 1
+    ;;
   'pull '*) echo 'fixture: registry denied pull' >&2; exit 17 ;;
-  'compose -p') exit 0 ;;
+  'compose -p')
+    case "$*" in
+      *' exec -T hub cat /data/secrets/bootstrap-setup-url') echo "$FAKE_HUB_URL/setup" ;;
+    esac
+    exit 0
+    ;;
 esac
 exit 1
 "#,
@@ -1146,11 +1191,125 @@ exit 1
 }
 
 #[test]
+fn noninteractive_docker_bootstrap_uses_the_recorded_dynamic_port_and_exits_pending() {
+    let (hub, machine) = (Hub::start(), Machine::new());
+    let repo = machine.repo();
+    fake_docker(&machine);
+    let port = hub.url.rsplit(':').next().unwrap();
+    let dir = machine.home.path().join(".agentscm/hub");
+    std::fs::create_dir_all(machine.config()).unwrap();
+    std::fs::write(
+        machine.config().join("quickstart.json"),
+        json!({
+            "local_hub": {"dir": dir, "project": "fixture-hub", "port": port.parse::<u16>().unwrap()}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let output = machine
+        .command(
+            repo.path(),
+            &[
+                "quickstart",
+                "--yes",
+                "--hub",
+                "local",
+                "--hub-runtime",
+                "docker",
+                "--hub-port",
+                port,
+                "--hub-project",
+                "fixture-hub",
+                "--github-login",
+                "octo",
+                "--hook",
+                "none",
+                "--no-collisions",
+            ],
+        )
+        .env("FAKE_DOCKER_IMAGE_PRESENT", "1")
+        .env("FAKE_HUB_URL", &hub.url)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    let said = out(&output);
+    assert!(
+        said.contains(&format!(
+            "Open this link (it works once, for 10 minutes):\n  {}/setup",
+            hub.url
+        )),
+        "{said}"
+    );
+    assert!(
+        said.contains(&format!(
+            "--hub-runtime docker --hub-port {port} --hub-project fixture-hub"
+        )),
+        "{said}"
+    );
+    assert!(last_line(&output).contains("the local hub is waiting for GitHub App setup"));
+    assert!(!machine.config().join("hub.json").exists());
+    assert!(
+        json_file(&machine.config().join("quickstart.json"))["tokens"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn invalid_local_runtime_project_and_port_fail_without_setup_files() {
+    let cases: &[(&[&str], i32, &str)] = &[
+        (&["--hub-runtime", "other"], 2, "invalid value"),
+        (
+            &["--hub-runtime", "docker", "--hub-port", "0"],
+            2,
+            "invalid value",
+        ),
+        (
+            &["--hub-runtime", "docker", "--hub-project", "Bad_Name"],
+            1,
+            "--hub-project must start with a lowercase letter",
+        ),
+    ];
+    for (extra, code, message) in cases {
+        let machine = Machine::new();
+        let repo = machine.repo();
+        fake_docker(&machine);
+        let mut args = vec![
+            "quickstart",
+            "--yes",
+            "--hub",
+            "local",
+            "--github-login",
+            "octo",
+            "--hook",
+            "none",
+            "--no-collisions",
+        ];
+        args.extend(*extra);
+        let output = machine.run(repo.path(), &args);
+        assert_eq!(output.status.code(), Some(*code), "{output:?}");
+        assert!(
+            format!(
+                "{}{}",
+                out(&output),
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .contains(message),
+            "{output:?}"
+        );
+        assert!(!machine.home.path().join(".agentscm/hub").exists());
+        assert!(!machine.config().join("quickstart.json").exists());
+    }
+}
+
+#[test]
 fn failed_hub_pull_leaves_no_setup_files_or_record_and_honors_platform() {
     for platform in [None, Some("linux/arm64")] {
         let machine = Machine::new();
         let repo = machine.repo();
         fake_docker(&machine);
+        let port = unused_port().to_string();
         let mut command = machine.command(
             repo.path(),
             &[
@@ -1158,6 +1317,10 @@ fn failed_hub_pull_leaves_no_setup_files_or_record_and_honors_platform() {
                 "--yes",
                 "--hub",
                 "local",
+                "--hub-runtime",
+                "docker",
+                "--hub-port",
+                &port,
                 "--github-login",
                 "octo",
                 "--hook",
@@ -1169,8 +1332,19 @@ fn failed_hub_pull_leaves_no_setup_files_or_record_and_honors_platform() {
             command.env("DOCKER_DEFAULT_PLATFORM", platform);
         }
         let result = command.output().unwrap();
-        let said = ok(&result);
+        assert_eq!(result.status.code(), Some(1), "{result:?}");
+        let said = out(&result);
         assert!(said.contains("Docker could not pull"), "{said}");
+        if platform == Some("linux/arm64") {
+            assert!(
+                said.contains("DOCKER_DEFAULT_PLATFORM=linux/amd64"),
+                "{said}"
+            );
+            assert!(
+                said.contains("no architecture was switched automatically"),
+                "{said}"
+            );
+        }
         assert!(said.contains("No changes made."), "{said}");
         assert!(String::from_utf8_lossy(&result.stderr).contains("registry denied pull"));
         assert!(!machine.home.path().join(".agentscm/hub").exists());
@@ -1239,11 +1413,33 @@ fn no_op_rerun_keeps_manifest_bytes_and_reports_no_changes() {
 }
 
 #[test]
+fn no_op_rerun_repairs_a_world_readable_manifest_mode() {
+    let machine = Machine::new();
+    let repo = machine.repo();
+    let args = [
+        "quickstart",
+        "--yes",
+        "--hub",
+        "skip",
+        "--hook",
+        "user",
+        "--no-collisions",
+    ];
+    ok(&machine.run(repo.path(), &args));
+    let record = machine.config().join("quickstart.json");
+    std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let said = ok(&machine.run(repo.path(), &args));
+    assert_eq!(mode(&record), 0o600);
+    assert!(!said.contains("No changes made."), "{said}");
+}
+
+#[test]
 fn malformed_custom_image_never_reaches_image_inspect_or_pull() {
     for image in ["--help", "-q", "bad image", "bad\nimage", "${IMAGE}"] {
         let machine = Machine::new();
         let repo = machine.repo();
         fake_docker(&machine);
+        let port = unused_port().to_string();
         let output = machine
             .command(
                 repo.path(),
@@ -1252,6 +1448,10 @@ fn malformed_custom_image_never_reaches_image_inspect_or_pull() {
                     "--yes",
                     "--hub",
                     "local",
+                    "--hub-runtime",
+                    "docker",
+                    "--hub-port",
+                    &port,
                     "--github-login",
                     "octo",
                     "--hook",
@@ -1262,7 +1462,8 @@ fn malformed_custom_image_never_reaches_image_inspect_or_pull() {
             .env("AGENTSCM_HUB_IMAGE", image)
             .output()
             .unwrap();
-        let said = ok(&output);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let said = out(&output);
         assert!(
             said.contains("AGENTSCM_HUB_IMAGE must be an image reference"),
             "{said}"
@@ -1283,12 +1484,13 @@ fn custom_image_drops_previous_platform_choice_and_failed_pull_preserves_existin
     let machine = Machine::new();
     let repo = machine.repo();
     fake_docker(&machine);
+    let port = unused_port().to_string();
     let dir = machine.home.path().join(".agentscm/hub");
     std::fs::create_dir_all(&dir).unwrap();
     let old_env = "DOCKER_DEFAULT_PLATFORM=linux/amd64\nAGENTSCM_ADMINS=github:octo\n";
     std::fs::write(dir.join(".env"), old_env).unwrap();
     std::fs::write(dir.join("compose.yaml"), "previous compose\n").unwrap();
-    let said = ok(&machine
+    let output = machine
         .command(
             repo.path(),
             &[
@@ -1296,6 +1498,10 @@ fn custom_image_drops_previous_platform_choice_and_failed_pull_preserves_existin
                 "--yes",
                 "--hub",
                 "local",
+                "--hub-runtime",
+                "docker",
+                "--hub-port",
+                &port,
                 "--github-login",
                 "octo",
                 "--hook",
@@ -1305,13 +1511,14 @@ fn custom_image_drops_previous_platform_choice_and_failed_pull_preserves_existin
         )
         .env("AGENTSCM_HUB_IMAGE", "example.invalid/custom:arm64")
         .output()
-        .unwrap());
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let said = out(&output);
     let commands = std::fs::read_to_string(machine.home.path().join("docker.log")).unwrap();
     assert!(
-        commands.contains("pull example.invalid/custom:arm64"),
+        commands.contains("pull --platform linux/amd64 example.invalid/custom:arm64"),
         "{commands}"
     );
-    assert!(!commands.contains("pull --platform"), "{commands}");
     assert_eq!(std::fs::read_to_string(dir.join(".env")).unwrap(), old_env);
     assert_eq!(
         std::fs::read_to_string(dir.join("compose.yaml")).unwrap(),
@@ -1319,4 +1526,371 @@ fn custom_image_drops_previous_platform_choice_and_failed_pull_preserves_existin
     );
     assert!(said.contains("No changes made."), "{said}");
     assert!(!machine.config().join("quickstart.json").exists());
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn native_fixture(machine: &Machine, hub: &Hub) -> (PathBuf, PathBuf) {
+    use sha2::{Digest, Sha256};
+    let digest = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+    let home = machine.home.path();
+    let project = "fixture-native";
+    let config = home.join(".agentscm/hub-native").join(project);
+    let data = config.join("data");
+    std::fs::create_dir_all(data.join("secrets")).unwrap();
+    std::fs::create_dir_all(machine.bin_dir()).unwrap();
+    let executable = machine
+        .bin_dir()
+        .join(format!("agentscm-{}", env!("CARGO_PKG_VERSION")));
+    place_binary(&executable);
+    symlink(
+        executable.file_name().unwrap(),
+        machine.bin_dir().join("agentscm"),
+    )
+    .unwrap();
+    let executable = executable.canonicalize().unwrap();
+    let plist = home.join("Library/LaunchAgents/com.counterbranch.agentscm.fixture-native.plist");
+    std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    std::fs::write(&plist, "previous plist").unwrap();
+    std::fs::create_dir_all(machine.config()).unwrap();
+    let label = format!(
+        "com.counterbranch.agentscm.{project}.{}",
+        &digest(home.as_os_str().as_encoded_bytes())[..10]
+    );
+    let record = json!({
+        "label": label, "plist": plist, "config_dir": config, "data_dir": data,
+        "executable": executable, "executable_sha256": digest(&std::fs::read(&executable).unwrap()),
+        "plist_sha256": digest(b"previous plist"), "port": hub.url.rsplit(':').next().unwrap().parse::<u16>().unwrap(),
+        "project": project, "environment": {"AGENTSCM_DATABASE_URL": format!("sqlite://{}",data.join("hub.sqlite").display())}
+    });
+    std::fs::write(
+        machine.config().join("quickstart.json"),
+        json!({"native_hub":record,"bin_dir":machine.bin_dir()}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        data.join("secrets/con_fixture.json"),
+        json!({"client_id":"fixture-client","slug":"fixture-app"}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        data.join("secrets/con_fixture.client_secret"),
+        "synthetic-secret",
+    )
+    .unwrap();
+    symlink("/usr/bin/id", machine.bin.path().join("id")).unwrap();
+    let launchctl = machine.bin.path().join("launchctl");
+    std::fs::write(&launchctl, r#"#!/bin/sh
+printf '%s\n' "$*" >> "$HOME/launchctl.log"
+case "$1" in
+ print)
+  case "$FAKE_PRINT_MODE" in
+   unavailable) echo "fixture: GUI domain unavailable" >&2; exit 5 ;;
+   absent) printf 'Could not find service "%s" in domain for user gui\n' "${2##*/}" >&2; exit 113 ;;
+  esac
+  printf 'program = %s\n' "$FAKE_EXECUTABLE" ;;
+ bootstrap|bootout)
+  if /usr/bin/grep -q AGENTSCM_ADMINS "$FAKE_PLIST"; then
+   [ "$FAKE_FAILURE" != "$1" ] || { echo "fixture $1 failed" >&2; exit 17; }
+   if [ "$FAKE_FAILURE" = health ] && [ "$1" = bootstrap ]; then printf broken > "$FAKE_HEALTH_MARKER"; fi
+  else
+   if [ -n "$FAKE_HEALTH_MARKER" ]; then printf ok > "$FAKE_HEALTH_MARKER"; fi
+  fi ;;
+esac
+exit 0
+"#).unwrap();
+    std::fs::set_permissions(launchctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (plist, executable)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn native_configuration_failure_restores_plist_record_and_previous_service() {
+    for failure in ["bootstrap", "bootout", "health"] {
+        let machine = Machine::new();
+        let marker = machine.home.path().join("health-marker");
+        let hub = Hub::start_with_health_guard(Some(marker.clone()));
+        let repo = machine.repo();
+        let (plist, _) = native_fixture(&machine, &hub);
+        let output = machine
+            .command(
+                repo.path(),
+                &[
+                    "quickstart",
+                    "--yes",
+                    "--hub",
+                    "local",
+                    "--hub-runtime",
+                    "native",
+                    "--github-login",
+                    "octo",
+                    "--hook",
+                    "none",
+                    "--no-collisions",
+                ],
+            )
+            .env("FAKE_FAILURE", failure)
+            .env("FAKE_PLIST", &plist)
+            .env("FAKE_HEALTH_MARKER", &marker)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{failure}: {output:?}");
+        assert!(
+            out(&output).contains("previous Hub configuration was restored"),
+            "{failure}: {output:?}"
+        );
+        assert!(
+            !std::fs::read_to_string(&plist)
+                .unwrap()
+                .contains("AGENTSCM_ADMINS")
+        );
+        let record = json_file(&machine.config().join("quickstart.json"));
+        assert!(
+            record["native_hub"]["environment"]
+                .get("AGENTSCM_ADMINS")
+                .is_none()
+        );
+        let response = std::net::TcpStream::connect(hub.url.trim_start_matches("http://"));
+        assert!(
+            response.is_ok(),
+            "previous fixture service remains reachable"
+        );
+        let calls = std::fs::read_to_string(machine.home.path().join("launchctl.log")).unwrap();
+        assert!(
+            calls
+                .lines()
+                .filter(|line| line.starts_with("bootstrap "))
+                .count()
+                >= if failure == "bootout" { 1 } else { 3 },
+            "{calls}"
+        );
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn native_uninstall_rejects_another_home_and_stops_when_the_executable_is_missing() {
+    let (machine, other, hub) = (Machine::new(), Machine::new(), Hub::start());
+    let repo = machine.repo();
+    let (other_plist, _) = native_fixture(&other, &hub);
+    let forged = json_file(&other.config().join("quickstart.json"));
+    std::fs::create_dir_all(machine.config()).unwrap();
+    std::fs::write(
+        machine.config().join("quickstart.json"),
+        json!({"native_hub":forged["native_hub"]}).to_string(),
+    )
+    .unwrap();
+    let output = machine.run(repo.path(), &["uninstall", "--yes", "--remove-hub-data"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(other_plist.exists());
+    assert!(
+        other
+            .home
+            .path()
+            .join(".agentscm/hub-native/fixture-native/data/secrets/con_fixture.json")
+            .exists()
+    );
+    assert!(!machine.home.path().join("launchctl.log").exists());
+    let (plist, executable) = native_fixture(&machine, &hub);
+    std::fs::remove_file(executable).unwrap();
+    let output = machine.run(repo.path(), &["uninstall", "--yes"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "binary drift remains recorded"
+    );
+    assert!(
+        !plist.exists(),
+        "owned service cleanup must not depend on executable availability: {output:?}"
+    );
+    assert!(
+        machine
+            .home
+            .path()
+            .join(".agentscm/hub-native/fixture-native/retained.json")
+            .exists()
+    );
+    let record = json_file(&machine.config().join("quickstart.json"));
+    assert!(record["native_hub"].is_null());
+    assert!(record["bin_dir"].is_string());
+}
+
+#[test]
+fn docker_platform_and_context_selection_use_the_effective_local_daemon() {
+    let cases = [
+        (
+            "linux/aarch64",
+            "unix:///fixture.sock",
+            "",
+            "",
+            "pull --platform linux/arm64",
+        ),
+        (
+            "linux/x86_64",
+            "unix:///fixture.sock",
+            "tcp://remote.invalid:2376",
+            "",
+            "requires a local Docker context",
+        ),
+        (
+            "linux/aarch64",
+            "ssh://remote.invalid",
+            "unix:///fixture.sock",
+            "remote",
+            "requires a local Docker context",
+        ),
+        (
+            "linux/aarch64",
+            "unix:///fixture.sock",
+            "ssh://remote.invalid",
+            "local",
+            "pull --platform linux/arm64",
+        ),
+        (
+            "linux/ppc64le",
+            "unix:///fixture.sock",
+            "",
+            "",
+            "unsupported architecture",
+        ),
+    ];
+    for (platform, endpoint, host, context, expected) in cases {
+        let machine = Machine::new();
+        let repo = machine.repo();
+        fake_docker(&machine);
+        let port = unused_port().to_string();
+        let output = machine
+            .command(
+                repo.path(),
+                &[
+                    "quickstart",
+                    "--yes",
+                    "--hub",
+                    "local",
+                    "--hub-runtime",
+                    "docker",
+                    "--hub-port",
+                    &port,
+                    "--github-login",
+                    "octo",
+                    "--hook",
+                    "none",
+                    "--no-collisions",
+                ],
+            )
+            .env("FAKE_DOCKER_PLATFORM", platform)
+            .env("FAKE_DOCKER_ENDPOINT", endpoint)
+            .env("DOCKER_HOST", host)
+            .env("DOCKER_CONTEXT", context)
+            .env("AGENTSCM_HUB_IMAGE", "example.invalid/fixture:custom")
+            .env("FAKE_DOCKER_IMAGE_PRESENT", "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let calls = std::fs::read_to_string(machine.home.path().join("docker.log")).unwrap();
+        let text = format!(
+            "{}{}{}",
+            out(&output),
+            String::from_utf8_lossy(&output.stderr),
+            calls
+        );
+        assert!(text.contains(expected), "{text}");
+        assert!(!calls.contains("up -d"), "{calls}");
+        assert!(
+            !machine
+                .home
+                .path()
+                .join(".agentscm/hub/compose.yaml")
+                .exists()
+        );
+        assert!(!machine.config().join("quickstart.json").exists());
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn native_uninstall_recovers_a_missing_plist_but_preserves_unknown_service_state() {
+    for mode in ["missing-plist", "unavailable", "absent"] {
+        let (machine, hub) = (Machine::new(), Hub::start());
+        let repo = machine.repo();
+        let (plist, executable) = native_fixture(&machine, &hub);
+        if mode == "missing-plist" {
+            std::fs::remove_file(&plist).unwrap();
+        }
+        let output = machine
+            .command(repo.path(), &["uninstall", "--yes"])
+            .env("FAKE_PRINT_MODE", mode)
+            .env("FAKE_EXECUTABLE", &executable)
+            .output()
+            .unwrap();
+        if mode == "unavailable" {
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            assert!(plist.exists());
+            assert!(machine.config().join("quickstart.json").exists());
+            assert!(
+                !std::fs::read_to_string(machine.home.path().join("launchctl.log"))
+                    .unwrap()
+                    .contains("bootout")
+            );
+        } else {
+            ok(&output);
+            assert!(!plist.exists());
+            assert!(!machine.config().join("quickstart.json").exists());
+            assert!(
+                machine
+                    .home
+                    .path()
+                    .join(".agentscm/hub-native/fixture-native/retained.json")
+                    .exists()
+            );
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn forged_native_dot_projects_cannot_delete_the_native_root_or_parent() {
+    let (machine, hub) = (Machine::new(), Hub::start());
+    let repo = machine.repo();
+    let _ = native_fixture(&machine, &hub);
+    let original = json_file(&machine.config().join("quickstart.json"));
+    let marker = machine.home.path().join(".agentscm/keep.txt");
+    let native_marker = machine.home.path().join(".agentscm/hub-native/keep.txt");
+    std::fs::write(&marker, "preserve").unwrap();
+    std::fs::write(&native_marker, "preserve").unwrap();
+    for project in [".", ".."] {
+        let mut forged = original.clone();
+        let r = &mut forged["native_hub"];
+        r["project"] = json!(project);
+        use sha2::{Digest, Sha256};
+        let home_hash = format!(
+            "{:x}",
+            Sha256::digest(machine.home.path().as_os_str().as_encoded_bytes())
+        );
+        r["label"] = json!(format!(
+            "com.counterbranch.agentscm.{project}.{}",
+            &home_hash[..10]
+        ));
+        r["config_dir"] = json!(
+            machine
+                .home
+                .path()
+                .join(".agentscm/hub-native")
+                .join(project)
+        );
+        r["data_dir"] = json!(Path::new(r["config_dir"].as_str().unwrap()).join("data"));
+        r["plist"] = json!(
+            machine
+                .home
+                .path()
+                .join("Library/LaunchAgents")
+                .join(format!("com.counterbranch.agentscm.{project}.plist"))
+        );
+        std::fs::write(Path::new(r["plist"].as_str().unwrap()), "previous plist").unwrap();
+        std::fs::write(machine.config().join("quickstart.json"), forged.to_string()).unwrap();
+        let output = machine.run(repo.path(), &["uninstall", "--yes", "--remove-hub-data"]);
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "preserve");
+        assert_eq!(std::fs::read_to_string(&native_marker).unwrap(), "preserve");
+        assert!(!machine.home.path().join("launchctl.log").exists());
+    }
 }

@@ -1,19 +1,25 @@
 //! A hub on this machine in Docker. Docker itself cannot run in CI, so the commands and
 //! files are built by small pure functions (unit tested); `start` only runs them in order.
+use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use serde_json::Value;
-
-use super::detect::{capture, which};
+use super::HubRuntime;
+use super::detect::which;
+use super::hub_setup::{self, Runtime, Started};
 use super::manifest::{LocalHubRecord, Manifest};
-use crate::hub_cli::{open_url, write_private};
+use super::process::{diagnostic, run};
+use crate::hub_cli::write_private;
 use crate::prompt::Ui;
 
-pub(crate) const PROJECT: &str = "agentscm-hub";
-pub(crate) const URL: &str = "http://127.0.0.1:7332";
 const SECRETS: &str = "/data/secrets";
 const QUICK: Duration = Duration::from_secs(20);
+
+pub(crate) struct Options {
+    pub(crate) runtime: HubRuntime,
+    pub(crate) port: u16,
+    pub(crate) project: String,
+}
 
 /// The published image for this build: the bare Cargo version, never `latest`.
 pub(crate) fn default_image() -> String {
@@ -23,7 +29,8 @@ pub(crate) fn default_image() -> String {
     )
 }
 
-const PUBLISHED_PLATFORM: &str = "linux/amd64";
+#[cfg(test)]
+const TEST_PLATFORM: &str = "linux/amd64";
 
 fn env_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     text.lines().find_map(|line| {
@@ -32,22 +39,17 @@ fn env_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
-/// The release image is currently published for amd64. An explicit process setting wins,
-/// followed by the platform quickstart persisted on an earlier run. Custom images keep Docker's
-/// native platform selection unless the user chose one.
+/// An explicit process setting wins, followed by a persisted choice and the daemon's native
+/// Linux architecture. Every image, including an override, is checked against this selection.
 fn selected_platform(
     process_platform: Option<String>,
     existing_env: &str,
-    custom_image: bool,
+    daemon_platform: &str,
 ) -> Option<String> {
     process_platform
         .filter(|value| !value.is_empty())
-        .or_else(|| {
-            (!custom_image)
-                .then(|| env_value(existing_env, "DOCKER_DEFAULT_PLATFORM").map(str::to_owned))
-                .flatten()
-        })
-        .or_else(|| (!custom_image).then(|| PUBLISHED_PLATFORM.to_owned()))
+        .or_else(|| env_value(existing_env, "DOCKER_DEFAULT_PLATFORM").map(str::to_owned))
+        .or_else(|| Some(daemon_platform.to_owned()))
 }
 
 fn platform_ok(platform: &str) -> bool {
@@ -63,9 +65,9 @@ services:
   hub:
     image: ${AGENTSCM_HUB_IMAGE:-@IMAGE@}
 @PLATFORM@
-    command: ["hub", "serve", "--bind", "0.0.0.0:7332", "--public", "--public-url", "${AGENTSCM_PUBLIC_URL:-http://127.0.0.1:7332}", "--poll-seconds", "${AGENTSCM_POLL_SECONDS:-300}"]
+    command: ["hub", "serve", "--bind", "0.0.0.0:@PORT@", "--public", "--public-url", "${AGENTSCM_PUBLIC_URL:-http://127.0.0.1:@PORT@}", "--poll-seconds", "${AGENTSCM_POLL_SECONDS:-300}"]
     ports:
-      - "127.0.0.1:7332:7332"
+      - "127.0.0.1:@PORT@:@PORT@"
     environment:
       AGENTSCM_GITHUB_CLIENT_ID: ${AGENTSCM_GITHUB_CLIENT_ID:-}
       AGENTSCM_GITHUB_CLIENT_SECRET: ${AGENTSCM_GITHUB_CLIENT_SECRET:-}
@@ -108,16 +110,17 @@ const FORCE_RECREATE: [&str; 5] = ["up", "-d", "--pull", "never", "--force-recre
 
 #[cfg(test)]
 pub(crate) fn compose_text() -> String {
-    compose_text_for(Some(PUBLISHED_PLATFORM))
+    compose_text_for(Some(TEST_PLATFORM), 7332)
 }
 
-fn compose_text_for(platform: Option<&str>) -> String {
+fn compose_text_for(platform: Option<&str>, port: u16) -> String {
     let platform = platform
         .map(|value| format!("    platform: \"{value}\""))
         .unwrap_or_default();
     COMPOSE
         .replace("@IMAGE@", &default_image())
         .replace("@PLATFORM@", &platform)
+        .replace("@PORT@", &port.to_string())
 }
 
 /// `KEY=value` lines, in order, with `updates` replacing or appending. Values must be
@@ -160,11 +163,11 @@ fn env_has(text: &str, key: &str) -> bool {
     })
 }
 
-pub(crate) fn compose_args(dir: &Path, rest: &[&str]) -> Vec<String> {
+pub(crate) fn compose_args(dir: &Path, project: &str, rest: &[&str]) -> Vec<String> {
     let mut args: Vec<String> = [
         "compose",
         "-p",
-        PROJECT,
+        project,
         "-f",
         &dir.join("compose.yaml").display().to_string(),
         "--env-file",
@@ -176,10 +179,10 @@ pub(crate) fn compose_args(dir: &Path, rest: &[&str]) -> Vec<String> {
     args
 }
 
-pub(crate) fn exec_args(dir: &Path, command: &[&str]) -> Vec<String> {
+pub(crate) fn exec_args(dir: &Path, project: &str, command: &[&str]) -> Vec<String> {
     let mut rest = vec!["exec", "-T", "hub"];
     rest.extend(command);
-    compose_args(dir, &rest)
+    compose_args(dir, project, &rest)
 }
 
 /// Connection ids named by `ls /data/secrets/con_*.json`.
@@ -194,34 +197,24 @@ pub(crate) fn connection_ids(listing: &str) -> Vec<String> {
         .collect()
 }
 
-fn login_ok(login: &str) -> bool {
-    (1..=39).contains(&login.len())
-        && login
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-}
-
-pub(crate) struct Started {
-    /// Where to install the hub's GitHub App, when known.
-    pub(crate) install_url: Option<String>,
-    pub(crate) pending: bool,
-}
-
 fn docker() -> Result<PathBuf, String> {
     which("docker").ok_or_else(|| "Docker was not found on PATH.".to_owned())
 }
 
 fn run_visible(args: &[String]) -> Result<bool, String> {
-    let status = std::process::Command::new(docker()?)
-        .args(args)
-        .status()
-        .map_err(|e| e.to_string())?;
-    Ok(status.success())
+    let output = run(
+        std::process::Command::new(docker()?).args(args),
+        Duration::from_secs(60),
+    )?;
+    if !output.success && !diagnostic(&output).is_empty() {
+        eprintln!("{}", diagnostic(&output));
+    }
+    Ok(output.success)
 }
 
 fn run_capture(args: &[String], limit: Duration) -> Option<String> {
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    capture(&docker().ok()?, &args, None, limit)
+    let output = run(std::process::Command::new(docker().ok()?).args(args), limit).ok()?;
+    output.success.then_some(output.stdout)
 }
 
 fn matches_platform(found: &str, requested: &str) -> bool {
@@ -260,14 +253,24 @@ fn acquire_image(image: &str, platform: Option<&str>) -> Result<(), String> {
         pull.extend(["--platform".into(), platform.to_owned()]);
     }
     pull.push(image.to_owned());
-    if run_visible(&pull)? {
+    let output = run(
+        std::process::Command::new(docker()?).args(&pull),
+        Duration::from_secs(180),
+    )?;
+    if output.success {
         Ok(())
     } else {
         let platform = platform
             .map(|value| format!(" for platform {value}"))
             .unwrap_or_default();
+        let emulation = if platform.contains("linux/arm64") {
+            " If only an AMD64 image exists, explicitly set DOCKER_DEFAULT_PLATFORM=linux/amd64 to opt into Docker emulation, when your Docker runtime supports it. Emulation can be slower and is not guaranteed; no architecture was switched automatically."
+        } else {
+            ""
+        };
         Err(format!(
-            "Docker could not pull the hub image {image}{platform}. Check the Docker error above, set AGENTSCM_HUB_IMAGE to a usable image, or connect to an existing hub."
+            "Docker could not pull the hub image {image}{platform}: {}. Set AGENTSCM_HUB_IMAGE to a usable image, or connect to an existing hub.{emulation}",
+            diagnostic(&output)
         ))
     }
 }
@@ -279,35 +282,118 @@ fn write(path: &Path, text: &str) -> Result<(), String> {
     write_private(path, text).map_err(|e| e.to_string())
 }
 
+fn write_setup_files(
+    compose: &Path,
+    compose_text: &str,
+    env: &Path,
+    env_text: &str,
+) -> Result<(), String> {
+    let old_compose = std::fs::read(compose).ok();
+    let old_env = std::fs::read(env).ok();
+    write(compose, compose_text)?;
+    if let Err(error) = write(env, env_text) {
+        match old_compose {
+            Some(bytes) => {
+                let _ = std::fs::write(compose, bytes);
+            }
+            None => {
+                let _ = std::fs::remove_file(compose);
+            }
+        }
+        match old_env {
+            Some(bytes) => {
+                let _ = std::fs::write(env, bytes);
+            }
+            None => {
+                let _ = std::fs::remove_file(env);
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+struct DockerRuntime {
+    dir: PathBuf,
+    project: String,
+    url: String,
+}
+
+impl DockerRuntime {
+    fn up(&self, force: bool) -> Result<(), String> {
+        let rest: &[&str] = if force {
+            &FORCE_RECREATE
+        } else {
+            &["up", "-d", "--pull", "never"]
+        };
+        run_visible(&compose_args(&self.dir, &self.project, rest))?
+            .then_some(())
+            .ok_or_else(|| "Docker could not start the hub.".into())
+    }
+}
+
+impl Runtime for DockerRuntime {
+    fn url(&self) -> &str {
+        &self.url
+    }
+
+    fn connection_ids(&self) -> Result<Vec<String>, String> {
+        let command = ["sh", "-c", "ls /data/secrets/con_*.json 2>/dev/null"];
+        Ok(connection_ids(
+            &run_capture(&exec_args(&self.dir, &self.project, &command), QUICK).unwrap_or_default(),
+        ))
+    }
+
+    fn read_secret(&self, name: &str) -> Result<String, String> {
+        if name.contains('/') || name.contains('\\') || name == "." || name == ".." {
+            return Err("invalid Hub secret name".into());
+        }
+        run_capture(
+            &exec_args(
+                &self.dir,
+                &self.project,
+                &["cat", &format!("{SECRETS}/{name}")],
+            ),
+            QUICK,
+        )
+        .ok_or_else(|| format!("could not read Hub secret {name}"))
+    }
+
+    fn restart_fresh(&mut self) -> Result<(), String> {
+        self.up(true)
+    }
+
+    async fn configure_github(
+        &mut self,
+        connection: &str,
+        client_id: &str,
+        login: &str,
+    ) -> Result<(), String> {
+        let env = self.dir.join(".env");
+        let existing = std::fs::read_to_string(&env).unwrap_or_default();
+        if env_has(&existing, "AGENTSCM_ADMINS") {
+            return Ok(());
+        }
+        let secret_file = format!("{SECRETS}/{connection}.client_secret");
+        let admins = format!("github:{login}");
+        let text = env_text(
+            &existing,
+            &[
+                ("AGENTSCM_GITHUB_CLIENT_ID", client_id),
+                ("AGENTSCM_GITHUB_CLIENT_SECRET_FILE", &secret_file),
+                ("AGENTSCM_ADMINS", &admins),
+            ],
+            &[],
+        )?;
+        write(&env, &text)?;
+        self.up(false)
+    }
+}
+
 /// The GitHub login of the hub's administrator. With `--yes` only a login that was given or
 /// that `gh` verified is used; interactively `git config` may prefill the question.
 fn github_login(given: Option<&str>, ui: &Ui) -> Result<String, String> {
-    if let Some(login) = given {
-        return if login_ok(login) {
-            Ok(login.to_owned())
-        } else {
-            Err("--github-login isn't a GitHub login.".into())
-        };
-    }
-    let verified = which("gh")
-        .and_then(|gh| capture(&gh, &["api", "user", "-q", ".login"], None, QUICK))
-        .filter(|login| login_ok(login));
-    let login = if ui.yes {
-        verified.unwrap_or_default()
-    } else {
-        let guess = verified
-            .or_else(|| capture(&which("git")?, &["config", "github.user"], None, QUICK))
-            .unwrap_or_default();
-        ui.ask(
-            "Your GitHub login (this account becomes the hub's administrator)",
-            &guess,
-        )
-    };
-    if login_ok(&login) {
-        Ok(login)
-    } else {
-        Err("I need your GitHub login to make you the hub's administrator; pass --github-login (with --yes, or install gh and run gh auth login).".into())
-    }
+    hub_setup::github_login(given, ui)
 }
 
 /// Starts (or re-uses) the local hub and completes first-run GitHub setup.
@@ -318,7 +404,22 @@ pub(crate) async fn start(
     home: &Path,
     repo: Option<&str>,
     manifest: &mut Manifest,
+    options: &Options,
 ) -> Result<Started, String> {
+    if options.runtime != HubRuntime::Docker {
+        return Err("the Docker Hub backend received another runtime".into());
+    }
+    let url = format!("http://127.0.0.1:{}", options.port);
+    if manifest.local_hub.is_none() {
+        TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, options.port))
+            .map(drop)
+            .map_err(|_| {
+                format!(
+                    "127.0.0.1:{} is already in use; choose another --hub-port. No existing service was stopped.",
+                    options.port
+                )
+            })?;
+    }
     // Without a terminal the administrator must be known before anything starts.
     let preset = if ui.yes {
         Some(github_login(login, ui)?)
@@ -336,25 +437,39 @@ pub(crate) async fn start(
         return Err("Skipped the local hub.".into());
     }
     let existing_env = std::fs::read_to_string(&env).unwrap_or_default();
+    let prior_compose = std::fs::read(&compose).ok();
+    let prior_env = std::fs::read(&env).ok();
+    let prior_record = manifest.local_hub.clone();
     let configured_image = std::env::var("AGENTSCM_HUB_IMAGE")
         .ok()
-        .filter(|value| !value.is_empty());
+        .filter(|value| !value.is_empty())
+        .or_else(|| env_value(&existing_env, "AGENTSCM_HUB_IMAGE").map(str::to_owned));
     let selected_image = configured_image.clone().unwrap_or_else(default_image);
     let requested_platform = std::env::var("DOCKER_DEFAULT_PLATFORM")
         .ok()
         .filter(|value| !value.is_empty());
-    let platform = selected_platform(
-        requested_platform.clone(),
-        &existing_env,
-        configured_image.is_some(),
-    );
+    let daemon = super::detect::docker_daemon()?;
+    if daemon.os != "linux" || !matches!(daemon.arch.as_str(), "amd64" | "arm64") {
+        return Err(format!(
+            "The Docker daemon reports {}/{}; the local Hub supports Linux amd64 or arm64 daemons.",
+            daemon.os, daemon.arch
+        ));
+    }
+    let daemon_platform = format!("{}/{}", daemon.os, daemon.arch);
+    let platform = selected_platform(requested_platform.clone(), &existing_env, &daemon_platform);
     if platform.as_deref().is_some_and(|value| !platform_ok(value)) {
         return Err("DOCKER_DEFAULT_PLATFORM isn't a valid Docker platform.".into());
     }
-    if configured_image.is_none() && platform.as_deref() == Some(PUBLISHED_PLATFORM) {
+    let explicit_platform = requested_platform
+        .as_deref()
+        .or_else(|| env_value(&existing_env, "DOCKER_DEFAULT_PLATFORM"));
+    if explicit_platform.is_some() {
         println!(
-            "The published hub image uses linux/amd64; Docker Desktop runs it through emulation on Apple Silicon."
+            "Docker daemon platform: {daemon_platform}; requested platform: {}. Any cross-architecture emulation was explicitly selected with DOCKER_DEFAULT_PLATFORM.",
+            explicit_platform.unwrap_or("Docker default")
         );
+    } else {
+        println!("Docker daemon platform: {daemon_platform}; no emulation platform was requested.");
     }
 
     // Reject malformed image references before Docker can interpret one as an option.
@@ -368,7 +483,7 @@ pub(crate) async fn start(
     // Do not leave setup files or an uninstall record behind when image acquisition fails.
     acquire_image(&selected_image, platform.as_deref())?;
 
-    // The image goes into .env only when the user chose one; a stale one we wrote is dropped.
+    // Keep explicit image overrides across resume and retained-data reinstall.
     let mut updates = Vec::new();
     let mut stale = vec![];
     if let Some(image) = configured_image.as_deref() {
@@ -378,138 +493,64 @@ pub(crate) async fn start(
     }
     if let Some(platform) = requested_platform.as_deref() {
         updates.push(("DOCKER_DEFAULT_PLATFORM", platform));
-    } else if configured_image.is_some() {
-        stale.push("DOCKER_DEFAULT_PLATFORM");
     }
     let rendered_env = env_text(&existing_env, &updates, &stale)?;
-    let rendered_compose = compose_text_for(platform.as_deref());
-    write(&compose, &rendered_compose)?;
-    write(&env, &rendered_env)?;
+    let rendered_compose = compose_text_for(platform.as_deref(), options.port);
+    write_setup_files(&compose, &rendered_compose, &env, &rendered_env)?;
     manifest.local_hub = Some(LocalHubRecord {
         dir: dir.clone(),
-        project: PROJECT.into(),
+        project: options.project.clone(),
+        port: options.port,
     });
-    manifest.save().map_err(|e| e.to_string())?;
-
-    let up = compose_args(&dir, &["up", "-d", "--pull", "never"]);
-    if !run_visible(&up)? {
-        return Err("Docker could not start the hub (is port 7332 already in use?).".into());
-    }
-    wait_healthy().await?;
-
-    let ls = ["sh", "-c", "ls /data/secrets/con_*.json 2>/dev/null"];
-    let listed = || connection_ids(&run_capture(&exec_args(&dir, &ls), QUICK).unwrap_or_default());
-    if listed().is_empty() {
-        // The hub writes its one-time link when it starts; a restart makes sure it is fresh.
-        println!("Restarting the hub so its first-run link is fresh ...");
-        if !run_visible(&compose_args(&dir, &FORCE_RECREATE))? {
-            return Err("Docker could not restart the hub.".into());
-        }
-        wait_healthy().await?;
-    }
-    let link = run_capture(
-        &exec_args(&dir, &["cat", &format!("{SECRETS}/bootstrap-setup-url")]),
-        QUICK,
-    )
-    .filter(|url| url.starts_with(&format!("{URL}/")) && !url.chars().any(char::is_control));
-    let mut connection = listed();
-    if let Some(link) = link {
-        println!(
-            "\nFirst run: the hub needs a GitHub App. Open this link (it works once, for 10 minutes):\n  {link}"
-        );
-        println!(
-            "Create the app on GitHub, then on the success page click Install and choose your repository."
-        );
-        if tty && !ui.yes {
-            open_url(&link);
-        }
-        if ui.yes {
-            println!(
-                "Non-interactive setup will not wait for the browser. Finish creating and installing the app, then run quickstart again."
-            );
-            return Ok(Started {
-                install_url: None,
-                pending: true,
-            });
-        }
-        let deadline = Instant::now() + Duration::from_secs(600);
-        while connection.is_empty() {
-            if Instant::now() >= deadline {
-                return Err("GitHub App setup wasn't finished in 10 minutes. Run quickstart again to continue.".into());
+    if let Err(error) = manifest.save() {
+        manifest.local_hub = prior_record;
+        for (path, prior) in [(&compose, prior_compose), (&env, prior_env)] {
+            match prior {
+                Some(bytes) => {
+                    let _ = std::fs::write(path, bytes);
+                }
+                None => {
+                    let _ = std::fs::remove_file(path);
+                }
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            connection = listed();
         }
-        let repo = repo.unwrap_or("your repository");
-        ui.pause(&format!(
-            "On the GitHub page, click Install and pick {repo}, then press Enter."
+        return Err(error.to_string());
+    }
+
+    let up = compose_args(&dir, &options.project, &["up", "-d", "--pull", "never"]);
+    if !run_visible(&up)? {
+        return Err(format!(
+            "Docker could not start the hub on 127.0.0.1:{}; its setup remains recorded for recovery.",
+            options.port
         ));
     }
-    let Some(con) = connection.first() else {
-        return Ok(Started {
-            install_url: None,
-            pending: false,
-        });
+    wait_healthy(&url).await?;
+
+    let mut runtime = DockerRuntime {
+        dir,
+        project: options.project.clone(),
+        url,
     };
-    let app: Value = run_capture(
-        &exec_args(&dir, &["cat", &format!("{SECRETS}/{con}.json")]),
-        QUICK,
-    )
-    .and_then(|text| serde_json::from_str(&text).ok())
-    .unwrap_or_default();
-    let install_url = app["slug"]
-        .as_str()
-        .filter(|s| {
-            !s.is_empty()
-                && s.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
-        })
-        .map(|slug| format!("https://github.com/apps/{slug}/installations/new"));
-    let client_id = app["client_id"].as_str().unwrap_or_default();
-    let current_env = std::fs::read_to_string(&env).unwrap_or_default();
-    if !client_id.is_empty() && !env_has(&current_env, "AGENTSCM_ADMINS") {
-        let login = match preset {
-            Some(login) => login,
-            None => github_login(login, ui)?,
-        };
-        let secret_file = format!("{SECRETS}/{con}.client_secret");
-        let admins = format!("github:{login}");
-        let mut all = updates;
-        all.extend([
-            ("AGENTSCM_GITHUB_CLIENT_ID", client_id),
-            ("AGENTSCM_GITHUB_CLIENT_SECRET_FILE", secret_file.as_str()),
-            ("AGENTSCM_ADMINS", admins.as_str()),
-        ]);
-        write(&env, &env_text(&current_env, &all, &[])?)?;
-        println!("Restarting the hub with sign-in enabled ...");
-        if !run_visible(&up)? {
-            return Err("Docker could not restart the hub with sign-in enabled.".into());
-        }
-        wait_healthy().await?;
-    }
-    Ok(Started {
-        install_url,
-        pending: false,
-    })
+    hub_setup::finish(&mut runtime, ui, login, preset, tty, repo).await
 }
 
-async fn wait_healthy() -> Result<(), String> {
-    if super::wait_healthy(URL, Duration::from_secs(60)).await {
+async fn wait_healthy(url: &str) -> Result<(), String> {
+    if super::wait_healthy(url, Duration::from_secs(60)).await {
         Ok(())
     } else {
         Err(format!(
-            "The hub at {URL} didn't become healthy within 60 seconds."
+            "The hub at {url} didn't become healthy within 60 seconds."
         ))
     }
 }
 
 /// `docker compose down`, with `-v` to delete the hub's data as well.
-pub(crate) fn down(dir: &Path, volumes: bool) -> bool {
+pub(crate) fn down(dir: &Path, project: &str, volumes: bool) -> bool {
     let mut rest = vec!["down"];
     if volumes {
         rest.push("-v");
     }
-    run_visible(&compose_args(dir, &rest)).unwrap_or(false)
+    run_visible(&compose_args(dir, project, &rest)).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -536,22 +577,29 @@ mod tests {
             selected_platform(
                 Some("linux/arm64".into()),
                 "DOCKER_DEFAULT_PLATFORM=linux/amd64\n",
-                false
+                "linux/amd64",
             ),
             Some("linux/arm64".into())
         );
         assert_eq!(
-            selected_platform(None, "DOCKER_DEFAULT_PLATFORM=linux/arm64/v8\n", false),
+            selected_platform(
+                None,
+                "DOCKER_DEFAULT_PLATFORM=linux/arm64/v8\n",
+                "linux/amd64"
+            ),
             Some("linux/arm64/v8".into())
         );
         assert_eq!(
-            selected_platform(None, "", false),
-            Some("linux/amd64".into())
+            selected_platform(None, "", "linux/arm64"),
+            Some("linux/arm64".into())
         );
-        assert_eq!(selected_platform(None, "", true), None);
         assert_eq!(
-            selected_platform(None, "DOCKER_DEFAULT_PLATFORM=linux/amd64\n", true),
-            None
+            selected_platform(None, "", "linux/arm64"),
+            Some("linux/arm64".into())
+        );
+        assert_eq!(
+            selected_platform(None, "DOCKER_DEFAULT_PLATFORM=linux/amd64\n", "linux/arm64"),
+            Some("linux/amd64".into())
         );
         assert!(matches_platform("linux/arm64", "linux/arm64/v8"));
         assert!(matches_platform("linux/arm64/v8", "linux/arm64"));
@@ -559,8 +607,10 @@ mod tests {
         assert!(platform_ok("linux/arm64/v8"));
         assert!(!platform_ok("linux/amd64\ncommand: nope"));
         assert!(!platform_ok("linux:${ARCH}"));
-        assert!(!compose_text_for(None).contains("platform:"));
-        assert!(compose_text_for(Some("linux/arm64")).contains("    platform: \"linux/arm64\"\n"));
+        assert!(!compose_text_for(None, 7444).contains("platform:"));
+        let compose = compose_text_for(Some("linux/arm64"), 7444);
+        assert!(compose.contains("    platform: \"linux/arm64\"\n"));
+        assert!(compose.contains("127.0.0.1:7444:7444"));
     }
 
     #[test]
@@ -614,15 +664,20 @@ mod tests {
     fn docker_commands_are_exact() {
         let dir = Path::new("/h/.agentscm/hub");
         assert_eq!(
-            compose_args(dir, &["up", "-d", "--pull", "never"]).join(" "),
-            "compose -p agentscm-hub -f /h/.agentscm/hub/compose.yaml --env-file /h/.agentscm/hub/.env up -d --pull never"
+            compose_args(dir, "my-hub", &["up", "-d", "--pull", "never"]).join(" "),
+            "compose -p my-hub -f /h/.agentscm/hub/compose.yaml --env-file /h/.agentscm/hub/.env up -d --pull never"
         );
         assert_eq!(
-            compose_args(dir, &FORCE_RECREATE).join(" "),
+            compose_args(dir, "agentscm-hub", &FORCE_RECREATE).join(" "),
             "compose -p agentscm-hub -f /h/.agentscm/hub/compose.yaml --env-file /h/.agentscm/hub/.env up -d --pull never --force-recreate"
         );
         assert_eq!(
-            exec_args(dir, &["cat", "/data/secrets/bootstrap-setup-url"]).join(" "),
+            exec_args(
+                dir,
+                "agentscm-hub",
+                &["cat", "/data/secrets/bootstrap-setup-url"]
+            )
+            .join(" "),
             "compose -p agentscm-hub -f /h/.agentscm/hub/compose.yaml --env-file /h/.agentscm/hub/.env exec -T hub cat /data/secrets/bootstrap-setup-url"
         );
     }
@@ -631,6 +686,5 @@ mod tests {
     fn finds_connection_files() {
         let listing = "/data/secrets/con_0a1b.json\n/data/secrets/con_0a1b.client_secret\n/data/secrets/other.json\n/data/secrets/con_x;y.json\n";
         assert_eq!(connection_ids(listing), ["con_0a1b"]);
-        assert!(login_ok("octo-cat") && !login_ok("a b") && !login_ok(""));
     }
 }

@@ -1,7 +1,8 @@
 name: Release
 
-# Runs only when a maintainer pushes a `v*` tag. It builds the container image, smoke-tests it,
-# pushes it to GHCR by digest with a version tag (no `latest` during alpha), attests its build
+# Runs only when a maintainer pushes a `v*` tag. It builds and smoke-tests native amd64 and arm64
+# container children, pushes those exact tested images, assembles a verified two-platform version
+# index (no `latest` during alpha), attests the children, their SBOMs and the index, builds attested
 # provenance, builds attested release binaries (Linux and macOS, plus Windows x86_64), and creates a GitHub prerelease whose body is the
 # CHANGELOG entry. It then publishes the `agentscm` npm package unless the tag contains `-dry`
 # (for example v0.2.0-dry1); any other tag publishes with npm trusted publishing.
@@ -22,25 +23,28 @@ env:
   IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
-  image:
-    # Only the public repository publishes: the image name, the attestation and the docs assume it.
+  image-platform:
+    # Each runnable child is built and fully exercised on matching native hardware before it is pushed.
     if: ${{ github.repository == 'counterbranch/agentscm' && !github.event.repository.private }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {platform: linux/amd64, arch: amd64, runner: ubuntu-24.04}
+          - {platform: linux/arm64, arch: arm64, runner: ubuntu-24.04-arm}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: write
       id-token: write
       attestations: write
-    outputs:
-      digest: ${{ steps.push.outputs.digest }}
-      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
-      - name: Check the tag matches Cargo.toml and is on main
+      - name: Check the tag matches Cargo.toml and is on main before building
         id: version
         env:
           TAG: ${{ github.ref_name }}
@@ -55,45 +59,159 @@ jobs:
             found { print }
           ' CHANGELOG.md | wc -l | awk '$1 > 2 { ok = 1 } END { exit !ok }' || { echo "no CHANGELOG entry for $version" >&2; exit 1; }
           git merge-base --is-ancestor HEAD origin/main || { echo "tag $TAG is not on main" >&2; exit 1; }
+          echo "VERSION=$version" >> "$GITHUB_ENV"
           echo "version=$version" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - name: Build and smoke test
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          load: true
-          push: false
-          tags: agentscm:release-check
-      - run: .github/docker-smoke.sh agentscm:release-check
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.IMAGE }}
           flavor: latest=false
-          tags: type=raw,value=${{ steps.version.outputs.version }}
+          tags: type=raw,value=sha-${{ github.sha }}-${{ matrix.arch }}
           labels: |
             org.opencontainers.image.licenses=FSL-1.1-ALv2
             org.opencontainers.image.source=https://github.com/counterbranch/agentscm
             org.opencontainers.image.vendor=DUVATL, Inc.
-      - name: Push by digest
-        id: push
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+      - name: Build the native image once and load it for qualification
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
-          push: true
-          sbom: true
-          provenance: false # build provenance is attested below
+          platforms: ${{ matrix.platform }}
+          load: true
+          push: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          provenance: false # the tested digest is attested after the exact local image is pushed
+          sbom: false # generated from the tested local image below
+      - name: Confirm the loaded image architecture
+        env:
+          REF: ${{ env.IMAGE }}:sha-${{ github.sha }}-${{ matrix.arch }}
+          EXPECTED: ${{ matrix.arch }}/linux
+        run: test "$(docker image inspect --format '{{.Architecture}}/{{.Os}}' "$REF")" = "$EXPECTED"
+      - name: Smoke test the native image
+        env:
+          REF: ${{ env.IMAGE }}:sha-${{ github.sha }}-${{ matrix.arch }}
+        run: .github/docker-smoke.sh "$REF"
+      - name: Generate an SPDX SBOM from the tested local image
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          image: ${{ env.IMAGE }}:sha-${{ github.sha }}-${{ matrix.arch }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Push the exact tested child and record its immutable digest
+        id: push
+        env:
+          REF: ${{ env.IMAGE }}:sha-${{ github.sha }}-${{ matrix.arch }}
+          PLATFORM: ${{ matrix.platform }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          docker push "$REF"
+          docker buildx imagetools inspect "$REF" --format '{{json .Manifest}}' > manifest.json
+          digest=$(jq -r '.digest' manifest.json)
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "invalid child digest: $digest" >&2; exit 1; }
+          docker buildx imagetools inspect "$REF" --format '{{json .Image}}' > image.json
+          test "$(jq -r '.os + "/" + .architecture' image.json)" = "$PLATFORM"
+          jq -n --arg platform "$PLATFORM" --arg arch "$ARCH" --arg digest "$digest" \
+            '{platform: $platform, arch: $arch, digest: $digest}' > "image-descriptor-$ARCH.json"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+      - name: Attest the tested child's SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: sbom.spdx.json
+          push-to-registry: true
+          create-storage-record: false
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-descriptor-${{ matrix.arch }}
+          path: image-descriptor-${{ matrix.arch }}.json
+          if-no-files-found: error
+
+  image:
+    # Assemble and verify the public version tag only after both native children pass.
+    needs: image-platform
+    if: ${{ github.repository == 'counterbranch/agentscm' && !github.event.repository.private }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.index.outputs.digest }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Recheck the release version
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          [ "$TAG" = "v$version" ] || { echo "tag $TAG does not match Cargo.toml version $version" >&2; exit 1; }
+          git merge-base --is-ancestor HEAD origin/main || { echo "tag $TAG is not on main" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: image-descriptor-*
+          merge-multiple: true
+          path: descriptors
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Assemble, verify and publish the two-platform index
+        id: index
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          for arch in amd64 arm64; do
+            file="descriptors/image-descriptor-$arch.json"
+            test -f "$file" || { echo "missing $file" >&2; exit 1; }
+            test "$(jq -r .platform "$file")" = "linux/$arch"
+            digest=$(jq -r .digest "$file")
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "invalid $arch digest: $digest" >&2; exit 1; }
+            printf -v "${arch}_digest" '%s' "$digest"
+          done
+          candidate="$IMAGE:sha-$GITHUB_SHA-index-candidate"
+          docker buildx imagetools create --tag "$candidate" "$IMAGE@$amd64_digest" "$IMAGE@$arm64_digest"
+          docker buildx imagetools inspect "$candidate" --format '{{json .Manifest}}' > index.json
+          jq -e --arg amd64 "$amd64_digest" --arg arm64 "$arm64_digest" '
+            .manifests | length == 2 and
+            ([.[] | .platform.os + "/" + .platform.architecture] | sort == ["linux/amd64", "linux/arm64"]) and
+            ([.[] | .digest] | sort) == ([$amd64, $arm64] | sort)
+          ' index.json >/dev/null || { echo "candidate index does not contain exactly the tested linux/amd64 and linux/arm64 children" >&2; cat index.json >&2; exit 1; }
+          candidate_digest=$(jq -r .digest index.json)
+          [[ "$candidate_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "invalid index digest: $candidate_digest" >&2; exit 1; }
+          docker buildx imagetools create --tag "$IMAGE:$VERSION" "$IMAGE@$candidate_digest"
+          final_digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)
+          test "$final_digest" = "$candidate_digest" || { echo "published index digest differs from verified candidate" >&2; exit 1; }
+          echo "digest=$final_digest" >> "$GITHUB_OUTPUT"
+      - name: Attest the verified two-platform index
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.index.outputs.digest }}
           push-to-registry: true
 
   ui:
@@ -241,11 +359,13 @@ jobs:
           DIGEST: ${{ needs.image.outputs.digest }}
           IMAGE: ${{ env.IMAGE }}
         run: |
+          # shellcheck disable=SC2016 # awk program intentionally uses $0 inside single quotes
           awk -v v="$VERSION" '
             /^## / { if (found) exit; if ($0 == "## " v || index($0, "## " v " ") == 1) found = 1 }
             found { print }
           ' CHANGELOG.md > notes.md
           [ "$(wc -l < notes.md)" -gt 2 ] || { echo "no CHANGELOG entry for $VERSION" >&2; exit 1; }
+          # shellcheck disable=SC2016 # Markdown backticks are literal inside the format string
           printf '\nImage: `%s:%s` (digest `%s`)\n' "$IMAGE" "$VERSION" "$DIGEST" >> notes.md
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file notes.md --prerelease --verify-tag \
             dist/agentscm-* dist/SHA256SUMS dist/install.sh LICENSE NOTICE THIRD_PARTY_NOTICES.md
