@@ -69,7 +69,7 @@ The highest source with a matching rule decides. Within one file the last matchi
 
 Limits:
 
-- Unsupported patterns are `Invalid` errors that name the file and line: `**` before an escaped slash, a NUL byte in a rule, a pattern over 4,096 bytes, and a character class whose range end is not ASCII.
+- Unsupported patterns are `Invalid` errors that name the file and line: a run of two or more stars other than a whole `**` path segment (a leading `**/`, `/**/`, a trailing `/**`, or the whole pattern `**`; so `a**/b`, `a/***/b`, `***`, `k**` and `**` before an escaped slash are refused), a NUL byte in a rule, a pattern over 4,096 bytes, and a character class whose range end is not ASCII.
 - Case folding is ASCII only.
 - Budgets are `Limit` errors that name the file; shorten the file or exclude its directory. A rule file may be at most 64 KiB. One scan may read at most 8 MiB and 100,000 patterns of rules in total, with at most 1 MiB and 10,000 patterns resident at once (the `.gitignore` files of the directories being walked plus the fixed sources). Matching work in one scan is capped at 3x10^9 units, a few seconds of matching.
 - A `.gitignore` that is a symbolic link inside the tree is ignored as a rule source. `.agentscmignore` and the private exclude must be regular files.

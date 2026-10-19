@@ -212,30 +212,24 @@ fn tokenize(pattern: &[u8], ignore_case: bool) -> Result<Option<Vec<Token>>, ()>
                     .take_while(|&&byte| byte == b'*')
                     .count();
                 let after = at + run;
-                // Measured: a `**` right after the pattern's wildcard-free prefix behaves as if
-                // at the start of a component (`a**/b` matches `ab`, `?**/b` does not); pinned
-                // by the star rows of the adversarial table and the fuzz comparison.
-                let segment_start = at == 0
-                    || pattern[at - 1] == b'/'
-                    || !pattern[..at].iter().any(|byte| b"*?[\\".contains(byte));
-                if run >= 2
-                    && pattern.get(after) == Some(&b'\\')
-                    && pattern.get(after + 1) == Some(&b'/')
-                {
-                    // `**` before an escaped slash is not modelled (rows `a/**\\/b.key`).
+                // A run of two or more stars is accepted only as exactly `**` forming a whole path segment: the
+                // pattern's start or a `/` before it, and the pattern's end or a `/` after it.
+                // Other runs read differently across Git versions, so they are refused (rows
+                // `a**/b.key`, `a/***/b.key`, `***`, `k**`, `**k` of the adversarial table).
+                let whole_segment = (at == 0 || pattern[at - 1] == b'/')
+                    && (after == pattern.len() || pattern[after] == b'/');
+                if run >= 2 && (run > 2 || !whole_segment) {
                     return Err(());
                 }
                 if run == 1 {
                     tokens.push(Token::Star);
-                } else if segment_start && pattern.get(after) == Some(&b'/') {
+                } else if pattern.get(after) == Some(&b'/') {
                     // `**/` spans zero or more whole components.
                     tokens.push(Token::Components);
                     at = after + 1;
                     continue;
-                } else if segment_start && after == pattern.len() {
-                    tokens.push(Token::Remainder);
                 } else {
-                    tokens.push(Token::Star);
+                    tokens.push(Token::Remainder);
                 }
                 at = after;
             }
@@ -542,7 +536,8 @@ mod tests {
         assert!(rule("a/**/b").matches(b"a/x/y/b", false));
         assert!(rule("a/**").matches(b"a/x/y", false));
         assert!(!rule("a/**").matches(b"a", false));
-        assert!(rule("a**/**").matches(b"a", false));
+        assert!(parse_line("a**/**", false).is_err());
+        assert!(rule("**/**").matches(b"a", false));
         assert!(rule("foo/").matches(b"x/foo", true));
         assert!(!rule("foo/").matches(b"x/foo", false));
         assert!(!rule("a?b").matches(b"a/b", false));
@@ -551,12 +546,12 @@ mod tests {
     #[test]
     fn pathological_star_runs_finish_quickly() {
         let started = std::time::Instant::now();
-        let nested = rule(&format!("{}z", "*a**/".repeat(40)));
+        let nested = rule(&format!("{}z", "**/*a/".repeat(40)));
         let path = "a/".repeat(500) + "b";
         assert!(!nested.matches(path.as_bytes(), false));
-        let wide = rule(&format!("{}b", "*".repeat(300)));
+        let wide = rule(&format!("{}b", "*a".repeat(300)));
         assert!(wide.matches(format!("{}b", "a".repeat(2000)).as_bytes(), false));
-        let mixed = rule(&format!("{}x", "**/*".repeat(60)));
+        let mixed = rule(&format!("{}x", "**/*/".repeat(60)));
         assert!(!mixed.matches("d/".repeat(1000).as_bytes(), false));
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }

@@ -4237,17 +4237,9 @@ mod tests {
             table.push((patterns.to_owned(), shapes, extras, Equal));
         }
         for patterns in [
-            "a**/b.key\n",
-            "a/***/b.key\n",
-            "***\n",
-            "k**\n",
             "a\u{a0}\n",
             "a\u{3000}\n",
             "a\\\u{a0}\n",
-            "**k\n",
-            "k**/\n",
-            "x/a**\n",
-            "**/k**\n",
             "foo/\n!foo\\/\n",
             "/\n",
             "//\n",
@@ -4296,7 +4288,26 @@ mod tests {
                 Equal,
             ));
         }
-        // `**` before an escaped slash is not modelled and is refused.
+        // A run of two or more stars that is not a whole path segment reads differently across
+        // Git versions and is refused, as is `**` before an escaped slash.
+        for patterns in [
+            "a**/b.key\n",
+            "a/***/b.key\n",
+            "***\n",
+            "k**\n",
+            "**k\n",
+            "k**/\n",
+            "x/a**\n",
+            "**/k**\n",
+            ".*/***b\n",
+            "a**/\\b\n",
+            "?**/b\n",
+            "a/**b\n",
+            "a**\n",
+            "**/**a\n",
+        ] {
+            table.push((patterns.to_owned(), vec![], vec!["a/b.key"], Invalid));
+        }
         for patterns in ["a/**\\/b.key\n", "/**\\/[a-b]a\n", "**\\/b\n"] {
             table.push((patterns.to_owned(), vec![], vec!["a/b.key"], Invalid));
         }
@@ -4522,9 +4533,13 @@ mod tests {
         let files = [
             ".env", ".ENV", "a.tmp", "b.TMP", "ax", "Bx", "dx", "Docs/f", "docs/f", "other",
         ];
-        // Distinct names only: macOS-style case-insensitive filesystems would merge pairs.
-        assert_matches_git(patterns, &files, false);
-        assert_matches_git(patterns, &files, true);
+        // One file per fixture: names that differ only in case would collide on a case-folding
+        // file system, and the scan reports that collision.
+        for ignore_case in [false, true] {
+            for file in files {
+                assert_matches_git(patterns, &[file], ignore_case);
+            }
+        }
     }
 
     #[test]
