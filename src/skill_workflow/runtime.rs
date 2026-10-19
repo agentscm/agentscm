@@ -36,7 +36,7 @@ pub use agent_tasks::*;
 
 const VIEW_VERSION: u32 = 1;
 const APPLICATION_ID: i64 = 0x4153_5746;
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const MAX_RUN_ID_BYTES: usize = 64;
 const MAX_DEFINITION_BYTES: usize = 256 * 1024;
 const MAX_DETAIL_BYTES: usize = 4 * 1024;
@@ -1215,6 +1215,9 @@ fn initialize_schema(connection: &mut Connection, create: bool) -> Result<()> {
     } else if application == APPLICATION_ID && version == 2 {
         agent_tasks::create_schema(&tx)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    } else if application == APPLICATION_ID && version == 3 {
+        agent_tasks::migrate_v3_to_v4(&tx)?;
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     } else if application != APPLICATION_ID || version != SCHEMA_VERSION {
         return Err(Error::Invalid(
             "unsupported workflow journal identity or version".into(),
@@ -1225,6 +1228,17 @@ fn initialize_schema(connection: &mut Connection, create: bool) -> Result<()> {
 }
 
 pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version == 3 {
+        return Err(Error::Invalid(
+            "workflow journal schema version 3 requires a writable migration to version 4".into(),
+        ));
+    }
+    validate_recovery_schema(connection)
+}
+
+/// Inspect supported retained shapes without migrating recovery artifacts.
+pub(crate) fn validate_recovery_schema(connection: &Connection) -> Result<()> {
     let application: i64 =
         connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -1245,7 +1259,9 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
             "SELECT run_id,step_id,record_digest,record_json FROM workflow_reviews LIMIT 0",
         )?;
     }
-    if version >= 3 {
+    if version == 3 {
+        agent_tasks::validate_v3_schema(connection)?;
+    } else if version >= 4 {
         agent_tasks::validate_schema(connection)?;
     }
     Ok(())
@@ -1698,7 +1714,7 @@ fn require_optional_regular(path: &Path) -> Result<()> {
     }
 }
 
-fn journal_open_options() -> OpenOptions {
+pub(super) fn journal_open_options() -> OpenOptions {
     #[cfg_attr(not(unix), allow(unused_mut))]
     let mut options = OpenOptions::new();
     #[cfg(unix)]
