@@ -312,7 +312,7 @@ fn validate_artifact_inputs(payload: &EvidencePayload, inputs: &[ArtifactInput<'
 
 /// Rejects encodings where the Edwards y-coordinate is not below 2^255 - 19.
 /// The high bit encodes the x-coordinate sign and is excluded from this test.
-fn is_canonical_ed25519_encoding(bytes: &[u8; 32]) -> bool {
+pub(crate) fn is_canonical_ed25519_encoding(bytes: &[u8; 32]) -> bool {
     const FIELD_MODULUS: [u8; 32] = [
         0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,

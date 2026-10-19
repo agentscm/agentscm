@@ -17,10 +17,11 @@ use crate::model::{
 use crate::store::{Engine, create_directory_durable, validate_id};
 use crate::{Error, Result};
 
+pub mod workflow_executors;
 pub mod workflows;
 
 const APPLICATION_ID: i64 = 0x4153_434d;
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 const CURRENT_SEMANTICS_VERSION: i64 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IDENTIFIER_BYTES: usize = 128;
@@ -938,6 +939,8 @@ pub(crate) fn validate_current_tables(connection: &Connection) -> Result<()> {
         "SELECT digest,attempt_id,canonical_json FROM command_evidence LIMIT 0",
         "SELECT target,digest,installed_policy_epoch,canonical_json FROM workflow_requirements LIMIT 0",
         "SELECT digest,requirement_digest,run_id,plan_digest,skill_digest,repository,revision,target,policy_epoch,change_repository,change_id,change_version,context_digest,canonical_json FROM workflow_receipts LIMIT 0",
+        "SELECT registration_id,executor_id,repository,registration_epoch,verification_key_id,public_key_hex,enrolled_policy_epoch,canonical_json FROM workflow_executor_enrollments LIMIT 0",
+        "SELECT registration_id,registration_epoch,revoked_policy_epoch,canonical_json FROM workflow_executor_revocations LIMIT 0",
     ] {
         connection.prepare(sql)?;
     }
@@ -956,6 +959,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
             create_schema_v5(&tx)?;
             create_schema_v6(&tx)?;
             workflows::create_schema_v7(&tx)?;
+            workflow_executors::create_schema_v8(&tx)?;
         }
         (APPLICATION_ID, 1) => {
             migrate_v1_to_v2(&tx)?;
@@ -964,6 +968,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
             create_schema_v5(&tx)?;
             create_schema_v6(&tx)?;
             workflows::create_schema_v7(&tx)?;
+            workflow_executors::create_schema_v8(&tx)?;
         }
         (APPLICATION_ID, 2) => {
             checks::create_schema_v3(&tx)?;
@@ -971,23 +976,31 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
             create_schema_v5(&tx)?;
             create_schema_v6(&tx)?;
             workflows::create_schema_v7(&tx)?;
+            workflow_executors::create_schema_v8(&tx)?;
         }
         (APPLICATION_ID, 3) => {
             create_schema_v4(&tx)?;
             create_schema_v5(&tx)?;
             create_schema_v6(&tx)?;
             workflows::create_schema_v7(&tx)?;
+            workflow_executors::create_schema_v8(&tx)?;
         }
         (APPLICATION_ID, 4) => {
             create_schema_v5(&tx)?;
             create_schema_v6(&tx)?;
             workflows::create_schema_v7(&tx)?;
+            workflow_executors::create_schema_v8(&tx)?;
         }
         (APPLICATION_ID, 5) => {
             create_schema_v6(&tx)?;
             workflows::create_schema_v7(&tx)?;
+            workflow_executors::create_schema_v8(&tx)?;
         }
-        (APPLICATION_ID, 6) => workflows::create_schema_v7(&tx)?,
+        (APPLICATION_ID, 6) => {
+            workflows::create_schema_v7(&tx)?;
+            workflow_executors::create_schema_v8(&tx)?;
+        }
+        (APPLICATION_ID, 7) => workflow_executors::create_schema_v8(&tx)?,
         (APPLICATION_ID, SCHEMA_VERSION) => {
             tx.commit()?;
             return Ok(());
