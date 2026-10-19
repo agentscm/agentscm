@@ -2,6 +2,8 @@
 pub mod compiler;
 pub mod contracts;
 pub mod runtime;
+pub mod task_contracts;
 pub use compiler::{CompiledPlan, compile, verify_current};
 pub use contracts::*;
 pub use runtime::{RunState, RunView, StepState, StepView, advance, cancel, start, status};
+pub use task_contracts::*;
