@@ -25,7 +25,10 @@ mod binary;
 pub(crate) mod detect;
 mod hook;
 mod hub_local;
+mod hub_native;
+mod hub_setup;
 mod manifest;
+mod process;
 
 use crate::prompt::Ui;
 use detect::{Detected, Forge};
@@ -35,12 +38,20 @@ use manifest::{
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum HubChoice {
-    /// Start a hub on this machine with Docker (GitHub only).
+    /// Start a managed native hub, or explicitly choose Docker (GitHub only).
     Local,
     /// Connect to a hub that already runs; needs --hub-url.
     Existing,
     /// Only the collision check and hooks; no live warnings yet.
     Skip,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum HubRuntime {
+    /// Run the installed native binary as a managed user service (macOS ARM64).
+    Native,
+    /// Run the matching Linux container image with Docker Compose.
+    Docker,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -64,6 +75,15 @@ pub struct QuickstartArgs {
     /// The hub to connect to (with --hub existing).
     #[arg(long)]
     hub_url: Option<String>,
+    /// Local hub runtime; native is recommended on qualified macOS ARM64 hosts.
+    #[arg(long, value_enum)]
+    hub_runtime: Option<HubRuntime>,
+    /// Loopback port for the local hub; reuse the recorded port on resume.
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+    hub_port: Option<u16>,
+    /// Instance name for an isolated local service or Docker Compose project.
+    #[arg(long)]
+    hub_project: Option<String>,
     /// Your GitHub login, to make you the local hub's administrator.
     #[arg(long)]
     github_login: Option<String>,
@@ -86,7 +106,7 @@ pub struct QuickstartArgs {
     #[arg(long)]
     no_collisions: bool,
     /// Also write the repository's agent config (agentscm init-repo); with --yes it is
-    /// skipped unless this is passed.
+    /// skipped unless this is passed. Loopback hubs never generate repository config.
     #[arg(long)]
     init: bool,
 }
@@ -96,7 +116,7 @@ pub struct UninstallArgs {
     /// Do not ask; take back everything quickstart recorded.
     #[arg(long)]
     yes: bool,
-    /// Also delete the local hub's data (its Docker volume and ~/.agentscm/hub).
+    /// Also delete the recorded local hub data (native directory or Docker volume).
     #[arg(long)]
     remove_hub_data: bool,
 }
@@ -104,6 +124,7 @@ pub struct UninstallArgs {
 const NEEDS_TERMINAL: &str = "agentscm quickstart asks questions, and there is no terminal here. \
 To run it without one, pass --yes and choose with flags: --hub local|existing|skip, --hub-url URL, \
 --agent-token-file PATH, --agent-name NAME, --ttl 30d, --provider github|gitlab, --github-login LOGIN, \
+--hub-runtime native|docker, --hub-port PORT, --hub-project NAME, \
 --hook user|project|none, --no-collisions, --init";
 
 const HUB_EXPLAINED: &str =
@@ -300,16 +321,23 @@ struct Live {
     /// The repository whose token and hub settings were saved.
     repo: Option<String>,
     hooks: bool,
+    pending_local: Option<String>,
 }
 
 impl Live {
     /// The last line of every run.
     fn line(&self) -> String {
         let off = |reason: &str, todo: &str| format!("Live warnings: off — {reason} ({todo})");
+        if let Some(command) = &self.pending_local {
+            return off(
+                "the local hub is waiting for GitHub App setup",
+                &format!("finish creating and installing the app, then run `{command}`"),
+            );
+        }
         match (&self.hub, &self.repo) {
             (None, _) => off(
                 "no hub chosen",
-                "run `agentscm quickstart --hub existing --hub-url URL`, or `--hub local` with Docker",
+                "run `agentscm quickstart --hub existing --hub-url URL`, or `--hub local` for a managed local hub",
             ),
             (Some(url), _) if !self.hub_up => off(
                 &format!("the hub at {url} isn't answering"),
@@ -340,15 +368,17 @@ struct Cx<'a> {
     live: Live,
     /// Repository files `init_stage` wrote (relative to the root); not in the manifest.
     init_written: Vec<PathBuf>,
+    failure: Option<String>,
 }
 
-pub async fn run(args: QuickstartArgs) -> Result<()> {
+pub async fn run(args: QuickstartArgs) -> Result<u8> {
     let tty = std::io::stdin().is_terminal();
     if !args.yes && !tty {
         return Err(invalid(NEEDS_TERMINAL));
     }
     let ui = Ui { yes: args.yes };
     let home = home_dir()?;
+    let _quickstart_lease = manifest::acquire_lease()?;
     let cwd = std::env::current_dir()?;
     let found = detect::detect(&cwd, &home);
     let mut cx = Cx {
@@ -362,7 +392,16 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
         install_url: None,
         live: Live::default(),
         init_written: Vec::new(),
+        failure: None,
     };
+    let record_path = manifest::path()?;
+    let original_record = record_fingerprint(&record_path);
+    let hub_files = [
+        cx.home.join(".agentscm/hub/compose.yaml"),
+        cx.home.join(".agentscm/hub/.env"),
+    ];
+    let original_hub_files = hub_files.each_ref().map(|path| file_hash(path));
+    let original_program = program_fingerprint(&cx.home);
     // Running from the install directory is undoable even if nothing else is written.
     if let Some((binary::Program::InstallDir(_), _)) = program_plan(&cx.home) {
         cx.manifest.bin_dir = Some(binary::bin_dir(&cx.home));
@@ -386,14 +425,103 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
     if !cx.manifest.is_empty() {
         cx.manifest.save()?;
     }
-    summary(&cx);
+    let changed = record_fingerprint(&record_path) != original_record
+        || hub_files.each_ref().map(|path| file_hash(path)) != original_hub_files
+        || program_fingerprint(&cx.home) != original_program
+        || !cx.init_written.is_empty();
+    summary(&cx, changed);
+    let command = cli_command(&cx);
+    println!("Run AgentSCM commands with: {command}");
+    if let Some(dir) = &cx.manifest.bin_dir {
+        println!(
+            r#"To use `agentscm` in this shell: export PATH={}:"$PATH""#,
+            binary::quote(dir)
+        );
+    }
     println!("{}", cx.live.line());
-    Ok(())
+    if let Some(failure) = cx.failure {
+        return Err(invalid(&failure));
+    }
+    if cx.live.pending_local.is_some() {
+        return Ok(3);
+    }
+    if (matches!(args.hub, Some(HubChoice::Local | HubChoice::Existing)) || args.hub_url.is_some())
+        && (!cx.live.hub_up || cx.live.repo.is_none())
+    {
+        return Err(invalid(
+            "the requested hub setup is incomplete; see the status and recovery instructions above",
+        ));
+    }
+    Ok(0)
+}
+
+fn record_fingerprint(path: &Path) -> (Option<String>, Option<u32>) {
+    #[cfg(unix)]
+    let mode = path.metadata().ok().map(|m| m.permissions().mode() & 0o777);
+    #[cfg(not(unix))]
+    let mode = None;
+    (file_hash(path), mode)
+}
+
+type ProgramFileFingerprint = (PathBuf, Option<String>, Option<PathBuf>, Option<u32>);
+
+/// Stable managed-program state. The symlink target catches link repair while the digest catches
+/// Windows link-copy repair and replacement of a versioned executable with the same filename.
+fn program_fingerprint(home: &Path) -> (Option<u32>, Vec<ProgramFileFingerprint>) {
+    let directory = binary::bin_dir(home);
+    #[cfg(unix)]
+    let directory_mode = directory
+        .metadata()
+        .ok()
+        .map(|metadata| metadata.permissions().mode() & 0o777);
+    #[cfg(not(unix))]
+    let directory_mode = None;
+    let files = [
+        directory.join(binary::LINK),
+        directory.join(format!(
+            "agentscm-{}{}",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::EXE_SUFFIX
+        )),
+    ]
+    .into_iter()
+    .map(|path| {
+        let metadata = path.symlink_metadata().ok();
+        let target = metadata
+            .as_ref()
+            .filter(|metadata| metadata.file_type().is_symlink())
+            .and_then(|_| std::fs::read_link(&path).ok());
+        #[cfg(unix)]
+        let mode = path
+            .metadata()
+            .ok()
+            .map(|metadata| metadata.permissions().mode() & 0o777);
+        #[cfg(not(unix))]
+        let mode = None;
+        let digest = path
+            .metadata()
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .and_then(|_| file_hash(&path));
+        (path, digest, target, mode)
+    })
+    .collect();
+    (directory_mode, files)
 }
 
 async fn status(cx: &Cx<'_>) {
     println!("What I found:");
     let found = &cx.found;
+    println!(
+        "  Executable platform: {}/{}; managed native hub {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        if native_hub_supported() {
+            "available"
+        } else {
+            "unavailable (explicit Docker fallback or existing hub)"
+        }
+    );
     match (&found.repo_root, &found.remote) {
         (Some(root), Some(remote)) => {
             let forge = match remote.forge {
@@ -576,10 +704,11 @@ async fn choose_hub(cx: &mut Cx<'_>) -> Option<String> {
             }
             HubChoice::Existing => return existing_hub(cx, current.map(|c| c.url)),
             HubChoice::Local => match local_hub(cx).await {
-                Ok(()) => return Some(hub_local::URL.to_owned()),
+                Ok(url) => return url,
                 Err(message) => {
                     println!("{message}");
                     if cx.ui.yes {
+                        cx.failure = Some(message);
                         return None;
                     }
                     choice = Some(menu(cx, false));
@@ -605,10 +734,14 @@ fn menu(cx: &Cx<'_>, with_local: bool) -> HubChoice {
     if with_local {
         options.insert(
             0,
-            "Start a hub on this machine with Docker (GitHub repositories only)",
+            "Start a hub on this machine (native when supported; Docker fallback; GitHub only)",
         );
         choices.insert(0, HubChoice::Local);
-        default = if cx.found.docker && github { 0 } else { 2 };
+        default = if (native_hub_supported() || cx.found.docker) && github {
+            0
+        } else {
+            2
+        };
     }
     choices[cx
         .ui
@@ -636,29 +769,161 @@ fn existing_hub(cx: &Cx<'_>, configured: Option<String>) -> Option<String> {
     }
 }
 
-async fn local_hub(cx: &mut Cx<'_>) -> std::result::Result<(), String> {
+fn valid_hub_project(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 63
+        && value.as_bytes()[0].is_ascii_lowercase()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn native_hub_supported() -> bool {
+    cfg!(all(target_os = "macos", target_arch = "aarch64")) && detect::which("launchctl").is_some()
+}
+
+async fn local_hub(cx: &mut Cx<'_>) -> std::result::Result<Option<String>, String> {
     if let Some(remote) = &cx.found.remote
         && remote.forge != Forge::Github
     {
-        return Err("The local hub's first-run setup is GitHub-only today, and this repository isn't on GitHub.".into());
+        return Err("The local hub's first-run setup is GitHub-only today; connect to an existing hub for this forge.".into());
     }
-    if !cx.found.docker {
+    let recorded_runtime = if cx.manifest.native_hub.is_some() {
+        Some(HubRuntime::Native)
+    } else if cx.manifest.local_hub.is_some() {
+        Some(HubRuntime::Docker)
+    } else {
+        None
+    };
+    let runtime = match cx.args.hub_runtime.or(recorded_runtime) {
+        Some(runtime) => runtime,
+        None if native_hub_supported() => HubRuntime::Native,
+        None if cx.found.docker => {
+            println!("A managed native hub is not supported on this host. Docker is available as an explicit fallback.");
+            if cx.ui.yes { return Err("Choose Docker explicitly with --hub-runtime docker, or use --hub existing/skip.".into()); }
+            if !cx.ui.confirm("Use the Docker container fallback?", false) { return Ok(None); }
+            HubRuntime::Docker
+        }
+        None => return Err("No supported managed native hub or working Docker Engine was found. Connect to an existing hub, or use --hub skip for local read-only commands.".into()),
+    };
+    if recorded_runtime.is_some_and(|previous| previous != runtime) {
+        return Err("A local hub already uses another runtime. Uninstall that recorded hub before switching runtimes; no second authority was started.".into());
+    }
+    let (recorded_port, recorded_project) = if let Some(r) = &cx.manifest.native_hub {
+        (Some(r.port), Some(r.project.clone()))
+    } else if let Some(r) = &cx.manifest.local_hub {
+        (Some(r.port), Some(r.project.clone()))
+    } else {
+        (None, None)
+    };
+    let port = cx.args.hub_port.or(recorded_port).unwrap_or(7332);
+    let project = cx
+        .args
+        .hub_project
+        .clone()
+        .or(recorded_project.clone())
+        .unwrap_or_else(|| {
+            format!(
+                "agentscm-hub-{}",
+                &sha_hex(cx.home.as_os_str().as_encoded_bytes())[..10]
+            )
+        });
+    if !valid_hub_project(&project) {
+        return Err("--hub-project must start with a lowercase letter and contain only lowercase letters, digits and hyphens (at most 63 characters).".into());
+    }
+    if recorded_port.is_some_and(|old| old != port) {
         return Err(
-            "Docker isn't available (docker version and docker compose version must work).".into(),
+            "The recorded hub uses another port. Uninstall it before changing --hub-port.".into(),
+        );
+    }
+    if recorded_project.as_ref().is_some_and(|old| old != &project) {
+        return Err(
+            "The recorded hub uses another project. Uninstall it before changing --hub-project."
+                .into(),
         );
     }
     let repo = cx.found.remote.as_ref().map(|r| r.repo.clone());
-    let started = hub_local::start(
-        cx.ui,
-        cx.args.github_login.as_deref(),
-        cx.tty,
-        &cx.home,
-        repo.as_deref(),
-        &mut cx.manifest,
-    )
-    .await?;
+    let started = match runtime {
+        HubRuntime::Docker => {
+            if !cx.found.docker {
+                return Err("Docker fallback needs a running Linux Docker Engine and Docker Compose. Start Docker, connect to an existing hub, or use --hub skip.".into());
+            }
+            println!(
+                "Local hub runtime: Docker (explicit container fallback). No automatic emulation or runtime switching."
+            );
+            hub_local::start(
+                cx.ui,
+                cx.args.github_login.as_deref(),
+                cx.tty,
+                &cx.home,
+                repo.as_deref(),
+                &mut cx.manifest,
+                &hub_local::Options {
+                    runtime,
+                    port,
+                    project: project.clone(),
+                },
+            )
+            .await?
+        }
+        HubRuntime::Native => {
+            if !native_hub_supported() {
+                return Err("A managed native hub is currently qualified only for macOS ARM64 with launchctl. Choose --hub-runtime docker explicitly for the container fallback.".into());
+            }
+            if cx.manifest.native_hub.is_none() {
+                hub_native::preflight_port(port)?;
+            }
+            let executable = std::env::current_exe()
+                .map_err(|e| e.to_string())?
+                .canonicalize()
+                .map_err(|e| e.to_string())?;
+            let dir = binary::bin_dir(&cx.home);
+            println!(
+                "Local hub runtime: native macOS ARM64, managed by launchd. Will retain the verified executable in {}.",
+                shown(&dir, &cx.home)
+            );
+            println!(
+                "Will write the LaunchAgent in ~/Library/LaunchAgents and private Hub configuration/data in ~/.agentscm/hub-native/{project}, bound to 127.0.0.1:{port}."
+            );
+            if !cx.ui.confirm(
+                "Install the native hub executable and managed user service?",
+                true,
+            ) {
+                return Ok(None);
+            }
+            let stable = binary::install(&dir, &executable, env!("CARGO_PKG_VERSION"))?;
+            cx.manifest.bin_dir = Some(dir);
+            cx.manifest.save().map_err(|e| e.to_string())?;
+            hub_native::start(
+                cx.ui,
+                cx.args.github_login.as_deref(),
+                cx.tty,
+                &cx.home,
+                repo.as_deref(),
+                &mut cx.manifest,
+                &hub_native::Options {
+                    executable: stable,
+                    port,
+                    project: project.clone(),
+                },
+            )
+            .await?
+        }
+    };
     cx.install_url = started.install_url;
-    Ok(())
+    if started.pending {
+        let kind = if runtime == HubRuntime::Native {
+            "native"
+        } else {
+            "docker"
+        };
+        cx.live.pending_local = Some(format!(
+            "{} quickstart --hub local --hub-runtime {kind} --hub-port {port} --hub-project {project}",
+            cli_command(cx)
+        ));
+        return Ok(None);
+    }
+    Ok(Some(started.url))
 }
 
 // ---- sign-in and token ----
@@ -1158,6 +1423,14 @@ fn program_plan(home: &Path) -> Option<(binary::Program, PathBuf)> {
     Some((binary::plan(home, &exe, on_path.as_deref(), &temp), exe))
 }
 
+fn recommended_hook_scope(found: &Detected) -> HookScope {
+    if found.repo_root.is_some() && !found.worktrees {
+        HookScope::Project
+    } else {
+        HookScope::User
+    }
+}
+
 fn hook_stage(cx: &mut Cx<'_>) {
     let root = cx.found.repo_root.clone();
     let scope = match cx.args.hook {
@@ -1170,7 +1443,7 @@ fn hook_stage(cx: &mut Cx<'_>) {
         }
         None if cx.ui.yes => {
             if cx.live.repo.is_some() && root.is_some() {
-                HookScope::Project
+                recommended_hook_scope(&cx.found)
             } else {
                 println!(
                     "Not adding the Claude Code hooks: live warnings are off, so they would have nothing to report. Use --hook project to add them anyway."
@@ -1184,7 +1457,16 @@ fn hook_stage(cx: &mut Cx<'_>) {
                 "Every project (~/.claude/settings.json)",
                 "Skip the hooks",
             ];
-            let default = if root.is_some() { 0 } else { 1 };
+            if cx.found.worktrees {
+                println!(
+                    "Git worktrees detected. Every project is recommended so sessions in worktrees receive the hooks too."
+                );
+            }
+            let default = if recommended_hook_scope(&cx.found) == HookScope::Project {
+                0
+            } else {
+                1
+            };
             [HookScope::Project, HookScope::User, HookScope::None][cx.ui.choose(
                 "Where should Claude Code's hooks go?",
                 &options,
@@ -1465,18 +1747,18 @@ fn init_stage(cx: &mut Cx<'_>) {
         }
         return;
     };
-    let local = is_loopback(&hub);
+    if is_loopback(&hub) {
+        println!(
+            "Skipping repository agent config: this hub runs on this machine. When you have a shared hub, run `agentscm init-repo --hub-url URL`."
+        );
+        return;
+    }
     let go = if cx.ui.yes {
         cx.args.init
     } else {
-        if local {
-            println!(
-                "This hub runs on this machine, so teammates can't use it; for them the files need your team's hub URL (`agentscm init-repo --hub-url URL`)."
-            );
-        }
         cx.ui.confirm(
             "Also add AgentSCM to this repository's agent config (MCP, hooks and instructions for Claude Code, Codex, Cursor and Copilot)? It writes files you can commit.",
-            !local,
+            true,
         )
     };
     if !go {
@@ -1488,10 +1770,22 @@ fn init_stage(cx: &mut Cx<'_>) {
     }
 }
 
-fn summary(cx: &Cx<'_>) {
+fn cli_command(cx: &Cx<'_>) -> String {
+    if let Some(dir) = &cx.manifest.bin_dir {
+        return binary::quote(&dir.join(binary::LINK));
+    }
+    std::env::current_exe()
+        .map(|path| binary::quote(&path))
+        .unwrap_or_else(|_| "npx agentscm".to_owned())
+}
+
+fn summary(cx: &Cx<'_>, changed: bool) {
     let m = &cx.manifest;
     let home = &cx.home;
-    println!("\nWhat quickstart wrote or changed:");
+    if !changed {
+        println!("\nNo changes made.");
+    }
+    println!("\nQuickstart's recorded setup:");
     let mut any = false;
     let mut line = |text: String| {
         any = true;
@@ -1502,6 +1796,14 @@ fn summary(cx: &Cx<'_>) {
             "{}/compose.yaml and .env: the local hub's Docker files (project {})",
             shown(&local.dir, home),
             local.project
+        ));
+    }
+    if let Some(native) = &m.native_hub {
+        line(format!(
+            "{}: native hub LaunchAgent {} (port {})",
+            shown(&native.plist, home),
+            native.label,
+            native.port
         ));
     }
     for token in &m.tokens {
@@ -1549,14 +1851,14 @@ fn summary(cx: &Cx<'_>) {
         ));
     }
     if !any && cx.init_written.is_empty() {
-        println!("  nothing; no files were changed.");
+        println!("  nothing recorded.");
     } else if !any {
         println!("  nothing that `agentscm uninstall` undoes.");
     } else {
         if let Ok(path) = manifest::path() {
             println!("  {}: a record of the above", shown(&path, home));
         }
-        println!("Undo all of this with `agentscm uninstall`.");
+        println!("Undo all of this with `{} uninstall`.", cli_command(cx));
     }
     if !cx.init_written.is_empty() {
         println!(
@@ -1629,6 +1931,7 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
         ));
     }
     let ui = Ui { yes: args.yes };
+    let _quickstart_lease = manifest::acquire_lease()?;
     let Some(m) = Manifest::load()? else {
         println!("Nothing to undo: quickstart hasn't installed anything here.");
         return Ok(());
@@ -1681,7 +1984,29 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
             l.project
         );
     }
+    if let Some(native) = &m.native_hub {
+        println!(
+            "  - stop the native hub LaunchAgent {} and remove its recorded service configuration; data stays unless selected below",
+            native.label
+        );
+    }
     println!("  - delete quickstart's own record, if everything above could be undone");
+    let remove_hub_data = (m.local_hub.is_some() || m.native_hub.is_some())
+        && (args.remove_hub_data
+            || (!args.yes && ui.confirm("Also delete the recorded local hub data (native directory or Docker volume)? This can't be undone.", false)));
+    if m.local_hub.is_some() || m.native_hub.is_some() {
+        println!(
+            "Local hub data: {}.",
+            if remove_hub_data {
+                "will be deleted"
+            } else {
+                "will be kept for reinstall"
+            }
+        );
+        println!(
+            "The GitHub App and its installations stay on GitHub. Remove them in GitHub Settings if you no longer need them; keeping hub data lets reinstall reuse the app."
+        );
+    }
     if !ui.confirm("Go ahead?", true) {
         println!("Nothing changed.");
         return Ok(());
@@ -1763,12 +2088,37 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
             }
         }
     }
-    if let Some((dir, _)) = programs.as_ref().filter(|_| !left.hooks.is_empty()) {
+    let native_executable_drift = m.native_hub.as_ref().is_some_and(|native| {
+        file_hash(&native.executable).as_deref() != Some(native.executable_sha256.as_str())
+    });
+    if let Some(native) = &m.native_hub {
+        match hub_native::uninstall(native, &home, remove_hub_data) {
+            Ok(()) => println!(
+                "Stopped the native hub and removed its managed LaunchAgent. Hub data {}.",
+                if remove_hub_data {
+                    "was deleted"
+                } else {
+                    "was retained for reinstall"
+                }
+            ),
+            Err(message) => {
+                println!("Couldn't uninstall the native hub: {message}.");
+                manual.push(message);
+                left.native_hub = Some(native.clone());
+            }
+        }
+    }
+    if let Some((dir, _)) = programs
+        .as_ref()
+        .filter(|_| !left.hooks.is_empty() || left.native_hub.is_some() || native_executable_drift)
+    {
         println!(
-            "Left the program files in {}: some hooks still call them.",
+            "Left the program files in {}: recorded hooks or a managed hub still need them, or the native executable changed.",
             shown(dir, &home)
         );
-        manual.push("after fixing the hooks, run `agentscm uninstall` again".into());
+        manual.push(
+            "after resolving the retained hooks or hub, run `agentscm uninstall` again".into(),
+        );
         left.bin_dir = Some(dir.clone());
     } else if let Some((dir, files)) = programs {
         let mut failed = false;
@@ -1792,7 +2142,7 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
         }
     }
     if let Some(local) = &m.local_hub
-        && let Err(command) = undo_local_hub(&args, &ui, local, &home)
+        && let Err(command) = undo_local_hub(remove_hub_data, local, &home)
     {
         manual.push(command);
         left.local_hub = Some(local.clone());
@@ -1841,24 +2191,17 @@ async fn revoke(token: &TokenRecord) {
 
 /// `Err` carries the command to finish by hand.
 fn undo_local_hub(
-    args: &UninstallArgs,
-    ui: &Ui,
+    wipe: bool,
     local: &manifest::LocalHubRecord,
     home: &Path,
 ) -> std::result::Result<(), String> {
-    let wipe = args.remove_hub_data
-        || (!args.yes
-            && ui.confirm(
-                "Also delete the local hub's data (its Docker volume and ~/.agentscm/hub)? This can't be undone.",
-                false,
-            ));
     let compose = format!(
         "docker compose -p {} -f {}/compose.yaml down{}",
         local.project,
         shown(&local.dir, home),
         if wipe { " -v" } else { "" }
     );
-    if !hub_local::down(&local.dir, wipe) {
+    if !hub_local::down(&local.dir, &local.project, wipe) {
         println!("Docker couldn't stop the hub (is Docker running?).");
         return Err(compose);
     }
@@ -1867,7 +2210,9 @@ fn undo_local_hub(
             "Stopped the local hub. Its data and {} were kept.",
             shown(&local.dir, home)
         );
-    } else if local.dir.ends_with(".agentscm/hub") && std::fs::remove_dir_all(&local.dir).is_ok() {
+    } else if safe_hub_data_dir(&local.dir, home, &local.project)
+        && std::fs::remove_dir_all(&local.dir).is_ok()
+    {
         println!("Deleted the local hub and its data.");
     } else {
         println!(
@@ -1879,9 +2224,25 @@ fn undo_local_hub(
     Ok(())
 }
 
+fn safe_hub_data_dir(dir: &Path, home: &Path, project: &str) -> bool {
+    dir == home.join(".agentscm/hub") || dir == home.join(".agentscm/hubs").join(project)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_local_setup_names_the_resume_command_instead_of_token_setup() {
+        let live = Live {
+            pending_local: Some("/opt/agentscm quickstart --hub local".into()),
+            ..Live::default()
+        };
+        let line = live.line();
+        assert!(line.contains("finish creating and installing the app"));
+        assert!(line.contains("`/opt/agentscm quickstart --hub local`"));
+        assert!(!line.contains("agent-token-file"));
+    }
 
     #[test]
     fn not_connected_is_told_apart_from_other_refusals() {

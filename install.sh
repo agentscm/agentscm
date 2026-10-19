@@ -8,9 +8,17 @@ VERSION="${AGENTSCM_VERSION:-$AGENTSCM_DEFAULT_VERSION}"
 REPO="counterbranch/agentscm"
 SUMS_MAX=65536
 BINARY_MAX=209715200
+VERIFY_OUTPUT_MAX=1048576
 tmp=""
 
 die() { echo "agentscm: $*" >&2; exit 1; }
+verbose() { [ "${AGENTSCM_INSTALL_VERBOSE:-}" = 1 ]; }
+
+show_verify_output() { # show_verify_output <file>
+  bytes="$(wc -c <"$1" | tr -d ' ')"
+  head -c "$VERIFY_OUTPUT_MAX" "$1" >&2
+  [ "$bytes" -le "$VERIFY_OUTPUT_MAX" ] || echo >&2 "agentscm: GitHub CLI output truncated after $VERIFY_OUTPUT_MAX bytes"
+}
 
 fetch() { # fetch <url> <output file> <max bytes>
   if command -v curl >/dev/null 2>&1; then
@@ -46,15 +54,22 @@ provenance_gap() {
 # Without a usable gh the checksum comes from the same release as the binary: that catches corruption, not forgery.
 provenance() { # provenance <file>; uses $gap from main
   if [ -z "$gap" ]; then
-    gh attestation verify "$1" --repo "$REPO" \
+    if gh attestation verify "$1" --repo "$REPO" \
       --signer-workflow "$REPO/.github/workflows/release.yml" \
       --source-ref "refs/tags/v$VERSION" --deny-self-hosted-runners \
-      || die "build provenance verification failed; not running the binary"
+      >"$tmp/gh-verify.log" 2>&1; then
+      if verbose; then show_verify_output "$tmp/gh-verify.log"; fi
+      provenance_verified=1
+    else
+      show_verify_output "$tmp/gh-verify.log"
+      die "build provenance verification failed; not running the binary"
+    fi
   elif [ "${AGENTSCM_REQUIRE_PROVENANCE:-}" = 1 ]; then
     die "AGENTSCM_REQUIRE_PROVENANCE=1 but $gap"
   else
-    echo "Checksum-verified only: provenance was not checked ($gap)."
+    provenance_verified=0
   fi
+  return 0
 }
 
 main() {
@@ -104,7 +119,7 @@ See https://github.com/$REPO/blob/v$VERSION/docs/install.md"
   trap 'exit 143' TERM
 
   fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS" "$SUMS_MAX" || die "could not download SHA256SUMS for v$VERSION"
-  echo "Checksums from the GitHub release."
+  verbose && echo "Checksums from the GitHub release."
   # Strict, like the npm package: every line must be well formed and the target listed exactly once.
   if grep -qv -E '^[0-9a-f]{64}  agentscm-[a-z0-9_-]+(\.exe)?$' "$tmp/SHA256SUMS"; then
     die "SHA256SUMS has a malformed line"
@@ -116,7 +131,7 @@ See https://github.com/$REPO/blob/v$VERSION/docs/install.md"
   if [ -e "$bin" ]; then
     [ "$(sha256 "$bin")" = "$expected" ] || die "$bin does not match the release checksum; delete it and retry"
     provenance "$bin"
-    echo "Using the verified $bin"
+    verbose && echo "Using the verified $bin"
   else
     fetch "$base/$asset" "$tmp/$asset" "$BINARY_MAX" || die "could not download $asset"
     [ "$(sha256 "$tmp/$asset")" = "$expected" ] || die "checksum mismatch for $asset; nothing was installed"
@@ -126,6 +141,12 @@ See https://github.com/$REPO/blob/v$VERSION/docs/install.md"
   fi
   ln -s "agentscm-$VERSION" "$tmp/link"
   mv -f "$tmp/link" "$link"
+
+  if [ "$provenance_verified" = 1 ]; then
+    echo "Verified checksum and build provenance. Set AGENTSCM_INSTALL_VERBOSE=1 for details."
+  else
+    echo "Verified checksum; provenance was not checked ($gap)."
+  fi
 
   # Same rule as the npm package: no arguments or a leading flag starts the setup guide.
   if [ "$#" -eq 0 ]; then

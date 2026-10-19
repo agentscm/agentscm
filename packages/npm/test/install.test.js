@@ -112,23 +112,53 @@ test('provenance needs gh installed and signed in', () => {
   assert.equal(provenanceGap(ran({ '--version': { status: 0 }, auth: { status: 0 } })), null);
 });
 
-test('without gh, provenance is skipped unless required', () => {
+test('without gh, provenance is reported to the caller unless required', () => {
   const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'agentscm-test-'));
   const saved = { PATH: process.env.PATH, req: process.env.AGENTSCM_REQUIRE_PROVENANCE };
-  const log = console.log;
   try {
     process.env.PATH = empty;
     delete process.env.AGENTSCM_REQUIRE_PROVENANCE;
-    const lines = [];
-    console.log = (m) => lines.push(m);
-    checkProvenance(sample, '1.2.3');
-    assert.match(lines.join(''), /Checksum-verified only.*not installed/);
+    assert.equal(checkProvenance(sample, '1.2.3'), false);
     process.env.AGENTSCM_REQUIRE_PROVENANCE = '1';
     assert.throws(() => checkProvenance(sample, '1.2.3'), /AGENTSCM_REQUIRE_PROVENANCE=1 but .*not installed/);
   } finally {
-    console.log = log;
     process.env.PATH = saved.PATH;
     if (saved.req === undefined) delete process.env.AGENTSCM_REQUIRE_PROVENANCE; else process.env.AGENTSCM_REQUIRE_PROVENANCE = saved.req;
     fs.rmSync(empty, { recursive: true });
+  }
+});
+
+test('successful provenance verification is quiet unless installer verbose mode is enabled', () => {
+  const saved = process.env.AGENTSCM_INSTALL_VERBOSE;
+  const error = console.error;
+  const lines = [];
+  const run = () => ({ status: 0, stdout: 'verified attestation\n', stderr: 'upgrade gh now\n' });
+  try {
+    console.error = (line) => lines.push(line);
+    delete process.env.AGENTSCM_INSTALL_VERBOSE;
+    assert.equal(checkProvenance(sample, '1.2.3', null, run), true);
+    assert.deepEqual(lines, []);
+
+    process.env.AGENTSCM_INSTALL_VERBOSE = '1';
+    assert.equal(checkProvenance(sample, '1.2.3', null, run), true);
+    assert.deepEqual(lines, ['verified attestation', 'upgrade gh now']);
+  } finally {
+    console.error = error;
+    if (saved === undefined) delete process.env.AGENTSCM_INSTALL_VERBOSE; else process.env.AGENTSCM_INSTALL_VERBOSE = saved;
+  }
+});
+
+test('failed provenance verification exposes captured diagnostics', () => {
+  const error = console.error;
+  const lines = [];
+  try {
+    console.error = (line) => lines.push(line);
+    assert.throws(
+      () => checkProvenance(sample, '1.2.3', null, () => ({ status: 1, stdout: '', stderr: 'attestation mismatch\n' })),
+      /build provenance verification failed/,
+    );
+    assert.deepEqual(lines, ['attestation mismatch']);
+  } finally {
+    console.error = error;
   }
 });

@@ -22,11 +22,21 @@ jobs:
     # `ci-extended` label, once per labelling and against the head at that moment; pushing again
     # does not re-run it. Remove and re-add the label to run it again.
     if: ${{ github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'ci-extended') || (github.event.action != 'labeled' && github.event.pull_request.head.repo.full_name == github.repository) }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {platform: linux/amd64, arch: amd64, runner: ubuntu-24.04}
+          - {platform: linux/arm64, arch: arm64, runner: ubuntu-24.04-arm}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: docker build -t agentscm:ci .
-      - run: .github/docker-smoke.sh agentscm:ci # build and smoke test only; nothing is pushed
+      - name: Build on native hardware
+        run: docker build --platform "${{ matrix.platform }}" -t "agentscm:ci-${{ matrix.arch }}" .
+      - name: Confirm the loaded image architecture
+        run: test "$(docker image inspect --format '{{.Architecture}}/{{.Os}}' 'agentscm:ci-${{ matrix.arch }}')" = "${{ matrix.arch }}/linux"
+      - name: Smoke test
+        run: .github/docker-smoke.sh "agentscm:ci-${{ matrix.arch }}" # build and smoke test only; nothing is pushed

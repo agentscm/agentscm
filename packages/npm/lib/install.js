@@ -3,11 +3,12 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { execFileSync, spawnSync } = require('node:child_process');
+const { spawnSync } = require('node:child_process');
 
 const REPO = 'counterbranch/agentscm';
 const SUMS_MAX = 64 * 1024;
 const BINARY_MAX = 200 * 1024 * 1024;
+const VERIFY_OUTPUT_MAX = 1024 * 1024;
 const BUDGET_MS = 600_000; // overall, for both downloads
 
 const NOTICE_TEXT = `npx agentscm downloads the AgentSCM release binary for your platform from
@@ -104,18 +105,32 @@ function provenanceGap(run = spawnSync) {
   return null;
 }
 
-// Throws if the attestation does not verify. With no usable gh it only warns, unless AGENTSCM_REQUIRE_PROVENANCE=1.
-function checkProvenance(file, version, gap = provenanceGap()) {
+const verboseInstall = () => process.env.AGENTSCM_INSTALL_VERBOSE === '1';
+
+function showVerifyOutput(result) {
+  for (const output of [result.stdout, result.stderr]) {
+    if (output && output.trim()) console.error(output.trimEnd());
+  }
+}
+
+// Throws if the attestation does not verify. Returns whether provenance was verified.
+// gh output is captured so its success report and upgrade notices do not bury the setup prompt.
+function checkProvenance(file, version, gap = provenanceGap(), run = spawnSync) {
   if (gap) {
     if (process.env.AGENTSCM_REQUIRE_PROVENANCE === '1') throw new Error(`AGENTSCM_REQUIRE_PROVENANCE=1 but ${gap}`);
-    console.log(`Checksum-verified only: provenance was not checked (${gap}).`);
-    return;
+    return false;
   }
-  try {
-    execFileSync('gh', ghVerifyArgs(file, version), { stdio: 'inherit' });
-  } catch {
+  const result = run('gh', ghVerifyArgs(file, version), {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    maxBuffer: VERIFY_OUTPUT_MAX,
+  });
+  if (result.error || result.status !== 0) {
+    showVerifyOutput(result);
     throw new Error('build provenance verification failed; not running the binary');
   }
+  if (verboseInstall()) showVerifyOutput(result);
+  return true;
 }
 
 async function main(args) {
@@ -137,9 +152,9 @@ async function main(args) {
     const parts = [];
     await download(urlFor(version, 'SHA256SUMS'), SUMS_MAX, (c) => parts.push(c), signal);
     sums = Buffer.concat(parts).toString('utf8');
-    console.log('Checksums from the GitHub release.');
+    if (verboseInstall()) console.log('Checksums from the GitHub release.');
   } else {
-    console.log('Checksums from the npm package.');
+    if (verboseInstall()) console.log('Checksums from the npm package.');
   }
   const expected = parseSums(sums, target);
 
@@ -156,7 +171,7 @@ async function main(args) {
   if (fs.existsSync(binary)) {
     if (!matches(binary, expected)) throw new Error(`${binary} does not match the release checksum; delete it and retry`);
     checkProvenance(binary, version, gap);
-    console.log(`Using the verified ${binary}`);
+    if (verboseInstall()) console.log(`Using the verified ${binary}`);
   } else {
     const tmp = path.join(dir, `.agentscm-${version}-${rand}.tmp`);
     try {
@@ -190,6 +205,12 @@ async function main(args) {
     } finally {
       fs.rmSync(tmpLink, { force: true });
     }
+  }
+
+  if (gap) {
+    console.log(`Verified checksum; provenance was not checked (${gap}).`);
+  } else {
+    console.log('Verified checksum and build provenance. Set AGENTSCM_INSTALL_VERBOSE=1 for details.');
   }
 
   const r = spawnSync(binary, launchArgs(args), { stdio: 'inherit' });

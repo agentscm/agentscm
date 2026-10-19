@@ -2,6 +2,7 @@
 // Runs install.sh against a stub curl that serves only the fixture SHA256SUMS, so no network is used.
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -34,7 +35,6 @@ case "$url" in */SHA256SUMS) cp "$SUMS" "$out" ;; *) exit 22 ;; esac
 
 test('install.sh accepts a SHA256SUMS that lists the Windows .exe', { skip }, () => {
   const r = run(fs.readFileSync(fixtureSums, 'utf8'));
-  assert.match(r.stdout, /Checksums from the GitHub release/);
   assert.match(r.stderr, new RegExp(`could not download agentscm-${target}`)); // got past the checksum file checks
   assert.doesNotMatch(r.stderr, /malformed/);
 });
@@ -49,4 +49,40 @@ test('install.sh dies under AGENTSCM_REQUIRE_PROVENANCE=1 when gh is not signed 
   const r = run(fs.readFileSync(fixtureSums, 'utf8'), { AGENTSCM_REQUIRE_PROVENANCE: '1' }, { gh: '#!/bin/sh\n[ "$1" = auth ] && exit 1\nexit 0\n' });
   assert.notEqual(r.status, 0);
   assert.match(r.stderr, /AGENTSCM_REQUIRE_PROVENANCE=1 but the GitHub CLI \(gh\) is not signed in/);
+});
+
+test('install.sh hides successful gh details and offers verbose diagnostics', { skip }, () => {
+  const binary = '#!/bin/sh\nexit 0\n';
+  const hash = crypto.createHash('sha256').update(binary).digest('hex');
+  const validSums = `${hash}  agentscm-${target}\n`;
+  const curl = `#!/bin/sh
+for a; do [ "$prev" = -o ] && out=$a; prev=$a; url=$a; done
+case "$url" in */SHA256SUMS) cp "$SUMS" "$out" ;; *) printf '#!/bin/sh\\nexit 0\\n' >"$out" ;; esac
+`;
+  const gh = '#!/bin/sh\n[ "$1" = auth ] && exit 0\necho "verified attestation"\necho "upgrade gh now" >&2\n';
+
+  const quiet = run(validSums, {}, { curl, gh });
+  assert.equal(quiet.status, 0, quiet.stderr);
+  assert.match(quiet.stdout, /Verified checksum and build provenance\. Set AGENTSCM_INSTALL_VERBOSE=1 for details\./);
+  assert.doesNotMatch(`${quiet.stdout}${quiet.stderr}`, /verified attestation|upgrade gh now/);
+
+  const verbose = run(validSums, { AGENTSCM_INSTALL_VERBOSE: '1' }, { curl, gh });
+  assert.equal(verbose.status, 0, verbose.stderr);
+  assert.match(verbose.stderr, /verified attestation/);
+  assert.match(verbose.stderr, /upgrade gh now/);
+});
+
+test('install.sh exposes gh diagnostics when provenance verification fails', { skip }, () => {
+  const binary = '#!/bin/sh\nexit 0\n';
+  const hash = crypto.createHash('sha256').update(binary).digest('hex');
+  const validSums = `${hash}  agentscm-${target}\n`;
+  const curl = `#!/bin/sh
+for a; do [ "$prev" = -o ] && out=$a; prev=$a; url=$a; done
+case "$url" in */SHA256SUMS) cp "$SUMS" "$out" ;; *) printf '#!/bin/sh\\nexit 0\\n' >"$out" ;; esac
+`;
+  const gh = '#!/bin/sh\n[ "$1" = auth ] && exit 0\necho "attestation mismatch" >&2\nexit 1\n';
+  const failed = run(validSums, {}, { curl, gh });
+  assert.notEqual(failed.status, 0);
+  assert.match(failed.stderr, /attestation mismatch/);
+  assert.match(failed.stderr, /build provenance verification failed; not running the binary/);
 });
