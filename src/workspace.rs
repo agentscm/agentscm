@@ -18,6 +18,13 @@ use crate::store::{Engine, digest, validate_id, validate_symlink_target};
 use crate::sync;
 use crate::{Error, Result};
 
+mod git_config;
+mod glob;
+mod selection;
+
+pub use selection::Rule;
+use selection::{Classified, Selection, Selector, Settings, Tracked};
+
 pub const METADATA_DIRECTORY: &str = crate::local_recovery::WORKSPACE_METADATA_DIRECTORY;
 
 const DATABASE_FILE: &str = "state.sqlite";
@@ -26,6 +33,8 @@ const SCHEMA_VERSION: i64 = 3;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const LIST_PAGE_SIZE: usize = 4_096;
 const MAX_ENTRIES: usize = 100_000;
+/// Bound on everything read from directories, selected or not.
+const MAX_VISITED_ENTRIES: usize = 1_000_000;
 const MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TOTAL_BYTES: usize = 128 * 1024 * 1024;
 const MAX_DEPTH: usize = 128;
@@ -61,6 +70,25 @@ pub struct Status {
     pub base_revision: String,
     pub generation: u64,
     pub changes: Vec<WorkspaceChange>,
+    pub complete: bool,
+    /// Entries left out by exclusion rules. A directory counts once; its descendants, which are
+    /// never visited, are not counted.
+    pub excluded_total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending: Option<PendingOperation>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct Preview {
+    pub base_revision: String,
+    pub generation: u64,
+    /// Captured files and symbolic links, by path bytes, up to the requested limit.
+    pub included: Vec<IncludedPath>,
+    /// Paths left out by an exclusion rule, by path bytes, up to the requested limit.
+    pub excluded: Vec<ExcludedPath>,
+    pub included_total: usize,
+    pub excluded_total: usize,
+    /// False when a list was cut short or the working tree could not be fully scanned.
     pub complete: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending: Option<PendingOperation>,
@@ -203,10 +231,12 @@ impl Workspace {
                 generation: state.generation,
                 changes: Vec::new(),
                 complete: false,
+                excluded_total: 0,
                 pending: state.pending,
             }
         } else if let Some(base) = source_snapshot(engine, &state.base_revision)? {
-            if let Some(working) = scan_workspace(&self.root)? {
+            let tracked = Tracked::from_paths(base.files.keys().map(String::as_str));
+            if let Some((working, report)) = scan_workspace_full(&self.root, &tracked)? {
                 let mut changes = changes_between(&base.files, &working.files);
                 let complete = changes.len() <= limit;
                 changes.truncate(limit);
@@ -215,6 +245,7 @@ impl Workspace {
                     generation: state.generation,
                     changes,
                     complete,
+                    excluded_total: report.excluded_total,
                     pending: state.pending,
                 }
             } else {
@@ -223,6 +254,7 @@ impl Workspace {
                     generation: state.generation,
                     changes: Vec::new(),
                     complete: false,
+                    excluded_total: 0,
                     pending: state.pending,
                 }
             }
@@ -232,11 +264,65 @@ impl Workspace {
                 generation: state.generation,
                 changes: Vec::new(),
                 complete: false,
+                excluded_total: 0,
                 pending: state.pending,
             }
         };
         tx.commit()?;
         Ok(status)
+    }
+
+    /// List what the next status or checkpoint would capture and what the exclusion rules leave
+    /// out, with the rule behind each exclusion. Uses the same selector and scan as `status`; it
+    /// returns paths only, never file contents.
+    pub fn preview(&self, engine: &Engine, limit: usize) -> Result<Preview> {
+        if limit == 0 {
+            return Err(Error::Limit(
+                "workspace preview limit must be positive".to_owned(),
+            ));
+        }
+        let mut connection = self.connection()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state = state_with_pending(&tx)?;
+        let mut preview = Preview {
+            base_revision: state.base_revision.clone(),
+            generation: state.generation,
+            included: Vec::new(),
+            excluded: Vec::new(),
+            included_total: 0,
+            excluded_total: 0,
+            complete: false,
+            pending: state.pending,
+        };
+        if state.ready
+            && let Some(base) = source_snapshot(engine, &state.base_revision)?
+        {
+            let tracked = Tracked::from_paths(base.files.keys().map(String::as_str));
+            if let Some((working, mut report)) = scan_workspace_full(&self.root, &tracked)? {
+                preview.included_total = working.files.len();
+                preview.excluded_total = report.excluded_total;
+                preview.complete = working.files.len() <= limit
+                    && report.excluded_total <= limit
+                    && report.excluded_total == report.excluded.len()
+                    && !report.included_by_rule_truncated;
+                preview.included = working
+                    .files
+                    .keys()
+                    .take(limit)
+                    .map(|path| IncludedPath {
+                        rule: report.included_by_rule.remove(path),
+                        path: path.clone(),
+                    })
+                    .collect();
+                report
+                    .excluded
+                    .sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+                report.excluded.truncate(limit);
+                preview.excluded = report.excluded;
+            }
+        }
+        tx.commit()?;
+        Ok(preview)
     }
 
     pub fn checkpoint(
@@ -263,7 +349,8 @@ impl Workspace {
         let state = read_state(&tx)?;
         require_ready_generation(&state, expected_generation)?;
         let base = require_complete_snapshot(source_snapshot(engine, &state.base_revision)?)?;
-        let working = require_complete_snapshot(scan_workspace(&self.root)?)?;
+        let tracked = Tracked::from_paths(base.files.keys().map(String::as_str));
+        let working = require_complete_snapshot(scan_workspace(&self.root, &tracked)?)?;
         let staged = staged_between(&base.files, &working.files);
         if staged.is_empty() {
             return Err(Error::Invalid(
@@ -323,9 +410,19 @@ impl Workspace {
         }
         let current = require_complete_snapshot(source_snapshot(engine, &after_revision)?)?;
         let target = require_complete_snapshot(source_snapshot(engine, &before_revision)?)?;
-        let working = require_complete_snapshot(scan_workspace(&self.root)?)?;
+        let tracked = Tracked::from_paths(
+            current
+                .files
+                .keys()
+                .chain(target.files.keys())
+                .map(String::as_str),
+        );
+        let (working, report) = require_complete_scan(scan_workspace_full(&self.root, &tracked)?)?;
         let staged = staged_between(&current.files, &target.files);
-        let blocked = blocked_paths(&working, &staged, &self.root, operation_id, true)?;
+        let mut blocked = blocked_paths(&working, &staged, &self.root, operation_id, true)?;
+        blocked.extend(excluded_occupants(&report, &staged, &current.files));
+        blocked.sort();
+        blocked.dedup();
         if !blocked.is_empty() {
             return Ok(OperationOutcome::Blocked { paths: blocked });
         }
@@ -381,9 +478,19 @@ impl Workspace {
 
         let current = require_complete_snapshot(source_snapshot(engine, &state.base_revision)?)?;
         let target = require_complete_snapshot(source_snapshot(engine, &completion.revision)?)?;
-        let working = require_complete_snapshot(scan_workspace(&self.root)?)?;
+        let tracked = Tracked::from_paths(
+            current
+                .files
+                .keys()
+                .chain(target.files.keys())
+                .map(String::as_str),
+        );
+        let (working, report) = require_complete_scan(scan_workspace_full(&self.root, &tracked)?)?;
         let staged = staged_between(&current.files, &target.files);
-        let blocked = blocked_paths(&working, &staged, &self.root, operation_id, true)?;
+        let mut blocked = blocked_paths(&working, &staged, &self.root, operation_id, true)?;
+        blocked.extend(excluded_occupants(&report, &staged, &current.files));
+        blocked.sort();
+        blocked.dedup();
         if !blocked.is_empty() {
             return Ok(OperationOutcome::Blocked { paths: blocked });
         }
@@ -465,7 +572,8 @@ impl Workspace {
         if state.ready {
             return Ok(());
         }
-        let working = require_complete_snapshot(scan_workspace(&self.root)?)?;
+        let tracked = Tracked::from_paths(snapshot.files.keys().map(String::as_str));
+        let working = require_complete_snapshot(scan_workspace(&self.root, &tracked)?)?;
         let staged = snapshot
             .files
             .into_iter()
@@ -587,7 +695,8 @@ impl Workspace {
         };
 
         let staged = read_staged_allow_empty(&tx, operation_id)?;
-        let working = require_complete_snapshot(scan_workspace(&self.root)?)?;
+        let tracked = Tracked::from_paths(staged.keys().map(String::as_str));
+        let working = require_complete_snapshot(scan_workspace(&self.root, &tracked)?)?;
         let desired_after = choice == RecoveryChoice::Complete;
         let blocked = blocked_paths(&working, &staged, &self.root, operation_id, desired_after)?;
         if !blocked.is_empty() {
@@ -1414,124 +1523,286 @@ fn source_snapshot(engine: &Engine, revision: &str) -> Result<Option<Snapshot>> 
     Ok(Some(Snapshot { files, directories }))
 }
 
-fn scan_workspace(root: &Path) -> Result<Option<Snapshot>> {
-    // Kinds are recorded from file modes, so a mount that reports every file
-    // executable must be refused rather than reported as phantom changes.
-    require_executable_support(&root.join(METADATA_DIRECTORY))?;
-    let mut snapshot = Snapshot {
-        files: BTreeMap::new(),
-        directories: BTreeSet::new(),
-    };
-    let mut portable = BTreeMap::new();
-    let mut total_bytes = 0usize;
-    let mut entry_count = 0usize;
-    if !scan_directory(
-        root,
-        "",
-        0,
-        &mut snapshot,
-        &mut portable,
-        &mut total_bytes,
-        &mut entry_count,
-    )? {
-        return Ok(None);
-    }
-    Ok(Some(snapshot))
+/// Bound on the excluded-path bookkeeping kept for preview, so a huge ignored tree cannot grow
+/// memory; entries past the bound are counted but not listed.
+const MAX_REPORTED_PATHS: usize = 10_000;
+
+/// A working-tree path left out of the source by an exclusion rule.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ExcludedPath {
+    /// Relative path; non-UTF-8 names are shown lossily.
+    pub path: String,
+    pub directory: bool,
+    pub rule: Rule,
 }
 
-fn scan_directory(
-    directory: &Path,
-    prefix: &str,
-    depth: usize,
-    snapshot: &mut Snapshot,
-    portable: &mut BTreeMap<String, String>,
-    total_bytes: &mut usize,
-    entry_count: &mut usize,
-) -> Result<bool> {
-    if depth > MAX_DEPTH {
-        return Ok(false);
-    }
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        if prefix.is_empty() && entry.file_name() == METADATA_DIRECTORY {
-            continue;
+/// A captured path that an explicit `!pattern` rule included.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct IncludedPath {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule: Option<Rule>,
+}
+
+#[derive(Debug, Default)]
+struct ScanReport {
+    excluded: Vec<ExcludedPath>,
+    excluded_total: usize,
+    included_by_rule: BTreeMap<String, Rule>,
+    /// Set when `included_by_rule` hit its bound.
+    included_by_rule_truncated: bool,
+    /// Tracked files that an exclusion rule would have excluded.
+    overridden: BTreeSet<String>,
+}
+
+impl ScanReport {
+    fn record_excluded(&mut self, relative: &Path, directory: bool, rule: Rule) {
+        self.excluded_total += 1;
+        if self.excluded.len() < MAX_REPORTED_PATHS {
+            self.excluded.push(ExcludedPath {
+                path: relative.to_string_lossy().into_owned(),
+                directory,
+                rule,
+            });
         }
-        if *entry_count == MAX_ENTRIES {
+    }
+
+    fn record_included_by_rule(&mut self, relative: String, rule: Rule) {
+        if self.included_by_rule.len() < MAX_REPORTED_PATHS {
+            self.included_by_rule.insert(relative, rule);
+        } else {
+            self.included_by_rule_truncated = true;
+        }
+    }
+}
+
+struct Scan<'a> {
+    selector: Selector<'a>,
+    snapshot: Snapshot,
+    portable: BTreeMap<String, String>,
+    total_bytes: usize,
+    /// Selected entries; bounded by `MAX_ENTRIES`.
+    entry_count: usize,
+    /// Everything read from directories, selected or not; bounded by `MAX_VISITED_ENTRIES`.
+    visited: usize,
+    report: ScanReport,
+}
+
+struct Candidate {
+    entry: fs::DirEntry,
+    metadata: fs::Metadata,
+    classified: Classified,
+    relative_path: PathBuf,
+}
+
+/// Walk the working tree, selecting paths with the exclusion rules. Paths in `tracked` are
+/// always selected so tracked edits and deletions stay observable. Git settings come from the
+/// environment and, for a root with `.git`, from running `git config`.
+fn scan_workspace(root: &Path, tracked: &Tracked) -> Result<Option<Snapshot>> {
+    Ok(scan_workspace_full(root, tracked)?.map(|(snapshot, _)| snapshot))
+}
+
+fn scan_workspace_full(root: &Path, tracked: &Tracked) -> Result<Option<(Snapshot, ScanReport)>> {
+    let metadata = root.join(METADATA_DIRECTORY);
+    // Kinds are recorded from file modes, so a mount that reports every file
+    // executable must be refused rather than reported as phantom changes.
+    require_executable_support(&metadata)?;
+    let settings = git_config::ambient_settings(root, || probe_case_insensitive(&metadata))?;
+    scan_with_settings(root, tracked, &settings)
+}
+
+#[cfg(test)]
+/// The scan with explicit settings: the seam for tests that must not depend on the ambient Git
+/// configuration of the machine.
+fn scan_workspace_report(
+    root: &Path,
+    tracked: &Tracked,
+    settings: &Settings,
+) -> Result<Option<(Snapshot, ScanReport)>> {
+    require_executable_support(&root.join(METADATA_DIRECTORY))?;
+    scan_with_settings(root, tracked, settings)
+}
+
+fn scan_with_settings(
+    root: &Path,
+    tracked: &Tracked,
+    settings: &Settings,
+) -> Result<Option<(Snapshot, ScanReport)>> {
+    let mut scan = Scan {
+        selector: Selector::open(root, tracked, settings)?,
+        snapshot: Snapshot {
+            files: BTreeMap::new(),
+            directories: BTreeSet::new(),
+        },
+        portable: BTreeMap::new(),
+        total_bytes: 0,
+        entry_count: 0,
+        visited: 0,
+        report: ScanReport::default(),
+    };
+    if !scan.directory(root, Path::new(""), 0, None)? {
+        return Ok(None);
+    }
+    Ok(Some((scan.snapshot, scan.report)))
+}
+
+impl Scan<'_> {
+    fn directory(
+        &mut self,
+        directory: &Path,
+        prefix: &Path,
+        depth: usize,
+        inherited: Option<&Rule>,
+    ) -> Result<bool> {
+        if depth > MAX_DEPTH {
             return Ok(false);
         }
-        *entry_count += 1;
-        entries.push(entry);
-    }
-    entries.sort_by_key(|entry| entry.file_name());
-    for entry in entries {
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| Error::Invalid("workspace path is not UTF-8".to_owned()))?;
-        let relative = if prefix.is_empty() {
-            name
-        } else {
-            format!("{prefix}/{name}")
-        };
-        validate_workspace_path(&relative)?;
-        let folded = relative.to_ascii_lowercase();
-        if let Some(existing) = portable.insert(folded, relative.clone())
-            && existing != relative
-        {
-            return Err(Error::Conflict(format!(
-                "workspace paths collide on portable filesystems: {existing} and {relative}"
-            )));
+        let prefix_text = prefix.to_str().unwrap_or_default().to_owned();
+        // An invalid or oversize `.gitignore` in an included directory is an error rather than
+        // silently selecting everything.
+        let pushed = self.selector.enter_directory(directory, &prefix_text)?;
+        let result = self
+            .candidates(directory, prefix, inherited)
+            .and_then(|candidates| match candidates {
+                Some(candidates) => self.entries(candidates, depth),
+                None => Ok(false),
+            });
+        if pushed {
+            self.selector.leave_directory();
         }
-        let path = entry.path();
-        let metadata = fs::symlink_metadata(&path)?;
-        let file_type = metadata.file_type();
-        if file_type.is_symlink() {
-            // Never followed: the link itself is the entry, so a link to a
-            // directory is not descended into.
-            let item = read_symlink_item(&path, &relative)?;
-            *total_bytes = total_bytes
+        result
+    }
+
+    /// Classify every entry as it is read, so excluded entries are never held in memory.
+    /// `None` means a bound was exceeded.
+    fn candidates(
+        &mut self,
+        directory: &Path,
+        prefix: &Path,
+        inherited: Option<&Rule>,
+    ) -> Result<Option<Vec<Candidate>>> {
+        let mut selected = Vec::new();
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            if prefix.as_os_str().is_empty()
+                && (entry.file_name() == METADATA_DIRECTORY || entry.file_name() == ".git")
+            {
+                continue;
+            }
+            if self.visited == MAX_VISITED_ENTRIES {
+                return Ok(None);
+            }
+            self.visited += 1;
+            let relative_path = prefix.join(entry.file_name());
+            let metadata = fs::symlink_metadata(entry.path())?;
+            let is_dir = metadata.file_type().is_dir();
+            // Selection comes first: an excluded path is never validated, opened or read, so
+            // ignored non-portable, oversize or reserved-name paths do not fail the scan.
+            let classified = self.selector.classify(&relative_path, is_dir, inherited);
+            self.selector.check_work()?;
+            match &classified.selection {
+                Selection::Excluded(rule) => {
+                    self.report
+                        .record_excluded(&relative_path, is_dir, rule.clone());
+                    continue;
+                }
+                Selection::IncludedByRule(rule) => {
+                    self.report.record_included_by_rule(
+                        relative_path.to_string_lossy().into_owned(),
+                        rule.clone(),
+                    );
+                }
+                Selection::Included => {}
+            }
+            if classified.overridden.is_some() && !is_dir {
+                self.report
+                    .overridden
+                    .insert(relative_path.to_string_lossy().into_owned());
+            }
+            if self.entry_count == MAX_ENTRIES {
+                return Ok(None);
+            }
+            self.entry_count += 1;
+            selected.push(Candidate {
+                entry,
+                metadata,
+                classified,
+                relative_path,
+            });
+        }
+        selected.sort_by_key(|candidate| candidate.entry.file_name());
+        Ok(Some(selected))
+    }
+
+    fn entries(&mut self, candidates: Vec<Candidate>, depth: usize) -> Result<bool> {
+        for candidate in candidates {
+            let Candidate {
+                entry,
+                metadata,
+                classified,
+                relative_path,
+            } = candidate;
+            let path = entry.path();
+            let file_type = metadata.file_type();
+            let relative = relative_path
+                .into_os_string()
+                .into_string()
+                .map_err(|_| Error::Invalid("workspace path is not UTF-8".to_owned()))?;
+            validate_workspace_path(&relative)?;
+            let folded = relative.to_ascii_lowercase();
+            if let Some(existing) = self.portable.insert(folded, relative.clone())
+                && existing != relative
+            {
+                return Err(Error::Conflict(format!(
+                    "workspace paths collide on portable filesystems: {existing} and {relative}"
+                )));
+            }
+            if file_type.is_symlink() {
+                // Never followed: the link itself is the entry, so a link to a
+                // directory is not descended into.
+                let item = read_symlink_item(&path, &relative)?;
+                self.total_bytes = self
+                    .total_bytes
+                    .checked_add(item.content.len())
+                    .ok_or_else(|| Error::Limit("workspace byte count overflow".to_owned()))?;
+                if self.total_bytes > MAX_TOTAL_BYTES {
+                    return Ok(false);
+                }
+                self.snapshot.files.insert(relative, item);
+                continue;
+            }
+            if file_type.is_dir() {
+                self.snapshot.directories.insert(relative.clone());
+                if !self.directory(
+                    &path,
+                    Path::new(&relative),
+                    depth + 1,
+                    classified.child_exclusion.as_ref(),
+                )? {
+                    return Ok(false);
+                }
+                continue;
+            }
+            if !file_type.is_file() {
+                return Err(Error::Invalid(format!(
+                    "workspace contains a special file: {relative}"
+                )));
+            }
+            if metadata.len() > MAX_FILE_BYTES as u64 {
+                return Ok(false);
+            }
+            let item = read_regular_file(&path, &relative)?;
+            self.total_bytes = self
+                .total_bytes
                 .checked_add(item.content.len())
                 .ok_or_else(|| Error::Limit("workspace byte count overflow".to_owned()))?;
-            if *total_bytes > MAX_TOTAL_BYTES {
+            if self.total_bytes > MAX_TOTAL_BYTES {
                 return Ok(false);
             }
-            snapshot.files.insert(relative, item);
-            continue;
+            self.snapshot.files.insert(relative, item);
         }
-        if file_type.is_dir() {
-            snapshot.directories.insert(relative.clone());
-            if !scan_directory(
-                &path,
-                &relative,
-                depth + 1,
-                snapshot,
-                portable,
-                total_bytes,
-                entry_count,
-            )? {
-                return Ok(false);
-            }
-            continue;
-        }
-        if !file_type.is_file() {
-            return Err(Error::Invalid(format!(
-                "workspace contains a special file: {relative}"
-            )));
-        }
-        if metadata.len() > MAX_FILE_BYTES as u64 {
-            return Ok(false);
-        }
-        let item = read_regular_file(&path, &relative)?;
-        *total_bytes = total_bytes
-            .checked_add(item.content.len())
-            .ok_or_else(|| Error::Limit("workspace byte count overflow".to_owned()))?;
-        if *total_bytes > MAX_TOTAL_BYTES {
-            return Ok(false);
-        }
-        snapshot.files.insert(relative, item);
+        Ok(true)
     }
-    Ok(true)
 }
 
 /// Owner execute bit on a regular file, as Git decides it.
@@ -1646,6 +1917,13 @@ fn staged_between(
         .collect()
 }
 
+fn require_complete_scan(scan: Option<(Snapshot, ScanReport)>) -> Result<(Snapshot, ScanReport)> {
+    match scan {
+        Some((snapshot, report)) => Ok((require_complete_snapshot(Some(snapshot))?, report)),
+        None => require_complete_snapshot(None).map(|snapshot| (snapshot, ScanReport::default())),
+    }
+}
+
 fn require_complete_snapshot(snapshot: Option<Snapshot>) -> Result<Snapshot> {
     snapshot.ok_or_else(|| {
         Error::Limit(format!(
@@ -1679,7 +1957,8 @@ fn finish_undo(
     }
     let staged = read_staged(&tx, operation_id)?;
     let desired_after = choice == RecoveryChoice::Complete;
-    let working = require_complete_snapshot(scan_workspace(root)?)?;
+    let tracked = Tracked::from_paths(staged.keys().map(String::as_str));
+    let working = require_complete_snapshot(scan_workspace(root, &tracked)?)?;
     let blocked = blocked_paths(&working, &staged, root, operation_id, desired_after)?;
     if !blocked.is_empty() {
         return Ok(OperationOutcome::Blocked { paths: blocked });
@@ -1716,6 +1995,22 @@ fn finish_undo(
     complete_operation(&tx, operation_id, "completed", &outcome)?;
     tx.commit()?;
     Ok(outcome)
+}
+
+/// Staged destinations that hold a local file only because the target revision names the path:
+/// a rule excludes them and the current base does not track them. They are the user's own
+/// files, so the operation must not adopt, overwrite or later roll back over them, even when
+/// the bytes happen to match.
+fn excluded_occupants(
+    report: &ScanReport,
+    staged: &BTreeMap<String, Stage>,
+    current: &BTreeMap<String, Item>,
+) -> Vec<String> {
+    staged
+        .keys()
+        .filter(|path| report.overridden.contains(*path) && !current.contains_key(*path))
+        .cloned()
+        .collect()
 }
 
 fn blocked_paths(
@@ -2123,6 +2418,36 @@ fn probe_symlinks(directory: &Path) -> Result<bool> {
         Err(error) if is_unsupported(&error) => Ok(false),
         Err(error) => Err(Error::Io(error)),
     }
+}
+
+/// Whether names differing only in ASCII case name the same file here. The probe file lives in
+/// the workspace metadata directory and is removed before returning.
+fn probe_case_insensitive(directory: &Path) -> Result<bool> {
+    sweep_stale_probes(directory)?;
+    let path = probe_path(directory, "CaseProbe");
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
+    drop(file);
+    let name = path
+        .file_name()
+        .expect("probe path has a file name")
+        .as_bytes()
+        .iter()
+        .map(|byte| {
+            if byte.is_ascii_uppercase() {
+                byte.to_ascii_lowercase()
+            } else {
+                byte.to_ascii_uppercase()
+            }
+        })
+        .collect::<Vec<u8>>();
+    let flipped = path.with_file_name(std::ffi::OsString::from_vec(name));
+    let insensitive = fs::symlink_metadata(&flipped).is_ok();
+    fs::remove_file(&path)?;
+    Ok(insensitive)
 }
 
 fn probe_executable_bit(directory: &Path) -> Result<bool> {
@@ -3336,5 +3661,996 @@ mod tests {
         for code in [libc::EACCES, libc::ENOENT, libc::EROFS, libc::ENOSPC] {
             assert!(!is_unsupported(&std::io::Error::from_raw_os_error(code)));
         }
+    }
+
+    struct SelectionFixture {
+        _directory: TempDir,
+        root: PathBuf,
+        _workspace: Workspace,
+    }
+
+    fn selection_fixture() -> SelectionFixture {
+        let directory = TempDir::new().unwrap();
+        let engine = Engine::open(directory.path().join("source")).unwrap();
+        let revision = engine.checkpoint(None, &[put("a.txt", b"old")]).unwrap();
+        let root = directory.path().join("workspace");
+        let change = ChangeId {
+            repository: "repository-1".to_owned(),
+            id: "change-1".to_owned(),
+        };
+        let workspace = Workspace::create(&engine, &root, change, &revision).unwrap();
+        SelectionFixture {
+            _directory: directory,
+            root,
+            _workspace: workspace,
+        }
+    }
+
+    fn write_at(root: &Path, path: &str, content: &str) {
+        let full = root.join(path);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        fs::write(full, content).unwrap();
+    }
+
+    fn excluded_of(report: &ScanReport) -> Vec<(String, String)> {
+        let mut excluded: Vec<_> = report
+            .excluded
+            .iter()
+            .map(|entry| (entry.path.clone(), entry.rule.source.clone()))
+            .collect();
+        excluded.sort();
+        excluded
+    }
+
+    #[test]
+    fn explicit_global_excludes_apply_only_with_a_git_common_dir() {
+        let fixture = selection_fixture();
+        let global = fixture.root.parent().unwrap().join("global-ignore");
+        fs::write(&global, "*.globalonly\n").unwrap();
+        write_at(&fixture.root, "x.globalonly", "x");
+        let tracked = Tracked::default();
+        let without_git = Settings {
+            git_common_dir: None,
+            global_excludes: Some(global.clone()),
+            case_insensitive: false,
+        };
+        let (snapshot, report) = scan_workspace_report(&fixture.root, &tracked, &without_git)
+            .unwrap()
+            .unwrap();
+        assert!(snapshot.files.contains_key("x.globalonly"));
+        assert!(report.excluded.is_empty());
+
+        fs::create_dir(fixture.root.join(".git")).unwrap();
+        let with_git = Settings {
+            git_common_dir: Some(fixture.root.join(".git")),
+            ..without_git
+        };
+        let (snapshot, report) = scan_workspace_report(&fixture.root, &tracked, &with_git)
+            .unwrap()
+            .unwrap();
+        assert!(!snapshot.files.contains_key("x.globalonly"));
+        assert_eq!(
+            excluded_of(&report),
+            [("x.globalonly".to_owned(), "global-excludes".to_owned())]
+        );
+    }
+
+    #[test]
+    fn root_git_is_skipped_and_nested_git_blocks_unless_excluded() {
+        let fixture = selection_fixture();
+        let root = &fixture.root;
+        write_at(root, ".git/config", "[core]");
+        write_at(root, ".git/info/exclude", "from-info.txt\n");
+        write_at(root, "from-info.txt", "x");
+        write_at(root, "vendor/.git/config", "nested");
+        let tracked = Tracked::default();
+        let settings = Settings {
+            git_common_dir: Some(root.join(".git")),
+            ..Settings::default()
+        };
+        assert!(matches!(
+            scan_workspace_report(root, &tracked, &settings),
+            Err(Error::Invalid(_))
+        ));
+        write_at(root, ".agentscm-workspace/exclude", "vendor/\n");
+        let (snapshot, report) = scan_workspace_report(root, &tracked, &settings)
+            .unwrap()
+            .unwrap();
+        assert!(!snapshot.files.keys().any(|path| path.starts_with(".git")));
+        assert!(!snapshot.files.contains_key("from-info.txt"));
+        assert_eq!(
+            excluded_of(&report),
+            [
+                ("from-info.txt".to_owned(), "info/exclude".to_owned()),
+                (
+                    "vendor".to_owned(),
+                    ".agentscm-workspace/exclude".to_owned()
+                ),
+            ]
+        );
+    }
+
+    /// The Git these tests drive, resolved as in tests/git_snapshot.rs. A missing Git is a test
+    /// failure, never a silent skip.
+    fn test_git() -> PathBuf {
+        let path = PathBuf::from(
+            std::env::var("AGENTSCM_TEST_GIT").unwrap_or_else(|_| "/usr/bin/git".to_owned()),
+        );
+        assert!(
+            path.exists(),
+            "git not found at {}; set AGENTSCM_TEST_GIT to an absolute git path",
+            path.display()
+        );
+        path
+    }
+
+    /// Run Git with a cleared environment and an isolated configuration.
+    fn git_in(directory: &Path, args: &[&str]) -> String {
+        let git = test_git();
+        let home = directory.join(".isolated-home");
+        fs::create_dir_all(&home).unwrap();
+        let output = std::process::Command::new(&git)
+            .env_clear()
+            .env("PATH", git.parent().unwrap())
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join("xdg"))
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .current_dir(directory)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    fn files_below(root: &Path, relative: &str, out: &mut Vec<String>) {
+        for entry in fs::read_dir(root.join(relative)).unwrap() {
+            let name = entry.unwrap().file_name().into_string().unwrap();
+            let child = format!("{relative}/{name}");
+            if root.join(&child).is_dir() {
+                files_below(root, &child, out);
+            } else {
+                out.push(child);
+            }
+        }
+    }
+
+    /// Compare the selector's excluded files with Git's own ignored files for one fixture.
+    fn assert_matches_git(gitignore: &str, files: &[&str], ignore_case: bool) {
+        let fixture = selection_fixture();
+        let root = &fixture.root;
+        git_in(root, &["init", "-q"]);
+        git_in(
+            root,
+            &[
+                "config",
+                "core.ignorecase",
+                if ignore_case { "true" } else { "false" },
+            ],
+        );
+        write_at(root, ".gitignore", gitignore);
+        for path in files {
+            write_at(root, path, "x");
+        }
+        let tracked = Tracked::default();
+        let settings = Settings {
+            git_common_dir: Some(root.join(".git")),
+            global_excludes: None,
+            case_insensitive: ignore_case,
+        };
+        let (_, report) = scan_workspace_report(root, &tracked, &settings)
+            .unwrap()
+            .unwrap();
+        let mut ours = Vec::new();
+        for entry in &report.excluded {
+            if entry.directory {
+                files_below(root, &entry.path, &mut ours);
+            } else {
+                ours.push(entry.path.clone());
+            }
+        }
+        ours.sort();
+        let theirs = git_in(
+            root,
+            &[
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "-z",
+            ],
+        );
+        let mut theirs: Vec<String> = theirs
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned)
+            .collect();
+        theirs.sort();
+        assert_eq!(ours, theirs, "ignorecase={ignore_case}\n{gitignore}");
+    }
+
+    #[test]
+    fn selection_matches_git_for_literal_braces_and_glob_forms() {
+        let patterns = "secret{a,b}\nbad{\nclose}\n/anchored.txt\ndir-only/\na/**/z\ndocs/**\n*.tmp\n!keep.tmp\n[ab].x\n**/gen/out\n\\#hash\ntrail\\ \n";
+        assert_matches_git(
+            patterns,
+            &[
+                "secret{a,b}",
+                "secreta",
+                "bad{",
+                "close}",
+                "anchored.txt",
+                "sub/anchored.txt",
+                "dir-only/f",
+                "sub/dir-only",
+                "a/x/y/z",
+                "a/z",
+                "a/q",
+                "docs/readme",
+                "docs/sub/deep",
+                "x.tmp",
+                "keep.tmp",
+                "a.x",
+                "c.x",
+                "gen/out",
+                "p/gen/out",
+                "#hash",
+                "trail ",
+                "plain.txt",
+            ],
+            false,
+        );
+    }
+
+    /// `git check-ignore --no-index --stdin -z` in an isolated repository: the probe paths Git
+    /// ignores.
+    /// Rule files by directory, and the probe paths to ask about.
+    type GitCase = (Vec<(String, String)>, Vec<String>);
+
+    fn git_ignored(patterns: &str, probes: &[String], ignore_case: bool) -> BTreeSet<String> {
+        git_ignored_batch(
+            &[(vec![(String::new(), patterns.to_owned())], probes.to_vec())],
+            ignore_case,
+        )
+        .pop()
+        .expect("one case")
+    }
+
+    /// Many cases in one repository: case `i` lives in directory `c{i}` with its own
+    /// `.gitignore`, so a single `check-ignore` run answers all of them. Directory probes
+    /// (trailing slash) are created for real and asked about by plain name, because Git decides
+    /// directory-ness from the file system and would match a trailing slash as part of the path;
+    /// files and directories use separate repositories so a name can be both.
+    fn git_ignored_batch(cases: &[GitCase], ignore_case: bool) -> Vec<BTreeSet<String>> {
+        use std::io::Write as _;
+        let git = test_git();
+        let mut ignored = vec![BTreeSet::new(); cases.len()];
+        for directories in [false, true] {
+            let directory = TempDir::new().unwrap();
+            let root = directory.path();
+            git_in(root, &["init", "-q"]);
+            git_in(
+                root,
+                &[
+                    "config",
+                    "core.ignorecase",
+                    if ignore_case { "true" } else { "false" },
+                ],
+            );
+            let mut input = Vec::new();
+            for (index, (layers, probes)) in cases.iter().enumerate() {
+                let case_root = root.join(format!("c{index}"));
+                fs::create_dir(&case_root).unwrap();
+                for (dir, text) in layers {
+                    fs::create_dir_all(case_root.join(dir)).unwrap();
+                    fs::write(case_root.join(dir).join(".gitignore"), text).unwrap();
+                }
+                for probe in probes.iter().filter(|p| p.ends_with('/') == directories) {
+                    let name = probe.trim_end_matches('/');
+                    if directories {
+                        fs::create_dir_all(case_root.join(name)).unwrap();
+                    }
+                    input.extend_from_slice(format!("c{index}/{name}").as_bytes());
+                    input.push(0);
+                }
+            }
+            if input.is_empty() {
+                continue;
+            }
+            let mut child = std::process::Command::new(&git)
+                .env_clear()
+                .env("PATH", git.parent().unwrap())
+                .env("HOME", root.join(".isolated-home"))
+                .env("XDG_CONFIG_HOME", root.join(".isolated-home/xdg"))
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(["check-ignore", "--no-index", "--stdin", "-z"])
+                .current_dir(root)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut stdin = child.stdin.take().unwrap();
+            let writer = std::thread::spawn(move || stdin.write_all(&input));
+            let output = child.wait_with_output().unwrap();
+            writer.join().unwrap().unwrap();
+            // Exit 0: some ignored; 1: none ignored.
+            assert!(
+                matches!(output.status.code(), Some(0 | 1)),
+                "git check-ignore: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            for path in output.stdout.split(|&byte| byte == 0) {
+                let Ok(path) = std::str::from_utf8(path) else {
+                    continue;
+                };
+                let Some(rest) = path.strip_prefix('c') else {
+                    continue;
+                };
+                let (index, name) = rest.split_once('/').expect("case prefix");
+                let mut name = name.to_owned();
+                if directories {
+                    name.push('/');
+                }
+                ignored[index.parse::<usize>().unwrap()].insert(name);
+            }
+        }
+        ignored
+    }
+
+    /// The probe paths the selector excludes, walking parent directories as the scan does, or
+    /// the error from loading the rules.
+    fn selector_excluded(
+        patterns: &str,
+        probes: &[String],
+        ignore_case: bool,
+    ) -> Result<BTreeSet<String>> {
+        selector_excluded_layers(&[(String::new(), patterns.to_owned())], probes, ignore_case)
+    }
+
+    /// Rule files by directory (`""` is the root), loaded as the scan loads them: a directory's
+    /// `.gitignore` is read when the walk enters it, and nothing below an excluded directory is
+    /// visited.
+    fn selector_excluded_layers(
+        layers: &[(String, String)],
+        probes: &[String],
+        ignore_case: bool,
+    ) -> Result<BTreeSet<String>> {
+        let directory = TempDir::new().unwrap();
+        for (dir, text) in layers {
+            let name = if dir.is_empty() {
+                ".gitignore".to_owned()
+            } else {
+                format!("{dir}/.gitignore")
+            };
+            write_at(directory.path(), &name, text);
+        }
+        let tracked = Tracked::default();
+        let settings = Settings {
+            case_insensitive: ignore_case,
+            ..Settings::default()
+        };
+        let mut selector = Selector::open(directory.path(), &tracked, &settings)?;
+        let root_pushed = selector.enter_directory(directory.path(), "")?;
+        let mut excluded = BTreeSet::new();
+        for probe in probes {
+            let mut inherited: Option<Rule> = None;
+            let (trimmed, is_directory) = match probe.strip_suffix('/') {
+                Some(trimmed) => (trimmed, true),
+                None => (probe.as_str(), false),
+            };
+            let components: Vec<&str> = trimmed.split('/').collect();
+            let mut prefix = PathBuf::new();
+            let mut pushed = 0;
+            let mut outcome = Ok(());
+            for (position, component) in components.iter().enumerate() {
+                prefix.push(component);
+                let last = position + 1 == components.len();
+                let classified =
+                    selector.classify(&prefix, !last || is_directory, inherited.as_ref());
+                if matches!(classified.selection, Selection::Excluded(_)) {
+                    excluded.insert(probe.clone());
+                    break;
+                }
+                inherited = classified.child_exclusion;
+                if !last {
+                    match selector
+                        .enter_directory(&directory.path().join(&prefix), prefix.to_str().unwrap())
+                    {
+                        Ok(true) => pushed += 1,
+                        Ok(false) => {}
+                        Err(error) => {
+                            outcome = Err(error);
+                            break;
+                        }
+                    }
+                }
+            }
+            for _ in 0..pushed {
+                selector.leave_directory();
+            }
+            outcome?;
+        }
+        if root_pushed {
+            selector.leave_directory();
+        }
+        Ok(excluded)
+    }
+
+    enum Expect {
+        /// The parser accepts the rules and the selector must equal Git.
+        Equal,
+        /// The parser refuses the rules with a typed error naming file and line.
+        Invalid,
+    }
+
+    /// Every adversarial pattern raised in review. `\u{a7}` in a shape expands to each printable
+    /// ASCII character except `/`.
+    #[test]
+    fn selector_matches_git_check_ignore_for_adversarial_patterns() {
+        use Expect::{Equal, Invalid};
+        let class_shape = ["k\u{a7}.key"];
+        let class_extras = ["k.key", "k/.key", "k/x.key", "kab.key", "k/a.key"];
+        let mut table: Vec<(String, Vec<&str>, Vec<&str>, Expect)> = Vec::new();
+        for class in [
+            "[]]",
+            "[!]a]",
+            "[^]a]",
+            "[\\]]",
+            "[a\\-z]",
+            "[[:alpha:]-z]",
+            "[[:digit:][:alpha:]]",
+            "[[:punct:]]",
+            "[A-{]",
+            "[z-a]",
+            "[a-c-e]",
+            "[/]",
+            "[a/b]",
+            "[a",
+            "[",
+            "[a\\]",
+            "[[:alpha:]",
+            "[[:bogus:]]",
+            "[[:alpha:]",
+            "[!a]",
+            "[^a-c]",
+            "[!/]",
+            "[a-]",
+            "[-a]",
+            "[\\-a]",
+            "[a-\\]]",
+            "[[:]",
+            "[[:a]",
+            "[[]",
+            "[[a]",
+            "[[:space:]]",
+            "[[:blank:]]",
+            "[[:cntrl:]]",
+            "[[:graph:]]",
+            "[[:print:]]",
+            "[[:xdigit:]]",
+            "[[:upper:]]",
+            "[[:lower:]]",
+            "[[:alnum:]]",
+            "[!]]",
+            "[^[:alpha:]]",
+            "[a-a]",
+            "[\\a-c]",
+            "[a-c\\-e]",
+        ] {
+            table.push((
+                format!("k{class}.key\n"),
+                class_shape.to_vec(),
+                class_extras.to_vec(),
+                Equal,
+            ));
+        }
+        table.push((
+            "k[\u{e9}].key\n".into(),
+            vec![],
+            vec!["k\u{e9}.key", "ka.key", "k\u{c3}.key"],
+            Equal,
+        ));
+        // Classes with non-ASCII range endpoints are refused.
+        for class in ["[\u{e9}-z]", "[a-\u{e9}]"] {
+            table.push((format!("k{class}.key\n"), vec![], vec!["ka.key"], Invalid));
+        }
+        table.push((
+            "a[/]b\n".into(),
+            vec!["a\u{a7}b"],
+            vec!["a/b", "a/x/b", "ab"],
+            Equal,
+        ));
+        for (patterns, shapes, extras) in [
+            ("ka[\n", vec!["ka\u{a7}"], vec!["ka[", "ka"]),
+            ("k\\{.key\n", vec!["k\u{a7}.key"], vec![]),
+            ("k\\[a].key\n", vec!["k\u{a7}a].key"], vec!["k[a].key"]),
+            (
+                "k{a,b}.key\n",
+                vec!["k\u{a7}.key"],
+                vec!["k{a,b}.key", "ka.key", "kb.key", "k{a.key"],
+            ),
+            ("k{.key\n", vec!["k\u{a7}.key"], vec![]),
+            ("k\\\n", vec!["k\u{a7}"], vec!["k", "k\\"]),
+            ("!k\\\n*.key\n", vec!["k\u{a7}.key"], vec![]),
+            ("\\!k.key\n", vec!["\u{a7}k.key"], vec!["!k.key"]),
+            ("\\#k.key\n", vec!["\u{a7}k.key"], vec!["#k.key"]),
+            ("k\\*.key\n", vec!["k\u{a7}.key"], vec!["k*.key", "kab.key"]),
+            ("k\\?.key\n", vec!["k\u{a7}.key"], vec!["k?.key"]),
+            ("**\n", vec![], vec!["a", "a/b", "a/b/c.key"]),
+            (
+                "**/k.key\n",
+                vec![],
+                vec!["k.key", "a/k.key", "a/b/k.key", "xk.key"],
+            ),
+            ("x/a[!q]b\n", vec![], vec!["x/a/b", "x/aab", "x/aqb"]),
+            ("x/a[^q]b\n", vec![], vec!["x/a/b", "x/aab", "x/aqb"]),
+            ("x/a[!/]b\n", vec![], vec!["x/a/b", "x/aab"]),
+            ("x/a?b\n", vec![], vec!["x/a/b", "x/aab"]),
+            ("x/a*b\n", vec![], vec!["x/a/b", "x/aab", "x/ab"]),
+            ("k/**\n", vec![], vec!["k", "k/a", "k/a/b", "kk/a"]),
+            (
+                "a/**/b.key\n",
+                vec![],
+                vec!["a/b.key", "a/x/b.key", "a/x/y/b.key", "ab.key", "x/a/b.key"],
+            ),
+            ("k*.key\n", vec!["k\u{a7}x.key"], vec!["k.key", "k/x.key"]),
+            ("k?.key\n", vec!["k\u{a7}.key"], vec!["k/.key", "kab.key"]),
+            ("/k.key\n", vec![], vec!["k.key", "a/k.key"]),
+            ("a/k.key\n", vec![], vec!["a/k.key", "b/a/k.key", "k.key"]),
+            ("k/\n", vec![], vec!["k", "k/a", "x/k/a"]),
+            // Whitespace.
+            (".env\n!.env\t\n", vec![], vec![".env", ".env\t"]),
+            ("a\\\t\n", vec![], vec!["a\t", "a", "a "]),
+            ("a\\ \n", vec![], vec!["a ", "a", "a  "]),
+            ("a \n", vec![], vec!["a ", "a"]),
+            ("a  \t\n", vec![], vec!["a  \t", "a", "a  "]),
+            ("a\\\\ \n", vec![], vec!["a\\", "a\\ ", "a"]),
+            ("a\u{a0}b\n", vec![], vec!["a\u{a0}b", "ab"]),
+            ("a b\n", vec![], vec!["a b", "ab"]),
+            // Negation pairs.
+            (
+                "*.key\n!k[[:digit:]-z].key\n",
+                vec!["k\u{a7}.key"],
+                vec!["k.key"],
+            ),
+            (
+                "*.key\n!k[.key\n",
+                vec!["k\u{a7}.key"],
+                vec!["k[.key", "k.key"],
+            ),
+            ("*.key\n!k[a-c].key\n!kb.key\n", vec!["k\u{a7}.key"], vec![]),
+        ] {
+            table.push((patterns.to_owned(), shapes, extras, Equal));
+        }
+        for patterns in [
+            "a**/b.key\n",
+            "a/***/b.key\n",
+            "***\n",
+            "k**\n",
+            "a\u{a0}\n",
+            "a\u{3000}\n",
+            "a\\\u{a0}\n",
+            "**k\n",
+            "k**/\n",
+            "x/a**\n",
+            "**/k**\n",
+            "foo/\n!foo\\/\n",
+            "/\n",
+            "//\n",
+            "*/\n",
+            " \n",
+            "foo//\n",
+            "//foo\n",
+            "a//b\n",
+            "\\\n",
+            "!\n",
+            "!!foo\n",
+            "k[!a].key\n",
+            "*.key\n!k[a/b].key\n",
+            "k[!A].key\n",
+            "*.key\n!k[A].key\n",
+            "k[a-A].key\n",
+            "K[b].key\n",
+            "\u{c4}.key\n",
+        ] {
+            table.push((
+                patterns.to_owned(),
+                vec![],
+                vec![
+                    "a/b.key",
+                    "a",
+                    "foo",
+                    "foo/x",
+                    "x/foo",
+                    "k",
+                    "k.key",
+                    "ka.key",
+                    "kb.key",
+                    "kA.key",
+                    "kB.key",
+                    "ab",
+                    "a/",
+                    "x/a/b.key",
+                    "\u{e4}.key",
+                    "\u{c4}.key",
+                    "ab/b.key",
+                    "aXY/b.key",
+                    "x/a",
+                    "x/ab",
+                    "x/a/c",
+                ],
+                Equal,
+            ));
+        }
+        // `**` before an escaped slash is not modelled and is refused.
+        for patterns in ["a/**\\/b.key\n", "/**\\/[a-b]a\n", "**\\/b\n"] {
+            table.push((patterns.to_owned(), vec![], vec!["a/b.key"], Invalid));
+        }
+        // A NUL cannot be part of a rule and is refused with its line.
+        table.push(("a\0b\n".to_owned(), vec![], vec!["a"], Invalid));
+
+        let mut total_git_exclusions = 0;
+        let printable: Vec<char> = (' '..='~').filter(|c| *c != '/').collect();
+        for ignore_case in [false, true] {
+            let mut compared: Vec<(String, Vec<String>, BTreeSet<String>)> = Vec::new();
+            for (patterns, shapes, extras, expect) in &table {
+                let mut probes: BTreeSet<String> =
+                    extras.iter().map(|probe| (*probe).to_owned()).collect();
+                for shape in shapes {
+                    for c in &printable {
+                        probes.insert(shape.replace('\u{a7}', &c.to_string()));
+                    }
+                }
+                // Every probe also appears nested, and as a directory (trailing slash).
+                let base: Vec<String> = probes.iter().cloned().collect();
+                for probe in &base {
+                    for prefix in ["dir/", "a-/", "sub/deep/"] {
+                        probes.insert(format!("{prefix}{probe}"));
+                    }
+                    if !probe.ends_with('/') {
+                        probes.insert(format!("{probe}/"));
+                    }
+                }
+                let probes: Vec<String> = probes.into_iter().collect();
+                let context = format!("{patterns:?} ignorecase={ignore_case}");
+                let ours = selector_excluded(patterns, &probes, ignore_case);
+                match expect {
+                    Invalid => assert!(
+                        matches!(&ours, Err(Error::Invalid(message)) if message.contains(".gitignore") && message.contains("line")),
+                        "{context}: {ours:?}"
+                    ),
+                    Equal => {
+                        let ours = ours.unwrap_or_else(|error| panic!("{context}: {error}"));
+                        compared.push((patterns.clone(), probes, ours));
+                    }
+                }
+            }
+            let cases: Vec<GitCase> = compared
+                .iter()
+                .map(|(patterns, probes, _)| {
+                    (vec![(String::new(), patterns.clone())], probes.clone())
+                })
+                .collect();
+            for ((patterns, _, ours), theirs) in
+                compared.iter().zip(git_ignored_batch(&cases, ignore_case))
+            {
+                total_git_exclusions += theirs.len();
+                // Never fail open: whatever Git excludes, the selector excludes, and no more.
+                let missed: Vec<_> = theirs.difference(ours).collect();
+                let extra: Vec<_> = ours.difference(&theirs).collect();
+                assert!(
+                    missed.is_empty() && extra.is_empty(),
+                    "{patterns:?} ignorecase={ignore_case}\nGit excludes but selector includes: {missed:?}\nselector excludes but Git includes: {extra:?}"
+                );
+            }
+        }
+        // Guard against a vacuous comparison: the table makes Git exclude many probes.
+        assert!(total_git_exclusions > 500, "{total_git_exclusions}");
+    }
+
+    /// A fixed-seed xorshift generator: the corpus is the same on every run.
+    struct Prng(u64);
+
+    impl Prng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next() % bound as u64) as usize
+        }
+    }
+
+    /// Seeded random rule files (root, `sub/` and `sub/deep/` layers) against `git check-ignore`:
+    /// every rule set the parser accepts must select exactly what Git does (files, directories,
+    /// nested paths, both case modes), and every one it rejects must be a typed error.
+    #[test]
+    fn seeded_fuzz_patterns_match_git_check_ignore() {
+        // Two alphabets: general punctuation, classes and carriage returns, and star/slash
+        // heavy forms.
+        #[rustfmt::skip]
+        const GENERAL: [&str; 26] = [
+            "a", "b", "A", "-", "]", "[", "!", "^", "\\", "*", "?", "/", ":", "{", "}", ",", ".",
+            " ", "\t", "\r", "**", "[:alpha:]", "[:upper:]", "[:digit:]", "[:punct:]", "[:bogus:]",
+        ];
+        #[rustfmt::skip]
+        const STARS: [&str; 27] = [
+            "a", "b", "a", "b", "*", "*", "**", "/", "/", "/", "?", "!", "\\", "/", "*", "a", "b",
+            "A", "[a]", "[!a]", "**/", "/**", "*/", "-", "[a-b]", ".", "\r",
+        ];
+        #[rustfmt::skip]
+        let probes: Vec<String> = [
+            "a", "b", "A", "B", "ab", "a-", "-", "]", "[", "!", "^", "\\", ".a", "a.b", "a b",
+            "{", "}", ",", "x", "a/a", "a/b", "A/b", "b/a", "a/b/a", "a-/a", "ab/a", "[/a",
+            "a/ b", "a/!", "a/-", "-/a", "]/a", "x/y/z", "a/a/a", "b/b", "a/B", "A/a", "dir/ab",
+            "sub/a", "sub/b", "sub/A", "sub/ab", "sub/a/b", "sub/deep/a", "sub/deep/b",
+            "sub/deep/ab", "sub/deep/A/b", "sub/x/a",
+            "a/", "b/", "A/", "ab/", "a-/", "-/", "]/", "[/", "!/", "^/", ".a/", "x/", "a/a/",
+            "a/b/", "A/b/", "b/a/", "a/b/a/", "a-/a/", "x/y/", "x/y/z/", "a b/", "a/-/", "{/",
+            "}/", ",/", "sub/", "sub/deep/", "dir/", "dir/ab/", "sub/a/", "sub/deep/a/",
+            "sub/deep/A/",
+        ]
+        .iter()
+        .map(|probe| (*probe).to_owned())
+        .collect();
+        assert!(probes.len() >= 60);
+        let mut cases: Vec<Vec<(String, String)>> = Vec::new();
+        for (seed, tokens) in [
+            (0x9e37_79b9_7f4a_7c15, &GENERAL[..]),
+            (0x5151_5151_aaaa_bbbb, &STARS[..]),
+        ] {
+            let mut prng = Prng(seed);
+            for _ in 0..800 {
+                let file = |prng: &mut Prng| -> String {
+                    let line = |prng: &mut Prng| -> String {
+                        (0..1 + prng.below(7))
+                            .map(|_| tokens[prng.below(tokens.len())])
+                            .collect()
+                    };
+                    let mut text = line(prng);
+                    if prng.below(5) == 0 {
+                        text.push('\n');
+                        text.push_str(&line(prng));
+                    }
+                    // Sometimes no final newline, so a trailing carriage return ends the file.
+                    if prng.below(8) != 0 {
+                        text.push('\n');
+                    }
+                    text
+                };
+                let mut layers = vec![(String::new(), file(&mut prng))];
+                if prng.below(2) == 0 {
+                    layers.push(("sub".to_owned(), file(&mut prng)));
+                }
+                if prng.below(3) == 0 {
+                    layers.push(("sub/deep".to_owned(), file(&mut prng)));
+                }
+                cases.push(layers);
+            }
+        }
+        let mut accepted = 0;
+        let mut rejected = 0;
+        let mut compared = 0;
+        let mut git_exclusions = 0;
+        for ignore_case in [false, true] {
+            let mut batch = Vec::new();
+            let mut ours = Vec::new();
+            for layers in &cases {
+                match selector_excluded_layers(layers, &probes, ignore_case) {
+                    Ok(excluded) => {
+                        accepted += 1;
+                        batch.push((layers.clone(), probes.clone()));
+                        ours.push(excluded);
+                    }
+                    Err(Error::Invalid(message)) => {
+                        assert!(message.contains(".gitignore"), "{layers:?}: {message}");
+                        rejected += 1;
+                    }
+                    Err(error) => panic!("{layers:?}: {error}"),
+                }
+            }
+            let theirs = git_ignored_batch(&batch, ignore_case);
+            for ((case, ours), theirs) in batch.iter().zip(&ours).zip(&theirs) {
+                compared += 1;
+                git_exclusions += theirs.len();
+                let missed: Vec<_> = theirs.difference(ours).collect();
+                let extra: Vec<_> = ours.difference(theirs).collect();
+                assert!(
+                    missed.is_empty() && extra.is_empty(),
+                    "{:?} ignorecase={ignore_case}\nGit excludes but selector includes: {missed:?}\nselector excludes but Git includes: {extra:?}",
+                    case.0
+                );
+            }
+        }
+        eprintln!(
+            "fuzz: {} rule sets x 2 modes; accepted {accepted}, rejected {rejected}, compared {compared}, git exclusions {git_exclusions}",
+            cases.len()
+        );
+        assert!(compared >= 2000 && git_exclusions > 5000);
+    }
+
+    /// Git's measured handling of reversed and chained ranges, which the matcher implements.
+    #[test]
+    fn git_treats_reversed_and_chained_ranges_as_the_matcher_does() {
+        let probes: Vec<String> = ["a", "c", "d", "e", "f", "z", "-", "b"]
+            .iter()
+            .map(|c| format!("k{c}.key"))
+            .collect();
+        // `[z-a]` is an empty range, but its first character is still a member: only `z`.
+        let reversed = git_ignored("k[z-a].key\n", &probes, false);
+        assert_eq!(reversed, BTreeSet::from(["kz.key".to_owned()]));
+        // `[a-c-e]` is the range a-c, then a literal `-`, then a literal `e`.
+        let chained = git_ignored("k[a-c-e].key\n", &probes, false);
+        let expected: BTreeSet<String> = ["a", "b", "c", "-", "e"]
+            .iter()
+            .map(|c| format!("k{c}.key"))
+            .collect();
+        assert_eq!(chained, expected);
+        // A POSIX class cannot start a range, so the `-` after it is a literal member.
+        let after_class = git_ignored("k[[:digit:]-z].key\n", &probes, false);
+        assert!(after_class.contains("k-.key") && after_class.contains("kz.key"));
+        assert!(!after_class.contains("kd.key"));
+    }
+
+    #[test]
+    fn selection_matches_git_for_trailing_whitespace_rules() {
+        // A whitelist ending in a tab names a different file; escaped spaces are kept.
+        let patterns = ".env\n!.env\t\na\\ \nb\\\\ \nc  \nd\\ \t\n";
+        assert_matches_git(patterns, &[".env", "a ", "b\\", "c", "d \t"], false);
+    }
+
+    #[test]
+    fn selection_matches_git_in_both_case_modes() {
+        let patterns = ".env\n!.ENV\n*.TMP\n[A-C]x\nDocs/\n";
+        let files = [
+            ".env", ".ENV", "a.tmp", "b.TMP", "ax", "Bx", "dx", "Docs/f", "docs/f", "other",
+        ];
+        // Distinct names only: macOS-style case-insensitive filesystems would merge pairs.
+        assert_matches_git(patterns, &files, false);
+        assert_matches_git(patterns, &files, true);
+    }
+
+    #[test]
+    fn a_linked_worktree_gitfile_resolves_the_main_repository_exclude() {
+        let fixture = selection_fixture();
+        let parent = fixture.root.parent().unwrap().to_owned();
+        let main = parent.join("main");
+        fs::create_dir(&main).unwrap();
+        git_in(&main, &["init", "-q"]);
+        write_at(&main, "tracked.txt", "x");
+        git_in(&main, &["add", "tracked.txt"]);
+        git_in(&main, &["commit", "-q", "-m", "init"]);
+        let linked = parent.join("linked");
+        git_in(&main, &["worktree", "add", "-q", linked.to_str().unwrap()]);
+        write_at(&main, ".git/info/exclude", "from-main-info.txt\n");
+        fs::copy(linked.join(".git"), fixture.root.join(".git")).unwrap();
+        for name in ["from-main-info.txt", "plain.txt"] {
+            write_at(&fixture.root, name, "x");
+            write_at(&linked, name, "x");
+        }
+        // The common directory as Git reports it for the linked worktree.
+        let common = git_in(
+            &linked,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        );
+        let settings = Settings {
+            git_common_dir: Some(PathBuf::from(common.trim_end_matches('\n'))),
+            ..Settings::default()
+        };
+        let tracked = Tracked::default();
+        let (snapshot, report) = scan_workspace_report(&fixture.root, &tracked, &settings)
+            .unwrap()
+            .unwrap();
+        let theirs = git_in(
+            &linked,
+            &["ls-files", "--others", "--ignored", "--exclude-standard"],
+        );
+        let ours: Vec<&str> = report.excluded.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(ours, theirs.lines().collect::<Vec<_>>());
+        assert_eq!(ours, ["from-main-info.txt"]);
+        assert!(snapshot.files.contains_key("plain.txt"));
+    }
+
+    #[test]
+    fn apply_is_blocked_by_an_excluded_local_file_at_a_path_it_would_add() {
+        let fixtures = TempDir::new().unwrap();
+        let engine = Engine::open(fixtures.path().join("store")).unwrap();
+        let base = engine
+            .checkpoint(None, &[put("changed.txt", b"base")])
+            .unwrap();
+        let right = engine
+            .checkpoint(Some(&base), &[put("added.txt", b"theirs")])
+            .unwrap();
+        let merged = engine
+            .checkpoint_with_parents(&[base.clone(), right], &[put("added.txt", b"theirs")])
+            .unwrap();
+        let root = fixtures.path().join("workspace");
+        let mut workspace = Workspace::create(
+            &engine,
+            &root,
+            ChangeId {
+                repository: "repository-1".to_owned(),
+                id: "change-1".to_owned(),
+            },
+            &base,
+        )
+        .unwrap();
+        // The user's own excluded file holds exactly the bytes apply would write.
+        write_at(&root, ".agentscm-workspace/exclude", "added.txt\n");
+        write_at(&root, "added.txt", "theirs");
+        let completion = crate::merge::MergeCompletion {
+            repository: "repository-1".to_owned(),
+            session: "a".repeat(64),
+            generation: 7,
+            left: base,
+            revision: merged,
+        };
+        assert_eq!(
+            workspace.apply(&engine, "apply-1", 0, &completion).unwrap(),
+            OperationOutcome::Blocked {
+                paths: vec!["added.txt".to_owned()]
+            }
+        );
+        let state = workspace.state().unwrap();
+        assert!(state.pending.is_none());
+        assert_eq!(state.generation, 0);
+        assert_eq!(fs::read(root.join("added.txt")).unwrap(), b"theirs");
+    }
+
+    #[test]
+    fn excluded_entries_do_not_count_toward_the_selected_entry_bound() {
+        let fixture = selection_fixture();
+        write_at(&fixture.root, ".agentscm-workspace/exclude", "*.skip\n");
+        for index in 0..300 {
+            write_at(&fixture.root, &format!("top{index}.skip"), "x");
+        }
+        let tracked = Tracked::default();
+        let (snapshot, report) =
+            scan_workspace_report(&fixture.root, &tracked, &Settings::default())
+                .unwrap()
+                .unwrap();
+        assert_eq!(report.excluded_total, 300);
+        assert_eq!(snapshot.files.len(), 1, "only the base file a.txt");
+        assert_eq!(snapshot.directories.len(), 0);
+    }
+
+    #[test]
+    fn ambient_settings_probe_case_for_native_workspaces_without_running_git() {
+        let fixture = selection_fixture();
+        // No `.git`: PATH is irrelevant because Git is never started.
+        let settings = git_config::ambient_settings(&fixture.root, || {
+            probe_case_insensitive(&fixture.root.join(METADATA_DIRECTORY))
+        })
+        .unwrap();
+        assert!(settings.global_excludes.is_none());
+        let probes = fs::read_dir(fixture.root.join(METADATA_DIRECTORY))
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(PROBE_PREFIX)
+            })
+            .count();
+        assert_eq!(probes, 0);
     }
 }

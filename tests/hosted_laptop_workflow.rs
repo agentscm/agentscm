@@ -403,6 +403,15 @@ async fn two_laptops_get_failure_fix_feedback_and_exact_success_without_native_a
     assert_eq!(authority_counts(&native), (0, 0));
     land(&env, &reviewer, &csrf, &generation, &first, "seed").await;
 
+    // Locally excluded files stay on laptop A and are not part of the transferred source.
+    fs::write(
+        laptop_a.workspace.join(".agentscm-workspace/exclude"),
+        b".env\ntarget/\n",
+    )
+    .unwrap();
+    fs::write(laptop_a.workspace.join(".env"), b"SECRET=synthetic\n").unwrap();
+    fs::create_dir(laptop_a.workspace.join("target")).unwrap();
+    fs::write(laptop_a.workspace.join("target/out"), b"build output\n").unwrap();
     fs::write(laptop_a.workspace.join("a.txt"), b"from laptop a\n").unwrap();
     let advanced_a = run_cli(&data_a, &laptop_a, "remote-check");
     assert!(!advanced_a["receipt"].is_null(), "{advanced_a}");
@@ -418,6 +427,12 @@ async fn two_laptops_get_failure_fix_feedback_and_exact_success_without_native_a
     assert_eq!(
         fs::read(laptop_b.workspace.join("b.txt")).unwrap(),
         b"from laptop b\n"
+    );
+    assert!(!laptop_b.workspace.join(".env").exists());
+    assert!(!laptop_b.workspace.join("target").exists());
+    assert_eq!(
+        fs::read(laptop_a.workspace.join(".env")).unwrap(),
+        b"SECRET=synthetic\n"
     );
     let merged_counts = queue_counts(root.path());
     let repeated_merge = run_cli(&data_b, &laptop_b, "remote-check");

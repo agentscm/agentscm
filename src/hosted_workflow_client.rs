@@ -24,7 +24,7 @@ use agentscm::skill_workflow::{RunState, StepState};
 use agentscm::skill_workflow_service::SkillWorkflowProjection;
 use agentscm::store::Engine;
 use agentscm::sync::{self, SourceOffer};
-use agentscm::workspace::{OperationKind, OperationOutcome, Workspace};
+use agentscm::workspace::{OperationKind, OperationOutcome, Status, Workspace, WorkspaceState};
 use agentscm::{Error, Result};
 use clap::Args;
 use reqwest::{Method, StatusCode, Url};
@@ -318,13 +318,8 @@ pub async fn check(data_dir: &Path, args: &HostedWorkflowArgs) -> Result<Value> 
     let current_subject = remote.subject(&subject.change_id).await?;
     let after = workspace.state()?;
     let status = workspace.status(&engine, MAX_WORKSPACE_CHANGES)?;
-    let workspace_changed = after.change != initial.change
-        || !after.ready
-        || after.pending.is_some()
-        || after.generation != workspace_after_refresh.generation
-        || after.base_revision != workspace_after_refresh.base_revision
-        || !status.complete
-        || !status.changes.is_empty();
+    let workspace_changed =
+        workspace_changed_since(&initial, &workspace_after_refresh, &after, &status);
     let exact_success = run.state == ExecutionState::Succeeded
         && run.receipt.is_some()
         && run.subject == subject
@@ -351,6 +346,27 @@ pub async fn check(data_dir: &Path, args: &HostedWorkflowArgs) -> Result<Value> 
     Ok(
         json!({"context_subject":subject,"run":run,"receipt":Value::Null,"workspace_changed_during_run":workspace_changed,"failures":failures,"next_action":next}),
     )
+}
+
+/// Whether the workspace differs from the state that was uploaded. `status` is a separate read
+/// from `after`, so it must describe the same base, generation and pending operation: a
+/// checkpoint between the two reads would otherwise report a clean tree against a newer base.
+fn workspace_changed_since(
+    initial: &WorkspaceState,
+    refreshed: &WorkspaceState,
+    after: &WorkspaceState,
+    status: &Status,
+) -> bool {
+    after.change != initial.change
+        || !after.ready
+        || after.pending.is_some()
+        || after.generation != refreshed.generation
+        || after.base_revision != refreshed.base_revision
+        || status.base_revision != after.base_revision
+        || status.generation != after.generation
+        || status.pending != after.pending
+        || !status.complete
+        || !status.changes.is_empty()
 }
 
 pub async fn claude_stop(data_dir: &Path, args: HostedWorkflowArgs) -> Result<()> {
@@ -2113,5 +2129,48 @@ mod tests {
         assert!(revision_is_ancestor(&engine, &base, &merged).unwrap());
         assert!(revision_is_ancestor(&engine, &other, &merged).unwrap());
         assert!(!revision_is_ancestor(&engine, &other, &edited).unwrap());
+    }
+
+    #[test]
+    fn a_checkpoint_between_the_state_and_status_reads_is_a_workspace_change() {
+        let state = |base: &str, generation: u64| WorkspaceState {
+            change: agentscm::context::ChangeId {
+                repository: "repository-1".into(),
+                id: "change-1".into(),
+            },
+            base_revision: base.into(),
+            generation,
+            ready: true,
+            pending: None,
+        };
+        let status = |base: &str, generation: u64| Status {
+            base_revision: base.into(),
+            generation,
+            changes: Vec::new(),
+            complete: true,
+            excluded_total: 0,
+            pending: None,
+        };
+        let uploaded = state("rev-a", 3);
+        assert!(!workspace_changed_since(
+            &uploaded,
+            &uploaded,
+            &uploaded,
+            &status("rev-a", 3)
+        ));
+        // The state read saw the uploaded base; a checkpoint then advanced it, so status is
+        // clean against rev-b. That must not count as the uploaded bytes still being current.
+        assert!(workspace_changed_since(
+            &uploaded,
+            &uploaded,
+            &uploaded,
+            &status("rev-b", 4)
+        ));
+        assert!(workspace_changed_since(
+            &uploaded,
+            &uploaded,
+            &uploaded,
+            &status("rev-a", 4)
+        ));
     }
 }

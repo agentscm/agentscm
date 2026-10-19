@@ -9,7 +9,7 @@ use agentscm::context::ChangeId;
 use agentscm::model::{EntryChange, EntryKind, FileChange};
 use agentscm::store::{Engine, digest};
 use agentscm::workspace::{
-    METADATA_DIRECTORY, OperationOutcome, RecoveryChoice, Workspace, WorkspaceChange,
+    METADATA_DIRECTORY, OperationOutcome, Preview, RecoveryChoice, Workspace, WorkspaceChange,
 };
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
@@ -277,11 +277,11 @@ fn create_rejects_reserved_names_in_any_case_and_position() {
 
 #[test]
 fn reserved_names_in_the_working_tree_block_checkpoints_without_staging() {
-    for name in [".git", ".AGENTSCM"] {
+    for name in ["sub/.git", ".AGENTSCM", "sub/agentscm-data"] {
         let (directory, engine, base, change) = fixture();
         let root = directory.path().join("workspace");
         let mut workspace = Workspace::create(&engine, &root, change, &base).unwrap();
-        fs::create_dir(root.join(name)).unwrap();
+        fs::create_dir_all(root.join(name)).unwrap();
         fs::write(root.join(name).join("config"), b"planted").unwrap();
 
         assert!(
@@ -1118,4 +1118,400 @@ fn recovery_completes_an_interrupted_symlink_replacement_from_its_marker() {
     assert_eq!(link_target(&root.join("link")), "one.txt");
     assert!(!marker.exists());
     assert!(workspace.status(&engine, 10).unwrap().changes.is_empty());
+}
+
+// Source selection: Git and workspace exclusions.
+
+fn selection_fixture() -> (TempDir, Engine, std::path::PathBuf, Workspace) {
+    let (directory, engine, base, change) = fixture();
+    let root = directory.path().join("workspace");
+    let workspace = Workspace::create(&engine, &root, change, &base).unwrap();
+    (directory, engine, root, workspace)
+}
+
+fn write_file(root: &std::path::Path, path: &str, content: &[u8]) {
+    let full = root.join(path);
+    fs::create_dir_all(full.parent().unwrap()).unwrap();
+    fs::write(full, content).unwrap();
+}
+
+fn changed_paths(workspace: &Workspace, engine: &Engine) -> Vec<String> {
+    let status = workspace.status(engine, 1000).unwrap();
+    assert!(status.complete);
+    status
+        .changes
+        .into_iter()
+        .map(|change| match change {
+            WorkspaceChange::Added { path }
+            | WorkspaceChange::Modified { path }
+            | WorkspaceChange::Deleted { path }
+            | WorkspaceChange::KindChanged { path, .. } => path,
+        })
+        .collect()
+}
+
+fn excluded_paths(preview: &Preview) -> Vec<&str> {
+    preview
+        .excluded
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect()
+}
+
+fn rule_for<'a>(preview: &'a Preview, path: &str) -> (&'a str, &'a str) {
+    let entry = preview
+        .excluded
+        .iter()
+        .find(|entry| entry.path == path)
+        .unwrap_or_else(|| panic!("{path} is not excluded"));
+    (&entry.rule.source, &entry.rule.pattern)
+}
+
+#[test]
+fn gitignore_rules_hide_paths_from_status_and_checkpoint() {
+    let (_directory, engine, root, mut workspace) = selection_fixture();
+    write_file(
+        &root,
+        ".gitignore",
+        b".env\ntarget/\nnode_modules/\n*.log\nspace dir/\n",
+    );
+    write_file(&root, ".env", b"SECRET=1");
+    write_file(&root, "target/debug/out", b"binary");
+    write_file(&root, "node_modules/pkg/index.js", b"module");
+    write_file(&root, "space dir/file.txt", b"spaced");
+    write_file(&root, "sub/.gitignore", b"!keep.log\n/local-only\n");
+    write_file(&root, "sub/keep.log", b"kept by negation");
+    write_file(&root, "sub/drop.log", b"dropped");
+    write_file(&root, "sub/local-only", b"anchored to sub");
+    write_file(&root, "sub/deep/local-only", b"not anchored here");
+    // Excluded names are never validated: reserved, oversize and non-ASCII names do not fail.
+    write_file(&root, "target/CON", b"device name");
+    fs::write(root.join("ignored-\u{e9}.log"), b"unicode").unwrap();
+
+    assert_eq!(
+        changed_paths(&workspace, &engine),
+        [
+            ".gitignore",
+            "sub/.gitignore",
+            "sub/deep/local-only",
+            "sub/keep.log"
+        ]
+    );
+    let preview = workspace.preview(&engine, 100).unwrap();
+    assert!(preview.complete);
+    let excluded = excluded_paths(&preview);
+    for path in [
+        ".env",
+        "target",
+        "node_modules",
+        "space dir",
+        "sub/drop.log",
+        "sub/local-only",
+    ] {
+        assert!(excluded.contains(&path), "{path}: {excluded:?}");
+    }
+    assert!(!excluded.iter().any(|path| path.starts_with("target/")));
+    assert_eq!(rule_for(&preview, "target"), (".gitignore", "target/"));
+    let kept = preview
+        .included
+        .iter()
+        .find(|entry| entry.path == "sub/keep.log")
+        .unwrap();
+    assert_eq!(kept.rule.as_ref().unwrap().pattern, "!keep.log");
+    let paths: Vec<&str> = preview
+        .excluded
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect();
+    let mut sorted = paths.clone();
+    sorted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    assert_eq!(paths, sorted);
+
+    let outcome = workspace.checkpoint(&engine, "checkpoint-1", 0).unwrap();
+    assert!(matches!(outcome, OperationOutcome::Checkpointed { .. }));
+    assert_eq!(fs::read(root.join(".env")).unwrap(), b"SECRET=1");
+    // Nothing excluded changed the next status either.
+    assert!(changed_paths(&workspace, &engine).is_empty());
+}
+
+#[test]
+fn unignored_non_ascii_untracked_paths_still_block_the_scan() {
+    let (_directory, engine, root, workspace) = selection_fixture();
+    fs::write(root.join("caf\u{e9}.txt"), b"unicode").unwrap();
+    assert!(matches!(
+        workspace.status(&engine, 100),
+        Err(Error::Invalid(_))
+    ));
+    fs::write(root.join(".agentscm-workspace/exclude"), "caf\u{e9}.txt\n").unwrap();
+    assert!(changed_paths(&workspace, &engine).is_empty());
+}
+
+#[test]
+fn precedence_and_re_inclusion_across_rule_sources() {
+    let (_directory, engine, root, workspace) = selection_fixture();
+    write_file(&root, ".gitignore", b"*.gen\n!pinned.gen\nshared.txt\n");
+    write_file(&root, ".agentscmignore", b"pinned.gen\n");
+    fs::write(
+        root.join(METADATA_DIRECTORY).join("exclude"),
+        "!shared.txt\nprivate.txt\n",
+    )
+    .unwrap();
+    for name in [
+        "a.gen",
+        "pinned.gen",
+        "shared.txt",
+        "private.txt",
+        "plain.txt",
+    ] {
+        write_file(&root, name, b"x");
+    }
+    let preview = workspace.preview(&engine, 100).unwrap();
+    assert_eq!(rule_for(&preview, "a.gen"), (".gitignore", "*.gen"));
+    assert_eq!(
+        rule_for(&preview, "pinned.gen"),
+        (".agentscmignore", "pinned.gen")
+    );
+    assert_eq!(
+        rule_for(&preview, "private.txt"),
+        (".agentscm-workspace/exclude", "private.txt")
+    );
+    let shared = preview
+        .included
+        .iter()
+        .find(|entry| entry.path == "shared.txt")
+        .unwrap();
+    assert_eq!(
+        shared.rule.as_ref().unwrap().source,
+        ".agentscm-workspace/exclude"
+    );
+    // The tracked .agentscmignore is ordinary source; the private file never is.
+    assert_eq!(
+        changed_paths(&workspace, &engine),
+        [".agentscmignore", ".gitignore", "plain.txt", "shared.txt"]
+    );
+}
+
+#[test]
+fn changing_the_private_exclude_changes_preview_and_checkpoint_together() {
+    let (_directory, engine, root, mut workspace) = selection_fixture();
+    write_file(&root, "notes.txt", b"notes");
+    write_file(&root, "scratch.txt", b"scratch");
+    assert_eq!(
+        changed_paths(&workspace, &engine),
+        ["notes.txt", "scratch.txt"]
+    );
+    fs::write(
+        root.join(METADATA_DIRECTORY).join("exclude"),
+        "scratch.txt\n",
+    )
+    .unwrap();
+    let preview = workspace.preview(&engine, 100).unwrap();
+    assert_eq!(excluded_paths(&preview), ["scratch.txt"]);
+    assert_eq!(changed_paths(&workspace, &engine), ["notes.txt"]);
+    workspace.checkpoint(&engine, "checkpoint-1", 0).unwrap();
+    // Preview and checkpoint agree on the captured set.
+    let included: Vec<&str> = preview
+        .included
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect();
+    assert_eq!(included, ["a.txt", "dir/kept.txt", "notes.txt"]);
+}
+
+#[test]
+fn preview_is_bounded_and_reports_truncation() {
+    let (_directory, engine, root, workspace) = selection_fixture();
+    fs::write(root.join(METADATA_DIRECTORY).join("exclude"), "*.tmp\n").unwrap();
+    for index in 0..5 {
+        write_file(&root, &format!("f{index}.tmp"), b"x");
+    }
+    let preview = workspace.preview(&engine, 3).unwrap();
+    assert!(!preview.complete);
+    assert_eq!(preview.excluded.len(), 3);
+    assert_eq!(preview.excluded_total, 5);
+    assert_eq!(preview.included_total, 2);
+    assert!(workspace.preview(&engine, 0).is_err());
+}
+
+#[test]
+fn tracked_paths_are_never_excluded_so_edits_and_deletions_stay_observable() {
+    let (_directory, engine, root, mut workspace) = selection_fixture();
+    fs::write(
+        root.join(METADATA_DIRECTORY).join("exclude"),
+        "a.txt\ndir/\n",
+    )
+    .unwrap();
+    assert!(changed_paths(&workspace, &engine).is_empty());
+    write_file(&root, "a.txt", b"edited");
+    write_file(&root, "dir/untracked.txt", b"stays excluded");
+    assert_eq!(changed_paths(&workspace, &engine), ["a.txt"]);
+    fs::remove_file(root.join("dir/kept.txt")).unwrap();
+    assert_eq!(
+        changed_paths(&workspace, &engine),
+        ["a.txt", "dir/kept.txt"]
+    );
+    workspace.checkpoint(&engine, "checkpoint-1", 0).unwrap();
+    // Once deleted from the base, the path is no longer protected by being tracked.
+    write_file(&root, "dir/kept.txt", b"recreated");
+    assert!(changed_paths(&workspace, &engine).is_empty());
+}
+
+#[test]
+fn git_sources_do_not_apply_without_a_root_git() {
+    let (_directory, engine, root, workspace) = selection_fixture();
+    write_file(&root, "info/exclude", b"ordinary.txt\n");
+    write_file(&root, "ordinary.txt", b"x");
+    // `info/exclude` here is an ordinary tracked-by-capture file, not a rule source.
+    assert_eq!(
+        changed_paths(&workspace, &engine),
+        ["info/exclude", "ordinary.txt"]
+    );
+}
+
+#[test]
+fn oversize_and_unreadable_excluded_content_never_affects_the_scan() {
+    let (_directory, engine, root, workspace) = selection_fixture();
+    fs::write(
+        root.join(METADATA_DIRECTORY).join("exclude"),
+        "huge.bin\nlocked/\n",
+    )
+    .unwrap();
+    let huge = fs::File::create(root.join("huge.bin")).unwrap();
+    huge.set_len(65 * 1024 * 1024).unwrap();
+    write_file(&root, "locked/inner", b"x");
+    fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+    let status = workspace.status(&engine, 100);
+    fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+    let status = status.unwrap();
+    assert!(status.complete);
+    assert!(status.changes.is_empty());
+}
+
+#[test]
+fn an_unreadable_included_directory_stays_an_error() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let (_directory, engine, root, workspace) = selection_fixture();
+    write_file(&root, "open/inner", b"x");
+    fs::set_permissions(root.join("open"), fs::Permissions::from_mode(0o000)).unwrap();
+    let status = workspace.status(&engine, 100);
+    fs::set_permissions(root.join("open"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(matches!(status, Err(Error::Io(_))));
+}
+
+#[test]
+fn bad_rule_files_are_typed_errors() {
+    let (_directory, engine, root, workspace) = selection_fixture();
+    let ignore = root.join(".agentscmignore");
+    fs::write(root.join("real"), b"x\n").unwrap();
+    symlink("real", &ignore).unwrap();
+    assert!(matches!(
+        workspace.status(&engine, 100),
+        Err(Error::Invalid(_))
+    ));
+    fs::remove_file(&ignore).unwrap();
+    fs::write(&ignore, vec![b'a'; 64 * 1024 + 1]).unwrap();
+    assert!(matches!(
+        workspace.status(&engine, 100),
+        Err(Error::Limit(_))
+    ));
+    fs::remove_file(&ignore).unwrap();
+    // An in-tree .gitignore symlink is not a rule source (as in Git); it is ordinary source.
+    fs::write(root.join("real"), b"hidden\n").unwrap();
+    fs::create_dir(root.join("sub")).unwrap();
+    symlink("../real", root.join("sub").join(".gitignore")).unwrap();
+    write_file(&root, "sub/hidden", b"x");
+    let changed = changed_paths(&workspace, &engine);
+    assert!(changed.contains(&"sub/.gitignore".to_owned()));
+    assert!(changed.contains(&"sub/hidden".to_owned()));
+}
+
+#[test]
+fn undo_never_overwrites_or_prunes_excluded_local_files() {
+    let (_directory, engine, root, mut workspace) = selection_fixture();
+    fs::write(
+        root.join(METADATA_DIRECTORY).join("exclude"),
+        "*.bin\n.env\n",
+    )
+    .unwrap();
+    write_file(&root, ".env", b"SECRET=1");
+    write_file(&root, "newdir/f.txt", b"added");
+    write_file(&root, "newdir/cache.bin", b"cache");
+    workspace.checkpoint(&engine, "checkpoint-1", 0).unwrap();
+    let outcome = workspace
+        .undo(&engine, "undo-1", 1, "checkpoint-1")
+        .unwrap();
+    assert!(matches!(outcome, OperationOutcome::Undone { .. }));
+    assert!(!root.join("newdir/f.txt").exists());
+    assert_eq!(fs::read(root.join("newdir/cache.bin")).unwrap(), b"cache");
+    assert_eq!(fs::read(root.join(".env")).unwrap(), b"SECRET=1");
+}
+
+#[test]
+fn undo_is_blocked_by_an_excluded_local_file_at_a_path_it_would_write() {
+    let (_directory, engine, root, mut workspace) = selection_fixture();
+    fs::remove_file(root.join("a.txt")).unwrap();
+    workspace.checkpoint(&engine, "checkpoint-1", 0).unwrap();
+    fs::write(root.join(METADATA_DIRECTORY).join("exclude"), "a.txt\n").unwrap();
+    write_file(&root, "a.txt", b"local excluded bytes");
+    assert!(changed_paths(&workspace, &engine).is_empty());
+
+    let outcome = workspace
+        .undo(&engine, "undo-1", 1, "checkpoint-1")
+        .unwrap();
+    assert_eq!(
+        outcome,
+        OperationOutcome::Blocked {
+            paths: vec!["a.txt".to_owned()]
+        }
+    );
+    assert_eq!(
+        fs::read(root.join("a.txt")).unwrap(),
+        b"local excluded bytes"
+    );
+    assert_eq!(workspace.state().unwrap().generation, 1);
+}
+
+#[test]
+fn undo_never_adopts_an_excluded_file_that_matches_the_restored_bytes() {
+    let (_directory, engine, root, mut workspace) = selection_fixture();
+    fs::remove_file(root.join("a.txt")).unwrap();
+    workspace.checkpoint(&engine, "checkpoint-1", 0).unwrap();
+    // The user's own, excluded file happens to hold exactly the bytes the undo would restore.
+    fs::write(root.join(METADATA_DIRECTORY).join("exclude"), "a.txt\n").unwrap();
+    write_file(&root, "a.txt", b"old");
+    assert!(changed_paths(&workspace, &engine).is_empty());
+
+    let outcome = workspace
+        .undo(&engine, "undo-1", 1, "checkpoint-1")
+        .unwrap();
+    assert_eq!(
+        outcome,
+        OperationOutcome::Blocked {
+            paths: vec!["a.txt".to_owned()]
+        }
+    );
+    // Nothing was journaled, so no interrupted-operation rollback can later delete the file.
+    let state = workspace.state().unwrap();
+    assert!(state.pending.is_none());
+    assert_eq!(state.generation, 1);
+    assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"old");
+    assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"old");
+}
+
+#[test]
+fn status_reports_excluded_top_level_entries() {
+    let (_directory, engine, root, workspace) = selection_fixture();
+    fs::write(
+        root.join(METADATA_DIRECTORY).join("exclude"),
+        "build/\n*.log\n",
+    )
+    .unwrap();
+    write_file(&root, "build/a/b/c", b"x");
+    write_file(&root, "build/d", b"x");
+    write_file(&root, "x.log", b"x");
+    let status = workspace.status(&engine, 100).unwrap();
+    // `build` counts once; its descendants are never visited.
+    assert_eq!(status.excluded_total, 2);
 }
