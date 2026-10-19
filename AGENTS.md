@@ -17,10 +17,12 @@ docker build -t agentscm . && .github/docker-smoke.sh agentscm
 
 The toolchain is pinned in `rust-toolchain.toml`. Tests needing PostgreSQL or S3 skip locally unless `AGENTSCM_TEST_DATABASE_URL` or `AGENTSCM_TEST_S3_*` are set. `tools/portable-verifier` is a separate crate with its own `Cargo.toml`.
 
+Workflow commands live in `.agents/commands/`: `implement` (issue to reviewed PR), `commit`, `review`, `pr`, `fix-pr` and `handoff`. `.claude/commands` is a symlink to that directory and `CLAUDE.md` is a symlink to this file, so Claude Code and other agents read the same instructions. Follow the matching file when asked to run one of these workflows.
+
 ## Rules
 
 - Work on a feature branch; never commit or push to `main`. Do not merge, enable auto-merge, force-push, bypass hooks or weaken CI, signing or branch protections.
-- Do not edit `.github/workflows/`, release or packaging files, `AGENTS.md` or `CLAUDE.md` unless the task is about them and a maintainer has agreed.
+- Do not edit `.github/workflows/`, release or packaging files, `AGENTS.md`, `CLAUDE.md` or `.agents/` unless the task is about them and a maintainer has agreed.
 - Keep changes focused. Preserve other contributors' work and check `git status` before writing. Run only the checks that fit the change, and report exactly what ran and what did not. Never present an incomplete check as passing.
 - Use synthetic fixtures. Never commit credentials, personal data, machine-specific paths, transcripts, session links or raw review evidence.
 - Commit and PR text is factual: behavior, reason, validation, limits. An `Assisted-by:` trailer is optional; never use `Co-authored-by` for a tool. Disclose assistance in the PR template.
