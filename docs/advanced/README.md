@@ -11,6 +11,7 @@ AgentSCM also contains an immutable ledger for exact revisions, their review con
 - [Workspaces](workspace.md), [merge sessions](merge.md), [offline sync](sync.md), [source history](source-history.md) and the [source reader](source-reader.md)
 - [Native CLI reference](../reference/cli.md)
 - [Source-bound skill workflows](skill-workflows.md): run exact-file checks and explicit packaged container commands against an immutable revision; inspect, resume, cancel or recover the run.
+- [Agent-owned workflow task contract](agent-workflow-tasks.md): agreed strict task, attempt, instruction, assertion, enrolled-laptop provenance and recovery schemas; no task mutation or enrollment API is implemented yet.
 - [Claude Code workflow loop](claude-code-workflows.md): an opt-in local Stop trigger, tests/review, failure feedback and exact-current native landing requirements. Existing edit hooks remain contention-only.
 - [Community workspace pilot](community-workspace.md): persistent members/settings, independent roles, shared execution and explicit approval/native landing on one server. The legacy token dashboard and MCP remain inspection-only.
 
