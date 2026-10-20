@@ -25,6 +25,8 @@ pub mod work;
 pub mod work_http;
 pub mod workspace;
 #[cfg(unix)]
+pub mod workspace_agent_tasks;
+#[cfg(unix)]
 pub mod workspace_execution;
 #[cfg(unix)]
 pub mod workspace_http;
@@ -269,6 +271,7 @@ pub fn router(state: HubState) -> Router {
     #[cfg(unix)]
     let workspace_routes = workspace::routes()
         .merge(workspace_http::routes())
+        .merge(workspace_agent_tasks::routes())
         .merge(workspace_source_http::routes());
     #[cfg(not(unix))]
     let workspace_routes = workspace::routes();

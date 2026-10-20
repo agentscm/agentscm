@@ -8,10 +8,14 @@ use std::sync::Arc;
 
 use agentscm::authority::Authority;
 use agentscm::hub::store::{mint_agent_token, mint_bound_agent_token};
-use agentscm::hub::workspace_execution::{ExecutionConfig, ExecutionService};
-use agentscm::skill_workflow;
+use agentscm::hub::workspace_execution::{AgentTaskProfile, ExecutionConfig, ExecutionService};
+use agentscm::skill_workflow::{
+    self, CriterionOutcome, CriterionResult, EvidenceTrustClass, ExecutorEnrollment,
+    ObservationSignatureAlgorithm, TaskAttemptView, TaskOutcome, TaskResultAssertion, WorkflowTask,
+};
 use agentscm::team::auth::Role;
 use axum::http::header;
+use ed25519_dalek::SigningKey;
 use reqwest::{Method, Url};
 use serde_json::{Value, json};
 use workspace_hub::{Env, NativeSourceProfile, native_source_profile};
@@ -32,6 +36,7 @@ async fn execution_env(
             ExecutionConfig {
                 version: 1,
                 source_profiles: vec![],
+                agent_task_profiles: vec![],
                 profiles: vec![profile],
             },
             workspace,
@@ -43,6 +48,610 @@ async fn execution_env(
     })
     .await;
     (env, installed.get().unwrap().clone())
+}
+
+async fn agent_only_env(
+    root: &std::path::Path,
+    native: &NativeSourceProfile,
+) -> (Env, Arc<ExecutionService>) {
+    let profile = AgentTaskProfile {
+        repository_id: native.profile.repository_id.clone(),
+        profile_id: native.profile.profile_id.clone(),
+        native_repository: native.profile.native_repository.clone(),
+        data_dir: native.profile.data_dir.clone(),
+        target: native.profile.target.clone(),
+        requirement_digest: native.profile.requirement_digest.clone(),
+    };
+    let queue = root.join("agent-only.sqlite");
+    let installed = Arc::new(std::sync::OnceLock::new());
+    let retain = installed.clone();
+    let env = Env::with_state(move |state, workspace| {
+        let service = Arc::new(
+            ExecutionService::open(
+                &queue,
+                ExecutionConfig {
+                    version: 1,
+                    profiles: vec![],
+                    source_profiles: vec![],
+                    agent_task_profiles: vec![profile],
+                },
+                workspace,
+            )
+            .unwrap(),
+        );
+        retain.set(service.clone()).ok().unwrap();
+        state.with_workspace_execution(service)
+    })
+    .await;
+    (env, installed.get().unwrap().clone())
+}
+
+fn install_executor(native: &NativeSourceProfile) -> serde_json::Value {
+    let public = SigningKey::from_bytes(&[7_u8; 32])
+        .verifying_key()
+        .to_bytes();
+    let public_hex = public
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let enrollment = ExecutorEnrollment {
+        version: 1,
+        registration_id: "registration-http-1".into(),
+        executor_id: "executor-http-1".into(),
+        operator_id: "operator-http-1".into(),
+        repository: native.context.change.repository.clone(),
+        step_ids: vec!["source".into()],
+        registration_epoch: 1,
+        verification_key_id: agentscm::policy::issuer_key_id(&public_hex).unwrap(),
+        verification_key_sha256: agentscm::store::digest(&public),
+        signature_algorithm: ObservationSignatureAlgorithm::Ed25519,
+        issued_at_ms: 1,
+    };
+    Authority::open(&native.profile.data_dir)
+        .unwrap()
+        .enroll_workflow_executor(&enrollment, &public_hex)
+        .unwrap();
+    serde_json::to_value(enrollment.binding().unwrap()).unwrap()
+}
+
+async fn agent_client(
+    root: &std::path::Path,
+    native: &NativeSourceProfile,
+) -> (Env, String, Value) {
+    let executor = install_executor(native);
+    let (env, _) = agent_only_env(root, native).await;
+    let (_, owner) = env.signin(101).await;
+    let owner_session = env.session(&owner).await;
+    let grant = env.member(
+        202,
+        &[Role::Reader, Role::Contributor],
+        true,
+        env.workspace.settings().unwrap().generation,
+        "add-agent-task-transport-contributor",
+    );
+    assert_eq!(
+        env.request(
+            Method::PUT,
+            "/v1/hub/workspace/members",
+            Some(&owner),
+            Some(owner_session["csrf_token"].as_str().unwrap()),
+            None,
+            Some(grant),
+        )
+        .await
+        .0,
+        200
+    );
+    env.signin(202).await;
+    let user = env
+        .store
+        .list_users()
+        .unwrap()
+        .into_iter()
+        .find(|user| user.identity.user_id == 202)
+        .unwrap();
+    let (_, token) = mint_agent_token(
+        &*env.store,
+        &user.id,
+        "agent-task-transport-client",
+        "synthetic/project",
+        3600,
+    )
+    .unwrap();
+    (env, token.expose().to_owned(), executor)
+}
+
+fn claim_input(task: &WorkflowTask, executor: &Value, suffix: &str) -> Value {
+    json!({
+        "version":1,
+        "request_id":format!("claim-{suffix}"),
+        "execution_operation_id":format!("execute-{suffix}"),
+        "task_id":task.task_id,
+        "task_digest":task.digest().unwrap(),
+        "attempt_id":format!("attempt-{suffix}"),
+        "executor":executor,
+        "requested_lease_ms":60_000
+    })
+}
+
+fn mutation_input(view: &TaskAttemptView, request_id: &str, kind: &str) -> Value {
+    json!({
+        "version":1,
+        "request_id":request_id,
+        "execution_operation_id":view.attempt.execution_operation_id,
+        "task_id":view.attempt.task_id,
+        "task_digest":view.attempt.task_digest,
+        "attempt_id":view.attempt.attempt_id,
+        "attempt_digest":view.attempt.digest().unwrap(),
+        "fence":view.attempt.lease.fence,
+        "executor":view.attempt.executor,
+        "action":{"kind":kind}
+    })
+}
+
+fn large_assertion_input(task: &WorkflowTask, view: &TaskAttemptView, request_id: &str) -> Value {
+    let assertion = TaskResultAssertion {
+        version: 1,
+        task_id: task.task_id.clone(),
+        task_digest: task.digest().unwrap(),
+        attempt_id: view.attempt.attempt_id.clone(),
+        attempt_digest: view.attempt.digest().unwrap(),
+        request_id: request_id.into(),
+        execution_operation_id: view.attempt.execution_operation_id.clone(),
+        agent: view.attempt.agent.clone(),
+        executor: view.attempt.executor.clone(),
+        fence: view.attempt.lease.fence,
+        trust_class: EvidenceTrustClass::AgentAssertion,
+        outcome: TaskOutcome::Incomplete,
+        criteria: vec![CriterionResult {
+            criterion: task.entrypoint.required_criteria[0].id.clone(),
+            outcome: CriterionOutcome::Incomplete,
+            findings: vec!["\u{1}".repeat(700); 16],
+            evidence_digests: vec![],
+        }],
+        executor_provenance: None,
+    };
+    let canonical = assertion.canonical_bytes().unwrap();
+    assert!(canonical.len() > 64 * 1024);
+    assert!(canonical.len() <= 256 * 1024);
+    let mut value = serde_json::to_value(assertion).unwrap();
+    value.as_object_mut().unwrap().remove("agent");
+    value
+}
+
+fn mcp_call(name: &str, arguments: Value) -> Value {
+    json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":arguments}})
+}
+
+fn mcp_envelope(response: &Value) -> Value {
+    serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn agent_only_http_and_workspace_mcp_expose_the_same_side_effect_free_requirements() {
+    let root = tempfile::tempdir().unwrap();
+    let native = native_source_profile(root.path());
+    let (env, service) = agent_only_env(root.path(), &native).await;
+    assert!(
+        !service.server_execution_enabled(),
+        "agent-only configuration must not start the server executor"
+    );
+    let (_, owner) = env.signin(101).await;
+    let owner_session = env.session(&owner).await;
+    let grant = env.member(
+        202,
+        &[Role::Reader, Role::Contributor],
+        true,
+        env.workspace.settings().unwrap().generation,
+        "add-agent-task-contributor",
+    );
+    assert_eq!(
+        env.request(
+            Method::PUT,
+            "/v1/hub/workspace/members",
+            Some(&owner),
+            Some(owner_session["csrf_token"].as_str().unwrap()),
+            None,
+            Some(grant),
+        )
+        .await
+        .0,
+        200
+    );
+    let (_, member_cookie) = env.signin(202).await;
+    let user = env
+        .store
+        .list_users()
+        .unwrap()
+        .into_iter()
+        .find(|user| user.identity.user_id == 202)
+        .unwrap();
+    let (_, token) = mint_agent_token(
+        &*env.store,
+        &user.id,
+        "agent-task-client",
+        "synthetic/project",
+        3600,
+    )
+    .unwrap();
+    let task_path = format!("{REPO}/profiles/checks/agent-tasks");
+    let body = json!({"operation":"requirements","subject":native.subject});
+    let journal = native.profile.data_dir.join("skill-workflows/state.sqlite");
+    assert!(!journal.exists());
+    let http = env
+        .request(
+            Method::POST,
+            &task_path,
+            None,
+            None,
+            Some(token.expose()),
+            Some(body.clone()),
+        )
+        .await;
+    assert_eq!(http.0, 200, "{http:?}");
+    assert_eq!(http.1["capability"], "agentscm.agent-workflow-tasks/v1");
+    assert_eq!(http.1["schema_version"], 1);
+    assert!(
+        http.1["result"]
+            .as_array()
+            .is_some_and(|tasks| !tasks.is_empty())
+    );
+    assert!(
+        !journal.exists(),
+        "requirements must not initialize the task journal"
+    );
+
+    let mcp = env
+        .request(
+            Method::POST,
+            "/v1/hub/workspace/mcp?repository=synthetic%2Fproject&profile=checks",
+            None,
+            None,
+            Some(token.expose()),
+            Some(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_task_requirements","arguments":{"subject":native.subject}}})),
+        )
+        .await;
+    assert_eq!(mcp.0, 200, "{mcp:?}");
+    assert_eq!(mcp.1["result"]["isError"], false);
+    let envelope: Value =
+        serde_json::from_str(mcp.1["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(envelope, http.1);
+    assert!(
+        !journal.exists(),
+        "MCP requirements must remain side-effect free"
+    );
+    let digest = "0".repeat(64);
+    let executor = json!({"registration_id":"missing-registration","executor_id":"missing-executor","registration_epoch":1,"verification_key_id":"missing-key"});
+    let status = json!({"version":1,"task_id":"missing-task","task_digest":digest.clone(),"attempt_id":"missing-attempt","attempt_digest":digest.clone(),"fence":1,"executor":executor.clone()});
+    let response = env
+        .request(
+            Method::POST,
+            &task_path,
+            None,
+            None,
+            Some(token.expose()),
+            Some(json!({"operation":"status","subject":native.subject,"status":status})),
+        )
+        .await;
+    assert_eq!(response.0, 200, "{response:?}");
+    assert_eq!(response.1["result"], Value::Null);
+    let recovery = env
+        .request(
+            Method::POST,
+            &task_path,
+            None,
+            None,
+            Some(token.expose()),
+            Some(json!({"operation":"recovery","subject":native.subject,"mutation":{
+                "version":1,"request_id":"missing-recovery","execution_operation_id":"missing-execution",
+                "task_id":"missing-task","task_digest":digest.clone(),"attempt_id":"missing-attempt",
+                "attempt_digest":digest,"fence":1,"executor":executor,"action":{"kind":"heartbeat"}
+            }})),
+        )
+        .await;
+    assert_eq!(recovery.0, 200, "{recovery:?}");
+    assert_eq!(recovery.1["result"]["disposition"], "conclusive_rejection");
+    assert_eq!(recovery.1["result"]["observed_state"], "unknown");
+    assert!(
+        !journal.exists(),
+        "status and recovery must not initialize the task journal"
+    );
+
+    let mut injected_actor = body.clone();
+    injected_actor["actor"] = json!({"owner_id":"caller","agent_id":"caller"});
+    assert_eq!(
+        env.request(
+            Method::POST,
+            &task_path,
+            None,
+            None,
+            Some(token.expose()),
+            Some(injected_actor),
+        )
+        .await
+        .0,
+        400,
+        "the wire contract must not accept a caller-selected actor"
+    );
+    let (_, read_token, _) = mint_bound_agent_token(
+        &*env.store,
+        &user.id,
+        "read-only-task-client",
+        "synthetic/project",
+        7,
+        3600,
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        env.request(
+            Method::POST,
+            &task_path,
+            None,
+            None,
+            Some(read_token.expose()),
+            Some(body.clone()),
+        )
+        .await
+        .0,
+        403,
+        "legacy read-only scope must not gain task tools"
+    );
+
+    let browser = env
+        .request(
+            Method::POST,
+            &task_path,
+            Some(&member_cookie),
+            Some("not-a-valid-csrf-token"),
+            None,
+            Some(body),
+        )
+        .await;
+    assert_eq!(browser.0, 403);
+}
+
+#[tokio::test]
+async fn task_http_accepts_a_claimed_assertion_above_64_kib_and_rejects_over_route_bound() {
+    let root = tempfile::tempdir().unwrap();
+    let native = native_source_profile(root.path());
+    let (env, token, executor) = agent_client(root.path(), &native).await;
+    let task_path = format!("{REPO}/profiles/checks/agent-tasks");
+    let requirements = env
+        .request(
+            Method::POST,
+            &task_path,
+            None,
+            None,
+            Some(&token),
+            Some(json!({"operation":"requirements","subject":native.subject})),
+        )
+        .await;
+    assert_eq!(requirements.0, 200, "{requirements:?}");
+    let task: WorkflowTask = serde_json::from_value(requirements.1["result"][0].clone()).unwrap();
+    let claim = env
+        .request(
+            Method::POST,
+            &task_path,
+            None,
+            None,
+            Some(&token),
+            Some(json!({"operation":"claim","subject":native.subject,"claim":claim_input(&task,&executor,"http-large")})),
+        )
+        .await;
+    assert_eq!(claim.0, 200, "{claim:?}");
+    let view: TaskAttemptView = serde_json::from_value(claim.1["result"].clone()).unwrap();
+    let assertion = large_assertion_input(&task, &view, "result-http-large");
+    let request = json!({"operation":"result","subject":native.subject,"assertion":assertion});
+    assert!(request.to_string().len() > 64 * 1024);
+    let result = env
+        .request(
+            Method::POST,
+            &task_path,
+            None,
+            None,
+            Some(&token),
+            Some(request),
+        )
+        .await;
+    assert_eq!(result.0, 200, "{result:?}");
+    assert_eq!(result.1["result"]["state"], "finished");
+
+    let over_bound = env
+        .request(
+            Method::POST,
+            &task_path,
+            None,
+            None,
+            Some(&token),
+            Some(json!({"padding":"x".repeat(400 * 1024)})),
+        )
+        .await;
+    assert_eq!(over_bound.0, 400, "{over_bound:?}");
+}
+
+#[tokio::test]
+async fn workspace_mcp_accepts_real_mutation_and_large_result_and_rejects_over_route_bound() {
+    let root = tempfile::tempdir().unwrap();
+    let native = native_source_profile(root.path());
+    let (env, token, executor) = agent_client(root.path(), &native).await;
+    let mcp_path = "/v1/hub/workspace/mcp?repository=synthetic%2Fproject&profile=checks";
+    let requirements = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_requirements",
+                json!({"subject":native.subject}),
+            )),
+        )
+        .await;
+    assert_eq!(requirements.0, 200, "{requirements:?}");
+    let requirements = mcp_envelope(&requirements.1);
+    let task: WorkflowTask = serde_json::from_value(requirements["result"][0].clone()).unwrap();
+    let claim = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_claim",
+                json!({"subject":native.subject,"claim":claim_input(&task,&executor,"mcp-large")}),
+            )),
+        )
+        .await;
+    assert_eq!(claim.0, 200, "{claim:?}");
+    let claim = mcp_envelope(&claim.1);
+    let view: TaskAttemptView = serde_json::from_value(claim["result"].clone()).unwrap();
+    let heartbeat = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_heartbeat",
+                json!({"subject":native.subject,"mutation":mutation_input(&view,"heartbeat-mcp-large","heartbeat")}),
+            )),
+        )
+        .await;
+    assert_eq!(heartbeat.0, 200, "{heartbeat:?}");
+    assert_eq!(heartbeat.1["result"]["isError"], false);
+    let heartbeat = mcp_envelope(&heartbeat.1);
+    let view: TaskAttemptView = serde_json::from_value(heartbeat["result"].clone()).unwrap();
+    let assertion = large_assertion_input(&task, &view, "result-mcp-large");
+    let request = mcp_call(
+        "agentscm_task_result",
+        json!({"subject":native.subject,"assertion":assertion}),
+    );
+    assert!(request.to_string().len() > 64 * 1024);
+    let result = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(request),
+        )
+        .await;
+    assert_eq!(result.0, 200, "{result:?}");
+    assert_eq!(result.1["result"]["isError"], false);
+    assert_eq!(mcp_envelope(&result.1)["result"]["state"], "finished");
+
+    let over_bound = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(json!({"padding":"x".repeat(400 * 1024)})),
+        )
+        .await;
+    assert_ne!(over_bound.0, 200, "{over_bound:?}");
+}
+
+#[tokio::test]
+async fn task_http_and_mcp_distinguish_invalid_claims_from_unavailable_journal() {
+    let root = tempfile::tempdir().unwrap();
+    let native = native_source_profile(root.path());
+    let (env, token, executor) = agent_client(root.path(), &native).await;
+    let task_path = format!("{REPO}/profiles/checks/agent-tasks");
+    let mcp_path = "/v1/hub/workspace/mcp?repository=synthetic%2Fproject&profile=checks";
+    let requirements = env
+        .request(
+            Method::POST,
+            &task_path,
+            None,
+            None,
+            Some(&token),
+            Some(json!({"operation":"requirements","subject":native.subject})),
+        )
+        .await;
+    assert_eq!(requirements.0, 200, "{requirements:?}");
+    let task: WorkflowTask = serde_json::from_value(requirements.1["result"][0].clone()).unwrap();
+    let mut unknown = claim_input(&task, &executor, "unknown");
+    unknown["task_id"] = json!("unknown-task");
+    unknown["task_digest"] = json!("0".repeat(64));
+    let invalid_http = env
+        .request(
+            Method::POST,
+            &task_path,
+            None,
+            None,
+            Some(&token),
+            Some(json!({"operation":"claim","subject":native.subject,"claim":unknown.clone()})),
+        )
+        .await;
+    assert_eq!(invalid_http, (400, json!({"error":"invalid_request"})));
+    let invalid_mcp = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_claim",
+                json!({"subject":native.subject,"claim":unknown}),
+            )),
+        )
+        .await;
+    assert_eq!(invalid_mcp.0, 200, "{invalid_mcp:?}");
+    assert_eq!(invalid_mcp.1["result"]["isError"], true);
+    assert_eq!(
+        invalid_mcp.1["result"]["content"][0]["text"],
+        "AgentSCM task request was invalid or not found"
+    );
+
+    std::fs::write(
+        native.profile.data_dir.join("skill-workflows"),
+        b"block journal directory creation",
+    )
+    .unwrap();
+    let unavailable_http = env
+        .request(
+            Method::POST,
+            &task_path,
+            None,
+            None,
+            Some(&token),
+            Some(json!({"operation":"claim","subject":native.subject,"claim":claim_input(&task,&executor,"unavailable-http")})),
+        )
+        .await;
+    assert_eq!(unavailable_http, (503, json!({"error":"unavailable"})));
+    let unavailable_mcp = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_claim",
+                json!({"subject":native.subject,"claim":claim_input(&task,&executor,"unavailable-mcp")}),
+            )),
+        )
+        .await;
+    assert_eq!(unavailable_mcp.0, 200, "{unavailable_mcp:?}");
+    assert_eq!(unavailable_mcp.1["error"]["code"], -32603);
+    assert_eq!(
+        unavailable_mcp.1["error"]["message"],
+        "temporarily unavailable; inspect task status or recovery before retrying"
+    );
+    assert!(
+        !unavailable_mcp
+            .1
+            .to_string()
+            .contains(root.path().to_str().unwrap())
+    );
 }
 
 fn start_request(native: &NativeSourceProfile, generation: &Value, id: &str) -> Value {

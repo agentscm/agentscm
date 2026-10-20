@@ -110,6 +110,7 @@ impl Fixture {
         let config = ExecutionConfig {
             version: 1,
             source_profiles: vec![],
+            agent_task_profiles: vec![],
             profiles: vec![ExecutionProfile {
                 repository_id: REPO.into(),
                 profile_id: "checks".into(),
