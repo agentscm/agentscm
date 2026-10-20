@@ -2,6 +2,7 @@
 use std::sync::Arc;
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Json;
@@ -9,10 +10,12 @@ use axum::routing::get;
 use serde::{Deserialize, Serialize};
 
 use super::http::{ApiError, JsonBody, blocking};
-use super::workspace::{WorkspaceAction, WorkspaceActor, api_error};
-use super::workspace_execution::{
-    CancelRequest, ExecutionService, RunSubject, StartRequest, SubjectAuthorization,
+use super::workspace::{WorkspaceActor, api_error};
+use super::workspace_agent_tasks::{
+    AgentTaskEnvelope, AgentTaskRequest, CollectorUploadRequest, MAX_AGENT_TASK_REQUEST_BYTES,
+    NativeTaskAction,
 };
+use super::workspace_execution::{CancelRequest, ExecutionService, RunSubject, StartRequest};
 use super::{HubError, HubState, Result};
 
 type ApiResult<T> = std::result::Result<Json<T>, ApiError>;
@@ -51,6 +54,17 @@ pub fn routes() -> Router<HubState> {
         .route(
             "/v1/hub/workspace/repositories/{repository}/profiles/{profile}/integrate",
             axum::routing::post(integrate),
+        )
+        .route(
+            "/v1/hub/workspace/repositories/{repository}/profiles/{profile}/agent-tasks",
+            axum::routing::post(agent_tasks)
+                .layer(DefaultBodyLimit::max(MAX_AGENT_TASK_REQUEST_BYTES)),
+        )
+        .route(
+            "/v1/hub/workspace/repositories/{repository}/profiles/{profile}/agent-tasks/collector-upload",
+            axum::routing::post(collector_upload).layer(DefaultBodyLimit::max(
+                crate::skill_workflow::MAX_COLLECTOR_TRANSFER_BYTES + 64 * 1024,
+            )),
         )
 }
 
@@ -210,21 +224,6 @@ fn operation_id(actor: &WorkspaceActor, kind: &str, request_id: &str) -> Result<
     Ok(format!("ws-{kind}-{}-{request_id}", actor.user_id()))
 }
 
-fn native_approval(
-    id: &str,
-    context: &crate::context::ReviewContext,
-) -> crate::Result<crate::model::Approval> {
-    Ok(crate::model::Approval {
-        approval_id: id.into(),
-        target: context.target.clone(),
-        revision: context.revision.clone(),
-        context_digest: context.digest()?,
-        change: Some(context.change.clone()),
-        change_version: Some(context.change_version),
-        policy_epoch: context.policy_epoch,
-    })
-}
-
 fn approval_response(
     approval: &crate::model::Approval,
     actor: &WorkspaceActor,
@@ -240,52 +239,20 @@ async fn approve(
 ) -> ApiResult<serde_json::Value> {
     call(&state, move |service| {
         let approval_id = operation_id(&actor, "approve", &request.request_id)?;
-        service.with_subject_authorization(
+        let approval = service.approve_with_agent_task_origins(
             &actor,
-            &SubjectAuthorization {
+            NativeTaskAction {
                 repository: &repository,
                 profile_id: &profile,
-                subject: &request.subject,
-                action: WorkspaceAction::ApproveRevision,
                 request_id: &request.request_id,
                 expected_generation: request.expected_generation,
+                subject: &request.subject,
             },
-            |path, context| {
-                let approval = native_approval(&approval_id, context)?;
-                let authority = crate::authority::Authority::open_read_only(path)?;
-                Ok(authority
-                    .approval_retry(&approval)?
-                    .then(|| approval_response(&approval, &actor)))
-            },
-            |path, context| {
-                let approval = native_approval(&approval_id, context)?;
-                crate::authority::Authority::open(path)?.approve_idempotent(&approval)?;
-                Ok(approval_response(&approval, &actor))
-            },
-        )
+            &approval_id,
+        )?;
+        Ok(approval_response(&approval, &actor))
     })
     .await
-}
-
-fn native_integration(
-    id: &str,
-    approval_id: &str,
-    context: &crate::context::ReviewContext,
-) -> crate::Result<crate::model::IntegrateRequest> {
-    Ok(crate::model::IntegrateRequest {
-        operation_id: id.into(),
-        target: context.target.clone(),
-        expected_target: context.base.as_ref().map(|base| crate::model::TargetState {
-            revision: base.revision.clone(),
-            version: base.target_version,
-        }),
-        revision: context.revision.clone(),
-        context_digest: context.digest()?,
-        approval_id: approval_id.into(),
-        change: Some(context.change.clone()),
-        change_version: Some(context.change_version),
-        policy_epoch: context.policy_epoch,
-    })
 }
 
 async fn integrate(
@@ -296,26 +263,48 @@ async fn integrate(
 ) -> ApiResult<crate::model::IntegrationEvent> {
     call(&state, move |service| {
         let id = operation_id(&actor, "integrate", &request.request_id)?;
-        service.with_subject_authorization(
+        service.integrate_with_agent_task_origins(
             &actor,
-            &SubjectAuthorization {
+            NativeTaskAction {
                 repository: &repository,
                 profile_id: &profile,
-                subject: &request.subject,
-                action: WorkspaceAction::IntegrateRevision,
                 request_id: &request.request_id,
                 expected_generation: request.expected_generation,
+                subject: &request.subject,
             },
-            |path, context| {
-                crate::authority::Authority::open_read_only(path)?
-                    .integration_retry(&native_integration(&id, &request.approval_id, context)?)
-            },
-            |path, context| {
-                let integration = native_integration(&id, &request.approval_id, context)?;
-                crate::authority::Authority::open(path)?
-                    .integrate(&crate::store::Engine::open(path)?, &integration)
-            },
+            &id,
+            &request.approval_id,
         )
     })
     .await
+}
+
+async fn agent_tasks(
+    State(state): State<HubState>,
+    actor: WorkspaceActor,
+    Path((repository, profile)): Path<(String, String)>,
+    JsonBody(request): JsonBody<AgentTaskRequest>,
+) -> ApiResult<AgentTaskEnvelope> {
+    call(&state, move |service| {
+        service.agent_task_call(&actor, &repository, &profile, request)
+    })
+    .await
+}
+
+async fn collector_upload(
+    State(state): State<HubState>,
+    actor: WorkspaceActor,
+    Path((repository, profile)): Path<(String, String)>,
+    JsonBody(request): JsonBody<CollectorUploadRequest>,
+) -> ApiResult<AgentTaskEnvelope> {
+    let execution = state.workspace_execution.clone().ok_or_else(|| {
+        ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "execution_not_configured")
+    })?;
+    let runtime = tokio::runtime::Handle::current();
+    blocking(&state, move || {
+        runtime.block_on(execution.agent_task_upload(&actor, &repository, &profile, request))
+    })
+    .await
+    .map(Json)
+    .map_err(api_error)
 }

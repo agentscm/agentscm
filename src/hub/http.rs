@@ -167,6 +167,7 @@ pub async fn serve(config: HubConfig) -> Result<()> {
     let execution_worker = state
         .workspace_execution
         .as_ref()
+        .filter(|execution| execution.server_execution_enabled())
         .map(|execution| execution.clone().spawn_worker());
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal())

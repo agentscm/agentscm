@@ -13,12 +13,13 @@ use crate::{Error, Result};
 pub const AGENT_TASK_CONTRACT_VERSION: u32 = 1;
 pub const AGENT_TASK_CAPABILITY: &str = "agentscm.agent-workflow-tasks/v1";
 
-const MAX_WIRE_BYTES: usize = 256 * 1024;
-const MAX_ID_BYTES: usize = 128;
-const MAX_TEXT_BYTES: usize = 2 * 1024;
+pub(crate) const MAX_SUPPORTED_SCHEMA_VERSIONS: usize = 16;
+pub(crate) const MAX_WIRE_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_ID_BYTES: usize = 128;
+pub(crate) const MAX_TEXT_BYTES: usize = 2 * 1024;
 pub(crate) const MAX_REFERENCE_BYTES: usize = 128 * 1024;
 const MAX_REFERENCE_ENVELOPE_BYTES: usize = MAX_REFERENCE_BYTES + 16 * 1024;
-const MAX_LEASE_MS: u64 = 24 * 60 * 60 * 1_000;
+pub(crate) const MAX_LEASE_MS: u64 = 24 * 60 * 60 * 1_000;
 const TASK_DOMAIN: &[u8] = b"agentscm.agent-workflow-task.v1\0";
 const ATTEMPT_DOMAIN: &[u8] = b"agentscm.agent-workflow-attempt.v1\0";
 const ASSERTION_DOMAIN: &[u8] = b"agentscm.agent-workflow-assertion.v1\0";
@@ -1192,7 +1193,7 @@ impl InstructionEntrypointResponse {
             } if capability == AGENT_TASK_CAPABILITY
                 && *required_schema_version > 0
                 && !supported_schema_versions.is_empty()
-                && supported_schema_versions.len() <= 16
+                && supported_schema_versions.len() <= MAX_SUPPORTED_SCHEMA_VERSIONS
                 && supported_schema_versions.iter().all(|version| *version > 0)
                 && supported_schema_versions
                     .iter()

@@ -277,7 +277,10 @@ impl<'a> AgentTaskService<'a> {
                     repository: context.change.repository.clone(),
                     origins: origins.clone(),
                 };
-                Authority::open(self.data_dir)?.approve_with_imported_origins(approval, &live)?;
+                let mut authority = Authority::open(self.data_dir)?;
+                if !authority.approval_retry(approval)? {
+                    authority.approve_with_imported_origins(approval, &live)?;
+                }
                 result = Some(());
                 Ok(())
             },
@@ -502,6 +505,47 @@ impl<'a> AgentTaskService<'a> {
         validate_profile_action(task, &current.plan, &profile)?;
         self.with_authorized(&request.claim.agent, context, || {
             self.claim_current_with_collector(context, request, &current, &profile)
+        })
+    }
+
+    /// Returns only authority-derived bindings for an already claimed collector attempt.
+    /// It does not execute a command, invoke a model, or initialize a missing journal.
+    pub fn collector_descriptor(
+        &self,
+        context: &ReviewContext,
+        request: &TaskStatusRequest,
+        origin: OriginGrantBinding,
+    ) -> Result<CollectorWorkDescriptor> {
+        if origin.actor != request.agent {
+            return Err(Error::Conflict(
+                "collector origin differs from authenticated attempt actor".into(),
+            ));
+        }
+        let view = self
+            .status(context, request)?
+            .ok_or_else(|| Error::NotFound(format!("task attempt {}", request.attempt_id)))?;
+        let current = self.current(context)?;
+        let task = exact_task(&current.tasks, &request.task_id, &request.task_digest)?.clone();
+        let journal = Journal::open(self.data_dir, OpenMode::Read)?;
+        let profile_id: String = journal.connection.query_row(
+            "SELECT profile_id FROM agent_workflow_collector_claims WHERE attempt_id=?1",
+            [&request.attempt_id],
+            |row| row.get(0),
+        )?;
+        let authority = Authority::open_read_only(self.data_dir)?;
+        let profile = authority.require_current_collector_profile(
+            &profile_id,
+            &task,
+            &view.attempt.executor,
+        )?;
+        validate_profile_action(&task, &current.plan, &profile)?;
+        Ok(CollectorWorkDescriptor {
+            version: COLLECTOR_TRANSFER_VERSION,
+            capability: COLLECTOR_TRANSFER_CAPABILITY.into(),
+            profile,
+            task,
+            attempt: view.attempt,
+            origin,
         })
     }
 

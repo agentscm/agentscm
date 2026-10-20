@@ -92,6 +92,17 @@ pub struct CollectorClaimRequest {
     pub collector_profile_id: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CollectorWorkDescriptor {
+    pub version: u32,
+    pub capability: String,
+    pub profile: CollectorProfile,
+    pub task: WorkflowTask,
+    pub attempt: WorkflowTaskAttempt,
+    pub origin: OriginGrantBinding,
+}
+
 impl CollectorClaimRequest {
     pub fn digest(&self) -> Result<String> {
         identifier(&self.collector_profile_id)?;
