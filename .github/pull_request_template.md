@@ -20,6 +20,6 @@ Tool and what I verified myself: <!-- required unless "No AI assistance" -->
 
 ## Checklist
 
-- [ ] `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings` and `cargo test --locked` pass
+- [ ] `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo nextest run --locked` and `cargo test --locked --doc` pass
 - [ ] Tests and docs are updated for behavior changes
 - [ ] No secrets, personal data, session links or transcripts

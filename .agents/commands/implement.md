@@ -52,18 +52,21 @@ Propagate corrected reconnaissance to every later phase. If a late structural fo
 
 ## Phase 5: Whole-branch validation
 
-Run the complete repository gate:
+Complete the final whole-branch repository gate:
 
 ```sh
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
-cargo test --locked
+cargo nextest run --locked
+cargo test --locked --doc
 git diff --check
 ```
 
 When `ui/` changes, also run `npm ci --ignore-scripts`, `npm run lint`, `npm run build` and `npm run notices -- --check` in `ui/`; when the container image or its inputs change, also run `docker build -t agentscm . && .github/docker-smoke.sh agentscm`. Tests needing PostgreSQL or S3 skip unless `AGENTSCM_TEST_DATABASE_URL` or `AGENTSCM_TEST_S3_*` are set; report such skips as coverage limits, not passes.
 
-Also run focused synthetic CLI or integration checks identified during reconnaissance when they materially test behavior not covered by the suite. Do not use real credentials, private documents, production systems, or untrusted repository code with ambient credentials.
+Reuse a completed final gate only under `docs/contributor-testing.md`, after comparing the tested inputs and retaining the original commands, results, snapshot and comparison. Relevant changes invalidate affected evidence; runner or test-configuration changes require the full nextest suite and doctests. Applicable reviews remain required.
+
+Also run focused synthetic CLI or integration checks identified during reconnaissance when they materially test behavior not covered by the suite. Choose focused tests from the actual changed behavior, its callers and failure paths; these iteration checks do not replace the final whole-branch gate. Do not use real credentials, private documents, production systems, or untrusted repository code with ambient credentials.
 
 If a check fails because of the branch, send the exact failure to one fresh correction subagent on a fast, cost-efficient model, then rerun the full gate. If that coding correction fails, use one fresh correction subagent on a high-capability model, for the second and final attempt. Allow at most two correction attempts. If a prerequisite or external artifact is unavailable, record the resulting coverage limit; never convert it into a pass.
 

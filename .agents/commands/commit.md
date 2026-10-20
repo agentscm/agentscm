@@ -14,10 +14,13 @@ Commit the intended working-tree changes with a factual message. If `$ARGUMENTS`
    ```sh
    cargo fmt --check
    cargo clippy --all-targets --locked -- -D warnings
-   cargo test --locked
+   cargo nextest run --locked
+   cargo test --locked --doc
    ```
 
    When `ui/` changes, also run `npm ci --ignore-scripts`, `npm run lint`, `npm run build` and `npm run notices -- --check` in `ui/`; when the container image or its inputs change, also run `docker build -t agentscm . && .github/docker-smoke.sh agentscm`. Tests needing PostgreSQL or S3 skip unless `AGENTSCM_TEST_DATABASE_URL` or `AGENTSCM_TEST_S3_*` are set; report such skips as coverage limits, not passes.
+
+   Reuse a completed final gate only under `docs/contributor-testing.md`, after comparing the tested inputs and retaining the original commands, results, snapshot and comparison. Relevant changes invalidate affected evidence; runner or test-configuration changes require the full nextest suite and doctests. Applicable reviews remain required.
 
    If a required check cannot run, stop and report the failure or missing prerequisite explicitly.
 7. Re-read `git diff --staged` and verify that it contains no credentials, confidential information, machine-specific paths, unrelated edits, or accidental generated files.

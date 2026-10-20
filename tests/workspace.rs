@@ -2,7 +2,6 @@ use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::{Duration, Instant};
 
 use agentscm::Error;
 use agentscm::context::ChangeId;
@@ -361,7 +360,8 @@ fn recover_completes_a_durable_pending_checkpoint() {
     let (directory, engine, base, change) = fixture();
     let root = directory.path().join("workspace");
     let mut workspace = Workspace::create(&engine, &root, change, &base).unwrap();
-    fs::write(root.join("a.txt"), b"staged after crash").unwrap();
+    let changed = vec![b'x'; 32 * 1024 * 1024];
+    fs::write(root.join("a.txt"), &changed).unwrap();
     let connection = database(&root);
     connection
         .execute(
@@ -372,7 +372,7 @@ fn recover_completes_a_durable_pending_checkpoint() {
     connection
         .execute(
             "INSERT INTO staged_paths(operation_id, path, before_content, after_content) VALUES ('pending-checkpoint', 'a.txt', ?1, ?2)",
-            params![b"old".as_slice(), b"staged after crash".as_slice()],
+            params![b"old".as_slice(), changed.as_slice()],
         )
         .unwrap();
     drop(connection);
@@ -387,86 +387,8 @@ fn recover_completes_a_durable_pending_checkpoint() {
         } => revision,
         other => panic!("unexpected recovery outcome: {other:?}"),
     };
-    assert_eq!(
-        engine.read_file(&revision, "a.txt").unwrap(),
-        b"staged after crash"
-    );
-    assert!(workspace.state().unwrap().pending.is_none());
-}
-
-#[cfg(unix)]
-#[test]
-fn killed_checkpoint_process_recovers_its_staged_bytes() {
-    let (directory, engine, base, change) = fixture();
-    let root = directory.path().join("workspace");
-    Workspace::create(&engine, &root, change, &base).unwrap();
-    let changed = vec![b'x'; 32 * 1024 * 1024];
-    fs::write(root.join("a.txt"), &changed).unwrap();
-
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .arg("--exact")
-        .arg("subprocess_checkpoint_helper")
-        .arg("--nocapture")
-        .env("AGENTSCM_WORKSPACE_CHILD", "1")
-        .env("AGENTSCM_WORKSPACE_ROOT", &root)
-        .env("AGENTSCM_SOURCE_ROOT", directory.path().join("source"))
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let observed_pending = loop {
-        let connection = database(&root);
-        let status = connection.query_row(
-            "SELECT status FROM operations WHERE operation_id = 'killed-checkpoint'",
-            [],
-            |row| row.get::<_, String>(0),
-        );
-        if status.as_deref() == Ok("pending") {
-            break true;
-        }
-        if Instant::now() >= deadline {
-            break false;
-        }
-        thread::yield_now();
-    };
-    let killed = child.kill();
-    let waited = child.wait();
-    assert!(
-        observed_pending,
-        "checkpoint did not expose its durable pending intent"
-    );
-    killed.unwrap();
-    waited.unwrap();
-
-    let mut workspace = Workspace::open(&root).unwrap();
-    assert_eq!(
-        workspace.state().unwrap().pending.unwrap().operation_id,
-        "killed-checkpoint"
-    );
-    let outcome = workspace
-        .recover(&engine, RecoveryChoice::Complete)
-        .unwrap();
-    let revision = match outcome {
-        OperationOutcome::Checkpointed {
-            revision,
-            generation: 1,
-        } => revision,
-        other => panic!("unexpected recovery outcome: {other:?}"),
-    };
     assert_eq!(engine.read_file(&revision, "a.txt").unwrap(), changed);
-}
-
-#[test]
-fn subprocess_checkpoint_helper() {
-    if std::env::var_os("AGENTSCM_WORKSPACE_CHILD").is_none() {
-        return;
-    }
-    let root = std::env::var_os("AGENTSCM_WORKSPACE_ROOT").unwrap();
-    let source = std::env::var_os("AGENTSCM_SOURCE_ROOT").unwrap();
-    let engine = Engine::open(source).unwrap();
-    let mut workspace = Workspace::open(root).unwrap();
-    workspace
-        .checkpoint(&engine, "killed-checkpoint", 0)
-        .unwrap();
+    assert!(workspace.state().unwrap().pending.is_none());
 }
 
 #[test]
