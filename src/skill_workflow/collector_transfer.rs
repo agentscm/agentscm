@@ -1593,7 +1593,8 @@ impl<T: crate::reviewer::ModelTransport + Sync> crate::reviewer::ModelTransport
     }
 }
 
-#[cfg(test)]
+// Every test drives the Unix-only `TrustedLocalCollector`.
+#[cfg(all(test, unix))]
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
