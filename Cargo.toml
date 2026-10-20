@@ -38,6 +38,11 @@ tempfile = "=3.25.0"
 strip = true
 lto = "thin"
 
-# Linux embeds DWARF in the binary; full debuginfo makes the test binary exceed the 128 MiB native bundle limit.
+# Keep line-level diagnostics without full variable debug information.
 [profile.dev]
 debug = "line-tables-only"
+
+# Packaging integration tests copy the actual CLI. Omit embedded DWARF from test
+# executables so debug metadata does not consume the native bundle's 128 MiB limit.
+[profile.test]
+strip = "debuginfo"
