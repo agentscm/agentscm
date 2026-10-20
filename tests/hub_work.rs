@@ -533,7 +533,8 @@ fn native_and_automatic_starts_have_explicit_retry_rules(db: &Db) {
         WorkConflictKind::MetadataChanged
     );
 
-    let automatic = automatic_start("automatic", "auto-session");
+    let mut automatic = automatic_start("automatic", "auto-session");
+    automatic.scope = vec!["automatic/**".into()];
     let auto_first = store
         .work_start_auto(&alice.token, &automatic, now + 3)
         .unwrap();
@@ -545,7 +546,11 @@ fn native_and_automatic_starts_have_explicit_retry_rules(db: &Db) {
     let auto_changed = store
         .work_start_auto(
             &alice.token,
-            &automatic_start("different", "auto-session"),
+            &{
+                let mut changed = automatic_start("different", "auto-session");
+                changed.scope = vec!["automatic/**".into()];
+                changed
+            },
             now + 5,
         )
         .unwrap();
@@ -557,7 +562,11 @@ fn native_and_automatic_starts_have_explicit_retry_rules(db: &Db) {
     let other_session = store
         .work_start_auto(
             &alice.token,
-            &automatic_start("automatic", "other-session"),
+            &{
+                let mut other = automatic_start("automatic", "other-session");
+                other.scope = vec!["other/**".into()];
+                other
+            },
             now + 6,
         )
         .unwrap();
@@ -737,16 +746,16 @@ fn repository_namespaces_fence_work_and_relations(db: &Db) {
     let store = db.open();
     let alice = agent(&*store, 1);
     let now = unix_now();
+    let mut target_start = native_start("target", "target", "target");
+    target_start.scope = vec!["target/**".into()];
     let target = store
-        .work_start(
-            &alice.token,
-            &native_start("target", "target", "target"),
-            now,
-        )
+        .work_start(&alice.token, &target_start, now)
         .unwrap()
         .item;
+    let mut local_start = native_start("local", "local", "local");
+    local_start.scope = vec!["local/**".into()];
     let local = store
-        .work_start(&alice.token, &native_start("local", "local", "local"), now)
+        .work_start(&alice.token, &local_start, now)
         .unwrap()
         .item;
 
@@ -1176,12 +1185,10 @@ fn stale_observed_pause_cannot_overwrite_newer_checkpoint(db: &Db) {
     .enumerate()
     {
         let session = format!("cas-{index}");
+        let mut start = native_start(&format!("cas-{index}"), "CAS work", &session);
+        start.scope = vec![format!("src/cas-{index}.rs")];
         let started = store
-            .work_start(
-                &lead.token,
-                &native_start(&format!("cas-{index}"), "CAS work", &session),
-                now + index as i64 * 10,
-            )
+            .work_start(&lead.token, &start, now + index as i64 * 10)
             .unwrap()
             .item;
         let observed = started.updated_seq;
@@ -1231,12 +1238,10 @@ fn stale_observed_pause_cannot_overwrite_newer_checkpoint(db: &Db) {
     }
 
     let session = "cas-retry";
+    let mut retry_start = native_start("cas-retry", "CAS retry", session);
+    retry_start.scope = vec!["src/cas-retry.rs".into()];
     let started = store
-        .work_start(
-            &lead.token,
-            &native_start("cas-retry", "CAS retry", session),
-            now + 40,
-        )
+        .work_start(&lead.token, &retry_start, now + 40)
         .unwrap()
         .item;
     assert_invalid(
@@ -1398,17 +1403,19 @@ fn concurrent_deliveries_and_acks_are_monotonic_and_retryable(db: &Db) {
     let after = store
         .work_briefing(&first.token, &BriefingQuery::default(), now + 5)
         .unwrap();
-    assert_eq!(after.from, newest.through);
+    assert_eq!(after.from, initial[0].through);
+    assert_eq!(after.through, newest.through);
     assert!(after.complete);
-    store
-        .work_ack(
+    assert_invalid(
+        store.work_ack(
             &second.token,
             &BriefingAck {
                 delivery: old_delivery,
             },
             now + 6,
-        )
-        .unwrap();
+        ),
+        "delivery is unknown or incomplete",
+    );
     let (used, aggregate) = db.work_usage_and_aggregate();
     assert_eq!(used, aggregate);
     store
@@ -1422,7 +1429,7 @@ fn concurrent_deliveries_and_acks_are_monotonic_and_retryable(db: &Db) {
         .unwrap();
 
     // Acknowledged receipts remain retryable for 24 hours and do not consume the
-    // eight-delivery bound.
+    // token's eight-delivery bound.
     for offset in 0..9 {
         let page = store
             .work_briefing(
@@ -1434,7 +1441,7 @@ fn concurrent_deliveries_and_acks_are_monotonic_and_retryable(db: &Db) {
         assert!(page.complete);
         store
             .work_ack(
-                &second.token,
+                &first.token,
                 &BriefingAck {
                     delivery: page.delivery.unwrap(),
                 },
@@ -1592,6 +1599,7 @@ fn compaction_preserves_baselines_and_expires_old_receipts(db: &Db) {
             &reader.token,
             &BriefingQuery {
                 delivery: None,
+                subscriber: None,
                 after: Some(fixed.next_after),
                 work_after: fixed.next_work_after,
                 work_done: fixed.next_work_done,
@@ -1800,6 +1808,76 @@ fn concurrent_delivery_reservations_enforce_capacity_and_roll_back(db: &Db) {
     assert_eq!(db.delivery_count(), 2);
 }
 
+fn briefing_sessions_on_one_token_have_independent_cursors(db: &Db) {
+    let store = db.open();
+    let lead = agent(&*store, 1);
+    let now = unix_now();
+    let item = store
+        .work_start(
+            &lead.token,
+            &native_start("session-cursors", "Session cursors", "lead-session"),
+            now,
+        )
+        .unwrap()
+        .item;
+    let query = |subscriber: &str| BriefingQuery {
+        subscriber: Some(subscriber.into()),
+        ..BriefingQuery::default()
+    };
+    let first_a = store
+        .work_briefing(&lead.token, &query("subscriber-a"), now + 1)
+        .unwrap();
+    let first_b = store
+        .work_briefing(&lead.token, &query("subscriber-b"), now + 1)
+        .unwrap();
+    assert_eq!(first_a.subscriber.as_deref(), Some("subscriber-a"));
+    assert_eq!(first_b.subscriber.as_deref(), Some("subscriber-b"));
+    assert_eq!(first_a.from, 0);
+    assert_eq!(first_b.from, 0);
+    assert_eq!(first_a.through, first_b.through);
+    store
+        .work_ack(
+            &lead.token,
+            &BriefingAck {
+                delivery: first_a.delivery.clone().unwrap(),
+            },
+            now + 2,
+        )
+        .unwrap();
+
+    let mut progress = checkpoint(
+        &item.id,
+        "session-cursor-progress",
+        1,
+        "lead-session",
+        CheckpointKind::Progress,
+        "session cursor event",
+    );
+    progress.expected_updated_seq = Some(item.updated_seq);
+    store
+        .work_checkpoint(&lead.token, &progress, now + 3)
+        .unwrap();
+
+    let next_a = store
+        .work_briefing(&lead.token, &query("subscriber-a"), now + 4)
+        .unwrap();
+    let next_b = store
+        .work_briefing(&lead.token, &query("subscriber-b"), now + 4)
+        .unwrap();
+    assert_eq!(next_a.from, first_a.through);
+    assert_eq!(next_b.from, 0);
+    assert_eq!(next_a.through, next_b.through);
+
+    let mut wrong_subscriber = query("subscriber-b");
+    wrong_subscriber.delivery = next_a.delivery;
+    wrong_subscriber.after = Some(next_a.after);
+    wrong_subscriber.through = Some(next_a.through);
+    assert_invalid(
+        store.work_briefing(&lead.token, &wrong_subscriber, now + 5),
+        "unknown briefing delivery",
+    );
+}
+
 macro_rules! conformance {
     ($($case:ident),* $(,)?) => {
         mod on_sqlite {
@@ -1827,4 +1905,5 @@ conformance!(
     compaction_delete_exception_is_exact_and_updates_remain_prohibited,
     postgres_read_briefings_share_the_repository_maintenance_lock,
     concurrent_delivery_reservations_enforce_capacity_and_roll_back,
+    briefing_sessions_on_one_token_have_independent_cursors,
 );

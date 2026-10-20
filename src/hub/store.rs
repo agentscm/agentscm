@@ -8,6 +8,10 @@ use serde_json::{Value, json};
 use super::connection::{
     ConnectedRepository, Connection, NewConnection, Observation, Observed, Outbound,
 };
+use super::coordination::{
+    CoordinationAck, CoordinationInbox, CoordinationInboxQuery, CoordinationListQuery,
+    CoordinationReply, CoordinationRequest, CoordinationResolve, CoordinationWithdraw,
+};
 use super::handoff::{Answered, Asked};
 use super::intent::{Announced, Intent, NewIntent};
 use super::publish::{Create, NewPublication, Publication, Update};
@@ -16,7 +20,8 @@ use super::store_pg::PgStore;
 use super::store_sqlite::SqliteStore;
 use super::work::{
     Briefing, BriefingAck, BriefingQuery, WorkCheckpoint, WorkCheckpointResult, WorkCompaction,
-    WorkItem, WorkRepositoryScope, WorkStart, WorkStartResult,
+    WorkItem, WorkOverview, WorkOverviewQuery, WorkRepositoryScope, WorkScopeCheck, WorkStart,
+    WorkStartResult,
 };
 use super::{HubError, Result};
 use crate::team::auth::{Secret, generate_secret, lower_hex, token_digest};
@@ -339,7 +344,68 @@ pub trait Store: Send + Sync {
     fn session_name_for(&self, token: &str, session: Option<&str>, now: i64) -> Result<String>;
     fn work_briefing(&self, token: &str, query: &BriefingQuery, now: i64) -> Result<Briefing>;
     /// Side-effect-free current page for hooks and implicit contexts; never ackable.
-    fn work_briefing_preview(&self, token: &str, limit: usize, now: i64) -> Result<Briefing>;
+    fn work_briefing_preview(&self, token: &str, limit: usize, now: i64) -> Result<Briefing> {
+        self.work_briefing_preview_for(token, None, limit, now)
+    }
+    /// Like `work_briefing_preview`, with an isolated explicit subscriber/session cursor.
+    fn work_briefing_preview_for(
+        &self,
+        token: &str,
+        subscriber: Option<&str>,
+        limit: usize,
+        now: i64,
+    ) -> Result<Briefing>;
+    /// Read-only current work, recent decisions/completions and declared-scope overlaps.
+    fn work_overview(
+        &self,
+        token: &str,
+        query: &WorkOverviewQuery,
+        now: i64,
+    ) -> Result<WorkOverview>;
+    /// Check whether one lead session's durable claim covers requested paths. Never writes.
+    fn work_scope_check(
+        &self,
+        token: &str,
+        session: &str,
+        scope: &[String],
+        now: i64,
+    ) -> Result<WorkScopeCheck>;
+    fn coordination_inbox(
+        &self,
+        token: &str,
+        query: &CoordinationInboxQuery,
+        now: i64,
+    ) -> Result<CoordinationInbox>;
+    fn coordination_list(
+        &self,
+        token: &str,
+        query: &CoordinationListQuery,
+        now: i64,
+    ) -> Result<CoordinationInbox>;
+    fn coordination_ack(
+        &self,
+        token: &str,
+        ack: &CoordinationAck,
+        now: i64,
+    ) -> Result<CoordinationRequest>;
+    fn coordination_reply(
+        &self,
+        token: &str,
+        reply: &CoordinationReply,
+        now: i64,
+    ) -> Result<CoordinationRequest>;
+    fn coordination_resolve(
+        &self,
+        token: &str,
+        resolve: &CoordinationResolve,
+        now: i64,
+    ) -> Result<CoordinationRequest>;
+    fn coordination_withdraw(
+        &self,
+        token: &str,
+        withdraw: &CoordinationWithdraw,
+        now: i64,
+    ) -> Result<CoordinationRequest>;
     fn work_ack(&self, token: &str, ack: &BriefingAck, now: i64) -> Result<()>;
     /// Local operator maintenance. `apply = false` is a side-effect-free preview.
     fn work_compact(
@@ -695,6 +761,26 @@ const MIGRATIONS: &[Migration] = &[
         sqlite: include_str!("migrations/0010_work.sqlite.sql"),
         postgres: include_str!("migrations/0010_work.pg.sql"),
     },
+    Migration {
+        version: 11,
+        sqlite: include_str!("migrations/0011_work_subscribers.sqlite.sql"),
+        postgres: include_str!("migrations/0011_work_subscribers.pg.sql"),
+    },
+    Migration {
+        version: 12,
+        sqlite: include_str!("migrations/0012_work_subscriber_sessions.sqlite.sql"),
+        postgres: include_str!("migrations/0012_work_subscriber_sessions.pg.sql"),
+    },
+    Migration {
+        version: 13,
+        sqlite: include_str!("migrations/0013_coordination_requests.sqlite.sql"),
+        postgres: include_str!("migrations/0013_coordination_requests.pg.sql"),
+    },
+    Migration {
+        version: 14,
+        sqlite: include_str!("migrations/0014_coordination_retention.sqlite.sql"),
+        postgres: include_str!("migrations/0014_coordination_retention.pg.sql"),
+    },
 ];
 
 /// Migrations not yet applied. The registry must be numbered 1..n and the
@@ -733,12 +819,17 @@ mod tests {
 
     #[test]
     fn pending_requires_an_applied_prefix() {
-        assert_eq!(pending(&[]).unwrap().len(), 10);
-        assert_eq!(pending(&[1]).unwrap().len(), 9);
-        assert_eq!(pending(&[1, 2, 3]).unwrap().len(), 7);
-        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap().len(), 2);
-        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap().len(), 1);
-        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]).unwrap().len(), 0);
+        assert_eq!(pending(&[]).unwrap().len(), 14);
+        assert_eq!(pending(&[1]).unwrap().len(), 13);
+        assert_eq!(pending(&[1, 2, 3]).unwrap().len(), 11);
+        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap().len(), 6);
+        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap().len(), 5);
+        assert_eq!(
+            pending(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14])
+                .unwrap()
+                .len(),
+            0
+        );
         assert!(pending(&[2]).is_err());
         let newer = pending(&[1, 999]).err().unwrap().to_string();
         assert!(newer.contains("newer than this binary"), "{newer}");

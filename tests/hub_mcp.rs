@@ -183,40 +183,56 @@ async fn protocol_basics() {
             "agentscm_done",
             "agentscm_ask",
             "agentscm_handoff",
+            "agentscm_work_overview",
             "agentscm_work_briefing",
+            "agentscm_coordination_inbox",
             "agentscm_work_checkpoint",
             "agentscm_work_ack",
-            "agentscm_workflow_status"
+            "agentscm_workflow_status",
+            "agentscm_coordination_ack",
+            "agentscm_coordination_reply",
+            "agentscm_coordination_resolve",
+            "agentscm_coordination_withdraw",
         ]
     );
-    assert_eq!(names.len(), 10);
+    let tool = |name: &str| {
+        listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap()
+    };
     assert_eq!(
-        listed["result"]["tools"][4]["inputSchema"]["required"],
+        tool("agentscm_ask")["inputSchema"]["required"],
         json!(["path"])
     );
     assert_eq!(
-        listed["result"]["tools"][5]["inputSchema"]["required"],
+        tool("agentscm_handoff")["inputSchema"]["required"],
         json!(["path", "accept"])
     );
-    assert!(listed["result"]["tools"][1]["inputSchema"]["required"] == json!(["paths"]));
     assert_eq!(
-        listed["result"]["tools"][9]["inputSchema"]["required"],
+        tool("agentscm_check")["inputSchema"]["required"],
+        json!(["paths"])
+    );
+    assert_eq!(
+        tool("agentscm_workflow_status")["inputSchema"]["required"],
         json!(["run_id"])
     );
     assert_eq!(
-        listed["result"]["tools"][9]["inputSchema"]["additionalProperties"],
+        tool("agentscm_workflow_status")["inputSchema"]["additionalProperties"],
         false
     );
+    for name in [
+        "agentscm_workflow_status",
+        "agentscm_work_overview",
+        "agentscm_work_briefing",
+        "agentscm_coordination_inbox",
+    ] {
+        assert_eq!(tool(name)["annotations"]["readOnlyHint"], true);
+    }
     assert_eq!(
-        listed["result"]["tools"][9]["annotations"]["readOnlyHint"],
-        true
-    );
-    assert_eq!(
-        listed["result"]["tools"][6]["annotations"]["readOnlyHint"],
-        true
-    );
-    assert_eq!(
-        listed["result"]["tools"][7]["inputSchema"]["required"],
+        tool("agentscm_work_checkpoint")["inputSchema"]["required"],
         json!([
             "work_id",
             "operation_id",
@@ -228,7 +244,7 @@ async fn protocol_basics() {
         ])
     );
     assert_eq!(
-        listed["result"]["tools"][7]["inputSchema"]["properties"]["expected_updated_seq"]["type"],
+        tool("agentscm_work_checkpoint")["inputSchema"]["properties"]["expected_updated_seq"]["type"],
         "integer"
     );
 
@@ -329,7 +345,7 @@ async fn two_agents_round_trip_to_a_stop() {
             &bob,
             "/mcp",
             "agentscm_start",
-            json!({"task": "refactor docs"}),
+            json!({"task": "refactor docs", "paths": ["docs/a.md"]}),
         )
         .await;
     assert!(!error);
@@ -359,15 +375,10 @@ async fn two_agents_round_trip_to_a_stop() {
             json!({"paths": ["src/billing.rs"]}),
         )
         .await;
-    assert!(!error);
-    assert!(
-        stop.starts_with("AgentSCM: another agent is already working on src/billing.rs."),
-        "{stop}"
-    );
-    assert!(stop.contains("alice-agent"), "{stop}");
-
-    // Checked once, not reported again.
-    let (again, _) = hub
+    assert!(error);
+    assert!(stop.contains("outside the declared work scope"), "{stop}");
+    // Repeating an undeclared edit cannot turn the refusal into permission.
+    let (again, error) = hub
         .tool(
             &bob,
             "/mcp",
@@ -375,22 +386,17 @@ async fn two_agents_round_trip_to_a_stop() {
             json!({"paths": ["src/billing.rs"]}),
         )
         .await;
-    assert_eq!(
-        again,
-        "AgentSCM: nothing new about these files since this session's last report."
+    assert!(
+        error && again.contains("outside the declared work scope"),
+        "{again}"
     );
-
-    // Alice's next heartbeat carries the notice that bob came after her.
     let (status, error) = hub.tool(&alice, "/mcp", "agentscm_status", json!({})).await;
     assert!(!error);
     assert!(
-        status.contains("started working on src/billing.rs"),
+        !status.contains("started working on src/billing.rs"),
         "{status}"
     );
-    assert!(
-        status.contains("1 other agent") && status.contains("no open pull requests"),
-        "{status}"
-    );
+    assert!(status.contains("1 other agent"), "{status}");
 
     let (done, _) = hub.tool(&bob, "/mcp", "agentscm_done", json!({})).await;
     assert!(
@@ -414,13 +420,33 @@ async fn a_refused_agent_asks_and_the_holder_hands_the_file_over() {
         async move { hub.tool(&secret, "/mcp", &name, arguments).await }
     };
 
-    call(
-        &alice,
-        "agentscm_start",
-        json!({"task": "fix billing", "paths": [file]}),
-    )
-    .await;
-    call(&bob, "agentscm_start", json!({"task": "refactor"})).await;
+    // Exercise the legacy advisory handoff contract. Managed assignments require
+    // an agreed durable join/scope change before accepting a transferred file.
+    for (secret, task, paths) in [
+        (&alice, "fix billing", vec![file.to_owned()]),
+        (&bob, "refactor", vec![]),
+    ] {
+        let token = hub
+            .store
+            .authenticate(&store::agent_token_digest(secret).unwrap(), unix_now())
+            .unwrap()
+            .unwrap()
+            .token_id;
+        hub.store
+            .touch_session(
+                &token,
+                &agentscm::hub::session::SessionCall {
+                    session: None,
+                    via: "mcp".into(),
+                    task: Some(task.into()),
+                    paths,
+                    deny: false,
+                    report: true,
+                },
+                unix_now(),
+            )
+            .unwrap();
+    }
     let (nobody, _) = call(&bob, "agentscm_ask", json!({"path": "src/free.rs"})).await;
     assert_eq!(
         nobody,
@@ -871,7 +897,7 @@ async fn errors_are_tool_results_with_fixed_text() {
         )
         .await;
     assert!(error && !text.contains("sekrit"), "{text}");
-    assert!(text.contains("(invalid request)"), "{text}");
+    assert!(text.contains("invalid_or_changed"), "{text}");
 
     // An unknown tool or a call without a name is a protocol error.
     for params in [json!({"name": "nope"}), json!({}), json!("x")] {

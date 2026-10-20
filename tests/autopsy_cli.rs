@@ -143,16 +143,18 @@ fn file_names_cannot_reorder_or_escape_the_output() {
     fs::create_dir(repo.path().join(".git")).unwrap();
     let root = repo.path().canonicalize().unwrap();
     let logs = TempDir::new().unwrap();
-    // A name with a control character is not a path the hub would hold, so it never counts;
-    // one with a bidirectional override does, and is printed without it.
+    // Neither terminal controls nor hidden direction changes are paths the hub
+    // would hold. A normal path still counts alongside these rejected names.
     let escape = root.join("esc\u{1b}[31m.rs");
     let bidi = root.join("evil\u{202e}.rs");
+    let safe = root.join("safe.rs");
     write_log(
         logs.path(),
         "s1",
         &[
             edit_line("s1", "a", &escape, 600),
             edit_line("s1", "a", &bidi, 590),
+            edit_line("s1", "a", &safe, 580),
         ],
     );
     write_log(
@@ -161,11 +163,13 @@ fn file_names_cannot_reorder_or_escape_the_output() {
         &[
             edit_line("s2", "b", &escape, 300),
             edit_line("s2", "b", &bidi, 290),
+            edit_line("s2", "b", &safe, 280),
         ],
     );
     let text = stdout(&autopsy(repo.path(), logs.path(), &[]));
     assert!(text.contains("1 near-miss"), "{text}");
-    assert!(text.contains("evil.rs"), "{text}");
+    assert!(text.contains("safe.rs"), "{text}");
+    assert!(!text.contains("evil") && !text.contains("esc"), "{text}");
     assert!(
         !text.contains('\u{1b}') && !text.contains('\u{202e}'),
         "{text:?}"

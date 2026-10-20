@@ -21,7 +21,7 @@ const SESSION_CHARS: usize = 128;
 const NOTE_CHARS: usize = 200;
 
 /// Zero-width, bidirectional and tag characters can hide or reorder text.
-fn invisible(c: char) -> bool {
+pub(super) fn invisible(c: char) -> bool {
     matches!(c, '\u{00AD}' | '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}'
         | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}'
         | '\u{E0000}'..='\u{E007F}')

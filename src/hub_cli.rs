@@ -216,6 +216,15 @@ pub(crate) fn map_hub_error(error: HubError) -> Error {
         HubError::WorkCapacity => Error::Invalid(
             "repository work storage capacity reached; operator compaction required".into(),
         ),
+        HubError::WorkOverlap(_) => {
+            Error::Invalid("declared work scope overlaps another assignment".into())
+        }
+        HubError::WorkCoordinationRequired { .. } => {
+            Error::Invalid("work scope needs coordination; inspect the agent inbox".into())
+        }
+        HubError::WorkOverlapIncomplete => {
+            Error::Invalid("work overlap coverage is incomplete; no scope was claimed".into())
+        }
         HubError::Unavailable(message) => Error::Invalid(format!("hub unavailable: {message}")),
     }
 }

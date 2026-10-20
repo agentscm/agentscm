@@ -6,6 +6,9 @@ const MAX_SCOPE = 256
 const MAX_RELATED = 100
 const MAX_PARTICIPANTS = 100
 const MAX_REFS = 100
+const MAX_OVERLAPS = (MAX_PAGE * (MAX_PAGE - 1)) / 2
+const MAX_COORDINATION_UPDATES = MAX_PAGE * MAX_PAGE
+const MAX_COORDINATION_REASONS = 4
 const MAX_TEXT_BYTES = 500
 const MAX_LABEL_BYTES = 255
 const textEncoder = new TextEncoder()
@@ -15,6 +18,9 @@ export type WorkState = 'active' | 'blocked' | 'paused' | 'finished' | 'handover
 export type ClaimStatus = 'active' | 'stale' | 'unknown'
 export type CheckpointKind = 'progress' | 'decision' | 'blocker' | 'pause' | 'finish' | 'handover'
 export type WorkEventKind = 'work_started' | 'work_joined' | 'work_takeover' | 'work_checkpoint'
+export type WorkOutcomeKind = 'decision' | 'completion'
+export type CoordinationStatus = 'pending' | 'responded' | 'resolved' | 'withdrawn'
+export type CoordinationResponseKind = 'propose_split' | 'join' | 'handover' | 'decline'
 
 export type WorkSource =
   | { kind: 'native'; request_key: string }
@@ -107,10 +113,144 @@ export interface StandupBriefing {
   complete: boolean
 }
 
+export interface WorkOutcome {
+  seq: number
+  at: number
+  kind: WorkOutcomeKind
+  item: WorkItem
+}
+
+export interface WorkPathPair {
+  left_path: string
+  right_path: string
+}
+
+export interface WorkOverlapPair {
+  left: WorkItem
+  right: WorkItem
+  reasons: WorkPathPair[]
+  reasons_complete: boolean
+}
+
+export interface WorkOverview {
+  recent_since: number
+  until: number
+  current: WorkItem[]
+  recent: WorkOutcome[]
+  overlaps: WorkOverlapPair[]
+  current_complete: boolean
+  recent_complete: boolean
+  overlaps_complete: boolean
+  history_retention_gap: boolean
+}
+
+export interface CoordinationAgent {
+  token: string
+  agent: string
+  session: string
+  owner: string
+  login: string
+}
+
+export interface ForgeWorkRef {
+  provider: string
+  host: string
+  repository: string
+  issue: string
+}
+
+export interface CoordinationProposal {
+  work_id: string | null
+  source: ForgeWorkRef | null
+  request_key: string | null
+  title: string
+  scope: string[]
+}
+
+export interface CoordinationTarget {
+  work_id: string
+  lead: CoordinationAgent
+  generation: number
+  reasons: { your_path: string; their_path: string }[]
+  reasons_complete: boolean
+}
+
+export interface CoordinationAcknowledgement {
+  target_work_id: string | null
+  agent: CoordinationAgent
+  generation: number
+  through_seq: number
+  acknowledged_at: number
+  seq: number
+}
+
+export interface CoordinationResponse {
+  id: string
+  operation_id: string
+  target_work_id: string
+  responder: CoordinationAgent
+  target_generation: number
+  kind: CoordinationResponseKind
+  note: string | null
+  created_at: number
+  seq: number
+}
+
+export interface CoordinationRequest {
+  id: string
+  requester: CoordinationAgent
+  proposal: CoordinationProposal
+  targets: CoordinationTarget[]
+  status: CoordinationStatus
+  acknowledgements: CoordinationAcknowledgement[]
+  acknowledgements_complete: boolean
+  responses: CoordinationResponse[]
+  responses_complete: boolean
+  created_at: number
+  updated_at: number
+  created_seq: number
+  updated_seq: number
+}
+
+export interface CoordinationBriefing {
+  from: number
+  through: number
+  next_after: number
+  requests: CoordinationRequest[]
+  complete: boolean
+  retention_gap: boolean
+}
+
+export function hasMoreBriefing(briefing: StandupBriefing, view: 'current' | 'changes'): boolean {
+  return !briefing.complete && (view === 'current' ? !briefing.next_work_done : briefing.next_after < briefing.through)
+}
+
+export function workMatchesSearch(item: WorkItem, search: string): boolean {
+  const normalized = search.trim().toLocaleLowerCase()
+  if (!normalized) return true
+  const source = item.source.kind === 'native' ? item.source.request_key : `${item.source.provider} ${item.source.repository} ${item.source.issue}`
+  return [item.title, item.owner_login, item.blocker?.summary, item.next_action, source,
+    ...item.scope,
+    ...item.participants.flatMap((participant) => [participant.agent, participant.login])]
+    .some((value) => value?.toLocaleLowerCase().includes(normalized))
+}
+
 export interface BriefingQuery {
   after?: number
   workAfter?: string
   workDone?: boolean
+  through?: number
+  limit?: number
+}
+
+export interface OverviewQuery {
+  recentSince?: number
+  limit?: number
+}
+
+export interface CoordinationQuery {
+  activeOnly?: boolean
+  after?: number
   through?: number
   limit?: number
 }
@@ -122,15 +262,20 @@ const fail = (field: string): never => {
 }
 const record = (value: unknown, field: string): Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : fail(field)
+const hiddenText = /[\p{Cc}\u00ad\u061c\u200b-\u200f\u2028-\u202e\u2060-\u2064\u2066-\u206f\ufeff\u{e0000}-\u{e007f}]/u
 const boundedText = (value: unknown, field: string, maxBytes = MAX_TEXT_BYTES): string => {
   const result = typeof value === 'string' ? value : fail(field)
-  if (textEncoder.encode(result).byteLength > maxBytes) fail(field)
+  if (textEncoder.encode(result).byteLength > maxBytes || hiddenText.test(result)) fail(field)
   return result
 }
 const nullableText = (value: unknown, field: string, maxBytes = MAX_TEXT_BYTES): string | null =>
   value === null ? null : boundedText(value, field, maxBytes)
 const safeInteger = (value: unknown, field: string): number =>
   typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : fail(field)
+const timestamp = (value: unknown, field: string): number => {
+  const result = safeInteger(value, field)
+  return result <= 8_640_000_000_000 ? result : fail(field)
+}
 const positiveInteger = (value: unknown, field: string): number => {
   const result = safeInteger(value, field)
   return result > 0 ? result : fail(field)
@@ -149,6 +294,11 @@ const STATES = new Set<WorkState>(['active', 'blocked', 'paused', 'finished', 'h
 const CLAIM_STATUSES = new Set<ClaimStatus>(['active', 'stale', 'unknown'])
 const CHECKPOINT_KINDS = new Set<CheckpointKind>(['progress', 'decision', 'blocker', 'pause', 'finish', 'handover'])
 const EVENT_KINDS = new Set<WorkEventKind>(['work_started', 'work_joined', 'work_takeover', 'work_checkpoint'])
+const OUTCOME_KINDS = new Set<WorkOutcomeKind>(['decision', 'completion'])
+const COORDINATION_STATUSES = new Set<CoordinationStatus>(['pending', 'responded', 'resolved', 'withdrawn'])
+const COORDINATION_RESPONSE_KINDS = new Set<CoordinationResponseKind>(['propose_split', 'join', 'handover', 'decline'])
+const COORDINATION_ID = /^crq_[0-9a-f]{32}$/
+const COORDINATION_RESPONSE_ID = /^crs_[0-9a-f]{32}$/
 
 export const validWorkId = (value: string): boolean => WORK_ID.test(value)
 
@@ -231,7 +381,7 @@ function checkpoint(value: unknown): WorkCheckpoint | null {
     summary: boundedText(item['summary'], 'work.current.summary'),
     next_action: nullableText(item['next_action'], 'work.current.next_action'),
     source_refs: list(item['source_refs'], MAX_REFS, 'work.current.source_refs').map(sourceRef),
-    at: safeInteger(item['at'], 'work.current.at'),
+    at: timestamp(item['at'], 'work.current.at'),
     token: label(item['token'], 'work.current.token'),
     agent: label(item['agent'], 'work.current.agent'),
     session: label(item['session'], 'work.current.session'),
@@ -255,7 +405,7 @@ export function decodeWorkItem(value: unknown, expectedId?: string): WorkItem {
     title: boundedText(item['title'], 'work.title'),
     state: enumValue(item['state'], STATES, 'work.state'),
     claim_status: enumValue(item['claim_status'], CLAIM_STATUSES, 'work.claim_status'),
-    last_checkin_at: safeInteger(item['last_checkin_at'], 'work.last_checkin_at'),
+    last_checkin_at: timestamp(item['last_checkin_at'], 'work.last_checkin_at'),
     generation: safeInteger(item['generation'], 'work.generation'),
     lead_token: label(item['lead_token'], 'work.lead_token'),
     lead_agent: label(item['lead_agent'], 'work.lead_agent'),
@@ -269,8 +419,8 @@ export function decodeWorkItem(value: unknown, expectedId?: string): WorkItem {
     blocker: checkpoint(item['blocker']),
     depends_on: dependencies,
     related_work: related,
-    created_at: safeInteger(item['created_at'], 'work.created_at'),
-    updated_at: safeInteger(item['updated_at'], 'work.updated_at'),
+    created_at: timestamp(item['created_at'], 'work.created_at'),
+    updated_at: timestamp(item['updated_at'], 'work.updated_at'),
     created_seq: safeInteger(item['created_seq'], 'work.created_seq'),
     updated_seq: safeInteger(item['updated_seq'], 'work.updated_seq'),
   }
@@ -285,7 +435,7 @@ function event(value: unknown): BriefingEvent {
   const id = workId(item['work_id'], 'briefing.event.work_id')
   return {
     seq: safeInteger(item['seq'], 'briefing.event.seq'),
-    at: safeInteger(item['at'], 'briefing.event.at'),
+    at: timestamp(item['at'], 'briefing.event.at'),
     kind: enumValue(item['kind'], EVENT_KINDS, 'briefing.event.kind'),
     work_id: id,
     item: decodeWorkItem(item['item'], id),
@@ -326,6 +476,210 @@ export function decodeBriefing(value: unknown): StandupBriefing {
   }
 }
 
+function outcome(value: unknown): WorkOutcome {
+  const item = record(value, 'overview.recent.item')
+  const kind = enumValue(item['kind'], OUTCOME_KINDS, 'overview.recent.kind')
+  const work = decodeWorkItem(item['item'])
+  if (kind === 'completion' && work.state !== 'finished') fail('overview.recent.completion.state')
+  return {
+    seq: safeInteger(item['seq'], 'overview.recent.seq'),
+    at: timestamp(item['at'], 'overview.recent.at'),
+    kind,
+    item: work,
+  }
+}
+
+function pathPair(value: unknown): WorkPathPair {
+  const item = record(value, 'overview.overlap.reason')
+  return {
+    left_path: repositoryPath(item['left_path'], 'overview.overlap.reason.left_path'),
+    right_path: repositoryPath(item['right_path'], 'overview.overlap.reason.right_path'),
+  }
+}
+
+function overlapPair(value: unknown): WorkOverlapPair {
+  const item = record(value, 'overview.overlap')
+  const left = decodeWorkItem(item['left'])
+  const right = decodeWorkItem(item['right'])
+  if (left.id === right.id) fail('overview.overlap.work')
+  const reasons = list(item['reasons'], MAX_COORDINATION_REASONS, 'overview.overlap.reasons').map(pathPair)
+  if (reasons.length === 0) fail('overview.overlap.reasons')
+  return { left, right, reasons, reasons_complete: bool(item['reasons_complete'], 'overview.overlap.reasons_complete') }
+}
+
+export function decodeOverview(value: unknown): WorkOverview {
+  const item = record(value, 'overview')
+  const recentSince = timestamp(item['recent_since'], 'overview.recent_since')
+  const until = timestamp(item['until'], 'overview.until')
+  if (recentSince > until) fail('overview.window')
+  const current = list(item['current'], MAX_PAGE, 'overview.current').map((entry) => decodeWorkItem(entry))
+  if (current.some((work) => work.state === 'finished')) fail('overview.current.state')
+  if (new Set(current.map((work) => work.id)).size !== current.length) fail('overview.current.id')
+  const recent = list(item['recent'], MAX_PAGE, 'overview.recent').map(outcome)
+  for (let index = 1; index < recent.length; index++) {
+    if (recent[index - 1]!.seq <= recent[index]!.seq) fail('overview.recent.order')
+  }
+  if (recent.some((entry) => entry.at < recentSince || entry.at > until)) fail('overview.recent.at')
+  const overlaps = list(item['overlaps'], MAX_OVERLAPS, 'overview.overlaps').map(overlapPair)
+  const currentIds = new Set(current.map((work) => work.id))
+  const overlapKeys = new Set<string>()
+  for (const overlap of overlaps) {
+    if (!currentIds.has(overlap.left.id) || !currentIds.has(overlap.right.id)) fail('overview.overlap.current')
+    const key = [overlap.left.id, overlap.right.id].sort().join(':')
+    if (overlapKeys.has(key)) fail('overview.overlap.duplicate')
+    overlapKeys.add(key)
+  }
+  const currentComplete = bool(item['current_complete'], 'overview.current_complete')
+  const recentComplete = bool(item['recent_complete'], 'overview.recent_complete')
+  const overlapsComplete = bool(item['overlaps_complete'], 'overview.overlaps_complete')
+  const historyRetentionGap = bool(item['history_retention_gap'], 'overview.history_retention_gap')
+  if (overlapsComplete && !currentComplete) fail('overview.overlaps_complete')
+  if (historyRetentionGap && recentComplete) fail('overview.recent_complete')
+  return {
+    recent_since: recentSince,
+    until,
+    current,
+    recent,
+    overlaps,
+    current_complete: currentComplete,
+    recent_complete: recentComplete,
+    overlaps_complete: overlapsComplete,
+    history_retention_gap: historyRetentionGap,
+  }
+}
+
+function coordinationAgent(value: unknown, field: string): CoordinationAgent {
+  const item = record(value, field)
+  return {
+    token: label(item['token'], `${field}.token`),
+    agent: label(item['agent'], `${field}.agent`),
+    session: label(item['session'], `${field}.session`),
+    owner: label(item['owner'], `${field}.owner`),
+    login: label(item['login'], `${field}.login`),
+  }
+}
+
+function forgeWorkRef(value: unknown, field: string): ForgeWorkRef {
+  const item = record(value, field)
+  return {
+    provider: label(item['provider'], `${field}.provider`),
+    host: label(item['host'], `${field}.host`),
+    repository: label(item['repository'], `${field}.repository`),
+    issue: label(item['issue'], `${field}.issue`),
+  }
+}
+
+function coordinationRequest(value: unknown): CoordinationRequest {
+  const item = record(value, 'coordination.request')
+  const id = boundedText(item['id'], 'coordination.request.id', 36)
+  if (!COORDINATION_ID.test(id)) fail('coordination.request.id')
+  const proposalValue = record(item['proposal'], 'coordination.request.proposal')
+  const proposal: CoordinationProposal = {
+    work_id: proposalValue['work_id'] === null ? null : workId(proposalValue['work_id'], 'coordination.request.proposal.work_id'),
+    source: proposalValue['source'] === null ? null : forgeWorkRef(proposalValue['source'], 'coordination.request.proposal.source'),
+    request_key: nullableText(proposalValue['request_key'], 'coordination.request.proposal.request_key', MAX_LABEL_BYTES),
+    title: boundedText(proposalValue['title'], 'coordination.request.proposal.title'),
+    scope: list(proposalValue['scope'], MAX_SCOPE, 'coordination.request.proposal.scope').map((entry) => repositoryPath(entry, 'coordination.request.proposal.scope.item')),
+  }
+  const targets = list(item['targets'], MAX_PAGE, 'coordination.request.targets').map((entry) => {
+    const target = record(entry, 'coordination.request.target')
+    const reasons = list(target['reasons'], MAX_COORDINATION_REASONS, 'coordination.request.target.reasons').map((reasonValue) => {
+      const reason = record(reasonValue, 'coordination.request.target.reason')
+      return {
+        your_path: repositoryPath(reason['your_path'], 'coordination.request.target.reason.your_path'),
+        their_path: repositoryPath(reason['their_path'], 'coordination.request.target.reason.their_path'),
+      }
+    })
+    if (reasons.length === 0) fail('coordination.request.target.reasons')
+    return {
+      work_id: workId(target['work_id'], 'coordination.request.target.work_id'),
+      lead: coordinationAgent(target['lead'], 'coordination.request.target.lead'),
+      generation: safeInteger(target['generation'], 'coordination.request.target.generation'),
+      reasons,
+      reasons_complete: bool(target['reasons_complete'], 'coordination.request.target.reasons_complete'),
+    }
+  })
+  if (targets.length === 0 || new Set(targets.map((target) => target.work_id)).size !== targets.length) fail('coordination.request.targets')
+  const targetIds = new Set(targets.map((target) => target.work_id))
+  const acknowledgements = list(item['acknowledgements'], MAX_COORDINATION_UPDATES, 'coordination.request.acknowledgements').map((entry) => {
+    const acknowledgement = record(entry, 'coordination.request.acknowledgement')
+    const targetWorkId = acknowledgement['target_work_id'] === null ? null : workId(acknowledgement['target_work_id'], 'coordination.request.acknowledgement.target_work_id')
+    if (targetWorkId !== null && !targetIds.has(targetWorkId)) fail('coordination.request.acknowledgement.target_work_id')
+    return {
+      target_work_id: targetWorkId,
+      agent: coordinationAgent(acknowledgement['agent'], 'coordination.request.acknowledgement.agent'),
+      generation: safeInteger(acknowledgement['generation'], 'coordination.request.acknowledgement.generation'),
+      through_seq: safeInteger(acknowledgement['through_seq'], 'coordination.request.acknowledgement.through_seq'),
+      acknowledged_at: timestamp(acknowledgement['acknowledged_at'], 'coordination.request.acknowledgement.acknowledged_at'),
+      seq: safeInteger(acknowledgement['seq'], 'coordination.request.acknowledgement.seq'),
+    }
+  })
+  const responses = list(item['responses'], MAX_COORDINATION_UPDATES, 'coordination.request.responses').map((entry) => {
+    const response = record(entry, 'coordination.request.response')
+    const targetWorkId = workId(response['target_work_id'], 'coordination.request.response.target_work_id')
+    if (!targetIds.has(targetWorkId)) fail('coordination.request.response.target_work_id')
+    const responseId = boundedText(response['id'], 'coordination.request.response.id', 36)
+    if (!COORDINATION_RESPONSE_ID.test(responseId)) fail('coordination.request.response.id')
+    return {
+      id: responseId,
+      operation_id: label(response['operation_id'], 'coordination.request.response.operation_id'),
+      target_work_id: targetWorkId,
+      responder: coordinationAgent(response['responder'], 'coordination.request.response.responder'),
+      target_generation: safeInteger(response['target_generation'], 'coordination.request.response.target_generation'),
+      kind: enumValue(response['kind'], COORDINATION_RESPONSE_KINDS, 'coordination.request.response.kind'),
+      note: nullableText(response['note'], 'coordination.request.response.note'),
+      created_at: timestamp(response['created_at'], 'coordination.request.response.created_at'),
+      seq: safeInteger(response['seq'], 'coordination.request.response.seq'),
+    }
+  })
+  const createdAt = timestamp(item['created_at'], 'coordination.request.created_at')
+  const updatedAt = timestamp(item['updated_at'], 'coordination.request.updated_at')
+  const createdSeq = safeInteger(item['created_seq'], 'coordination.request.created_seq')
+  const updatedSeq = safeInteger(item['updated_seq'], 'coordination.request.updated_seq')
+  if (createdAt > updatedAt || createdSeq > updatedSeq) fail('coordination.request.updated')
+  return {
+    id,
+    requester: coordinationAgent(item['requester'], 'coordination.request.requester'),
+    proposal,
+    targets,
+    status: enumValue(item['status'], COORDINATION_STATUSES, 'coordination.request.status'),
+    acknowledgements,
+    acknowledgements_complete: bool(item['acknowledgements_complete'], 'coordination.request.acknowledgements_complete'),
+    responses,
+    responses_complete: bool(item['responses_complete'], 'coordination.request.responses_complete'),
+    created_at: createdAt,
+    updated_at: updatedAt,
+    created_seq: createdSeq,
+    updated_seq: updatedSeq,
+  }
+}
+
+export function decodeCoordinationBriefing(value: unknown): CoordinationBriefing {
+  const item = record(value, 'coordination')
+  const from = safeInteger(item['from'], 'coordination.from')
+  const through = safeInteger(item['through'], 'coordination.through')
+  const nextAfter = safeInteger(item['next_after'], 'coordination.next_after')
+  if (from > nextAfter || nextAfter > through) fail('coordination.sequence')
+  const requests = list(item['requests'], MAX_PAGE, 'coordination.requests').map(coordinationRequest)
+  if (new Set(requests.map((request) => request.id)).size !== requests.length) fail('coordination.requests.id')
+  for (let index = 0; index < requests.length; index++) {
+    if (requests[index]!.updated_seq <= from || requests[index]!.updated_seq > through) fail('coordination.requests.seq')
+    if (index > 0 && requests[index - 1]!.updated_seq >= requests[index]!.updated_seq) fail('coordination.requests.order')
+  }
+  if (requests.length > 0 && requests.at(-1)!.updated_seq !== nextAfter) fail('coordination.next_after')
+  if (requests.length === 0 && nextAfter !== from) fail('coordination.next_after')
+  const complete = bool(item['complete'], 'coordination.complete')
+  if (!complete && requests.length === 0) fail('coordination.complete')
+  return {
+    from,
+    through,
+    next_after: nextAfter,
+    requests,
+    complete,
+    retention_gap: bool(item['retention_gap'], 'coordination.retention_gap'),
+  }
+}
+
 export function briefingPath(query: BriefingQuery = {}): string {
   const limit = query.limit ?? 50
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_PAGE) throw new RangeError('Stand-up page size must be between 1 and 100')
@@ -341,16 +695,36 @@ export function briefingPath(query: BriefingQuery = {}): string {
   return `/v1/hub/standup/briefing?${params.toString()}`
 }
 
+export function overviewPath(query: OverviewQuery = {}): string {
+  const limit = query.limit ?? MAX_PAGE
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_PAGE) throw new RangeError('Stand-up overview limit must be between 1 and 100')
+  const params = new URLSearchParams()
+  if (query.recentSince !== undefined) params.set('recent_since', String(timestamp(query.recentSince, 'query.recent_since')))
+  params.set('limit', String(limit))
+  return `/v1/hub/standup/overview?${params.toString()}`
+}
+
+export function coordinationPath(query: CoordinationQuery = {}): string {
+  const limit = query.limit ?? MAX_PAGE
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_PAGE) throw new RangeError('Coordination page size must be between 1 and 100')
+  const params = new URLSearchParams()
+  if (query.after !== undefined) params.set('after', String(safeInteger(query.after, 'query.after')))
+  if (query.through !== undefined) params.set('through', String(safeInteger(query.through, 'query.through')))
+  if (query.activeOnly !== undefined) params.set('active_only', String(query.activeOnly))
+  params.set('limit', String(limit))
+  return `/v1/hub/standup/coordination?${params.toString()}`
+}
+
 export const workPath = (id: string): string => validWorkId(id)
   ? `/v1/hub/standup/work/${encodeURIComponent(id)}`
   : fail('work.id')
 
 export const workHref = (id: string): string => validWorkId(id)
-  ? `#coordination/work/${encodeURIComponent(id)}`
+  ? `#work/${encodeURIComponent(id)}`
   : fail('work.id')
 
 export function workIdFromHash(hash: string): string | null {
-  const match = /^#coordination\/work\/([^/]+)$/.exec(hash)
+  const match = /^#(?:work|coordination\/work)\/([^/]+)$/.exec(hash)
   if (!match) return null
   try {
     const id = decodeURIComponent(match[1]!)
@@ -420,6 +794,14 @@ async function getBoundedJson(path: string, token: string, signal: AbortSignal):
 
 export async function fetchBriefing(token: string, signal: AbortSignal, query: BriefingQuery = {}): Promise<StandupBriefing> {
   return decodeBriefing(await getBoundedJson(briefingPath(query), token, signal))
+}
+
+export async function fetchOverview(token: string, signal: AbortSignal, query: OverviewQuery = {}): Promise<WorkOverview> {
+  return decodeOverview(await getBoundedJson(overviewPath(query), token, signal))
+}
+
+export async function fetchCoordination(token: string, signal: AbortSignal, query: CoordinationQuery = {}): Promise<CoordinationBriefing> {
+  return decodeCoordinationBriefing(await getBoundedJson(coordinationPath(query), token, signal))
 }
 
 export async function fetchStandupWork(id: string, token: string, signal: AbortSignal): Promise<WorkItem> {

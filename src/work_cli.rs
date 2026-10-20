@@ -4,6 +4,9 @@ use std::io::{self, Read};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use agentscm::hub::coordination::{
+    CoordinationAck, CoordinationReply, CoordinationResolve, CoordinationWithdraw,
+};
 use agentscm::hub::store::{self, unix_now};
 use agentscm::hub::work::{
     BriefingAck, WorkCheckpoint, WorkRepositoryScope, WorkStart, WorkStartResult,
@@ -22,8 +25,53 @@ const REQUEST_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Subcommand)]
 pub enum WorkCommand {
+    /// Read durable requests addressed to an agent session; does not acknowledge receipt.
+    Inbox {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        after: Option<i64>,
+        #[arg(long)]
+        through: Option<i64>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long, default_value_t = 0)]
+        wait_seconds: u64,
+    },
+    /// Acknowledge receipt of a specific coordination request version.
+    CoordinationAck {
+        #[arg(long, default_value = "-")]
+        request: PathBuf,
+    },
+    /// Report a split, join, handover or decline as the affected lead.
+    CoordinationReply {
+        #[arg(long, default_value = "-")]
+        request: PathBuf,
+    },
+    /// Validate and record resolution after work scope or participation changes.
+    CoordinationResolve {
+        #[arg(long, default_value = "-")]
+        request: PathBuf,
+    },
+    /// Withdraw your proposal, or clean up an unavailable requester as a current affected lead.
+    CoordinationWithdraw {
+        #[arg(long, default_value = "-")]
+        request: PathBuf,
+    },
+    /// Read ongoing assignments, recent outcomes and scope overlaps without acknowledging.
+    Overview {
+        /// Include reported outcomes since this Unix timestamp; defaults to the last 24 hours.
+        #[arg(long)]
+        recent_since: Option<i64>,
+        /// Maximum records per section. Inspect completeness flags in the response.
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
     /// Read unfinished shared work and changes since the last acknowledged delivery.
     Briefing {
+        /// Independent subscriber/session identity. Repeat it with each continuation.
+        #[arg(long)]
+        subscriber: Option<String>,
         /// Retry or acknowledge one durable writer delivery.
         #[arg(long)]
         delivery: Option<String>,
@@ -121,9 +169,102 @@ pub async fn run(command: WorkCommand) -> Result<()> {
         command => command,
     };
 
-    let hub = Hub::connect(LIMIT)?;
+    let timeout = match &command {
+        WorkCommand::Inbox { wait_seconds, .. } => {
+            LIMIT + Duration::from_secs((*wait_seconds).min(25))
+        }
+        _ => LIMIT,
+    };
+    let hub = Hub::connect(timeout)?;
     let (reply, claim_conflict) = match command {
+        WorkCommand::Inbox {
+            session,
+            after,
+            through,
+            limit,
+            wait_seconds,
+        } => {
+            let mut url = reqwest::Url::parse("http://hub/v1/hub/standup/inbox")
+                .map_err(|_| invalid("cannot construct inbox URL"))?;
+            {
+                let mut params = url.query_pairs_mut();
+                params
+                    .append_pair("session", &session)
+                    .append_pair("limit", &limit.to_string())
+                    .append_pair("wait_seconds", &wait_seconds.to_string());
+                if let Some(after) = after {
+                    params.append_pair("after", &after.to_string());
+                }
+                if let Some(through) = through {
+                    params.append_pair("through", &through.to_string());
+                }
+            }
+            let path = url
+                .as_str()
+                .strip_prefix("http://hub")
+                .ok_or_else(|| invalid("cannot construct inbox URL"))?;
+            (hub.call(Method::GET, path, None).await?, false)
+        }
+        WorkCommand::CoordinationAck { request } => {
+            let request: CoordinationAck = read_request(&request)?;
+            (
+                hub.call(
+                    Method::POST,
+                    "/v1/hub/standup/coordination/ack",
+                    Some(serde_json::to_value(request)?),
+                )
+                .await?,
+                false,
+            )
+        }
+        WorkCommand::CoordinationReply { request } => {
+            let request: CoordinationReply = read_request(&request)?;
+            (
+                hub.call(
+                    Method::POST,
+                    "/v1/hub/standup/coordination/reply",
+                    Some(serde_json::to_value(request)?),
+                )
+                .await?,
+                false,
+            )
+        }
+        WorkCommand::CoordinationResolve { request } => {
+            let request: CoordinationResolve = read_request(&request)?;
+            (
+                hub.call(
+                    Method::POST,
+                    "/v1/hub/standup/coordination/resolve",
+                    Some(serde_json::to_value(request)?),
+                )
+                .await?,
+                false,
+            )
+        }
+        WorkCommand::CoordinationWithdraw { request } => {
+            let request: CoordinationWithdraw = read_request(&request)?;
+            (
+                hub.call(
+                    Method::POST,
+                    "/v1/hub/standup/coordination/withdraw",
+                    Some(serde_json::to_value(request)?),
+                )
+                .await?,
+                false,
+            )
+        }
+        WorkCommand::Overview {
+            recent_since,
+            limit,
+        } => {
+            let mut query = format!("/v1/hub/standup/overview?limit={limit}");
+            if let Some(since) = recent_since {
+                query.push_str(&format!("&recent_since={since}"));
+            }
+            (hub.call(Method::GET, &query, None).await?, false)
+        }
         WorkCommand::Briefing {
+            subscriber,
             delivery,
             after,
             work_after,
@@ -135,6 +276,9 @@ pub async fn run(command: WorkCommand) -> Result<()> {
                 .map_err(|_| invalid("cannot construct briefing URL"))?;
             {
                 let mut query = url.query_pairs_mut();
+                if let Some(subscriber) = subscriber {
+                    query.append_pair("subscriber", &subscriber);
+                }
                 if let Some(delivery) = delivery {
                     query.append_pair("delivery", &delivery);
                 }
@@ -168,9 +312,15 @@ pub async fn run(command: WorkCommand) -> Result<()> {
                     Some(serde_json::to_value(request)?),
                 )
                 .await?;
-            let claim_conflict = serde_json::from_value::<WorkStartResult>(reply.clone())?
-                .conflict
-                .is_some();
+            let result = serde_json::from_value::<WorkStartResult>(reply.clone())?;
+            let claim_conflict = result.conflict.is_some()
+                || result.coordination_request.is_some()
+                || matches!(
+                    result.item.state,
+                    agentscm::hub::work::WorkState::Paused
+                        | agentscm::hub::work::WorkState::Finished
+                        | agentscm::hub::work::WorkState::Handover
+                );
             (reply, claim_conflict)
         }
         WorkCommand::Checkpoint { request } => {

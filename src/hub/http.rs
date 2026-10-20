@@ -231,6 +231,18 @@ impl From<HubError> for ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 code: "work_storage_capacity",
             },
+            HubError::WorkOverlap(_) => Self {
+                status: StatusCode::CONFLICT,
+                code: "work_scope_overlap",
+            },
+            HubError::WorkCoordinationRequired { .. } => Self {
+                status: StatusCode::CONFLICT,
+                code: "work_coordination_required",
+            },
+            HubError::WorkOverlapIncomplete => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "work_overlap_incomplete",
+            },
             HubError::Unavailable(detail) => {
                 eprintln!("hub error: {detail}");
                 Self {

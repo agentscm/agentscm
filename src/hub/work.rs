@@ -4,14 +4,16 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
+use super::coordination::CoordinationRequest;
 use super::github::valid_ref_name;
-use super::intent::{spec_key, text};
+use super::intent::{display, overlaps, spec_key, text};
 use super::store::{User, validate_repository};
 use super::{HubError, Result};
 
 pub const MAX_WORK_PAGE: usize = 100;
 pub const MAX_BRIEFING_BYTES: usize = 2 * 1024 * 1024;
 pub const CLAIM_STALE_SECONDS: i64 = 15 * 60;
+pub const DEFAULT_RECENT_WORK_SECONDS: i64 = 24 * 60 * 60;
 pub const WORK_PAYLOAD_CAPACITY_BYTES: i64 = 128 * 1024 * 1024;
 pub const WORK_DELIVERY_RESERVATION_BYTES: i64 = 4 * 1024 * 1024;
 pub(super) const WORK_PAYLOAD_ROW_BYTES: i64 = 256;
@@ -233,6 +235,8 @@ pub struct WorkCompaction {
     pub deleted_operations: u64,
     pub deleted_versions: u64,
     pub retention_floor: i64,
+    pub deleted_coordination_requests: u64,
+    pub coordination_retention_floor: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -243,6 +247,10 @@ pub struct WorkStartResult {
     pub joined: bool,
     pub took_over: bool,
     pub conflict: Option<WorkStartConflict>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<WorkOverview>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordination_request: Option<CoordinationRequest>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -253,6 +261,7 @@ pub enum WorkConflictKind {
     GenerationChanged,
     SessionGoalChanged,
     MetadataChanged,
+    ScopeOverlap,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -260,11 +269,103 @@ pub enum WorkConflictKind {
 pub struct WorkStartConflict {
     pub kind: WorkConflictKind,
     pub current_generation: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overlaps: Vec<WorkScopeOverlap>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkPathOverlap {
+    pub your_path: String,
+    pub their_path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkScopeOverlap {
+    pub item: WorkItem,
+    pub your_scope: Vec<String>,
+    pub their_scope: Vec<String>,
+    pub reasons: Vec<WorkPathOverlap>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkOverviewQuery {
+    pub recent_since: Option<i64>,
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+}
+
+impl Default for WorkOverviewQuery {
+    fn default() -> Self {
+        Self {
+            recent_since: None,
+            limit: default_limit(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkOutcomeKind {
+    Decision,
+    Completion,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkOutcome {
+    pub seq: i64,
+    pub at: i64,
+    pub kind: WorkOutcomeKind,
+    pub item: WorkItem,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkPathPair {
+    pub left_path: String,
+    pub right_path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkOverlapPair {
+    pub left: WorkItem,
+    pub right: WorkItem,
+    pub reasons: Vec<WorkPathPair>,
+    pub reasons_complete: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkOverview {
+    pub recent_since: i64,
+    pub until: i64,
+    pub current: Vec<WorkItem>,
+    pub recent: Vec<WorkOutcome>,
+    pub overlaps: Vec<WorkOverlapPair>,
+    pub current_complete: bool,
+    pub recent_complete: bool,
+    pub overlaps_complete: bool,
+    pub history_retention_gap: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkScopeCheck {
+    pub item: Option<WorkItem>,
+    pub requested_scope: Vec<String>,
+    pub uncovered_scope: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BriefingQuery {
+    /// Optional session/subscriber identity. Omitted calls retain token-level catch-up.
+    #[serde(default)]
+    pub subscriber: Option<String>,
     pub delivery: Option<String>,
     pub after: Option<i64>,
     pub work_after: Option<String>,
@@ -278,6 +379,7 @@ pub struct BriefingQuery {
 impl Default for BriefingQuery {
     fn default() -> Self {
         Self {
+            subscriber: None,
             delivery: None,
             after: None,
             work_after: None,
@@ -305,6 +407,9 @@ pub struct WorkEvent {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Briefing {
+    /// The explicit subscriber identity, or `None` for the token-level compatibility cursor.
+    #[serde(default)]
+    pub subscriber: Option<String>,
     pub delivery: Option<String>,
     pub from: i64,
     pub through: i64,
@@ -498,11 +603,82 @@ impl BriefingQuery {
         if let Some(id) = &self.delivery {
             validate_id("delivery", id, "dlv")?;
         }
+        if let Some(subscriber) = &self.subscriber {
+            label("briefing subscriber", subscriber)?;
+        }
         if let Some(id) = &self.work_after {
             validate_id("work_after", id, "wrk")?;
         }
         Ok(())
     }
+}
+
+impl WorkOverviewQuery {
+    pub(super) fn validate(&self, now: i64) -> Result<i64> {
+        if !(1..=MAX_WORK_PAGE).contains(&self.limit) {
+            return Err(invalid("overview limit must be 1 to 100"));
+        }
+        let since = self
+            .recent_since
+            .unwrap_or_else(|| now.saturating_sub(DEFAULT_RECENT_WORK_SECONDS));
+        if since < 0 || since > now {
+            return Err(invalid(
+                "overview recent_since must be between zero and now",
+            ));
+        }
+        Ok(since)
+    }
+}
+
+pub(super) fn scope_overlap_reasons(
+    your_scope: &[String],
+    their_scope: &[String],
+) -> Vec<WorkPathOverlap> {
+    let mut reasons = Vec::new();
+    for yours in your_scope {
+        for theirs in their_scope {
+            if overlaps(yours, theirs) {
+                reasons.push(WorkPathOverlap {
+                    your_path: display(yours),
+                    their_path: display(theirs),
+                });
+                // Four displayed witnesses plus one overflow witness let
+                // callers report incomplete reasons without materializing the
+                // Cartesian product of two 256-path scopes.
+                if reasons.len() == 5 {
+                    return reasons;
+                }
+            }
+        }
+    }
+    reasons
+}
+
+pub(super) fn work_overlap_pairs(items: &[WorkItem]) -> Vec<WorkOverlapPair> {
+    let mut pairs = Vec::new();
+    for (index, left) in items.iter().enumerate() {
+        for right in &items[index + 1..] {
+            let all_reasons = scope_overlap_reasons(&left.scope, &right.scope);
+            let reasons_complete = all_reasons.len() <= 4;
+            let reasons = all_reasons
+                .into_iter()
+                .take(4)
+                .map(|reason| WorkPathPair {
+                    left_path: reason.your_path,
+                    right_path: reason.their_path,
+                })
+                .collect::<Vec<_>>();
+            if !reasons.is_empty() {
+                pairs.push(WorkOverlapPair {
+                    left: left.clone(),
+                    right: right.clone(),
+                    reasons,
+                    reasons_complete,
+                });
+            }
+        }
+    }
+    pairs
 }
 
 impl BriefingAck {
@@ -536,6 +712,23 @@ fn paths(input: &[String]) -> Result<Vec<String>> {
     paths.sort();
     paths.dedup();
     Ok(paths)
+}
+
+pub(super) fn normalized_scope(input: &[String]) -> Result<Vec<String>> {
+    paths(input)
+}
+
+pub(super) fn uncovered_scope(declared: &[String], requested: &[String]) -> Vec<String> {
+    requested
+        .iter()
+        .filter(|requested| {
+            !declared.iter().any(|declared| {
+                declared == *requested
+                    || (declared.ends_with('/') && requested.starts_with(declared))
+            })
+        })
+        .cloned()
+        .collect()
 }
 
 fn label(name: &str, value: &str) -> Result<()> {
@@ -609,6 +802,18 @@ mod tests {
         WORK_DELIVERY_RESERVATION_BYTES, WORK_PAYLOAD_ROW_BYTES, check_work_delivery_page,
         check_work_payload_capacity,
     };
+
+    #[test]
+    fn overlap_witnesses_bound_dense_scope_expansions() {
+        let requested = (0..256).map(|i| format!("src/{i}/")).collect::<Vec<_>>();
+        let assigned = (0..256)
+            .map(|i| format!("src/0/{i}.rs"))
+            .collect::<Vec<_>>();
+        let reasons = super::scope_overlap_reasons(&requested, &assigned);
+        assert_eq!(reasons.len(), 5, "four witnesses and one overflow marker");
+        assert!(reasons.iter().all(|r| r.your_path == "src/0/**"));
+        assert!(super::scope_overlap_reasons(&["docs/".into()], &assigned).is_empty());
+    }
 
     #[test]
     fn work_payload_capacity_is_atomic_math_and_allows_non_growing_effects() {

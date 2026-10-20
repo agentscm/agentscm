@@ -1,6 +1,8 @@
 //! Multi-user coordination hub: storage and authenticated HTTP.
 pub mod advice;
 pub mod connection;
+pub mod coordination;
+mod coordination_http;
 pub mod forge_api;
 pub mod forge_http;
 pub mod github;
@@ -53,6 +55,15 @@ pub enum HubError {
     Busy,
     /// The repository's retained work budget needs operator maintenance.
     WorkCapacity,
+    /// The requested lead scope intersects durable unfinished work.
+    WorkOverlap(Vec<work::WorkScopeOverlap>),
+    /// A rejected scope mutation that durably created or reused a coordination request.
+    WorkCoordinationRequired {
+        overlaps: Vec<work::WorkScopeOverlap>,
+        request: Box<coordination::CoordinationRequest>,
+    },
+    /// The bounded overlap scan could not prove that the requested scope is free.
+    WorkOverlapIncomplete,
     /// Internal detail for the operator's stderr only; never sent to a client.
     Unavailable(String),
 }
@@ -69,6 +80,13 @@ impl fmt::Display for HubError {
                 f,
                 "repository work storage capacity reached; operator compaction required"
             ),
+            Self::WorkOverlap(_) => write!(f, "work scope overlaps unfinished work"),
+            Self::WorkCoordinationRequired { .. } => {
+                write!(f, "work scope needs a durable coordination response")
+            }
+            Self::WorkOverlapIncomplete => {
+                write!(f, "work overlap scan is incomplete; claim refused")
+            }
             Self::Unavailable(message) => write!(f, "unavailable: {message}"),
         }
     }

@@ -20,13 +20,16 @@ use serde_json::{Value, json};
 use tokio::time::{Instant, timeout_at};
 
 use super::advice::unknown;
+use super::coordination::{CoordinationInboxQuery, CoordinationStatus};
 use super::http::{ApiError, blocking};
 use super::intent::spec_key;
 use super::session::{
     SessionCall, announce_for, check_name, count_fail_open, done_for, others_for, record_hook_ms,
 };
 use super::store::{Principal, agent_token_digest, unix_now};
-use super::work::{Briefing, CheckpointKind, WorkCheckpoint, WorkState};
+use super::work::{
+    Briefing, CheckpointKind, WorkCheckpoint, WorkOverview, WorkOverviewQuery, WorkState,
+};
 use super::{HubError, HubState};
 
 /// Write payloads carry file contents.
@@ -210,11 +213,77 @@ async fn hook(
             format!("{:x}", hasher.finish())
         },
     );
-    let mut outcome = match timeout_at(deadline, call.run(&state, token, repo)).await {
-        Ok(Ok(outcome)) => outcome,
-        Ok(Err(reason)) => Outcome::unknown(reason),
-        Err(_) => Outcome::unknown("hub timed out"),
-    };
+    let mut outcome =
+        match timeout_at(deadline, call.run(&state, token.clone(), repo.clone())).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(reason)) => Outcome::unknown(reason),
+            Err(_) => Outcome::unknown("hub timed out"),
+        };
+    if matches!(call.kind, Kind::Start | Kind::Check)
+        && let Some(token) = token
+    {
+        let delivery = async {
+            let principal = authenticate(&state, Some(token), repo).await?;
+            let store = state.store.clone();
+            let requested = call.session.clone();
+            let id = principal.token_id.clone();
+            let (session, page) = blocking(&state, move || {
+                let now = unix_now();
+                let session = store.session_name_for(&id, requested.as_deref(), now)?;
+                let page = store.coordination_inbox(
+                    &id,
+                    &CoordinationInboxQuery {
+                        session: Some(session.clone()),
+                        ..Default::default()
+                    },
+                    now,
+                )?;
+                Ok((session, page))
+            })
+            .await
+            .map_err(reason)?;
+            Ok::<_, &'static str>((principal, session, page))
+        };
+        match timeout_at(deadline, delivery).await {
+            Ok(Ok((principal, session, page))) => {
+                for request in page.requests.iter().take(5) {
+                    if matches!(
+                        request.status,
+                        CoordinationStatus::Resolved | CoordinationStatus::Withdrawn
+                    ) {
+                        continue;
+                    }
+                    outcome.text.push_str(&format!("\nAgentSCM coordination request {}: {} (third-party report). Inspect agentscm_coordination_inbox, acknowledge receipt, then report a split/join/handover/decline. Reading this hook does not acknowledge receipt.", request.id, bounded_hook_text(&request.proposal.title, 120)));
+                    let reply_needed = request.targets.iter().any(|target| {
+                        target.lead.token == principal.token_id
+                            && target.lead.session == session
+                            && !request.responses.iter().any(|reply| {
+                                reply.target_work_id == target.work_id
+                                    && reply.target_generation == target.generation
+                                    && reply.responder.token == principal.token_id
+                                    && reply.responder.session == session
+                            })
+                    });
+                    if reply_needed && call.deny && matches!(call.kind, Kind::Check) {
+                        outcome.deny = Some(format!(
+                            "Coordination request {} needs your response before continuing edits. Read agentscm_coordination_inbox and report the proposed split, join, handover or decline.",
+                            request.id
+                        ));
+                        outcome.status = "stop";
+                    } else if outcome.status == "clean" {
+                        outcome.status = "fyi";
+                    }
+                }
+                if !page.complete || page.requests.len() > 5 {
+                    outcome.text.push_str("\nCoordination inbox is partial in this hook. Page agentscm_coordination_inbox before relying on coverage.");
+                }
+            }
+            _ if outcome.status != "unknown" => {
+                outcome.text.push_str("\nAgentSCM coordination inbox delivery is unknown; inspect agentscm_coordination_inbox before assuming coverage.");
+            }
+            _ => {}
+        }
+    }
     if outcome.status == "unknown" {
         count_fail_open();
         // Said once per session; later failures are silent no-ops.
@@ -248,6 +317,13 @@ fn reason(error: HubError) -> &'static str {
     match error {
         HubError::Busy => "hub busy",
         HubError::WorkCapacity => "work storage capacity reached",
+        HubError::WorkOverlap(_) => "declared work scope overlaps another assignment",
+        HubError::WorkCoordinationRequired { .. } => {
+            "work scope needs coordination; inspect the agent inbox"
+        }
+        HubError::WorkOverlapIncomplete => {
+            "work overlap coverage is incomplete; no scope was claimed"
+        }
         HubError::Unauthorized => DENIED,
         HubError::Invalid(_) => "invalid hook payload",
         HubError::Unavailable(detail) => {
@@ -378,9 +454,37 @@ impl Call {
             Kind::Check if self.paths.is_empty() => Ok(Outcome::clean()),
             Kind::Check => {
                 let principal = authenticate(state, token, repo).await?;
-                let advice = announce_for(state, &principal, call(self.paths.clone()))
-                    .await
-                    .map_err(reason)?;
+                let store = state.store.clone();
+                let token = principal.token_id.clone();
+                let requested = self.session.clone();
+                let paths = self.paths.clone();
+                let coverage = blocking(state, move || {
+                    let now = unix_now();
+                    let session = store.session_name_for(&token, requested.as_deref(), now)?;
+                    store.work_scope_check(&token, &session, &paths, now)
+                })
+                .await
+                .map_err(reason)?;
+                if coverage.item.is_some() && !coverage.uncovered_scope.is_empty() {
+                    let text = "AgentSCM: these files are not covered by a current unfinished assignment. Start or explicitly rejoin the work, or ask its lead to checkpoint the expanded scope and resolve overlaps before editing. No new file intent was announced.".to_owned();
+                    return Ok(Outcome {
+                        deny: self.deny.then(|| text.clone()),
+                        text,
+                        status: "stop",
+                    });
+                }
+                let advice = match announce_for(state, &principal, call(self.paths.clone())).await {
+                    Ok(advice) => advice,
+                    Err(HubError::Invalid(_)) => {
+                        let text = "AgentSCM: this edit could not be linked to a current assignment. Use the assigned session, or explicitly start or join work with this conversation's session ID before editing. No new file intent was announced.".to_owned();
+                        return Ok(Outcome {
+                            deny: self.deny.then(|| text.clone()),
+                            text,
+                            status: "stop",
+                        });
+                    }
+                    Err(error) => return Err(reason(error)),
+                };
                 let mut outcome = Outcome::advice(advice.text, advice.stop);
                 outcome.deny = advice.deny;
                 Ok(outcome)
@@ -389,8 +493,14 @@ impl Call {
                 let principal = authenticate(state, token, repo).await?;
                 let store = state.store.clone();
                 let token = principal.token_id.clone();
+                let requested = self.session.clone();
                 let briefing = blocking(state, move || {
-                    store.work_briefing_preview(&token, 20, unix_now())
+                    let now = unix_now();
+                    let subscriber = store.session_name_for(&token, requested.as_deref(), now)?;
+                    Ok((
+                        store.work_briefing_preview_for(&token, Some(&subscriber), 20, now)?,
+                        store.work_overview(&token, &WorkOverviewQuery::default(), now)?,
+                    ))
                 })
                 .await;
                 let advice = announce_for(state, &principal, call(Vec::new()))
@@ -409,7 +519,7 @@ impl Call {
                 };
                 text.push('\n');
                 text.push_str(&match briefing {
-                    Ok(briefing) => render_briefing(&briefing),
+                    Ok((briefing, overview)) => format!("{}\n{}", render_briefing(&briefing), render_overview(&overview)),
                     Err(_) => format!(
                         "{} Call agentscm_work_briefing before planning meaningful work. Once the user intent is known, call agentscm_start with a stable work_id, canonical forge source or request_key before taking coordinated paths.",
                         unknown("shared work could not be listed")
@@ -486,8 +596,9 @@ fn render_briefing(briefing: &Briefing) -> String {
     )];
     for item in briefing.items.iter().take(SHOWN_ITEMS) {
         lines.push(format!(
-            "- {} [{:?}, claim {:?}]: {} (third-party text)",
+            "- {} by {} [{:?}, claim {:?}]: {} (third-party text)",
             item.id,
+            bounded_hook_text(&item.lead_agent, 64),
             item.state,
             item.claim_status,
             bounded_hook_text(&item.title, 120)
@@ -495,10 +606,18 @@ fn render_briefing(briefing: &Briefing) -> String {
     }
     for event in briefing.events.iter().take(SHOWN_EVENTS) {
         lines.push(format!(
-            "- change {} for {}: {}",
+            "- change {} for {}: {} — {} (third-party text)",
             event.seq,
             event.work_id,
-            bounded_hook_text(&event.kind, 40)
+            bounded_hook_text(&event.kind, 40),
+            bounded_hook_text(
+                event
+                    .item
+                    .current
+                    .as_ref()
+                    .map_or(&event.item.title, |checkpoint| &checkpoint.summary),
+                160
+            )
         ));
     }
     if briefing.items.len() > SHOWN_ITEMS
@@ -517,35 +636,59 @@ fn render_briefing(briefing: &Briefing) -> String {
     lines.join("\n")
 }
 
-fn bounded_hook_text(text: &str, max: usize) -> String {
-    let mut out: String = text
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .take(max)
-        .collect();
-    if text.chars().count() > max {
-        out.push('…');
+fn render_overview(overview: &WorkOverview) -> String {
+    let mut lines = vec![format!(
+        "AgentSCM startup recap: reported completions and decisions from Unix {} to {} (independent of read acknowledgements).",
+        overview.recent_since, overview.until
+    )];
+    for outcome in overview.recent.iter().take(5) {
+        let summary = outcome
+            .item
+            .current
+            .as_ref()
+            .map_or(&outcome.item.title, |checkpoint| &checkpoint.summary);
+        lines.push(format!(
+            "- {:?}: {} by {} — {} (third-party text)",
+            outcome.kind,
+            bounded_hook_text(&outcome.item.title, 100),
+            bounded_hook_text(&outcome.item.lead_agent, 64),
+            bounded_hook_text(summary, 160)
+        ));
     }
-    out
+    for overlap in overview.overlaps.iter().take(5) {
+        lines.push(format!("- Needs coordination: {} ({}) and {} ({}) have overlapping declared scope. Split scope, join existing work, or arrange handover. (third-party text)",
+            bounded_hook_text(&overlap.left.title, 80), bounded_hook_text(&overlap.left.lead_agent, 64),
+            bounded_hook_text(&overlap.right.title, 80), bounded_hook_text(&overlap.right.lead_agent, 64)));
+    }
+    if !overview.current_complete
+        || !overview.recent_complete
+        || !overview.overlaps_complete
+        || overview.recent.len() > 5
+        || overview.overlaps.len() > 5
+    {
+        lines.push("This startup recap is partial. Inspect agentscm_work_overview and page agentscm_work_briefing before relying on coverage.".into());
+    }
+    lines.push("Only declared work is visible; empty scope is unknown coverage. Give each agent a separate token for independent catch-up. Reported finish does not prove tests, review or merge.".into());
+    lines.join("\n")
+}
+
+fn bounded_hook_text(text: &str, max: usize) -> String {
+    super::advice::sanitize(text, max)
 }
 
 async fn pause_known_work(state: &HubState, principal: &Principal, session: String, via: &str) {
     let store = state.store.clone();
     let token = principal.token_id.clone();
     let lookup_session = session.clone();
-    let item = match blocking(state, move || {
-        store.work_for_session(&token, &lookup_session, unix_now())
+    let (item, session) = match blocking(state, move || {
+        let now = unix_now();
+        let canonical = store.session_name_for(&token, Some(&lookup_session), now)?;
+        Ok((store.work_for_session(&token, &canonical, now)?, canonical))
     })
     .await
     {
-        Ok(Some(item)) => item,
-        Ok(None) => return,
+        Ok((Some(item), canonical)) => (item, canonical),
+        Ok((None, _)) => return,
         Err(error) => {
             eprintln!("hub: work lookup at session end: {error}");
             return;
