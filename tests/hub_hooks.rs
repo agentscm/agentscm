@@ -10,7 +10,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentscm::backend::LocalBackend;
-use agentscm::hub::store::{self, ForgeIdentity, Store, mint_agent_token, unix_now};
+use agentscm::hub::store::{
+    self, ForgeIdentity, Store, agent_token_digest, mint_agent_token, unix_now,
+};
+use agentscm::hub::work::{WorkRole, WorkStart, WorkState};
 use agentscm::hub::{HubState, router};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -214,8 +217,10 @@ async fn every_fixture_gets_its_agents_output_shape() {
         match expect {
             Expect::Empty => assert_eq!(answer, json!({}), "{name}"),
             Expect::Context(pointer) => {
+                let text = text_at(&answer, pointer);
+                assert!(text.starts_with("AgentSCM:"), "{name}: {answer}");
                 assert!(
-                    text_at(&answer, pointer).starts_with("AgentSCM:"),
+                    text.contains("Once the user intent is known, call agentscm_start"),
                     "{name}: {answer}"
                 );
                 if pointer == CLAUDE_CONTEXT {
@@ -231,6 +236,15 @@ async fn every_fixture_gets_its_agents_output_shape() {
             Expect::Generic(status) => {
                 assert_eq!(answer["status"], status, "{name}: {answer}");
                 assert!(answer["text"].is_string(), "{name}: {answer}");
+                if name == "generic-start" {
+                    assert!(
+                        answer["text"]
+                            .as_str()
+                            .unwrap()
+                            .contains("Once the user intent is known, call agentscm_start"),
+                        "{answer}"
+                    );
+                }
             }
         }
     }
@@ -262,6 +276,135 @@ async fn hooks_register_one_session_and_done_releases_it() {
     let live = hub.store.live_intents(REPO, unix_now(), 10).unwrap();
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].via, ["hook:generic"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_end_pauses_known_work_without_claiming_completion() {
+    let mut hub = Hub::start().await;
+    let secret = hub.agent();
+    let session = "11111111-2222-3333-4444-555555555555";
+    let start_answer = hub.hook("claude", &secret, &fixture("claude-SessionStart"));
+    let start_context = text_at(&start_answer, CLAUDE_CONTEXT);
+    assert!(
+        start_context.contains("AgentSCM shared work"),
+        "{start_answer}"
+    );
+    assert!(
+        !start_context.contains("Briefing delivery"),
+        "{start_answer}"
+    );
+
+    let principal = hub
+        .store
+        .authenticate(&agent_token_digest(&secret).unwrap(), unix_now())
+        .unwrap()
+        .unwrap();
+    let started = hub
+        .store
+        .work_start_auto(
+            &principal.token_id,
+            &WorkStart {
+                work_id: None,
+                source: None,
+                request_key: None,
+                title: "implement hook handover".into(),
+                session: session.into(),
+                role: WorkRole::Lead,
+                scope: vec!["src/hub/hook.rs".into()],
+                branch: Some("feat/hooks".into()),
+                worktree: None,
+                next_action: Some("resume the hook tests".into()),
+                depends_on: Vec::new(),
+                related_work: Vec::new(),
+                takeover_generation: None,
+            },
+            unix_now(),
+        )
+        .unwrap();
+    assert_eq!(started.item.state, WorkState::Active);
+
+    assert_eq!(
+        hub.hook("claude", &secret, &fixture("claude-SessionEnd")),
+        json!({})
+    );
+    let paused = hub
+        .store
+        .work_get(&principal.token_id, &started.item.id, unix_now())
+        .unwrap()
+        .unwrap();
+    assert_eq!(paused.state, WorkState::Paused);
+    assert_eq!(
+        paused.current.as_ref().unwrap().summary,
+        "Session ended without a reported final work outcome."
+    );
+    assert_eq!(paused.next_action.as_deref(), Some("resume the hook tests"));
+    let paused_seq = paused.updated_seq;
+
+    // Repeated SessionEnd is a no-op for the durable pause and never invents completion.
+    hub.hook("claude", &secret, &fixture("claude-SessionEnd"));
+    let repeated = hub
+        .store
+        .work_get(&principal.token_id, &started.item.id, unix_now())
+        .unwrap()
+        .unwrap();
+    assert_eq!(repeated.state, WorkState::Paused);
+    assert_eq!(repeated.updated_seq, paused_seq);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_start_flags_records_omitted_from_a_complete_preview() {
+    let mut hub = Hub::start().await;
+    let secret = hub.agent();
+    let principal = hub
+        .store
+        .authenticate(&agent_token_digest(&secret).unwrap(), unix_now())
+        .unwrap()
+        .unwrap();
+    for index in 0..6 {
+        hub.store
+            .work_start_auto(
+                &principal.token_id,
+                &WorkStart {
+                    work_id: None,
+                    source: None,
+                    request_key: None,
+                    title: format!("unfinished goal {index}"),
+                    session: format!("preview-session-{index}"),
+                    role: WorkRole::Lead,
+                    scope: vec![format!("src/preview-{index}.rs")],
+                    branch: None,
+                    worktree: None,
+                    next_action: None,
+                    depends_on: Vec::new(),
+                    related_work: Vec::new(),
+                    takeover_generation: None,
+                },
+                unix_now(),
+            )
+            .unwrap();
+    }
+    let preview = hub
+        .store
+        .work_briefing_preview(&principal.token_id, 20, unix_now())
+        .unwrap();
+    assert!(preview.complete);
+    assert_eq!(preview.items.len(), 6);
+
+    let answer = hub.hook("claude", &secret, &fixture("claude-SessionStart"));
+    let context = text_at(&answer, CLAUDE_CONTEXT);
+    assert!(
+        context.contains("AgentSCM shared work: 6 unfinished item(s)"),
+        "{answer}"
+    );
+    assert!(
+        context.contains("This bounded hook preview omits shared-work records"),
+        "{answer}"
+    );
+    assert!(
+        context.contains("agentscm_work_briefing to begin durable pagination"),
+        "{answer}"
+    );
+    assert!(!context.contains("Briefing delivery"), "{answer}");
 }
 
 /// The refusal of a pre-edit hook: its reason, which names the file and the holder.

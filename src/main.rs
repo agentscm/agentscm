@@ -63,6 +63,7 @@ mod skill_workflow_cli;
 #[cfg(unix)]
 mod skill_workflow_loop;
 mod team_cli;
+mod work_cli;
 #[cfg(unix)]
 mod workflow_cli;
 
@@ -158,6 +159,11 @@ enum Command {
     Intent {
         #[command(subcommand)]
         command: intent_cli::IntentCommand,
+    },
+    /// Coordinate durable engineering work, claims and resumable check-ins.
+    Work {
+        #[command(subcommand)]
+        command: work_cli::WorkCommand,
     },
     /// [experimental] Capture a clean committed Git tree as a native revision.
     #[cfg(unix)]
@@ -507,6 +513,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Hook(args) => hook_cli::run(args).await,
         Command::InitRepo(args) => init_cli::run(args)?,
         Command::Intent { command } => intent_cli::run(command).await?,
+        Command::Work { command } => work_cli::run(command).await?,
         Command::Demo(args) => demo_cli::run(args).await?,
         Command::Quickstart(args) => {
             let code = quickstart::run(args).await?;

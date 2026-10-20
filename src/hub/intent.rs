@@ -140,7 +140,12 @@ fn invalid(message: &str) -> HubError {
 }
 
 pub(super) fn text(name: &str, value: &str, max: usize) -> Result<()> {
-    if value.is_empty() || value.len() > max || value.chars().any(char::is_control) {
+    if value.is_empty()
+        || value.len() > max
+        || value
+            .chars()
+            .any(|c| c.is_control() || super::advice::invisible(c))
+    {
         return Err(HubError::Invalid(format!(
             "{name} must be 1-{max} bytes without control characters"
         )));
@@ -162,7 +167,9 @@ pub fn spec_key(spec: &str) -> Result<String> {
         || drive
         || spec.starts_with('/')
         || spec.contains('\\')
-        || spec.chars().any(char::is_control)
+        || spec
+            .chars()
+            .any(|c| c.is_control() || super::advice::invisible(c))
         || path.contains('*')
         || path
             .split('/')
@@ -728,6 +735,16 @@ async fn notices(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hidden_text_cannot_spoof_task_or_path() {
+        for hidden in ['\u{202e}', '\u{200b}', '\u{2066}', '\u{e0001}', '\u{00ad}'] {
+            assert!(super::text("title", &format!("Safe{hidden}txt.exe"), 500).is_err());
+            assert!(super::spec_key(&format!("src/{hidden}file.rs")).is_err());
+        }
+        assert!(super::text("title", "日本語の説明", 500).is_ok());
+        assert!(super::spec_key("src/étiquette.rs").is_ok());
+    }
+
     use super::*;
 
     #[test]

@@ -4,8 +4,9 @@ import {
   HeartOutlined,
   HistoryOutlined,
   TeamOutlined,
+  UnorderedListOutlined,
 } from '@ant-design/icons'
-import { Tabs } from 'antd'
+import { Alert, Tabs } from 'antd'
 import { useEffect, useMemo, useRef, useState, type AnimationEvent } from 'react'
 import { derive } from '../derive.ts'
 import type { HubData } from '../useHub.ts'
@@ -18,16 +19,19 @@ import { LiveAgents } from './LiveAgents.tsx'
 import { PullRequests } from './PullRequests.tsx'
 import { Workspace } from './Workspace.tsx'
 import { SkillWorkflow } from './SkillWorkflow.tsx'
+import { Standup } from './Standup.tsx'
 
-type HubSection = 'coordination' | 'workflows' | 'activity' | 'health' | 'workspace'
+type HubSection = 'coordination' | 'work' | 'workflows' | 'activity' | 'health' | 'workspace'
 
 const sectionFromHash = (): HubSection => {
+  if (window.location.hash.startsWith('#coordination/work/')) return 'work'
   const section = window.location.hash.slice(1).split('/')[0]
-  return section === 'workflows' || section === 'activity' || section === 'health' || section === 'workspace' ? section : 'coordination'
+  return section === 'work' || section === 'workflows' || section === 'activity' || section === 'health' || section === 'workspace' ? section : 'coordination'
 }
 
 const navigation = [
   { key: 'coordination', label: <span><ApartmentOutlined /> Coordination</span> },
+  { key: 'work', label: <span><UnorderedListOutlined /> Work</span> },
   { key: 'workflows', label: <span><BranchesOutlined /> Workflows</span> },
   { key: 'activity', label: <span><HistoryOutlined /> Activity</span> },
   { key: 'workspace', label: <span><TeamOutlined /> Workspace</span> },
@@ -62,6 +66,9 @@ export function Dashboard({ data, token }: { data: HubData; token: string }) {
   return (
     <main className={`page hub-page${intro ? ' intro' : ''}`} onAnimationStart={onStart}>
       {data.health?.demo && <DemoBanner />}
+      {import.meta.env.DEV && import.meta.env.VITE_SYNTHETIC_PREVIEW === '1' && (
+        <Alert className="synthetic-workflow-preview" type="info" showIcon message="Synthetic examples · not live coding sessions" />
+      )}
       <nav className="hub-navigation" aria-label="Repository sections">
         <Tabs activeKey={section} items={navigation} onChange={selectSection} />
       </nav>
@@ -80,6 +87,8 @@ export function Dashboard({ data, token }: { data: HubData; token: string }) {
           </div>
         </div>
       )}
+
+      {section === 'work' && <Standup key={repo} token={token} repository={repo} />}
 
       {section === 'workflows' && (
         <SkillWorkflow

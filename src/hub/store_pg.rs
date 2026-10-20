@@ -6,11 +6,22 @@ use std::time::Duration;
 
 use postgres::config::{Host, SslMode};
 use postgres::{Client, Config, IsolationLevel, NoTls};
+use serde_json::json;
 
 use super::connection::{
     CONNECTION_SELECT, ConnectedRepository, Connection as ForgeConnection, DELIVERY_KEEP_SECONDS,
     NewConnection, Observation, Observed, Outbound, REPOSITORY_SELECT, gone_event,
     observation_kinds, validate_observation, validate_repository_row, validate_status,
+};
+use super::coordination::{
+    CoordinationAck, CoordinationAcknowledgement, CoordinationAgent, CoordinationInbox,
+    CoordinationInboxQuery, CoordinationListQuery, CoordinationProposal, CoordinationReply,
+    CoordinationRequest, CoordinationResolve, CoordinationResponse, CoordinationStatus,
+    CoordinationTarget, CoordinationWithdraw, MAX_ACTIVE_COORDINATION_REQUESTS,
+    MAX_ACTIVE_COORDINATION_REQUESTS_PER_OWNER, MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN,
+    MAX_COORDINATION_REASONS_PER_TARGET, MAX_COORDINATION_UPDATES,
+    MAX_PROJECTED_COORDINATION_UPDATES, parse_response_kind, parse_status, response_kind_name,
+    status_name,
 };
 use super::handoff::{
     Answered, Asked, HandoffNote, MAX_OPEN, PER_TOUCH, Request, Verdict, answer_kind, clean_note,
@@ -29,8 +40,18 @@ use super::session::{
 };
 use super::store::{
     ACTIVITY_KINDS, ActivityEvent, AgentToken, Event, ForgeIdentity, HubEvent, LIST_LIMIT,
-    NewAgentToken, Principal, SessionView, Store, TokenDigest, User, event_limit, new_id, pending,
-    session_key, unix_now, validate_login,
+    NewAgentToken, Principal, SessionView, Store, TokenDigest, User, event_limit, lower_hex_of,
+    new_id, pending, session_key, unix_now, validate_login,
+};
+use super::work::{
+    Briefing, BriefingAck, BriefingQuery, CLAIM_STALE_SECONDS, Checkpoint, CheckpointReceipt,
+    ClaimStatus, MAX_BRIEFING_BYTES, SourceRef, WORK_DELIVERY_RESERVATION_BYTES,
+    WORK_PAYLOAD_CAPACITY_BYTES, WorkCheckpoint, WorkCheckpointResult, WorkCompaction,
+    WorkConflictKind, WorkEvent, WorkItem, WorkOutcome, WorkOutcomeKind, WorkOverview,
+    WorkOverviewQuery, WorkParticipant, WorkRepositoryScope, WorkRole, WorkScopeCheck,
+    WorkScopeOverlap, WorkSource, WorkStart, WorkStartConflict, WorkStartResult, WorkState,
+    WorkWho, check_work_delivery_page, check_work_payload_capacity, normalized_scope,
+    scope_overlap_reasons, uncovered_scope, work_overlap_pairs, work_payload_row_bytes,
 };
 use super::{HubError, Result};
 
@@ -43,6 +64,10 @@ const INTENT_LOCK_CLASS: i32 = 0x6167_656e;
 /// First key of the advisory lock that serializes publication creates per token, so the
 /// open-publication cap holds across hub processes.
 const PUBLICATION_LOCK_CLASS: i32 = 0x6167_6570;
+/// Serializes briefing delivery creation and acknowledgements per owner and repository scope.
+const WORK_DELIVERY_LOCK_CLASS: i32 = 0x6167_6578;
+/// Serializes every payload-growing effect in a complete repository identity.
+const WORK_CAPACITY_LOCK_CLASS: i32 = 0x6167_6579;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TCP_USER_TIMEOUT: Duration = Duration::from_secs(15);
 const KEEPALIVES_IDLE: Duration = Duration::from_secs(30);
@@ -235,10 +260,11 @@ fn migrate(client: &mut Client) -> Result<()> {
     Ok(tx.commit()?)
 }
 
-fn append(tx: &mut postgres::Transaction<'_>, event: &Event) -> Result<()> {
+fn append(tx: &mut postgres::Transaction<'_>, event: &Event) -> Result<i64> {
     tx.execute("SELECT pg_advisory_xact_lock($1)", &[&EVENT_LOCK])?;
-    tx.execute(
-        "INSERT INTO hub_events (id, at, kind, subject, data) VALUES ($1, $2, $3, $4, $5)",
+    let row = tx.query_one(
+        "INSERT INTO hub_events (id, at, kind, subject, data) VALUES ($1, $2, $3, $4, $5)
+         RETURNING seq",
         &[
             &event.id,
             &event.at,
@@ -247,7 +273,7 @@ fn append(tx: &mut postgres::Transaction<'_>, event: &Event) -> Result<()> {
             &event.data,
         ],
     )?;
-    Ok(())
+    Ok(row.get(0))
 }
 
 /// Appends `events` in order with one statement, so a wide fan-out is one round trip.
@@ -273,6 +299,1922 @@ fn append_all(tx: &mut postgres::Transaction<'_>, events: &[Event]) -> Result<()
         ],
     )?;
     Ok(())
+}
+
+fn work_who(tx: &mut postgres::Transaction<'_>, token: &str, now: i64) -> Result<WorkWho> {
+    let row = tx
+        .query_opt(
+            "SELECT t.repository, t.repository_id, t.name, t.read_only,
+                    u.id, u.provider, u.host, u.forge_user_id, u.login
+             FROM hub_agent_tokens t JOIN hub_users u ON u.id = t.owner
+             WHERE t.id = $1 AND NOT t.revoked AND t.expires_at > $2 AND NOT u.disabled
+             FOR SHARE",
+            &[&token, &now],
+        )?
+        .ok_or(HubError::Unauthorized)?;
+    Ok(WorkWho {
+        token: token.to_owned(),
+        repository: row.get(0),
+        repository_id: row.get(1),
+        agent: row.get(2),
+        read_only: row.get(3),
+        owner: User {
+            id: row.get(4),
+            identity: ForgeIdentity {
+                provider: row.get(5),
+                host: row.get(6),
+                user_id: row.get(7),
+            },
+            login: row.get(8),
+            disabled: false,
+        },
+    })
+}
+
+fn role_name(role: WorkRole) -> &'static str {
+    match role {
+        WorkRole::Lead => "lead",
+        WorkRole::Helper => "helper",
+        WorkRole::Reviewer => "reviewer",
+    }
+}
+
+fn state_name(state: WorkState) -> &'static str {
+    match state {
+        WorkState::Active => "active",
+        WorkState::Blocked => "blocked",
+        WorkState::Paused => "paused",
+        WorkState::Finished => "finished",
+        WorkState::Handover => "handover",
+    }
+}
+
+fn json_string<T: serde::Serialize>(value: &T) -> Result<String> {
+    serde_json::to_string(value).map_err(|error| HubError::Unavailable(error.to_string()))
+}
+
+fn json_value<T: serde::de::DeserializeOwned>(value: &str) -> Result<T> {
+    serde_json::from_str(value).map_err(|error| HubError::Unavailable(error.to_string()))
+}
+
+fn project_claim(tx: &mut postgres::Transaction<'_>, item: &mut WorkItem, now: i64) -> Result<()> {
+    if now < item.last_checkin_at {
+        item.claim_status = ClaimStatus::Unknown;
+        return Ok(());
+    }
+    let active = tx
+        .query_opt(
+            "SELECT 1 FROM hub_agent_tokens t JOIN hub_users u ON u.id = t.owner
+             WHERE t.id = $1 AND NOT t.revoked AND t.expires_at > $2 AND NOT u.disabled",
+            &[&item.lead_token, &now],
+        )?
+        .is_some();
+    item.claim_status = if active && item.last_checkin_at >= now - CLAIM_STALE_SECONDS {
+        ClaimStatus::Active
+    } else {
+        ClaimStatus::Stale
+    };
+    Ok(())
+}
+
+fn scoped_work(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    id: &str,
+    now: i64,
+    lock: bool,
+) -> Result<Option<WorkItem>> {
+    let tail = if lock { " FOR UPDATE" } else { "" };
+    let row = tx.query_opt(
+        &format!(
+            "SELECT snapshot FROM hub_work_items
+             WHERE id = $1 AND provider = $2 AND host = $3 AND repository = $4
+               AND repository_id IS NOT DISTINCT FROM $5{tail}"
+        ),
+        &[
+            &id,
+            &who.owner.identity.provider,
+            &who.owner.identity.host,
+            &who.repository,
+            &who.repository_id,
+        ],
+    )?;
+    row.map(|row| {
+        let snapshot: String = row.get(0);
+        let mut item: WorkItem = json_value(&snapshot)?;
+        project_claim(tx, &mut item, now)?;
+        Ok(item)
+    })
+    .transpose()
+}
+
+fn relation_targets(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    ids: &[String],
+) -> Result<()> {
+    for id in ids {
+        if scoped_work(tx, who, id, 0, false)?.is_none() {
+            return Err(HubError::Invalid(format!(
+                "related work {id} is outside the repository or unknown"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn work_scope_overlaps(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    scope: &[String],
+    exclude: Option<&str>,
+    now: i64,
+) -> Result<Vec<WorkScopeOverlap>> {
+    if scope.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = tx.query(
+        "SELECT snapshot FROM hub_work_items
+         WHERE provider = $1 AND host = $2 AND repository = $3
+           AND repository_id IS NOT DISTINCT FROM $4 AND state <> 'finished'
+           AND ($5::text IS NULL OR id <> $5)
+         ORDER BY id LIMIT 101",
+        &[
+            &who.owner.identity.provider,
+            &who.owner.identity.host,
+            &who.repository,
+            &who.repository_id,
+            &exclude,
+        ],
+    )?;
+    if rows.len() > 100 {
+        return Err(HubError::WorkOverlapIncomplete);
+    }
+    let mut found = Vec::new();
+    for row in rows {
+        let snapshot: String = row.get(0);
+        let mut item: WorkItem = json_value(&snapshot)?;
+        project_claim(tx, &mut item, now)?;
+        let reasons = scope_overlap_reasons(scope, &item.scope);
+        if !reasons.is_empty() {
+            let their_scope = item.scope.clone();
+            found.push(WorkScopeOverlap {
+                item,
+                your_scope: scope.to_vec(),
+                their_scope,
+                reasons,
+            });
+        }
+    }
+    Ok(found)
+}
+
+fn work_event(kind: &'static str, item: &WorkItem) -> Result<Event> {
+    let mut event = Event::new(
+        kind,
+        &item.id,
+        json!({"generation": item.generation, "owner": item.owner,
+            "repository": item.repository, "state": state_name(item.state)}),
+    )?;
+    event.at = item.updated_at;
+    Ok(event)
+}
+
+fn save_work_version(tx: &mut postgres::Transaction<'_>, item: &WorkItem, seq: i64) -> Result<()> {
+    let snapshot = json_string(item)?;
+    let current = item.current.as_ref().map(json_string).transpose()?;
+    let scope = json_string(&item.scope)?;
+    tx.execute(
+        "UPDATE hub_work_items SET lead_token = $2, lead_agent = $3, lead_session = $4,
+             generation = $5, state = $6, next_action = $7, current_checkpoint = $8,
+             snapshot = $9, updated_at = $10, updated_seq = $11, scope = $12,
+             branch = $13, worktree = $14 WHERE id = $1",
+        &[
+            &item.id,
+            &item.lead_token,
+            &item.lead_agent,
+            &item.lead_session,
+            &item.generation,
+            &state_name(item.state),
+            &item.next_action,
+            &current,
+            &snapshot,
+            &item.updated_at,
+            &seq,
+            &scope,
+            &item.branch,
+            &item.worktree,
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO hub_work_versions (work, event_seq, state, snapshot)
+         VALUES ($1, $2, $3, $4)",
+        &[&item.id, &seq, &state_name(item.state), &snapshot],
+    )?;
+    Ok(())
+}
+
+fn work_payload_bytes(
+    tx: &mut postgres::Transaction<'_>,
+    provider: &str,
+    host: &str,
+    repository: &str,
+    repository_id: Option<i64>,
+) -> Result<i64> {
+    Ok(tx
+        .query_one(
+            "SELECT COALESCE(SUM(bytes), 0)::bigint FROM (
+                 SELECT octet_length(snapshot)::bigint + 256 AS bytes FROM hub_work_items
+                  WHERE provider = $1 AND host = $2 AND repository = $3
+                    AND repository_id IS NOT DISTINCT FROM $4
+                 UNION ALL
+                 SELECT octet_length(v.snapshot)::bigint + 256 FROM hub_work_versions v
+                  JOIN hub_work_items w ON w.id = v.work
+                  WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+                    AND w.repository_id IS NOT DISTINCT FROM $4
+                 UNION ALL
+                 SELECT octet_length(o.request)::bigint + 256 FROM hub_work_checkpoint_ops o
+                  JOIN hub_work_items w ON w.id = o.work
+                  WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+                    AND w.repository_id IS NOT DISTINCT FROM $4
+                 UNION ALL
+                 SELECT CASE WHEN NOT acknowledged THEN 4194304::bigint
+                             ELSE octet_length(page)::bigint + 256 END
+                   FROM hub_work_deliveries
+                  WHERE provider = $1 AND host = $2 AND repository = $3
+                    AND repository_id IS NOT DISTINCT FROM $4
+                 UNION ALL
+                 SELECT octet_length(e.data)::bigint + octet_length(e.kind)::bigint
+                        + octet_length(e.subject)::bigint + 256
+                   FROM hub_events e JOIN hub_work_items w ON w.id = e.subject
+                  WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+                    AND w.repository_id IS NOT DISTINCT FROM $4
+                    AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint')
+                 UNION ALL
+                 SELECT octet_length(r.proposed_scope)::bigint
+                        + octet_length(r.proposed_title)::bigint + 256
+                   FROM hub_coordination_requests r
+                  WHERE r.provider=$1 AND r.host=$2 AND r.repository=$3
+                    AND r.repository_id IS NOT DISTINCT FROM $4
+                 UNION ALL
+                 SELECT octet_length(t.reasons)::bigint + 256
+                   FROM hub_coordination_targets t
+                   JOIN hub_coordination_requests r ON r.id=t.request
+                  WHERE r.provider=$1 AND r.host=$2 AND r.repository=$3
+                    AND r.repository_id IS NOT DISTINCT FROM $4
+                 UNION ALL
+                 SELECT octet_length(COALESCE(s.note,''))::bigint + 256
+                   FROM hub_coordination_responses s
+                   JOIN hub_coordination_requests r ON r.id=s.request
+                  WHERE r.provider=$1 AND r.host=$2 AND r.repository=$3
+                    AND r.repository_id IS NOT DISTINCT FROM $4
+                 UNION ALL
+                 SELECT octet_length(o.payload)::bigint + 256
+                   FROM hub_coordination_operations o
+                   JOIN hub_coordination_requests r ON r.id=o.request
+                  WHERE r.provider=$1 AND r.host=$2 AND r.repository=$3
+                    AND r.repository_id IS NOT DISTINCT FROM $4
+                 UNION ALL
+                 SELECT 256::bigint FROM hub_coordination_acknowledgements a
+                   JOIN hub_coordination_requests r ON r.id=a.request
+                  WHERE r.provider=$1 AND r.host=$2 AND r.repository=$3
+                    AND r.repository_id IS NOT DISTINCT FROM $4
+                 UNION ALL
+                 SELECT 256::bigint FROM hub_coordination_versions v
+                   JOIN hub_coordination_requests r ON r.id=v.request
+                  WHERE r.provider=$1 AND r.host=$2 AND r.repository=$3
+                    AND r.repository_id IS NOT DISTINCT FROM $4
+                 UNION ALL
+                 SELECT octet_length(e.data)::bigint + octet_length(e.kind)::bigint
+                        + octet_length(e.subject)::bigint + 256
+                   FROM hub_events e JOIN hub_coordination_requests r ON r.id=e.subject
+                  WHERE r.provider=$1 AND r.host=$2 AND r.repository=$3
+                    AND r.repository_id IS NOT DISTINCT FROM $4
+             ) payloads",
+            &[
+                &provider,
+                &host,
+                &repository,
+                &repository_id,
+            ],
+        )?
+        .get(0))
+}
+
+fn work_event_payload_bytes(event: &Event) -> Result<i64> {
+    work_payload_row_bytes(
+        event
+            .data
+            .len()
+            .saturating_add(event.kind.len())
+            .saturating_add(event.subject.len()),
+    )
+}
+
+fn work_event_high_water(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    minimum: i64,
+) -> Result<i64> {
+    Ok(tx
+        .query_one(
+            "SELECT MAX(value) FROM (
+                 SELECT COALESCE(MAX(seq),0)::bigint AS value FROM hub_events
+                 UNION ALL SELECT $5::bigint
+                 UNION ALL SELECT event_floor_seq FROM hub_work_retention
+                   WHERE provider=$1 AND host=$2 AND repository=$3
+                     AND repository_id IS NOT DISTINCT FROM $4
+                 UNION ALL SELECT snapshot_floor_seq FROM hub_work_retention
+                   WHERE provider=$1 AND host=$2 AND repository=$3
+                     AND repository_id IS NOT DISTINCT FROM $4
+                 UNION ALL SELECT event_floor_seq FROM hub_coordination_retention
+                   WHERE provider=$1 AND host=$2 AND repository=$3
+                     AND repository_id IS NOT DISTINCT FROM $4) watermarks",
+            &[
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                &who.repository_id,
+                &minimum,
+            ],
+        )?
+        .get(0))
+}
+
+fn work_transition_payload_bytes(snapshot: &str, event: &Event) -> Result<i64> {
+    let snapshot = work_payload_row_bytes(snapshot.len())?;
+    let event = work_event_payload_bytes(event)?;
+    snapshot
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(event))
+        .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))
+}
+
+fn stored_work_item_bytes(tx: &mut postgres::Transaction<'_>, id: &str) -> Result<i64> {
+    Ok(tx
+        .query_one(
+            "SELECT octet_length(snapshot)::bigint + 256 FROM hub_work_items WHERE id = $1",
+            &[&id],
+        )?
+        .get(0))
+}
+
+fn adjust_work_payload_capacity(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    delta: i64,
+    now: i64,
+) -> Result<()> {
+    let used: Option<i64> = tx
+        .query_opt(
+            "SELECT charged_bytes FROM hub_work_usage
+             WHERE provider = $1 AND host = $2 AND repository = $3
+               AND repository_id IS NOT DISTINCT FROM $4 FOR UPDATE",
+            &[
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                &who.repository_id,
+            ],
+        )?
+        .map(|row| row.get(0));
+    let used = used.unwrap_or(0);
+    check_work_payload_capacity(used, delta, WORK_PAYLOAD_CAPACITY_BYTES)?;
+    let charged = used
+        .checked_add(delta)
+        .filter(|charged| *charged >= 0)
+        .ok_or_else(|| HubError::Unavailable("work payload accounting is inconsistent".into()))?;
+    let changed = tx.execute(
+        "UPDATE hub_work_usage SET charged_bytes = $5, updated_at = $6
+         WHERE provider = $1 AND host = $2 AND repository = $3
+           AND repository_id IS NOT DISTINCT FROM $4",
+        &[
+            &who.owner.identity.provider,
+            &who.owner.identity.host,
+            &who.repository,
+            &who.repository_id,
+            &charged,
+            &now,
+        ],
+    )?;
+    if changed == 0 {
+        tx.execute(
+            "INSERT INTO hub_work_usage
+                (provider, host, repository, repository_id, charged_bytes, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+            &[
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                &who.repository_id,
+                &charged,
+                &now,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn work_retention_floors(tx: &mut postgres::Transaction<'_>, who: &WorkWho) -> Result<(i64, i64)> {
+    Ok(tx
+        .query_opt(
+            "SELECT event_floor_seq, snapshot_floor_seq FROM hub_work_retention
+             WHERE provider = $1 AND host = $2 AND repository = $3
+               AND repository_id IS NOT DISTINCT FROM $4",
+            &[
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                &who.repository_id,
+            ],
+        )?
+        .map_or((0, 0), |row| (row.get(0), row.get(1))))
+}
+
+fn replace_relations(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    work: &str,
+    depends_on: &[String],
+    related: &[String],
+) -> Result<()> {
+    relation_targets(tx, who, depends_on)?;
+    relation_targets(tx, who, related)?;
+    if depends_on.iter().chain(related).any(|id| id == work) {
+        return Err(HubError::Invalid("work cannot relate to itself".into()));
+    }
+    tx.execute("DELETE FROM hub_work_relations WHERE work = $1", &[&work])?;
+    for (kind, ids) in [("depends_on", depends_on), ("related", related)] {
+        for id in ids {
+            tx.execute(
+                "INSERT INTO hub_work_relations (work, related, kind) VALUES ($1, $2, $3)",
+                &[&work, id, &kind],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn unfinished_for_session(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    session: &str,
+    now: i64,
+) -> Result<Option<WorkItem>> {
+    let rows = tx.query(
+        "SELECT snapshot FROM hub_work_items
+         WHERE provider = $1 AND host = $2 AND repository = $3
+           AND repository_id IS NOT DISTINCT FROM $4 AND lead_token = $5
+           AND lead_session = $6 AND state <> 'finished'
+         ORDER BY id LIMIT 2",
+        &[
+            &who.owner.identity.provider,
+            &who.owner.identity.host,
+            &who.repository,
+            &who.repository_id,
+            &who.token,
+            &session,
+        ],
+    )?;
+    if rows.len() > 1 {
+        return Err(HubError::Invalid(
+            "session is lead for more than one unfinished work item".into(),
+        ));
+    }
+    rows.first()
+        .map(|row| {
+            let snapshot: String = row.get(0);
+            let mut item: WorkItem = json_value(&snapshot)?;
+            project_claim(tx, &mut item, now)?;
+            Ok(item)
+        })
+        .transpose()
+}
+
+fn resolve_work(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    start: &WorkStart,
+    now: i64,
+) -> Result<Option<WorkItem>> {
+    if let Some(id) = &start.work_id {
+        return scoped_work(tx, who, id, now, true);
+    }
+    let row = if let Some(source) = &start.source {
+        tx.query_opt(
+            "SELECT snapshot FROM hub_work_items
+             WHERE provider = $1 AND host = $2 AND repository = $3
+               AND repository_id IS NOT DISTINCT FROM $4 AND source_provider = $5
+               AND source_host = $6 AND source_repository = $7 AND source_issue = $8
+             FOR UPDATE",
+            &[
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                &who.repository_id,
+                &source.provider,
+                &source.host,
+                &source.repository,
+                &source.issue,
+            ],
+        )?
+    } else {
+        tx.query_opt(
+            "SELECT snapshot FROM hub_work_items
+             WHERE provider = $1 AND host = $2 AND repository = $3
+               AND repository_id IS NOT DISTINCT FROM $4 AND owner = $5 AND request_key = $6
+             FOR UPDATE",
+            &[
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                &who.repository_id,
+                &who.owner.id,
+                &start.request_key,
+            ],
+        )?
+    };
+    row.map(|row| {
+        let snapshot: String = row.get(0);
+        let mut item: WorkItem = json_value(&snapshot)?;
+        project_claim(tx, &mut item, now)?;
+        Ok(item)
+    })
+    .transpose()
+}
+
+fn coordination_event(
+    kind: &'static str,
+    request: &str,
+    now: i64,
+    data: serde_json::Value,
+) -> Result<Event> {
+    let mut event = Event::new(kind, request, data)?;
+    event.at = now;
+    Ok(event)
+}
+
+fn coordination_lead(item: &WorkItem) -> CoordinationAgent {
+    let participant = item.participants.iter().find(|participant| {
+        participant.token == item.lead_token && participant.session == item.lead_session
+    });
+    CoordinationAgent {
+        token: item.lead_token.clone(),
+        agent: item.lead_agent.clone(),
+        session: item.lead_session.clone(),
+        owner: participant.map_or_else(
+            || item.owner.clone(),
+            |participant| participant.owner.clone(),
+        ),
+        login: participant.map_or_else(
+            || item.owner_login.clone(),
+            |participant| participant.login.clone(),
+        ),
+    }
+}
+
+fn coordination_request_at(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    request: &str,
+    through: i64,
+    now: i64,
+) -> Result<Option<CoordinationRequest>> {
+    let Some(row) = tx.query_opt(
+        "SELECT r.requester_owner, r.requester_token, r.requester_agent,
+                r.requester_session, u.login, v.proposed_work, r.source_provider,
+                r.source_host, r.source_repository, r.source_issue, r.request_key,
+                r.proposed_title, r.proposed_scope, v.status, r.created_at, v.updated_at,
+                r.created_seq, v.event_seq
+         FROM hub_coordination_requests r
+         JOIN hub_users u ON u.id = r.requester_owner
+         JOIN hub_coordination_versions v ON v.request = r.id
+         WHERE r.id = $1 AND r.provider = $2 AND r.host = $3
+           AND r.repository = $4 AND r.repository_id IS NOT DISTINCT FROM $5
+           AND v.event_seq = (SELECT MAX(v2.event_seq) FROM hub_coordination_versions v2
+                              WHERE v2.request = r.id AND v2.event_seq <= $6)",
+        &[
+            &request,
+            &who.owner.identity.provider,
+            &who.owner.identity.host,
+            &who.repository,
+            &who.repository_id,
+            &through,
+        ],
+    )?
+    else {
+        return Ok(None);
+    };
+    let requester_owner: String = row.get(0);
+    let requester_token: String = row.get(1);
+    let requester_agent: String = row.get(2);
+    let requester_session: String = row.get(3);
+    let requester_login: String = row.get(4);
+    let proposed_work: Option<String> = row.get(5);
+    let source_provider: Option<String> = row.get(6);
+    let source_host: Option<String> = row.get(7);
+    let source_repository: Option<String> = row.get(8);
+    let source_issue: Option<String> = row.get(9);
+    let source = match (
+        source_provider,
+        source_host,
+        source_repository,
+        source_issue,
+    ) {
+        (Some(provider), Some(host), Some(repository), Some(issue)) => {
+            Some(super::work::ForgeWorkRef {
+                provider,
+                host,
+                repository,
+                issue,
+            })
+        }
+        (None, None, None, None) => None,
+        _ => {
+            return Err(HubError::Unavailable(
+                "invalid coordination proposal source".into(),
+            ));
+        }
+    };
+    let mut targets = Vec::new();
+    for target in tx.query(
+        "SELECT work, reasons, reasons_complete FROM hub_coordination_targets
+         WHERE request = $1 ORDER BY work",
+        &[&request],
+    )? {
+        let work: String = target.get(0);
+        let reasons: String = target.get(1);
+        let reasons_complete: bool = target.get(2);
+        let item = scoped_work(tx, who, &work, now, false)?
+            .ok_or_else(|| HubError::Unavailable("coordination target work is missing".into()))?;
+        targets.push(CoordinationTarget {
+            work_id: work,
+            lead: coordination_lead(&item),
+            generation: item.generation,
+            reasons: json_value(&reasons)?,
+            reasons_complete,
+        });
+    }
+    let acknowledgements = tx
+        .query(
+            "SELECT target_work, token, agent, session, owner, login, generation, through_seq,
+                acknowledged_at, event_seq
+         FROM hub_coordination_acknowledgements a
+         WHERE request = $1 AND event_seq <= $2
+           AND event_seq = (SELECT MAX(a2.event_seq) FROM hub_coordination_acknowledgements a2
+                            WHERE a2.request = a.request AND a2.target_work = a.target_work
+                              AND a2.token = a.token AND a2.session = a.session
+                              AND a2.generation = a.generation AND a2.event_seq <= $2)
+         ORDER BY CASE WHEN
+             (a.target_work='' AND a.token=$4 AND a.session=$5 AND a.generation=0)
+             OR EXISTS (SELECT 1 FROM hub_coordination_targets t
+                        JOIN hub_work_items w ON w.id=t.work
+                        WHERE t.request=a.request AND t.work=a.target_work
+                          AND w.lead_token=a.token AND w.lead_session=a.session
+                          AND w.generation=a.generation)
+             THEN 0 ELSE 1 END, event_seq DESC LIMIT $3",
+            &[
+                &request,
+                &through,
+                &(MAX_PROJECTED_COORDINATION_UPDATES + 1),
+                &requester_token,
+                &requester_session,
+            ],
+        )?
+        .into_iter()
+        .map(|row| {
+            let target: String = row.get(0);
+            CoordinationAcknowledgement {
+                target_work_id: (!target.is_empty()).then_some(target),
+                agent: CoordinationAgent {
+                    token: row.get(1),
+                    agent: row.get(2),
+                    session: row.get(3),
+                    owner: row.get(4),
+                    login: row.get(5),
+                },
+                generation: row.get(6),
+                through_seq: row.get(7),
+                acknowledged_at: row.get(8),
+                seq: row.get(9),
+            }
+        })
+        .collect::<Vec<_>>();
+    let acknowledgements_complete =
+        acknowledgements.len() <= MAX_PROJECTED_COORDINATION_UPDATES as usize;
+    let acknowledgements = acknowledgements
+        .into_iter()
+        .take(MAX_PROJECTED_COORDINATION_UPDATES as usize)
+        .collect::<Vec<_>>();
+    let response_rows = tx.query(
+        "SELECT id, operation_id, target_work, token, agent, session, owner, login,
+                target_generation, kind, note, created_at, event_seq
+         FROM hub_coordination_responses WHERE request = $1 AND event_seq <= $2
+         ORDER BY CASE WHEN EXISTS (
+             SELECT 1 FROM hub_coordination_targets t JOIN hub_work_items w ON w.id=t.work
+             WHERE t.request=hub_coordination_responses.request
+               AND t.work=hub_coordination_responses.target_work
+               AND w.lead_token=hub_coordination_responses.token
+               AND w.lead_session=hub_coordination_responses.session
+               AND w.generation=hub_coordination_responses.target_generation)
+             THEN 0 ELSE 1 END, event_seq DESC LIMIT $3",
+        &[
+            &request,
+            &through,
+            &(MAX_PROJECTED_COORDINATION_UPDATES + 1),
+        ],
+    )?;
+    let responses_complete = response_rows.len() <= MAX_PROJECTED_COORDINATION_UPDATES as usize;
+    let mut responses = Vec::new();
+    for row in response_rows
+        .into_iter()
+        .take(MAX_PROJECTED_COORDINATION_UPDATES as usize)
+    {
+        let kind: String = row.get(9);
+        responses.push(CoordinationResponse {
+            id: row.get(0),
+            operation_id: row.get(1),
+            target_work_id: row.get(2),
+            responder: CoordinationAgent {
+                token: row.get(3),
+                agent: row.get(4),
+                session: row.get(5),
+                owner: row.get(6),
+                login: row.get(7),
+            },
+            target_generation: row.get(8),
+            kind: parse_response_kind(&kind)?,
+            note: row.get(10),
+            created_at: row.get(11),
+            seq: row.get(12),
+        });
+    }
+    let stored_status: String = row.get(13);
+    let status = parse_status(&stored_status)?;
+    Ok(Some(CoordinationRequest {
+        id: request.to_owned(),
+        requester: CoordinationAgent {
+            token: requester_token,
+            agent: requester_agent,
+            session: requester_session,
+            owner: requester_owner,
+            login: requester_login,
+        },
+        proposal: CoordinationProposal {
+            work_id: proposed_work,
+            source,
+            request_key: row.get(10),
+            title: row.get(11),
+            scope: json_value(&row.get::<_, String>(12))?,
+        },
+        targets,
+        status,
+        acknowledgements,
+        acknowledgements_complete,
+        responses,
+        responses_complete,
+        created_at: row.get(14),
+        updated_at: row.get(15),
+        created_seq: row.get(16),
+        updated_seq: row.get(17),
+    }))
+}
+
+fn coordination_all_targets_responded(
+    tx: &mut postgres::Transaction<'_>,
+    request: &str,
+) -> Result<bool> {
+    Ok(tx
+        .query_one(
+            "SELECT NOT EXISTS (
+                 SELECT 1 FROM hub_coordination_targets t
+                 JOIN hub_work_items w ON w.id=t.work
+                 WHERE t.request=$1 AND NOT EXISTS (
+                     SELECT 1 FROM hub_coordination_responses r
+                     WHERE r.request=t.request AND r.target_work=t.work
+                       AND r.token=w.lead_token AND r.session=w.lead_session
+                       AND r.target_generation=w.generation
+                 )
+             )",
+            &[&request],
+        )?
+        .get(0))
+}
+
+fn coordination_was_initially_bound(
+    tx: &mut postgres::Transaction<'_>,
+    request: &str,
+) -> Result<bool> {
+    Ok(tx
+        .query_one(
+            "SELECT proposed_work IS NOT NULL FROM hub_coordination_versions
+             WHERE request=$1 ORDER BY event_seq LIMIT 1",
+            &[&request],
+        )?
+        .get(0))
+}
+
+fn coordination_payload_bytes(parts: &[&str], event: &Event) -> Result<i64> {
+    parts
+        .iter()
+        .try_fold(work_event_payload_bytes(event)?, |total, part| {
+            total
+                .checked_add(work_payload_row_bytes(part.len())?)
+                .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))
+        })
+}
+
+fn create_coordination_request(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    requester_session: &str,
+    proposal: CoordinationProposal,
+    overlaps: &[WorkScopeOverlap],
+    now: i64,
+) -> Result<CoordinationRequest> {
+    let mut target_ids = overlaps
+        .iter()
+        .map(|overlap| overlap.item.id.clone())
+        .collect::<Vec<_>>();
+    target_ids.sort();
+    target_ids.dedup();
+    let identity = if let Some(work) = &proposal.work_id {
+        json_string(&("work", work))?
+    } else if let Some(source) = &proposal.source {
+        json_string(&("source", source))?
+    } else if let Some(key) = &proposal.request_key
+        && !super::coordination::is_automatic_request_key(key)
+    {
+        json_string(&("request", key))?
+    } else {
+        json_string(&("automatic", &proposal.title))?
+    };
+    let fingerprint = lower_hex_of(
+        json_string(&(
+            (&who.token, requester_session),
+            &identity,
+            &proposal.title,
+            &target_ids,
+            &proposal.scope,
+        ))?
+        .as_bytes(),
+    );
+    if let Some(row) = tx.query_opt(
+        "SELECT id FROM hub_coordination_requests
+         WHERE provider = $1 AND host = $2 AND repository = $3
+           AND repository_id IS NOT DISTINCT FROM $4 AND fingerprint = $5
+           AND status IN ('pending', 'responded')",
+        &[
+            &who.owner.identity.provider,
+            &who.owner.identity.host,
+            &who.repository,
+            &who.repository_id,
+            &fingerprint,
+        ],
+    )? {
+        let id: String = row.get(0);
+        return coordination_request_at(tx, who, &id, i64::MAX, now)?
+            .ok_or_else(|| HubError::Unavailable("coordination request disappeared".into()));
+    }
+    let row = tx.query_one(
+        "SELECT COUNT(*),
+                    COUNT(*) FILTER (WHERE requester_owner = $5),
+                    COUNT(*) FILTER (WHERE requester_token = $6)
+             FROM hub_coordination_requests
+         WHERE provider = $1 AND host = $2 AND repository = $3
+           AND repository_id IS NOT DISTINCT FROM $4 AND status IN ('pending', 'responded')",
+        &[
+            &who.owner.identity.provider,
+            &who.owner.identity.host,
+            &who.repository,
+            &who.repository_id,
+            &who.owner.id,
+            &who.token,
+        ],
+    )?;
+    let active: i64 = row.get(0);
+    let owner_active: i64 = row.get(1);
+    let token_active: i64 = row.get(2);
+    if active >= MAX_ACTIVE_COORDINATION_REQUESTS
+        || owner_active >= MAX_ACTIVE_COORDINATION_REQUESTS_PER_OWNER
+        || token_active >= MAX_ACTIVE_COORDINATION_REQUESTS_PER_TOKEN
+    {
+        return Err(HubError::WorkCapacity);
+    }
+    let id = new_id("crq")?;
+    // Automatic requests are built from work scopes that are already in their
+    // canonical storage form (directory entries end in `/`). Re-normalizing
+    // that internal form would reject a valid scope expansion such as `ui/**`.
+    let scope = json_string(&proposal.scope)?;
+    let event = coordination_event(
+        "coordination_requested",
+        &id,
+        now,
+        json!({"requester": who.token, "session": requester_session,
+            "proposal": &proposal, "targets": &target_ids}),
+    )?;
+    let seq = append(tx, &event)?;
+    let (source_provider, source_host, source_repository, source_issue) = proposal
+        .source
+        .as_ref()
+        .map_or((None, None, None, None), |source| {
+            (
+                Some(source.provider.as_str()),
+                Some(source.host.as_str()),
+                Some(source.repository.as_str()),
+                Some(source.issue.as_str()),
+            )
+        });
+    tx.execute(
+        "INSERT INTO hub_coordination_requests
+            (id, provider, host, repository, repository_id, requester_owner, requester_token,
+             requester_agent, requester_session, proposed_work, source_provider, source_host,
+             source_repository, source_issue, request_key, proposed_title, proposed_scope,
+             fingerprint, status, created_at, updated_at, created_seq, updated_seq)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
+                 'pending',$19,$19,$20,$20)",
+        &[
+            &id,
+            &who.owner.identity.provider,
+            &who.owner.identity.host,
+            &who.repository,
+            &who.repository_id,
+            &who.owner.id,
+            &who.token,
+            &who.agent,
+            &requester_session,
+            &proposal.work_id,
+            &source_provider,
+            &source_host,
+            &source_repository,
+            &source_issue,
+            &proposal.request_key,
+            &proposal.title,
+            &scope,
+            &fingerprint,
+            &now,
+            &seq,
+        ],
+    )?;
+    let mut target_payloads = Vec::new();
+    for overlap in overlaps {
+        let reasons_complete = overlap.reasons.len() <= MAX_COORDINATION_REASONS_PER_TARGET;
+        let reasons = json_string(
+            &overlap
+                .reasons
+                .iter()
+                .take(MAX_COORDINATION_REASONS_PER_TARGET)
+                .cloned()
+                .collect::<Vec<_>>(),
+        )?;
+        tx.execute(
+            "INSERT INTO hub_coordination_targets
+             (request,work,original_generation,reasons,reasons_complete) VALUES ($1,$2,$3,$4,$5)",
+            &[
+                &id,
+                &overlap.item.id,
+                &overlap.item.generation,
+                &reasons,
+                &reasons_complete,
+            ],
+        )?;
+        target_payloads.push(reasons);
+    }
+    tx.execute(
+        "INSERT INTO hub_coordination_versions
+            (request,event_seq,status,proposed_work,updated_at) VALUES ($1,$2,'pending',$3,$4)",
+        &[&id, &seq, &proposal.work_id, &now],
+    )?;
+    let mut parts = vec![scope.as_str(), proposal.title.as_str()];
+    parts.extend(target_payloads.iter().map(String::as_str));
+    adjust_work_payload_capacity(tx, who, coordination_payload_bytes(&parts, &event)?, now)?;
+    coordination_request_at(tx, who, &id, seq, now)?
+        .ok_or_else(|| HubError::Unavailable("coordination request was not stored".into()))
+}
+
+fn coordination_is_requester(request: &CoordinationRequest, who: &WorkWho, session: &str) -> bool {
+    request.requester.token == who.token && request.requester.session == session
+}
+
+fn coordination_target_for<'a>(
+    request: &'a CoordinationRequest,
+    work: &str,
+    who: &WorkWho,
+    session: &str,
+) -> Option<&'a CoordinationTarget> {
+    request.targets.iter().find(|target| {
+        target.work_id == work && target.lead.token == who.token && target.lead.session == session
+    })
+}
+
+fn save_coordination_version(
+    tx: &mut postgres::Transaction<'_>,
+    request: &str,
+    status: CoordinationStatus,
+    proposed_work: Option<&str>,
+    now: i64,
+    seq: i64,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE hub_coordination_requests SET status=$2, proposed_work=$3,
+         source_provider=CASE WHEN $3::text IS NULL THEN source_provider ELSE NULL END,
+         source_host=CASE WHEN $3::text IS NULL THEN source_host ELSE NULL END,
+         source_repository=CASE WHEN $3::text IS NULL THEN source_repository ELSE NULL END,
+         source_issue=CASE WHEN $3::text IS NULL THEN source_issue ELSE NULL END,
+         request_key=CASE WHEN $3::text IS NULL THEN request_key ELSE NULL END,
+         updated_at=$4, updated_seq=$5 WHERE id=$1",
+        &[&request, &status_name(status), &proposed_work, &now, &seq],
+    )?;
+    tx.execute(
+        "INSERT INTO hub_coordination_versions
+         (request,event_seq,status,proposed_work,updated_at) VALUES ($1,$2,$3,$4,$5)",
+        &[&request, &seq, &status_name(status), &proposed_work, &now],
+    )?;
+    Ok(())
+}
+
+fn bind_coordination_request(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    session: &str,
+    item: &WorkItem,
+    now: i64,
+) -> Result<()> {
+    let mut row = match &item.source {
+        WorkSource::Native { request_key } => tx.query_opt(
+            "SELECT id FROM hub_coordination_requests
+             WHERE provider=$1 AND host=$2 AND repository=$3
+               AND repository_id IS NOT DISTINCT FROM $4 AND requester_token=$5
+               AND requester_session=$6 AND proposed_work IS NULL
+               AND status IN ('pending','responded') AND request_key=$7
+             ORDER BY created_seq DESC LIMIT 1",
+            &[
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                &who.repository_id,
+                &who.token,
+                &session,
+                &request_key,
+            ],
+        )?,
+        WorkSource::Forge {
+            provider,
+            host,
+            repository,
+            issue,
+        } => tx.query_opt(
+            "SELECT id FROM hub_coordination_requests
+             WHERE provider=$1 AND host=$2 AND repository=$3
+               AND repository_id IS NOT DISTINCT FROM $4 AND requester_token=$5
+               AND requester_session=$6 AND proposed_work IS NULL
+               AND status IN ('pending','responded') AND source_provider=$7
+               AND source_host=$8 AND source_repository=$9 AND source_issue=$10
+             ORDER BY created_seq DESC LIMIT 1",
+            &[
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                &who.repository_id,
+                &who.token,
+                &session,
+                &provider,
+                &host,
+                &repository,
+                &issue,
+            ],
+        )?,
+    };
+    if row.is_none()
+        && matches!(&item.source, WorkSource::Native { request_key }
+            if super::coordination::is_automatic_request_key(request_key))
+    {
+        row = tx
+            .query(
+                "SELECT id,proposed_scope FROM hub_coordination_requests
+             WHERE provider=$1 AND host=$2 AND repository=$3
+               AND repository_id IS NOT DISTINCT FROM $4 AND requester_token=$5
+               AND requester_session=$6 AND proposed_work IS NULL
+               AND status IN ('pending','responded') AND proposed_title=$7
+             ORDER BY created_seq DESC",
+                &[
+                    &who.owner.identity.provider,
+                    &who.owner.identity.host,
+                    &who.repository,
+                    &who.repository_id,
+                    &who.token,
+                    &session,
+                    &item.title,
+                ],
+            )?
+            .into_iter()
+            .find_map(|candidate| {
+                let scope: String = candidate.get(1);
+                json_value::<Vec<String>>(&scope)
+                    .ok()
+                    .filter(|proposal_scope| {
+                        uncovered_scope(proposal_scope, &item.scope).is_empty()
+                    })
+                    .map(|_| candidate)
+            });
+    }
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let request: String = row.get(0);
+    let event = coordination_event(
+        "coordination_bound",
+        &request,
+        now,
+        json!({"work_id": item.id}),
+    )?;
+    let seq = append(tx, &event)?;
+    save_coordination_version(
+        tx,
+        &request,
+        CoordinationStatus::Pending,
+        Some(&item.id),
+        now,
+        seq,
+    )?;
+    adjust_work_payload_capacity(
+        tx,
+        who,
+        coordination_payload_bytes(&[&item.id], &event)?,
+        now,
+    )
+}
+
+fn retarget_coordination_requests(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    work: &str,
+    generation: i64,
+    lead_session: &str,
+    now: i64,
+) -> Result<()> {
+    let rows = tx.query(
+        "SELECT r.id,r.proposed_work FROM hub_coordination_requests r
+         JOIN hub_coordination_targets t ON t.request=r.id
+         WHERE t.work=$1 AND r.status IN ('pending','responded')
+         ORDER BY r.id LIMIT 101",
+        &[&work],
+    )?;
+    if rows.len() > MAX_ACTIVE_COORDINATION_REQUESTS as usize {
+        return Err(HubError::WorkCapacity);
+    }
+    for row in rows {
+        let request: String = row.get(0);
+        let proposed_work: Option<String> = row.get(1);
+        let event = coordination_event(
+            "coordination_retargeted",
+            &request,
+            now,
+            json!({"work_id": work, "lead_token": who.token,
+                "lead_session": lead_session, "generation": generation}),
+        )?;
+        let seq = append(tx, &event)?;
+        save_coordination_version(
+            tx,
+            &request,
+            CoordinationStatus::Pending,
+            proposed_work.as_deref(),
+            now,
+            seq,
+        )?;
+        adjust_work_payload_capacity(tx, who, coordination_payload_bytes(&[work], &event)?, now)?;
+    }
+    Ok(())
+}
+
+fn coordination_operation_replay(
+    tx: &mut postgres::Transaction<'_>,
+    request: &str,
+    operation: &str,
+    kind: &str,
+    payload: &str,
+) -> Result<bool> {
+    match tx.query_opt(
+        "SELECT kind,payload FROM hub_coordination_operations
+         WHERE request=$1 AND operation_id=$2",
+        &[&request, &operation],
+    )? {
+        None => Ok(false),
+        Some(row) if row.get::<_, String>(0) == kind && row.get::<_, String>(1) == payload => {
+            Ok(true)
+        }
+        Some(_) => Err(HubError::Invalid(
+            "coordination operation_id was already used for another request".into(),
+        )),
+    }
+}
+
+fn coordination_page(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    session: Option<&str>,
+    cursor: (i64, Option<i64>, bool),
+    limit: usize,
+    now: i64,
+) -> Result<CoordinationInbox> {
+    let (after, requested_through, pending_only) = cursor;
+    let retention_floor: i64 = tx
+        .query_opt(
+            "SELECT event_floor_seq FROM hub_coordination_retention
+             WHERE provider=$1 AND host=$2 AND repository=$3
+               AND repository_id IS NOT DISTINCT FROM $4",
+            &[
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                &who.repository_id,
+            ],
+        )?
+        .map_or(0, |row| row.get(0));
+    let through = match requested_through {
+        Some(through) => through,
+        None => tx
+            .query_one("SELECT COALESCE(MAX(seq),0) FROM hub_events", &[])?
+            .get::<_, i64>(0)
+            .max(retention_floor)
+            .max(after),
+    };
+    let status = if pending_only {
+        "AND v.status IN ('pending', 'responded')"
+    } else {
+        ""
+    };
+    let rows = if let Some(session) = session {
+        tx.query(
+            &format!(
+                "SELECT r.id,v.event_seq FROM hub_coordination_requests r
+             JOIN hub_coordination_versions v ON v.request=r.id
+             WHERE r.provider=$1 AND r.host=$2 AND r.repository=$3
+               AND r.repository_id IS NOT DISTINCT FROM $4 AND v.event_seq>$5 AND v.event_seq<=$6
+               AND v.event_seq=(SELECT MAX(v2.event_seq) FROM hub_coordination_versions v2
+                                WHERE v2.request=r.id AND v2.event_seq<=$6)
+               {status}
+               AND (r.requester_token=$7 AND r.requester_session=$8 OR EXISTS (
+                    SELECT 1 FROM hub_coordination_targets t JOIN hub_work_items w ON w.id=t.work
+                    WHERE t.request=r.id AND w.lead_token=$7 AND w.lead_session=$8))
+             ORDER BY v.event_seq,r.id LIMIT $9"
+            ),
+            &[
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                &who.repository_id,
+                &after,
+                &through,
+                &who.token,
+                &session,
+                &i64::try_from(limit + 1).unwrap_or(i64::MAX),
+            ],
+        )?
+    } else {
+        tx.query(
+            &format!(
+                "SELECT r.id,v.event_seq FROM hub_coordination_requests r
+             JOIN hub_coordination_versions v ON v.request=r.id
+             WHERE r.provider=$1 AND r.host=$2 AND r.repository=$3
+               AND r.repository_id IS NOT DISTINCT FROM $4 AND v.event_seq>$5 AND v.event_seq<=$6
+               AND v.event_seq=(SELECT MAX(v2.event_seq) FROM hub_coordination_versions v2
+                                WHERE v2.request=r.id AND v2.event_seq<=$6)
+               {status}
+             ORDER BY v.event_seq,r.id LIMIT $7"
+            ),
+            &[
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                &who.repository_id,
+                &after,
+                &through,
+                &i64::try_from(limit + 1).unwrap_or(i64::MAX),
+            ],
+        )?
+    };
+    let mut complete = rows.len() <= limit;
+    let rows = rows.into_iter().take(limit).collect::<Vec<_>>();
+    let mut next_after = after;
+    let mut requests = Vec::new();
+    let mut bytes = 0_usize;
+    for row in rows {
+        let id: String = row.get(0);
+        let seq: i64 = row.get(1);
+        let request = coordination_request_at(tx, who, &id, through, now)?
+            .ok_or_else(|| HubError::Unavailable("coordination page changed during read".into()))?;
+        let request_bytes = json_string(&request)?.len();
+        if !requests.is_empty() && bytes.saturating_add(request_bytes) > MAX_BRIEFING_BYTES {
+            complete = false;
+            break;
+        }
+        if request_bytes > MAX_BRIEFING_BYTES {
+            return Err(HubError::Unavailable(
+                "one coordination request exceeds the page byte limit".into(),
+            ));
+        }
+        bytes = bytes.saturating_add(request_bytes);
+        next_after = seq;
+        requests.push(request);
+    }
+    Ok(CoordinationInbox {
+        from: after,
+        through,
+        next_after,
+        requests,
+        complete,
+        retention_gap: after < retention_floor,
+    })
+}
+
+fn start_in(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    start: &WorkStart,
+    now: i64,
+) -> Result<WorkStartResult> {
+    if who.read_only {
+        return Err(HubError::Unauthorized);
+    }
+    let scope = start.validate(who)?;
+    if let Some(mut item) = resolve_work(tx, who, start, now)? {
+        if start.role != WorkRole::Lead {
+            let previous_item_bytes = stored_work_item_bytes(tx, &item.id)?;
+            let participant_generation = tx
+                .query_opt(
+                    "SELECT generation FROM hub_work_participants
+                     WHERE work=$1 AND token=$2 AND session=$3",
+                    &[&item.id, &who.token, &start.session],
+                )?
+                .map(|row| row.get::<_, i64>(0));
+            if let Some(existing) = item
+                .participants
+                .iter()
+                .find(|p| p.token == who.token && p.session == start.session)
+            {
+                if existing.role == WorkRole::Lead {
+                    return Err(HubError::Invalid(
+                        "the lead role can only change through takeover".into(),
+                    ));
+                }
+                if existing.role == start.role && participant_generation == Some(item.generation) {
+                    return Ok(WorkStartResult {
+                        item,
+                        created: false,
+                        joined: false,
+                        took_over: false,
+                        conflict: None,
+                        context: None,
+                        coordination_request: None,
+                    });
+                }
+                item.participants
+                    .retain(|p| p.token != who.token || p.session != start.session);
+            } else if item.participants.len() >= 100 {
+                return Err(HubError::Invalid(
+                    "work has the maximum of 100 participants".into(),
+                ));
+            }
+            item.participants.push(WorkParticipant {
+                owner: who.owner.id.clone(),
+                login: who.owner.login.clone(),
+                token: who.token.clone(),
+                agent: who.agent.clone(),
+                session: start.session.clone(),
+                role: start.role,
+            });
+            item.participants.sort_by(|a, b| {
+                (&a.owner, &a.token, &a.session).cmp(&(&b.owner, &b.token, &b.session))
+            });
+            item.updated_at = now;
+            let event = work_event("work_joined", &item)?;
+            let seq = append(tx, &event)?;
+            item.updated_seq = seq;
+            tx.execute(
+                "INSERT INTO hub_work_participants
+                    (work, token, owner, agent, session, role, generation, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+                 ON CONFLICT (work, token, session) DO UPDATE SET role = excluded.role,
+                    agent = excluded.agent, generation = excluded.generation,
+                    updated_at = excluded.updated_at",
+                &[
+                    &item.id,
+                    &who.token,
+                    &who.owner.id,
+                    &who.agent,
+                    &start.session,
+                    &role_name(start.role),
+                    &item.generation,
+                    &now,
+                ],
+            )?;
+            save_work_version(tx, &item, seq)?;
+            let snapshot = json_string(&item)?;
+            let delta = work_transition_payload_bytes(&snapshot, &event)?
+                .checked_sub(previous_item_bytes)
+                .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+            adjust_work_payload_capacity(tx, who, delta, now)?;
+            return Ok(WorkStartResult {
+                item,
+                created: false,
+                joined: true,
+                took_over: false,
+                conflict: None,
+                context: None,
+                coordination_request: None,
+            });
+        }
+        if item.lead_token == who.token
+            && item.lead_session == start.session
+            && start.takeover_generation.is_none()
+        {
+            if item.title != start.title
+                || item.scope != scope
+                || item.branch != start.branch
+                || item.worktree != start.worktree
+                || item.next_action != start.next_action
+                || item.depends_on != start.depends_on
+                || item.related_work != start.related_work
+            {
+                return Ok(WorkStartResult {
+                    conflict: Some(WorkStartConflict {
+                        kind: WorkConflictKind::MetadataChanged,
+                        current_generation: item.generation,
+                        overlaps: Vec::new(),
+                    }),
+                    item,
+                    created: false,
+                    joined: false,
+                    took_over: false,
+                    context: None,
+                    coordination_request: None,
+                });
+            }
+            let overlaps = work_scope_overlaps(tx, who, &item.scope, Some(&item.id), now)?;
+            let coordination_request = if overlaps.is_empty() {
+                None
+            } else {
+                Some(create_coordination_request(
+                    tx,
+                    who,
+                    &start.session,
+                    CoordinationProposal {
+                        work_id: Some(item.id.clone()),
+                        source: None,
+                        request_key: None,
+                        title: item.title.clone(),
+                        scope: item.scope.clone(),
+                    },
+                    &overlaps,
+                    now,
+                )?)
+            };
+            return Ok(WorkStartResult {
+                item,
+                created: false,
+                joined: false,
+                took_over: false,
+                conflict: None,
+                context: None,
+                coordination_request,
+            });
+        }
+        if start.takeover_generation != Some(item.generation) {
+            let kind = if start.takeover_generation.is_some() {
+                WorkConflictKind::GenerationChanged
+            } else if item.claim_status == ClaimStatus::Stale {
+                WorkConflictKind::StaleTakeoverRequired
+            } else {
+                WorkConflictKind::ClaimHeld
+            };
+            return Ok(WorkStartResult {
+                conflict: Some(WorkStartConflict {
+                    kind,
+                    current_generation: item.generation,
+                    overlaps: Vec::new(),
+                }),
+                item,
+                created: false,
+                joined: false,
+                took_over: false,
+                context: None,
+                coordination_request: None,
+            });
+        }
+        let resuming_own_paused = item.lead_token == who.token
+            && item.state == WorkState::Paused
+            && start.takeover_generation == Some(item.generation);
+        if !resuming_own_paused
+            && item.claim_status != ClaimStatus::Stale
+            && item.state != WorkState::Handover
+        {
+            return Ok(WorkStartResult {
+                conflict: Some(WorkStartConflict {
+                    kind: WorkConflictKind::ClaimHeld,
+                    current_generation: item.generation,
+                    overlaps: Vec::new(),
+                }),
+                item,
+                created: false,
+                joined: false,
+                took_over: false,
+                context: None,
+                coordination_request: None,
+            });
+        }
+        let previous_item_bytes = stored_work_item_bytes(tx, &item.id)?;
+        let previous_lead_token = item.lead_token.clone();
+        let previous_lead_session = item.lead_session.clone();
+        for participant in &mut item.participants {
+            if participant.role == WorkRole::Lead {
+                participant.role = WorkRole::Helper;
+            }
+        }
+        if !item.participants.iter().any(|participant| {
+            participant.token == who.token && participant.session == start.session
+        }) && item.participants.len() >= 100
+        {
+            return Err(HubError::Invalid(
+                "work has the maximum of 100 participants".into(),
+            ));
+        }
+        item.participants.retain(|participant| {
+            participant.token != who.token || participant.session != start.session
+        });
+        item.participants.push(WorkParticipant {
+            owner: who.owner.id.clone(),
+            login: who.owner.login.clone(),
+            token: who.token.clone(),
+            agent: who.agent.clone(),
+            session: start.session.clone(),
+            role: WorkRole::Lead,
+        });
+        item.lead_token = who.token.clone();
+        item.lead_agent = who.agent.clone();
+        item.lead_session = start.session.clone();
+        item.generation += 1;
+        item.state = WorkState::Active;
+        item.claim_status = ClaimStatus::Active;
+        item.last_checkin_at = now;
+        item.updated_at = now;
+        let event = work_event("work_takeover", &item)?;
+        let seq = append(tx, &event)?;
+        item.updated_seq = seq;
+        tx.execute(
+            "UPDATE hub_work_participants SET role = 'helper', updated_at = $2
+             WHERE work = $1 AND role = 'lead'",
+            &[&item.id, &now],
+        )?;
+        tx.execute(
+            "INSERT INTO hub_work_participants
+                (work, token, owner, agent, session, role, generation, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, 'lead', $6, $7, $7)
+             ON CONFLICT (work, token, session) DO UPDATE SET role = 'lead',
+                owner = excluded.owner, agent = excluded.agent, generation = excluded.generation,
+                updated_at = excluded.updated_at",
+            &[
+                &item.id,
+                &who.token,
+                &who.owner.id,
+                &who.agent,
+                &start.session,
+                &item.generation,
+                &now,
+            ],
+        )?;
+        save_work_version(tx, &item, seq)?;
+        release_session_intent(tx, &previous_lead_token, &previous_lead_session, now)?;
+        retarget_coordination_requests(tx, who, &item.id, item.generation, &start.session, now)?;
+        let snapshot = json_string(&item)?;
+        let delta = work_transition_payload_bytes(&snapshot, &event)?
+            .checked_sub(previous_item_bytes)
+            .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+        adjust_work_payload_capacity(tx, who, delta, now)?;
+        return Ok(WorkStartResult {
+            item,
+            created: false,
+            joined: false,
+            took_over: true,
+            conflict: None,
+            context: None,
+            coordination_request: None,
+        });
+    }
+    if start.work_id.is_some() {
+        return Err(HubError::Invalid("unknown work item".into()));
+    }
+    if let Some(item) = unfinished_for_session(tx, who, &start.session, now)? {
+        return Ok(WorkStartResult {
+            conflict: Some(WorkStartConflict {
+                kind: WorkConflictKind::SessionGoalChanged,
+                current_generation: item.generation,
+                overlaps: Vec::new(),
+            }),
+            item,
+            created: false,
+            joined: false,
+            took_over: false,
+            context: None,
+            coordination_request: None,
+        });
+    }
+    let overlaps = work_scope_overlaps(tx, who, &scope, None, now)?;
+    if let Some(first) = overlaps.first() {
+        let coordination_request = create_coordination_request(
+            tx,
+            who,
+            &start.session,
+            CoordinationProposal {
+                work_id: None,
+                source: start.source.clone(),
+                request_key: start.request_key.clone(),
+                title: start.title.clone(),
+                scope: scope.clone(),
+            },
+            &overlaps,
+            now,
+        )?;
+        return Ok(WorkStartResult {
+            item: first.item.clone(),
+            created: false,
+            joined: false,
+            took_over: false,
+            conflict: Some(WorkStartConflict {
+                kind: WorkConflictKind::ScopeOverlap,
+                current_generation: first.item.generation,
+                overlaps,
+            }),
+            context: None,
+            coordination_request: Some(coordination_request),
+        });
+    }
+    relation_targets(tx, who, &start.depends_on)?;
+    relation_targets(tx, who, &start.related_work)?;
+    let id = new_id("wrk")?;
+    let source = match (&start.source, &start.request_key) {
+        (Some(source), None) => WorkSource::Forge {
+            provider: source.provider.clone(),
+            host: source.host.clone(),
+            repository: source.repository.clone(),
+            issue: source.issue.clone(),
+        },
+        (None, Some(request_key)) => WorkSource::Native {
+            request_key: request_key.clone(),
+        },
+        _ => return Err(HubError::Invalid("invalid work resolver".into())),
+    };
+    let mut item = WorkItem {
+        id: id.clone(),
+        repository: who.repository.clone(),
+        owner: who.owner.id.clone(),
+        owner_login: who.owner.login.clone(),
+        source,
+        title: start.title.clone(),
+        state: WorkState::Active,
+        claim_status: ClaimStatus::Active,
+        last_checkin_at: now,
+        generation: 1,
+        lead_token: who.token.clone(),
+        lead_agent: who.agent.clone(),
+        lead_session: start.session.clone(),
+        participants: vec![WorkParticipant {
+            owner: who.owner.id.clone(),
+            login: who.owner.login.clone(),
+            token: who.token.clone(),
+            agent: who.agent.clone(),
+            session: start.session.clone(),
+            role: WorkRole::Lead,
+        }],
+        scope,
+        branch: start.branch.clone(),
+        worktree: start.worktree.clone(),
+        next_action: start.next_action.clone(),
+        current: None,
+        blocker: None,
+        depends_on: start.depends_on.clone(),
+        related_work: start.related_work.clone(),
+        created_at: now,
+        updated_at: now,
+        created_seq: 0,
+        updated_seq: 0,
+    };
+    let event = work_event("work_started", &item)?;
+    let seq = append(tx, &event)?;
+    item.created_seq = seq;
+    item.updated_seq = seq;
+    let (source_provider, source_host, source_repository, source_issue, request_key) =
+        match &item.source {
+            WorkSource::Native { request_key } => (None, None, None, None, Some(request_key)),
+            WorkSource::Forge {
+                provider,
+                host,
+                repository,
+                issue,
+            } => (
+                Some(provider),
+                Some(host),
+                Some(repository),
+                Some(issue),
+                None,
+            ),
+        };
+    let scope_json = json_string(&item.scope)?;
+    let snapshot = json_string(&item)?;
+    tx.execute(
+        "INSERT INTO hub_work_items
+            (id, provider, host, repository, repository_id, owner, lead_token, lead_agent,
+             lead_session, generation, source_provider, source_host, source_repository,
+             source_issue, request_key, title, state, scope, branch, worktree, next_action,
+             current_checkpoint, snapshot, created_at, updated_at, created_seq, updated_seq)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, $10, $11, $12, $13, $14,
+                 $15, 'active', $16, $17, $18, $19, NULL, $20, $21, $21, $22, $22)",
+        &[
+            &item.id,
+            &who.owner.identity.provider,
+            &who.owner.identity.host,
+            &who.repository,
+            &who.repository_id,
+            &who.owner.id,
+            &who.token,
+            &who.agent,
+            &start.session,
+            &source_provider,
+            &source_host,
+            &source_repository,
+            &source_issue,
+            &request_key,
+            &item.title,
+            &scope_json,
+            &item.branch,
+            &item.worktree,
+            &item.next_action,
+            &snapshot,
+            &now,
+            &seq,
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO hub_work_participants
+            (work, token, owner, agent, session, role, generation, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, 'lead', 1, $6, $6)",
+        &[
+            &id,
+            &who.token,
+            &who.owner.id,
+            &who.agent,
+            &start.session,
+            &now,
+        ],
+    )?;
+    replace_relations(tx, who, &id, &item.depends_on, &item.related_work)?;
+    tx.execute(
+        "INSERT INTO hub_work_versions (work, event_seq, state, snapshot)
+         VALUES ($1, $2, 'active', $3)",
+        &[&id, &seq, &snapshot],
+    )?;
+    adjust_work_payload_capacity(
+        tx,
+        who,
+        work_transition_payload_bytes(&snapshot, &event)?,
+        now,
+    )?;
+    bind_coordination_request(tx, who, &start.session, &item, now)?;
+    Ok(WorkStartResult {
+        item,
+        created: true,
+        joined: false,
+        took_over: false,
+        conflict: None,
+        context: None,
+        coordination_request: None,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn briefing_page(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    delivery: Option<String>,
+    subscriber: Option<String>,
+    from: i64,
+    through: i64,
+    after: i64,
+    work_after: Option<String>,
+    work_done: bool,
+    limit: usize,
+    now: i64,
+) -> Result<Briefing> {
+    if after < from || after > through {
+        return Err(HubError::Invalid(
+            "briefing event cursor is outside its delivery".into(),
+        ));
+    }
+    let (event_floor, snapshot_floor) = work_retention_floors(tx, who)?;
+    if through < snapshot_floor {
+        return Err(HubError::Invalid(
+            "briefing watermark is older than retained work history".into(),
+        ));
+    }
+    let mut items = Vec::new();
+    let mut more_work = false;
+    let mut bytes = 0_usize;
+    if !work_done {
+        let rows = tx.query(
+            "SELECT v.snapshot FROM hub_work_items w JOIN hub_work_versions v ON v.work = w.id
+             WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+               AND w.repository_id IS NOT DISTINCT FROM $4 AND w.id > $5
+               AND v.event_seq = (SELECT MAX(v2.event_seq) FROM hub_work_versions v2
+                   WHERE v2.work = w.id AND v2.event_seq <= $6)
+               AND v.state <> 'finished'
+             ORDER BY w.id LIMIT $7",
+            &[
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                &who.repository_id,
+                &work_after.as_deref().unwrap_or(""),
+                &through,
+                &((limit + 1) as i64),
+            ],
+        )?;
+        more_work = rows.len() > limit;
+        for row in rows.iter().take(limit) {
+            let snapshot: String = row.get(0);
+            if !items.is_empty() && bytes.saturating_add(snapshot.len()) > MAX_BRIEFING_BYTES {
+                more_work = true;
+                break;
+            }
+            bytes = bytes.saturating_add(snapshot.len());
+            let mut item: WorkItem = json_value(&snapshot)?;
+            project_claim(tx, &mut item, now)?;
+            items.push(item);
+        }
+    }
+    let next_work_after = items
+        .last()
+        .map(|item| item.id.clone())
+        .or_else(|| work_after.clone());
+    let next_work_done = work_done || !more_work;
+    let rows = tx.query(
+        "SELECT e.seq, e.at, e.kind, e.subject, v.snapshot
+         FROM hub_events e JOIN hub_work_versions v ON v.event_seq = e.seq
+         JOIN hub_work_items w ON w.id = v.work
+         WHERE e.seq > $1 AND e.seq <= $2 AND w.provider = $3 AND w.host = $4
+           AND w.repository = $5 AND w.repository_id IS NOT DISTINCT FROM $6
+         ORDER BY e.seq LIMIT $7",
+        &[
+            &after,
+            &through,
+            &who.owner.identity.provider,
+            &who.owner.identity.host,
+            &who.repository,
+            &who.repository_id,
+            &((limit + 1) as i64),
+        ],
+    )?;
+    let mut more_events = rows.len() > limit;
+    let mut events = Vec::new();
+    for row in rows.iter().take(limit) {
+        let snapshot: String = row.get(4);
+        if !events.is_empty() && bytes.saturating_add(snapshot.len()) > MAX_BRIEFING_BYTES {
+            more_events = true;
+            break;
+        }
+        bytes = bytes.saturating_add(snapshot.len());
+        let mut item: WorkItem = json_value(&snapshot)?;
+        project_claim(tx, &mut item, now)?;
+        events.push(WorkEvent {
+            seq: row.get(0),
+            at: row.get(1),
+            kind: row.get(2),
+            work_id: row.get(3),
+            item,
+        });
+    }
+    let next_after = if more_events {
+        events.last().map_or(after, |event| event.seq)
+    } else {
+        through
+    };
+    let minimum: Option<i64> = tx.query_one("SELECT MIN(seq) FROM hub_events", &[])?.get(0);
+    let retention_gap =
+        from < event_floor || minimum.is_some_and(|minimum| from < minimum.saturating_sub(1));
+    Ok(Briefing {
+        subscriber,
+        delivery,
+        from,
+        through,
+        after,
+        work_after,
+        next_after,
+        next_work_after,
+        next_work_done,
+        items,
+        events,
+        retention_gap,
+        complete: next_after == through && next_work_done,
+    })
 }
 
 /// Rechecks inside the write transaction that the token is still usable; the
@@ -464,6 +2406,61 @@ fn lock_repository(tx: &mut postgres::Transaction<'_>, repository: &str) -> Resu
     Ok(())
 }
 
+fn lock_work_delivery(tx: &mut postgres::Transaction<'_>, who: &WorkWho) -> Result<()> {
+    let scope = json_string(&(
+        &who.owner.id,
+        &who.owner.identity.provider,
+        &who.owner.identity.host,
+        &who.repository,
+        who.repository_id,
+    ))?;
+    tx.execute(
+        "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+        &[&WORK_DELIVERY_LOCK_CLASS, &scope],
+    )?;
+    Ok(())
+}
+
+fn lock_work_repository(
+    tx: &mut postgres::Transaction<'_>,
+    provider: &str,
+    host: &str,
+    repository: &str,
+    repository_id: Option<i64>,
+) -> Result<()> {
+    let scope = json_string(&(provider, host, repository, repository_id))?;
+    tx.execute(
+        "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+        &[&WORK_CAPACITY_LOCK_CLASS, &scope],
+    )?;
+    Ok(())
+}
+
+fn lock_work_repository_shared(
+    tx: &mut postgres::Transaction<'_>,
+    provider: &str,
+    host: &str,
+    repository: &str,
+    repository_id: Option<i64>,
+) -> Result<()> {
+    let scope = json_string(&(provider, host, repository, repository_id))?;
+    tx.execute(
+        "SELECT pg_advisory_xact_lock_shared($1, hashtext($2))",
+        &[&WORK_CAPACITY_LOCK_CLASS, &scope],
+    )?;
+    Ok(())
+}
+
+fn lock_work_capacity(tx: &mut postgres::Transaction<'_>, who: &WorkWho) -> Result<()> {
+    lock_work_repository(
+        tx,
+        &who.owner.identity.provider,
+        &who.owner.identity.host,
+        &who.repository,
+        who.repository_id,
+    )
+}
+
 /// The announce of `intent` (validated into `keys`) inside the caller's transaction.
 fn announce_in(
     tx: &mut postgres::Transaction<'_>,
@@ -591,6 +2588,25 @@ fn release_in(
     Ok(changed > 0)
 }
 
+fn release_session_intent(
+    tx: &mut postgres::Transaction<'_>,
+    token: &str,
+    session: &str,
+    now: i64,
+) -> Result<bool> {
+    let intent = tx
+        .query_opt(
+            "SELECT intent FROM hub_sessions WHERE token=$1 AND session=$2",
+            &[&token, &session],
+        )?
+        .and_then(|row| row.get::<_, Option<String>>(0));
+    intent
+        .as_deref()
+        .map(|intent| release_in(tx, token, intent, now))
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
 /// The named session, else the token's only recent hook-connected one, else the default.
 fn session_name(
     tx: &mut postgres::Transaction<'_>,
@@ -599,6 +2615,16 @@ fn session_name(
     now: i64,
 ) -> Result<String> {
     if let Some(name) = requested {
+        if name == DEFAULT_SESSION {
+            return Ok(name.to_owned());
+        }
+        if let Some(row) = tx.query_opt(
+            "SELECT canonical_session FROM hub_session_aliases
+             WHERE token=$1 AND observed_session=$2",
+            &[&token, &name],
+        )? {
+            return Ok(row.get(0));
+        }
         return Ok(name.to_owned());
     }
     let recent = tx.query(
@@ -610,6 +2636,62 @@ fn session_name(
         [only] => only.get(0),
         _ => DEFAULT_SESSION.to_owned(),
     })
+}
+
+fn alias_hook_session(
+    tx: &mut postgres::Transaction<'_>,
+    token: &str,
+    observed: &str,
+    now: i64,
+) -> Result<String> {
+    if observed == DEFAULT_SESSION {
+        return Ok(observed.to_owned());
+    }
+    if let Some(row) = tx.query_opt(
+        "SELECT canonical_session FROM hub_session_aliases
+         WHERE token=$1 AND observed_session=$2",
+        &[&token, &observed],
+    )? {
+        return Ok(row.get(0));
+    }
+    if session_row(tx, token, observed)?.is_some() {
+        return Ok(observed.to_owned());
+    }
+    if tx
+        .query_opt(
+            "SELECT 1 FROM hub_session_aliases
+             WHERE token=$1 AND canonical_session=$2",
+            &[&token, &DEFAULT_SESSION],
+        )?
+        .is_some()
+    {
+        return Err(HubError::Invalid(
+            "durable default work is already bound to another hook session".into(),
+        ));
+    }
+    let eligible = tx
+        .query_opt(
+            "SELECT 1 WHERE EXISTS (
+                 SELECT 1 FROM hub_work_participants p
+                 WHERE p.token=$1 AND p.session=$2)",
+            &[&token, &DEFAULT_SESSION],
+        )?
+        .is_some();
+    if !eligible {
+        return Ok(observed.to_owned());
+    }
+    let changed = tx.execute(
+        "INSERT INTO hub_session_aliases
+            (token,observed_session,canonical_session,created_at) VALUES ($1,$2,$3,$4)
+         ON CONFLICT DO NOTHING",
+        &[&token, &observed, &DEFAULT_SESSION, &now],
+    )?;
+    if changed == 0 {
+        return Err(HubError::Invalid(
+            "durable default work is already bound to another hook session".into(),
+        ));
+    }
+    Ok(DEFAULT_SESSION.to_owned())
 }
 
 fn session_row(
@@ -635,6 +2717,49 @@ fn session_row(
 
 /// One touch of the session inside the caller's transaction. A call without `report` (made on
 /// the session's behalf, or answered without text) tells and consumes nothing.
+/// The shared work lock remains held through the intent write, fencing takeovers,
+/// finishes and scope changes without a check/announce transaction gap.
+fn guard_managed_touch(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    name: &str,
+    keys: &[String],
+) -> Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let rows = tx.query(
+        "SELECT w.snapshot,p.generation FROM hub_work_items w
+         JOIN hub_work_participants p ON p.work=w.id
+         WHERE w.provider=$1 AND w.host=$2 AND w.repository=$3
+           AND w.repository_id IS NOT DISTINCT FROM $4 AND p.token=$5 AND p.session=$6",
+        &[
+            &who.owner.identity.provider,
+            &who.owner.identity.host,
+            &who.repository,
+            &who.repository_id,
+            &who.token,
+            &name,
+        ],
+    )?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut eligible = Vec::new();
+    for row in rows {
+        let item: WorkItem = json_value(&row.get::<_, String>(0))?;
+        if matches!(item.state, WorkState::Active | WorkState::Blocked)
+            && item.generation == row.get::<_, i64>(1)
+        {
+            eligible.push(item);
+        }
+    }
+    if eligible.len() != 1 || !uncovered_scope(&eligible[0].scope, keys).is_empty() {
+        return Err(HubError::Invalid("These files are not covered by a current unfinished assignment. Start or explicitly rejoin the work, or checkpoint the scope before editing.".into()));
+    }
+    Ok(())
+}
+
 fn touch_in(
     tx: &mut postgres::Transaction<'_>,
     who: &Who,
@@ -642,13 +2767,28 @@ fn touch_in(
     now: i64,
 ) -> Result<Touched> {
     let token = who.token.as_str();
+    let work = work_who(tx, token, now)?;
+    lock_work_repository_shared(
+        tx,
+        &work.owner.identity.provider,
+        &work.owner.identity.host,
+        &work.repository,
+        work.repository_id,
+    )?;
     // Two calls of one session must not each start an intent.
     lock_repository(tx, &who.repository)?;
     tx.execute(
         "DELETE FROM hub_sessions WHERE token = $1 AND updated_at < $2",
         &[&token, &(now - STALE_SESSION_SECONDS)],
     )?;
-    let name = session_name(tx, token, call.session.as_deref(), now)?;
+    let mut name = session_name(tx, token, call.session.as_deref(), now)?;
+    if call.via.starts_with("hook:")
+        && let Some(observed) = call.session.as_deref()
+        && name == observed
+    {
+        name = alias_hook_session(tx, token, observed, now)?;
+    }
+    guard_managed_touch(tx, &work, &name, &call.keys)?;
     let mut row = session_row(tx, token, &name)?;
     if row.is_none() && name != DEFAULT_SESSION && call.via.starts_with("hook:") {
         // An agent that called agentscm_start before its first hook keeps that session.
@@ -1358,7 +3498,6 @@ impl Store for PgStore {
         self.run(false, |client| {
             let mut tx = client.transaction()?;
             let who = active_token(&mut tx, token, now)?;
-            lock_repository(&mut tx, &who.repository)?;
             let name = session_name(&mut tx, token, session, now)?;
             let found = tx.query_opt(
                 "SELECT h.id, h.requester_token, h.requester_session, h.holder_session,
@@ -1381,6 +3520,45 @@ impl Store for PgStore {
             }) else {
                 return Ok(Answered::NoRequest);
             };
+            // A grant touches the requester's managed assignment. Acquire its
+            // work lock before the intent repository lock, just like direct touches.
+            let requester_available = if accept {
+                match work_who(&mut tx, &request.requester_token, now) {
+                    Ok(work) => {
+                        lock_work_repository_shared(
+                            &mut tx,
+                            &work.owner.identity.provider,
+                            &work.owner.identity.host,
+                            &work.repository,
+                            work.repository_id,
+                        )?;
+                        true
+                    }
+                    Err(HubError::Unauthorized) => false,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                true
+            };
+            lock_repository(&mut tx, &who.repository)?;
+            // The pending request was read before waiting for the locks. Another
+            // answer or expiry may have committed while we waited.
+            if tx
+                .query_opt(
+                    "SELECT id FROM hub_handoffs WHERE id=$1 AND state='pending' AND created_at>$2",
+                    &[&request.id, &cutoff(now)],
+                )?
+                .is_none()
+            {
+                return Ok(Answered::NoRequest);
+            }
+            // Preserve this operation's unavailable decision even if an owner
+            // is re-enabled concurrently: touch_in requires the lock above.
+            if !requester_available {
+                lapse(&mut tx, &request.id, now)?;
+                tx.commit()?;
+                return Ok(Answered::NoRequest);
+            }
             let requester = (request.agent.clone(), request.login.clone());
             // The holder session's intent now: a hold cap may have renewed it since the request.
             let holder_intent = session_row(&mut tx, token, &request.holder_session)?
@@ -2120,6 +4298,1862 @@ impl Store for PgStore {
             }
             tx.commit()?;
             Ok(p)
+        })
+    }
+
+    fn work_start(&self, token: &str, start: &WorkStart, now: i64) -> Result<WorkStartResult> {
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            lock_work_capacity(&mut tx, &who)?;
+            let resolver = match (&start.work_id, &start.source, &start.request_key) {
+                (Some(id), None, None) => vec!["work", id],
+                (None, Some(source), None) => vec![
+                    "forge",
+                    &source.provider,
+                    &source.host,
+                    &source.repository,
+                    &source.issue,
+                ],
+                (None, None, Some(key)) => vec!["native", &who.owner.id, key],
+                _ => vec!["invalid"],
+            };
+            let lock = json_string(&(
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                who.repository_id,
+                &who.repository,
+                resolver,
+            ))?;
+            tx.execute(
+                "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+                &[&0x6167_6577_i32, &lock],
+            )?;
+            lock_repository(&mut tx, &who.repository)?;
+            let result = start_in(&mut tx, &who, start, now)?;
+            tx.commit()?;
+            Ok(result)
+        })
+    }
+
+    fn work_start_auto(&self, token: &str, start: &WorkStart, now: i64) -> Result<WorkStartResult> {
+        if start.work_id.is_some() || start.source.is_some() || start.request_key.is_some() {
+            return Err(HubError::Invalid(
+                "automatic start does not accept a work resolver".into(),
+            ));
+        }
+        if start.role != WorkRole::Lead || start.takeover_generation.is_some() {
+            return Err(HubError::Invalid(
+                "automatic start requires a new lead without takeover".into(),
+            ));
+        }
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            if who.read_only {
+                return Err(HubError::Unauthorized);
+            }
+            lock_work_capacity(&mut tx, &who)?;
+            let mut planned = start.clone();
+            planned.request_key = Some("automatic-session-start".into());
+            let planned_scope = planned.validate(&who)?;
+            let lock = json_string(&(token, &start.session))?;
+            tx.execute(
+                "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+                &[&0x6167_6577_i32, &lock],
+            )?;
+            lock_repository(&mut tx, &who.repository)?;
+            if let Some(item) = unfinished_for_session(&mut tx, &who, &start.session, now)? {
+                let changed = item.title != start.title
+                    || item.scope != planned_scope
+                    || item.branch != start.branch
+                    || item.worktree != start.worktree
+                    || item.next_action != start.next_action
+                    || item.depends_on != start.depends_on
+                    || item.related_work != start.related_work;
+                let conflict = changed.then_some(WorkStartConflict {
+                    kind: WorkConflictKind::SessionGoalChanged,
+                    current_generation: item.generation,
+                    overlaps: Vec::new(),
+                });
+                tx.commit()?;
+                return Ok(WorkStartResult {
+                    item,
+                    created: false,
+                    joined: false,
+                    took_over: false,
+                    conflict,
+                    context: None,
+                    coordination_request: None,
+                });
+            }
+            let mut created = start.clone();
+            created.request_key = Some(new_id("req")?);
+            let result = start_in(&mut tx, &who, &created, now)?;
+            tx.commit()?;
+            Ok(result)
+        })
+    }
+
+    fn work_checkpoint(
+        &self,
+        token: &str,
+        checkpoint: &WorkCheckpoint,
+        now: i64,
+    ) -> Result<WorkCheckpointResult> {
+        checkpoint.validate()?;
+        let request = json_string(checkpoint)?;
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            if who.read_only {
+                return Err(HubError::Unauthorized);
+            }
+            lock_work_capacity(&mut tx, &who)?;
+            if checkpoint.kind == super::work::CheckpointKind::Finish {
+                lock_repository(&mut tx, &who.repository)?;
+            }
+            let mut item = scoped_work(&mut tx, &who, &checkpoint.work_id, now, true)?
+                .ok_or_else(|| HubError::Invalid("unknown work item".into()))?;
+            if let Some(row) = tx.query_opt(
+                "SELECT o.request, v.snapshot, o.event_seq FROM hub_work_checkpoint_ops o
+                 JOIN hub_work_versions v ON v.work = o.work AND v.event_seq = o.event_seq
+                 WHERE o.work = $1 AND o.operation_id = $2",
+                &[&checkpoint.work_id, &checkpoint.operation_id],
+            )? {
+                let previous: String = row.get(0);
+                if previous != request {
+                    return Err(HubError::Invalid(
+                        "checkpoint operation_id was already used for another request".into(),
+                    ));
+                }
+                let snapshot: String = row.get(1);
+                let committed: WorkItem = json_value(&snapshot)?;
+                if committed.lead_token != token
+                    || committed.lead_session != checkpoint.session
+                    || committed.generation != checkpoint.generation
+                {
+                    return Err(HubError::Invalid(
+                        "checkpoint operation belongs to another lead session".into(),
+                    ));
+                }
+                let event_seq: i64 = row.get(2);
+                tx.commit()?;
+                return Ok(WorkCheckpointResult {
+                    item,
+                    receipt: CheckpointReceipt {
+                        work_id: checkpoint.work_id.clone(),
+                        operation_id: checkpoint.operation_id.clone(),
+                        generation: committed.generation,
+                        event_seq,
+                        replayed: true,
+                    },
+                });
+            }
+            if item.generation != checkpoint.generation {
+                return Err(HubError::Invalid(format!(
+                    "checkpoint generation is fenced; current generation is {}",
+                    item.generation
+                )));
+            }
+            if item.lead_token != token || item.lead_session != checkpoint.session {
+                return Err(HubError::Invalid(
+                    "only the current lead session may checkpoint work".into(),
+                ));
+            }
+            let expected = checkpoint.expected_updated_seq.ok_or_else(|| {
+                HubError::Invalid("expected_updated_seq is required for a new checkpoint".into())
+            })?;
+            if expected != item.updated_seq {
+                return Err(HubError::Invalid(format!(
+                    "checkpoint receipt expired or work changed; current updated_seq is {}",
+                    item.updated_seq
+                )));
+            }
+            if let Some(scope) = checkpoint.normalized_scope()? {
+                let overlaps = work_scope_overlaps(&mut tx, &who, &scope, Some(&item.id), now)?;
+                if !overlaps.is_empty() {
+                    let request = create_coordination_request(
+                        &mut tx,
+                        &who,
+                        &checkpoint.session,
+                        CoordinationProposal {
+                            work_id: Some(item.id.clone()),
+                            source: None,
+                            request_key: None,
+                            title: item.title.clone(),
+                            scope,
+                        },
+                        &overlaps,
+                        now,
+                    )?;
+                    tx.commit()?;
+                    return Err(HubError::WorkCoordinationRequired {
+                        overlaps,
+                        request: Box::new(request),
+                    });
+                }
+            }
+            let previous_item_bytes = stored_work_item_bytes(&mut tx, &item.id)?;
+            let referenced = checkpoint
+                .source_refs
+                .iter()
+                .filter_map(|source| match source {
+                    SourceRef::Work { work_id } => Some(work_id.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            relation_targets(&mut tx, &who, &referenced)?;
+            replace_relations(
+                &mut tx,
+                &who,
+                &item.id,
+                &checkpoint.depends_on,
+                &checkpoint.related_work,
+            )?;
+            item.state = checkpoint.state();
+            item.claim_status = ClaimStatus::Active;
+            item.last_checkin_at = now;
+            item.next_action = checkpoint.next_action.clone();
+            if let Some(scope) = checkpoint.normalized_scope()? {
+                item.scope = scope;
+            }
+            if checkpoint.branch.is_some() {
+                item.branch = checkpoint.branch.clone();
+            }
+            if checkpoint.worktree.is_some() {
+                item.worktree = checkpoint.worktree.clone();
+            }
+            let current = Checkpoint {
+                kind: checkpoint.kind,
+                summary: checkpoint.summary.clone(),
+                next_action: checkpoint.next_action.clone(),
+                source_refs: checkpoint.source_refs.clone(),
+                at: now,
+                token: token.to_owned(),
+                agent: who.agent.clone(),
+                session: checkpoint.session.clone(),
+                generation: checkpoint.generation,
+            };
+            if checkpoint.kind == super::work::CheckpointKind::Blocker {
+                item.blocker = Some(current.clone());
+            } else if checkpoint.resolve_blocker {
+                item.blocker = None;
+            }
+            item.current = Some(current);
+            item.depends_on = checkpoint.depends_on.clone();
+            item.related_work = checkpoint.related_work.clone();
+            item.updated_at = now;
+            let event = work_event("work_checkpoint", &item)?;
+            let seq = append(&mut tx, &event)?;
+            item.updated_seq = seq;
+            save_work_version(&mut tx, &item, seq)?;
+            tx.execute(
+                "INSERT INTO hub_work_checkpoint_ops
+                    (work, operation_id, request, event_seq)
+                 VALUES ($1, $2, $3, $4)",
+                &[&item.id, &checkpoint.operation_id, &request, &seq],
+            )?;
+            let snapshot = json_string(&item)?;
+            let request_bytes = work_payload_row_bytes(request.len())?;
+            let delta = work_transition_payload_bytes(&snapshot, &event)?
+                .checked_sub(previous_item_bytes)
+                .and_then(|bytes| bytes.checked_add(request_bytes))
+                .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+            adjust_work_payload_capacity(&mut tx, &who, delta, now)?;
+            if checkpoint.kind == super::work::CheckpointKind::Finish {
+                release_session_intent(&mut tx, token, &checkpoint.session, now)?;
+            }
+            tx.commit()?;
+            Ok(WorkCheckpointResult {
+                item,
+                receipt: CheckpointReceipt {
+                    work_id: checkpoint.work_id.clone(),
+                    operation_id: checkpoint.operation_id.clone(),
+                    generation: checkpoint.generation,
+                    event_seq: seq,
+                    replayed: false,
+                },
+            })
+        })
+    }
+
+    fn work_get(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkItem>> {
+        self.run(true, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            let item = scoped_work(&mut tx, &who, id, now, false)?;
+            tx.commit()?;
+            Ok(item)
+        })
+    }
+
+    fn work_for_session(&self, token: &str, session: &str, now: i64) -> Result<Option<WorkItem>> {
+        super::intent::text("session", session, 255)?;
+        self.run(true, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            let item = unfinished_for_session(&mut tx, &who, session, now)?;
+            tx.commit()?;
+            Ok(item)
+        })
+    }
+
+    fn session_name_for(&self, token: &str, session: Option<&str>, now: i64) -> Result<String> {
+        self.run(true, |client| {
+            let mut tx = client.transaction()?;
+            work_who(&mut tx, token, now)?;
+            let name = session_name(&mut tx, token, session, now)?;
+            tx.commit()?;
+            Ok(name)
+        })
+    }
+
+    fn work_briefing(&self, token: &str, query: &BriefingQuery, now: i64) -> Result<Briefing> {
+        query.validate()?;
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            if who.read_only {
+                lock_work_repository_shared(
+                    &mut tx,
+                    &who.owner.identity.provider,
+                    &who.owner.identity.host,
+                    &who.repository,
+                    who.repository_id,
+                )?;
+            } else {
+                lock_work_capacity(&mut tx, &who)?;
+                lock_work_delivery(&mut tx, &who)?;
+            }
+            let subscriber = query.subscriber.clone();
+            let subscriber_key = subscriber.as_deref().unwrap_or("");
+            let ack_cursor = tx
+                .query_opt(
+                    "SELECT cursor FROM hub_work_acks
+                     WHERE owner = $1 AND provider = $2 AND host = $3 AND repository = $4
+                       AND repository_id IS NOT DISTINCT FROM $5 AND subscriber_token = $6
+                       AND subscriber_session = $7",
+                    &[
+                        &who.owner.id,
+                        &who.owner.identity.provider,
+                        &who.owner.identity.host,
+                        &who.repository,
+                        &who.repository_id,
+                        &who.token,
+                        &subscriber_key,
+                    ],
+                )?
+                .map_or(0, |row| row.get(0));
+            if who.read_only {
+                if query.delivery.is_some() {
+                    return Err(HubError::Invalid(
+                        "read-only briefing does not accept a delivery".into(),
+                    ));
+                }
+                let after = query.after.unwrap_or(ack_cursor);
+                if query.after.is_none() && (query.work_after.is_some() || query.work_done) {
+                    return Err(HubError::Invalid(
+                        "first briefing page cannot have a work cursor".into(),
+                    ));
+                }
+                let through = match query.through {
+                    Some(through) => through,
+                    None => work_event_high_water(&mut tx, &who, after)?,
+                };
+                let page = briefing_page(
+                    &mut tx,
+                    &who,
+                    None,
+                    subscriber.clone(),
+                    after,
+                    through,
+                    after,
+                    query.work_after.clone(),
+                    query.work_done,
+                    query.limit,
+                    now,
+                )?;
+                tx.commit()?;
+                return Ok(page);
+            }
+            if let Some(delivery) = &query.delivery {
+                let row = tx
+                    .query_opt(
+                        "SELECT from_seq, through_seq, page_after, page_work_after, page_work_done,
+                                next_after, next_work_after, next_work_done, page, complete
+                         FROM hub_work_deliveries WHERE id = $1 AND owner = $2 AND provider = $3
+                           AND host = $4 AND repository = $5
+                           AND repository_id IS NOT DISTINCT FROM $6 AND subscriber_token = $7
+                           AND subscriber_session = $8 FOR UPDATE",
+                        &[
+                            &delivery,
+                            &who.owner.id,
+                            &who.owner.identity.provider,
+                            &who.owner.identity.host,
+                            &who.repository,
+                            &who.repository_id,
+                            &who.token,
+                            &subscriber_key,
+                        ],
+                    )?
+                    .ok_or_else(|| HubError::Invalid("unknown briefing delivery".into()))?;
+                let from: i64 = row.get(0);
+                let through: i64 = row.get(1);
+                let page_after: i64 = row.get(2);
+                let page_work_after: Option<String> = row.get(3);
+                let page_work_done: bool = row.get(4);
+                let next_after: i64 = row.get(5);
+                let next_work_after: Option<String> = row.get(6);
+                let next_work_done: bool = row.get(7);
+                let cached: String = row.get(8);
+                let complete: bool = row.get(9);
+                if query.through != Some(through) || query.after.is_none() {
+                    return Err(HubError::Invalid(
+                        "delivery requires its exact through and cursors".into(),
+                    ));
+                }
+                let after = query.after.unwrap_or_default();
+                if after == page_after
+                    && query.work_after == page_work_after
+                    && query.work_done == page_work_done
+                {
+                    let page = json_value(&cached)?;
+                    tx.commit()?;
+                    return Ok(page);
+                }
+                if complete
+                    || after != next_after
+                    || query.work_after != next_work_after
+                    || query.work_done != next_work_done
+                {
+                    return Err(HubError::Invalid(
+                        "briefing cursors must retry the previous page or continue exactly".into(),
+                    ));
+                }
+                let page = briefing_page(
+                    &mut tx,
+                    &who,
+                    Some(delivery.clone()),
+                    subscriber.clone(),
+                    from,
+                    through,
+                    after,
+                    query.work_after.clone(),
+                    query.work_done,
+                    query.limit,
+                    now,
+                )?;
+                let page_json = json_string(&page)?;
+                check_work_delivery_page(&page_json)?;
+                tx.execute(
+                    "UPDATE hub_work_deliveries SET page_after = $2, page_work_after = $3,
+                         page_work_done = $4, next_after = $5, next_work_after = $6,
+                         next_work_done = $7, page = $8, complete = $9, updated_at = $10
+                     WHERE id = $1",
+                    &[
+                        &delivery,
+                        &page.after,
+                        &page.work_after,
+                        &query.work_done,
+                        &page.next_after,
+                        &page.next_work_after,
+                        &page.next_work_done,
+                        &page_json,
+                        &page.complete,
+                        &now,
+                    ],
+                )?;
+                tx.commit()?;
+                return Ok(page);
+            }
+            if query.through.is_some()
+                || query.work_after.is_some()
+                || query.work_done
+                || query.after.is_some_and(|after| after != ack_cursor)
+            {
+                return Err(HubError::Invalid(
+                    "a new delivery starts at the acknowledged cursor without paging cursors"
+                        .into(),
+                ));
+            }
+            let released: i64 = tx
+                .query_one(
+                    "SELECT COALESCE(SUM(CASE WHEN NOT acknowledged THEN 4194304::bigint
+                                ELSE octet_length(page)::bigint + 256 END), 0)::bigint
+                     FROM hub_work_deliveries WHERE updated_at < $1
+                       AND provider = $2 AND host = $3 AND repository = $4
+                       AND repository_id IS NOT DISTINCT FROM $5",
+                    &[
+                        &now.saturating_sub(86_400),
+                        &who.owner.identity.provider,
+                        &who.owner.identity.host,
+                        &who.repository,
+                        &who.repository_id,
+                    ],
+                )?
+                .get(0);
+            tx.execute(
+                "DELETE FROM hub_work_deliveries WHERE updated_at < $1
+                   AND provider = $2 AND host = $3 AND repository = $4
+                   AND repository_id IS NOT DISTINCT FROM $5",
+                &[
+                    &now.saturating_sub(86_400),
+                    &who.owner.identity.provider,
+                    &who.owner.identity.host,
+                    &who.repository,
+                    &who.repository_id,
+                ],
+            )?;
+            let row = tx.query_one(
+                "SELECT COUNT(*),
+                            COUNT(*) FILTER (WHERE subscriber_token = $6)
+                     FROM hub_work_deliveries
+                     WHERE owner = $1 AND provider = $2 AND host = $3 AND repository = $4
+                       AND repository_id IS NOT DISTINCT FROM $5 AND NOT acknowledged",
+                &[
+                    &who.owner.id,
+                    &who.owner.identity.provider,
+                    &who.owner.identity.host,
+                    &who.repository,
+                    &who.repository_id,
+                    &who.token,
+                ],
+            )?;
+            let owner_open: i64 = row.get(0);
+            let token_open: i64 = row.get(1);
+            if owner_open >= 16 || token_open >= 8 {
+                return Err(HubError::Invalid(
+                    "too many unacknowledged briefing deliveries".into(),
+                ));
+            }
+            let through = work_event_high_water(&mut tx, &who, ack_cursor)?;
+            let delivery = new_id("dlv")?;
+            let page = briefing_page(
+                &mut tx,
+                &who,
+                Some(delivery.clone()),
+                subscriber.clone(),
+                ack_cursor,
+                through,
+                ack_cursor,
+                None,
+                false,
+                query.limit,
+                now,
+            )?;
+            let page_json = json_string(&page)?;
+            check_work_delivery_page(&page_json)?;
+            tx.execute(
+                "INSERT INTO hub_work_deliveries
+                    (id, owner, provider, host, repository, repository_id, subscriber_token,
+                     subscriber_session,
+                     from_seq, through_seq,
+                     page_after, page_work_after, page_work_done, next_after, next_work_after,
+                     next_work_done, page, complete, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $9, NULL, FALSE, $11, $12,
+                         $13, $14, $15, $16, $16)",
+                &[
+                    &delivery,
+                    &who.owner.id,
+                    &who.owner.identity.provider,
+                    &who.owner.identity.host,
+                    &who.repository,
+                    &who.repository_id,
+                    &who.token,
+                    &subscriber_key,
+                    &ack_cursor,
+                    &through,
+                    &page.next_after,
+                    &page.next_work_after,
+                    &page.next_work_done,
+                    &page_json,
+                    &page.complete,
+                    &now,
+                ],
+            )?;
+            adjust_work_payload_capacity(
+                &mut tx,
+                &who,
+                WORK_DELIVERY_RESERVATION_BYTES
+                    .checked_sub(released)
+                    .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?,
+                now,
+            )?;
+            tx.commit()?;
+            Ok(page)
+        })
+    }
+
+    fn work_ack(&self, token: &str, ack: &BriefingAck, now: i64) -> Result<()> {
+        ack.validate()?;
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            if who.read_only {
+                return Err(HubError::Unauthorized);
+            }
+            lock_work_capacity(&mut tx, &who)?;
+            lock_work_delivery(&mut tx, &who)?;
+            let row = tx
+                .query_opt(
+                    "SELECT through_seq, page, acknowledged, subscriber_session
+                     FROM hub_work_deliveries
+                     WHERE id = $1 AND owner = $2 AND provider = $3 AND host = $4
+                       AND repository = $5 AND repository_id IS NOT DISTINCT FROM $6
+                       AND subscriber_token = $7 AND complete FOR UPDATE",
+                    &[
+                        &ack.delivery,
+                        &who.owner.id,
+                        &who.owner.identity.provider,
+                        &who.owner.identity.host,
+                        &who.repository,
+                        &who.repository_id,
+                        &who.token,
+                    ],
+                )?
+                .ok_or_else(|| HubError::Invalid("delivery is unknown or incomplete".into()))?;
+            let through: i64 = row.get(0);
+            let page: String = row.get(1);
+            let acknowledged: bool = row.get(2);
+            let subscriber_key: String = row.get(3);
+            let changed = tx.execute(
+                "UPDATE hub_work_acks SET cursor = GREATEST(cursor, $6), updated_at = $7
+                 WHERE owner = $1 AND provider = $2 AND host = $3 AND repository = $4
+                   AND repository_id IS NOT DISTINCT FROM $5 AND subscriber_token = $8
+                   AND subscriber_session = $9",
+                &[
+                    &who.owner.id,
+                    &who.owner.identity.provider,
+                    &who.owner.identity.host,
+                    &who.repository,
+                    &who.repository_id,
+                    &through,
+                    &now,
+                    &who.token,
+                    &subscriber_key,
+                ],
+            )?;
+            if changed == 0 {
+                tx.execute(
+                    "INSERT INTO hub_work_acks
+                        (owner, provider, host, repository, repository_id, cursor, updated_at,
+                         subscriber_token, subscriber_session)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                    &[
+                        &who.owner.id,
+                        &who.owner.identity.provider,
+                        &who.owner.identity.host,
+                        &who.repository,
+                        &who.repository_id,
+                        &through,
+                        &now,
+                        &who.token,
+                        &subscriber_key,
+                    ],
+                )?;
+            }
+            tx.execute(
+                "UPDATE hub_work_deliveries SET acknowledged = TRUE, updated_at = $2
+                 WHERE id = $1",
+                &[&ack.delivery, &now],
+            )?;
+            if !acknowledged {
+                adjust_work_payload_capacity(
+                    &mut tx,
+                    &who,
+                    work_payload_row_bytes(page.len())?
+                        .checked_sub(WORK_DELIVERY_RESERVATION_BYTES)
+                        .ok_or_else(|| {
+                            HubError::Invalid("work payload size is too large".into())
+                        })?,
+                    now,
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    fn work_compact(
+        &self,
+        scope: &WorkRepositoryScope,
+        before: i64,
+        apply: bool,
+        now: i64,
+    ) -> Result<WorkCompaction> {
+        scope.validate()?;
+        if before < 0 || before > now.saturating_sub(86_400) {
+            return Err(HubError::Invalid(
+                "work compaction cutoff must be at least 24 hours old".into(),
+            ));
+        }
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            lock_work_repository(
+                &mut tx,
+                &scope.provider,
+                &scope.host,
+                &scope.repository,
+                scope.repository_id,
+            )?;
+            let active_deliveries: i64 = tx
+                .query_one(
+                    "SELECT COUNT(*) FROM hub_work_deliveries
+                     WHERE provider = $1 AND host = $2 AND repository = $3
+                       AND repository_id IS NOT DISTINCT FROM $4
+                       AND NOT acknowledged AND updated_at >= $5",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &scope.repository,
+                        &scope.repository_id,
+                        &now.saturating_sub(86_400),
+                    ],
+                )?
+                .get(0);
+            if active_deliveries > 0 {
+                return Err(HubError::Invalid(
+                    "work compaction is blocked by an unacknowledged briefing delivery".into(),
+                ));
+            }
+            let operations: i64 = tx
+                .query_one(
+                    "SELECT COUNT(*) FROM hub_work_checkpoint_ops o
+                     JOIN hub_work_items w ON w.id = o.work
+                     JOIN hub_events e ON e.seq = o.event_seq
+                     WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+                       AND w.repository_id IS NOT DISTINCT FROM $4 AND e.at < $5",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &scope.repository,
+                        &scope.repository_id,
+                        &before,
+                    ],
+                )?
+                .get(0);
+            let versions: i64 = tx
+                .query_one(
+                    "SELECT COUNT(*) FROM hub_work_versions v
+                     JOIN hub_work_items w ON w.id = v.work
+                     JOIN hub_events e ON e.seq = v.event_seq
+                     WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+                       AND w.repository_id IS NOT DISTINCT FROM $4 AND e.at < $5
+                       AND v.event_seq <> (SELECT MAX(v2.event_seq) FROM hub_work_versions v2
+                           JOIN hub_events e2 ON e2.seq = v2.event_seq
+                           WHERE v2.work = v.work AND e2.at < $5)",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &scope.repository,
+                        &scope.repository_id,
+                        &before,
+                    ],
+                )?
+                .get(0);
+            let candidate_snapshot_floor: Option<i64> = tx
+                .query_one(
+                    "SELECT MAX(baseline) FROM (
+                         SELECT v.work, MAX(v.event_seq) AS baseline, COUNT(*) AS versions
+                         FROM hub_work_versions v JOIN hub_work_items w ON w.id = v.work
+                         JOIN hub_events e ON e.seq = v.event_seq
+                         WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+                           AND w.repository_id IS NOT DISTINCT FROM $4 AND e.at < $5
+                         GROUP BY v.work HAVING COUNT(*) > 1
+                     ) compacted",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &scope.repository,
+                        &scope.repository_id,
+                        &before,
+                    ],
+                )?
+                .get(0);
+            let (current_event_floor, current_snapshot_floor): (i64, i64) = tx
+                .query_opt(
+                    "SELECT event_floor_seq, snapshot_floor_seq FROM hub_work_retention
+                     WHERE provider = $1 AND host = $2 AND repository = $3
+                       AND repository_id IS NOT DISTINCT FROM $4",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &scope.repository,
+                        &scope.repository_id,
+                    ],
+                )?
+                .map_or((0, 0), |row| (row.get(0), row.get(1)));
+            let retention_floor =
+                candidate_snapshot_floor.map_or(current_snapshot_floor, |floor| {
+                    floor.max(current_snapshot_floor)
+                });
+            let current_coordination_floor: i64 = tx
+                .query_opt(
+                    "SELECT event_floor_seq FROM hub_coordination_retention
+                     WHERE provider=$1 AND host=$2 AND repository=$3
+                       AND repository_id IS NOT DISTINCT FROM $4",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &scope.repository,
+                        &scope.repository_id,
+                    ],
+                )?
+                .map_or(0, |row| row.get(0));
+            let compacted_coordination = tx
+                .query(
+                    "SELECT r.id, (
+                         SELECT MAX(e.seq) FROM hub_events e WHERE e.subject=r.id AND e.kind IN (
+                           'coordination_requested','coordination_bound','coordination_retargeted',
+                           'coordination_acknowledged','coordination_responded',
+                           'coordination_resolved','coordination_withdrawn'))
+                     FROM hub_coordination_requests r
+                     WHERE r.provider=$1 AND r.host=$2 AND r.repository=$3
+                       AND r.repository_id IS NOT DISTINCT FROM $4
+                       AND r.status IN ('resolved','withdrawn') AND r.updated_at < $5
+                       AND EXISTS (SELECT 1 FROM hub_events e WHERE e.subject=r.id AND e.kind IN (
+                           'coordination_requested','coordination_bound','coordination_retargeted',
+                           'coordination_acknowledged','coordination_responded',
+                           'coordination_resolved','coordination_withdrawn'))
+                       AND NOT EXISTS (SELECT 1 FROM hub_events e WHERE e.subject=r.id
+                           AND e.kind IN ('coordination_requested','coordination_bound',
+                             'coordination_retargeted','coordination_acknowledged',
+                             'coordination_responded','coordination_resolved',
+                             'coordination_withdrawn') AND e.at >= $5)",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &scope.repository,
+                        &scope.repository_id,
+                        &before,
+                    ],
+                )?
+                .into_iter()
+                .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1)))
+                .collect::<Vec<_>>();
+            let coordination_floor = compacted_coordination
+                .iter()
+                .map(|(_, floor)| *floor)
+                .max()
+                .unwrap_or(0)
+                .max(current_coordination_floor);
+            if apply {
+                tx.execute(
+                    "DELETE FROM hub_work_deliveries
+                     WHERE provider = $1 AND host = $2 AND repository = $3
+                       AND repository_id IS NOT DISTINCT FROM $4 AND updated_at < $5",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &scope.repository,
+                        &scope.repository_id,
+                        &now.saturating_sub(86_400),
+                    ],
+                )?;
+                tx.execute(
+                    "DELETE FROM hub_work_checkpoint_ops AS o USING hub_work_items AS w, hub_events AS e
+                     WHERE w.id = o.work AND e.seq = o.event_seq
+                       AND w.provider = $1 AND w.host = $2 AND w.repository = $3
+                       AND w.repository_id IS NOT DISTINCT FROM $4 AND e.at < $5",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &scope.repository,
+                        &scope.repository_id,
+                        &before,
+                    ],
+                )?;
+                tx.execute(
+                    "DELETE FROM hub_work_versions AS v USING hub_work_items AS w, hub_events AS e
+                     WHERE w.id = v.work AND e.seq = v.event_seq
+                       AND w.provider = $1 AND w.host = $2 AND w.repository = $3
+                       AND w.repository_id IS NOT DISTINCT FROM $4 AND e.at < $5
+                       AND v.event_seq <> (SELECT MAX(v2.event_seq) FROM hub_work_versions v2
+                           JOIN hub_events e2 ON e2.seq = v2.event_seq
+                           WHERE v2.work = v.work AND e2.at < $5)",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &scope.repository,
+                        &scope.repository_id,
+                        &before,
+                    ],
+                )?;
+                let removed_event_floor: Option<i64> = tx
+                    .query_one(
+                        "SELECT MAX(e.seq) FROM hub_events e
+                         JOIN hub_work_items w ON w.id = e.subject
+                         WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+                           AND w.repository_id IS NOT DISTINCT FROM $4 AND e.at < $5
+                           AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint')
+                           AND NOT EXISTS (SELECT 1 FROM hub_work_versions v WHERE v.event_seq = e.seq)
+                           AND NOT EXISTS (SELECT 1 FROM hub_work_checkpoint_ops o WHERE o.event_seq = e.seq)",
+                        &[
+                            &scope.provider,
+                            &scope.host,
+                            &scope.repository,
+                            &scope.repository_id,
+                            &before,
+                        ],
+                    )?
+                    .get(0);
+                tx.execute(
+                    "DELETE FROM hub_events AS e USING hub_work_items AS w
+                     WHERE w.id = e.subject
+                       AND w.provider = $1 AND w.host = $2 AND w.repository = $3
+                       AND w.repository_id IS NOT DISTINCT FROM $4 AND e.at < $5
+                       AND e.kind IN ('work_started', 'work_joined', 'work_takeover', 'work_checkpoint')
+                       AND NOT EXISTS (SELECT 1 FROM hub_work_versions v WHERE v.event_seq = e.seq)
+                       AND NOT EXISTS (SELECT 1 FROM hub_work_checkpoint_ops o WHERE o.event_seq = e.seq)",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &scope.repository,
+                        &scope.repository_id,
+                        &before,
+                    ],
+                )?;
+                let event_floor = removed_event_floor.map_or(current_event_floor, |floor| {
+                    floor.max(current_event_floor)
+                });
+                if candidate_snapshot_floor.is_some() || removed_event_floor.is_some() {
+                    let changed = tx.execute(
+                        "UPDATE hub_work_retention
+                         SET event_floor_seq = GREATEST(event_floor_seq, $5),
+                             snapshot_floor_seq = GREATEST(snapshot_floor_seq, $6),
+                             updated_at = $7
+                         WHERE provider = $1 AND host = $2 AND repository = $3
+                           AND repository_id IS NOT DISTINCT FROM $4",
+                        &[
+                            &scope.provider,
+                            &scope.host,
+                            &scope.repository,
+                            &scope.repository_id,
+                            &event_floor,
+                            &retention_floor,
+                            &now,
+                        ],
+                    )?;
+                    if changed == 0 {
+                        tx.execute(
+                            "INSERT INTO hub_work_retention
+                                (provider, host, repository, repository_id, event_floor_seq,
+                                 snapshot_floor_seq, updated_at)
+                             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                            &[
+                                &scope.provider,
+                                &scope.host,
+                                &scope.repository,
+                                &scope.repository_id,
+                                &event_floor,
+                                &retention_floor,
+                                &now,
+                            ],
+                        )?;
+                    }
+                }
+                for (request, _) in &compacted_coordination {
+                    tx.execute(
+                        "DELETE FROM hub_coordination_operations WHERE request=$1",
+                        &[request],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM hub_coordination_acknowledgements WHERE request=$1",
+                        &[request],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM hub_coordination_responses WHERE request=$1",
+                        &[request],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM hub_coordination_versions WHERE request=$1",
+                        &[request],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM hub_coordination_targets WHERE request=$1",
+                        &[request],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM hub_coordination_requests WHERE id=$1",
+                        &[request],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM hub_events WHERE subject=$1 AND kind IN (
+                           'coordination_requested','coordination_bound','coordination_retargeted',
+                           'coordination_acknowledged','coordination_responded',
+                           'coordination_resolved','coordination_withdrawn') AND at < $2",
+                        &[request, &before],
+                    )?;
+                }
+                if coordination_floor > current_coordination_floor {
+                    let changed = tx.execute(
+                        "UPDATE hub_coordination_retention
+                         SET event_floor_seq=GREATEST(event_floor_seq,$5), updated_at=$6
+                         WHERE provider=$1 AND host=$2 AND repository=$3
+                           AND repository_id IS NOT DISTINCT FROM $4",
+                        &[
+                            &scope.provider,
+                            &scope.host,
+                            &scope.repository,
+                            &scope.repository_id,
+                            &coordination_floor,
+                            &now,
+                        ],
+                    )?;
+                    if changed == 0 {
+                        tx.execute(
+                            "INSERT INTO hub_coordination_retention
+                                (provider,host,repository,repository_id,event_floor_seq,updated_at)
+                             VALUES ($1,$2,$3,$4,$5,$6)",
+                            &[
+                                &scope.provider,
+                                &scope.host,
+                                &scope.repository,
+                                &scope.repository_id,
+                                &coordination_floor,
+                                &now,
+                            ],
+                        )?;
+                    }
+                }
+                let charged = work_payload_bytes(
+                    &mut tx,
+                    &scope.provider,
+                    &scope.host,
+                    &scope.repository,
+                    scope.repository_id,
+                )?;
+                let changed = tx.execute(
+                    "UPDATE hub_work_usage SET charged_bytes = $5, updated_at = $6
+                     WHERE provider = $1 AND host = $2 AND repository = $3
+                       AND repository_id IS NOT DISTINCT FROM $4",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &scope.repository,
+                        &scope.repository_id,
+                        &charged,
+                        &now,
+                    ],
+                )?;
+                if changed == 0 {
+                    tx.execute(
+                        "INSERT INTO hub_work_usage
+                            (provider, host, repository, repository_id, charged_bytes, updated_at)
+                         VALUES ($1, $2, $3, $4, $5, $6)",
+                        &[
+                            &scope.provider,
+                            &scope.host,
+                            &scope.repository,
+                            &scope.repository_id,
+                            &charged,
+                            &now,
+                        ],
+                    )?;
+                }
+            }
+            tx.commit()?;
+            Ok(WorkCompaction {
+                scope: scope.clone(),
+                before,
+                applied: apply,
+                deleted_operations: operations as u64,
+                deleted_versions: versions as u64,
+                retention_floor,
+                deleted_coordination_requests: compacted_coordination.len() as u64,
+                coordination_retention_floor: coordination_floor,
+            })
+        })
+    }
+
+    fn work_briefing_preview_for(
+        &self,
+        token: &str,
+        subscriber: Option<&str>,
+        limit: usize,
+        now: i64,
+    ) -> Result<Briefing> {
+        BriefingQuery {
+            subscriber: subscriber.map(str::to_owned),
+            limit,
+            ..BriefingQuery::default()
+        }
+        .validate()?;
+        self.run(true, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            let subscriber_key = subscriber.unwrap_or("");
+            lock_work_repository_shared(
+                &mut tx,
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                who.repository_id,
+            )?;
+            let after = tx
+                .query_opt(
+                    "SELECT cursor FROM hub_work_acks
+                     WHERE owner = $1 AND provider = $2 AND host = $3 AND repository = $4
+                       AND repository_id IS NOT DISTINCT FROM $5 AND subscriber_token = $6
+                       AND subscriber_session = $7",
+                    &[
+                        &who.owner.id,
+                        &who.owner.identity.provider,
+                        &who.owner.identity.host,
+                        &who.repository,
+                        &who.repository_id,
+                        &who.token,
+                        &subscriber_key,
+                    ],
+                )?
+                .map_or(0, |row| row.get(0));
+            let through = work_event_high_water(&mut tx, &who, after)?;
+            let page = briefing_page(
+                &mut tx,
+                &who,
+                None,
+                subscriber.map(str::to_owned),
+                after,
+                through,
+                after,
+                None,
+                false,
+                limit,
+                now,
+            )?;
+            tx.commit()?;
+            Ok(page)
+        })
+    }
+
+    fn work_overview(
+        &self,
+        token: &str,
+        query: &WorkOverviewQuery,
+        now: i64,
+    ) -> Result<WorkOverview> {
+        let recent_since = query.validate(now)?;
+        self.run(true, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            lock_work_repository_shared(
+                &mut tx,
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                who.repository_id,
+            )?;
+            let fetch_limit = i64::try_from(query.limit + 1).unwrap_or(101);
+            let mut current = tx
+                .query(
+                    "SELECT snapshot FROM hub_work_items
+                     WHERE provider = $1 AND host = $2 AND repository = $3
+                       AND repository_id IS NOT DISTINCT FROM $4 AND state <> 'finished'
+                     ORDER BY id LIMIT $5",
+                    &[
+                        &who.owner.identity.provider,
+                        &who.owner.identity.host,
+                        &who.repository,
+                        &who.repository_id,
+                        &fetch_limit,
+                    ],
+                )?
+                .into_iter()
+                .map(|row| json_value::<WorkItem>(&row.get::<_, String>(0)))
+                .collect::<Result<Vec<_>>>()?;
+            let mut current_complete = current.len() <= query.limit;
+            current.truncate(query.limit);
+            for item in &mut current {
+                project_claim(&mut tx, item, now)?;
+            }
+            let overview_part_budget = (MAX_BRIEFING_BYTES - 4096) / 3;
+            while json_string(&current)?.len() > overview_part_budget {
+                current.pop();
+                current_complete = false;
+            }
+
+            let mut recent = tx
+                .query(
+                    "SELECT v.event_seq, e.at, v.snapshot FROM hub_work_versions v
+                     JOIN hub_work_items w ON w.id = v.work
+                     JOIN hub_events e ON e.seq = v.event_seq
+                     WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+                       AND w.repository_id IS NOT DISTINCT FROM $4
+                       AND e.at >= $5 AND e.at <= $6
+                       AND e.kind = 'work_checkpoint'
+                       AND v.snapshot::jsonb #>> '{current,kind}' IN ('decision', 'finish')
+                     ORDER BY v.event_seq DESC LIMIT $7",
+                    &[
+                        &who.owner.identity.provider,
+                        &who.owner.identity.host,
+                        &who.repository,
+                        &who.repository_id,
+                        &recent_since,
+                        &now,
+                        &fetch_limit,
+                    ],
+                )?
+                .into_iter()
+                .map(|row| {
+                    let item: WorkItem = json_value(&row.get::<_, String>(2))?;
+                    let kind = if item.state == WorkState::Finished {
+                        WorkOutcomeKind::Completion
+                    } else {
+                        WorkOutcomeKind::Decision
+                    };
+                    Ok(WorkOutcome {
+                        seq: row.get(0),
+                        at: row.get(1),
+                        kind,
+                        item,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let (event_floor, snapshot_floor) = work_retention_floors(&mut tx, &who)?;
+            let history_retention_gap = event_floor > 0 || snapshot_floor > 0;
+            let mut recent_complete = recent.len() <= query.limit && !history_retention_gap;
+            recent.truncate(query.limit);
+            while json_string(&recent)?.len() > overview_part_budget {
+                recent.pop();
+                recent_complete = false;
+            }
+            let mut overlaps = work_overlap_pairs(&current);
+            let mut overlaps_complete = current_complete && overlaps.len() <= query.limit;
+            overlaps.truncate(query.limit);
+            while json_string(&overlaps)?.len() > overview_part_budget {
+                overlaps.pop();
+                overlaps_complete = false;
+            }
+            tx.commit()?;
+            Ok(WorkOverview {
+                recent_since,
+                until: now,
+                current,
+                recent,
+                overlaps,
+                current_complete,
+                recent_complete,
+                overlaps_complete,
+                history_retention_gap,
+            })
+        })
+    }
+
+    fn work_scope_check(
+        &self,
+        token: &str,
+        session: &str,
+        scope: &[String],
+        now: i64,
+    ) -> Result<WorkScopeCheck> {
+        super::intent::text("session", session, 255)?;
+        let requested_scope = normalized_scope(scope)?;
+        self.run(true, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            lock_work_repository_shared(
+                &mut tx,
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                who.repository_id,
+            )?;
+            let rows = tx.query(
+                "SELECT w.snapshot FROM hub_work_items w
+                 JOIN hub_work_participants p ON p.work = w.id
+                 WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+                   AND w.repository_id IS NOT DISTINCT FROM $4 AND w.state IN ('active','blocked')
+                   AND p.token = $5 AND p.session = $6 AND p.generation = w.generation
+                 ORDER BY w.id LIMIT 2",
+                &[
+                    &who.owner.identity.provider,
+                    &who.owner.identity.host,
+                    &who.repository,
+                    &who.repository_id,
+                    &who.token,
+                    &session,
+                ],
+            )?;
+            if rows.len() > 1 {
+                return Err(HubError::Invalid(
+                    "session participates in more than one unfinished work item".into(),
+                ));
+            }
+            let eligible = !rows.is_empty();
+            let fallback = if eligible {
+                None
+            } else {
+                tx.query_opt(
+                    "SELECT w.snapshot FROM hub_work_items w
+                     JOIN hub_work_participants p ON p.work=w.id
+                     WHERE w.provider=$1 AND w.host=$2 AND w.repository=$3
+                       AND w.repository_id IS NOT DISTINCT FROM $4
+                       AND p.token=$5 AND p.session=$6
+                     ORDER BY w.updated_at DESC,w.id LIMIT 1",
+                    &[
+                        &who.owner.identity.provider,
+                        &who.owner.identity.host,
+                        &who.repository,
+                        &who.repository_id,
+                        &who.token,
+                        &session,
+                    ],
+                )?
+                .map(|row| row.get::<_, String>(0))
+            };
+            let mut item = rows
+                .into_iter()
+                .next()
+                .map(|row| row.get::<_, String>(0))
+                .or(fallback)
+                .map(|snapshot| json_value::<WorkItem>(&snapshot))
+                .transpose()?;
+            if let Some(item) = &mut item {
+                project_claim(&mut tx, item, now)?;
+            }
+            let uncovered_scope = if eligible {
+                item.as_ref().map_or_else(
+                    || requested_scope.clone(),
+                    |item| uncovered_scope(&item.scope, &requested_scope),
+                )
+            } else {
+                requested_scope.clone()
+            };
+            tx.commit()?;
+            Ok(WorkScopeCheck {
+                item,
+                requested_scope: requested_scope.clone(),
+                uncovered_scope,
+            })
+        })
+    }
+
+    fn coordination_inbox(
+        &self,
+        token: &str,
+        query: &CoordinationInboxQuery,
+        now: i64,
+    ) -> Result<CoordinationInbox> {
+        query.validate()?;
+        let session = query
+            .session
+            .as_deref()
+            .ok_or_else(|| HubError::Invalid("coordination inbox requires a session".into()))?;
+        self.run(true, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            let page = coordination_page(
+                &mut tx,
+                &who,
+                Some(session),
+                (
+                    query.after.unwrap_or(0),
+                    query.through,
+                    query.after.is_none(),
+                ),
+                query.limit,
+                now,
+            )?;
+            tx.commit()?;
+            Ok(page)
+        })
+    }
+
+    fn coordination_list(
+        &self,
+        token: &str,
+        query: &CoordinationListQuery,
+        now: i64,
+    ) -> Result<CoordinationInbox> {
+        query.validate()?;
+        self.run(true, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            let page = coordination_page(
+                &mut tx,
+                &who,
+                None,
+                (query.after.unwrap_or(0), query.through, query.active_only),
+                query.limit,
+                now,
+            )?;
+            tx.commit()?;
+            Ok(page)
+        })
+    }
+
+    fn coordination_ack(
+        &self,
+        token: &str,
+        ack: &CoordinationAck,
+        now: i64,
+    ) -> Result<CoordinationRequest> {
+        ack.validate()?;
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            if who.read_only {
+                return Err(HubError::Unauthorized);
+            }
+            lock_work_capacity(&mut tx, &who)?;
+            let request =
+                coordination_request_at(&mut tx, &who, &ack.request_id, i64::MAX, now)?
+                    .ok_or_else(|| HubError::Invalid("unknown coordination request".into()))?;
+            let (target, generation) = match &ack.target_work_id {
+                None if coordination_is_requester(&request, &who, &ack.session) => ("", 0),
+                Some(work) => {
+                    let target = coordination_target_for(&request, work, &who, &ack.session)
+                        .ok_or(HubError::Unauthorized)?;
+                    (target.work_id.as_str(), target.generation)
+                }
+                None => return Err(HubError::Unauthorized),
+            };
+            if request.acknowledgements.iter().any(|receipt| {
+                receipt.target_work_id.as_deref().unwrap_or("") == target
+                    && receipt.agent.token == who.token
+                    && receipt.agent.session == ack.session
+                    && receipt.generation == generation
+                    && receipt.through_seq >= ack.expected_updated_seq
+            }) {
+                tx.commit()?;
+                return Ok(request);
+            }
+            if request.updated_seq != ack.expected_updated_seq {
+                return Err(HubError::Invalid(format!(
+                    "coordination request changed; current updated_seq is {}",
+                    request.updated_seq
+                )));
+            }
+            let updates: i64 = tx
+                .query_one(
+                    "SELECT COUNT(*) FROM hub_coordination_acknowledgements WHERE request=$1",
+                    &[&request.id],
+                )?
+                .get(0);
+            if updates >= MAX_COORDINATION_UPDATES {
+                return Err(HubError::WorkCapacity);
+            }
+            let event = coordination_event(
+                "coordination_acknowledged",
+                &request.id,
+                now,
+                json!({"target_work_id": ack.target_work_id, "token": who.token,
+                    "session": ack.session, "generation": generation,
+                    "through_seq": request.updated_seq}),
+            )?;
+            let seq = append(&mut tx, &event)?;
+            tx.execute(
+                "INSERT INTO hub_coordination_acknowledgements
+                 (request,target_work,token,agent,session,owner,login,generation,through_seq,
+                  acknowledged_at,event_seq) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+                &[
+                    &request.id,
+                    &target,
+                    &who.token,
+                    &who.agent,
+                    &ack.session,
+                    &who.owner.id,
+                    &who.owner.login,
+                    &generation,
+                    &seq,
+                    &now,
+                    &seq,
+                ],
+            )?;
+            save_coordination_version(
+                &mut tx,
+                &request.id,
+                request.status,
+                request.proposal.work_id.as_deref(),
+                now,
+                seq,
+            )?;
+            let receipt = json_string(&(target, &who.token, &ack.session, generation, seq))?;
+            adjust_work_payload_capacity(
+                &mut tx,
+                &who,
+                coordination_payload_bytes(&[&receipt, ""], &event)?,
+                now,
+            )?;
+            let updated = coordination_request_at(&mut tx, &who, &ack.request_id, i64::MAX, now)?
+                .ok_or_else(|| {
+                HubError::Unavailable("coordination request disappeared".into())
+            })?;
+            tx.commit()?;
+            Ok(updated)
+        })
+    }
+
+    fn coordination_reply(
+        &self,
+        token: &str,
+        reply: &CoordinationReply,
+        now: i64,
+    ) -> Result<CoordinationRequest> {
+        reply.validate()?;
+        let payload = json_string(reply)?;
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            if who.read_only {
+                return Err(HubError::Unauthorized);
+            }
+            lock_work_capacity(&mut tx, &who)?;
+            let request = coordination_request_at(&mut tx, &who, &reply.request_id, i64::MAX, now)?
+                .ok_or_else(|| HubError::Invalid("unknown coordination request".into()))?;
+            let target =
+                coordination_target_for(&request, &reply.target_work_id, &who, &reply.session)
+                    .ok_or(HubError::Unauthorized)?;
+            if coordination_operation_replay(
+                &mut tx,
+                &request.id,
+                &reply.operation_id,
+                "reply",
+                &payload,
+            )? {
+                tx.commit()?;
+                return Ok(request);
+            }
+            if !matches!(
+                request.status,
+                CoordinationStatus::Pending | CoordinationStatus::Responded
+            ) {
+                return Err(HubError::Invalid("coordination request is closed".into()));
+            }
+            if request.updated_seq != reply.expected_updated_seq {
+                return Err(HubError::Invalid(format!(
+                    "coordination request changed; current updated_seq is {}",
+                    request.updated_seq
+                )));
+            }
+            let updates: i64 = tx
+                .query_one(
+                    "SELECT COUNT(*) FROM hub_coordination_responses WHERE request=$1",
+                    &[&request.id],
+                )?
+                .get(0);
+            if updates >= MAX_COORDINATION_UPDATES {
+                return Err(HubError::WorkCapacity);
+            }
+            let response_id = new_id("crs")?;
+            let event = coordination_event(
+                "coordination_responded",
+                &request.id,
+                now,
+                json!({"response_id": response_id, "target_work_id": target.work_id,
+                    "kind": response_kind_name(reply.kind), "token": who.token,
+                    "session": reply.session, "generation": target.generation}),
+            )?;
+            let seq = append(&mut tx, &event)?;
+            tx.execute(
+                "INSERT INTO hub_coordination_responses
+                 (id,request,operation_id,target_work,token,agent,session,owner,login,
+                  target_generation,kind,note,created_at,event_seq)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+                &[
+                    &response_id,
+                    &request.id,
+                    &reply.operation_id,
+                    &target.work_id,
+                    &who.token,
+                    &who.agent,
+                    &reply.session,
+                    &who.owner.id,
+                    &who.owner.login,
+                    &target.generation,
+                    &response_kind_name(reply.kind),
+                    &reply.note,
+                    &now,
+                    &seq,
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO hub_coordination_operations
+                 (request,operation_id,kind,payload,event_seq) VALUES ($1,$2,'reply',$3,$4)",
+                &[&request.id, &reply.operation_id, &payload, &seq],
+            )?;
+            let all_responded = coordination_all_targets_responded(&mut tx, &request.id)?;
+            let status = if all_responded {
+                CoordinationStatus::Responded
+            } else {
+                CoordinationStatus::Pending
+            };
+            save_coordination_version(
+                &mut tx,
+                &request.id,
+                status,
+                request.proposal.work_id.as_deref(),
+                now,
+                seq,
+            )?;
+            let response = json_string(&(
+                &response_id,
+                &reply.operation_id,
+                &target.work_id,
+                response_kind_name(reply.kind),
+                &reply.note,
+            ))?;
+            adjust_work_payload_capacity(
+                &mut tx,
+                &who,
+                coordination_payload_bytes(&[&payload, &response, ""], &event)?,
+                now,
+            )?;
+            let updated = coordination_request_at(&mut tx, &who, &reply.request_id, i64::MAX, now)?
+                .ok_or_else(|| HubError::Unavailable("coordination request disappeared".into()))?;
+            tx.commit()?;
+            Ok(updated)
+        })
+    }
+
+    fn coordination_resolve(
+        &self,
+        token: &str,
+        resolve: &CoordinationResolve,
+        now: i64,
+    ) -> Result<CoordinationRequest> {
+        resolve.validate()?;
+        let payload = json_string(resolve)?;
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            if who.read_only {
+                return Err(HubError::Unauthorized);
+            }
+            lock_work_capacity(&mut tx, &who)?;
+            let request =
+                coordination_request_at(&mut tx, &who, &resolve.request_id, i64::MAX, now)?
+                    .ok_or_else(|| HubError::Invalid("unknown coordination request".into()))?;
+            let authorized = coordination_is_requester(&request, &who, &resolve.session)
+                || request.targets.iter().any(|target| {
+                    target.lead.token == who.token && target.lead.session == resolve.session
+                });
+            if !authorized {
+                return Err(HubError::Unauthorized);
+            }
+            if coordination_operation_replay(
+                &mut tx,
+                &request.id,
+                &resolve.operation_id,
+                "resolve",
+                &payload,
+            )? {
+                tx.commit()?;
+                return Ok(request);
+            }
+            if !matches!(
+                request.status,
+                CoordinationStatus::Pending | CoordinationStatus::Responded
+            ) {
+                return Err(HubError::Invalid("coordination request is closed".into()));
+            }
+            if request.updated_seq != resolve.expected_updated_seq {
+                return Err(HubError::Invalid(format!(
+                    "coordination request changed; current updated_seq is {}",
+                    request.updated_seq
+                )));
+            }
+            let proposal_scope = if let Some(work) = &request.proposal.work_id {
+                let item = scoped_work(&mut tx, &who, work, now, true)?
+                    .ok_or_else(|| HubError::Unavailable("proposed work item is missing".into()))?;
+                if item.state == WorkState::Finished {
+                    Vec::new()
+                } else if coordination_was_initially_bound(&mut tx, &request.id)? {
+                    if item.scope != request.proposal.scope {
+                        return Err(HubError::Invalid(
+                            "queued coordination proposal scope has not been applied".into(),
+                        ));
+                    }
+                    request.proposal.scope.clone()
+                } else {
+                    item.scope
+                }
+            } else {
+                request.proposal.scope.clone()
+            };
+            let mut unresolved = work_scope_overlaps(
+                &mut tx,
+                &who,
+                &proposal_scope,
+                request.proposal.work_id.as_deref(),
+                now,
+            )?;
+            let mut needs_coordination = Vec::new();
+            for overlap in unresolved.drain(..) {
+                let participating = tx
+                    .query_opt(
+                        "SELECT 1 FROM hub_work_participants
+                     WHERE work=$1 AND token=$2 AND session=$3 AND generation=$4",
+                        &[
+                            &overlap.item.id,
+                            &request.requester.token,
+                            &request.requester.session,
+                            &overlap.item.generation,
+                        ],
+                    )?
+                    .is_some();
+                if !participating {
+                    needs_coordination.push(overlap);
+                }
+            }
+            if !needs_coordination.is_empty() {
+                let requester_who = WorkWho {
+                    token: request.requester.token.clone(),
+                    repository: who.repository.clone(),
+                    repository_id: who.repository_id,
+                    agent: request.requester.agent.clone(),
+                    read_only: false,
+                    owner: User {
+                        id: request.requester.owner.clone(),
+                        identity: who.owner.identity.clone(),
+                        login: request.requester.login.clone(),
+                        disabled: false,
+                    },
+                };
+                let refreshed = create_coordination_request(
+                    &mut tx,
+                    &requester_who,
+                    &request.requester.session,
+                    request.proposal.clone(),
+                    &needs_coordination,
+                    now,
+                )?;
+                tx.commit()?;
+                return Err(HubError::WorkCoordinationRequired {
+                    overlaps: needs_coordination,
+                    request: Box::new(refreshed),
+                });
+            }
+            let event = coordination_event(
+                "coordination_resolved",
+                &request.id,
+                now,
+                json!({"by": who.token, "session": resolve.session}),
+            )?;
+            let seq = append(&mut tx, &event)?;
+            tx.execute(
+                "INSERT INTO hub_coordination_operations
+                 (request,operation_id,kind,payload,event_seq) VALUES ($1,$2,'resolve',$3,$4)",
+                &[&request.id, &resolve.operation_id, &payload, &seq],
+            )?;
+            save_coordination_version(
+                &mut tx,
+                &request.id,
+                CoordinationStatus::Resolved,
+                request.proposal.work_id.as_deref(),
+                now,
+                seq,
+            )?;
+            adjust_work_payload_capacity(
+                &mut tx,
+                &who,
+                coordination_payload_bytes(&[&payload, ""], &event)?,
+                now,
+            )?;
+            let updated =
+                coordination_request_at(&mut tx, &who, &resolve.request_id, i64::MAX, now)?
+                    .ok_or_else(|| {
+                        HubError::Unavailable("coordination request disappeared".into())
+                    })?;
+            tx.commit()?;
+            Ok(updated)
+        })
+    }
+
+    fn coordination_withdraw(
+        &self,
+        token: &str,
+        withdraw: &CoordinationWithdraw,
+        now: i64,
+    ) -> Result<CoordinationRequest> {
+        withdraw.validate()?;
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            if who.read_only {
+                return Err(HubError::Unauthorized);
+            }
+            lock_work_capacity(&mut tx, &who)?;
+            let request =
+                coordination_request_at(&mut tx, &who, &withdraw.request_id, i64::MAX, now)?
+                    .ok_or_else(|| HubError::Invalid("unknown coordination request".into()))?;
+            let requester = coordination_is_requester(&request, &who, &withdraw.session);
+            let requester_available = tx
+                .query_opt(
+                    "SELECT 1 FROM hub_agent_tokens t JOIN hub_users u ON u.id=t.owner
+                     WHERE t.id=$1 AND NOT t.revoked AND t.expires_at>$2 AND NOT u.disabled",
+                    &[&request.requester.token, &now],
+                )?
+                .is_some();
+            let current_target_lead = request.targets.iter().any(|target| {
+                target.lead.token == who.token && target.lead.session == withdraw.session
+            });
+            let cleanup = !requester && !requester_available && current_target_lead;
+            if !requester && !cleanup {
+                return Err(HubError::Unauthorized);
+            }
+            let reason = if cleanup {
+                "requester_unavailable"
+            } else {
+                "requester_withdrawn"
+            };
+            let payload = json_string(&(withdraw, reason))?;
+            if coordination_operation_replay(
+                &mut tx,
+                &request.id,
+                &withdraw.operation_id,
+                "withdraw",
+                &payload,
+            )? {
+                tx.commit()?;
+                return Ok(request);
+            }
+            if !matches!(
+                request.status,
+                CoordinationStatus::Pending | CoordinationStatus::Responded
+            ) {
+                return Err(HubError::Invalid("coordination request is closed".into()));
+            }
+            if request.updated_seq != withdraw.expected_updated_seq {
+                return Err(HubError::Invalid(format!(
+                    "coordination request changed; current updated_seq is {}",
+                    request.updated_seq
+                )));
+            }
+            let event = coordination_event(
+                "coordination_withdrawn",
+                &request.id,
+                now,
+                json!({"by": who.token, "session": withdraw.session, "reason": reason}),
+            )?;
+            let seq = append(&mut tx, &event)?;
+            tx.execute(
+                "INSERT INTO hub_coordination_operations
+                 (request,operation_id,kind,payload,event_seq) VALUES ($1,$2,'withdraw',$3,$4)",
+                &[&request.id, &withdraw.operation_id, &payload, &seq],
+            )?;
+            save_coordination_version(
+                &mut tx,
+                &request.id,
+                CoordinationStatus::Withdrawn,
+                request.proposal.work_id.as_deref(),
+                now,
+                seq,
+            )?;
+            adjust_work_payload_capacity(
+                &mut tx,
+                &who,
+                coordination_payload_bytes(&[&payload, ""], &event)?,
+                now,
+            )?;
+            let updated =
+                coordination_request_at(&mut tx, &who, &withdraw.request_id, i64::MAX, now)?
+                    .ok_or_else(|| {
+                        HubError::Unavailable("coordination request disappeared".into())
+                    })?;
+            tx.commit()?;
+            Ok(updated)
         })
     }
 

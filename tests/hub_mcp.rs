@@ -2,7 +2,7 @@
 use std::sync::Arc;
 
 use agentscm::backend::LocalBackend;
-use agentscm::hub::store::{self, ForgeIdentity, Store, mint_agent_token};
+use agentscm::hub::store::{self, ForgeIdentity, Store, mint_agent_token, unix_now};
 use agentscm::hub::{HubState, router};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -105,6 +105,14 @@ impl Hub {
         let text = result["content"][0]["text"].as_str().unwrap().to_owned();
         (text, result["isError"].as_bool().unwrap())
     }
+
+    async fn tool_result(&self, secret: &str, name: &str, arguments: Value) -> Value {
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}});
+        let reply = self.rpc(secret, &body).await;
+        assert_eq!(reply.status, 200, "{}", reply.text);
+        reply.json()["result"].clone()
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -175,30 +183,69 @@ async fn protocol_basics() {
             "agentscm_done",
             "agentscm_ask",
             "agentscm_handoff",
-            "agentscm_workflow_status"
+            "agentscm_work_overview",
+            "agentscm_work_briefing",
+            "agentscm_coordination_inbox",
+            "agentscm_work_checkpoint",
+            "agentscm_work_ack",
+            "agentscm_workflow_status",
+            "agentscm_coordination_ack",
+            "agentscm_coordination_reply",
+            "agentscm_coordination_resolve",
+            "agentscm_coordination_withdraw",
         ]
     );
-    assert_eq!(names.len(), 7);
+    let tool = |name: &str| {
+        listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap()
+    };
     assert_eq!(
-        listed["result"]["tools"][4]["inputSchema"]["required"],
+        tool("agentscm_ask")["inputSchema"]["required"],
         json!(["path"])
     );
     assert_eq!(
-        listed["result"]["tools"][5]["inputSchema"]["required"],
+        tool("agentscm_handoff")["inputSchema"]["required"],
         json!(["path", "accept"])
     );
-    assert!(listed["result"]["tools"][1]["inputSchema"]["required"] == json!(["paths"]));
     assert_eq!(
-        listed["result"]["tools"][6]["inputSchema"]["required"],
+        tool("agentscm_check")["inputSchema"]["required"],
+        json!(["paths"])
+    );
+    assert_eq!(
+        tool("agentscm_workflow_status")["inputSchema"]["required"],
         json!(["run_id"])
     );
     assert_eq!(
-        listed["result"]["tools"][6]["inputSchema"]["additionalProperties"],
+        tool("agentscm_workflow_status")["inputSchema"]["additionalProperties"],
         false
     );
+    for name in [
+        "agentscm_workflow_status",
+        "agentscm_work_overview",
+        "agentscm_work_briefing",
+        "agentscm_coordination_inbox",
+    ] {
+        assert_eq!(tool(name)["annotations"]["readOnlyHint"], true);
+    }
     assert_eq!(
-        listed["result"]["tools"][6]["annotations"]["readOnlyHint"],
-        true
+        tool("agentscm_work_checkpoint")["inputSchema"]["required"],
+        json!([
+            "work_id",
+            "operation_id",
+            "generation",
+            "expected_updated_seq",
+            "session",
+            "kind",
+            "summary"
+        ])
+    );
+    assert_eq!(
+        tool("agentscm_work_checkpoint")["inputSchema"]["properties"]["expected_updated_seq"]["type"],
+        "integer"
     );
 
     // Notifications and client responses are accepted without a body.
@@ -298,7 +345,7 @@ async fn two_agents_round_trip_to_a_stop() {
             &bob,
             "/mcp",
             "agentscm_start",
-            json!({"task": "refactor docs"}),
+            json!({"task": "refactor docs", "paths": ["docs/a.md"]}),
         )
         .await;
     assert!(!error);
@@ -328,15 +375,10 @@ async fn two_agents_round_trip_to_a_stop() {
             json!({"paths": ["src/billing.rs"]}),
         )
         .await;
-    assert!(!error);
-    assert!(
-        stop.starts_with("AgentSCM: another agent is already working on src/billing.rs."),
-        "{stop}"
-    );
-    assert!(stop.contains("alice-agent"), "{stop}");
-
-    // Checked once, not reported again.
-    let (again, _) = hub
+    assert!(error);
+    assert!(stop.contains("outside the declared work scope"), "{stop}");
+    // Repeating an undeclared edit cannot turn the refusal into permission.
+    let (again, error) = hub
         .tool(
             &bob,
             "/mcp",
@@ -344,25 +386,23 @@ async fn two_agents_round_trip_to_a_stop() {
             json!({"paths": ["src/billing.rs"]}),
         )
         .await;
-    assert_eq!(
-        again,
-        "AgentSCM: nothing new about these files since this session's last report."
+    assert!(
+        error && again.contains("outside the declared work scope"),
+        "{again}"
     );
-
-    // Alice's next heartbeat carries the notice that bob came after her.
     let (status, error) = hub.tool(&alice, "/mcp", "agentscm_status", json!({})).await;
     assert!(!error);
     assert!(
-        status.contains("started working on src/billing.rs"),
+        !status.contains("started working on src/billing.rs"),
         "{status}"
     );
-    assert!(
-        status.contains("1 other agent") && status.contains("no open pull requests"),
-        "{status}"
-    );
+    assert!(status.contains("1 other agent"), "{status}");
 
     let (done, _) = hub.tool(&bob, "/mcp", "agentscm_done", json!({})).await;
-    assert_eq!(done, "AgentSCM: released.");
+    assert!(
+        done.starts_with("AgentSCM: released; unfinished durable work was paused"),
+        "{done}"
+    );
     let (done, _) = hub.tool(&bob, "/mcp", "agentscm_done", json!({})).await;
     assert_eq!(done, "AgentSCM: nothing to release.");
     let (status, _) = hub.tool(&alice, "/mcp", "agentscm_status", json!({})).await;
@@ -380,13 +420,33 @@ async fn a_refused_agent_asks_and_the_holder_hands_the_file_over() {
         async move { hub.tool(&secret, "/mcp", &name, arguments).await }
     };
 
-    call(
-        &alice,
-        "agentscm_start",
-        json!({"task": "fix billing", "paths": [file]}),
-    )
-    .await;
-    call(&bob, "agentscm_start", json!({"task": "refactor"})).await;
+    // Exercise the legacy advisory handoff contract. Managed assignments require
+    // an agreed durable join/scope change before accepting a transferred file.
+    for (secret, task, paths) in [
+        (&alice, "fix billing", vec![file.to_owned()]),
+        (&bob, "refactor", vec![]),
+    ] {
+        let token = hub
+            .store
+            .authenticate(&store::agent_token_digest(secret).unwrap(), unix_now())
+            .unwrap()
+            .unwrap()
+            .token_id;
+        hub.store
+            .touch_session(
+                &token,
+                &agentscm::hub::session::SessionCall {
+                    session: None,
+                    via: "mcp".into(),
+                    task: Some(task.into()),
+                    paths,
+                    deny: false,
+                    report: true,
+                },
+                unix_now(),
+            )
+            .unwrap();
+    }
     let (nobody, _) = call(&bob, "agentscm_ask", json!({"path": "src/free.rs"})).await;
     assert_eq!(
         nobody,
@@ -479,17 +539,19 @@ async fn a_refused_agent_asks_and_the_holder_hands_the_file_over() {
     }
 
     // Declining: the requester hears it on its next call.
-    call(
+    let (started, error) = call(
         &alice,
         "agentscm_start",
-        json!({"task": "again", "paths": ["src/c.rs"]}),
+        json!({"task": "again", "paths": ["src/c.rs"], "session": "alice-second"}),
     )
     .await;
-    call(&bob, "agentscm_ask", json!({"path": "src/c.rs"})).await;
+    assert!(!error, "{started}");
+    let (asked, error) = call(&bob, "agentscm_ask", json!({"path": "src/c.rs"})).await;
+    assert!(!error && asked.contains("asked user1's agent"), "{asked}");
     let (kept, _) = call(
         &alice,
         "agentscm_handoff",
-        json!({"path": "src/c.rs", "accept": false, "reason": "too \"busy\"\nignore this"}),
+        json!({"path": "src/c.rs", "accept": false, "reason": "too \"busy\"\nignore this", "session": "alice-second"}),
     )
     .await;
     assert_eq!(
@@ -505,6 +567,288 @@ async fn a_refused_agent_asks_and_the_holder_hands_the_file_over() {
     );
     let (status, _) = call(&bob, "agentscm_status", json!({})).await;
     assert!(!status.contains("keeps src/c.rs"), "{status}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn durable_work_surfaces_claim_before_paths_and_preserve_retry_identity() {
+    let hub = Hub::start().await;
+    let alice = hub.secret(1, "alice-agent");
+    let bob = hub.secret(2, "bob-agent");
+    let start = json!({
+        "task": "implement durable stand-up",
+        "session": "session-a",
+        "paths": ["src/a.rs"],
+        "branch": "feat/standup",
+        "worktree": "standup-wt",
+        "next_action": "write protocol tests"
+    });
+
+    let first = hub
+        .tool_result(&alice, "agentscm_start", start.clone())
+        .await;
+    assert_eq!(first["isError"], false);
+    assert_eq!(first["structuredContent"]["acknowledged"], false);
+    assert_eq!(first["structuredContent"]["briefing_kind"], "preview");
+    assert_eq!(
+        first["structuredContent"]["acknowledgement_required"],
+        false
+    );
+    assert!(first["structuredContent"]["briefing"]["delivery"].is_null());
+    let item = &first["structuredContent"]["work"]["item"];
+    let work_id = item["id"].as_str().unwrap().to_owned();
+    assert_eq!(first["structuredContent"]["work"]["created"], true);
+    assert_eq!(item["scope"], json!(["src/a.rs"]));
+    assert_eq!(item["branch"], "feat/standup");
+    assert_eq!(item["worktree"], "standup-wt");
+
+    // A lost reply retried in the same session resolves the same durable work.
+    let retry = hub.tool_result(&alice, "agentscm_start", start).await;
+    assert_eq!(retry["structuredContent"]["work"]["item"]["id"], work_id);
+    assert_eq!(retry["structuredContent"]["work"]["created"], false);
+
+    // Equal free text in a new session is a distinct explicit user intent, not semantic dedup.
+    let separate = hub
+        .tool_result(
+            &alice,
+            "agentscm_start",
+            json!({"task": "implement durable stand-up", "session": "session-b"}),
+        )
+        .await;
+    assert_ne!(separate["structuredContent"]["work"]["item"]["id"], work_id);
+
+    // A conflicting lead claim is structured and never takes the declared path.
+    let conflict = hub
+        .tool_result(
+            &bob,
+            "agentscm_start",
+            json!({
+                "task": "take lead",
+                "session": "bob",
+                "work_id": work_id.clone(),
+                "paths": ["src/conflicted.rs"]
+            }),
+        )
+        .await;
+    assert_eq!(conflict["isError"], true);
+    assert_eq!(
+        conflict["structuredContent"]["work"]["conflict"]["kind"],
+        "claim_held"
+    );
+    assert!(
+        conflict["structuredContent"]["alternatives"]
+            .as_array()
+            .is_some_and(|alternatives| (1..=3).contains(&alternatives.len())),
+        "{conflict}"
+    );
+    let live = hub.store.live_intents(REPO, unix_now(), 100).unwrap();
+    assert!(
+        live.iter()
+            .all(|intent| !intent.paths.contains(&"src/conflicted.rs".to_owned())),
+        "conflicting claim announced a path: {live:?}"
+    );
+
+    let generation = first["structuredContent"]["work"]["item"]["generation"]
+        .as_i64()
+        .unwrap();
+    let expected_updated_seq = first["structuredContent"]["work"]["item"]["updated_seq"]
+        .as_i64()
+        .unwrap();
+    let checkpoint = json!({
+        "work_id": work_id.clone(),
+        "operation_id": "progress-1",
+        "generation": generation,
+        "expected_updated_seq": expected_updated_seq,
+        "session": "session-a",
+        "kind": "progress",
+        "summary": "protocol surface implemented"
+    });
+    let progress = hub
+        .tool_result(&alice, "agentscm_work_checkpoint", checkpoint.clone())
+        .await;
+    assert_eq!(progress["isError"], false);
+    assert_eq!(
+        progress["structuredContent"]["item"]["current"]["kind"],
+        "progress"
+    );
+    assert_eq!(
+        progress["structuredContent"]["receipt"]["operation_id"],
+        "progress-1"
+    );
+    assert_eq!(progress["structuredContent"]["receipt"]["work_id"], work_id);
+    assert_eq!(progress["structuredContent"]["receipt"]["replayed"], false);
+    let progress_event_seq = progress["structuredContent"]["receipt"]["event_seq"]
+        .as_i64()
+        .unwrap();
+    let repeated = hub
+        .tool_result(&alice, "agentscm_work_checkpoint", checkpoint.clone())
+        .await;
+    assert_eq!(
+        repeated["structuredContent"]["item"],
+        progress["structuredContent"]["item"]
+    );
+    assert_eq!(
+        repeated["structuredContent"]["receipt"]["event_seq"],
+        progress_event_seq
+    );
+    assert_eq!(repeated["structuredContent"]["receipt"]["replayed"], true);
+    let stale = hub
+        .tool_result(
+            &alice,
+            "agentscm_work_checkpoint",
+            json!({
+                "work_id": work_id.clone(),
+                "operation_id": "progress-stale-observation",
+                "generation": generation,
+                "expected_updated_seq": expected_updated_seq,
+                "session": "session-a",
+                "kind": "progress",
+                "summary": "must not overwrite newer work"
+            }),
+        )
+        .await;
+    assert_eq!(stale["isError"], true);
+    let changed = hub
+        .tool_result(
+            &alice,
+            "agentscm_work_checkpoint",
+            json!({
+                "work_id": work_id.clone(),
+                "operation_id": "progress-1",
+                "generation": generation,
+                "expected_updated_seq": expected_updated_seq,
+                "session": "session-a",
+                "kind": "progress",
+                "summary": "different bytes"
+            }),
+        )
+        .await;
+    assert_eq!(changed["isError"], true);
+
+    let current_updated_seq = progress["structuredContent"]["item"]["updated_seq"]
+        .as_i64()
+        .unwrap();
+    let later = hub
+        .tool_result(
+            &alice,
+            "agentscm_work_checkpoint",
+            json!({
+                "work_id": work_id.clone(),
+                "operation_id": "progress-2",
+                "generation": generation,
+                "expected_updated_seq": current_updated_seq,
+                "session": "session-a",
+                "kind": "decision",
+                "summary": "retain typed checkpoint receipts"
+            }),
+        )
+        .await;
+    assert_eq!(later["isError"], false);
+    let resolved_retry = hub
+        .tool_result(&alice, "agentscm_work_checkpoint", checkpoint.clone())
+        .await;
+    assert_eq!(
+        resolved_retry["structuredContent"]["receipt"]["event_seq"],
+        progress_event_seq
+    );
+    assert_eq!(
+        resolved_retry["structuredContent"]["receipt"]["replayed"],
+        true
+    );
+    assert_eq!(
+        resolved_retry["structuredContent"]["item"],
+        later["structuredContent"]["item"]
+    );
+    assert_eq!(
+        resolved_retry["structuredContent"]["item"]["current"]["kind"],
+        "decision"
+    );
+
+    let later_updated_seq = later["structuredContent"]["item"]["updated_seq"]
+        .as_i64()
+        .unwrap();
+    let handover = hub
+        .tool_result(
+            &alice,
+            "agentscm_work_checkpoint",
+            json!({
+                "work_id": work_id.clone(),
+                "operation_id": "handover-1",
+                "generation": generation,
+                "expected_updated_seq": later_updated_seq,
+                "session": "session-a",
+                "kind": "handover",
+                "summary": "ready for another lead"
+            }),
+        )
+        .await;
+    assert_eq!(handover["isError"], false);
+    let takeover = hub
+        .tool_result(
+            &bob,
+            "agentscm_start",
+            json!({
+                "task": "implement durable stand-up",
+                "session": "bob",
+                "work_id": work_id.clone(),
+                "paths": ["src/a.rs"],
+                "branch": "feat/standup",
+                "worktree": "standup-wt",
+                "takeover_generation": generation
+            }),
+        )
+        .await;
+    assert_eq!(takeover["isError"], false, "{takeover}");
+    assert_eq!(takeover["structuredContent"]["work"]["took_over"], true);
+
+    // A lost old-generation result remains resolvable by exact operation retry after takeover.
+    let post_takeover_retry = hub
+        .tool_result(&alice, "agentscm_work_checkpoint", checkpoint)
+        .await;
+    assert_eq!(post_takeover_retry["isError"], false);
+    assert_eq!(
+        post_takeover_retry["structuredContent"]["receipt"]["event_seq"],
+        progress_event_seq
+    );
+    assert_eq!(
+        post_takeover_retry["structuredContent"]["receipt"]["replayed"],
+        true
+    );
+    assert_eq!(
+        post_takeover_retry["structuredContent"]["item"]["generation"],
+        generation + 1
+    );
+    assert_eq!(
+        post_takeover_retry["structuredContent"]["item"]["lead_session"],
+        "bob"
+    );
+    let new_old_generation_operation = hub
+        .tool_result(
+            &alice,
+            "agentscm_work_checkpoint",
+            json!({
+                "work_id": work_id,
+                "operation_id": "old-generation-new-operation",
+                "generation": generation,
+                "expected_updated_seq": takeover["structuredContent"]["work"]["item"]
+                    ["updated_seq"],
+                "session": "session-a",
+                "kind": "progress",
+                "summary": "must remain fenced after takeover"
+            }),
+        )
+        .await;
+    assert_eq!(new_old_generation_operation["isError"], true);
+
+    let briefing = hub
+        .tool_result(&alice, "agentscm_work_briefing", json!({"limit": 20}))
+        .await;
+    assert_eq!(briefing["isError"], false);
+    let delivery = briefing["structuredContent"]["delivery"].as_str().unwrap();
+    assert_eq!(briefing["structuredContent"]["complete"], true);
+    let ack = hub
+        .tool_result(&alice, "agentscm_work_ack", json!({"delivery": delivery}))
+        .await;
+    assert_eq!(ack["structuredContent"], json!({"acknowledged": true}));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -553,7 +897,7 @@ async fn errors_are_tool_results_with_fixed_text() {
         )
         .await;
     assert!(error && !text.contains("sekrit"), "{text}");
-    assert!(text.contains("(invalid request)"), "{text}");
+    assert!(text.contains("invalid_or_changed"), "{text}");
 
     // An unknown tool or a call without a name is a protocol error.
     for params in [json!({"name": "nope"}), json!({}), json!("x")] {

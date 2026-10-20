@@ -201,7 +201,10 @@ fn idempotent_migrations(db: &Db) {
     for _ in 0..3 {
         db.open();
     }
-    assert_eq!(db.versions(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert_eq!(
+        db.versions(),
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+    );
     db.exec("INSERT INTO hub_schema_migrations (version, applied_at) VALUES (999, 0)")
         .unwrap();
     let error = store::open(&db.url).err().unwrap();
@@ -221,7 +224,10 @@ fn concurrent_startup(db: &Db) {
     for open in opens {
         open.join().unwrap().unwrap();
     }
-    assert_eq!(db.versions(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert_eq!(
+        db.versions(),
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+    );
 }
 
 fn restart_persistence(db: &Db) {
@@ -311,7 +317,9 @@ fn events_record_each_change(db: &Db) {
         "DELETE FROM hub_events".to_owned(),
     ];
     if db.pg.is_some() {
-        tampering.push("TRUNCATE hub_events".into());
+        // CASCADE gets past the new work-history foreign keys so PostgreSQL
+        // reaches the hub_events append-only truncate trigger itself.
+        tampering.push("TRUNCATE hub_events CASCADE".into());
     } else {
         tampering.push(format!(
             "INSERT OR REPLACE INTO hub_events (seq, id, at, kind, subject, data) \
@@ -594,7 +602,10 @@ fn upgrade_from_migration_1(db: &Db) {
     ))
     .unwrap();
     let store = db.open();
-    assert_eq!(db.versions(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert_eq!(
+        db.versions(),
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+    );
     let principal = store
         .authenticate(&agent_token_digest(&raw).unwrap(), unix_now())
         .unwrap()
@@ -1168,7 +1179,10 @@ fn upgrade_from_migration_3(db: &Db) {
     ))
     .unwrap();
     let store = db.open();
-    assert_eq!(db.versions(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert_eq!(
+        db.versions(),
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+    );
     let intents = store.live_intents("acme/widgets", unix_now(), 10).unwrap();
     assert_eq!(intents.len(), 1);
     let con = store

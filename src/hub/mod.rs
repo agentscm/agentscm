@@ -1,6 +1,8 @@
 //! Multi-user coordination hub: storage and authenticated HTTP.
 pub mod advice;
 pub mod connection;
+pub mod coordination;
+mod coordination_http;
 pub mod forge_api;
 pub mod forge_http;
 pub mod github;
@@ -19,6 +21,8 @@ mod store_pg;
 mod store_sqlite;
 pub mod sync;
 mod ui;
+pub mod work;
+pub mod work_http;
 pub mod workspace;
 #[cfg(unix)]
 pub mod workspace_execution;
@@ -49,6 +53,17 @@ pub enum HubError {
     Unauthorized,
     /// Too many concurrent store operations; the request is not queued.
     Busy,
+    /// The repository's retained work budget needs operator maintenance.
+    WorkCapacity,
+    /// The requested lead scope intersects durable unfinished work.
+    WorkOverlap(Vec<work::WorkScopeOverlap>),
+    /// A rejected scope mutation that durably created or reused a coordination request.
+    WorkCoordinationRequired {
+        overlaps: Vec<work::WorkScopeOverlap>,
+        request: Box<coordination::CoordinationRequest>,
+    },
+    /// The bounded overlap scan could not prove that the requested scope is free.
+    WorkOverlapIncomplete,
     /// Internal detail for the operator's stderr only; never sent to a client.
     Unavailable(String),
 }
@@ -61,6 +76,17 @@ impl fmt::Display for HubError {
             Self::Invalid(message) => write!(f, "invalid: {message}"),
             Self::Unauthorized => write!(f, "authentication required"),
             Self::Busy => write!(f, "busy"),
+            Self::WorkCapacity => write!(
+                f,
+                "repository work storage capacity reached; operator compaction required"
+            ),
+            Self::WorkOverlap(_) => write!(f, "work scope overlaps unfinished work"),
+            Self::WorkCoordinationRequired { .. } => {
+                write!(f, "work scope needs a durable coordination response")
+            }
+            Self::WorkOverlapIncomplete => {
+                write!(f, "work overlap scan is incomplete; claim refused")
+            }
             Self::Unavailable(message) => write!(f, "unavailable: {message}"),
         }
     }
@@ -248,6 +274,7 @@ pub fn router(state: HubState) -> Router {
     let workspace_routes = workspace::routes();
     Router::new()
         .merge(http::routes())
+        .merge(work_http::routes())
         .merge(intent::routes())
         .merge(hook::routes())
         .merge(login::routes())

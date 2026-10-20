@@ -1,0 +1,215 @@
+---
+name: AgentSCM Hub
+description: A calm, read-only coordination Hub for seeing who owns each piece of agent work.
+colors:
+  primary-light: "#4F5BD5"
+  primary-dark: "#7C86FF"
+  canvas-light: "#F4F5F9"
+  canvas-dark: "#0A0C14"
+  surface-light: "#FFFFFF"
+  surface-dark: "#121522"
+  elevated-dark: "#1A1E30"
+  success: "#12B76A"
+  warning: "#F79009"
+  error: "#F04438"
+  success-ink-light: "#067647"
+  warning-ink-light: "#B54708"
+  error-ink-light: "#B42318"
+  success-ink-dark: "#6CE9A6"
+  warning-ink-dark: "#FEC84B"
+  error-ink-dark: "#FDA29B"
+typography:
+  display:
+    fontFamily: "-apple-system, BlinkMacSystemFont, SF Pro Text, Inter, Segoe UI, Roboto, Helvetica Neue, Arial, sans-serif"
+    fontSize: "clamp(24px, 2.5vw, 28px)"
+    fontWeight: 700
+    lineHeight: 1.12
+    letterSpacing: "-0.025em"
+  title:
+    fontFamily: "-apple-system, BlinkMacSystemFont, SF Pro Text, Inter, Segoe UI, Roboto, Helvetica Neue, Arial, sans-serif"
+    fontSize: "24px"
+    fontWeight: 700
+    lineHeight: 1.12
+    letterSpacing: "-0.025em"
+  body:
+    fontFamily: "-apple-system, BlinkMacSystemFont, SF Pro Text, Inter, Segoe UI, Roboto, Helvetica Neue, Arial, sans-serif"
+    fontSize: "14px"
+    fontWeight: 400
+    lineHeight: 1.5
+  label:
+    fontFamily: "-apple-system, BlinkMacSystemFont, SF Pro Text, Inter, Segoe UI, Roboto, Helvetica Neue, Arial, sans-serif"
+    fontSize: "12px"
+    fontWeight: 650
+    lineHeight: 1.4
+    letterSpacing: "0.03em"
+rounded:
+  sm: "8px"
+  md: "12px"
+  lg: "14px"
+  xl: "20px"
+spacing:
+  xs: "4px"
+  sm: "8px"
+  md: "12px"
+  lg: "16px"
+  xl: "20px"
+  section: "28px"
+components:
+  navigation:
+    textColor: "{colors.primary-light}"
+    typography: "{typography.label}"
+    rounded: "{rounded.sm}"
+    height: "44px"
+  filter-field:
+    backgroundColor: "{colors.surface-light}"
+    textColor: "{colors.primary-light}"
+    rounded: "{rounded.md}"
+    height: "44px"
+    padding: "0 12px"
+  work-row:
+    backgroundColor: "{colors.surface-light}"
+    textColor: "{colors.primary-light}"
+    rounded: "{rounded.sm}"
+    padding: "12px 14px"
+  primary-action:
+    backgroundColor: "{colors.primary-light}"
+    textColor: "{colors.surface-light}"
+    rounded: "{rounded.md}"
+    height: "44px"
+---
+
+# Design System: AgentSCM Hub
+
+## Overview
+
+**Creative North Star: "The Calm Work Register"**
+
+AgentSCM Hub is a quiet coordination surface for teams running coding agents. Ownership and the reported next step receive the strongest visual weight, while status and history remain easy to inspect without turning the page into a long feed. The visual language inherits the Hub: neutral surfaces, a violet navigation accent, system sans typography, restrained rules, and semantic labels that accompany color.
+
+The Work section is a focused expression of that world. Three plain primary tabs answer the stand-up jobs directly: Working now, Recently finished, and Needs coordination. Current work keeps the four progress lanes. Recent completions come from a server-bounded time window. Needs coordination leads with durable directed requests and their receipt, reply and resolution state; server-computed detected overlaps remain visibly separate. The fixed-watermark briefing remains available as a secondary Change history view.
+
+**Key Characteristics:**
+- Ownership, task, and reported action lead each work card.
+- Neutral surfaces and fine borders carry hierarchy.
+- Violet, rose, amber, and green fields communicate labelled work state.
+- Four desktop progress lanes collapse into a mobile lane selector and one visible queue.
+- Recently finished and coordination are first-class overview sections, with visible time and completeness boundaries.
+- No new imagery or decorative assets are part of the Work surface.
+
+## Colors
+
+The palette is a neutral light/dark canvas with white or deep blue-black content surfaces, a restrained violet accent, and labelled green, amber, and rose state colors.
+
+### Primary
+- **Hub violet, light** (`#4F5BD5`): Navigation, links, focus outlines, lane emphasis, and active controls in the light theme.
+- **Hub violet, dark** (`#7C86FF`): The same accent role in the dark theme.
+
+### Neutral
+- **Cool canvas, light** (`#F4F5F9`): The light application background.
+- **Deep canvas, dark** (`#0A0C14`): The dark application background.
+- **White surface** (`#FFFFFF`): Light content, lane, card, and control surfaces.
+- **Deep surface** (`#121522`): Dark content surfaces.
+- **Elevated dark surface** (`#1A1E30`): Dark elevated controls and overlays.
+- **Theme text and border:** Use `--cb-text`, `--cb-text-2`, `--cb-text-3`, and `--cb-border` so contrast follows the active theme.
+
+### Named Rules
+**The Semantic Field Rule.** State fields use violet for active or handover, rose for blocked, amber for paused or stale, and green for finished or active assignment; every field includes text.
+
+**The Ownership First Rule.** Keep the lead agent and task legible before source identities, bookkeeping, and technical identifiers.
+
+## Typography
+
+**Display Font:** System sans (`-apple-system`, BlinkMacSystemFont, SF Pro Text, Inter, Segoe UI, Roboto, Helvetica Neue, Arial, sans-serif)
+**Body Font:** The same system sans stack
+**Label/Mono Font:** `ui-monospace`, SF Mono, JetBrains Mono, Menlo, Consolas, monospace for identifiers and paths only.
+
+**Character:** Compact, direct, and highly legible. Weight and line-height establish hierarchy; the Work surface avoids display faces and ornamental type.
+
+### Hierarchy
+- **Display** (700, `clamp(24px, 2.5vw, 28px)`, 1.12): Work page and detail titles.
+- **Title** (700, 24px on narrow screens, 1.12): Mobile title treatment and detail headings.
+- **Body** (400, 14px, 1.5): Card content, descriptions, action text, and history rows.
+- **Label** (650, 12px, 1.4, `0.03em`): Lane counts, table headings, state labels, and compact metadata.
+- **Supporting text** (400, 13px): Timestamps, source hints, and secondary ownership context.
+
+### Named Rules
+**The System Sans Rule.** Use the system sans for product copy and reserve monospace for identifiers, source paths, branches, and work IDs.
+
+## Layout
+
+The Work surface begins with section navigation, a direct heading, read-only load status, and plain Working now / Recently finished / Needs coordination tabs. Search and counts apply only to the returned overview slice. The overview identifies its request-time upper bound and exposes incomplete current, recent, or overlap slices rather than implying a global all-clear. While the page is visible, the overview refreshes every 15 seconds without resetting the selected tab or search. A failed refresh keeps the last readable snapshot and labels its load time and error.
+
+Current work uses four desktop progress lanes: In progress, Blocked, Handover, and Paused. The board is a four-column grid with 12px gaps, 14px lane corners, 14px lane-heading and card insets, and an internally scrolling height of `clamp(240px, calc(100dvh - 570px), 460px)`. Recently finished uses a two-column task grid with the exact overview window above it. Needs coordination starts with a fixed-watermark page of compact directed-request summaries. Each summary exposes the stage, proposal, requester-to-target relationship and first concrete path reason; its native disclosure reveals all returned paths, receipts, responses and notes. Detected overlaps, other attention signals and recent decisions remain separate, count-labelled disclosures that are collapsed by default.
+
+At 860px and below, the board becomes two columns, directed-request targets become a single queue, and detected-overlap rows stack the reason above the involved work. Change history keeps its date column in the stacked record. At 640px and below, the Work surface uses 16px horizontal padding with an 8px side bleed, controls keep 44px targets, lane buttons wrap at a 110px basis, only the selected lane is visible as one scrollable queue, recently finished becomes one column, and each involved work item receives its own separated row. The search input remains visually present while its redundant label is visually hidden and remains available to screen readers.
+
+## Elevation & Depth
+
+The Work register is flat and structural. Depth comes from tonal lane fields, a one-pixel `--cb-border` rule, white or deep content surfaces, and a small violet hover tint. The feature adds no shadow vocabulary or decorative gradient. Focus-visible targets use a 2px violet outline with a 3px offset, and reduced-motion users receive no row hover transition.
+
+### Named Rules
+**The Bounded Register Rule.** Keep the active page compact, keep pagination in the reading path, and let the fixed watermark define the briefing boundary.
+
+**The Flat Work Rule.** Use tonal fields and restrained borders before adding elevation to a coordination row or detail section.
+
+## Shapes
+
+The Hub uses gently rounded controls and surfaces: 12px is the primary control radius, 14px shapes lanes and detail action groups, and 20px remains the large theme radius. Cards use 12px corners; lane headings use 14px corners on the containing lane. Focusable controls keep a minimum 44px height. The history table uses separators and stacked records rather than card decoration.
+
+## Components
+
+### Progress lanes
+- **Shape:** Four 14px-corner lanes on desktop with a sticky 76px heading and a scrollable card list; a defensive fifth finished lane may span the board when returned data requires it.
+- **Content hierarchy:** Agent and login, task title, labelled state and claim, reported blocker or next action, participants, then last check-in.
+- **State fields:** Active and handover use violet fields, blocked uses rose, paused uses amber, and finished uses green. Old or unknown check-ins say “still assigned.” Finished work has no assignment claim or warning.
+
+### Work cards
+- **Shape:** Neutral 12px-corner cards with 14px padding, one-pixel border, and a 10px internal gap.
+- **Behavior:** Source identity is compact and secondary. The title link, lead, state, and reported action form the primary scan path; participant details follow when present.
+
+### Recently finished
+- **Shape:** A two-column task grid on larger screens and a single queue on narrow screens, preceded by the exact server-provided start and end times.
+- **Behavior:** Completion is worded as agent-reported. The section explicitly says it does not confirm verification, review or merge. Clipped results and retained-history gaps are labelled incomplete, including when no completion remains visible.
+
+### Coordination rows
+- **Shape:** A flat, ruled row with the concrete overlap reason on one side and two equal involved-work columns on the other.
+- **Behavior:** Reasons pair the server-returned paths directly. Each side identifies the agent, human owner, task link, and declared scope. The bounded path-witness list warns when additional overlaps were omitted and points to both full scopes. Missing scope and stale or unknown check-ins remain visible as separate attention signals. The interface never computes a global overlap from a displayed page or implies that detecting one sent a coordination request.
+
+### Directed request queue
+- **Shape:** A ruled, fixed-watermark request list. Each compact native disclosure summary carries the proposal, stage, requester-to-target route and a concrete overlap reason. Expanding it reveals current target leads in equal 12px-corner subregions with receipt state, response state, all returned path reasons, message and time. Pagination remains directly after the compact list.
+- **Behavior:** Overall stages read Awaiting receipt, Awaiting replies, Replied, Resolved or Withdrawn. Receipt and response are evaluated against each target's recorded generation. The dashboard initially requests active items only; a checkbox includes resolved and withdrawn requests. The fresh first page refreshes every 15 seconds while visible, so agent replies can appear while someone watches. Following Previous or Next freezes the first-page watermark and every subsequent page to the same bounded snapshot; Refresh requests returns to a new first-page snapshot. Reading never acknowledges, replies to, resolves or withdraws a request; agents perform those actions through authenticated MCP or HTTP flows. Target path reasons and request receipt/response projections are bounded. Explicit warnings identify omitted paths or history, and an incomplete projection never becomes an inferred receipt or reply; the server request status remains authoritative.
+
+### Search and history pagination
+- **Shape:** Search and selects use 44px controls and a 12px radius. Mobile lane buttons wrap with 44px minimum height and an `aria-pressed` selected state.
+- **Behavior:** Overview search and counts are scoped to the returned snapshot. Change-history search, filters, and counts are page-local. The dashboard remains read-only and uses GET overview, coordination-list, briefing, and work-detail boundaries only.
+
+### Recent changes table
+- **Shape:** A distinct five-column table with sticky headings, 12px vertical and 14px horizontal cells, and a separately bounded scroll region. At 860px it becomes stacked records while preserving title, owner, status, reported context, and date.
+- **Behavior:** Dates use the viewer's local format. The dashboard does not acknowledge the briefing.
+
+### Detail disclosure
+- **Shape:** Reported blocker, next action, and last check-in appear as a three-cell action grid with a one-pixel border; the grid stacks on narrow screens.
+- **Behavior:** Technical identifiers use a native “Technical details” disclosure and stay collapsed by default. Read-only detail inspection uses the authorized work ID path.
+
+## Do's and Don'ts
+
+### Do:
+- **Do** keep four progress lanes as the normal desktop current-work model, with finished rendered only defensively when page data includes it.
+- **Do** keep the three primary overview labels literal: Working now, Recently finished, and Needs coordination.
+- **Do** show the exact recent window and explicit completeness state returned by the server.
+- **Do** show overlap reasons, involved agents, declared scopes, and work links together.
+- **Do** show durable directed requests before raw detected overlaps, with per-target receipt and reply state.
+- **Do** lead with agent, task, and reported blocker or next action.
+- **Do** pair every state field with an explicit text label and retain “still assigned” for stale or unknown claims.
+- **Do** keep search, filters, and counts scoped to the fetched page and preserve fixed-watermark pagination.
+- **Do** keep the search input visible on mobile, hiding only its redundant visual label while preserving its accessible name.
+- **Do** preserve read-only GET boundaries, visible keyboard focus, and local history dates.
+
+### Don't:
+- **Don't** turn current work and recent changes into one chronological feed.
+- **Don't** derive repository-wide overlaps from a visible page or claim an all-clear when the overview is incomplete.
+- **Don't** imply that opening the dashboard acknowledged a request or that overlap detection alone delivered one.
+- **Don't** imply that stale or unknown claims are available work.
+- **Don't** show an assignment claim or warning on reported-finished work.
+- **Don't** use status color without its text label.
+- **Don't** introduce a large hero, new decorative imagery, or a second visual world inside this section.
