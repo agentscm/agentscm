@@ -1,13 +1,15 @@
 #![cfg(unix)]
+use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use agentscm::authority::Authority;
 use agentscm::context::ReviewContext;
+use agentscm::git_export::remote::{Request as RemoteRequest, State as RemoteState};
 use agentscm::git_export::{
-    CommitMetadata, ExportRecord, ExportRequest, ExportState, ExternalCheckOutcome,
-    ExternalCheckRequest, Mirror,
+    CandidateExportRequest, CandidateSubject, CommitMetadata, ExportRecord, ExportRequest,
+    ExportState, ExternalCheckOutcome, ExternalCheckRequest, Mirror,
 };
 use agentscm::local_recovery;
 use agentscm::model::{
@@ -2122,6 +2124,317 @@ fn export_refuses_executable_and_symlink_entries_instead_of_flattening() {
 #[test]
 fn export_profile_string_is_fixed() {
     assert_eq!(agentscm::git_export::PROFILE, "agentscm-git-snapshot/v2");
+}
+
+#[test]
+fn draft_candidate_is_typed_durable_and_preserves_entry_kinds_without_an_event() {
+    let root = TempDir::new().unwrap();
+    let seed = root.path().join("seed");
+    let (_, parent) = seed_repository(&seed);
+    let data = root.path().join("data");
+    let engine = Engine::open(&data).unwrap();
+    let authority = Authority::open(&data).unwrap();
+    let revision = engine
+        .checkpoint_entries(
+            None,
+            &[
+                EntryChange {
+                    path: "plain".into(),
+                    content: Some(b"text\n".to_vec()),
+                    kind: EntryKind::Regular,
+                },
+                EntryChange {
+                    path: "run".into(),
+                    content: Some(b"#!/bin/sh\n".to_vec()),
+                    kind: EntryKind::Executable,
+                },
+                EntryChange {
+                    path: "link".into(),
+                    content: Some(b"plain".to_vec()),
+                    kind: EntryKind::Symlink,
+                },
+            ],
+        )
+        .unwrap();
+    let change = agentscm::context::ChangeId {
+        repository: authority.repository_id().unwrap(),
+        id: "attached-change".into(),
+    };
+    let mut subject = CandidateSubject {
+        id: String::new(),
+        attachment: "a".repeat(64),
+        endpoint: root
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("remote.git")
+            .to_string_lossy()
+            .into_owned(),
+        output: "agents/candidate".into(),
+        change,
+        change_version: 1,
+        context_digest: "b".repeat(64),
+        policy_epoch: 0,
+        revision,
+        target: "main".into(),
+        baseline_commit: parent.clone(),
+        parent_commit: parent.clone(),
+        source_commit: parent.clone(),
+        source_fingerprint: "c".repeat(64),
+        comparison_fingerprint: "d".repeat(64),
+    };
+    subject.id = subject.canonical_id().unwrap();
+    let request = CandidateExportRequest {
+        subject: subject.clone(),
+        expected_oid: parent,
+        metadata: CommitMetadata {
+            name: "Candidate test".into(),
+            email: "candidate@example.invalid".into(),
+            timestamp: 1780000000,
+            message: "Prepare candidate".into(),
+        },
+    };
+    let mirror_path = root.path().join("candidate.git");
+    let mut mirror = Mirror::initialize_with_seed(
+        &git(),
+        &mirror_path,
+        &authority.repository_id().unwrap(),
+        "main",
+        &seed,
+        &request.expected_oid,
+    )
+    .unwrap();
+    let remote = root.path().join("remote.git");
+    fs::create_dir(&remote).unwrap();
+    run(
+        &remote,
+        &["init", "--bare", "--template=", "--object-format=sha1"],
+    );
+    run(
+        &remote,
+        &[
+            "fetch",
+            seed.to_str().unwrap(),
+            &format!("{}:refs/heads/main", request.expected_oid),
+        ],
+    );
+    run(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    mirror.remote_bind(&remote, "agents/candidate").unwrap();
+    // A post-build guard failure retains Verified but grants no publication.
+    let mut guards = 0;
+    assert!(
+        mirror
+            .export_candidate_guarded(&engine, &request, || {
+                guards += 1;
+                if guards == 2 {
+                    Err(agentscm::Error::Conflict("source moved".into()))
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err()
+    );
+    assert_eq!(
+        mirror.candidate_record(&subject.id).unwrap().unwrap().state,
+        ExportState::Verified
+    );
+    assert!(mirror.candidate_publication(&subject.id).is_err());
+    assert!(
+        mirror
+            .remote_run(&RemoteRequest::PublishCandidate {
+                operation_id: "verified-must-not-push".into(),
+                candidate_id: subject.id.clone(),
+                expected_oid: None,
+            })
+            .is_err()
+    );
+    assert!(
+        !String::from_utf8(run(&remote, &["show-ref"]))
+            .unwrap()
+            .contains("refs/heads/agents/candidate")
+    );
+    // Present closure avoids reopening/copying the baseline source.
+    mirror
+        .import_candidate_baseline(&root.path().join("absent-source"), &request.expected_oid)
+        .unwrap();
+    let first = mirror.export_candidate(&engine, &request).unwrap();
+    assert!(
+        mirror
+            .reserve_candidate_operation("stale-parent", &json!({}), &request)
+            .is_err()
+    );
+    assert!(
+        mirror
+            .candidate_operation("stale-parent", &json!({}))
+            .unwrap()
+            .is_none()
+    );
+    // An explicit no-effect abandon keeps the old ID and permits a new subject.
+    let empty_path = root.path().join("reservation.git");
+    let reserved = Mirror::initialize_with_seed(
+        &git(),
+        &empty_path,
+        &authority.repository_id().unwrap(),
+        "main",
+        &seed,
+        &request.expected_oid,
+    )
+    .unwrap();
+    reserved
+        .reserve_candidate_operation("no-effect", &json!({}), &request)
+        .unwrap();
+    reserved.abandon_candidate_operation("no-effect").unwrap();
+    assert!(
+        reserved
+            .candidate_operation("no-effect", &json!({}))
+            .is_err()
+    );
+    let mut refreshed = request.clone();
+    refreshed.subject.change_version += 1;
+    refreshed.subject.id = refreshed.subject.canonical_id().unwrap();
+    reserved
+        .reserve_candidate_operation("refreshed", &json!({}), &refreshed)
+        .unwrap();
+    assert_eq!(first.state, ExportState::Mirrored);
+    assert_eq!(mirror.export_candidate(&engine, &request).unwrap(), first);
+    assert!(authority.events(0, 10).unwrap().is_empty());
+    let publication = mirror.candidate_publication(&subject.id).unwrap();
+    assert_eq!(publication.revision, subject.revision);
+    assert_eq!(
+        publication
+            .changes
+            .iter()
+            .filter(|c| c.mode != "000000")
+            .map(|c| c.mode.as_str())
+            .collect::<Vec<_>>(),
+        ["120000", "100644", "100755"]
+    );
+    // Even with target main, the actual remote default may be the output branch.
+    run(
+        &remote,
+        &[
+            "update-ref",
+            "refs/heads/agents/candidate",
+            &request.expected_oid,
+        ],
+    );
+    run(
+        &remote,
+        &["symbolic-ref", "HEAD", "refs/heads/agents/candidate"],
+    );
+    let blocked = mirror
+        .remote_run(&RemoteRequest::PublishCandidate {
+            operation_id: "default-must-not-push".into(),
+            candidate_id: subject.id.clone(),
+            expected_oid: Some(request.expected_oid.clone()),
+        })
+        .unwrap_err();
+    assert!(blocked.to_string().contains("default branch"));
+    assert_eq!(
+        String::from_utf8(run(&remote, &["rev-parse", "refs/heads/agents/candidate"]))
+            .unwrap()
+            .trim(),
+        request.expected_oid
+    );
+    assert_eq!(
+        mirror
+            .remote_recover("default-must-not-push")
+            .unwrap()
+            .state,
+        RemoteState::ObservedExpected,
+        "an unsupported preflight retains its operation and requires observation before new work"
+    );
+    run(
+        &remote,
+        &["update-ref", "-d", "refs/heads/agents/candidate"],
+    );
+    run(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    let pushed = mirror
+        .remote_run(&RemoteRequest::PublishCandidate {
+            operation_id: "candidate-push".into(),
+            candidate_id: subject.id.clone(),
+            expected_oid: None,
+        })
+        .unwrap();
+    assert_eq!(pushed.state, RemoteState::Published);
+    assert_eq!(
+        run(&remote, &["rev-parse", "refs/heads/agents/candidate"]),
+        format!("{}\n", publication.commit).into_bytes()
+    );
+    let next_revision = engine
+        .checkpoint_entries(
+            Some(&subject.revision),
+            &[EntryChange {
+                path: "plain".into(),
+                content: Some(b"updated\n".to_vec()),
+                kind: EntryKind::Regular,
+            }],
+        )
+        .unwrap();
+    let mut next = subject.clone();
+    next.id.clear();
+    next.change_version = 2;
+    next.context_digest = "e".repeat(64);
+    next.revision = next_revision;
+    next.parent_commit = publication.commit.clone();
+    next.source_commit = "f".repeat(40);
+    next.source_fingerprint = "1".repeat(64);
+    next.comparison_fingerprint = "2".repeat(64);
+    next.id = next.canonical_id().unwrap();
+    let next_request = CandidateExportRequest {
+        subject: next.clone(),
+        expected_oid: publication.commit.clone(),
+        metadata: request.metadata.clone(),
+    };
+    let next_record = mirror.export_candidate(&engine, &next_request).unwrap();
+    let updated = mirror
+        .remote_run(&RemoteRequest::PublishCandidate {
+            operation_id: "candidate-update".into(),
+            candidate_id: next.id,
+            expected_oid: Some(publication.commit),
+        })
+        .unwrap();
+    assert_eq!(updated.state, RemoteState::Published);
+    assert_eq!(updated.commit, next_record.commit.unwrap());
+    // Historical prepare is still retrievable after a later candidate advanced the ref.
+    assert_eq!(mirror.export_candidate(&engine, &request).unwrap(), first);
+    let mut authority = authority;
+    let mixed_event = integrate_revision(
+        &engine,
+        &mut authority,
+        None,
+        request.subject.revision.clone(),
+    );
+    let mixed = mirror
+        .export(
+            &engine,
+            &authority,
+            &ExportRequest {
+                event_sequence: mixed_event.sequence,
+                expected_oid: mirror.owned_oid().unwrap(),
+                metadata: request.metadata.clone(),
+            },
+        )
+        .unwrap_err();
+    assert!(mixed.to_string().contains("different export stream"));
+    drop(mirror);
+    let mirror = Mirror::open(&git(), &mirror_path, &authority.repository_id().unwrap()).unwrap();
+    assert_eq!(mirror.candidate_record(&subject.id).unwrap(), Some(first));
+    let db = rusqlite::Connection::open(mirror_path.join("agentscm-export.sqlite")).unwrap();
+    db.execute(
+        "UPDATE candidates SET record=zeroblob(65537) WHERE id=?1",
+        [&subject.id],
+    )
+    .unwrap();
+    assert!(
+        mirror.candidate_record(&subject.id).is_err(),
+        "oversized retained rows must not become missing"
+    );
+    assert!(
+        mirror
+            .candidate_for_subject(&subject, &request.metadata)
+            .is_err()
+    );
 }
 
 fn entry(path: &str, kind: EntryKind, bytes: Option<&[u8]>) -> EntryChange {

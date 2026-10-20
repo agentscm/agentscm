@@ -611,7 +611,7 @@ async fn run(cli: Cli) -> Result<RunExit> {
         }
         #[cfg(unix)]
         Command::AttachedWorktree { command } => {
-            print_json(&attached_worktree_cli::run(&cli.data_dir, command)?);
+            print_json(&attached_worktree_cli::run(&cli.data_dir, command).await?);
         }
         #[cfg(unix)]
         Command::GitReconcile { command } => {

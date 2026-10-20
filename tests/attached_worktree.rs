@@ -381,10 +381,15 @@ fn refresh_adopts_explicit_git_conflict_resolution() {
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .current_dir(repo.path())
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
         .args(["merge", "--no-edit", &target])
         .status()
         .unwrap();
     assert!(!status.success());
+    assert_eq!(
+        git(repo.path(), &["rev-parse", "--verify", "MERGE_HEAD"]),
+        target
+    );
     write(repo.path(), "a.txt", b"resolved by git user\n");
     git(repo.path(), &["add", "a.txt"]);
     git(repo.path(), &["commit", "-qm", "resolve"]);
@@ -843,6 +848,14 @@ fn actual_authority_binding_runs_exact_checks_without_native_landing_and_invalid
             .state,
         CheckState::Success
     );
+    assert_eq!(
+        authority
+            .qualify_draft_candidate(&context.change)
+            .unwrap()
+            .digest()
+            .unwrap(),
+        context.digest().unwrap()
+    );
     assert!(authority.target("main").unwrap().is_none());
     write(repo.path(), "a.txt", b"new source");
     let advanced = journal
@@ -859,6 +872,7 @@ fn actual_authority_binding_runs_exact_checks_without_native_landing_and_invalid
     context.change_version = 2;
     context.revision = advanced.candidate_revision.clone();
     authority.update_change_context(1, &context).unwrap();
+    assert!(authority.qualify_draft_candidate(&context.change).is_err());
     let rebound = journal
         .bind_context(&authority, "rebind", &state.id, 2, &context.change)
         .unwrap();
@@ -1678,4 +1692,36 @@ fn existing_journal_inspection_does_not_write_or_wait_for_reserved_writer() {
         0o750
     );
     db.execute_batch("ROLLBACK").unwrap();
+}
+
+#[test]
+fn local_remote_attachment_retains_transport_canonical_identity() {
+    let (repo, _data, engine, journal) = fixture();
+    let remote = TempDir::new().unwrap();
+    git(remote.path(), &["init", "--bare", "--template="]);
+    git(
+        repo.path(),
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            remote.path().to_str().unwrap(),
+        ],
+    );
+    let state = journal
+        .attach(
+            &engine,
+            "local-identity",
+            &request(repo.path(), "alice", SourceMode::Committed, &[]),
+        )
+        .unwrap();
+    assert_eq!(
+        PathBuf::from(&state.remote_url),
+        remote.path().canonicalize().unwrap()
+    );
+    assert!(
+        journal
+            .validate_current(&engine, &state.id, state.generation)
+            .is_ok()
+    );
 }

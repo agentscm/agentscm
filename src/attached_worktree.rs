@@ -487,6 +487,32 @@ impl AttachmentJournal {
         }
         ensure_unchanged(&state_request(state), before)
     }
+    /// Bounded preview through the exact capture selector; no operation ID or
+    /// attachment generation is consumed. Source objects may be cached.
+    pub fn preview(
+        &self,
+        engine: &Engine,
+        id: &str,
+        generation: u64,
+    ) -> Result<crate::workspace::SelectedCapture> {
+        let db = self.connect()?;
+        let state = read_state(&db, id, &self.repository)?;
+        fence(&state, generation)?;
+        let request = state_request(&state);
+        self.separation(engine, &request)?;
+        let before = observe(&request)?;
+        self.separation_observed(&before)?;
+        validate_identity(&state, &before)?;
+        let (head, _) = capture_commit(engine, &self.repository, &request, &before.head)?;
+        let selected = self.local_source(engine, &state, &before, &head)?;
+        let after = self.local_source(engine, &state, &before, &head)?;
+        if selected.fingerprint != after.fingerprint {
+            return Err(Error::Conflict("source changed during preview".into()));
+        }
+        ensure_unchanged(&request, &before)?;
+        Ok(selected)
+    }
+
     /// A fresh comparison, still historical when returned. Not a publication lease.
     pub fn validate_current(&self, engine: &Engine, id: &str, generation: u64) -> Result<String> {
         let mut db = self.connect()?;
@@ -1376,6 +1402,16 @@ fn capture_commit(
     )
 }
 fn safe_remote(url: &str) -> Result<()> {
+    if url.starts_with("ssh://") || (!url.contains("://") && url.contains('@')) {
+        return Err(Error::Invalid("SSH attachment source identity is not supported by this profile; an SSH username is not a password. Use an explicitly configured credential-free HTTPS identity; standalone Mirror SSH transport remains separate".into()));
+    }
+    if url.starts_with("https://") {
+        crate::git_export::remote::Endpoint::Https {
+            url: url.into(),
+            trust: crate::git_export::remote::HttpsTrust::System,
+        }
+        .validate()?;
+    }
     // Phase 1 admits no HTTP userinfo, query strings or fragments; errors never echo it.
     if url.contains('@')
         || url.len() > 4096
@@ -1498,6 +1534,17 @@ fn observe(r: &AttachRequest) -> Result<Observation> {
     }
     let remote_url = git(r, &["remote", "get-url", "--", &r.remote])?;
     safe_remote(&remote_url)?;
+    // Local transport binds the canonical directory identity. Preserve that same
+    // spelling in the attachment (not an alias such as /var on macOS).
+    let remote_url = if Path::new(&remote_url).is_absolute() {
+        Path::new(&remote_url)
+            .canonicalize()?
+            .to_str()
+            .ok_or_else(|| Error::Invalid("local remote path is not UTF-8".into()))?
+            .to_owned()
+    } else {
+        remote_url
+    };
     if git_optional(r, &["config", "--get-regexp", r"^filter\."])?
         .is_some_and(|value| !value.is_empty())
     {

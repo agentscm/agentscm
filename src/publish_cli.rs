@@ -108,32 +108,7 @@ pub async fn run(args: PublishArgs, data_dir: &Path) -> Result<()> {
         "title": args.title, "body": body, "author": export.author,
         "committer": export.committer, "message": export.message, "changes": changes});
     let created = call(&hub, Method::POST, &path, Some(manifest)).await?;
-    for sha256 in created["missing_blobs"].as_array().into_iter().flatten() {
-        let sha256 = sha256.as_str().unwrap_or_default();
-        let bytes = blobs
-            .get(sha256)
-            .ok_or_else(|| invalid("the hub asked for a file this publication does not have"))?;
-        let url = format!("{}{path}/{id}/blobs/{sha256}", hub.base);
-        let request = hub
-            .client
-            .put(url)
-            .bearer_auth(&hub.token)
-            .timeout(hub.limit)
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .body(bytes.clone());
-        refuse(
-            send(request, BODY_BYTES)
-                .await
-                .map_err(|_| invalid("hub unreachable"))?,
-        )?;
-    }
-    let result = call(
-        &hub,
-        Method::POST,
-        &format!("{path}/{id}/run"),
-        Some(json!({})),
-    )
-    .await?;
+    let result = upload_and_run(&hub, &path, &id, created, &blobs, || Ok(())).await?;
     println!("{}", serde_json::to_string_pretty(&result)?);
     let rejected = result["states"]["branch"]["state"] == "rejected";
     match result["error"].as_str() {
@@ -181,4 +156,137 @@ async fn call(hub: &Hub, method: Method, path: &str, body: Option<Value>) -> Res
             .await
             .map_err(|_| invalid("hub unreachable"))?,
     )
+}
+
+async fn upload_and_run(
+    hub: &Hub,
+    path: &str,
+    id: &str,
+    created: Value,
+    blobs: &BTreeMap<String, Vec<u8>>,
+    mut qualify: impl FnMut() -> Result<()>,
+) -> Result<Value> {
+    for sha256 in created["missing_blobs"].as_array().into_iter().flatten() {
+        let sha256 = sha256.as_str().unwrap_or_default();
+        let bytes = blobs
+            .get(sha256)
+            .ok_or_else(|| invalid("the hub asked for a file this publication does not have"))?;
+        let url = format!("{}{path}/{id}/blobs/{sha256}", hub.base);
+        let request = hub
+            .client
+            .put(url)
+            .bearer_auth(&hub.token)
+            .timeout(hub.limit)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(bytes.clone());
+        refuse(
+            send(request, BODY_BYTES)
+                .await
+                .map_err(|_| invalid("hub unreachable"))?,
+        )?;
+    }
+    qualify()?;
+    let result = call(
+        hub,
+        Method::POST,
+        &format!("{path}/{id}/run"),
+        Some(json!({})),
+    )
+    .await?;
+    Ok(result)
+}
+
+pub(crate) struct CandidatePublication<'a> {
+    pub mirror: &'a Mirror,
+    pub subject: agentscm::git_export::CandidateSubject,
+    pub endpoint: String,
+    pub branch: String,
+    pub title: String,
+    pub body: String,
+    pub previous_publication: Option<String>,
+}
+
+pub(crate) async fn publish_candidate(
+    request: CandidatePublication<'_>,
+    mut qualify: impl FnMut() -> Result<()>,
+) -> Result<Value> {
+    use agentscm::hub::publish::{Candidate, Manifest, candidate_repository, derive_candidate_id};
+    let export = request.mirror.candidate_publication(&request.subject.id)?;
+    let hub = Hub::connect(LIMIT)?;
+    let whoami = call(&hub, Method::GET, "/v1/hub/whoami", None).await?;
+    let name = whoami["token"]["repository"].as_str().unwrap_or_default();
+    if candidate_repository(&request.endpoint)
+        .map_err(|e| invalid(&e.to_string()))?
+        .1
+        != name
+    {
+        return Err(invalid(
+            "Hub token repository differs from attached endpoint",
+        ));
+    }
+    let mut blobs = BTreeMap::new();
+    let mut changes = Vec::new();
+    for change in &export.changes {
+        let sha256 = match &change.blob {
+            Some(blob) => {
+                let bytes = request.mirror.blob(blob, change.size)?;
+                let hash = hex(&Sha256::digest(&bytes));
+                blobs.insert(hash.clone(), bytes);
+                Some(hash)
+            }
+            None => None,
+        };
+        changes.push(json!({"path":change.path,"mode":change.mode,"blob":change.blob,"sha256":sha256,"size":change.size}));
+    }
+    let id = derive_candidate_id(name, &request.subject.id, &export.commit, &request.branch);
+    let mut manifest = json!({"revision":export.revision,"commit":export.commit,"tree":export.tree,"parent":export.parent,
+        "branch":request.branch,"base":request.subject.target,"title":request.title,"body":request.body,
+        "author":export.author,"committer":export.committer,"message":export.message,"changes":changes,
+        "candidate":Candidate { subject:request.subject, endpoint:request.endpoint, previous_publication:request.previous_publication }});
+    serde_json::from_value::<Manifest>(manifest.clone())?
+        .validate()
+        .map_err(|e| invalid(&e.to_string()))?;
+    manifest["publication_id"] = json!(id);
+    let path = format!("{}/publications", Hub::repo_path(name));
+    qualify()?;
+    let created = call(&hub, Method::POST, &path, Some(manifest)).await?;
+    if created["state"]["pull_request"]["state"] == "opened"
+        || created["state"]["pull_request"]["state"] == "merged"
+    {
+        let mut receipt = call(&hub, Method::GET, &format!("{path}/{id}"), None).await?;
+        receipt["receipt_replayed"] = json!(true);
+        return Ok(receipt);
+    }
+    upload_and_run(&hub, &path, &id, created, &blobs, qualify).await
+}
+
+/// Read-only recovery through the existing Hub publication controller.
+pub(crate) async fn recover_candidate(
+    endpoint: &str,
+    attachment: &str,
+    publication: &str,
+) -> Result<Value> {
+    let (_, name) = agentscm::hub::publish::candidate_repository(endpoint)
+        .map_err(|e| invalid(&e.to_string()))?;
+    if !publication.starts_with("pub_")
+        || publication.len() != 36
+        || !publication[4..].bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(invalid("invalid publication id"));
+    }
+    let hub = Hub::connect(LIMIT)?;
+    let path = format!("{}/publications/{publication}", Hub::repo_path(&name));
+    let retained = call(&hub, Method::GET, &path, None).await?;
+    if retained["candidate"]["subject"]["attachment"] != attachment
+        || retained["candidate"]["endpoint"] != endpoint
+    {
+        return Err(invalid("publication differs from attachment identity"));
+    }
+    call(
+        &hub,
+        Method::POST,
+        &format!("{path}/recover"),
+        Some(json!({})),
+    )
+    .await
 }

@@ -4,6 +4,15 @@
 #![cfg(unix)]
 #[path = "support/fake_github.rs"]
 mod fake_github;
+#[path = "support/git_https.rs"]
+mod https_fixture;
+#[path = "common/hub_pg.rs"]
+mod hub_pg;
+use https_fixture::HttpsFixture;
+
+fn git() -> PathBuf {
+    PathBuf::from(GIT)
+}
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -126,11 +135,22 @@ struct Env {
 
 impl Env {
     async fn start() -> Self {
+        Self::start_with_transport(None).await
+    }
+
+    async fn start_with_transport(transport: Option<&HttpsFixture>) -> Self {
+        Self::start_with_database(transport, None).await
+    }
+
+    async fn start_with_database(transport: Option<&HttpsFixture>, database: Option<&str>) -> Self {
         let root = TempDir::new().unwrap();
         // The forge's base: one commit with a file the revision deletes.
         let seed_repo = root.path().join("seed");
         fs::create_dir(&seed_repo).unwrap();
-        run(&seed_repo, &["init", "--object-format=sha1"]);
+        run(
+            &seed_repo,
+            &["init", "--object-format=sha1", "--initial-branch=main"],
+        );
         run(&seed_repo, &["config", "user.name", "Seed Test"]);
         run(
             &seed_repo,
@@ -183,7 +203,19 @@ impl Env {
 
         // The fake forge holds the same base commit.
         let fake = FakeGithub::start().await;
-        let bare = bare_clone(root.path(), &seed_repo);
+        let bare = if let Some(transport) = transport {
+            run(
+                &transport.remote,
+                &[
+                    "fetch",
+                    seed_repo.to_str().unwrap(),
+                    &format!("{seed}:refs/heads/main"),
+                ],
+            );
+            transport.remote.clone()
+        } else {
+            bare_clone(root.path(), &seed_repo)
+        };
         fake.with(|s| {
             let mut repo = Repo::new(REPO_ID, REPO);
             repo.git = Some(bare.clone());
@@ -194,14 +226,22 @@ impl Env {
 
         let dir = root.path().join("hub");
         fs::create_dir(&dir).unwrap();
-        let store = store::open(&format!("sqlite://{}", dir.join("hub.sqlite").display())).unwrap();
+        let local_url = format!("sqlite://{}", dir.join("hub.sqlite").display());
+        let database = database.unwrap_or(&local_url).to_owned();
+        let store = tokio::task::spawn_blocking(move || store::open(&database).unwrap())
+            .await
+            .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let secrets = dir.join("secrets");
         sync::prepare_secrets_dir(&secrets, true).unwrap();
         let base = fake.base.clone();
+        let web = transport
+            .map(|t| t.url.trim_end_matches("/acme/widgets.git").to_owned())
+            .unwrap_or_else(|| base.clone());
         let config = SyncConfig::from_lookup(&url, secrets, 14, |name| match name {
-            "AGENTSCM_GITHUB_URL" | "AGENTSCM_GITHUB_API_URL" => Some(base.clone()),
+            "AGENTSCM_GITHUB_URL" => Some(web.clone()),
+            "AGENTSCM_GITHUB_API_URL" => Some(base.clone()),
             "AGENTSCM_GITHUB_PAT" => Some(PAT.into()),
             _ => None,
         })
@@ -216,27 +256,37 @@ impl Env {
         tokio::spawn(async move { axum::serve(listener, app).await });
 
         // The repository is connected, outbound writes are on, and an agent holds a token.
-        let host = fake.base.trim_start_matches("http://").to_owned();
-        let connection = store.pat_connection(&host).unwrap().unwrap().id;
-        store
-            .upsert_repository(&connection, &host, REPO_ID, REPO, None, None)
-            .unwrap();
-        store
-            .set_connection_outbound(&connection, true, "test")
-            .unwrap();
-        let owner = store
-            .upsert_user(
-                &ForgeIdentity {
-                    provider: "github".into(),
-                    host,
-                    user_id: 5,
-                },
-                "alice",
-            )
-            .unwrap();
-        let (_, secret) = mint_agent_token(&*store, &owner.id, "agent-a", REPO, 3600).unwrap();
+        let host = web
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .to_owned();
+        let setup_store = store.clone();
+        let (connection, owner, secret) = tokio::task::spawn_blocking(move || {
+            let store = setup_store;
+            let connection = store.pat_connection(&host).unwrap().unwrap().id;
+            store
+                .upsert_repository(&connection, &host, REPO_ID, REPO, None, None)
+                .unwrap();
+            store
+                .set_connection_outbound(&connection, true, "test")
+                .unwrap();
+            let owner = store
+                .upsert_user(
+                    &ForgeIdentity {
+                        provider: "github".into(),
+                        host,
+                        user_id: 5,
+                    },
+                    "alice",
+                )
+                .unwrap();
+            let (_, secret) = mint_agent_token(&*store, &owner.id, "agent-a", REPO, 3600).unwrap();
+            (connection, owner.id, secret.expose().to_owned())
+        })
+        .await
+        .unwrap();
         let token_file = root.path().join("token");
-        fs::write(&token_file, secret.expose()).unwrap();
+        fs::write(&token_file, &secret).unwrap();
         Self {
             fake,
             url,
@@ -246,9 +296,9 @@ impl Env {
             commit: exported.record.commit.unwrap(),
             seed,
             connection,
-            token: secret.expose().to_owned(),
+            token: secret,
             token_file,
-            owner: owner.id,
+            owner,
             root,
             http: reqwest::Client::builder().no_proxy().build().unwrap(),
         }
@@ -1105,4 +1155,926 @@ async fn a_repository_on_another_forge_is_not_published() {
         (409, Some("unsupported_provider"))
     );
     assert_eq!(env.fake.with(|state| state.requests.len()), before);
+}
+
+impl Env {
+    async fn attached_cli(&self, args: &[&str]) -> (bool, Value, String) {
+        let args: Vec<String> = args.iter().map(|s| (*s).into()).collect();
+        let root = self.root.path().to_owned();
+        let url = self.url.clone();
+        let token = self.token_file.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            Command::new(env!("CARGO_BIN_EXE_agentscm"))
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", &root)
+                .env("AGENTSCM_HUB_URL", url)
+                .env("AGENTSCM_HUB_TOKEN_FILE", token)
+                .arg("--data-dir")
+                .arg(root.join("attached-data"))
+                .args(args)
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        let value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+        (
+            output.status.success(),
+            value,
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+    async fn attached_ok(&self, args: &[&str]) -> Value {
+        let (ok, value, error) = self.attached_cli(args).await;
+        assert!(ok, "{args:?}: {error} {value}");
+        value
+    }
+    async fn attached_context(&self, state: &Value, version: u64, expected: &[u8]) -> Value {
+        use agentscm::checks::{CheckLimits, SourcePathExpectation, SourcePathsRecipe};
+        let recipe = SourcePathsRecipe {
+            version: 1,
+            expectations: vec![SourcePathExpectation {
+                path: "old".into(),
+                sha256: agentscm::store::digest(expected),
+            }],
+            limits: CheckLimits {
+                max_paths: 8,
+                max_total_bytes: 4096,
+                max_output_bytes: 4096,
+                timeout_ms: 30000,
+            },
+        };
+        let identity = json!({"state":"digest","sha256":recipe.digest().unwrap()});
+        let repository = Authority::open_read_only(self.root.path().join("attached-data"))
+            .unwrap()
+            .repository_id()
+            .unwrap();
+        let context: ReviewContext = serde_json::from_value(json!({"version":1,"change":{"repository":repository,"id":"attached-change"},"change_version":version,"revision":state["candidate_revision"],"base":null,"target":"main","policy_epoch":0,"intent":"synthetic source-path qualification","acceptance_criteria":["exact expected bytes"],"scope":["old"],"exclusions":[],"omissions":[],"dependencies":[],"recipe":identity,"toolchain":{"state":"digest","sha256":"a".repeat(64)},"environment":{"state":"digest","sha256":"b".repeat(64)},"required_evidence":[{"identity":agentscm::checks::SOURCE_PATHS_EVIDENCE,"digest":identity}],"required_capabilities":["agentscm.review-context/v1",agentscm::checks::SOURCE_PATHS_CAPABILITY]})).unwrap();
+        let path = self.root.path().join("context.json");
+        fs::write(&path, serde_json::to_vec(&context).unwrap()).unwrap();
+        if version == 1 {
+            self.attached_ok(&["start", path.to_str().unwrap()]).await;
+        } else {
+            self.attached_ok(&[
+                "context",
+                &(version - 1).to_string(),
+                path.to_str().unwrap(),
+            ])
+            .await;
+        }
+        let bound = self
+            .attached_ok(&[
+                "attached-worktree",
+                "bind-context",
+                "--id",
+                state["id"].as_str().unwrap(),
+                "--expected-generation",
+                &state["generation"].to_string(),
+                "--change",
+                "attached-change",
+                "--operation-id",
+                &format!("bind-{version}"),
+            ])
+            .await;
+        let request = json!({"attempt_id":format!("check-{version}"),"change":context.change,"change_version":version,"context_digest":context.digest().unwrap(),"revision":context.revision,"recipe":recipe});
+        fs::write(&path, serde_json::to_vec(&request).unwrap()).unwrap();
+        self.attached_ok(&["check-source-paths", path.to_str().unwrap()])
+            .await;
+        let checked = self
+            .attached_ok(&["check-run", &format!("check-{version}"), "0"])
+            .await;
+        json!({"attachment":bound["attachment"],"attempt":checked["attempt"]})
+    }
+}
+
+#[tokio::test]
+async fn attached_joined_https_candidate_uses_existing_hub_and_continues_same_pr() {
+    let transport = HttpsFixture::new(false).repository(REPO);
+    let env = Env::start_with_transport(Some(&transport)).await;
+    let data = env.root.path().join("attached-data");
+    drop(Engine::open(&data).unwrap());
+    drop(Authority::open(&data).unwrap());
+    let worktree = env.root.path().join("seed");
+    run(&worktree, &["remote", "add", "origin", &transport.url]);
+    run(
+        &worktree,
+        &["update-ref", "refs/remotes/origin/main", &env.seed],
+    );
+    run(&worktree, &["config", "core.excludesFile", ""]);
+    fs::write(worktree.join(".git/info/exclude"), "secret\n").unwrap();
+    fs::write(worktree.join("secret"), "ignored synthetic bytes").unwrap();
+    let index = fs::read(worktree.join(".git/index")).unwrap();
+    let attached = env
+        .attached_ok(&[
+            "attached-worktree",
+            "attach",
+            "--repository",
+            worktree.to_str().unwrap(),
+            "--actor",
+            "alice",
+            "--target",
+            "main",
+            "--output",
+            "agents/attached",
+            "--source",
+            "worktree",
+            "--path",
+            ".",
+            "--operation-id",
+            "attach",
+        ])
+        .await;
+    let mut state = attached["attachment"].clone();
+    let id = state["id"].as_str().unwrap().to_owned();
+    let failed = env.attached_context(&state, 1, b"fixed source\n").await;
+    assert_ne!(failed["attempt"]["state"], "success");
+    state = failed["attachment"].clone();
+    let mirror = env.root.path().join("attached.git");
+    let prepare = |generation: u64, operation: &str| {
+        vec![
+            "attached-worktree".to_owned(),
+            "prepare".into(),
+            "--id".into(),
+            id.clone(),
+            "--expected-generation".into(),
+            generation.to_string(),
+            "--mirror".into(),
+            mirror.to_string_lossy().into_owned(),
+            "--operation-id".into(),
+            operation.into(),
+            "--name".into(),
+            "Synthetic".into(),
+            "--email".into(),
+            "synthetic@example.invalid".into(),
+            "--timestamp".into(),
+            "1780000000".into(),
+            "--message".into(),
+            "Reviewed candidate".into(),
+        ]
+    };
+    let args = prepare(state["generation"].as_u64().unwrap(), "prepare-failed");
+    assert!(
+        !env.attached_cli(&args.iter().map(String::as_str).collect::<Vec<_>>())
+            .await
+            .0
+    );
+    fs::write(worktree.join("old"), b"fixed source\n").unwrap();
+    fs::write(worktree.join("run"), b"#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(worktree.join("run"), fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink("old", worktree.join("link")).unwrap();
+    fs::remove_file(worktree.join("second")).unwrap();
+    let preview = env
+        .attached_ok(&[
+            "attached-worktree",
+            "preview",
+            "--id",
+            &id,
+            "--expected-generation",
+            &state["generation"].to_string(),
+        ])
+        .await;
+    assert!(
+        preview["preview"]["changed_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p == "old")
+    );
+    let capture = env
+        .attached_ok(&[
+            "attached-worktree",
+            "capture",
+            "--id",
+            &id,
+            "--expected-generation",
+            &state["generation"].to_string(),
+            "--operation-id",
+            "capture-fixed",
+        ])
+        .await;
+    state = capture["capture"]["attachment"].clone();
+    let checked = env.attached_context(&state, 2, b"fixed source\n").await;
+    assert_eq!(checked["attempt"]["state"], "success");
+    state = checked["attachment"].clone();
+    let args = prepare(state["generation"].as_u64().unwrap(), "prepare-fixed");
+    let refs: Vec<_> = args.iter().map(String::as_str).collect();
+    let prepared = env.attached_ok(&refs).await;
+    assert_eq!(prepared["ok"], true, "{prepared}");
+    let candidate = prepared["candidate"]["request"]["subject"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let commit = prepared["candidate"]["commit"].as_str().unwrap().to_owned();
+    let duplicate = env.attached_ok(&refs).await;
+    assert_eq!(duplicate["candidate"], prepared["candidate"]);
+    assert_eq!(duplicate["qualification"], "not_checked");
+    let noop_args = prepare(state["generation"].as_u64().unwrap(), "prepare-noop");
+    let noop = env
+        .attached_ok(&noop_args.iter().map(String::as_str).collect::<Vec<_>>())
+        .await;
+    assert_eq!(noop["candidate"], prepared["candidate"]);
+    let db = rusqlite::Connection::open(mirror.join("agentscm-export.sqlite")).unwrap();
+    let operations: i64 = db
+        .query_row("SELECT count(*) FROM candidate_operations", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(operations, 1, "no-op preparation must not consume IDs");
+    drop(db);
+    let publish = |candidate: &str, generation: u64, operation: &str, expected: Option<&str>| {
+        let mut args = vec![
+            "attached-worktree".to_owned(),
+            "publish-branch".into(),
+            "--id".into(),
+            id.clone(),
+            "--expected-generation".into(),
+            generation.to_string(),
+            "--mirror".into(),
+            mirror.to_string_lossy().into_owned(),
+            "--candidate".into(),
+            candidate.into(),
+            "--operation-id".into(),
+            operation.into(),
+            "--credential-file".into(),
+            transport.credential.to_string_lossy().into_owned(),
+            "--ca-file".into(),
+            transport.ca.to_string_lossy().into_owned(),
+        ];
+        if let Some(expected) = expected {
+            args.extend(["--expected-oid".into(), expected.into()]);
+        }
+        args
+    };
+    let args = publish(
+        &candidate,
+        state["generation"].as_u64().unwrap(),
+        "push-1",
+        None,
+    );
+    let refs: Vec<_> = args.iter().map(String::as_str).collect();
+    fs::write(worktree.join("old"), b"stale before dispatch").unwrap();
+    let before_requests = transport.requests().len();
+    assert!(!env.attached_cli(&refs).await.0);
+    assert_eq!(transport.requests().len(), before_requests);
+    fs::write(worktree.join("old"), b"fixed source\n").unwrap();
+    transport.option(
+        "before_push_write",
+        json!({"path":worktree.join("old"),"text":"concurrent edit"}),
+    );
+    transport.option("lose_push_reply", json!(true));
+    let unknown = env.attached_ok(&refs).await;
+    assert_eq!(unknown["record"]["state"], "unknown", "{unknown}");
+    assert_eq!(unknown["qualification"]["state"], "stale_or_unknown");
+    transport.option("before_push_write", Value::Null);
+    fs::write(worktree.join("old"), b"fixed source\n").unwrap();
+    let count = transport
+        .requests()
+        .iter()
+        .filter(|r| {
+            r["method"] == "POST" && r["path"].as_str().unwrap().ends_with("git-receive-pack")
+        })
+        .count();
+    env.attached_ok(&refs).await;
+    assert_eq!(
+        count,
+        transport
+            .requests()
+            .iter()
+            .filter(|r| r["method"] == "POST"
+                && r["path"].as_str().unwrap().ends_with("git-receive-pack"))
+            .count()
+    );
+    transport.option("lose_push_reply", json!(false));
+    let recovered = env
+        .attached_ok(&[
+            "attached-worktree",
+            "recover-branch",
+            "--id",
+            &id,
+            "--mirror",
+            mirror.to_str().unwrap(),
+            "--operation-id",
+            "push-1",
+            "--credential-file",
+            transport.credential.to_str().unwrap(),
+            "--ca-file",
+            transport.ca.to_str().unwrap(),
+        ])
+        .await;
+    assert_eq!(recovered["record"]["state"], "observed_desired");
+    let pr_args = |candidate: &str, generation: u64, operation: &str, previous: Option<&str>| {
+        let mut args = publish(candidate, generation, operation, None);
+        args[1] = "publish-pr".into();
+        args.extend(["--title".into(), "Synthetic attached change".into()]);
+        if let Some(previous) = previous {
+            args.extend(["--previous-publication".into(), previous.into()]);
+        }
+        args
+    };
+    let args = pr_args(
+        &candidate,
+        state["generation"].as_u64().unwrap(),
+        "push-1",
+        None,
+    );
+    let refs: Vec<_> = args.iter().map(String::as_str).collect();
+    env.fake.with(|s| s.lose_next_pull_reply = true);
+    let lost = env.attached_ok(&refs).await;
+    assert_eq!(lost["ok"], false, "{lost}");
+    let recovered_pr = env
+        .attached_ok(&[
+            "attached-worktree",
+            "recover-pr",
+            "--id",
+            &id,
+            "--publication",
+            lost["publication"]["id"].as_str().unwrap(),
+        ])
+        .await;
+    assert_eq!(
+        recovered_pr["publication"]["states"]["pull_request"]["number"],
+        1
+    );
+    let opened = env.attached_ok(&refs).await;
+    assert_eq!(
+        opened["ok"], false,
+        "historical replay must not become a current pass: {opened}"
+    );
+    assert_eq!(opened["publication"]["states"]["native_landed"], false);
+    assert_eq!(opened["publication"]["states"]["pull_request"]["number"], 1);
+    env.attached_ok(&refs).await;
+    assert_eq!(env.requests("POST", "/pulls"), 1);
+    assert_eq!(
+        env.requests("POST", "/git/refs"),
+        0,
+        "Mirror owns the branch push"
+    );
+    let tree = run(
+        &transport.remote,
+        &["ls-tree", "-r", "refs/heads/agents/attached"],
+    );
+    assert!(
+        tree.lines()
+            .any(|l| l.starts_with("100755 ") && l.ends_with("\trun"))
+    );
+    assert!(
+        tree.lines()
+            .any(|l| l.starts_with("120000 ") && l.ends_with("\tlink"))
+    );
+    assert!(
+        !tree
+            .lines()
+            .any(|l| l.ends_with("\tsecond") || l.ends_with("\tsecret"))
+    );
+    assert_eq!(fs::read(worktree.join(".git/index")).unwrap(), index);
+    assert_eq!(
+        fs::read(worktree.join("secret")).unwrap(),
+        b"ignored synthetic bytes"
+    );
+    // An explicit external commit and target advance retain the Change and output ancestry.
+    run(&worktree, &["add", "old"]);
+    run(&worktree, &["commit", "-m", "external source commit"]);
+    let captured = env
+        .attached_ok(&[
+            "attached-worktree",
+            "capture",
+            "--id",
+            &id,
+            "--expected-generation",
+            &state["generation"].to_string(),
+            "--operation-id",
+            "external",
+        ])
+        .await;
+    state = captured["capture"]["attachment"].clone();
+    let target = env.root.path().join("target");
+    fs::create_dir(&target).unwrap();
+    run(&target, &["init"]);
+    run(
+        &target,
+        &[
+            "fetch",
+            transport.remote.to_str().unwrap(),
+            "refs/heads/main",
+        ],
+    );
+    run(&target, &["checkout", "-b", "main", "FETCH_HEAD"]);
+    fs::write(target.join("incoming"), "target advance").unwrap();
+    run(&target, &["add", "incoming"]);
+    run(
+        &target,
+        &[
+            "-c",
+            "user.name=Synthetic",
+            "-c",
+            "user.email=s@example.invalid",
+            "commit",
+            "-m",
+            "target",
+        ],
+    );
+    let advanced = run(&target, &["rev-parse", "HEAD"]);
+    run(
+        &transport.remote,
+        &["fetch", target.to_str().unwrap(), "main:refs/heads/main"],
+    );
+    run(
+        &worktree,
+        &[
+            "fetch",
+            target.to_str().unwrap(),
+            "main:refs/remotes/origin/main",
+        ],
+    );
+    let refreshed = env
+        .attached_ok(&[
+            "attached-worktree",
+            "refresh",
+            "--id",
+            &id,
+            "--expected-generation",
+            &state["generation"].to_string(),
+            "--operation-id",
+            "refresh",
+        ])
+        .await;
+    state = refreshed["attachment"].clone();
+    let checked = env.attached_context(&state, 3, b"fixed source\n").await;
+    state = checked["attachment"].clone();
+    let args = prepare(state["generation"].as_u64().unwrap(), "prepare-next");
+    let next = env
+        .attached_ok(&args.iter().map(String::as_str).collect::<Vec<_>>())
+        .await;
+    assert_eq!(next["ok"], true, "{next}");
+    let next_id = next["candidate"]["request"]["subject"]["id"]
+        .as_str()
+        .unwrap();
+    let next_commit = next["candidate"]["commit"].as_str().unwrap();
+    run(
+        &mirror,
+        &["merge-base", "--is-ancestor", &advanced, next_commit],
+    );
+    run(
+        &mirror,
+        &["merge-base", "--is-ancestor", &commit, next_commit],
+    );
+    let args = publish(
+        next_id,
+        state["generation"].as_u64().unwrap(),
+        "push-2",
+        Some(&commit),
+    );
+    let pushed = env
+        .attached_ok(&args.iter().map(String::as_str).collect::<Vec<_>>())
+        .await;
+    assert_eq!(pushed["ok"], true, "{pushed}");
+    // The fixture's PR observations are scripted; update its observed head to
+    // the commit actually received by the real Git HTTPS transport.
+    env.fake.with(|s| {
+        s.repos
+            .get_mut(&REPO_ID)
+            .unwrap()
+            .pulls
+            .get_mut(&1)
+            .unwrap()
+            .head_sha = next_commit.to_owned();
+    });
+    let args = pr_args(
+        next_id,
+        state["generation"].as_u64().unwrap(),
+        "push-2",
+        opened["publication"]["id"].as_str(),
+    );
+    let continued = env
+        .attached_ok(&args.iter().map(String::as_str).collect::<Vec<_>>())
+        .await;
+    assert_eq!(continued["ok"], true, "{continued}");
+    assert_eq!(
+        continued["publication"]["states"]["pull_request"]["number"],
+        1
+    );
+    assert_eq!(env.requests("POST", "/pulls"), 1);
+    let revoked = env.root.path().join("revoked.json");
+    fs::write(
+        &revoked,
+        br#"{"username":"synthetic","password":"revoked"}"#,
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&revoked, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut denied_args = publish(
+        next_id,
+        state["generation"].as_u64().unwrap(),
+        "revoked",
+        Some(next_commit),
+    );
+    let credential_index = denied_args
+        .iter()
+        .position(|v| v == "--credential-file")
+        .unwrap()
+        + 1;
+    denied_args[credential_index] = revoked.to_string_lossy().into_owned();
+    let denied = env
+        .attached_ok(&denied_args.iter().map(String::as_str).collect::<Vec<_>>())
+        .await;
+    assert_eq!(denied["record"]["state"], "unknown");
+    let observed_requests = transport.requests().len();
+    denied_args[credential_index] = transport.credential.to_string_lossy().into_owned();
+    env.attached_ok(&denied_args.iter().map(String::as_str).collect::<Vec<_>>())
+        .await;
+    assert_eq!(
+        transport.requests().len(),
+        observed_requests,
+        "historical retry cannot replay authentication"
+    );
+    Authority::open(&data).unwrap().advance_policy(0).unwrap();
+    assert!(
+        !env.attached_cli(&[
+            "attached-worktree",
+            "compare",
+            "--id",
+            &id,
+            "--expected-generation",
+            &state["generation"].to_string()
+        ])
+        .await
+        .0
+    );
+    assert!(
+        Authority::open_read_only(&data)
+            .unwrap()
+            .events(0, 100)
+            .unwrap()
+            .is_empty()
+    );
+    // A corrupted candidate must not be reinterpreted as an integrated event.
+    let db = rusqlite::Connection::open(env.root.path().join("hub/hub.sqlite")).unwrap();
+    let publication = continued["publication"]["id"].as_str().unwrap();
+    let raw: String = db
+        .query_row(
+            "SELECT manifest FROM hub_publications WHERE id=?1",
+            [publication],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut corrupt: Value = serde_json::from_str(&raw).unwrap();
+    corrupt.as_object_mut().unwrap().remove("candidate");
+    corrupt["event_seq"] = json!(17);
+    db.execute(
+        "UPDATE hub_publications SET event_seq=17,manifest=?1 WHERE id=?2",
+        rusqlite::params![corrupt.to_string(), publication],
+    )
+    .unwrap();
+    let before = env.requests("POST", "/pulls");
+    let path = format!("/v1/hub/repos/acme%2Fwidgets/publications/{publication}/run");
+    let (status, _) = env
+        .api(Method::POST, &path, &env.token, Some(json!({})))
+        .await;
+    assert_ne!(status, 200, "corrupt subject substitution must fail closed");
+    assert_eq!(env.requests("POST", "/pulls"), before);
+}
+
+fn candidate_manifest(env: &Env, branch: &str, version: u64, previous: Option<&str>) -> Value {
+    let mut m = manifest(&hello(), branch);
+    m.as_object_mut().unwrap().remove("event_seq");
+    m["revision"] = json!(env.revision);
+    m["commit"] = json!(env.commit);
+    m["parent"] = json!(env.seed);
+    m["changes"] = json!([{"path":"old","mode":"000000","blob":null,"sha256":null,"size":0}]);
+    let endpoint = format!(
+        "{}/{}.git",
+        env.fake.base.replace("http://", "https://"),
+        REPO
+    );
+    let mut subject: agentscm::candidate::CandidateSubject = serde_json::from_value(json!({
+        "id":"", "attachment":"1".repeat(64), "endpoint":endpoint, "output":branch,
+        "change":{"repository":"2".repeat(64),"id":"change"}, "change_version":version,
+        "context_digest":"3".repeat(64), "policy_epoch":0, "revision":env.revision,
+        "target":"main", "baseline_commit":env.seed, "parent_commit":env.seed,
+        "source_commit":env.seed, "source_fingerprint":"4".repeat(64), "comparison_fingerprint":"5".repeat(64)
+    })).unwrap();
+    subject.id = subject.canonical_id().unwrap();
+    m["publication_id"] = json!(agentscm::hub::publish::derive_candidate_id(
+        REPO,
+        &subject.id,
+        &env.commit,
+        branch
+    ));
+    m["candidate"] = json!({"subject":subject,"endpoint":endpoint,"previous_publication":previous});
+    m
+}
+
+#[tokio::test]
+async fn candidate_attempt_survives_unreadable_success_store_failure_and_list_lag() {
+    let env = Env::start().await;
+    let db = rusqlite::Connection::open(env.root.path().join("hub/hub.sqlite")).unwrap();
+    for mode in 0..3 {
+        let branch = format!("agents/uncertain-{mode}");
+        run(
+            &env.bare,
+            &[
+                "fetch",
+                env.root.path().join("mirror.git").to_str().unwrap(),
+                &format!("{}:refs/heads/{branch}", env.commit),
+            ],
+        );
+        let m = candidate_manifest(&env, &branch, 1, None);
+        let id = m["publication_id"].as_str().unwrap().to_owned();
+        let (status, body) = env.api(Method::POST, BASE, &env.token, Some(m)).await;
+        assert_eq!(status, 200, "{body}");
+        if mode == 0 {
+            env.fake.with(|s| s.malformed_next_pull_reply = true);
+        }
+        if mode == 1 {
+            env.fake.with(|s| s.lose_next_pull_reply = true);
+        }
+        if mode == 2 {
+            db.execute_batch("CREATE TRIGGER fail_pr_record BEFORE UPDATE OF pr_number ON hub_publications WHEN NEW.pr_number IS NOT NULL BEGIN SELECT RAISE(ABORT,'synthetic storage failure'); END;").unwrap();
+        }
+        let path = format!("{BASE}/{id}/run");
+        env.api(Method::POST, &path, &env.token, Some(json!({})))
+            .await;
+        if mode == 2 {
+            db.execute_batch("DROP TRIGGER fail_pr_record").unwrap();
+        }
+        assert_eq!(
+            env.store
+                .publication(REPO, &id)
+                .unwrap()
+                .unwrap()
+                .branch_state,
+            "pr_attempting"
+        );
+        let hidden = env
+            .fake
+            .with(|s| std::mem::take(&mut s.repos.get_mut(&REPO_ID).unwrap().pulls));
+        let count = env.requests("POST", "/pulls");
+        env.api(Method::POST, &path, &env.token, Some(json!({})))
+            .await;
+        assert_eq!(
+            env.requests("POST", "/pulls"),
+            count,
+            "list lag cannot grant retry"
+        );
+        env.fake
+            .with(|s| s.repos.get_mut(&REPO_ID).unwrap().pulls = hidden);
+        // Both head and target move: the immutable create marker still associates
+        // the historical PR, while the result explicitly reports stale history.
+        run(&env.bare, &["update-ref", "refs/heads/main", &env.commit]);
+        run(
+            &env.bare,
+            &["update-ref", &format!("refs/heads/{branch}"), &env.seed],
+        );
+        env.fake.with(|s| {
+            for pull in s.repos.get_mut(&REPO_ID).unwrap().pulls.values_mut() {
+                if pull.head_ref == branch {
+                    pull.head_sha = env.seed.clone();
+                }
+            }
+        });
+        let (status, recovered) = env
+            .api(
+                Method::POST,
+                &format!("{BASE}/{id}/recover"),
+                &env.token,
+                Some(json!({})),
+            )
+            .await;
+        assert_eq!(status, 200, "{recovered}");
+        assert!(
+            recovered["states"]["pull_request"]["number"]
+                .as_i64()
+                .is_some(),
+            "{recovered}"
+        );
+        assert!(recovered["error"].as_str().unwrap().contains("historical"));
+        assert_eq!(env.requests("POST", "/pulls"), count);
+        run(&env.bare, &["update-ref", "refs/heads/main", &env.seed]);
+    }
+}
+
+#[tokio::test]
+async fn stale_unattempted_candidate_continues_prior_pr_after_supersession() {
+    stale_candidate_handler(Env::start().await).await;
+}
+
+#[test]
+fn stale_unattempted_candidate_continues_prior_pr_on_postgres() {
+    let Some(pg) = hub_pg::PgSchema::create() else {
+        return;
+    };
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        stale_candidate_handler(Env::start_with_database(None, Some(&pg.url)).await).await;
+    });
+}
+
+async fn stale_candidate_handler(env: Env) {
+    let branch = "agents/lineage";
+    run(
+        &env.bare,
+        &[
+            "fetch",
+            env.root.path().join("mirror.git").to_str().unwrap(),
+            &format!("{}:refs/heads/{branch}", env.commit),
+        ],
+    );
+    let a = candidate_manifest(&env, branch, 1, None);
+    let aid = a["publication_id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        env.api(Method::POST, BASE, &env.token, Some(a)).await.0,
+        200
+    );
+    let (_, opened) = env
+        .api(
+            Method::POST,
+            &format!("{BASE}/{aid}/run"),
+            &env.token,
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(opened["states"]["pull_request"]["number"], 1, "{opened}");
+    let b = candidate_manifest(&env, branch, 2, Some(&aid));
+    let bid = b["publication_id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        env.api(Method::POST, BASE, &env.token, Some(b)).await.0,
+        200
+    );
+    run(&env.bare, &["update-ref", "refs/heads/main", &env.commit]);
+    let (_, stale) = env
+        .api(
+            Method::POST,
+            &format!("{BASE}/{bid}/run"),
+            &env.token,
+            Some(json!({})),
+        )
+        .await;
+    assert!(stale["error"].as_str().unwrap().contains("target differs"));
+    let store = env.store.clone();
+    let retained_id = bid.clone();
+    assert!(
+        tokio::task::spawn_blocking(move || store
+            .publication(REPO, &retained_id)
+            .unwrap()
+            .unwrap()
+            .pr_number
+            .is_none())
+        .await
+        .unwrap()
+    );
+    let mut c = candidate_manifest(&env, branch, 3, Some(&bid));
+    let mut subject: agentscm::candidate::CandidateSubject =
+        serde_json::from_value(c["candidate"]["subject"].clone()).unwrap();
+    subject.baseline_commit = env.commit.clone();
+    subject.id = subject.canonical_id().unwrap();
+    let cid = agentscm::hub::publish::derive_candidate_id(REPO, &subject.id, &env.commit, branch);
+    c["candidate"]["subject"] = json!(subject);
+    c["publication_id"] = json!(cid);
+    let (status, body) = env.api(Method::POST, BASE, &env.token, Some(c)).await;
+    assert_eq!(status, 200, "{body}");
+    let (_, continued) = env
+        .api(
+            Method::POST,
+            &format!("{BASE}/{cid}/run"),
+            &env.token,
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(
+        continued["states"]["pull_request"]["number"], 1,
+        "{continued}"
+    );
+    assert_eq!(env.requests("POST", "/pulls"), 1);
+}
+
+#[tokio::test]
+async fn refused_candidate_allows_manual_adoption_after_target_moves() {
+    let env = Env::start().await;
+    let branch = "agents/manual";
+    run(
+        &env.bare,
+        &[
+            "fetch",
+            env.root.path().join("mirror.git").to_str().unwrap(),
+            &format!("{}:refs/heads/{branch}", env.commit),
+        ],
+    );
+    let m = candidate_manifest(&env, branch, 1, None);
+    let id = m["publication_id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        env.api(Method::POST, BASE, &env.token, Some(m)).await.0,
+        200
+    );
+    env.fake.with(|s| s.refuse_next_pull = true);
+    let (_, refused) = env
+        .api(
+            Method::POST,
+            &format!("{BASE}/{id}/run"),
+            &env.token,
+            Some(json!({})),
+        )
+        .await;
+    assert!(
+        refused["error"].as_str().unwrap().contains("refused (422)"),
+        "{refused}"
+    );
+    assert_eq!(
+        env.store
+            .publication(REPO, &id)
+            .unwrap()
+            .unwrap()
+            .branch_state,
+        "pr_refused"
+    );
+    env.api(
+        Method::POST,
+        &format!("{BASE}/{id}/run"),
+        &env.token,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(env.requests("POST", "/pulls"), 1);
+    assert!(env.pulls().is_empty());
+    env.fake.with(|s| {
+        let mut pull = fake_github::Pull::new(42, branch, &[]);
+        pull.head_sha = env.commit.clone();
+        s.repos.get_mut(&REPO_ID).unwrap().pulls.insert(42, pull);
+    });
+    run(&env.bare, &["update-ref", "refs/heads/main", &env.commit]);
+    let (_, observed) = env
+        .api(
+            Method::POST,
+            &format!("{BASE}/{id}/recover"),
+            &env.token,
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(
+        observed["states"]["pull_request"]["number"], 42,
+        "{observed}"
+    );
+    assert!(observed["error"].as_str().unwrap().contains("historical"));
+    assert_eq!(env.requests("POST", "/pulls"), 1);
+}
+
+fn reidentify_candidate(m: &mut Value) {
+    let mut subject: agentscm::candidate::CandidateSubject =
+        serde_json::from_value(m["candidate"]["subject"].clone()).unwrap();
+    subject.id = subject.canonical_id().unwrap();
+    m["publication_id"] = json!(agentscm::hub::publish::derive_candidate_id(
+        REPO,
+        &subject.id,
+        m["commit"].as_str().unwrap(),
+        m["branch"].as_str().unwrap()
+    ));
+    m["candidate"]["subject"] = json!(subject);
+}
+
+#[tokio::test]
+async fn candidate_endpoint_and_actual_default_are_checked_before_reservation() {
+    let env = Env::start().await;
+    let mut wrong_host = candidate_manifest(&env, "agents/wrong-host", 1, None);
+    wrong_host["candidate"]["endpoint"] = json!("https://elsewhere.invalid/acme/widgets.git");
+    wrong_host["candidate"]["subject"]["endpoint"] = wrong_host["candidate"]["endpoint"].clone();
+    reidentify_candidate(&mut wrong_host);
+    assert_eq!(
+        env.api(Method::POST, BASE, &env.token, Some(wrong_host))
+            .await
+            .0,
+        409
+    );
+    let mut default = candidate_manifest(&env, "main", 2, None);
+    default["base"] = json!("develop");
+    default["candidate"]["subject"]["target"] = json!("develop");
+    reidentify_candidate(&mut default);
+    assert_eq!(
+        env.api(Method::POST, BASE, &env.token, Some(default))
+            .await
+            .0,
+        409
+    );
+    for alias in ["HEAD", "refs/heads/main"] {
+        let m = candidate_manifest(&env, alias, 3, None);
+        assert_ne!(
+            env.api(Method::POST, BASE, &env.token, Some(m)).await.0,
+            200
+        );
+    }
+    env.fake
+        .with(|s| s.repos.get_mut(&REPO_ID).unwrap().default_branch = None);
+    let unknown = candidate_manifest(&env, "agents/unknown-default", 4, None);
+    assert_eq!(
+        env.api(Method::POST, BASE, &env.token, Some(unknown))
+            .await
+            .0,
+        409
+    );
+    let db = rusqlite::Connection::open(env.root.path().join("hub/hub.sqlite")).unwrap();
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM hub_candidate_heads", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(env.writes(), 0);
 }

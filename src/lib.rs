@@ -8,6 +8,7 @@ pub mod authority;
 pub mod autopsy;
 pub mod backend;
 pub mod backend_s3;
+pub mod candidate;
 pub mod checks;
 pub mod context;
 pub mod error;

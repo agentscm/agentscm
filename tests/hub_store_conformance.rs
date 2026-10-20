@@ -203,7 +203,7 @@ fn idempotent_migrations(db: &Db) {
     }
     assert_eq!(
         db.versions(),
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
     db.exec("INSERT INTO hub_schema_migrations (version, applied_at) VALUES (999, 0)")
         .unwrap();
@@ -226,7 +226,7 @@ fn concurrent_startup(db: &Db) {
     }
     assert_eq!(
         db.versions(),
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
 }
 
@@ -604,7 +604,7 @@ fn upgrade_from_migration_1(db: &Db) {
     let store = db.open();
     assert_eq!(
         db.versions(),
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
     let principal = store
         .authenticate(&agent_token_digest(&raw).unwrap(), unix_now())
@@ -1181,7 +1181,7 @@ fn upgrade_from_migration_3(db: &Db) {
     let store = db.open();
     assert_eq!(
         db.versions(),
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
     let intents = store.live_intents("acme/widgets", unix_now(), 10).unwrap();
     assert_eq!(intents.len(), 1);
@@ -1223,6 +1223,105 @@ fn url_errors(_: &Db) {
     );
 }
 
+fn upgrade_from_migration_14_with_publication(db: &Db) {
+    let migrations = if db.pg.is_some() {
+        [
+            include_str!("../src/hub/migrations/0001_core.pg.sql"),
+            include_str!("../src/hub/migrations/0002_login.pg.sql"),
+            include_str!("../src/hub/migrations/0003_intents.pg.sql"),
+            include_str!("../src/hub/migrations/0004_github.pg.sql"),
+            include_str!("../src/hub/migrations/0005_publish.pg.sql"),
+            include_str!("../src/hub/migrations/0006_sessions.pg.sql"),
+            include_str!("../src/hub/migrations/0007_warn_once.pg.sql"),
+            include_str!("../src/hub/migrations/0008_read_only_tokens.pg.sql"),
+            include_str!("../src/hub/migrations/0009_handoffs.pg.sql"),
+            include_str!("../src/hub/migrations/0010_work.pg.sql"),
+            include_str!("../src/hub/migrations/0011_work_subscribers.pg.sql"),
+            include_str!("../src/hub/migrations/0012_work_subscriber_sessions.pg.sql"),
+            include_str!("../src/hub/migrations/0013_coordination_requests.pg.sql"),
+            include_str!("../src/hub/migrations/0014_coordination_retention.pg.sql"),
+        ]
+    } else {
+        [
+            include_str!("../src/hub/migrations/0001_core.sqlite.sql"),
+            include_str!("../src/hub/migrations/0002_login.sqlite.sql"),
+            include_str!("../src/hub/migrations/0003_intents.sqlite.sql"),
+            include_str!("../src/hub/migrations/0004_github.sqlite.sql"),
+            include_str!("../src/hub/migrations/0005_publish.sqlite.sql"),
+            include_str!("../src/hub/migrations/0006_sessions.sqlite.sql"),
+            include_str!("../src/hub/migrations/0007_warn_once.sqlite.sql"),
+            include_str!("../src/hub/migrations/0008_read_only_tokens.sqlite.sql"),
+            include_str!("../src/hub/migrations/0009_handoffs.sqlite.sql"),
+            include_str!("../src/hub/migrations/0010_work.sqlite.sql"),
+            include_str!("../src/hub/migrations/0011_work_subscribers.sqlite.sql"),
+            include_str!("../src/hub/migrations/0012_work_subscriber_sessions.sqlite.sql"),
+            include_str!("../src/hub/migrations/0013_coordination_requests.sqlite.sql"),
+            include_str!("../src/hub/migrations/0014_coordination_retention.sqlite.sql"),
+        ]
+    };
+    for sql in migrations {
+        db.exec(sql).unwrap();
+    }
+    db.exec("CREATE TABLE hub_schema_migrations (version BIGINT PRIMARY KEY, applied_at BIGINT NOT NULL)").unwrap();
+    for version in 1..=14 {
+        db.exec(&format!(
+            "INSERT INTO hub_schema_migrations VALUES ({version},0)"
+        ))
+        .unwrap();
+    }
+    let manifest: agentscm::hub::publish::Manifest = serde_json::from_value(json!({
+        "revision":"a".repeat(64), "event_seq":3, "commit":"b".repeat(40), "tree":"c".repeat(40), "parent":"d".repeat(40),
+        "branch":"feat/legacy", "base":"main", "title":"Legacy integrated publication", "body":"", "message":"snapshot",
+        "author":{"name":"A","email":"a@example.invalid","date":"2026-05-28T20:26:40Z"},
+        "committer":{"name":"A","email":"a@example.invalid","date":"2026-05-28T20:26:40Z"},
+        "changes":[{"path":"removed","mode":"000000","blob":null,"sha256":null,"size":0}]
+    })).unwrap();
+    let id = agentscm::hub::publish::derive_id(REPO, 3, &manifest.commit, &manifest.branch);
+    let canonical = manifest.canonical();
+    agentscm::hub::publish::NewPublication {
+        id: id.clone(),
+        manifest: manifest.clone(),
+    }
+    .validate(REPO)
+    .unwrap();
+    db.exec(&format!("INSERT INTO hub_users (id,provider,host,forge_user_id,login,created_at) VALUES ('usr_legacy','github','github.com',7,'alice',0);
+        INSERT INTO hub_agent_tokens (id,owner,name,repository,digest,expires_at,created_at) VALUES ('tok_legacy','usr_legacy','builder','acme/widgets','legacy',4102444800,0);
+        INSERT INTO hub_publications (id,repository,token,revision,event_seq,commit_sha,branch,base,manifest,branch_state,pr_number,pr_node_id,pr_url,created_at,updated_at) VALUES ('{id}','acme/widgets','tok_legacy','{}',3,'{}','feat/legacy','main','{}','created',7,'PR_7','https://github.com/acme/widgets/pull/7',10,11);
+        INSERT INTO hub_events (id,at,kind,subject,data) VALUES ('evt_legacy',10,'publication_pr_opened','{id}','{{\"number\":7}}')", manifest.revision,manifest.commit,canonical.replace('\'', "''"))).unwrap();
+    let store = db.open();
+    assert_eq!(db.versions(), (1..=15).collect::<Vec<_>>());
+    let p = store.publication(REPO, &id).unwrap().unwrap();
+    assert_eq!(p.event_seq, Some(3));
+    assert_eq!(p.manifest, canonical);
+    assert_eq!((p.pr_number, p.created_at, p.updated_at), (Some(7), 10, 11));
+    assert_eq!(store.events_after(0, 10).unwrap()[0].data, "{\"number\":7}");
+    let index_exists = if db.pg.is_some() {
+        postgres::Client::connect(&db.url, postgres::NoTls).unwrap().query_one("SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema() AND indexname='hub_publications_repository'", &[]).unwrap().get::<_,i64>(0)
+    } else {
+        rusqlite::Connection::open(db.url.strip_prefix("sqlite://").unwrap()).unwrap().query_row("SELECT count(*) FROM sqlite_schema WHERE type='index' AND name='hub_publications_repository'", [], |r| r.get::<_,i64>(0)).unwrap()
+    };
+    assert_eq!(index_exists, 1);
+    // Corrupt retained data must return an error on both backends, never panic.
+    let oversized = "x".repeat(2 * 1024 * 1024 + 1);
+    if db.pg.is_some() {
+        postgres::Client::connect(&db.url, postgres::NoTls)
+            .unwrap()
+            .execute(
+                "UPDATE hub_publications SET manifest=$1 WHERE id=$2",
+                &[&oversized, &id],
+            )
+            .unwrap();
+    } else {
+        rusqlite::Connection::open(db.url.strip_prefix("sqlite://").unwrap())
+            .unwrap()
+            .execute(
+                "UPDATE hub_publications SET manifest=?1 WHERE id=?2",
+                [&oversized, &id],
+            )
+            .unwrap();
+    }
+    assert!(store.publication(REPO, &id).is_err());
+}
 macro_rules! conformance {
     ($($case:ident),* $(,)?) => {
         mod on_sqlite {
@@ -1256,6 +1355,7 @@ conformance!(
     observations,
     deliveries_outbound_and_notices,
     upgrade_from_migration_3,
+    upgrade_from_migration_14_with_publication,
     url_errors,
 );
 

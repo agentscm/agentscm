@@ -249,3 +249,234 @@ fn publications_on_postgres() {
     let Some(pg) = PgSchema::create() else { return };
     suite(store::open(&pg.url).unwrap());
 }
+
+fn candidate(sequence: u64, branch: &str, previous: Option<&str>) -> NewPublication {
+    use agentscm::candidate::CandidateSubject;
+    use agentscm::hub::publish::{Candidate, derive_candidate_id};
+    let mut m = manifest("candidate", branch);
+    m.event_seq = None;
+    m.commit = format!("{sequence:040x}");
+    let mut subject = CandidateSubject {
+        id: String::new(),
+        attachment: "1".repeat(64),
+        endpoint: "https://github.com/acme/widgets.git".into(),
+        output: branch.into(),
+        change: agentscm::context::ChangeId {
+            repository: "2".repeat(64),
+            id: "change".into(),
+        },
+        change_version: sequence,
+        context_digest: "3".repeat(64),
+        policy_epoch: 0,
+        revision: m.revision.clone(),
+        target: m.base.clone(),
+        baseline_commit: "4".repeat(40),
+        parent_commit: m.parent.clone(),
+        source_commit: "5".repeat(40),
+        source_fingerprint: "6".repeat(64),
+        comparison_fingerprint: "7".repeat(64),
+    };
+    subject.id = subject.canonical_id().unwrap();
+    let id = derive_candidate_id(REPO, &subject.id, &m.commit, branch);
+    m.candidate = Some(Candidate {
+        endpoint: subject.endpoint.clone(),
+        subject,
+        previous_publication: previous.map(str::to_owned),
+    });
+    NewPublication { id, manifest: m }
+}
+
+fn candidate_suite(store: Arc<dyn Store>) {
+    let owner = store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 7,
+            },
+            "alice",
+        )
+        .unwrap();
+    let (token, _) = mint_agent_token(&*store, &owner.id, "candidate", REPO, 3600).unwrap();
+    let now = unix_now();
+    let a = candidate(1, "agents/lineage", None);
+    done(store.create_publication(&token, &a, now).unwrap());
+    store
+        .update_publication(&a.id, &Update::BranchCreated, now)
+        .unwrap();
+    store
+        .update_publication(&a.id, &Update::PullRequestAttempt, now)
+        .unwrap();
+    // A stale local branch update cannot erase the attempted write, nor can rejection.
+    let attempted = store
+        .update_publication(&a.id, &Update::BranchCreated, now)
+        .unwrap();
+    assert_eq!(attempted.branch_state, "pr_attempting");
+    assert_eq!(attempted.states()["branch"]["state"], "created");
+    assert!(
+        store
+            .update_publication(&a.id, &Update::PullRequestAttempt, now)
+            .is_err()
+    );
+    let b = candidate(2, "agents/lineage", Some(&a.id));
+    assert_eq!(
+        store.create_publication(&token, &b, now).unwrap(),
+        Create::Conflict
+    );
+    store
+        .update_publication(
+            &a.id,
+            &Update::PullRequest {
+                number: 7,
+                node_id: "PR_7".into(),
+                html_url: "https://github.com/acme/widgets/pull/7".into(),
+            },
+            now,
+        )
+        .unwrap();
+    done(store.create_publication(&token, &b, now).unwrap());
+    store
+        .update_publication(
+            &b.id,
+            &Update::Error(Some("target advanced before attempt".into())),
+            now,
+        )
+        .unwrap();
+    let c = candidate(3, "agents/lineage", Some(&b.id));
+    done(store.create_publication(&token, &c, now).unwrap());
+    assert_eq!(
+        store.publication(REPO, &b.id).unwrap().unwrap().manifest,
+        b.manifest.canonical()
+    );
+    store
+        .update_publication(&b.id, &Update::BranchCreated, now)
+        .unwrap();
+    assert!(
+        store
+            .update_publication(&b.id, &Update::PullRequestAttempt, now)
+            .is_err(),
+        "superseded B cannot dispatch"
+    );
+    // No PR in the chain is also safe to supersede before an attempt.
+    let initial = candidate(4, "agents/initial", None);
+    done(store.create_publication(&token, &initial, now).unwrap());
+    let successor = candidate(5, "agents/initial", Some(&initial.id));
+    done(store.create_publication(&token, &successor, now).unwrap());
+    let other = store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 8,
+            },
+            "bob",
+        )
+        .unwrap();
+    let (other_token, _) = mint_agent_token(&*store, &other.id, "other", REPO, 3600).unwrap();
+    let wrong_owner = candidate(6, "agents/initial", Some(&successor.id));
+    assert_eq!(
+        store
+            .create_publication(&other_token, &wrong_owner, now)
+            .unwrap(),
+        Create::Conflict
+    );
+    let wrong_parent = candidate(7, "agents/initial", Some(&initial.id));
+    assert_eq!(
+        store
+            .create_publication(&token, &wrong_parent, now)
+            .unwrap(),
+        Create::Conflict
+    );
+    let mut wrong_lineage = candidate(10, "agents/initial", Some(&successor.id));
+    let subject = &mut wrong_lineage.manifest.candidate.as_mut().unwrap().subject;
+    subject.change.id = "different-change".into();
+    subject.id = subject.canonical_id().unwrap();
+    wrong_lineage.id = agentscm::hub::publish::derive_candidate_id(
+        REPO,
+        &subject.id,
+        &wrong_lineage.manifest.commit,
+        &wrong_lineage.manifest.branch,
+    );
+    assert_eq!(
+        store
+            .create_publication(&token, &wrong_lineage, now)
+            .unwrap(),
+        Create::Conflict
+    );
+    // A rejected quota check must roll back the candidate head reservation too.
+    let (capped, _) = mint_agent_token(&*store, &owner.id, "capped-candidate", REPO, 3600).unwrap();
+    for index in 0..MAX_UNFINISHED {
+        done(
+            store
+                .create_publication(&capped, &new_on("quota", &format!("quota/{index}")), now)
+                .unwrap(),
+        );
+    }
+    let quota_candidate = candidate(11, "agents/quota", None);
+    assert_eq!(
+        store
+            .create_publication(&capped, &quota_candidate, now)
+            .unwrap(),
+        Create::TooMany
+    );
+    store
+        .update_publication(
+            &new_on("quota", "quota/0").id,
+            &Update::BranchRejected {
+                status: 422,
+                message: "refused".into(),
+            },
+            now,
+        )
+        .unwrap();
+    done(
+        store
+            .create_publication(&capped, &quota_candidate, now)
+            .unwrap(),
+    );
+    // Race: either the old write reserves first, or the successor reserves first;
+    // both must never succeed. This exercises the actual backend transaction locks.
+    let race = candidate(8, "agents/race", None);
+    done(store.create_publication(&token, &race, now).unwrap());
+    store
+        .update_publication(&race.id, &Update::BranchCreated, now)
+        .unwrap();
+    let next = candidate(9, "agents/race", Some(&race.id));
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let writer = {
+        let store = store.clone();
+        let barrier = barrier.clone();
+        let id = race.id.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            store
+                .update_publication(&id, &Update::PullRequestAttempt, now)
+                .is_ok()
+        })
+    };
+    barrier.wait();
+    let reserved = matches!(
+        store.create_publication(&token, &next, now).unwrap(),
+        Create::Done(_)
+    );
+    let dispatched = writer.join().unwrap();
+    assert_ne!(reserved, dispatched, "exactly one wins the branch fence");
+}
+
+#[test]
+fn candidate_lineage_on_sqlite() {
+    let dir = TempDir::new().unwrap();
+    candidate_suite(
+        store::open(&format!(
+            "sqlite://{}",
+            dir.path().join("hub.sqlite").display()
+        ))
+        .unwrap(),
+    );
+}
+
+#[test]
+fn candidate_lineage_on_postgres() {
+    let Some(pg) = PgSchema::create() else { return };
+    candidate_suite(store::open(&pg.url).unwrap());
+}

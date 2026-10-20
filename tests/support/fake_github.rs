@@ -239,6 +239,7 @@ impl Branch {
 
 #[derive(Clone, Debug)]
 pub struct Repo {
+    pub default_branch: Option<String>,
     pub id: i64,
     pub full_name: String,
     pub node_id: String,
@@ -257,6 +258,7 @@ impl Repo {
     /// A private repository; set `private = false` for a publicly readable one.
     pub fn new(id: i64, full_name: &str) -> Self {
         Repo {
+            default_branch: Some("main".into()),
             id,
             full_name: full_name.into(),
             node_id: format!("R_{id}"),
@@ -294,6 +296,8 @@ pub struct FakeState {
     pub protected_branches: HashMap<String, u16>,
     /// Store the next created pull request, then answer 502 with no body.
     pub lose_next_pull_reply: bool,
+    pub malformed_next_pull_reply: bool,
+    pub refuse_next_pull: bool,
     /// Create the next branch, then answer 502 with no body.
     pub lose_next_ref_reply: bool,
     /// Build every created commit with a different message, so its SHA differs from the client's.
@@ -562,7 +566,7 @@ fn paginate(
 
 fn pull_json(ctx: &Ctx, repo: &Repo, p: &Pull) -> Value {
     json!({
-        "number": p.number, "node_id": p.node_id, "title": p.title, "state": p.state,
+        "number": p.number, "node_id": p.node_id, "title": p.title, "body": p.body, "state": p.state,
         "merged": p.merged, "merge_commit_sha": p.merge_commit_sha, "draft": p.draft,
         "head": {"ref": p.head_ref, "sha": p.head_sha},
         "base": {"ref": p.base_ref},
@@ -784,6 +788,9 @@ fn git_data(
             )
         }
         (&Method::POST, ["pulls"]) => {
+            if std::mem::take(&mut state.refuse_next_pull) {
+                return Some(json_reply(422, json!({"message":"synthetic refusal"})));
+            }
             let head = body["head"].as_str().unwrap_or_default();
             let Some(head_sha) = git_text(
                 &dir,
@@ -803,6 +810,9 @@ fn git_data(
             repo.pulls.insert(number, pull);
             if std::mem::take(&mut state.lose_next_pull_reply) {
                 return Some(reply(502, &[], None));
+            }
+            if std::mem::take(&mut state.malformed_next_pull_reply) {
+                return Some(json_reply(201, json!({"number": number})));
             }
             Some(json_reply(201, created))
         }
@@ -929,7 +939,7 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                 .filter(|i| i.id == id)
                 .flat_map(|i| i.repos.iter())
                 .filter_map(|r| state.repos.get(r))
-                .map(|r| json!({"id": r.id, "full_name": r.full_name, "node_id": r.node_id, "private": r.private}))
+                .map(|r| json!({"id": r.id, "full_name": r.full_name, "node_id": r.node_id, "private": r.private, "default_branch": r.default_branch}))
                 .collect();
             let total = repos.len();
             let (page, link) = paginate(ctx, uri, &query, repos);
@@ -994,7 +1004,7 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                     };
                     json_reply(
                         200,
-                        json!({"id": r.id, "full_name": r.full_name, "node_id": r.node_id, "private": r.private, "permissions": {"pull": true, "push": push}}),
+                        json!({"id": r.id, "full_name": r.full_name, "node_id": r.node_id, "private": r.private, "default_branch": r.default_branch, "permissions": {"pull": true, "push": push}}),
                     )
                 }
                 (&Method::GET, ["pulls"]) => {

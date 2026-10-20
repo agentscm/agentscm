@@ -36,6 +36,27 @@ pub struct Authority {
 }
 
 impl Authority {
+    /// Recheck an unlanded Change and all evidence configured for its exact current context.
+    /// This is a read-only Git-candidate boundary; it creates no integration event and moves
+    /// no native target.
+    pub fn qualify_draft_candidate(&self, change: &ChangeId) -> Result<ReviewContext> {
+        let current = self.change(change)?;
+        let context = self.review_context(&current.context_digest)?;
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        validate_current_context(
+            &tx,
+            CurrentContextRequest {
+                change,
+                change_version: current.version,
+                digest: &current.context_digest,
+                target: &context.target,
+                revision: &context.revision,
+                policy_epoch: sql_i64("policy epoch", context.policy_epoch)?,
+            },
+            None,
+        )
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         crate::local_recovery::check_before_create(path.as_ref(), false)?;
         let data_root = create_directory_durable(path.as_ref())?;

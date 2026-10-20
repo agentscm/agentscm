@@ -4,7 +4,7 @@
 use serde::Serialize;
 
 use super::git::validate_oid;
-use super::{ExportState, Mirror};
+use super::{CandidateExportRecord, ExportState, Mirror};
 use crate::hub::publish::{MAX_BLOB_BYTES, MAX_CHANGES, MAX_TOTAL_BYTES};
 use crate::{Error, Result};
 
@@ -59,6 +59,36 @@ impl Mirror {
         let (Some(commit), Some(tree)) = (record.commit, record.tree) else {
             return Err(Error::Conflict("the export has no commit yet".into()));
         };
+        self.publication_from(record.event.after.revision, commit, tree, false)
+    }
+
+    /// An exact draft candidate as a forge could rebuild it. This has no integration event.
+    pub fn candidate_publication(&self, id: &str) -> Result<Publication> {
+        let record: CandidateExportRecord = self
+            .candidate_record(id)?
+            .ok_or_else(|| Error::NotFound("candidate export record".into()))?;
+        if record.state != ExportState::Mirrored || self.owned_oid()? != record.commit {
+            return Err(Error::Conflict(
+                "candidate must complete prepare and own the mirror ref".into(),
+            ));
+        }
+        let (Some(commit), Some(tree)) = (record.commit, record.tree) else {
+            return Err(Error::Conflict(
+                "the candidate export has no commit yet".into(),
+            ));
+        };
+        self.publication_from(record.request.subject.revision, commit, tree, true)
+    }
+
+    fn publication_from(
+        &self,
+        revision: String,
+        commit: String,
+        tree: String,
+        candidate: bool,
+    ) -> Result<Publication> {
+        self.git
+            .verify_closure(&commit, Some(&tree), super::git::MAX_CLOSURE_OBJECTS)?;
         let raw = self
             .git
             .run(&["cat-file", "commit", &commit], None, 1 << 20)?;
@@ -87,17 +117,18 @@ impl Mirror {
                 "the commit's tree differs from the record".into(),
             ));
         }
-        let [parent] = parents[..] else {
+        if parents.len() != 1 && !(candidate && parents.len() == 2) {
             return Err(Error::Invalid(
                 "publishing needs a commit with exactly one parent (a mirror seeded from the \
                  forge's base commit)"
                     .into(),
             ));
-        };
+        }
+        let parent = parents[0];
         validate_oid(parent)?;
         let changes = self.changes(parent, &commit)?;
         Ok(Publication {
-            revision: record.event.after.revision,
+            revision,
             tree,
             parent: parent.to_owned(),
             author: author.ok_or_else(|| Error::Invalid("the commit has no author".into()))?,
