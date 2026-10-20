@@ -198,6 +198,8 @@ dashboard inspect retained runs. The optional [Claude Code loop](../advanced/cla
 adds `skill-workflow configure`, `check`, `claude-stop` and `require`. Configured native targets
 require an exact-current finalized graph receipt; a standalone successful run is not an approval.
 
+Three further `skill-workflow` commands support the Stop triggers. `codex-stop` takes the arguments of `check` and `claude-stop` and is a Codex CLI Stop hook with the same pass/block behavior. `remote-codex-stop` takes the arguments of `remote-check` and `remote-stop` for hosted workspaces. `install-stop --settings FILE [--apply] [--remove [--workspace PATH]] -- <claude-stop|remote-stop|codex-stop|remote-codex-stop> ARGS...` previews by default and writes the hook entry into an operator-local Claude Code or Codex hook file only with `--apply`; it replaces only the same workspace's entry, whatever the stop subcommand or change, and `--remove` removes all its entries or only those for `--workspace`. The Stop handlers require `stop_hook_active` and allow at most 8 consecutive automatic continuations per agent, session, workspace and change; a parse error in a Stop subcommand exits 1, a non-blocking error. See the [Stop hook guide](../advanced/claude-code-workflows.md#opt-in-claude-code-stop-hook) and the [hosted variant](../advanced/hosted-laptop-workflows.md#optional-stop-hooks).
+
 ## Agent-owned workflow tasks
 
 `agent-task` is the Unix operator/client route for the same authenticated task facade and existing workflow journal described in [agent-owned workflow tasks](../advanced/agent-workflow-tasks.md). It does not create another scheduler and does not invoke the server executor.

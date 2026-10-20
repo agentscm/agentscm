@@ -27,6 +27,10 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 #[cfg(unix)]
+mod agent_stop;
+#[cfg(unix)]
+mod agent_stop_install;
+#[cfg(unix)]
 mod agent_task_cli;
 mod autopsy_cli;
 mod demo_cli;
@@ -451,6 +455,23 @@ struct CheckpointInput {
     changes: Vec<FileChange>,
 }
 
+/// Whether argv structurally parses to a Stop-hook subcommand of `skill-workflow`.
+fn is_stop_hook_invocation() -> bool {
+    let Ok(root) = <Cli as clap::CommandFactory>::command()
+        .ignore_errors(true)
+        .try_get_matches_from(std::env::args_os())
+    else {
+        return false;
+    };
+    let Some(("skill-workflow", sub)) = root.subcommand() else {
+        return false;
+    };
+    matches!(
+        sub.subcommand_name(),
+        Some("claude-stop" | "remote-stop" | "codex-stop" | "remote-codex-stop")
+    )
+}
+
 #[tokio::main]
 async fn main() {
     // Before clap: a bad flag must not exit non-zero (agents read that as "block").
@@ -462,7 +483,8 @@ async fn main() {
         Ok(cli) => cli,
         Err(error) if error.use_stderr() => {
             print_error(&Error::Invalid(error.to_string()));
-            std::process::exit(2);
+            // Exit 2 blocks a Stop hook, so a parse error there is a non-blocking error.
+            std::process::exit(if is_stop_hook_invocation() { 1 } else { 2 });
         }
         Err(error) => {
             let _ = error.print();

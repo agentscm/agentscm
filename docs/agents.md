@@ -114,6 +114,31 @@ These are not generated and not tested here. The shape is always the same:
 2. Make sure the agent reads `AGENTS.md` (or paste the snippet from it into the agent's own instructions file).
 3. If the agent can run a command before edits and wants a JSON answer, `agentscm hook generic` accepts `{"agent", "session", "event", "tool", "paths", "task"}` on standard input.
 
+## Workflow lifecycle capability matrix
+
+Matrix version 1. It records, per client surface, what this repository's code and tests cover for the workflow lifecycle. Nothing here is live-qualified: no cell rests on a run in the real client product.
+
+Cell values:
+
+- **Fixture-tested**: exercised by tests with synthetic payloads or a stub hub built from vendor documentation.
+- **Live-qualified**: verified in a real client session. No cell has this value.
+- **Unsupported**: no wiring exists, or the vendor surface cannot do it.
+- **Not verified**: not wired or not checked against this surface.
+
+| Surface | MCP participation | Edit coordination | Completion trigger (Stop) | Blocking on completion |
+| --- | --- | --- | --- | --- |
+| Claude Code CLI | Not verified: `init-repo` writes `.mcp.json` from vendor docs; no client session was run. The hub tools are covered in the last row | Fixture-tested: pre-edit hook, refuses once per file and session | Fixture-tested: `claude-stop`, `remote-stop` | Fixture-tested: `decision: block`, at most 8 consecutive continuations; per vendor documentation checked 2026-10-20 the Claude cap resets on tool calls |
+| Claude Code desktop/IDE | Not verified: MCP config is the CLI's | Not verified: hook support in these surfaces is not checked | Not verified | Not verified |
+| Codex CLI | Not verified: `init-repo` writes `.codex/config.toml` from vendor docs; no client session was run | Fixture-tested: pre-edit hook, refuses once per file and session | Fixture-tested: `codex-stop`, `remote-codex-stop` | Fixture-tested: `decision: block`, at most 8 consecutive continuations; per vendor documentation checked 2026-10-20 Codex documents no cap of its own |
+| Codex IDE/desktop | Not verified | Not verified: hook support is not checked | Not verified | Not verified |
+| Cursor | Not verified: `init-repo` writes `.cursor/mcp.json` from vendor docs; no client session was run | Fixture-tested: post-edit note only; the hook cannot refuse | Not verified: no Stop adapter | Unsupported: no adapter, and the edit hook cannot refuse |
+| Copilot | Not verified: `init-repo` writes `.vscode/mcp.json` from vendor docs; no client session was run | Fixture-tested: pre-edit hook, refuses once; the CLI gets the refusal but no notes | Not verified: no Stop adapter | Unsupported: no adapter |
+| Any MCP client | Fixture-tested: the hub's `POST /mcp` coordination tools ([hub](hub.md#agent-sessions-mcp-and-hook-endpoints)) and the workspace [agent-task MCP](advanced/agent-workflow-tasks.md) are implemented and tested server-side; advice only, and a model can skip calls | Unsupported: MCP alone has no hook, so no edit is intercepted | Unsupported: MCP has no completion event | Unsupported |
+
+Sources: the edit hooks and wiring are the "Implemented (alpha)" fixture-tested row in the [roadmap](roadmap.md) and are described in [warn once](hub.md#warn-once) and [work intents](intents.md); the coordination and workspace MCP endpoints are described in [hub](hub.md#agent-sessions-mcp-and-hook-endpoints) and [agent-owned workflow tasks](advanced/agent-workflow-tasks.md); the Stop adapters are described in the [Stop hook guide](advanced/claude-code-workflows.md#opt-in-claude-code-stop-hook). Stop hooks are installed by `skill-workflow install-stop`, not by `init-repo`.
+
+A Stop trigger only prompts the agent to run the check. Omitting, misconfiguring or bypassing a hook does not bypass native landing policy, which requires an exact-current receipt independently.
+
 ## Verified against
 
 The file formats were checked against the vendors' public documentation in October 2026: [Claude Code hooks](https://code.claude.com/docs/en/hooks) and [MCP](https://code.claude.com/docs/en/mcp), the Codex documentation for hooks and MCP servers, [Cursor hooks](https://cursor.com/docs/hooks) and [MCP](https://cursor.com/docs/mcp), and the GitHub Copilot and VS Code documentation for hooks and `mcp.json`. Vendors change these formats; if a generated file stops working, please open an issue.

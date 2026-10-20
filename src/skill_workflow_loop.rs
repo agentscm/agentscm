@@ -1,8 +1,9 @@
 //! One bounded native checkpoint -> workflow -> feedback loop for Claude Code.
 
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::agent_stop::{self, StopAgent};
 use agentscm::authority::Authority;
 use agentscm::authority::workflows::WorkflowRequirement;
 use agentscm::context::{BaseState, ChangeId, ReviewContext};
@@ -12,14 +13,13 @@ use agentscm::reviewer::ReviewCancellation;
 use agentscm::skill_workflow::runtime::{ClaudeExecutor, CommandExecutor};
 use agentscm::skill_workflow::{self, RunState, RunView, StepState};
 use agentscm::store::Engine;
-use agentscm::workspace::{OperationKind, OperationOutcome, Workspace};
+use agentscm::workspace::{OperationKind, OperationOutcome, Status, Workspace, WorkspaceState};
 use agentscm::{Error, Result};
 use clap::Args;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 const MAX_WORKSPACE_CHANGES: usize = 4_096;
-const MAX_HOOK_INPUT_BYTES: u64 = 64 * 1024;
 const MAX_HOOK_REASON_BYTES: usize = 16 * 1024;
 const MAX_FAILURE_DETAIL_BYTES: usize = 4 * 1024;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 8 * 1024;
@@ -220,13 +220,7 @@ pub fn check(data_dir: &Path, args: LoopArgs) -> Result<Value> {
     {
         let after = workspace.state()?;
         let status = workspace.status(&engine, MAX_WORKSPACE_CHANGES)?;
-        after.change != change_id
-            || !after.ready
-            || after.pending.is_some()
-            || after.generation != *generation
-            || after.base_revision != *revision
-            || !status.complete
-            || !status.changes.is_empty()
+        workspace_changed_since(&change_id, *generation, revision, &after, &status)
     } else {
         false
     };
@@ -265,43 +259,52 @@ pub fn check(data_dir: &Path, args: LoopArgs) -> Result<Value> {
     }))
 }
 
-pub fn claude_stop(data_dir: &Path, args: LoopArgs) -> Result<()> {
-    let payload = read_hook_payload()?;
-    if payload.get("hook_event_name").and_then(Value::as_str) != Some("Stop") {
-        return Err(Error::Invalid(
-            "Claude workflow hook expects hook_event_name Stop".into(),
-        ));
-    }
+/// `status` is a separate read from `after`, so it must describe the same base, generation and
+/// pending operation: a concurrent checkpoint between the reads would otherwise look clean.
+fn workspace_changed_since(
+    change: &ChangeId,
+    generation: u64,
+    revision: &str,
+    after: &WorkspaceState,
+    status: &Status,
+) -> bool {
+    after.change != *change
+        || !after.ready
+        || after.pending.is_some()
+        || after.generation != generation
+        || after.base_revision != revision
+        || status.generation != after.generation
+        || status.base_revision != after.base_revision
+        || status.pending != after.pending
+        || !status.complete
+        || !status.changes.is_empty()
+}
+
+pub fn claude_stop(data_dir: &Path, args: LoopArgs, agent: StopAgent) -> Result<()> {
     if args.workspace.is_none() {
         return Err(Error::Invalid(
-            "Claude Stop workflow hook requires --workspace".into(),
+            "Stop workflow hook requires --workspace".into(),
         ));
     }
-    let result = match check(data_dir, args) {
-        Ok(result) => result,
-        Err(error) => json!({
-            "failures": [{"detail": bounded_text(&error.to_string(), MAX_FAILURE_DETAIL_BYTES)}],
-            "next_action": "Resolve the workflow setup or execution error, then try to finish again.",
-        }),
-    };
-    if result
-        .get("receipt")
-        .is_some_and(|receipt| !receipt.is_null())
-        && result
-            .get("workspace_changed_during_run")
-            .and_then(Value::as_bool)
-            != Some(true)
-    {
-        println!("{{}}");
-        return Ok(());
-    }
-    let feedback = json!({
-        "failures": result.get("failures").cloned().unwrap_or_else(|| json!([])),
-        "next_action": result.get("next_action").cloned().unwrap_or_else(||
-            json!("Fix the workflow failure and run it again for the current bytes.")),
-    });
-    let reason = bounded_json(&feedback, MAX_HOOK_REASON_BYTES)?;
-    println!("{}", json!({"decision":"block","reason":reason}));
+    let workspace = args.workspace.clone();
+    let change = args.change.clone();
+    let output = agent_stop::run_stop(
+        data_dir,
+        agent,
+        workspace.as_deref(),
+        &change,
+        io::stdin().lock(),
+        "Fix the workflow failure and run it again for the current bytes.",
+        MAX_HOOK_REASON_BYTES,
+        || match check(data_dir, args) {
+            Ok(result) => result,
+            Err(error) => json!({
+                "failures": [{"detail": bounded_text(&error.to_string(), MAX_FAILURE_DETAIL_BYTES)}],
+                "next_action": "Resolve the workflow setup or execution error, then try to finish again.",
+            }),
+        },
+    )?;
+    println!("{output}");
     Ok(())
 }
 
@@ -459,23 +462,6 @@ fn signal_bridge(
     }))
 }
 
-fn read_hook_payload() -> Result<Value> {
-    let mut bytes = Vec::new();
-    io::stdin()
-        .lock()
-        .take(MAX_HOOK_INPUT_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_HOOK_INPUT_BYTES {
-        return Err(Error::Limit("Claude Stop hook input exceeds 64 KiB".into()));
-    }
-    Ok(serde_json::from_slice(&bytes)?)
-}
-
-fn bounded_json(value: &Value, maximum: usize) -> Result<String> {
-    let encoded = serde_json::to_string(value)?;
-    Ok(bounded_text(&encoded, maximum))
-}
-
 fn bounded_text(value: &str, maximum: usize) -> String {
     if value.len() <= maximum {
         return value.into();
@@ -508,4 +494,69 @@ fn stable_hash(fields: &[&[u8]]) -> String {
         hasher.update(field);
     }
     format!("{:x}", hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_concurrent_checkpoint_between_the_state_and_status_reads_is_a_change() {
+        let change = ChangeId {
+            repository: "repository-1".into(),
+            id: "change-1".into(),
+        };
+        let state = WorkspaceState {
+            change: change.clone(),
+            base_revision: "rev-a".into(),
+            generation: 3,
+            scope: None,
+            ready: true,
+            pending: None,
+        };
+        let status = |base: &str, generation: u64| Status {
+            base_revision: base.into(),
+            generation,
+            changes: Vec::new(),
+            complete: true,
+            excluded_total: 0,
+            pending: None,
+        };
+        assert!(!workspace_changed_since(
+            &change,
+            3,
+            "rev-a",
+            &state,
+            &status("rev-a", 3)
+        ));
+        assert!(workspace_changed_since(
+            &change,
+            3,
+            "rev-a",
+            &state,
+            &status("rev-b", 4)
+        ));
+        assert!(workspace_changed_since(
+            &change,
+            3,
+            "rev-a",
+            &state,
+            &status("rev-a", 4)
+        ));
+        assert!(workspace_changed_since(
+            &change,
+            3,
+            "rev-a",
+            &state,
+            &status("rev-b", 3)
+        ));
+        let mut pending = status("rev-a", 3);
+        pending.pending = Some(agentscm::workspace::PendingOperation {
+            operation_id: "op-1".into(),
+            kind: OperationKind::Checkpoint,
+        });
+        assert!(workspace_changed_since(
+            &change, 3, "rev-a", &state, &pending
+        ));
+    }
 }
