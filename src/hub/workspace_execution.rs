@@ -37,9 +37,23 @@ const MAX_PROFILES: usize = 32;
 #[serde(deny_unknown_fields)]
 pub struct ExecutionConfig {
     pub version: u32,
+    #[serde(default)]
     pub profiles: Vec<ExecutionProfile>,
     #[serde(default)]
     pub source_profiles: Vec<source::SourceProfile>,
+    #[serde(default)]
+    pub agent_task_profiles: Vec<AgentTaskProfile>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentTaskProfile {
+    pub repository_id: String,
+    pub profile_id: String,
+    pub native_repository: String,
+    pub data_dir: PathBuf,
+    pub target: String,
+    pub requirement_digest: String,
 }
 
 #[derive(Clone, Deserialize)]
@@ -153,34 +167,31 @@ pub struct ProfileView {
     pub limitations: &'static str,
 }
 
-pub(crate) struct SubjectAuthorization<'a> {
-    pub repository: &'a str,
-    pub profile_id: &'a str,
-    pub subject: &'a RunSubject,
-    pub action: WorkspaceAction,
-    pub request_id: &'a str,
-    pub expected_generation: i64,
-}
-
 struct Queue {
     db: Connection,
 }
 pub struct ExecutionService {
     queue: Mutex<Queue>,
     profiles: BTreeMap<(String, String), ExecutionProfile>,
+    pub(crate) agent_task_profiles: BTreeMap<(String, String), AgentTaskProfile>,
     source_profiles: BTreeMap<(String, String), source::SourceProfile>,
     source_worker: Mutex<()>,
-    workspace: Arc<Workspace>,
+    pub(crate) workspace: Arc<Workspace>,
     // Prevent a second server from recovering or dispatching the same queue.
     _lease: Lease,
     worker: Mutex<()>,
 }
 
 impl ExecutionService {
+    pub fn server_execution_enabled(&self) -> bool {
+        !self.profiles.is_empty()
+    }
+
     pub fn open(path: &Path, config: ExecutionConfig, workspace: Arc<Workspace>) -> Result<Self> {
         if config.version != 1
             || config.profiles.len() > MAX_PROFILES
             || config.source_profiles.len() > MAX_PROFILES
+            || config.agent_task_profiles.len() > MAX_PROFILES
         {
             return Err(HubError::Invalid(
                 "unsupported execution configuration".into(),
@@ -216,6 +227,31 @@ impl ExecutionService {
                 .is_some()
             {
                 return Err(HubError::Invalid("duplicate execution profile".into()));
+            }
+        }
+        let mut agent_task_profiles = BTreeMap::new();
+        for profile in profiles.values() {
+            let task = AgentTaskProfile::from(profile);
+            agent_task_profiles.insert((task.repository_id.clone(), task.profile_id.clone()), task);
+        }
+        for mut profile in config.agent_task_profiles {
+            super::store::validate_repository(&profile.repository_id)?;
+            validate_id(&profile.profile_id)?;
+            if !profile.data_dir.is_absolute() {
+                return Err(HubError::Invalid(
+                    "agent task data paths must be absolute".into(),
+                ));
+            }
+            profile.data_dir = fs::canonicalize(&profile.data_dir)?;
+            profile.current_requirement()?;
+            if agent_task_profiles
+                .insert(
+                    (profile.repository_id.clone(), profile.profile_id.clone()),
+                    profile,
+                )
+                .is_some()
+            {
+                return Err(HubError::Invalid("duplicate agent task profile".into()));
             }
         }
         let mut source_profiles = BTreeMap::new();
@@ -278,6 +314,7 @@ impl ExecutionService {
         Ok(Self {
             queue: Mutex::new(queue),
             profiles,
+            agent_task_profiles,
             source_profiles,
             source_worker: Mutex::new(()),
             workspace,
@@ -300,7 +337,7 @@ impl ExecutionService {
 
     pub fn repositories(&self, actor: &WorkspaceActor) -> Result<RepositoryPage> {
         let mut repositories: BTreeMap<String, Vec<ProfileView>> = BTreeMap::new();
-        for profile in self.profiles.values() {
+        for profile in self.agent_task_profiles.values() {
             if self
                 .workspace
                 .authorize(
@@ -316,7 +353,9 @@ impl ExecutionService {
                 profile_id: profile.profile_id.clone(), target: profile.target.clone(),
                 requirement_digest: profile.requirement_digest.clone(),
                 readiness: if profile.current_requirement().is_ok() { "configured" } else { "unavailable" },
-                limitations: if self.source_profiles.contains_key(&(profile.repository_id.clone(), profile.profile_id.clone())) { "Opt-in laptop source/context sync is enabled. Use the remote workflow CLI and Stop hook; runtime availability is checked on execution." } else { "Source and Change context must already exist in the server native store. Source sync is not enabled for this profile. Runtime availability is checked on execution." },
+                limitations: if self.profiles.contains_key(&(profile.repository_id.clone(), profile.profile_id.clone())) {
+                    if self.source_profiles.contains_key(&(profile.repository_id.clone(), profile.profile_id.clone())) { "Server execution and opt-in laptop source/context sync are enabled. Agent-owned tasks remain separately claimed and never trigger server model dispatch." } else { "Server execution and agent-owned tasks are enabled. Source and Change context must already exist in the server native store." }
+                } else { "Agent-owned tasks only. No server command or model executor is configured; source and Change context must already exist in the native store." },
             });
         }
         Ok(RepositoryPage {
@@ -339,7 +378,10 @@ impl ExecutionService {
     ) -> Result<RunSubject> {
         self.workspace
             .authorize(actor, repository, WorkspaceAction::ReadRepository)?;
-        let profile = self.profile(repository, profile)?;
+        let profile = self
+            .agent_task_profiles
+            .get(&(repository.into(), profile.into()))
+            .ok_or(HubError::Unauthorized)?;
         let (authority, requirement) = profile.current_requirement()?;
         let id = ChangeId {
             repository: profile.native_repository.clone(),
@@ -376,7 +418,10 @@ impl ExecutionService {
         if !(1..=50).contains(&limit) {
             return Err(HubError::Invalid("invalid subject page limit".into()));
         }
-        let configured = self.profile(repository, profile)?;
+        let configured = self
+            .agent_task_profiles
+            .get(&(repository.into(), profile.into()))
+            .ok_or(HubError::Unauthorized)?;
         let (authority, _) = configured.current_requirement()?;
         // The cursor advances over all Changes, including Changes for another
         // target. A page may be empty while retaining an actionable next cursor.
@@ -435,40 +480,6 @@ impl ExecutionService {
             projection: Some(projection),
             reason: None,
         })
-    }
-
-    /// Hold current workspace authorization through a short native authority
-    /// operation. The operator-selected path is never returned to HTTP clients.
-    pub(crate) fn with_subject_authorization<T>(
-        &self,
-        actor: &WorkspaceActor,
-        binding: &SubjectAuthorization<'_>,
-        retry: impl FnOnce(&Path, &ReviewContext) -> crate::Result<Option<T>>,
-        operation: impl FnOnce(&Path, &ReviewContext) -> crate::Result<T>,
-    ) -> Result<T> {
-        self.workspace
-            .authorize(actor, binding.repository, binding.action)?;
-        let profile = self.profile(binding.repository, binding.profile_id)?;
-        self.workspace.with_audited_authorization(
-            actor,
-            binding.repository,
-            binding.action,
-            binding.request_id,
-            binding.subject,
-            || {
-                let context = profile.action_subject(binding.subject)?;
-                if let Some(retained) =
-                    retry(&profile.data_dir, &context).map_err(native_action_error)?
-                {
-                    return Ok(retained);
-                }
-                if actor.generation() != binding.expected_generation {
-                    return Err(HubError::Invalid("workspace_generation_conflict".into()));
-                }
-                profile.validate_subject(binding.subject)?;
-                operation(&profile.data_dir, &context).map_err(native_action_error)
-            },
-        )
     }
 
     pub fn start(
@@ -862,24 +873,6 @@ impl ExecutionService {
 }
 
 impl ExecutionProfile {
-    /// Reconstruct the immutable request for the authority, including historical
-    /// retries. New approvals/landings must pass the authority's current-context,
-    /// target and policy checks; matching retries return their original outcome.
-    fn action_subject(&self, subject: &RunSubject) -> Result<ReviewContext> {
-        let authority = self.stable_mapping()?;
-        let context = authority.review_context(&subject.context_digest)?;
-        if subject.requirement_digest != self.requirement_digest
-            || context.change.repository != self.native_repository
-            || context.change.id != subject.change_id
-            || context.change_version != subject.change_version
-            || context.revision != subject.revision
-            || context.target != self.target
-        {
-            return Err(HubError::Invalid("workspace_native_conflict".into()));
-        }
-        Ok(context)
-    }
-
     fn stable_mapping(&self) -> Result<Authority> {
         let authority = Authority::open_read_only(&self.data_dir)?;
         if authority.repository_id()? != self.native_repository {
@@ -931,6 +924,90 @@ impl ExecutionProfile {
             return Err(HubError::Invalid(
                 "exact native workflow subject changed; refresh the subject".into(),
             ));
+        }
+        Ok(context)
+    }
+}
+
+impl From<&ExecutionProfile> for AgentTaskProfile {
+    fn from(profile: &ExecutionProfile) -> Self {
+        Self {
+            repository_id: profile.repository_id.clone(),
+            profile_id: profile.profile_id.clone(),
+            native_repository: profile.native_repository.clone(),
+            data_dir: profile.data_dir.clone(),
+            target: profile.target.clone(),
+            requirement_digest: profile.requirement_digest.clone(),
+        }
+    }
+}
+
+impl AgentTaskProfile {
+    pub(crate) fn action_subject(&self, subject: &RunSubject) -> Result<ReviewContext> {
+        let authority = self.stable_mapping()?;
+        let context = authority.review_context(&subject.context_digest)?;
+        if subject.requirement_digest != self.requirement_digest
+            || context.change.repository != self.native_repository
+            || context.change.id != subject.change_id
+            || context.change_version != subject.change_version
+            || context.revision != subject.revision
+            || context.target != self.target
+        {
+            return Err(HubError::Invalid("workspace_native_conflict".into()));
+        }
+        Ok(context)
+    }
+
+    pub(crate) fn stable_mapping(&self) -> Result<Authority> {
+        let authority = Authority::open_read_only(&self.data_dir)?;
+        if authority.repository_id()? != self.native_repository {
+            return Err(HubError::Invalid(
+                "native repository mapping changed".into(),
+            ));
+        }
+        Ok(authority)
+    }
+
+    pub(crate) fn current_requirement(&self) -> Result<(Authority, WorkflowRequirement)> {
+        let authority = self.stable_mapping()?;
+        let requirement = authority
+            .workflow_requirement(&self.target)?
+            .ok_or_else(|| {
+                HubError::Invalid("profile has no installed native requirement".into())
+            })?;
+        if requirement.digest()? != self.requirement_digest {
+            return Err(HubError::Invalid(
+                "native requirement differs from registered profile".into(),
+            ));
+        }
+        Ok((authority, requirement))
+    }
+
+    pub(crate) fn validate_subject(&self, subject: &RunSubject) -> Result<ReviewContext> {
+        let (authority, requirement) = self.current_requirement()?;
+        let id = ChangeId {
+            repository: self.native_repository.clone(),
+            id: subject.change_id.clone(),
+        };
+        let change = authority.change(&id)?;
+        let context = authority.review_context(&change.context_digest)?;
+        let target = authority.target(&self.target)?;
+        let base_current = match (&context.base, target) {
+            (None, None) => true,
+            (Some(base), Some(target)) => {
+                base.revision == target.revision && base.target_version == target.version
+            }
+            _ => false,
+        };
+        if !base_current
+            || subject.requirement_digest != requirement.digest()?
+            || change.version != subject.change_version
+            || change.context_digest != subject.context_digest
+            || context.revision != subject.revision
+            || context.target != self.target
+            || context.policy_epoch != authority.policy_epoch()?
+        {
+            return Err(HubError::Invalid("workspace_native_conflict".into()));
         }
         Ok(context)
     }
@@ -1018,15 +1095,6 @@ fn guard_error(_: HubError) -> crate::Error {
     )
 }
 
-fn native_action_error(error: crate::Error) -> HubError {
-    match error {
-        crate::Error::Conflict(_) => HubError::Invalid("workspace_native_conflict".into()),
-        crate::Error::Invalid(_) | crate::Error::NotFound(_) => {
-            HubError::Invalid("invalid native action".into())
-        }
-        _ => HubError::Unavailable("native action unavailable".into()),
-    }
-}
 fn private_directory(path: &Path) -> Result<PathBuf> {
     match fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => {}

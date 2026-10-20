@@ -55,6 +55,7 @@ async fn hosted_env(root: &Path, native: &NativeSourceProfile) -> (Env, Arc<Exec
                     version: 1,
                     profiles: vec![profile],
                     source_profiles: vec![source],
+                    agent_task_profiles: vec![],
                 },
                 workspace,
             )

@@ -8,4 +8,5 @@ mod verification;
 
 pub use contracts::*;
 pub use signature::sign_evidence;
+pub(crate) use verification::is_canonical_ed25519_encoding;
 pub use verification::{ArtifactInput, SuppliedArtifact, verify_evidence};

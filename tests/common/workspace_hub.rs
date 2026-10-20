@@ -367,6 +367,29 @@ pub(super) fn native_source_profile(root: &std::path::Path) -> NativeSourceProfi
     let requirement_digest = authority
         .install_workflow_requirement(&requirement)
         .unwrap();
+    let public = ed25519_dalek::SigningKey::from_bytes(&[7_u8; 32])
+        .verifying_key()
+        .to_bytes();
+    let public_hex = public
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let enrollment = skill_workflow::ExecutorEnrollment {
+        version: 1,
+        registration_id: "registration-http-1".into(),
+        executor_id: "executor-http-1".into(),
+        operator_id: "operator-http-1".into(),
+        repository: repository.clone(),
+        step_ids: vec!["source".into()],
+        registration_epoch: 1,
+        verification_key_id: agentscm::policy::issuer_key_id(&public_hex).unwrap(),
+        verification_key_sha256: digest(&public),
+        signature_algorithm: skill_workflow::ObservationSignatureAlgorithm::Ed25519,
+        issued_at_ms: 1,
+    };
+    authority
+        .enroll_workflow_executor(&enrollment, &public_hex)
+        .unwrap();
     let context:ReviewContext=serde_json::from_value(json!({
         "version":REVIEW_CONTEXT_VERSION,"change":{"repository":repository,"id":"work"},"change_version":1,
         "revision":revision,"base":null,"target":"main","policy_epoch":authority.policy_epoch().unwrap(),

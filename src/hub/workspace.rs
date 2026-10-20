@@ -137,6 +137,31 @@ impl WorkspaceActor {
     pub fn is_browser(&self) -> bool {
         matches!(self.credential, Credential::Browser { .. })
     }
+
+    pub(crate) fn agent_identity(
+        &self,
+    ) -> Result<crate::skill_workflow::AuthenticatedAgentIdentity> {
+        let Credential::Agent { digest, .. } = &self.credential else {
+            return Err(forbidden());
+        };
+        Ok(crate::skill_workflow::AuthenticatedAgentIdentity {
+            owner_id: self.user_id.clone(),
+            agent_id: digest.clone(),
+        })
+    }
+
+    pub(crate) fn authorization_identity(
+        &self,
+    ) -> crate::skill_workflow::AuthenticatedAgentIdentity {
+        let agent_id = match &self.credential {
+            Credential::Browser { .. } => "workspace-browser".to_owned(),
+            Credential::Agent { digest, .. } => digest.clone(),
+        };
+        crate::skill_workflow::AuthenticatedAgentIdentity {
+            owner_id: self.user_id.clone(),
+            agent_id,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -145,6 +170,15 @@ pub enum WorkspaceAction {
     ExecuteWorkflow,
     ApproveRevision,
     IntegrateRevision,
+}
+
+pub(crate) struct AgentTaskAuthorization<'a> {
+    pub actor: &'a WorkspaceActor,
+    pub repository: &'a str,
+    pub core_actor: &'a crate::skill_workflow::AuthenticatedAgentIdentity,
+    pub action: crate::skill_workflow::CollectorAction,
+    pub origins: &'a [crate::skill_workflow::OriginGrantBinding],
+    pub audited: Option<(&'a str, &'a Value)>,
 }
 
 pub struct Workspace {
@@ -408,6 +442,93 @@ impl Workspace {
         let conn = self.conn()?;
         self.authorized(&conn, actor, repository, action)?;
         operation().map_err(HubError::from)
+    }
+
+    /// Hold one workspace lock while checking the initiating credential/action and every
+    /// originating agent grant. The callback may acquire the workflow journal and native
+    /// authority in that order; it must not re-enter workspace authorization.
+    pub(crate) fn with_agent_task_authorization<T>(
+        &self,
+        binding: AgentTaskAuthorization<'_>,
+        operation: impl FnOnce() -> crate::Result<T>,
+    ) -> Result<T> {
+        let workspace_action = match binding.action {
+            crate::skill_workflow::CollectorAction::Submit
+            | crate::skill_workflow::CollectorAction::Finalize => WorkspaceAction::ExecuteWorkflow,
+            crate::skill_workflow::CollectorAction::Approve => WorkspaceAction::ApproveRevision,
+            crate::skill_workflow::CollectorAction::Integrate => WorkspaceAction::IntegrateRevision,
+        };
+        let conn = self.conn()?;
+        self.authorized(&conn, binding.actor, binding.repository, workspace_action)?;
+        if &binding.actor.authorization_identity() != binding.core_actor {
+            return Err(HubError::Unauthorized);
+        }
+        for origin in binding.origins {
+            if origin.grant_id != origin.actor.owner_id {
+                return Err(forbidden());
+            }
+            let digest = TokenDigest::from_persisted(&origin.actor.agent_id)?;
+            let principal = self
+                .store
+                .authenticate(&digest, unix_now())?
+                .filter(|principal| {
+                    principal.owner.id == origin.actor.owner_id
+                        && principal.repository == binding.repository
+                        && !principal.read_only
+                })
+                .ok_or(HubError::Unauthorized)?;
+            let identity = Identity::from(&principal.owner.identity);
+            member(&conn, &identity.key()?)?
+                .filter(|member| {
+                    member.enabled
+                        && u64::try_from(member.generation).ok() == Some(origin.grant_generation)
+                        && member.roles.contains(&Role::Contributor)
+                        && member
+                            .repository_ids
+                            .iter()
+                            .any(|id| id == binding.repository || id == "*")
+                })
+                .ok_or_else(forbidden)?;
+        }
+        if matches!(
+            binding.action,
+            crate::skill_workflow::CollectorAction::Approve
+                | crate::skill_workflow::CollectorAction::Integrate
+        ) {
+            let (request_id, subject) = binding.audited.ok_or_else(forbidden)?;
+            if !valid_id(request_id) {
+                return Err(invalid("invalid request id"));
+            }
+            let action_name = if binding.action == crate::skill_workflow::CollectorAction::Approve {
+                "approve_revision"
+            } else {
+                "integrate_revision"
+            };
+            let data = json!({"request_id":request_id,"repository":binding.repository,"action":action_name,"subject":subject});
+            audit(
+                &conn,
+                &binding.actor.identity.key()?,
+                "native_action_started",
+                &data,
+            )?;
+            let outcome = operation().map_err(HubError::from);
+            audit(
+                &conn,
+                &binding.actor.identity.key()?,
+                if outcome.is_ok() {
+                    "native_action_succeeded"
+                } else {
+                    "native_action_failed"
+                },
+                &data,
+            )?;
+            outcome
+        } else {
+            if binding.audited.is_some() {
+                return Err(forbidden());
+            }
+            operation().map_err(HubError::from)
+        }
     }
 
     /// Native authority retries retain their own exact-subject idempotency.
@@ -1041,7 +1162,92 @@ async fn update_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
     use tempfile::TempDir;
+
+    #[test]
+    fn agent_task_origin_grants_and_token_revocation_share_one_workspace_lock() {
+        let dir = TempDir::new().unwrap();
+        let store = super::super::store::open(&format!(
+            "sqlite://{}",
+            dir.path().join("hub.sqlite").display()
+        ))
+        .unwrap();
+        let identity = ForgeIdentity {
+            provider: "github".into(),
+            host: "forge.example".into(),
+            user_id: 101,
+        };
+        let user = store.upsert_user(&identity, "synthetic-owner").unwrap();
+        let workspace = Arc::new(
+            Workspace::open(
+                WorkspaceConfig {
+                    workspace_id: "synthetic".into(),
+                    name: "Synthetic workspace".into(),
+                    database: dir.path().join("workspace.sqlite"),
+                    initial_owner: Identity::from(&identity),
+                },
+                store.clone(),
+            )
+            .unwrap(),
+        );
+        let (token_id, token) = super::super::store::mint_agent_token(
+            &*store,
+            &user.id,
+            "task-agent",
+            "synthetic/project",
+            3600,
+        )
+        .unwrap();
+        let actor = workspace.actor_for_agent(token.expose(), true).unwrap();
+        let task_actor = actor.agent_identity().unwrap();
+        let origin = crate::skill_workflow::OriginGrantBinding {
+            actor: task_actor.clone(),
+            grant_id: task_actor.owner_id.clone(),
+            grant_generation: u64::try_from(actor.generation()).unwrap(),
+        };
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let held = workspace.clone();
+        let guard = std::thread::spawn(move || {
+            held.with_agent_task_authorization(
+                AgentTaskAuthorization {
+                    actor: &actor,
+                    repository: "synthetic/project",
+                    core_actor: &task_actor,
+                    action: crate::skill_workflow::CollectorAction::Submit,
+                    origins: &[origin],
+                    audited: None,
+                },
+                || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let changing = workspace.clone();
+        let revoke_store = store.clone();
+        let (revoked_tx, revoked_rx) = std::sync::mpsc::channel();
+        let revoker = std::thread::spawn(move || {
+            changing
+                .with_identity_change(|| {
+                    revoke_store.revoke_owned_agent_token(&user.id, &token_id)?;
+                    Ok(())
+                })
+                .unwrap();
+            revoked_tx.send(()).unwrap();
+        });
+        assert!(revoked_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        release_tx.send(()).unwrap();
+        guard.join().unwrap();
+        revoked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        revoker.join().unwrap();
+        assert!(workspace.actor_for_agent(token.expose(), false).is_err());
+    }
 
     #[test]
     fn administrator_does_not_imply_repository_actions_or_self_escalation() {

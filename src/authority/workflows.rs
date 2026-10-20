@@ -8,21 +8,25 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    Authority, read_policy, sql_i64, validate_current_context_without_workflow, validate_identifier,
+    Authority, read_policy, sql_i64, validate_current_context_subject,
+    validate_current_context_without_workflow, validate_identifier,
 };
 use crate::context::ReviewContext;
 use crate::skill_workflow::{
-    CompiledPlan, RunState, RunView, StepAction, StepState, WorkflowDefinition,
+    CollectorTransfer, CompiledPlan, ImportedStepDependency, ImportedTrustClass, RunState, RunView,
+    StepAction, StepState, WorkflowDefinition,
 };
 use crate::{Error, Result};
 
 const REQUIREMENT_VERSION: u32 = 1;
 const RECEIPT_VERSION: u32 = 1;
+const IMPORTED_RECEIPT_VERSION: u32 = 2;
 const PROFILE_REPOSITORY: &str = "00000000000000000000000000000000";
 const PROFILE_REVISION: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const PROFILE_CHANGE_ID: &str = "profile";
 const REQUIREMENT_DOMAIN: &[u8] = b"agentscm.workflow-requirement.v1\0";
 const RECEIPT_DOMAIN: &[u8] = b"agentscm.workflow-receipt.v1\0";
+const IMPORTED_RECEIPT_DOMAIN: &[u8] = b"agentscm.workflow-receipt.v2\0";
 const MAX_REQUIREMENT_BYTES: usize = 256 * 1024;
 const MAX_RECEIPT_BYTES: usize = 512 * 1024;
 
@@ -131,10 +135,31 @@ struct WorkflowReceipt {
     change_version: u64,
     context_digest: String,
     run_state: RunState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    imported_dependencies: Vec<ImportedStepDependency>,
 }
 
 impl WorkflowReceipt {
     fn canonical_bytes(&self) -> Result<Vec<u8>> {
+        match self.version {
+            RECEIPT_VERSION if !self.imported_dependencies.is_empty() => {
+                return Err(Error::Invalid(
+                    "legacy workflow receipt cannot contain imported dependencies".into(),
+                ));
+            }
+            RECEIPT_VERSION => {}
+            IMPORTED_RECEIPT_VERSION if self.imported_dependencies.is_empty() => {
+                return Err(Error::Invalid(
+                    "imported workflow receipt is missing dependencies".into(),
+                ));
+            }
+            IMPORTED_RECEIPT_VERSION => {}
+            _ => {
+                return Err(Error::Invalid(
+                    "unsupported workflow receipt version".into(),
+                ));
+            }
+        }
         let bytes = serde_json::to_vec(self)?;
         if bytes.len() > MAX_RECEIPT_BYTES {
             return Err(Error::Limit("workflow receipt exceeds 512 KiB".into()));
@@ -143,8 +168,24 @@ impl WorkflowReceipt {
     }
 
     fn digest(&self) -> Result<String> {
-        Ok(domain_digest(RECEIPT_DOMAIN, &self.canonical_bytes()?))
+        let domain = if self.version == RECEIPT_VERSION {
+            RECEIPT_DOMAIN
+        } else if self.version == IMPORTED_RECEIPT_VERSION {
+            IMPORTED_RECEIPT_DOMAIN
+        } else {
+            return Err(Error::Invalid(
+                "unsupported workflow receipt version".into(),
+            ));
+        };
+        Ok(domain_digest(domain, &self.canonical_bytes()?))
     }
+}
+
+/// Internal, non-deserializable result of validating the existing compiled graph.
+pub(crate) struct ValidatedImportedWorkflow {
+    pub(crate) dependencies: Vec<ImportedStepDependency>,
+    pub(crate) native_steps: Vec<String>,
+    pub(crate) run_state: RunState,
 }
 
 impl Authority {
@@ -239,6 +280,7 @@ impl Authority {
             change_version: context.change_version,
             context_digest: context_digest.clone(),
             run_state: view.state,
+            imported_dependencies: Vec::new(),
         };
         let canonical = receipt.canonical_bytes()?;
         let digest = receipt.digest()?;
@@ -301,11 +343,178 @@ impl Authority {
         tx.commit()?;
         Ok(digest)
     }
+
+    pub(crate) fn record_imported_workflow_success(
+        &mut self,
+        requirement: &WorkflowRequirement,
+        plan: &CompiledPlan,
+        context: &ReviewContext,
+        validated: ValidatedImportedWorkflow,
+        origins: &crate::skill_workflow::LiveImportedOrigins,
+        load: &mut dyn FnMut(&ImportedStepDependency) -> Result<Vec<u8>>,
+    ) -> Result<String> {
+        self.require_writable()?;
+        requirement.validate()?;
+        let expected_definition = requirement.instantiate(context)?;
+        if plan.definition() != &expected_definition
+            || plan.skill_digest() != requirement.skill_digest
+            || !matches!(
+                validated.run_state,
+                RunState::Succeeded | RunState::CompletedWithOmissions
+            )
+            || validated.dependencies.len() > 32
+        {
+            return Err(Error::Conflict(
+                "imported completion does not match the installed workflow graph".into(),
+            ));
+        }
+        validate_imported_graph(plan, &validated)?;
+        let requirement_digest = requirement.digest()?;
+        let context_digest = context.digest()?;
+        let receipt = WorkflowReceipt {
+            version: IMPORTED_RECEIPT_VERSION,
+            requirement_digest: requirement_digest.clone(),
+            run_id: imported_run_id(plan, &validated.dependencies)?,
+            plan_digest: plan.digest().into(),
+            skill_digest: plan.skill_digest().into(),
+            repository: context.change.repository.clone(),
+            revision: context.revision.clone(),
+            target: context.target.clone(),
+            policy_epoch: context.policy_epoch,
+            change_repository: context.change.repository.clone(),
+            change_id: context.change.id.clone(),
+            change_version: context.change_version,
+            context_digest: context_digest.clone(),
+            run_state: validated.run_state,
+            imported_dependencies: validated.dependencies,
+        };
+        let canonical = receipt.canonical_bytes()?;
+        let digest = receipt.digest()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let installed = read_requirement(&tx, &context.target)?.ok_or_else(|| {
+            Error::Conflict("target has no installed workflow requirement".into())
+        })?;
+        if installed != *requirement || installed.digest()? != requirement_digest {
+            return Err(Error::Conflict(
+                "installed workflow requirement changed before imported completion".into(),
+            ));
+        }
+        validate_current_context_subject(
+            &tx,
+            &context.change,
+            context.change_version,
+            &context_digest,
+            &context.target,
+            &context.revision,
+            sql_i64("policy epoch", context.policy_epoch)?,
+        )?;
+        for dependency in &receipt.imported_dependencies {
+            if !origins.matches_repository(&context.change.repository)
+                || !origins.permits(&dependency.origin)
+            {
+                return Err(Error::Conflict(
+                    "finalization origin manifest changed".into(),
+                ));
+            }
+            let bytes = load(dependency)?;
+            if bytes.len() > crate::skill_workflow::MAX_COLLECTOR_TRANSFER_BYTES {
+                return Err(Error::Limit(
+                    "imported collector evidence exceeds 16 MiB".into(),
+                ));
+            }
+            let transfer = CollectorTransfer::from_slice(&bytes)?;
+            if transfer.digest()? != dependency.transfer_digest
+                || !dependency_matches_transfer(dependency, &transfer)?
+            {
+                return Err(Error::Invalid(
+                    "imported dependency differs from its original signed transfer".into(),
+                ));
+            }
+            validate_live_dependency(&tx, dependency, &transfer)?;
+            tx.execute(
+                "INSERT INTO workflow_imported_evidence(digest,repository,step_id,profile_digest,registration_id,registration_epoch,origin_owner_id,origin_agent_id,origin_grant_id,origin_grant_generation,canonical_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(digest) DO NOTHING",
+                params![
+                    dependency.transfer_digest,
+                    context.change.repository,
+                    dependency.step_id,
+                    dependency.collector_profile_digest,
+                    dependency.registration_id,
+                    sql_i64("registration epoch", dependency.registration_epoch)?,
+                    dependency.origin.actor.owner_id,
+                    dependency.origin.actor.agent_id,
+                    dependency.origin.grant_id,
+                    sql_i64("origin grant generation", dependency.origin.grant_generation)?,
+                    bytes,
+                ],
+            )?;
+            let matches: bool = tx.query_row(
+                "SELECT canonical_json=?2 FROM workflow_imported_evidence WHERE digest=?1",
+                params![dependency.transfer_digest, bytes],
+                |row| row.get(0),
+            )?;
+            if !matches {
+                return Err(Error::Conflict(
+                    "imported evidence digest is bound to different bytes".into(),
+                ));
+            }
+        }
+        insert_receipt(&tx, &digest, &receipt, &canonical)?;
+        tx.commit()?;
+        Ok(digest)
+    }
+
+    pub(crate) fn imported_workflow_origins(
+        &self,
+        context: &ReviewContext,
+    ) -> Result<Vec<crate::skill_workflow::OriginGrantBinding>> {
+        let Some(requirement) = read_requirement(&self.connection, &context.target)? else {
+            return Ok(Vec::new());
+        };
+        let requirement_digest = requirement.digest()?;
+        let context_digest = context.digest()?;
+        let mut statement = self.connection.prepare(
+            "SELECT canonical_json FROM workflow_receipts WHERE requirement_digest=?1 AND repository=?2 AND revision=?3 AND target=?4 AND policy_epoch=?5 AND change_repository=?6 AND change_id=?7 AND change_version=?8 AND context_digest=?9",
+        )?;
+        let rows = statement.query_map(
+            params![
+                requirement_digest,
+                context.change.repository,
+                context.revision,
+                context.target,
+                sql_i64("policy epoch", context.policy_epoch)?,
+                context.change.repository,
+                context.change.id,
+                sql_i64("change version", context.change_version)?,
+                context_digest,
+            ],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?;
+        let mut origins = Vec::new();
+        for row in rows {
+            let bytes = row?;
+            let receipt: WorkflowReceipt = serde_json::from_slice(&bytes)?;
+            if receipt.version != IMPORTED_RECEIPT_VERSION || receipt.canonical_bytes()? != bytes {
+                continue;
+            }
+            for dependency in receipt.imported_dependencies {
+                if !origins.contains(&dependency.origin) {
+                    origins.push(dependency.origin);
+                }
+            }
+        }
+        Ok(origins)
+    }
 }
 
-pub(super) fn require_current_success(tx: &Transaction<'_>, context: &ReviewContext) -> Result<()> {
+pub(super) fn require_current_success(
+    tx: &Transaction<'_>,
+    context: &ReviewContext,
+    imported_origins: Option<&crate::skill_workflow::LiveImportedOrigins>,
+) -> Result<bool> {
     let Some(requirement) = read_requirement(tx, &context.target)? else {
-        return Ok(());
+        return Ok(false);
     };
     let requirement_digest = requirement.digest()?;
     let context_digest = context.digest()?;
@@ -332,7 +541,14 @@ pub(super) fn require_current_success(tx: &Transaction<'_>, context: &ReviewCont
     for row in rows {
         let (digest, canonical) = row?;
         let receipt: WorkflowReceipt = serde_json::from_slice(&canonical)?;
-        if receipt.version == RECEIPT_VERSION
+        let imported_valid = if receipt.version == IMPORTED_RECEIPT_VERSION {
+            imported_origins.is_some_and(|origins| {
+                validate_receipt_dependencies(tx, context, &receipt, origins).is_ok()
+            })
+        } else {
+            receipt.version == RECEIPT_VERSION && receipt.imported_dependencies.is_empty()
+        };
+        if imported_valid
             && receipt.requirement_digest == requirement.digest()?
             && receipt.repository == context.change.repository
             && receipt.revision == context.revision
@@ -350,7 +566,7 @@ pub(super) fn require_current_success(tx: &Transaction<'_>, context: &ReviewCont
             && receipt.canonical_bytes()? == canonical
             && receipt.digest()? == digest
         {
-            return Ok(());
+            return Ok(receipt.version == IMPORTED_RECEIPT_VERSION);
         }
     }
     Err(Error::Conflict(format!(
@@ -391,6 +607,25 @@ pub(super) fn create_schema_v7(tx: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn create_schema_v9(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE workflow_imported_evidence(
+            digest TEXT PRIMARY KEY CHECK(length(digest)=64),
+            repository TEXT NOT NULL CHECK(length(repository)=32),
+            step_id TEXT NOT NULL CHECK(length(step_id) BETWEEN 1 AND 128),
+            profile_digest TEXT NOT NULL CHECK(length(profile_digest)=64),
+            registration_id TEXT NOT NULL,
+            registration_epoch INTEGER NOT NULL CHECK(registration_epoch>0),
+            origin_owner_id TEXT NOT NULL,
+            origin_agent_id TEXT NOT NULL,
+            origin_grant_id TEXT NOT NULL,
+            origin_grant_generation INTEGER NOT NULL CHECK(origin_grant_generation>0),
+            canonical_json BLOB NOT NULL CHECK(length(canonical_json)<=16777216)
+         ) STRICT;",
+    )?;
+    Ok(())
+}
+
 fn read_requirement(connection: &Connection, target: &str) -> Result<Option<WorkflowRequirement>> {
     let row = connection
         .query_row(
@@ -417,6 +652,258 @@ fn read_requirement(connection: &Connection, target: &str) -> Result<Option<Work
         Ok(requirement)
     })
     .transpose()
+}
+
+fn insert_receipt(
+    tx: &Transaction<'_>,
+    digest: &str,
+    receipt: &WorkflowReceipt,
+    canonical: &[u8],
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO workflow_receipts(\
+            digest,requirement_digest,run_id,plan_digest,skill_digest,repository,revision,target,\
+            policy_epoch,change_repository,change_id,change_version,context_digest,canonical_json\
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14) \
+         ON CONFLICT(digest) DO NOTHING",
+        params![
+            digest,
+            receipt.requirement_digest,
+            receipt.run_id,
+            receipt.plan_digest,
+            receipt.skill_digest,
+            receipt.repository,
+            receipt.revision,
+            receipt.target,
+            sql_i64("policy epoch", receipt.policy_epoch)?,
+            receipt.change_repository,
+            receipt.change_id,
+            sql_i64("change version", receipt.change_version)?,
+            receipt.context_digest,
+            canonical,
+        ],
+    )?;
+    let stored: Vec<u8> = tx.query_row(
+        "SELECT canonical_json FROM workflow_receipts WHERE digest=?1",
+        [digest],
+        |row| row.get(0),
+    )?;
+    if stored != canonical {
+        return Err(Error::Conflict(format!(
+            "workflow receipt digest {digest} is bound to different bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn imported_run_id(plan: &CompiledPlan, dependencies: &[ImportedStepDependency]) -> Result<String> {
+    let bytes = serde_json::to_vec(&(plan.digest(), dependencies))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"agentscm.imported-workflow-run.v1\0");
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn validate_imported_graph(
+    plan: &CompiledPlan,
+    validated: &ValidatedImportedWorkflow,
+) -> Result<()> {
+    let native = validated
+        .native_steps
+        .iter()
+        .collect::<std::collections::HashSet<_>>();
+    if native.len() != validated.native_steps.len() {
+        return Err(Error::Invalid(
+            "duplicate native imported workflow step".into(),
+        ));
+    }
+    let mut dependencies = std::collections::HashMap::new();
+    for dependency in &validated.dependencies {
+        if dependencies
+            .insert(dependency.step_id.as_str(), dependency)
+            .is_some()
+        {
+            return Err(Error::Invalid("duplicate imported step dependency".into()));
+        }
+    }
+    let mut omitted = false;
+    for step in plan.ordered_steps() {
+        let satisfied = match &step.action {
+            StepAction::Command { .. } => dependencies.get(step.id.as_str()).is_some_and(|value| {
+                value.trust_class == ImportedTrustClass::EnrolledCommandCollector
+            }),
+            StepAction::ClaudeCodeReview { .. } => {
+                dependencies.get(step.id.as_str()).is_some_and(|value| {
+                    value.trust_class == ImportedTrustClass::EnrolledFiniteReviewController
+                })
+            }
+            StepAction::SourcePaths { .. } => native.contains(&step.id),
+            StepAction::RequireCapability { .. } => false,
+        };
+        if step.required && !satisfied {
+            return Err(Error::Conflict(format!(
+                "required workflow step {} lacks independently validated evidence",
+                step.id
+            )));
+        }
+        omitted |= !step.required && !satisfied;
+    }
+    if dependencies
+        .keys()
+        .any(|step| !plan.ordered_steps().iter().any(|value| value.id == *step))
+        || native
+            .iter()
+            .any(|step| !plan.ordered_steps().iter().any(|value| value.id == ***step))
+    {
+        return Err(Error::Invalid(
+            "imported workflow completion names a foreign step".into(),
+        ));
+    }
+    let expected = if omitted {
+        RunState::CompletedWithOmissions
+    } else {
+        RunState::Succeeded
+    };
+    if validated.run_state != expected {
+        return Err(Error::Invalid(
+            "imported workflow state does not match graph completion".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn dependency_matches_transfer(
+    dependency: &ImportedStepDependency,
+    transfer: &CollectorTransfer,
+) -> Result<bool> {
+    Ok(dependency.transfer_digest == transfer.digest()?
+        && dependency.task_id == transfer.header.task_id
+        && dependency.task_digest == transfer.header.task_digest
+        && dependency.attempt_id == transfer.header.attempt_id
+        && dependency.attempt_digest == transfer.header.attempt_digest
+        && dependency.fence == transfer.header.fence
+        && dependency.registration_id == transfer.header.executor.registration_id
+        && dependency.registration_epoch == transfer.header.executor.registration_epoch
+        && dependency.verification_key_id == transfer.header.executor.verification_key_id
+        && dependency.collector_profile_id == transfer.header.collector_profile_id
+        && dependency.collector_profile_digest == transfer.header.collector_profile_digest
+        && dependency.origin == transfer.header.origin
+        && matches!(
+            (&dependency.trust_class, &transfer.payload),
+            (
+                ImportedTrustClass::EnrolledCommandCollector,
+                crate::skill_workflow::CollectorPayload::Command { .. }
+            ) | (
+                ImportedTrustClass::EnrolledFiniteReviewController,
+                crate::skill_workflow::CollectorPayload::Review { .. }
+            )
+        ))
+}
+
+fn validate_live_dependency(
+    connection: &Connection,
+    dependency: &ImportedStepDependency,
+    transfer: &CollectorTransfer,
+) -> Result<()> {
+    let registration = super::workflow_executors::read_current_registration(
+        connection,
+        &dependency.registration_id,
+    )?
+    .ok_or_else(|| Error::Conflict("imported evidence executor is no longer enrolled".into()))?;
+    if registration.revocation.is_some()
+        || registration.enrollment.repository != transfer.header.repository
+        || registration.enrollment.registration_epoch != dependency.registration_epoch
+        || registration.enrollment.verification_key_id != dependency.verification_key_id
+        || !registration
+            .enrollment
+            .step_ids
+            .contains(&dependency.step_id)
+    {
+        return Err(Error::Conflict(
+            "imported evidence executor registration is stale or revoked".into(),
+        ));
+    }
+    let profile = super::workflow_executors::read_collector_profile(
+        connection,
+        &dependency.collector_profile_id,
+    )?
+    .ok_or_else(|| Error::Conflict("imported evidence collector profile is missing".into()))?;
+    if profile.digest()? != dependency.collector_profile_digest
+        || profile.registration_id != dependency.registration_id
+        || profile.registration_epoch != dependency.registration_epoch
+        || profile.repository != transfer.header.repository
+        || profile.step_id != dependency.step_id
+    {
+        return Err(Error::Conflict(
+            "imported evidence collector profile is stale".into(),
+        ));
+    }
+    transfer.validate_profile_identity(&profile)?;
+    transfer.verify_signature(&registration.public_key_hex)
+}
+
+fn validate_receipt_dependencies(
+    tx: &Transaction<'_>,
+    context: &ReviewContext,
+    receipt: &WorkflowReceipt,
+    origins: &crate::skill_workflow::LiveImportedOrigins,
+) -> Result<()> {
+    if receipt.imported_dependencies.is_empty()
+        || !origins.matches_repository(&context.change.repository)
+    {
+        return Err(Error::Conflict(
+            "imported workflow admission lacks a live origin authorization guard".into(),
+        ));
+    }
+    if receipt.imported_dependencies.len() > 32 {
+        return Err(Error::Limit("too many imported dependencies".into()));
+    }
+    let expected_command = crate::execution::expected_subject(context)?;
+    let mut command_satisfied =
+        crate::execution::require_current_command_success(tx, context).is_ok();
+    for dependency in &receipt.imported_dependencies {
+        if !origins.permits(&dependency.origin) {
+            return Err(Error::Conflict(
+                "originating evidence actor or grant is no longer authorized".into(),
+            ));
+        }
+        let length: i64 = tx.query_row(
+            "SELECT length(canonical_json) FROM workflow_imported_evidence WHERE digest=?1",
+            [&dependency.transfer_digest],
+            |row| row.get(0),
+        )?;
+        if length < 0 || length > crate::skill_workflow::MAX_COLLECTOR_TRANSFER_BYTES as i64 {
+            return Err(Error::Limit("imported transfer exceeds 16 MiB".into()));
+        }
+        let bytes: Vec<u8> = tx.query_row(
+            "SELECT canonical_json FROM workflow_imported_evidence WHERE digest=?1 AND repository=?2 AND step_id=?3",
+            params![dependency.transfer_digest, context.change.repository, dependency.step_id],
+            |row| row.get(0),
+        )?;
+        let transfer = CollectorTransfer::from_slice(&bytes)?;
+        if !dependency_matches_transfer(dependency, &transfer)? {
+            return Err(Error::Invalid(
+                "workflow receipt dependency differs from retained imported evidence".into(),
+            ));
+        }
+        validate_live_dependency(tx, dependency, &transfer)?;
+        if let crate::skill_workflow::CollectorPayload::Command { request, record } =
+            &transfer.payload
+        {
+            crate::skill_workflow::validate_command_record(request, record)?;
+            command_satisfied |= dependency.trust_class
+                == ImportedTrustClass::EnrolledCommandCollector
+                && expected_command.as_ref() == Some(&request.subject)
+                && crate::skill_workflow::command_record_succeeded(record);
+        }
+    }
+    if !command_satisfied {
+        return Err(Error::Conflict(
+            "required command evidence has no exact successful native or imported command".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn normalized_definition(definition: &WorkflowDefinition) -> WorkflowDefinition {

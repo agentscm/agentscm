@@ -68,6 +68,7 @@ pub struct ClaudeCodeTransport {
     executable: PathBuf,
     work_dir: PathBuf,
     scope: String,
+    executable_sha256: String,
 }
 
 #[derive(Serialize)]
@@ -146,6 +147,7 @@ impl ClaudeCodeTransport {
     /// subscription login; API-key and third-party-provider authentication are rejected.
     pub fn new(executable: &Path, work_dir: &Path) -> Result<Self> {
         let executable = validate_executable(executable)?;
+        let executable_sha256 = executable_digest(&executable)?;
         let work_dir = validate_work_dir(work_dir)?;
         let version = probe_version(&executable, &work_dir)?;
         let auth_method = probe_auth(&executable, &work_dir)?;
@@ -163,7 +165,15 @@ impl ClaudeCodeTransport {
             executable,
             work_dir,
             scope,
+            executable_sha256,
         })
+    }
+
+    pub fn verified_executable_sha256(&self) -> Result<String> {
+        if executable_digest(&self.executable)? != self.executable_sha256 {
+            return Err(Error::Conflict("Claude Code executable changed".into()));
+        }
+        Ok(self.executable_sha256.clone())
     }
 
     fn invoke_blocking(
@@ -175,6 +185,9 @@ impl ClaudeCodeTransport {
             TransportBasis::ClaudeCode,
             ModelFailure::InvalidResponse,
         );
+        if self.verified_executable_sha256().is_err() {
+            return observation;
+        }
         if review_cancel.is_cancelled() {
             observation.failure = Some(ModelFailure::Cancelled);
             return observation;
@@ -231,6 +244,9 @@ impl ClaudeCodeTransport {
             }
         };
         observation.state = CallState::Uncertain;
+        if self.verified_executable_sha256().is_err() {
+            return observation;
+        }
         observation.captured_response_bytes = capture.stdout.len() as u64;
         observation.captured_response_sha256 = hash_bytes(&capture.stdout);
         observation.captured_response = capture.stdout;
@@ -507,7 +523,7 @@ fn validate_requested_model(
     requested: &str,
     observed: &str,
 ) -> std::result::Result<(), ModelFailure> {
-    validate_requested_model_selector(requested).map_err(|_| ModelFailure::Identity)?;
+    super::validate_requested_model_selector(requested).map_err(|_| ModelFailure::Identity)?;
     match requested {
         "sonnet" | "haiku" | "opus" | "fable" => {
             let mut prefix = String::with_capacity(requested.len() + "claude--".len());
@@ -522,24 +538,6 @@ fn validate_requested_model(
         }
         full if full == observed => Ok(()),
         _ => Err(ModelFailure::Identity),
-    }
-}
-
-/// Accepts only aliases with an explicit observed-family rule or a full Claude
-/// identifier that must match the provider-reported identity exactly.
-pub(crate) fn validate_requested_model_selector(requested: &str) -> Result<()> {
-    validate_identifier(requested)?;
-    if matches!(requested, "sonnet" | "haiku" | "opus" | "fable")
-        || requested
-            .strip_prefix("claude-")
-            .is_some_and(|suffix| !suffix.is_empty())
-    {
-        Ok(())
-    } else {
-        Err(Error::Invalid(
-            "Claude review model must be sonnet, haiku, opus, fable, or a full claude-* identifier"
-                .into(),
-        ))
     }
 }
 
@@ -727,5 +725,45 @@ mod tests {
 
         assert_ne!(current, old_profile);
         assert_ne!(current, changed_schema);
+    }
+}
+
+fn executable_digest(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(validate_executable(path)?)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buffer[..n]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+#[cfg(test)]
+mod executable_identity_tests {
+    use super::*;
+
+    #[test]
+    fn concrete_transport_hashes_bytes_and_rejects_replaced_executable() {
+        let root = tempfile::tempdir().unwrap();
+        let work = root.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = root.path().join("claude-fixture");
+        let script = b"#!/bin/sh\nif [ \"$1\" = --version ]; then echo '2.1.300 (Claude Code)'; else echo '{\"loggedIn\":true,\"authMethod\":\"claude.ai\"}'; fi\n";
+        std::fs::write(&executable, script).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let transport = ClaudeCodeTransport::new(&executable, &work).unwrap();
+        assert_eq!(
+            transport.verified_executable_sha256().unwrap(),
+            hash_bytes(script)
+        );
+        std::fs::write(&executable, b"#!/bin/sh\nexit 1\n").unwrap();
+        assert!(transport.verified_executable_sha256().is_err());
     }
 }

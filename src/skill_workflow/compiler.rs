@@ -1,8 +1,6 @@
 //! Validation and immutable-source compilation for skill workflows.
 
-#[cfg(unix)]
-use std::collections::BTreeMap;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use serde::Serialize;
@@ -10,9 +8,7 @@ use sha2::{Digest, Sha256};
 
 use super::contracts::{StepAction, StepDefinition, WorkflowDefinition};
 use crate::authority::Authority;
-#[cfg(unix)]
 use crate::checks::required_binding;
-#[cfg(unix)]
 use crate::execution::{COMMAND_CAPABILITY, COMMAND_EVIDENCE, CommandRecipe};
 use crate::skill_bundle::{
     MAX_SKILL_RESOURCE_BYTES, MAX_SKILL_RESOURCE_PATH_BYTES, MAX_SKILL_RESOURCES, SkillBundle,
@@ -44,7 +40,9 @@ pub struct CompiledPlan {
     pub(crate) digest: String,
     pub(crate) skill_digest: String,
     pub(crate) ordered_steps: Vec<StepDefinition>,
-    #[cfg(unix)]
+    /// Exact resource hashes from the already bounded, verified compilation read.
+    #[serde(skip)]
+    pub(crate) instruction_sha256: BTreeMap<String, String>,
     #[serde(skip)]
     command_recipes: BTreeMap<String, CommandRecipe>,
 }
@@ -66,8 +64,7 @@ impl CompiledPlan {
         &self.ordered_steps
     }
 
-    #[cfg(unix)]
-    pub(super) fn command_recipe(&self, step_id: &str) -> Option<&CommandRecipe> {
+    pub(crate) fn command_recipe(&self, step_id: &str) -> Option<&CommandRecipe> {
         self.command_recipes.get(step_id)
     }
 }
@@ -109,18 +106,28 @@ pub fn compile(data_dir: &Path, definition: &WorkflowDefinition) -> Result<Compi
         Ok(bundle)
     })())?;
     validate_claude_review_skill(definition, &bundle)?;
-    #[cfg(unix)]
     let command_recipes = compile_command_recipes(&authority, definition, &bundle)?;
     validate_authority(&authority, definition)?;
     let skill_digest = bundle.identity().as_str().to_owned();
     let digest = plan_digest(definition, &skill_digest)?;
 
+    let root = skill_root(&definition.skill.entrypoint);
+    let instruction_sha256 = std::iter::once(&definition.skill.entrypoint)
+        .chain(definition.skill.resources.iter())
+        .map(|path| {
+            let relative = relative_skill_path(path, root);
+            let bytes = bundle
+                .resource(relative)
+                .ok_or_else(|| Error::Invalid("compiled skill resource missing".into()))?;
+            Ok((path.clone(), format!("{:x}", Sha256::digest(bytes))))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
     Ok(CompiledPlan {
+        instruction_sha256,
         definition: definition.clone(),
         digest,
         skill_digest,
         ordered_steps,
-        #[cfg(unix)]
         command_recipes,
     })
 }
@@ -153,7 +160,6 @@ pub fn validate_sources(data_dir: &Path, definition: &WorkflowDefinition) -> Res
     Ok(())
 }
 
-#[cfg(unix)]
 pub fn read_command_recipe(data_dir: &Path, revision: &str, path: &str) -> Result<CommandRecipe> {
     validate_path(path)?;
     let engine = Engine::open(data_dir)?;
@@ -321,15 +327,7 @@ fn validate_step(step: &StepDefinition) -> Result<()> {
                     return Err(Error::Invalid("duplicate Claude review source path".into()));
                 }
             }
-            #[cfg(unix)]
             crate::reviewer::validate_requested_model_selector(model)?;
-            #[cfg(not(unix))]
-            {
-                let _ = model;
-                return Err(Error::Invalid(
-                    "Claude review is unsupported on this platform".into(),
-                ));
-            }
         }
         StepAction::Command {
             runner,
@@ -350,10 +348,6 @@ fn validate_step(step: &StepDefinition) -> Result<()> {
                 ));
             }
             validate_sha256("command context digest", context_digest)?;
-            #[cfg(not(unix))]
-            return Err(Error::Invalid(
-                "command workflow steps are unsupported on this platform".into(),
-            ));
         }
     }
     Ok(())
@@ -537,7 +531,6 @@ fn validate_claude_review_sources(engine: &Engine, definition: &WorkflowDefiniti
     Ok(())
 }
 
-#[cfg(unix)]
 fn compile_command_recipes(
     authority: &Authority,
     definition: &WorkflowDefinition,

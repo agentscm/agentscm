@@ -8,8 +8,8 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use crate::store::{Engine, MAX_FILE_PAGE};
 use crate::{Error, Result};
 
-const MAX_SNAPSHOT_FILES: u32 = 10_000;
-const MAX_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const MAX_SNAPSHOT_FILES: u32 = 10_000;
+pub(crate) const MAX_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct Snapshot {

@@ -198,6 +198,82 @@ dashboard inspect retained runs. The optional [Claude Code loop](../advanced/cla
 adds `skill-workflow configure`, `check`, `claude-stop` and `require`. Configured native targets
 require an exact-current finalized graph receipt; a standalone successful run is not an approval.
 
+## Agent-owned workflow tasks
+
+`agent-task` is the Unix operator/client route for the same authenticated task facade and existing workflow journal described in [agent-owned workflow tasks](../advanced/agent-workflow-tasks.md). It does not create another scheduler and does not invoke the server executor.
+
+Generate an owner-private signing key, then use the reported public identifiers when preparing the strict enrollment JSON. The CLI never accepts private key bytes in arguments and never overwrites an existing key file.
+
+```sh
+agentscm agent-task key-generate /secure/collector.key
+agentscm agent-task key-info /secure/collector.key
+agentscm agent-task command-runtime-info --docker /usr/local/bin/docker \
+  --docker-socket /var/run/docker.sock --state-dir /secure/collector-state
+agentscm agent-task review-transport-info --claude /usr/local/bin/claude \
+  --state-dir /secure/collector-state
+agentscm --data-dir /srv/native agent-task enroll enrollment.json --private-key /secure/collector.key
+agentscm --data-dir /srv/native agent-task profile-install collector-profile.json
+agentscm --data-dir /srv/native agent-task inspect REGISTRATION_ID --profile PROFILE_ID
+agentscm --data-dir /srv/native agent-task revoke revocation.json
+```
+
+Enrollment JSON is the version-1 `ExecutorEnrollment` object. `key-info` supplies `verification_key_id`, `verification_key_sha256` and `public_key_hex`; set a positive immutable `registration_epoch`, repository, executor/operator IDs, allowed step IDs, `signature_algorithm: "ed25519"` and `issued_at_ms`. Revocation JSON is the version-1 `ExecutorRevocation`; `revoked_at_policy_epoch` must equal the currently reported policy epoch plus one. A profile is the strict version-1 `CollectorProfile` described in the task contract and is immutable after installation. The two transport-info commands supply the otherwise internal runtime/executable/provider digests for its action. The review probe checks the selected executable and existing Claude Code subscription authentication but performs no review/model call.
+
+```json
+{
+  "version": 1,
+  "registration_id": "laptop-tests-1",
+  "executor_id": "laptop-tests",
+  "operator_id": "workspace-operator",
+  "repository": "NATIVE_REPOSITORY_ID",
+  "step_ids": ["test"],
+  "registration_epoch": 1,
+  "verification_key_id": "KEY_INFO_VALUE",
+  "verification_key_sha256": "KEY_INFO_VALUE",
+  "signature_algorithm": "ed25519",
+  "issued_at_ms": 1792368000000
+}
+```
+
+Every task operation is a strict tagged `AgentTaskRequest` JSON file sent to the shared authenticated HTTP facade. This covers `requirements`, `next`, `instructions`, `reference`, `claim`, `collector_claim`, `heartbeat`, `result`, `status`, `cancel`, `reconcile`, `recovery`, `collector_descriptor` and `collector_finalize`. The server supplies the actor from the bearer token; the JSON cannot select credentials, native paths, executables or providers.
+
+```sh
+agentscm agent-task call --endpoint https://hub.example.com --repository acme/widgets \
+  --profile laptop-checks --token-file /secure/agent.token request.json
+agentscm agent-task upload --endpoint https://hub.example.com --repository acme/widgets \
+  --profile laptop-checks --token-file /secure/agent.token upload.json
+```
+
+For example, a requirements request contains only the exact workspace subject; subsequent responses supply task IDs/digests used by claim and status requests.
+
+```json
+{
+  "operation": "requirements",
+  "subject": {
+    "change_id": "change-1",
+    "change_version": 3,
+    "context_digest": "CONTEXT_SHA256",
+    "revision": "REVISION_SHA256",
+    "requirement_digest": "REQUIREMENT_SHA256"
+  }
+}
+```
+
+For trusted collection, save the exact `collector_descriptor` result and use the same locally available authoritative native data directory. A command profile requires the pinned Docker executable and local socket; a review profile requires the pinned Claude Code executable. The profile, not the client, selects recipe, image, model, limits and provider scope.
+
+```sh
+agentscm --data-dir /srv/native agent-task collect \
+  --endpoint http://127.0.0.1:7331 --repository acme/widgets --profile laptop-checks \
+  --token-file /secure/agent.token --descriptor descriptor.json \
+  --state-dir /secure/collector-state --private-key /secure/collector.key \
+  --transfer-request-id upload-001 --docker /usr/local/bin/docker \
+  --docker-socket /var/run/docker.sock
+```
+
+Collection rechecks current authenticated authorization before external dispatch and before signing/upload. The signed transfer is durably retained first. If upload fails, do not run `collect` again: retry the exact bytes with `retry-upload` and the identical descriptor, state directory, key and transfer request ID. Uncertain reserved effects remain nonpassing and cannot be rerun through this recovery path.
+
+Task-only profiles do not download native source or authority state. The collector must already have the exact immutable revision, context and installed requirement in `--data-dir`; automatic independent-laptop bootstrap and two-machine collector portability are not implemented. Token/key/state paths must be absolute, outside candidate source and located directly in an owner-private directory; the CLI opens the verified immediate parent and leaf without following a final symlink. Trusted ancestors may include platform aliases such as macOS `/var`, and the whole operator account remains trusted. Loopback IP HTTP is allowed for a local hub; other endpoints require HTTPS. Requests use no proxy, no redirects, finite timeouts and bounded input/output.
+
 ## Local workspaces and offline exchange
 
 Keep the initialized repository data directory outside the working directory. Start a Change for `REVISION` before creating its workspace. Workspace checkpoints advance the local workspace base; updating the Change's review context remains an explicit operation.

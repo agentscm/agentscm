@@ -10,7 +10,6 @@ pub mod checks;
 pub mod context;
 pub mod error;
 pub mod evidence;
-#[cfg(unix)]
 pub mod execution;
 #[cfg(unix)]
 pub mod git_collisions;

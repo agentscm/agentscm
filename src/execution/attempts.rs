@@ -1,23 +1,26 @@
 //! Durable `command/v1` attempts. Only the controller's run, cancel and recovery write records,
 //! and admission re-reads them against the exact current context; nothing here accepts an
 //! external record.
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(unix)]
 use super::snapshot::remove_private_tree;
-use super::{
-    Cancellation, CleanupHandle, CommandRecipe, ExecutionOutcome, ExecutionRecord,
-    ExecutionRequest, OciBackend, Snapshot,
-};
+#[cfg(unix)]
+use super::{Cancellation, OciBackend, Snapshot};
+use super::{CleanupHandle, CommandRecipe, ExecutionOutcome, ExecutionRecord, ExecutionRequest};
 use crate::checks::{
     CheckSubject, ensure_repository, load_current_context, required_binding, sha256, sql_i64,
-    sql_u64, truncate_utf8, validate_digest, validate_identifier, validate_positive_sql_integer,
-    validate_reason, validate_subject,
+    sql_u64, validate_digest, validate_identifier, validate_positive_sql_integer, validate_subject,
 };
+#[cfg(unix)]
+use crate::checks::{truncate_utf8, validate_reason};
 use crate::context::{ChangeId, ReviewContext};
+#[cfg(unix)]
 use crate::store::Engine;
 use crate::{Error, Result};
 
@@ -164,6 +167,7 @@ pub(crate) fn create_command_attempt(
     Ok(attempt)
 }
 
+#[cfg(unix)]
 pub(crate) fn run_command_attempt(
     connection: &mut Connection,
     engine: &Engine,
@@ -288,6 +292,7 @@ pub(crate) fn run_command_attempt(
 /// fenced first, so a late finisher's compare-and-swap fails, and finish only once any container
 /// is confirmed removed; otherwise they stay running for a retry at the new generation.
 #[allow(clippy::too_many_arguments)]
+#[cfg(unix)]
 pub(crate) fn stop_command_attempt(
     connection: &mut Connection,
     backend: Option<&OciBackend>,
@@ -535,6 +540,7 @@ pub(super) fn verify_success(
     Ok(record)
 }
 
+#[cfg(unix)]
 fn store_record(
     connection: &mut Connection,
     running: &CommandAttempt,
@@ -570,6 +576,7 @@ fn store_record(
 
 /// Compare-and-swap `from` at `generation` to finished at `to_generation`, then add the evidence.
 /// False means the attempt was no longer there, so a late writer changes nothing.
+#[cfg(unix)]
 fn finish_attempt(
     tx: &Connection,
     attempt_id: &str,
@@ -604,6 +611,7 @@ fn finish_attempt(
 
 /// `owner_generation` is the claimed generation whose request owns the handle; the compare-and-swap
 /// is against the attempt's current `generation`. Zero rows changed means recovery fenced the run.
+#[cfg(unix)]
 fn store_custody(
     connection: &Connection,
     attempt_id: &str,
@@ -632,11 +640,13 @@ fn store_custody(
     Ok(())
 }
 
+#[cfg(unix)]
 fn snapshot_path(work_dir: &Path, attempt_id: &str, generation: u64) -> PathBuf {
     work_dir.join(format!("snapshot-{attempt_id}-{generation}"))
 }
 
 /// No isolation was observed and the container is confirmed absent, so nothing can admit.
+#[cfg(unix)]
 fn unobserved_record(
     request: ExecutionRequest,
     outcome: ExecutionOutcome,
@@ -777,7 +787,7 @@ fn read_attempt_with_recipe(
         .transpose()
 }
 
-fn expected_subject(context: &ReviewContext) -> Result<Option<CheckSubject>> {
+pub(crate) fn expected_subject(context: &ReviewContext) -> Result<Option<CheckSubject>> {
     let Some((recipe, toolchain, environment)) =
         required_binding(context, COMMAND_CAPABILITY, COMMAND_EVIDENCE)?
     else {

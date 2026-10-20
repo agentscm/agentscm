@@ -17,10 +17,11 @@ use crate::model::{
 use crate::store::{Engine, create_directory_durable, validate_id};
 use crate::{Error, Result};
 
+pub mod workflow_executors;
 pub mod workflows;
 
 const APPLICATION_ID: i64 = 0x4153_434d;
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 9;
 const CURRENT_SEMANTICS_VERSION: i64 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IDENTIFIER_BYTES: usize = 128;
@@ -451,13 +452,21 @@ impl Authority {
     }
 
     pub fn approve(&mut self, approval: &Approval) -> Result<()> {
-        self.register_approval(approval, false)
+        self.register_approval(approval, false, None)
+    }
+
+    pub(crate) fn approve_with_imported_origins(
+        &mut self,
+        approval: &Approval,
+        origins: &crate::skill_workflow::LiveImportedOrigins,
+    ) -> Result<()> {
+        self.register_approval(approval, false, Some(origins))
     }
 
     /// Return an already registered, exactly equal approval on a retry. This
     /// reports its historical registration; it never unrevokes or renews it.
     pub fn approve_idempotent(&mut self, approval: &Approval) -> Result<()> {
-        self.register_approval(approval, true)
+        self.register_approval(approval, true, None)
     }
 
     /// Inspect an exact historical registration without writing or reviving it.
@@ -484,7 +493,12 @@ impl Authority {
             .transpose()
     }
 
-    fn register_approval(&mut self, approval: &Approval, matching_retry: bool) -> Result<()> {
+    fn register_approval(
+        &mut self,
+        approval: &Approval,
+        matching_retry: bool,
+        imported_origins: Option<&crate::skill_workflow::LiveImportedOrigins>,
+    ) -> Result<()> {
         self.require_writable()?;
         let (policy_epoch, change, change_version) = validate_approval_request(approval)?;
         let tx = self
@@ -496,12 +510,15 @@ impl Authority {
         }
         validate_current_context(
             &tx,
-            change,
-            change_version,
-            &approval.context_digest,
-            &approval.target,
-            &approval.revision,
-            policy_epoch,
+            CurrentContextRequest {
+                change,
+                change_version,
+                digest: &approval.context_digest,
+                target: &approval.target,
+                revision: &approval.revision,
+                policy_epoch,
+            },
+            imported_origins,
         )?;
         if tx
             .query_row(
@@ -552,6 +569,24 @@ impl Authority {
         engine: &Engine,
         request: &IntegrateRequest,
     ) -> Result<IntegrationEvent> {
+        self.integrate_inner(engine, request, None)
+    }
+
+    pub(crate) fn integrate_with_imported_origins(
+        &mut self,
+        engine: &Engine,
+        request: &IntegrateRequest,
+        origins: &crate::skill_workflow::LiveImportedOrigins,
+    ) -> Result<IntegrationEvent> {
+        self.integrate_inner(engine, request, Some(origins))
+    }
+
+    fn integrate_inner(
+        &mut self,
+        engine: &Engine,
+        request: &IntegrateRequest,
+        imported_origins: Option<&crate::skill_workflow::LiveImportedOrigins>,
+    ) -> Result<IntegrationEvent> {
         self.require_writable()?;
         validate_identifier("operation ID", &request.operation_id)?;
         if request.change.is_some() != request.change_version.is_some() {
@@ -592,12 +627,15 @@ impl Authority {
         }
         validate_current_context(
             &tx,
-            change,
-            change_version,
-            &request.context_digest,
-            &request.target,
-            &request.revision,
-            request_policy,
+            CurrentContextRequest {
+                change,
+                change_version,
+                digest: &request.context_digest,
+                target: &request.target,
+                revision: &request.revision,
+                policy_epoch: request_policy,
+            },
+            imported_origins,
         )?;
         validate_approval(&tx, request, request_policy, change, change_version)?;
         validate_direct_parent(&candidate, current.as_ref())?;
@@ -717,12 +755,15 @@ impl Authority {
         }
         validate_current_context(
             &tx,
-            change,
-            change_version,
-            &request.context_digest,
-            &request.target,
-            &request.revision,
-            request_policy,
+            CurrentContextRequest {
+                change,
+                change_version,
+                digest: &request.context_digest,
+                target: &request.target,
+                revision: &request.revision,
+                policy_epoch: request_policy,
+            },
+            None,
         )?;
         validate_approval(&tx, request, request_policy, change, change_version)?;
         tx.execute(
@@ -924,6 +965,13 @@ impl Authority {
 
 /// Required table shapes for read-only opens and consistent local recovery.
 pub(crate) fn validate_current_tables(connection: &Connection) -> Result<()> {
+    validate_v8_tables(connection)?;
+    connection.prepare("SELECT profile_id,digest,registration_id,registration_epoch,repository,step_id,installed_policy_epoch,canonical_json FROM workflow_collector_profiles LIMIT 0")?;
+    Ok(())
+}
+
+/// Parent authority shape retained by recovery without running a migration.
+pub(crate) fn validate_v8_tables(connection: &Connection) -> Result<()> {
     for sql in [
         "SELECT digest,version,canonical_json FROM review_contexts LIMIT 0",
         "SELECT repository,change_id,version,context_digest FROM changes LIMIT 0",
@@ -938,6 +986,8 @@ pub(crate) fn validate_current_tables(connection: &Connection) -> Result<()> {
         "SELECT digest,attempt_id,canonical_json FROM command_evidence LIMIT 0",
         "SELECT target,digest,installed_policy_epoch,canonical_json FROM workflow_requirements LIMIT 0",
         "SELECT digest,requirement_digest,run_id,plan_digest,skill_digest,repository,revision,target,policy_epoch,change_repository,change_id,change_version,context_digest,canonical_json FROM workflow_receipts LIMIT 0",
+        "SELECT registration_id,executor_id,repository,registration_epoch,verification_key_id,public_key_hex,enrolled_policy_epoch,canonical_json FROM workflow_executor_enrollments LIMIT 0",
+        "SELECT registration_id,registration_epoch,revoked_policy_epoch,canonical_json FROM workflow_executor_revocations LIMIT 0",
     ] {
         connection.prepare(sql)?;
     }
@@ -956,6 +1006,8 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
             create_schema_v5(&tx)?;
             create_schema_v6(&tx)?;
             workflows::create_schema_v7(&tx)?;
+            workflow_executors::create_schema_v8(&tx)?;
+            workflow_executors::create_schema_v9(&tx)?;
         }
         (APPLICATION_ID, 1) => {
             migrate_v1_to_v2(&tx)?;
@@ -964,6 +1016,8 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
             create_schema_v5(&tx)?;
             create_schema_v6(&tx)?;
             workflows::create_schema_v7(&tx)?;
+            workflow_executors::create_schema_v8(&tx)?;
+            workflow_executors::create_schema_v9(&tx)?;
         }
         (APPLICATION_ID, 2) => {
             checks::create_schema_v3(&tx)?;
@@ -971,23 +1025,40 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
             create_schema_v5(&tx)?;
             create_schema_v6(&tx)?;
             workflows::create_schema_v7(&tx)?;
+            workflow_executors::create_schema_v8(&tx)?;
+            workflow_executors::create_schema_v9(&tx)?;
         }
         (APPLICATION_ID, 3) => {
             create_schema_v4(&tx)?;
             create_schema_v5(&tx)?;
             create_schema_v6(&tx)?;
             workflows::create_schema_v7(&tx)?;
+            workflow_executors::create_schema_v8(&tx)?;
+            workflow_executors::create_schema_v9(&tx)?;
         }
         (APPLICATION_ID, 4) => {
             create_schema_v5(&tx)?;
             create_schema_v6(&tx)?;
             workflows::create_schema_v7(&tx)?;
+            workflow_executors::create_schema_v8(&tx)?;
+            workflow_executors::create_schema_v9(&tx)?;
         }
         (APPLICATION_ID, 5) => {
             create_schema_v6(&tx)?;
             workflows::create_schema_v7(&tx)?;
+            workflow_executors::create_schema_v8(&tx)?;
+            workflow_executors::create_schema_v9(&tx)?;
         }
-        (APPLICATION_ID, 6) => workflows::create_schema_v7(&tx)?,
+        (APPLICATION_ID, 6) => {
+            workflows::create_schema_v7(&tx)?;
+            workflow_executors::create_schema_v8(&tx)?;
+            workflow_executors::create_schema_v9(&tx)?;
+        }
+        (APPLICATION_ID, 7) => {
+            workflow_executors::create_schema_v8(&tx)?;
+            workflow_executors::create_schema_v9(&tx)?;
+        }
+        (APPLICATION_ID, 8) => workflow_executors::create_schema_v9(&tx)?,
         (APPLICATION_ID, SCHEMA_VERSION) => {
             tx.commit()?;
             return Ok(());
@@ -1146,7 +1217,43 @@ fn validate_context_authority(tx: &Transaction<'_>, context: &ReviewContext) -> 
     Ok(())
 }
 
+struct CurrentContextRequest<'a> {
+    change: &'a ChangeId,
+    change_version: u64,
+    digest: &'a str,
+    target: &'a str,
+    revision: &'a str,
+    policy_epoch: i64,
+}
+
 fn validate_current_context(
+    tx: &Transaction<'_>,
+    request: CurrentContextRequest<'_>,
+    imported_origins: Option<&crate::skill_workflow::LiveImportedOrigins>,
+) -> Result<ReviewContext> {
+    let context = validate_current_context_subject(
+        tx,
+        request.change,
+        request.change_version,
+        request.digest,
+        request.target,
+        request.revision,
+        request.policy_epoch,
+    )?;
+    checks::require_current_success(tx, &context)?;
+    let imported = workflows::require_current_success(tx, &context, imported_origins)?;
+    #[cfg(not(unix))]
+    let _ = imported;
+    #[cfg(unix)]
+    // Imported receipt validation checks the context-wide command requirement too,
+    // accepting only an exact successful native or enrolled imported command.
+    if !imported {
+        crate::execution::require_current_command_success(tx, &context)?;
+    }
+    Ok(context)
+}
+
+pub(super) fn validate_current_context_without_workflow(
     tx: &Transaction<'_>,
     change: &ChangeId,
     change_version: u64,
@@ -1155,7 +1262,7 @@ fn validate_current_context(
     revision: &str,
     policy_epoch: i64,
 ) -> Result<ReviewContext> {
-    let context = validate_current_context_without_workflow(
+    let context = validate_current_context_subject(
         tx,
         change,
         change_version,
@@ -1164,11 +1271,13 @@ fn validate_current_context(
         revision,
         policy_epoch,
     )?;
-    workflows::require_current_success(tx, &context)?;
+    checks::require_current_success(tx, &context)?;
+    #[cfg(unix)]
+    crate::execution::require_current_command_success(tx, &context)?;
     Ok(context)
 }
 
-pub(super) fn validate_current_context_without_workflow(
+pub(super) fn validate_current_context_subject(
     tx: &Transaction<'_>,
     change: &ChangeId,
     change_version: u64,
@@ -1213,9 +1322,6 @@ pub(super) fn validate_current_context_without_workflow(
             reasons.join("; ")
         )));
     }
-    checks::require_current_success(tx, &context)?;
-    #[cfg(unix)]
-    crate::execution::require_current_command_success(tx, &context)?;
     Ok(context)
 }
 
