@@ -29,6 +29,30 @@ impl Reply {
 }
 
 impl Hub {
+    async fn onboarding_request(
+        &self,
+        secret: &str,
+        binding: &str,
+        method: reqwest::Method,
+        path: &str,
+        body: Value,
+    ) -> (u16, Value) {
+        let reply = self
+            .client
+            .request(method, format!("{}{path}", self.base))
+            .bearer_auth(secret)
+            .header("x-agentscm-client", binding)
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+        let status = reply.status().as_u16();
+        (
+            status,
+            serde_json::from_str(&reply.text().await.unwrap()).unwrap(),
+        )
+    }
     async fn start() -> Self {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}", dir.path().join("hub.sqlite").display());
@@ -116,6 +140,297 @@ impl Hub {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn onboarding_requires_mcp_and_native_edit_for_each_agent_and_binding() {
+    let hub = Hub::start().await;
+    let secret = hub.secret(1, "member-agent");
+    let binding = "a".repeat(64);
+    for agent in ["claude", "codex", "cursor", "copilot", "gemini"] {
+        let session = format!("setup-{agent}");
+        let (start_endpoint, start_payload) = match agent {
+            "cursor" => (
+                "cursor",
+                json!({"hook_event_name":"sessionStart","conversation_id":session}),
+            ),
+            "copilot" => ("copilot", json!({"source":"startup","sessionId":session})),
+            "gemini" => (
+                "generic",
+                json!({"agent":"gemini","event":"start","session":session}),
+            ),
+            name => (
+                name,
+                json!({"hook_event_name":"SessionStart","session_id":session}),
+            ),
+        };
+        hub.onboarding_request(
+            &secret,
+            &binding,
+            reqwest::Method::POST,
+            &format!("/v1/hub/hook/{start_endpoint}"),
+            start_payload,
+        )
+        .await;
+        let setup_call = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+            "name":"agentscm_setup_status","arguments":{"agent":agent,"session":session}}});
+        let status = |reply: &Value| -> Value {
+            serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+        };
+        let (_, mcp) = hub
+            .onboarding_request(
+                &secret,
+                &binding,
+                reqwest::Method::POST,
+                "/mcp",
+                setup_call.clone(),
+            )
+            .await;
+        assert_eq!(status(&mcp)["state"], "unverified");
+        assert_eq!(status(&mcp)["mcp_verified"], true);
+        assert_eq!(status(&mcp)["native_verified"], false);
+        let (endpoint, edit, lifecycle) = match agent {
+            "cursor" => (
+                "cursor",
+                json!({"hook_event_name":"postToolUse","conversation_id":session,"tool_name":"Write","tool_input":{"file_path":"src/synthetic.rs"}}),
+                json!({"hook_event_name":"sessionEnd","conversation_id":session}),
+            ),
+            "copilot" => (
+                "copilot",
+                json!({"sessionId":session,"toolName":"write","toolArgs":{"path":"src/synthetic.rs"}}),
+                json!({"sessionId":session,"reason":"done"}),
+            ),
+            "gemini" => (
+                "generic",
+                json!({"agent":"gemini","session":session,"event":"check","paths":["src/synthetic.rs"]}),
+                json!({"agent":"gemini","session":session,"event":"done"}),
+            ),
+            name => (
+                name,
+                json!({"hook_event_name":"PreToolUse","session_id":session,"tool_name":"Write","tool_input":{"file_path":"src/synthetic.rs"}}),
+                json!({"hook_event_name":"SessionEnd","session_id":session}),
+            ),
+        };
+        let path = format!("/v1/hub/hook/{endpoint}");
+        // Another checkout's native event cannot combine with this checkout's MCP call.
+        hub.onboarding_request(
+            &secret,
+            &"b".repeat(64),
+            reqwest::Method::POST,
+            &path,
+            edit.clone(),
+        )
+        .await;
+        let (_, still_pending) = hub
+            .onboarding_request(
+                &secret,
+                &binding,
+                reqwest::Method::POST,
+                "/mcp",
+                setup_call.clone(),
+            )
+            .await;
+        assert_eq!(status(&still_pending)["native_verified"], false);
+        hub.onboarding_request(&secret, &binding, reqwest::Method::POST, &path, edit)
+            .await;
+        let (_, ready) = hub
+            .onboarding_request(
+                &secret,
+                &binding,
+                reqwest::Method::POST,
+                "/mcp",
+                setup_call.clone(),
+            )
+            .await;
+        assert_eq!(status(&ready)["state"], "ready", "{agent}");
+        let (_, blocked) = hub
+            .onboarding_request(
+                &secret,
+                &binding,
+                reqwest::Method::POST,
+                "/v1/hub/onboarding",
+                json!({"agent":agent,"session":session,"blocker":"quota"}),
+            )
+            .await;
+        assert_eq!(blocked["state"], "blocked");
+        let (_, no_fake_clear) = hub
+            .onboarding_request(
+                &secret,
+                &binding,
+                reqwest::Method::POST,
+                "/v1/hub/onboarding",
+                json!({"agent":agent,"session":session}),
+            )
+            .await;
+        assert_eq!(no_fake_clear["state"], "blocked");
+        hub.onboarding_request(&secret, &binding, reqwest::Method::POST, &path, lifecycle)
+            .await;
+        let (_, ended) = hub
+            .onboarding_request(
+                &secret,
+                &binding,
+                reqwest::Method::GET,
+                &format!("/v1/hub/onboarding?agent={agent}&session={session}"),
+                Value::Null,
+            )
+            .await;
+        assert!(
+            ended
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["state"] != "ready"
+                    && row["mcp_verified"] == false
+                    && row["native_verified"] == false)
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn onboarding_is_authenticated_revalidates_revocation_and_rejects_fabricated_fields() {
+    let hub = Hub::start().await;
+    let secret = hub.secret(1, "agent");
+    let viewer = hub.secret(2, "viewer");
+    let binding = "a".repeat(64);
+    let (code, _) = hub
+        .onboarding_request(
+            "bad",
+            &binding,
+            reqwest::Method::GET,
+            "/v1/hub/onboarding",
+            Value::Null,
+        )
+        .await;
+    assert_eq!(code, 401);
+    let (code, _) = hub
+        .onboarding_request(
+            &secret,
+            &binding,
+            reqwest::Method::POST,
+            "/v1/hub/onboarding",
+            json!({"agent":"codex","session":"s","ready":true}),
+        )
+        .await;
+    assert_eq!(code, 400);
+    hub.onboarding_request(
+        &secret,
+        &binding,
+        reqwest::Method::POST,
+        "/v1/hub/onboarding",
+        json!({"agent":"codex","session":"s","blocker":"login"}),
+    )
+    .await;
+    // A viewer's different token can see repository status, without sharing the writer's credential.
+    let reply = hub
+        .send(
+            reqwest::Method::GET,
+            "/v1/hub/onboarding",
+            Some(&viewer),
+            "",
+        )
+        .await;
+    assert_eq!(reply.json().as_array().unwrap().len(), 1);
+    let aggregate = reply.json();
+    assert!(aggregate[0].get("session").is_none());
+    assert!(aggregate[0].get("token").is_none());
+    assert!(aggregate[0].get("client").is_none());
+    assert_eq!(aggregate[0]["key"].as_str().unwrap().len(), 64);
+    let foreign = hub
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "gitlab".into(),
+                host: "forge.example.com".into(),
+                user_id: 3,
+            },
+            "foreign",
+        )
+        .unwrap();
+    let (_, foreign_secret) =
+        mint_agent_token(&*hub.store, &foreign.id, "foreign", REPO, 3600).unwrap();
+    let reply = hub
+        .send(
+            reqwest::Method::GET,
+            "/v1/hub/onboarding",
+            Some(foreign_secret.expose()),
+            "",
+        )
+        .await;
+    assert!(reply.json().as_array().unwrap().is_empty());
+    let principal = hub
+        .store
+        .authenticate(&store::agent_token_digest(&secret).unwrap(), unix_now())
+        .unwrap()
+        .unwrap();
+    hub.store.revoke_agent_token(&principal.token_id).unwrap();
+    let reply = hub
+        .send(
+            reqwest::Method::GET,
+            "/v1/hub/onboarding",
+            Some(&viewer),
+            "",
+        )
+        .await;
+    assert!(reply.json().as_array().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn onboarding_lifecycle_invalidates_even_when_coordination_writes_fail() {
+    let hub = Hub::start().await;
+    let secret = hub.secret(1, "agent");
+    let binding = "a".repeat(64);
+    for lifecycle in ["SessionStart", "SessionEnd"] {
+        hub.onboarding_request(
+            &secret,
+            &binding,
+            reqwest::Method::POST,
+            "/v1/hub/hook/codex",
+            json!({"hook_event_name":"SessionStart","session_id":"s"}),
+        )
+        .await;
+        hub.onboarding_request(&secret, &binding, reqwest::Method::POST, "/mcp", json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_setup_status","arguments":{"agent":"codex","session":"s"}}})).await;
+        hub.onboarding_request(&secret, &binding, reqwest::Method::POST, "/v1/hub/hook/codex", json!({"hook_event_name":"PreToolUse","session_id":"s","tool_name":"Write","tool_input":{"file_path":"test.txt"}})).await;
+        let (_, ready) = hub
+            .onboarding_request(
+                &secret,
+                &binding,
+                reqwest::Method::GET,
+                "/v1/hub/onboarding",
+                Value::Null,
+            )
+            .await;
+        assert_eq!(ready[0]["state"], "ready");
+        let lock = rusqlite::Connection::open(hub._dir.path().join("hub.sqlite")).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+        hub.onboarding_request(
+            &secret,
+            &binding,
+            reqwest::Method::POST,
+            "/v1/hub/hook/codex",
+            json!({"hook_event_name":lifecycle,"session_id":"s"}),
+        )
+        .await;
+        lock.execute_batch("ROLLBACK").unwrap();
+        let (_, ended) = hub
+            .onboarding_request(
+                &secret,
+                &binding,
+                reqwest::Method::GET,
+                "/v1/hub/onboarding",
+                Value::Null,
+            )
+            .await;
+        assert!(
+            ended
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["state"] != "ready"
+                    && row["mcp_verified"] == false
+                    && row["native_verified"] == false),
+            "{lifecycle}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn protocol_basics() {
     let hub = Hub::start().await;
     let key = hub.secret(1, "alice");
@@ -177,6 +492,7 @@ async fn protocol_basics() {
     assert_eq!(
         names,
         [
+            "agentscm_setup_status",
             "agentscm_start",
             "agentscm_check",
             "agentscm_status",
@@ -203,6 +519,14 @@ async fn protocol_basics() {
             .find(|tool| tool["name"] == name)
             .unwrap()
     };
+    assert_eq!(
+        tool("agentscm_setup_status")["inputSchema"]["required"],
+        json!(["agent", "session"])
+    );
+    assert_eq!(
+        tool("agentscm_setup_status")["inputSchema"]["additionalProperties"],
+        false
+    );
     assert_eq!(
         tool("agentscm_ask")["inputSchema"]["required"],
         json!(["path"])

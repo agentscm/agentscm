@@ -20,6 +20,7 @@ import { PullRequests } from './PullRequests.tsx'
 import { Workspace } from './Workspace.tsx'
 import { SkillWorkflow } from './SkillWorkflow.tsx'
 import { Standup } from './Standup.tsx'
+import { AgentSetup } from './AgentSetup.tsx'
 
 type HubSection = 'coordination' | 'work' | 'workflows' | 'activity' | 'health' | 'workspace'
 
@@ -66,6 +67,7 @@ export function Dashboard({ data, token }: { data: HubData; token: string }) {
   return (
     <main className={`page hub-page${intro ? ' intro' : ''}`} onAnimationStart={onStart}>
       {data.health?.demo && <DemoBanner />}
+      <AgentSetup token={token} />
       {import.meta.env.DEV && import.meta.env.VITE_SYNTHETIC_PREVIEW === '1' && (
         <Alert className="synthetic-workflow-preview" type="info" showIcon message="Synthetic examples · not live coding sessions" />
       )}

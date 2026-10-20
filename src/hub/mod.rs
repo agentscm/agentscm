@@ -13,6 +13,7 @@ pub mod http;
 pub mod intent;
 pub mod login;
 pub mod mcp;
+pub mod onboarding;
 pub mod publish;
 pub mod session;
 pub mod skill_workflow;
@@ -129,6 +130,7 @@ pub struct HubState {
     login: Arc<login::Login>,
     sync: Arc<sync::Sync>,
     skill_workflows: Arc<skill_workflow::SkillWorkflowRegistry>,
+    onboarding: Arc<onboarding::Observations>,
     /// Set by `agentscm demo`; health says so, for the status page.
     demo: bool,
     workspace: Option<Arc<workspace::Workspace>>,
@@ -145,6 +147,7 @@ impl HubState {
             login: Arc::new(login::Login::unconfigured()),
             sync: Arc::new(sync::Sync::unconfigured()),
             skill_workflows: Arc::new(skill_workflow::SkillWorkflowRegistry::unconfigured()),
+            onboarding: Arc::new(onboarding::Observations::default()),
             demo: false,
             workspace: None,
             #[cfg(unix)]
@@ -277,6 +280,7 @@ pub fn router(state: HubState) -> Router {
     let workspace_routes = workspace::routes();
     Router::new()
         .merge(http::routes())
+        .merge(onboarding::routes())
         .merge(work_http::routes())
         .merge(intent::routes())
         .merge(hook::routes())

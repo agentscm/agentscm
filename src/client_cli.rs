@@ -37,6 +37,8 @@ pub(crate) enum ClientCommand {
     Remove(RemoveArgs),
     /// Verify the saved connection for a checkout against its Hub.
     Check(RootArgs),
+    /// Inspect onboarding proof, or classify a captured native-host error locally.
+    Doctor(DoctorArgs),
     /// Serve the checkout-bound Hub MCP transport over standard input/output.
     Mcp(RootArgs),
 }
@@ -78,6 +80,21 @@ pub(crate) struct RootArgs {
 }
 
 #[derive(Debug, Args)]
+pub(crate) struct DoctorArgs {
+    /// Native coding-agent name.
+    #[arg(long)]
+    agent: String,
+    /// Actual native hook session ID; omit for blockers before a session can start.
+    #[arg(long)]
+    session: Option<String>,
+    /// Read up to 64 KiB of captured host diagnostics from stdin; only a blocker category leaves this machine.
+    #[arg(long)]
+    diagnostic_stdin: bool,
+    #[command(flatten)]
+    checkout: RootArgs,
+}
+
+#[derive(Debug, Args)]
 pub(crate) struct RemoveArgs {
     /// Exact absolute registered root (default: current directory); it may no longer exist.
     #[arg(long)]
@@ -101,6 +118,7 @@ pub(crate) async fn run(command: ClientCommand) -> Result<()> {
         ClientCommand::List => list(),
         ClientCommand::Remove(args) => remove(args),
         ClientCommand::Check(args) => check(args).await,
+        ClientCommand::Doctor(args) => doctor(args).await,
         ClientCommand::Mcp(args) => crate::client_mcp::run(args.root.as_deref()).await,
     }
 }
@@ -745,6 +763,79 @@ async fn check(args: RootArgs) -> Result<()> {
         verified.host,
         verified.expires_at
     );
+    println!(
+        "This checks only the Hub binding. Use client doctor and agentscm_setup_status in your native MCP client to verify hooks and MCP."
+    );
+    Ok(())
+}
+
+async fn doctor(args: DoctorArgs) -> Result<()> {
+    use agentscm::hub::onboarding::{Agent, Blocker, CLIENT_HEADER};
+    let agent = Agent::from_name(&args.agent)
+        .ok_or_else(|| invalid("agent must be claude, codex, cursor, copilot or gemini"))?;
+    let session = args
+        .session
+        .as_deref()
+        .unwrap_or(agentscm::hub::onboarding::PENDING_SESSION);
+    if session.is_empty() || session.len() > 128 || session.chars().any(char::is_control) {
+        return Err(invalid(
+            "session must be the native session ID, 1-128 bytes without controls",
+        ));
+    }
+    let root = selected_root(args.checkout.root.as_deref())?;
+    let connection = load()?.into_iter().find(|saved| saved.root == root)
+        .ok_or_else(|| invalid("No Hub binding. Run client setup for this agent and Hub; complete forge sign-in when prompted."))?;
+    if !is_current(&connection) {
+        return Err(invalid(
+            "checkout root or origin changed; review client setup before reconnecting",
+        ));
+    }
+    verify(&connection).await?;
+    let token = read_token(&connection.token_file)?;
+    let client_id = crate::client_config::onboarding_client(&root, &token);
+    let client = forge_http::client().map_err(map_hub_error)?;
+    let endpoint = format!("{}/v1/hub/onboarding", connection.hub);
+    let request = if args.diagnostic_stdin {
+        use std::io::Read;
+        let mut input = Vec::new();
+        std::io::stdin().take(65537).read_to_end(&mut input)?;
+        if input.len() > 65536 {
+            return Err(invalid(
+                "host diagnostic exceeds 64 KiB; nothing was reported",
+            ));
+        }
+        let blocker = Blocker::detect(&String::from_utf8_lossy(&input));
+        client
+            .post(&endpoint)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(json!({"agent":agent,"session":session,"blocker":blocker}).to_string())
+    } else {
+        let request = client
+            .get(&endpoint)
+            .query(&[("agent", args.agent.as_str())]);
+        if let Some(session) = args.session.as_deref() {
+            request.query(&[("session", session)])
+        } else {
+            request
+        }
+    };
+    let (status, reply) = send(
+        request.bearer_auth(&token).header(CLIENT_HEADER, client_id),
+        REPLY_BYTES,
+    )
+    .await
+    .map_err(map_hub_error)?;
+    if status != 200 {
+        return Err(invalid(
+            "Hub onboarding check failed; review the Hub binding and server version",
+        ));
+    }
+    println!("{}", serde_json::to_string_pretty(&reply)?);
+    if reply.as_array().is_some_and(Vec::is_empty) {
+        println!(
+            "Unverified: call agentscm_setup_status through native MCP using this agent and its actual native session ID, then use a native edit tool on a disposable file and check again. Missing proof does not distinguish pending trust from missing login or quota. Inspect the host's own status; pipe a captured error to client doctor --diagnostic-stdin to classify it locally."
+        );
+    }
     Ok(())
 }
 

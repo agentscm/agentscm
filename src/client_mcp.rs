@@ -120,10 +120,12 @@ async fn forward(
     url: &reqwest::Url,
     token: &str,
     body: Vec<u8>,
+    client_id: &str,
 ) -> Result<(u16, bool, Value)> {
     let request = client
         .post(url.clone())
         .bearer_auth(token)
+        .header(agentscm::hub::onboarding::CLIENT_HEADER, client_id)
         .header(CONTENT_TYPE, "application/json")
         .body(body);
     let reply = send_full(request, RESPONSE_BYTES)
@@ -184,7 +186,8 @@ async fn serve(
                 "client connection changed; restart the AgentSCM MCP server",
             ));
         }
-        let forwarded = forward(&client, &url, token, line).await;
+        let client_id = crate::client_config::onboarding_client(&connection.root, token);
+        let forwarded = forward(&client, &url, token, line, &client_id).await;
         match (id, forwarded) {
             (None, Ok((202 | 204, _, _))) => {}
             (None, _) => eprintln!("AgentSCM MCP: Hub notification failed"),

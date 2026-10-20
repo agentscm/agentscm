@@ -91,9 +91,10 @@ export function ConnectAgent({ open, onClose }: { open: boolean; onClose: () => 
             { title: 'Paste into your agent', description: 'Open your repository and paste the instructions.' },
             { title: 'Sign in with your forge', description: 'Complete the browser sign-in when asked.' },
             { title: 'Review AgentSCM access', description: 'Approve AgentSCM hooks and MCP in your agent.' },
+            { title: 'Verify a native edit', description: 'Your agent checks MCP and its edit hook in the same session. Login, approval and quota blockers include the next step.' },
           ]}
         />
-        <Text type="secondary">macOS and Linux. Verify the connection before relying on it.</Text>
+        <Text type="secondary">macOS and Linux. Your agent guides setup; you approve sign-in and trust. Configuration alone is unverified.</Text>
       </Space>
     </Modal>
   )

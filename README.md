@@ -46,6 +46,9 @@ AgentSCM connects three parts of that process:
 | Native workflow pilot | Revision-bound tests/review, explicit approval and native landing | [Claude Code workflow loop](docs/advanced/claude-code-workflows.md) |
 
 For packaged binaries or containers, see [install options](docs/install.md).
+Joining an existing Hub? Use **Connect an agent** in its status page. Your agent guides sign-in,
+native approvals and verification; readiness requires recent MCP and native edit-hook observations.
+See [member onboarding](docs/team-member-onboarding.md#verify-trust-and-behavior).
 
 ## Try it
 

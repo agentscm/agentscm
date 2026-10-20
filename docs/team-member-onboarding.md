@@ -145,6 +145,59 @@ workspace membership or enable native source control.
 
 ## Verify trust and behavior
 
+The Hub's **Agent setup** card separates live activity from setup readiness. Copy its instructions
+to your agent; it guides setup and leaves account sign-in and trust decisions with you. Coding-agent
+login is separate from forge login. Installed configuration, cached login, MCP discovery and a
+session-start event alone do not mark an agent ready.
+
+Your agent calls `agentscm_setup_status` through its native AgentSCM MCP server with its agent name
+and actual native hook session ID. Restart after installation: the native start hook supplies this
+session's validated, JSON-quoted ID in its own context. Treat it as literal tool data. If that context
+is missing, repair the hooks and restart; never guess or inspect another session. The agent uses a
+native file-edit tool on a disposable repository file,
+removes that test change, then calls the tool again. Both transports need recent observations for
+the same checkout binding, token, agent and session. Shell writes and `client check` do not supply
+edit-hook proof. Cursor observes edits afterward; use `agentscm_check` before editing there.
+
+To classify a locally captured host error or read current proof:
+
+```sh
+agentscm client doctor --agent codex --session 'actual-native-session-id' --diagnostic-stdin < host-error.txt
+agentscm client doctor --agent codex --session 'actual-native-session-id'
+```
+
+Use the actual agent and session. Before a native session can start, omit `--session` when reporting
+a login or trust blocker. Pending setup reports can never become proof; a later verified native
+session replaces them. The first command reads at most 64 KiB and sends only a blocker
+category, never raw diagnostics. Keep diagnostic files private and delete them afterward. The second
+reads observations; it does not simulate MCP or hook proof. Both require a current checkout binding.
+Run `client setup` again when that binding needs forge sign-in or token renewal.
+
+| Blocker | Guided next step |
+| --- | --- |
+| Coding-agent login missing/expired | Use that agent's normal login flow. If no account exists, stop there; setup does not create one. |
+| Hook, project or MCP approval pending | Review AgentSCM in the host controls listed above, approve it yourself, then restart the session. Never edit trust records or bypass approval. |
+| Usage/quota limit | Follow the provider's reported reset/access instructions, then resume verification. Do not repeatedly probe models, change billing or buy credits automatically. |
+| Unsupported account/client | Check supported provider access. No silent credential or paid API fallback. |
+| Unknown | Inspect host status. Missing traffic cannot distinguish login, trust and quota failures. |
+
+A blocker invalidates earlier proof. Both transports must be observed again to clear it; an HTTP
+success report cannot create readiness. Observations expire after 15 minutes, at token expiry, on
+an observed session end/restart, or on Hub restart. Revoked tokens and disabled owners are filtered
+from the card. Verify each checkout and session independently.
+The team card uses opaque row keys; only same-token, same-binding self-service reads return exact
+session IDs. The cache retains at most 16 sessions per token, 64 per forge repository and 256 total.
+New rows at capacity cannot evict other tokens' proof; capacity never implies readiness.
+In-flight proof and delayed starts are fenced against lifecycle/blocker invalidations. New, ended,
+expired or evicted sessions cannot earn proof until a native start is observed again. An unrelated
+concurrent invalidation may require retrying verification.
+
+This is advisory runtime observation, not remote host or trust-database attestation: an authenticated
+client can imitate protocol traffic. Do not fabricate payloads or use manual HTTP probes to qualify
+an agent. Ready covers the observed MCP/edit-hook path, not future quota, every edit tool or native
+workflow execution. Provider diagnostics are classified from locally captured errors; the hosted Hub
+does not continuously query provider accounts.
+
 Before approving hooks or MCP configuration:
 
 1. Verify the Hub URL with the team through a trusted channel. Repository hooks can send the Hub a
