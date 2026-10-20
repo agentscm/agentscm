@@ -63,14 +63,14 @@ fn codex_package_files(program: &str) -> Vec<(&'static str, Vec<u8>)> {
         "{} --no-telemetry hook codex --client-connection",
         shell_quote(program)
     );
-    let hook = |message: &str| {
+    let hook = |message: &str, timeout| {
         json!({"type":"command", "command":command,
-        "timeout":5, "statusMessage":message})
+        "timeout":timeout, "statusMessage":message})
     };
     let hooks = json!({"hooks": {
-        "SessionStart":[{"hooks":[hook("AgentSCM: connect this chat")]}],
-        "PreToolUse":[{"matcher":"^apply_patch$|^Edit$|^Write$", "hooks":[hook("AgentSCM: check overlapping edits")]}],
-        "SessionEnd":[{"hooks":[hook("AgentSCM: release file intents")]}]
+        "SessionStart":[{"hooks":[hook("AgentSCM: connect this chat", 5)]}],
+        "PreToolUse":[{"matcher":"^apply_patch$|^Edit$|^Write$", "hooks":[hook("AgentSCM: check overlapping edits", 5)]}],
+        "SessionEnd":[{"hooks":[hook("AgentSCM: release file intents", 3)]}]
     }});
     let common = json!({"name":"agentscm", "version":env!("CARGO_PKG_VERSION"),
         "description":"Coordination hooks for configured AgentSCM checkouts.",
@@ -883,6 +883,7 @@ mod tests {
         assert_eq!(portable, json!({"name":"agentscm"}));
         assert_eq!(compat["interface"]["displayName"], "AgentSCM");
         let hooks = read("agentscm/hooks/hooks.json");
+        assert_eq!(hooks["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3);
         for groups in hooks["hooks"].as_object().unwrap().values() {
             for group in groups.as_array().unwrap() {
                 let command = group["hooks"][0]["command"].as_str().unwrap();

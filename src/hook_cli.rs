@@ -283,7 +283,16 @@ fn valid_path_text(path: &str) -> bool {
 fn tool_call(agent: &str, payload: &Value) -> (String, Value) {
     if agent == "copilot" && payload.get("hook_event_name").is_none() {
         let input = match payload.get("toolArgs") {
-            Some(Value::String(text)) => serde_json::from_str(text).unwrap_or(Value::Null),
+            Some(Value::String(text)) => serde_json::from_str(text).unwrap_or_else(|_| {
+                if payload["toolName"]
+                    .as_str()
+                    .is_some_and(|tool| tool.eq_ignore_ascii_case("apply_patch"))
+                {
+                    Value::String(text.clone())
+                } else {
+                    Value::Null
+                }
+            }),
             Some(input) => input.clone(),
             None => Value::Null,
         };
@@ -1254,7 +1263,10 @@ mod tests {
                 "private patch",
                 "private prompt",
             ] {
-                assert!(!sent.contains(secret), "{secret}");
+                assert!(
+                    !sent.contains(secret),
+                    "excluded payload field was forwarded"
+                );
             }
         }
     }
@@ -1298,7 +1310,7 @@ mod tests {
         for (agent, payload) in cases {
             let safe = sanitized_client(agent, &payload, &path).unwrap();
             let sent = safe.to_string();
-            assert!(sent.contains("src/new.rs"), "{agent}: {sent}");
+            assert!(sent.contains("src/new.rs"), "missing edit path for {agent}");
             for secret in [
                 private,
                 "private-content",
@@ -1307,9 +1319,34 @@ mod tests {
                 "private-result",
                 "private/transcript",
             ] {
-                assert!(!sent.contains(secret), "{agent} leaked {secret}: {sent}");
+                assert!(!sent.contains(secret), "excluded payload field for {agent}");
             }
         }
+    }
+
+    #[test]
+    fn copilot_native_raw_patch_is_routed_and_source_is_not_forwarded() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = git_repo(parent.path(), "repo");
+        let connections = [connection(&root, "acme/widgets")];
+        let patch = "*** Begin Patch\n*** Add File: src/native.rs\n+private body\n*** End Patch\n";
+        for input in [
+            json!(patch),
+            json!({"command":patch}),
+            json!(json!(patch).to_string()),
+        ] {
+            let payload = json!({"sessionId":"native", "cwd":root, "toolName":"apply_patch",
+                "toolArgs":input});
+            let routed = route_client_with("copilot", &payload, &connections).unwrap();
+            assert_eq!(routed.connection.repo, "acme/widgets");
+            assert_eq!(
+                routed.payload,
+                json!({"sessionId":"native", "toolName":"apply_patch",
+                "toolArgs":{"command":"*** Add File: src/native.rs\n"}})
+            );
+        }
+        let malformed = json!({"toolName":"edit", "toolArgs":"not JSON"});
+        assert!(edit_paths("copilot", &malformed).is_err());
     }
 
     #[test]

@@ -340,13 +340,13 @@ async fn mint_request(hub: &str, session: &str, repo: &str) -> Result<(u16, Valu
 async fn session_for(hub: &str, provider: Provider, origin_host: &str) -> Result<String> {
     if has_session(Some(hub))? {
         let session = load_session(Some(hub))?.1;
-        if session_identity_matches(hub, &session, provider, origin_host).await? {
+        if hub_identity_matches(hub, &session, provider, origin_host).await? {
             return Ok(session);
         }
     }
     sign_in(hub, provider_name(provider), Some(origin_host)).await?;
     let session = load_session(Some(hub))?.1;
-    if !session_identity_matches(hub, &session, provider, origin_host).await? {
+    if !hub_identity_matches(hub, &session, provider, origin_host).await? {
         return Err(invalid(
             "Hub sign-in identity does not match the checkout origin",
         ));
@@ -354,7 +354,7 @@ async fn session_for(hub: &str, provider: Provider, origin_host: &str) -> Result
     Ok(session)
 }
 
-async fn session_identity_matches(
+async fn hub_identity_matches(
     hub: &str,
     session: &str,
     provider: Provider,
@@ -873,12 +873,12 @@ mod tests {
             ),
         ]);
         assert!(
-            session_identity_matches(&hub, "session-synthetic", Provider::Gitlab, "127.0.0.1")
+            hub_identity_matches(&hub, "session-synthetic", Provider::Gitlab, "127.0.0.1")
                 .await
                 .unwrap()
         );
         assert!(
-            !session_identity_matches(&hub, "session-synthetic", Provider::Gitlab, "127.0.0.1")
+            !hub_identity_matches(&hub, "session-synthetic", Provider::Gitlab, "127.0.0.1")
                 .await
                 .unwrap()
         );

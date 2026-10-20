@@ -43,8 +43,14 @@ fn shell_quote(value: &str) -> String {
 fn program_text(program: &Path) -> Result<&str> {
     program
         .to_str()
-        .filter(|text| program.is_absolute() && !text.chars().any(char::is_control))
+        .filter(|text| program.is_absolute() && safe_native_literal(text))
         .ok_or_else(|| invalid("installed executable path is not a safe absolute UTF-8 path"))
+}
+
+fn safe_native_literal(text: &str) -> bool {
+    !text
+        .chars()
+        .any(|character| character.is_control() || matches!(character, '$' | '%'))
 }
 
 fn command(agent: Agent, program: &Path) -> Result<String> {
@@ -58,14 +64,30 @@ fn command(agent: Agent, program: &Path) -> Result<String> {
 fn mcp_args(root: &Path) -> Result<Value> {
     let root = root
         .to_str()
-        .filter(|text| !text.chars().any(char::is_control))
+        .filter(|text| safe_native_literal(text))
         .ok_or_else(|| invalid("checkout path is not safe UTF-8"))?;
     Ok(json!(["--no-telemetry", "client", "mcp", "--root", root]))
 }
 
 fn mcp(root: &Path, program: &Path) -> Result<Value> {
     // Gemini's strict schema selects stdio from `command` and rejects a `type` key.
-    Ok(json!({"command":program_text(program)?, "args":mcp_args(root)?}))
+    Ok(
+        json!({"command":program_text(program)?, "args":mcp_args(root)?,
+        "env":{"XDG_CONFIG_HOME":mcp_config_home(&crate::hub_cli::config_dir()?)?}}),
+    )
+}
+
+fn mcp_config_home(directory: &Path) -> Result<String> {
+    let text = std::path::absolute(directory)?
+        .into_os_string()
+        .into_string()
+        .map_err(|_| invalid("client configuration directory is not UTF-8"))?;
+    if !safe_native_literal(&text) {
+        return Err(invalid(
+            "client configuration directory is not safe for native MCP settings",
+        ));
+    }
+    Ok(text)
 }
 
 fn own_command(value: &Value) -> bool {
@@ -177,7 +199,7 @@ fn hook_groups(agent: Agent, program: &Path) -> Result<Vec<(&'static str, Vec<Va
             ]
         }
         Agent::Copilot => {
-            let hook = |timeout| json!({"type":"command","command":command,"timeout":timeout});
+            let hook = |timeout| json!({"type":"command","command":command,"timeoutSec":timeout});
             vec![
                 ("sessionStart", vec![hook(5)]),
                 ("preToolUse", vec![hook(5)]),
@@ -350,9 +372,10 @@ fn codex_mcp(root: &Path, program: &Path) -> Result<Edit> {
         ));
     }
     let body = format!(
-        "{BEGIN}\n[mcp_servers.agentscm]\ncommand = {}\nargs = {}\nstartup_timeout_sec = 10\ntool_timeout_sec = 30\n{END}",
+        "{BEGIN}\n[mcp_servers.agentscm]\ncommand = {}\nargs = {}\nenv = {{ XDG_CONFIG_HOME = {} }}\nstartup_timeout_sec = 10\ntool_timeout_sec = 30\n{END}",
         json!(program_text(program)?),
-        mcp_args(root)?
+        mcp_args(root)?,
+        json!(mcp_config_home(&crate::hub_cli::config_dir()?)?)
     );
     Ok(Edit {
         relative,
@@ -657,6 +680,18 @@ mod tests {
             Agent::Gemini,
         ] {
             let edits = plan(agent, &root, Path::new("/opt/team's bin/agentscm")).unwrap();
+            for edit in &edits {
+                if let Ok(value) = serde_json::from_str::<Value>(&edit.after) {
+                    for key in ["mcpServers", "servers"] {
+                        if let Some(server) = value[key].get("agentscm") {
+                            assert_eq!(
+                                server["env"],
+                                json!({"XDG_CONFIG_HOME":mcp_config_home(&crate::hub_cli::config_dir().unwrap()).unwrap()})
+                            );
+                        }
+                    }
+                }
+            }
             assert!(
                 edits
                     .iter()
@@ -695,6 +730,9 @@ mod tests {
         .unwrap();
         assert_eq!(hooks["version"], 1);
         assert!(hooks["hooks"]["preToolUse"].is_array());
+        assert_eq!(hooks["hooks"]["preToolUse"][0]["timeoutSec"], 5);
+        assert_eq!(hooks["hooks"]["sessionEnd"][0]["timeoutSec"], 3);
+        assert!(hooks["hooks"]["preToolUse"][0].get("timeout").is_none());
         assert!(hooks["hooks"].get("PreToolUse").is_none());
     }
 
@@ -786,6 +824,41 @@ mod tests {
     }
 
     #[test]
+    fn native_mcp_paths_cannot_be_rewritten_by_host_expansion() {
+        let (_dir, root) = repo();
+        for path in [
+            "/work/${HOME}/repo",
+            "/work/$HOME/repo",
+            "/work/%HOME%/repo",
+        ] {
+            assert!(mcp_args(Path::new(path)).is_err());
+            assert!(mcp(Path::new(path), Path::new("/opt/agentscm")).is_err());
+            assert!(mcp(&root, Path::new(path)).is_err());
+            assert!(codex_mcp(&root, Path::new(path)).is_err());
+        }
+    }
+
+    #[test]
+    fn mcp_configuration_home_keeps_the_setup_location_and_rejects_expansion() {
+        let relative = Path::new("state with spaces");
+        let captured = mcp_config_home(relative).unwrap();
+        assert_eq!(
+            Path::new(&captured),
+            std::env::current_dir().unwrap().join(relative)
+        );
+        assert!(Path::new(&captured).is_absolute());
+        assert_eq!(mcp_config_home(Path::new(&captured)).unwrap(), captured);
+        for path in [
+            "state\nelsewhere",
+            "${HOME}/state",
+            "$HOME/state",
+            "%HOME%/state",
+        ] {
+            assert!(mcp_config_home(Path::new(path)).is_err());
+        }
+    }
+
+    #[test]
     fn codex_upgrade_keeps_unrelated_toml_and_replaces_one_owned_block() {
         let (_dir, root) = repo();
         std::fs::create_dir(root.join(".codex")).unwrap();
@@ -800,6 +873,10 @@ mod tests {
         assert!(next.after.starts_with("[features]\nexample = false\n"));
         assert!(!next.after.contains("/old/agentscm"));
         assert_eq!(next.after.matches(BEGIN).count(), 1);
+        assert!(next.after.contains(&format!(
+            "env = {{ XDG_CONFIG_HOME = {} }}",
+            json!(mcp_config_home(&crate::hub_cli::config_dir().unwrap()).unwrap())
+        )));
     }
 
     #[test]
