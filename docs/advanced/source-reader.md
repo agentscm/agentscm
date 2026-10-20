@@ -8,6 +8,13 @@ manifest traversal and diff implementation with the local `Engine`. It does
 not require a temporary store or a copy of the repository. The `SourceRead`
 trait also lets history and relation pagination use either reader.
 
+`Engine::stat_file` and `SourceReader::stat_file` resolve exact manifest membership
+and return the path, entry kind and blob identity without fetching the blob.
+Only an absent manifest entry returns `None`; unavailable metadata remains an
+error. Membership does not establish blob availability. The local `files`, `stat`
+and `read` commands expose this exploration before creating a
+[task workspace](task-workspaces.md).
+
 Each requested object ID is checked before the callback opens it. The reader
 consumes at most `MAX_OBJECT_BYTES + 1` bytes, rejects an oversized object, and
 checks its digest and native encoding before using it. High-level operations

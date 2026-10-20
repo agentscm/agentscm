@@ -16,6 +16,24 @@ pub enum WorkspaceCommand {
         root: PathBuf,
         change: String,
         revision: String,
+        /// Materialize this path and its descendants; repeat for configuration/dependencies.
+        /// With no paths, materialize the complete supported revision.
+        #[arg(long = "path")]
+        paths: Vec<String>,
+    },
+    /// Add paths from the current immutable base without replacing local occupants.
+    Expand {
+        root: PathBuf,
+        operation_id: String,
+        expected_generation: u64,
+        /// Path root to add; repeat as needed. A sole '.' requests the complete revision.
+        #[arg(long = "path", required = true)]
+        paths: Vec<String>,
+    },
+    /// Inspect base membership and projection state without fetching file contents.
+    PathState {
+        root: PathBuf,
+        path: String,
     },
     State {
         root: PathBuf,
@@ -113,6 +131,8 @@ pub fn sync(data_dir: &Path, command: SyncCommand) -> Result<Value> {
 pub fn workspace(data_dir: &Path, command: WorkspaceCommand) -> Result<Value> {
     let root = match &command {
         WorkspaceCommand::Create { root, .. }
+        | WorkspaceCommand::Expand { root, .. }
+        | WorkspaceCommand::PathState { root, .. }
         | WorkspaceCommand::State { root }
         | WorkspaceCommand::Status { root, .. }
         | WorkspaceCommand::Preview { root, .. }
@@ -152,6 +172,7 @@ pub fn workspace(data_dir: &Path, command: WorkspaceCommand) -> Result<Value> {
         root,
         change,
         revision,
+        paths,
     } = command
     {
         let id = ChangeId {
@@ -165,7 +186,11 @@ pub fn workspace(data_dir: &Path, command: WorkspaceCommand) -> Result<Value> {
                 "workspace revision must match the Change's current context at creation".into(),
             ));
         }
-        let workspace = Workspace::create(&engine, root, id, &revision)?;
+        let workspace = if paths.is_empty() {
+            Workspace::create(&engine, root, id, &revision)?
+        } else {
+            Workspace::create_scoped(&engine, root, id, &revision, &paths)?
+        };
         return Ok(json!({"ok":true,"workspace":workspace.state()?}));
     }
     let mut workspace = Workspace::open(root)?;
@@ -175,6 +200,17 @@ pub fn workspace(data_dir: &Path, command: WorkspaceCommand) -> Result<Value> {
         ));
     }
     match command {
+        WorkspaceCommand::Expand {
+            operation_id,
+            expected_generation,
+            paths,
+            ..
+        } => Ok(
+            json!({"ok":true,"outcome":workspace.expand(&engine, &operation_id, expected_generation, &paths)?}),
+        ),
+        WorkspaceCommand::PathState { path, .. } => {
+            Ok(json!({"ok":true,"path":path,"state":workspace.path_state(&engine, &path)?}))
+        }
         WorkspaceCommand::State { .. } => Ok(json!({"ok":true,"workspace":workspace.state()?})),
         WorkspaceCommand::Status { limit, .. } => {
             Ok(json!({"ok":true,"status":workspace.status(&engine, limit)?}))

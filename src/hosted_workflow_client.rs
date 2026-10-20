@@ -2140,6 +2140,7 @@ mod tests {
             },
             base_revision: base.into(),
             generation,
+            scope: None,
             ready: true,
             pending: None,
         };

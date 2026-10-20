@@ -82,9 +82,12 @@ struct Verifier {
 /// Create a new v1 directory only. A successful manifest is written after its members.
 /// On failure a partial directory can remain; callers must not treat it as complete.
 pub fn package_native(output: &Path) -> Result<NativeBundle> {
-    let executable = std::env::current_exe()?;
+    package_native_from_executable(output, &std::env::current_exe()?)
+}
+
+fn package_native_from_executable(output: &Path, executable: &Path) -> Result<NativeBundle> {
     create_output(output)?;
-    let mut files = vec![copy_executable(&executable, output, MAX_EXECUTABLE_BYTES)?];
+    let mut files = vec![copy_executable(executable, output, MAX_EXECUTABLE_BYTES)?];
     write_main_materials(output, &mut files)?;
     let manifest = native_bundle("agentscm.native-bundle/v1", files, None);
     write_member(
@@ -102,14 +105,17 @@ pub fn package_native(output: &Path) -> Result<NativeBundle> {
 /// the output directory is created. The retained handle is copied but never executed.
 pub fn package_native_with_verifier(output: &Path, verifier: &Path) -> Result<NativeBundle> {
     let verifier = open_verifier(verifier)?;
-    package_native_with_open_verifier(output, verifier)
+    package_native_with_open_verifier(output, verifier, &std::env::current_exe()?)
 }
 
-fn package_native_with_open_verifier(output: &Path, mut verifier: File) -> Result<NativeBundle> {
-    let executable = std::env::current_exe()?;
+fn package_native_with_open_verifier(
+    output: &Path,
+    mut verifier: File,
+    executable: &Path,
+) -> Result<NativeBundle> {
     create_output(output)?;
 
-    let mut files = vec![copy_executable(&executable, output, MAX_EXECUTABLE_BYTES)?];
+    let mut files = vec![copy_executable(executable, output, MAX_EXECUTABLE_BYTES)?];
     write_main_materials(output, &mut files)?;
     create_material_directories(output)?;
     files.push(copy_open_executable(
@@ -154,7 +160,7 @@ fn package_native_with_verifier_after_check(
     after_initial_check: impl FnOnce(),
 ) -> Result<NativeBundle> {
     let verifier = open_verifier_after_check(verifier, after_initial_check)?;
-    package_native_with_open_verifier(output, verifier)
+    package_native_with_open_verifier(output, verifier, &std::env::current_exe()?)
 }
 
 fn create_output(output: &Path) -> Result<()> {
@@ -682,6 +688,33 @@ mod tests {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
+    fn explicit_executable_fixtures_keep_the_production_size_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("oversized-native");
+        File::create(&executable)
+            .unwrap()
+            .set_len(MAX_EXECUTABLE_BYTES + 1)
+            .unwrap();
+        let verifier = directory.path().join("portable-verifier");
+        fs::write(&verifier, b"opaque verifier bytes").unwrap();
+        let v1 = directory.path().join("v1");
+        let v2 = directory.path().join("v2");
+        assert!(matches!(
+            package_native_from_executable(&v1, &executable),
+            Err(Error::Limit(_))
+        ));
+        assert!(matches!(
+            package_native_with_open_verifier(&v2, open_verifier(&verifier).unwrap(), &executable),
+            Err(Error::Limit(_))
+        ));
+        for output in [v1, v2] {
+            assert!(!output.join(EXECUTABLE_NAME).exists());
+            assert!(!output.join("manifest.json").exists());
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
     fn verifier_final_symlink_is_rejected_before_any_read() {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("verifier");
@@ -800,18 +833,28 @@ mod tests {
     #[test]
     fn late_parent_sync_failure_retains_unknown_manifest_and_refuses_reuse() {
         let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("native-executable");
+        fs::write(&executable, b"synthetic native executable").unwrap();
         let output = directory.path().join("bundle");
         let _failure = fail_sync_at(SyncPoint::Parent);
-        assert!(matches!(package_native(&output), Err(Error::Io(_))));
+        assert!(matches!(
+            package_native_from_executable(&output, &executable),
+            Err(Error::Io(_))
+        ));
         let manifest = fs::read(output.join("manifest.json")).unwrap();
         serde_json::from_slice::<serde_json::Value>(&manifest).unwrap();
-        assert!(matches!(package_native(&output), Err(Error::Conflict(_))));
+        assert!(matches!(
+            package_native_from_executable(&output, &executable),
+            Err(Error::Conflict(_))
+        ));
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn v2_sync_failures_preserve_pre_manifest_and_unknown_outputs() {
         let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("native-executable");
+        fs::write(&executable, b"synthetic native executable").unwrap();
         let verifier = directory.path().join("portable-verifier");
         fs::write(&verifier, b"opaque verifier bytes").unwrap();
 
@@ -819,7 +862,11 @@ mod tests {
         {
             let _failure = fail_sync_at(SyncPoint::Child);
             assert!(matches!(
-                package_native_with_verifier(&child_failure, &verifier),
+                package_native_with_open_verifier(
+                    &child_failure,
+                    open_verifier(&verifier).unwrap(),
+                    &executable
+                ),
                 Err(Error::Io(_))
             ));
         }
@@ -830,7 +877,11 @@ mod tests {
         {
             let _failure = fail_sync_at(SyncPoint::Parent);
             assert!(matches!(
-                package_native_with_verifier(&parent_failure, &verifier),
+                package_native_with_open_verifier(
+                    &parent_failure,
+                    open_verifier(&verifier).unwrap(),
+                    &executable
+                ),
                 Err(Error::Io(_))
             ));
         }
@@ -840,12 +891,23 @@ mod tests {
         assert_eq!(manifest["files"].as_array().unwrap().len(), 94);
         assert_eq!(regular_file_count(&parent_failure), 95);
         assert!(matches!(
-            package_native_with_verifier(&parent_failure, &verifier),
+            package_native_with_open_verifier(
+                &parent_failure,
+                open_verifier(&verifier).unwrap(),
+                &executable
+            ),
             Err(Error::Conflict(_))
         ));
 
         let fresh_output = directory.path().join("fresh-bundle");
-        assert!(package_native_with_verifier(&fresh_output, &verifier).is_ok());
+        assert!(
+            package_native_with_open_verifier(
+                &fresh_output,
+                open_verifier(&verifier).unwrap(),
+                &executable
+            )
+            .is_ok()
+        );
         assert_eq!(regular_file_count(&fresh_output), 95);
     }
 
@@ -876,13 +938,19 @@ mod tests {
             ),
         ] {
             let directory = tempfile::tempdir().unwrap();
+            let executable = directory.path().join("native-executable");
+            fs::write(&executable, b"synthetic native executable").unwrap();
             let verifier = directory.path().join("portable-verifier");
             let output = directory.path().join("failed-bundle");
             fs::write(&verifier, b"opaque verifier bytes").unwrap();
 
             let result = {
                 let _failure = fail_write_at(fault);
-                package_native_with_verifier(&output, &verifier)
+                package_native_with_open_verifier(
+                    &output,
+                    open_verifier(&verifier).unwrap(),
+                    &executable,
+                )
             };
             assert!(matches!(result, Err(Error::Io(_))));
             assert!(output.is_dir());
@@ -917,11 +985,22 @@ mod tests {
             }
 
             assert!(matches!(
-                package_native_with_verifier(&output, &verifier),
+                package_native_with_open_verifier(
+                    &output,
+                    open_verifier(&verifier).unwrap(),
+                    &executable
+                ),
                 Err(Error::Conflict(_))
             ));
             let fresh_output = directory.path().join("fresh-bundle");
-            assert!(package_native_with_verifier(&fresh_output, &verifier).is_ok());
+            assert!(
+                package_native_with_open_verifier(
+                    &fresh_output,
+                    open_verifier(&verifier).unwrap(),
+                    &executable
+                )
+                .is_ok()
+            );
             assert_eq!(regular_file_count(&fresh_output), 95);
         }
     }

@@ -1247,3 +1247,120 @@ fn publication_scratch_still_rejects_links_and_oversized_files() {
         assert!(!output.exists());
     }
 }
+
+#[test]
+fn scoped_workspace_restore_retains_projection_and_unseen_source() {
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    let (_, base, mut context, _) = populated(&data);
+    let engine = Engine::open(&data).unwrap();
+    let revision = engine
+        .checkpoint(
+            Some(&base),
+            &[FileChange {
+                path: "unseen.txt".into(),
+                content: Some(b"preserve unseen".to_vec()),
+            }],
+        )
+        .unwrap();
+    context.change.id = "scoped-backup".into();
+    context.revision = revision.clone();
+    Authority::open(&data)
+        .unwrap()
+        .start_change(&context)
+        .unwrap();
+    let work = temp.path().join("work");
+    let workspace = Workspace::create_scoped(
+        &engine,
+        &work,
+        context.change,
+        &revision,
+        &["hello.txt".into()],
+    )
+    .unwrap();
+    let before = workspace.state().unwrap();
+    fs::write(work.join("hello.txt"), b"dirty retained").unwrap();
+    drop(workspace);
+    drop(engine);
+    let backup = temp.path().join("backup");
+    local_recovery::backup(&data, &backup, &[work], &[], true).unwrap();
+    let restored = temp.path().join("restored");
+    local_recovery::restore(&backup, &restored).unwrap();
+    local_recovery::activate(&restored, true, true).unwrap();
+    let engine = Engine::open(restored.join("data")).unwrap();
+    let root = restored.join("workspaces/0");
+    let mut workspace = Workspace::open(&root).unwrap();
+    assert_eq!(workspace.state().unwrap(), before);
+    assert!(!root.join("unseen.txt").exists());
+    let outcome = workspace.checkpoint(&engine, "restored-edit", 0).unwrap();
+    let agentscm::workspace::OperationOutcome::Checkpointed { revision, .. } = outcome else {
+        panic!("checkpoint failed")
+    };
+    assert_eq!(
+        engine.read_file(&revision, "hello.txt").unwrap(),
+        b"dirty retained"
+    );
+    assert_eq!(
+        engine.read_file(&revision, "unseen.txt").unwrap(),
+        b"preserve unseen"
+    );
+}
+
+#[test]
+fn schema_four_workspace_backup_rejects_missing_scope_relations() {
+    for table in [
+        "workspace_scope",
+        "scope_expansions",
+        "scope_expansion_paths",
+    ] {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        let (_, revision, context, _) = populated(&data);
+        let engine = Engine::open(&data).unwrap();
+        let root = temp.path().join("work");
+        let workspace = Workspace::create_scoped(
+            &engine,
+            &root,
+            context.change,
+            &revision,
+            &["hello.txt".into()],
+        )
+        .unwrap();
+        drop(workspace);
+        drop(engine);
+        let db = rusqlite::Connection::open(root.join(".agentscm-workspace/state.sqlite")).unwrap();
+        db.execute_batch(&format!("PRAGMA foreign_keys=OFF; DROP TABLE {table};"))
+            .unwrap();
+        drop(db);
+        let backup = temp.path().join("backup");
+        assert!(
+            local_recovery::backup(&data, &backup, &[root], &[], true).is_err(),
+            "accepted missing {table}"
+        );
+    }
+}
+
+#[test]
+fn schema_four_backup_rejects_a_pending_scope_shrink() {
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    let (_, revision, context, _) = populated(&data);
+    let engine = Engine::open(&data).unwrap();
+    let root = temp.path().join("work");
+    let workspace = Workspace::create_scoped(
+        &engine,
+        &root,
+        context.change,
+        &revision,
+        &["hello.txt".into()],
+    )
+    .unwrap();
+    drop(workspace);
+    drop(engine);
+    let db = rusqlite::Connection::open(root.join(".agentscm-workspace/state.sqlite")).unwrap();
+    db.execute("INSERT INTO scope_expansions(operation_id,request_digest,status,expected_generation,before_roots_json,after_roots_json) VALUES ('bad',?1,'pending',0,?2,?3)", rusqlite::params!["0".repeat(64), &b"[\"hello.txt\"]"[..], &b"[\"later\"]"[..]]).unwrap();
+    drop(db);
+    assert!(
+        local_recovery::backup(&data, &temp.path().join("backup"), &[root], &[], true).is_err()
+    );
+}

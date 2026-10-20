@@ -2,7 +2,7 @@
 
 > **Experimental (alpha).** This part of AgentSCM is not part of the main path, may change without migration, and has had limited testing. See the [advanced index](README.md).
 
-AgentSCM workspaces are ordinary directories materialized from an immutable native revision. They use `store::Engine`. Git is run only to read exclusion settings when the workspace root has a `.git` (see [source selection](#source-selection)). The local alpha supports workspace creation, status, checkpoint, undo, completed native merge application and interrupted-operation recovery. See [durable merge sessions](merge.md) for local divergence and conflict resolution. Authenticated remote synchronization and the remaining gates below are not yet implemented.
+AgentSCM workspaces are ordinary directories materialized from an immutable native revision. They use `store::Engine`. A full workspace materializes the complete supported revision; a [task-scoped workspace](task-workspaces.md) materializes explicit path roots and can expand them later without treating unmaterialized base paths as deletions. Git is run only to read exclusion settings when the workspace root has a `.git` (see [source selection](#source-selection)). The local alpha supports workspace creation, scope expansion, status, checkpoint, undo, completed native merge application and interrupted-operation recovery. See [durable merge sessions](merge.md) for local divergence and conflict resolution. The separate hosted laptop profile transfers a bounded complete source bundle; authenticated remote task-workspace mutation and the remaining gates below are not implemented.
 
 Every workspace contains a reserved `.agentscm-workspace` directory. It stores a SQLite journal, exact staged checkpoint bytes and recovery files. The whole namespace is excluded from status and checkpoints. A source revision, or a working-tree file, with any path component equal to `.git`, `.agentscm`, `.agentscm-workspace` or `agentscm-data`, ignoring ASCII case, is rejected: on a case-insensitive filesystem a variant such as `.AGENTSCM-WORKSPACE` would otherwise resolve into this directory, and Git metadata never belongs in native source. A `.git` directory or `gitdir` file at the workspace root is skipped as metadata and never captured; a `.git` anywhere deeper blocks status and checkpoint unless a rule excludes it. Do not edit this directory.
 
@@ -16,9 +16,21 @@ Create a workspace for an existing Change and revision:
 
 ```sh
 agentscm --data-dir ./agentscm-data workspace create ./work change-1 REVISION
+agentscm --data-dir ./agentscm-data workspace create ./scoped-work change-2 REVISION \
+  --path Cargo.toml --path crates/example
 ```
 
-The destination must not exist. Creation first reads and validates the complete bounded source snapshot, including the reserved namespace, entry, byte and depth limits. It then reserves the destination with a non-overwriting directory create, writes durable initializing state, and materializes the captured bytes. A rejected source leaves no destination. Existing paths are never replaced. A crash before the initialization journal exists can leave an unrecognized empty destination; inspect and remove it manually if appropriate. A crash after the journal exists is recoverable.
+The destination must not exist. Creation first reads and validates the complete bounded source inventory, including the reserved namespace, entry and depth limits. A full workspace reads the complete supported snapshot. A scoped workspace reads the selected paths and records canonical effective roots; `--path .` explicitly selects the full tree. Creation then reserves the destination with a non-overwriting directory create, writes durable initializing state, and materializes the captured bytes. A rejected source leaves no destination. Existing paths are never replaced. A crash before the initialization journal exists can leave an unrecognized empty destination; inspect and remove it manually if appropriate. A crash after the journal exists is recoverable.
+
+Expand an existing scoped workspace with a fresh operation ID and its expected generation:
+
+```sh
+agentscm --data-dir ./agentscm-data workspace expand ./scoped-work expand-1 0 \
+  --path crates/shared
+agentscm --data-dir ./agentscm-data workspace path-state ./scoped-work crates/shared/src/lib.rs
+```
+
+Expansion materializes exact entries from the current immutable base, refuses newly selected local occupants rather than overwriting them, records the expanded canonical scope and advances the workspace generation. Existing dirty paths already in scope remain untouched. Move an out-of-scope occupant aside before expansion, then reapply its edit. `path-state` reads base membership and local projection state without reading a source blob: `materialized` means the path is in scope and exists locally, including a local addition or modification; `missing_local` means an in-scope base path is absent and would be a deletion; `unmaterialized` means a base path is outside scope; `outside_scope_local` means a local occupant exists outside scope; `nonexistent` means neither the base nor projected working tree contains the path. See the [task-scoped guide](task-workspaces.md) for exploration, full fallback and checkpoint semantics.
 
 Inspect the workspace state or compare its ordinary files with the current base:
 
@@ -53,7 +65,7 @@ Undo restores the prior base only when every affected path still matches one of 
 
 Status, checkpoint, undo, merge application and recovery capture the working tree through one selection. Preview is a read-only report of that selection.
 
-**What is selected.** Every path in the base revision is always selected, so a rule can never hide an edit to a tracked file or its deletion; to remove a tracked file, delete it. Untracked files and directories are selected unless a rule excludes them. An excluded directory is not entered. A tracked file inside an excluded directory is still selected; untracked files beside it stay excluded.
+**What is selected.** In a full workspace, every path in the base revision is selected. In a scoped workspace, every base path under an effective scope root is selected; base paths outside scope remain unmaterialized and checkpoint inherits them unchanged. Root and ancestor ignore files needed to evaluate the requested projection can be added to the effective scope. Within that effective scope, a rule can never hide an edit to a tracked file or its deletion; to remove an in-scope tracked file, delete it. Untracked files and directories inside scope are selected unless a rule excludes them. Untracked files outside scope are ignored and preserved until their parent is explicitly expanded. An excluded directory is not entered. An in-scope tracked file inside an excluded directory is still selected; untracked files beside it stay excluded.
 
 **Rule sources.** Rules use gitignore syntax. From lowest to highest precedence:
 
@@ -77,7 +89,7 @@ Limits:
 
 **Git at the root.** When the root has a `.git`, status and checkpoint run `git` to read its exclusion settings. This needs a working `git` (2.31 or later, for `--path-format`) and a repository Git accepts (ownership and `safe.directory` apply) whose top level is exactly the workspace root; otherwise they fail with an explicit error and capture nothing. Git configuration includes are honored. The user's `PATH`, `HOME` and Git configuration environment are trusted. Every scan (status, checkpoint, preview, undo, merge application, recovery) runs three Git commands, one `rev-parse` and two `config` reads, each with a 10 second timeout and bounded output. Without a root `.git`, Git is not run; the scan instead writes a short-lived case-probe file in `.agentscm-workspace` and removes it.
 
-**Preview.** Before the first hosted `skill-workflow remote-check` or any other transfer, list what will be sent (`remote-init` creates the workspace, so preview applies after it):
+**Preview.** Before the first hosted `skill-workflow remote-check` or any other transfer, list what will be sent (`remote-init` creates a full workspace, so preview applies after it). For a scoped workspace, the preview covers only its effective projection:
 
 ```sh
 agentscm --data-dir ./agentscm-data workspace preview ./work --limit 1000
@@ -103,13 +115,13 @@ Status reports `kind_changed` with `before` and `after` kinds when a path keeps 
 
 ## Interrupted operations
 
-State and status expose one pending operation. Complete it after a restart:
+State and status expose one pending operation, including a pending expansion. Complete it after a restart:
 
 ```sh
 agentscm --data-dir ./agentscm-data workspace recover ./work --choice complete
 ```
 
-For a pending checkpoint, completion publishes only the staged bytes. For initialization, it fills missing files and accepts already written files only when their bytes match the requested revision. For undo or merge application, each affected path must be the before state, after state or a recognized journal temporary. Divergent bytes produce a blocked outcome and remain untouched.
+For a pending checkpoint, completion publishes only the staged bytes. For initialization, it fills missing files and accepts already written files only when their bytes match the requested revision. For expansion, it installs only its retained base entries, checks retained installation evidence and commits the retained scope after the paths match. An unrelated local occupant blocks recovery even if its bytes match. Expansion rollback preserves ancestor directories, including harmless empty directories created during an interrupted attempt. For undo or merge application, each affected path must be the before state, after state or a recognized journal temporary. Divergent bytes produce a blocked outcome and remain untouched.
 
 Cancel a pending checkpoint or roll a partial undo or merge application back to its prior state:
 
@@ -117,7 +129,7 @@ Cancel a pending checkpoint or roll a partial undo or merge application back to 
 agentscm --data-dir ./agentscm-data workspace recover ./work --choice roll-back
 ```
 
-Initialization cannot be rolled back automatically. AgentSCM does not delete a workspace root because it cannot prove that another process did not add files after creation.
+Initialization cannot be rolled back automatically. Rolling back expansion removes only entries installed by that pending operation when they still match the retained bytes. AgentSCM does not delete a workspace root because it cannot prove that another process did not add files after creation.
 
 One SQLite immediate-writer transaction serializes bounded filesystem mutation for a workspace across processes. Independent workspaces have independent journals and can checkpoint concurrently into the immutable source store. SQLite uses WAL, full synchronous commits and a bounded busy timeout.
 
