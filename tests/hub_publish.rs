@@ -1168,6 +1168,9 @@ impl Env {
                 .env_clear()
                 .env("PATH", "/usr/bin:/bin")
                 .env("HOME", &root)
+                .env("GIT_CONFIG_SYSTEM", root.join("synthetic-system-gitconfig"))
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("AGENTSCM_HUB_URL", url)
                 .env("AGENTSCM_HUB_TOKEN_FILE", token)
                 .arg("--data-dir")
@@ -1252,6 +1255,11 @@ impl Env {
 async fn attached_joined_https_candidate_uses_existing_hub_and_continues_same_pr() {
     let transport = HttpsFixture::new(false).repository(REPO);
     let env = Env::start_with_transport(Some(&transport)).await;
+    fs::write(
+        env.root.path().join("synthetic-system-gitconfig"),
+        "[filter \"synthetic-runner\"]\nclean = cat\n",
+    )
+    .unwrap();
     let data = env.root.path().join("attached-data");
     drop(Engine::open(&data).unwrap());
     drop(Authority::open(&data).unwrap());
