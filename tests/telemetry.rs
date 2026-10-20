@@ -459,7 +459,12 @@ fn specialized_setup_failure_keeps_its_exit_and_records_failed_feature() {
     assert!(failed.stdout.is_empty());
     let rendered: Value = serde_json::from_slice(&failed.stderr).expect("specialized JSON failure");
     assert_eq!(rendered["ok"], false);
-    assert_eq!(rendered["error"]["kind"], "existing_path");
+    let expected_error = if cfg!(target_os = "macos") {
+        "existing_path"
+    } else {
+        "unsupported_platform"
+    };
+    assert_eq!(rendered["error"]["kind"], expected_error);
 
     let inspected = json(&run(&config, &data, &["telemetry", "inspect"]));
     let events = inspected["queued_events"].as_array().unwrap();

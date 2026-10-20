@@ -93,15 +93,15 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Inspect or change pseudonymous product telemetry.
-    Telemetry {
-        #[command(subcommand)]
-        command: telemetry_cli::TelemetryCommand,
-    },
     /// [experimental] Run bounded repository skill workflows on immutable local source.
     SkillWorkflow {
         #[command(subcommand)]
         command: skill_workflow_cli::SkillWorkflowCommand,
+    },
+    /// Inspect or change pseudonymous product telemetry.
+    Telemetry {
+        #[command(subcommand)]
+        command: telemetry_cli::TelemetryCommand,
     },
     /// [experimental] Initialize or inspect an explicitly owned local native installation.
     #[cfg(unix)]
@@ -525,14 +525,14 @@ enum RunExit {
 
 async fn run(cli: Cli) -> Result<RunExit> {
     match cli.command {
+        Command::SkillWorkflow { command } => {
+            skill_workflow_cli::run(&cli.data_dir, command).await?;
+        }
         Command::Telemetry { command } => {
             match telemetry_cli::run(command, cli.no_telemetry).await? {
                 telemetry_cli::Output::Value(value) => print_json(&value),
                 telemetry_cli::Output::Quiet => {}
             }
-        }
-        Command::SkillWorkflow { command } => {
-            skill_workflow_cli::run(&cli.data_dir, command).await?;
         }
         #[cfg(unix)]
         Command::Setup { command } => match setup_cli::run(command) {
