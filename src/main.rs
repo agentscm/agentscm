@@ -324,6 +324,24 @@ enum Command {
         #[arg(default_value = "-")]
         input: PathBuf,
     },
+    /// [experimental] List or find paths in one bounded manifest page, without file contents.
+    Files {
+        revision: String,
+        /// JSON cursor string from a previous page, saved in a file.
+        #[arg(long)]
+        cursor: Option<PathBuf>,
+        /// Maximum manifest entries scanned in this page, before filtering.
+        #[arg(long, default_value_t = 1000)]
+        limit: usize,
+        /// Include this exact path and its descendants.
+        #[arg(long)]
+        prefix: Option<String>,
+        /// Include paths containing this literal, case-sensitive text.
+        #[arg(long)]
+        contains: Option<String>,
+    },
+    /// [experimental] Resolve one path's manifest membership without reading its blob.
+    Stat { revision: String, path: String },
     /// [experimental] Read one file from an immutable revision.
     Read { revision: String, path: String },
     /// [experimental] Compare two immutable revisions.
@@ -497,7 +515,12 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Intent { command } => intent_cli::run(command).await?,
         Command::Work { command } => work_cli::run(command).await?,
         Command::Demo(args) => demo_cli::run(args).await?,
-        Command::Quickstart(args) => quickstart::run(args).await?,
+        Command::Quickstart(args) => {
+            let code = quickstart::run(args).await?;
+            if code != 0 {
+                std::process::exit(i32::from(code));
+            }
+        }
         Command::Uninstall(args) => quickstart::uninstall(args).await?,
         #[cfg(unix)]
         Command::GitSnapshot { command } => {
@@ -739,9 +762,60 @@ async fn run(cli: Cli) -> Result<()> {
             };
             print_json(&json!({"ok": true, "revision": revision}));
         }
+        Command::Files {
+            revision,
+            cursor,
+            limit,
+            prefix,
+            contains,
+        } => {
+            require_limit(limit, agentscm::store::MAX_FILE_PAGE, "files")?;
+            if let Some(prefix) = &prefix {
+                agentscm::store::validate_path(prefix)?;
+            }
+            if contains
+                .as_ref()
+                .is_some_and(|text| text.is_empty() || text.len() > 1024)
+            {
+                return Err(Error::Invalid(
+                    "path search text must contain 1 to 1024 bytes".into(),
+                ));
+            }
+            let engine = Engine::open(&cli.data_dir)?;
+            let reader = agentscm::store::SourceReader::new(&engine);
+            let cursor: Option<String> = cursor.as_deref().map(read_json).transpose()?;
+            let page = reader.list_files(&revision, cursor.as_deref(), limit)?;
+            let scanned = page.entries.len();
+            let entries: Vec<_> = page
+                .entries
+                .into_iter()
+                .filter(|entry| {
+                    prefix.as_ref().is_none_or(|prefix| {
+                        entry.path == *prefix
+                            || entry
+                                .path
+                                .strip_prefix(prefix)
+                                .is_some_and(|suffix| suffix.starts_with('/'))
+                    }) && contains
+                        .as_ref()
+                        .is_none_or(|text| entry.path.contains(text))
+                })
+                .collect();
+            print_json(
+                &json!({"ok": true, "revision": revision, "entries": entries,
+                "scanned": scanned, "next": page.next, "complete": page.next.is_none()}),
+            );
+        }
+        Command::Stat { revision, path } => {
+            let engine = Engine::open(&cli.data_dir)?;
+            let entry = agentscm::store::SourceReader::new(&engine).stat_file(&revision, &path)?;
+            print_json(&json!({"ok": true, "revision": revision, "path": path,
+                "state": if entry.is_some() { "present" } else { "nonexistent" }, "entry": entry}));
+        }
         Command::Read { revision, path } => {
             let engine = Engine::open(&cli.data_dir)?;
-            let (kind, content) = engine.read_entry(&revision, &path)?;
+            let (kind, content) =
+                agentscm::store::SourceReader::new(&engine).read_entry(&revision, &path)?;
             if content.len() > MAX_OUTPUT_BYTES {
                 return Err(Error::Limit(format!(
                     "CLI source response exceeds {MAX_OUTPUT_BYTES} bytes"
@@ -978,7 +1052,22 @@ fn print_page(value: &Value) -> Result<()> {
 }
 
 fn print_error(error: &Error) {
-    eprintln!("{}", json!({"ok": false, "error": error.to_string()}));
+    let kind = match error {
+        Error::MissingObject(_) => "unavailable",
+        Error::NotFound(message) if message.starts_with("object: ") => "unavailable",
+        Error::NotFound(_) => "nonexistent",
+        Error::SourceDenied => "denied",
+        Error::SourceIndeterminate => "indeterminate",
+        Error::Limit(_) => "limit",
+        Error::Conflict(_) => "conflict",
+        Error::Invalid(_) | Error::UnsupportedGitVersion { .. } => "invalid",
+        Error::Io(error) if error.kind() == io::ErrorKind::PermissionDenied => "denied",
+        Error::Io(_) | Error::Json(_) | Error::Sql(_) => "failed",
+    };
+    eprintln!(
+        "{}",
+        json!({"ok": false, "error": error.to_string(), "error_kind": kind})
+    );
 }
 
 #[cfg(all(test, unix))]

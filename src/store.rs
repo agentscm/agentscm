@@ -182,7 +182,7 @@ enum Node {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
 pub struct FileEntry {
     pub path: String,
     pub blob: String,
@@ -282,6 +282,11 @@ impl ReadBudgetState {
 }
 
 impl ReadBudget {
+    #[cfg(test)]
+    pub(crate) fn remaining(&self) -> u64 {
+        self.state.remaining.load(Ordering::Acquire)
+    }
+
     pub(crate) fn finish<T>(&self, result: Result<T>) -> Result<T> {
         if self.state.exceeded.load(Ordering::Acquire) {
             Err(Error::Limit(READ_BUDGET_EXCEEDED.into()))
@@ -894,6 +899,12 @@ impl Engine {
     /// Use `read_entry` to learn the kind.
     pub fn read_file(&self, revision: &str, path: &str) -> Result<Vec<u8>> {
         ReadObjects::read_file_impl(self, revision, path)
+    }
+
+    /// Resolve exact manifest membership without fetching the file's blob.
+    /// `None` means the path is absent; missing source objects remain errors.
+    pub fn stat_file(&self, revision: &str, path: &str) -> Result<Option<FileEntry>> {
+        ReadObjects::stat_file_impl(self, revision, path)
     }
 
     pub fn read_entry(&self, revision: &str, path: &str) -> Result<(EntryKind, Vec<u8>)> {
@@ -1545,16 +1556,26 @@ trait ReadObjects {
         Ok(self.read_entry_impl(revision, path)?.1)
     }
 
-    fn read_entry_impl(&self, revision: &str, path: &str) -> Result<(EntryKind, Vec<u8>)> {
+    fn stat_file_impl(&self, revision: &str, path: &str) -> Result<Option<FileEntry>> {
         validate_path(path)?;
         let revision = self.load_revision_impl(revision)?;
         let (exact, _, _) = self.load_tree(&revision.tree)?;
         let key = key_for(path.as_bytes());
-        let leaf = self
+        Ok(self
             .lookup(Some(&exact), Namespace::Exact, &key)?
             .filter(|leaf| leaf.path == path)
+            .map(|leaf| FileEntry {
+                path: leaf.path,
+                blob: leaf.value,
+                kind: leaf.kind,
+            }))
+    }
+
+    fn read_entry_impl(&self, revision: &str, path: &str) -> Result<(EntryKind, Vec<u8>)> {
+        let entry = self
+            .stat_file_impl(revision, path)?
             .ok_or_else(|| Error::NotFound(format!("path: {path}")))?;
-        Ok((leaf.kind, self.load_blob(&leaf.value)?))
+        Ok((entry.kind, self.load_blob(&entry.blob)?))
     }
 
     fn load_revision_impl(&self, id: &str) -> Result<Revision> {
@@ -2234,6 +2255,12 @@ impl<'a> SourceReader<'a> {
     /// Use `read_entry` to learn the kind.
     pub fn read_file(&self, revision: &str, path: &str) -> Result<Vec<u8>> {
         ReadObjects::read_file_impl(self, revision, path)
+    }
+
+    /// Resolve exact manifest membership without fetching the file's blob.
+    /// `None` means the path is absent; missing source objects remain errors.
+    pub fn stat_file(&self, revision: &str, path: &str) -> Result<Option<FileEntry>> {
+        ReadObjects::stat_file_impl(self, revision, path)
     }
 
     pub fn read_entry(&self, revision: &str, path: &str) -> Result<(EntryKind, Vec<u8>)> {

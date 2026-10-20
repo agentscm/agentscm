@@ -162,7 +162,8 @@ fn conflict_result(output: &Output, expected: WorkConflictKind) -> WorkStartResu
         error,
         serde_json::json!({
             "ok": false,
-            "error": "conflict: durable work claim was not acquired; inspect the JSON result"
+            "error": "conflict: durable work claim was not acquired; inspect the JSON result",
+            "error_kind": "conflict"
         })
     );
     result
@@ -225,7 +226,8 @@ fn start_claim_conflicts_keep_json_and_exit_nonzero() {
         serde_json::from_slice::<serde_json::Value>(&missing.stderr).unwrap(),
         serde_json::json!({
             "ok": false,
-            "error": "invalid: database environment variable is not set"
+            "error": "invalid: database environment variable is not set",
+            "error_kind": "invalid"
         })
     );
     #[cfg(unix)]
@@ -240,7 +242,8 @@ fn start_claim_conflicts_keep_json_and_exit_nonzero() {
             serde_json::from_slice::<serde_json::Value>(&invalid.stderr).unwrap(),
             serde_json::json!({
                 "ok": false,
-                "error": "invalid: database environment variable is not valid Unicode"
+                "error": "invalid: database environment variable is not valid Unicode",
+                "error_kind": "invalid"
             })
         );
     }

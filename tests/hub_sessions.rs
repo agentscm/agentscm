@@ -827,20 +827,31 @@ fn only_active_tokens_have_live_sessions(db: &Db) {
     let alice = agent(&*store, 1, "a");
     let bob = agent(&*store, 2, "b");
     let carol = agent(&*store, 3, "c");
-    let short = {
+    let (short, expires_at) = {
         let identity = ForgeIdentity {
             provider: "github".into(),
             host: "github.com".into(),
             user_id: 4,
         };
         let owner = store.upsert_user(&identity, "user4").unwrap();
-        let (token, _) = mint_agent_token(&*store, &owner.id, "short", REPO, 1).unwrap();
-        Agent {
-            token,
-            secret: String::new(),
-        }
+        let (token, _) = mint_agent_token(&*store, &owner.id, "short", REPO, 60).unwrap();
+        let expires_at = store
+            .list_agent_tokens(&owner.id)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.id == token)
+            .unwrap()
+            .expires_at;
+        (
+            Agent {
+                token,
+                secret: String::new(),
+            },
+            expires_at,
+        )
     };
-    let now = unix_now();
+    // Use the recorded expiry rather than racing a one-second wall-clock token on slow runners.
+    let now = expires_at - 1;
     for who in [&alice, &bob, &carol, &short] {
         touch(&*store, who, &["x.rs"], now);
     }
@@ -865,15 +876,15 @@ fn only_active_tokens_have_live_sessions(db: &Db) {
     assert_eq!(tokens(now), all);
     // An expired token, a revoked token and a disabled owner drop out.
     all.retain(|token| *token != short.token);
-    assert_eq!(tokens(now + 2), all);
+    assert_eq!(tokens(expires_at), all);
     assert!(store.revoke_agent_token(&bob.token).unwrap());
     all.retain(|token| *token != bob.token);
-    assert_eq!(tokens(now + 2), all);
+    assert_eq!(tokens(expires_at), all);
     store
         .set_user_disabled(&principal(&*store, &carol).owner.id, true)
         .unwrap();
     all.retain(|token| *token != carol.token);
-    assert_eq!(tokens(now + 2), all);
+    assert_eq!(tokens(expires_at), all);
 }
 
 fn invalid_calls_are_rejected_without_events(db: &Db) {

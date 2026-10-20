@@ -76,6 +76,24 @@ fn yes_writes_from_a_subdirectory_and_a_second_run_writes_nothing() {
     assert!(mcp.contains("https://hub.example.test/mcp"), "{mcp}");
     assert!(mcp.contains("${AGENTSCM_HUB_TOKEN}"));
     assert!(stdout(&first).contains("export AGENTSCM_HUB_TOKEN="));
+    let instructions = std::fs::read_to_string(repo.path().join("AGENTS.md")).unwrap();
+    for required in [
+        "operator provides an existing native store and exact revision",
+        "`files`, `stat` and `read`",
+        "workspace path-state",
+        "workspace expand ROOT OPERATION_ID EXPECTED_GENERATION --path PATH",
+        "review `--scope`",
+        "git worktree add --no-checkout",
+        "never reconfigure an existing worktree",
+        "git sparse-checkout add",
+        "git sparse-checkout disable",
+        "not measured token, dollar, network or time savings",
+    ] {
+        assert!(
+            instructions.contains(required),
+            "missing instruction: {required}"
+        );
+    }
 
     let second = init_repo(&sub, home.path(), &args);
     assert!(second.status.success());

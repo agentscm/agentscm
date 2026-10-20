@@ -63,6 +63,14 @@ For your own agents, run `npx agentscm` for guided setup, or follow the
 [setup guide](docs/setup-guide.md). Existing configuration changes are shown before
 confirmation. The [agent guide](docs/agents.md) distinguishes native hooks, advisory MCP
 and client qualification; coordination support is broader than workflow execution support.
+Generated instructions also guide [selective source use](docs/advanced/agent-source-workflow.md)
+at task start and dependency expansion, using a configured native store or a dedicated sparse
+Git worktree. Rerun `init-repo` to review the updated instruction block; hooks still handle
+coordination, and selection does not narrow required checks or establish model-cost savings.
+
+Quickstart recommends user hooks when it detects Git worktrees, skips team repository
+config for a local hub, defaults to a native managed hub on Apple Silicon macOS with an explicit Docker fallback, and prints the executable path and PATH guidance for later commands.
+See [guided setup](docs/setup-guide.md) for details.
 
 ## The native workflow loop
 

@@ -54,6 +54,21 @@ On Windows PowerShell, `setx AGENTSCM_HUB_TOKEN "<your agent token>"` and restar
 
 These files need a hub that serves `/mcp` and `/v1/hub/hook/<agent>`. `init-repo` merges into existing JSON files: your own entries are kept, but keys are rewritten in alphabetical order, and a file with comments (JSONC) is left alone with a message.
 
+### Choose source at task start and when dependencies grow
+
+The generated instructions also teach selective source use in native and Git workflows:
+inspect paths before reading contents, start with a bounded working set, and explicitly add
+dependencies before editing them. Native operations need an operator-provided store and exact
+revision; coordination setup does not create either. Git-only tasks can use a separate sparse
+worktree without adopting native source control. Small or tightly coupled tasks can use a full
+checkout. Neither mode fetches automatically when an editor opens a missing file.
+
+Follow the [agent source workflow](advanced/agent-source-workflow.md) for safe commands,
+dependency expansion, full-tree validation and occasional measured savings reports. Existing
+installations receive the updated marked instruction block by rerunning `init-repo`; read its
+proposed diff and reload agent instructions. This remains model-followed guidance, not proof that
+every agent obeyed it. Hooks still handle coordination only.
+
 ### What needs the `agentscm` binary
 
 - **Claude Code needs no install.** Its hooks are HTTP hooks that call the hub directly, and `.mcp.json` is a remote MCP server. Claude Code does not support HTTP hooks for `SessionStart`, so the session starts, for the hub, at the first edit check.

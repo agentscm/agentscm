@@ -466,3 +466,55 @@ fn unpaged_diff_rejects_repeated_depth_before_recursive_or_flattened_descent() {
         assert!(provider.calls.borrow().len() <= 20);
     }
 }
+
+#[test]
+fn metadata_membership_does_not_fetch_blobs_and_preserves_missing_vs_absent() {
+    let directory = TempDir::new().unwrap();
+    let engine = Engine::open(directory.path()).unwrap();
+    let revision = engine
+        .checkpoint(None, &[put("task/main.rs", b"body")])
+        .unwrap();
+    let entry = engine
+        .stat_file(&revision, "task/main.rs")
+        .unwrap()
+        .unwrap();
+    let scoped = ScopedReader::new(&engine);
+    scoped.missing.borrow_mut().insert(entry.blob.clone());
+    let reader = SourceReader::new(&scoped);
+    assert_eq!(
+        reader.stat_file(&revision, "task/main.rs").unwrap(),
+        Some(entry.clone())
+    );
+    assert_eq!(reader.stat_file(&revision, "absent").unwrap(), None);
+    assert!(!scoped.calls.borrow().contains(&entry.blob));
+    assert!(
+        matches!(reader.read_file(&revision, "task/main.rs"), Err(Error::MissingObject(id)) if id == entry.blob)
+    );
+    scoped.missing.borrow_mut().insert(revision.clone());
+    assert!(
+        matches!(reader.stat_file(&revision, "absent"), Err(Error::MissingObject(id)) if id == revision)
+    );
+}
+
+#[test]
+fn metadata_membership_never_turns_denial_or_uncertainty_into_absence() {
+    struct Unavailable(bool);
+    impl EncodedObjectReader for Unavailable {
+        fn open_encoded(&self, _: &str) -> Result<Box<dyn Read + '_>> {
+            Err(if self.0 {
+                Error::SourceDenied
+            } else {
+                Error::SourceIndeterminate
+            })
+        }
+    }
+    let revision = "a".repeat(64);
+    assert!(matches!(
+        SourceReader::new(&Unavailable(true)).stat_file(&revision, "absent"),
+        Err(Error::SourceDenied)
+    ));
+    assert!(matches!(
+        SourceReader::new(&Unavailable(false)).stat_file(&revision, "absent"),
+        Err(Error::SourceIndeterminate)
+    ));
+}

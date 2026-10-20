@@ -42,13 +42,17 @@ curl -fsSL https://github.com/counterbranch/agentscm/releases/download/v<version
 docker run --rm -it ghcr.io/counterbranch/agentscm:<version> --help
 ```
 
-Use this on platforms without a binary. The image's default command serves on all interfaces inside the container, so when you publish a port, bind it to loopback: `-p 127.0.0.1:7331:7331` (`7332` for the hub). See [deployment](deployment.md) for running the hub.
+Use this as an explicit fallback on a supported Linux AMD64 or ARM64 Docker daemon. A macOS or Windows host needs a Linux VM, such as Docker Desktop. The release workflow builds both image architectures; use a release that publishes the matching architecture. An unsupported host architecture still needs a supported Docker daemon or an existing remote hub. The image's default command serves on all interfaces inside the container, so when you publish a port, bind it to loopback: `-p 127.0.0.1:7331:7331` (`7332` for the hub). See [deployment](deployment.md) for running the hub.
 
 ## What is verified
 
 - Checksum, always. `npx agentscm` checks the binary against checksums shipped inside the npm package, which is published with npm provenance. Those checksums are written in the release workflow from the build artifacts and attested with them, never copied from the GitHub release, so a release asset replaced after publication does not match them. `install.sh` fetches `SHA256SUMS` from the same release as the binary, so without `gh` it catches corruption but does not prove authenticity.
 - Build provenance, only when the GitHub CLI (`gh`) is installed and signed in (`gh auth status` succeeds). The binary must be attested by this repository's `release.yml` for the matching tag, or it is deleted and not run. If `gh` is missing or not signed in, the installer says why and that it checked the checksum only.
 - To make a missing or signed-out `gh` an error, set `AGENTSCM_REQUIRE_PROVENANCE=1`.
+
+Successful installer verification prints one summary line. To include the verification
+command's details, set `AGENTSCM_INSTALL_VERBOSE=1`. Verification failures always show
+diagnostics and stop installation.
 
 Checks run before anything is installed or linked.
 
@@ -58,11 +62,18 @@ On Linux and macOS, `~/.agentscm/bin/agentscm-<version>` is the binary, and `~/.
 
 On Windows, `%USERPROFILE%\.agentscm\bin\agentscm-<version>.exe` is the binary, and `agentscm.exe` in the same directory is a copy of the latest installed one, not a symlink (symlinks need extra privileges on Windows). If `agentscm.exe` is running when you install a newer version, it cannot be replaced; the installer warns, keeps the old copy and runs the new versioned binary.
 
+Quickstart prints the installed executable's full path, so it works before `agentscm`
+is on PATH. On macOS or Linux, use `export PATH="$HOME/.agentscm/bin:$PATH"` in the
+current shell, or add that line to your shell's startup file for future terminals.
+You can also keep using `npx agentscm <subcommand>`.
+
 Remove them with `agentscm uninstall`.
 
 ## Platforms
 
-Linux and macOS, x86_64 and arm64. Linux binaries are static (musl). Windows, x86_64 only (see [Windows](#windows)); Windows on arm64 may run the x64 binary under emulation, which is untested. Elsewhere, use Docker.
+Linux and macOS, x86_64 and arm64. Linux binaries are static (musl). Windows, x86_64 only (see [Windows](#windows)); Windows on arm64 may run the x64 binary under emulation, which is untested. For other hosts, check whether a local Linux AMD64 or ARM64 Docker daemon is supported. Docker availability and emulation depend on the host; they are not a universal fallback.
+
+The CLI platform and the managed hub runtime are separate. Quickstart defaults to a native user service on Apple Silicon macOS. Linux, Intel macOS and Windows currently use an explicitly selected Docker hub or an existing hub; installing a native CLI does not install a native managed service on those hosts. See the [setup guide](setup-guide.md).
 
 ## Windows
 

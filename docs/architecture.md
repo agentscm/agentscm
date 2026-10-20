@@ -24,12 +24,19 @@ Context digests attest to canonical bytes, not execution truth. The local owner 
 
 ## Local workflow continuation
 
-Ordinary filesystem workspaces use a separate durable journal and local generation counter. Checkpoints publish captured bytes; undo/recovery preserve divergent user edits. Offline bundles (see [offline sync](advanced/sync.md)) exchange exact source objects, qualify their closure and publish revisions only after their dependencies. They transfer no authority. Controller-built-in source-path checks bind immutable recipes and exact current review subjects, and a requesting context cannot be approved or integrated without matching successful evidence. These are trusted-local primitives. The isolated [command collector](advanced/execution.md) runs declared recipes with durable attempts and explicit recovery; a context requesting its capability needs successful evidence for that exact subject before approval or integration. Model execution, authenticated transfer and unattended service recovery remain incomplete.
+Ordinary filesystem workspaces use a separate durable journal and local generation counter. A [task-scoped workspace](advanced/task-workspaces.md) can project explicit paths from the full immutable base and expand them durably; checkpoints overlay only that scope, so unmaterialized base paths remain unchanged. Omitting scope retains full-workspace behavior. Checkpoints publish complete revisions; undo/recovery preserve divergent user edits. This is local materialization control, not a partial-source identity, virtual filesystem or permission boundary.
+
+Offline bundles (see [offline sync](advanced/sync.md)) exchange exact source objects, qualify their closure and publish revisions only after their dependencies. They transfer no authority. Controller-built-in source-path checks bind immutable recipes and exact current review subjects, and a requesting context cannot be approved or integrated without matching successful evidence. These are trusted-local primitives. The isolated [command collector](advanced/execution.md) runs declared recipes with durable attempts and explicit recovery; a context requesting its capability needs successful evidence for that exact subject before approval or integration. Model execution, authenticated transfer and unattended service recovery remain incomplete.
 
 Immutable reads also accept bounded controller-supplied encoded-object streams
 through a shared [source reader](advanced/source-reader.md). Authorization, manifest
 membership and retention belong to that controller; source parsing and complete
 closure qualification do not confer those permissions.
+
+The local CLI exposes bounded manifest listing, stat, read, diff and history for
+workspace-free exploration. The experimental team profile separately exposes
+authenticated paged reads from retained publications. Neither read surface creates
+an authenticated remote task or workspace mutation lifecycle.
 
 Durable [local merge sessions](advanced/merge.md) retain all best bases, deterministic
 conflicts and exact current resolutions. Root-last R2 publication qualifies

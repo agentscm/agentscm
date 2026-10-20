@@ -382,3 +382,108 @@ fn read_reports_the_entry_kind() {
         assert_eq!(json_output(&read)["kind"], kind);
     }
 }
+
+#[test]
+fn source_exploration_pages_metadata_before_checkout_and_types_unavailable_reads() {
+    use agentscm::model::FileChange;
+    use agentscm::store::Engine;
+    let data = TempDir::new().unwrap();
+    let engine = Engine::open(data.path()).unwrap();
+    let revision = engine
+        .checkpoint(
+            None,
+            &[
+                FileChange {
+                    path: "src/main.rs".into(),
+                    content: Some(b"main".to_vec()),
+                },
+                FileChange {
+                    path: "src2/other.rs".into(),
+                    content: Some(b"other".to_vec()),
+                },
+                FileChange {
+                    path: "docs/readme.md".into(),
+                    content: Some(b"docs".to_vec()),
+                },
+            ],
+        )
+        .unwrap();
+    let mut cursor = None;
+    let mut found = Vec::new();
+    loop {
+        let mut args = vec![
+            "files",
+            &revision,
+            "--limit",
+            "1",
+            "--prefix",
+            "src",
+            "--contains",
+            ".rs",
+        ];
+        if cursor.is_some() {
+            args.extend(["--cursor", "-"]);
+        }
+        let output = if let Some(cursor) = &cursor {
+            let file = data.path().join("cursor.json");
+            fs::write(&file, serde_json::to_vec(cursor).unwrap()).unwrap();
+            args.pop();
+            args.push(file.to_str().unwrap());
+            agentscm(&data, &args)
+        } else {
+            agentscm(&data, &args)
+        };
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let page = json_output(&output);
+        assert!(page["scanned"].as_u64().unwrap() <= 1);
+        found.extend(
+            page["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["path"].as_str().unwrap().to_owned()),
+        );
+        if page["complete"] == true {
+            break;
+        }
+        cursor = Some(page["next"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(found, ["src/main.rs"]);
+    let stat = agentscm(&data, &["stat", &revision, "src/main.rs"]);
+    assert!(stat.status.success());
+    assert_eq!(json_output(&stat)["state"], "present");
+    assert_eq!(
+        json_output(&agentscm(&data, &["stat", &revision, "missing"]))["state"],
+        "nonexistent"
+    );
+    let blob = engine
+        .stat_file(&revision, "src/main.rs")
+        .unwrap()
+        .unwrap()
+        .blob;
+    fs::remove_file(
+        data.path()
+            .join("objects")
+            .join(&blob[..2])
+            .join(&blob[2..]),
+    )
+    .unwrap();
+    assert!(
+        agentscm(&data, &["stat", &revision, "src/main.rs"])
+            .status
+            .success()
+    );
+    let unavailable = agentscm(&data, &["read", &revision, "src/main.rs"]);
+    assert!(!unavailable.status.success());
+    let error: Value = serde_json::from_slice(&unavailable.stderr).unwrap();
+    assert_eq!(error["error_kind"], "unavailable");
+    let absent = agentscm(&data, &["read", &revision, "missing"]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&absent.stderr).unwrap()["error_kind"],
+        "nonexistent"
+    );
+}
