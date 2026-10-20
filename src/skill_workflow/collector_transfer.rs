@@ -2982,7 +2982,6 @@ mod tests {
             crate::execution::OciBackend::new(&executable, &socket, &config).unwrap()
         };
         let probe = backend.probe();
-        eprintln!("collector backend probe (real={real}): {probe:?}");
         let identity = probe.identity.expect("available test runtime");
         let mut profile = profile.clone();
         if let CollectorProfileAction::Command {
@@ -3018,7 +3017,6 @@ mod tests {
         let CollectorPayload::Command { record, .. } = &transfer.payload else {
             unreachable!()
         };
-        eprintln!("collector record (real={real}): {record:?}");
         assert_eq!(record.runtime_identity.as_ref(), Some(&identity));
         assert_eq!(
             std::fs::read_dir(state.join("snapshots")).unwrap().count(),
