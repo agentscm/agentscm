@@ -60,10 +60,16 @@ impl WorkspaceGuard<'_> {
 
     fn guard_error(error: HubError) -> crate::Error {
         match error {
-            HubError::Busy | HubError::Unavailable(_) => crate::Error::Io(std::io::Error::other(
+            HubError::Busy
+            | HubError::WorkCapacity
+            | HubError::WorkOverlapIncomplete
+            | HubError::Unavailable(_) => crate::Error::Io(std::io::Error::other(
                 "workspace task authorization unavailable",
             )),
-            HubError::Invalid(_) | HubError::Unauthorized => {
+            HubError::Invalid(_)
+            | HubError::Unauthorized
+            | HubError::WorkOverlap(_)
+            | HubError::WorkCoordinationRequired { .. } => {
                 crate::Error::Conflict("workspace task authorization changed".into())
             }
         }
@@ -1045,11 +1051,20 @@ async fn mcp(
     };
     Ok(match result {
         Ok(result) => axum::Json(json!({"jsonrpc":"2.0","id":id,"result":result})).into_response(),
-        Err(HubError::Busy | HubError::Unavailable(_)) => mcp_failure(
+        Err(
+            HubError::Busy
+            | HubError::WorkCapacity
+            | HubError::WorkOverlapIncomplete
+            | HubError::Unavailable(_),
+        ) => mcp_failure(
             id,
             -32603,
             "temporarily unavailable; inspect task status or recovery before retrying",
         ),
+        Err(HubError::WorkOverlap(_) | HubError::WorkCoordinationRequired { .. }) => axum::Json(
+            json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":"AgentSCM task request conflicted with current state; inspect task status or recovery"}],"isError":true}}),
+        )
+        .into_response(),
         Err(HubError::Invalid(code)) if code == "workspace_native_conflict" => axum::Json(
             json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":"AgentSCM task request conflicted with current state; inspect task status or recovery"}],"isError":true}}),
         )
