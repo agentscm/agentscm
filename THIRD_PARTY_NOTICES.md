@@ -9365,6 +9365,7 @@ Production dependencies of the status page that are compiled into `app.js`. Buil
 | copy-to-clipboard | 3.3.3 | MIT | notice-5149051aed807f78 |
 | rc-checkbox | 3.5.0 | MIT | notice-3fefe89002bfade4 |
 | rc-collapse | 3.9.0 | MIT | notice-509eabacb9ef4e7b |
+| rc-dialog | 9.6.0 | MIT | notice-509eabacb9ef4e7b |
 | rc-dropdown | 4.2.1 | MIT | notice-fc54f50dbda2f75b |
 | rc-field-form | 2.7.1 | MIT | notice-8781f0ca19205733 |
 | rc-input | 1.8.0 | MIT | notice-e3be4577f9f03567 |
@@ -9374,9 +9375,11 @@ Production dependencies of the status page that are compiled into `app.js`. Buil
 | rc-overflow | 1.5.0 | MIT | notice-e3be4577f9f03567 |
 | rc-pagination | 5.1.0 | MIT | notice-509eabacb9ef4e7b |
 | rc-picker | 4.11.3 | MIT | notice-e3be4577f9f03567 |
+| rc-progress | 4.0.0 | MIT | notice-509eabacb9ef4e7b |
 | rc-resize-observer | 1.4.3 | MIT | notice-e3be4577f9f03567 |
 | rc-segmented | 2.7.1 | MIT | notice-e3be4577f9f03567 |
 | rc-select | 14.16.8 | MIT | notice-420804296afd6233 |
+| rc-steps | 6.0.1 | MIT | notice-509eabacb9ef4e7b |
 | rc-table | 7.54.0 | MIT | notice-06af38d559a6264a |
 | rc-tabs | 15.7.0 | MIT | notice-509eabacb9ef4e7b |
 | rc-textarea | 1.10.2 | MIT | notice-e3be4577f9f03567 |
@@ -9525,7 +9528,7 @@ SOFTWARE.
 
 ### notice-509eabacb9ef4e7b
 
-Applies to: @rc-component/async-validator 5.1.2 / LICENSE.md; @rc-component/context 1.4.0 / LICENSE.md; rc-collapse 3.9.0 / LICENSE.md; rc-input-number 9.5.0 / LICENSE.md; rc-menu 9.16.1 / LICENSE.md; rc-pagination 5.1.0 / LICENSE.md; rc-tabs 15.7.0 / LICENSE.md
+Applies to: @rc-component/async-validator 5.1.2 / LICENSE.md; @rc-component/context 1.4.0 / LICENSE.md; rc-collapse 3.9.0 / LICENSE.md; rc-dialog 9.6.0 / LICENSE.md; rc-input-number 9.5.0 / LICENSE.md; rc-menu 9.16.1 / LICENSE.md; rc-pagination 5.1.0 / LICENSE.md; rc-progress 4.0.0 / LICENSE.md; rc-steps 6.0.1 / LICENSE.md; rc-tabs 15.7.0 / LICENSE.md
 
 ```text
 The MIT License (MIT)
