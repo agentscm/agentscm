@@ -111,6 +111,16 @@ pub struct QuickstartArgs {
     init: bool,
 }
 
+impl QuickstartArgs {
+    pub(crate) fn noninteractive(&self) -> bool {
+        self.yes || !std::io::stdin().is_terminal()
+    }
+
+    pub(crate) fn can_start(&self) -> bool {
+        self.yes || std::io::stdin().is_terminal()
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct UninstallArgs {
     /// Do not ask; take back everything quickstart recorded.

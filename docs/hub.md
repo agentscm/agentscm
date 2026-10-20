@@ -1000,10 +1000,12 @@ The container test does not include a forge. Pull-request overlaps (webhook and 
 ## Data the hub stores
 
 AgentSCM is self-hosted. Whoever runs a hub decides who may sign in and where
-its data lives, and is responsible for that data. DUVATL, Inc. receives no
-data from your hub: AgentSCM has no telemetry, analytics, update checks or
-crash reporting. The hub contacts only the GitHub or GitLab hosts and the
-object storage you configure.
+its data lives, and is responsible for that data. The hub contacts only the
+GitHub or GitLab hosts and the object storage you configure. Staged product
+[usage telemetry](telemetry.md) is a separate client-side path: it does not
+send hub records, source, repository or file paths, prompts, account data or
+workflow text, and it is inactive until an endpoint and data-handling profile
+are configured.
 
 What the hub keeps, in its database and object store:
 

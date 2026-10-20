@@ -39,6 +39,13 @@ pub enum SetupCommand {
     },
 }
 
+pub(crate) fn telemetry_action(command: &SetupCommand) -> bool {
+    matches!(
+        command,
+        SetupCommand::Begin { .. } | SetupCommand::Resume { .. }
+    )
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum Profile {
     TrustedLocalNative,

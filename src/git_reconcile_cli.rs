@@ -29,6 +29,15 @@ pub enum GitReconcileCommand {
     },
 }
 
+pub(crate) fn telemetry_action(command: &GitReconcileCommand) -> bool {
+    matches!(
+        command,
+        GitReconcileCommand::Init { .. }
+            | GitReconcileCommand::Observe { .. }
+            | GitReconcileCommand::PrepareExit { .. }
+    )
+}
+
 fn read<T: serde::de::DeserializeOwned>(input: &Path) -> Result<T> {
     let mut reader: Box<dyn Read> = if input == Path::new("-") {
         Box::new(std::io::stdin())

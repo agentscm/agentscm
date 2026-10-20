@@ -140,6 +140,20 @@ pub enum SkillWorkflowCommand {
     },
 }
 
+pub(crate) fn telemetry_action(command: &SkillWorkflowCommand) -> bool {
+    match command {
+        SkillWorkflowCommand::Status { .. } => false,
+        #[cfg(unix)]
+        SkillWorkflowCommand::ClaudeStop(_)
+        | SkillWorkflowCommand::CodexStop(_)
+        | SkillWorkflowCommand::RemoteStop(_)
+        | SkillWorkflowCommand::RemoteCodexStop(_)
+        | SkillWorkflowCommand::TaskStop(_)
+        | SkillWorkflowCommand::TaskCodexStop(_) => false,
+        _ => true,
+    }
+}
+
 pub async fn run(data_dir: &Path, command: SkillWorkflowCommand) -> Result<()> {
     match command {
         #[cfg(unix)]
@@ -579,4 +593,74 @@ fn read_definition(path: &Path) -> Result<WorkflowDefinition> {
         return Err(Error::Limit("workflow definition exceeds 256 KiB".into()));
     }
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Wrap {
+        #[command(subcommand)]
+        command: SkillWorkflowCommand,
+    }
+
+    #[test]
+    fn stop_hooks_are_not_telemetry_actions() {
+        let local = [
+            "C",
+            "--workspace",
+            "/w",
+            "--docker",
+            "/d",
+            "--docker-socket",
+            "/s",
+            "--claude",
+            "/c",
+        ];
+        let remote = [
+            "--endpoint",
+            "https://h.example",
+            "--repository",
+            "o/r",
+            "--profile",
+            "p",
+            "--token-file",
+            "/t",
+            "--workspace",
+            "/w",
+            "--change",
+            "c",
+        ];
+        let task = [
+            "C",
+            "--endpoint",
+            "https://h.example",
+            "--repository",
+            "o/r",
+            "--profile",
+            "p",
+            "--token-file",
+            "/t",
+            "--workspace",
+            "/w",
+        ];
+        for (name, args) in [
+            ("claude-stop", &local[..]),
+            ("codex-stop", &local[..]),
+            ("remote-stop", &remote[..]),
+            ("remote-codex-stop", &remote[..]),
+            ("task-stop", &task[..]),
+            ("task-codex-stop", &task[..]),
+        ] {
+            let wrap = Wrap::try_parse_from(
+                std::iter::once("x")
+                    .chain([name])
+                    .chain(args.iter().copied()),
+            )
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert!(!telemetry_action(&wrap.command), "{name}");
+        }
+    }
 }

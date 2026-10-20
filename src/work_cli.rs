@@ -140,6 +140,22 @@ pub enum WorkCommand {
     },
 }
 
+pub(crate) fn telemetry_action(command: &WorkCommand) -> bool {
+    match command {
+        WorkCommand::Inbox { .. } | WorkCommand::Overview { .. } | WorkCommand::Briefing { .. } => {
+            false
+        }
+        WorkCommand::Compact { apply, .. } => *apply,
+        WorkCommand::CoordinationAck { .. }
+        | WorkCommand::CoordinationReply { .. }
+        | WorkCommand::CoordinationResolve { .. }
+        | WorkCommand::CoordinationWithdraw { .. }
+        | WorkCommand::Start { .. }
+        | WorkCommand::Checkpoint { .. }
+        | WorkCommand::Ack { .. } => true,
+    }
+}
+
 pub async fn run(command: WorkCommand) -> Result<()> {
     let command = match command {
         WorkCommand::Compact {

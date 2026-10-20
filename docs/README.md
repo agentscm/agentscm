@@ -14,6 +14,7 @@
 - [Agent source selection](advanced/agent-source-workflow.md) — inspect before checkout, expand dependencies, and report measured working-file savings in native or Git tasks.
 
 - [Guided setup: `agentscm quickstart`](setup-guide.md)
+- [Usage telemetry: data, activation and controls](telemetry.md)
 - [Early collision warnings](collisions.md)
 - [Autopsy: how often your own sessions collided](autopsy.md)
 - [Work intents](intents.md) and the Claude Code hook

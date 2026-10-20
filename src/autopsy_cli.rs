@@ -397,7 +397,7 @@ pub fn run(args: AutopsyArgs) -> Result<()> {
         HOLD_CAP_SECONDS / 60
     );
     println!(
-        "Reads Claude Code logs only; other agents are not included. Nothing is uploaded, and file \
+        "Reads Claude Code logs only; other agents are not included. Log contents and report data are not uploaded; configured product telemetry may record only a coarse autopsy feature outcome. File \
          contents in the logs are never kept or printed."
     );
     if !near.is_empty() {

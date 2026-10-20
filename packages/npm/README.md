@@ -3,9 +3,14 @@
 ```
 npx agentscm downloads the AgentSCM release binary for your platform from
 GitHub Releases, verifies its SHA-256 checksum and build provenance, and then
-starts the setup guide. It does not run install scripts, send telemetry or
-change anything without asking. Everything it writes is listed before it
-writes it, and can be undone with `agentscm uninstall`.
+starts the setup guide. It does not run install scripts. After verification it
+marks that binary invocation as a verified install; the binary records one
+installation indicator only after setup explains pseudonymous product telemetry
+and the configured choice permits it. Disable this before any send with
+`--no-telemetry`, `AGENTSCM_TELEMETRY=off`, or `DO_NOT_TRACK=1`.
+The setup guide previews repository, hook and Hub changes; `agentscm uninstall`
+reverses setup. Manage usage reporting with `agentscm telemetry status` and
+`agentscm telemetry off`.
 ```
 
 ## Usage

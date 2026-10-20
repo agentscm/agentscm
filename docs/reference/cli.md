@@ -6,7 +6,7 @@
 
 ## Commands
 
-Every command accepts `--data-dir`; its default is `.agentscm`. Most commands print one JSON value on standard output on success, and one JSON value (`{"ok":false,"error":...}`) on standard error with a nonzero exit on failure. The exceptions are:
+Every command accepts `--data-dir`; its default is `.agentscm`. The global `--no-telemetry` flag disables product usage telemetry for that invocation. Most commands print one JSON value on standard output on success, and one JSON value (`{"ok":false,"error":...}`) on standard error with a nonzero exit on failure. The exceptions are:
 
 - `--help` and `--version` print plain text.
 - `serve`, `hub serve` and `team serve` print nothing on standard output; they log to standard error.
@@ -125,6 +125,21 @@ agentscm uninstall                      # asks first; --yes, --remove-hub-data
 ```
 
 Flags: `--yes`, `--init` (also run `init-repo`; with `--yes` it is skipped unless passed), `--hub local|existing|skip`, `--hub-url URL`, `--provider github|gitlab`, `--agent-token-file PATH` (skip sign-in and minting), `--github-login LOGIN` (required with `--yes --hub local` unless `gh` is signed in), `--agent-name NAME`, `--ttl 30d`, `--hook user|project|none`, `--no-collisions`.
+
+## Usage telemetry
+
+```sh
+agentscm telemetry status
+agentscm telemetry inspect
+agentscm telemetry off
+agentscm telemetry on
+agentscm telemetry configure --endpoint https://example.com/v1/telemetry/batches --profile permitted-default
+agentscm telemetry configure --profile consent-required
+agentscm telemetry configure --profile unknown
+agentscm telemetry configure --clear-endpoint
+```
+
+`status` reports `enabled`, `disabled` or `waiting` and a reason. `inspect` shows the bounded event fields without enabling transmission. `off` persists the opt-out and removes queued records and pseudonymous identifiers; `on` shows the disclosure and records an affirmative preference but still cannot send without an eligible profile and endpoint. `configure` only provisions the recipient and profile: it does not record notice or consent, and changing either binding clears collection state while preserving an explicit `off`. Configuration is per user. The endpoint must be an absolute HTTPS URL ending in `/v1/telemetry/batches`. `--endpoint` and `--clear-endpoint` cannot be combined; either may be combined with `--profile`. See [usage telemetry](../telemetry.md) for precedence, delivery and durability limits, data categories and activation limits.
 
 ## Demo
 
