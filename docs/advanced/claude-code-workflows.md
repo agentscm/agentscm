@@ -150,7 +150,7 @@ error). That is acceptable only because native admission is
 enforced independently: a missing, failing or bypassed Stop hook cannot bypass it. The
 existing file-edit coordination hook is unchanged and remains warn-once/fail-open, and
 `init-repo` does not install Stop hooks. The hook is fixture-tested with payloads built from
-vendor documentation, not live-qualified; see the [capability matrix](../agents.md#workflow-lifecycle-capability-matrix).
+vendor documentation. `claude-stop` was also live-qualified once on 2026-10-20 in print mode (`claude -p`, CLI 2.1.304, one macOS machine, synthetic fixture): the first Stop blocked with the failing test's output, the next passed after the fix, and an always-failing requirement stopped after 8 blocks. Claude Code labels a blocking Stop output "Stop hook error" in its stream, but the agent still receives the reason. Interactive sessions and desktop/IDE surfaces were not tested. See the [capability matrix](../agents.md#workflow-lifecycle-capability-matrix).
 
 ### Codex CLI Stop hook
 
@@ -170,7 +170,23 @@ review and trust new or changed hooks (`/hooks`), and per vendor documentation c
 2026-10-20 trusts them by hash, so reinstalling with different arguments needs trust again.
 Codex documents no continuation cap of its own, so the 8-round counter above is the only
 bound. The same cwd guard, error behavior and independent
-native admission apply. Fixture-tested only.
+native admission apply.
+
+Live-qualified once on 2026-10-20 with `codex exec` (CLI 0.163.0, one macOS machine, synthetic fixture, hooks file in an isolated `CODEX_HOME`): one block with feedback, then a pass after the fix, with the current receipt verified independently. Notes from that run:
+
+- `codex exec` fired the hooks only with `--dangerously-bypass-hook-trust`; without it, exec silently skips untrusted hooks. Interactive Codex with `/hooks` trust was not tested.
+- A native workspace is not a Git repository, so `codex exec` also needs `--skip-git-repo-check`.
+- The 8-round bound was not live-tested on Codex; it is fixture-tested. Codex IDE/desktop were not tested.
+
+### Agent-owned task Stop hooks
+
+`task-stop` and `task-codex-stop` (see [agent-owned workflow tasks](agent-workflow-tasks.md#stop-hook-agent-owned-mode)) share the counter and output shapes above, with these limits:
+
+- Malformed stdin or counter errors exit 1, which is non-blocking.
+- An exhausted or unreadable counter ends continuation without running qualification.
+- `qualification` runs admission's current-subject and evidence checks in one read snapshot but remains advisory, since landing rechecks.
+- The workspace is opened read-only and read before and after the call; a change between the reads blocks. The local Change subject (version, context digest, revision, requirement digest) is read again after the call and a difference blocks with `next: checkpoint`.
+- `task-stop` does not migrate, alter or write the workspace or authority databases and creates no store files other than the Stop guard's own `agent-stop` counter; SQLite may recreate its own `-wal`/`-shm` sidecar files when reading a WAL database. Its store open requires the existing directories and lock; a missing component blocks.
 
 ## Review and hub behavior
 

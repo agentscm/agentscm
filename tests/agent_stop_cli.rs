@@ -63,6 +63,59 @@ fn unusable_local_setup_blocks_and_counts_without_docker() {
 }
 
 #[test]
+fn unusable_task_stop_setup_blocks_and_counts_without_a_network() {
+    let root = TempDir::new().unwrap();
+    let data = root.path().join("data");
+    fs::create_dir(&data).unwrap();
+    let workspace = root.path().join("missing-workspace");
+    for (subcommand, active) in [("task-codex-stop", false), ("task-stop", true)] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_agentscm"))
+            .arg("--data-dir")
+            .arg(&data)
+            .args(["skill-workflow", subcommand, "change-1"])
+            .args(["--endpoint", "http://127.0.0.1:9"])
+            .args(["--repository", "synthetic/project", "--profile", "checks"])
+            .args(["--token-file", "/nonexistent/synthetic.token"])
+            .arg("--workspace")
+            .arg(&workspace)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let payload = json!({"hook_event_name": "Stop", "session_id": "synthetic",
+            "cwd": workspace, "stop_hook_active": active})
+        .to_string();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{subcommand}");
+        let out: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(out["decision"], "block", "{out}");
+        let reason: Value = serde_json::from_str(out["reason"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            reason["failures"][0]["detail"],
+            "local native store, workspace or token file is unavailable"
+        );
+        let text = out["reason"].as_str().unwrap();
+        assert!(!text.contains(workspace.to_str().unwrap()), "{text}");
+        assert!(!text.contains("synthetic.token") && !text.contains("missing-workspace"));
+        // Claude and Codex keep separate counters for the same session.
+        assert_eq!(
+            fs::read_dir(data.join("agent-stop")).unwrap().count() as u64,
+            if subcommand == "task-stop" { 2 } else { 1 }
+        );
+        if subcommand == "task-codex-stop" {
+            assert_eq!(counter(&data), 1);
+        }
+    }
+}
+
+#[test]
 fn stop_subcommand_parse_errors_are_not_blocking() {
     let data = TempDir::new().unwrap();
     let data = data.path().to_str().unwrap();
@@ -94,6 +147,14 @@ fn stop_subcommand_parse_errors_are_not_blocking() {
             data,
             "skill-workflow",
             "remote-stop",
+            "--bogus",
+        ],
+        &["--data-dir", data, "skill-workflow", "task-stop", "--bogus"],
+        &[
+            "--data-dir",
+            data,
+            "skill-workflow",
+            "task-codex-stop",
             "--bogus",
         ],
     ] {

@@ -293,6 +293,8 @@ impl AssertionInput {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentTaskRequest {
+    /// Task-independent discovery; needs no subject.
+    Capabilities {},
     Requirements {
         subject: RunSubject,
     },
@@ -351,6 +353,10 @@ pub enum AgentTaskRequest {
         status: StatusInput,
     },
     CollectorFinalize {
+        subject: RunSubject,
+    },
+    /// Read-only: never finalizes, writes a receipt or changes task state.
+    Qualification {
         subject: RunSubject,
     },
 }
@@ -455,6 +461,7 @@ impl ExecutionService {
     ) -> Result<AgentTaskEnvelope> {
         let profile = self.agent_task_profile(repository, profile_id)?;
         let subject = match &request {
+            AgentTaskRequest::Capabilities {} => None,
             AgentTaskRequest::Requirements { subject }
             | AgentTaskRequest::Next { subject }
             | AgentTaskRequest::Instructions { subject, .. }
@@ -468,7 +475,27 @@ impl ExecutionService {
             | AgentTaskRequest::Status { subject, .. }
             | AgentTaskRequest::Recovery { subject, .. }
             | AgentTaskRequest::CollectorDescriptor { subject, .. }
-            | AgentTaskRequest::CollectorFinalize { subject } => subject,
+            | AgentTaskRequest::CollectorFinalize { subject }
+            | AgentTaskRequest::Qualification { subject } => Some(subject),
+        };
+        let Some(subject) = subject else {
+            // Same profile binding and workflow-execution authorization as `requirements`.
+            let (identity, guard) = self.task_parts(actor, repository, &profile)?;
+            task(guard.authorize(&identity, &profile.native_repository))?;
+            let mut operations = MCP_TOOLS
+                .iter()
+                .map(|(_, operation)| *operation)
+                .collect::<Vec<_>>();
+            operations.sort_unstable();
+            return Ok(AgentTaskEnvelope {
+                capability: AGENT_TASK_CAPABILITY.into(),
+                schema_version: AGENT_TASK_CONTRACT_VERSION,
+                result: json!({
+                    "capability": AGENT_TASK_CAPABILITY,
+                    "supported_schema_versions": [AGENT_TASK_CONTRACT_VERSION],
+                    "operations": operations,
+                }),
+            });
         };
         // The shared core decides whether an exact retained request may be read or retried
         // after drift. Resolve the immutable registered subject here without imposing a
@@ -483,6 +510,7 @@ impl ExecutionService {
             &guard,
         ))?;
         let value = match request {
+            AgentTaskRequest::Capabilities {} => return Err(HubError::Unauthorized),
             AgentTaskRequest::Requirements { .. } => {
                 encode(task(tasks.requirements(&context, &identity))?)?
             }
@@ -561,6 +589,9 @@ impl ExecutionService {
             AgentTaskRequest::CollectorFinalize { .. } => json!({
                 "receipt": task(tasks.reconcile_collector_finalization(&identity, &context))?
             }),
+            AgentTaskRequest::Qualification { .. } => {
+                encode(task(tasks.qualification(&context, &identity))?)?
+            }
         };
         Ok(AgentTaskEnvelope {
             capability: AGENT_TASK_CAPABILITY.into(),
@@ -718,7 +749,8 @@ struct McpQuery {
     profile: String,
 }
 
-const MCP_TOOLS: [(&str, &str); 14] = [
+const MCP_TOOLS: [(&str, &str); 16] = [
+    ("agentscm_task_capabilities", "capabilities"),
     ("agentscm_task_requirements", "requirements"),
     ("agentscm_task_next", "next"),
     ("agentscm_task_instructions", "instructions"),
@@ -733,6 +765,7 @@ const MCP_TOOLS: [(&str, &str); 14] = [
     ("agentscm_task_recovery", "recovery"),
     ("agentscm_task_collector_descriptor", "collector_descriptor"),
     ("agentscm_task_collector_finalize", "collector_finalize"),
+    ("agentscm_task_qualification", "qualification"),
 ];
 const MCP_VERSIONS: [&str; 3] = ["2025-11-25", "2025-06-18", "2025-03-26"];
 
@@ -896,9 +929,12 @@ fn mcp_tools() -> Value {
     };
     let schema = |operation: &str| {
         let mut properties = serde_json::Map::new();
-        properties.insert("subject".into(), subject());
+        if operation != "capabilities" {
+            properties.insert("subject".into(), subject());
+        }
         let required = match operation {
-            "requirements" | "next" | "collector_finalize" => vec!["subject"],
+            "capabilities" => vec![],
+            "requirements" | "next" | "collector_finalize" | "qualification" => vec!["subject"],
             "instructions" => {
                 properties.insert("task_id".into(), id());
                 properties.insert("task_digest".into(), digest());
@@ -915,9 +951,10 @@ fn mcp_tools() -> Value {
                 properties.insert("task_digest".into(), digest());
                 properties.insert("reference_name".into(), id());
                 properties.insert("expected_sha256".into(), digest());
+                // Not a const: a wrong version returns the typed schema mismatch.
                 properties.insert(
                     "expected_schema_version".into(),
-                    json!({"const":AGENT_TASK_CONTRACT_VERSION}),
+                    json!({"type":"integer","minimum":1,"maximum":u32::MAX}),
                 );
                 vec![
                     "subject",
@@ -1158,7 +1195,10 @@ mod tests {
 
     fn arguments(operation: &str) -> Value {
         match operation {
-            "requirements" | "next" | "collector_finalize" => json!({"subject":subject()}),
+            "capabilities" => json!({}),
+            "requirements" | "next" | "collector_finalize" | "qualification" => {
+                json!({"subject":subject()})
+            }
             "instructions" => {
                 json!({"subject":subject(),"task_id":"task-1","task_digest":"4".repeat(64),"supported_schema_versions":[1]})
             }
@@ -1391,6 +1431,8 @@ mod tests {
                 capability: AGENT_TASK_CAPABILITY.into(),
                 required_schema_version: 1,
                 supported_schema_versions: versions,
+                server_schema_versions: vec![1],
+                action: String::new(),
             };
             assert_eq!(
                 InstructionEntrypointResponse::from_slice(&serde_json::to_vec(&response).unwrap())

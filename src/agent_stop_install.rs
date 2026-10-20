@@ -11,11 +11,13 @@ use serde_json::{Value, json};
 
 use crate::agent_stop::StopAgent;
 
-const SUBCOMMANDS: [&str; 4] = [
+const SUBCOMMANDS: [&str; 6] = [
     "claude-stop",
     "remote-stop",
     "codex-stop",
     "remote-codex-stop",
+    "task-stop",
+    "task-codex-stop",
 ];
 const TIMEOUT_SECONDS: u32 = 600;
 const MAX_SETTINGS_BYTES: u64 = 4 * 1024 * 1024;
@@ -34,6 +36,8 @@ enum StopCommand {
     CodexStop(crate::skill_workflow_loop::LoopArgs),
     RemoteStop(crate::hosted_workflow_client::HostedWorkflowArgs),
     RemoteCodexStop(crate::hosted_workflow_client::HostedWorkflowArgs),
+    TaskStop(crate::agent_task_stop::TaskStopArgs),
+    TaskCodexStop(crate::agent_task_stop::TaskStopArgs),
 }
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -121,10 +125,17 @@ pub fn run(
     if applied {
         write_atomic(settings, &new)?;
     }
-    Ok(
-        json!({"settings":settings,"agent":agent.name(),"action":action,"applied":applied,"entry":group}),
-    )
+    let mut out = json!({"settings":settings,"agent":agent.name(),"action":action,"applied":applied,"entry":group});
+    if words
+        .iter()
+        .any(|w| w == "task-stop" || w == "task-codex-stop")
+    {
+        out["instructions"] = TASK_INSTRUCTIONS.into();
+    }
+    Ok(out)
 }
+
+const TASK_INSTRUCTIONS: &str = "Run `agentscm init-repo` to install the short instruction entrypoint; agents discover the supported schema with the task `capabilities` operation, then fetch only what they need.";
 
 /// The agent and workspace of a trailing command that is exactly one valid Stop subcommand.
 fn parse(words: &[String]) -> Result<(StopAgent, PathBuf)> {
@@ -160,6 +171,16 @@ fn parse(words: &[String]) -> Result<(StopAgent, PathBuf)> {
             StopAgent::Codex,
             Some(args.workspace),
             vec![("--token-file", args.token_file)],
+        ),
+        StopCommand::TaskStop(args) => (
+            StopAgent::Claude,
+            Some(args.workspace),
+            vec![("--token-file", args.remote.token_file)],
+        ),
+        StopCommand::TaskCodexStop(args) => (
+            StopAgent::Codex,
+            Some(args.workspace),
+            vec![("--token-file", args.remote.token_file)],
         ),
     };
     let workspace = workspace

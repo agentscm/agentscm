@@ -156,6 +156,7 @@ pub enum WorkspacePathState {
 pub struct Workspace {
     root: PathBuf,
     _access: crate::local_recovery::AccessGuard,
+    read_only: bool,
 }
 
 impl Workspace {
@@ -245,6 +246,7 @@ impl Workspace {
         let workspace = Self {
             root,
             _access: access,
+            read_only: false,
         };
         workspace.finish_initialization_snapshot(snapshot)?;
         Ok(workspace)
@@ -263,7 +265,25 @@ impl Workspace {
         Ok(Self {
             root,
             _access: access,
+            read_only: false,
         })
+    }
+
+    /// Inspect an existing current-schema workspace without migrating it, creating files or
+    /// changing the journal mode. `state` and `status` work; mutating calls fail.
+    pub fn open_read_only(root: impl AsRef<Path>) -> Result<Self> {
+        let root = absolute_path(root.as_ref())?;
+        require_directory(&root, "workspace root")?;
+        let metadata = root.join(METADATA_DIRECTORY);
+        require_directory(&metadata, "workspace metadata")?;
+        let access = crate::local_recovery::AccessGuard::workspace_existing(&metadata)?;
+        let workspace = Self {
+            root,
+            _access: access,
+            read_only: true,
+        };
+        read_state(&workspace.connection()?)?;
+        Ok(workspace)
     }
 
     pub fn state(&self) -> Result<WorkspaceState> {
@@ -484,7 +504,12 @@ impl Workspace {
             ));
         }
         let mut connection = self.connection()?;
-        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let behavior = if self.read_only {
+            TransactionBehavior::Deferred
+        } else {
+            TransactionBehavior::Immediate
+        };
+        let tx = connection.transaction_with_behavior(behavior)?;
         let state = state_with_pending(&tx)?;
         let scope = read_scope(&tx)?;
         let status = if !state.ready {
@@ -859,6 +884,11 @@ impl Workspace {
 
     fn connection(&self) -> Result<Connection> {
         let path = self.root.join(METADATA_DIRECTORY).join(DATABASE_FILE);
+        if self.read_only {
+            let connection = open_connection_read_only(&path)?;
+            validate_schema(&connection)?;
+            return Ok(connection);
+        }
         let mut connection = open_connection(&path, false)?;
         migrate_schema(&mut connection)?;
         validate_schema(&connection)?;
@@ -1277,6 +1307,18 @@ fn open_connection(path: &Path, create: bool) -> Result<Connection> {
             "SQLite refused workspace durability settings".to_owned(),
         ));
     }
+    Ok(connection)
+}
+
+fn open_connection_read_only(path: &Path) -> Result<Connection> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(Error::Invalid(
+            "workspace database is not a non-symlink regular file".to_owned(),
+        ));
+    }
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection.busy_timeout(BUSY_TIMEOUT)?;
     Ok(connection)
 }
 
@@ -4726,6 +4768,62 @@ mod tests {
             workspace.apply(&engine, "apply-1", 0, &changed_receipt),
             Err(Error::Conflict(message)) if message.contains("reused with different input")
         ));
+    }
+
+    #[test]
+    fn read_only_open_inspects_current_workspaces_and_never_migrates_older_ones() {
+        let fixtures = TempDir::new().unwrap();
+        let engine = Engine::open(fixtures.path().join("store")).unwrap();
+        let revision = engine.checkpoint(None, &[put("a.txt", b"a")]).unwrap();
+        let change = ChangeId {
+            repository: "0".repeat(32),
+            id: "change-1".into(),
+        };
+        let root = fixtures.path().join("workspace");
+        Workspace::create(&engine, &root, change, &revision).unwrap();
+        let database = root.join(METADATA_DIRECTORY).join(DATABASE_FILE);
+        // Main database bytes, mtime, `user_version` and the metadata names; only SQLite's own
+        // `-wal`/`-shm` sidecars may come and go.
+        let snapshot = || {
+            let version: i64 =
+                Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .unwrap()
+                    .pragma_query_value(None, "user_version", |row| row.get(0))
+                    .unwrap();
+            let mut names: Vec<_> = fs::read_dir(root.join(METADATA_DIRECTORY))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .filter(|name| !name.ends_with("-wal") && !name.ends_with("-shm"))
+                .collect();
+            names.sort();
+            (
+                fs::read(&database).unwrap(),
+                fs::metadata(&database).unwrap().modified().unwrap(),
+                version,
+                names,
+            )
+        };
+        let before = snapshot();
+        let inspected = Workspace::open_read_only(&root).unwrap();
+        let state = inspected.state().unwrap();
+        assert_eq!(state.base_revision, revision);
+        let status = inspected.status(&engine, 8).unwrap();
+        assert!(status.complete && status.changes.is_empty());
+        assert_eq!(status.generation, state.generation);
+        drop(inspected);
+        assert_eq!(snapshot(), before);
+
+        let raw = Connection::open(&database).unwrap();
+        raw.pragma_update(None, "user_version", 3).unwrap();
+        drop(raw);
+        let older = snapshot();
+        assert!(Workspace::open_read_only(&root).is_err());
+        assert_eq!(snapshot(), older);
+        let raw = Connection::open(&database).unwrap();
+        let version: i64 = raw
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
     }
 
     #[test]

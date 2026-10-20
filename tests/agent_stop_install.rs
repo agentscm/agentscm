@@ -308,3 +308,97 @@ fn local_executor_paths_must_be_absolute() {
     }
     assert!(!f.settings().exists());
 }
+
+fn task(subcommand: &str, workspace: &Path, token: &str) -> Vec<String> {
+    [
+        subcommand,
+        "c1",
+        "--endpoint",
+        "http://127.0.0.1:9",
+        "--repository",
+        "synthetic/project",
+        "--profile",
+        "checks",
+        "--token-file",
+        token,
+        "--workspace",
+        workspace.to_str().unwrap(),
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+#[test]
+fn task_stop_hooks_render_are_recognized_and_removable() {
+    let f = Fixture::new();
+    let claude_words = task("task-stop", &f.ws(), "/synthetic/agent.token");
+    let applied = json_out(&invoke(
+        &f.data(),
+        &f.settings(),
+        &["--apply"],
+        &refs(&claude_words),
+    ));
+    assert_eq!(applied["agent"], "claude");
+    assert!(
+        applied["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("capabilities")
+    );
+    let hook = &settings_json(&f)["hooks"]["Stop"][0]["hooks"][0];
+    assert_eq!(hook["args"][2], "skill-workflow");
+    assert_eq!(hook["args"][3], "task-stop");
+    assert!(hook.get("args").is_some());
+
+    // Replacing for the same workspace with the Codex form recognizes the earlier entry.
+    let codex_words = task("task-codex-stop", &f.ws(), "/synthetic/agent.token");
+    let replaced = json_out(&invoke(
+        &f.data(),
+        &f.settings(),
+        &["--apply"],
+        &refs(&codex_words),
+    ));
+    assert_eq!(
+        (replaced["agent"].as_str(), replaced["action"].as_str()),
+        (Some("codex"), Some("replace"))
+    );
+    let codex = &settings_json(&f)["hooks"]["Stop"][0]["hooks"][0];
+    assert!(codex.get("args").is_none());
+    let command = codex["command"].as_str().unwrap();
+    assert!(
+        command.contains(" skill-workflow task-codex-stop c1 "),
+        "{command}"
+    );
+    assert!(command.contains("--token-file /synthetic/agent.token"));
+
+    let removed = json_out(&invoke(
+        &f.data(),
+        &f.settings(),
+        &[
+            "--apply",
+            "--remove",
+            "--workspace",
+            f.ws().to_str().unwrap(),
+        ],
+        &[],
+    ));
+    assert_eq!(removed["removed"], 1);
+    assert_eq!(settings_json(&f), json!({}));
+}
+
+#[test]
+fn task_stop_requires_absolute_token_file_and_workspace() {
+    let f = Fixture::new();
+    for subcommand in ["task-stop", "task-codex-stop"] {
+        let relative = task(subcommand, &f.ws(), "agent.token");
+        let out = invoke(&f.data(), &f.settings(), &["--apply"], &refs(&relative));
+        assert!(!out.status.success(), "{subcommand}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("--token-file must be an absolute"));
+        let mut words = task(subcommand, &f.ws(), "/synthetic/agent.token");
+        let at = words.iter().position(|word| word == "--workspace").unwrap();
+        words[at + 1] = "relative-ws".into();
+        let out = invoke(&f.data(), &f.settings(), &["--apply"], &refs(&words));
+        assert!(!out.status.success(), "{subcommand}");
+    }
+    assert!(!f.settings().exists());
+}

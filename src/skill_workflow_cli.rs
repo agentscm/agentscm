@@ -45,6 +45,13 @@ pub enum SkillWorkflowCommand {
     /// Opt-in Codex Stop hook. Native landing is independently enforced by the authority.
     #[cfg(unix)]
     CodexStop(crate::skill_workflow_loop::LoopArgs),
+    /// Opt-in Claude Code Stop hook for agent-owned tasks. Read-only: asks the task facade whether
+    /// the exact Change subject is qualified and never runs, uploads, finalizes or checkpoints.
+    #[cfg(unix)]
+    TaskStop(crate::agent_task_stop::TaskStopArgs),
+    /// Opt-in Codex Stop hook for agent-owned tasks. Read-only like `task-stop`.
+    #[cfg(unix)]
+    TaskCodexStop(crate::agent_task_stop::TaskStopArgs),
     /// Preview (default) or apply a Stop hook entry in an operator-local Claude Code or Codex hook
     /// file. Writes only that file, never installs from candidate source. Give the Stop
     /// subcommand and its arguments after `--`; `--remove` takes none.
@@ -175,6 +182,14 @@ pub async fn run(data_dir: &Path, command: SkillWorkflowCommand) -> Result<()> {
         #[cfg(unix)]
         SkillWorkflowCommand::CodexStop(args) => {
             crate::skill_workflow_loop::claude_stop(data_dir, args, StopAgent::Codex)
+        }
+        #[cfg(unix)]
+        SkillWorkflowCommand::TaskStop(args) => {
+            crate::agent_task_stop::task_stop(data_dir, args, StopAgent::Claude).await
+        }
+        #[cfg(unix)]
+        SkillWorkflowCommand::TaskCodexStop(args) => {
+            crate::agent_task_stop::task_stop(data_dir, args, StopAgent::Codex).await
         }
         #[cfg(unix)]
         SkillWorkflowCommand::InstallStop {

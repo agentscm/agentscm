@@ -32,6 +32,8 @@ mod agent_stop;
 mod agent_stop_install;
 #[cfg(unix)]
 mod agent_task_cli;
+#[cfg(unix)]
+mod agent_task_stop;
 mod autopsy_cli;
 mod demo_cli;
 mod distribution;
@@ -468,7 +470,14 @@ fn is_stop_hook_invocation() -> bool {
     };
     matches!(
         sub.subcommand_name(),
-        Some("claude-stop" | "remote-stop" | "codex-stop" | "remote-codex-stop")
+        Some(
+            "claude-stop"
+                | "remote-stop"
+                | "codex-stop"
+                | "remote-codex-stop"
+                | "task-stop"
+                | "task-codex-stop"
+        )
     )
 }
 

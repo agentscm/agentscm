@@ -142,7 +142,7 @@ pub struct RemoteArgs {
     profile: String,
     /// Absolute owner-private bearer-token file.
     #[arg(long)]
-    token_file: PathBuf,
+    pub(crate) token_file: PathBuf,
 }
 
 pub async fn run(data_dir: &Path, command: AgentTaskCommand) -> Result<Value> {
@@ -482,6 +482,37 @@ fn retained_upload_error(transfer_request_id: &str, failure: RemoteFailure) -> E
     }
 }
 
+/// Fixed failure categories of the Stop-hook qualification call; carries no free text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QualificationFailure {
+    Local,
+    Request,
+    Rejected,
+    Malformed,
+}
+
+/// One bounded read-only `qualification` call for the Stop hook; returns the envelope result.
+pub(crate) async fn qualification(
+    remote: &RemoteArgs,
+    subject: RunSubject,
+) -> std::result::Result<Value, QualificationFailure> {
+    let client = Client::with_timeout(remote, Duration::from_secs(30))
+        .map_err(|_| QualificationFailure::Local)?;
+    let envelope = client
+        .call(&AgentTaskRequest::Qualification { subject })
+        .await
+        .map_err(|failure| match failure {
+            RemoteFailure::Authorization(_) => QualificationFailure::Rejected,
+            _ => QualificationFailure::Request,
+        })?;
+    if envelope.capability != agentscm::skill_workflow::AGENT_TASK_CAPABILITY
+        || envelope.schema_version != agentscm::skill_workflow::AGENT_TASK_CONTRACT_VERSION
+    {
+        return Err(QualificationFailure::Malformed);
+    }
+    Ok(envelope.result)
+}
+
 fn status_request(descriptor: &CollectorWorkDescriptor) -> Result<AgentTaskRequest> {
     Ok(AgentTaskRequest::Status {
         subject: run_subject(descriptor),
@@ -517,6 +548,10 @@ struct Client {
 
 impl Client {
     fn new(args: &RemoteArgs) -> Result<Self> {
+        Self::with_timeout(args, Duration::from_secs(60))
+    }
+
+    fn with_timeout(args: &RemoteArgs, timeout: Duration) -> Result<Self> {
         let endpoint = vetted_url(&args.endpoint)?;
         validate_repository(&args.repository)?;
         validate_id(&args.profile, "profile")?;
@@ -535,7 +570,7 @@ impl Client {
             .http1_only()
             .pool_max_idle_per_host(0)
             .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(60))
+            .timeout(timeout)
             .build()
             .map_err(|_| Error::Invalid("could not build agent-task HTTP client".into()))?;
         Ok(Self {

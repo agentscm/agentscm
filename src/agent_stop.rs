@@ -174,10 +174,13 @@ impl Guard {
         if passed {
             return Ok(pass());
         }
-        let feedback = json!({
+        let mut feedback = json!({
             "failures": result.get("failures").cloned().unwrap_or_else(|| json!([])),
             "next_action": result.get("next_action").cloned().unwrap_or_else(|| json!(default_action)),
         });
+        if let Some(next) = result.get("next") {
+            feedback["next"] = next.clone();
+        }
         let state = RoundState {
             version: 1,
             rounds: self.rounds + 1,
@@ -288,6 +291,20 @@ mod tests {
 
     fn passing() -> Value {
         json!({"receipt": "r", "workspace_changed_during_run": false})
+    }
+
+    #[test]
+    fn typed_next_is_carried_into_the_feedback_when_present() {
+        let data = TempDir::new().unwrap();
+        let mut ran = false;
+        let mut result = failing();
+        result["next"] = json!({"operation": "checkpoint"});
+        let out = run(data.path(), StopAgent::Codex, STOP, result, &mut ran).unwrap();
+        let reason: Value = serde_json::from_str(out["reason"].as_str().unwrap()).unwrap();
+        assert_eq!(reason["next"], json!({"operation": "checkpoint"}));
+        let out = run(data.path(), StopAgent::Codex, STOP, failing(), &mut ran).unwrap();
+        let reason: Value = serde_json::from_str(out["reason"].as_str().unwrap()).unwrap();
+        assert!(reason.get("next").is_none());
     }
 
     fn failing() -> Value {

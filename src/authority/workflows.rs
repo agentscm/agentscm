@@ -513,8 +513,94 @@ pub(super) fn require_current_success(
     context: &ReviewContext,
     imported_origins: Option<&crate::skill_workflow::LiveImportedOrigins>,
 ) -> Result<bool> {
-    let Some(requirement) = read_requirement(tx, &context.target)? else {
+    if read_requirement(tx, &context.target)?.is_none() {
         return Ok(false);
+    }
+    match find_current_success(tx, context, imported_origins)? {
+        Some((_, imported)) => Ok(imported),
+        None => Err(Error::Conflict(format!(
+            "target {} requires a successful workflow for the exact current revision and review context",
+            context.target
+        ))),
+    }
+}
+
+/// Result of the single-snapshot qualification read.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CurrentEvidence {
+    /// The Change, context, policy or target no longer match the queried subject.
+    SubjectChanged,
+    /// The subject is current but the admission evidence checks do not pass.
+    NotQualified,
+    /// Digest of the accepted workflow receipt.
+    Receipt(String),
+}
+
+impl Authority {
+    /// One deferred read snapshot that runs admission's current-subject check and evidence
+    /// checks (source paths, workflow receipt, command unless the receipt is imported).
+    /// It never writes or commits.
+    pub(crate) fn current_qualification(
+        &self,
+        context: &ReviewContext,
+        imported_origins: &crate::skill_workflow::LiveImportedOrigins,
+    ) -> Result<CurrentEvidence> {
+        // Qualification requires a receipt: a target without a requirement is never qualified,
+        // unlike admission's `Ok(false)` pass-through.
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        let current = match validate_current_context_subject(
+            &tx,
+            &context.change,
+            context.change_version,
+            &context.digest()?,
+            &context.target,
+            &context.revision,
+            sql_i64("policy epoch", context.policy_epoch)?,
+        ) {
+            Ok(current) => current,
+            Err(Error::Invalid(_) | Error::Conflict(_)) => {
+                return Ok(CurrentEvidence::SubjectChanged);
+            }
+            Err(error) => return Err(error),
+        };
+        match current_evidence(&tx, &current, imported_origins) {
+            Ok(Some(digest)) => Ok(CurrentEvidence::Receipt(digest)),
+            Ok(None) | Err(Error::Invalid(_) | Error::Conflict(_)) => {
+                Ok(CurrentEvidence::NotQualified)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// Admission's evidence order: source paths, workflow receipt, then command evidence unless
+/// the accepted receipt is the imported kind.
+fn current_evidence(
+    tx: &Transaction<'_>,
+    context: &ReviewContext,
+    imported_origins: &crate::skill_workflow::LiveImportedOrigins,
+) -> Result<Option<String>> {
+    crate::checks::require_current_success(tx, context)?;
+    let Some((digest, imported)) = find_current_success(tx, context, Some(imported_origins))?
+    else {
+        return Ok(None);
+    };
+    #[cfg(not(unix))]
+    let _ = imported;
+    #[cfg(unix)]
+    if !imported {
+        crate::execution::require_current_command_success(tx, context)?;
+    }
+    Ok(Some(digest))
+}
+
+fn find_current_success(
+    tx: &Transaction<'_>,
+    context: &ReviewContext,
+    imported_origins: Option<&crate::skill_workflow::LiveImportedOrigins>,
+) -> Result<Option<(String, bool)>> {
+    let Some(requirement) = read_requirement(tx, &context.target)? else {
+        return Ok(None);
     };
     let requirement_digest = requirement.digest()?;
     let context_digest = context.digest()?;
@@ -566,13 +652,10 @@ pub(super) fn require_current_success(
             && receipt.canonical_bytes()? == canonical
             && receipt.digest()? == digest
         {
-            return Ok(receipt.version == IMPORTED_RECEIPT_VERSION);
+            return Ok(Some((digest, receipt.version == IMPORTED_RECEIPT_VERSION)));
         }
     }
-    Err(Error::Conflict(format!(
-        "target {} requires a successful workflow for the exact current revision and review context",
-        context.target
-    )))
+    Ok(None)
 }
 
 pub(super) fn create_schema_v7(tx: &Transaction<'_>) -> Result<()> {
@@ -1096,5 +1179,104 @@ mod tests {
         assert_eq!(instantiated.source.policy_epoch, context.policy_epoch);
         assert_eq!(required, original);
         assert_eq!(normalized_definition(&instantiated), required.definition);
+    }
+
+    /// A qualified non-imported receipt with real command evidence needs an OCI run, and
+    /// finalization refuses without it. So a native receipt is stored directly for a context
+    /// that requires command evidence no attempt supplies; a control context without the
+    /// requirement accepts the same shape of receipt.
+    #[cfg(unix)]
+    #[test]
+    fn missing_command_evidence_maps_to_not_qualified() {
+        let directory = TempDir::new().unwrap();
+        let engine = crate::store::Engine::open(directory.path()).unwrap();
+        let revision = engine
+            .checkpoint(
+                None,
+                &[crate::model::FileChange {
+                    path: "a".into(),
+                    content: Some(b"a".to_vec()),
+                }],
+            )
+            .unwrap();
+        let mut authority = Authority::open(directory.path()).unwrap();
+        let required = requirement("required");
+        authority.install_workflow_requirement(&required).unwrap();
+        let repository = authority.repository_id().unwrap();
+        let live = crate::skill_workflow::LiveImportedOrigins::empty_for_test(repository.clone());
+        let mut outcomes = Vec::new();
+        for (id, command) in [("change-plain", false), ("change-command", true)] {
+            let mut context = context();
+            context.change = ChangeId {
+                repository: repository.clone(),
+                id: id.into(),
+            };
+            context.change_version = 1;
+            context.revision = revision.clone();
+            context.policy_epoch = authority.policy_epoch().unwrap();
+            if command {
+                context
+                    .required_evidence
+                    .push(crate::context::RequiredEvidence {
+                        identity: crate::execution::COMMAND_EVIDENCE.into(),
+                        digest: context.recipe.clone(),
+                    });
+                context
+                    .required_capabilities
+                    .insert(0, crate::execution::COMMAND_CAPABILITY.into());
+            }
+            authority.start_change(&context).unwrap();
+            let receipt = WorkflowReceipt {
+                version: RECEIPT_VERSION,
+                requirement_digest: required.digest().unwrap(),
+                run_id: "run-1".into(),
+                plan_digest: format!("sha256:{}", "c".repeat(64)),
+                skill_digest: required.skill_digest.clone(),
+                repository: context.change.repository.clone(),
+                revision: context.revision.clone(),
+                target: context.target.clone(),
+                policy_epoch: context.policy_epoch,
+                change_repository: context.change.repository.clone(),
+                change_id: context.change.id.clone(),
+                change_version: context.change_version,
+                context_digest: context.digest().unwrap(),
+                run_state: RunState::Succeeded,
+                imported_dependencies: Vec::new(),
+            };
+            authority
+                .connection
+                .execute(
+                    "INSERT INTO workflow_receipts(digest,requirement_digest,run_id,plan_digest,\
+                     skill_digest,repository,revision,target,policy_epoch,change_repository,\
+                     change_id,change_version,context_digest,canonical_json) \
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                    params![
+                        receipt.digest().unwrap(),
+                        receipt.requirement_digest,
+                        receipt.run_id,
+                        receipt.plan_digest,
+                        receipt.skill_digest,
+                        receipt.repository,
+                        receipt.revision,
+                        receipt.target,
+                        receipt.policy_epoch,
+                        receipt.change_repository,
+                        receipt.change_id,
+                        receipt.change_version,
+                        receipt.context_digest,
+                        receipt.canonical_bytes().unwrap(),
+                    ],
+                )
+                .unwrap();
+            outcomes.push((
+                authority.current_qualification(&context, &live).unwrap(),
+                receipt.digest().unwrap(),
+            ));
+        }
+        assert_eq!(
+            outcomes[0].0,
+            CurrentEvidence::Receipt(outcomes[0].1.clone())
+        );
+        assert_eq!(outcomes[1].0, CurrentEvidence::NotQualified);
     }
 }

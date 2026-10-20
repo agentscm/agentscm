@@ -53,6 +53,11 @@ impl AccessGuard {
         Self::acquire(metadata, false, false, true)
     }
 
+    /// Existing workspace lock only; never creates one.
+    pub(crate) fn workspace_existing(metadata: &Path) -> Result<Self> {
+        Self::acquire_existing(metadata, false, false, true, true)
+    }
+
     fn acquire(root: &Path, exclusive: bool, quarantined: bool, workspace: bool) -> Result<Self> {
         Self::acquire_existing(root, exclusive, quarantined, workspace, false)
     }

@@ -346,6 +346,25 @@ impl Engine {
         })
     }
 
+    /// Opens an already provisioned store without creating directories or the lock file.
+    /// Missing state fails closed.
+    pub fn open_existing(path: impl AsRef<Path>) -> Result<Self> {
+        let root = fs::canonicalize(path.as_ref())?;
+        let access = crate::local_recovery::AccessGuard::shared_existing(&root)?;
+        let objects = root.join("objects");
+        if !fs::symlink_metadata(&objects)?.is_dir() {
+            return Err(Error::Invalid(
+                "store objects path is not a directory".into(),
+            ));
+        }
+        Ok(Self {
+            objects,
+            _access: access,
+            read_budget: None,
+            staged: None,
+        })
+    }
+
     /// Derives an engine that buffers published objects in memory until `flush`.
     /// A staged call holds every object it publishes in memory until flush,
     /// including unreachable intermediates and a copy of blob bytes, bounded by
@@ -3524,6 +3543,52 @@ mod blob_reference_tests {
         assert_eq!(output, [7; 8]);
         drop(stream);
         assert!(matches!(budget.finish(Ok(())), Err(Error::Limit(_))));
+    }
+
+    #[test]
+    fn open_existing_requires_provisioned_state_and_creates_nothing() {
+        fn names(root: &Path) -> BTreeSet<PathBuf> {
+            fn walk(dir: &Path, out: &mut BTreeSet<PathBuf>) {
+                for entry in fs::read_dir(dir).unwrap() {
+                    let path = entry.unwrap().path();
+                    out.insert(path.clone());
+                    if path.is_dir() {
+                        walk(&path, out);
+                    }
+                }
+            }
+            let mut out = BTreeSet::new();
+            walk(root, &mut out);
+            out
+        }
+        let data = TempDir::new().unwrap();
+        let missing = data.path().join("absent");
+        assert!(Engine::open_existing(&missing).is_err());
+        assert!(!missing.exists());
+
+        let store = data.path().join("store");
+        let engine = Engine::open(&store).unwrap();
+        let revision = engine.checkpoint(None, &[]).unwrap();
+        drop(engine);
+        let provisioned = names(&store);
+        let engine = Engine::open_existing(&store).unwrap();
+        assert!(engine.checkpoint(Some(&revision), &[]).is_ok());
+        drop(engine);
+
+        let lock = store.join(".agentscm-local-access.lock");
+        let objects = store.join("objects");
+        fs::rename(&objects, store.join("moved-objects")).unwrap();
+        let before = names(&store);
+        assert!(Engine::open_existing(&store).is_err());
+        assert_eq!(names(&store), before);
+        fs::rename(store.join("moved-objects"), &objects).unwrap();
+
+        fs::remove_file(&lock).unwrap();
+        let before = names(&store);
+        assert!(Engine::open_existing(&store).is_err());
+        assert_eq!(names(&store), before);
+        assert!(!lock.exists());
+        assert!(provisioned.contains(&objects));
     }
 }
 
