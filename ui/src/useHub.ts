@@ -8,7 +8,7 @@ const MAX_BACKOFF_MS = 60_000
  * Sequential polling loop: one request in flight at a time, paused while the tab
  * is hidden, refreshed on becoming visible, exponential backoff after errors.
  */
-function useLoop(tick: (signal: AbortSignal) => Promise<void>, baseMs: number, onFailure: (e: unknown) => void) {
+export function useLoop(tick: (signal: AbortSignal) => Promise<void>, baseMs: number, onFailure: (e: unknown) => void) {
   const latest = useRef({ tick, onFailure })
   useEffect(() => {
     latest.current = { tick, onFailure }

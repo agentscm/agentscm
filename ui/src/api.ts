@@ -1,6 +1,7 @@
 // The page only ever issues GETs. Responses are coerced defensively because
 // every string in them is teammate-supplied.
 import { decodeSkillWorkflowEnvelope, decodeSkillWorkflowListEnvelope } from './skillWorkflow.ts'
+import { decodeSetup } from './onboarding.ts'
 import type { Activity, Health, HubEvent, Intent, Session, SkillWorkflowEnvelope, SkillWorkflowListEnvelope, Whoami, Work } from './types.ts'
 
 export const AGENT_TOKEN_MESSAGE = 'This is an agent token, which can change coordination. The status page needs a read-only token.'
@@ -25,6 +26,10 @@ async function getJson(path: string, signal: AbortSignal, token?: string): Promi
 }
 
 const MAX_SKILL_WORKFLOW_RESPONSE_BYTES = 4 * 1024 * 1024
+
+export async function fetchSetup(token: string, signal: AbortSignal) {
+  return decodeSetup(await getJson('/v1/hub/onboarding', signal, token))
+}
 
 async function getBoundedJson(path: string, signal: AbortSignal, token: string): Promise<unknown> {
   const res = await fetch(path, {

@@ -6,6 +6,7 @@ use axum::Router;
 use axum::body::Bytes;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Json, Query, State};
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -159,7 +160,9 @@ fn default_briefing_limit() -> usize {
 
 async fn mcp(
     State(state): State<HubState>,
+    super::onboarding::Epoch(epoch): super::onboarding::Epoch,
     Reader(principal): Reader,
+    headers: HeaderMap,
     query: std::result::Result<Query<McpQuery>, QueryRejection>,
     body: Bytes,
 ) -> std::result::Result<Response, ApiError> {
@@ -198,7 +201,32 @@ async fn mcp(
                 .repo
                 .as_deref()
                 .is_some_and(|repo| repo != principal.repository);
-            call(&state, &principal, foreign, params).await
+            if params.and_then(|p| p["name"].as_str()) == Some("agentscm_setup_status") {
+                if foreign {
+                    Ok(refused("this token is for another repository"))
+                } else if let Some(call) =
+                    args::<super::onboarding::SetupCall>(params.and_then(|p| p.get("arguments")))
+                {
+                    Ok(
+                        match super::onboarding::mcp(
+                            &state,
+                            &principal,
+                            super::onboarding::client(&headers),
+                            call,
+                            epoch,
+                        ) {
+                            Ok(status) => {
+                                result(&serde_json::to_string(&status).unwrap_or_default(), false)
+                            }
+                            Err(error) => hub_failure(&error),
+                        },
+                    )
+                } else {
+                    Ok(refused("invalid setup arguments"))
+                }
+            } else {
+                call(&state, &principal, foreign, params).await
+            }
         }
         _ => Err(NO_METHOD),
     };
@@ -295,6 +323,13 @@ fn tools(read_only: bool) -> Value {
         return json!([overview, briefing, inbox, workflow]);
     }
     let mut listed = json!([
+        {"name": "agentscm_setup_status",
+         "description": "Verify onboarding through native MCP using the actual native hook session ID. Reports MCP and native edit-hook evidence separately, with the next setup step. Optional blocker reports describe observed login, trust, quota or unsupported-account errors; never send raw diagnostics or credentials. CLI/config checks do not verify native hooks.",
+         "inputSchema": schema(json!({
+             "agent": {"type":"string", "enum":["claude","codex","cursor","copilot","gemini"]},
+             "session": {"type":"string", "minLength":1, "maxLength":128},
+             "blocker": {"type":"string", "enum":["login","trust","quota","unsupported","unknown"]}
+         }), &["agent", "session"])},
         {"name": "agentscm_start",
          "description": "Call before editing. Reads ongoing work and recent outcomes, then atomically checks declared scope and claims or joins the task. Conflicting new lead scopes are refused with existing assignments and paths. Inspect work.context, completeness flags and overlap alternatives before proceeding.",
          "inputSchema": schema(json!({

@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process'
 import assert from 'node:assert/strict'
 import { CLIENT_AGENTS, agentSetupPrompt, clientSetupCommand, safeHubOrigin } from '../src/connectAgent.ts'
+import { decodeSetup, setupState } from '../src/onboarding.ts'
 
 assert.equal(safeHubOrigin('https://hub.example.com'), 'https://hub.example.com')
 assert.equal(safeHubOrigin('https://hub.example.com:8443'), 'https://hub.example.com:8443')
@@ -31,11 +32,24 @@ assert.ok(prompt?.includes('Never configure or deploy a Hub'))
 assert.ok(prompt?.includes("client setup --agent NAME --hub 'https://hub.example.com'"))
 for (const agent of CLIENT_AGENTS) assert.ok(prompt?.includes(agent))
 assert.ok(prompt?.includes('Run npx agentscm client check'))
-assert.ok(prompt?.includes('verify a real agent session reaches the expected repository'))
+assert.ok(prompt?.includes('both mcp_verified and native_verified true'))
+assert.ok(prompt?.includes('diagnostic-stdin'))
+assert.ok(prompt?.includes('do not invent a session ID or simulate hooks'))
 assert.ok(!prompt?.toLowerCase().includes('token='))
 assert.equal(agentSetupPrompt('https://hub.example.com/?token=secret'), null)
 
 console.log('connect-agent command checks passed')
+
+const row = { agent: 'codex', key: 'opaque-key', name: 'Agent', owner: 'member', blocker: null, mcp_verified: true, native_verified: false, expires_at: 2000, next_action: 'Verify native hook', state: 'ready' }
+const [decoded] = decodeSetup([row])
+assert.equal(setupState(decoded, 1000000, true), 'Unverified') // Ignore a supplied ready flag.
+assert.equal(setupState({ ...decoded, native_verified: true }, 1000000, true), 'Ready')
+assert.equal(setupState({ ...decoded, native_verified: true }, 2000000, true), 'Unverified')
+assert.equal(setupState({ ...decoded, native_verified: true }, 1000000, false), 'Unverified')
+assert.equal(setupState({ ...decoded, native_verified: true, blocker: 'quota' }, 1000000, true), 'Blocked')
+assert.equal(setupState(decodeSetup([{ ...row, blocker: undefined, native_verified: true }])[0], 1000000, true), 'Blocked')
+assert.deepEqual(decodeSetup([{ ...row, agent: 'other' }, { ...row, expires_at: Infinity }]), [])
+assert.throws(() => decodeSetup({}))
 
 // URL accepts shell metacharacters in hostnames. Every dynamic argument must remain literal.
 const unusualOrigin = "https://a'$(id)'b.com"

@@ -1,5 +1,5 @@
 import { BranchesOutlined, ExportOutlined, LaptopOutlined } from '@ant-design/icons'
-import { Skeleton, Typography } from 'antd'
+import { Skeleton } from 'antd'
 import type { Derived, LiveAgent, OwnerGroup } from '../derive.ts'
 import { useNow } from '../useHub.ts'
 import { Av, Chips, RelTime, Section, ViaTag } from './bits.tsx'
@@ -61,22 +61,19 @@ export function Onboarding({ index }: { index: number }) {
           <li>
             <span className="step-n">1</span>
             <div>
-              <p>In your repository run</p>
-              <Typography.Text code copyable>
-                agentscm init-repo
-              </Typography.Text>
+              <p>Choose “Connect an agent” above and copy the setup instructions.</p>
             </div>
           </li>
           <li>
             <span className="step-n">2</span>
             <div>
-              <p>Start your coding agent (Claude Code, Codex, Cursor or Copilot) in that repository.</p>
+              <p>Paste setup instructions into Claude Code, Codex, Cursor, Copilot or Gemini CLI in your repository.</p>
             </div>
           </li>
           <li>
             <span className="step-n">3</span>
             <div>
-              <p>This page updates within seconds.</p>
+              <p>Your agent guides sign-in and approvals, then verifies MCP and its native edit hook. Live activity alone does not mean ready.</p>
             </div>
           </li>
         </ol>

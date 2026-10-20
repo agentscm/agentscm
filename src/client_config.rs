@@ -17,6 +17,17 @@ use crate::hub_cli::{config_dir, map_hub_error, write_private};
 use crate::intent_cli::{repo_root, valid_repo};
 
 const VERSION: u8 = 1;
+
+/// Opaque root-and-token binding, shared by the native hook and MCP proxies.
+/// Not a credential or remote attestation. A replaced token or root gets different proof.
+pub(crate) fn onboarding_client(root: &Path, token: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"agentscm-onboarding-client-v1\0");
+    digest.update((token.len() as u64).to_be_bytes());
+    digest.update(token.as_bytes());
+    digest.update(root.as_os_str().as_encoded_bytes());
+    format!("{:x}", digest.finalize())
+}
 const MAX_CONNECTIONS: usize = 128;
 const FILE_BYTES: u64 = 64 * 1024;
 const LOCK_WAIT: Duration = Duration::from_secs(2);

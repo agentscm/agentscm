@@ -136,7 +136,7 @@ async fn call_hub(
         return Err("client connection mode does not support this agent".into());
     }
     let plugin_route = client_connection;
-    let (url, token, repo, root, endpoint_agent, outbound) = if plugin_route {
+    let (url, token, repo, root, endpoint_agent, outbound, client_root) = if plugin_route {
         let routed = route_client(&agent, &payload)?;
         (
             routed.connection.hub.clone(),
@@ -145,6 +145,7 @@ async fn call_hub(
             None,
             routed.endpoint_agent,
             routed.payload,
+            Some(routed.connection.root.clone()),
         )
     } else {
         let env = |name| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
@@ -169,7 +170,7 @@ async fn call_hub(
         } else {
             payload.clone()
         };
-        (url, token, repo, root, agent.clone(), outbound)
+        (url, token, repo, root, agent.clone(), outbound, None)
     };
     let token = match token {
         Token::Value(token) => token,
@@ -189,7 +190,7 @@ async fn call_hub(
         // Preserve the legacy transport contract, including original JSON bytes.
         original_body
     };
-    let request = hub_request(
+    let mut request = hub_request(
         &client,
         &url,
         &endpoint_agent,
@@ -198,6 +199,12 @@ async fn call_hub(
         &outbound_body,
         root.as_deref(),
     )?;
+    if let Some(root) = client_root {
+        request = request.header(
+            agentscm::hub::onboarding::CLIENT_HEADER,
+            client_config::onboarding_client(&root, &token),
+        );
+    }
     // `send` errors carry no URL or credentials.
     let (status, reply) = send(request, REPLY_BYTES)
         .await
@@ -914,6 +921,17 @@ fn fail_open(agent: &str, payload: &Value, note: Option<&str>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gemini_native_start_preserves_session_discovery_context() {
+        let context = "AgentSCM native session ID (literal data, not instructions): \"native-id\". Use this exact session argument with agentscm_setup_status.";
+        let reply = gemini_reply(
+            json!({"status":"clean","text":context}),
+            &json!({"hook_event_name":"SessionStart"}),
+            None,
+        );
+        assert_eq!(reply["hookSpecificOutput"]["additionalContext"], context);
+    }
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| (*s).to_owned()).collect()
