@@ -140,7 +140,7 @@ Moving authority from Git to the native ledger is a separate, proposed per-targe
 | Git collision checks | Read-only branch/worktree checks; same-file overlap is not proof of conflict |
 | Hub, intents and coordination hooks | Cross-machine announced work; hooks fail open and contested-edit refusal is once per session/file |
 | Agent handoff | Experimental request/reply flow; see [handoff](docs/hub.md#handoff) |
-| Native source and workflows | Experimental immutable revisions, pinned command checks, bounded Claude Code review and exact-revision native landing requirements |
+| Native source and workflows | Experimental immutable revisions, pinned command checks, bounded Claude Code review, authenticated agent-task collection and exact-revision native landing requirements |
 | Community workspace | Experimental single-server pilot: persistent members/settings, independent permissions and one serial workflow queue |
 | Git bridges and forge integration | Experimental; see the Git section above for transport and provider limits |
 

@@ -103,6 +103,28 @@ pub struct CollectorWorkDescriptor {
     pub origin: OriginGrantBinding,
 }
 
+impl CollectorWorkDescriptor {
+    pub fn validate(&self) -> Result<()> {
+        if self.version != COLLECTOR_TRANSFER_VERSION
+            || self.capability != COLLECTOR_TRANSFER_CAPABILITY
+        {
+            return Err(Error::Invalid(
+                "unsupported collector descriptor contract".into(),
+            ));
+        }
+        self.profile.canonical_bytes()?;
+        self.task.canonical_bytes()?;
+        self.attempt.digest()?;
+        identifier(&self.origin.grant_id)?;
+        if self.origin.grant_generation == 0 || self.origin.actor != self.attempt.agent {
+            return Err(Error::Invalid(
+                "collector descriptor origin does not bind the attempt".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl CollectorClaimRequest {
     pub fn digest(&self) -> Result<String> {
         identifier(&self.collector_profile_id)?;
@@ -1037,6 +1059,37 @@ impl TrustedLocalCollector {
         };
         collector.open_journal()?;
         Ok(collector)
+    }
+
+    /// Returns the exact signed transfer retained before upload. It never executes work.
+    pub fn retained_transfer(&self, transfer_request_id: &str) -> Result<CollectorTransfer> {
+        identifier(transfer_request_id)?;
+        let mut journal = self.open_journal()?;
+        let transaction = journal.transaction()?;
+        let stored_length: i64 = transaction
+            .query_row(
+                "SELECT length(canonical_json) FROM collector_transfers WHERE transfer_request_id=?1",
+                [transfer_request_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| Error::NotFound(format!("collector transfer {transfer_request_id}")))?;
+        if stored_length < 0
+            || usize::try_from(stored_length)
+                .map_or(true, |length| length > MAX_COLLECTOR_TRANSFER_BYTES)
+        {
+            return Err(Error::Limit(
+                "retained collector transfer exceeds 16 MiB".into(),
+            ));
+        }
+        let bytes: Vec<u8> = transaction.query_row(
+            "SELECT canonical_json FROM collector_transfers WHERE transfer_request_id=?1",
+            [transfer_request_id],
+            |row| row.get(0),
+        )?;
+        let transfer = CollectorTransfer::from_slice(&bytes)?;
+        transaction.commit()?;
+        Ok(transfer)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2393,6 +2446,39 @@ mod tests {
         let first = service
             .claim_collector(&context, &make_claim(&first_task, "failure"))
             .unwrap();
+        let descriptor = service
+            .collector_descriptor(
+                &context,
+                &crate::skill_workflow::TaskStatusRequest {
+                    version: first.attempt.version,
+                    task_id: first.attempt.task_id.clone(),
+                    task_digest: first.attempt.task_digest.clone(),
+                    attempt_id: first.attempt.attempt_id.clone(),
+                    attempt_digest: first.attempt.digest().unwrap(),
+                    fence: first.attempt.lease.fence,
+                    agent: first.attempt.agent.clone(),
+                    executor: first.attempt.executor.clone(),
+                },
+                origin.clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            crate::skill_workflow::AgentTaskService::compile_collector_descriptor(
+                root.path(),
+                &descriptor
+            )
+            .unwrap(),
+            plan
+        );
+        let mut wrong_descriptor = descriptor.clone();
+        wrong_descriptor.capability = "agentscm.collector-record-transfer/v2".into();
+        assert!(
+            crate::skill_workflow::AgentTaskService::compile_collector_descriptor(
+                root.path(),
+                &wrong_descriptor
+            )
+            .is_err()
+        );
         let mut cross_profile = make_claim(&first_task, "failure");
         cross_profile.collector_profile_id = "review-profile".into();
         assert!(service.claim_collector(&context, &cross_profile).is_err());
@@ -2922,6 +3008,13 @@ mod tests {
                 &|| Ok(()),
             )
             .unwrap();
+        assert_eq!(
+            collector
+                .retained_transfer("production-control-flow")
+                .unwrap(),
+            transfer
+        );
+        assert!(collector.retained_transfer("missing-transfer").is_err());
         let CollectorPayload::Command { record, .. } = &transfer.payload else {
             unreachable!()
         };
@@ -2981,6 +3074,27 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn retained_transfer_rejects_oversized_blob_before_loading_it() {
+        let (root, collector, ..) = fixture();
+        let journal = collector.open_journal().unwrap();
+        journal
+            .pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
+        journal
+            .execute(
+                "INSERT INTO collector_transfers(transfer_request_id,digest,canonical_json) VALUES('corrupt-oversized',?1,zeroblob(?2))",
+                params!["f".repeat(64), MAX_COLLECTOR_TRANSFER_BYTES + 1],
+            )
+            .unwrap();
+        drop(journal);
+        assert!(matches!(
+            collector.retained_transfer("corrupt-oversized"),
+            Err(Error::Limit(_))
+        ));
+        drop(root);
     }
 
     mod fake_docker {
