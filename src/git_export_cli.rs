@@ -70,6 +70,15 @@ pub enum GitExportCommand {
     },
 }
 
+pub(crate) fn telemetry_action(command: &GitExportCommand) -> bool {
+    matches!(
+        command,
+        GitExportCommand::Init { .. }
+            | GitExportCommand::Export { .. }
+            | GitExportCommand::RecordCheck { .. }
+    )
+}
+
 pub fn run(command: GitExportCommand, data_dir: &Path) -> Result<Value> {
     let data = data_dir.canonicalize()?;
     if !data.join("state.sqlite").is_file() {

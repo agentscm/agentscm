@@ -2,7 +2,13 @@
 
 > **Alpha: not for production.** The CLI and the files it writes may change without migration.
 
-`agentscm quickstart` (and `npx agentscm`, which runs it) sets AgentSCM up for the repository you are in. You choose from short menus; it never asks you to edit a file. Before each write it says what it will write and asks once. `agentscm uninstall` undoes the recorded local setup. Nothing is sent anywhere except to the hub you choose; there is no telemetry. Unix only (macOS and Linux).
+`agentscm quickstart` (and `npx agentscm`, which runs it) sets AgentSCM up for the repository you are in. You choose from short menus; it never asks you to edit a file. Before each write it says what it will write and asks once. `agentscm uninstall` undoes the recorded local setup. Hub traffic goes only to the hub you choose. Product usage telemetry is a separate staged capability and is effectively inactive until an HTTPS endpoint and data-handling profile are configured. Unix only (macOS and Linux).
+
+## Usage telemetry choice
+
+When telemetry is configured and eligible, quickstart shows the disclosure and offers an opt-out before the first event can be sent. Provisioning the endpoint and profile alone does not record that notice or enable sending. A `consent-required` profile stays inactive until you affirmatively run `agentscm telemetry on` or make the equivalent interactive choice; `--yes` never supplies that consent. A `permitted-default` profile may enable collection after quickstart shows the notice and completes its default-on flow, subject to the operator's legal determination. An `unknown` profile stays inactive.
+
+Your choice is stored in the per-user telemetry configuration. `agentscm telemetry off` persists the opt-out and deletes queued events and telemetry identifiers without sending an opt-out event. `DO_NOT_TRACK=1`, `AGENTSCM_TELEMETRY=off` and the global `--no-telemetry` flag provide stronger overrides. See [usage telemetry](telemetry.md) for the fields, status and inspection commands.
 
 ## What it does
 
@@ -32,7 +38,7 @@ Quickstart and uninstall share one lock for the user configuration directory. An
 
 ## Running without a terminal (CI)
 
-Without a terminal quickstart refuses unless you pass `--yes`, which takes the recommended answer to every question. Choose with flags:
+Without a terminal quickstart refuses unless you pass `--yes`, which takes the recommended setup answers. Telemetry still requires an earlier eligible choice or explicit enablement. Choose with flags:
 
 | Flag | Meaning |
 | --- | --- |
@@ -49,6 +55,8 @@ Without a terminal quickstart refuses unless you pass `--yes`, which takes the r
 | `--no-collisions` | Skip the collision check. |
 
 Without a terminal quickstart never starts a browser or device sign-in: pass `--agent-token-file` for non-interactive setup. A new local hub still requires GitHub App setup in a browser; `--yes` prints the link and returns exit status **3** without waiting. Finish that step, then resume with the printed command, which includes the runtime, port and project. Exit status **0** means the requested setup completed; other failures exit non-zero.
+
+Non-interactive `--yes` leaves a fresh telemetry notice and choice pending under every profile. It does not enable telemetry; use an earlier eligible choice or explicit `agentscm telemetry on`.
 
 Example: `agentscm quickstart --yes --hub existing --hub-url https://hub.example.com --agent-token-file ~/hub.token --hook project`.
 

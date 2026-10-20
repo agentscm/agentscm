@@ -71,6 +71,17 @@ enum GitRemoteCommand {
     Recover { operation_id: String },
 }
 
+pub(crate) fn telemetry_action(args: &GitRemoteArgs) -> bool {
+    matches!(
+        args.command,
+        GitRemoteCommand::Bind { .. }
+            | GitRemoteCommand::BindNetwork { .. }
+            | GitRemoteCommand::Fetch { .. }
+            | GitRemoteCommand::Publish { .. }
+            | GitRemoteCommand::Recover { .. }
+    )
+}
+
 pub fn run(args: GitRemoteArgs, data_dir: &Path) -> Result<Value> {
     let data = data_dir.canonicalize()?;
     let mirror_path = args.mirror.canonicalize()?;

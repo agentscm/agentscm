@@ -63,6 +63,8 @@ mod skill_workflow_cli;
 #[cfg(unix)]
 mod skill_workflow_loop;
 mod team_cli;
+mod telemetry;
+mod telemetry_cli;
 mod work_cli;
 #[cfg(unix)]
 mod workflow_cli;
@@ -82,12 +84,20 @@ struct Cli {
     /// Repository data directory.
     #[arg(long, global = true, default_value = ".agentscm")]
     data_dir: PathBuf,
+    /// Disable telemetry for this invocation, including any background sender.
+    #[arg(long, global = true)]
+    no_telemetry: bool,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Inspect or change pseudonymous product telemetry.
+    Telemetry {
+        #[command(subcommand)]
+        command: telemetry_cli::TelemetryCommand,
+    },
     /// [experimental] Run bounded repository skill workflows on immutable local source.
     SkillWorkflow {
         #[command(subcommand)]
@@ -462,15 +472,65 @@ async fn main() {
         }
     };
 
+    let invocation_off = cli.no_telemetry;
+    let verified_install = matches!(
+        std::env::var("AGENTSCM_VERIFIED_INSTALL").as_deref(),
+        Ok("1")
+    ) && verified_install_command(&cli.command);
+    let install_after_command = matches!(
+        &cli.command,
+        Command::Telemetry {
+            command: telemetry_cli::TelemetryCommand::On
+        }
+    );
+    if let Command::Quickstart(args) = &cli.command
+        && args.can_start()
+    {
+        let _ = telemetry::onboard(args.noninteractive(), invocation_off);
+    }
+    if verified_install && !install_after_command {
+        telemetry::record_installation(invocation_off);
+    }
+    let feature = telemetry_feature(&cli.command);
     let result = run(cli).await;
-    if let Err(error) = result {
-        print_error(&error);
-        std::process::exit(1);
+    if verified_install && install_after_command && matches!(result, Ok(RunExit::Completed)) {
+        telemetry::record_installation(invocation_off);
+    }
+    if let Some(feature) = feature {
+        telemetry::record(
+            feature,
+            if matches!(result, Ok(RunExit::Completed)) {
+                telemetry::Outcome::Succeeded
+            } else {
+                telemetry::Outcome::Failed
+            },
+            invocation_off,
+        );
+    }
+    match result {
+        Ok(RunExit::Completed) => {}
+        Ok(RunExit::SpecializedFailure(code)) => std::process::exit(code),
+        Err(error) => {
+            print_error(&error);
+            std::process::exit(1);
+        }
     }
 }
 
-async fn run(cli: Cli) -> Result<()> {
+enum RunExit {
+    Completed,
+    /// The command already rendered its specialized failure; preserve only its exit status.
+    SpecializedFailure(i32),
+}
+
+async fn run(cli: Cli) -> Result<RunExit> {
     match cli.command {
+        Command::Telemetry { command } => {
+            match telemetry_cli::run(command, cli.no_telemetry).await? {
+                telemetry_cli::Output::Value(value) => print_json(&value),
+                telemetry_cli::Output::Quiet => {}
+            }
+        }
         Command::SkillWorkflow { command } => {
             skill_workflow_cli::run(&cli.data_dir, command).await?;
         }
@@ -479,7 +539,7 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(value) => print_json(&value),
             Err(error) => {
                 eprintln!("{}", json!({"ok":false,"error":error}));
-                std::process::exit(1);
+                return Ok(RunExit::SpecializedFailure(1));
             }
         },
         #[cfg(unix)]
@@ -518,7 +578,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Quickstart(args) => {
             let code = quickstart::run(args).await?;
             if code != 0 {
-                std::process::exit(i32::from(code));
+                return Ok(RunExit::SpecializedFailure(i32::from(code)));
             }
         }
         Command::Uninstall(args) => quickstart::uninstall(args).await?,
@@ -925,7 +985,94 @@ async fn run(cli: Cli) -> Result<()> {
             server::serve(cli.data_dir, bind, public, max_concurrency, collisions_repo).await?;
         }
     }
-    Ok(())
+    Ok(RunExit::Completed)
+}
+
+fn telemetry_feature(command: &Command) -> Option<telemetry::Feature> {
+    use telemetry::Feature;
+    match command {
+        Command::Quickstart(_) => Some(Feature::Quickstart),
+        Command::Uninstall(_) => Some(Feature::Uninstall),
+        Command::InitRepo(_) => Some(Feature::InitRepo),
+        #[cfg(unix)]
+        Command::Collisions(_) => Some(Feature::Collisions),
+        Command::Autopsy(_) => Some(Feature::Autopsy),
+        Command::Intent { command } if intent_cli::telemetry_action(command) => {
+            Some(Feature::Intent)
+        }
+        Command::Work { command } if work_cli::telemetry_action(command) => Some(Feature::Work),
+        Command::Hub { command } if hub_cli::telemetry_action(command) => Some(Feature::Hub),
+        Command::Team { command } if team_cli::telemetry_action(command) => Some(Feature::Team),
+        Command::SkillWorkflow { command } if skill_workflow_cli::telemetry_action(command) => {
+            Some(Feature::SkillWorkflow)
+        }
+        #[cfg(unix)]
+        Command::Setup { command } if setup_cli::telemetry_action(command) => Some(Feature::Setup),
+        #[cfg(unix)]
+        Command::Workflow { command } if guided_cli::telemetry_action(command) => {
+            Some(Feature::Workflow)
+        }
+        #[cfg(unix)]
+        Command::GitSnapshot { command } if git_snapshot_cli::telemetry_action(command) => {
+            Some(Feature::GitBridge)
+        }
+        #[cfg(unix)]
+        Command::GitRemote(args) if git_remote_cli::telemetry_action(args) => {
+            Some(Feature::GitBridge)
+        }
+        #[cfg(unix)]
+        Command::GitExport { command } if git_export_cli::telemetry_action(command) => {
+            Some(Feature::GitBridge)
+        }
+        #[cfg(unix)]
+        Command::GitReconcile { command } if git_reconcile_cli::telemetry_action(command) => {
+            Some(Feature::GitBridge)
+        }
+        #[cfg(unix)]
+        Command::Workspace { command } if workflow_cli::workspace_telemetry_action(command) => {
+            Some(Feature::NativeSource)
+        }
+        #[cfg(unix)]
+        Command::Sync { .. } => Some(Feature::NativeSource),
+        #[cfg(unix)]
+        Command::Merge { command } if merge_cli::telemetry_action(command) => {
+            Some(Feature::NativeSource)
+        }
+        Command::Policy { advance: Some(_) } => Some(Feature::NativeSource),
+        Command::Init
+        | Command::Start { .. }
+        | Command::Context { .. }
+        | Command::CheckRecipe { .. }
+        | Command::CheckSourcePaths { .. }
+        | Command::CheckRun { .. }
+        | Command::CheckCancel { .. }
+        | Command::CheckRecover { .. }
+        | Command::Checkpoint { .. }
+        | Command::Approve { .. }
+        | Command::Revoke { .. }
+        | Command::Integrate { .. }
+        | Command::InitializeTarget { .. }
+        | Command::PrepareLanding { .. } => Some(Feature::NativeSource),
+        #[cfg(unix)]
+        Command::IsolatedCheckRecipe { .. }
+        | Command::IsolatedCheckCreate { .. }
+        | Command::IsolatedCheckRun { .. }
+        | Command::IsolatedCheckCancel { .. }
+        | Command::IsolatedCheckRecover { .. } => Some(Feature::NativeSource),
+        _ => None,
+    }
+}
+
+fn verified_install_command(command: &Command) -> bool {
+    !matches!(
+        command,
+        Command::Demo(_)
+            | Command::Hook(_)
+            | Command::Telemetry {
+                command: telemetry_cli::TelemetryCommand::Off
+                    | telemetry_cli::TelemetryCommand::Send
+            }
+    )
 }
 
 fn require_limit(value: usize, maximum: usize, operation: &str) -> Result<()> {

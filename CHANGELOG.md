@@ -4,6 +4,7 @@ All notable changes are listed here, newest first. AgentSCM is alpha: any releas
 
 ## Unreleased
 
+- Add staged product usage telemetry with inspectable coarse feature/day events, a pseudonymous random installation identifier, persistent on/off controls and environment or per-command overrides. Transmission remains inactive without a configured HTTPS endpoint and data-handling profile; consent-required profiles wait for an affirmative choice. No production endpoint is configured. See [telemetry](docs/telemetry.md).
 - Workspace capture honors exclusion rules. Status, checkpoint and the other workspace scans leave out untracked paths matched by `.gitignore`, a root `.agentscmignore`, the private `.agentscm-workspace/exclude` and, with a root `.git`, Git's global and `info/exclude` rules; base-revision paths are always captured. A root `.git` is skipped as metadata but needs a working `git` that accepts the repository. `agentscm workspace preview` lists included and excluded paths with the deciding rule, and `workspace status` reports `excluded_total`. Undo, merge application and refresh block rather than overwrite an excluded local file. Local backup still copies ignored files. See [source selection](docs/advanced/workspace.md#source-selection).
 - A hosted laptop check counts as changed if the workspace base moves during the run.
 

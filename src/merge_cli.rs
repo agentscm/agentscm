@@ -94,6 +94,19 @@ pub enum MergeCommand {
     },
 }
 
+pub(crate) fn telemetry_action(command: &MergeCommand) -> bool {
+    matches!(
+        command,
+        MergeCommand::Begin { .. }
+            | MergeCommand::Base { .. }
+            | MergeCommand::Resolve { .. }
+            | MergeCommand::Complete { .. }
+            | MergeCommand::Abort { .. }
+            | MergeCommand::Recover { .. }
+            | MergeCommand::Apply { .. }
+    )
+}
+
 pub fn merge(data_dir: &Path, command: MergeCommand) -> Result<Value> {
     let data = existing_data_directory(data_dir)?;
     let authority = Authority::open(&data)?;

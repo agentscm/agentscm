@@ -105,6 +105,15 @@ pub enum SkillWorkflowCommand {
     },
 }
 
+pub(crate) fn telemetry_action(command: &SkillWorkflowCommand) -> bool {
+    match command {
+        SkillWorkflowCommand::Status { .. } => false,
+        #[cfg(unix)]
+        SkillWorkflowCommand::ClaudeStop(_) | SkillWorkflowCommand::RemoteStop(_) => false,
+        _ => true,
+    }
+}
+
 pub async fn run(data_dir: &Path, command: SkillWorkflowCommand) -> Result<()> {
     match command {
         #[cfg(unix)]
