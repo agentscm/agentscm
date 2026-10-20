@@ -53,13 +53,16 @@ Make focused changes and add or update deterministic synthetic tests when approp
 ```sh
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
-cargo test --locked
+cargo nextest run --locked
+cargo test --locked --doc
 git diff --check
 ```
 
 When `ui/` changes, also run `npm ci --ignore-scripts`, `npm run lint`, `npm run build` and `npm run notices -- --check` in `ui/`; when the container image or its inputs change, also run `docker build -t agentscm . && .github/docker-smoke.sh agentscm`. Tests needing PostgreSQL or S3 skip unless `AGENTSCM_TEST_DATABASE_URL` or `AGENTSCM_TEST_S3_*` are set; report such skips as coverage limits, not passes.
 
 All applicable checks must pass before committing. Report missing prerequisites and failures explicitly; do not describe an incomplete gate as successful verification.
+
+Reuse a completed final gate only under `docs/contributor-testing.md`, after comparing the tested inputs and retaining the original commands, results, snapshot and comparison. Relevant changes invalidate affected evidence; runner or test-configuration changes require the full nextest suite and doctests. Applicable reviews remain required.
 
 ### 5. Commit, push, and verify
 

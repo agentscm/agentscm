@@ -10,6 +10,8 @@ use crate::{Error, Result};
 pub(super) struct Git {
     executable: PathBuf,
     destination: PathBuf,
+    #[cfg(test)]
+    fixture_launcher: bool,
 }
 
 pub(super) const MAX_SEED_OBJECTS: usize = 100_000;
@@ -34,7 +36,15 @@ impl Git {
         Ok(Self {
             executable: executable.to_path_buf(),
             destination,
+            #[cfg(test)]
+            fixture_launcher: false,
         })
+    }
+
+    #[cfg(test)]
+    fn fixture_launcher(mut self) -> Self {
+        self.fixture_launcher = true;
+        self
     }
 
     pub(super) fn executable(&self) -> PathBuf {
@@ -101,29 +111,32 @@ impl Git {
             .env("GIT_ATTR_NOSYSTEM", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("HOME", "/nonexistent")
-            .env("LC_ALL", "C")
-            .arg("-C")
-            .arg(&self.destination)
-            .args([
-                "--no-replace-objects",
-                "--no-lazy-fetch",
-                "--no-optional-locks",
-                "--literal-pathspecs",
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                "core.fsmonitor=false",
-                "-c",
-                "commit.gpgSign=false",
-                "-c",
-                "gc.auto=0",
-                "-c",
-                "maintenance.auto=false",
-                "-c",
-                "core.fsync=loose-object,reference",
-                "-c",
-                "core.fsyncMethod=fsync",
-            ]);
+            .env("LC_ALL", "C");
+        #[cfg(test)]
+        if self.fixture_launcher {
+            command.current_dir(&self.destination);
+            return command;
+        }
+        command.arg("-C").arg(&self.destination).args([
+            "--no-replace-objects",
+            "--no-lazy-fetch",
+            "--no-optional-locks",
+            "--literal-pathspecs",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "core.fsync=loose-object,reference",
+            "-c",
+            "core.fsyncMethod=fsync",
+        ]);
         command
     }
 
@@ -361,7 +374,7 @@ mod tests {
 
     fn descendants_stop_with_git(output_limit: bool) {
         use std::fs;
-        use std::os::unix::fs::PermissionsExt;
+        use std::path::Path;
         use std::time::Duration;
 
         let root = tempfile::tempdir().unwrap();
@@ -382,10 +395,12 @@ mod tests {
             ),
         )
         .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
-        let git = super::Git::new(&script, root.path().to_path_buf()).unwrap();
+        let git = super::Git::new(Path::new("/bin/sh"), root.path().to_path_buf())
+            .unwrap()
+            .fixture_launcher();
+        let script = script.to_str().unwrap();
         let result = git.run_code_with_timeout(
-            &["fixture"],
+            &[script],
             None,
             if output_limit { 64 } else { 8192 },
             false,

@@ -9,10 +9,11 @@ Users run the container image (see the [README](README.md#quickstart)). To work 
 ```sh
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
-cargo test --locked
+cargo nextest run --locked
+cargo test --locked --doc
 ```
 
-Use synthetic fixtures only. Some tests also run against PostgreSQL (`AGENTSCM_TEST_DATABASE_URL`) or an S3-compatible server (`AGENTSCM_TEST_S3_*`); they are skipped locally when unset and required in CI. Read [STYLE.md](STYLE.md), [docs/README.md](docs/README.md) and [docs/architecture.md](docs/architecture.md) before larger changes.
+Install the pinned nextest version and read the focused-validation, coverage-audit and timing instructions in [contributor testing](docs/contributor-testing.md). Use synthetic fixtures only. Some tests also run against PostgreSQL (`AGENTSCM_TEST_DATABASE_URL`) or an S3-compatible server (`AGENTSCM_TEST_S3_*`); they are skipped locally when unset and required in Linux CI. Read [STYLE.md](STYLE.md), [docs/README.md](docs/README.md) and [docs/architecture.md](docs/architecture.md) before larger changes.
 
 ## Pull requests
 
@@ -20,7 +21,7 @@ Use synthetic fixtures only. Some tests also run against PostgreSQL (`AGENTSCM_T
 - Say what changed, why, how you tested it, and what is not covered. State unsupported behavior instead of hiding it.
 - Keep commit messages factual: the behavior, the reason and any limit. Do not include session links, transcripts, secrets or personal data anywhere in a commit or pull request.
 - Signing your commits is welcome but not required. Maintainers sign theirs, and squash merges are signed by GitHub.
-- CI must pass: formatting, clippy with warnings denied, the test suite, and a container build and smoke test. For pull requests from forks the formatting, clippy and test job runs automatically; a maintainer starts the container and end-to-end jobs by adding the `ci-extended` label after reading the change. Do not weaken CI, signing or branch protections in a change that is not about them.
+- CI must pass: formatting, clippy with warnings denied, the nextest suite, separate doctests, and a container build and smoke test. For pull requests from forks the formatting, clippy and test job runs automatically; a maintainer starts the container and end-to-end jobs by adding the `ci-extended` label after reading the change. Do not weaken CI, signing or branch protections in a change that is not about them.
 
 ## AI and agent assistance
 

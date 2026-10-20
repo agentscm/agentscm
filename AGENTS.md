@@ -11,11 +11,12 @@ Read README.md, CONTRIBUTING.md, STYLE.md, docs/README.md (the index) and docs/a
 ```sh
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
-cargo test --locked                       # or a filter: cargo test --locked git_collisions
+cargo nextest run --locked
+cargo test --locked --doc
 docker build -t agentscm . && .github/docker-smoke.sh agentscm
 ```
 
-The toolchain is pinned in `rust-toolchain.toml`. Tests needing PostgreSQL or S3 skip locally unless `AGENTSCM_TEST_DATABASE_URL` or `AGENTSCM_TEST_S3_*` are set. `tools/portable-verifier` is a separate crate with its own `Cargo.toml`.
+The two test commands are the preferred equivalent full test gate; doctests run separately because nextest does not run them. For focused iteration, select the actual affected tests, callers and failure paths with a nextest filter such as `cargo nextest run --locked -E 'binary(git_collisions)'`. Follow [contributor testing](docs/contributor-testing.md) for installing the pinned runner, measuring or auditing the suite, reusing unchanged evidence, and applying the final whole-branch gate. The toolchain is pinned in `rust-toolchain.toml`. Tests needing PostgreSQL or S3 skip locally unless `AGENTSCM_TEST_DATABASE_URL` or `AGENTSCM_TEST_S3_*` are set. `tools/portable-verifier` is a separate crate with its own `Cargo.toml`.
 
 Workflow commands live in `.agents/commands/`: `implement` (issue to reviewed PR), `commit`, `review`, `pr`, `fix-pr` and `handoff`. `.claude/commands` is a symlink to that directory and `CLAUDE.md` is a symlink to this file, so Claude Code and other agents read the same instructions. Follow the matching file when asked to run one of these workflows.
 

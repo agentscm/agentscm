@@ -1,0 +1,21 @@
+nextest-version = { required = "0.9.148", recommended = "0.9.148" }
+
+[profile.default]
+fail-fast = false
+retries = 0
+
+[profile.default.junit]
+path = "junit.xml"
+report-skipped = "ignored"
+
+[test-groups]
+backend-s3 = { max-threads = 1 }
+hub-postgres = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(backend_s3)'
+test-group = 'backend-s3'
+
+[[profile.default.overrides]]
+filter = 'test(/(^on_postgres::|::postgres$|^postgres_|_on_postgres$)/)'
+test-group = 'hub-postgres'

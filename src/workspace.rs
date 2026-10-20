@@ -652,6 +652,8 @@ impl Workspace {
         )?;
         insert_staged(&tx, operation_id, &staged)?;
         tx.commit()?;
+        #[cfg(all(test, unix))]
+        tests::checkpoint_boundary(&self.root)?;
         self.finish_checkpoint(engine, operation_id)
     }
 
@@ -4294,7 +4296,60 @@ mod tests {
     use super::*;
 
     use crate::model::FileChange;
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
+    #[cfg(unix)]
+    use std::process::{Child, Command, Stdio};
+    #[cfg(unix)]
+    use std::time::Instant;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    const CHECKPOINT_BOUNDARY_ROOT: &str = "AGENTSCM_CHECKPOINT_BOUNDARY_ROOT";
+    #[cfg(unix)]
+    const CHECKPOINT_BOUNDARY_READY: &str = "AGENTSCM_CHECKPOINT_BOUNDARY_READY";
+    #[cfg(unix)]
+    const CHECKPOINT_BOUNDARY_SOURCE: &str = "AGENTSCM_CHECKPOINT_BOUNDARY_SOURCE";
+
+    #[cfg(unix)]
+    pub(super) fn checkpoint_boundary(root: &Path) -> Result<()> {
+        let Some(expected_root) = std::env::var_os(CHECKPOINT_BOUNDARY_ROOT) else {
+            return Ok(());
+        };
+        if root != Path::new(&expected_root) {
+            return Err(Error::Invalid(
+                "test checkpoint boundary workspace mismatch".into(),
+            ));
+        }
+        let ready = std::env::var_os(CHECKPOINT_BOUNDARY_READY)
+            .ok_or_else(|| Error::Invalid("test checkpoint boundary ready path missing".into()))?;
+        let mut ready_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(ready)?;
+        ready_file.write_all(b"durable-pending")?;
+        ready_file.sync_all()?;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Err(Error::Limit(
+            "test checkpoint boundary pause expired".into(),
+        ))
+    }
+
+    #[cfg(unix)]
+    struct CheckpointChild(Option<Child>);
+
+    #[cfg(unix)]
+    impl Drop for CheckpointChild {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
 
     fn put(path: &str, content: &[u8]) -> FileChange {
         FileChange {
@@ -4308,6 +4363,107 @@ mod tests {
             path: path.to_owned(),
             content: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn killed_checkpoint_process_recovers_its_staged_bytes() {
+        let fixtures = TempDir::new().unwrap();
+        let source = fixtures.path().join("store");
+        let engine = Engine::open(&source).unwrap();
+        let base = engine.checkpoint(None, &[put("a.txt", b"old")]).unwrap();
+        let root = fixtures.path().join("workspace");
+        Workspace::create(
+            &engine,
+            &root,
+            ChangeId {
+                repository: "repository-crash".to_owned(),
+                id: "change-crash".to_owned(),
+            },
+            &base,
+        )
+        .unwrap();
+        let changed = b"staged after killed checkpoint";
+        fs::write(root.join("a.txt"), changed).unwrap();
+
+        let ready = fixtures.path().join("checkpoint-ready");
+        let stdout_path = fixtures.path().join("checkpoint-child.stdout");
+        let stderr_path = fixtures.path().join("checkpoint-child.stderr");
+        let mut owned = CheckpointChild(Some(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "workspace::tests::subprocess_checkpoint_helper",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env(CHECKPOINT_BOUNDARY_ROOT, &root)
+                .env(CHECKPOINT_BOUNDARY_READY, &ready)
+                .env(CHECKPOINT_BOUNDARY_SOURCE, &source)
+                .stdin(Stdio::null())
+                .stdout(File::create(&stdout_path).unwrap())
+                .stderr(File::create(&stderr_path).unwrap())
+                .spawn()
+                .unwrap(),
+        ));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if matches!(fs::read(&ready), Ok(bytes) if bytes == b"durable-pending") {
+                break;
+            }
+            assert!(
+                owned.0.as_mut().unwrap().try_wait().unwrap().is_none(),
+                "checkpoint child exited before durable pending boundary: {}",
+                fs::read_to_string(&stderr_path).unwrap()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "durable pending checkpoint boundary was not reached"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let child = owned.0.as_mut().unwrap();
+        child.kill().unwrap();
+        let status = child.wait().unwrap();
+        drop(owned.0.take());
+        assert_eq!(
+            status.signal(),
+            Some(9),
+            "checkpoint child was not SIGKILLed"
+        );
+
+        let mut workspace = Workspace::open(&root).unwrap();
+        let state = workspace.state().unwrap();
+        assert_eq!(state.generation, 0);
+        assert_eq!(state.pending.unwrap().operation_id, "killed-checkpoint");
+        let outcome = workspace
+            .recover(&engine, RecoveryChoice::Complete)
+            .unwrap();
+        let revision = match outcome {
+            OperationOutcome::Checkpointed {
+                revision,
+                generation: 1,
+            } => revision,
+            other => panic!("unexpected recovery outcome: {other:?}"),
+        };
+        assert_eq!(engine.read_file(&revision, "a.txt").unwrap(), changed);
+        let state = workspace.state().unwrap();
+        assert_eq!(state.generation, 1);
+        assert!(state.pending.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subprocess_checkpoint_helper() {
+        let Some(root) = std::env::var_os(CHECKPOINT_BOUNDARY_ROOT) else {
+            return;
+        };
+        let source = std::env::var_os(CHECKPOINT_BOUNDARY_SOURCE).unwrap();
+        let engine = Engine::open(source).unwrap();
+        let mut workspace = Workspace::open(root).unwrap();
+        workspace
+            .checkpoint(&engine, "killed-checkpoint", 0)
+            .unwrap();
     }
 
     #[test]
