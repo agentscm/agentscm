@@ -102,6 +102,155 @@ pub struct Preview {
     pub pending: Option<PendingOperation>,
 }
 
+/// Result of capturing explicitly selected paths from an existing working tree.
+/// Paths outside `selected` inherit the immutable base revision.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct SelectedCapture {
+    pub revision: String,
+    pub changed_paths: Vec<String>,
+    pub excluded_total: usize,
+    pub fingerprint: String,
+}
+
+/// Capture selected working-tree paths with the workspace selector and limits, without
+/// materializing or mutating the tree. The caller is responsible for fencing ambient Git state.
+pub(crate) fn validate_attachment_paths(selected: &[String]) -> Result<()> {
+    Scope::from_requested(selected)?;
+    Ok(())
+}
+
+pub(crate) struct AttachedScan<'a> {
+    pub root: &'a Path,
+    pub probe: &'a Path,
+    pub git: &'a Path,
+    pub tracked: &'a [String],
+}
+
+pub(crate) fn capture_selected_worktree(
+    engine: &Engine,
+    scan: AttachedScan<'_>,
+    base_revision: &str,
+    selected: &[String],
+) -> Result<SelectedCapture> {
+    let scope = Scope::from_requested(selected)?;
+    if fs::metadata(scan.root)?.dev() != fs::metadata(scan.probe)?.dev() {
+        return Err(Error::Invalid(
+            "attachment probe and worktree must be on the same filesystem".into(),
+        ));
+    }
+    require_executable_support(scan.probe)?;
+    let settings = git_config::selected_settings(scan.root, scan.git)?;
+    let base = require_complete_snapshot(source_snapshot(engine, base_revision)?)?;
+    let tracked = Tracked::from_paths(
+        scan.tracked
+            .iter()
+            .map(String::as_str)
+            .chain(base.files.keys().map(String::as_str)),
+    );
+    let (working, report) = require_complete_scan(scan_with_settings_scoped(
+        scan.root,
+        &tracked,
+        &settings,
+        scope.as_ref(),
+    )?)?;
+    let includes = |path: &str| scope.as_ref().is_none_or(|s| s.includes(path));
+    let changes: Vec<_> = staged_between(&base.files, &working.files)
+        .into_iter()
+        .filter(|(path, _)| includes(path))
+        .map(|(path, stage)| EntryChange {
+            path,
+            kind: stage
+                .after
+                .as_ref()
+                .map_or(EntryKind::Regular, |item| item.kind),
+            content: stage.after.map(|item| item.content),
+        })
+        .collect();
+    let changed_paths = changes.iter().map(|c| c.path.clone()).collect();
+    let mut fingerprint = Sha256::new();
+    fingerprint.update(serde_json::to_vec(&(
+        selected,
+        scan.tracked,
+        settings.case_insensitive,
+        report.selection_digest,
+    ))?);
+    for (path, item) in &working.files {
+        fingerprint.update(serde_json::to_vec(&(
+            path,
+            item.kind,
+            digest(&item.content),
+        ))?);
+    }
+    let revision = if changes.is_empty() {
+        base_revision.to_owned()
+    } else {
+        engine.checkpoint_entries(Some(base_revision), &changes)?
+    };
+    Ok(SelectedCapture {
+        revision,
+        changed_paths,
+        excluded_total: report.excluded_total,
+        fingerprint: format!("{:x}", fingerprint.finalize()),
+    })
+}
+
+/// Conservative three-way overlay using the caller's recorded, verified base.
+/// A same-path divergence blocks; no unrelated native ancestry is invented.
+pub(crate) fn merge_attached(
+    engine: &Engine,
+    base: &str,
+    left: &str,
+    right: &str,
+) -> Result<String> {
+    if left == right || base == right {
+        return Ok(left.into());
+    }
+    if base == left {
+        return Ok(right.into());
+    }
+    let base = require_complete_snapshot(source_snapshot(engine, base)?)?;
+    let ours = require_complete_snapshot(source_snapshot(engine, left)?)?;
+    let theirs = require_complete_snapshot(source_snapshot(engine, right)?)?;
+    let mut changes = Vec::new();
+    for (path, stage) in staged_between(&base.files, &theirs.files) {
+        let current = ours.files.get(&path);
+        if current == stage.after.as_ref() {
+            continue;
+        }
+        if current != base.files.get(&path) {
+            return Err(Error::Conflict(format!(
+                "attached refresh conflicts at {path}; no attachment state changed; automatic conflict resolution is unsupported in phase 1"
+            )));
+        }
+        changes.push(EntryChange {
+            path,
+            kind: stage.after.as_ref().map_or(EntryKind::Regular, |i| i.kind),
+            content: stage.after.map(|i| i.content),
+        });
+    }
+    if changes.is_empty() {
+        Ok(left.into())
+    } else {
+        engine.checkpoint_entries(Some(left), &changes)
+    }
+}
+
+/// Confirm every native-only candidate difference is exactly supplied by the recorded target.
+/// This lets an attached refresh adopt a Git merge resolution without dropping unrelated state.
+pub(crate) fn attached_candidate_is_target_derived(
+    engine: &Engine,
+    source: &str,
+    candidate: &str,
+    target: &str,
+) -> Result<bool> {
+    let source = require_complete_snapshot(source_snapshot(engine, source)?)?;
+    let candidate = require_complete_snapshot(source_snapshot(engine, candidate)?)?;
+    let target = require_complete_snapshot(source_snapshot(engine, target)?)?;
+    Ok(staged_between(&source.files, &candidate.files)
+        .into_iter()
+        .all(|(path, stage)| target.files.get(&path) == stage.after.as_ref()))
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkspaceChange {
@@ -2608,7 +2757,6 @@ fn require_scope_selection_dependencies(
     }
 }
 
-#[cfg(test)]
 fn source_snapshot(engine: &Engine, revision: &str) -> Result<Option<Snapshot>> {
     source_snapshot_scoped(engine, revision, None)
 }
@@ -2636,6 +2784,7 @@ pub struct IncludedPath {
 
 #[derive(Debug, Default)]
 struct ScanReport {
+    selection_digest: String,
     excluded: Vec<ExcludedPath>,
     excluded_total: usize,
     included_by_rule: BTreeMap<String, Rule>,
@@ -2700,10 +2849,19 @@ fn scan_workspace_full_scoped<'a>(
     scope: Option<&'a Scope>,
 ) -> Result<Option<(Snapshot, ScanReport)>> {
     let metadata = root.join(METADATA_DIRECTORY);
+    scan_workspace_full_scoped_with_probe(root, tracked, scope, &metadata)
+}
+
+fn scan_workspace_full_scoped_with_probe<'a>(
+    root: &Path,
+    tracked: &'a Tracked,
+    scope: Option<&'a Scope>,
+    probe_directory: &Path,
+) -> Result<Option<(Snapshot, ScanReport)>> {
     // Kinds are recorded from file modes, so a mount that reports every file
     // executable must be refused rather than reported as phantom changes.
-    require_executable_support(&metadata)?;
-    let settings = git_config::ambient_settings(root, || probe_case_insensitive(&metadata))?;
+    require_executable_support(probe_directory)?;
+    let settings = git_config::ambient_settings(root, || probe_case_insensitive(probe_directory))?;
     scan_with_settings_scoped(root, tracked, &settings, scope)
 }
 
@@ -2750,6 +2908,7 @@ fn scan_with_settings_scoped<'a>(
     if !scan.directory(root, Path::new(""), 0, None)? {
         return Ok(None);
     }
+    scan.report.selection_digest = scan.selector.input_digest();
     Ok(Some((scan.snapshot, scan.report)))
 }
 
@@ -5385,6 +5544,56 @@ mod tests {
             excluded_of(&report),
             [("x.globalonly".to_owned(), "global-excludes".to_owned())]
         );
+    }
+
+    #[test]
+    fn native_selection_hashes_non_utf8_root_and_global_excludes_bytes() {
+        let directory = TempDir::new().unwrap();
+        let engine = Engine::open(directory.path().join("source")).unwrap();
+        let revision = engine.checkpoint(None, &[put("a.txt", b"old")]).unwrap();
+        let root = directory
+            .path()
+            .join(std::ffi::OsString::from_vec(b"workspace-\xff".to_vec()));
+        match fs::create_dir(&root) {
+            Ok(()) => fs::remove_dir(&root).unwrap(),
+            Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => return,
+            Err(error) => panic!("non-UTF-8 filesystem probe failed: {error}"),
+        }
+        let change = ChangeId {
+            repository: "repository-1".into(),
+            id: "change-non-utf8".into(),
+        };
+        let _workspace = Workspace::create(&engine, &root, change, &revision).unwrap();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join(".git/info")).unwrap();
+        let global = directory
+            .path()
+            .join(std::ffi::OsString::from_vec(b"global-\xfe".to_vec()));
+        fs::write(&global, b"*.ignored\n").unwrap();
+        let settings = Settings {
+            git_common_dir: Some(root.join(".git")),
+            global_excludes: Some(global.clone()),
+            case_insensitive: false,
+        };
+        let tracked = Tracked::from_paths(["a.txt"]);
+        let first = scan_workspace_report(&root, &tracked, &settings)
+            .unwrap()
+            .unwrap()
+            .1
+            .selection_digest;
+        let second = scan_workspace_report(&root, &tracked, &settings)
+            .unwrap()
+            .unwrap()
+            .1
+            .selection_digest;
+        assert_eq!(first, second);
+        fs::write(global, b"*.other\n").unwrap();
+        let changed = scan_workspace_report(&root, &tracked, &settings)
+            .unwrap()
+            .unwrap()
+            .1
+            .selection_digest;
+        assert_ne!(first, changed);
     }
 
     #[test]

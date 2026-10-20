@@ -19,6 +19,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+use sha2::Digest;
 
 use super::glob::{Rule as GlobRule, basename, parse_line};
 use crate::{Error, Result};
@@ -174,6 +175,7 @@ impl Budget {
 }
 
 pub struct Selector<'a> {
+    inputs: sha2::Sha256,
     tracked: &'a Tracked,
     case_insensitive: bool,
     budget: Budget,
@@ -193,6 +195,7 @@ impl<'a> Selector<'a> {
     /// Build a selector from the files currently on disk.
     pub fn open(root: &Path, tracked: &'a Tracked, settings: &Settings) -> Result<Self> {
         let mut selector = Self {
+            inputs: sha2::Sha256::new(),
             tracked,
             case_insensitive: settings.case_insensitive,
             budget: Budget::default(),
@@ -233,6 +236,10 @@ impl<'a> Selector<'a> {
         Ok(selector)
     }
 
+    pub fn input_digest(&self) -> String {
+        format!("{:x}", self.inputs.clone().finalize())
+    }
+
     fn layer(
         &mut self,
         path: &Path,
@@ -240,7 +247,19 @@ impl<'a> Selector<'a> {
         base: &str,
         links: LinkPolicy,
     ) -> Result<Option<Layer>> {
-        let Some(bytes) = read_bounded(path, label, MAX_RULE_FILE_BYTES, links)? else {
+        let bytes = read_bounded(path, label, MAX_RULE_FILE_BYTES, links)?;
+        let path = path.as_os_str().as_bytes();
+        self.inputs.update((path.len() as u64).to_be_bytes());
+        self.inputs.update(path);
+        match &bytes {
+            Some(bytes) => {
+                self.inputs.update([1]);
+                self.inputs.update((bytes.len() as u64).to_be_bytes());
+                self.inputs.update(bytes);
+            }
+            None => self.inputs.update([0]),
+        }
+        let Some(bytes) = bytes else {
             return Ok(None);
         };
         let size = bytes.len() as u64;

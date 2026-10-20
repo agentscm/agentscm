@@ -2,6 +2,8 @@
 // The native workspace is Unix-only, which leaves some of its supporting code unused on Windows.
 #![cfg_attr(not(unix), allow(dead_code))]
 
+#[cfg(unix)]
+pub mod attached_worktree;
 pub mod authority;
 pub mod autopsy;
 pub mod backend;

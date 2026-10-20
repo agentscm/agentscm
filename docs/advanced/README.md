@@ -22,6 +22,7 @@ AgentSCM also contains an immutable ledger for exact revisions, their review con
 Capture a Git commit, work and land natively, reconcile with Git and export to a local mirror you own. Explicit local-bare remote exchange is a separate opt-in command.
 
 - [Git snapshot capture](git-snapshot.md), [Git reconciliation](git-reconcile.md), [Git export](git-export.md) and [local Git remote exchange](git-remote.md) and [authenticated network transport](git-remote-network.md)
+- [Attached Git worktrees](attached-git-worktrees.md): experimental read-only capture, exact mappings and conservative refresh; publication and nonempty attached-store recovery remain unsupported.
 
 ## Isolated command checks
 

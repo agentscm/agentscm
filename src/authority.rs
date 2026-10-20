@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rusqlite::{
@@ -30,6 +30,7 @@ const MAX_LANDING_CHAIN: usize = 100_000;
 
 pub struct Authority {
     connection: Connection,
+    data_root: PathBuf,
     _access: crate::local_recovery::AccessGuard,
     read_only: bool,
 }
@@ -37,10 +38,10 @@ pub struct Authority {
 impl Authority {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         crate::local_recovery::check_before_create(path.as_ref(), false)?;
-        create_directory_durable(path.as_ref())?;
-        let access = crate::local_recovery::AccessGuard::shared(path.as_ref())?;
+        let data_root = create_directory_durable(path.as_ref())?;
+        let access = crate::local_recovery::AccessGuard::shared(&data_root)?;
         let mut connection = Connection::open_with_flags(
-            path.as_ref().join("state.sqlite"),
+            data_root.join("state.sqlite"),
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         )?;
         connection.busy_timeout(BUSY_TIMEOUT)?;
@@ -74,6 +75,7 @@ impl Authority {
         initialize_schema(&mut connection)?;
         Ok(Self {
             connection,
+            data_root,
             _access: access,
             read_only: false,
         })
@@ -122,6 +124,7 @@ impl Authority {
         validate_current_tables(&connection)?;
         let authority = Self {
             connection,
+            data_root: root.canonicalize()?,
             _access: access,
             read_only: true,
         };
@@ -161,6 +164,10 @@ impl Authority {
                 |row| row.get(0),
             )
             .map_err(Error::from)
+    }
+
+    pub(crate) fn data_root(&self) -> &Path {
+        &self.data_root
     }
 
     pub fn policy_epoch(&self) -> Result<u64> {

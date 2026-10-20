@@ -1247,6 +1247,12 @@ fn database_paths(
     destination: &str,
     issue_config: Option<&IssueWorkflowRecoveryConfig>,
 ) -> Result<Vec<(PathBuf, DbKind)>> {
+    if destination == "data"
+        && root.join("attachments").try_exists()?
+        && retained_attachments(root)?
+    {
+        return Err(Error::Invalid("backup/restore of nonempty attached stores is not qualified; attachment journals must not be copied as unmanaged files".into()));
+    }
     if destination == "data" && issue_config.is_none() {
         reject_unqualified_issue_workflow(root)?;
     }
@@ -1292,6 +1298,16 @@ fn database_paths(
         paths.push((path, DbKind::Issue));
     }
     Ok(paths)
+}
+
+#[cfg(unix)]
+fn retained_attachments(root: &Path) -> Result<bool> {
+    crate::attached_worktree::journal_has_retained_state(root)
+}
+
+#[cfg(not(unix))]
+fn retained_attachments(_root: &Path) -> Result<bool> {
+    Ok(true)
 }
 fn ignored_paths(
     root: &Path,
