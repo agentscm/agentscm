@@ -158,6 +158,25 @@ pub enum TokenCommand {
     },
 }
 
+pub(crate) fn telemetry_action(command: &HubCommand) -> bool {
+    match command {
+        HubCommand::Serve { .. } => false,
+        HubCommand::Token {
+            command: TokenCommand::List { .. },
+        }
+        | HubCommand::Connections {
+            command: ConnectionCommand::List { .. },
+        } => false,
+        HubCommand::Login { .. }
+        | HubCommand::Logout
+        | HubCommand::Token { .. }
+        | HubCommand::Github { .. }
+        | HubCommand::Connections { .. } => true,
+        #[cfg(unix)]
+        HubCommand::Publish(_) => true,
+    }
+}
+
 #[cfg_attr(not(unix), allow(unused_variables))]
 pub async fn run(command: HubCommand, data_dir: &std::path::Path) -> Result<()> {
     match command {

@@ -154,8 +154,10 @@ workflow runs; they do not grant execution or landing authority. See the
   is visible; semantic conflicts and unannounced shell edits can go undetected.
 - **Native admission and Git protections are distinct.** Native requirements bind source,
   context, policy and target. Your forge needs its own configured merge protections.
-- **You run the Hub.** AgentSCM sends no telemetry to its maintainers. Review
-  [what the Hub stores](docs/hub.md#data-the-hub-stores), including task text from agents.
+- **You run the Hub.** Hub data stays with the service you configure. This source also
+  contains staged, configurable usage telemetry, but it cannot send until an endpoint and
+  data-handling profile are configured. Review the [telemetry data and controls](docs/telemetry.md)
+  and [what the Hub stores](docs/hub.md#data-the-hub-stores), including task text from agents.
 - **One writer for the pilot.** Shared native execution requires the documented Unix/runtime
   setup, persistent storage and explicit recovery. No automatic failover or production
   security/scale qualification is claimed.

@@ -72,6 +72,15 @@ pub enum TeamCommand {
     },
 }
 
+pub(crate) fn telemetry_action(command: &TeamCommand) -> bool {
+    matches!(
+        command,
+        TeamCommand::Credential { .. }
+            | TeamCommand::Bootstrap { .. }
+            | TeamCommand::RetireAccess { .. }
+    )
+}
+
 pub async fn run(command: TeamCommand) -> Result<()> {
     match command {
         TeamCommand::Serve { config } => {

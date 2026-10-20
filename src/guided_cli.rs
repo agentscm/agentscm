@@ -119,6 +119,13 @@ pub enum WorkflowCommand {
     },
 }
 
+pub(crate) fn telemetry_action(command: &WorkflowCommand) -> bool {
+    !matches!(
+        command,
+        WorkflowCommand::Status | WorkflowCommand::Inspect { .. }
+    )
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Session {

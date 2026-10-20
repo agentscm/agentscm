@@ -43,6 +43,10 @@ pub enum GitSnapshotCommand {
     },
 }
 
+pub(crate) fn telemetry_action(command: &GitSnapshotCommand) -> bool {
+    matches!(command, GitSnapshotCommand::Capture { .. })
+}
+
 fn request(source: Source) -> SnapshotRequest {
     SnapshotRequest {
         git: source.git,

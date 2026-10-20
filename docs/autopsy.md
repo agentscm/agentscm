@@ -2,7 +2,7 @@
 
 > **Alpha: not for production.** APIs, CLI, storage and schemas may change without migration. See the [README](../README.md) for status and the [changelog](../CHANGELOG.md) for known limits.
 
-`agentscm autopsy` answers one question about the repository you are in: in the last few days, how often did two of your own Claude Code sessions edit the same file while the other still held it? It is read-only and local. It needs no account, no hub and no network, and nothing is uploaded.
+`agentscm autopsy` answers one question about the repository you are in: in the last few days, how often did two of your own Claude Code sessions edit the same file while the other still held it? The analysis is read-only and local, and needs no account or hub. If product usage telemetry is configured and enabled, running the command may record one coarse `autopsy` feature outcome for the UTC day; log contents, report results and paths are not included. See [usage telemetry](telemetry.md).
 
 ```sh
 agentscm autopsy                  # last 7 days, this repository
@@ -15,7 +15,7 @@ agentscm autopsy --days 30 --no-paths
   lib.rs — 1 near-miss
 
 Near-miss = two of your sessions touched the same file while the other still held it (the hub's 20-minute hold, renewed by activity, capped at 30 minutes). It means the hub would have warned, not that anything would have broken.
-Reads Claude Code logs only; other agents are not included. Nothing is uploaded, and file contents in the logs are never kept or printed.
+Reads Claude Code logs only; other agents are not included. Log contents and report data are not uploaded, and file contents in the logs are never kept or printed.
 merge-tree check: 1 of 2 near-misses on branches that still exist and differ; it compares today's branch tips, not the files as they were then.
 Read: 236 log files from ~/.claude/projects
 Repository: /work/app

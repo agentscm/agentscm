@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { NOTICE_TEXT, targetFor, assetNameFor, installNames, urlFor, launchArgs, parseSums, matches, localSums, ghVerifyArgs, provenanceGap, checkProvenance } = require('../lib/install.js');
+const { NOTICE_TEXT, targetFor, assetNameFor, installNames, urlFor, launchArgs, verifiedInstallEnv, parseSums, matches, localSums, ghVerifyArgs, provenanceGap, checkProvenance } = require('../lib/install.js');
 
 const fixtures = path.join(__dirname, 'fixtures');
 const sums = fs.readFileSync(path.join(fixtures, 'SHA256SUMS'), 'utf8');
@@ -81,6 +81,15 @@ test('launch arguments', () => {
   assert.deepEqual(launchArgs(['-h']), ['-h']);
   assert.deepEqual(launchArgs(['uninstall']), ['uninstall']);
   assert.deepEqual(launchArgs(['hub', 'serve', '--x']), ['hub', 'serve', '--x']);
+});
+
+test('verified installer marks only the launched product process', () => {
+  const original = { PATH: '/bin', AGENTSCM_VERIFIED_INSTALL: 'stale' };
+  assert.deepEqual(verifiedInstallEnv(original), {
+    PATH: '/bin',
+    AGENTSCM_VERIFIED_INSTALL: '1',
+  });
+  assert.equal(original.AGENTSCM_VERIFIED_INSTALL, 'stale');
 });
 
 test('README carries the notice text verbatim', () => {

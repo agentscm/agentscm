@@ -67,6 +67,17 @@ pub enum WorkspaceCommand {
     },
 }
 
+pub(crate) fn workspace_telemetry_action(command: &WorkspaceCommand) -> bool {
+    matches!(
+        command,
+        WorkspaceCommand::Create { .. }
+            | WorkspaceCommand::Expand { .. }
+            | WorkspaceCommand::Checkpoint { .. }
+            | WorkspaceCommand::Undo { .. }
+            | WorkspaceCommand::Recover { .. }
+    )
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum Choice {
     Complete,

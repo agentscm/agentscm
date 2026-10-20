@@ -13,9 +13,14 @@ const BUDGET_MS = 600_000; // overall, for both downloads
 
 const NOTICE_TEXT = `npx agentscm downloads the AgentSCM release binary for your platform from
 GitHub Releases, verifies its SHA-256 checksum and build provenance, and then
-starts the setup guide. It does not run install scripts, send telemetry or
-change anything without asking. Everything it writes is listed before it
-writes it, and can be undone with \`agentscm uninstall\`.`;
+starts the setup guide. It does not run install scripts. After verification it
+marks that binary invocation as a verified install; the binary records one
+installation indicator only after setup explains pseudonymous product telemetry
+and the configured choice permits it. Disable this before any send with
+\`--no-telemetry\`, \`AGENTSCM_TELEMETRY=off\`, or \`DO_NOT_TRACK=1\`.
+The setup guide previews repository, hook and Hub changes; \`agentscm uninstall\`
+reverses setup. Manage usage reporting with \`agentscm telemetry status\` and
+\`agentscm telemetry off\`.`;
 
 const TARGETS = {
   'linux/x64': 'x86_64-unknown-linux-musl',
@@ -43,6 +48,11 @@ const urlFor = (version, asset) => `https://github.com/${REPO}/releases/download
 const TOP_LEVEL_FLAGS = new Set(['--version', '-V', '--help', '-h']);
 const launchArgs = (args) =>
   args.length === 0 || (args[0].startsWith('-') && !TOP_LEVEL_FLAGS.has(args[0])) ? ['quickstart', ...args] : args;
+
+const verifiedInstallEnv = (environment = process.env) => ({
+  ...environment,
+  AGENTSCM_VERIFIED_INSTALL: '1',
+});
 
 // Strict: every line must be `<64 lowercase hex>  agentscm-<target>[.exe]`, and the asset appears exactly once.
 function parseSums(text, target) {
@@ -213,9 +223,12 @@ async function main(args) {
     console.log('Verified checksum and build provenance. Set AGENTSCM_INSTALL_VERBOSE=1 for details.');
   }
 
-  const r = spawnSync(binary, launchArgs(args), { stdio: 'inherit' });
+  // This process-only assertion comes from the verified installer. The binary records an
+  // installation only after its disclosure/choice gates are effective; HTTP stays detached.
+  const env = verifiedInstallEnv();
+  const r = spawnSync(binary, launchArgs(args), { stdio: 'inherit', env });
   if (r.error) throw r.error;
   return r.status ?? 128 + (os.constants.signals[r.signal] ?? 0);
 }
 
-module.exports = { NOTICE_TEXT, targetFor, assetNameFor, installNames, urlFor, launchArgs, parseSums, sha256File, matches, localSums, ghVerifyArgs, provenanceGap, checkProvenance, main };
+module.exports = { NOTICE_TEXT, targetFor, assetNameFor, installNames, urlFor, launchArgs, verifiedInstallEnv, parseSums, sha256File, matches, localSums, ghVerifyArgs, provenanceGap, checkProvenance, main };

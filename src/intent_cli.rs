@@ -86,6 +86,15 @@ pub enum IntentCommand {
     },
 }
 
+pub(crate) fn telemetry_action(command: &IntentCommand) -> bool {
+    match command {
+        IntentCommand::Start { common, .. }
+        | IntentCommand::Check { common, .. }
+        | IntentCommand::Done { common } => common.hook.is_none(),
+        IntentCommand::Watch { .. } => false,
+    }
+}
+
 struct Ctx {
     hook: bool,
     input: Value,

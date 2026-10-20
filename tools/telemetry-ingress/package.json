@@ -1,0 +1,13 @@
+{
+  "name": "agentscm-telemetry-ingress",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test test.mjs"
+  }
+}
