@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 
 use crate::hub_cli::config_dir;
 use crate::intent_cli::{HubFile, parse_hub_file, repo_root, token_for, valid_repo};
+use crate::{client_config, client_config::Connection};
 
 const LIMIT: Duration = Duration::from_secs(3);
 const STDIN_BYTES: usize = 4 << 20;
@@ -19,6 +20,8 @@ const REPLY_BYTES: usize = 1 << 20;
 
 #[derive(Debug, Args)]
 pub struct HookArgs {
+    /// Agent name, followed by explicit --hub-url/--repo routing or local
+    /// --client-connection routing. The modes cannot be combined.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
 }
@@ -30,7 +33,16 @@ pub async fn run(args: HookArgs) {
 /// Never returns: prints the agent's reply and exits 0.
 pub async fn run_unparsed(args: Vec<String>) -> ! {
     let (agent, flag_url, repo) = parse_args(&args);
-    let reply = hook(&agent, flag_url, repo).await;
+    let client_connection = args.iter().any(|arg| arg == "--client-connection");
+    let destination_args = args.iter().any(|arg| {
+        ["--hub-url", "--repo"].iter().any(|flag| {
+            arg == *flag
+                || arg
+                    .strip_prefix(*flag)
+                    .is_some_and(|rest| rest.starts_with('='))
+        })
+    });
+    let reply = hook(&agent, flag_url, repo, client_connection, destination_args).await;
     let mut out = std::io::stdout();
     // Ignore write errors (a closed pipe must not panic or change the exit code).
     let _ = writeln!(out, "{reply}");
@@ -65,7 +77,13 @@ fn parse_args(args: &[String]) -> (String, Option<String>, Option<String>) {
     )
 }
 
-async fn hook(agent: &str, flag_url: Option<String>, repo: Option<String>) -> Value {
+async fn hook(
+    agent: &str,
+    flag_url: Option<String>,
+    repo: Option<String>,
+    client_connection: bool,
+    destination_args: bool,
+) -> Value {
     let deadline = Instant::now() + LIMIT;
     let read = tokio::time::timeout(LIMIT, tokio::task::spawn_blocking(read_stdin)).await;
     let Ok(Ok(Some(body))) = read else {
@@ -77,6 +95,8 @@ async fn hook(agent: &str, flag_url: Option<String>, repo: Option<String>) -> Va
         agent.to_owned(),
         flag_url,
         repo,
+        client_connection,
+        destination_args,
         payload.clone(),
         body,
     ));
@@ -100,51 +120,92 @@ async fn call_hub(
     agent: String,
     flag_url: Option<String>,
     repo: Option<String>,
+    client_connection: bool,
+    destination_args: bool,
     payload: Value,
-    body: Vec<u8>,
+    original_body: Vec<u8>,
 ) -> Result<Value, String> {
-    let env = |name| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
-    let settings = Settings {
-        url: env("AGENTSCM_HUB_URL"),
-        token: env("AGENTSCM_HUB_TOKEN"),
-        token_file: env("AGENTSCM_HUB_TOKEN_FILE"),
+    let supported_client = matches!(
+        agent.as_str(),
+        "claude" | "codex" | "cursor" | "copilot" | "gemini"
+    );
+    if client_connection && destination_args {
+        return Err("client connection mode cannot use destination flags".into());
+    }
+    if client_connection && !supported_client {
+        return Err("client connection mode does not support this agent".into());
+    }
+    let plugin_route = client_connection;
+    let (url, token, repo, root, endpoint_agent, outbound) = if plugin_route {
+        let routed = route_client(&agent, &payload)?;
+        (
+            routed.connection.hub.clone(),
+            Token::PrivateFile(routed.connection.token_file.clone()),
+            Some(routed.connection.repo.clone()),
+            None,
+            routed.endpoint_agent,
+            routed.payload,
+        )
+    } else {
+        let env = |name| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
+        let settings = Settings {
+            url: env("AGENTSCM_HUB_URL"),
+            token: env("AGENTSCM_HUB_TOKEN"),
+            token_file: env("AGENTSCM_HUB_TOKEN_FILE"),
+        };
+        let file = config_dir()
+            .ok()
+            .and_then(|dir| std::fs::read_to_string(dir.join("agentscm").join("hub.json")).ok())
+            .and_then(|text| parse_hub_file(&text).ok());
+        let (url, token) = resolve(
+            &settings,
+            flag_url.as_deref(),
+            &cwd_of(&payload),
+            file.as_ref(),
+        )?;
+        let root = repo_root(&cwd_of(&payload));
+        let outbound = if agent == "codex" {
+            sanitized_codex(&payload, None)?
+        } else {
+            payload.clone()
+        };
+        (url, token, repo, root, agent.clone(), outbound)
     };
-    let file = config_dir()
-        .ok()
-        .and_then(|dir| std::fs::read_to_string(dir.join("agentscm").join("hub.json")).ok())
-        .and_then(|text| parse_hub_file(&text).ok());
-    let (url, token) = resolve(
-        &settings,
-        flag_url.as_deref(),
-        &cwd_of(&payload),
-        file.as_ref(),
-    )?;
     let token = match token {
         Token::Value(token) => token,
         Token::File(path) => std::fs::read_to_string(path)
             .map_err(|_| "no token")?
             .trim()
             .to_owned(),
+        Token::PrivateFile(path) => crate::client_cli::read_token(&path).map_err(|_| "no token")?,
     };
     if token.is_empty() {
         return Err("no token".into());
     }
     let client = forge_http::client().map_err(|_| "hub unreachable")?;
-    // The hub answers "coordination unknown" when the repository differs from the token's.
-    let query = repo.map_or_else(String::new, |r| format!("?repo={r}"));
-    let mut request = client
-        .post(format!("{url}/v1/hub/hook/{}{query}", path_segment(&agent)))
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .bearer_auth(token)
-        .body(body);
-    if let Some(root) = root_header(&cwd_of(&payload)) {
-        request = request.header("X-Agentscm-Root", root);
-    }
+    let outbound_body = if plugin_route || agent == "codex" {
+        serde_json::to_vec(&outbound).map_err(|_| "payload unreadable")?
+    } else {
+        // Preserve the legacy transport contract, including original JSON bytes.
+        original_body
+    };
+    let request = hub_request(
+        &client,
+        &url,
+        &endpoint_agent,
+        repo.as_deref(),
+        &token,
+        &outbound_body,
+        root.as_deref(),
+    )?;
     // `send` errors carry no URL or credentials.
     let (status, reply) = send(request, REPLY_BYTES)
         .await
         .map_err(|_| "hub unreachable")?;
     match status {
+        200 if reply.is_object() && agent == "gemini" && plugin_route => {
+            Ok(gemini_reply(reply, &payload, config_dir().ok().as_deref()))
+        }
         200 if reply.is_object() => Ok(defanged(
             reply,
             &agent,
@@ -154,6 +215,441 @@ async fn call_hub(
         200 => Err("bad reply".into()),
         401 | 403 => Err("token rejected".into()),
         _ => Err(format!("hub error {status}")),
+    }
+}
+
+fn hub_request(
+    client: &reqwest::Client,
+    url: &str,
+    agent: &str,
+    repo: Option<&str>,
+    token: &str,
+    outbound: &[u8],
+    root: Option<&Path>,
+) -> Result<reqwest::RequestBuilder, String> {
+    // The hub answers "coordination unknown" when the repository differs from the token's.
+    let query = repo.map_or_else(String::new, |repo| format!("?repo={repo}"));
+    let request = client
+        .post(format!("{url}/v1/hub/hook/{}{query}", path_segment(agent)))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .bearer_auth(token)
+        .body(outbound.to_vec());
+    Ok(with_root_header(request, root))
+}
+
+fn with_root_header(
+    mut request: reqwest::RequestBuilder,
+    root: Option<&Path>,
+) -> reqwest::RequestBuilder {
+    if let Some(root) = root
+        .and_then(Path::to_str)
+        .and_then(|root| reqwest::header::HeaderValue::from_str(root).ok())
+    {
+        request = request.header("X-Agentscm-Root", root);
+    }
+    request
+}
+
+const MAX_WORKSPACE_ROOTS: usize = 16;
+const MAX_EDIT_PATHS: usize = 256;
+const PATCH_HEADERS: [&str; 4] = [
+    "*** Update File: ",
+    "*** Add File: ",
+    "*** Delete File: ",
+    "*** Move to: ",
+];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EditPath {
+    header: Option<&'static str>,
+    path: String,
+}
+
+#[derive(Debug)]
+struct RoutedClient {
+    connection: Connection,
+    endpoint_agent: String,
+    payload: Value,
+}
+
+fn patch_text(input: &Value) -> Option<&str> {
+    input.as_str().or_else(|| input["command"].as_str())
+}
+
+fn valid_path_text(path: &str) -> bool {
+    !path.is_empty() && path.len() <= 1024 && !path.chars().any(char::is_control)
+}
+
+fn tool_call(agent: &str, payload: &Value) -> (String, Value) {
+    if agent == "copilot" && payload.get("hook_event_name").is_none() {
+        let input = match payload.get("toolArgs") {
+            Some(Value::String(text)) => serde_json::from_str(text).unwrap_or(Value::Null),
+            Some(input) => input.clone(),
+            None => Value::Null,
+        };
+        return (
+            payload["toolName"].as_str().unwrap_or_default().to_owned(),
+            input,
+        );
+    }
+    (
+        payload["tool_name"].as_str().unwrap_or_default().to_owned(),
+        payload.get("tool_input").cloned().unwrap_or(Value::Null),
+    )
+}
+
+fn edit_paths(agent: &str, payload: &Value) -> Result<Vec<EditPath>, String> {
+    let (tool, input) = tool_call(agent, payload);
+    let mut paths = Vec::new();
+    if tool.eq_ignore_ascii_case("apply_patch") {
+        let patch = patch_text(&input).ok_or_else(|| "edit path not understood".to_owned())?;
+        for line in patch.lines() {
+            if let Some((header, path)) = PATCH_HEADERS
+                .iter()
+                .find_map(|header| line.strip_prefix(header).map(|path| (*header, path)))
+            {
+                let path = path.trim();
+                if valid_path_text(path) {
+                    paths.push(EditPath {
+                        header: Some(header),
+                        path: path.to_owned(),
+                    });
+                } else {
+                    return Err("edit path not understood".into());
+                }
+            }
+            if paths.len() > MAX_EDIT_PATHS {
+                return Err("too many edit paths".into());
+            }
+        }
+        if paths.is_empty() {
+            return Err("edit path not understood".into());
+        }
+        return Ok(paths);
+    }
+    if [
+        "edit",
+        "write",
+        "multiedit",
+        "notebookedit",
+        "create",
+        "str_replace_editor",
+        "delete",
+        "write_file",
+        "replace",
+    ]
+    .iter()
+    .any(|name| tool.eq_ignore_ascii_case(name))
+    {
+        let path = ["file_path", "notebook_path", "path", "filePath"]
+            .iter()
+            .find_map(|field| input[*field].as_str())
+            .ok_or_else(|| "edit path not understood".to_owned())?;
+        if !valid_path_text(path) {
+            return Err("edit path not understood".into());
+        }
+        paths.push(EditPath {
+            header: None,
+            path: path.to_owned(),
+        });
+    }
+    Ok(paths)
+}
+
+fn unique_connection(
+    connections: &[Connection],
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> Result<Option<(&Connection, PathBuf)>, String> {
+    let mut found: Vec<(&Connection, PathBuf)> = Vec::new();
+    for candidate in candidates {
+        if let Some(connection) = client_config::connection_for_path(connections, &candidate) {
+            let resolved = client_config::resolved(&candidate);
+            let existing = resolved
+                .as_deref()
+                .and_then(|path| path.ancestors().find(|path| path.exists()));
+            if existing.and_then(repo_root).as_deref() != Some(connection.root.as_path()) {
+                return Err("path belongs to another Git checkout".into());
+            }
+            if !found.iter().any(|(saved, _)| saved.root == connection.root) {
+                found.push((connection, candidate));
+            }
+        }
+    }
+    match found.len() {
+        0 => Ok(None),
+        1 => Ok(found.pop()),
+        _ => Err("repository route is ambiguous".into()),
+    }
+}
+
+fn match_edit<'a>(
+    payload: &Value,
+    connections: &'a [Connection],
+    path: &str,
+) -> Result<Option<(&'a Connection, PathBuf)>, String> {
+    if payload["workspace_roots"]
+        .as_array()
+        .is_some_and(|roots| roots.len() > MAX_WORKSPACE_ROOTS)
+    {
+        return Err("too many workspace roots".into());
+    }
+    let path = Path::new(path);
+    if path.is_absolute() {
+        return Ok(client_config::connection_for_path(connections, path)
+            .map(|connection| (connection, path.to_owned())));
+    }
+    if let Some(cwd) = payload["cwd"].as_str() {
+        let candidate = Path::new(cwd).join(path);
+        if let Some(connection) = client_config::connection_for_path(connections, &candidate) {
+            return Ok(Some((connection, candidate)));
+        }
+    }
+    let workspace_candidates = payload["workspace_roots"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(MAX_WORKSPACE_ROOTS)
+        .filter_map(Value::as_str)
+        .map(|root| Path::new(root).join(path));
+    if let Some(found) = unique_connection(connections, workspace_candidates)? {
+        return Ok(Some(found));
+    }
+    Ok(None)
+}
+
+fn match_session<'a>(
+    payload: &Value,
+    connections: &'a [Connection],
+) -> Result<Option<(&'a Connection, PathBuf)>, String> {
+    if payload["workspace_roots"]
+        .as_array()
+        .is_some_and(|roots| roots.len() > MAX_WORKSPACE_ROOTS)
+    {
+        return Err("too many workspace roots".into());
+    }
+    let cwd = payload["cwd"].as_str().map(PathBuf::from);
+    let workspace_roots = payload["workspace_roots"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(MAX_WORKSPACE_ROOTS)
+        .filter_map(Value::as_str)
+        .map(PathBuf::from);
+    unique_connection(connections, cwd.into_iter().chain(workspace_roots))
+}
+
+fn route_client(agent: &str, payload: &Value) -> Result<RoutedClient, String> {
+    let connections = client_config::load().map_err(|_| "client connections unavailable")?;
+    let routed = route_client_with(agent, payload, &connections)?;
+    if !client_config::is_current(&routed.connection) {
+        return Err("client connection no longer matches this checkout".into());
+    }
+    Ok(routed)
+}
+
+fn route_client_with(
+    agent: &str,
+    payload: &Value,
+    connections: &[Connection],
+) -> Result<RoutedClient, String> {
+    if connections.is_empty() {
+        return Err("no client connection for this checkout".into());
+    }
+    let edits = edit_paths(agent, payload)?;
+    let mut selected: Option<Connection> = None;
+    let mut normalized = Vec::with_capacity(edits.len());
+    for edit in &edits {
+        let Some((connection, candidate)) = match_edit(payload, connections, &edit.path)? else {
+            return Err("no client connection for an edit path".into());
+        };
+        let connection = connection.clone();
+        if selected
+            .as_ref()
+            .is_some_and(|selected| selected.root != connection.root)
+        {
+            return Err("edit crosses configured repositories".into());
+        }
+        let relative = client_config::relative(&connection.root, &candidate)
+            .ok_or_else(|| "edit path is outside the configured repository".to_owned())?;
+        // An unregistered nested Git checkout must never inherit the parent's credential.
+        let resolved = client_config::resolved(&candidate);
+        let existing = resolved
+            .as_deref()
+            .and_then(|path| path.ancestors().find(|path| path.exists()));
+        if existing.and_then(repo_root).as_deref() != Some(connection.root.as_path()) {
+            return Err("edit path belongs to another Git checkout".into());
+        }
+        selected = Some(connection);
+        normalized.push(EditPath {
+            header: edit.header,
+            path: relative,
+        });
+    }
+    let connection = match selected {
+        Some(connection) => connection,
+        None => match_session(payload, connections)?
+            .map(|(connection, _)| connection.clone())
+            .ok_or_else(|| "no client connection for this checkout".to_owned())?,
+    };
+    let endpoint_agent = if agent == "gemini" { "generic" } else { agent };
+    Ok(RoutedClient {
+        payload: sanitized_client(agent, payload, &normalized)?,
+        connection,
+        endpoint_agent: endpoint_agent.to_owned(),
+    })
+}
+
+#[cfg(test)]
+fn route_codex_with(payload: &Value, connections: &[Connection]) -> Result<RoutedClient, String> {
+    route_client_with("codex", payload, connections)
+}
+
+/// Codex may include source, patch bodies and prompts outside the tool input. Only fields needed
+/// for coordination leave the machine. For patches, only recognized operation headers survive.
+fn sanitized_codex(payload: &Value, normalized: Option<&[EditPath]>) -> Result<Value, String> {
+    let mut out = serde_json::Map::new();
+    for (key, max) in [
+        ("hook_event_name", 64),
+        ("session_id", 1024),
+        ("tool_name", 128),
+    ] {
+        if let Some(value) = payload[key]
+            .as_str()
+            .filter(|value| value.len() <= max && !value.chars().any(char::is_control))
+        {
+            out.insert(key.into(), json!(value));
+        }
+    }
+    if normalized.is_none() {
+        if let Some(cwd) = payload["cwd"]
+            .as_str()
+            .filter(|cwd| cwd.len() <= 4096 && !cwd.chars().any(char::is_control))
+        {
+            out.insert("cwd".into(), json!(cwd));
+        }
+        let roots: Vec<&str> = payload["workspace_roots"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(MAX_WORKSPACE_ROOTS)
+            .filter_map(Value::as_str)
+            .filter(|root| root.len() <= 4096 && !root.chars().any(char::is_control))
+            .collect();
+        if !roots.is_empty() {
+            out.insert("workspace_roots".into(), json!(roots));
+        }
+    }
+    let tool = payload["tool_name"].as_str().unwrap_or_default();
+    let paths = match normalized {
+        Some(paths) => paths.to_vec(),
+        None => edit_paths("codex", payload)?,
+    };
+    if tool.eq_ignore_ascii_case("apply_patch") && !paths.is_empty() {
+        let mut headers = String::new();
+        for path in paths {
+            if let Some(header) = path.header {
+                headers.push_str(header);
+                headers.push_str(&path.path);
+                headers.push('\n');
+            }
+        }
+        out.insert("tool_input".into(), json!({"command": headers}));
+    } else if let Some(path) = paths.first() {
+        out.insert("tool_input".into(), json!({"path": path.path}));
+    }
+    Ok(Value::Object(out))
+}
+
+fn bounded_string(value: &Value, max: usize) -> Option<&str> {
+    value
+        .as_str()
+        .filter(|text| text.len() <= max && !text.chars().any(char::is_control))
+}
+
+fn sanitized_client(agent: &str, payload: &Value, paths: &[EditPath]) -> Result<Value, String> {
+    match agent {
+        "claude" | "codex" => sanitized_codex(payload, Some(paths)),
+        "cursor" => {
+            let mut out = sanitized_codex(payload, Some(paths))?;
+            if let Some(id) = bounded_string(&payload["conversation_id"], 1024) {
+                out["conversation_id"] = json!(id);
+            }
+            Ok(out)
+        }
+        "copilot" if payload.get("hook_event_name").is_some() => {
+            sanitized_codex(payload, Some(paths))
+        }
+        "copilot" => {
+            let mut out = serde_json::Map::new();
+            for (key, max) in [("sessionId", 1024), ("toolName", 128)] {
+                if let Some(value) = bounded_string(&payload[key], max) {
+                    out.insert(key.into(), json!(value));
+                }
+            }
+            let tool = payload["toolName"].as_str().unwrap_or_default();
+            if tool.eq_ignore_ascii_case("apply_patch") && !paths.is_empty() {
+                let mut headers = String::new();
+                for path in paths {
+                    if let Some(header) = path.header {
+                        headers.push_str(header);
+                        headers.push_str(&path.path);
+                        headers.push('\n');
+                    }
+                }
+                out.insert("toolArgs".into(), json!({"command": headers}));
+            } else if let Some(path) = paths.first() {
+                out.insert("toolArgs".into(), json!({"path": path.path}));
+            } else if payload.get("reason").is_some() {
+                out.insert("reason".into(), json!("client-session-end"));
+            } else if payload.get("source").is_some() || payload.get("initialPrompt").is_some() {
+                out.insert("source".into(), json!("client-session-start"));
+            }
+            Ok(Value::Object(out))
+        }
+        "gemini" => {
+            let event = match payload["hook_event_name"].as_str() {
+                Some("SessionStart") => "start",
+                Some("BeforeTool") if !paths.is_empty() => "check",
+                Some("SessionEnd") => "done",
+                _ => return Err("hook event not recognised".into()),
+            };
+            let mut out = json!({"agent":"gemini", "event":event});
+            if let Some(session) = bounded_string(&payload["session_id"], 1024) {
+                out["session"] = json!(session);
+            }
+            if !paths.is_empty() {
+                out["paths"] = json!(
+                    paths
+                        .iter()
+                        .map(|path| path.path.as_str())
+                        .collect::<Vec<_>>()
+                );
+            }
+            Ok(out)
+        }
+        _ => Err("unsupported client agent".into()),
+    }
+}
+
+fn gemini_reply(reply: Value, payload: &Value, config: Option<&Path>) -> Value {
+    let status = reply["status"].as_str().unwrap_or_default();
+    let text = reply["text"].as_str().unwrap_or_default();
+    match payload["hook_event_name"].as_str() {
+        Some("BeforeTool") if status == "stop" && !text.is_empty() => {
+            if first_deny(config, "gemini", payload) {
+                json!({"decision":"deny", "reason":text})
+            } else {
+                json!({})
+            }
+        }
+        Some("BeforeTool") if !text.is_empty() => json!({"systemMessage":text}),
+        Some("SessionStart") if !text.is_empty() => json!({
+            "hookSpecificOutput": {
+                "hookEventName":"SessionStart",
+                "additionalContext":text
+            }
+        }),
+        _ => json!({}),
     }
 }
 
@@ -261,12 +757,6 @@ fn path_segment(agent: &str) -> String {
     }
 }
 
-/// The Git root of `cwd` as a header value, or `None` (no `.git`, or not valid UTF-8 / header text).
-fn root_header(cwd: &Path) -> Option<reqwest::header::HeaderValue> {
-    let root = repo_root(cwd)?;
-    reqwest::header::HeaderValue::from_str(root.to_str()?).ok()
-}
-
 /// Where the agent is working: the payload's `cwd`, else its first workspace root, else here.
 fn cwd_of(payload: &Value) -> PathBuf {
     let first_root = payload["workspace_roots"][0].as_str();
@@ -286,6 +776,7 @@ struct Settings {
 enum Token {
     Value(String),
     File(PathBuf),
+    PrivateFile(PathBuf),
 }
 
 /// The hub URL and where its token comes from. A token stored in hub.json goes only to the hub
@@ -397,6 +888,13 @@ fn fail_open(agent: &str, payload: &Value, note: Option<&str>) -> Value {
         ("cursor", Some("sessionStart" | "postToolUse"), Some(r)) => {
             json!({"additional_context": text(r)})
         }
+        ("gemini", Some("SessionStart"), Some(r)) => json!({
+            "hookSpecificOutput": {
+                "hookEventName":"SessionStart",
+                "additionalContext":text(r)
+            }
+        }),
+        ("gemini", Some("BeforeTool"), Some(r)) => json!({"systemMessage":text(r)}),
         ("cursor", None, _) if !payload.is_object() || payload.get("tool_name").is_some() => {
             json!({"permission": "allow"})
         }
@@ -575,6 +1073,10 @@ mod tests {
             ("cursor".into(), Some("https://h.test".into()), None)
         );
         assert_eq!(parsed(&["--hub-url"]), (String::new(), None, None));
+        assert_eq!(
+            parsed(&["codex", "--client-connection"]),
+            ("codex".into(), None, None)
+        );
         assert_eq!(parsed(&[]), (String::new(), None, None));
         let repo = |list: &[&str]| parsed(list).2;
         assert_eq!(
@@ -706,6 +1208,304 @@ mod tests {
         );
     }
 
+    fn connection(root: &Path, repo: &str) -> Connection {
+        Connection {
+            root: root.canonicalize().unwrap(),
+            origin_host: "example.test".into(),
+            hub: "https://hub.example.test".into(),
+            repo: repo.into(),
+            token_file: std::env::temp_dir().join(format!("{}-token", repo.replace('/', "-"))),
+            owned_token_id: None,
+            owned_token_expires_at: None,
+        }
+    }
+
+    fn git_repo(parent: &Path, name: &str) -> PathBuf {
+        let root = parent.join(name);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        root.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn codex_payload_keeps_only_patch_headers_for_string_or_command_input() {
+        let patch = "*** Begin Patch\n*** Update File: src/a.rs\n@@\n-old secret\n+new secret\n\
+                     *** Move to: src/b.rs\n*** End Patch";
+        for input in [json!(patch), json!({"command": patch})] {
+            let payload = json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "s",
+                "tool_name": "apply_patch",
+                "tool_input": input,
+                "source": "private source",
+                "patch": "private patch",
+                "prompt": "private prompt"
+            });
+            let safe = sanitized_codex(&payload, None).unwrap();
+            assert_eq!(safe["hook_event_name"], "PreToolUse");
+            assert_eq!(safe["session_id"], "s");
+            assert_eq!(safe["tool_name"], "apply_patch");
+            let sent = safe.to_string();
+            assert!(sent.contains("*** Update File: src/a.rs"));
+            assert!(sent.contains("*** Move to: src/b.rs"));
+            for secret in [
+                "old secret",
+                "new secret",
+                "private source",
+                "private patch",
+                "private prompt",
+            ] {
+                assert!(!sent.contains(secret), "{secret}");
+            }
+        }
+    }
+
+    #[test]
+    fn client_payloads_keep_only_bounded_session_and_relative_path_metadata() {
+        let path = [EditPath {
+            header: None,
+            path: "src/new.rs".into(),
+        }];
+        let private = "/private/work/acme/widgets";
+        let cases = [
+            (
+                "claude",
+                json!({"hook_event_name":"PreToolUse", "session_id":"s",
+                    "cwd":private, "tool_name":"Write",
+                    "tool_input":{"file_path":format!("{private}/src/new.rs"), "content":"private-content"},
+                    "prompt":"private-prompt", "source":"private-source"}),
+            ),
+            (
+                "cursor",
+                json!({"hook_event_name":"postToolUse", "conversation_id":"c",
+                    "cwd":private, "tool_name":"Write",
+                    "tool_input":{"file_path":format!("{private}/src/new.rs"), "content":"private-content"},
+                    "tool_result":"private-result"}),
+            ),
+            (
+                "copilot",
+                json!({"sessionId":"c", "cwd":private, "toolName":"edit",
+                    "toolArgs":"{\"path\":\"/private/work/acme/widgets/src/new.rs\",\"content\":\"private-content\"}",
+                    "initialPrompt":"private-prompt"}),
+            ),
+            (
+                "gemini",
+                json!({"hook_event_name":"BeforeTool", "session_id":"g", "cwd":private,
+                    "tool_name":"write_file",
+                    "tool_input":{"file_path":format!("{private}/src/new.rs"), "content":"private-content"},
+                    "transcript_path":"/private/transcript.json"}),
+            ),
+        ];
+        for (agent, payload) in cases {
+            let safe = sanitized_client(agent, &payload, &path).unwrap();
+            let sent = safe.to_string();
+            assert!(sent.contains("src/new.rs"), "{agent}: {sent}");
+            for secret in [
+                private,
+                "private-content",
+                "private-prompt",
+                "private-source",
+                "private-result",
+                "private/transcript",
+            ] {
+                assert!(!sent.contains(secret), "{agent} leaked {secret}: {sent}");
+            }
+        }
+    }
+
+    #[test]
+    fn client_routes_each_native_agent_without_a_root_header() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = git_repo(parent.path(), "repo");
+        let connections = [connection(&root, "acme/widgets")];
+        let payloads = [
+            (
+                "claude",
+                json!({"hook_event_name":"PreToolUse", "session_id":"s", "cwd":root.clone(),
+                    "tool_name":"Write", "tool_input":{"file_path":"src/a.rs", "content":"secret"}}),
+            ),
+            (
+                "codex",
+                json!({"hook_event_name":"PreToolUse", "session_id":"s", "cwd":root.clone(),
+                    "tool_name":"Write", "tool_input":{"file_path":"src/a.rs", "content":"secret"}}),
+            ),
+            (
+                "cursor",
+                json!({"hook_event_name":"postToolUse", "conversation_id":"s", "cwd":root.clone(),
+                    "tool_name":"Write", "tool_input":{"file_path":"src/a.rs", "content":"secret"}}),
+            ),
+            (
+                "copilot",
+                json!({"sessionId":"s", "cwd":root.clone(), "toolName":"edit",
+                    "toolArgs":{"path":"src/a.rs", "content":"secret"}}),
+            ),
+            (
+                "gemini",
+                json!({"hook_event_name":"BeforeTool", "session_id":"s", "cwd":root,
+                    "tool_name":"write_file", "tool_input":{"file_path":"src/a.rs", "content":"secret"}}),
+            ),
+        ];
+        for (agent, payload) in payloads {
+            let routed = route_client_with(agent, &payload, &connections).unwrap();
+            assert_eq!(routed.connection.repo, "acme/widgets");
+            assert_eq!(
+                routed.endpoint_agent,
+                if agent == "gemini" { "generic" } else { agent }
+            );
+            let sent = routed.payload.to_string();
+            assert!(sent.contains("src/a.rs"), "{agent}: {sent}");
+            assert!(!sent.contains("secret"), "{agent}: {sent}");
+            assert!(
+                !sent.contains(parent.path().to_str().unwrap()),
+                "{agent}: {sent}"
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_stop_is_denied_once_without_forwarding_generic_fields() {
+        let config = tempfile::tempdir().unwrap();
+        let payload = json!({"hook_event_name":"BeforeTool", "session_id":"g",
+            "tool_name":"write_file", "tool_input":{"file_path":"src/a.rs", "content":"private"}});
+        let reply = json!({"status":"stop", "text":"coordinate this edit", "extra":"drop"});
+        assert_eq!(
+            gemini_reply(reply.clone(), &payload, Some(config.path())),
+            json!({"decision":"deny", "reason":"coordinate this edit"})
+        );
+        assert_eq!(
+            gemini_reply(reply, &payload, Some(config.path())),
+            json!({})
+        );
+    }
+
+    #[test]
+    fn codex_route_handles_parent_cwd_and_rejects_cross_root_patches() {
+        let parent = tempfile::tempdir().unwrap();
+        let one = git_repo(parent.path(), "one");
+        let two = git_repo(parent.path(), "two");
+        let connections = [connection(&one, "acme/one"), connection(&two, "acme/two")];
+        let payload = json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "s",
+            "cwd": parent.path(),
+            "workspace_roots": [one.clone()],
+            "tool_name": "apply_patch",
+            "tool_input": "*** Begin Patch\n*** Add File: one/new.rs\n+secret\n*** End Patch"
+        });
+        let routed = route_codex_with(&payload, &connections).unwrap();
+        assert_eq!(routed.connection.repo, "acme/one");
+        let body = routed.payload.to_string();
+        assert!(body.contains("*** Add File: new.rs"));
+        assert!(!body.contains("secret") && !body.contains(parent.path().to_str().unwrap()));
+
+        let crossing = json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "s",
+            "cwd": parent.path(),
+            "tool_name": "apply_patch",
+            "tool_input": format!(
+                "*** Begin Patch\n*** Update File: {}/a.rs\n*** Move to: {}/a.rs\n*** End Patch",
+                one.display(), two.display()
+            )
+        });
+        assert_eq!(
+            route_codex_with(&crossing, &connections).unwrap_err(),
+            "edit crosses configured repositories"
+        );
+    }
+
+    #[test]
+    fn unregistered_nested_checkout_never_uses_parent_binding() {
+        let parent = tempfile::tempdir().unwrap();
+        let outer = git_repo(parent.path(), "outer");
+        let inner = git_repo(&outer, "inner");
+        let connections = [connection(&outer, "acme/outer")];
+        let payload = json!({"hook_event_name":"PreToolUse", "session_id":"nested",
+            "cwd":outer, "tool_name":"Write", "tool_input":{"file_path":inner.join("new.rs")}});
+        assert_eq!(
+            route_codex_with(&payload, &connections).unwrap_err(),
+            "edit path belongs to another Git checkout"
+        );
+        let mixed = json!({"hook_event_name":"SessionStart", "session_id":"nested", "cwd":connections[0].root, "workspace_roots":[inner.clone()]});
+        assert_eq!(
+            route_codex_with(&mixed, &connections).unwrap_err(),
+            "path belongs to another Git checkout"
+        );
+        let session = json!({"hook_event_name":"SessionStart", "session_id":"nested", "cwd":inner});
+        assert_eq!(
+            route_codex_with(&session, &connections).unwrap_err(),
+            "path belongs to another Git checkout"
+        );
+    }
+
+    #[test]
+    fn codex_session_route_rejects_multiple_registered_workspace_roots() {
+        let parent = tempfile::tempdir().unwrap();
+        let one = git_repo(parent.path(), "one");
+        let two = git_repo(parent.path(), "two");
+        let connections = [connection(&one, "acme/one"), connection(&two, "acme/two")];
+        let payload = json!({
+            "hook_event_name": "SessionStart",
+            "session_id": "s",
+            "cwd": parent.path(),
+            "workspace_roots": [one.clone(), two.clone()],
+            "prompt": "must stay local"
+        });
+        assert_eq!(
+            route_codex_with(&payload, &connections).unwrap_err(),
+            "repository route is ambiguous"
+        );
+
+        let cwd_inside_one = json!({
+            "hook_event_name": "SessionEnd",
+            "session_id": "s",
+            "cwd": one,
+            "workspace_roots": [two]
+        });
+        assert_eq!(
+            route_codex_with(&cwd_inside_one, &connections).unwrap_err(),
+            "repository route is ambiguous"
+        );
+        assert_eq!(
+            route_codex_with(&json!({"hook_event_name":"SessionEnd"}), &connections).unwrap_err(),
+            "no client connection for this checkout"
+        );
+    }
+
+    #[test]
+    fn client_request_omits_the_private_root_header() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = git_repo(parent.path(), "private-checkout");
+        let connections = [connection(&root, "acme/widgets")];
+        let routed = route_codex_with(
+            &json!({
+                "hook_event_name":"PreToolUse",
+                "session_id":"s",
+                "cwd":root.clone(),
+                "tool_name":"Write",
+                "tool_input":{"file_path":"src/new.rs", "content":"private"}
+            }),
+            &connections,
+        )
+        .unwrap();
+        let request = hub_request(
+            &reqwest::Client::new(),
+            "https://hub.example.test",
+            "codex",
+            Some("acme/widgets"),
+            "synthetic-token",
+            &serde_json::to_vec(&routed.payload).unwrap(),
+            None,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        assert!(!request.headers().contains_key("X-Agentscm-Root"));
+        let body = request.body().and_then(reqwest::Body::as_bytes).unwrap();
+        let body = std::str::from_utf8(body).unwrap();
+        assert!(!body.contains(root.to_str().unwrap()));
+        assert!(!body.contains("private"));
+    }
+
     fn event(name: &str) -> Value {
         json!({"hook_event_name": name})
     }
@@ -757,6 +1557,42 @@ mod tests {
         }
         assert_eq!(out(&event("sessionEnd")), json!({}));
         assert_eq!(out(&json!({"conversation_id": "c"})), json!({}));
+    }
+
+    #[test]
+    fn gemini_fail_open_uses_only_documented_non_blocking_outputs() {
+        let before = fail_open(
+            "gemini",
+            &json!({"hook_event_name":"BeforeTool", "session_id":"s"}),
+            Some("no token"),
+        );
+        assert!(
+            before["systemMessage"]
+                .as_str()
+                .unwrap()
+                .contains("no token")
+        );
+        assert!(before.get("decision").is_none());
+        let start = fail_open(
+            "gemini",
+            &json!({"hook_event_name":"SessionStart", "session_id":"other"}),
+            Some("hub unreachable"),
+        );
+        assert_eq!(start["hookSpecificOutput"]["hookEventName"], "SessionStart");
+        assert!(
+            start["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .contains("hub unreachable")
+        );
+        assert_eq!(
+            fail_open(
+                "gemini",
+                &json!({"hook_event_name":"SessionEnd", "session_id":"end"}),
+                Some("no token")
+            ),
+            json!({})
+        );
     }
 
     #[test]

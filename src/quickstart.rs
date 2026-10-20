@@ -1217,7 +1217,13 @@ async fn obtain(
                 return None;
             }
             println!("Signing in ...");
-            let existed = hub_cli::session_path().is_ok_and(|p| p.exists());
+            let existed = match hub_cli::has_session(Some(url)) {
+                Ok(existed) => existed,
+                Err(error) => {
+                    println!("Couldn't inspect saved sign-ins: {}.", short(&error));
+                    return None;
+                }
+            };
             match hub_cli::sign_in(url, provider, Some(forge_host)).await {
                 Ok(who) => println!("Signed in as {who}."),
                 Err(error) => {
@@ -1236,7 +1242,7 @@ async fn obtain(
         };
         match mint(cx, url, &session, body).await {
             Mint::Unauthorized if !signed_in => {
-                let _ = std::fs::remove_file(hub_cli::session_path().ok()?);
+                let _ = hub_cli::forget_session_if_current(url, &session);
             }
             Mint::Unauthorized => {
                 println!("The hub didn't accept the new sign-in.");
@@ -1839,7 +1845,7 @@ fn summary(cx: &Cx<'_>, changed: bool) {
         ));
     }
     if m.session.is_some()
-        && let Ok(path) = hub_cli::session_path()
+        && let Ok(path) = hub_cli::sessions_path()
     {
         line(format!("{}: your hub sign-in", shown(&path, home)));
     }

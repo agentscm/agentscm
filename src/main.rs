@@ -29,6 +29,13 @@ use serde_json::{Value, json};
 #[cfg(unix)]
 mod agent_task_cli;
 mod autopsy_cli;
+mod client_cli;
+mod client_config;
+mod client_mcp;
+#[cfg(unix)]
+mod client_plugin;
+#[cfg(unix)]
+mod client_setup;
 mod demo_cli;
 mod distribution;
 #[cfg(unix)]
@@ -173,6 +180,14 @@ enum Command {
     Hook(hook_cli::HookArgs),
     /// Wire this Git repository's agents to a hub: write hooks, MCP config and instructions.
     InitRepo(init_cli::InitArgs),
+    /// Bind or diagnose a checkout's connection to an existing coordination Hub.
+    Client {
+        #[command(subcommand)]
+        command: client_cli::ClientCommand,
+    },
+    /// Create a local branded Codex plugin marketplace for this installed executable.
+    #[cfg(unix)]
+    ClientPlugin(client_plugin::PluginArgs),
     /// Announce and check work intents on a hub (advisory).
     Intent {
         #[command(subcommand)]
@@ -584,6 +599,9 @@ async fn run(cli: Cli) -> Result<RunExit> {
         Command::Hub { command } => hub_cli::run(command, &cli.data_dir).await?,
         Command::Hook(args) => hook_cli::run(args).await,
         Command::InitRepo(args) => init_cli::run(args)?,
+        Command::Client { command } => client_cli::run(command).await?,
+        #[cfg(unix)]
+        Command::ClientPlugin(args) => client_plugin::run(args)?,
         Command::Intent { command } => intent_cli::run(command).await?,
         Command::Work { command } => work_cli::run(command).await?,
         Command::Demo(args) => demo_cli::run(args).await?,

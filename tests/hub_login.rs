@@ -1651,7 +1651,7 @@ impl Cli {
     }
 
     fn session_file(&self) -> std::path::PathBuf {
-        self.config.path().join("agentscm/hub-session.json")
+        self.config.path().join("agentscm/hub-sessions.json")
     }
 }
 
@@ -1679,8 +1679,15 @@ async fn cli_signs_in_with_the_device_flow_and_manages_tokens() {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
     }
-    let saved: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
-    assert_eq!(saved["hub"], json!(hub));
+    let store: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(store["version"], 2);
+    assert_eq!(store["default_hub"], json!(hub));
+    let saved = store["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|saved| saved["hub"] == hub)
+        .unwrap();
     assert!(!stderr.contains(saved["session"].as_str().unwrap()));
 
     let (ok, stdout, stderr) = cli.run(&[
@@ -1729,7 +1736,10 @@ async fn cli_signs_in_with_the_device_flow_and_manages_tokens() {
     );
     // A session is only ever sent to the hub that issued it.
     let (ok, _, stderr) = cli.run(&["token", "list", "--hub", "https://other.example.com"]);
-    assert!(!ok && stderr.contains("different hub"), "{stderr}");
+    assert!(
+        !ok && stderr.contains("no saved session for this hub"),
+        "{stderr}"
+    );
 
     // Readable on the forge but not connected: the CLI says how to connect it.
     env.fake
@@ -1772,14 +1782,16 @@ async fn cli_signs_in_with_the_device_flow_and_manages_tokens() {
     let (ok, _, stderr) = cli.run(&["logout"]);
     assert!(ok && stderr.contains("not signed in"), "{stderr}");
 
-    // An expired session says to sign in again.
+    // A rejected read can still use a legacy session without rewriting its local storage.
+    let legacy = cli.config.path().join("agentscm/hub-session.json");
     std::fs::write(
-        &file,
+        &legacy,
         json!({"hub": hub, "session": "0".repeat(64)}).to_string(),
     )
     .unwrap();
     let (ok, _, stderr) = cli.run(&["token", "list"]);
     assert!(!ok && stderr.contains("run agentscm hub login"), "{stderr}");
+    assert!(!file.exists() && legacy.exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1836,7 +1848,7 @@ async fn cli_falls_back_to_the_loopback_flow_when_device_flow_is_unavailable() {
         .unwrap()
         .filter(|entry| {
             let name = entry.as_ref().unwrap().file_name();
-            name.to_string_lossy().starts_with("hub-session.json.tmp-")
+            name.to_string_lossy().starts_with("hub-sessions.json.tmp-")
         })
         .count();
     assert_eq!(leftovers, 0);
