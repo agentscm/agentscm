@@ -48,6 +48,10 @@ remains an observation; an installed target requirement additionally needs a con
 exact-subject receipt in the authority database before approval or native landing.
 
 The native API and operator-mapped hub/MCP/dashboard inspect retained status and current binding.
+The Unix `agent-task` CLI uses that same authenticated facade for typed task operations and uses
+the existing trusted-local collector for an exact server-derived descriptor. It requires the
+authoritative immutable native source and context in its selected local data directory; task-only
+profiles do not bootstrap source to an independent collector machine.
 The [Claude Code Stop loop](advanced/claude-code-workflows.md) is an opt-in local trigger; the
 authority independently enforces installed native target requirements. The existing file-edit
 hooks retain contention-only behavior. The optional Community workspace exposes authenticated

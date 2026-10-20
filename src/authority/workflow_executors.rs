@@ -17,7 +17,7 @@ use crate::{Error, Result};
 const MAX_REGISTRATIONS: i64 = 4_096;
 const MAX_COLLECTOR_PROFILES: i64 = 4_096;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
 pub struct CurrentExecutorRegistration {
     pub enrollment: ExecutorEnrollment,
     pub public_key_hex: String,

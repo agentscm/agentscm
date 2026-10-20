@@ -26,6 +26,8 @@ use clap::{Parser, Subcommand};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+#[cfg(unix)]
+mod agent_task_cli;
 mod autopsy_cli;
 mod demo_cli;
 mod distribution;
@@ -87,6 +89,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// [experimental] Operate or consume agent-owned workflow tasks.
+    #[cfg(unix)]
+    AgentTask {
+        #[command(subcommand)]
+        command: agent_task_cli::AgentTaskCommand,
+    },
     /// [experimental] Run bounded repository skill workflows on immutable local source.
     SkillWorkflow {
         #[command(subcommand)]
@@ -447,6 +455,10 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        #[cfg(unix)]
+        Command::AgentTask { command } => {
+            print_json(&agent_task_cli::run(&cli.data_dir, command).await?);
+        }
         Command::SkillWorkflow { command } => {
             skill_workflow_cli::run(&cli.data_dir, command).await?;
         }

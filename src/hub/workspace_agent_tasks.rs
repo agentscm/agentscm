@@ -156,7 +156,7 @@ impl CollectorOriginAuthorizationGuard for WorkspaceGuard<'_> {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClaimInput {
     pub version: u32,
@@ -185,7 +185,7 @@ impl ClaimInput {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MutationInput {
     pub version: u32,
@@ -218,7 +218,7 @@ impl MutationInput {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StatusInput {
     pub version: u32,
@@ -245,7 +245,7 @@ impl StatusInput {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AssertionInput {
     pub version: u32,
@@ -284,7 +284,7 @@ impl AssertionInput {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentTaskRequest {
     Requirements {
@@ -349,16 +349,16 @@ pub enum AgentTaskRequest {
     },
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CollectorUploadRequest {
     pub subject: RunSubject,
     pub transfer: CollectorTransfer,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentTaskEnvelope {
-    pub capability: &'static str,
+    pub capability: String,
     pub schema_version: u32,
     pub result: Value,
 }
@@ -557,7 +557,7 @@ impl ExecutionService {
             }),
         };
         Ok(AgentTaskEnvelope {
-            capability: AGENT_TASK_CAPABILITY,
+            capability: AGENT_TASK_CAPABILITY.into(),
             schema_version: AGENT_TASK_CONTRACT_VERSION,
             result: value,
         })
@@ -586,7 +586,7 @@ impl ExecutionService {
                 .await,
         )?;
         Ok(AgentTaskEnvelope {
-            capability: AGENT_TASK_CAPABILITY,
+            capability: AGENT_TASK_CAPABILITY.into(),
             schema_version: AGENT_TASK_CONTRACT_VERSION,
             result: encode(result)?,
         })

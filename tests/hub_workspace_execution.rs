@@ -4,15 +4,29 @@
 #[path = "common/workspace_hub.rs"]
 mod workspace_hub;
 
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
+use std::{fs, process::Command};
 
 use agentscm::authority::Authority;
+use agentscm::checks::SourcePathExpectation;
+use agentscm::context::{
+    ChangeId, InputIdentity, REVIEW_CONTEXT_VERSION, RequiredEvidence, ReviewContext,
+};
+use agentscm::execution::{
+    COMMAND_CAPABILITY, COMMAND_EVIDENCE, CommandRecipe, ExecutionLimits, OciBackend,
+    SyscallPolicy, environment_digest,
+};
 use agentscm::hub::store::{mint_agent_token, mint_bound_agent_token};
 use agentscm::hub::workspace_execution::{AgentTaskProfile, ExecutionConfig, ExecutionService};
+use agentscm::model::FileChange;
 use agentscm::skill_workflow::{
-    self, CriterionOutcome, CriterionResult, EvidenceTrustClass, ExecutorEnrollment,
-    ObservationSignatureAlgorithm, TaskAttemptView, TaskOutcome, TaskResultAssertion, WorkflowTask,
+    self, CollectorPayload, CollectorProfile, CollectorProfileAction, CriterionOutcome,
+    CriterionResult, EvidenceTrustClass, ExecutorEnrollment, ObservationSignatureAlgorithm,
+    SkillReference, StepAction, StepDefinition, TaskAttemptView, TaskOutcome, TaskResultAssertion,
+    TrustedLocalCollector, WorkflowDefinition, WorkflowSource, WorkflowTask, runtime_scope_digest,
 };
+use agentscm::store::{Engine, digest};
 use agentscm::team::auth::Role;
 use axum::http::header;
 use ed25519_dalek::SigningKey;
@@ -21,6 +35,13 @@ use serde_json::{Value, json};
 use workspace_hub::{Env, NativeSourceProfile, native_source_profile};
 
 const REPO: &str = "/v1/hub/workspace/repositories/synthetic%2Fproject";
+
+mod fake_docker {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/common/fake_docker.rs"
+    ));
+}
 
 async fn execution_env(
     root: &std::path::Path,
@@ -175,6 +196,11 @@ fn claim_input(task: &WorkflowTask, executor: &Value, suffix: &str) -> Value {
 }
 
 fn mutation_input(view: &TaskAttemptView, request_id: &str, kind: &str) -> Value {
+    let action = if kind == "cancel" {
+        json!({"kind":"cancel","reason":"synthetic cancellation"})
+    } else {
+        json!({"kind":kind})
+    };
     json!({
         "version":1,
         "request_id":request_id,
@@ -185,7 +211,7 @@ fn mutation_input(view: &TaskAttemptView, request_id: &str, kind: &str) -> Value
         "attempt_digest":view.attempt.digest().unwrap(),
         "fence":view.attempt.lease.fence,
         "executor":view.attempt.executor,
-        "action":{"kind":kind}
+        "action":action
     })
 }
 
@@ -224,7 +250,237 @@ fn mcp_call(name: &str, arguments: Value) -> Value {
 }
 
 fn mcp_envelope(response: &Value) -> Value {
+    assert_eq!(response["result"]["isError"], false, "{response}");
     serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+}
+
+fn source_command_profile(
+    root: &std::path::Path,
+    docker: &std::path::Path,
+    docker_socket: &std::path::Path,
+    docker_config: &std::path::Path,
+) -> (NativeSourceProfile, CollectorProfile) {
+    let backend = OciBackend::new(docker, docker_socket, docker_config).unwrap();
+    let runtime_identity = backend.probe().identity.expect("fake Docker is available");
+    let environment = std::collections::BTreeMap::new();
+    let recipe = CommandRecipe {
+        version: 1,
+        image: format!("sha256:{}", "1".repeat(64)),
+        argv: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "test -r /source/src/example.rs".into(),
+        ],
+        environment_sha256: environment_digest(&environment).unwrap(),
+        environment,
+        toolchain_sha256: "2".repeat(64),
+        limits: ExecutionLimits {
+            timeout_ms: 1_000,
+            max_output_bytes: 4_096,
+            memory_bytes: 64 * 1024 * 1024,
+            scratch_bytes: 1024 * 1024,
+            pids: 8,
+            cpu_millis: 500,
+        },
+        syscall_policy: SyscallPolicy::DockerBuiltin,
+        no_new_privileges: true,
+    };
+    let native = root.join("native-transport");
+    fs::create_dir_all(&native).unwrap();
+    let engine = Engine::open(&native).unwrap();
+    let revision = engine
+        .checkpoint(
+            None,
+            &[
+                FileChange {
+                    path: "skills/check/SKILL.md".into(),
+                    content: Some(b"# Run the pinned local check\n".to_vec()),
+                },
+                FileChange {
+                    path: "skills/check/runner.json".into(),
+                    content: Some(serde_json::to_vec(&recipe).unwrap()),
+                },
+                FileChange {
+                    path: "src/example.rs".into(),
+                    content: Some(b"fn example() -> bool { false }\n".to_vec()),
+                },
+            ],
+        )
+        .unwrap();
+    let mut authority = Authority::open(&native).unwrap();
+    let repository = authority.repository_id().unwrap();
+    let identity = |sha256: &str| InputIdentity::Digest {
+        sha256: sha256.into(),
+    };
+    let mut context = ReviewContext {
+        version: REVIEW_CONTEXT_VERSION,
+        change: ChangeId {
+            repository: repository.clone(),
+            id: "transport-work".into(),
+        },
+        change_version: 1,
+        revision: revision.clone(),
+        base: None,
+        target: "main".into(),
+        policy_epoch: 0,
+        intent: "exercise the complete agent-owned collector transport".into(),
+        acceptance_criteria: vec!["the pinned source and command checks pass".into()],
+        scope: vec!["src/example.rs".into()],
+        exclusions: vec![],
+        omissions: vec![],
+        dependencies: vec![],
+        recipe: identity(&recipe.digest().unwrap()),
+        toolchain: identity(&recipe.toolchain_sha256),
+        environment: identity(&recipe.environment_sha256),
+        required_evidence: vec![RequiredEvidence {
+            identity: COMMAND_EVIDENCE.into(),
+            digest: identity(&recipe.digest().unwrap()),
+        }],
+        required_capabilities: vec![
+            COMMAND_CAPABILITY.into(),
+            "agentscm.review-context/v1".into(),
+        ],
+    };
+    let definition = WorkflowDefinition {
+        version: 1,
+        name: "transport-source-command".into(),
+        source: WorkflowSource {
+            repository: repository.clone(),
+            revision: revision.clone(),
+            policy_epoch: 0,
+        },
+        skill: SkillReference {
+            entrypoint: "skills/check/SKILL.md".into(),
+            resources: vec!["skills/check/runner.json".into()],
+        },
+        steps: vec![
+            StepDefinition {
+                id: "command".into(),
+                needs: vec![],
+                required: true,
+                action: StepAction::Command {
+                    runner: "runner.json".into(),
+                    change: context.change.clone(),
+                    change_version: context.change_version,
+                    context_digest: context.digest().unwrap(),
+                },
+            },
+            StepDefinition {
+                id: "source".into(),
+                needs: vec!["command".into()],
+                required: true,
+                action: StepAction::SourcePaths {
+                    expectations: vec![SourcePathExpectation {
+                        path: "skills/check/SKILL.md".into(),
+                        sha256: digest(b"# Run the pinned local check\n"),
+                    }],
+                },
+            },
+        ],
+    };
+    authority.start_change(&context).unwrap();
+    let initial = skill_workflow::compile(&native, &definition).unwrap();
+    let requirement =
+        agentscm::authority::workflows::WorkflowRequirement::from_plan("main", &initial).unwrap();
+    let requirement_digest = authority
+        .install_workflow_requirement(&requirement)
+        .unwrap();
+    let signing = SigningKey::from_bytes(&[7_u8; 32]);
+    let public = signing.verifying_key().to_bytes();
+    let public_hex = public
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let enrollment = ExecutorEnrollment {
+        version: 1,
+        registration_id: "registration-http-1".into(),
+        executor_id: "executor-http-1".into(),
+        operator_id: "operator-http-1".into(),
+        repository: repository.clone(),
+        step_ids: vec!["command".into()],
+        registration_epoch: 1,
+        verification_key_id: agentscm::policy::issuer_key_id(&public_hex).unwrap(),
+        verification_key_sha256: digest(&public),
+        signature_algorithm: ObservationSignatureAlgorithm::Ed25519,
+        issued_at_ms: 1,
+    };
+    authority
+        .enroll_workflow_executor(&enrollment, &public_hex)
+        .unwrap();
+    let collector_profile = CollectorProfile {
+        version: 1,
+        profile_id: "command-profile".into(),
+        authority_audience: repository.clone(),
+        repository: repository.clone(),
+        workflow_profile: "checks".into(),
+        step_id: "command".into(),
+        registration_id: enrollment.registration_id.clone(),
+        registration_epoch: enrollment.registration_epoch,
+        verification_key_id: enrollment.verification_key_id.clone(),
+        action: CollectorProfileAction::Command {
+            recipe,
+            runtime_scope_sha256: runtime_scope_digest(&runtime_identity),
+        },
+    };
+    authority
+        .install_workflow_collector_profile(&collector_profile)
+        .unwrap();
+    let previous_version = context.change_version;
+    context.change_version += 1;
+    context.policy_epoch = authority.policy_epoch().unwrap();
+    let change = authority
+        .update_change_context(previous_version, &context)
+        .unwrap();
+    let plan =
+        skill_workflow::compile(&native, &requirement.instantiate(&context).unwrap()).unwrap();
+    (
+        NativeSourceProfile {
+            profile: agentscm::hub::workspace_execution::ExecutionProfile {
+                repository_id: "synthetic/project".into(),
+                profile_id: "checks".into(),
+                native_repository: repository,
+                data_dir: native,
+                target: "main".into(),
+                requirement_digest: requirement_digest.clone(),
+                docker: "/usr/bin/false".into(),
+                docker_socket: root.join("not-used.socket"),
+                claude: "/usr/bin/false".into(),
+            },
+            subject: agentscm::hub::workspace_execution::RunSubject {
+                change_id: context.change.id.clone(),
+                change_version: change.version,
+                context_digest: change.context_digest,
+                revision,
+                requirement_digest,
+            },
+            context,
+            plan,
+        },
+        collector_profile,
+    )
+}
+
+fn fake_docker_effect_counts(path: &std::path::Path) -> (usize, usize, usize) {
+    let calls = fs::read_to_string(path).unwrap_or_default();
+    calls.lines().fold((0, 0, 0), |mut counts, line| {
+        let args: Vec<String> = serde_json::from_str(line).unwrap();
+        if args.first().is_some_and(|value| value == "info")
+            || args.first().is_some_and(|value| value == "version")
+            || args.first().is_some_and(|value| value == "image")
+                && args.get(1).is_some_and(|value| value == "inspect")
+        {
+            counts.0 += 1;
+        } else if args.first().is_some_and(|value| value == "container")
+            && args.get(1).is_some_and(|value| value == "create")
+        {
+            counts.1 += 1;
+        } else if args.first().is_some_and(|value| value == "container")
+            && args.get(1).is_some_and(|value| value == "start")
+        {
+            counts.2 += 1;
+        }
+        counts
+    })
 }
 
 #[tokio::test]
@@ -409,6 +665,966 @@ async fn agent_only_http_and_workspace_mcp_expose_the_same_side_effect_free_requ
         )
         .await;
     assert_eq!(browser.0, 403);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_cli_uses_the_real_authenticated_task_route_without_server_execution() {
+    let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let native = native_source_profile(root.path());
+    let (env, token, _) = agent_client(root.path(), &native).await;
+    let token_file = root.path().join("agent.token");
+    let request_file = root.path().join("requirements.json");
+    fs::write(&token_file, token).unwrap();
+    fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(
+        &request_file,
+        serde_json::to_vec(&json!({"operation":"requirements","subject":native.subject})).unwrap(),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agentscm"))
+        .args([
+            "agent-task",
+            "call",
+            "--endpoint",
+            &env.base,
+            "--repository",
+            "synthetic/project",
+            "--profile",
+            "checks",
+            "--token-file",
+            token_file.to_str().unwrap(),
+            request_file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["capability"], "agentscm.agent-workflow-tasks/v1");
+    assert!(
+        response["result"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_owned_transport_failure_revision_success_and_native_landing_are_end_to_end() {
+    let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let docker_home = root.path().join("fake-docker-home");
+    let docker_config = root.path().join("fake-docker-config");
+    let collector_state = root.path().join("collector-state");
+    for directory in [&docker_home, &docker_config, &collector_state] {
+        fs::create_dir(directory).unwrap();
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let docker = root.path().join("docker.py");
+    let fake = fake_docker::FAKE_DOCKER.replace(
+        "home = pathlib.Path(os.environ[\"HOME\"])",
+        &format!(
+            "home = pathlib.Path({})",
+            serde_json::to_string(docker_home.to_str().unwrap()).unwrap()
+        ),
+    );
+    fs::write(&docker, fake).unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o700)).unwrap();
+    let docker_socket = root.path().join("docker.sock");
+    let _socket = std::os::unix::net::UnixListener::bind(&docker_socket).unwrap();
+    let (mut native, collector_profile) =
+        source_command_profile(root.path(), &docker, &docker_socket, &docker_config);
+    let (env, service) = agent_only_env(root.path(), &native).await;
+    assert!(
+        !service.server_execution_enabled(),
+        "the task-only profile must not enable server model or command dispatch"
+    );
+
+    let (_, owner) = env.signin(101).await;
+    let owner_session = env.session(&owner).await;
+    let owner_csrf = owner_session["csrf_token"].as_str().unwrap();
+    let roles = [
+        Role::Reader,
+        Role::Contributor,
+        Role::Reviewer,
+        Role::Integrator,
+    ];
+    let grant = env.member(
+        202,
+        &roles,
+        true,
+        env.workspace.settings().unwrap().generation,
+        "grant-agent-owned-transport",
+    );
+    assert_eq!(
+        env.request(
+            Method::PUT,
+            "/v1/hub/workspace/members",
+            Some(&owner),
+            Some(owner_csrf),
+            None,
+            Some(grant),
+        )
+        .await
+        .0,
+        200
+    );
+    let (_, member) = env.signin(202).await;
+    let mut member_session = env.session(&member).await;
+    let user = env
+        .store
+        .list_users()
+        .unwrap()
+        .into_iter()
+        .find(|user| user.identity.user_id == 202)
+        .unwrap();
+    let mint_token = || {
+        mint_agent_token(
+            &*env.store,
+            &user.id,
+            "agent-owned-transport",
+            "synthetic/project",
+            3_600,
+        )
+        .unwrap()
+        .1
+        .expose()
+        .to_owned()
+    };
+    let mut token = mint_token();
+    let token_file = root.path().join("agent.token");
+    let key_file = root.path().join("collector.key");
+    fs::write(&token_file, &token).unwrap();
+    fs::write(&key_file, [7_u8; 32]).unwrap();
+    for private in [&token_file, &key_file] {
+        fs::set_permissions(private, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let executor = json!({
+        "registration_id":"registration-http-1",
+        "executor_id":"executor-http-1",
+        "registration_epoch":1,
+        "verification_key_id":collector_profile.verification_key_id
+    });
+    let mcp_path = "/v1/hub/workspace/mcp?repository=synthetic%2Fproject&profile=checks";
+    let task_path = format!("{REPO}/profiles/checks/agent-tasks");
+    let upload_path = format!("{task_path}/collector-upload");
+
+    let requirements = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_requirements",
+                json!({"subject":native.subject}),
+            )),
+        )
+        .await;
+    assert_eq!(requirements.0, 200, "{requirements:?}");
+    let requirements = mcp_envelope(&requirements.1);
+    let first_task: WorkflowTask = serde_json::from_value(
+        requirements["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["subject"]["step_id"] == "command")
+            .unwrap()
+            .clone(),
+    )
+    .unwrap();
+    let next = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_next",
+                json!({"subject":native.subject}),
+            )),
+        )
+        .await;
+    assert_eq!(next.0, 200, "{next:?}");
+    assert_eq!(
+        mcp_envelope(&next.1)["result"]["task_id"],
+        first_task.task_id
+    );
+    let claim = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_collector_claim",
+                json!({
+                    "subject":native.subject,
+                    "claim":claim_input(&first_task,&executor,"transport-failure"),
+                    "collector_profile_id":"command-profile"
+                }),
+            )),
+        )
+        .await;
+    assert_eq!(claim.0, 200, "{claim:?}");
+    let first_attempt: TaskAttemptView =
+        serde_json::from_value(mcp_envelope(&claim.1)["result"].clone()).unwrap();
+    let descriptor = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_collector_descriptor",
+                json!({"subject":native.subject,"status":{
+                    "version":1,
+                    "task_id":first_attempt.attempt.task_id,
+                    "task_digest":first_attempt.attempt.task_digest,
+                    "attempt_id":first_attempt.attempt.attempt_id,
+                    "attempt_digest":first_attempt.attempt.digest().unwrap(),
+                    "fence":first_attempt.attempt.lease.fence,
+                    "executor":first_attempt.attempt.executor
+                }}),
+            )),
+        )
+        .await;
+    assert_eq!(descriptor.0, 200, "{descriptor:?}");
+    let first_descriptor = mcp_envelope(&descriptor.1)["result"].clone();
+    let first_descriptor_file = root.path().join("first-descriptor.json");
+    fs::write(
+        &first_descriptor_file,
+        serde_json::to_vec(&first_descriptor).unwrap(),
+    )
+    .unwrap();
+    fs::write(docker_home.join("scenario"), "nonzero").unwrap();
+
+    let cli_at = |endpoint: &str,
+                  subcommand: &str,
+                  descriptor: &std::path::Path,
+                  transfer_request_id: &str,
+                  token_file: &std::path::Path,
+                  key_file: &std::path::Path| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agentscm"));
+        command.env("HOME", &docker_home).args([
+            "--data-dir",
+            native.profile.data_dir.to_str().unwrap(),
+            "agent-task",
+            subcommand,
+            "--endpoint",
+            endpoint,
+            "--repository",
+            "synthetic/project",
+            "--profile",
+            "checks",
+            "--token-file",
+            token_file.to_str().unwrap(),
+            "--descriptor",
+            descriptor.to_str().unwrap(),
+            "--state-dir",
+            collector_state.to_str().unwrap(),
+            "--private-key",
+            key_file.to_str().unwrap(),
+            "--transfer-request-id",
+            transfer_request_id,
+        ]);
+        if subcommand == "collect" {
+            command.args([
+                "--docker",
+                docker.to_str().unwrap(),
+                "--docker-socket",
+                docker_socket.to_str().unwrap(),
+            ]);
+        }
+        command.output().unwrap()
+    };
+    let cli = |subcommand: &str,
+               descriptor: &std::path::Path,
+               transfer_request_id: &str,
+               token_file: &std::path::Path| {
+        cli_at(
+            &env.base,
+            subcommand,
+            descriptor,
+            transfer_request_id,
+            token_file,
+            &key_file,
+        )
+    };
+
+    let cancelled = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_cancel",
+                json!({"subject":native.subject,"mutation":mutation_input(&first_attempt,"cancel-before-cli","cancel")}),
+            )),
+        )
+        .await;
+    assert_eq!(cancelled.0, 200, "{cancelled:?}");
+    let effects_before_refusals = fake_docker_effect_counts(&docker_home.join("calls.jsonl"));
+    let cancelled_collect = cli(
+        "collect",
+        &first_descriptor_file,
+        "cancelled-must-not-run",
+        &token_file,
+    );
+    assert!(!cancelled_collect.status.success());
+    assert_eq!(
+        fake_docker_effect_counts(&docker_home.join("calls.jsonl")),
+        effects_before_refusals
+    );
+    let reconciled = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_reconcile",
+                json!({"subject":native.subject,"mutation":mutation_input(&first_attempt,"reconcile-cancelled-cli","reconcile")}),
+            )),
+        )
+        .await;
+    assert_eq!(reconciled.0, 200, "{reconciled:?}");
+
+    let mut expiry_claim = claim_input(&first_task, &executor, "expiry-refusal");
+    expiry_claim["requested_lease_ms"] = json!(1);
+    let expiry_claim = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_collector_claim",
+                json!({"subject":native.subject,"claim":expiry_claim,"collector_profile_id":"command-profile"}),
+            )),
+        )
+        .await;
+    assert_eq!(expiry_claim.0, 200, "{expiry_claim:?}");
+    let expired_attempt: TaskAttemptView =
+        serde_json::from_value(mcp_envelope(&expiry_claim.1)["result"].clone()).unwrap();
+    let expired_descriptor = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_collector_descriptor",
+                json!({"subject":native.subject,"status":{
+                    "version":1,
+                    "task_id":expired_attempt.attempt.task_id,
+                    "task_digest":expired_attempt.attempt.task_digest,
+                    "attempt_id":expired_attempt.attempt.attempt_id,
+                    "attempt_digest":expired_attempt.attempt.digest().unwrap(),
+                    "fence":expired_attempt.attempt.lease.fence,
+                    "executor":expired_attempt.attempt.executor
+                }}),
+            )),
+        )
+        .await;
+    assert_eq!(expired_descriptor.0, 200, "{expired_descriptor:?}");
+    let expired_descriptor_file = root.path().join("expired-descriptor.json");
+    fs::write(
+        &expired_descriptor_file,
+        serde_json::to_vec(&mcp_envelope(&expired_descriptor.1)["result"]).unwrap(),
+    )
+    .unwrap();
+    let expiry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let status = env
+            .request(
+                Method::POST,
+                mcp_path,
+                None,
+                None,
+                Some(&token),
+                Some(mcp_call(
+                    "agentscm_task_status",
+                    json!({"subject":native.subject,"status":{
+                        "version":1,
+                        "task_id":expired_attempt.attempt.task_id,
+                        "task_digest":expired_attempt.attempt.task_digest,
+                        "attempt_id":expired_attempt.attempt.attempt_id,
+                        "attempt_digest":expired_attempt.attempt.digest().unwrap(),
+                        "fence":expired_attempt.attempt.lease.fence,
+                        "executor":expired_attempt.attempt.executor
+                    }}),
+                )),
+            )
+            .await;
+        assert_eq!(status.0, 200, "{status:?}");
+        if mcp_envelope(&status.1)["result"]["state"] == "expired" {
+            break;
+        }
+        assert!(std::time::Instant::now() < expiry_deadline);
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    let expired_collect = cli(
+        "collect",
+        &expired_descriptor_file,
+        "expired-must-not-run",
+        &token_file,
+    );
+    assert!(!expired_collect.status.success());
+    assert_eq!(
+        fake_docker_effect_counts(&docker_home.join("calls.jsonl")),
+        effects_before_refusals
+    );
+    let reconciled_expiry = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_reconcile",
+                json!({"subject":native.subject,"mutation":mutation_input(&expired_attempt,"reconcile-expired-cli","reconcile")}),
+            )),
+        )
+        .await;
+    assert_eq!(reconciled_expiry.0, 200, "{reconciled_expiry:?}");
+
+    let replacement_claim = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_collector_claim",
+                json!({
+                    "subject":native.subject,
+                    "claim":claim_input(&first_task,&executor,"transport-failure-replacement"),
+                    "collector_profile_id":"command-profile"
+                }),
+            )),
+        )
+        .await;
+    assert_eq!(replacement_claim.0, 200, "{replacement_claim:?}");
+    let first_attempt: TaskAttemptView =
+        serde_json::from_value(mcp_envelope(&replacement_claim.1)["result"].clone()).unwrap();
+    let replacement_descriptor = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_collector_descriptor",
+                json!({"subject":native.subject,"status":{
+                    "version":1,
+                    "task_id":first_attempt.attempt.task_id,
+                    "task_digest":first_attempt.attempt.task_digest,
+                    "attempt_id":first_attempt.attempt.attempt_id,
+                    "attempt_digest":first_attempt.attempt.digest().unwrap(),
+                    "fence":first_attempt.attempt.lease.fence,
+                    "executor":first_attempt.attempt.executor
+                }}),
+            )),
+        )
+        .await;
+    assert_eq!(replacement_descriptor.0, 200, "{replacement_descriptor:?}");
+    let first_descriptor = mcp_envelope(&replacement_descriptor.1)["result"].clone();
+    fs::write(
+        &first_descriptor_file,
+        serde_json::to_vec(&first_descriptor).unwrap(),
+    )
+    .unwrap();
+    let failed = cli(
+        "collect",
+        &first_descriptor_file,
+        "transfer-failure",
+        &token_file,
+    );
+    assert!(
+        failed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
+    let failed_envelope: Value = serde_json::from_slice(&failed.stdout).unwrap();
+    assert_eq!(failed_envelope["result"]["state"], "finished");
+    let effects_after_failure = fake_docker_effect_counts(&docker_home.join("calls.jsonl"));
+    assert_eq!((effects_after_failure.1, effects_after_failure.2), (1, 1));
+
+    let collector = TrustedLocalCollector::new(
+        &collector_state,
+        collector_profile.clone(),
+        SigningKey::from_bytes(&[7_u8; 32]),
+    )
+    .unwrap();
+    let no_http = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    no_http.set_nonblocking(true).unwrap();
+    let no_http_endpoint = format!("http://{}", no_http.local_addr().unwrap());
+    for (label, pointer) in [
+        ("profile", "/profile/profile_id"),
+        ("task", "/task/task_id"),
+        ("attempt", "/attempt/attempt_id"),
+        ("origin", "/origin/grant_id"),
+    ] {
+        let mut mismatched = first_descriptor.clone();
+        *mismatched.pointer_mut(pointer).unwrap() = json!(format!("mismatched-{label}"));
+        let path = root.path().join(format!("mismatched-{label}.json"));
+        fs::write(&path, serde_json::to_vec(&mismatched).unwrap()).unwrap();
+        let rejected = cli_at(
+            &no_http_endpoint,
+            "retry-upload",
+            &path,
+            "transfer-failure",
+            &token_file,
+            &key_file,
+        );
+        assert!(!rejected.status.success(), "{label} mismatch was accepted");
+        assert!(matches!(
+            no_http.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+    let wrong_key = root.path().join("wrong-collector.key");
+    fs::write(&wrong_key, [8_u8; 32]).unwrap();
+    fs::set_permissions(&wrong_key, fs::Permissions::from_mode(0o600)).unwrap();
+    let rejected_key = cli_at(
+        &no_http_endpoint,
+        "retry-upload",
+        &first_descriptor_file,
+        "transfer-failure",
+        &token_file,
+        &wrong_key,
+    );
+    assert!(!rejected_key.status.success());
+    assert!(matches!(
+        no_http.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    let collector_database = collector_state.join("collector.sqlite");
+    let connection = rusqlite::Connection::open(&collector_database).unwrap();
+    connection
+        .execute(
+            "UPDATE collector_transfers SET transfer_request_id='aliased-transfer' WHERE transfer_request_id='transfer-failure'",
+            [],
+        )
+        .unwrap();
+    let rejected_request = cli_at(
+        &no_http_endpoint,
+        "retry-upload",
+        &first_descriptor_file,
+        "aliased-transfer",
+        &token_file,
+        &key_file,
+    );
+    assert!(!rejected_request.status.success());
+    assert!(matches!(
+        no_http.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    connection
+        .execute(
+            "UPDATE collector_transfers SET transfer_request_id='transfer-failure' WHERE transfer_request_id='aliased-transfer'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let mut fabricated = collector.retained_transfer("transfer-failure").unwrap();
+    let CollectorPayload::Command { record, .. } = &mut fabricated.payload else {
+        unreachable!()
+    };
+    record.detail.push_str(" fabricated");
+    let fabricated_upload = env
+        .request(
+            Method::POST,
+            &upload_path,
+            None,
+            None,
+            Some(&token),
+            Some(json!({"subject":native.subject,"transfer":fabricated})),
+        )
+        .await;
+    assert_eq!(fabricated_upload.0, 400, "{fabricated_upload:?}");
+
+    let approve_path = format!("{REPO}/profiles/checks/approve");
+    let blocked = env
+        .request(
+            Method::POST,
+            &approve_path,
+            Some(&member),
+            Some(member_session["csrf_token"].as_str().unwrap()),
+            None,
+            Some(json!({
+                "request_id":"failure-must-block",
+                "expected_generation":member_session["actor"]["generation"],
+                "subject":native.subject
+            })),
+        )
+        .await;
+    assert_eq!(blocked.0, 409, "{blocked:?}");
+
+    let retried = cli(
+        "retry-upload",
+        &first_descriptor_file,
+        "transfer-failure",
+        &token_file,
+    );
+    assert!(
+        retried.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retried.stderr)
+    );
+    let repeated_collect = cli(
+        "collect",
+        &first_descriptor_file,
+        "different-upload-same-execution",
+        &token_file,
+    );
+    assert!(!repeated_collect.status.success());
+    assert_eq!(
+        fake_docker_effect_counts(&docker_home.join("calls.jsonl")),
+        effects_after_failure,
+        "retry-upload and a restarted collector must not repeat probes or execution"
+    );
+
+    let disable = env.member(
+        202,
+        &roles,
+        false,
+        env.workspace.settings().unwrap().generation,
+        "revoke-agent-owned-origin",
+    );
+    assert_eq!(
+        env.request(
+            Method::PUT,
+            "/v1/hub/workspace/members",
+            Some(&owner),
+            Some(owner_csrf),
+            None,
+            Some(disable),
+        )
+        .await
+        .0,
+        200
+    );
+    let revoked_retry = cli(
+        "retry-upload",
+        &first_descriptor_file,
+        "transfer-failure",
+        &token_file,
+    );
+    assert!(!revoked_retry.status.success());
+    assert_eq!(
+        fake_docker_effect_counts(&docker_home.join("calls.jsonl")),
+        effects_after_failure
+    );
+    let reenable = env.member(
+        202,
+        &roles,
+        true,
+        env.workspace.settings().unwrap().generation,
+        "reenroll-agent-owned-origin",
+    );
+    assert_eq!(
+        env.request(
+            Method::PUT,
+            "/v1/hub/workspace/members",
+            Some(&owner),
+            Some(owner_csrf),
+            None,
+            Some(reenable),
+        )
+        .await
+        .0,
+        200
+    );
+    let (_, current_member) = env.signin(202).await;
+    member_session = env.session(&current_member).await;
+    token = mint_token();
+    fs::write(&token_file, &token).unwrap();
+    fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let engine = Engine::open(&native.profile.data_dir).unwrap();
+    let CollectorProfileAction::Command { recipe, .. } = &collector_profile.action else {
+        unreachable!()
+    };
+    let next_revision = engine
+        .checkpoint(
+            None,
+            &[
+                FileChange {
+                    path: "skills/check/SKILL.md".into(),
+                    content: Some(b"# Run the pinned local check\n".to_vec()),
+                },
+                FileChange {
+                    path: "skills/check/runner.json".into(),
+                    content: Some(serde_json::to_vec(recipe).unwrap()),
+                },
+                FileChange {
+                    path: "src/example.rs".into(),
+                    content: Some(b"fn example() -> bool { true }\n".to_vec()),
+                },
+            ],
+        )
+        .unwrap();
+    let previous_version = native.context.change_version;
+    native.context.change_version += 1;
+    native.context.revision = next_revision.clone();
+    let changed = Authority::open(&native.profile.data_dir)
+        .unwrap()
+        .update_change_context(previous_version, &native.context)
+        .unwrap();
+    native.subject.change_version = changed.version;
+    native.subject.context_digest = changed.context_digest;
+    native.subject.revision = next_revision;
+
+    let stale_retry = cli(
+        "retry-upload",
+        &first_descriptor_file,
+        "transfer-failure",
+        &token_file,
+    );
+    assert!(!stale_retry.status.success());
+    let stale_blocked = env
+        .request(
+            Method::POST,
+            &approve_path,
+            Some(&current_member),
+            Some(member_session["csrf_token"].as_str().unwrap()),
+            None,
+            Some(json!({
+                "request_id":"stale-failure-must-not-authorize",
+                "expected_generation":member_session["actor"]["generation"],
+                "subject":native.subject
+            })),
+        )
+        .await;
+    assert_eq!(stale_blocked.0, 409, "{stale_blocked:?}");
+
+    let fresh_requirements = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_requirements",
+                json!({"subject":native.subject}),
+            )),
+        )
+        .await;
+    assert_eq!(fresh_requirements.0, 200, "{fresh_requirements:?}");
+    let fresh_requirements = mcp_envelope(&fresh_requirements.1);
+    let fresh_task: WorkflowTask = serde_json::from_value(
+        fresh_requirements["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["subject"]["step_id"] == "command")
+            .unwrap()
+            .clone(),
+    )
+    .unwrap();
+    assert_ne!(fresh_task.task_id, first_task.task_id);
+    let fresh_next = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_next",
+                json!({"subject":native.subject}),
+            )),
+        )
+        .await;
+    assert_eq!(fresh_next.0, 200, "{fresh_next:?}");
+    assert_eq!(
+        mcp_envelope(&fresh_next.1)["result"]["task_id"],
+        fresh_task.task_id
+    );
+    let fresh_claim = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_collector_claim",
+                json!({
+                    "subject":native.subject,
+                    "claim":claim_input(&fresh_task,&executor,"transport-success"),
+                    "collector_profile_id":"command-profile"
+                }),
+            )),
+        )
+        .await;
+    assert_eq!(fresh_claim.0, 200, "{fresh_claim:?}");
+    let fresh_attempt: TaskAttemptView =
+        serde_json::from_value(mcp_envelope(&fresh_claim.1)["result"].clone()).unwrap();
+    let fresh_descriptor = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_collector_descriptor",
+                json!({"subject":native.subject,"status":{
+                    "version":1,
+                    "task_id":fresh_attempt.attempt.task_id,
+                    "task_digest":fresh_attempt.attempt.task_digest,
+                    "attempt_id":fresh_attempt.attempt.attempt_id,
+                    "attempt_digest":fresh_attempt.attempt.digest().unwrap(),
+                    "fence":fresh_attempt.attempt.lease.fence,
+                    "executor":fresh_attempt.attempt.executor
+                }}),
+            )),
+        )
+        .await;
+    assert_eq!(fresh_descriptor.0, 200, "{fresh_descriptor:?}");
+    let fresh_descriptor_file = root.path().join("fresh-descriptor.json");
+    fs::write(
+        &fresh_descriptor_file,
+        serde_json::to_vec(&mcp_envelope(&fresh_descriptor.1)["result"]).unwrap(),
+    )
+    .unwrap();
+    fs::write(docker_home.join("scenario"), "success").unwrap();
+    let success = cli(
+        "collect",
+        &fresh_descriptor_file,
+        "transfer-success",
+        &token_file,
+    );
+    assert!(
+        success.status.success(),
+        "{}",
+        String::from_utf8_lossy(&success.stderr)
+    );
+    let effects_after_success = fake_docker_effect_counts(&docker_home.join("calls.jsonl"));
+    assert_eq!((effects_after_success.1, effects_after_success.2), (2, 2));
+    assert!(effects_after_success.0 > effects_after_failure.0);
+
+    let approval = env
+        .request(
+            Method::POST,
+            &approve_path,
+            Some(&current_member),
+            Some(member_session["csrf_token"].as_str().unwrap()),
+            None,
+            Some(json!({
+                "request_id":"approve-agent-owned-success",
+                "expected_generation":member_session["actor"]["generation"],
+                "subject":native.subject
+            })),
+        )
+        .await;
+    assert_eq!(approval.0, 200, "{approval:?}");
+    let integration = env
+        .request(
+            Method::POST,
+            &format!("{REPO}/profiles/checks/integrate"),
+            Some(&current_member),
+            Some(member_session["csrf_token"].as_str().unwrap()),
+            None,
+            Some(json!({
+                "request_id":"integrate-agent-owned-success",
+                "expected_generation":member_session["actor"]["generation"],
+                "subject":native.subject,
+                "approval_id":approval.1["approval_id"]
+            })),
+        )
+        .await;
+    assert_eq!(integration.0, 200, "{integration:?}");
+    assert_eq!(
+        Authority::open(&native.profile.data_dir)
+            .unwrap()
+            .target("main")
+            .unwrap()
+            .unwrap()
+            .revision,
+        native.context.revision
+    );
+
+    let independent_human = env.member(
+        303,
+        &[Role::Reader, Role::Reviewer, Role::Integrator],
+        true,
+        env.workspace.settings().unwrap().generation,
+        "grant-independent-native-reviewer",
+    );
+    assert_eq!(
+        env.request(
+            Method::PUT,
+            "/v1/hub/workspace/members",
+            Some(&owner),
+            Some(owner_csrf),
+            None,
+            Some(independent_human),
+        )
+        .await
+        .0,
+        200
+    );
+    let (_, independent_human) = env.signin(303).await;
+    let independent_session = env.session(&independent_human).await;
+    let revoke_success_origin = env.member(
+        202,
+        &roles,
+        false,
+        env.workspace.settings().unwrap().generation,
+        "revoke-successful-collector-origin",
+    );
+    assert_eq!(
+        env.request(
+            Method::PUT,
+            "/v1/hub/workspace/members",
+            Some(&owner),
+            Some(owner_csrf),
+            None,
+            Some(revoke_success_origin),
+        )
+        .await
+        .0,
+        200
+    );
+    let revoked_origin_approval = env
+        .request(
+            Method::POST,
+            &approve_path,
+            Some(&independent_human),
+            Some(independent_session["csrf_token"].as_str().unwrap()),
+            None,
+            Some(json!({
+                "request_id":"successful-receipt-revoked-origin",
+                "expected_generation":independent_session["actor"]["generation"],
+                "subject":native.subject
+            })),
+        )
+        .await;
+    assert_eq!(
+        revoked_origin_approval.0, 409,
+        "{revoked_origin_approval:?}"
+    );
 }
 
 #[tokio::test]

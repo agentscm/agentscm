@@ -1446,9 +1446,63 @@ impl<'a> AgentTaskService<'a> {
     }
 
     fn current(&self, context: &ReviewContext) -> Result<CurrentTasks> {
+        Self::load_current_tasks(self.data_dir, self.profile, context)
+    }
+
+    /// Rebuilds the authoritative plan for a server-derived collector descriptor.
+    /// This performs no task mutation or remote authorization; callers must still use the
+    /// authenticated facade for dispatch and finalization guards.
+    pub fn compile_collector_descriptor(
+        data_dir: &Path,
+        descriptor: &CollectorWorkDescriptor,
+    ) -> Result<CompiledPlan> {
+        descriptor.validate()?;
+        let authority = Authority::open_read_only(data_dir)?;
+        let context = authority.review_context(&descriptor.task.subject.context_digest)?;
+        let current =
+            Self::load_current_tasks(data_dir, &descriptor.task.subject.profile, &context)?;
+        let task = exact_task(
+            &current.tasks,
+            &descriptor.task.task_id,
+            &descriptor.task.digest()?,
+        )?;
+        if task != &descriptor.task
+            || descriptor.attempt.task_id != task.task_id
+            || descriptor.attempt.task_digest != task.digest()?
+            || descriptor.attempt.executor.registration_id != descriptor.profile.registration_id
+            || descriptor.origin.actor != descriptor.attempt.agent
+        {
+            return Err(Error::Conflict(
+                "collector descriptor differs from authoritative task bindings".into(),
+            ));
+        }
+        descriptor.profile.validate_for(
+            task,
+            &descriptor.attempt.executor,
+            &task.subject.repository,
+        )?;
+        let installed = authority.require_current_collector_profile(
+            &descriptor.profile.profile_id,
+            task,
+            &descriptor.attempt.executor,
+        )?;
+        if installed != descriptor.profile {
+            return Err(Error::Conflict(
+                "collector descriptor profile differs from native authority".into(),
+            ));
+        }
+        validate_profile_action(task, &current.plan, &descriptor.profile)?;
+        Ok(current.plan)
+    }
+
+    fn load_current_tasks(
+        data_dir: &Path,
+        profile: &str,
+        context: &ReviewContext,
+    ) -> Result<CurrentTasks> {
         context.validate()?;
         let context_digest = context.digest()?;
-        let authority = Authority::open_read_only(self.data_dir)?;
+        let authority = Authority::open_read_only(data_dir)?;
         if authority.repository_id()? != context.change.repository
             || authority.policy_epoch()? != context.policy_epoch
         {
@@ -1475,11 +1529,11 @@ impl<'a> AgentTaskService<'a> {
             })?;
         let requirement_digest = requirement.digest()?;
         let definition = requirement.instantiate(context)?;
-        let plan = compile(self.data_dir, &definition)?;
+        let plan = compile(data_dir, &definition)?;
         if plan.skill_digest() != requirement.skill_digest {
             return Err(Error::Conflict("installed workflow skill is stale".into()));
         }
-        let tasks = derive_tasks(self.profile, context, &requirement_digest, &plan)?;
+        let tasks = derive_tasks(profile, context, &requirement_digest, &plan)?;
         Ok(CurrentTasks { plan, tasks })
     }
 
