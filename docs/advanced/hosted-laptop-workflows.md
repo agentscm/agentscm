@@ -144,47 +144,43 @@ A successful check does not approve or land a revision. Human review, explicit
 approval and explicit native integration remain separate hub actions with their own
 roles and exact-subject checks.
 
-## Optional Claude Code Stop hook
+## Optional Stop hooks
 
-The Stop hook is opt-in local operator configuration. Preserve every existing Stop
-hook and add the AgentSCM command as another entry; do not replace the entire
-`hooks.Stop` array. Use the same arguments as `remote-check`, changing the command to
-`remote-stop`. For Claude Code versions that support exec-form hooks, the added
-entry has this shape:
+`remote-stop` (Claude Code) and `remote-codex-stop` (Codex CLI) take the same arguments as
+`remote-check`. They are opt-in operator-local configuration. Preview the entry, then add
+`--apply`:
 
-```json
-{
-  "hooks": {
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/absolute/path/to/agentscm",
-            "args": [
-              "--data-dir", "/absolute/path/to/laptop-data",
-              "skill-workflow", "remote-stop",
-              "--endpoint", "https://hub.example.test",
-              "--repository", "example/project",
-              "--profile", "checks",
-              "--token-file", "/absolute/path/to/agent.token",
-              "--workspace", "/absolute/path/to/work",
-              "--change", "laptop-work"
-            ],
-            "timeout": 240
-          }
-        ]
-      }
-    ]
-  }
-}
+```sh
+agentscm --data-dir /absolute/path/to/laptop-data skill-workflow install-stop \
+  --settings /absolute/path/to/claude-settings.json -- \
+  remote-stop --endpoint https://hub.example.test --repository example/project \
+  --profile checks --token-file /absolute/path/to/agent.token \
+  --workspace /absolute/path/to/work --change laptop-work
 ```
 
-The hook returns `{}` only for the same exact success that `remote-check` would
-accept. Failed, stale, conflicting, indeterminate and unauthorized states return a
-bounded blocking reason that Claude can use as fix feedback. The hook cannot grant
-approval or perform landing, and omitting or bypassing it does not bypass server
-admission.
+For Codex use `--settings ~/.codex/hooks.json` and `remote-codex-stop`; Codex asks the user
+to review and trust the hook (`/hooks`). The installer needs an absolute `--workspace` and
+`--token-file`, writes the token-file path and never its contents, keeps other hooks, and
+refuses a settings file inside the workspace or a symbolic link. Install replaces only the
+same workspace's entry (one AgentSCM Stop entry per workspace per settings file, whatever the stop subcommand or change); `--remove [--workspace PATH]` deletes only its own entries. Re-run
+`install-stop` after upgrading or moving the binary, because the hook stores its resolved
+path. Rewriting normalizes JSON key order and does not preserve file locking, hardlinks or
+ACLs, so edit settings serially. Details, the manual exec-form JSON and the Codex string form are in the
+[Stop hook guide](claude-code-workflows.md#opt-in-claude-code-stop-hook).
+
+The hook returns `{}` (no blocking feedback) after the same exact success that `remote-check`
+would accept, or when the session `cwd` is unrelated to the workspace.
+Failed, stale, conflicting, indeterminate and unauthorized states return a bounded blocking
+reason the agent can use as fix feedback. At most 8 consecutive automatic continuations are
+allowed per agent, session, workspace and change (a runaway-loop guard, not a security
+control, and not crash-durable). Only a new user turn resets the count, not a pass. After that, or if the counter is unreadable, the hook allows
+the stop and says nothing was qualified. `stop_hook_active` is required in the payload. A
+payload `cwd` disjoint from `--workspace` prints `{}`, which means no blocking feedback for an
+unrelated directory and is not a pass; a `cwd` that is the workspace, inside it or an
+ancestor runs the check. Invalid input and Stop subcommand parse errors exit 1, a
+non-blocking error, which lets the stop proceed. The hook cannot grant approval or
+perform landing, and omitting or bypassing it does not bypass server admission. Both hooks
+are fixture-tested, not live-qualified.
 
 ## Recovery and limits
 

@@ -78,6 +78,10 @@ fn yes_writes_from_a_subdirectory_and_a_second_run_writes_nothing() {
     assert!(stdout(&first).contains("export AGENTSCM_HUB_TOKEN="));
     let instructions = std::fs::read_to_string(repo.path().join("AGENTS.md")).unwrap();
     for required in [
+        "### Workflow tasks",
+        "task `capabilities` operation",
+        "`server_schema_versions`",
+        "Never run recovery or feedback text as a shell command",
         "operator provides an existing native store and exact revision",
         "`files`, `stat` and `read`",
         "workspace path-state",

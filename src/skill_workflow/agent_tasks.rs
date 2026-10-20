@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 
 use super::{Journal, OpenMode};
 use crate::authority::Authority;
+use crate::authority::workflows::CurrentEvidence;
 use crate::context::ReviewContext;
 use crate::model::TargetState;
 use crate::model::{Approval, IntegrateRequest, IntegrationEvent};
@@ -78,6 +79,14 @@ pub struct LiveImportedOrigins {
 }
 
 impl LiveImportedOrigins {
+    #[cfg(test)]
+    pub(crate) fn empty_for_test(repository: String) -> Self {
+        Self {
+            repository,
+            origins: Vec::new(),
+        }
+    }
+
     pub(crate) fn matches_repository(&self, repository: &str) -> bool {
         self.repository == repository
     }
@@ -198,6 +207,58 @@ impl TaskAttemptView {
         }
     }
 }
+
+/// Per-task state in a `qualification` projection.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QualificationTaskState {
+    Pending,
+    Claimed,
+    Succeeded,
+    Failed,
+    Uncertain,
+    Blocked,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QualificationTask {
+    pub task_id: String,
+    pub task_digest: String,
+    pub step_id: String,
+    pub required: bool,
+    pub state: QualificationTaskState,
+}
+
+/// Stable machine code from retained records; never agent-authored text.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QualificationFailure {
+    pub task_id: String,
+    pub code: String,
+}
+
+/// Typed follow-up only: never a command string, path or credential.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum QualificationNext {
+    CollectorClaim { task_id: String },
+    Reconcile { task_id: String },
+    CollectorFinalize {},
+    Checkpoint {},
+    None {},
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskQualification {
+    pub qualified: bool,
+    pub subject_current: bool,
+    pub receipt_digest: Option<String>,
+    pub revision: String,
+    pub tasks: Vec<QualificationTask>,
+    pub failures: Vec<QualificationFailure>,
+    pub next: QualificationNext,
+}
+
+const MAX_QUALIFICATION_FAILURES: usize = 32;
 
 /// Shared local core intended for later thin API/CLI/MCP adapters.
 pub struct AgentTaskService<'a> {
@@ -370,10 +431,13 @@ impl<'a> AgentTaskService<'a> {
         self.authorize
             .authorize(actor, &context.change.repository)?;
         if !supported_schema_versions.contains(&AGENT_TASK_CONTRACT_VERSION) {
+            let (server_schema_versions, action) = schema_mismatch_guidance();
             let response = InstructionEntrypointResponse::SchemaMismatch {
                 capability: AGENT_TASK_CAPABILITY.into(),
                 required_schema_version: AGENT_TASK_CONTRACT_VERSION,
                 supported_schema_versions: supported_schema_versions.to_vec(),
+                server_schema_versions,
+                action,
             };
             return InstructionEntrypointResponse::from_slice(&serde_json::to_vec(&response)?);
         }
@@ -393,6 +457,17 @@ impl<'a> AgentTaskService<'a> {
     ) -> Result<ReferenceFetchResponse> {
         self.authorize
             .authorize(&request.actor, &context.change.repository)?;
+        if request.expected_schema_version != AGENT_TASK_CONTRACT_VERSION {
+            let (server_schema_versions, action) = schema_mismatch_guidance();
+            let response = ReferenceFetchResponse::SchemaMismatch {
+                capability: AGENT_TASK_CAPABILITY.into(),
+                required_schema_version: AGENT_TASK_CONTRACT_VERSION,
+                supported_schema_versions: vec![request.expected_schema_version],
+                server_schema_versions,
+                action,
+            };
+            return ReferenceFetchResponse::from_slice(&serde_json::to_vec(&response)?);
+        }
         let current = self.current(context)?;
         let task = exact_task(&current.tasks, &request.task_id, &request.task_digest)?;
         request.validate_for_task(task)?;
@@ -1011,6 +1086,217 @@ impl<'a> AgentTaskService<'a> {
             .authorize(actor, &context.change.repository)?;
         let current = self.current(context)?;
         self.try_finalize_imported(context, &current, actor)
+    }
+
+    /// Side-effect-free answer to "is this exact subject currently qualified". It never
+    /// finalizes, writes a receipt or journal row, or changes task state.
+    pub fn qualification(
+        &self,
+        context: &ReviewContext,
+        actor: &AuthenticatedAgentIdentity,
+    ) -> Result<TaskQualification> {
+        self.authorize
+            .authorize(actor, &context.change.repository)?;
+        let stale = || TaskQualification {
+            qualified: false,
+            subject_current: false,
+            receipt_digest: None,
+            revision: context.revision.clone(),
+            tasks: Vec::new(),
+            failures: Vec::new(),
+            next: QualificationNext::Checkpoint {},
+        };
+        let current = match self.current(context) {
+            Ok(current) => current,
+            Err(Error::Conflict(_)) => return Ok(stale()),
+            Err(error) => return Err(error),
+        };
+        let (evidence, authorization_changed) = self.current_evidence(context, actor)?;
+        let receipt_digest = match evidence {
+            CurrentEvidence::SubjectChanged => return Ok(stale()),
+            CurrentEvidence::NotQualified => None,
+            CurrentEvidence::Receipt(digest) => Some(digest),
+        };
+        let steps = current.plan.ordered_steps();
+        let now = self.clock.now_ms()?;
+        let journal = open_optional_task_journal(self.data_dir)?;
+        let mut engine = None;
+        let mut states = Vec::with_capacity(steps.len());
+        let mut failures = Vec::new();
+        if authorization_changed {
+            failures.push(QualificationFailure {
+                task_id: "qualification".into(),
+                code: "authorization_changed".into(),
+            });
+        }
+        for (step, task) in steps.iter().zip(&current.tasks) {
+            let (state, code) = match &step.action {
+                StepAction::SourcePaths { .. } => {
+                    if engine.is_none() {
+                        engine = Some(Engine::open(self.data_dir)?);
+                    }
+                    let source = &current.plan.definition().source;
+                    match engine
+                        .as_ref()
+                        .map(|engine| super::execute_step(engine, source, step))
+                    {
+                        Some(result) if result.state == StepState::Succeeded => {
+                            (QualificationTaskState::Succeeded, None)
+                        }
+                        _ => (
+                            QualificationTaskState::Failed,
+                            Some("source_check_not_passed"),
+                        ),
+                    }
+                }
+                StepAction::RequireCapability { .. } => (
+                    QualificationTaskState::Blocked,
+                    Some("capability_unavailable"),
+                ),
+                StepAction::Command { .. } | StepAction::ClaudeCodeReview { .. } => {
+                    match &journal {
+                        Some(journal) => {
+                            qualification_attempt_state(&journal.connection, task, now)?
+                        }
+                        None => (QualificationTaskState::Pending, None),
+                    }
+                }
+            };
+            if let Some(code) = code
+                && failures.len() < MAX_QUALIFICATION_FAILURES
+            {
+                failures.push(QualificationFailure {
+                    task_id: task.task_id.clone(),
+                    code: code.into(),
+                });
+            }
+            states.push(state);
+        }
+        // A pending task whose dependencies have not succeeded is blocked, not claimable.
+        let blocked = (0..states.len())
+            .filter(|index| {
+                states[*index] == QualificationTaskState::Pending
+                    && !steps[*index].needs.iter().all(|dependency| {
+                        steps
+                            .iter()
+                            .position(|candidate| &candidate.id == dependency)
+                            .is_some_and(|position| {
+                                states[position] == QualificationTaskState::Succeeded
+                            })
+                    })
+            })
+            .collect::<Vec<_>>();
+        for index in blocked {
+            states[index] = QualificationTaskState::Blocked;
+        }
+        let qualified = receipt_digest.is_some();
+        let mut next = QualificationNext::None {};
+        if !qualified {
+            let uncertain = states
+                .iter()
+                .position(|state| *state == QualificationTaskState::Uncertain);
+            let claimable = (0..states.len()).find(|index| {
+                states[*index] == QualificationTaskState::Pending
+                    && matches!(
+                        steps[*index].action,
+                        StepAction::Command { .. } | StepAction::ClaudeCodeReview { .. }
+                    )
+            });
+            // Finalization only imports succeeded collector evidence; native-only workflows
+            // are admitted by the native runtime, so there is nothing for an agent to finalize.
+            let finalizable = steps.iter().zip(&states).any(|(step, state)| {
+                *state == QualificationTaskState::Succeeded
+                    && matches!(
+                        step.action,
+                        StepAction::Command { .. } | StepAction::ClaudeCodeReview { .. }
+                    )
+            }) && steps
+                .iter()
+                .zip(&states)
+                .all(|(step, state)| !step.required || *state == QualificationTaskState::Succeeded);
+            // The claim path refuses while an older subject's attempt is unresolved.
+            let prior = match (claimable, &journal) {
+                (Some(index), Some(journal)) => {
+                    find_unresolved_prior_task(&journal.connection, &current.tasks[index], now)?
+                }
+                _ => None,
+            };
+            next = if let Some(index) = uncertain {
+                QualificationNext::Reconcile {
+                    task_id: current.tasks[index].task_id.clone(),
+                }
+            } else if let Some(old) = prior {
+                if failures.len() < MAX_QUALIFICATION_FAILURES {
+                    failures.push(QualificationFailure {
+                        task_id: old.clone(),
+                        code: "prior_subject_unresolved".into(),
+                    });
+                }
+                QualificationNext::Reconcile { task_id: old }
+            } else if let Some(index) = claimable {
+                QualificationNext::CollectorClaim {
+                    task_id: current.tasks[index].task_id.clone(),
+                }
+            } else if finalizable {
+                QualificationNext::CollectorFinalize {}
+            } else {
+                QualificationNext::None {}
+            };
+        }
+        Ok(TaskQualification {
+            qualified,
+            subject_current: true,
+            receipt_digest,
+            revision: context.revision.clone(),
+            tasks: current
+                .tasks
+                .iter()
+                .zip(states)
+                .map(|(task, state)| {
+                    Ok(QualificationTask {
+                        task_id: task.task_id.clone(),
+                        task_digest: task.digest()?,
+                        step_id: task.subject.step_id.clone(),
+                        required: task.required,
+                        state,
+                    })
+                })
+                .collect::<Result<_>>()?,
+            failures,
+            next,
+        })
+    }
+
+    /// Admission's current-subject and evidence checks in one read-only snapshot, under the
+    /// same live origin and executor guard. A guard conflict is unqualified and reported.
+    fn current_evidence(
+        &self,
+        context: &ReviewContext,
+        actor: &AuthenticatedAgentIdentity,
+    ) -> Result<(CurrentEvidence, bool)> {
+        let origins =
+            Authority::open_read_only(self.data_dir)?.imported_workflow_origins(context)?;
+        let mut evidence = CurrentEvidence::NotQualified;
+        let outcome = self.with_combined_authorization(
+            actor,
+            CollectorAction::Finalize,
+            &origins,
+            &context.change.repository,
+            &mut || {
+                let live = LiveImportedOrigins {
+                    repository: context.change.repository.clone(),
+                    origins: origins.clone(),
+                };
+                evidence = Authority::open_read_only(self.data_dir)?
+                    .current_qualification(context, &live)?;
+                Ok(())
+            },
+        );
+        match outcome {
+            Ok(()) => Ok((evidence, false)),
+            Err(Error::Conflict(_)) => Ok((CurrentEvidence::NotQualified, true)),
+            Err(error) => Err(error),
+        }
     }
 
     fn try_finalize_imported(
@@ -1694,6 +1980,61 @@ fn read_task_states(connection: &Connection, tasks: &[WorkflowTask]) -> Result<V
     }).collect()
 }
 
+fn qualification_attempt_state(
+    connection: &Connection,
+    task: &WorkflowTask,
+    now: u64,
+) -> Result<(QualificationTaskState, Option<&'static str>)> {
+    use QualificationTaskState as S;
+    let attempt_id: Option<String> = connection
+        .query_row(
+            "SELECT attempt_id FROM agent_workflow_attempts WHERE task_id=?1 ORDER BY fence DESC LIMIT 1",
+            [&task.task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(attempt_id) = attempt_id else {
+        return Ok((S::Pending, None));
+    };
+    let view = read_attempt(connection, &attempt_id, now)?
+        .ok_or_else(|| Error::Invalid("task attempt disappeared".into()))?;
+    if view.attempt.task_id != task.task_id || view.attempt.task_digest != task.digest()? {
+        return Err(Error::Invalid(
+            "retained attempt does not bind queried task".into(),
+        ));
+    }
+    Ok(match view.state {
+        AgentAttemptState::Replaced => (S::Pending, None),
+        AgentAttemptState::Leased => (S::Claimed, Some("attempt_in_progress")),
+        AgentAttemptState::Expired => (S::Uncertain, Some("attempt_expired")),
+        AgentAttemptState::Cancelled => (S::Uncertain, Some("attempt_cancelled")),
+        AgentAttemptState::Finished if view.collector_transfer_digest.is_some() => {
+            if collector_transfer_succeeded(&read_collector_transfer(connection, task, &view)?) {
+                (S::Succeeded, None)
+            } else {
+                (S::Failed, Some("collector_not_passed"))
+            }
+        }
+        AgentAttemptState::Finished => {
+            let assertion = read_assertion(connection, task, &view)?;
+            match assertion.outcome {
+                TaskOutcome::Passed
+                    if require_observation_task(task).is_ok()
+                        && assertion.trust_class
+                            == EvidenceTrustClass::RegisteredExecutorObservation =>
+                {
+                    (S::Succeeded, None)
+                }
+                TaskOutcome::Passed => (S::Failed, Some("result_not_admissible")),
+                TaskOutcome::Failed => (S::Failed, Some("result_failed")),
+                TaskOutcome::Incomplete => (S::Failed, Some("result_incomplete")),
+                TaskOutcome::Cancelled => (S::Uncertain, Some("result_cancelled")),
+                TaskOutcome::Uncertain => (S::Uncertain, Some("result_uncertain")),
+            }
+        }
+    })
+}
+
 fn read_assertion(
     connection: &Connection,
     task: &WorkflowTask,
@@ -2251,6 +2592,22 @@ fn refuse_unresolved_prior_tasks(
     task: &WorkflowTask,
     now: u64,
 ) -> Result<()> {
+    if find_unresolved_prior_task(connection, task, now)?.is_some() {
+        return Err(Error::Conflict(
+            "prior task subject has an unresolved attempt; explicit reconciliation is required"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Id of the first older-subject task for the same change, profile and step whose latest
+/// attempt is unresolved.
+fn find_unresolved_prior_task(
+    connection: &Connection,
+    task: &WorkflowTask,
+    now: u64,
+) -> Result<Option<String>> {
     // v3 inventory is capped at 4096: scan canonical identities rather than trusting a
     // second mutable scheduling index. Refuse an oversized restored inventory as well.
     let mut statement = connection
@@ -2277,13 +2634,10 @@ fn refuse_unresolved_prior_tasks(
                 AgentAttemptState::Finished | AgentAttemptState::Replaced
             )
         {
-            return Err(Error::Conflict(
-                "prior task subject has an unresolved attempt; explicit reconciliation is required"
-                    .into(),
-            ));
+            return Ok(Some(id));
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 fn read_attempt(
@@ -2707,6 +3061,15 @@ mod tests {
         }
 
         fn configured(two_steps: bool, resource_bytes: usize) -> Self {
+            Self::build(two_steps, resource_bytes, false)
+        }
+
+        /// Context that also requires the controller source-paths check evidence.
+        fn with_source_check() -> Self {
+            Self::build(false, 0, true)
+        }
+
+        fn build(two_steps: bool, resource_bytes: usize, source_check: bool) -> Self {
             let root = tempfile::tempdir().unwrap();
             let engine = Engine::open(root.path()).unwrap();
             let revision = engine
@@ -2795,7 +3158,7 @@ mod tests {
             authority
                 .enroll_workflow_executor(&enrollment, &public_hex)
                 .unwrap();
-            let context = ReviewContext {
+            let mut context = ReviewContext {
                 version: REVIEW_CONTEXT_VERSION,
                 change: ChangeId {
                     repository,
@@ -2824,6 +3187,22 @@ mod tests {
                 required_evidence: vec![],
                 required_capabilities: vec!["agentscm.review-context/v1".into()],
             };
+            if source_check {
+                let digest = source_check_recipe().digest().unwrap();
+                context.recipe = InputIdentity::Digest {
+                    sha256: digest.clone(),
+                };
+                context
+                    .required_evidence
+                    .push(crate::context::RequiredEvidence {
+                        identity: crate::checks::SOURCE_PATHS_EVIDENCE.into(),
+                        digest: InputIdentity::Digest { sha256: digest },
+                    });
+                // Canonical order sorts capabilities.
+                context
+                    .required_capabilities
+                    .insert(0, crate::checks::SOURCE_PATHS_CAPABILITY.into());
+            }
             authority.start_change(&context).unwrap();
             drop(authority);
             Self {
@@ -2985,6 +3364,267 @@ mod tests {
         };
         assert_eq!(service.status(&fixture.context, &absent).unwrap(), None);
         assert!(!fixture.root.path().join("skill-workflows").exists());
+    }
+
+    #[test]
+    fn reference_with_unsupported_schema_version_returns_typed_mismatch() {
+        let fixture = Fixture::new();
+        let service = fixture.service();
+        let task = service
+            .requirements(&fixture.context, &fixture.agent("agent-1"))
+            .unwrap()
+            .remove(0);
+        let request = ReferenceFetchRequest {
+            version: 1,
+            task_id: task.task_id.clone(),
+            task_digest: task.digest().unwrap(),
+            reference_name: "entrypoint".into(),
+            expected_sha256: task.entrypoint.references[0].sha256.clone(),
+            expected_schema_version: 2,
+            actor: fixture.agent("agent-1"),
+        };
+        assert_eq!(
+            service.reference(&fixture.context, &request).unwrap(),
+            ReferenceFetchResponse::SchemaMismatch {
+                capability: AGENT_TASK_CAPABILITY.into(),
+                required_schema_version: 1,
+                supported_schema_versions: vec![2],
+                server_schema_versions: vec![1],
+                action: "Retry with expected_schema_version 1, or update agentscm to a client supporting it.".into(),
+            }
+        );
+        let mut zero = request;
+        zero.expected_schema_version = 0;
+        assert!(matches!(
+            service.reference(&fixture.context, &zero),
+            Err(Error::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn qualification_reports_typed_state_without_creating_a_journal_or_receipt() {
+        let fixture = Fixture::new();
+        let service = fixture.service();
+        let report = service
+            .qualification(&fixture.context, &fixture.agent("agent-1"))
+            .unwrap();
+        assert!(!report.qualified && report.subject_current);
+        assert_eq!(report.receipt_digest, None);
+        assert_eq!(report.revision, fixture.context.revision);
+        assert_eq!(report.tasks.len(), 1);
+        assert_eq!(report.tasks[0].step_id, "tests");
+        assert_eq!(report.tasks[0].state, QualificationTaskState::Succeeded);
+        assert!(report.failures.is_empty());
+        assert_eq!(report.next, QualificationNext::None {});
+        assert!(!fixture.root.path().join("skill-workflows").exists());
+        assert_eq!(
+            serde_json::to_value(&report.next).unwrap(),
+            serde_json::json!({"operation":"none"})
+        );
+        let receipts: i64 = Connection::open(fixture.root.path().join("state.sqlite"))
+            .unwrap()
+            .query_row("SELECT count(*) FROM workflow_receipts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(receipts, 0);
+    }
+
+    #[test]
+    fn qualification_requires_an_exact_receipt_and_live_origin_authorization() {
+        struct RevokedOrigins;
+        impl TaskAuthorizationGuard for RevokedOrigins {
+            fn authorize(&self, _: &AuthenticatedAgentIdentity, _: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+        impl CollectorOriginAuthorizationGuard for RevokedOrigins {
+            fn with_current_collector_authorization(
+                &self,
+                _: &AuthenticatedAgentIdentity,
+                _: CollectorAction,
+                _: &[OriginGrantBinding],
+                _: &str,
+                _: &mut dyn FnMut() -> Result<()>,
+            ) -> Result<()> {
+                Err(Error::Conflict(
+                    "workspace task authorization changed".into(),
+                ))
+            }
+        }
+        let fixture = Fixture::new();
+        let root = fixture.root.path();
+        let requirement = Authority::open_read_only(root)
+            .unwrap()
+            .workflow_requirement("main")
+            .unwrap()
+            .unwrap();
+        let plan = compile(root, &requirement.instantiate(&fixture.context).unwrap()).unwrap();
+        crate::skill_workflow::start(root, "run-1", &plan).unwrap();
+        crate::skill_workflow::advance(root, "run-1", 8).unwrap();
+        let agent = fixture.agent("agent-1");
+        let before = fixture
+            .service()
+            .qualification(&fixture.context, &agent)
+            .unwrap();
+        assert!(!before.qualified);
+        let receipt =
+            crate::skill_workflow::runtime::finalize(root, "run-1", &fixture.context).unwrap();
+        let after = fixture
+            .service()
+            .qualification(&fixture.context, &agent)
+            .unwrap();
+        assert!(after.qualified && after.subject_current);
+        assert_eq!(after.receipt_digest.as_deref(), Some(receipt.as_str()));
+        assert_eq!(after.next, QualificationNext::None {});
+
+        let revoked = RevokedOrigins;
+        let denied = AgentTaskService::new_with_collector_authorization(
+            root,
+            "trusted-local",
+            &fixture,
+            &revoked,
+        )
+        .unwrap()
+        .qualification(&fixture.context, &agent)
+        .unwrap();
+        assert!(!denied.qualified && denied.subject_current);
+        assert_eq!(denied.receipt_digest, None);
+        assert!(
+            denied
+                .failures
+                .iter()
+                .any(|failure| failure.code == "authorization_changed")
+        );
+    }
+
+    fn source_check_recipe() -> crate::checks::SourcePathsRecipe {
+        crate::checks::SourcePathsRecipe {
+            version: 1,
+            expectations: vec![crate::checks::SourcePathExpectation {
+                path: "src/file".into(),
+                sha256: crate::store::digest(b"abc"),
+            }],
+            limits: crate::checks::CheckLimits {
+                max_paths: 8,
+                max_total_bytes: 1024 * 1024,
+                max_output_bytes: 4096,
+                timeout_ms: 30_000,
+            },
+        }
+    }
+
+    #[test]
+    fn qualification_needs_the_check_evidence_admission_needs_beside_the_receipt() {
+        let fixture = Fixture::with_source_check();
+        let root = fixture.root.path();
+        let agent = fixture.agent("agent-1");
+        let mut authority = Authority::open(root).unwrap();
+        let context = &fixture.context;
+        authority
+            .create_source_paths_attempt(&crate::checks::SourcePathsRequest {
+                attempt_id: "check-1".into(),
+                change: context.change.clone(),
+                change_version: context.change_version,
+                context_digest: context.digest().unwrap(),
+                revision: context.revision.clone(),
+                recipe: source_check_recipe(),
+            })
+            .unwrap();
+        authority
+            .run_source_paths_attempt(&Engine::open(root).unwrap(), "check-1", 0)
+            .unwrap();
+        drop(authority);
+        let plan = compile(
+            root,
+            &Authority::open_read_only(root)
+                .unwrap()
+                .workflow_requirement("main")
+                .unwrap()
+                .unwrap()
+                .instantiate(context)
+                .unwrap(),
+        )
+        .unwrap();
+        crate::skill_workflow::start(root, "run-1", &plan).unwrap();
+        crate::skill_workflow::advance(root, "run-1", 8).unwrap();
+        let receipt = crate::skill_workflow::runtime::finalize(root, "run-1", context).unwrap();
+        let service = fixture.service();
+        let report = service.qualification(context, &agent).unwrap();
+        assert!(report.qualified && report.subject_current, "{report:?}");
+        assert_eq!(report.receipt_digest.as_deref(), Some(receipt.as_str()));
+
+        // The receipt stays, but its source-path check attempt is invalid, then missing.
+        let raw = Connection::open(root.join("state.sqlite")).unwrap();
+        let unqualified = || {
+            let report = service.qualification(context, &agent).unwrap();
+            assert!(!report.qualified, "{report:?}");
+            assert!(report.subject_current);
+            assert_eq!(report.receipt_digest, None);
+        };
+        raw.execute("UPDATE check_attempts SET state='fail'", [])
+            .unwrap();
+        unqualified();
+        raw.execute("UPDATE check_attempts SET state='success'", [])
+            .unwrap();
+        assert!(service.qualification(context, &agent).unwrap().qualified);
+        raw.execute("DELETE FROM check_evidence", []).unwrap();
+        raw.execute("DELETE FROM check_attempts", []).unwrap();
+        let receipts: i64 = raw
+            .query_row("SELECT count(*) FROM workflow_receipts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(receipts, 1);
+        unqualified();
+    }
+
+    #[test]
+    fn single_snapshot_rejects_a_receipt_for_an_older_context() {
+        let fixture = Fixture::new();
+        let root = fixture.root.path();
+        let requirement = Authority::open_read_only(root)
+            .unwrap()
+            .workflow_requirement("main")
+            .unwrap()
+            .unwrap();
+        let plan = compile(root, &requirement.instantiate(&fixture.context).unwrap()).unwrap();
+        crate::skill_workflow::start(root, "run-1", &plan).unwrap();
+        crate::skill_workflow::advance(root, "run-1", 8).unwrap();
+        let receipt =
+            crate::skill_workflow::runtime::finalize(root, "run-1", &fixture.context).unwrap();
+        let live = LiveImportedOrigins {
+            repository: fixture.context.change.repository.clone(),
+            origins: Vec::new(),
+        };
+        let read = |context: &ReviewContext| {
+            Authority::open_read_only(root)
+                .unwrap()
+                .current_qualification(context, &live)
+                .unwrap()
+        };
+        assert_eq!(
+            read(&fixture.context),
+            CurrentEvidence::Receipt(receipt.clone())
+        );
+        // An update between the task read and the snapshot cannot be interleaved with a
+        // single call, so the snapshot is shown to reject the older context on its own.
+        let mut next = fixture.context.clone();
+        next.change_version += 1;
+        next.intent = "a later context".into();
+        Authority::open(root)
+            .unwrap()
+            .update_change_context(1, &next)
+            .unwrap();
+        assert_eq!(read(&fixture.context), CurrentEvidence::SubjectChanged);
+        assert_eq!(read(&next), CurrentEvidence::NotQualified);
+        let report = fixture
+            .service()
+            .qualification(&fixture.context, &fixture.agent("agent-1"))
+            .unwrap();
+        assert!(!report.qualified && !report.subject_current);
+        assert_eq!(report.receipt_digest, None);
+        assert_eq!(report.next, QualificationNext::Checkpoint {});
     }
 
     #[test]

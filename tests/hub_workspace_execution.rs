@@ -254,6 +254,236 @@ fn mcp_envelope(response: &Value) -> Value {
     serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
 }
 
+/// Digest of every row of every table, to prove a read path wrote nothing.
+fn database_snapshot(path: &std::path::Path) -> Vec<(String, String)> {
+    let Ok(connection) =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        return vec![];
+    };
+    let mut tables = connection
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+        .unwrap();
+    let tables = tables
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    tables
+        .into_iter()
+        .map(|table| {
+            let mut statement = connection
+                .prepare(&format!("SELECT * FROM \"{table}\""))
+                .unwrap();
+            let columns = statement.column_count();
+            let mut rows = statement.query([]).unwrap();
+            let mut dump = String::new();
+            while let Some(row) = rows.next().unwrap() {
+                for column in 0..columns {
+                    dump.push_str(&format!("{:?}|", row.get_ref(column).unwrap()));
+                }
+                dump.push('\n');
+            }
+            (table, digest(dump.as_bytes()))
+        })
+        .collect()
+}
+
+fn task_state_snapshot(data_dir: &std::path::Path) -> [Vec<(String, String)>; 2] {
+    [
+        database_snapshot(&data_dir.join("state.sqlite")),
+        database_snapshot(&data_dir.join("skill-workflows/state.sqlite")),
+    ]
+}
+
+const MCP_PATH: &str = "/v1/hub/workspace/mcp?repository=synthetic%2Fproject&profile=checks";
+
+/// Read-only `qualification` through MCP; asserts it changed no authority or journal row.
+async fn qualification(
+    env: &Env,
+    token: &str,
+    data_dir: &std::path::Path,
+    subject: &agentscm::hub::workspace_execution::RunSubject,
+) -> Value {
+    let before = task_state_snapshot(data_dir);
+    let response = env
+        .request(
+            Method::POST,
+            MCP_PATH,
+            None,
+            None,
+            Some(token),
+            Some(mcp_call(
+                "agentscm_task_qualification",
+                json!({"subject":subject}),
+            )),
+        )
+        .await;
+    assert_eq!(response.0, 200, "{response:?}");
+    assert_eq!(
+        task_state_snapshot(data_dir),
+        before,
+        "qualification must not write"
+    );
+    let envelope = mcp_envelope(&response.1);
+    assert_eq!(envelope["capability"], "agentscm.agent-workflow-tasks/v1");
+    envelope["result"].clone()
+}
+
+fn qualified_task<'a>(report: &'a Value, step: &str) -> &'a Value {
+    report["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["step_id"] == step)
+        .unwrap()
+}
+
+/// Local Change workspace at `revision`, for the read-only Stop hook.
+fn stop_workspace(
+    data_dir: &std::path::Path,
+    change: &str,
+    revision: &str,
+    path: &std::path::Path,
+) -> std::path::PathBuf {
+    let repository = Authority::open_read_only(data_dir)
+        .unwrap()
+        .repository_id()
+        .unwrap();
+    let engine = Engine::open(data_dir).unwrap();
+    agentscm::workspace::Workspace::create(
+        &engine,
+        path,
+        ChangeId {
+            repository,
+            id: change.into(),
+        },
+        revision,
+    )
+    .unwrap();
+    fs::canonicalize(path).unwrap()
+}
+
+fn stop_rounds(data_dir: &std::path::Path) -> u64 {
+    fs::read_dir(data_dir.join("agent-stop"))
+        .map(|entries| {
+            entries
+                .map(|entry| {
+                    let state: Value =
+                        serde_json::from_slice(&fs::read(entry.unwrap().path()).unwrap()).unwrap();
+                    state["rounds"].as_u64().unwrap()
+                })
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// Runs `task-codex-stop` with a Codex payload; it must exit 0 and print one JSON object.
+fn task_codex_stop(
+    data_dir: &std::path::Path,
+    endpoint: &str,
+    token_file: &std::path::Path,
+    workspace: &std::path::Path,
+    change: &str,
+    stop_hook_active: bool,
+) -> Value {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentscm"))
+        .arg("--data-dir")
+        .arg(data_dir)
+        .args(["skill-workflow", "task-codex-stop", change, "--endpoint"])
+        .arg(endpoint)
+        .args([
+            "--repository",
+            "synthetic/project",
+            "--profile",
+            "checks",
+            "--token-file",
+        ])
+        .arg(token_file)
+        .arg("--workspace")
+        .arg(workspace)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let payload = json!({"hook_event_name":"Stop","session_id":"synthetic-codex","cwd":workspace,
+        "stop_hook_active":stop_hook_active});
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.to_string().as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/// Names under the data directory and the workspace metadata directory, main database bytes and
+/// `user_version`. Ignored: SQLite's own `-wal`/`-shm` sidecars and the Stop guard's own
+/// `agent-stop` counter directory, which is not store state.
+fn hook_inventory(data_dir: &std::path::Path, workspace: &std::path::Path) -> Vec<String> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<String>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.to_string_lossy().into_owned();
+            if name.ends_with("-wal") || name.ends_with("-shm") || name.ends_with("/agent-stop") {
+                continue;
+            }
+            out.push(name);
+            if path.is_dir() {
+                walk(&path, out);
+            }
+        }
+    }
+    let metadata = fs::read_dir(workspace)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.join("state.sqlite").is_file())
+        .unwrap();
+    let (mut data_names, mut workspace_names) = (Vec::new(), Vec::new());
+    walk(data_dir, &mut data_names);
+    walk(&metadata, &mut workspace_names);
+    data_names.sort();
+    workspace_names.sort();
+    let databases = [
+        data_dir.join("state.sqlite"),
+        data_dir.join("skill-workflows/state.sqlite"),
+        metadata.join("state.sqlite"),
+    ]
+    .into_iter()
+    .map(|path| {
+        let version: i64 = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap()
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+        format!(
+            "{}:{}:{version}",
+            path.display(),
+            digest(&fs::read(&path).unwrap())
+        )
+    });
+    data_names
+        .into_iter()
+        .chain(workspace_names)
+        .chain(databases)
+        .collect()
+}
+
+fn stop_feedback(output: &Value) -> Value {
+    assert_eq!(output["decision"], "block", "{output}");
+    serde_json::from_str(output["reason"].as_str().unwrap()).unwrap()
+}
+
 fn source_command_profile(
     root: &std::path::Path,
     docker: &std::path::Path,
@@ -576,6 +806,147 @@ async fn agent_only_http_and_workspace_mcp_expose_the_same_side_effect_free_requ
         !journal.exists(),
         "MCP requirements must remain side-effect free"
     );
+    let capabilities_http = env
+        .request(
+            Method::POST,
+            &task_path,
+            None,
+            None,
+            Some(token.expose()),
+            Some(json!({"operation":"capabilities"})),
+        )
+        .await;
+    assert_eq!(capabilities_http.0, 200, "{capabilities_http:?}");
+    let capabilities_mcp = env
+        .request(
+            Method::POST,
+            "/v1/hub/workspace/mcp?repository=synthetic%2Fproject&profile=checks",
+            None,
+            None,
+            Some(token.expose()),
+            Some(mcp_call("agentscm_task_capabilities", json!({}))),
+        )
+        .await;
+    assert_eq!(capabilities_mcp.0, 200, "{capabilities_mcp:?}");
+    assert_eq!(mcp_envelope(&capabilities_mcp.1), capabilities_http.1);
+    let capabilities = &capabilities_http.1["result"];
+    assert_eq!(
+        capabilities["capability"],
+        "agentscm.agent-workflow-tasks/v1"
+    );
+    assert_eq!(capabilities["supported_schema_versions"], json!([1]));
+    let operations = capabilities["operations"].as_array().unwrap();
+    let mut sorted = operations.clone();
+    sorted.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+    assert_eq!(operations, &sorted);
+    for operation in ["capabilities", "qualification", "requirements", "reference"] {
+        assert!(operations.contains(&json!(operation)), "{operation}");
+    }
+    let tools = env
+        .request(
+            Method::POST,
+            "/v1/hub/workspace/mcp?repository=synthetic%2Fproject&profile=checks",
+            None,
+            None,
+            Some(token.expose()),
+            Some(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})),
+        )
+        .await;
+    let mut tool_operations = tools.1["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| {
+            tool["name"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("agentscm_task_")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    tool_operations.sort();
+    assert_eq!(
+        json!(tool_operations),
+        capabilities["operations"],
+        "capabilities must list exactly the MCP-exposed operations"
+    );
+    let unauthenticated = env
+        .request(
+            Method::POST,
+            &task_path,
+            None,
+            None,
+            None,
+            Some(json!({"operation":"capabilities"})),
+        )
+        .await;
+    assert!(
+        matches!(unauthenticated.0, 401 | 403),
+        "{unauthenticated:?}"
+    );
+
+    let qualification_http = env
+        .request(
+            Method::POST,
+            &task_path,
+            None,
+            None,
+            Some(token.expose()),
+            Some(json!({"operation":"qualification","subject":native.subject})),
+        )
+        .await;
+    assert_eq!(qualification_http.0, 200, "{qualification_http:?}");
+    let report = &qualification_http.1["result"];
+    assert_eq!(report["qualified"], false);
+    assert_eq!(report["subject_current"], true);
+    assert_eq!(report["receipt_digest"], Value::Null);
+    assert_eq!(report["revision"], native.subject.revision);
+    assert!(report["next"]["operation"].is_string());
+    assert!(
+        !journal.exists(),
+        "qualification must not initialize the task journal"
+    );
+    let reference = json!({
+        "operation":"reference","subject":native.subject,"task_id":"task-unknown",
+        "task_digest":"0".repeat(64),"reference_name":"entrypoint",
+        "expected_sha256":"0".repeat(64),"expected_schema_version":2
+    });
+    let mismatch = env
+        .request(
+            Method::POST,
+            &task_path,
+            None,
+            None,
+            Some(token.expose()),
+            Some(reference.clone()),
+        )
+        .await;
+    assert_eq!(mismatch.0, 200, "{mismatch:?}");
+    assert_eq!(
+        mismatch.1["result"],
+        json!({
+            "status":"schema_mismatch",
+            "capability":"agentscm.agent-workflow-tasks/v1",
+            "required_schema_version":1,
+            "supported_schema_versions":[2],
+            "server_schema_versions":[1],
+            "action":"Retry with expected_schema_version 1, or update agentscm to a client supporting it."
+        })
+    );
+    let mut mcp_reference = reference;
+    mcp_reference.as_object_mut().unwrap().remove("operation");
+    let mismatch_mcp = env
+        .request(
+            Method::POST,
+            "/v1/hub/workspace/mcp?repository=synthetic%2Fproject&profile=checks",
+            None,
+            None,
+            Some(token.expose()),
+            Some(mcp_call("agentscm_task_reference", mcp_reference)),
+        )
+        .await;
+    assert_eq!(mcp_envelope(&mismatch_mcp.1), mismatch.1);
+
     let digest = "0".repeat(64);
     let executor = json!({"registration_id":"missing-registration","executor_id":"missing-executor","registration_epoch":1,"verification_key_id":"missing-key"});
     let status = json!({"version":1,"task_id":"missing-task","task_digest":digest.clone(),"attempt_id":"missing-attempt","attempt_digest":digest.clone(),"fence":1,"executor":executor.clone()});
@@ -856,6 +1227,75 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
         mcp_envelope(&next.1)["result"]["task_id"],
         first_task.task_id
     );
+    let uncollected = qualification(&env, &token, &native.profile.data_dir, &native.subject).await;
+    assert_eq!(uncollected["qualified"], false);
+    assert_eq!(uncollected["subject_current"], true);
+    assert_eq!(uncollected["receipt_digest"], Value::Null);
+    assert_eq!(uncollected["revision"], native.subject.revision);
+    assert_eq!(qualified_task(&uncollected, "command")["state"], "pending");
+    assert_eq!(
+        qualified_task(&uncollected, "command")["task_digest"],
+        first_task.digest().unwrap()
+    );
+    assert_eq!(
+        uncollected["next"],
+        json!({"operation":"collector_claim","task_id":first_task.task_id})
+    );
+    // Read-only Stop hook before any collection: blocks with the typed next step, and an
+    // unreachable endpoint also blocks rather than passes.
+    let change_id = native.subject.change_id.clone();
+    let stop_ws = stop_workspace(
+        &native.profile.data_dir,
+        &change_id,
+        &native.subject.revision,
+        &root.path().join("stop-workspace"),
+    );
+    let before_stop = task_state_snapshot(&native.profile.data_dir);
+    let blocked = stop_feedback(&task_codex_stop(
+        &native.profile.data_dir,
+        &env.base,
+        &token_file,
+        &stop_ws,
+        &change_id,
+        false,
+    ));
+    assert_eq!(
+        blocked["next"],
+        json!({"operation":"collector_claim","task_id":first_task.task_id})
+    );
+    assert!(
+        blocked["next_action"]
+            .as_str()
+            .unwrap()
+            .contains("agent-task")
+    );
+    assert_eq!(stop_rounds(&native.profile.data_dir), 1);
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let unreachable = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    let offline = stop_feedback(&task_codex_stop(
+        &native.profile.data_dir,
+        &unreachable,
+        &token_file,
+        &stop_ws,
+        &change_id,
+        true,
+    ));
+    assert!(offline["failures"][0]["detail"].is_string(), "{offline}");
+    assert_eq!(stop_rounds(&native.profile.data_dir), 2);
+    assert_eq!(
+        task_state_snapshot(&native.profile.data_dir),
+        before_stop,
+        "the Stop hook must not write task state"
+    );
+    assert!(
+        !native
+            .profile
+            .data_dir
+            .join("skill-workflows/state.sqlite")
+            .exists(),
+        "qualification must not initialize the task journal"
+    );
     let claim = env
         .request(
             Method::POST,
@@ -876,6 +1316,13 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
     assert_eq!(claim.0, 200, "{claim:?}");
     let first_attempt: TaskAttemptView =
         serde_json::from_value(mcp_envelope(&claim.1)["result"].clone()).unwrap();
+    let in_progress = qualification(&env, &token, &native.profile.data_dir, &native.subject).await;
+    assert_eq!(qualified_task(&in_progress, "command")["state"], "claimed");
+    assert_eq!(
+        in_progress["failures"],
+        json!([{"task_id":first_task.task_id,"code":"attempt_in_progress"}])
+    );
+    assert_eq!(in_progress["next"], json!({"operation":"none"}));
     let descriptor = env
         .request(
             Method::POST,
@@ -974,6 +1421,21 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
         )
         .await;
     assert_eq!(cancelled.0, 200, "{cancelled:?}");
+    let cancelled_report =
+        qualification(&env, &token, &native.profile.data_dir, &native.subject).await;
+    assert_eq!(cancelled_report["qualified"], false);
+    assert_eq!(
+        qualified_task(&cancelled_report, "command")["state"],
+        "uncertain"
+    );
+    assert_eq!(
+        cancelled_report["failures"],
+        json!([{"task_id":first_task.task_id,"code":"attempt_cancelled"}])
+    );
+    assert_eq!(
+        cancelled_report["next"],
+        json!({"operation":"reconcile","task_id":first_task.task_id})
+    );
     let effects_before_refusals = fake_docker_effect_counts(&docker_home.join("calls.jsonl"));
     let cancelled_collect = cli(
         "collect",
@@ -1077,6 +1539,15 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
         assert!(std::time::Instant::now() < expiry_deadline);
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     }
+    let expired_report =
+        qualification(&env, &token, &native.profile.data_dir, &native.subject).await;
+    assert_eq!(expired_report["qualified"], false);
+    assert_eq!(
+        qualified_task(&expired_report, "command")["state"],
+        "uncertain"
+    );
+    assert_eq!(expired_report["failures"][0]["code"], "attempt_expired");
+    assert_eq!(expired_report["next"]["operation"], "reconcile");
     let expired_collect = cli(
         "collect",
         &expired_descriptor_file,
@@ -1164,6 +1635,12 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
     );
     let failed_envelope: Value = serde_json::from_slice(&failed.stdout).unwrap();
     assert_eq!(failed_envelope["result"]["state"], "finished");
+    let failed_report =
+        qualification(&env, &token, &native.profile.data_dir, &native.subject).await;
+    assert_eq!(failed_report["qualified"], false);
+    assert_eq!(qualified_task(&failed_report, "command")["state"], "failed");
+    assert_eq!(failed_report["failures"][0]["code"], "collector_not_passed");
+    assert_eq!(failed_report["next"], json!({"operation":"none"}));
     let effects_after_failure = fake_docker_effect_counts(&docker_home.join("calls.jsonl"));
     assert_eq!((effects_after_failure.1, effects_after_failure.2), (1, 1));
 
@@ -1382,6 +1859,7 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
             ],
         )
         .unwrap();
+    let old_subject = native.subject.clone();
     let previous_version = native.context.change_version;
     native.context.change_version += 1;
     native.context.revision = next_revision.clone();
@@ -1460,6 +1938,59 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
         mcp_envelope(&fresh_next.1)["result"]["task_id"],
         fresh_task.task_id
     );
+    // An older subject's unresolved attempt sends the agent to reconcile it, never to a claim
+    // the claim path would refuse. The journal row is restored afterwards.
+    let journal_path = native.profile.data_dir.join("skill-workflows/state.sqlite");
+    let journal = rusqlite::Connection::open(&journal_path).unwrap();
+    type Retained = (
+        String,
+        String,
+        i64,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+    );
+    let retained: Retained = journal
+        .query_row(
+            "SELECT attempt_id,state,lease_expires_at,superseding_fence,assertion_digest,collector_transfer_digest FROM agent_workflow_attempts WHERE task_id=?1 ORDER BY fence DESC LIMIT 1",
+            [&first_task.task_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    journal
+        .execute(
+            "UPDATE agent_workflow_attempts SET state='cancelled',superseding_fence=NULL,assertion_digest=NULL,collector_transfer_digest=NULL WHERE attempt_id=?1",
+            [&retained.0],
+        )
+        .unwrap();
+    let prior = qualification(&env, &token, &native.profile.data_dir, &native.subject).await;
+    assert_eq!(prior["qualified"], false);
+    assert_eq!(prior["subject_current"], true);
+    assert_eq!(
+        prior["next"],
+        json!({"operation":"reconcile","task_id":first_task.task_id})
+    );
+    assert_eq!(
+        prior["failures"],
+        json!([{"task_id":first_task.task_id,"code":"prior_subject_unresolved"}])
+    );
+    journal
+        .execute(
+            "UPDATE agent_workflow_attempts SET state=?2,lease_expires_at=?3,superseding_fence=?4,assertion_digest=?5,collector_transfer_digest=?6 WHERE attempt_id=?1",
+            rusqlite::params![retained.0, retained.1, retained.2, retained.3, retained.4, retained.5],
+        )
+        .unwrap();
+    drop(journal);
+
     let fresh_claim = env
         .request(
             Method::POST,
@@ -1523,6 +2054,115 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
     let effects_after_success = fake_docker_effect_counts(&docker_home.join("calls.jsonl"));
     assert_eq!((effects_after_success.1, effects_after_success.2), (2, 2));
     assert!(effects_after_success.0 > effects_after_failure.0);
+    let qualified = qualification(&env, &token, &native.profile.data_dir, &native.subject).await;
+    assert_eq!(qualified["qualified"], true, "{qualified}");
+    assert_eq!(qualified["subject_current"], true);
+    assert_eq!(qualified["revision"], native.subject.revision);
+    assert_eq!(qualified_task(&qualified, "command")["state"], "succeeded");
+    assert_eq!(qualified["next"], json!({"operation":"none"}));
+    assert!(qualified["failures"].as_array().unwrap().is_empty());
+    let receipt_digest = qualified["receipt_digest"].as_str().unwrap().to_owned();
+    assert_eq!(receipt_digest.len(), 64);
+    let qualified_ws = stop_workspace(
+        &native.profile.data_dir,
+        &native.subject.change_id,
+        &native.subject.revision,
+        &root.path().join("qualified-workspace"),
+    );
+    let before_pass = task_state_snapshot(&native.profile.data_dir);
+    assert_eq!(
+        task_codex_stop(
+            &native.profile.data_dir,
+            &env.base,
+            &token_file,
+            &qualified_ws,
+            &native.subject.change_id,
+            true,
+        ),
+        json!({})
+    );
+    fs::write(qualified_ws.join("uncheckpointed.txt"), b"edit\n").unwrap();
+    let inventory_before = hook_inventory(&native.profile.data_dir, &qualified_ws);
+    let dirty = stop_feedback(&task_codex_stop(
+        &native.profile.data_dir,
+        &env.base,
+        &token_file,
+        &qualified_ws,
+        &native.subject.change_id,
+        true,
+    ));
+    assert!(
+        dirty["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|failure| failure["detail"] == "workspace has uncheckpointed edits"),
+        "{dirty}"
+    );
+    assert_eq!(dirty["next"], json!({"operation":"checkpoint"}));
+    assert_eq!(
+        hook_inventory(&native.profile.data_dir, &qualified_ws),
+        inventory_before,
+        "the Stop hook must not create or change store or workspace database files"
+    );
+    fs::remove_file(qualified_ws.join("uncheckpointed.txt")).unwrap();
+    assert_eq!(
+        task_state_snapshot(&native.profile.data_dir),
+        before_pass,
+        "the Stop hook must not write task state"
+    );
+    // An older-schema workspace is neither migrated nor trusted: the hook blocks with a fixed
+    // category and leaves the database file untouched.
+    let older_ws = stop_workspace(
+        &native.profile.data_dir,
+        &native.subject.change_id,
+        &native.subject.revision,
+        &root.path().join("older-schema-workspace"),
+    );
+    let older_db = fs::read_dir(&older_ws)
+        .unwrap()
+        .map(|entry| entry.unwrap().path().join("state.sqlite"))
+        .find(|path| path.is_file())
+        .unwrap();
+    let raw = rusqlite::Connection::open(&older_db).unwrap();
+    raw.pragma_update(None, "user_version", 3).unwrap();
+    drop(raw);
+    let older_before = (
+        fs::read(&older_db).unwrap(),
+        fs::metadata(&older_db).unwrap().modified().unwrap(),
+    );
+    let older = stop_feedback(&task_codex_stop(
+        &native.profile.data_dir,
+        &env.base,
+        &token_file,
+        &older_ws,
+        &native.subject.change_id,
+        true,
+    ));
+    assert_eq!(
+        older["failures"][0]["detail"],
+        "local native store, workspace or token file is unavailable"
+    );
+    assert!(!older.to_string().contains(older_ws.to_str().unwrap()));
+    assert_eq!(
+        (
+            fs::read(&older_db).unwrap(),
+            fs::metadata(&older_db).unwrap().modified().unwrap()
+        ),
+        older_before
+    );
+    let raw = rusqlite::Connection::open(&older_db).unwrap();
+    let version: i64 = raw
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 3);
+    drop(raw);
+    let superseded = qualification(&env, &token, &native.profile.data_dir, &old_subject).await;
+    assert_eq!(superseded["qualified"], false);
+    assert_eq!(superseded["subject_current"], false);
+    assert_eq!(superseded["receipt_digest"], Value::Null);
+    assert_eq!(superseded["revision"], old_subject.revision);
+    assert_eq!(superseded["next"], json!({"operation":"checkpoint"}));
 
     let approval = env
         .request(
@@ -3126,4 +3766,162 @@ async fn exact_queue_retry_survives_membership_regrant_but_new_old_generation_re
         .0,
         403
     );
+}
+
+/// SYNTHETIC protocol client, not a live editor test: a hand-written JSON-RPC client that
+/// speaks plain MCP over HTTP with no vendor hook and discovers the common task API.
+#[tokio::test]
+async fn synthetic_mcp_protocol_client_discovers_and_reads_tasks_without_a_vendor_hook() {
+    let root = tempfile::tempdir().unwrap();
+    let native = native_source_profile(root.path());
+    let (env, _, _) = agent_client(root.path(), &native).await;
+    let user = env
+        .store
+        .list_users()
+        .unwrap()
+        .into_iter()
+        .find(|user| user.identity.user_id == 202)
+        .unwrap();
+    let (token_id, secret) = mint_agent_token(
+        &*env.store,
+        &user.id,
+        "synthetic-protocol-client",
+        "synthetic/project",
+        3600,
+    )
+    .unwrap();
+    let token = secret.expose().to_owned();
+    let rpc = |body: Value, token: String| {
+        let env = &env;
+        async move {
+            env.request(Method::POST, MCP_PATH, None, None, Some(&token), Some(body))
+                .await
+        }
+    };
+    let call = |name: &str, arguments: Value| mcp_call(name, arguments);
+
+    // Handshake: initialize, the initialized notification (202, no body), then tools/list.
+    let init = rpc(
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "protocolVersion":"2025-06-18","capabilities":{},
+            "clientInfo":{"name":"synthetic-protocol-client","version":"0"}}}),
+        token.clone(),
+    )
+    .await;
+    assert_eq!(init.0, 200, "{init:?}");
+    assert_eq!(init.1["result"]["protocolVersion"], "2025-06-18");
+    let initialized = rpc(
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        token.clone(),
+    )
+    .await;
+    assert_eq!(initialized.0, 202);
+    let tools = rpc(
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+        token.clone(),
+    )
+    .await;
+    let names: Vec<&str> = tools.1["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    for required in ["agentscm_task_capabilities", "agentscm_task_qualification"] {
+        assert!(names.contains(&required), "{required} in {names:?}");
+    }
+
+    let capabilities = rpc(call("agentscm_task_capabilities", json!({})), token.clone()).await;
+    assert!(
+        mcp_envelope(&capabilities.1)["result"]["supported_schema_versions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(1))
+    );
+
+    let subject = json!(native.subject);
+    let requirements = rpc(
+        call("agentscm_task_requirements", json!({"subject":subject})),
+        token.clone(),
+    )
+    .await;
+    let tasks = mcp_envelope(&requirements.1)["result"].clone();
+    let task: WorkflowTask = serde_json::from_value(tasks[0].clone()).unwrap();
+    let next = rpc(
+        call("agentscm_task_next", json!({"subject":subject})),
+        token.clone(),
+    )
+    .await;
+    assert_eq!(mcp_envelope(&next.1)["result"]["task_id"], task.task_id);
+    let task_digest = task.digest().unwrap();
+    let instructions = rpc(
+        call(
+            "agentscm_task_instructions",
+            json!({"subject":subject,"task_id":task.task_id,"task_digest":task_digest,
+                "supported_schema_versions":[1]}),
+        ),
+        token.clone(),
+    )
+    .await;
+    assert_eq!(
+        mcp_envelope(&instructions.1)["result"]["status"],
+        "available"
+    );
+    let entrypoint = &task.entrypoint.references[0];
+    let reference = |version: u32| {
+        json!({"subject":subject,"task_id":task.task_id,"task_digest":task_digest,
+            "reference_name":entrypoint.name,"expected_sha256":entrypoint.sha256,
+            "expected_schema_version":version})
+    };
+    let fetched = rpc(call("agentscm_task_reference", reference(1)), token.clone()).await;
+    let fetched = mcp_envelope(&fetched.1)["result"].clone();
+    assert_eq!(fetched["status"], "available", "{fetched}");
+    assert_eq!(fetched["sha256"], entrypoint.sha256);
+    assert!(fetched["content"].as_str().unwrap().len() <= 128 * 1024);
+    let mismatch = rpc(
+        call("agentscm_task_reference", reference(99)),
+        token.clone(),
+    )
+    .await;
+    let mismatch = mcp_envelope(&mismatch.1)["result"].clone();
+    assert_eq!(mismatch["status"], "schema_mismatch");
+    assert_eq!(mismatch["server_schema_versions"], json!([1]));
+    assert!(mismatch["action"].is_string());
+
+    let report = qualification(&env, &token, &native.profile.data_dir, &native.subject).await;
+    assert_eq!(report["qualified"], false);
+    assert!(report["next"]["operation"].is_string());
+    assert!(
+        report["next"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|key| !key.contains("command") && !key.contains("shell")),
+        "next must be typed data, not a shell command: {}",
+        report["next"]
+    );
+
+    // Fail closed after revocation: the MCP call is refused and the Stop hook blocks.
+    let token_file = root.path().join("agent.token");
+    fs::write(&token_file, &token).unwrap();
+    fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(env.store.revoke_agent_token(&token_id).unwrap());
+    let refused = rpc(call("agentscm_task_capabilities", json!({})), token.clone()).await;
+    assert!(matches!(refused.0, 401 | 403), "{refused:?}");
+    let change = native.subject.change_id.clone();
+    let workspace = stop_workspace(
+        &native.profile.data_dir,
+        &change,
+        &native.subject.revision,
+        &root.path().join("stop-workspace"),
+    );
+    let blocked = task_codex_stop(
+        &native.profile.data_dir,
+        &env.base,
+        &token_file,
+        &workspace,
+        &change,
+        false,
+    );
+    assert_eq!(blocked["decision"], "block", "{blocked}");
 }

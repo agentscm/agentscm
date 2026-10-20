@@ -121,6 +121,11 @@ pub enum InstructionEntrypointResponse {
         capability: String,
         required_schema_version: u32,
         supported_schema_versions: Vec<u32>,
+        /// The server's versions and a fixed retry hint; absent in older payloads.
+        #[serde(default)]
+        server_schema_versions: Vec<u32>,
+        #[serde(default)]
+        action: String,
     },
 }
 
@@ -282,6 +287,18 @@ pub enum ReferenceFetchResponse {
         task_id: String,
         task_digest: String,
         reference_name: String,
+    },
+    /// `supported_schema_versions` echoes the versions the caller offered, as in
+    /// `InstructionEntrypointResponse`; `server_schema_versions` is the server's.
+    SchemaMismatch {
+        capability: String,
+        required_schema_version: u32,
+        supported_schema_versions: Vec<u32>,
+        /// The server's versions and a fixed retry hint; absent in older payloads.
+        #[serde(default)]
+        server_schema_versions: Vec<u32>,
+        #[serde(default)]
+        action: String,
     },
 }
 
@@ -934,8 +951,9 @@ impl ReferenceFetchResponse {
         Ok(value)
     }
 
-    fn identity(&self) -> (&str, &str, &str) {
+    fn identity(&self) -> Option<(&str, &str, &str)> {
         match self {
+            Self::SchemaMismatch { .. } => None,
             Self::Available {
                 task_id,
                 task_digest,
@@ -961,12 +979,30 @@ impl ReferenceFetchResponse {
                 task_id,
                 task_digest,
                 reference_name,
-            } => (task_id, task_digest, reference_name),
+            } => Some((task_id, task_digest, reference_name)),
         }
     }
 
     fn validate(&self) -> Result<()> {
-        let (task_id, task_digest, reference_name) = self.identity();
+        let Some((task_id, task_digest, reference_name)) = self.identity() else {
+            let Self::SchemaMismatch {
+                capability,
+                required_schema_version,
+                supported_schema_versions,
+                server_schema_versions,
+                action,
+            } = self
+            else {
+                return invalid("invalid reference response");
+            };
+            return validate_schema_mismatch(
+                capability,
+                *required_schema_version,
+                supported_schema_versions,
+                server_schema_versions,
+                action,
+            );
+        };
         id(task_id)?;
         raw_digest(task_digest)?;
         id(reference_name)?;
@@ -991,7 +1027,9 @@ impl ReferenceFetchResponse {
     pub fn validate_for_request(&self, request: &ReferenceFetchRequest) -> Result<()> {
         self.validate()?;
         request.validate()?;
-        let (task_id, task_digest, reference_name) = self.identity();
+        let Some((task_id, task_digest, reference_name)) = self.identity() else {
+            return invalid("schema mismatch does not bind a validated request");
+        };
         if task_id != request.task_id
             || task_digest != request.task_digest
             || reference_name != request.reference_name
@@ -1190,20 +1228,55 @@ impl InstructionEntrypointResponse {
                 capability,
                 required_schema_version,
                 supported_schema_versions,
-            } if capability == AGENT_TASK_CAPABILITY
-                && *required_schema_version > 0
-                && !supported_schema_versions.is_empty()
-                && supported_schema_versions.len() <= MAX_SUPPORTED_SCHEMA_VERSIONS
-                && supported_schema_versions.iter().all(|version| *version > 0)
-                && supported_schema_versions
-                    .iter()
-                    .collect::<HashSet<_>>()
-                    .len()
-                    == supported_schema_versions.len()
-                && !supported_schema_versions.contains(required_schema_version) => {}
-            Self::SchemaMismatch { .. } => return invalid("invalid schema mismatch response"),
+                server_schema_versions,
+                action,
+            } => validate_schema_mismatch(
+                capability,
+                *required_schema_version,
+                supported_schema_versions,
+                server_schema_versions,
+                action,
+            )?,
         }
         Ok(value)
+    }
+}
+
+/// The server's versions and the fixed retry hint for a `schema_mismatch` result.
+pub(crate) fn schema_mismatch_guidance() -> (Vec<u32>, String) {
+    (
+        vec![AGENT_TASK_CONTRACT_VERSION],
+        format!(
+            "Retry with expected_schema_version {AGENT_TASK_CONTRACT_VERSION}, or update agentscm to a client supporting it."
+        ),
+    )
+}
+
+fn validate_schema_mismatch(
+    capability: &str,
+    required: u32,
+    supported: &[u32],
+    server: &[u32],
+    action: &str,
+) -> Result<()> {
+    let guidance = (server.is_empty() && action.is_empty())
+        || (!server.is_empty()
+            && server.len() <= MAX_SUPPORTED_SCHEMA_VERSIONS
+            && server.contains(&required)
+            && server.iter().collect::<HashSet<_>>().len() == server.len()
+            && action.len() <= 256);
+    if guidance
+        && capability == AGENT_TASK_CAPABILITY
+        && required > 0
+        && !supported.is_empty()
+        && supported.len() <= MAX_SUPPORTED_SCHEMA_VERSIONS
+        && supported.iter().all(|version| *version > 0)
+        && supported.iter().collect::<HashSet<_>>().len() == supported.len()
+        && !supported.contains(&required)
+    {
+        Ok(())
+    } else {
+        invalid("invalid schema mismatch response")
     }
 }
 
@@ -2016,6 +2089,8 @@ mod tests {
             capability: AGENT_TASK_CAPABILITY.into(),
             required_schema_version: 2,
             supported_schema_versions: vec![1],
+            server_schema_versions: vec![2],
+            action: "Retry with expected_schema_version 2.".into(),
         };
         assert!(
             InstructionEntrypointResponse::from_slice(&serde_json::to_vec(&response).unwrap())

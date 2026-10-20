@@ -11,6 +11,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::agent_stop::{self, Prepared, StopAgent};
 use agentscm::context::ChangeId;
 use agentscm::hub::workspace_execution::source::{
     ContextDeclaration, MAX_SOURCE_BUNDLE_BYTES, MAX_SOURCE_OBJECTS, MAX_SOURCE_OFFER_BYTES,
@@ -369,13 +370,24 @@ fn workspace_changed_since(
         || !status.changes.is_empty()
 }
 
-pub async fn claude_stop(data_dir: &Path, args: HostedWorkflowArgs) -> Result<()> {
-    let input = read_hook_payload()?;
-    if input.get("hook_event_name").and_then(Value::as_str) != Some("Stop") {
-        return Err(Error::Invalid(
-            "hosted Claude workflow hook expects hook_event_name Stop".into(),
-        ));
-    }
+pub async fn claude_stop(
+    data_dir: &Path,
+    args: HostedWorkflowArgs,
+    agent: StopAgent,
+) -> Result<()> {
+    let guard = match agent_stop::prepare(
+        data_dir,
+        agent,
+        Some(&args.workspace),
+        &args.change,
+        std::io::stdin().lock(),
+    )? {
+        Prepared::Done(output) => {
+            println!("{output}");
+            return Ok(());
+        }
+        Prepared::Run(guard) => guard,
+    };
     let result = match check(data_dir, &args).await {
         Ok(value) => value,
         Err(error) => blocked(
@@ -383,21 +395,12 @@ pub async fn claude_stop(data_dir: &Path, args: HostedWorkflowArgs) -> Result<()
             "Resolve the hosted workflow setup or execution error, then try to finish again.",
         ),
     };
-    if result.get("receipt").is_some_and(|value| !value.is_null())
-        && result
-            .get("workspace_changed_during_run")
-            .and_then(Value::as_bool)
-            == Some(false)
-    {
-        println!("{{}}");
-    } else {
-        let feedback = json!({
-            "failures":result.get("failures").cloned().unwrap_or_else(||json!([])),
-            "next_action":result.get("next_action").cloned().unwrap_or_else(||json!("Retry the hosted workflow for the current bytes.")),
-        });
-        let reason = bounded(&serde_json::to_string(&feedback)?, MAX_FAILURE_BYTES);
-        println!("{}", json!({"decision":"block","reason":reason}));
-    }
+    let output = guard.finish(
+        &result,
+        "Retry the hosted workflow for the current bytes.",
+        MAX_FAILURE_BYTES,
+    )?;
+    println!("{output}");
     Ok(())
 }
 
@@ -1788,17 +1791,6 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
     published?;
     File::open(parent)?.sync_all()?;
     Ok(())
-}
-
-fn read_hook_payload() -> Result<Value> {
-    let mut bytes = Vec::new();
-    std::io::stdin()
-        .take(64 * 1024 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > 64 * 1024 {
-        return Err(Error::Limit("hosted Stop hook input exceeds 64 KiB".into()));
-    }
-    Ok(serde_json::from_slice(&bytes)?)
 }
 
 fn bounded(value: &str, maximum: usize) -> String {

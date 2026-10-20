@@ -394,9 +394,43 @@ async fn two_laptops_get_failure_fix_feedback_and_exact_success_without_native_a
         &data_a,
         &laptop_a,
         "remote-stop",
-        Some(br#"{"hook_event_name":"Stop"}"#),
+        Some(br#"{"hook_event_name":"Stop","stop_hook_active":false}"#),
     );
     assert_eq!(stopped, serde_json::json!({}));
+    assert_eq!(queue_counts(root.path()), retained);
+    let codex_payload = serde_json::json!({
+        "hook_event_name": "Stop",
+        "session_id": "synthetic-codex-session",
+        "turn_id": "turn-1",
+        "cwd": laptop_a.workspace,
+        "stop_hook_active": false,
+        "last_assistant_message": "done",
+    })
+    .to_string();
+    let codex_stopped = run_cli_input(
+        &data_a,
+        &laptop_a,
+        "remote-codex-stop",
+        Some(codex_payload.as_bytes()),
+    );
+    assert_eq!(codex_stopped, serde_json::json!({}));
+    assert_eq!(queue_counts(root.path()), retained);
+    fs::create_dir(root.path().join("unrelated")).unwrap();
+    let elsewhere = serde_json::json!({
+        "hook_event_name": "Stop",
+        "cwd": root.path().join("unrelated"),
+        "stop_hook_active": false,
+    })
+    .to_string();
+    assert_eq!(
+        run_cli_input(
+            &data_a,
+            &laptop_a,
+            "remote-codex-stop",
+            Some(elsewhere.as_bytes())
+        ),
+        serde_json::json!({})
+    );
     assert_eq!(queue_counts(root.path()), retained);
 
     // Nothing above approved or landed. A separate human actor now advances
@@ -445,7 +479,7 @@ async fn two_laptops_get_failure_fix_feedback_and_exact_success_without_native_a
             &data_b,
             &laptop_b,
             "remote-stop",
-            Some(br#"{"hook_event_name":"Stop"}"#),
+            Some(br#"{"hook_event_name":"Stop","stop_hook_active":false}"#),
         ),
         serde_json::json!({})
     );
@@ -484,11 +518,33 @@ async fn two_laptops_get_failure_fix_feedback_and_exact_success_without_native_a
         &data_a,
         &laptop_a,
         "remote-stop",
-        Some(br#"{"hook_event_name":"Stop"}"#),
+        Some(br#"{"hook_event_name":"Stop","stop_hook_active":false}"#),
     );
     assert_eq!(blocked_stop["decision"], "block");
     assert!(
         blocked_stop["reason"]
+            .as_str()
+            .unwrap()
+            .contains("failures")
+    );
+    // The same failing state through Codex with cwd in the workspace proves the check ran
+    // rather than being skipped as an unrelated directory.
+    let inside = serde_json::json!({
+        "hook_event_name": "Stop",
+        "session_id": "synthetic-codex-session",
+        "cwd": laptop_a.workspace,
+        "stop_hook_active": false,
+    })
+    .to_string();
+    let codex_blocked = run_cli_input(
+        &data_a,
+        &laptop_a,
+        "remote-codex-stop",
+        Some(inside.as_bytes()),
+    );
+    assert_eq!(codex_blocked["decision"], "block", "{codex_blocked}");
+    assert!(
+        codex_blocked["reason"]
             .as_str()
             .unwrap()
             .contains("failures")
@@ -547,7 +603,7 @@ async fn stop_blocks_when_workspace_changes_while_the_exact_hosted_run_succeeds(
         .stdin
         .take()
         .unwrap()
-        .write_all(br#"{"hook_event_name":"Stop"}"#)
+        .write_all(br#"{"hook_event_name":"Stop","stop_hook_active":false}"#)
         .unwrap();
     let waiting = tokio::task::spawn_blocking(move || child.wait_with_output().unwrap());
 

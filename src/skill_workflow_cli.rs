@@ -5,6 +5,8 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
+use crate::agent_stop::StopAgent;
+#[cfg(unix)]
 use agentscm::execution::Cancellation;
 #[cfg(unix)]
 use agentscm::skill_workflow::runtime::CommandExecutor;
@@ -40,6 +42,36 @@ pub enum SkillWorkflowCommand {
     /// Opt-in Claude Code Stop hook. Native landing is independently enforced by the authority.
     #[cfg(unix)]
     ClaudeStop(crate::skill_workflow_loop::LoopArgs),
+    /// Opt-in Codex Stop hook. Native landing is independently enforced by the authority.
+    #[cfg(unix)]
+    CodexStop(crate::skill_workflow_loop::LoopArgs),
+    /// Opt-in Claude Code Stop hook for agent-owned tasks. Read-only: asks the task facade whether
+    /// the exact Change subject is qualified and never runs, uploads, finalizes or checkpoints.
+    #[cfg(unix)]
+    TaskStop(crate::agent_task_stop::TaskStopArgs),
+    /// Opt-in Codex Stop hook for agent-owned tasks. Read-only like `task-stop`.
+    #[cfg(unix)]
+    TaskCodexStop(crate::agent_task_stop::TaskStopArgs),
+    /// Preview (default) or apply a Stop hook entry in an operator-local Claude Code or Codex hook
+    /// file. Writes only that file, never installs from candidate source. Give the Stop
+    /// subcommand and its arguments after `--`; `--remove` takes none.
+    #[cfg(unix)]
+    InstallStop {
+        /// Hook file to edit; it must be outside the workspace and not a symbolic link.
+        #[arg(long)]
+        settings: PathBuf,
+        /// Write the change; without it only the result is printed.
+        #[arg(long)]
+        apply: bool,
+        /// Remove the installed Stop hooks instead of adding one.
+        #[arg(long)]
+        remove: bool,
+        /// With --remove, remove only the hooks for this workspace.
+        #[arg(long, requires = "remove")]
+        workspace: Option<PathBuf>,
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
     /// Create an empty laptop workspace from an operator-enabled hosted source profile.
     #[cfg(unix)]
     RemoteInit(crate::hosted_workflow_client::HostedWorkflowArgs),
@@ -49,6 +81,9 @@ pub enum SkillWorkflowCommand {
     /// Opt-in Claude Code Stop hook using the hosted source and workflow queue.
     #[cfg(unix)]
     RemoteStop(crate::hosted_workflow_client::HostedWorkflowArgs),
+    /// Opt-in Codex Stop hook using the hosted source and workflow queue.
+    #[cfg(unix)]
+    RemoteCodexStop(crate::hosted_workflow_client::HostedWorkflowArgs),
     /// Validate and pin a workflow against an existing native source revision.
     Plan {
         /// JSON definition, or - for standard input.
@@ -109,7 +144,12 @@ pub(crate) fn telemetry_action(command: &SkillWorkflowCommand) -> bool {
     match command {
         SkillWorkflowCommand::Status { .. } => false,
         #[cfg(unix)]
-        SkillWorkflowCommand::ClaudeStop(_) | SkillWorkflowCommand::RemoteStop(_) => false,
+        SkillWorkflowCommand::ClaudeStop(_)
+        | SkillWorkflowCommand::CodexStop(_)
+        | SkillWorkflowCommand::RemoteStop(_)
+        | SkillWorkflowCommand::RemoteCodexStop(_)
+        | SkillWorkflowCommand::TaskStop(_)
+        | SkillWorkflowCommand::TaskCodexStop(_) => false,
         _ => true,
     }
 }
@@ -151,7 +191,38 @@ pub async fn run(data_dir: &Path, command: SkillWorkflowCommand) -> Result<()> {
         }
         #[cfg(unix)]
         SkillWorkflowCommand::ClaudeStop(args) => {
-            crate::skill_workflow_loop::claude_stop(data_dir, args)
+            crate::skill_workflow_loop::claude_stop(data_dir, args, StopAgent::Claude)
+        }
+        #[cfg(unix)]
+        SkillWorkflowCommand::CodexStop(args) => {
+            crate::skill_workflow_loop::claude_stop(data_dir, args, StopAgent::Codex)
+        }
+        #[cfg(unix)]
+        SkillWorkflowCommand::TaskStop(args) => {
+            crate::agent_task_stop::task_stop(data_dir, args, StopAgent::Claude).await
+        }
+        #[cfg(unix)]
+        SkillWorkflowCommand::TaskCodexStop(args) => {
+            crate::agent_task_stop::task_stop(data_dir, args, StopAgent::Codex).await
+        }
+        #[cfg(unix)]
+        SkillWorkflowCommand::InstallStop {
+            settings,
+            apply,
+            remove,
+            workspace,
+            command,
+        } => {
+            let value = crate::agent_stop_install::run(
+                data_dir,
+                &settings,
+                apply,
+                remove,
+                workspace.as_deref(),
+                &command,
+            )?;
+            crate::print_json(&value);
+            Ok(())
         }
         #[cfg(unix)]
         SkillWorkflowCommand::RemoteInit(args) => {
@@ -180,7 +251,11 @@ pub async fn run(data_dir: &Path, command: SkillWorkflowCommand) -> Result<()> {
         }
         #[cfg(unix)]
         SkillWorkflowCommand::RemoteStop(args) => {
-            crate::hosted_workflow_client::claude_stop(data_dir, args).await
+            crate::hosted_workflow_client::claude_stop(data_dir, args, StopAgent::Claude).await
+        }
+        #[cfg(unix)]
+        SkillWorkflowCommand::RemoteCodexStop(args) => {
+            crate::hosted_workflow_client::claude_stop(data_dir, args, StopAgent::Codex).await
         }
         SkillWorkflowCommand::Plan { input } => {
             let definition = read_definition(&input)?;
@@ -518,4 +593,74 @@ fn read_definition(path: &Path) -> Result<WorkflowDefinition> {
         return Err(Error::Limit("workflow definition exceeds 256 KiB".into()));
     }
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Wrap {
+        #[command(subcommand)]
+        command: SkillWorkflowCommand,
+    }
+
+    #[test]
+    fn stop_hooks_are_not_telemetry_actions() {
+        let local = [
+            "C",
+            "--workspace",
+            "/w",
+            "--docker",
+            "/d",
+            "--docker-socket",
+            "/s",
+            "--claude",
+            "/c",
+        ];
+        let remote = [
+            "--endpoint",
+            "https://h.example",
+            "--repository",
+            "o/r",
+            "--profile",
+            "p",
+            "--token-file",
+            "/t",
+            "--workspace",
+            "/w",
+            "--change",
+            "c",
+        ];
+        let task = [
+            "C",
+            "--endpoint",
+            "https://h.example",
+            "--repository",
+            "o/r",
+            "--profile",
+            "p",
+            "--token-file",
+            "/t",
+            "--workspace",
+            "/w",
+        ];
+        for (name, args) in [
+            ("claude-stop", &local[..]),
+            ("codex-stop", &local[..]),
+            ("remote-stop", &remote[..]),
+            ("remote-codex-stop", &remote[..]),
+            ("task-stop", &task[..]),
+            ("task-codex-stop", &task[..]),
+        ] {
+            let wrap = Wrap::try_parse_from(
+                std::iter::once("x")
+                    .chain([name])
+                    .chain(args.iter().copied()),
+            )
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert!(!telemetry_action(&wrap.command), "{name}");
+        }
+    }
 }
