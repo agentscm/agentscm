@@ -951,6 +951,9 @@ Limits:
   Create returns 409 `ambiguous_repository_name` (and a run blocks) when the same repository
   full name is connected on another configured forge host, because publications and lineages are
   keyed by name only; repository rows from a forge host no longer configured are not considered.
+  While a name is shared, merge reads and GitHub workflow status checks also skip candidate
+  publications of that name, so a status posted before the name became shared is neither
+  superseded nor retired; remove the duplicate connection to resume them.
   A self-managed GitLab under a relative URL root is refused (400/409).
   The branch push is the provider-neutral Git transport; a protected-branch rejection stays
   Unknown rather than a typed refusal. AgentSCM never changes protections, merges or bypasses a
