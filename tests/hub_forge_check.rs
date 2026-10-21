@@ -340,13 +340,19 @@ impl Env {
 
     /// A second publication, for pull request `number` on its own branch and head commit.
     fn add_pull(&self, number: u64, commit: &str, open: bool) {
-        let branch = format!("agents/pull-{number}");
         let endpoint = format!(
             "{}/{REPO}.git",
             self.fake.base.replace("http://", "https://")
         );
+        self.add_pull_at(number, commit, open, endpoint);
+    }
+
+    /// As `add_pull`, for a candidate published to `endpoint`.
+    fn add_pull_at(&self, number: u64, commit: &str, open: bool, endpoint: String) {
+        let branch = format!("agents/pull-{number}");
         let mut subject = self.subject.clone();
         subject.output = branch.clone();
+        subject.endpoint = endpoint.clone();
         subject.id = String::new();
         subject.id = subject.canonical_id().unwrap();
         self.fake.with(|s| {
@@ -1022,4 +1028,34 @@ async fn a_forge_merged_pull_request_in_the_window_is_recorded_and_not_read_agai
     let reads = pull_reads(&env, 1);
     env.poll().await;
     assert_eq!(pull_reads(&env, 1), reads);
+}
+
+#[tokio::test]
+async fn a_publication_to_another_host_is_never_reconciled_against_a_same_named_pull_request() {
+    let env = Env::start(true).await;
+    env.qualify();
+    let other = "d".repeat(40);
+    // A GitLab merge request iid 2 shares its number with a qualifying, merged GitHub pull
+    // request of the same repository name.
+    env.add_pull_at(
+        2,
+        &other,
+        true,
+        format!("https://gitlab.example.invalid/{REPO}.git"),
+    );
+    merged_in_forge(&env, 2);
+    env.poll().await;
+    env.poll().await;
+    // Only the GitHub publication's own commit is judged; nothing is posted for the other.
+    assert_eq!(env.status_posts(), 1);
+    assert!(env.statuses().iter().all(|(sha, _, _)| sha == COMMIT));
+    // The listing omits merged publications: still listed means no merge was recorded.
+    let foreign = env.store.pull_publications(REPO, 1, 1).unwrap();
+    assert_eq!(
+        foreign.len(),
+        1,
+        "a merge was recorded on the other host's publication"
+    );
+    assert_eq!(foreign[0].pr_number, Some(2));
+    assert_eq!(pull_reads(&env, 2), 0);
 }

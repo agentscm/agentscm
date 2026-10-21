@@ -42,6 +42,14 @@ impl ForgeApi<'_> {
         }
     }
 
+    /// Like [`pull`](Self::pull); on GitHub a 403 is a refusal of this read, not a failed credential.
+    pub async fn pull_soft(&self, token: &str, repo: &Repo, number: i64) -> Gh<Option<Value>> {
+        match self {
+            Self::Github(api) => api.pull_soft(token, &repo.full_name, number).await,
+            Self::Gitlab(api) => api.pull(token, repo.repository_id, number).await,
+        }
+    }
+
     pub async fn pull_files(
         &self,
         token: &str,
@@ -139,6 +147,67 @@ impl ForgeApi<'_> {
             }
             Self::Gitlab(api) => {
                 api.create_status(token, repo.repository_id, sha, description)
+                    .await
+            }
+        }
+    }
+
+    /// The forge's explicit default branch; an error when it is unknown.
+    pub async fn default_branch(&self, token: &str, repo: &Repo) -> Gh<String> {
+        match self {
+            Self::Github(api) => api.default_branch(token, &repo.full_name).await,
+            Self::Gitlab(api) => api.default_branch(token, repo.repository_id).await,
+        }
+    }
+
+    /// The commit a branch points at; None when it does not exist.
+    pub async fn ref_sha(&self, token: &str, repo: &Repo, branch: &str) -> Gh<Option<String>> {
+        match self {
+            Self::Github(api) => api.ref_sha(token, &repo.full_name, branch).await,
+            Self::Gitlab(api) => api.ref_sha(token, repo.repository_id, branch).await,
+        }
+    }
+
+    /// Open pull requests from `branch` in the repository itself (no forks). An error, never a
+    /// partial list, past the page cap. GitHub lists by head only (`base` is left to the caller);
+    /// GitLab filters by both.
+    pub async fn find_open_pulls(
+        &self,
+        token: &str,
+        repo: &Repo,
+        branch: &str,
+        base: &str,
+    ) -> Gh<Vec<Value>> {
+        match self {
+            Self::Github(api) => {
+                let owner = repo.full_name.split('/').next().unwrap_or_default();
+                api.find_open_pulls(token, &repo.full_name, owner, branch)
+                    .await
+            }
+            Self::Gitlab(api) => {
+                api.find_open_pulls(token, repo.repository_id, branch, base)
+                    .await
+            }
+        }
+    }
+
+    /// `Err(status)` is a definitive refusal; any other failure leaves the outcome uncertain.
+    pub async fn create_candidate_pull(
+        &self,
+        token: &str,
+        repo: &Repo,
+        title: &str,
+        body: &str,
+        head: &str,
+        base: &str,
+    ) -> Gh<std::result::Result<Value, u16>> {
+        match self {
+            Self::Github(api) => {
+                api.create_candidate_pull(token, &repo.full_name, title, body, head, base)
+                    .await
+            }
+            Self::Gitlab(api) => {
+                api.create_candidate_pull(token, repo.repository_id, title, body, head, base)
                     .await
             }
         }

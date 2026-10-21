@@ -756,7 +756,8 @@ _Experimental: tested only against in-process fake servers, not live GitHub or G
 
 `agentscm hub publish` pushes one exported native revision to GitHub as a new branch
 and a pull request, through the hub. It works only for repositories on a GitHub connection; a
-repository on a GitLab connection is refused with 409 `unsupported_provider`.
+repository on a GitLab connection is refused with 409 `unsupported_provider` before any forge call.
+Candidate publication from an attached worktree (below) is the only GitLab publication path.
 
 ```sh
 agentscm --data-dir ./native-data hub publish --mirror ./owned-mirror.git --event 1 \
@@ -897,7 +898,8 @@ App or source: anyone with `statuses:write` on the repository can post the same 
 Merge queue (`merge_group`) is not supported; a required context will block queued
 merges. Verification that a protected branch actually requires the check, and that
 raw pushes and administrator bypass are closed, is pending: the Hub reports
-`protection: "unverified"` and does not enforce it. GitLab is unsupported. A native
+`protection: "unverified"` and does not enforce it. GitLab is unsupported: `forge_check.provider` is `unsupported`, and a SHA
+status is not a verified merge-request merged-result pipeline. A native
 store that exists only on a laptop cannot be pinned here; signed local attestations
 for that case are tracked separately and are not implemented.
 
@@ -932,7 +934,30 @@ Events, each with the exact revision, commit, ref and pull request number and no
 
 Limits:
 
-- GitHub only. Publishing merge requests to GitLab is not implemented.
+- `hub publish --event` is GitHub only. Candidate publication from an attached worktree
+  (`attached-worktree publish-pr`, `recover-pr`; candidate manifests on
+  `/v1/hub/repos/{repo}/publications`) also works on a GitLab PAT connection, including nested
+  groups (`group/sub/project`), tested only against an in-process fake. The Hub creates or adopts
+  one merge request in the same project; fork merge requests are never adopted, and a truncated
+  merge-request search or a 429 blocks without creating. On create, 400/403/404/422 is a
+  definitive refusal retained as a no-create result (400 is definitive on GitLab only; on GitHub
+  it is 403/404/422 and a 400 stays uncertain); 409 (GitLab's "already exists"), 5xx, transport failures and unreadable success stay
+  uncertain, `pr_attempting` survives restart, nothing replays automatically and `recover-pr`
+  adopts only by exact head/base or the publication marker. A GitLab merge without a merge commit
+  (fast-forward or merged by push) is recorded as merged only when the MR head equals the
+  published commit.
+  A completed receipt is historical: after a source rewrite or target advance the Hub keeps the
+  recorded MR number, creates nothing and does not present the receipt as current qualification.
+  Create returns 409 `ambiguous_repository_name` (and a run blocks) when the same repository
+  full name is connected on another configured forge host, because publications and lineages are
+  keyed by name only; repository rows from a forge host no longer configured are not considered.
+  While a name is shared, merge reads and GitHub workflow status checks also skip candidate
+  publications of that name, so a status posted before the name became shared is neither
+  superseded nor retired; remove the duplicate connection to resume them.
+  A self-managed GitLab under a relative URL root is refused (400/409).
+  The branch push is the provider-neutral Git transport; a conclusive protected-branch or hook
+  rejection is recorded as `rejected` (kind unverified against live GitLab; Unknown if the outcome is unclear). AgentSCM never changes protections, merges or bypasses a
+  target. This is neither full-history migration nor native authority cutover.
 - Existing Git export profile v1 mirrors write regular `100644` files only. New mirrors use v2, which also preserves executable `100755` entries and symbolic links as `120000` target blobs. The hub and client accept these modes and deletions in a manifest; submodules and other entry kinds are refused before upload. Live GitHub publication of v2 exports remains unqualified.
 - At most 1000 changed paths, 8 MiB per file and 64 MiB in total. An upload over a cap is
   refused with a clear error and never truncated. GitHub's own limits (blob, file and
@@ -1052,13 +1077,14 @@ The container test does not include a forge. Pull-request overlaps (webhook and 
   keeps at most 8 live sessions. Sessions are not rechecked per request: a user
   disabled by other means keeps an existing session until it expires and can
   still list and revoke their tokens, though not mint.
-- GitLab: a fast-forward merge records `merge_commit_sha` null. After a project is
+- GitLab: a merge without a merge commit (fast-forward or merged by push) records `merge_commit_sha` null. After a project is
   renamed, the stored name refreshes only when it is added again (`add-repo`), and
   tokens must then be re-minted. Note adoption scans the first 300 notes, system
   notes included.
 - GitLab sync needs GitLab 15.7 or newer for the MR `diffs` endpoint. It has been run
   only against an in-process fake, never a live or self-managed GitLab; commit status
-  is posted by SHA and does not attach to a merge request pipeline.
+  is posted by SHA and does not attach to a merge request pipeline. Candidate MR publication
+  has the same fake-only limit.
 - GitLab sign-in uses OAuth and the REST user endpoint; there is no OIDC
   id_token validation. There are no refresh tokens: sign in again.
 - Tokens are not revoked when a person later loses forge access. They expire

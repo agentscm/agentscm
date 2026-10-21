@@ -118,7 +118,7 @@ pub enum AttachedWorktreeCommand {
         #[arg(long)]
         expected_oid: Option<String>,
     },
-    /// Create or find the same GitHub pull request for the exactly published branch.
+    /// Create or find the same pull or merge request for the exactly published branch.
     PublishPr {
         #[arg(long)]
         id: String,

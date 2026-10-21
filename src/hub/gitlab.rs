@@ -65,7 +65,13 @@ impl Api {
             let reply = self.call(token, Method::GET, &url, None).await?;
             let (next, last) = (reply.next, reply.last_page);
             let body = reply.ok(endpoint_kind(&url, &self.base))?;
-            items.extend(body.as_array().cloned().unwrap_or_default());
+            let Some(page_items) = body.as_array() else {
+                return Err(GhError::Failed(format!(
+                    "unreadable reply from {}",
+                    endpoint_kind(&url, &self.base)
+                )));
+            };
+            items.extend(page_items.iter().cloned());
             if !next || page == max_pages {
                 let unread = if next {
                     last.map_or(1, |last| last.saturating_sub(max_pages).max(1))
@@ -157,6 +163,103 @@ impl Api {
         branch_of(&body)
             .map(Some)
             .ok_or_else(|| GhError::Failed("unreadable reply from projects".into()))
+    }
+
+    /// The project's explicit default branch; absence is unsupported, as on GitHub.
+    pub async fn default_branch(&self, token: &str, project: i64) -> Gh<String> {
+        let body = self
+            .get(token, &format!("/projects/{project}"))
+            .await?
+            .ok("projects")?;
+        body["default_branch"]
+            .as_str()
+            .filter(|name| valid_ref_name(name) && *name != "HEAD" && !name.starts_with("refs/"))
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                GhError::Failed(
+                    "unsupported candidate profile: forge default branch is unknown".into(),
+                )
+            })
+    }
+
+    /// The commit a branch points at; None when it does not exist. A bad name is an error.
+    pub async fn ref_sha(&self, token: &str, project: i64, name: &str) -> Gh<Option<String>> {
+        if !valid_ref_name(name) {
+            return Err(GhError::Failed("bad branch name".into()));
+        }
+        Ok(self.branch(token, project, name).await?.map(|b| b.sha))
+    }
+
+    /// Open merge requests from `source` into `target` within the project (fork merge requests
+    /// are left out). Past the page cap the answer is unknown, so it is an error rather than a
+    /// partial list: the caller must not create a duplicate.
+    pub async fn find_open_pulls(
+        &self,
+        token: &str,
+        project: i64,
+        source: &str,
+        target: &str,
+    ) -> Gh<Vec<Value>> {
+        let path = format!(
+            "/projects/{project}/merge_requests?state=opened&source_branch={}&target_branch={}",
+            encode(source),
+            encode(target)
+        );
+        let paged = self.paged(token, &path, MAX_PULL_PAGES).await?;
+        if paged.unread > 0 {
+            return Err(GhError::Failed(
+                "too many open merge requests from that branch to search".into(),
+            ));
+        }
+        let mut found = Vec::new();
+        for mr in &paged.items {
+            // An item that cannot be read could be the merge request being looked for.
+            if mr["iid"].as_i64().is_none()
+                || mr["id"].as_i64().is_none()
+                || mr["source_project_id"].as_i64().is_none()
+                || mr["target_project_id"].as_i64().is_none()
+            {
+                return Err(GhError::Failed(
+                    "unreadable reply from merge_requests".into(),
+                ));
+            }
+            if in_project(mr, project) {
+                found.push(pull_json(mr));
+            }
+        }
+        Ok(found)
+    }
+
+    /// Opens a merge request within the project. `Err(status)` is a definitive refusal (400, 403,
+    /// 404, 422); anything else that is not a readable 201, including GitLab's 409 for an open
+    /// merge request that already exists, leaves the outcome uncertain.
+    pub async fn create_candidate_pull(
+        &self,
+        token: &str,
+        project: i64,
+        title: &str,
+        body: &str,
+        source: &str,
+        target: &str,
+    ) -> Gh<std::result::Result<Value, u16>> {
+        let url = format!("{}/projects/{project}/merge_requests", self.base);
+        let request = json!({"source_branch": source, "target_branch": target,
+            "title": title, "description": body});
+        let reply = self.call(token, Method::POST, &url, Some(request)).await?;
+        if matches!(reply.status, 400 | 403 | 404 | 422) {
+            return Ok(Err(reply.status));
+        }
+        if reply.status != 201 {
+            return Err(GhError::Failed(format!("{} from projects", reply.status)));
+        }
+        let mr = reply.body;
+        if mr["iid"].as_i64().is_none()
+            || mr["id"].as_i64().is_none()
+            || mr["web_url"].as_str().is_none()
+        {
+            return Err(GhError::Failed("unreadable reply from projects".into()));
+        }
+        Ok(Ok(pull_json(&mr)))
     }
 
     /// Branches whose tip commit is at or after `since` (unix seconds), newest first, at most
@@ -293,12 +396,19 @@ fn pull_json(mr: &Value) -> Value {
     json!({"number": mr["iid"], "node_id": format!("gid://gitlab/MergeRequest/{}", mr["id"]),
         "title": mr["title"], "state": if open { "open" } else { "closed" },
         "draft": mr["draft"].as_bool().or(mr["work_in_progress"].as_bool()).unwrap_or(false),
-        "merged": merged,
+        "merged": merged, "body": mr["description"],
+        "source_project_id": mr["source_project_id"], "target_project_id": mr["target_project_id"],
         "merge_commit_sha": if mr["merge_commit_sha"].is_null() { &mr["squash_commit_sha"] } else { &mr["merge_commit_sha"] },
         "head": {"ref": mr["source_branch"], "sha": mr["sha"]},
         "base": {"ref": mr["target_branch"]},
         "user": {"login": mr["author"]["username"], "id": mr["author"]["id"]},
         "html_url": mr["web_url"]})
+}
+
+/// Whether the merge request is from the project into itself.
+fn in_project(mr: &Value, project: i64) -> bool {
+    mr["source_project_id"].as_i64() == Some(project)
+        && mr["target_project_id"].as_i64() == Some(project)
 }
 
 fn branch_of(item: &Value) -> Option<Branch> {
@@ -423,6 +533,27 @@ mod tests {
         assert_eq!(pull["head"], json!({"ref": "feat/x", "sha": "head"}));
         assert_eq!(pull["user"], json!({"login": "alice", "id": 5}));
         assert_eq!(pull_json(&json!({"state": "opened"}))["state"], "open");
+    }
+
+    #[test]
+    fn merge_requests_carry_body_and_projects() {
+        let mr = json!({"iid": 3, "description": "text\n\n<!-- m -->",
+            "source_project_id": 1, "target_project_id": 2});
+        let pull = pull_json(&mr);
+        assert_eq!(pull["body"], "text\n\n<!-- m -->");
+        assert_eq!(
+            (&pull["source_project_id"], &pull["target_project_id"]),
+            (&json!(1), &json!(2))
+        );
+    }
+
+    #[test]
+    fn only_same_project_merge_requests_count() {
+        let mr = |s: Value, t: Value| json!({"source_project_id": s, "target_project_id": t});
+        assert!(in_project(&mr(json!(1), json!(1)), 1));
+        assert!(!in_project(&mr(json!(9), json!(1)), 1));
+        assert!(!in_project(&mr(json!(1), json!(9)), 1));
+        assert!(!in_project(&json!({}), 1));
     }
 
     #[test]

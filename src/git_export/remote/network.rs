@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{invalid, path_text, shell_quote};
-use crate::Result;
-use crate::git_export::git::Git;
+use crate::git_export::git::{Git, PushExit};
+use crate::{Error, Result};
 
 const MAX_SECRET: u64 = 16 * 1024;
 const MAX_TRUST: u64 = 1024 * 1024;
@@ -165,6 +165,20 @@ impl Endpoint {
         args: &[&str],
         budget: u64,
     ) -> Result<Vec<u8>> {
+        let exit = self.run_exit(git, access, args, budget)?;
+        if !exit.finished || exit.code != Some(0) {
+            return Err(Error::SourceIndeterminate);
+        }
+        Ok(exit.stdout)
+    }
+
+    pub(super) fn run_exit(
+        &self,
+        git: &Git,
+        access: &Access,
+        args: &[&str],
+        budget: u64,
+    ) -> Result<PushExit> {
         self.validate_access(access)?;
         // Git/OpenSSH reopen trust paths. Keep the exact digest-verified bytes
         // under our own temporary name so concurrent operator rotation cannot

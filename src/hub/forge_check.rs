@@ -14,7 +14,7 @@ use super::connection::{
 };
 use super::github::{CommitStatus, Gh, GhError, StatusState};
 use super::http::blocking;
-use super::publish::Update;
+use super::publish::{Update, publication_on_forge};
 use super::store::unix_now;
 use super::workspace_execution::AgentTaskProfile;
 use super::{HubError, HubState, Result};
@@ -338,6 +338,11 @@ pub(super) async fn reconcile_repo(
         let Some(candidate) = publication.manifest().ok().and_then(|m| m.candidate) else {
             continue;
         };
+        // Publications are keyed by name alone: a GitLab or ambiguous-name publication is not
+        // this repository's pull request, whatever its number.
+        if !publication_on_forge(state, &publication, repo).await {
+            continue;
+        }
         for profile in profiles
             .iter()
             .filter(|p| p.target == candidate.subject.target)
@@ -450,16 +455,24 @@ async fn record_merge(
         return Ok(());
     };
     let (store, name) = (state.store.clone(), repo.full_name.clone());
+    // The listing omits merged pull requests, so a match is the unrecorded newest one.
+    let newest = blocking(state, move || {
+        store.pull_publications(&name, number.saturating_sub(1), 1)
+    })
+    .await?;
+    let Some(publication) = newest.into_iter().find(|p| p.pr_number == Some(number)) else {
+        return Ok(());
+    };
+    if !publication_on_forge(state, &publication, repo).await {
+        return Ok(());
+    }
+    let store = state.store.clone();
     blocking(state, move || {
-        // The listing omits merged pull requests, so a match is the unrecorded newest one.
-        let newest = store.pull_publications(&name, number.saturating_sub(1), 1)?;
-        if let Some(publication) = newest.iter().find(|p| p.pr_number == Some(number)) {
-            store.update_publication(
-                &publication.id,
-                &Update::Merged { merge_commit },
-                unix_now(),
-            )?;
-        }
+        store.update_publication(
+            &publication.id,
+            &Update::Merged { merge_commit },
+            unix_now(),
+        )?;
         Ok(())
     })
     .await

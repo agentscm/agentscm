@@ -264,3 +264,73 @@ async fn note_lost_reply_and_author_check() {
     assert_eq!(status.status(), 201);
     assert_eq!(fake.with(|s| s.projects[&1].statuses.len()), 1);
 }
+
+#[tokio::test]
+async fn merge_request_create_filters_and_duplicates() {
+    let fake = FakeGitlab::start().await;
+    fake.with(|s| {
+        let mut p = Project::new(1, "group/sub/widgets", "public");
+        p.branches = vec![
+            Branch::new("main", "2026-01-01T00:00:00Z"),
+            Branch::new("f", "2026-01-02T00:00:00Z"),
+        ];
+        s.projects.insert(1, p);
+        s.tokens.insert("t".into(), token("alice", 10, &[]));
+    });
+    let api = format!("{}/api/v4/projects/group%2Fsub%2Fwidgets", fake.base);
+    assert_eq!(
+        get(api.clone(), "t").await.val::<Value>().await["default_branch"],
+        "main"
+    );
+    let create = |source: &'static str| {
+        call(
+            reqwest::Method::POST,
+            format!("{api}/merge_requests"),
+            Some("t"),
+            Some(json!({"source_branch": source, "target_branch": "main",
+                "title": "T", "description": "D"})),
+        )
+    };
+    let made: Value = create("f").await.val().await;
+    assert_eq!(
+        (made["iid"].as_i64(), made["description"].as_str()),
+        (Some(1), Some("D"))
+    );
+    assert_eq!(made["source_project_id"], made["target_project_id"]);
+    assert_eq!(create("f").await.status(), 409);
+    assert_eq!(fake.with(|s| s.mr_creates()), 2);
+
+    // A fork's MR and a different target are filtered out of the list.
+    fake.with(|s| {
+        let p = s.projects.get_mut(&1).unwrap();
+        let mut fork = Mr::new(8, "f", &[]);
+        fork.source_project_id = Some(99);
+        p.mrs.insert(8, fork);
+        let mut other = Mr::new(9, "f", &[]);
+        other.target_branch = "dev".into();
+        p.mrs.insert(9, other);
+    });
+    let listed: Vec<Value> = get(
+        format!("{api}/merge_requests?state=opened&source_branch=f&target_branch=main&per_page=1"),
+        "t",
+    )
+    .await
+    .val()
+    .await;
+    assert_eq!(listed.len(), 1);
+    let all: Vec<Value> = get(format!("{api}/merge_requests?source_branch=f"), "t")
+        .await
+        .val()
+        .await;
+    assert_eq!(all.len(), 3);
+
+    // Toggles: refusal stores nothing; a lost reply stores the MR.
+    fake.with(|s| s.refuse_next_mr = Some(403));
+    assert_eq!(create("main").await.status(), 403);
+    fake.with(|s| {
+        s.projects.get_mut(&1).unwrap().mrs.clear();
+        s.lose_next_mr_reply = true;
+    });
+    assert_eq!(create("f").await.status(), 502);
+    assert_eq!(fake.with(|s| s.projects[&1].mrs.len()), 1);
+}

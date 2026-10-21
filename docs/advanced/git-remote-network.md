@@ -120,6 +120,12 @@ observation, after which an operator may choose a new operation ID. Every new
 publication still has an exact current-ref/create-only lease and ancestry
 check. It cannot overwrite a hidden existing branch by assuming absence.
 
+A `rejected` create-only push with no observed oid is recorded only for a
+server-side `[remote rejected]`; it relies on the server's report plus the ref
+not being advertised. A client-side `[rejected]` (stale info, fetch first,
+non-fast-forward) with no advertised ref is `observed_unadvertised`. Absence is
+not proven, and later pushes still use the exact lease. `rejected` does not fence new operations.
+
 `pending`/`unknown` operations are never automatically retried, and repeating the
 same ID returns its saved result. Recovery only reads; it does not repeat a
 push. A remote server may finish a request after the client terminates, so a
@@ -131,4 +137,4 @@ explicitly under a new ID and preserve the old receipt.
 Local processes retain the reviewed timeout/output/process-group bounds.
 Network transfer has no hard disk quota or whole-workflow latency guarantee.
 The remote transport does not add a scheduler, automatic reconciliation/landing,
-GitLab MR creation, repository archival or live authority cutover.
+GitLab MR creation (the Hub candidate path creates MRs separately), repository archival or live authority cutover.

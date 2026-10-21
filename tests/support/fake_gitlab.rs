@@ -113,6 +113,9 @@ pub struct Mr {
     pub files: Vec<String>,
     /// (old_path, new_path) entries added to the diffs after `files`.
     pub renamed: Vec<(String, String)>,
+    pub description: String,
+    /// The source project when it is not the one the MR lives in (a fork).
+    pub source_project_id: Option<i64>,
 }
 
 impl Mr {
@@ -132,6 +135,8 @@ impl Mr {
             author_id: 1,
             files: files.iter().map(|f| f.to_string()).collect(),
             renamed: Vec::new(),
+            description: String::new(),
+            source_project_id: None,
         }
     }
 }
@@ -148,6 +153,9 @@ pub struct Project {
     pub notes: BTreeMap<i64, Vec<Note>>,
     /// (sha, {state, name, description}) in creation order.
     pub statuses: Vec<(String, Value)>,
+    pub default_branch: Option<String>,
+    /// A bare Git repository behind the branch reads and MR creation, if any.
+    pub git: Option<std::path::PathBuf>,
 }
 
 impl Project {
@@ -160,6 +168,8 @@ impl Project {
             branches: Vec::new(),
             notes: BTreeMap::new(),
             statuses: Vec::new(),
+            default_branch: Some("main".into()),
+            git: None,
         }
     }
 }
@@ -173,7 +183,48 @@ pub struct FakeState {
     pub fail: VecDeque<Failure>,
     /// Store the next created note, then answer 502 with no body.
     pub lose_next_note_reply: bool,
+    /// Store the next created MR, then answer 502 with no body.
+    pub lose_next_mr_reply: bool,
+    /// Store the next created MR, then answer 201 with a body that is not an MR.
+    pub malformed_next_mr_reply: bool,
+    /// Answer the next MR create with this status and store nothing.
+    pub refuse_next_mr: Option<u16>,
+    /// Answer the next MR list with 200 and a JSON object instead of an array.
+    pub malformed_next_mr_list: bool,
+    /// Answer every MR list with items that carry no project ids, until cleared.
+    pub omit_mr_list_project_ids: bool,
     pub requests: Vec<Request>,
+}
+
+impl FakeState {
+    /// How many MR creates (`POST .../merge_requests`) reached the fake, however they were answered.
+    pub fn mr_creates(&self) -> usize {
+        self.requests
+            .iter()
+            .filter(|r| {
+                r.method == "POST"
+                    && r.path_and_query
+                        .split('?')
+                        .next()
+                        .is_some_and(|p| p.ends_with("/merge_requests"))
+            })
+            .count()
+    }
+}
+
+/// Runs Git in a bare repository with no user configuration; None on failure.
+pub fn git_text(dir: &std::path::Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("/usr/bin/git")
+        .env_clear()
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_DIR", dir)
+        .args(args)
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
 fn fake_sha(seed: &str) -> String {
@@ -366,6 +417,7 @@ fn project_json(ctx: &Ctx, p: &Project, token: &Token) -> Value {
     let level = token.access.get(&p.id);
     json!({
         "id": p.id, "path_with_namespace": p.path_with_namespace, "visibility": p.visibility,
+        "default_branch": p.default_branch,
         "web_url": format!("{}/{}", ctx.base, p.path_with_namespace),
         "permissions": {
             "project_access": level.map(|l| json!({"access_level": l})),
@@ -379,6 +431,8 @@ fn mr_json(ctx: &Ctx, p: &Project, m: &Mr) -> Value {
         "id": m.id, "iid": m.iid, "title": m.title, "state": m.state, "draft": m.draft,
         "source_branch": m.source_branch, "target_branch": m.target_branch, "sha": m.sha,
         "merge_commit_sha": m.merge_commit_sha, "squash_commit_sha": null,
+        "description": m.description,
+        "source_project_id": m.source_project_id.unwrap_or(p.id), "target_project_id": p.id,
         "author": {"id": m.author_id, "username": m.author_username},
         "web_url": format!("{}/{}/-/merge_requests/{}", ctx.base, p.path_with_namespace, m.iid),
     })
@@ -386,6 +440,18 @@ fn mr_json(ctx: &Ctx, p: &Project, m: &Mr) -> Value {
 
 fn branch_json(b: &Branch) -> Value {
     json!({"name": b.name, "commit": {"id": b.sha, "committed_date": b.committed_date}})
+}
+
+/// A branch read from the project's bare repository, if it has one.
+fn git_branch(dir: &std::path::Path, name: &str) -> Option<Branch> {
+    let refname = format!("refs/heads/{name}");
+    let sha = git_text(dir, &["rev-parse", "--verify", "-q", &refname])?;
+    let date = git_text(dir, &["log", "-1", "--format=%cI", &sha])?;
+    Some(Branch {
+        name: name.into(),
+        sha,
+        committed_date: date,
+    })
 }
 
 fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8]) -> Response {
@@ -455,19 +521,87 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
     match (method, tail) {
         (&Method::GET, []) => json_reply(200, project_json(ctx, project, &token)),
         (&Method::GET, ["merge_requests"]) => {
-            let want = query
-                .iter()
-                .find(|(k, _)| k == "state")
-                .map_or("opened", |(_, v)| v.as_str());
+            let q = |name: &str| {
+                query
+                    .iter()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| v.as_str())
+            };
+            if std::mem::take(&mut state.malformed_next_mr_list) {
+                return json_reply(200, json!({"message": "not a list"}));
+            }
+            let omit = state.omit_mr_list_project_ids;
+            let want = q("state").unwrap_or("opened");
             let mrs: Vec<Value> = project
                 .mrs
                 .values()
                 .rev()
                 .filter(|m| m.state == want)
-                .map(|m| mr_json(ctx, project, m))
+                .filter(|m| q("source_branch").is_none_or(|b| m.source_branch == b))
+                .filter(|m| q("target_branch").is_none_or(|b| m.target_branch == b))
+                .map(|m| {
+                    let mut json = mr_json(ctx, project, m);
+                    if omit {
+                        json["source_project_id"] = Value::Null;
+                        json["target_project_id"] = Value::Null;
+                    }
+                    json
+                })
                 .collect();
             let (page, link) = paginate(ctx, uri, &query, mrs);
             reply(200, &link, Some(Value::Array(page)))
+        }
+        (&Method::POST, ["merge_requests"]) => {
+            if let Some(status) = state.refuse_next_mr.take() {
+                return json_reply(status, json!({"message": "synthetic refusal"}));
+            }
+            let b = json_body();
+            let text = |k: &str| b[k].as_str().unwrap_or_default().to_owned();
+            let (source, target) = (text("source_branch"), text("target_branch"));
+            let tip = |name: &str| match &project.git {
+                Some(dir) => git_branch(dir, name).map(|b| b.sha),
+                None => Some(
+                    project
+                        .branches
+                        .iter()
+                        .find(|b| b.name == name)
+                        .map_or_else(|| fake_sha(name), |b| b.sha.clone()),
+                ),
+            };
+            // Assumption, not verified against live GitLab: a missing source or target branch may
+            // be answered 409 instead, which the Hub treats as uncertain rather than a refusal.
+            let (Some(sha), Some(_)) = (tip(&source), tip(&target)) else {
+                return json_reply(400, json!({"message": "branch does not exist"}));
+            };
+            if project.mrs.values().any(|m| {
+                m.state == "opened"
+                    && m.source_branch == source
+                    && m.target_branch == target
+                    && m.source_project_id.is_none()
+            }) {
+                return json_reply(
+                    409,
+                    json!({"message": ["Another open merge request already exists for this source branch"]}),
+                );
+            }
+            let iid = project.mrs.keys().max().copied().unwrap_or(0) + 1;
+            let mut mr = Mr::new(iid, &source, &[]);
+            mr.id = 9000 + project.id * 1000 + iid;
+            mr.title = text("title");
+            mr.description = text("description");
+            mr.target_branch = target;
+            mr.sha = sha;
+            mr.author_username = token.username.clone();
+            mr.author_id = token.user_id;
+            let created = mr_json(ctx, project, &mr);
+            project.mrs.insert(iid, mr);
+            if std::mem::take(&mut state.lose_next_mr_reply) {
+                return reply(502, &[], None);
+            }
+            if std::mem::take(&mut state.malformed_next_mr_reply) {
+                return json_reply(201, json!({"iid": iid}));
+            }
+            json_reply(201, created)
         }
         (&Method::GET, ["merge_requests", iid]) => {
             match iid.parse::<i64>().ok().and_then(|n| project.mrs.get(&n)) {
@@ -503,7 +637,11 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
         }
         (&Method::GET, ["repository", "branches", name @ ..]) if !name.is_empty() => {
             let name = name.join("/");
-            match project.branches.iter().find(|b| b.name == name) {
+            let found = match &project.git {
+                Some(dir) => git_branch(dir, &name),
+                None => project.branches.iter().find(|b| b.name == name).cloned(),
+            };
+            match found.as_ref() {
                 Some(b) => json_reply(200, branch_json(b)),
                 None => not_found(),
             }

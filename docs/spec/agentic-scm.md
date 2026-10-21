@@ -389,7 +389,7 @@ unless a team explicitly chooses a cutover for a target.
 | Reconcile | Repeatedly compare Git and native state; capture Git-side changes as candidates | No (its `prepare-exit` step uses export to write the local mirror) | Implemented (`git-reconcile`) |
 | Export | Project a landed native revision into a separately owned local bare mirror with ref compare-and-swap, optionally seeded with existing Git history | Local mirror only; never pushes | Implemented (`git-export`, [details](../advanced/git-export.md)) |
 | Observe forge | Record pull/merge requests and branches from GitHub and GitLab; optionally post comments and statuses (opt-in per connection) | Comments and statuses only | Implemented for GitHub and GitLab, tested only against in-process fakes |
-| Publish | Push an exported commit to the forge as a new branch and pull/merge request for normal forge review | Remote branch | Implemented for GitHub only (`hub publish`, not yet verified against live GitHub); GitLab merge requests are not implemented |
+| Publish | Push an exported commit to the forge as a new branch and pull/merge request for normal forge review | Remote branch | Event publication (`hub publish`) is implemented for GitHub only and not verified against live GitHub; attached-worktree candidate publication also covers GitLab merge requests, fake-tested only |
 | Cutover (optional, reversible, per target) | The ledger becomes the landing authority for one target, with Git kept as a projection; a tested way back restores forge authority | Remote, by policy | Proposed |
 
 A cutover is optional and MUST be an explicit, recorded, reversible decision per target. Before it, a
@@ -406,8 +406,8 @@ Status: per row.
 | Level | A conforming tool… | Repository status |
 |---|---|---|
 | **L0 — Observe Git** | Reads Git refs and worktrees; emits collision notices as JSON; never moves refs, edits worktrees or keeps a ledger | Implemented for local Git repositories (`agentscm collisions`, section 4.3); notices are read on demand and not pushed to actors |
-| **L1 — Ledger + shadow** | Keeps the append-only ledger of section 3; captures, reconciles and exports Git state; binds approvals to exact subjects; publishes work intents; Git/forge stays authoritative | Partial: the ledger, capture, reconcile and export are implemented for one trusted local operator. The [hub](../hub.md) adds forge sign-in, owner-scoped agent tokens and declared intents for several people, but is not joined to the ledger and has no approval or landing admission. It observes GitHub and GitLab and can publish a branch and pull request to GitHub (fake-tested only) |
-| **L2 — Native authority** | Optionally owns protected targets, after an explicit cutover; performs conditional landings; projects to Git for compatibility | Partial: local conditional landing and journal are implemented; authenticated multi-user admission and a cutover procedure are not; remote publication exists for GitHub only through the hub |
+| **L1 — Ledger + shadow** | Keeps the append-only ledger of section 3; captures, reconciles and exports Git state; binds approvals to exact subjects; publishes work intents; Git/forge stays authoritative | Partial: the ledger, capture, reconcile and export are implemented for one trusted local operator. The [hub](../hub.md) adds forge sign-in, owner-scoped agent tokens and declared intents for several people, but is not joined to the ledger and has no approval or landing admission. It observes GitHub and GitLab and can publish a branch and pull request to GitHub, and attached-worktree candidates to GitLab as merge requests (fake-tested only) |
+| **L2 — Native authority** | Optionally owns protected targets, after an explicit cutover; performs conditional landings; projects to Git for compatibility | Partial: local conditional landing and journal are implemented; authenticated multi-user admission and a cutover procedure are not; remote publication exists through the hub for GitHub, and for GitLab only as attached-worktree candidate merge requests (fake-tested only); event publication is GitHub-only |
 
 Levels are independent claims: L0 needs no ledger, and a ledger tool need not
 implement L0. A tool MUST state each level it implements and its profile
@@ -452,7 +452,7 @@ fully usable if the team decides against it or reverses it.
    GitHub and GitLab (fake-tested); still needed are exact commit SHA ↔
    revision and pull request ↔ Change mappings in the ledger.
 2. Publish out: a native Change becomes a forge branch and pull request on
-   GitHub; GitLab merge requests are not implemented. Native landing, remote publication, request creation and forge
+   GitHub; for attached-worktree candidates also a GitLab merge request (fake-tested only; event publication and status projection stay GitHub-only). Native landing, remote publication, request creation and forge
    acceptance (including squash and rebase) stay distinct outcomes.
 3. Join the hub and the native ledger, so authenticated people approve and
    land, not a local operator.

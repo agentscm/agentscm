@@ -1,6 +1,8 @@
 //! `agentscm hub publish`: send one exported native revision to the hub, which pushes it
-//! to GitHub as a branch and opens a pull request. Forge credentials never reach this
-//! process: it reads the local git-export mirror and talks to the hub with the agent token.
+//! to GitHub as a branch and opens a pull request. Attached-worktree candidates, whose
+//! branch the client has already pushed, get a pull request on GitHub or a merge request on
+//! GitLab. Forge credentials never reach this process: it reads the local git-export mirror
+//! and talks to the hub with the agent token.
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};

@@ -26,6 +26,29 @@ pub(super) struct ObjectDescriptor {
     pub size: u64,
 }
 
+/// Exit facts of a transport command. `finished` is false after a timeout, kill or
+/// budget overflow. Stderr is never retained.
+pub(super) struct PushExit {
+    pub finished: bool,
+    pub code: Option<i32>,
+    pub stdout: Vec<u8>,
+}
+
+fn push_exit(command: &mut Command, budget: u64) -> Result<PushExit> {
+    let output = capture_with_input(
+        command,
+        None,
+        Duration::from_secs(60),
+        budget,
+        &Cancellation::default(),
+    )?;
+    Ok(PushExit {
+        finished: output.stop.is_none(),
+        code: output.code,
+        stdout: output.stdout,
+    })
+}
+
 impl Git {
     pub(super) fn new(executable: &Path, destination: PathBuf) -> Result<Self> {
         if !executable.is_absolute() {
@@ -101,6 +124,12 @@ impl Git {
         Ok((output.code.unwrap_or_default(), output.stdout))
     }
 
+    /// Run a push whose exit status is not trusted. Neither stderr nor an error
+    /// message is returned, because peers can echo credentials.
+    pub(super) fn run_push(&self, args: &[&str], budget: u64) -> Result<PushExit> {
+        push_exit(self.command().args(args), budget)
+    }
+
     fn command(&self) -> Command {
         let mut command = Command::new(&self.executable);
         command
@@ -148,7 +177,7 @@ impl Git {
         config: &[(String, String)],
         environment: &[(String, String)],
         budget: u64,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<PushExit> {
         let mut command = self.command();
         for (key, value) in config {
             command.args(["-c", &format!("{key}={value}")]);
@@ -156,17 +185,7 @@ impl Git {
         command
             .envs(environment.iter().map(|(key, value)| (key, value)))
             .args(args);
-        let output = capture_with_input(
-            &mut command,
-            None,
-            Duration::from_secs(60),
-            budget,
-            &Cancellation::default(),
-        )?;
-        if output.stop.is_some() || output.code != Some(0) {
-            return Err(Error::SourceIndeterminate);
-        }
-        Ok(output.stdout)
+        push_exit(&mut command, budget)
     }
 
     pub(super) fn text(&self, args: &[&str]) -> Result<String> {
