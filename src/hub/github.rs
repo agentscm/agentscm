@@ -67,10 +67,10 @@ impl StatusState {
 /// A commit status checked before any request: 40-hex sha, bounded context and description.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitStatus {
-    sha: String,
-    state: StatusState,
-    context: String,
-    description: String,
+    pub(super) sha: String,
+    pub(super) state: StatusState,
+    pub(super) context: String,
+    pub(super) description: String,
 }
 
 impl CommitStatus {

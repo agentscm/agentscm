@@ -2,16 +2,19 @@
 //! does, with the same results, and rewrites merge requests into the pull
 //! request JSON the sync already reads. The credential is an argument, never
 //! stored here, and never appears in an error.
+use std::collections::HashMap;
+
 use reqwest::Method;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
+use ring::digest::{Context, SHA1_FOR_LEGACY_USE_ONLY};
 use serde_json::{Value, json};
 
 use super::Result;
 use super::forge_http::{self, Full, send_full};
 use super::github::{
-    API_BODY_BYTES, Branch, Gh, GhError, MAX_COMMENT_PAGES, MAX_FILE_PAGES, MAX_PULL_PAGES,
-    MAX_RECENT_BRANCHES, PER_PAGE, Paged, Reply, RepoInfo, endpoint_kind, parse_rfc3339,
-    valid_ref_name,
+    API_BODY_BYTES, Branch, CommitStatus, Gh, GhError, MAX_COMMENT_PAGES, MAX_FILE_PAGES,
+    MAX_PULL_PAGES, MAX_RECENT_BRANCHES, PER_PAGE, Paged, PullHead, Reply, RepoInfo, StatusState,
+    endpoint_kind, parse_rfc3339, valid_ref_name,
 };
 use super::store::{unix_now, validate_repository};
 
@@ -20,6 +23,28 @@ const MIN_BACKOFF_SECONDS: i64 = 60;
 const MAX_BACKOFF_SECONDS: i64 = 24 * 60 * 60;
 /// Pages of branches read before giving up; the 200-branch cap ends the walk sooner.
 const MAX_BRANCH_PAGES: u32 = 10;
+/// Pages of the head commit's root listing (1,000 entries); more is undetermined, never guessed.
+pub const MAX_TREE_PAGES: u32 = 5;
+/// Pages of one commit's statuses of a single name.
+pub const MAX_STATUS_PAGES: u32 = 2;
+
+/// The newest status of one name on a commit, as GitLab reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListedStatus {
+    pub id: i64,
+    /// GitLab's own state: pending, running, success, failed, canceled, skipped, manual.
+    pub state: String,
+    pub description: String,
+}
+
+/// GitLab's spelling of a provider-neutral status state.
+pub fn status_state(state: StatusState) -> &'static str {
+    match state {
+        StatusState::Pending => "pending",
+        StatusState::Success => "success",
+        StatusState::Failure | StatusState::Error => "failed",
+    }
+}
 
 pub struct Api {
     client: reqwest::Client,
@@ -262,6 +287,212 @@ impl Api {
         Ok(Ok(pull_json(&mr)))
     }
 
+    /// Everything a forge check needs from one merge request, as `github::Api::pull_head` does.
+    /// None when the merge request does not exist. A `locked` merge request (being merged) is an
+    /// `Err(Failed)`: its state is undetermined. A closed or merged one carries only the head sha
+    /// and merge commit. The head repository is `source_project_id` (0 when null, a deleted fork).
+    /// The root tree OID is rebuilt from a bounded listing of the top-level tree because GitLab's
+    /// commit API names none; a listing past [`MAX_TREE_PAGES`] or with a malformed entry is an
+    /// error, never a guessed tree. ponytail: head commit parts are not cached (GitHub caches 256).
+    pub async fn pull_head(
+        &self,
+        token: &str,
+        project: i64,
+        iid: i64,
+        base_tips: &mut HashMap<String, String>,
+    ) -> Gh<Option<PullHead>> {
+        let bad = || GhError::Failed("unreadable reply from merge_requests".into());
+        let reply = self
+            .get(token, &format!("/projects/{project}/merge_requests/{iid}"))
+            .await?;
+        if reply.status == 404 {
+            return Ok(None);
+        }
+        let mr = reply.ok("merge_requests")?;
+        if mr["iid"].as_i64() != Some(iid) {
+            return Err(bad());
+        }
+        let (open, merged) = match mr["state"].as_str() {
+            Some("opened") => (true, false),
+            Some("closed") => (false, false),
+            Some("merged") => (false, true),
+            Some("locked") => {
+                return Err(GhError::Failed(
+                    "merge request is locked; its state is undetermined".into(),
+                ));
+            }
+            _ => return Err(bad()),
+        };
+        let head_sha = sha40(&mr["sha"]).ok_or_else(bad)?;
+        if !open {
+            let merge_commit = if merged {
+                [&mr["merge_commit_sha"], &mr["squash_commit_sha"]]
+                    .into_iter()
+                    .find_map(sha40)
+            } else {
+                None
+            };
+            return Ok(Some(PullHead {
+                open,
+                merged,
+                merge_commit,
+                head_sha,
+                head_repo_id: 0,
+                base_repo_id: 0,
+                base_ref: String::new(),
+                base_tip: String::new(),
+                head_tree: String::new(),
+                head_parents: Vec::new(),
+            }));
+        }
+        let head_repo_id = match &mr["source_project_id"] {
+            Value::Null => 0,
+            id => id.as_u64().filter(|id| *id > 0).ok_or_else(bad)?,
+        };
+        let base_repo_id = mr["target_project_id"]
+            .as_u64()
+            .filter(|id| *id > 0)
+            .ok_or_else(bad)?;
+        let base_ref = mr["target_branch"]
+            .as_str()
+            .filter(|name| valid_ref_name(name))
+            .ok_or_else(bad)?
+            .to_owned();
+        mr["source_branch"]
+            .as_str()
+            .filter(|name| valid_ref_name(name))
+            .ok_or_else(bad)?;
+        let base_tip = match base_tips.get(&base_ref) {
+            Some(tip) => tip.clone(),
+            None => {
+                let tip = self
+                    .ref_sha(token, project, &base_ref)
+                    .await?
+                    .ok_or_else(|| GhError::Failed("base branch not found".into()))?;
+                base_tips.insert(base_ref.clone(), tip.clone());
+                tip
+            }
+        };
+        let commit = self
+            .get(
+                token,
+                &format!("/projects/{project}/repository/commits/{head_sha}"),
+            )
+            .await?;
+        if commit.status == 404 {
+            return Err(GhError::Failed("head commit not found".into()));
+        }
+        let commit = commit.ok("commits")?;
+        let head_parents = (sha40(&commit["id"]).as_deref() == Some(head_sha.as_str()))
+            .then(|| commit["parent_ids"].as_array())
+            .flatten()
+            .and_then(|ids| ids.iter().map(sha40).collect::<Option<Vec<_>>>())
+            .ok_or_else(|| GhError::Failed("unreadable reply from commits".into()))?;
+        let path = format!("/projects/{project}/repository/tree?ref={head_sha}");
+        let listing = self.paged(token, &path, MAX_TREE_PAGES).await?;
+        if listing.unread > 0 {
+            return Err(GhError::Failed("head tree listing is too large".into()));
+        }
+        let head_tree = tree_oid(&listing.items)
+            .ok_or_else(|| GhError::Failed("unreadable reply from tree".into()))?;
+        Ok(Some(PullHead {
+            open,
+            merged,
+            merge_commit: None,
+            head_sha,
+            head_repo_id,
+            base_repo_id,
+            base_ref,
+            base_tip,
+            head_tree,
+            head_parents,
+        }))
+    }
+
+    /// Posts a commit status on the commit with `ref_name` (the merge request's source branch).
+    /// `Ok(Err(status))`: 403 or 404 is a definite refusal. 400 is GitLab's "cannot transition"
+    /// (for instance reposting the same state): it does not refuse the desired state, so the
+    /// caller must read [`commit_statuses`](Self::commit_statuses) to resolve it. `Limited` and
+    /// `Auth` mean it was not applied; any other error (5xx, no reply, a reply that is not this
+    /// status in the sent state) is uncertain.
+    pub async fn post_commit_status(
+        &self,
+        token: &str,
+        project: i64,
+        status: &CommitStatus,
+        ref_name: &str,
+    ) -> Gh<std::result::Result<(), u16>> {
+        if !valid_ref_name(ref_name) {
+            return Err(GhError::Failed("bad branch name".into()));
+        }
+        let url = format!("{}/projects/{project}/statuses/{}", self.base, status.sha);
+        let state = status_state(status.state);
+        let body = json!({"state": state, "name": status.context,
+            "description": status.description, "ref": ref_name});
+        let reply = self.call(token, Method::POST, &url, Some(body)).await?;
+        if matches!(reply.status, 400 | 403 | 404) {
+            return Ok(Err(reply.status));
+        }
+        if !matches!(reply.status, 200 | 201)
+            || reply.body["status"] != state
+            || reply.body["name"] != status.context.as_str()
+        {
+            return Err(GhError::Failed(format!("{} from statuses", reply.status)));
+        }
+        Ok(Ok(()))
+    }
+
+    /// The newest (highest id) status named `name` on the commit for `ref_name`, from at most
+    /// [`MAX_STATUS_PAGES`] pages; None when there is none. Past the cap, or with an item that
+    /// cannot be read, it is an error: the answer would be a guess.
+    pub async fn commit_statuses(
+        &self,
+        token: &str,
+        project: i64,
+        sha: &str,
+        name: &str,
+        ref_name: &str,
+    ) -> Gh<Option<ListedStatus>> {
+        if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(GhError::Failed("bad commit sha".into()));
+        }
+        if !valid_ref_name(ref_name) {
+            return Err(GhError::Failed("bad branch name".into()));
+        }
+        let path = format!(
+            "/projects/{project}/repository/commits/{}/statuses?name={}&ref={}",
+            sha.to_ascii_lowercase(),
+            encode(name),
+            encode(ref_name)
+        );
+        let paged = self.paged(token, &path, MAX_STATUS_PAGES).await?;
+        if paged.unread > 0 {
+            return Err(GhError::Failed("too many statuses to read".into()));
+        }
+        let mut newest: Option<ListedStatus> = None;
+        for item in &paged.items {
+            let (Some(id), Some(state), Some(item_name)) = (
+                item["id"].as_i64(),
+                item["status"].as_str(),
+                item["name"].as_str(),
+            ) else {
+                return Err(GhError::Failed("unreadable reply from statuses".into()));
+            };
+            // The server filtered by name and ref; a reply for another name is not an answer.
+            if item_name != name || item["ref"].as_str().is_some_and(|r| r != ref_name) {
+                continue;
+            }
+            if newest.as_ref().is_none_or(|n| id > n.id) {
+                newest = Some(ListedStatus {
+                    id,
+                    state: state.to_owned(),
+                    description: item["description"].as_str().unwrap_or_default().to_owned(),
+                });
+            }
+        }
+        Ok(newest)
+    }
+
     /// Branches whose tip commit is at or after `since` (unix seconds), newest first, at most
     /// [`MAX_RECENT_BRANCHES`]; true when that cap cut the list short.
     pub async fn recent_branches(
@@ -403,6 +634,62 @@ fn pull_json(mr: &Value) -> Value {
         "base": {"ref": mr["target_branch"]},
         "user": {"login": mr["author"]["username"], "id": mr["author"]["id"]},
         "html_url": mr["web_url"]})
+}
+
+/// A lowercase 40-hex object id, or None.
+fn sha40(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .filter(|sha| sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase)
+}
+
+/// The Git tree OID of a top-level listing (`id`, `name`, `type`, `mode` per entry). None for
+/// anything Git could not hold: a bad id, name, mode or type, a mode that disagrees with the type,
+/// or a duplicate name.
+fn tree_oid(items: &[Value]) -> Option<String> {
+    let mut entries = Vec::new();
+    for item in items {
+        let (name, kind) = (item["name"].as_str()?, item["type"].as_str()?);
+        let mode = match (kind, item["mode"].as_str()?) {
+            ("tree", "040000" | "40000") => "40000",
+            ("blob", mode @ ("100644" | "100755" | "120000")) => mode,
+            ("commit", "160000") => "160000",
+            _ => return None,
+        };
+        if name.is_empty() || name.contains(['/', '\0']) || matches!(name, "." | "..") {
+            return None;
+        }
+        let id = sha40(&item["id"])?;
+        // Git sorts a directory as if its name ended in '/'.
+        let key = if kind == "tree" {
+            format!("{name}/")
+        } else {
+            name.to_owned()
+        };
+        entries.push((key, mode, name, id));
+    }
+    entries.sort();
+    if entries.windows(2).any(|pair| pair[0].2 == pair[1].2) {
+        return None;
+    }
+    let mut body = Vec::new();
+    for (_, mode, name, id) in &entries {
+        body.extend_from_slice(format!("{mode} {name}\0").as_bytes());
+        for pair in id.as_bytes().chunks(2) {
+            body.push(u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?);
+        }
+    }
+    let mut hash = Context::new(&SHA1_FOR_LEGACY_USE_ONLY);
+    hash.update(format!("tree {}\0", body.len()).as_bytes());
+    hash.update(&body);
+    Some(
+        hash.finish()
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    )
 }
 
 /// Whether the merge request is from the project into itself.

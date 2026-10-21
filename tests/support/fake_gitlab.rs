@@ -141,6 +141,23 @@ impl Mr {
     }
 }
 
+/// One top-level tree entry as GitLab lists it.
+#[derive(Clone, Debug)]
+pub struct TreeEntry {
+    pub id: String,
+    pub name: String,
+    /// blob | tree | commit
+    pub kind: String,
+    /// Six digits, e.g. 100644 or 040000.
+    pub mode: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct FakeCommit {
+    pub parent_ids: Vec<String>,
+    pub tree: Vec<TreeEntry>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Project {
     pub id: i64,
@@ -152,7 +169,10 @@ pub struct Project {
     /// MR iid to notes.
     pub notes: BTreeMap<i64, Vec<Note>>,
     /// (sha, {state, name, description}) in creation order.
+    /// Status values also hold `ref` and `id` when posted with a ref.
     pub statuses: Vec<(String, Value)>,
+    /// Commits readable without a bare repository: sha to parents and top-level tree entries.
+    pub commits: BTreeMap<String, FakeCommit>,
     pub default_branch: Option<String>,
     /// A bare Git repository behind the branch reads and MR creation, if any.
     pub git: Option<std::path::PathBuf>,
@@ -168,6 +188,7 @@ impl Project {
             branches: Vec::new(),
             notes: BTreeMap::new(),
             statuses: Vec::new(),
+            commits: BTreeMap::new(),
             default_branch: Some("main".into()),
             git: None,
         }
@@ -193,6 +214,12 @@ pub struct FakeState {
     pub malformed_next_mr_list: bool,
     /// Answer every MR list with items that carry no project ids, until cleared.
     pub omit_mr_list_project_ids: bool,
+    /// Store the next status, then answer 502 with no body.
+    pub lose_next_status_reply: bool,
+    /// Answer the next status POST with 403 and store nothing.
+    pub refuse_next_status: bool,
+    /// Answer the next status POST with 429 and `retry-after: 120`, storing nothing.
+    pub limit_next_status: bool,
     pub requests: Vec<Request>,
 }
 
@@ -716,12 +743,114 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
             }
         }
         (&Method::POST, ["statuses", sha]) => {
+            if std::mem::take(&mut state.refuse_next_status) {
+                return json_reply(403, json!({"message": "403 Forbidden"}));
+            }
+            if std::mem::take(&mut state.limit_next_status) {
+                return reply(429, &[("retry-after".into(), "120".into())], None);
+            }
             let b = json_body();
-            let status =
-                json!({"state": b["state"], "name": b["name"], "description": b["description"]});
-            project.statuses.push((sha.to_string(), status.clone()));
-            json_reply(201, status)
+            let (name, wanted) = (b["name"].clone(), b["state"].clone());
+            let ref_name = b["ref"].clone();
+            // GitLab refuses to move a status to the state it already has. Only a status posted
+            // with a ref is checked; the coordination status carries none.
+            if !ref_name.is_null()
+                && project.statuses.iter().rev().any(|(s, v)| {
+                    s == sha && v["name"] == name && v["ref"] == ref_name && v["state"] == wanted
+                })
+            {
+                return json_reply(
+                    400,
+                    json!({"message": format!("Cannot transition status via :run from :{}", wanted.as_str().unwrap_or_default())}),
+                );
+            }
+            let n = project.statuses.len() as i64 + 1;
+            let mut status =
+                json!({"state": wanted, "name": name, "description": b["description"]});
+            if !ref_name.is_null() {
+                status["id"] = json!(n);
+                status["ref"] = ref_name.clone();
+            }
+            project.statuses.push((sha.to_string(), status));
+            if std::mem::take(&mut state.lose_next_status_reply) {
+                return reply(502, &[], None);
+            }
+            json_reply(
+                201,
+                json!({"id": n, "sha": sha, "status": wanted, "name": name,
+                    "ref": ref_name, "description": b["description"]}),
+            )
+        }
+        (&Method::GET, ["repository", "commits", sha, "statuses"]) => {
+            let q = |name: &str| {
+                query
+                    .iter()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| v.as_str())
+            };
+            let items = project
+                .statuses
+                .iter()
+                .filter(|(s, v)| {
+                    s == sha
+                        && q("name").is_none_or(|n| v["name"] == n)
+                        && q("ref").is_none_or(|r| v["ref"] == r)
+                })
+                .map(|(s, v)| {
+                    json!({"id": v["id"], "sha": s, "status": v["state"], "name": v["name"],
+                        "ref": v["ref"], "description": v["description"]})
+                })
+                .collect();
+            let (page, link) = paginate(ctx, uri, &query, items);
+            reply(200, &link, Some(Value::Array(page)))
+        }
+        (&Method::GET, ["repository", "commits", sha]) => match commit_of(project, sha) {
+            Some((parents, _)) => json_reply(200, json!({"id": sha, "parent_ids": parents})),
+            None => not_found(),
+        },
+        (&Method::GET, ["repository", "tree"]) => {
+            let sha = query
+                .iter()
+                .find(|(k, _)| k == "ref")
+                .map(|(_, v)| v.as_str())
+                .unwrap_or_default();
+            match commit_of(project, sha) {
+                Some((_, tree)) => {
+                    let (page, link) = paginate(ctx, uri, &query, tree);
+                    reply(200, &link, Some(Value::Array(page)))
+                }
+                None => not_found(),
+            }
         }
         _ => not_found(),
     }
+}
+
+/// Parents and top-level tree entries (JSON, in GitLab's trees-first order) of a commit, from the
+/// configured commits or else the project's bare repository.
+fn commit_of(project: &Project, sha: &str) -> Option<(Vec<String>, Vec<Value>)> {
+    let entry = |e: &TreeEntry| json!({"id": e.id, "name": e.name, "type": e.kind, "mode": e.mode});
+    if let Some(c) = project.commits.get(sha) {
+        return Some((c.parent_ids.clone(), c.tree.iter().map(entry).collect()));
+    }
+    let dir = project.git.as_ref()?;
+    let line = git_text(dir, &["rev-list", "--parents", "-n1", sha])?;
+    let parents = line.split(' ').skip(1).map(str::to_owned).collect();
+    let listing = git_text(dir, &["ls-tree", "-z", sha])?;
+    let tree = listing
+        .split('\0')
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| {
+            let (meta, name) = l.split_once('\t')?;
+            let mut f = meta.split(' ');
+            let (mode, kind, id) = (f.next()?, f.next()?, f.next()?);
+            Some(entry(&TreeEntry {
+                id: id.into(),
+                name: name.into(),
+                kind: kind.into(),
+                mode: mode.into(),
+            }))
+        })
+        .collect();
+    Some((parents, tree))
 }

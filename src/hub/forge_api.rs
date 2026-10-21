@@ -1,10 +1,12 @@
 //! The one client the sync talks through: GitHub or GitLab by the connection's
 //! provider. Calls take the connected repository; GitLab is called by its
 //! numeric project id so a rename never points at another project.
+use std::collections::HashMap;
+
 use serde_json::Value;
 
 use super::connection::ConnectedRepository as Repo;
-use super::github::{self, Branch, Gh, Paged, RepoInfo};
+use super::github::{self, Branch, CommitStatus, Gh, GhError, Paged, PullHead, RepoInfo};
 use super::gitlab;
 
 #[derive(Clone, Copy)]
@@ -208,6 +210,64 @@ impl ForgeApi<'_> {
             }
             Self::Gitlab(api) => {
                 api.create_candidate_pull(token, repo.repository_id, title, body, head, base)
+                    .await
+            }
+        }
+    }
+
+    /// The live facts a forge check evaluates for one pull or merge request. GitLab reports a
+    /// `locked` merge request as an error (state undetermined). `base_tips` caches base tips.
+    pub async fn pull_head(
+        &self,
+        token: &str,
+        repo: &Repo,
+        number: i64,
+        base_tips: &mut HashMap<String, String>,
+    ) -> Gh<Option<PullHead>> {
+        match self {
+            Self::Github(api) => {
+                api.pull_head(token, &repo.full_name, number, base_tips)
+                    .await
+            }
+            Self::Gitlab(api) => {
+                api.pull_head(token, repo.repository_id, number, base_tips)
+                    .await
+            }
+        }
+    }
+
+    /// Posts a commit status; `ref_name` (the source branch) is used by GitLab only.
+    /// `Ok(Err(status))` is a refusal. On GitLab a 400 means "cannot transition", which is not a
+    /// refusal of the desired state: the caller must read [`commit_statuses`](Self::commit_statuses).
+    pub async fn post_commit_status(
+        &self,
+        token: &str,
+        repo: &Repo,
+        status: &CommitStatus,
+        ref_name: &str,
+    ) -> Gh<std::result::Result<(), u16>> {
+        match self {
+            Self::Github(api) => api.post_commit_status(token, &repo.full_name, status).await,
+            Self::Gitlab(api) => {
+                api.post_commit_status(token, repo.repository_id, status, ref_name)
+                    .await
+            }
+        }
+    }
+
+    /// The latest status of that name on the commit (GitLab only; GitHub is an error).
+    pub async fn commit_statuses(
+        &self,
+        token: &str,
+        repo: &Repo,
+        sha: &str,
+        name: &str,
+        ref_name: &str,
+    ) -> Gh<Option<gitlab::ListedStatus>> {
+        match self {
+            Self::Github(_) => Err(GhError::Failed("status listing is unsupported".into())),
+            Self::Gitlab(api) => {
+                api.commit_statuses(token, repo.repository_id, sha, name, ref_name)
                     .await
             }
         }
