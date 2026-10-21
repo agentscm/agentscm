@@ -318,6 +318,13 @@ pub trait Store: Send + Sync {
         description: &str,
     ) -> Result<()>;
     fn forge_check(&self, repo: &str, number: i64, context: &str) -> Result<Option<ForgeCheck>>;
+    /// Rows of `repo` that may show a success (state `success` or an uncertain post) as
+    /// `(number, context, row)`, by number then context, at most `limit`.
+    fn forge_checks_showing_success(
+        &self,
+        repo: &str,
+        limit: usize,
+    ) -> Result<Vec<(i64, String, ForgeCheck)>>;
     /// Compare-and-set on `expected` (`None` for an absent row): records the desired post as
     /// `attempting` and returns the new generation, or `Conflict` when another writer won.
     fn reserve_forge_check(
@@ -349,7 +356,7 @@ pub trait Store: Send + Sync {
     fn publication(&self, repository: &str, id: &str) -> Result<Option<Publication>>;
     /// The newest publication of each pull request number above `after` in `repository`
     /// (matched case-insensitively), omitting pull requests whose newest publication is merged,
-    /// by number, at most `limit`.
+    /// by number, at most `limit`. "Newest" is by `created_at`, then `id`, descending.
     fn pull_publications(
         &self,
         repository: &str,

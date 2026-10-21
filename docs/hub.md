@@ -826,14 +826,22 @@ candidate's baseline. States:
 - `success`: all of the above hold. The Hub then reads the pull request again; if that
   confirming read fails, the posted success stays and the next pass rechecks it.
 
-A `success` is never left on a commit the Hub cannot vouch for. When the head changes, or
-the pull request is closed, the Hub posts a `failure` on the old head first
-(`superseded: ...` or `not applicable: pull request closed`) and moves on only once that
-post is accepted or definitely refused. A post whose reply is lost is journalled as
+A `success` is posted only when the Hub verified exact current qualification, and the Hub
+tries to retire it when it stops holding. When the head changes, the pull request is
+closed, or the context is no longer published (the profile's flag is turned off, the
+profile is removed or its target changes), the Hub posts a `failure` on the old head first
+(`superseded: ...`, `not applicable: pull request closed` or `not applicable: forge check
+disabled`) and moves on once that post is accepted or definitely refused. A retire that
+GitHub definitely refuses (for example a collected or forbidden old commit) therefore
+cannot block the new head, and can leave a `success` on a commit that is no longer the
+head. A post whose reply is lost is journalled as
 `attempting` (reported as `uncertain`), and the next pass posts the current status
 again, for an old head too. A definite refusal (403, 404 or 422) is journalled as
 `refused` and reported as `posting: "refused"`; the same status is not posted again
-until the desired head, state or description changes. A refusal is never treated as
+until the desired head, state or description changes. The exception is a refusal of a
+status that replaces a row that may show a `success` (a downgrade on the same head): the
+row stays `attempting` and the next pass tries again, since GitHub still shows the
+success. A refusal is never treated as
 success. Missing pull requests get no status. The journal is `hub_forge_checks`
 (migration 16).
 
@@ -843,10 +851,18 @@ connection is in backoff. A `pull_request` webhook reconciles only that pull req
 `push` webhook and each poll reconcile the repository. A pass examines the newest
 publication of up to 50 pull requests and continues after the last one on the next pass,
 wrapping at the end, so a busy repository is covered over several passes. Merged
-pull requests are skipped; closed ones are read again only to retire an earlier success.
+pull requests are skipped; closed ones are read again only to retire an earlier success,
+using only the pull request itself (a deleted base branch or gone head does not block it).
+After a push to a base branch with more than one window of pull requests, every status is
+rechecked only after up to ceil(N/50) passes. A poll or push also retires successes on contexts
+that are no longer published (at most 50 rows per pass).
 The reconciler holds an in-process repository lock and assumes a single Hub process
 for a repository; with several, posts can interleave (the journal compare-and-set only
 limits the damage).
+
+Known limit: publications and profiles match a repository by name across hosts. A `success`
+still needs the exact commit and tree, but an unrelated repository of the same name on
+another host can receive `failure` or `pending` statuses.
 
 The candidate baseline and parent commits are fields the publisher attested in the
 manifest. The Hub verifies the head tree against the native revision and that the live

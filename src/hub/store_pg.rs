@@ -4216,6 +4216,42 @@ impl Store for PgStore {
         })
     }
 
+    fn forge_checks_showing_success(
+        &self,
+        repo: &str,
+        limit: usize,
+    ) -> Result<Vec<(i64, String, ForgeCheck)>> {
+        self.run(true, |client| {
+            let limit = limit as i64;
+            Ok(client
+                .query(
+                    "SELECT number, context, head_sha, state, binding_digest, description, phase,
+                            generation, updated_at
+                     FROM hub_forge_checks
+                     WHERE repository = $1 AND (state = 'success' OR phase = 'attempting')
+                     ORDER BY number, context LIMIT $2",
+                    &[&repo, &limit],
+                )?
+                .iter()
+                .map(|row| {
+                    (
+                        row.get(0),
+                        row.get(1),
+                        ForgeCheck {
+                            head_sha: row.get(2),
+                            state: row.get(3),
+                            binding_digest: row.get(4),
+                            description: row.get(5),
+                            phase: row.get(6),
+                            generation: row.get(7),
+                            updated_at: row.get(8),
+                        },
+                    )
+                })
+                .collect())
+        })
+    }
+
     fn reserve_forge_check(
         &self,
         repo: &str,
@@ -4402,7 +4438,7 @@ impl Store for PgStore {
                          AND p.merge_commit IS NULL
                          AND p.id = (SELECT q.id FROM hub_publications q
                              WHERE lower(q.repository) = lower($1) AND q.pr_number = p.pr_number
-                             ORDER BY q.created_at DESC, q.id LIMIT 1)
+                             ORDER BY q.created_at DESC, q.id DESC LIMIT 1)
                          ORDER BY p.pr_number LIMIT $3"
                     ),
                     &[&repository, &after, &limit],

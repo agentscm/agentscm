@@ -11,3 +11,4 @@ CREATE TABLE hub_forge_checks (
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (repository, number, context)
 );
+CREATE INDEX hub_publications_pull ON hub_publications (lower(repository), pr_number, created_at);

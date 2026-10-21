@@ -693,6 +693,19 @@ impl Api {
             Some("closed") => false,
             _ => return Err(bad()),
         };
+        if !open {
+            // Only the head matters to retire a success; the base and head commit may be gone.
+            return Ok(Some(PullHead {
+                open,
+                head_sha: sha_of(&pull["head"])?,
+                head_repo_id: 0,
+                base_repo_id: 0,
+                base_ref: String::new(),
+                base_tip: String::new(),
+                head_tree: String::new(),
+                head_parents: Vec::new(),
+            }));
+        }
         let repo_id = |repo: Option<&Value>| match repo {
             Some(Value::Null) => Ok(0),
             Some(repo) => repo["id"].as_u64().filter(|id| *id > 0).ok_or_else(bad),

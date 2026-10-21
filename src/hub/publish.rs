@@ -971,7 +971,11 @@ async fn forge_check_view(
     if !enabled {
         return Ok(Some(view));
     }
-    let context = super::forge_check::status_context(target)?;
+    // An unusable target has no status to report; the publication itself still shows.
+    let Ok(context) = super::forge_check::status_context(target) else {
+        view["enabled"] = json!(true);
+        return Ok(Some(view));
+    };
     let (store, id, ctx) = (state.store.clone(), repo.id.clone(), context.clone());
     let row = blocking(state, move || store.forge_check(&id, number, &ctx)).await?;
     view["enabled"] = json!(true);

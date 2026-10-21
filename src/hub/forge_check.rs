@@ -258,6 +258,7 @@ pub fn status_context(target: &str) -> Result<String> {
 const MAX_PULLS_PER_PASS: usize = 50;
 const SUPERSEDED: &str = "superseded: pull request head changed";
 const CLOSED: &str = "not applicable: pull request closed";
+const DISABLED: &str = "not applicable: forge check disabled";
 
 /// How one status post ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -266,7 +267,7 @@ enum Posting {
     Posted,
     /// The forge accepted it but the journal write lost a race; read again.
     Unrecorded,
-    /// The forge definitely refused it; recorded as `refused`.
+    /// The forge definitely refused it; recorded as `refused`, unless a success may remain.
     Refused,
     /// Not applied, uncertain, or not reserved: the row is left for the next pass.
     Unknown,
@@ -281,6 +282,9 @@ fn may_show_success(row: &ForgeCheck) -> bool {
 struct Desired {
     new: NewForgeCheck,
     state: StatusState,
+    /// A refusal settles the row even when the row it replaces may show a success. Only a
+    /// retire sets this: it moves on rather than retry, so a forbidden commit cannot wedge it.
+    final_on_refusal: bool,
 }
 
 /// Re-reads every candidate pull request of `repo` from the forge and the pinned native store
@@ -296,19 +300,19 @@ pub(super) async fn reconcile_repo(
     only: Option<i64>,
 ) -> Gh<()> {
     // Statuses are a GitHub feature; another forge's token never goes to the GitHub client.
-    let Some(service) = state
-        .workspace_execution
-        .as_ref()
-        .filter(|_| conn.provider == "github")
-    else {
+    if conn.provider != "github" {
         return Ok(());
-    };
-    let profiles: Vec<AgentTaskProfile> = service
-        .agent_task_profiles
-        .values()
+    }
+    let profiles: Vec<AgentTaskProfile> = state
+        .workspace_execution
+        .iter()
+        .flat_map(|service| service.agent_task_profiles.values())
         .filter(|p| p.publish_forge_status && p.repository_id.eq_ignore_ascii_case(&repo.full_name))
         .cloned()
         .collect();
+    if only.is_none() {
+        retire_disabled(state, repo, token, &profiles).await?;
+    }
     if profiles.is_empty() {
         return Ok(());
     }
@@ -364,6 +368,32 @@ pub(super) async fn reconcile_repo(
         state
             .sync
             .set_forge_cursor(&repo.id, if full { last } else { 0 });
+    }
+    Ok(())
+}
+
+/// Retires a success (or uncertain post) on a context no enabled profile of `repo` publishes
+/// any more: the flag was turned off, the profile removed or its target changed. At most
+/// `MAX_PULLS_PER_PASS` rows per pass; a retired row no longer qualifies, so none repeats.
+async fn retire_disabled(
+    state: &HubState,
+    repo: &ConnectedRepository,
+    token: &str,
+    profiles: &[AgentTaskProfile],
+) -> Gh<()> {
+    let enabled: Vec<String> = profiles
+        .iter()
+        .filter_map(|p| status_context(&p.target).ok())
+        .collect();
+    let (store, id) = (state.store.clone(), repo.id.clone());
+    let rows = blocking(state, move || {
+        store.forge_checks_showing_success(&id, MAX_PULLS_PER_PASS)
+    })
+    .await?;
+    for (number, context, row) in rows {
+        if !enabled.contains(&context) {
+            retire(state, repo, token, number, &context, &row, DISABLED).await?;
+        }
     }
     Ok(())
 }
@@ -457,6 +487,7 @@ async fn retire(
             description: description.into(),
         },
         state: StatusState::Failure,
+        final_on_refusal: true,
     };
     let posting = post(state, repo, token, number, context, Some(old), &stale).await?;
     Ok(matches!(posting, Posting::Posted | Posting::Refused))
@@ -512,6 +543,7 @@ fn desired(
             description,
         },
         state,
+        final_on_refusal: false,
     }
 }
 
@@ -575,6 +607,11 @@ async fn post(
             return Ok(Posting::Unknown);
         }
     };
+    // Replacing a row that may show a success: a refusal means the success is still there, so
+    // the row stays `attempting` and the next pass tries again.
+    if phase == "refused" && !desired.final_on_refusal && row.is_some_and(may_show_success) {
+        return Ok(Posting::Refused);
+    }
     let (store, id, ctx) = (state.store.clone(), repo.id.clone(), context.to_owned());
     let recorded = blocking(state, move || {
         store.complete_forge_check(&id, number, &ctx, generation, phase, unix_now())

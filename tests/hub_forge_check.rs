@@ -53,6 +53,9 @@ struct Env {
     token: String,
     token_id: String,
     publication: String,
+    workspace: Arc<Workspace>,
+    profile: AgentTaskProfile,
+    dir: PathBuf,
 }
 
 /// The tree Git builds for the native revision's two files.
@@ -215,23 +218,24 @@ impl Env {
             )
             .unwrap(),
         );
+        let profile = AgentTaskProfile {
+            repository_id: REPO.into(),
+            profile_id: "checks".into(),
+            native_repository: repository.clone(),
+            data_dir: data.clone(),
+            target: "main".into(),
+            requirement_digest,
+            publish_forge_status: publish,
+        };
         let service = ExecutionService::open(
             &dir.join("execution.sqlite"),
             ExecutionConfig {
                 version: 1,
                 source_profiles: vec![],
-                agent_task_profiles: vec![AgentTaskProfile {
-                    repository_id: REPO.into(),
-                    profile_id: "checks".into(),
-                    native_repository: repository.clone(),
-                    data_dir: data.clone(),
-                    target: "main".into(),
-                    requirement_digest,
-                    publish_forge_status: publish,
-                }],
+                agent_task_profiles: vec![profile.clone()],
                 profiles: vec![],
             },
-            workspace,
+            workspace.clone(),
         )
         .unwrap();
         let state = HubState::new(
@@ -307,7 +311,30 @@ impl Env {
             token,
             token_id,
             publication,
+            workspace,
+            profile,
+            dir,
         }
+    }
+
+    /// Replaces the profile with `edit` applied, as an operator reconfiguring the Hub.
+    fn reconfigure(&mut self, edit: impl FnOnce(&mut AgentTaskProfile)) {
+        edit(&mut self.profile);
+        let service = ExecutionService::open(
+            &self.dir.join("execution-2.sqlite"),
+            ExecutionConfig {
+                version: 1,
+                source_profiles: vec![],
+                agent_task_profiles: vec![self.profile.clone()],
+                profiles: vec![],
+            },
+            self.workspace.clone(),
+        )
+        .unwrap();
+        self.state = self
+            .state
+            .clone()
+            .with_workspace_execution(Arc::new(service));
     }
 
     /// A second publication, for pull request `number` on its own branch and head commit.
@@ -743,4 +770,84 @@ async fn a_late_pull_request_is_reached_when_older_ones_fill_the_window() {
         posted.iter().any(|p| p.0 == late && p.1 == "success"),
         "{posted:?}"
     );
+}
+
+#[tokio::test]
+async fn a_refused_downgrade_on_the_same_head_is_retried() {
+    let env = Env::start(true).await;
+    env.qualify();
+    env.poll().await;
+    assert_eq!(env.statuses()[0].1, "success");
+    Authority::open(&env.data)
+        .unwrap()
+        .advance_policy(env.subject.policy_epoch)
+        .unwrap();
+    env.fake.with(|s| {
+        s.fail.push_back(Failure {
+            path_contains: "/statuses/".into(),
+            status: 403,
+            headers: vec![],
+        });
+    });
+    env.poll().await;
+    assert!(
+        env.fake.with(|s| s.fail.is_empty()),
+        "the refusal was not hit"
+    );
+    // GitHub still shows the success, so the journal must not call the row settled.
+    assert_eq!(env.statuses()[0].1, "success");
+    assert_eq!(env.row().unwrap().phase, "attempting");
+    env.poll().await;
+    let posted = env.statuses();
+    assert_eq!(posted.len(), 2, "{posted:?}");
+    assert_eq!(
+        (posted[1].0.as_str(), posted[1].1.as_str()),
+        (COMMIT, "failure")
+    );
+    assert_eq!(env.row().unwrap().phase, "posted");
+    env.poll().await;
+    assert_eq!(env.status_posts(), 3);
+}
+
+#[tokio::test]
+async fn a_refusal_on_a_row_that_never_showed_success_is_not_retried() {
+    let env = Env::start(true).await;
+    env.poll().await;
+    assert_eq!(env.statuses()[0].1, "pending");
+    env.qualify();
+    Authority::open(&env.data)
+        .unwrap()
+        .advance_policy(env.subject.policy_epoch)
+        .unwrap();
+    env.fake.with(|s| {
+        s.fail.push_back(Failure {
+            path_contains: "/statuses/".into(),
+            status: 422,
+            headers: vec![],
+        });
+    });
+    env.poll().await;
+    assert_eq!(env.row().unwrap().phase, "refused");
+    let posts = env.status_posts();
+    env.poll().await;
+    assert_eq!(env.status_posts(), posts);
+}
+
+#[tokio::test]
+async fn disabling_the_profile_retires_its_success_once() {
+    let mut env = Env::start(true).await;
+    env.qualify();
+    env.poll().await;
+    assert_eq!(env.statuses()[0].1, "success");
+    env.reconfigure(|p| p.publish_forge_status = false);
+    env.poll().await;
+    let posted = env.statuses();
+    assert_eq!(posted.len(), 2, "{posted:?}");
+    assert_eq!(
+        (posted[1].0.as_str(), posted[1].1.as_str()),
+        (COMMIT, "failure")
+    );
+    assert!(posted[1].2.contains("forge check disabled"));
+    env.poll().await;
+    assert_eq!(env.status_posts(), 2);
 }

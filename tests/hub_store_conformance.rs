@@ -1273,6 +1273,46 @@ fn forge_check_journal(db: &Db) {
         None
     );
 
+    // Rows that may show a success are listed by number then context, bounded.
+    let dev = "agentscm/workflow/dev";
+    for (number, context, state) in [
+        (3, ctx, "pending"),
+        (3, dev, "failure"),
+        (9, ctx, "failure"),
+    ] {
+        store
+            .reserve_forge_check(&repo.id, number, context, None, &check(state, 'a'), 20)
+            .unwrap();
+        if context == dev || number == 9 {
+            store
+                .complete_forge_check(&repo.id, number, context, 1, "posted", 21)
+                .unwrap();
+        }
+    }
+    let listed = store.forge_checks_showing_success(&repo.id, 10).unwrap();
+    // 3/main is uncertain, 5/main says success; 3/dev and 9/main are settled failures.
+    assert_eq!(
+        listed
+            .iter()
+            .map(|(n, c, _)| (*n, c.as_str()))
+            .collect::<Vec<_>>(),
+        [(3, ctx), (5, ctx)]
+    );
+    assert_eq!(listed[1].2.state, "success");
+    assert_eq!(
+        store
+            .forge_checks_showing_success(&repo.id, 1)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        store
+            .forge_checks_showing_success("other", 10)
+            .unwrap()
+            .is_empty()
+    );
+
     // Validation happens on write.
     let bad = |new: NewForgeCheck| {
         store
