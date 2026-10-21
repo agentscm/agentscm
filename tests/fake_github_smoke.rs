@@ -9,6 +9,7 @@ use fake_github::{Branch, FakeGithub, Pull, Repo, private_pem};
 use ring::rand::SystemRandom;
 use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 
 fn jwt(iss: Value, iat: i64, exp: i64, tamper: bool) -> String {
     let pem: String = private_pem()
@@ -338,7 +339,7 @@ async fn pull_head_reads_ids_live_base_tip_tree_and_parents() {
     });
     let api = api(&fake);
     let read = api
-        .pull_head("pat", "Acme/Widgets", 1)
+        .pull_head("pat", "Acme/Widgets", 1, &mut HashMap::new())
         .await
         .unwrap()
         .unwrap();
@@ -360,10 +361,21 @@ async fn pull_head_reads_ids_live_base_tip_tree_and_parents() {
         ("main", tip.as_str(), tree.as_str())
     );
     assert_eq!(read.head_parents, vec![parent.clone()]);
+    assert!(!read.merged);
+
+    // A base tip already read in the pass is reused, even if the ref has since moved.
+    let mut tips = HashMap::from([("main".to_owned(), sha('9'))]);
+    let reused = api
+        .pull_head("pat", "Acme/Widgets", 1, &mut tips)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reused.base_tip, sha('9'));
 
     // The fork's head commit is unseeded: that is an error, not a default.
     assert!(matches!(
-        api.pull_head("pat", "Acme/Widgets", 2).await,
+        api.pull_head("pat", "Acme/Widgets", 2, &mut HashMap::new())
+            .await,
         Err(GhError::Failed(_))
     ));
     let fork_head = fake.with(|s| s.repos[&1].pulls[&2].head_sha.clone());
@@ -375,7 +387,7 @@ async fn pull_head_reads_ids_live_base_tip_tree_and_parents() {
             .insert(fork_head, (tree.clone(), vec![]));
     });
     let fork = api
-        .pull_head("pat", "Acme/Widgets", 2)
+        .pull_head("pat", "Acme/Widgets", 2, &mut HashMap::new())
         .await
         .unwrap()
         .unwrap();
@@ -393,7 +405,7 @@ async fn pull_head_reads_ids_live_base_tip_tree_and_parents() {
             .head_repo = Some(None)
     });
     let gone = api
-        .pull_head("pat", "Acme/Widgets", 2)
+        .pull_head("pat", "Acme/Widgets", 2, &mut HashMap::new())
         .await
         .unwrap()
         .unwrap();
@@ -401,14 +413,15 @@ async fn pull_head_reads_ids_live_base_tip_tree_and_parents() {
 
     // A pull that is not there, and a pull without repository objects.
     assert!(
-        api.pull_head("pat", "Acme/Widgets", 9)
+        api.pull_head("pat", "Acme/Widgets", 9, &mut HashMap::new())
             .await
             .unwrap()
             .is_none()
     );
     fake.with(|s| s.omit_pull_repos = true);
     assert!(matches!(
-        api.pull_head("pat", "Acme/Widgets", 1).await,
+        api.pull_head("pat", "Acme/Widgets", 1, &mut HashMap::new())
+            .await,
         Err(GhError::Failed(_))
     ));
     // A moved live base is read, not the pull's recorded base.
@@ -417,9 +430,22 @@ async fn pull_head_reads_ids_live_base_tip_tree_and_parents() {
         s.repos.get_mut(&1).unwrap().branches[0].sha = sha('5');
     });
     let moved = api
-        .pull_head("pat", "Acme/Widgets", 1)
+        .pull_head("pat", "Acme/Widgets", 1, &mut HashMap::new())
         .await
         .unwrap()
         .unwrap();
     assert_eq!(moved.base_tip, sha('5'));
+
+    // A merged pull request says so.
+    fake.with(|s| {
+        let pull = s.repos.get_mut(&1).unwrap().pulls.get_mut(&1).unwrap();
+        pull.state = "closed".into();
+        pull.merged = true;
+    });
+    let merged = api
+        .pull_head("pat", "Acme/Widgets", 1, &mut HashMap::new())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!((!merged.open, merged.merged) == (true, true));
 }

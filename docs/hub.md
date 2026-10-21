@@ -834,7 +834,10 @@ profile is removed or its target changes), the Hub posts a `failure` on the old 
 disabled`) and moves on once that post is accepted or definitely refused. A retire that
 GitHub definitely refuses (for example a collected or forbidden old commit) therefore
 cannot block the new head, and can leave a `success` on a commit that is no longer the
-head. A post whose reply is lost is journalled as
+head. A merged pull request (the forge says `merged`, or the Hub recorded the merge) is left
+alone: no retire is posted onto its head. If a pull request's newest publication is no
+longer a candidate for a target, the earlier context row is not superseded and stays on a
+non-head commit. A post whose reply is lost is journalled as
 `attempting` (reported as `uncertain`), and the next pass posts the current status
 again, for an old head too. A definite refusal (403, 404 or 422) is journalled as
 `refused` and reported as `posting: "refused"`; the same status is not posted again
@@ -855,7 +858,19 @@ pull requests are skipped; closed ones are read again only to retire an earlier 
 using only the pull request itself (a deleted base branch or gone head does not block it).
 After a push to a base branch with more than one window of pull requests, every status is
 rechecked only after up to ceil(N/50) passes. A poll or push also retires successes on contexts
-that are no longer published (at most 50 rows per pass).
+that are no longer published (at most 50 rows per pass). Rows on contexts that are still
+published, and rows of merged pull requests, are excluded by the query, so they cannot
+crowd out a disabled context. At most one profile may enable `publish_forge_status` for a
+repository (compared case-insensitively) and target; the Hub refuses to start otherwise.
+
+Cost: each pass makes one pull request read per examined pull request, one base ref read
+per distinct base branch, and one commit read per head not seen before (commit trees and
+parents are cached in memory, bounded at 256). A closed, unmerged pull request is still
+read once per pass until its earlier success is retired and the window moves on; no
+state skips it. GitHub's documented installation budget is 5000 requests per hour, so
+choose a poll interval that keeps (pull requests in a window + base branches + new
+heads) times passes per hour within it. During rate-limit backoff no pass runs, so
+nothing is invalidated until it ends.
 The reconciler holds an in-process repository lock and assumes a single Hub process
 for a repository; with several, posts can interleave (the journal compare-and-set only
 limits the damage).

@@ -1,6 +1,9 @@
 //! GitHub client for hub sync: app JWTs, webhook signatures and the REST and
 //! GraphQL reads and writes the sync uses. Credentials are arguments, never
 //! stored here, and never appear in an error.
+use std::collections::HashMap;
+use std::sync::{Mutex, PoisonError};
+
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use reqwest::Method;
@@ -97,6 +100,8 @@ impl CommitStatus {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PullHead {
     pub open: bool,
+    /// Merged pull requests are left alone: their head is history, not a candidate.
+    pub merged: bool,
     pub head_sha: String,
     pub head_repo_id: u64,
     pub base_repo_id: u64,
@@ -156,10 +161,16 @@ impl Branch {
     }
 }
 
+/// A commit's tree and parents.
+type CommitParts = (String, Vec<String>);
+
 pub struct Api {
     client: reqwest::Client,
     base: String,
     graphql: String,
+    /// Tree and parents per (repository, commit); a commit never changes.
+    /// ponytail: cleared whole past 256 entries; an LRU only matters beyond that many live heads.
+    commits: Mutex<HashMap<(String, String), CommitParts>>,
 }
 
 impl Api {
@@ -174,6 +185,7 @@ impl Api {
             client: forge_http::client()?,
             base: api.to_owned(),
             graphql,
+            commits: Mutex::default(),
         })
     }
 
@@ -659,6 +671,15 @@ impl Api {
         full_name: &str,
         commit: &str,
     ) -> Gh<Option<(String, Vec<String>)>> {
+        let key = (full_name.to_ascii_lowercase(), commit.to_owned());
+        if let Some(found) = self
+            .commits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+        {
+            return Ok(Some(found.clone()));
+        }
         let reply = self
             .get(token, &format!("/repos/{full_name}/git/commits/{commit}"))
             .await?;
@@ -672,17 +693,25 @@ impl Api {
             .iter()
             .map(sha_of)
             .collect::<Gh<Vec<_>>>()?;
-        Ok(Some((sha_of(&body["tree"])?, parents)))
+        let parts = (sha_of(&body["tree"])?, parents);
+        let mut commits = self.commits.lock().unwrap_or_else(PoisonError::into_inner);
+        if commits.len() >= 256 {
+            commits.clear();
+        }
+        commits.insert(key, parts.clone());
+        Ok(Some(parts))
     }
 
     /// Everything a forge check needs from one pull request: the pull, the live tip of its
     /// base ref and the head commit's tree and parents. None when the pull does not exist.
     /// A missing or ill-typed field is an error; a deleted head repository is id 0.
+    /// `base_tips` holds the base ref tips already read in this pass, so each is read once.
     pub async fn pull_head(
         &self,
         token: &str,
         full_name: &str,
         number: i64,
+        base_tips: &mut HashMap<String, String>,
     ) -> Gh<Option<PullHead>> {
         let bad = || GhError::Failed("unreadable reply from pulls".into());
         let Some(pull) = self.pull(token, full_name, number).await? else {
@@ -693,10 +722,12 @@ impl Api {
             Some("closed") => false,
             _ => return Err(bad()),
         };
+        let merged = pull["merged"].as_bool().ok_or_else(bad)?;
         if !open {
             // Only the head matters to retire a success; the base and head commit may be gone.
             return Ok(Some(PullHead {
                 open,
+                merged,
                 head_sha: sha_of(&pull["head"])?,
                 head_repo_id: 0,
                 base_repo_id: 0,
@@ -722,16 +753,24 @@ impl Api {
             .filter(|name| valid_ref_name(name))
             .ok_or_else(bad)?
             .to_owned();
-        let base_tip = self
-            .ref_sha(token, full_name, &base_ref)
-            .await?
-            .ok_or_else(|| GhError::Failed("base branch not found".into()))?;
+        let base_tip = match base_tips.get(&base_ref) {
+            Some(tip) => tip.clone(),
+            None => {
+                let tip = self
+                    .ref_sha(token, full_name, &base_ref)
+                    .await?
+                    .ok_or_else(|| GhError::Failed("base branch not found".into()))?;
+                base_tips.insert(base_ref.clone(), tip.clone());
+                tip
+            }
+        };
         let (head_tree, head_parents) = self
             .commit_parts(token, full_name, &head_sha)
             .await?
             .ok_or_else(|| GhError::Failed("head commit not found".into()))?;
         Ok(Some(PullHead {
             open,
+            merged,
             head_sha,
             head_repo_id,
             base_repo_id,

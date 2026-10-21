@@ -1289,7 +1289,9 @@ fn forge_check_journal(db: &Db) {
                 .unwrap();
         }
     }
-    let listed = store.forge_checks_showing_success(&repo.id, 10).unwrap();
+    let listed = store
+        .forge_checks_showing_success(&repo.id, "acme/widgets", &[], 10)
+        .unwrap();
     // 3/main is uncertain, 5/main says success; 3/dev and 9/main are settled failures.
     assert_eq!(
         listed
@@ -1299,16 +1301,23 @@ fn forge_check_journal(db: &Db) {
         [(3, ctx), (5, ctx)]
     );
     assert_eq!(listed[1].2.state, "success");
+    // An enabled context is not a retire candidate.
+    assert!(
+        store
+            .forge_checks_showing_success(&repo.id, "acme/widgets", &[ctx.to_owned()], 10)
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
         store
-            .forge_checks_showing_success(&repo.id, 1)
+            .forge_checks_showing_success(&repo.id, "acme/widgets", &[], 1)
             .unwrap()
             .len(),
         1
     );
     assert!(
         store
-            .forge_checks_showing_success("other", 10)
+            .forge_checks_showing_success("other", "acme/widgets", &[], 10)
             .unwrap()
             .is_empty()
     );

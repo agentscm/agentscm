@@ -7,7 +7,7 @@
 
 pub mod source;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -255,6 +255,19 @@ impl ExecutionService {
                 .is_some()
             {
                 return Err(HubError::Invalid("duplicate agent task profile".into()));
+            }
+        }
+        let mut publishing = BTreeSet::new();
+        for task in agent_task_profiles
+            .values()
+            .filter(|p| p.publish_forge_status)
+        {
+            // Two profiles would post the same status context on one repository.
+            if !publishing.insert((task.repository_id.to_ascii_lowercase(), task.target.clone())) {
+                return Err(HubError::Invalid(
+                    "more than one agent task profile publishes forge status for a repository and target"
+                        .into(),
+                ));
             }
         }
         let mut source_profiles = BTreeMap::new();

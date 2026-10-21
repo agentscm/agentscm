@@ -15,6 +15,7 @@ use agentscm::candidate::CandidateSubject;
 use agentscm::checks::SourcePathExpectation;
 use agentscm::context::ReviewContext;
 use agentscm::hub::HubState;
+use agentscm::hub::connection::NewForgeCheck;
 use agentscm::hub::publish::{NewPublication, Update, derive_candidate_id};
 use agentscm::hub::store::{self, ForgeIdentity, Store, mint_agent_token, unix_now};
 use agentscm::hub::sync::{self, Sync, SyncConfig};
@@ -850,4 +851,82 @@ async fn disabling_the_profile_retires_its_success_once() {
     assert!(posted[1].2.contains("forge check disabled"));
     env.poll().await;
     assert_eq!(env.status_posts(), 2);
+}
+
+impl Env {
+    /// Journals a posted success on `context` at `COMMIT`, as an earlier pass would have.
+    fn seed_success(&self, number: i64, context: &str) {
+        let repo = self
+            .store
+            .repository_named(self.fake.base.trim_start_matches("http://"), REPO)
+            .unwrap()
+            .unwrap();
+        let new = NewForgeCheck {
+            head_sha: COMMIT.into(),
+            state: "success".into(),
+            binding_digest: Some("d".repeat(64)),
+            description: "seeded".into(),
+        };
+        self.store
+            .reserve_forge_check(&repo.id, number, context, None, &new, unix_now())
+            .unwrap();
+        self.store
+            .complete_forge_check(&repo.id, number, context, 1, "posted", unix_now())
+            .unwrap();
+    }
+
+    fn posts_to(&self, context: &str) -> usize {
+        self.fake.with(|s| {
+            s.repos[&REPO_ID]
+                .statuses
+                .iter()
+                .filter(|(_, v)| v["context"] == context)
+                .count()
+        })
+    }
+}
+
+#[tokio::test]
+async fn enabled_context_successes_do_not_crowd_out_a_disabled_context_retire() {
+    let env = Env::start(true).await;
+    let old = "agentscm/workflow/old";
+    // More enabled-context rows than one pass reads, all numbered ahead of the disabled one.
+    for number in 2..=61 {
+        env.seed_success(number, CONTEXT);
+    }
+    env.seed_success(70, old);
+    env.poll().await;
+    assert_eq!(env.posts_to(old), 1);
+    assert_eq!(env.posts_to(CONTEXT), 1, "enabled rows are left alone");
+    env.poll().await;
+    assert_eq!(env.posts_to(old), 1);
+}
+
+#[tokio::test]
+async fn a_merged_pull_request_keeps_whatever_its_head_shows() {
+    let mut env = Env::start(true).await;
+    env.qualify();
+    env.poll().await;
+    assert_eq!(env.statuses()[0].1, "success");
+    // The forge says merged before the Hub recorded the merge: leave the head alone.
+    env.edit_pull(|pull| {
+        pull.state = "closed".into();
+        pull.merged = true;
+    });
+    env.poll().await;
+    assert_eq!(env.status_posts(), 1);
+    // Once recorded as merged, disabling the profile does not post onto the merged head.
+    env.store
+        .update_publication(
+            &env.publication,
+            &Update::Merged {
+                merge_commit: "e".repeat(40),
+            },
+            unix_now(),
+        )
+        .unwrap();
+    env.reconfigure(|p| p.publish_forge_status = false);
+    env.poll().await;
+    assert_eq!(env.status_posts(), 1);
+    assert_eq!(env.row().unwrap().state, "success");
 }

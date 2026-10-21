@@ -324,6 +324,7 @@ pub(super) async fn reconcile_repo(
     let publications =
         blocking(state, move || store.pull_publications(&name, after, limit)).await?;
     let full = publications.len() >= limit;
+    let mut base_tips = HashMap::new();
     let last = publications.last().and_then(|p| p.pr_number).unwrap_or(0);
     for publication in publications {
         // One (newest) publication per pull request number; older ones are history.
@@ -348,8 +349,8 @@ pub(super) async fn reconcile_repo(
                     token,
                     profile,
                     number,
-                    &candidate.subject,
-                    &publication.commit,
+                    (&candidate.subject, &publication.commit),
+                    &mut base_tips,
                 )
                 .await;
                 match step {
@@ -373,8 +374,9 @@ pub(super) async fn reconcile_repo(
 }
 
 /// Retires a success (or uncertain post) on a context no enabled profile of `repo` publishes
-/// any more: the flag was turned off, the profile removed or its target changed. At most
-/// `MAX_PULLS_PER_PASS` rows per pass; a retired row no longer qualifies, so none repeats.
+/// any more: the flag was turned off, the profile removed or its target changed. The store
+/// leaves out enabled contexts and merged pull requests, so neither crowds out the rest. At
+/// most `MAX_PULLS_PER_PASS` rows per pass; a retired row no longer qualifies, so none repeats.
 async fn retire_disabled(
     state: &HubState,
     repo: &ConnectedRepository,
@@ -385,15 +387,13 @@ async fn retire_disabled(
         .iter()
         .filter_map(|p| status_context(&p.target).ok())
         .collect();
-    let (store, id) = (state.store.clone(), repo.id.clone());
+    let (store, id, name) = (state.store.clone(), repo.id.clone(), repo.full_name.clone());
     let rows = blocking(state, move || {
-        store.forge_checks_showing_success(&id, MAX_PULLS_PER_PASS)
+        store.forge_checks_showing_success(&id, &name, &enabled, MAX_PULLS_PER_PASS)
     })
     .await?;
     for (number, context, row) in rows {
-        if !enabled.contains(&context) {
-            retire(state, repo, token, number, &context, &row, DISABLED).await?;
-        }
+        retire(state, repo, token, number, &context, &row, DISABLED).await?;
     }
     Ok(())
 }
@@ -407,14 +407,21 @@ async fn pull_step(
     token: &str,
     profile: &AgentTaskProfile,
     number: i64,
-    subject: &CandidateSubject,
-    commit: &str,
+    (subject, commit): (&CandidateSubject, &str),
+    base_tips: &mut HashMap<String, String>,
 ) -> Gh<bool> {
     let api = state.sync.api()?;
     // A missing pull request gets no post; a read that fails claims nothing.
-    let Some(head) = api.pull_head(token, &repo.full_name, number).await? else {
+    let Some(head) = api
+        .pull_head(token, &repo.full_name, number, base_tips)
+        .await?
+    else {
         return Ok(false);
     };
+    // A merged head is history, not a candidate: leave whatever it shows alone.
+    if head.merged {
+        return Ok(false);
+    }
     let context = status_context(&profile.target)?;
     let row = journal(state, repo, number, &context).await?;
     if !head.open {

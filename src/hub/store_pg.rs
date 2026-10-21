@@ -4219,6 +4219,8 @@ impl Store for PgStore {
     fn forge_checks_showing_success(
         &self,
         repo: &str,
+        full_name: &str,
+        enabled: &[String],
         limit: usize,
     ) -> Result<Vec<(i64, String, ForgeCheck)>> {
         self.run(true, |client| {
@@ -4229,8 +4231,13 @@ impl Store for PgStore {
                             generation, updated_at
                      FROM hub_forge_checks
                      WHERE repository = $1 AND (state = 'success' OR phase = 'attempting')
-                     ORDER BY number, context LIMIT $2",
-                    &[&repo, &limit],
+                       AND context <> ALL($3)
+                       AND (SELECT q.merge_commit FROM hub_publications q
+                            WHERE lower(q.repository) = lower($2)
+                              AND q.pr_number = hub_forge_checks.number
+                            ORDER BY q.created_at DESC, q.id DESC LIMIT 1) IS NULL
+                     ORDER BY number, context LIMIT $4",
+                    &[&repo, &full_name, &enabled, &limit],
                 )?
                 .iter()
                 .map(|row| {

@@ -4095,6 +4095,8 @@ impl Store for SqliteStore {
     fn forge_checks_showing_success(
         &self,
         repo: &str,
+        full_name: &str,
+        enabled: &[String],
         limit: usize,
     ) -> Result<Vec<(i64, String, ForgeCheck)>> {
         let conn = self.conn();
@@ -4103,10 +4105,16 @@ impl Store for SqliteStore {
                     updated_at
              FROM hub_forge_checks
              WHERE repository = ?1 AND (state = 'success' OR phase = 'attempting')
-             ORDER BY number, context LIMIT ?2",
+               AND context NOT IN (SELECT value FROM json_each(?3))
+               AND (SELECT q.merge_commit FROM hub_publications q
+                    WHERE lower(q.repository) = lower(?2) AND q.pr_number = hub_forge_checks.number
+                    ORDER BY q.created_at DESC, q.id DESC LIMIT 1) IS NULL
+             ORDER BY number, context LIMIT ?4",
         )?;
+        let enabled =
+            serde_json::to_string(enabled).map_err(|e| HubError::Invalid(e.to_string()))?;
         let rows = statement
-            .query_map(params![repo, limit as i64], |row| {
+            .query_map(params![repo, full_name, enabled, limit as i64], |row| {
                 Ok((
                     row.get(0)?,
                     row.get(1)?,

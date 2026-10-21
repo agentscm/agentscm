@@ -319,10 +319,14 @@ pub trait Store: Send + Sync {
     ) -> Result<()>;
     fn forge_check(&self, repo: &str, number: i64, context: &str) -> Result<Option<ForgeCheck>>;
     /// Rows of `repo` that may show a success (state `success` or an uncertain post) as
-    /// `(number, context, row)`, by number then context, at most `limit`.
+    /// `(number, context, row)`, by number then context, at most `limit`. Rows on a context in
+    /// `enabled`, and rows of a pull request whose newest publication in `full_name` is merged,
+    /// are left out: neither is a retire candidate.
     fn forge_checks_showing_success(
         &self,
         repo: &str,
+        full_name: &str,
+        enabled: &[String],
         limit: usize,
     ) -> Result<Vec<(i64, String, ForgeCheck)>>;
     /// Compare-and-set on `expected` (`None` for an absent row): records the desired post as

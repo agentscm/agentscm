@@ -232,6 +232,7 @@ pub struct Sync {
     /// Rotates which repository a connection's poll starts with.
     round: AtomicUsize,
     /// Per repository id, the last pull request number the forge check pass finished with.
+    #[cfg(unix)]
     forge_cursors: Mutex<HashMap<String, i64>>,
     /// Files already noticed per (intent, repository, pull request number).
     noticed: Mutex<HashMap<(String, String, i64), BTreeSet<String>>>,
@@ -288,6 +289,7 @@ impl Sync {
             truncated: Mutex::default(),
             pending: AtomicUsize::new(0),
             round: AtomicUsize::new(0),
+            #[cfg(unix)]
             forge_cursors: Mutex::default(),
             noticed: Mutex::default(),
         }
