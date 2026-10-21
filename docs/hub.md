@@ -854,8 +854,9 @@ connection is in backoff. A `pull_request` webhook reconciles only that pull req
 `push` webhook and each poll reconcile the repository. A pass examines the newest
 publication of up to 50 pull requests and continues after the last one on the next pass,
 wrapping at the end, so a busy repository is covered over several passes. A pull
-request the forge reports merged is recorded as merged on its newest publication (a Hub
-store write only) on first observation and skipped afterwards; closed ones are read again
+request the forge reports merged is recorded as merged on its newest publication on first
+observation and skipped afterwards. That is a Hub store write only; it also records the merge
+event and ends that branch's candidate lineage. Closed ones are read again
 only to retire an earlier success, using only the pull request itself (a deleted base
 branch or gone head does not block it).
 After a push to a base branch with more than one window of pull requests, every status is

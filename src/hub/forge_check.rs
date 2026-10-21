@@ -408,7 +408,13 @@ async fn retire_disabled(
                 Some(false) => {}
                 Some(true) => {
                     let merge_commit = pull["merge_commit_sha"].as_str().map(str::to_owned);
-                    record_merge(state, repo, number, merge_commit).await?;
+                    // A failed store write only delays the record; it must not end the pass.
+                    if let Err(error) = record_merge(state, repo, number, merge_commit).await {
+                        eprintln!(
+                            "hub: forge check for {}#{number}: recording the merge: {error}",
+                            repo.full_name
+                        );
+                    }
                     continue;
                 }
                 None => {
