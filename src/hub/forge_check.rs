@@ -788,8 +788,9 @@ async fn post(
         .await
     {
         Ok(Ok(())) => "posted",
-        // GitLab's "cannot transition" only answers a repeated `pending`: the status list says
-        // whether the desired one is there. A 400 for any other state is a definite refusal.
+        // GitLab's "cannot transition" only answers a `pending` post onto a pending or running
+        // status: the status list says whether the desired one is there. A 400 for any other
+        // state is a definite refusal.
         Ok(Err(400)) if gitlab && desired.state == StatusState::Pending => match shows(false).await
         {
             Ok(true) => "posted",

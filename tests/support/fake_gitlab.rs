@@ -756,8 +756,8 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
             let (name, wanted) = (b["name"].clone(), b["state"].clone());
             let ref_name = b["ref"].clone();
             // GitLab reuses a status that is still pending or running and refuses to move it to
-            // the state it already has, or a running one back to pending; a finished status is never reused, so a post then makes a
-            // new one. Only a status posted with a ref is checked; the coordination status
+            // the state it already has, or a running one back to pending; a finished status is
+            // never reused, so a post then makes a new one. Only a status posted with a ref is checked; the coordination status
             // carries none.
             if !ref_name.is_null()
                 && project
