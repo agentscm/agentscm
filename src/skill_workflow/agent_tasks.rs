@@ -79,8 +79,8 @@ pub struct LiveImportedOrigins {
 }
 
 impl LiveImportedOrigins {
-    #[cfg(test)]
-    pub(crate) fn empty_for_test(repository: String) -> Self {
+    /// No imported-origin grants: only native receipts can qualify.
+    pub(crate) fn native_only(repository: String) -> Self {
         Self {
             repository,
             origins: Vec::new(),

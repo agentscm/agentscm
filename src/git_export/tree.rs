@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use ring::digest::{Context, SHA1_FOR_LEGACY_USE_ONLY};
+
 use super::git::Git;
 use crate::git_path_profile::{PortableSpellings, uses_reserved_namespace};
 use crate::model::EntryKind;
@@ -36,6 +38,33 @@ impl Directory {
         }
     }
 
+    fn oid(&self) -> Result<String> {
+        let mut entries = Vec::new();
+        for (name, (mode, oid)) in &self.files {
+            entries.push((name.clone(), mode.trim_start_matches('0'), oid.clone()));
+        }
+        for (name, directory) in &self.directories {
+            // Git sorts a directory as if its name ended in '/'.
+            entries.push((format!("{name}/"), "40000", directory.oid()?));
+        }
+        entries.sort();
+        let mut body = Vec::new();
+        for (key, mode, oid) in entries {
+            body.extend_from_slice(mode.as_bytes());
+            body.push(b' ');
+            body.extend_from_slice(key.trim_end_matches('/').as_bytes());
+            body.push(0);
+            for pair in oid.as_bytes().chunks(2) {
+                let pair = std::str::from_utf8(pair).unwrap_or_default();
+                body.push(
+                    u8::from_str_radix(pair, 16)
+                        .map_err(|_| Error::Invalid("invalid object ID".into()))?,
+                );
+            }
+        }
+        Ok(git_object_oid("tree", &body))
+    }
+
     fn write(&self, git: &Git) -> Result<String> {
         let mut input = Vec::new();
         for (name, (mode, oid)) in &self.files {
@@ -54,23 +83,21 @@ impl Directory {
     }
 }
 
-/// No index, checkout, attributes, filters or source commands are involved.
-/// The complete listing is compared, then every blob is read back byte for byte.
-pub(super) fn build_and_verify(
-    git: &Git,
+/// Visits every native entry after the profile, path, symlink and size bounds are enforced.
+fn walk_entries(
     engine: &Engine,
     revision: &str,
     profile: &str,
-) -> Result<String> {
+    mut visit: impl FnMut(&str, &'static str, &[u8]) -> Result<()>,
+) -> Result<()> {
     if !matches!(profile, super::LEGACY_PROFILE | super::PROFILE) {
         return Err(Error::Invalid("unsupported export profile".into()));
     }
     engine.load_revision(revision)?;
-    let mut directory = Directory::default();
-    let mut manifest = BTreeMap::new();
     let mut spellings = PortableSpellings::default();
     let mut cursor = None;
     let mut total = 0usize;
+    let mut visited = 0usize;
     loop {
         let page = engine.list_files(revision, cursor.as_deref(), 4096)?;
         for entry in page.entries {
@@ -108,23 +135,62 @@ pub(super) fn build_and_verify(
                 .ok_or_else(|| Error::Limit("snapshot size overflow".into()))?;
             if bytes.len() > MAX_FILE_BYTES
                 || total > MAX_CHECKPOINT_BYTES
-                || manifest.len() >= MAX_ENTRIES
+                || visited >= MAX_ENTRIES
             {
                 return Err(Error::Limit(
                     "snapshot export exceeds capture profile bounds".into(),
                 ));
             }
-            let oid = git.write_object("blob", &bytes)?;
-            directory.insert(&entry.path, mode, oid.clone())?;
-            if manifest.insert(entry.path, (mode, oid)).is_some() {
-                return Err(Error::Invalid("duplicate native path".into()));
-            }
+            visited += 1;
+            visit(&entry.path, mode, &bytes)?;
         }
         cursor = page.next;
         if cursor.is_none() {
-            break;
+            return Ok(());
         }
     }
+}
+
+fn git_object_oid(kind: &str, body: &[u8]) -> String {
+    let mut hash = Context::new(&SHA1_FOR_LEGACY_USE_ONLY);
+    hash.update(format!("{kind} {}\0", body.len()).as_bytes());
+    hash.update(body);
+    hex(hash.finish().as_ref())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The SHA-1 Git tree OID `build_and_verify` would produce, computed without Git or
+/// writing any object. Same listing validation and bounds; no readback is needed
+/// because nothing is stored.
+pub(crate) fn native_tree_oid(engine: &Engine, revision: &str) -> Result<String> {
+    let mut directory = Directory::default();
+    walk_entries(engine, revision, super::PROFILE, |path, mode, bytes| {
+        directory.insert(path, mode, git_object_oid("blob", bytes))
+    })?;
+    directory.oid()
+}
+
+/// No index, checkout, attributes, filters or source commands are involved.
+/// The complete listing is compared, then every blob is read back byte for byte.
+pub(super) fn build_and_verify(
+    git: &Git,
+    engine: &Engine,
+    revision: &str,
+    profile: &str,
+) -> Result<String> {
+    let mut directory = Directory::default();
+    let mut manifest = BTreeMap::new();
+    walk_entries(engine, revision, profile, |path, mode, bytes| {
+        let oid = git.write_object("blob", bytes)?;
+        directory.insert(path, mode, oid.clone())?;
+        if manifest.insert(path.to_owned(), (mode, oid)).is_some() {
+            return Err(Error::Invalid("duplicate native path".into()));
+        }
+        Ok(())
+    })?;
     let tree = directory.write(git)?;
     let listing = git.run(
         &["ls-tree", "-r", "-z", "--full-tree", &tree],
@@ -153,4 +219,61 @@ pub(super) fn build_and_verify(
         }
     }
     Ok(tree)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use super::*;
+    use crate::model::EntryChange;
+
+    fn change(path: &str, bytes: &[u8], kind: EntryKind) -> EntryChange {
+        EntryChange {
+            path: path.into(),
+            content: Some(bytes.to_vec()),
+            kind,
+        }
+    }
+
+    #[test]
+    fn native_tree_oid_matches_git_mktree() {
+        let git_path = PathBuf::from(
+            std::env::var("AGENTSCM_TEST_GIT").unwrap_or_else(|_| "/usr/bin/git".into()),
+        );
+        assert!(git_path.is_absolute() && git_path.exists());
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("mirror.git");
+        std::fs::create_dir(&repo).unwrap();
+        let git = Git::new(Path::new(&git_path), repo).unwrap();
+        git.run(&["init", "--bare", "--object-format=sha1", "."], None, 4096)
+            .unwrap();
+        let native = root.path().join("native");
+        let engine = Engine::open(&native).unwrap();
+        // "a.b" and "a-b/z" sort before directory "a" ("a/"); "a0" sorts after it.
+        let revision = engine
+            .checkpoint_entries(
+                None,
+                &[
+                    change("a.b", b"dot\n", EntryKind::Regular),
+                    change("a/x", b"nested\n", EntryKind::Regular),
+                    change("a/deep/y", b"deeper\n", EntryKind::Regular),
+                    change("a-b/z", b"dash\n", EntryKind::Regular),
+                    change("a0", b"zero\n", EntryKind::Regular),
+                    change("bin/tool", b"#!/bin/sh\n", EntryKind::Executable),
+                    change("link", b"a.b", EntryKind::Symlink),
+                    change("empty", b"", EntryKind::Regular),
+                ],
+            )
+            .unwrap();
+        let expected = build_and_verify(&git, &engine, &revision, super::super::PROFILE).unwrap();
+        assert_eq!(native_tree_oid(&engine, &revision).unwrap(), expected);
+        let other = engine
+            .checkpoint_entries(
+                Some(&revision),
+                &[change("bin/tool", b"#!/bin/sh\n", EntryKind::Regular)],
+            )
+            .unwrap();
+        assert_ne!(native_tree_oid(&engine, &other).unwrap(), expected);
+    }
 }

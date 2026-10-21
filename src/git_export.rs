@@ -7,6 +7,7 @@ pub mod publish;
 pub mod remote;
 mod seed;
 mod tree;
+pub(crate) use tree::native_tree_oid;
 
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -4,6 +4,8 @@ pub mod connection;
 pub mod coordination;
 mod coordination_http;
 pub mod forge_api;
+#[cfg(unix)]
+pub mod forge_check;
 pub mod forge_http;
 pub mod github;
 pub mod gitlab;

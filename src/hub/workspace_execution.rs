@@ -54,6 +54,9 @@ pub struct AgentTaskProfile {
     pub data_dir: PathBuf,
     pub target: String,
     pub requirement_digest: String,
+    /// Off by default: the Hub publishes a forge commit status for this profile only when set.
+    #[serde(default)]
+    pub publish_forge_status: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -938,6 +941,7 @@ impl From<&ExecutionProfile> for AgentTaskProfile {
             data_dir: profile.data_dir.clone(),
             target: profile.target.clone(),
             requirement_digest: profile.requirement_digest.clone(),
+            publish_forge_status: false,
         }
     }
 }
