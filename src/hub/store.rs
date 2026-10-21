@@ -873,18 +873,18 @@ mod tests {
 
     #[test]
     fn pending_requires_an_applied_prefix() {
-        assert_eq!(pending(&[]).unwrap().len(), 15);
-        assert_eq!(pending(&[1]).unwrap().len(), 14);
-        assert_eq!(pending(&[1, 2, 3]).unwrap().len(), 12);
-        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap().len(), 7);
-        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap().len(), 6);
+        assert_eq!(pending(&[]).unwrap().len(), 16);
+        assert_eq!(pending(&[1]).unwrap().len(), 15);
+        assert_eq!(pending(&[1, 2, 3]).unwrap().len(), 13);
+        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap().len(), 8);
+        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap().len(), 7);
         assert_eq!(
             pending(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14])
                 .unwrap()
                 .len(),
-            1
+            2
         );
-        assert!(pending(&(1..=15).collect::<Vec<_>>()).unwrap().is_empty());
+        assert!(pending(&(1..=16).collect::<Vec<_>>()).unwrap().is_empty());
         assert!(pending(&[2]).is_err());
         let newer = pending(&[1, 999]).err().unwrap().to_string();
         assert!(newer.contains("newer than this binary"), "{newer}");
