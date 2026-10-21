@@ -149,7 +149,7 @@ included below.
 | rustix | 1.1.5 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | notice-a60eea8175145316, notice-268872b9816f90fd, notice-23f18e03dc49df91 |
 | rustls | 0.23.46 | Apache-2.0 OR ISC OR MIT | notice-a60eea8175145316, notice-7cfafc877eccc46c, notice-709e3175b4212f7b |
 | rustls-pki-types | 1.15.1 | MIT OR Apache-2.0 | notice-45fd05c4865e7c35, notice-9117d922e6671255 |
-| rustls-webpki | 0.103.15 | ISC | notice-5b698ca13897be3a |
+| rustls-webpki | 0.103.16 | ISC | notice-5b698ca13897be3a |
 | rustversion | 1.0.23 | MIT OR Apache-2.0 | notice-62c7a1e35f564068, notice-23f18e03dc49df91 |
 | ryu | 1.0.23 | Apache-2.0 OR BSL-1.0 | notice-62c7a1e35f564068, notice-c9bff75738922193 |
 | scopeguard | 1.2.0 | MIT OR Apache-2.0 | notice-a60eea8175145316, notice-fb77f0a9c53e473a |
@@ -218,7 +218,7 @@ included below.
 | wasm-bindgen-shared | 0.2.129 | MIT OR Apache-2.0 | notice-a60eea8175145316, notice-378f5840b258e277 |
 | web-sys | 0.3.106 | MIT OR Apache-2.0 | notice-a60eea8175145316, notice-378f5840b258e277 |
 | web-time | 1.1.0 | MIT OR Apache-2.0 | notice-54a744942eb3fa63, notice-f428305bbf2e70fb |
-| webpki-roots | 1.0.9 | CDLA-Permissive-2.0 | notice-e271993808fec50a |
+| webpki-roots | 1.0.10 | CDLA-Permissive-2.0 | notice-e271993808fec50a |
 | whoami | 2.1.3 | Apache-2.0 OR BSL-1.0 OR MIT | notice-62c7a1e35f564068, notice-c9bff75738922193, notice-508a77d2e7b51d98 |
 | windows-link | 0.2.1 | MIT OR Apache-2.0 | notice-c16f8dcf1a368b83, notice-c2cfccb812fe4821 |
 | windows-sys | 0.52.0 | MIT OR Apache-2.0 | notice-c16f8dcf1a368b83, notice-c2cfccb812fe4821 |
@@ -8692,7 +8692,7 @@ DEALINGS IN THE SOFTWARE.
 
 ## notice-5b698ca13897be3a
 
-Applies to: rustls-webpki 0.103.15 / LICENSE
+Applies to: rustls-webpki 0.103.16 / LICENSE
 
 ```text
 Except as otherwise noted, this project is licensed under the following
@@ -9214,7 +9214,7 @@ SOFTWARE.
 
 ## notice-e271993808fec50a
 
-Applies to: webpki-roots 1.0.9 / LICENSE
+Applies to: webpki-roots 1.0.10 / LICENSE
 
 ```text
 # Community Data License Agreement - Permissive - Version 2.0
