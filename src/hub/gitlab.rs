@@ -65,7 +65,13 @@ impl Api {
             let reply = self.call(token, Method::GET, &url, None).await?;
             let (next, last) = (reply.next, reply.last_page);
             let body = reply.ok(endpoint_kind(&url, &self.base))?;
-            items.extend(body.as_array().cloned().unwrap_or_default());
+            let Some(page_items) = body.as_array() else {
+                return Err(GhError::Failed(format!(
+                    "unreadable reply from {}",
+                    endpoint_kind(&url, &self.base)
+                )));
+            };
+            items.extend(page_items.iter().cloned());
             if !next || page == max_pages {
                 let unread = if next {
                     last.map_or(1, |last| last.saturating_sub(max_pages).max(1))
@@ -205,12 +211,22 @@ impl Api {
                 "too many open merge requests from that branch to search".into(),
             ));
         }
-        Ok(paged
-            .items
-            .iter()
-            .filter(|mr| in_project(mr, project))
-            .map(pull_json)
-            .collect())
+        let mut found = Vec::new();
+        for mr in &paged.items {
+            // An item that cannot be read could be the merge request being looked for.
+            if mr["iid"].as_i64().is_none()
+                || mr["source_project_id"].as_i64().is_none()
+                || mr["target_project_id"].as_i64().is_none()
+            {
+                return Err(GhError::Failed(
+                    "unreadable reply from merge_requests".into(),
+                ));
+            }
+            if in_project(mr, project) {
+                found.push(pull_json(mr));
+            }
+        }
+        Ok(found)
     }
 
     /// Opens a merge request within the project. `Err(status)` is a definitive refusal (400, 403,

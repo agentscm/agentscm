@@ -189,6 +189,10 @@ pub struct FakeState {
     pub malformed_next_mr_reply: bool,
     /// Answer the next MR create with this status and store nothing.
     pub refuse_next_mr: Option<u16>,
+    /// Answer the next MR list with 200 and a JSON object instead of an array.
+    pub malformed_next_mr_list: bool,
+    /// Answer every MR list with items that carry no project ids, until cleared.
+    pub omit_mr_list_project_ids: bool,
     pub requests: Vec<Request>,
 }
 
@@ -523,6 +527,10 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                     .find(|(k, _)| k == name)
                     .map(|(_, v)| v.as_str())
             };
+            if std::mem::take(&mut state.malformed_next_mr_list) {
+                return json_reply(200, json!({"message": "not a list"}));
+            }
+            let omit = state.omit_mr_list_project_ids;
             let want = q("state").unwrap_or("opened");
             let mrs: Vec<Value> = project
                 .mrs
@@ -531,7 +539,14 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                 .filter(|m| m.state == want)
                 .filter(|m| q("source_branch").is_none_or(|b| m.source_branch == b))
                 .filter(|m| q("target_branch").is_none_or(|b| m.target_branch == b))
-                .map(|m| mr_json(ctx, project, m))
+                .map(|m| {
+                    let mut json = mr_json(ctx, project, m);
+                    if omit {
+                        json["source_project_id"] = Value::Null;
+                        json["target_project_id"] = Value::Null;
+                    }
+                    json
+                })
                 .collect();
             let (page, link) = paginate(ctx, uri, &query, mrs);
             reply(200, &link, Some(Value::Array(page)))
@@ -553,6 +568,8 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                         .map_or_else(|| fake_sha(name), |b| b.sha.clone()),
                 ),
             };
+            // Assumption, not verified against live GitLab: a missing source or target branch may
+            // be answered 409 instead, which the Hub treats as uncertain rather than a refusal.
             let (Some(sha), Some(_)) = (tip(&source), tip(&target)) else {
                 return json_reply(400, json!({"message": "branch does not exist"}));
             };

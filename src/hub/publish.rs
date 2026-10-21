@@ -897,6 +897,21 @@ fn read_due(id: &str) -> bool {
     true
 }
 
+/// Whether the candidate's endpoint is this repository's host and no other host shares its name.
+async fn candidate_on_host(
+    state: &HubState,
+    publication: &Publication,
+    repository: &ConnectedRepository,
+) -> bool {
+    let on_host = publication
+        .manifest()
+        .ok()
+        .and_then(|m| m.candidate)
+        .and_then(|c| candidate_repository(&c.endpoint).ok())
+        .is_some_and(|(host, _)| host == repository.host);
+    on_host && matches!(name_shared_across_hosts(state, repository).await, Ok(false))
+}
+
 async fn show(
     State(state): State<HubState>,
     Authenticated(principal): Authenticated,
@@ -908,6 +923,9 @@ async fn show(
         && read_due(&id)
         && let Some(candidate) = publication.manifest().ok().map(|m| m.candidate.is_some())
         && let Ok((conn, repository)) = target(&state, &principal, false, candidate).await
+        // Publications are keyed by repository name alone: read the merge only from the forge the
+        // candidate was published to, and never where another forge host shares the name.
+        && (!candidate || candidate_on_host(&state, &publication, &repository).await)
     {
         match merged_commit(&state, &conn, &repository, number, &publication.commit).await {
             Ok(Some(merge_commit)) => {

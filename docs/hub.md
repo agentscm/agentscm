@@ -940,16 +940,18 @@ Limits:
   groups (`group/sub/project`), tested only against an in-process fake. The Hub creates or adopts
   one merge request in the same project; fork merge requests are never adopted, and a truncated
   merge-request search or a 429 blocks without creating. On create, 400/403/404/422 is a
-  definitive refusal retained as a no-create result (the GitHub refusal list now includes 400
-  too); 409 (GitLab's "already exists"), 5xx, transport failures and unreadable success stay
+  definitive refusal retained as a no-create result (400 is definitive on GitLab only; on GitHub
+  it is 403/404/422 and a 400 stays uncertain); 409 (GitLab's "already exists"), 5xx, transport failures and unreadable success stay
   uncertain, `pr_attempting` survives restart, nothing replays automatically and `recover-pr`
-  adopts only by exact head/base or the publication marker. A GitLab fast-forward merge has no
-  merge commit, so it is recorded as merged only when the MR head equals the published commit.
+  adopts only by exact head/base or the publication marker. A GitLab merge without a merge commit
+  (fast-forward or merged by push) is recorded as merged only when the MR head equals the
+  published commit.
   A completed receipt is historical: after a source rewrite or target advance the Hub keeps the
   recorded MR number, creates nothing and does not present the receipt as current qualification.
   Create returns 409 `ambiguous_repository_name` (and a run blocks) when the same repository
   full name is connected on another configured forge host, because publications and lineages are
-  keyed by name only. A self-managed GitLab under a relative URL root is refused (400/409).
+  keyed by name only; repository rows from a forge host no longer configured are not considered.
+  A self-managed GitLab under a relative URL root is refused (400/409).
   The branch push is the provider-neutral Git transport; a protected-branch rejection stays
   Unknown rather than a typed refusal. AgentSCM never changes protections, merges or bypasses a
   target. This is neither full-history migration nor native authority cutover.
@@ -1072,7 +1074,7 @@ The container test does not include a forge. Pull-request overlaps (webhook and 
   keeps at most 8 live sessions. Sessions are not rechecked per request: a user
   disabled by other means keeps an existing session until it expires and can
   still list and revoke their tokens, though not mint.
-- GitLab: a fast-forward merge records `merge_commit_sha` null. After a project is
+- GitLab: a merge without a merge commit (fast-forward or merged by push) records `merge_commit_sha` null. After a project is
   renamed, the stored name refreshes only when it is added again (`add-repo`), and
   tokens must then be re-minted. Note adoption scans the first 300 notes, system
   notes included.

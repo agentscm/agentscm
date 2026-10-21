@@ -553,10 +553,41 @@ async fn disabled_outbound_or_lost_access_blocks_without_creating() {
     .unwrap();
     env.fake
         .with(|s| s.tokens.get_mut(TOKEN).unwrap().access.clear());
+    // Lost access is only seen as an unreadable branch read: the run blocks, creates nothing and
+    // records neither a pull request nor a refusal.
     let (_, out) = env.run(&id).await;
     assert!(out["error"].is_string(), "{out}");
     assert_eq!(env.creates(), 0);
-    assert!(env.stored(&id).pr_number.is_none());
+    let stored = env.stored(&id);
+    assert!(stored.pr_number.is_none());
+    assert!(stored.merge_commit.is_none());
+    assert_ne!(out["states"]["pull_request"]["state"], "refused", "{out}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unreadable_merge_request_list_blocks_without_creating() {
+    let env = Env::start().await;
+    let id = env.create("agents/feat").await;
+    // An unrelated open merge request from the same branch gives the list an item to misread.
+    env.fake.with(|s| {
+        let mr = Mr::new(5, "agents/feat", &[]);
+        s.projects.get_mut(&REPO_ID).unwrap().mrs.insert(5, mr);
+    });
+    for toggle in [0, 1] {
+        env.fake.with(|s| match toggle {
+            0 => s.malformed_next_mr_list = true,
+            _ => s.omit_mr_list_project_ids = true,
+        });
+        let (_, out) = env.run(&id).await;
+        assert!(
+            out["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("unreadable")),
+            "{toggle}: {out}"
+        );
+        assert_eq!(env.creates(), 0, "{toggle}");
+        assert!(env.stored(&id).pr_number.is_none(), "{toggle}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -593,6 +624,10 @@ async fn an_external_merge_ends_the_lineage_only_for_the_published_commit() {
             assert_eq!(pull["state"], "merged", "{branch}: {shown}");
             let expected = merge_commit.unwrap_or_else(|| env.commit.clone());
             assert_eq!(pull["merge_commit"], expected.as_str(), "{branch}");
+            // The lineage ended: a successor naming the merged publication is refused.
+            let next = lineage_manifest(&env, branch, 2, Some(&id), &env.seed);
+            let (status, refused) = env.api(Method::POST, &env.base(), Some(next)).await;
+            assert_eq!(status, 409, "{branch}: {refused}");
         } else {
             assert_eq!(pull["state"], "opened", "{branch}: {shown}");
             assert!(pull["merge_commit"].is_null());
@@ -627,20 +662,8 @@ async fn event_publication_never_reaches_a_gitlab_connection() {
     assert_eq!(env.fake.with(|s| s.requests.len()), before);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_endpoint_under_a_url_root_or_a_name_shared_with_another_forge_fails_closed() {
-    let env = Env::start_named("group/widgets").await;
-    let endpoint = format!("https://{}/gitlab/group/widgets.git", env.host);
-    let rooted = env.manifest_at("agents/rooted", &endpoint);
-    let id = rooted["publication_id"].as_str().unwrap().to_owned();
-    let before = env.fake.with(|s| s.requests.len());
-    let (status, _) = env.api(Method::POST, &env.base(), Some(rooted)).await;
-    // The prefix is never stripped: the manifest is refused and nothing is stored or sent.
-    assert!(matches!(status, 400 | 409), "{status}");
-    assert!(env.store.publication(&env.repo, &id).unwrap().is_none());
-    assert_eq!(env.fake.with(|s| s.requests.len()), before);
-
-    // The same name is connected on the GitHub host: publications are keyed by name alone.
+/// Connects the same full name on the GitHub host: publications are keyed by name alone.
+async fn share_name_on_github(env: &Env) {
     let store = env.store.clone();
     tokio::task::spawn_blocking(move || {
         let conn = store
@@ -663,6 +686,22 @@ async fn an_endpoint_under_a_url_root_or_a_name_shared_with_another_forge_fails_
     })
     .await
     .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_endpoint_under_a_url_root_or_a_name_shared_with_another_forge_fails_closed() {
+    let env = Env::start_named("group/widgets").await;
+    let endpoint = format!("https://{}/gitlab/group/widgets.git", env.host);
+    let rooted = env.manifest_at("agents/rooted", &endpoint);
+    let id = rooted["publication_id"].as_str().unwrap().to_owned();
+    let before = env.fake.with(|s| s.requests.len());
+    let (status, _) = env.api(Method::POST, &env.base(), Some(rooted)).await;
+    // The prefix is never stripped: the manifest is refused and nothing is stored or sent.
+    assert!(matches!(status, 400 | 409), "{status}");
+    assert!(env.store.publication(&env.repo, &id).unwrap().is_none());
+    assert_eq!(env.fake.with(|s| s.requests.len()), before);
+
+    share_name_on_github(&env).await;
     bare_ref(&env.bare, "agents/shared", &env.commit);
     let before = env.fake.with(|s| s.requests.len());
     let (status, out) = env
@@ -797,4 +836,37 @@ async fn a_stale_unattempted_candidate_continues_the_prior_merge_request() {
         "{continued}"
     );
     assert_eq!(env.creates(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn show_never_reads_a_merge_when_the_name_is_shared_with_another_forge() {
+    let env = Env::start_named("group/widgets").await;
+    let id = env.create("agents/feat").await;
+    let (_, out) = env.run(&id).await;
+    let number = out["states"]["pull_request"]["number"].as_i64().unwrap();
+    // The same name is later connected on the GitHub host. A GitHub principal cannot be wired
+    // into this harness, so this covers the shared-name skip on the GitLab principal's own read.
+    share_name_on_github(&env).await;
+    let merge = "8".repeat(40);
+    env.fake.with(|s| {
+        let mr = s
+            .projects
+            .get_mut(&REPO_ID)
+            .unwrap()
+            .mrs
+            .get_mut(&number)
+            .unwrap();
+        mr.state = "merged".into();
+        mr.merge_commit_sha = Some(merge.clone());
+    });
+    let before = env.fake.with(|s| s.requests.len());
+    let (status, shown) = env.show(&id).await;
+    assert_eq!(status, 200, "{shown}");
+    assert_eq!(
+        shown["states"]["pull_request"]["state"], "opened",
+        "{shown}"
+    );
+    assert!(shown["states"]["pull_request"]["merge_commit"].is_null());
+    assert!(env.stored(&id).merge_commit.is_none());
+    assert_eq!(env.fake.with(|s| s.requests.len()), before);
 }
