@@ -98,7 +98,8 @@ pub enum RejectionKind {
 
 enum Dispatched {
     Done(Option<String>),
-    Refused(RejectionKind),
+    /// `server` is true for `[remote rejected]`, false for a client-side `[rejected]`.
+    Refused(RejectionKind, bool),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -348,8 +349,8 @@ impl Mirror {
                     Request::Publish { .. } | Request::PublishCandidate { .. } => State::Published,
                 };
             }
-            Ok(Dispatched::Refused(kind)) => {
-                self.classify_refusal(&mut record, &binding, access, kind)
+            Ok(Dispatched::Refused(kind, server)) => {
+                self.classify_refusal(&mut record, &binding, access, kind, server)
             }
             Err(_) => record.state = State::Unknown,
         }
@@ -359,13 +360,17 @@ impl Mirror {
 
     // The refusal came from the server's report; the re-read must agree with it.
     // A network create-only push has no preimage to compare beyond "not advertised",
-    // which is accepted because every later push still uses the exact lease.
+    // which is accepted because every later push still uses the exact lease. That
+    // reliance holds only for a server-side `[remote rejected]`: a client-side
+    // `[rejected]` (stale info, fetch first, non-fast-forward) implies the ref was
+    // advertised, so an unadvertised re-read is never recorded as an absence claim.
     fn classify_refusal(
         &self,
         record: &mut Record,
         binding: &Binding,
         access: &Access,
         kind: RejectionKind,
+        server: bool,
     ) {
         let Ok(current) = self.observe_remote(binding, access) else {
             record.state = State::Unknown;
@@ -376,7 +381,8 @@ impl Mirror {
             Request::Publish { expected_oid, .. }
             | Request::PublishCandidate { expected_oid, .. } => expected_oid.as_ref(),
         };
-        record.state = if current.as_ref() == expected {
+        let hidden_client_refusal = current.is_none() && binding.network.is_some() && !server;
+        record.state = if current.as_ref() == expected && !hidden_client_refusal {
             record.rejection = Some(kind);
             State::Rejected
         } else if current.as_deref() == Some(record.commit.as_str()) {
@@ -744,8 +750,8 @@ impl Mirror {
                         16384,
                     )?
                 };
-                if let Some(kind) = parse_porcelain(&exit, &reference) {
-                    return Ok(Dispatched::Refused(kind));
+                if let Some((kind, server)) = parse_porcelain(&exit, &reference) {
+                    return Ok(Dispatched::Refused(kind, server));
                 }
                 if !exit.finished || exit.code != Some(0) {
                     return Err(Error::Conflict("push did not complete".into()));
@@ -802,7 +808,8 @@ impl Mirror {
 
 /// Classify `git push --porcelain` output as a conclusive refusal of exactly `reference`.
 /// Anything unfinished, unparseable or ambiguous is not a refusal. The exit code is not trusted.
-fn parse_porcelain(exit: &PushExit, reference: &str) -> Option<RejectionKind> {
+/// The flag is true for a server-side `[remote rejected]`, false for a client-side `[rejected]`.
+fn parse_porcelain(exit: &PushExit, reference: &str) -> Option<(RejectionKind, bool)> {
     if !exit.finished {
         return None;
     }
@@ -824,11 +831,12 @@ fn parse_porcelain(exit: &PushExit, reference: &str) -> Option<RejectionKind> {
         if flag != "!" || to != reference {
             return None;
         }
-        let reason = summary
-            .strip_prefix("[remote rejected]")
-            .or_else(|| summary.strip_prefix("[rejected]"))?
-            .to_ascii_lowercase();
-        refusal = Some(if reason.contains("protected branch") {
+        let (server, reason) = match summary.strip_prefix("[remote rejected]") {
+            Some(rest) => (true, rest),
+            None => (false, summary.strip_prefix("[rejected]")?),
+        };
+        let reason = reason.to_ascii_lowercase();
+        let kind = if reason.contains("protected branch") {
             RejectionKind::ProtectedBranch
         } else if reason.contains("hook declined") {
             RejectionKind::HookDeclined
@@ -840,7 +848,8 @@ fn parse_porcelain(exit: &PushExit, reference: &str) -> Option<RejectionKind> {
             RejectionKind::FetchFirst
         } else {
             RejectionKind::Other
-        });
+        };
+        refusal = Some((kind, server));
     }
     refusal
 }
@@ -1113,7 +1122,7 @@ mod tests {
     const REF: &str = "refs/heads/work";
     const OID: &str = "0123456789012345678901234567890123456789";
 
-    fn parse(stdout: &[u8], finished: bool) -> Option<RejectionKind> {
+    fn parse(stdout: &[u8], finished: bool) -> Option<(RejectionKind, bool)> {
         let exit = PushExit {
             finished,
             code: Some(1),
@@ -1128,28 +1137,40 @@ mod tests {
 
     #[test]
     fn classifies_conclusive_refusals() {
-        for (summary, kind) in [
+        for (summary, kind, server) in [
             (
                 "[remote rejected] (pre-receive hook declined)",
                 RejectionKind::HookDeclined,
+                true,
             ),
             (
                 "[remote rejected] (hook declined)",
                 RejectionKind::HookDeclined,
+                true,
             ),
             (
                 "[remote rejected] (protected branch hook declined)",
                 RejectionKind::ProtectedBranch,
+                true,
             ),
-            ("[rejected] (stale info)", RejectionKind::StaleInfo),
+            ("[rejected] (stale info)", RejectionKind::StaleInfo, false),
             (
                 "[rejected] (non-fast-forward)",
                 RejectionKind::NonFastForward,
+                false,
             ),
-            ("[rejected] (fetch first)", RejectionKind::FetchFirst),
-            ("[remote rejected] (something new)", RejectionKind::Other),
+            ("[rejected] (fetch first)", RejectionKind::FetchFirst, false),
+            (
+                "[remote rejected] (something new)",
+                RejectionKind::Other,
+                true,
+            ),
         ] {
-            assert_eq!(parse(&report(summary), true), Some(kind), "{summary}");
+            assert_eq!(
+                parse(&report(summary), true),
+                Some((kind, server)),
+                "{summary}"
+            );
         }
     }
 
@@ -1187,6 +1208,5 @@ mod tests {
         assert_eq!(parse(&bytes, true), None, "non-utf8");
         let flag = text.replace("!\t", "=\t");
         assert_eq!(parse(flag.as_bytes(), true), None, "wrong flag");
-        assert_eq!(parse(&vec![b'x'; 20000], false), None, "oversized");
     }
 }

@@ -104,7 +104,10 @@ means the operation receipt was obtained:
   `protected_branch` appears only when the server's reason says "protected
   branch". It is terminal, had no effect and does not fence new operations. If
   the re-read shows the desired commit the record is `observed_desired`; if
-  the ref is unadvertised on a network remote, `observed_unadvertised`; any other
+  the ref is unadvertised on a network remote, `observed_unadvertised` (there,
+  `rejected` is recorded only for a server-side `[remote rejected]`; a
+  client-side `[rejected]` implies the ref was advertised and is
+  `observed_unadvertised`); any other
   state, `diverged`; a failed re-read, `unknown`. Lost or partial replies,
   timeouts, output over budget (stderr shares the 16 KiB budget, so a very chatty
   hook yields `unknown`) and transport failures also stay `unknown`.

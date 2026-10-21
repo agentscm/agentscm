@@ -650,9 +650,9 @@ fn network_hidden_advertisement_never_becomes_an_absence_claim() {
             &access,
         )
         .unwrap();
-    // The server's refusal is conclusive; the hidden ref is still not reported as absent.
-    assert_eq!(attempted.state, State::Rejected);
-    assert_eq!(attempted.rejection, Some(RejectionKind::StaleInfo));
+    // A client-side refusal proves the ref was advertised; it is never recorded as an absence claim.
+    assert_eq!(attempted.state, State::ObservedUnadvertised);
+    assert_eq!(attempted.rejection, None);
     assert_eq!(attempted.observed_oid, None);
     assert_eq!(run(&fixture.remote, &["rev-parse", "refs/heads/main"]), oid);
 }
