@@ -4262,6 +4262,18 @@ impl Store for SqliteStore {
         Ok(publication_by_id(&self.conn(), id)?.filter(|p| p.repository == repository))
     }
 
+    fn pull_publications(&self, repository: &str, limit: usize) -> Result<Vec<Publication>> {
+        let conn = self.conn();
+        let mut statement = conn.prepare(&format!(
+            "{PUBLICATION_SELECT} WHERE p.repository = ?1 AND p.pr_number IS NOT NULL
+             AND p.merge_commit IS NULL ORDER BY p.pr_number, p.created_at DESC, p.id LIMIT ?2"
+        ))?;
+        let rows = statement
+            .query_map(params![repository, limit as i64], publication_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     fn update_publication(&self, id: &str, update: &Update, now: i64) -> Result<Publication> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;

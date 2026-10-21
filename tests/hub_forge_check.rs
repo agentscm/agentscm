@@ -1,0 +1,535 @@
+//! The Hub-published forge commit status for a candidate pull request, end to end: a real
+//! native store, an in-process hub and a fake GitHub. Synthetic data only.
+#![cfg(unix)]
+#[path = "support/fake_github.rs"]
+mod fake_github;
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+
+use agentscm::authority::Authority;
+use agentscm::authority::workflows::WorkflowRequirement;
+use agentscm::backend::LocalBackend;
+use agentscm::candidate::CandidateSubject;
+use agentscm::checks::SourcePathExpectation;
+use agentscm::context::ReviewContext;
+use agentscm::hub::HubState;
+use agentscm::hub::publish::{NewPublication, Update, derive_candidate_id};
+use agentscm::hub::store::{self, ForgeIdentity, Store, mint_agent_token, unix_now};
+use agentscm::hub::sync::{self, Sync, SyncConfig};
+use agentscm::hub::workspace::{Identity, Workspace, WorkspaceConfig};
+use agentscm::hub::workspace_execution::{AgentTaskProfile, ExecutionConfig, ExecutionService};
+use agentscm::model::FileChange;
+use agentscm::skill_workflow::{
+    self, SkillReference, StepAction, StepDefinition, WorkflowDefinition, WorkflowSource,
+};
+use agentscm::store::{Engine, digest};
+use fake_github::{Branch, Failure, FakeGithub, Pull, Repo};
+use serde_json::json;
+use tempfile::TempDir;
+
+const REPO: &str = "acme/widgets";
+const REPO_ID: i64 = 100;
+const PAT: &str = "ghp_synthetic_pat";
+const GIT: &str = "/usr/bin/git";
+const SKILL: &str = "skills/check/SKILL.md";
+const SKILL_BYTES: &[u8] = b"# Check synthetic source\n";
+const SOURCE_BYTES: &[u8] = b"fn example() {}\n";
+const CONTEXT: &str = "agentscm/workflow/main";
+const BASELINE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const PARENT: &str = "cccccccccccccccccccccccccccccccccccccccc";
+const COMMIT: &str = "1111111111111111111111111111111111111111";
+const BRANCH: &str = "agents/work";
+
+struct Env {
+    fake: FakeGithub,
+    state: HubState,
+    store: Arc<dyn Store>,
+    _root: TempDir,
+    data: PathBuf,
+    context: ReviewContext,
+    subject: CandidateSubject,
+    tree: String,
+}
+
+/// The tree Git builds for the native revision's two files.
+fn git_tree(dir: &Path) -> String {
+    let git = |args: &[&str]| {
+        let out = Command::new(GIT)
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "--object-format=sha1", "-q"]);
+    for (path, bytes) in [(SKILL, SKILL_BYTES), ("src/example.rs", SOURCE_BYTES)] {
+        std::fs::create_dir_all(dir.join(path).parent().unwrap()).unwrap();
+        std::fs::write(dir.join(path), bytes).unwrap();
+    }
+    git(&["add", "."]);
+    git(&["write-tree"])
+}
+
+impl Env {
+    async fn start(publish: bool) -> Self {
+        let root = TempDir::new().unwrap();
+        let data = root.path().join("native");
+        std::fs::create_dir(&data).unwrap();
+        let engine = Engine::open(&data).unwrap();
+        let revision = engine
+            .checkpoint(
+                None,
+                &[
+                    FileChange {
+                        path: SKILL.into(),
+                        content: Some(SKILL_BYTES.to_vec()),
+                    },
+                    FileChange {
+                        path: "src/example.rs".into(),
+                        content: Some(SOURCE_BYTES.to_vec()),
+                    },
+                ],
+            )
+            .unwrap();
+        let mut authority = Authority::open(&data).unwrap();
+        let repository = authority.repository_id().unwrap();
+        let definition = WorkflowDefinition {
+            version: 1,
+            name: "synthetic-forge-check".into(),
+            source: WorkflowSource {
+                repository: repository.clone(),
+                revision: revision.clone(),
+                policy_epoch: 0,
+            },
+            skill: SkillReference {
+                entrypoint: SKILL.into(),
+                resources: vec![],
+            },
+            steps: vec![StepDefinition {
+                id: "source".into(),
+                needs: vec![],
+                required: true,
+                action: StepAction::SourcePaths {
+                    expectations: vec![SourcePathExpectation {
+                        path: "src/example.rs".into(),
+                        sha256: digest(SOURCE_BYTES),
+                    }],
+                },
+            }],
+        };
+        let plan = skill_workflow::compile(&data, &definition).unwrap();
+        let required = WorkflowRequirement::from_plan("main", &plan).unwrap();
+        let requirement_digest = required.digest().unwrap();
+        authority.install_workflow_requirement(&required).unwrap();
+        let policy_epoch = authority.policy_epoch().unwrap();
+        let context: ReviewContext = serde_json::from_value(json!({
+            "version":1,"change":{"repository":repository,"id":"work"},"change_version":1,
+            "revision":revision,"base":null,"target":"main","policy_epoch":policy_epoch,
+            "intent":"Verify synthetic source","acceptance_criteria":["Source matches"],
+            "scope":["src/example.rs"],"exclusions":[],"omissions":[],"dependencies":[],
+            "recipe":{"state":"digest","sha256":"a".repeat(64)},
+            "toolchain":{"state":"digest","sha256":"b".repeat(64)},
+            "environment":{"state":"digest","sha256":"c".repeat(64)},
+            "required_evidence":[],"required_capabilities":["agentscm.review-context/v1"]
+        }))
+        .unwrap();
+        authority.start_change(&context).unwrap();
+        drop((authority, engine));
+        let tree_dir = root.path().join("tree");
+        std::fs::create_dir(&tree_dir).unwrap();
+        let tree = git_tree(&tree_dir);
+
+        let fake = FakeGithub::start().await;
+        let endpoint = format!("{}/{REPO}.git", fake.base.replace("http://", "https://"));
+        let mut subject = CandidateSubject {
+            id: String::new(),
+            attachment: "1".repeat(64),
+            endpoint: endpoint.clone(),
+            output: BRANCH.into(),
+            change: context.change.clone(),
+            change_version: 1,
+            context_digest: context.digest().unwrap(),
+            policy_epoch,
+            revision: revision.clone(),
+            target: "main".into(),
+            baseline_commit: BASELINE.into(),
+            parent_commit: PARENT.into(),
+            source_commit: "d".repeat(40),
+            source_fingerprint: "4".repeat(64),
+            comparison_fingerprint: "5".repeat(64),
+        };
+        subject.id = subject.canonical_id().unwrap();
+        fake.with(|s| {
+            let mut repo = Repo::new(REPO_ID, REPO);
+            let mut pull = Pull::new(1, BRANCH, &["src/example.rs"]);
+            pull.head_sha = COMMIT.into();
+            repo.pulls.insert(1, pull);
+            repo.commits.insert(
+                COMMIT.into(),
+                (tree.clone(), vec![PARENT.into(), BASELINE.into()]),
+            );
+            repo.branches.push(Branch {
+                name: "main".into(),
+                sha: BASELINE.into(),
+                committed_at: "2026-01-01T00:00:00Z".into(),
+            });
+            s.repos.insert(REPO_ID, repo);
+            s.pats
+                .insert(PAT.into(), ("robot".into(), 77, [REPO_ID].into()));
+        });
+
+        let dir = root.path().join("hub");
+        std::fs::create_dir(&dir).unwrap();
+        let store = store::open(&format!("sqlite://{}", dir.join("hub.sqlite").display())).unwrap();
+        let secrets = dir.join("secrets");
+        sync::prepare_secrets_dir(&secrets, true).unwrap();
+        let base = fake.base.clone();
+        let config =
+            SyncConfig::from_lookup("http://127.0.0.1:1", secrets, 14, |name| match name {
+                "AGENTSCM_GITHUB_URL" | "AGENTSCM_GITHUB_API_URL" => Some(base.clone()),
+                "AGENTSCM_GITHUB_PAT" => Some(PAT.into()),
+                _ => None,
+            })
+            .unwrap();
+        let host = fake.base.trim_start_matches("http://").to_owned();
+        let workspace = Arc::new(
+            Workspace::open(
+                WorkspaceConfig {
+                    workspace_id: "synthetic-workspace".into(),
+                    name: "Synthetic workspace".into(),
+                    database: dir.join("workspace.sqlite"),
+                    initial_owner: Identity {
+                        provider: "github".into(),
+                        host: host.clone(),
+                        user_id: 101,
+                    },
+                },
+                store.clone(),
+            )
+            .unwrap(),
+        );
+        let service = ExecutionService::open(
+            &dir.join("execution.sqlite"),
+            ExecutionConfig {
+                version: 1,
+                source_profiles: vec![],
+                agent_task_profiles: vec![AgentTaskProfile {
+                    repository_id: REPO.into(),
+                    profile_id: "checks".into(),
+                    native_repository: repository.clone(),
+                    data_dir: data.clone(),
+                    target: "main".into(),
+                    requirement_digest,
+                    publish_forge_status: publish,
+                }],
+                profiles: vec![],
+            },
+            workspace,
+        )
+        .unwrap();
+        let state = HubState::new(
+            store.clone(),
+            Arc::new(LocalBackend::open(dir.join("objects")).unwrap()),
+        )
+        .with_sync(Sync::new(config).unwrap())
+        .with_workspace_execution(Arc::new(service));
+        sync::start(&state).await.unwrap();
+
+        // Outbound writes stay off: statuses have their own opt-in.
+        let (setup, setup_subject, setup_host) = (store.clone(), subject.clone(), host.clone());
+        let setup_endpoint = endpoint;
+        tokio::task::spawn_blocking(move || {
+            let store = setup;
+            let connection = store.pat_connection(&setup_host).unwrap().unwrap().id;
+            store
+                .upsert_repository(&connection, &setup_host, REPO_ID, REPO, None, None)
+                .unwrap();
+            let owner = store
+                .upsert_user(
+                    &ForgeIdentity {
+                        provider: "github".into(),
+                        host: setup_host,
+                        user_id: 5,
+                    },
+                    "alice",
+                )
+                .unwrap();
+            let (token, _) = mint_agent_token(&*store, &owner.id, "agent-a", REPO, 3600).unwrap();
+            let id = derive_candidate_id(REPO, &setup_subject.id, COMMIT, BRANCH);
+            let manifest = serde_json::from_value(json!({
+                "revision": setup_subject.revision, "commit": COMMIT, "tree": "c".repeat(40),
+                "parent": PARENT, "branch": BRANCH, "base": "main", "title": "t", "body": "",
+                "message": "msg\n",
+                "author": {"name": "A", "email": "a@example.invalid", "date": "2026-05-28T20:26:40Z"},
+                "committer": {"name": "A", "email": "a@example.invalid", "date": "2026-05-28T20:26:40Z"},
+                "changes": [{"path": "old", "mode": "000000", "blob": null, "sha256": null, "size": 0}],
+                "candidate": {"subject": setup_subject, "endpoint": setup_endpoint,
+                    "previous_publication": null}
+            }))
+            .unwrap();
+            store
+                .create_publication(&token, &NewPublication { id: id.clone(), manifest }, unix_now())
+                .unwrap();
+            store
+                .update_publication(&id, &Update::BranchCreated, unix_now())
+                .unwrap();
+            store
+                .update_publication(
+                    &id,
+                    &Update::PullRequest {
+                        number: 1,
+                        node_id: "PR_1".into(),
+                        html_url: format!("https://example.invalid/{REPO}/pull/1"),
+                    },
+                    unix_now(),
+                )
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        Self {
+            fake,
+            state,
+            store,
+            _root: root,
+            data,
+            context,
+            subject,
+            tree,
+        }
+    }
+
+    async fn poll(&self) {
+        sync::poll_once(&self.state).await.unwrap();
+    }
+
+    fn qualify(&self) {
+        let requirement = Authority::open_read_only(&self.data)
+            .unwrap()
+            .workflow_requirement("main")
+            .unwrap()
+            .unwrap();
+        let plan =
+            skill_workflow::compile(&self.data, &requirement.instantiate(&self.context).unwrap())
+                .unwrap();
+        skill_workflow::start(&self.data, "run-1", &plan).unwrap();
+        skill_workflow::advance(&self.data, "run-1", 8).unwrap();
+        skill_workflow::runtime::finalize(&self.data, "run-1", &self.context).unwrap();
+    }
+
+    /// `(sha, state, description)` of every status posted under the workflow context.
+    fn statuses(&self) -> Vec<(String, String, String)> {
+        self.fake.with(|s| {
+            s.repos[&REPO_ID]
+                .statuses
+                .iter()
+                .filter(|(_, v)| v["context"] == CONTEXT)
+                .map(|(sha, v)| {
+                    let text = |key: &str| v[key].as_str().unwrap().to_owned();
+                    (sha.clone(), text("state"), text("description"))
+                })
+                .collect()
+        })
+    }
+
+    fn status_posts(&self) -> usize {
+        self.fake.with(|s| {
+            s.requests
+                .iter()
+                .filter(|r| r.method == "POST" && r.path_and_query.contains("/statuses/"))
+                .count()
+        })
+    }
+
+    fn edit_pull(&self, edit: impl FnOnce(&mut Pull)) {
+        self.fake.with(|s| {
+            edit(
+                s.repos
+                    .get_mut(&REPO_ID)
+                    .unwrap()
+                    .pulls
+                    .get_mut(&1)
+                    .unwrap(),
+            )
+        });
+    }
+
+    fn row(&self) -> Option<agentscm::hub::connection::ForgeCheck> {
+        let repo = self
+            .store
+            .repository_named(self.fake.base.trim_start_matches("http://"), REPO)
+            .unwrap()
+            .unwrap();
+        self.store.forge_check(&repo.id, 1, CONTEXT).unwrap()
+    }
+}
+
+#[tokio::test]
+async fn a_qualified_candidate_with_a_matching_head_gets_exactly_one_success() {
+    let env = Env::start(true).await;
+    assert_eq!(env.tree.len(), 40);
+    env.qualify();
+    env.poll().await;
+    let posted = env.statuses();
+    assert_eq!(posted.len(), 1, "{posted:?}");
+    assert_eq!(
+        (posted[0].0.as_str(), posted[0].1.as_str()),
+        (COMMIT, "success")
+    );
+    assert_eq!(env.row().unwrap().phase, "posted");
+    // Re-reading an unchanged world posts nothing.
+    env.poll().await;
+    env.poll().await;
+    assert_eq!(env.status_posts(), 1);
+}
+
+#[tokio::test]
+async fn the_profile_flag_off_makes_no_status_calls() {
+    let env = Env::start(false).await;
+    env.qualify();
+    env.poll().await;
+    assert_eq!(env.status_posts(), 0);
+    assert!(env.row().is_none());
+}
+
+#[tokio::test]
+async fn no_receipt_is_pending_and_never_success() {
+    let env = Env::start(true).await;
+    env.poll().await;
+    let posted = env.statuses();
+    assert_eq!(posted.len(), 1, "{posted:?}");
+    assert_eq!(posted[0].1, "pending");
+}
+
+#[tokio::test]
+async fn an_advanced_policy_is_a_failure_not_a_success() {
+    let env = Env::start(true).await;
+    env.qualify();
+    Authority::open(&env.data)
+        .unwrap()
+        .advance_policy(env.subject.policy_epoch)
+        .unwrap();
+    env.poll().await;
+    let posted = env.statuses();
+    assert_eq!(posted.len(), 1, "{posted:?}");
+    assert_eq!(posted[0].1, "failure");
+
+    // A success that was posted earlier is replaced on the same head once the policy moves.
+    let env = Env::start(true).await;
+    env.qualify();
+    env.poll().await;
+    assert_eq!(env.statuses()[0].1, "success");
+    Authority::open(&env.data)
+        .unwrap()
+        .advance_policy(env.subject.policy_epoch)
+        .unwrap();
+    env.poll().await;
+    let posted = env.statuses();
+    assert_eq!(posted.len(), 2, "{posted:?}");
+    assert_eq!(
+        (posted[1].0.as_str(), posted[1].1.as_str()),
+        (COMMIT, "failure")
+    );
+}
+
+#[tokio::test]
+async fn a_new_head_supersedes_the_old_success_and_is_not_itself_a_success() {
+    let env = Env::start(true).await;
+    env.qualify();
+    env.poll().await;
+    assert_eq!(env.statuses()[0].1, "success");
+    let pushed = "2".repeat(40);
+    env.fake.with(|s| {
+        s.repos.get_mut(&REPO_ID).unwrap().commits.insert(
+            pushed.clone(),
+            (env.tree.clone(), vec![PARENT.into(), BASELINE.into()]),
+        );
+    });
+    env.edit_pull(|pull| pull.head_sha = "2".repeat(40));
+    env.poll().await;
+    let posted = env.statuses();
+    assert_eq!(posted.len(), 3, "{posted:?}");
+    assert_eq!(
+        (posted[1].0.as_str(), posted[1].1.as_str()),
+        (COMMIT, "failure")
+    );
+    assert!(posted[1].2.starts_with("superseded"));
+    assert_eq!(
+        (posted[2].0.as_str(), posted[2].1.as_str()),
+        (pushed.as_str(), "failure")
+    );
+}
+
+#[tokio::test]
+async fn an_advanced_target_a_fork_or_a_closed_pull_never_succeed() {
+    let env = Env::start(true).await;
+    env.qualify();
+    env.fake.with(|s| {
+        let branch = &mut s.repos.get_mut(&REPO_ID).unwrap().branches[0];
+        branch.sha = "9".repeat(40);
+    });
+    env.poll().await;
+    let posted = env.statuses();
+    assert_eq!(posted.len(), 1, "{posted:?}");
+    assert_eq!(posted[0].1, "failure");
+    assert!(posted[0].2.contains("advanced"));
+
+    let env = Env::start(true).await;
+    env.qualify();
+    env.edit_pull(|pull| pull.head_repo = Some(Some(999)));
+    env.poll().await;
+    let posted = env.statuses();
+    assert_eq!(posted.len(), 1, "{posted:?}");
+    assert_eq!(posted[0].1, "failure");
+    assert!(posted[0].2.contains("connected repository"));
+
+    let env = Env::start(true).await;
+    env.qualify();
+    env.edit_pull(|pull| pull.state = "closed".into());
+    env.poll().await;
+    assert_eq!(env.status_posts(), 0);
+}
+
+#[tokio::test]
+async fn a_lost_status_reply_is_reposted_once_and_then_left_alone() {
+    let env = Env::start(true).await;
+    env.qualify();
+    env.fake.with(|s| s.lose_next_status_reply = true);
+    env.poll().await;
+    assert_eq!(env.statuses().len(), 1);
+    assert_eq!(env.row().unwrap().phase, "attempting");
+    env.poll().await;
+    assert_eq!(env.statuses().len(), 2);
+    assert_eq!(env.row().unwrap().phase, "posted");
+    env.poll().await;
+    assert_eq!(env.statuses().len(), 2);
+    assert!(env.statuses().iter().all(|s| s.1 == "success"));
+}
+
+#[tokio::test]
+async fn a_rate_limited_pull_read_posts_nothing() {
+    let env = Env::start(true).await;
+    // The first poll caches the pull list, so the next one reads only the pull for the check.
+    env.poll().await;
+    assert_eq!(env.statuses().len(), 1);
+    env.qualify();
+    env.fake.with(|s| {
+        s.fail.push_back(Failure {
+            path_contains: "/pulls/1".into(),
+            status: 429,
+            headers: vec![("retry-after".into(), "600".into())],
+        });
+    });
+    env.poll().await;
+    assert!(
+        env.fake.with(|s| s.fail.is_empty()),
+        "the limit was not hit"
+    );
+    assert_eq!(env.status_posts(), 1, "{:?}", env.statuses());
+    assert_eq!(env.statuses()[0].1, "pending");
+}

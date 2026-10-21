@@ -625,7 +625,7 @@ impl Publication {
         reply
     }
 
-    fn manifest(&self) -> Result<Manifest> {
+    pub(super) fn manifest(&self) -> Result<Manifest> {
         if self.manifest.len() > MANIFEST_BODY_BYTES {
             return Err(invalid("retained publication exceeds manifest budget"));
         }

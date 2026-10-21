@@ -4385,6 +4385,23 @@ impl Store for PgStore {
         })
     }
 
+    fn pull_publications(&self, repository: &str, limit: usize) -> Result<Vec<Publication>> {
+        self.run(true, |client| {
+            let limit = limit as i64;
+            client
+                .query(
+                    &format!(
+                        "{PUBLICATION_SELECT} WHERE p.repository = $1 AND p.pr_number IS NOT NULL
+                         AND p.merge_commit IS NULL ORDER BY p.pr_number, p.created_at DESC, p.id LIMIT $2"
+                    ),
+                    &[&repository, &limit],
+                )?
+                .iter()
+                .map(publication_row)
+                .collect()
+        })
+    }
+
     fn update_publication(&self, id: &str, update: &Update, now: i64) -> Result<Publication> {
         self.run(false, |client| {
             let mut tx = client.transaction()?;

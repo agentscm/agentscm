@@ -346,6 +346,9 @@ pub trait Store: Send + Sync {
     fn create_publication(&self, token: &str, new: &NewPublication, now: i64) -> Result<Create>;
     fn publication(&self, repository: &str, id: &str) -> Result<Option<Publication>>;
     /// Applies one forge fact (see [`Update`]); an event only when the state changes. Unknown id is `Invalid`.
+    /// Unmerged publications of `repository` that have a pull request, by pull request number then
+    /// newest first, at most `limit`.
+    fn pull_publications(&self, repository: &str, limit: usize) -> Result<Vec<Publication>>;
     fn update_publication(&self, id: &str, update: &Update, now: i64) -> Result<Publication>;
     /// Events with `seq` greater than the argument, oldest first, at most 1000.
     /// Retained events in sequence order; operator-compacted work events can leave gaps.

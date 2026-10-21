@@ -864,6 +864,8 @@ async fn read_repo(
     if conn.outbound {
         outbound_repo(state, conn, repo, token).await?;
     }
+    #[cfg(unix)]
+    super::forge_check::reconcile_repo(state, conn, repo, token).await?;
     Ok(report)
 }
 
@@ -1631,6 +1633,9 @@ async fn webhook_work(
                     }
                 }
             }
+            // Only the re-read state matters to a status, never the payload.
+            #[cfg(unix)]
+            super::forge_check::reconcile_repo(state, conn, &repo, &token).await?;
             Ok(())
         };
         reads
