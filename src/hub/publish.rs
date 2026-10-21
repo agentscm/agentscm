@@ -498,7 +498,8 @@ impl Publication {
                 None
             }
             Update::PullRequestRefused { status } => {
-                if self.branch_state != "pr_attempting" || !matches!(status, 403 | 404 | 422) {
+                if self.branch_state != "pr_attempting" || !matches!(status, 400 | 403 | 404 | 422)
+                {
                     return Err(invalid(
                         "PR refusal requires an attempted write and definitive refusal",
                     ));
