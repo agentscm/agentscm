@@ -42,6 +42,14 @@ impl ForgeApi<'_> {
         }
     }
 
+    /// Like [`pull`](Self::pull); on GitHub a 403 is a refusal of this read, not a failed credential.
+    pub async fn pull_soft(&self, token: &str, repo: &Repo, number: i64) -> Gh<Option<Value>> {
+        match self {
+            Self::Github(api) => api.pull_soft(token, &repo.full_name, number).await,
+            Self::Gitlab(api) => api.pull(token, repo.repository_id, number).await,
+        }
+    }
+
     pub async fn pull_files(
         &self,
         token: &str,

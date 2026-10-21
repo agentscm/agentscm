@@ -696,6 +696,7 @@ async fn target(
     state: &HubState,
     principal: &Principal,
     outbound: bool,
+    candidate: bool,
 ) -> std::result::Result<(Connection, ConnectedRepository), ApiError> {
     let (host, name) = (
         principal.owner.identity.host.clone(),
@@ -711,8 +712,9 @@ async fn target(
     })
     .await?
     .ok_or_else(|| conflict("not_connected"))?;
-    // Publishing speaks the GitHub API; another forge's token must never be sent there.
-    if found.0.provider != "github" {
+    // Each forge's token goes only to that forge's API (see `Sync::forge`). Event publication
+    // rebuilds commits through the GitHub Git Data API, so only candidates may use GitLab.
+    if !(found.0.provider == "github" || (candidate && found.0.provider == "gitlab")) {
         return Err(conflict("unsupported_provider"));
     }
     if outbound && !found.0.outbound {
@@ -765,11 +767,15 @@ async fn create(
     let manifest: Manifest = serde_json::from_value(request).map_err(|_| ApiError::invalid())?;
     let new = NewPublication { id, manifest };
     new.validate(&principal.repository)?;
-    let (connection, connected) = target(&state, &principal, true).await?;
+    let (connection, connected) =
+        target(&state, &principal, true, new.manifest.candidate.is_some()).await?;
     if let Some(candidate) = &new.manifest.candidate {
         let (host, full) = candidate_repository(&candidate.endpoint)?;
         if host != connected.host || full != connected.full_name {
             return Err(conflict("candidate_endpoint_mismatch"));
+        }
+        if name_shared_across_hosts(&state, &connected).await? {
+            return Err(conflict("ambiguous_repository_name"));
         }
         let token = state
             .sync
@@ -778,9 +784,9 @@ async fn create(
             .map_err(|_| conflict("candidate_default_unavailable"))?;
         let default = state
             .sync
-            .api()
+            .forge(&connection)
             .map_err(|_| conflict("candidate_default_unavailable"))?
-            .default_branch(&token, &connected.full_name)
+            .default_branch(&token, &connected)
             .await
             .map_err(|_| conflict("unsupported_candidate_default"))?;
         if new.manifest.branch == default
@@ -900,9 +906,10 @@ async fn show(
     let mut publication = load(&state, &repo, &id).await?;
     if let (Some(number), None) = (publication.pr_number, &publication.merge_commit)
         && read_due(&id)
-        && let Ok((conn, repository)) = target(&state, &principal, false).await
+        && let Some(candidate) = publication.manifest().ok().map(|m| m.candidate.is_some())
+        && let Ok((conn, repository)) = target(&state, &principal, false, candidate).await
     {
-        match merged_commit(&state, &conn, &repository, number).await {
+        match merged_commit(&state, &conn, &repository, number, &publication.commit).await {
             Ok(Some(merge_commit)) => {
                 publication = record(&state, &id, Update::Merged { merge_commit }).await?;
             }
@@ -996,23 +1003,59 @@ async fn merged_commit(
     conn: &Connection,
     repository: &ConnectedRepository,
     number: i64,
+    published: &str,
 ) -> Gh<Option<String>> {
     let token = state.sync.token(conn, repository.installation_id).await?;
     let pull = state
         .sync
-        .api()?
-        .pull_soft(&token, &repository.full_name, number)
+        .forge(conn)?
+        .pull_soft(&token, repository, number)
         .await?;
-    Ok(pull
-        .filter(|pull| pull["merged"] == true)
-        .and_then(|pull| pull["merge_commit_sha"].as_str().map(str::to_owned)))
+    Ok(pull.filter(|pull| pull["merged"] == true).and_then(|pull| {
+        pull["merge_commit_sha"]
+            .as_str()
+            .or_else(|| {
+                // A GitLab fast-forward merge reports no merge commit: the branch tip became
+                // the target tip. That proves the merge only when the tip is the published commit.
+                (conn.provider == "gitlab")
+                    .then(|| pull["head"]["sha"].as_str().filter(|sha| *sha == published))
+                    .flatten()
+            })
+            .map(str::to_owned)
+    }))
+}
+
+/// Whether a repository of the same name is also connected on another configured forge host.
+/// Publications and candidate lineages are keyed by repository name alone, so two forges
+/// sharing a name could be read as each other's.
+async fn name_shared_across_hosts(
+    state: &HubState,
+    repository: &ConnectedRepository,
+) -> Result<bool> {
+    let hosts: Vec<String> = state
+        .sync
+        .hosts()
+        .into_iter()
+        .filter(|host| *host != repository.host)
+        .collect();
+    let (store, name) = (state.store.clone(), repository.full_name.clone());
+    blocking(state, move || {
+        for host in hosts {
+            if store.repository_named(&host, &name)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })
+    .await
 }
 
 /// Records what a failed call means for the connection and returns text for the publication.
 async fn forge_failure(state: &HubState, conn: &Connection, error: GhError) -> Result<String> {
+    let who = super::sync::who(conn);
     let text = match &error {
-        GhError::Auth(_) => "GitHub rejected the hub's credentials".to_owned(),
-        GhError::Limited(_) => "GitHub rate limit reached; retry later".to_owned(),
+        GhError::Auth(_) => format!("{who} rejected the hub's credentials"),
+        GhError::Limited(_) => format!("{who} rate limit reached; retry later"),
         GhError::Failed(detail) => clean(detail),
     };
     failed(state, conn, "publication", error).await?;
@@ -1034,7 +1077,8 @@ async fn run(
     scope(&principal, &repo)?;
     let publication = load(&state, &repo, &id).await?;
     owned(&principal, &publication)?;
-    let (_, repository) = target(&state, &principal, true).await?;
+    let candidate = publication.manifest()?.candidate.is_some();
+    let (_, repository) = target(&state, &principal, true, candidate).await?;
     if !missing_blobs(&state, &publication).await?.is_empty() {
         return Err(conflict("blobs_missing"));
     }
@@ -1058,7 +1102,7 @@ async fn recover(
     if publication.manifest()?.candidate.is_none() {
         return Err(conflict("candidate_required"));
     }
-    let (_, repository) = target(&state, &principal, false).await?;
+    let (_, repository) = target(&state, &principal, false, true).await?;
     let result = execute(state, repository, publication, true).await?;
     Ok(Json(result.to_json()))
 }
@@ -1146,7 +1190,6 @@ async fn push(
         ));
     }
     let manifest = publication.manifest()?;
-    let api = state.sync.api()?;
     let token = state.sync.token(conn, repository.installation_id).await?;
     let (full, branch, id) = (&repository.full_name, &manifest.branch, &publication.id);
     if let Some(candidate) = &manifest.candidate {
@@ -1166,6 +1209,13 @@ async fn push(
             "read-only candidate recovery requires a candidate subject".into(),
         ));
     }
+    // Event publication rebuilds commits through the GitHub Git Data API.
+    if conn.provider != "github" {
+        return Err(Stop::Message(
+            "event publication supports only GitHub".into(),
+        ));
+    }
+    let api = state.sync.api()?;
     let created_before = publication.branch_state == "created";
     match api.ref_sha(&token, full, branch).await? {
         // A branch at our commit is ours only if this publication sent the create (a reply
@@ -1405,15 +1455,23 @@ async fn candidate_pull(
             "candidate endpoint differs from connected repository".into(),
         ));
     }
-    let api = state.sync.api()?;
+    if name_shared_across_hosts(state, repository).await? {
+        return Err(Stop::Message(
+            "repository name is also connected on another forge host".into(),
+        ));
+    }
+    let api = state.sync.forge(conn)?;
     let token = state.sync.token(conn, repository.installation_id).await?;
     if !recovery
         && publication.pr_number.is_none()
         && publication.branch_state != "pr_attempting"
-        && (api.ref_sha(&token, &full, &manifest.base).await?.as_deref()
+        && (api
+            .ref_sha(&token, repository, &manifest.base)
+            .await?
+            .as_deref()
             != Some(&candidate.subject.baseline_commit)
             || api
-                .ref_sha(&token, &full, &manifest.branch)
+                .ref_sha(&token, repository, &manifest.branch)
                 .await?
                 .as_deref()
                 != Some(&manifest.commit))
@@ -1467,9 +1525,8 @@ async fn candidate_pull(
         "<!-- agentscm-candidate:{}:{} -->",
         publication.id, manifest.commit
     );
-    let owner = full.split('/').next().unwrap_or_default();
     let pulls = api
-        .find_open_pulls(&token, &full, owner, &manifest.branch)
+        .find_open_pulls(&token, repository, &manifest.branch, &manifest.base)
         .await?;
     let matching: Vec<_> = pulls
         .iter()
@@ -1507,7 +1564,7 @@ async fn candidate_pull(
                     "PR outcome unknown or prior PR unavailable; read-only recovery only".into(),
                 ));
             }
-            let default = api.default_branch(&token, &full).await?;
+            let default = api.default_branch(&token, repository).await?;
             if manifest.branch == default
                 || manifest.branch == "HEAD"
                 || manifest.branch.starts_with("refs/")
@@ -1518,10 +1575,13 @@ async fn candidate_pull(
             }
             // Long provider reads do not establish a lease. Compare again at the
             // new PR effect boundary and retain an attempted state before dispatch.
-            if api.ref_sha(&token, &full, &manifest.base).await?.as_deref()
+            if api
+                .ref_sha(&token, repository, &manifest.base)
+                .await?
+                .as_deref()
                 != Some(&candidate.subject.baseline_commit)
                 || api
-                    .ref_sha(&token, &full, &manifest.branch)
+                    .ref_sha(&token, repository, &manifest.branch)
                     .await?
                     .as_deref()
                     != Some(&manifest.commit)
@@ -1541,7 +1601,7 @@ async fn candidate_pull(
             let result = api
                 .create_candidate_pull(
                     &token,
-                    &full,
+                    repository,
                     &manifest.title,
                     &format!("{}\n\n{marker}", manifest.body),
                     &manifest.branch,
@@ -1599,10 +1659,13 @@ async fn candidate_pull(
         },
     )
     .await?;
-    if api.ref_sha(&token, &full, &manifest.base).await?.as_deref()
+    if api
+        .ref_sha(&token, repository, &manifest.base)
+        .await?
+        .as_deref()
         != Some(&candidate.subject.baseline_commit)
         || api
-            .ref_sha(&token, &full, &manifest.branch)
+            .ref_sha(&token, repository, &manifest.branch)
             .await?
             .as_deref()
             != Some(&manifest.commit)

@@ -382,12 +382,23 @@ impl Sync {
     }
 
     /// The client for the connection's provider.
-    fn forge(&self, conn: &Connection) -> Gh<ForgeApi<'_>> {
+    pub(super) fn forge(&self, conn: &Connection) -> Gh<ForgeApi<'_>> {
         let api = match conn.provider.as_str() {
             "gitlab" => self.gitlab.as_ref().map(ForgeApi::Gitlab),
             _ => self.api.as_ref().map(ForgeApi::Github),
         };
         api.ok_or_else(|| GhError::Failed("sync is not configured".into()))
+    }
+
+    /// The identity hosts of the configured forges.
+    pub(super) fn hosts(&self) -> Vec<String> {
+        self.config
+            .iter()
+            .flat_map(|config| {
+                std::iter::once(config.host.clone())
+                    .chain(config.gitlab.iter().map(|g| g.host.clone()))
+            })
+            .collect()
     }
 
     pub(super) fn api(&self) -> Gh<&Api> {
@@ -469,7 +480,7 @@ fn forge_to_hub(who: &str, error: GhError) -> HubError {
 }
 
 /// The provider's name for operator-facing text.
-fn who(conn: &Connection) -> &'static str {
+pub(super) fn who(conn: &Connection) -> &'static str {
     if conn.provider == "gitlab" {
         "GitLab"
     } else {

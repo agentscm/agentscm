@@ -557,7 +557,10 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                 return json_reply(400, json!({"message": "branch does not exist"}));
             };
             if project.mrs.values().any(|m| {
-                m.state == "opened" && m.source_branch == source && m.target_branch == target
+                m.state == "opened"
+                    && m.source_branch == source
+                    && m.target_branch == target
+                    && m.source_project_id.is_none()
             }) {
                 return json_reply(
                     409,
