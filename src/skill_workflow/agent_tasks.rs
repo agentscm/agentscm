@@ -80,6 +80,7 @@ pub struct LiveImportedOrigins {
 
 impl LiveImportedOrigins {
     /// No imported-origin grants: only native receipts can qualify.
+    #[cfg(any(unix, test))]
     pub(crate) fn native_only(repository: String) -> Self {
         Self {
             repository,

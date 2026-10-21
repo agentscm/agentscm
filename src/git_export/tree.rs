@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+#[cfg(unix)]
 use ring::digest::{Context, SHA1_FOR_LEGACY_USE_ONLY};
 
 use super::git::Git;
@@ -38,6 +39,7 @@ impl Directory {
         }
     }
 
+    #[cfg(unix)]
     fn oid(&self) -> Result<String> {
         let mut entries = Vec::new();
         for (name, (mode, oid)) in &self.files {
@@ -151,6 +153,7 @@ fn walk_entries(
     }
 }
 
+#[cfg(unix)]
 fn git_object_oid(kind: &str, body: &[u8]) -> String {
     let mut hash = Context::new(&SHA1_FOR_LEGACY_USE_ONLY);
     hash.update(format!("{kind} {}\0", body.len()).as_bytes());
@@ -158,6 +161,7 @@ fn git_object_oid(kind: &str, body: &[u8]) -> String {
     hex(hash.finish().as_ref())
 }
 
+#[cfg(unix)]
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

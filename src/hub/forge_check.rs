@@ -3,6 +3,10 @@
 //! Success needs the Hub's own read of an operator-pinned native store and of the live pull
 //! request head. Webhook or comment text is never an input here. Nothing in this module
 //! performs network I/O or writes state.
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Mutex, PoisonError};
+
 use sha2::{Digest, Sha256};
 
 use super::connection::{
@@ -98,9 +102,7 @@ pub fn native_state(profile: &AgentTaskProfile, subject: &CandidateSubject) -> N
         }
         Err(_) => return NativeState::Unavailable("qualification unreadable"),
     };
-    let tree_oid = crate::store::Engine::open_existing(&profile.data_dir)
-        .and_then(|engine| crate::git_export::native_tree_oid(&engine, &subject.revision));
-    match tree_oid {
+    match cached_tree_oid(&profile.data_dir, &subject.revision) {
         Ok(tree_oid) => NativeState::Qualified {
             receipt,
             requirement_digest: profile.requirement_digest.clone(),
@@ -108,6 +110,30 @@ pub fn native_state(profile: &AgentTaskProfile, subject: &CandidateSubject) -> N
         },
         Err(_) => NativeState::Unavailable("revision tree unavailable"),
     }
+}
+
+/// A revision is immutable, so its tree OID is computed once per store.
+/// ponytail: cleared whole past 256 entries; an LRU only matters beyond that many live revisions.
+fn cached_tree_oid(data_dir: &std::path::Path, revision: &str) -> crate::Result<String> {
+    static TREES: Mutex<Option<HashMap<(PathBuf, String), String>>> = Mutex::new(None);
+    let key = (data_dir.to_path_buf(), revision.to_owned());
+    if let Some(found) = TREES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get_or_insert_with(HashMap::new)
+        .get(&key)
+    {
+        return Ok(found.clone());
+    }
+    let engine = crate::store::Engine::open_existing(data_dir)?;
+    let oid = crate::git_export::native_tree_oid(&engine, revision)?;
+    let mut trees = TREES.lock().unwrap_or_else(PoisonError::into_inner);
+    let trees = trees.get_or_insert_with(HashMap::new);
+    if trees.len() >= 256 {
+        trees.clear();
+    }
+    trees.insert(key, oid.clone());
+    Ok(oid)
 }
 
 fn is_oid(value: &str) -> bool {
@@ -231,6 +257,25 @@ pub fn status_context(target: &str) -> Result<String> {
 /// Pull requests examined per pass; the rest wait for the next one.
 const MAX_PULLS_PER_PASS: usize = 50;
 const SUPERSEDED: &str = "superseded: pull request head changed";
+const CLOSED: &str = "not applicable: pull request closed";
+
+/// How one status post ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Posting {
+    /// The forge accepted it and the journal says `posted`.
+    Posted,
+    /// The forge accepted it but the journal write lost a race; read again.
+    Unrecorded,
+    /// The forge definitely refused it; recorded as `refused`.
+    Refused,
+    /// Not applied, uncertain, or not reserved: the row is left for the next pass.
+    Unknown,
+}
+
+/// A status on `row` may still show a success: it says success, or its last post is uncertain.
+fn may_show_success(row: &ForgeCheck) -> bool {
+    row.state == "success" || row.phase == "attempting"
+}
 
 /// What one status post should say about one head.
 struct Desired {
@@ -241,11 +286,14 @@ struct Desired {
 /// Re-reads every candidate pull request of `repo` from the forge and the pinned native store
 /// and posts the status each opted-in profile calls for. The caller holds the repository lock.
 /// `Auth` and `Limited` stop the pass; anything else skips only the pull request concerned.
+/// `only` limits the pass to one pull request; otherwise each pass takes the next window of
+/// `MAX_PULLS_PER_PASS` pull requests after the previous one's last, wrapping at the end.
 pub(super) async fn reconcile_repo(
     state: &HubState,
     conn: &Connection,
     repo: &ConnectedRepository,
     token: &str,
+    only: Option<i64>,
 ) -> Gh<()> {
     // Statuses are a GitHub feature; another forge's token never goes to the GitHub client.
     let Some(service) = state
@@ -264,18 +312,23 @@ pub(super) async fn reconcile_repo(
     if profiles.is_empty() {
         return Ok(());
     }
+    let (after, limit) = match only {
+        Some(number) => (number.saturating_sub(1), 1),
+        None => (state.sync.forge_cursor(&repo.id), MAX_PULLS_PER_PASS),
+    };
     let (store, name) = (state.store.clone(), repo.full_name.clone());
-    let publications = blocking(state, move || {
-        store.pull_publications(&name, MAX_PULLS_PER_PASS)
-    })
-    .await?;
-    let mut last = 0;
+    let publications =
+        blocking(state, move || store.pull_publications(&name, after, limit)).await?;
+    let full = publications.len() >= limit;
+    let last = publications.last().and_then(|p| p.pr_number).unwrap_or(0);
     for publication in publications {
-        // Newest publication of a pull request first; older ones of the same number are history.
-        let Some(number) = publication.pr_number.filter(|n| *n != last) else {
+        // One (newest) publication per pull request number; older ones are history.
+        let Some(number) = publication
+            .pr_number
+            .filter(|n| only.is_none_or(|o| o == *n))
+        else {
             continue;
         };
-        last = number;
         let Some(candidate) = publication.manifest().ok().and_then(|m| m.candidate) else {
             continue;
         };
@@ -307,11 +360,17 @@ pub(super) async fn reconcile_repo(
             }
         }
     }
+    if only.is_none() {
+        state
+            .sync
+            .set_forge_cursor(&repo.id, if full { last } else { 0 });
+    }
     Ok(())
 }
 
 /// One read-decide-post round for one pull request. True when it posted a success, so the
-/// caller reads again before trusting it.
+/// caller reads again; if that confirming read fails, the posted success stays for the next
+/// pass to recheck.
 async fn pull_step(
     state: &HubState,
     repo: &ConnectedRepository,
@@ -322,11 +381,17 @@ async fn pull_step(
     commit: &str,
 ) -> Gh<bool> {
     let api = state.sync.api()?;
-    // A closed or missing pull request gets no new post; a read that fails claims nothing.
+    // A missing pull request gets no post; a read that fails claims nothing.
     let Some(head) = api.pull_head(token, &repo.full_name, number).await? else {
         return Ok(false);
     };
+    let context = status_context(&profile.target)?;
+    let row = journal(state, repo, number, &context).await?;
     if !head.open {
+        // A success must not stay on a commit once its pull request is closed.
+        if let Some(old) = row.as_ref().filter(|r| may_show_success(r)) {
+            retire(state, repo, token, number, &context, old, CLOSED).await?;
+        }
         return Ok(false);
     }
     let live = LiveHead {
@@ -345,29 +410,21 @@ async fn pull_step(
     let verdict = evaluate(connected, subject, commit, &live, &native);
     let desired = desired(connected, number, profile, subject, &live, &native, verdict);
 
-    let context = status_context(&profile.target)?;
-    let row = journal(state, repo, number, &context).await?;
     if let Some(old) = row
         .as_ref()
-        .filter(|r| r.state == "success" && r.head_sha != live.head_sha)
+        .filter(|r| r.head_sha != live.head_sha && may_show_success(r))
     {
-        // A success must not stay on a commit the pull request may return to.
-        let stale = Desired {
-            new: NewForgeCheck {
-                head_sha: old.head_sha.clone(),
-                state: "failure".into(),
-                binding_digest: None,
-                description: SUPERSEDED.into(),
-            },
-            state: StatusState::Failure,
-        };
-        if !post(state, repo, token, number, &context, row.as_ref(), &stale).await? {
+        // A success must not stay on a commit the pull request may return to. Only a settled
+        // failure (posted or refused) lets the row move to the new head.
+        let settled = retire(state, repo, token, number, &context, old, SUPERSEDED).await?;
+        if !settled {
             return Ok(false);
         }
     }
     let row = journal(state, repo, number, &context).await?;
+    // A refusal is not retried until the desired status changes.
     if row.as_ref().is_some_and(|r| {
-        r.phase == "posted"
+        matches!(r.phase.as_str(), "posted" | "refused")
             && r.head_sha == desired.new.head_sha
             && r.state == desired.new.state
             && r.binding_digest == desired.new.binding_digest
@@ -376,7 +433,33 @@ async fn pull_step(
         return Ok(false);
     }
     let posted = post(state, repo, token, number, &context, row.as_ref(), &desired).await?;
-    Ok(posted && desired.state == StatusState::Success)
+    Ok(matches!(posted, Posting::Posted | Posting::Unrecorded)
+        && desired.state == StatusState::Success)
+}
+
+/// Posts a failure on the head `old` names. True when that failure is settled (the forge
+/// accepted it or definitely refused it), so a gc'd or forbidden commit cannot wedge the pull
+/// request. A lost or unrecorded post leaves the row for the next pass.
+async fn retire(
+    state: &HubState,
+    repo: &ConnectedRepository,
+    token: &str,
+    number: i64,
+    context: &str,
+    old: &ForgeCheck,
+    description: &str,
+) -> Gh<bool> {
+    let stale = Desired {
+        new: NewForgeCheck {
+            head_sha: old.head_sha.clone(),
+            state: "failure".into(),
+            binding_digest: None,
+            description: description.into(),
+        },
+        state: StatusState::Failure,
+    };
+    let posting = post(state, repo, token, number, context, Some(old), &stale).await?;
+    Ok(matches!(posting, Posting::Posted | Posting::Refused))
 }
 
 fn desired(
@@ -442,11 +525,10 @@ async fn journal(
     blocking(state, move || store.forge_check(&id, number, &context)).await
 }
 
-/// Reserves, posts and completes one status. True only when the forge accepted it and the
-/// journal says `posted`. A lost reply, a definite refusal or a lost race leaves the row
+/// Reserves, posts and completes one status. A lost reply or a lost race leaves the row
 /// `attempting` (or unchanged), so the next pass posts the desired status again; the latest
-/// status per context wins on GitHub, so the repost is the recovery. A refusal is never
-/// recorded as posted.
+/// status per context wins on GitHub, so the repost is the recovery. A definite refusal is
+/// recorded as `refused` and never as posted.
 async fn post(
     state: &HubState,
     repo: &ConnectedRepository,
@@ -455,7 +537,7 @@ async fn post(
     context: &str,
     row: Option<&ForgeCheck>,
     desired: &Desired,
-) -> Gh<bool> {
+) -> Gh<Posting> {
     let status = CommitStatus::new(
         &desired.new.head_sha,
         desired.state,
@@ -469,18 +551,18 @@ async fn post(
     })
     .await?;
     let ForgeCheckReserve::Reserved(generation) = reserved else {
-        return Ok(false);
+        return Ok(Posting::Unknown);
     };
-    match state
+    let phase = match state
         .sync
         .api()?
         .post_commit_status(token, &repo.full_name, &status)
         .await
     {
-        Ok(Ok(())) => {}
+        Ok(Ok(())) => "posted",
         Ok(Err(refused)) => {
             eprintln!("hub: {} refused a forge check ({refused})", repo.full_name);
-            return Ok(false);
+            "refused"
         }
         // Not applied; the row stays `attempting`.
         Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
@@ -490,14 +572,21 @@ async fn post(
                 "hub: forge check post for {}#{number}: {detail}",
                 repo.full_name
             );
-            return Ok(false);
+            return Ok(Posting::Unknown);
         }
-    }
+    };
     let (store, id, ctx) = (state.store.clone(), repo.id.clone(), context.to_owned());
-    Ok(blocking(state, move || {
-        store.complete_forge_check(&id, number, &ctx, generation, unix_now())
+    let recorded = blocking(state, move || {
+        store.complete_forge_check(&id, number, &ctx, generation, phase, unix_now())
     })
-    .await?)
+    .await?;
+    Ok(match (phase, recorded) {
+        ("posted", true) => Posting::Posted,
+        ("posted", false) => Posting::Unrecorded,
+        (_, true) => Posting::Refused,
+        // Refused but unrecorded: the row stays `attempting` and is retried.
+        _ => Posting::Unknown,
+    })
 }
 
 #[cfg(test)]

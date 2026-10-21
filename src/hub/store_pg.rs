@@ -11,8 +11,8 @@ use serde_json::json;
 use super::connection::{
     CONNECTION_SELECT, ConnectedRepository, Connection as ForgeConnection, DELIVERY_KEEP_SECONDS,
     ForgeCheck, ForgeCheckReserve, NewConnection, NewForgeCheck, Observation, Observed, Outbound,
-    REPOSITORY_SELECT, gone_event, observation_kinds, validate_check_key, validate_observation,
-    validate_repository_row, validate_status,
+    REPOSITORY_SELECT, gone_event, observation_kinds, validate_check_key, validate_check_phase,
+    validate_observation, validate_repository_row, validate_status,
 };
 use super::coordination::{
     CoordinationAck, CoordinationAcknowledgement, CoordinationAgent, CoordinationInbox,
@@ -4284,15 +4284,17 @@ impl Store for PgStore {
         number: i64,
         context: &str,
         generation: i64,
+        phase: &str,
         now: i64,
     ) -> Result<bool> {
         validate_check_key(number, context)?;
+        validate_check_phase(phase)?;
         self.run(false, |client| {
             Ok(client.execute(
-                "UPDATE hub_forge_checks SET phase = 'posted', generation = generation + 1,
+                "UPDATE hub_forge_checks SET phase = $6, generation = generation + 1,
                      updated_at = $5
                  WHERE repository = $1 AND number = $2 AND context = $3 AND generation = $4",
-                &[&repo, &number, &context, &generation, &now],
+                &[&repo, &number, &context, &generation, &now, &phase],
             )? == 1)
         })
     }
@@ -4385,16 +4387,25 @@ impl Store for PgStore {
         })
     }
 
-    fn pull_publications(&self, repository: &str, limit: usize) -> Result<Vec<Publication>> {
+    fn pull_publications(
+        &self,
+        repository: &str,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<Publication>> {
         self.run(true, |client| {
             let limit = limit as i64;
             client
                 .query(
                     &format!(
-                        "{PUBLICATION_SELECT} WHERE p.repository = $1 AND p.pr_number IS NOT NULL
-                         AND p.merge_commit IS NULL ORDER BY p.pr_number, p.created_at DESC, p.id LIMIT $2"
+                        "{PUBLICATION_SELECT} WHERE lower(p.repository) = lower($1) AND p.pr_number > $2
+                         AND p.merge_commit IS NULL
+                         AND p.id = (SELECT q.id FROM hub_publications q
+                             WHERE lower(q.repository) = lower($1) AND q.pr_number = p.pr_number
+                             ORDER BY q.created_at DESC, q.id LIMIT 1)
+                         ORDER BY p.pr_number LIMIT $3"
                     ),
-                    &[&repository, &limit],
+                    &[&repository, &after, &limit],
                 )?
                 .iter()
                 .map(publication_row)

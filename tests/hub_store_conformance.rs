@@ -1201,11 +1201,19 @@ fn forge_check_journal(db: &Db) {
             .unwrap(),
         ForgeCheckReserve::Conflict
     );
-    assert!(store.complete_forge_check(&repo.id, 5, ctx, 1, 12).unwrap());
+    assert!(
+        store
+            .complete_forge_check(&repo.id, 5, ctx, 1, "posted", 12)
+            .unwrap()
+    );
     let row = store.forge_check(&repo.id, 5, ctx).unwrap().unwrap();
     assert_eq!((row.phase.as_str(), row.generation), ("posted", 2));
     // Completing again with the old generation is refused.
-    assert!(!store.complete_forge_check(&repo.id, 5, ctx, 1, 13).unwrap());
+    assert!(
+        !store
+            .complete_forge_check(&repo.id, 5, ctx, 1, "posted", 13)
+            .unwrap()
+    );
 
     // Two evaluations that read generation 2: one wins, the other must re-read.
     assert_eq!(
@@ -1221,7 +1229,11 @@ fn forge_check_journal(db: &Db) {
         ForgeCheckReserve::Conflict
     );
     // The completion of a superseded reservation is refused.
-    assert!(!store.complete_forge_check(&repo.id, 5, ctx, 2, 16).unwrap());
+    assert!(
+        !store
+            .complete_forge_check(&repo.id, 5, ctx, 2, "posted", 16)
+            .unwrap()
+    );
     let row = store.forge_check(&repo.id, 5, ctx).unwrap().unwrap();
     assert_eq!(
         (
@@ -1239,6 +1251,19 @@ fn forge_check_journal(db: &Db) {
             3
         )
     );
+    // Only a final phase can be recorded; a definite refusal is its own phase.
+    assert!(
+        store
+            .complete_forge_check(&repo.id, 5, ctx, 3, "attempting", 17)
+            .is_err()
+    );
+    assert!(
+        store
+            .complete_forge_check(&repo.id, 5, ctx, 3, "refused", 17)
+            .unwrap()
+    );
+    let row = store.forge_check(&repo.id, 5, ctx).unwrap().unwrap();
+    assert_eq!((row.phase.as_str(), row.generation), ("refused", 4));
     // Other contexts and pull requests are independent rows.
     assert_eq!(store.forge_check(&repo.id, 6, ctx).unwrap(), None);
     assert_eq!(
@@ -1496,6 +1521,52 @@ fn upgrade_from_migration_14_with_publication(db: &Db) {
     }
     assert!(store.publication(REPO, &id).is_err());
 }
+fn pull_publications_are_newest_per_pull_request(db: &Db) {
+    let store = db.open();
+    let row = |id: &str, repository: &str, pr: &str, merged: &str, created: i64| {
+        format!(
+            "INSERT INTO hub_publications (id,repository,token,revision,event_seq,commit_sha,branch,
+                base,manifest,branch_state,pr_number,merge_commit,created_at,updated_at)
+             VALUES ('{id}','{repository}','tok_pp','{}',1,'{}','b-{id}','main','{{}}','created',{pr},
+                {merged},{created},{created});",
+            "a".repeat(64),
+            "b".repeat(40)
+        )
+    };
+    let mut sql = String::from(
+        "INSERT INTO hub_users (id,provider,host,forge_user_id,login,created_at)
+            VALUES ('usr_pp','github','github.com',9,'alice',0);
+         INSERT INTO hub_agent_tokens (id,owner,name,repository,digest,expires_at,created_at)
+            VALUES ('tok_pp','usr_pp','builder','Acme/Widgets','pp',4102444800,0);",
+    );
+    for (id, repository, pr, merged, created) in [
+        ("p1-old", "Acme/Widgets", "1", "NULL", 1),
+        ("p1-new", "Acme/Widgets", "1", "NULL", 2),
+        ("p2", "Acme/Widgets", "2", "NULL", 3),
+        ("p3-old", "Acme/Widgets", "3", "NULL", 4),
+        ("p3-merged", "Acme/Widgets", "3", "'c'", 5),
+        ("p4", "Acme/Widgets", "4", "NULL", 6),
+        ("other", "acme/other", "9", "NULL", 7),
+        ("nopr", "Acme/Widgets", "NULL", "NULL", 8),
+    ] {
+        sql.push_str(&row(id, repository, pr, merged, created));
+    }
+    db.exec(&sql).unwrap();
+    let ids = |after: i64, limit: usize| {
+        store
+            .pull_publications("acme/widgets", after, limit)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect::<Vec<_>>()
+    };
+    // Newest per number, the merged lineage omitted, the repository matched ignoring case.
+    assert_eq!(ids(0, 50), ["p1-new", "p2", "p4"]);
+    assert_eq!(ids(1, 50), ["p2", "p4"]);
+    assert_eq!(ids(0, 2), ["p1-new", "p2"]);
+    assert_eq!(ids(4, 50), Vec::<String>::new());
+}
+
 macro_rules! conformance {
     ($($case:ident),* $(,)?) => {
         mod on_sqlite {
@@ -1529,6 +1600,7 @@ conformance!(
     observations,
     deliveries_outbound_and_notices,
     forge_check_journal,
+    pull_publications_are_newest_per_pull_request,
     upgrade_from_migration_3,
     upgrade_from_migration_14_with_publication,
     url_errors,

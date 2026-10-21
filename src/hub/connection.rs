@@ -85,7 +85,8 @@ pub struct ForgeCheck {
     pub state: String,
     pub binding_digest: Option<String>,
     pub description: String,
-    /// `attempting` (reserved, reply not recorded: uncertain) or `posted`.
+    /// `attempting` (reserved, reply not recorded: uncertain), `posted`, or `refused` (the forge
+    /// definitely rejected it; never success).
     pub phase: String,
     pub generation: i64,
     pub updated_at: i64,
@@ -113,6 +114,14 @@ fn is_lower_hex(value: &str, len: usize) -> bool {
         && value
             .bytes()
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+pub(super) fn validate_check_phase(phase: &str) -> Result<()> {
+    if matches!(phase, "posted" | "refused") {
+        Ok(())
+    } else {
+        Err(invalid("forge check phase is not final"))
+    }
 }
 
 pub(super) fn validate_check_key(number: i64, context: &str) -> Result<()> {

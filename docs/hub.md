@@ -814,19 +814,44 @@ candidate is currently qualified for the profile's requirement and that the pull
 head's tree and parents equal the native revision's, and the live base tip equals the
 candidate's baseline. States:
 
-- `pending`: the candidate is not (yet) qualified in the pinned store.
-- `failure`: the requirement, change or candidate context no longer matches the pin
+- `pending`: the candidate is not (yet) qualified in the pinned store, or the store has no
+  installed requirement for the target.
+- `failure`: an installed requirement whose digest differs from the profile's pin, or a
+  change or candidate context that no longer matches
   (including a refreshed target), the live base tip differs from the candidate
   baseline, the head is not the published commit, its tree or parents differ from the
   native revision, or the pull request is from a fork or has another base. A `success`
   on an earlier head is flipped to `failure` when the pull request head changes.
 - `error`: the pinned native store, requirement or qualification could not be read.
-- `success`: all of the above hold. The Hub then reads the pull request again before
-  trusting it.
+- `success`: all of the above hold. The Hub then reads the pull request again; if that
+  confirming read fails, the posted success stays and the next pass rechecks it.
 
-Closed or missing pull requests get no new status. A post whose reply is lost is
-journalled as `attempting` (reported as `uncertain`), and the next pass posts the
-current status again. The journal is `hub_forge_checks` (migration 16).
+A `success` is never left on a commit the Hub cannot vouch for. When the head changes, or
+the pull request is closed, the Hub posts a `failure` on the old head first
+(`superseded: ...` or `not applicable: pull request closed`) and moves on only once that
+post is accepted or definitely refused. A post whose reply is lost is journalled as
+`attempting` (reported as `uncertain`), and the next pass posts the current status
+again, for an old head too. A definite refusal (403, 404 or 422) is journalled as
+`refused` and reported as `posting: "refused"`; the same status is not posted again
+until the desired head, state or description changes. A refusal is never treated as
+success. Missing pull requests get no status. The journal is `hub_forge_checks`
+(migration 16).
+
+Changes inside the native store (a policy advance, a requirement change) have no trigger.
+They are reflected on the next poll or webhook for the repository, and not while the
+connection is in backoff. A `pull_request` webhook reconciles only that pull request; a
+`push` webhook and each poll reconcile the repository. A pass examines the newest
+publication of up to 50 pull requests and continues after the last one on the next pass,
+wrapping at the end, so a busy repository is covered over several passes. Merged
+pull requests are skipped; closed ones are read again only to retire an earlier success.
+The reconciler holds an in-process repository lock and assumes a single Hub process
+for a repository; with several, posts can interleave (the journal compare-and-set only
+limits the damage).
+
+The candidate baseline and parent commits are fields the publisher attested in the
+manifest. The Hub verifies the head tree against the native revision and that the live
+base tip equals the claimed baseline and is a parent of the head, but it does not
+independently prove the baseline from the native store.
 
 AgentSCM never creates or changes branch protection or rulesets. To make the status
 binding, the operator must require the `agentscm/workflow/<target>` context in GitHub

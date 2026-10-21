@@ -9,8 +9,8 @@ use serde_json::json;
 use super::connection::{
     CONNECTION_SELECT, ConnectedRepository, Connection as ForgeConnection, DELIVERY_KEEP_SECONDS,
     ForgeCheck, ForgeCheckReserve, NewConnection, NewForgeCheck, Observation, Observed, Outbound,
-    REPOSITORY_SELECT, gone_event, observation_kinds, validate_check_key, validate_observation,
-    validate_repository_row, validate_status,
+    REPOSITORY_SELECT, gone_event, observation_kinds, validate_check_key, validate_check_phase,
+    validate_observation, validate_repository_row, validate_status,
 };
 use super::coordination::{
     CoordinationAck, CoordinationAcknowledgement, CoordinationAgent, CoordinationInbox,
@@ -4158,14 +4158,16 @@ impl Store for SqliteStore {
         number: i64,
         context: &str,
         generation: i64,
+        phase: &str,
         now: i64,
     ) -> Result<bool> {
         validate_check_key(number, context)?;
+        validate_check_phase(phase)?;
         Ok(self.conn().execute(
-            "UPDATE hub_forge_checks SET phase = 'posted', generation = generation + 1,
+            "UPDATE hub_forge_checks SET phase = ?6, generation = generation + 1,
                  updated_at = ?5
              WHERE repository = ?1 AND number = ?2 AND context = ?3 AND generation = ?4",
-            params![repo, number, context, generation, now],
+            params![repo, number, context, generation, now, phase],
         )? == 1)
     }
 
@@ -4262,14 +4264,23 @@ impl Store for SqliteStore {
         Ok(publication_by_id(&self.conn(), id)?.filter(|p| p.repository == repository))
     }
 
-    fn pull_publications(&self, repository: &str, limit: usize) -> Result<Vec<Publication>> {
+    fn pull_publications(
+        &self,
+        repository: &str,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<Publication>> {
         let conn = self.conn();
         let mut statement = conn.prepare(&format!(
-            "{PUBLICATION_SELECT} WHERE p.repository = ?1 AND p.pr_number IS NOT NULL
-             AND p.merge_commit IS NULL ORDER BY p.pr_number, p.created_at DESC, p.id LIMIT ?2"
+            "{PUBLICATION_SELECT} WHERE lower(p.repository) = lower(?1) AND p.pr_number > ?2
+             AND p.merge_commit IS NULL
+             AND p.id = (SELECT q.id FROM hub_publications q
+                 WHERE lower(q.repository) = lower(?1) AND q.pr_number = p.pr_number
+                 ORDER BY q.created_at DESC, q.id LIMIT 1)
+             ORDER BY p.pr_number LIMIT ?3"
         ))?;
         let rows = statement
-            .query_map(params![repository, limit as i64], publication_row)?
+            .query_map(params![repository, after, limit as i64], publication_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }

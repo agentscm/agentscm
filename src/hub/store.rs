@@ -329,13 +329,15 @@ pub trait Store: Send + Sync {
         new: &NewForgeCheck,
         now: i64,
     ) -> Result<ForgeCheckReserve>;
-    /// Marks the post `posted` only if `generation` is still current; returns whether it did.
+    /// Marks the post `phase` (`posted`, or `refused` for a definite refusal) only if
+    /// `generation` is still current; returns whether it did.
     fn complete_forge_check(
         &self,
         repo: &str,
         number: i64,
         context: &str,
         generation: i64,
+        phase: &str,
         now: i64,
     ) -> Result<bool>;
     /// `pr_notice` events as `(intent id, data JSON)`, in one transaction.
@@ -345,10 +347,16 @@ pub trait Store: Send + Sync {
     /// row. A token may have at most `MAX_UNFINISHED` open publications.
     fn create_publication(&self, token: &str, new: &NewPublication, now: i64) -> Result<Create>;
     fn publication(&self, repository: &str, id: &str) -> Result<Option<Publication>>;
+    /// The newest publication of each pull request number above `after` in `repository`
+    /// (matched case-insensitively), omitting pull requests whose newest publication is merged,
+    /// by number, at most `limit`.
+    fn pull_publications(
+        &self,
+        repository: &str,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<Publication>>;
     /// Applies one forge fact (see [`Update`]); an event only when the state changes. Unknown id is `Invalid`.
-    /// Unmerged publications of `repository` that have a pull request, by pull request number then
-    /// newest first, at most `limit`.
-    fn pull_publications(&self, repository: &str, limit: usize) -> Result<Vec<Publication>>;
     fn update_publication(&self, id: &str, update: &Update, now: i64) -> Result<Publication>;
     /// Events with `seq` greater than the argument, oldest first, at most 1000.
     /// Retained events in sequence order; operator-compacted work events can leave gaps.

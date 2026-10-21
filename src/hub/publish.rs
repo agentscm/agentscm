@@ -916,7 +916,9 @@ async fn show(
             }
         }
     }
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut reply = publication.to_json();
+    #[cfg(unix)]
     if let Some(view) = forge_check_view(&state, &principal, &publication).await? {
         reply["forge_check"] = view;
     }
@@ -925,6 +927,7 @@ async fn show(
 
 /// What the Hub does about a forge check for this publication's pull request. Read-only:
 /// it reads the journal and the configuration and posts nothing.
+#[cfg(unix)]
 async fn forge_check_view(
     state: &HubState,
     principal: &Principal,
@@ -975,12 +978,10 @@ async fn forge_check_view(
     view["context"] = json!(context);
     view["state"] = json!(row.as_ref().map(|r| r.state.as_str()));
     view["head_sha"] = json!(row.as_ref().map(|r| r.head_sha.as_str()));
-    view["posting"] = json!(row.as_ref().map(|r| {
-        if r.phase == "posted" {
-            "posted"
-        } else {
-            "uncertain"
-        }
+    view["posting"] = json!(row.as_ref().map(|r| match r.phase.as_str() {
+        "posted" => "posted",
+        "refused" => "refused",
+        _ => "uncertain",
     }));
     Ok(Some(view))
 }

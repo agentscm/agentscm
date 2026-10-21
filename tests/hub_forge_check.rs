@@ -32,7 +32,6 @@ use tempfile::TempDir;
 const REPO: &str = "acme/widgets";
 const REPO_ID: i64 = 100;
 const PAT: &str = "ghp_synthetic_pat";
-const GIT: &str = "/usr/bin/git";
 const SKILL: &str = "skills/check/SKILL.md";
 const SKILL_BYTES: &[u8] = b"# Check synthetic source\n";
 const SOURCE_BYTES: &[u8] = b"fn example() {}\n";
@@ -52,13 +51,14 @@ struct Env {
     subject: CandidateSubject,
     tree: String,
     token: String,
+    token_id: String,
     publication: String,
 }
 
 /// The tree Git builds for the native revision's two files.
 fn git_tree(dir: &Path) -> String {
     let git = |args: &[&str]| {
-        let out = Command::new(GIT)
+        let out = Command::new(std::env::var("AGENTSCM_TEST_GIT").unwrap_or_else(|_| "git".into()))
             .args(args)
             .current_dir(dir)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -245,7 +245,7 @@ impl Env {
         // Outbound writes stay off: statuses have their own opt-in.
         let (setup, setup_subject, setup_host) = (store.clone(), subject.clone(), host.clone());
         let setup_endpoint = endpoint;
-        let (token, publication) = tokio::task::spawn_blocking(move || {
+        let (token, token_id, publication) = tokio::task::spawn_blocking(move || {
             let store = setup;
             let connection = store.pat_connection(&setup_host).unwrap().unwrap().id;
             store
@@ -291,7 +291,7 @@ impl Env {
                     unix_now(),
                 )
                 .unwrap();
-            (secret.expose().to_owned(), id)
+            (secret.expose().to_owned(), token, id)
         })
         .await
         .unwrap();
@@ -305,7 +305,64 @@ impl Env {
             subject,
             tree,
             token,
+            token_id,
             publication,
+        }
+    }
+
+    /// A second publication, for pull request `number` on its own branch and head commit.
+    fn add_pull(&self, number: u64, commit: &str, open: bool) {
+        let branch = format!("agents/pull-{number}");
+        let endpoint = format!(
+            "{}/{REPO}.git",
+            self.fake.base.replace("http://", "https://")
+        );
+        let mut subject = self.subject.clone();
+        subject.output = branch.clone();
+        subject.id = String::new();
+        subject.id = subject.canonical_id().unwrap();
+        self.fake.with(|s| {
+            let repo = s.repos.get_mut(&REPO_ID).unwrap();
+            let mut pull = Pull::new(number, &branch, &["src/example.rs"]);
+            pull.head_sha = commit.into();
+            if !open {
+                pull.state = "closed".into();
+            }
+            repo.pulls.insert(number, pull);
+            repo.commits.insert(
+                commit.into(),
+                (self.tree.clone(), vec![PARENT.into(), BASELINE.into()]),
+            );
+        });
+        let id = derive_candidate_id(REPO, &subject.id, commit, &branch);
+        let manifest = serde_json::from_value(json!({
+            "revision": subject.revision, "commit": commit, "tree": "c".repeat(40),
+            "parent": PARENT, "branch": branch, "base": "main", "title": "t", "body": "",
+            "message": "msg\n",
+            "author": {"name": "A", "email": "a@example.invalid", "date": "2026-05-28T20:26:40Z"},
+            "committer": {"name": "A", "email": "a@example.invalid", "date": "2026-05-28T20:26:40Z"},
+            "changes": [{"path": "old", "mode": "000000", "blob": null, "sha256": null, "size": 0}],
+            "candidate": {"subject": subject, "endpoint": endpoint, "previous_publication": null}
+        }))
+        .unwrap();
+        let new = NewPublication {
+            id: id.clone(),
+            manifest,
+        };
+        self.store
+            .create_publication(&self.token_id, &new, unix_now())
+            .unwrap();
+        for update in [
+            Update::BranchCreated,
+            Update::PullRequest {
+                number: number as i64,
+                node_id: format!("PR_{number}"),
+                html_url: format!("https://example.invalid/{REPO}/pull/{number}"),
+            },
+        ] {
+            self.store
+                .update_publication(&id, &update, unix_now())
+                .unwrap();
         }
     }
 
@@ -586,4 +643,104 @@ async fn a_rate_limited_pull_read_posts_nothing() {
     );
     assert_eq!(env.status_posts(), 1, "{:?}", env.statuses());
     assert_eq!(env.statuses()[0].1, "pending");
+}
+
+#[tokio::test]
+async fn a_lost_superseding_reply_is_reposted_before_the_new_head_is_judged() {
+    let env = Env::start(true).await;
+    env.qualify();
+    env.poll().await;
+    assert_eq!(env.statuses()[0].1, "success");
+    let pushed = "2".repeat(40);
+    env.fake.with(|s| {
+        s.repos.get_mut(&REPO_ID).unwrap().commits.insert(
+            pushed.clone(),
+            (env.tree.clone(), vec![PARENT.into(), BASELINE.into()]),
+        );
+        s.lose_next_status_reply = true;
+    });
+    env.edit_pull(|pull| pull.head_sha = pushed.clone());
+    env.poll().await;
+    // The failure on the old head may or may not exist; the new head waits for it.
+    assert_eq!(env.status_posts(), 2);
+    assert_eq!(env.row().unwrap().phase, "attempting");
+    env.poll().await;
+    let posted = env.statuses();
+    assert_eq!(env.status_posts(), 4, "{posted:?}");
+    assert_eq!(
+        (posted[2].0.as_str(), posted[2].1.as_str()),
+        (COMMIT, "failure")
+    );
+    assert_eq!(
+        (posted[3].0.as_str(), posted[3].1.as_str()),
+        (pushed.as_str(), "failure")
+    );
+    env.poll().await;
+    assert_eq!(env.status_posts(), 4);
+}
+
+#[tokio::test]
+async fn closing_a_pull_request_retires_its_success_once() {
+    let env = Env::start(true).await;
+    env.qualify();
+    env.poll().await;
+    assert_eq!(env.statuses()[0].1, "success");
+    env.edit_pull(|pull| pull.state = "closed".into());
+    env.poll().await;
+    let posted = env.statuses();
+    assert_eq!(posted.len(), 2, "{posted:?}");
+    assert_eq!(
+        (posted[1].0.as_str(), posted[1].1.as_str()),
+        (COMMIT, "failure")
+    );
+    assert!(posted[1].2.starts_with("not applicable"));
+    env.poll().await;
+    assert_eq!(env.status_posts(), 2);
+}
+
+#[tokio::test]
+async fn a_refused_status_is_recorded_and_not_posted_again() {
+    let env = Env::start(true).await;
+    env.qualify();
+    env.fake.with(|s| {
+        s.fail.push_back(Failure {
+            path_contains: "/statuses/".into(),
+            status: 422,
+            headers: vec![],
+        });
+    });
+    env.poll().await;
+    assert!(
+        env.fake.with(|s| s.fail.is_empty()),
+        "the refusal was not hit"
+    );
+    let row = env.row().unwrap();
+    assert_eq!(
+        (row.phase.as_str(), row.state.as_str()),
+        ("refused", "success")
+    );
+    assert!(env.statuses().is_empty());
+    let posts = env.status_posts();
+    env.poll().await;
+    env.poll().await;
+    assert_eq!(env.status_posts(), posts);
+    assert_eq!(env.show().await["forge_check"]["posting"], "refused");
+}
+
+#[tokio::test]
+async fn a_late_pull_request_is_reached_when_older_ones_fill_the_window() {
+    let env = Env::start(true).await;
+    env.qualify();
+    for number in 2..=55 {
+        env.add_pull(number, COMMIT, false);
+    }
+    let late = "3".repeat(40);
+    env.add_pull(60, &late, true);
+    env.poll().await;
+    env.poll().await;
+    let posted = env.statuses();
+    assert!(
+        posted.iter().any(|p| p.0 == late && p.1 == "success"),
+        "{posted:?}"
+    );
 }
