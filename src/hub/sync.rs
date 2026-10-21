@@ -231,6 +231,9 @@ pub struct Sync {
     pending: AtomicUsize,
     /// Rotates which repository a connection's poll starts with.
     round: AtomicUsize,
+    /// Per repository id, the last pull request number the forge check pass finished with.
+    #[cfg(unix)]
+    forge_cursors: Mutex<HashMap<String, i64>>,
     /// Files already noticed per (intent, repository, pull request number).
     noticed: Mutex<HashMap<(String, String, i64), BTreeSet<String>>>,
 }
@@ -246,6 +249,19 @@ fn now_ms() -> i64 {
 }
 
 impl Sync {
+    #[cfg(unix)]
+    pub(super) fn forge_cursor(&self, repository: &str) -> i64 {
+        lock(&self.forge_cursors)
+            .get(repository)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn set_forge_cursor(&self, repository: &str, number: i64) {
+        lock(&self.forge_cursors).insert(repository.to_owned(), number);
+    }
+
     pub fn unconfigured() -> Self {
         Self::build(None, None, None)
     }
@@ -273,6 +289,8 @@ impl Sync {
             truncated: Mutex::default(),
             pending: AtomicUsize::new(0),
             round: AtomicUsize::new(0),
+            #[cfg(unix)]
+            forge_cursors: Mutex::default(),
             noticed: Mutex::default(),
         }
     }
@@ -864,6 +882,8 @@ async fn read_repo(
     if conn.outbound {
         outbound_repo(state, conn, repo, token).await?;
     }
+    #[cfg(unix)]
+    super::forge_check::reconcile_repo(state, conn, repo, token, None).await?;
     Ok(report)
 }
 
@@ -1629,6 +1649,21 @@ async fn webhook_work(
                     if let Some(name) = name.filter(|name| valid_ref_name(name)) {
                         reread_branch(state, conn, &repo, &token, name).await?;
                     }
+                }
+            }
+            // Only the re-read state matters to a status, never the payload. A push can move
+            // the base of any pull request; a pull request event concerns only its own.
+            #[cfg(unix)]
+            {
+                let only = (event == "pull_request")
+                    .then(|| {
+                        payload["pull_request"]["number"]
+                            .as_i64()
+                            .filter(|n| *n > 0)
+                    })
+                    .flatten();
+                if event != "pull_request" || only.is_some() {
+                    super::forge_check::reconcile_repo(state, conn, &repo, &token, only).await?;
                 }
             }
             Ok(())

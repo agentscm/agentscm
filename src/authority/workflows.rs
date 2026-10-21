@@ -1203,7 +1203,7 @@ mod tests {
         let required = requirement("required");
         authority.install_workflow_requirement(&required).unwrap();
         let repository = authority.repository_id().unwrap();
-        let live = crate::skill_workflow::LiveImportedOrigins::empty_for_test(repository.clone());
+        let live = crate::skill_workflow::LiveImportedOrigins::native_only(repository.clone());
         let mut outcomes = Vec::new();
         for (id, command) in [("change-plain", false), ("change-command", true)] {
             let mut context = context();

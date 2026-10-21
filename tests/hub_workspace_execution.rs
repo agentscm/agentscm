@@ -82,6 +82,7 @@ async fn agent_only_env(
         data_dir: native.profile.data_dir.clone(),
         target: native.profile.target.clone(),
         requirement_digest: native.profile.requirement_digest.clone(),
+        publish_forge_status: false,
     };
     let queue = root.join("agent-only.sqlite");
     let installed = Arc::new(std::sync::OnceLock::new());

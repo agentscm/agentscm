@@ -6,7 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 use super::connection::{
-    ConnectedRepository, Connection, NewConnection, Observation, Observed, Outbound,
+    ConnectedRepository, Connection, ForgeCheck, ForgeCheckReserve, NewConnection, NewForgeCheck,
+    Observation, Observed, Outbound,
 };
 use super::coordination::{
     CoordinationAck, CoordinationInbox, CoordinationInboxQuery, CoordinationListQuery,
@@ -316,6 +317,40 @@ pub trait Store: Send + Sync {
         sha: &str,
         description: &str,
     ) -> Result<()>;
+    fn forge_check(&self, repo: &str, number: i64, context: &str) -> Result<Option<ForgeCheck>>;
+    /// Rows of `repo` that may show a success (state `success` or an uncertain post) as
+    /// `(number, context, row)`, by number then context, at most `limit`. Rows on a context in
+    /// `enabled`, and rows of a pull request whose newest publication in `full_name` is merged,
+    /// are left out: neither is a retire candidate.
+    fn forge_checks_showing_success(
+        &self,
+        repo: &str,
+        full_name: &str,
+        enabled: &[String],
+        limit: usize,
+    ) -> Result<Vec<(i64, String, ForgeCheck)>>;
+    /// Compare-and-set on `expected` (`None` for an absent row): records the desired post as
+    /// `attempting` and returns the new generation, or `Conflict` when another writer won.
+    fn reserve_forge_check(
+        &self,
+        repo: &str,
+        number: i64,
+        context: &str,
+        expected: Option<i64>,
+        new: &NewForgeCheck,
+        now: i64,
+    ) -> Result<ForgeCheckReserve>;
+    /// Marks the post `phase` (`posted`, or `refused` for a definite refusal) only if
+    /// `generation` is still current; returns whether it did.
+    fn complete_forge_check(
+        &self,
+        repo: &str,
+        number: i64,
+        context: &str,
+        generation: i64,
+        phase: &str,
+        now: i64,
+    ) -> Result<bool>;
     /// `pr_notice` events as `(intent id, data JSON)`, in one transaction.
     fn append_pr_notices(&self, notices: &[(String, String)]) -> Result<()>;
     /// Idempotent by `new.id`: the first call records the publication for the active token's
@@ -323,6 +358,15 @@ pub trait Store: Send + Sync {
     /// row. A token may have at most `MAX_UNFINISHED` open publications.
     fn create_publication(&self, token: &str, new: &NewPublication, now: i64) -> Result<Create>;
     fn publication(&self, repository: &str, id: &str) -> Result<Option<Publication>>;
+    /// The newest publication of each pull request number above `after` in `repository`
+    /// (matched case-insensitively), omitting pull requests whose newest publication is merged,
+    /// by number, at most `limit`. "Newest" is by `created_at`, then `id`, descending.
+    fn pull_publications(
+        &self,
+        repository: &str,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<Publication>>;
     /// Applies one forge fact (see [`Update`]); an event only when the state changes. Unknown id is `Invalid`.
     fn update_publication(&self, id: &str, update: &Update, now: i64) -> Result<Publication>;
     /// Events with `seq` greater than the argument, oldest first, at most 1000.
@@ -786,6 +830,11 @@ const MIGRATIONS: &[Migration] = &[
         sqlite: include_str!("migrations/0015_candidate_publications.sqlite.sql"),
         postgres: include_str!("migrations/0015_candidate_publications.pg.sql"),
     },
+    Migration {
+        version: 16,
+        sqlite: include_str!("migrations/0016_forge_checks.sqlite.sql"),
+        postgres: include_str!("migrations/0016_forge_checks.pg.sql"),
+    },
 ];
 
 /// Migrations not yet applied. The registry must be numbered 1..n and the
@@ -824,18 +873,18 @@ mod tests {
 
     #[test]
     fn pending_requires_an_applied_prefix() {
-        assert_eq!(pending(&[]).unwrap().len(), 15);
-        assert_eq!(pending(&[1]).unwrap().len(), 14);
-        assert_eq!(pending(&[1, 2, 3]).unwrap().len(), 12);
-        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap().len(), 7);
-        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap().len(), 6);
+        assert_eq!(pending(&[]).unwrap().len(), 16);
+        assert_eq!(pending(&[1]).unwrap().len(), 15);
+        assert_eq!(pending(&[1, 2, 3]).unwrap().len(), 13);
+        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap().len(), 8);
+        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap().len(), 7);
         assert_eq!(
             pending(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14])
                 .unwrap()
                 .len(),
-            1
+            2
         );
-        assert!(pending(&(1..=15).collect::<Vec<_>>()).unwrap().is_empty());
+        assert!(pending(&(1..=16).collect::<Vec<_>>()).unwrap().is_empty());
         assert!(pending(&[2]).is_err());
         let newer = pending(&[1, 999]).err().unwrap().to_string();
         assert!(newer.contains("newer than this binary"), "{newer}");

@@ -2,6 +2,10 @@
 
 All notable changes are listed here, newest first. AgentSCM is alpha: any release may change the CLI, the HTTP API, storage and schemas without a migration.
 
+## Unreleased
+
+- Experimental, off by default: an agent-task profile with `publish_forge_status: true` makes the Hub post a GitHub commit status `agentscm/workflow/<target>` on a candidate pull request, `success` only when an operator-pinned read-only native store on the Hub host shows the exact candidate currently qualified, the head tree and parents match the native revision and the base tip equals the candidate baseline. Posts are journalled (Hub migration 16) and run on poll and `pull_request`/`push` webhooks. `GET` of a candidate publication gains a read-only `forge_check` object with `protection: "unverified"`. AgentSCM does not create or verify branch protection; the operator must require the context, ideally pinned to the posting App, and merge queue is unsupported. GitHub and Unix only, tested against fakes only; GitLab, live verification and signed attestations for laptop-only stores are not implemented. See [workflow status](docs/hub.md#workflow-status-for-candidate-pull-requests).
+
 ## 0.1.0-alpha.4 (2026-10-21)
 
 - Experimental Unix-only attached Git worktrees can capture and qualify exact native Changes, then publish a separate branch and GitHub PR through an owned mirror. Qualification uses synthetic checkouts, real local Git, loopback authenticated HTTPS and fake GitHub; live forge is not qualified and attached SSH identities are unsupported. Hub migration 15 preserves integrated publications but is not downgrade-safe for older binaries reading candidate rows. See [attached Git worktrees](docs/advanced/attached-git-worktrees.md) for unsupported operations and recovery limits.

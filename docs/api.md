@@ -86,6 +86,18 @@ user. Only configure a repository whose writers you trust that far. See
 [collisions](collisions.md) for the profile and its limits. The result is a
 warning, never a lock or a native record.
 
+## Hub publication forge check
+
+This is the Hub, not `serve`. `GET /v1/hub/repos/{repo}/publications/{id}` adds a
+read-only `forge_check` object when the publication is a candidate with a pull request.
+It posts and changes nothing. `mode` is always `git_default`. `provider` is `github` or
+`unsupported` (GitLab). `enabled` is false unless an agent-task profile for the target
+sets `publish_forge_status`; then `context`, `state` (the journal's last status state),
+`head_sha` and `posting` (`posted`; `uncertain` while a post's reply is unrecorded; or
+`refused` after a definite forge refusal) are added, and are null before the first post. `protection` is always `unverified`
+and `note` says branch protection, raw pushes and administrator bypass are not
+enforced or verified by AgentSCM. See [workflow status](hub.md#workflow-status-for-candidate-pull-requests).
+
 ## HTTP boundaries
 
 Workflow and collision responses carry `nosniff`, no referrer, `no-store` and a

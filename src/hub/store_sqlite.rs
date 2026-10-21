@@ -8,8 +8,9 @@ use serde_json::json;
 
 use super::connection::{
     CONNECTION_SELECT, ConnectedRepository, Connection as ForgeConnection, DELIVERY_KEEP_SECONDS,
-    NewConnection, Observation, Observed, Outbound, REPOSITORY_SELECT, gone_event,
-    observation_kinds, validate_observation, validate_repository_row, validate_status,
+    ForgeCheck, ForgeCheckReserve, NewConnection, NewForgeCheck, Observation, Observed, Outbound,
+    REPOSITORY_SELECT, gone_event, observation_kinds, validate_check_key, validate_check_phase,
+    validate_observation, validate_repository_row, validate_status,
 };
 use super::coordination::{
     CoordinationAck, CoordinationAcknowledgement, CoordinationAgent, CoordinationInbox,
@@ -4069,6 +4070,148 @@ impl Store for SqliteStore {
         Ok(tx.commit()?)
     }
 
+    fn forge_check(&self, repo: &str, number: i64, context: &str) -> Result<Option<ForgeCheck>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT head_sha, state, binding_digest, description, phase, generation, updated_at
+                 FROM hub_forge_checks WHERE repository = ?1 AND number = ?2 AND context = ?3",
+                params![repo, number, context],
+                |row| {
+                    Ok(ForgeCheck {
+                        head_sha: row.get(0)?,
+                        state: row.get(1)?,
+                        binding_digest: row.get(2)?,
+                        description: row.get(3)?,
+                        phase: row.get(4)?,
+                        generation: row.get(5)?,
+                        updated_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    fn forge_checks_showing_success(
+        &self,
+        repo: &str,
+        full_name: &str,
+        enabled: &[String],
+        limit: usize,
+    ) -> Result<Vec<(i64, String, ForgeCheck)>> {
+        let conn = self.conn();
+        let mut statement = conn.prepare(
+            "SELECT number, context, head_sha, state, binding_digest, description, phase, generation,
+                    updated_at
+             FROM hub_forge_checks
+             WHERE repository = ?1 AND (state = 'success' OR phase = 'attempting')
+               AND context NOT IN (SELECT value FROM json_each(?3))
+               AND (SELECT q.merge_commit FROM hub_publications q
+                    WHERE lower(q.repository) = lower(?2) AND q.pr_number = hub_forge_checks.number
+                    ORDER BY q.created_at DESC, q.id DESC LIMIT 1) IS NULL
+             ORDER BY number, context LIMIT ?4",
+        )?;
+        let enabled =
+            serde_json::to_string(enabled).map_err(|e| HubError::Invalid(e.to_string()))?;
+        let rows = statement
+            .query_map(params![repo, full_name, enabled, limit as i64], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    ForgeCheck {
+                        head_sha: row.get(2)?,
+                        state: row.get(3)?,
+                        binding_digest: row.get(4)?,
+                        description: row.get(5)?,
+                        phase: row.get(6)?,
+                        generation: row.get(7)?,
+                        updated_at: row.get(8)?,
+                    },
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    fn reserve_forge_check(
+        &self,
+        repo: &str,
+        number: i64,
+        context: &str,
+        expected: Option<i64>,
+        new: &NewForgeCheck,
+        now: i64,
+    ) -> Result<ForgeCheckReserve> {
+        validate_check_key(number, context)?;
+        new.validate()?;
+        let conn = self.conn();
+        let (changed, generation) = match expected {
+            None => (
+                conn.execute(
+                    "INSERT INTO hub_forge_checks (repository, number, context, head_sha, state,
+                         binding_digest, description, phase, generation, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'attempting', 1, ?8)
+                     ON CONFLICT (repository, number, context) DO NOTHING",
+                    params![
+                        repo,
+                        number,
+                        context,
+                        new.head_sha,
+                        new.state,
+                        new.binding_digest,
+                        new.description,
+                        now
+                    ],
+                )?,
+                1,
+            ),
+            Some(expected) => (
+                conn.execute(
+                    "UPDATE hub_forge_checks SET head_sha = ?5, state = ?6, binding_digest = ?7,
+                         description = ?8, phase = 'attempting', generation = generation + 1,
+                         updated_at = ?9
+                     WHERE repository = ?1 AND number = ?2 AND context = ?3 AND generation = ?4",
+                    params![
+                        repo,
+                        number,
+                        context,
+                        expected,
+                        new.head_sha,
+                        new.state,
+                        new.binding_digest,
+                        new.description,
+                        now
+                    ],
+                )?,
+                expected.saturating_add(1),
+            ),
+        };
+        Ok(if changed == 1 {
+            ForgeCheckReserve::Reserved(generation)
+        } else {
+            ForgeCheckReserve::Conflict
+        })
+    }
+
+    fn complete_forge_check(
+        &self,
+        repo: &str,
+        number: i64,
+        context: &str,
+        generation: i64,
+        phase: &str,
+        now: i64,
+    ) -> Result<bool> {
+        validate_check_key(number, context)?;
+        validate_check_phase(phase)?;
+        Ok(self.conn().execute(
+            "UPDATE hub_forge_checks SET phase = ?6, generation = generation + 1,
+                 updated_at = ?5
+             WHERE repository = ?1 AND number = ?2 AND context = ?3 AND generation = ?4",
+            params![repo, number, context, generation, now, phase],
+        )? == 1)
+    }
+
     fn append_pr_notices(&self, notices: &[(String, String)]) -> Result<()> {
         let events = notices
             .iter()
@@ -4160,6 +4303,27 @@ impl Store for SqliteStore {
 
     fn publication(&self, repository: &str, id: &str) -> Result<Option<Publication>> {
         Ok(publication_by_id(&self.conn(), id)?.filter(|p| p.repository == repository))
+    }
+
+    fn pull_publications(
+        &self,
+        repository: &str,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<Publication>> {
+        let conn = self.conn();
+        let mut statement = conn.prepare(&format!(
+            "{PUBLICATION_SELECT} WHERE lower(p.repository) = lower(?1) AND p.pr_number > ?2
+             AND p.merge_commit IS NULL
+             AND p.id = (SELECT q.id FROM hub_publications q
+                 WHERE lower(q.repository) = lower(?1) AND q.pr_number = p.pr_number
+                 ORDER BY q.created_at DESC, q.id DESC LIMIT 1)
+             ORDER BY p.pr_number LIMIT ?3"
+        ))?;
+        let rows = statement
+            .query_map(params![repository, after, limit as i64], publication_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     fn update_publication(&self, id: &str, update: &Update, now: i64) -> Result<Publication> {

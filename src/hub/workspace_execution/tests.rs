@@ -228,6 +228,34 @@ fn browser_actor(
 }
 
 #[test]
+fn one_profile_per_repository_and_target_may_publish_forge_status() {
+    let fixture = Fixture::new();
+    let open = |profiles: Vec<AgentTaskProfile>| {
+        let mut config = fixture.config.clone();
+        config.agent_task_profiles = profiles;
+        ExecutionService::open(
+            &fixture.root.path().join("publish-queue.sqlite"),
+            config,
+            fixture.workspace.clone(),
+        )
+    };
+    let publishing = |repository: &str, id: &str| {
+        let mut task = AgentTaskProfile::from(&fixture.config.profiles[0]);
+        (task.repository_id, task.profile_id) = (repository.into(), id.into());
+        task.publish_forge_status = true;
+        task
+    };
+    open(vec![publishing(REPO, "one")]).unwrap();
+    let error = open(vec![
+        publishing(REPO, "one"),
+        publishing(&REPO.to_uppercase(), "two"),
+    ])
+    .err()
+    .expect("two publishers for one repository and target");
+    assert!(error.to_string().contains("forge status"), "{error}");
+}
+
+#[test]
 fn requests_bind_exact_registered_subject_and_are_durably_idempotent() {
     let fixture = Fixture::new();
     let service = fixture.service();

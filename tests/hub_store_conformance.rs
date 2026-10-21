@@ -5,7 +5,7 @@ mod hub_pg;
 use std::sync::Arc;
 use std::thread;
 
-use agentscm::hub::connection::{NewConnection, Observed};
+use agentscm::hub::connection::{ForgeCheckReserve, NewConnection, NewForgeCheck, Observed};
 use agentscm::hub::intent::NewIntent;
 use agentscm::hub::store::{
     self, ForgeIdentity, MAX_AGENT_TOKEN_TTL_SECONDS, NewAgentToken, Store, agent_token_digest,
@@ -203,7 +203,7 @@ fn idempotent_migrations(db: &Db) {
     }
     assert_eq!(
         db.versions(),
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     );
     db.exec("INSERT INTO hub_schema_migrations (version, applied_at) VALUES (999, 0)")
         .unwrap();
@@ -226,7 +226,7 @@ fn concurrent_startup(db: &Db) {
     }
     assert_eq!(
         db.versions(),
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     );
 }
 
@@ -604,7 +604,7 @@ fn upgrade_from_migration_1(db: &Db) {
     let store = db.open();
     assert_eq!(
         db.versions(),
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     );
     let principal = store
         .authenticate(&agent_token_digest(&raw).unwrap(), unix_now())
@@ -1152,6 +1152,254 @@ fn deliveries_outbound_and_notices(db: &Db) {
     );
 }
 
+fn forge_check_journal(db: &Db) {
+    let store = db.open();
+    let con = store
+        .insert_connection(&app("github.com"), "usr_admin")
+        .unwrap();
+    let repo = store
+        .upsert_repository(&con.id, "github.com", 4242, "acme/widgets", None, None)
+        .unwrap();
+    let ctx = "agentscm/workflow/main";
+    let check = |state: &str, sha: char| NewForgeCheck {
+        head_sha: sha.to_string().repeat(40),
+        state: state.into(),
+        binding_digest: (state == "success").then(|| "d".repeat(64)),
+        description: "qualified".into(),
+    };
+    assert_eq!(store.forge_check(&repo.id, 5, ctx).unwrap(), None);
+
+    // A stale or wrong expectation never creates or overwrites a row.
+    assert_eq!(
+        store
+            .reserve_forge_check(&repo.id, 5, ctx, Some(1), &check("pending", 'a'), 10)
+            .unwrap(),
+        ForgeCheckReserve::Conflict
+    );
+    assert_eq!(store.forge_check(&repo.id, 5, ctx).unwrap(), None);
+
+    assert_eq!(
+        store
+            .reserve_forge_check(&repo.id, 5, ctx, None, &check("pending", 'a'), 10)
+            .unwrap(),
+        ForgeCheckReserve::Reserved(1)
+    );
+    let row = store.forge_check(&repo.id, 5, ctx).unwrap().unwrap();
+    assert_eq!(
+        (
+            row.state.as_str(),
+            row.phase.as_str(),
+            row.generation,
+            row.updated_at
+        ),
+        ("pending", "attempting", 1, 10)
+    );
+    // A second absent-row writer loses.
+    assert_eq!(
+        store
+            .reserve_forge_check(&repo.id, 5, ctx, None, &check("failure", 'b'), 11)
+            .unwrap(),
+        ForgeCheckReserve::Conflict
+    );
+    assert!(
+        store
+            .complete_forge_check(&repo.id, 5, ctx, 1, "posted", 12)
+            .unwrap()
+    );
+    let row = store.forge_check(&repo.id, 5, ctx).unwrap().unwrap();
+    assert_eq!((row.phase.as_str(), row.generation), ("posted", 2));
+    // Completing again with the old generation is refused.
+    assert!(
+        !store
+            .complete_forge_check(&repo.id, 5, ctx, 1, "posted", 13)
+            .unwrap()
+    );
+
+    // Two evaluations that read generation 2: one wins, the other must re-read.
+    assert_eq!(
+        store
+            .reserve_forge_check(&repo.id, 5, ctx, Some(2), &check("success", 'c'), 14)
+            .unwrap(),
+        ForgeCheckReserve::Reserved(3)
+    );
+    assert_eq!(
+        store
+            .reserve_forge_check(&repo.id, 5, ctx, Some(2), &check("error", 'e'), 15)
+            .unwrap(),
+        ForgeCheckReserve::Conflict
+    );
+    // The completion of a superseded reservation is refused.
+    assert!(
+        !store
+            .complete_forge_check(&repo.id, 5, ctx, 2, "posted", 16)
+            .unwrap()
+    );
+    let row = store.forge_check(&repo.id, 5, ctx).unwrap().unwrap();
+    assert_eq!(
+        (
+            row.head_sha,
+            row.state,
+            row.binding_digest,
+            row.phase,
+            row.generation
+        ),
+        (
+            "c".repeat(40),
+            "success".into(),
+            Some("d".repeat(64)),
+            "attempting".into(),
+            3
+        )
+    );
+    // Only a final phase can be recorded; a definite refusal is its own phase.
+    assert!(
+        store
+            .complete_forge_check(&repo.id, 5, ctx, 3, "attempting", 17)
+            .is_err()
+    );
+    assert!(
+        store
+            .complete_forge_check(&repo.id, 5, ctx, 3, "refused", 17)
+            .unwrap()
+    );
+    let row = store.forge_check(&repo.id, 5, ctx).unwrap().unwrap();
+    assert_eq!((row.phase.as_str(), row.generation), ("refused", 4));
+    // Other contexts and pull requests are independent rows.
+    assert_eq!(store.forge_check(&repo.id, 6, ctx).unwrap(), None);
+    assert_eq!(
+        store
+            .forge_check(&repo.id, 5, "agentscm/workflow/dev")
+            .unwrap(),
+        None
+    );
+
+    // Rows that may show a success are listed by number then context, bounded.
+    let dev = "agentscm/workflow/dev";
+    for (number, context, state) in [
+        (3, ctx, "pending"),
+        (3, dev, "failure"),
+        (9, ctx, "failure"),
+    ] {
+        store
+            .reserve_forge_check(&repo.id, number, context, None, &check(state, 'a'), 20)
+            .unwrap();
+        if context == dev || number == 9 {
+            store
+                .complete_forge_check(&repo.id, number, context, 1, "posted", 21)
+                .unwrap();
+        }
+    }
+    let listed = store
+        .forge_checks_showing_success(&repo.id, "acme/widgets", &[], 10)
+        .unwrap();
+    // 3/main is uncertain, 5/main says success; 3/dev and 9/main are settled failures.
+    assert_eq!(
+        listed
+            .iter()
+            .map(|(n, c, _)| (*n, c.as_str()))
+            .collect::<Vec<_>>(),
+        [(3, ctx), (5, ctx)]
+    );
+    assert_eq!(listed[1].2.state, "success");
+    // An enabled context is not a retire candidate.
+    assert!(
+        store
+            .forge_checks_showing_success(&repo.id, "acme/widgets", &[ctx.to_owned()], 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .forge_checks_showing_success(&repo.id, "acme/widgets", &[], 1)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        store
+            .forge_checks_showing_success("other", "acme/widgets", &[], 10)
+            .unwrap()
+            .is_empty()
+    );
+
+    // Validation happens on write.
+    let bad = |new: NewForgeCheck| {
+        store
+            .reserve_forge_check(&repo.id, 7, ctx, None, &new, 1)
+            .is_err()
+    };
+    assert!(bad(NewForgeCheck {
+        head_sha: "A".repeat(40),
+        ..check("pending", 'a')
+    }));
+    assert!(bad(NewForgeCheck {
+        head_sha: "a".repeat(39),
+        ..check("pending", 'a')
+    }));
+    assert!(bad(NewForgeCheck {
+        state: "ok".into(),
+        ..check("pending", 'a')
+    }));
+    assert!(bad(NewForgeCheck {
+        binding_digest: None,
+        ..check("success", 'a')
+    }));
+    assert!(bad(NewForgeCheck {
+        binding_digest: Some("d".repeat(64)),
+        ..check("pending", 'a')
+    }));
+    assert!(bad(NewForgeCheck {
+        binding_digest: Some("D".repeat(64)),
+        ..check("success", 'a')
+    }));
+    assert!(bad(NewForgeCheck {
+        description: "x".repeat(141),
+        ..check("pending", 'a')
+    }));
+    assert!(bad(NewForgeCheck {
+        description: "a\nb".into(),
+        ..check("pending", 'a')
+    }));
+    assert!(
+        store
+            .reserve_forge_check(
+                &repo.id,
+                7,
+                &"c".repeat(121),
+                None,
+                &check("pending", 'a'),
+                1
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .reserve_forge_check(&repo.id, 7, "bad context", None, &check("pending", 'a'), 1)
+            .is_err()
+    );
+    assert!(
+        store
+            .reserve_forge_check(&repo.id, 0, ctx, None, &check("pending", 'a'), 1)
+            .is_err()
+    );
+    assert!(
+        store
+            .reserve_forge_check("rep_unknown", 7, ctx, None, &check("pending", 'a'), 1)
+            .is_err()
+    );
+    assert_eq!(store.forge_check(&repo.id, 7, ctx).unwrap(), None);
+    let max = NewForgeCheck {
+        description: "x".repeat(140),
+        ..check("pending", 'a')
+    };
+    assert_eq!(
+        store
+            .reserve_forge_check(&repo.id, 7, &"c".repeat(120), None, &max, 1)
+            .unwrap(),
+        ForgeCheckReserve::Reserved(1)
+    );
+}
+
 fn upgrade_from_migration_3(db: &Db) {
     let (one, two, three) = if db.pg.is_some() {
         (
@@ -1181,7 +1429,7 @@ fn upgrade_from_migration_3(db: &Db) {
     let store = db.open();
     assert_eq!(
         db.versions(),
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     );
     let intents = store.live_intents("acme/widgets", unix_now(), 10).unwrap();
     assert_eq!(intents.len(), 1);
@@ -1289,7 +1537,7 @@ fn upgrade_from_migration_14_with_publication(db: &Db) {
         INSERT INTO hub_publications (id,repository,token,revision,event_seq,commit_sha,branch,base,manifest,branch_state,pr_number,pr_node_id,pr_url,created_at,updated_at) VALUES ('{id}','acme/widgets','tok_legacy','{}',3,'{}','feat/legacy','main','{}','created',7,'PR_7','https://github.com/acme/widgets/pull/7',10,11);
         INSERT INTO hub_events (id,at,kind,subject,data) VALUES ('evt_legacy',10,'publication_pr_opened','{id}','{{\"number\":7}}')", manifest.revision,manifest.commit,canonical.replace('\'', "''"))).unwrap();
     let store = db.open();
-    assert_eq!(db.versions(), (1..=15).collect::<Vec<_>>());
+    assert_eq!(db.versions(), (1..=16).collect::<Vec<_>>());
     let p = store.publication(REPO, &id).unwrap().unwrap();
     assert_eq!(p.event_seq, Some(3));
     assert_eq!(p.manifest, canonical);
@@ -1322,6 +1570,104 @@ fn upgrade_from_migration_14_with_publication(db: &Db) {
     }
     assert!(store.publication(REPO, &id).is_err());
 }
+fn pull_publications_are_newest_per_pull_request(db: &Db) {
+    let store = db.open();
+    let row = |id: &str, repository: &str, pr: &str, merged: &str, created: i64| {
+        format!(
+            "INSERT INTO hub_publications (id,repository,token,revision,event_seq,commit_sha,branch,
+                base,manifest,branch_state,pr_number,merge_commit,created_at,updated_at)
+             VALUES ('{id}','{repository}','tok_pp','{}',1,'{}','b-{id}','main','{{}}','created',{pr},
+                {merged},{created},{created});",
+            "a".repeat(64),
+            "b".repeat(40)
+        )
+    };
+    let mut sql = String::from(
+        "INSERT INTO hub_users (id,provider,host,forge_user_id,login,created_at)
+            VALUES ('usr_pp','github','github.com',9,'alice',0);
+         INSERT INTO hub_agent_tokens (id,owner,name,repository,digest,expires_at,created_at)
+            VALUES ('tok_pp','usr_pp','builder','Acme/Widgets','pp',4102444800,0);",
+    );
+    for (id, repository, pr, merged, created) in [
+        ("p1-old", "Acme/Widgets", "1", "NULL", 1),
+        ("p1-new", "Acme/Widgets", "1", "NULL", 2),
+        ("p2", "Acme/Widgets", "2", "NULL", 3),
+        ("p3-old", "Acme/Widgets", "3", "NULL", 4),
+        ("p3-merged", "Acme/Widgets", "3", "'c'", 5),
+        ("p4", "Acme/Widgets", "4", "NULL", 6),
+        ("other", "acme/other", "9", "NULL", 7),
+        ("nopr", "Acme/Widgets", "NULL", "NULL", 8),
+    ] {
+        sql.push_str(&row(id, repository, pr, merged, created));
+    }
+    db.exec(&sql).unwrap();
+    let ids = |after: i64, limit: usize| {
+        store
+            .pull_publications("acme/widgets", after, limit)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect::<Vec<_>>()
+    };
+    // Newest per number, the merged lineage omitted, the repository matched ignoring case.
+    assert_eq!(ids(0, 50), ["p1-new", "p2", "p4"]);
+    assert_eq!(ids(1, 50), ["p2", "p4"]);
+    assert_eq!(ids(0, 2), ["p1-new", "p2"]);
+    assert_eq!(ids(4, 50), Vec::<String>::new());
+}
+
+fn forge_checks_showing_success_leave_out_merged_pull_requests(db: &Db) {
+    let store = db.open();
+    let con = store
+        .insert_connection(&app("github.com"), "usr_admin")
+        .unwrap();
+    let repo = store
+        .upsert_repository(&con.id, "github.com", 4242, "acme/widgets", None, None)
+        .unwrap();
+    let mut sql = String::from(
+        "INSERT INTO hub_users (id,provider,host,forge_user_id,login,created_at)
+            VALUES ('usr_fm','github','github.com',9,'alice',0);
+         INSERT INTO hub_agent_tokens (id,owner,name,repository,digest,expires_at,created_at)
+            VALUES ('tok_fm','usr_fm','builder','Acme/Widgets','fm',4102444800,0);",
+    );
+    for (id, pr, merged, created) in [
+        ("m1-old", 11, "NULL", 1),
+        ("m1-new", 11, "'c'", 2),
+        ("m2-old", 12, "'c'", 3),
+        ("m2-new", 12, "NULL", 4),
+        ("m3", 13, "NULL", 5),
+    ] {
+        sql.push_str(&format!(
+            "INSERT INTO hub_publications (id,repository,token,revision,event_seq,commit_sha,branch,
+                base,manifest,branch_state,pr_number,merge_commit,created_at,updated_at)
+             VALUES ('{id}','Acme/Widgets','tok_fm','{}',1,'{}','b-{id}','main','{{}}','created',{pr},
+                {merged},{created},{created});",
+            "a".repeat(64),
+            "b".repeat(40)
+        ));
+    }
+    db.exec(&sql).unwrap();
+    let new = NewForgeCheck {
+        head_sha: "a".repeat(40),
+        state: "success".into(),
+        binding_digest: Some("d".repeat(64)),
+        description: "qualified".into(),
+    };
+    for number in [11, 12, 13] {
+        store
+            .reserve_forge_check(&repo.id, number, "agentscm/workflow/main", None, &new, 20)
+            .unwrap();
+    }
+    let numbers = store
+        .forge_checks_showing_success(&repo.id, "acme/widgets", &[], 10)
+        .unwrap()
+        .into_iter()
+        .map(|(n, _, _)| n)
+        .collect::<Vec<_>>();
+    // 11: newest publication merged, excluded. 12: older merged, newer not, included.
+    assert_eq!(numbers, [12, 13]);
+}
+
 macro_rules! conformance {
     ($($case:ident),* $(,)?) => {
         mod on_sqlite {
@@ -1354,6 +1700,9 @@ conformance!(
     connections_and_repositories,
     observations,
     deliveries_outbound_and_notices,
+    forge_check_journal,
+    pull_publications_are_newest_per_pull_request,
+    forge_checks_showing_success_leave_out_merged_pull_requests,
     upgrade_from_migration_3,
     upgrade_from_migration_14_with_publication,
     url_errors,

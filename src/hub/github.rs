@@ -1,6 +1,9 @@
 //! GitHub client for hub sync: app JWTs, webhook signatures and the REST and
 //! GraphQL reads and writes the sync uses. Credentials are arguments, never
 //! stored here, and never appear in an error.
+use std::collections::HashMap;
+use std::sync::{Mutex, PoisonError};
+
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use reqwest::Method;
@@ -39,6 +42,75 @@ impl From<HubError> for GhError {
     fn from(error: HubError) -> Self {
         Self::Failed(error.to_string())
     }
+}
+
+/// A commit status state the forge accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusState {
+    Pending,
+    Success,
+    Failure,
+    Error,
+}
+
+impl StatusState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// A commit status checked before any request: 40-hex sha, bounded context and description.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitStatus {
+    sha: String,
+    state: StatusState,
+    context: String,
+    description: String,
+}
+
+impl CommitStatus {
+    pub fn new(sha: &str, state: StatusState, context: &str, description: &str) -> Result<Self> {
+        let text_ok = |text: &str, max: usize| {
+            text.chars().count() <= max && !text.chars().any(char::is_control)
+        };
+        if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(HubError::Invalid("status sha is not 40 hex digits".into()));
+        }
+        if context.is_empty() || !text_ok(context, 255) || !text_ok(description, 140) {
+            return Err(HubError::Invalid(
+                "status context or description is invalid".into(),
+            ));
+        }
+        Ok(Self {
+            sha: sha.to_ascii_lowercase(),
+            state,
+            context: context.to_owned(),
+            description: description.to_owned(),
+        })
+    }
+}
+
+/// The live facts about one pull request, field for field what a forge check evaluates.
+/// `head_repo_id` is 0 when the head repository is gone, which matches no connected repository.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullHead {
+    pub open: bool,
+    /// Merged pull requests are left alone: their head is history, not a candidate.
+    pub merged: bool,
+    /// The merge commit of a merged pull request, when the forge names one.
+    pub merge_commit: Option<String>,
+    pub head_sha: String,
+    pub head_repo_id: u64,
+    pub base_repo_id: u64,
+    pub base_ref: String,
+    pub base_tip: String,
+    pub head_tree: String,
+    pub head_parents: Vec<String>,
 }
 
 pub type Gh<T> = std::result::Result<T, GhError>;
@@ -91,10 +163,16 @@ impl Branch {
     }
 }
 
+/// A commit's tree and parents.
+type CommitParts = (String, Vec<String>);
+
 pub struct Api {
     client: reqwest::Client,
     base: String,
     graphql: String,
+    /// Tree and parents per (repository, commit); a commit never changes.
+    /// ponytail: cleared whole past 256 entries; an LRU only matters beyond that many live heads.
+    commits: Mutex<HashMap<(String, String), CommitParts>>,
 }
 
 impl Api {
@@ -109,6 +187,7 @@ impl Api {
             client: forge_http::client()?,
             base: api.to_owned(),
             graphql,
+            commits: Mutex::default(),
         })
     }
 
@@ -585,6 +664,156 @@ impl Api {
         }
         let body = reply.ok("git")?;
         Ok(Some(sha_of(&body["tree"])?))
+    }
+
+    /// The tree and parents of a commit; None when the commit is not on the forge.
+    async fn commit_parts(
+        &self,
+        token: &str,
+        full_name: &str,
+        commit: &str,
+    ) -> Gh<Option<(String, Vec<String>)>> {
+        let key = (full_name.to_ascii_lowercase(), commit.to_owned());
+        if let Some(found) = self
+            .commits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+        {
+            return Ok(Some(found.clone()));
+        }
+        let reply = self
+            .get(token, &format!("/repos/{full_name}/git/commits/{commit}"))
+            .await?;
+        if reply.status == 404 {
+            return Ok(None);
+        }
+        let body = reply.ok("git")?;
+        let parents = body["parents"]
+            .as_array()
+            .ok_or_else(|| GhError::Failed("unreadable reply from git".into()))?
+            .iter()
+            .map(sha_of)
+            .collect::<Gh<Vec<_>>>()?;
+        let parts = (sha_of(&body["tree"])?, parents);
+        let mut commits = self.commits.lock().unwrap_or_else(PoisonError::into_inner);
+        if commits.len() >= 256 {
+            commits.clear();
+        }
+        commits.insert(key, parts.clone());
+        Ok(Some(parts))
+    }
+
+    /// Everything a forge check needs from one pull request: the pull, the live tip of its
+    /// base ref and the head commit's tree and parents. None when the pull does not exist.
+    /// A missing or ill-typed field is an error; a deleted head repository is id 0.
+    /// `base_tips` holds the base ref tips already read in this pass, so each is read once.
+    pub async fn pull_head(
+        &self,
+        token: &str,
+        full_name: &str,
+        number: i64,
+        base_tips: &mut HashMap<String, String>,
+    ) -> Gh<Option<PullHead>> {
+        let bad = || GhError::Failed("unreadable reply from pulls".into());
+        let Some(pull) = self.pull(token, full_name, number).await? else {
+            return Ok(None);
+        };
+        let open = match pull["state"].as_str() {
+            Some("open") => true,
+            Some("closed") => false,
+            _ => return Err(bad()),
+        };
+        let merged = pull["merged"].as_bool().ok_or_else(bad)?;
+        let merge_commit = match &pull["merge_commit_sha"] {
+            Value::String(sha) if merged => Some(sha.clone()),
+            Value::Null => None,
+            _ if !merged => None,
+            _ => return Err(bad()),
+        };
+        if !open {
+            // Only the head matters to retire a success; the base and head commit may be gone.
+            return Ok(Some(PullHead {
+                open,
+                merged,
+                merge_commit,
+                head_sha: sha_of(&pull["head"])?,
+                head_repo_id: 0,
+                base_repo_id: 0,
+                base_ref: String::new(),
+                base_tip: String::new(),
+                head_tree: String::new(),
+                head_parents: Vec::new(),
+            }));
+        }
+        let repo_id = |repo: Option<&Value>| match repo {
+            Some(Value::Null) => Ok(0),
+            Some(repo) => repo["id"].as_u64().filter(|id| *id > 0).ok_or_else(bad),
+            None => Err(bad()),
+        };
+        let head_repo_id = repo_id(pull["head"].get("repo"))?;
+        let base_repo_id = match pull["base"].get("repo") {
+            Some(Value::Null) | None => return Err(bad()),
+            repo => repo_id(repo)?,
+        };
+        let head_sha = sha_of(&pull["head"])?;
+        let base_ref = pull["base"]["ref"]
+            .as_str()
+            .filter(|name| valid_ref_name(name))
+            .ok_or_else(bad)?
+            .to_owned();
+        let base_tip = match base_tips.get(&base_ref) {
+            Some(tip) => tip.clone(),
+            None => {
+                let tip = self
+                    .ref_sha(token, full_name, &base_ref)
+                    .await?
+                    .ok_or_else(|| GhError::Failed("base branch not found".into()))?;
+                base_tips.insert(base_ref.clone(), tip.clone());
+                tip
+            }
+        };
+        let (head_tree, head_parents) = self
+            .commit_parts(token, full_name, &head_sha)
+            .await?
+            .ok_or_else(|| GhError::Failed("head commit not found".into()))?;
+        Ok(Some(PullHead {
+            open,
+            merged,
+            merge_commit,
+            head_sha,
+            head_repo_id,
+            base_repo_id,
+            base_ref,
+            base_tip,
+            head_tree,
+            head_parents,
+        }))
+    }
+
+    /// Posts a commit status. `Ok(Err(status))` is a definite refusal (403, 404 or 422); `Auth`
+    /// and `Limited` mean it was not applied. Any other `Err` (no reply, 5xx, an unreadable or
+    /// different reply) is uncertain: the status may or may not exist.
+    pub async fn post_commit_status(
+        &self,
+        token: &str,
+        full_name: &str,
+        status: &CommitStatus,
+    ) -> Gh<std::result::Result<(), u16>> {
+        let url = format!("{}/repos/{full_name}/statuses/{}", self.base, status.sha);
+        let body = json!({"state": status.state.as_str(), "context": status.context,
+            "description": status.description});
+        let reply = self.write(token, Method::POST, &url, body).await?;
+        if matches!(reply.status, 403 | 404 | 422) {
+            return Ok(Err(reply.status));
+        }
+        if reply.status != 201
+            || reply.body["state"] != status.state.as_str()
+            || reply.body["context"] != status.context.as_str()
+        {
+            return Err(GhError::Failed(format!("{} from statuses", reply.status)));
+        }
+        Ok(Ok(()))
     }
 
     async fn git_write(&self, token: &str, full_name: &str, what: &str, body: Value) -> Gh<Value> {

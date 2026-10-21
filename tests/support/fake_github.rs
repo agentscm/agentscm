@@ -202,6 +202,11 @@ pub struct Pull {
     pub updated_at: String,
     pub files: Vec<String>,
     pub body: String,
+    /// `None`: the head is in this repository. `Some(None)`: the head repository is gone (null).
+    /// `Some(Some(id))`: a fork with that repository id.
+    pub head_repo: Option<Option<i64>>,
+    /// Overrides `base.repo.id`, which is otherwise the repository's own.
+    pub base_repo_id: Option<i64>,
 }
 
 impl Pull {
@@ -223,6 +228,8 @@ impl Pull {
             updated_at: "2026-01-01T00:00:00Z".into(),
             files: files.iter().map(|f| f.to_string()).collect(),
             body: String::new(),
+            head_repo: None,
+            base_repo_id: None,
         }
     }
 }
@@ -252,6 +259,8 @@ pub struct Repo {
     pub statuses: Vec<(String, Value)>,
     /// A bare Git repository behind the git-data API (blobs, trees, commits, refs), if any.
     pub git: Option<std::path::PathBuf>,
+    /// Without `git`: commit sha to (tree sha, parent shas) for `GET git/commits/{sha}`.
+    pub commits: BTreeMap<String, (String, Vec<String>)>,
 }
 
 impl Repo {
@@ -268,6 +277,7 @@ impl Repo {
             comments: BTreeMap::new(),
             statuses: Vec::new(),
             git: None,
+            commits: BTreeMap::new(),
         }
     }
 }
@@ -300,6 +310,12 @@ pub struct FakeState {
     pub refuse_next_pull: bool,
     /// Create the next branch, then answer 502 with no body.
     pub lose_next_ref_reply: bool,
+    /// Record the next commit status, then answer 502 with no body.
+    pub lose_next_status_reply: bool,
+    /// After recording the next commit status, move the first branch's tip to this sha.
+    pub advance_base_after_status: Option<String>,
+    /// Leave `head.repo` and `base.repo` out of pull request JSON.
+    pub omit_pull_repos: bool,
     /// Build every created commit with a different message, so its SHA differs from the client's.
     pub alter_commit_messages: bool,
 }
@@ -565,11 +581,17 @@ fn paginate(
 }
 
 fn pull_json(ctx: &Ctx, repo: &Repo, p: &Pull) -> Value {
+    let repo_ref = |id: i64| json!({"id": id});
+    let head_repo = match p.head_repo {
+        None => repo_ref(repo.id),
+        Some(None) => Value::Null,
+        Some(Some(id)) => repo_ref(id),
+    };
     json!({
         "number": p.number, "node_id": p.node_id, "title": p.title, "body": p.body, "state": p.state,
         "merged": p.merged, "merge_commit_sha": p.merge_commit_sha, "draft": p.draft,
-        "head": {"ref": p.head_ref, "sha": p.head_sha},
-        "base": {"ref": p.base_ref},
+        "head": {"ref": p.head_ref, "sha": p.head_sha, "repo": head_repo},
+        "base": {"ref": p.base_ref, "repo": repo_ref(p.base_repo_id.unwrap_or(repo.id))},
         "user": {"login": p.author_login, "id": p.author_id},
         "updated_at": p.updated_at,
         "html_url": format!("{}/{}/pull/{}", ctx.base, repo.full_name, p.number),
@@ -650,7 +672,18 @@ fn git_data(
                 &dir,
                 &["rev-parse", "--verify", "-q", &format!("{sha}^{{tree}}")],
             ) {
-                Some(tree) => json_reply(200, json!({"sha": sha, "tree": {"sha": tree}})),
+                Some(tree) => {
+                    let line = git_text(&dir, &["rev-list", "--parents", "-n1", sha]);
+                    let parents: Vec<&str> = line
+                        .as_deref()
+                        .map(|l| l.split(' ').skip(1).collect())
+                        .unwrap_or_default();
+                    json_reply(
+                        200,
+                        json!({"sha": sha, "tree": {"sha": tree},
+                            "parents": parents.iter().map(|p| json!({"sha": p})).collect::<Vec<_>>()}),
+                    )
+                }
                 None => not_found(),
             },
         ),
@@ -1041,7 +1074,14 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                 (&Method::GET, ["pulls", num]) => {
                     let repo = &state.repos[&id];
                     match num.parse::<u64>().ok().and_then(|n| repo.pulls.get(&n)) {
-                        Some(p) => json_reply(200, pull_json(ctx, repo, p)),
+                        Some(p) => {
+                            let mut pull = pull_json(ctx, repo, p);
+                            if state.omit_pull_repos {
+                                pull["head"].as_object_mut().unwrap().remove("repo");
+                                pull["base"].as_object_mut().unwrap().remove("repo");
+                            }
+                            json_reply(200, pull)
+                        }
                         None => not_found(),
                     }
                 }
@@ -1133,8 +1173,38 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                         None => not_found(),
                     }
                 }
+                (&Method::GET, ["git", "commits", sha]) => {
+                    match state.repos[&id].commits.get(*sha) {
+                        Some((tree, parents)) => json_reply(
+                            200,
+                            json!({"sha": sha, "tree": {"sha": tree},
+                                "parents": parents.iter().map(|p| json!({"sha": p})).collect::<Vec<_>>()}),
+                        ),
+                        None => not_found(),
+                    }
+                }
+                (&Method::GET, ["git", "ref", "heads", name @ ..]) => {
+                    let wanted = name.join("/");
+                    match state.repos[&id].branches.iter().find(|b| b.name == wanted) {
+                        Some(b) => json_reply(
+                            200,
+                            json!({"ref": format!("refs/heads/{wanted}"), "object": {"type": "commit", "sha": b.sha}}),
+                        ),
+                        None => not_found(),
+                    }
+                }
                 (&Method::POST, ["statuses", sha]) => {
                     let b = json_body();
+                    let valid_state = matches!(
+                        b["state"].as_str(),
+                        Some("pending" | "success" | "failure" | "error")
+                    );
+                    if !valid_state
+                        || sha.len() != 40
+                        || !sha.bytes().all(|c| c.is_ascii_hexdigit())
+                    {
+                        return json_reply(422, json!({"message": "Validation Failed"}));
+                    }
                     let status = json!({"state": b["state"], "context": b["context"], "description": b["description"]});
                     state
                         .repos
@@ -1142,6 +1212,12 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                         .unwrap()
                         .statuses
                         .push((sha.to_string(), status.clone()));
+                    if let Some(tip) = state.advance_base_after_status.take() {
+                        state.repos.get_mut(&id).unwrap().branches[0].sha = tip;
+                    }
+                    if std::mem::take(&mut state.lose_next_status_reply) {
+                        return reply(502, &[], None);
+                    }
                     json_reply(201, status)
                 }
                 _ => not_found(),
