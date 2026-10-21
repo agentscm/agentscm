@@ -358,10 +358,23 @@ impl Api {
             .filter(|name| valid_ref_name(name))
             .ok_or_else(bad)?
             .to_owned();
-        mr["source_branch"]
+        let source_branch = mr["source_branch"]
             .as_str()
             .filter(|name| valid_ref_name(name))
             .ok_or_else(bad)?;
+        // The merge request's `sha` can lag a new push. A head that is not the source branch's tip
+        // is superseded, so nothing may be judged on it. A fork's branch is not in this project.
+        if head_repo_id == project as u64
+            && self
+                .ref_sha(token, project, source_branch)
+                .await?
+                .as_deref()
+                != Some(head_sha.as_str())
+        {
+            return Err(GhError::Failed(
+                "merge request head lags its source branch".into(),
+            ));
+        }
         let base_tip = match base_tips.get(&base_ref) {
             Some(tip) => tip.clone(),
             None => {

@@ -1002,10 +1002,13 @@ async fn forge_check_view(
     }
     let target = &candidate.subject.target;
     let mut view = json!({"mode": "git_default", "enabled": false,
-        "provider": if conn.provider == "github" { "github" } else { "unsupported" },
+        "provider": match conn.provider.as_str() {
+            provider @ ("github" | "gitlab") => provider,
+            _ => "unsupported",
+        },
         "protection": "unverified",
         "note": "Branch protection, raw pushes and administrator bypass are not enforced or verified by AgentSCM."});
-    let enabled = conn.provider == "github"
+    let enabled = matches!(conn.provider.as_str(), "github" | "gitlab")
         && state.workspace_execution.as_ref().is_some_and(|service| {
             service.agent_task_profiles.values().any(|p| {
                 p.publish_forge_status

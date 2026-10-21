@@ -12,9 +12,11 @@ use sha2::{Digest, Sha256};
 use super::connection::{
     ConnectedRepository, Connection, ForgeCheck, ForgeCheckReserve, NewForgeCheck,
 };
+use super::forge_api::ForgeApi;
 use super::github::{CommitStatus, Gh, GhError, StatusState};
+use super::gitlab;
 use super::http::blocking;
-use super::publish::{Update, publication_on_forge};
+use super::publish::{Publication, Update, publication_on_forge};
 use super::store::unix_now;
 use super::workspace_execution::AgentTaskProfile;
 use super::{HubError, HubState, Result};
@@ -279,6 +281,13 @@ fn may_show_success(row: &ForgeCheck) -> bool {
     row.state == "success" || row.phase == "attempting"
 }
 
+/// The pull request a status is for. `branch` is its source branch, which GitLab keys a status by.
+struct Pr<'a> {
+    number: i64,
+    context: &'a str,
+    branch: &'a str,
+}
+
 /// What one status post should say about one head.
 struct Desired {
     new: NewForgeCheck,
@@ -300,8 +309,8 @@ pub(super) async fn reconcile_repo(
     token: &str,
     only: Option<i64>,
 ) -> Gh<()> {
-    // Statuses are a GitHub feature; another forge's token never goes to the GitHub client.
-    if conn.provider != "github" {
+    // Statuses exist on GitHub and GitLab; each token goes only to its own provider's client.
+    if !matches!(conn.provider.as_str(), "github" | "gitlab") {
         return Ok(());
     }
     let profiles: Vec<AgentTaskProfile> = state
@@ -312,7 +321,7 @@ pub(super) async fn reconcile_repo(
         .cloned()
         .collect();
     if only.is_none() {
-        retire_disabled(state, repo, token, &profiles).await?;
+        retire_disabled(state, conn, repo, token, &profiles).await?;
     }
     if profiles.is_empty() {
         return Ok(());
@@ -356,11 +365,16 @@ pub(super) async fn reconcile_repo(
                 }
                 let step = pull_step(
                     state,
+                    conn,
                     repo,
                     token,
                     profile,
-                    number,
-                    (&candidate.subject, &publication.commit),
+                    (
+                        number,
+                        &candidate.subject,
+                        &publication.commit,
+                        &publication.branch,
+                    ),
                     &mut base_tips,
                 )
                 .await;
@@ -392,6 +406,7 @@ pub(super) async fn reconcile_repo(
 /// retired row no longer qualifies, so none repeats.
 async fn retire_disabled(
     state: &HubState,
+    conn: &Connection,
     repo: &ConnectedRepository,
     token: &str,
     profiles: &[AgentTaskProfile],
@@ -405,16 +420,19 @@ async fn retire_disabled(
         store.forge_checks_showing_success(&id, &name, &enabled, MAX_PULLS_PER_PASS)
     })
     .await?;
-    let api = state.sync.api()?;
+    let api = state.sync.forge(conn)?;
     for (number, context, row) in rows {
         // The store knows only merges the Hub recorded; ask the forge, and skip on a failed read.
-        match api.pull(token, &repo.full_name, number).await {
+        match api.pull(token, repo, number).await {
             Ok(Some(pull)) => match pull["merged"].as_bool() {
                 Some(false) => {}
                 Some(true) => {
                     let merge_commit = pull["merge_commit_sha"].as_str().map(str::to_owned);
+                    let head = pull["head"]["sha"].as_str().unwrap_or_default();
                     // A failed store write only delays the record; it must not end the pass.
-                    if let Err(error) = record_merge(state, repo, number, merge_commit).await {
+                    if let Err(error) =
+                        record_merge(state, conn, repo, number, merge_commit, head).await
+                    {
                         eprintln!(
                             "hub: forge check for {}#{number}: recording the merge: {error}",
                             repo.full_name
@@ -437,35 +455,65 @@ async fn retire_disabled(
                 continue;
             }
         }
-        retire(state, repo, token, number, &context, &row, DISABLED).await?;
+        // GitLab posts on the merge request's source branch, which only its publication names.
+        let branch = if conn.provider == "gitlab" {
+            match newest_publication(state, repo, number).await? {
+                Some(publication) => publication.branch,
+                None => continue,
+            }
+        } else {
+            String::new()
+        };
+        let pr = Pr {
+            number,
+            context: &context,
+            branch: &branch,
+        };
+        retire(state, conn, repo, token, &pr, &row, DISABLED).await?;
     }
     Ok(())
 }
 
-/// Records a merge the forge reported on the pull request's newest publication, as the
-/// publication read does. A Hub-store write only. A merge the forge names no commit for is not
-/// recorded, since the publication needs one.
-async fn record_merge(
+/// The newest unmerged publication of `repo`'s pull request `number`, when it was published to
+/// this forge. The listing omits merged pull requests, so a match is the unrecorded newest one.
+async fn newest_publication(
     state: &HubState,
     repo: &ConnectedRepository,
     number: i64,
-    merge_commit: Option<String>,
-) -> Result<()> {
-    let Some(merge_commit) = merge_commit else {
-        return Ok(());
-    };
+) -> Result<Option<Publication>> {
     let (store, name) = (state.store.clone(), repo.full_name.clone());
-    // The listing omits merged pull requests, so a match is the unrecorded newest one.
     let newest = blocking(state, move || {
         store.pull_publications(&name, number.saturating_sub(1), 1)
     })
     .await?;
-    let Some(publication) = newest.into_iter().find(|p| p.pr_number == Some(number)) else {
+    let found = newest.into_iter().find(|p| p.pr_number == Some(number));
+    Ok(match found {
+        Some(p) if publication_on_forge(state, &p, repo).await => Some(p),
+        _ => None,
+    })
+}
+
+/// Records a merge the forge reported on the pull request's newest publication, as the
+/// publication read does. A Hub-store write only. A merge the forge names no commit for is
+/// recorded only on GitLab, where a fast-forward merge names none and the merged head being the
+/// published commit proves it; otherwise it is not recorded, since the publication needs one.
+async fn record_merge(
+    state: &HubState,
+    conn: &Connection,
+    repo: &ConnectedRepository,
+    number: i64,
+    merge_commit: Option<String>,
+    head_sha: &str,
+) -> Result<()> {
+    let Some(publication) = newest_publication(state, repo, number).await? else {
         return Ok(());
     };
-    if !publication_on_forge(state, &publication, repo).await {
+    let merge_commit = merge_commit.or_else(|| {
+        (conn.provider == "gitlab" && head_sha == publication.commit).then(|| head_sha.to_owned())
+    });
+    let Some(merge_commit) = merge_commit else {
         return Ok(());
-    }
+    };
     let store = state.store.clone();
     blocking(state, move || {
         store.update_publication(
@@ -483,34 +531,41 @@ async fn record_merge(
 /// pass to recheck.
 async fn pull_step(
     state: &HubState,
+    conn: &Connection,
     repo: &ConnectedRepository,
     token: &str,
     profile: &AgentTaskProfile,
-    number: i64,
-    (subject, commit): (&CandidateSubject, &str),
+    (number, subject, commit, branch): (i64, &CandidateSubject, &str, &str),
     base_tips: &mut HashMap<String, String>,
 ) -> Gh<bool> {
-    let api = state.sync.api()?;
+    let api = state.sync.forge(conn)?;
     // A missing pull request gets no post; a read that fails claims nothing.
-    let Some(head) = api
-        .pull_head(token, &repo.full_name, number, base_tips)
-        .await?
-    else {
+    let Some(head) = api.pull_head(token, repo, number, base_tips).await? else {
         return Ok(false);
     };
     // A merged head is history, not a candidate: leave whatever it shows alone, and record the
     // merge so later passes skip this pull request.
     if head.merged {
-        record_merge(state, repo, number, head.merge_commit).await?;
+        record_merge(state, conn, repo, number, head.merge_commit, &head.head_sha).await?;
         return Ok(false);
     }
     let context = status_context(&profile.target)?;
+    let pr = Pr {
+        number,
+        context: &context,
+        branch,
+    };
     let row = journal(state, repo, number, &context).await?;
     if !head.open {
         // A success must not stay on a commit once its pull request is closed.
         if let Some(old) = row.as_ref().filter(|r| may_show_success(r)) {
-            retire(state, repo, token, number, &context, old, CLOSED).await?;
+            retire(state, conn, repo, token, &pr, old, CLOSED).await?;
         }
+        return Ok(false);
+    }
+    let connected = u64::try_from(repo.repository_id).unwrap_or(0);
+    // A GitLab merge request from a fork is not this project's candidate: no status, no journal.
+    if conn.provider == "gitlab" && head.head_repo_id != connected {
         return Ok(false);
     }
     let live = LiveHead {
@@ -525,7 +580,6 @@ async fn pull_step(
     };
     let (task, task_subject) = (profile.clone(), subject.clone());
     let native = blocking(state, move || Ok(native_state(&task, &task_subject))).await?;
-    let connected = u64::try_from(repo.repository_id).unwrap_or(0);
     let verdict = evaluate(connected, subject, commit, &live, &native);
     let desired = desired(connected, number, profile, subject, &live, &native, verdict);
 
@@ -535,7 +589,7 @@ async fn pull_step(
     {
         // A success must not stay on a commit the pull request may return to. Only a settled
         // failure (posted or refused) lets the row move to the new head.
-        let settled = retire(state, repo, token, number, &context, old, SUPERSEDED).await?;
+        let settled = retire(state, conn, repo, token, &pr, old, SUPERSEDED).await?;
         if !settled {
             return Ok(false);
         }
@@ -551,7 +605,7 @@ async fn pull_step(
     }) {
         return Ok(false);
     }
-    let posted = post(state, repo, token, number, &context, row.as_ref(), &desired).await?;
+    let posted = post(state, conn, repo, token, &pr, row.as_ref(), &desired).await?;
     Ok(matches!(posted, Posting::Posted | Posting::Unrecorded)
         && desired.state == StatusState::Success)
 }
@@ -561,10 +615,10 @@ async fn pull_step(
 /// request. A lost or unrecorded post leaves the row for the next pass.
 async fn retire(
     state: &HubState,
+    conn: &Connection,
     repo: &ConnectedRepository,
     token: &str,
-    number: i64,
-    context: &str,
+    pr: &Pr<'_>,
     old: &ForgeCheck,
     description: &str,
 ) -> Gh<bool> {
@@ -578,7 +632,7 @@ async fn retire(
         state: StatusState::Failure,
         final_on_refusal: true,
     };
-    let posting = post(state, repo, token, number, context, Some(old), &stale).await?;
+    let posting = post(state, conn, repo, token, pr, Some(old), &stale).await?;
     Ok(matches!(posting, Posting::Posted | Posting::Refused))
 }
 
@@ -646,25 +700,51 @@ async fn journal(
     blocking(state, move || store.forge_check(&id, number, &context)).await
 }
 
-/// Reserves, posts and completes one status. A lost reply or a lost race leaves the row
-/// `attempting` (or unchanged), so the next pass posts the desired status again; the latest
-/// status per context wins on GitHub, so the repost is the recovery. A definite refusal is
-/// recorded as `refused` and never as posted.
+/// Whether GitLab's newest status of this name already shows what `desired` says. `exact` also
+/// needs the description to match; without it any non-success state that is shown counts, since
+/// it blocks as much as the desired one. A success always needs the exact binding description.
+async fn gitlab_shows(
+    forge: ForgeApi<'_>,
+    token: &str,
+    repo: &ConnectedRepository,
+    pr: &Pr<'_>,
+    desired: &Desired,
+    exact: bool,
+) -> Gh<bool> {
+    let listed = forge
+        .commit_statuses(token, repo, &desired.new.head_sha, pr.context, pr.branch)
+        .await?;
+    let exact = exact || desired.state == StatusState::Success;
+    Ok(listed.is_some_and(|l| {
+        l.state == gitlab::status_state(desired.state)
+            && (!exact || l.description == desired.new.description)
+    }))
+}
+
+/// Reserves, posts and completes one status. A lost race leaves the row unchanged. On GitHub a
+/// lost reply leaves the row `attempting` and the next pass posts the desired status again; the
+/// latest status per context wins there, so the repost is the recovery. GitLab refuses to repeat
+/// a state, so it never re-posts blindly: an `attempting` row first reads the status list and
+/// adopts a matching status, and a 400 reply is resolved by the list as well. A list that cannot
+/// be read leaves the row `attempting`. A definite refusal is recorded as `refused`, never as
+/// posted.
 async fn post(
     state: &HubState,
+    conn: &Connection,
     repo: &ConnectedRepository,
     token: &str,
-    number: i64,
-    context: &str,
+    pr: &Pr<'_>,
     row: Option<&ForgeCheck>,
     desired: &Desired,
 ) -> Gh<Posting> {
+    let (number, context) = (pr.number, pr.context);
     let status = CommitStatus::new(
         &desired.new.head_sha,
         desired.state,
         context,
         &desired.new.description,
     )?;
+    let forge = state.sync.forge(conn)?;
     let (store, id, ctx) = (state.store.clone(), repo.id.clone(), context.to_owned());
     let (expected, new) = (row.map(|r| r.generation), desired.new.clone());
     let reserved = blocking(state, move || {
@@ -674,13 +754,36 @@ async fn post(
     let ForgeCheckReserve::Reserved(generation) = reserved else {
         return Ok(Posting::Unknown);
     };
-    let phase = match state
-        .sync
-        .api()?
-        .post_commit_status(token, &repo.full_name, &status)
+    let gitlab = conn.provider == "gitlab";
+    let uncertain = |detail: &str| {
+        eprintln!(
+            "hub: forge check post for {}#{number}: {detail}",
+            repo.full_name
+        );
+        Ok(Posting::Unknown)
+    };
+    // A list that cannot be read leaves the status uncertain; a stopped pass still stops.
+    let shows = |exact| gitlab_shows(forge, token, repo, pr, desired, exact);
+    if gitlab && row.is_some_and(|r| r.phase == "attempting") {
+        match shows(true).await {
+            Ok(true) => return complete(state, repo, pr, generation, "posted").await,
+            Ok(false) => {}
+            Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
+            Err(GhError::Failed(detail)) => return uncertain(&detail),
+        }
+    }
+    let phase = match forge
+        .post_commit_status(token, repo, &status, pr.branch)
         .await
     {
         Ok(Ok(())) => "posted",
+        // GitLab's "cannot transition": the status list says whether the desired one is there.
+        Ok(Err(400)) if gitlab => match shows(false).await {
+            Ok(true) => "posted",
+            Ok(false) => return uncertain("cannot transition to the desired status"),
+            Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
+            Err(GhError::Failed(detail)) => return uncertain(&detail),
+        },
         Ok(Err(refused)) => {
             eprintln!("hub: {} refused a forge check ({refused})", repo.full_name);
             "refused"
@@ -688,20 +791,26 @@ async fn post(
         // Not applied; the row stays `attempting`.
         Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
         // Uncertain: the status may exist.
-        Err(GhError::Failed(detail)) => {
-            eprintln!(
-                "hub: forge check post for {}#{number}: {detail}",
-                repo.full_name
-            );
-            return Ok(Posting::Unknown);
-        }
+        Err(GhError::Failed(detail)) => return uncertain(&detail),
     };
     // Replacing a row that may show a success: a refusal means the success is still there, so
     // the row stays `attempting` and the next pass tries again.
     if phase == "refused" && !desired.final_on_refusal && row.is_some_and(may_show_success) {
         return Ok(Posting::Refused);
     }
-    let (store, id, ctx) = (state.store.clone(), repo.id.clone(), context.to_owned());
+    complete(state, repo, pr, generation, phase).await
+}
+
+/// Records how a reserved post ended.
+async fn complete(
+    state: &HubState,
+    repo: &ConnectedRepository,
+    pr: &Pr<'_>,
+    generation: i64,
+    phase: &'static str,
+) -> Gh<Posting> {
+    let (store, id, ctx) = (state.store.clone(), repo.id.clone(), pr.context.to_owned());
+    let number = pr.number;
     let recorded = blocking(state, move || {
         store.complete_forge_check(&id, number, &ctx, generation, phase, unix_now())
     })

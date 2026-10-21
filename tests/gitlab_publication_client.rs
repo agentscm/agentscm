@@ -354,7 +354,8 @@ async fn oversized_or_malformed_tree_listing_fails_closed() {
     let (fake, api) = setup().await;
     let sha = fake.with(|s| {
         let p = s.projects.get_mut(&1).unwrap();
-        let mr = Mr::new(1, "agent/x", &[]);
+        let mut mr = Mr::new(1, "agent/x", &[]);
+        mr.sha = p.branches[1].sha.clone();
         let sha = mr.sha.clone();
         p.mrs.insert(1, mr);
         let tree = (0..MAX_TREE_PAGES as usize * 100 + 1)
@@ -503,4 +504,30 @@ async fn status_list_is_bounded() {
         }
     });
     assert!(matches!(listed(&api, &sha).await, Err(GhError::Failed(d)) if d.contains("too many")));
+}
+
+#[tokio::test]
+async fn a_head_lagging_the_source_branch_is_an_error() {
+    let (fake, api) = setup().await;
+    let tip = fake.with(|s| {
+        let p = s.projects.get_mut(&1).unwrap();
+        let mut mr = Mr::new(1, "agent/x", &[]);
+        mr.sha = p.branches[1].sha.clone();
+        p.commits.insert(
+            mr.sha.clone(),
+            FakeCommit {
+                parent_ids: vec![],
+                tree: vec![entry("f.txt", "blob", "100644", 1)],
+            },
+        );
+        p.mrs.insert(1, mr);
+        p.branches[1].sha.clone()
+    });
+    assert_eq!(head(&api, 1).await.unwrap().unwrap().head_sha, tip);
+    // The source branch moved on; the merge request still reports the old head.
+    fake.with(|s| s.projects.get_mut(&1).unwrap().branches[1].sha = "c".repeat(40));
+    assert!(matches!(head(&api, 1).await, Err(GhError::Failed(d)) if d.contains("lags")));
+    // A missing source branch is not a match either.
+    fake.with(|s| s.projects.get_mut(&1).unwrap().branches.truncate(1));
+    assert!(matches!(head(&api, 1).await, Err(GhError::Failed(d)) if d.contains("lags")));
 }
