@@ -2246,8 +2246,8 @@ fn active_token(tx: &mut postgres::Transaction<'_>, token: &str, now: i64) -> Re
     })
 }
 
-fn publication_row(row: &postgres::Row) -> Publication {
-    Publication {
+fn publication_row(row: &postgres::Row) -> Result<Publication> {
+    Ok(Publication {
         id: row.get(0),
         repository: row.get(1),
         token: row.get(2),
@@ -2259,7 +2259,9 @@ fn publication_row(row: &postgres::Row) -> Publication {
         commit: row.get(7),
         branch: row.get(8),
         base: row.get(9),
-        manifest: row.get(10),
+        manifest: row.get::<_, Option<String>>(10).ok_or_else(|| {
+            HubError::Invalid("retained publication exceeds manifest budget".into())
+        })?,
         branch_state: row.get(11),
         branch_message: row.get(12),
         pr_number: row.get(13),
@@ -2269,7 +2271,7 @@ fn publication_row(row: &postgres::Row) -> Publication {
         error: row.get(17),
         created_at: row.get(18),
         updated_at: row.get(19),
-    }
+    })
 }
 
 /// `lock` adds `FOR UPDATE OF p` so a concurrent update waits for this transaction.
@@ -2283,7 +2285,7 @@ fn publication_by_id(
         &format!("{PUBLICATION_SELECT} WHERE p.id = $1{tail}"),
         &[&id],
     )?;
-    Ok(row.as_ref().map(publication_row))
+    row.as_ref().map(publication_row).transpose()
 }
 
 fn connection_row(row: &postgres::Row) -> ForgeConnection {
@@ -4220,6 +4222,20 @@ impl Store for PgStore {
             if let Some(found) = publication_by_id(&mut tx, &new.id, false)? {
                 return Ok(Create::of_existing(found, &who.repository, &manifest));
             }
+            // Serialize candidate/integrated reservations for this repository/branch,
+            // including tokens owned by different actors.
+            tx.execute("SELECT pg_advisory_xact_lock($1, hashtext($2))", &[&PUBLICATION_LOCK_CLASS, &format!("branch:{}:{}", who.repository, m.branch)])?;
+            let head: Option<String> = tx.query_opt("SELECT publication FROM hub_candidate_heads WHERE repository=$1 AND branch=$2", &[&who.repository, &m.branch])?.map(|r| r.get(0));
+            let previous = match &head { Some(id) => publication_by_id(&mut tx,id,false)?, None => None };
+            if head.is_some() && previous.is_none() { return Err(HubError::Unavailable("candidate lineage record missing".into())); }
+            if !super::publish::candidate_continuation(new, previous.as_ref(), &who.owner.id)? { return Ok(Create::Conflict); }
+            if m.candidate.is_some() && head.is_none() {
+                let occupied: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM hub_publications WHERE repository=$1 AND branch=$2)", &[&who.repository, &m.branch])?.get(0);
+                if occupied { return Ok(Create::Conflict); }
+            }
+            if m.candidate.is_some() {
+                tx.execute("INSERT INTO hub_candidate_heads VALUES($1,$2,$3) ON CONFLICT(repository,branch) DO UPDATE SET publication=excluded.publication", &[&who.repository, &m.branch, &new.id])?;
+            }
             let unfinished: i64 = tx
                 .query_one(
                     "SELECT count(*) FROM hub_publications
@@ -4271,6 +4287,19 @@ impl Store for PgStore {
     fn update_publication(&self, id: &str, update: &Update, now: i64) -> Result<Publication> {
         self.run(false, |client| {
             let mut tx = client.transaction()?;
+            // Same branch lock and ordering as create_publication: a successor
+            // reservation and an old candidate's dispatch fence are indivisible.
+            if matches!(update, Update::PullRequestAttempt) {
+                let current = publication_by_id(&mut tx, id, false)?
+                    .ok_or_else(|| HubError::Invalid("unknown publication".into()))?;
+                if current.event_seq.is_none() {
+                    tx.execute("SELECT pg_advisory_xact_lock($1, hashtext($2))", &[&PUBLICATION_LOCK_CLASS, &format!("branch:{}:{}", current.repository, current.branch)])?;
+                    let head: Option<String> = tx.query_opt("SELECT publication FROM hub_candidate_heads WHERE repository=$1 AND branch=$2", &[&current.repository, &current.branch])?.map(|r| r.get(0));
+                    if head.as_deref() != Some(id) {
+                        return Err(HubError::Invalid("candidate was superseded before PR attempt".into()));
+                    }
+                }
+            }
             let mut p = publication_by_id(&mut tx, id, true)?
                 .ok_or_else(|| HubError::Invalid("unknown publication".into()))?;
             let (changed, event) = p.apply(update, now)?;

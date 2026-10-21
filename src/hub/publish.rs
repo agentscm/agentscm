@@ -81,7 +81,10 @@ pub struct Change {
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub revision: String,
-    pub event_seq: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_seq: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate: Option<Candidate>,
     pub commit: String,
     pub tree: String,
     pub parent: String,
@@ -93,6 +96,16 @@ pub struct Manifest {
     pub committer: Person,
     pub message: String,
     pub changes: Vec<Change>,
+}
+
+/// A draft subject is not evidence of native integration. Its Git branch was
+/// published by the scoped Mirror transport before this bridge opens the PR.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Candidate {
+    pub subject: crate::candidate::CandidateSubject,
+    pub endpoint: String,
+    pub previous_publication: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,7 +126,7 @@ pub struct Publication {
     pub agent: String,
     pub owner_login: String,
     pub revision: String,
-    pub event_seq: i64,
+    pub event_seq: Option<i64>,
     pub commit: String,
     pub branch: String,
     pub base: String,
@@ -146,6 +159,36 @@ pub enum Create {
     TooMany,
 }
 
+/// Shared transactional lineage admission for both persistent backends.
+pub(super) fn candidate_continuation(
+    new: &NewPublication,
+    previous: Option<&Publication>,
+    owner: &str,
+) -> Result<bool> {
+    let Some(candidate) = &new.manifest.candidate else {
+        return Ok(previous.is_none());
+    };
+    let Some(previous) = previous else {
+        return Ok(candidate.previous_publication.is_none());
+    };
+    let old = previous.manifest()?;
+    Ok(
+        candidate.previous_publication.as_deref() == Some(&previous.id)
+            && previous.owner == owner
+            && (previous.pr_number.is_some()
+                || matches!(
+                    previous.branch_state.as_str(),
+                    "pending" | "created" | "rejected" | "pr_refused"
+                ))
+            && previous.merge_commit.is_none()
+            && previous.branch == new.manifest.branch
+            && previous.base == new.manifest.base
+            && old.candidate.as_ref().is_some_and(|old| {
+                old.subject.same_lineage(&candidate.subject) && old.endpoint == candidate.endpoint
+            }),
+    )
+}
+
 impl Create {
     pub(super) fn of_existing(found: Publication, repository: &str, manifest: &str) -> Self {
         if found.repository == repository && found.manifest == manifest {
@@ -162,6 +205,10 @@ pub enum Update {
     /// Recorded just before the branch create is sent.
     BranchAttempt,
     BranchCreated,
+    PullRequestAttempt,
+    PullRequestRefused {
+        status: u16,
+    },
     BranchRejected {
         status: u16,
         message: String,
@@ -175,6 +222,15 @@ pub enum Update {
         merge_commit: String,
     },
     Error(Option<String>),
+}
+
+fn valid_pull_url(value: &str) -> bool {
+    reqwest::Url::parse(value).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+    })
 }
 
 fn invalid(message: &str) -> HubError {
@@ -231,8 +287,54 @@ impl Person {
 impl Manifest {
     pub fn validate(&self) -> Result<()> {
         crate::store::validate_id(&self.revision).map_err(|_| invalid("bad revision"))?;
-        if self.event_seq < 1 {
-            return Err(invalid("event_seq must be positive"));
+        match (&self.event_seq, &self.candidate) {
+            (Some(event), None) if *event > 0 => {}
+            (None, Some(candidate)) => {
+                let subject = &candidate.subject;
+                subject
+                    .change
+                    .validate()
+                    .map_err(|_| invalid("invalid candidate Change"))?;
+                for id in [
+                    &subject.id,
+                    &subject.attachment,
+                    &subject.context_digest,
+                    &subject.revision,
+                    &subject.source_fingerprint,
+                    &subject.comparison_fingerprint,
+                ] {
+                    crate::store::validate_id(id)
+                        .map_err(|_| invalid("invalid candidate identity"))?;
+                }
+                if subject
+                    .canonical_id()
+                    .map_err(|_| invalid("invalid candidate digest"))?
+                    != subject.id
+                    || subject.endpoint != candidate.endpoint
+                    || subject.output != self.branch
+                    || subject.revision != self.revision
+                    || subject.target != self.base
+                    || self.base == self.branch
+                    || !hex_of(&subject.baseline_commit, 40)
+                    || !hex_of(&subject.source_commit, 40)
+                    || subject.parent_commit != self.parent
+                {
+                    return Err(invalid("candidate binding differs from publication"));
+                }
+                candidate_repository(&candidate.endpoint)?;
+                if candidate
+                    .previous_publication
+                    .as_ref()
+                    .is_some_and(|id| !id.starts_with("pub_") || !hex_of(&id[4..], 32))
+                {
+                    return Err(invalid("invalid previous publication"));
+                }
+            }
+            _ => {
+                return Err(invalid(
+                    "exactly one positive event_seq or typed candidate is required",
+                ));
+            }
         }
         for (name, sha) in [
             ("commit", &self.commit),
@@ -328,7 +430,17 @@ impl NewPublication {
     pub fn validate(&self, repository: &str) -> Result<()> {
         self.manifest.validate()?;
         let m = &self.manifest;
-        if self.id != derive_id(repository, m.event_seq as u64, &m.commit, &m.branch) {
+        let expected = match (&m.event_seq, &m.candidate) {
+            (Some(event), None) => derive_id(repository, *event as u64, &m.commit, &m.branch),
+            (None, Some(candidate)) => {
+                if candidate_repository(&candidate.endpoint)?.1 != repository {
+                    return Err(invalid("candidate endpoint repository differs"));
+                }
+                derive_candidate_id(repository, &candidate.subject.id, &m.commit, &m.branch)
+            }
+            _ => return Err(invalid("invalid publication subject")),
+        };
+        if self.id != expected {
             return Err(invalid(
                 "publication id must be derived from the repository, event, commit and branch",
             ));
@@ -364,14 +476,44 @@ impl Publication {
                 None
             }
             Update::BranchAttempt => {
-                if matches!(self.branch_state.as_str(), "attempting" | "created") {
+                if matches!(
+                    self.branch_state.as_str(),
+                    "attempting" | "created" | "pr_attempting" | "pr_refused"
+                ) {
                     return Ok((false, None));
                 }
                 self.branch_state = "attempting".into();
                 None
             }
+            Update::PullRequestAttempt => {
+                if matches!(self.branch_state.as_str(), "pr_attempting" | "pr_refused")
+                    || self.pr_number.is_some()
+                {
+                    return Err(invalid("PR write was already attempted"));
+                }
+                if self.branch_state != "created" {
+                    return Err(invalid("PR attempt requires observed branch"));
+                }
+                self.branch_state = "pr_attempting".into();
+                None
+            }
+            Update::PullRequestRefused { status } => {
+                if self.branch_state != "pr_attempting" || !matches!(status, 403 | 404 | 422) {
+                    return Err(invalid(
+                        "PR refusal requires an attempted write and definitive refusal",
+                    ));
+                }
+                self.branch_state = "pr_refused".into();
+                self.branch_message = Some(format!(
+                    "PR create refused ({status}); manual adoption or new qualified successor required"
+                ));
+                None
+            }
             Update::BranchCreated => {
-                if self.branch_state == "created" {
+                if matches!(
+                    self.branch_state.as_str(),
+                    "created" | "pr_attempting" | "pr_refused"
+                ) {
                     return Ok((false, None));
                 }
                 self.branch_state = "created".into();
@@ -384,7 +526,11 @@ impl Publication {
                 // The same refusal again (a retry against a protected branch) is not news; only
                 // the message is kept, so status is not compared.
                 let same = self.branch_message.as_deref() == Some(message.as_str());
-                if self.branch_state == "created" || (same && self.branch_state == "rejected") {
+                if matches!(
+                    self.branch_state.as_str(),
+                    "created" | "pr_attempting" | "pr_refused"
+                ) || (same && self.branch_state == "rejected")
+                {
                     return Ok((false, None));
                 }
                 self.branch_state = "rejected".into();
@@ -403,10 +549,16 @@ impl Publication {
                 node_id,
                 html_url,
             } => {
+                if *number <= 0 || node_id.is_empty() || !valid_pull_url(html_url) {
+                    return Err(invalid("invalid PR identity"));
+                }
                 if self.pr_number.is_some() {
                     return Ok((false, None));
                 }
-                if self.branch_state != "created" {
+                if !matches!(
+                    self.branch_state.as_str(),
+                    "created" | "pr_attempting" | "pr_refused"
+                ) {
                     return Err(invalid("a pull request needs a created branch"));
                 }
                 self.pr_number = Some(*number);
@@ -444,11 +596,13 @@ impl Publication {
         };
         let (branch, message) = if self.branch_state == "attempting" {
             ("pending", None)
+        } else if matches!(self.branch_state.as_str(), "pr_attempting" | "pr_refused") {
+            ("created", None)
         } else {
             (self.branch_state.as_str(), self.branch_message.as_ref())
         };
         // `native_landed` is the client's claim: the hub has no native data to check it against.
-        json!({"native_landed": true,
+        json!({"native_landed": self.event_seq.is_some(),
             "branch": {"state": branch, "commit": self.commit,
                 "ref": format!("refs/heads/{}", self.branch), "message": message},
             "pull_request": pull_request})
@@ -461,17 +615,42 @@ impl Publication {
         if let Some(error) = &self.error {
             reply["error"] = json!(error);
         }
+        if let Ok(manifest) = self.manifest()
+            && let Some(candidate) = manifest.candidate
+        {
+            reply["candidate"] = json!(candidate);
+            reply["historical"] = json!(true);
+            reply["qualification"] = json!("not_checked");
+        }
         reply
     }
 
     fn manifest(&self) -> Result<Manifest> {
-        serde_json::from_str(&self.manifest).map_err(|e| HubError::Unavailable(e.to_string()))
+        if self.manifest.len() > MANIFEST_BODY_BYTES {
+            return Err(invalid("retained publication exceeds manifest budget"));
+        }
+        let manifest: Manifest = serde_json::from_str(&self.manifest)
+            .map_err(|e| HubError::Unavailable(e.to_string()))?;
+        NewPublication {
+            id: self.id.clone(),
+            manifest: manifest.clone(),
+        }
+        .validate(&self.repository)?;
+        if manifest.revision != self.revision
+            || manifest.event_seq != self.event_seq
+            || manifest.commit != self.commit
+            || manifest.branch != self.branch
+            || manifest.base != self.base
+        {
+            return Err(invalid("retained publication columns differ from manifest"));
+        }
+        Ok(manifest)
     }
 }
 
 /// Column order read by both backends' row mappers.
 pub(super) const PUBLICATION_SELECT: &str = "SELECT p.id, p.repository, p.token, t.name, u.login,
-        p.revision, p.event_seq, p.commit_sha, p.branch, p.base, p.manifest, p.branch_state,
+        p.revision, p.event_seq, p.commit_sha, p.branch, p.base, CASE WHEN octet_length(p.manifest)<=2097152 THEN p.manifest END, p.branch_state,
         p.branch_message, p.pr_number, p.pr_node_id, p.pr_url, p.merge_commit, p.error,
         p.created_at, p.updated_at, t.owner
     FROM hub_publications p JOIN hub_agent_tokens t ON t.id = p.token
@@ -489,6 +668,10 @@ pub fn routes() -> Router<HubState> {
             put(upload).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
         )
         .route("/v1/hub/repos/{repo}/publications/{id}/run", post(run))
+        .route(
+            "/v1/hub/repos/{repo}/publications/{id}/recover",
+            post(recover),
+        )
 }
 
 type ApiResult = std::result::Result<Json<Value>, ApiError>;
@@ -543,9 +726,11 @@ async fn load(
     id: &str,
 ) -> std::result::Result<Publication, ApiError> {
     let (store, repository, id) = (state.store.clone(), repository.to_owned(), id.to_owned());
-    blocking(state, move || store.publication(&repository, &id))
+    let publication = blocking(state, move || store.publication(&repository, &id))
         .await?
-        .ok_or_else(ApiError::not_found)
+        .ok_or_else(ApiError::not_found)?;
+    publication.manifest()?;
+    Ok(publication)
 }
 
 async fn record(state: &HubState, id: &str, update: Update) -> Result<Publication> {
@@ -579,7 +764,31 @@ async fn create(
     let manifest: Manifest = serde_json::from_value(request).map_err(|_| ApiError::invalid())?;
     let new = NewPublication { id, manifest };
     new.validate(&principal.repository)?;
-    target(&state, &principal, true).await?;
+    let (connection, connected) = target(&state, &principal, true).await?;
+    if let Some(candidate) = &new.manifest.candidate {
+        let (host, full) = candidate_repository(&candidate.endpoint)?;
+        if host != connected.host || full != connected.full_name {
+            return Err(conflict("candidate_endpoint_mismatch"));
+        }
+        let token = state
+            .sync
+            .token(&connection, connected.installation_id)
+            .await
+            .map_err(|_| conflict("candidate_default_unavailable"))?;
+        let default = state
+            .sync
+            .api()
+            .map_err(|_| conflict("candidate_default_unavailable"))?
+            .default_branch(&token, &connected.full_name)
+            .await
+            .map_err(|_| conflict("unsupported_candidate_default"))?;
+        if new.manifest.branch == default
+            || new.manifest.branch == "HEAD"
+            || new.manifest.branch.starts_with("refs/")
+        {
+            return Err(conflict("candidate_output_is_default_or_alias"));
+        }
+    }
     let store = state.store.clone();
     let token = principal.token_id.clone();
     let created = blocking(&state, move || {
@@ -758,11 +967,28 @@ async fn run(
         return Err(conflict("blobs_missing"));
     }
     // A dropped client must not stop the run halfway; the steps are idempotent anyway.
-    let job = tokio::spawn(execute(state, repository, publication));
+    let job = tokio::spawn(execute(state, repository, publication, false));
     let publication = job
         .await
         .map_err(|_| HubError::Unavailable("publication task failed".into()))??;
     Ok(Json(publication.to_json()))
+}
+
+/// Candidate recovery observes only; absence never authorizes a second create.
+async fn recover(
+    State(state): State<HubState>,
+    Authenticated(principal): Authenticated,
+    Path((repo, id)): Path<(String, String)>,
+) -> ApiResult {
+    scope(&principal, &repo)?;
+    let publication = load(&state, &repo, &id).await?;
+    owned(&principal, &publication)?;
+    if publication.manifest()?.candidate.is_none() {
+        return Err(conflict("candidate_required"));
+    }
+    let (_, repository) = target(&state, &principal, false).await?;
+    let result = execute(state, repository, publication, true).await?;
+    Ok(Json(result.to_json()))
 }
 
 /// Why a run stopped.
@@ -793,6 +1019,7 @@ async fn execute(
     state: HubState,
     repository: ConnectedRepository,
     publication: Publication,
+    recovery: bool,
 ) -> Result<Publication> {
     let _guard = state.sync.lock_repo(&repository.id).await;
     // Everything is read again under the lock: a run ahead of this one may have recorded
@@ -813,7 +1040,7 @@ async fn execute(
     let (Some(publication), Some(conn)) = (publication, conn) else {
         return Err(invalid("unknown publication or connection"));
     };
-    let error = match push(&state, &conn, &repository, &publication).await {
+    let error = match push(&state, &conn, &repository, &publication, recovery).await {
         Ok(()) | Err(Stop::Done) => None,
         Err(Stop::Hub(error)) => return Err(error),
         Err(Stop::Message(message)) => Some(message),
@@ -829,12 +1056,14 @@ async fn push(
     conn: &Connection,
     repository: &ConnectedRepository,
     publication: &Publication,
+    recovery: bool,
 ) -> std::result::Result<(), Stop> {
+    publication.manifest()?;
     // Done is done: a branch moved or deleted since (after a merge, say) is not this run's business.
     if publication.pr_number.is_some() {
         return Ok(());
     }
-    if !conn.outbound {
+    if !conn.outbound && !recovery {
         return Err(Stop::Message(
             "outbound writes are off for the connection".into(),
         ));
@@ -848,6 +1077,23 @@ async fn push(
     let api = state.sync.api()?;
     let token = state.sync.token(conn, repository.installation_id).await?;
     let (full, branch, id) = (&repository.full_name, &manifest.branch, &publication.id);
+    if let Some(candidate) = &manifest.candidate {
+        return candidate_pull(
+            state,
+            conn,
+            repository,
+            publication,
+            &manifest,
+            candidate,
+            recovery,
+        )
+        .await;
+    }
+    if recovery {
+        return Err(Stop::Message(
+            "read-only candidate recovery requires a candidate subject".into(),
+        ));
+    }
     let created_before = publication.branch_state == "created";
     match api.ref_sha(&token, full, branch).await? {
         // A branch at our commit is ours only if this publication sent the create (a reply
@@ -1028,4 +1274,270 @@ pub fn derive_id(repository: &str, event: u64, commit: &str, branch: &str) -> St
     let digest = hash.finalize();
     let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
     format!("pub_{}", &hex[..32])
+}
+
+/// Credential-free canonical HTTPS repository identity. SSH publication remains
+/// an explicit unsupported attachment profile until its mapping is qualified.
+pub fn candidate_repository(endpoint: &str) -> Result<(String, String)> {
+    let url = reqwest::Url::parse(endpoint).map_err(|_| invalid("invalid candidate endpoint"))?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.as_str() != endpoint
+    {
+        return Err(invalid(
+            "candidate publication requires canonical credential-free HTTPS",
+        ));
+    }
+    let path = url
+        .path()
+        .trim_start_matches('/')
+        .strip_suffix(".git")
+        .unwrap_or(url.path().trim_start_matches('/'));
+    super::store::validate_repository(path)?;
+    Ok((
+        match url.port() {
+            Some(port) => format!(
+                "{}:{port}",
+                url.host_str()
+                    .ok_or_else(|| invalid("missing endpoint host"))?
+            ),
+            None => url
+                .host_str()
+                .ok_or_else(|| invalid("missing endpoint host"))?
+                .to_owned(),
+        },
+        path.to_owned(),
+    ))
+}
+
+pub fn derive_candidate_id(repository: &str, subject: &str, commit: &str, branch: &str) -> String {
+    let bytes = format!("candidate\0{repository}\0{subject}\0{commit}\0{branch}\0");
+    format!("pub_{}", &lower_hex_of(bytes.as_bytes())[..32])
+}
+
+async fn candidate_pull(
+    state: &HubState,
+    conn: &Connection,
+    repository: &ConnectedRepository,
+    publication: &Publication,
+    manifest: &Manifest,
+    candidate: &Candidate,
+    recovery: bool,
+) -> std::result::Result<(), Stop> {
+    let (host, full) = candidate_repository(&candidate.endpoint)?;
+    if host != repository.host || full != repository.full_name {
+        return Err(Stop::Message(
+            "candidate endpoint differs from connected repository".into(),
+        ));
+    }
+    let api = state.sync.api()?;
+    let token = state.sync.token(conn, repository.installation_id).await?;
+    if !recovery
+        && publication.pr_number.is_none()
+        && publication.branch_state != "pr_attempting"
+        && (api.ref_sha(&token, &full, &manifest.base).await?.as_deref()
+            != Some(&candidate.subject.baseline_commit)
+            || api
+                .ref_sha(&token, &full, &manifest.branch)
+                .await?
+                .as_deref()
+                != Some(&manifest.commit))
+    {
+        return Err(Stop::Message(
+            "candidate head or target differs; retain history and requalify".into(),
+        ));
+    }
+    // Walk only unattempted predecessors. Their fixed manifests preserve the chain
+    // to the last observed PR even when a stale preflight was superseded.
+    let mut prior = None;
+    let mut previous = candidate.previous_publication.clone();
+    let mut seen = BTreeSet::new();
+    while let Some(id) = previous {
+        if seen.len() >= 4096 || !seen.insert(id.clone()) {
+            return Err(Stop::Message(
+                "candidate lineage is cyclic or exceeds limit".into(),
+            ));
+        }
+        let store = state.store.clone();
+        let full = full.clone();
+        let retained = blocking(state, move || store.publication(&full, &id))
+            .await?
+            .ok_or_else(|| Stop::Message("previous candidate publication missing".into()))?;
+        let old = retained.manifest()?;
+        if retained.owner != publication.owner
+            || retained.branch != manifest.branch
+            || retained.base != manifest.base
+            || retained.merge_commit.is_some()
+            || !old.candidate.as_ref().is_some_and(|c| {
+                c.subject.same_lineage(&candidate.subject) && c.endpoint == candidate.endpoint
+            })
+        {
+            return Err(Stop::Message(
+                "candidate continuation is not the same owned Change/PR".into(),
+            ));
+        }
+        if retained.pr_number.is_some() {
+            prior = Some(retained);
+            break;
+        }
+        if !matches!(
+            retained.branch_state.as_str(),
+            "pending" | "created" | "rejected" | "pr_refused"
+        ) {
+            return Err(Stop::Message("previous PR write remains uncertain".into()));
+        }
+        previous = old.candidate.and_then(|c| c.previous_publication);
+    }
+    let marker = format!(
+        "<!-- agentscm-candidate:{}:{} -->",
+        publication.id, manifest.commit
+    );
+    let owner = full.split('/').next().unwrap_or_default();
+    let pulls = api
+        .find_open_pulls(&token, &full, owner, &manifest.branch)
+        .await?;
+    let matching: Vec<_> = pulls
+        .iter()
+        .filter(|p| {
+            p["base"]["ref"] == manifest.base
+                && (p["head"]["sha"] == manifest.commit
+                    || (recovery
+                        && p["body"]
+                            .as_str()
+                            .is_some_and(|body| body.lines().any(|line| line == marker))))
+        })
+        .collect();
+    if matching.len() > 1 {
+        return Err(Stop::Message("ambiguous candidate pull requests".into()));
+    }
+    let pull = match matching.first() {
+        Some(pull) => {
+            if prior
+                .as_ref()
+                .is_some_and(|p| pull["number"].as_i64() != p.pr_number)
+            {
+                return Err(Stop::Message("candidate PR identity changed".into()));
+            }
+            (*pull).clone()
+        }
+        None => {
+            if recovery
+                || prior.is_some()
+                || matches!(
+                    publication.branch_state.as_str(),
+                    "pr_attempting" | "pr_refused"
+                )
+            {
+                return Err(Stop::Message(
+                    "PR outcome unknown or prior PR unavailable; read-only recovery only".into(),
+                ));
+            }
+            let default = api.default_branch(&token, &full).await?;
+            if manifest.branch == default
+                || manifest.branch == "HEAD"
+                || manifest.branch.starts_with("refs/")
+            {
+                return Err(Stop::Message(
+                    "candidate output must not name the forge default branch or a ref alias".into(),
+                ));
+            }
+            // Long provider reads do not establish a lease. Compare again at the
+            // new PR effect boundary and retain an attempted state before dispatch.
+            if api.ref_sha(&token, &full, &manifest.base).await?.as_deref()
+                != Some(&candidate.subject.baseline_commit)
+                || api
+                    .ref_sha(&token, &full, &manifest.branch)
+                    .await?
+                    .as_deref()
+                    != Some(&manifest.commit)
+            {
+                return Err(Stop::Message("candidate changed before PR dispatch".into()));
+            }
+            let store = state.store.clone();
+            let connection = conn.id.clone();
+            let live = blocking(state, move || store.connection(&connection)).await?;
+            if live.is_none_or(|c| !c.outbound || c.status != "enabled") {
+                return Err(Stop::Message(
+                    "connection no longer permits publication".into(),
+                ));
+            }
+            record(state, &publication.id, Update::BranchCreated).await?;
+            record(state, &publication.id, Update::PullRequestAttempt).await?;
+            let result = api
+                .create_candidate_pull(
+                    &token,
+                    &full,
+                    &manifest.title,
+                    &format!("{}\n\n{marker}", manifest.body),
+                    &manifest.branch,
+                    &manifest.base,
+                )
+                .await?;
+            match result {
+                Ok(pull) => pull,
+                Err(status) => {
+                    record(
+                        state,
+                        &publication.id,
+                        Update::PullRequestRefused { status },
+                    )
+                    .await?;
+                    return Err(Stop::Message(format!(
+                        "PR create refused ({status}); manually open the exact head/base and recover-pr, or prepare a new qualified successor"
+                    )));
+                }
+            }
+        }
+    };
+    let (Some(number), Some(node_id), Some(html_url)) = (
+        pull["number"].as_i64(),
+        pull["node_id"].as_str(),
+        pull["html_url"].as_str(),
+    ) else {
+        return Err(Stop::Message("unreadable candidate pull request".into()));
+    };
+    if number <= 0
+        || node_id.is_empty()
+        || node_id.len() > 256
+        || html_url.len() > 2048
+        || !valid_pull_url(html_url)
+        || pull["head"]["ref"] != manifest.branch
+        || pull["base"]["ref"] != manifest.base
+        || (pull["head"]["sha"] != manifest.commit
+            && !(recovery
+                && pull["body"]
+                    .as_str()
+                    .is_some_and(|body| body.lines().any(|line| line == marker))))
+    {
+        return Err(Stop::Message(
+            "unreadable candidate pull request identity".into(),
+        ));
+    }
+    record(state, &publication.id, Update::BranchCreated).await?;
+    record(
+        state,
+        &publication.id,
+        Update::PullRequest {
+            number,
+            node_id: node_id.into(),
+            html_url: html_url.into(),
+        },
+    )
+    .await?;
+    if api.ref_sha(&token, &full, &manifest.base).await?.as_deref()
+        != Some(&candidate.subject.baseline_commit)
+        || api
+            .ref_sha(&token, &full, &manifest.branch)
+            .await?
+            .as_deref()
+            != Some(&manifest.commit)
+    {
+        return Err(Stop::Message(
+            "historical PR receipt: source/target changed after effect".into(),
+        ));
+    }
+    Ok(())
 }

@@ -69,6 +69,10 @@ class GitHandler(http.server.BaseHTTPRequestHandler):
             'CONTENT_TYPE': self.headers.get('Content-Type', ''),
             'CONTENT_LENGTH': str(len(body)),
         }
+        # Synthetic race injection used only by attached-lifecycle fixtures.
+        if self.command == 'POST' and path.endswith('/git-receive-pack') and settings.get('before_push_write'):
+            change = settings['before_push_write']
+            Path(change['path']).write_text(change['text'], encoding='utf-8')
         result = subprocess.run([settings['git'], 'http-backend'], input=body, capture_output=True, env=environment, timeout=15)
         if result.returncode != 0:
             self.send_error(500, 'synthetic backend failed')

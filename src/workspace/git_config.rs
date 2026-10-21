@@ -65,8 +65,13 @@ pub(super) fn ambient_settings(
         });
     }
     let git = git_executable();
-    let common_dir = repository_common_dir(&git, root)?;
-    let excludes = git_config(&git, root, &["--path", "--get", "core.excludesFile"])?;
+    selected_settings(root, &git)
+}
+
+/// Attachment scans must use the operator-selected Git executable.
+pub(super) fn selected_settings(root: &Path, git: &Path) -> Result<Settings> {
+    let common_dir = repository_common_dir(git, root)?;
+    let excludes = git_config(git, root, &["--path", "--get", "core.excludesFile"])?;
     let global_excludes = match excludes.map(strip_nul) {
         // An empty value means "no global file" (pinned by
         // `an_empty_core_excludes_file_means_no_global_file`).
@@ -81,7 +86,7 @@ pub(super) fn ambient_settings(
         }
         None => default_global_excludes(),
     };
-    let ignore_case = git_config(&git, root, &["--type=bool", "--get", "core.ignorecase"])?;
+    let ignore_case = git_config(git, root, &["--type=bool", "--get", "core.ignorecase"])?;
     Ok(Settings {
         git_common_dir: Some(common_dir),
         global_excludes,

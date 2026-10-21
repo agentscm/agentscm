@@ -128,10 +128,7 @@ Keep Git and your forge in charge of their existing merge path. Experimental bri
 already capture clean Git commits, reconcile changes, export native source to Git mirrors,
 and exchange with remotes over authenticated HTTPS or SSH.
 
-Those primitives are implemented; the joined-up attached-checkout lifecycle and live
-forge qualification are still in progress. GitHub/GitLab observation and GitHub branch/PR
-publication are tested against fake servers; GitLab MR publication is not implemented.
-Native landing controls do not enforce raw Git pushes or forge merges.
+The attached-checkout lifecycle can bind an exact native Change, require its current configured evidence, build a typed unlanded candidate in an owned mirror, and deliberately publish a separate branch and GitHub PR through the existing Mirror transport and Hub bridge. Qualification uses synthetic checkouts, local/loopback HTTPS transport and fake GitHub; live forge and attached SSH use are not qualified. GitLab MR publication is not implemented. Native landing controls do not enforce raw Git pushes or forge merges.
 
 See [Git exchange](docs/advanced/git-remote-network.md) and the [roadmap](docs/roadmap.md).
 Moving authority from Git to the native ledger is a separate, proposed per-target cutover.

@@ -17,6 +17,12 @@ Every command accepts `--data-dir`; its default is `.agentscm`. The global `--no
 - `hook` reads an agent's hook JSON on standard input and prints that agent's reply; it always exits 0, even on usage errors, and prints a valid "no information" reply when the hub cannot be consulted. `init-repo` prints plain text, shows a diff and asks before writing; without a terminal it needs `--yes`. See [supported agents](../agents.md).
 - `quickstart` and `uninstall` are guided and print plain text. Without a terminal they need `--yes`; otherwise they refuse and list their flags. `uninstall` exits nonzero when it could not undo something, and keeps its record of it.
 
+### `attached-worktree` (experimental, Unix)
+
+`attach`, `state`, `capture` and `refresh` retain the Git-authoritative source lifecycle described in the [attached worktree guide](../advanced/attached-git-worktrees.md). `preview` uses the shared bounded selector without consuming an operation ID. `bind-context` joins an existing Authority Change; `compare` checks source/target/context/policy/evidence; `prepare --operation-id ID` retains a fixed typed unlanded commit in an owned mirror. `publish-branch` uses the attachment's endpoint through Mirror's local/HTTPS transport, explicit credentials/trust and an exact expected-OID lease; `recover-branch` observes an uncertain push. `publish-pr` uses the existing authenticated Hub GitHub bridge, with `--operation-id` naming the branch receipt and `--previous-publication` naming a prior PR association for continuation. `recover-pr --id ATTACHMENT --publication PUBLICATION_ID` only observes. Historical receipts do not imply current qualification. Run `agentscm attached-worktree COMMAND --help` for arguments.
+
+`attached-worktree abandon-prepare --id ID --mirror PATH --operation-id PREPARE_ID` journals abandonment only before candidate construction and while the owned ref still equals the reserved parent. The original ID remains retained. Built/Verified candidates require explicit replay of the original prepare and cannot be published until Mirrored. See [attached worktree recovery and limits](../advanced/attached-git-worktrees.md).
+
 ```sh
 agentscm --data-dir ./agentscm-data init
 

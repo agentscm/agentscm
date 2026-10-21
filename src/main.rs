@@ -34,6 +34,8 @@ mod agent_stop_install;
 mod agent_task_cli;
 #[cfg(unix)]
 mod agent_task_stop;
+#[cfg(unix)]
+mod attached_worktree_cli;
 mod autopsy_cli;
 mod client_cli;
 mod client_config;
@@ -108,6 +110,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// [experimental] Bind an existing Git worktree to native source qualification.
+    #[cfg(unix)]
+    AttachedWorktree {
+        #[command(subcommand)]
+        command: attached_worktree_cli::AttachedWorktreeCommand,
+    },
     /// [experimental] Operate or consume agent-owned workflow tasks.
     #[cfg(unix)]
     AgentTask {
@@ -615,6 +623,10 @@ async fn run(cli: Cli) -> Result<RunExit> {
         #[cfg(unix)]
         Command::GitRemote(args) => {
             print_json(&git_remote_cli::run(args, &cli.data_dir)?);
+        }
+        #[cfg(unix)]
+        Command::AttachedWorktree { command } => {
+            print_json(&attached_worktree_cli::run(&cli.data_dir, command).await?);
         }
         #[cfg(unix)]
         Command::GitReconcile { command } => {

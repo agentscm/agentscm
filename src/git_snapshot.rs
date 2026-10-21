@@ -445,6 +445,10 @@ fn parent_directories(path: &str) -> impl Iterator<Item = &str> {
 
 /// Read and classify the committed tree. Never publishes anything.
 pub fn preflight(request: &SnapshotRequest) -> Result<Preflight> {
+    preflight_inner(request, false)
+}
+
+fn preflight_inner(request: &SnapshotRequest, immutable: bool) -> Result<Preflight> {
     let git_version = git_version(&request.git)?;
     let probe = Git {
         exe: &request.git,
@@ -505,7 +509,7 @@ pub fn preflight(request: &SnapshotRequest) -> Result<Preflight> {
     // `status` and `ls-files --ignored` stat and may clean-filter tracked files, so
     // with any configured filter neither runs and cleanliness stays unverified.
     let (head, tracked_changes, tracked_change_paths, untracked_count, clean) =
-        if filters.is_empty() {
+        if filters.is_empty() && !immutable {
             let status = git.run(
                 &[
                     "status",
@@ -556,7 +560,7 @@ pub fn preflight(request: &SnapshotRequest) -> Result<Preflight> {
     let raw = parse_tree(&tree_out, oid_length)?;
 
     // Valid only when the index equals the selected commit.
-    let mut ignored: Vec<String> = if clean {
+    let mut ignored: Vec<String> = if clean && !immutable {
         git.run(
             &[
                 "ls-files",
@@ -775,7 +779,8 @@ pub fn preflight(request: &SnapshotRequest) -> Result<Preflight> {
         .map(|byte| format!("{byte:02x}"))
         .collect();
 
-    let eligible = clean && unsupported.is_empty() && limits.is_empty() && filters.is_empty();
+    let eligible =
+        (clean || immutable) && unsupported.is_empty() && limits.is_empty() && filters.is_empty();
     // All-regular captures keep the v1 profile, so their receipts are unchanged.
     let profile = if entries.iter().any(|entry| entry.mode != "100644") {
         PROFILE_V2
@@ -1254,6 +1259,18 @@ pub fn write_receipt(path: &Path, receipt: &Receipt) -> Result<bool> {
         }
         Err(error) => Err(Error::Io(error)),
     }
+}
+
+/// Read an immutable commit without asserting that the checkout or index matches it.
+/// Tracked ignore rules do not remove committed entries. Content remains canonical Git bytes.
+pub(crate) fn capture_immutable(
+    engine: &Engine,
+    repository: &str,
+    request: &SnapshotRequest,
+) -> Result<(String, String)> {
+    let report = preflight_inner(request, true)?;
+    let tree = report.tree.clone();
+    Ok((capture(engine, repository, request, report)?.revision, tree))
 }
 
 #[cfg(test)]

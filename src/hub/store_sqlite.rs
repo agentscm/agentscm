@@ -4092,6 +4092,39 @@ impl Store for SqliteStore {
         if let Some(found) = publication_by_id(&tx, &new.id)? {
             return Ok(Create::of_existing(found, &who.repository, &manifest));
         }
+        let head: Option<String> = tx
+            .query_row(
+                "SELECT publication FROM hub_candidate_heads WHERE repository=?1 AND branch=?2",
+                params![who.repository, m.branch],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let previous = head
+            .as_ref()
+            .map(|id| publication_by_id(&tx, id))
+            .transpose()?
+            .flatten();
+        if head.is_some() && previous.is_none() {
+            return Err(HubError::Unavailable(
+                "candidate lineage record missing".into(),
+            ));
+        }
+        if !super::publish::candidate_continuation(new, previous.as_ref(), &who.owner.id)? {
+            return Ok(Create::Conflict);
+        }
+        if m.candidate.is_some() && head.is_none() {
+            let occupied: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM hub_publications WHERE repository=?1 AND branch=?2)",
+                params![who.repository, m.branch],
+                |r| r.get(0),
+            )?;
+            if occupied {
+                return Ok(Create::Conflict);
+            }
+        }
+        if m.candidate.is_some() {
+            tx.execute("INSERT INTO hub_candidate_heads VALUES(?1,?2,?3) ON CONFLICT(repository,branch) DO UPDATE SET publication=excluded.publication", params![who.repository, m.branch, new.id])?;
+        }
         let unfinished: i64 = tx.query_row(
             "SELECT count(*) FROM hub_publications
              WHERE token = ?1 AND pr_number IS NULL AND branch_state <> 'rejected'",
@@ -4134,6 +4167,20 @@ impl Store for SqliteStore {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut p = publication_by_id(&tx, id)?
             .ok_or_else(|| HubError::Invalid("unknown publication".into()))?;
+        if matches!(update, Update::PullRequestAttempt) && p.event_seq.is_none() {
+            let head: Option<String> = tx
+                .query_row(
+                    "SELECT publication FROM hub_candidate_heads WHERE repository=?1 AND branch=?2",
+                    params![p.repository, p.branch],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if head.as_deref() != Some(id) {
+                return Err(HubError::Invalid(
+                    "candidate was superseded before PR attempt".into(),
+                ));
+            }
+        }
         let (changed, event) = p.apply(update, now)?;
         if changed {
             tx.execute(

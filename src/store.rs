@@ -333,6 +333,13 @@ impl<R: Read> Read for BudgetedRead<R> {
 }
 
 impl Engine {
+    #[cfg(unix)]
+    pub(crate) fn data_root(&self) -> &Path {
+        self.objects
+            .parent()
+            .expect("engine objects have a data root")
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         crate::local_recovery::check_before_create(path.as_ref(), false)?;
         let root = create_directory_durable(path)?;

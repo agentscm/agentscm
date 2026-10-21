@@ -310,6 +310,23 @@ impl Api {
             .ok_or_else(|| GhError::Failed("unreadable reply from repos".into()))
     }
 
+    /// The connected forge's explicit default identity; absence is unsupported.
+    pub async fn default_branch(&self, token: &str, full_name: &str) -> Gh<String> {
+        let body = self
+            .get(token, &format!("/repos/{full_name}"))
+            .await?
+            .ok("repos")?;
+        body["default_branch"]
+            .as_str()
+            .filter(|name| valid_ref_name(name) && *name != "HEAD" && !name.starts_with("refs/"))
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                GhError::Failed(
+                    "unsupported candidate profile: forge default branch is unknown".into(),
+                )
+            })
+    }
+
     /// The login the token acts as.
     pub async fn user(&self, token: &str) -> Gh<(i64, String)> {
         let body = self.get(token, "/user").await?.ok("user")?;
@@ -674,6 +691,31 @@ impl Api {
             )));
         }
         Ok(reply.body)
+    }
+
+    pub async fn create_candidate_pull(
+        &self,
+        token: &str,
+        full_name: &str,
+        title: &str,
+        body: &str,
+        head: &str,
+        base: &str,
+    ) -> Gh<std::result::Result<Value, u16>> {
+        let url = format!("{}/repos/{full_name}/pulls", self.base);
+        let request = json!({"title": title, "body": body, "head": head, "base": base});
+        let reply = self.write(token, Method::POST, &url, request).await?;
+        if matches!(reply.status, 403 | 404 | 422) {
+            return Ok(Err(reply.status));
+        }
+        if reply.status != 201 {
+            return Err(GhError::Failed(format!(
+                "{} from pulls: {}",
+                reply.status,
+                refusal(&reply.body)
+            )));
+        }
+        Ok(Ok(reply.body))
     }
 
     pub async fn create_status(

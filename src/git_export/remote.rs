@@ -45,12 +45,20 @@ pub enum Request {
         /// None requires an absent remote branch.
         expected_oid: Option<String>,
     },
+    PublishCandidate {
+        operation_id: String,
+        candidate_id: String,
+        /// None requires an absent remote branch.
+        expected_oid: Option<String>,
+    },
 }
 
 impl Request {
     fn id(&self) -> &str {
         match self {
-            Self::Fetch { operation_id, .. } | Self::Publish { operation_id, .. } => operation_id,
+            Self::Fetch { operation_id, .. }
+            | Self::Publish { operation_id, .. }
+            | Self::PublishCandidate { operation_id, .. } => operation_id,
         }
     }
 }
@@ -199,6 +207,15 @@ impl Mirror {
     }
 
     pub fn remote_run_with(&self, request: &Request, access: &Access) -> Result<Record> {
+        self.remote_run_guarded(request, access, || Ok(()))
+    }
+
+    pub fn remote_run_guarded(
+        &self,
+        request: &Request,
+        access: &Access,
+        mut qualify: impl FnMut() -> Result<()>,
+    ) -> Result<Record> {
         self.validate()?;
         validate_request(request)?;
         let _lease = self.remote_lease()?;
@@ -255,6 +272,22 @@ impl Mirror {
                     None,
                 )
             }
+            Request::PublishCandidate { candidate_id, .. } => {
+                let record = self
+                    .candidate_record(candidate_id)?
+                    .ok_or_else(|| invalid("candidate export record is missing"))?;
+                if record.state != ExportState::Mirrored || self.owned_oid()? != record.commit {
+                    return Err(invalid(
+                        "publication requires an intact verified candidate export",
+                    ));
+                }
+                (
+                    record
+                        .commit
+                        .ok_or_else(|| invalid("candidate export commit is missing"))?,
+                    None,
+                )
+            }
         };
         let mut record = Record {
             request: request.clone(),
@@ -267,13 +300,27 @@ impl Mirror {
             "INSERT INTO operations(id,record) VALUES (?1,?2)",
             params![request.id(), serde_json::to_vec(&record)?],
         )?;
+        qualify()?;
+        // Preserve the durable authentication/no-replay boundary even when
+        // default discovery cannot complete. A proven unsupported profile is
+        // reported explicitly, with the same retained uncertain operation.
+        if matches!(request, Request::PublishCandidate { .. })
+            && let Err(error) = self.check_candidate_output(&binding, access)
+        {
+            record.state = State::Unknown;
+            save(&db, &record)?;
+            return match error {
+                Error::Invalid(_) => Err(error),
+                _ => Ok(record),
+            };
+        }
         // All failures after reservation retain Unknown, including a lost push response.
-        match self.dispatch_remote(&binding, &record, access) {
+        match self.dispatch_remote(&binding, &record, access, &mut qualify) {
             Ok(observed) => {
                 record.observed_oid = observed;
                 record.state = match request {
                     Request::Fetch { .. } => State::Fetched,
-                    Request::Publish { .. } => State::Published,
+                    Request::Publish { .. } | Request::PublishCandidate { .. } => State::Published,
                 };
             }
             Err(_) => record.state = State::Unknown,
@@ -309,7 +356,8 @@ impl Mirror {
         } else {
             let expected = match &record.request {
                 Request::Fetch { expected_oid, .. } => Some(expected_oid),
-                Request::Publish { expected_oid, .. } => expected_oid.as_ref(),
+                Request::Publish { expected_oid, .. }
+                | Request::PublishCandidate { expected_oid, .. } => expected_oid.as_ref(),
             };
             if current.as_ref() == expected {
                 State::ObservedExpected
@@ -338,6 +386,16 @@ impl Mirror {
             if export.commit.as_ref() != Some(&record.commit) {
                 return Err(invalid(
                     "remote publication differs from its export mapping",
+                ));
+            }
+        }
+        if let Request::PublishCandidate { candidate_id, .. } = &record.request {
+            let candidate = self
+                .candidate_record(candidate_id)?
+                .ok_or_else(|| invalid("remote publication candidate mapping is missing"))?;
+            if candidate.commit.as_ref() != Some(&record.commit) {
+                return Err(invalid(
+                    "remote publication differs from its candidate mapping",
                 ));
             }
         }
@@ -445,11 +503,100 @@ impl Mirror {
         Ok(advertised)
     }
 
+    fn candidate_default_branch(&self, binding: &Binding, access: &Access) -> Result<String> {
+        let bytes = if let Some(endpoint) = &binding.network {
+            endpoint.run(
+                &self.git,
+                access,
+                &["ls-remote", "--symref", "--", endpoint.url(), "HEAD"],
+                8192,
+            )?
+        } else {
+            let upload = server_command(&self.git.executable(), "upload-pack")?;
+            self.git.run(
+                &[
+                    "ls-remote",
+                    "--symref",
+                    &format!("--upload-pack={upload}"),
+                    "--",
+                    path_text(&binding.remote)?,
+                    "HEAD",
+                ],
+                None,
+                8192,
+            )?
+        };
+        let text = std::str::from_utf8(&bytes).map_err(|_| invalid("unreadable remote HEAD"))?;
+        let defaults: Vec<_> = text
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("ref: refs/heads/")
+                    .and_then(|s| s.strip_suffix("\tHEAD"))
+            })
+            .collect();
+        if defaults.len() != 1 || !crate::hub::github::valid_ref_name(defaults[0]) {
+            return Err(invalid(
+                "unsupported candidate profile: remote default branch is unknown",
+            ));
+        }
+        Ok(defaults[0].to_owned())
+    }
+
+    fn check_candidate_output(&self, binding: &Binding, access: &Access) -> Result<()> {
+        let default = self.candidate_default_branch(binding, access)?;
+        if binding.branch == default
+            || binding.branch == "HEAD"
+            || binding.branch.starts_with("refs/")
+        {
+            return Err(invalid(
+                "candidate output must not name the remote default branch or a ref alias",
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_candidate_target(
+        &self,
+        binding: &Binding,
+        record: &Record,
+        access: &Access,
+    ) -> Result<()> {
+        if let Request::PublishCandidate { candidate_id, .. } = &record.request {
+            let candidate = self
+                .candidate_record(candidate_id)?
+                .ok_or_else(|| invalid("candidate missing"))?;
+            let subject = &candidate.request.subject;
+            let endpoint = match &binding.network {
+                Some(endpoint) => endpoint.url(),
+                None => path_text(&binding.remote)?,
+            };
+            if subject.endpoint != endpoint
+                || subject.output != binding.branch
+                || subject.target == binding.branch
+            {
+                return Err(invalid(
+                    "candidate differs from attached remote/output identity",
+                ));
+            }
+            self.check_candidate_output(binding, access)?;
+            let mut target = binding.clone();
+            target.branch = subject.target.clone();
+            if self.observe_remote(&target, access)?.as_deref() != Some(&subject.baseline_commit) {
+                return Err(Error::Conflict(
+                    "attached remote target changed or is unadvertised; refresh and requalify"
+                        .into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn dispatch_remote(
         &self,
         binding: &Binding,
         record: &Record,
         access: &Access,
+        qualify: &mut impl FnMut() -> Result<()>,
     ) -> Result<Option<String>> {
         let current = self.observe_remote(binding, access)?;
         match &record.request {
@@ -477,7 +624,8 @@ impl Mirror {
                 )?;
                 Ok(current)
             }
-            Request::Publish { expected_oid, .. } => {
+            Request::Publish { expected_oid, .. }
+            | Request::PublishCandidate { expected_oid, .. } => {
                 if current != *expected_oid {
                     return Err(Error::Conflict(
                         "remote branch differs from expected ref".into(),
@@ -490,6 +638,13 @@ impl Mirror {
                         None,
                         8192,
                     )?;
+                }
+                self.check_candidate_target(binding, record, access)?;
+                qualify()?;
+                if matches!(record.request, Request::PublishCandidate { .. })
+                    && current.as_deref() == Some(&record.commit)
+                {
+                    return Ok(current);
                 }
                 // The exact lease is a compare-and-swap; the ancestry check above
                 // refuses a rewind. Remote hooks and receive policy remain in force.
@@ -529,6 +684,8 @@ impl Mirror {
                         16384,
                     )?;
                 }
+                self.check_candidate_target(binding, record, access)?;
+                qualify()?;
                 let observed = self.observe_remote(binding, access)?;
                 if observed.as_deref() != Some(record.commit.as_str()) {
                     return Err(Error::Conflict(
@@ -635,19 +792,26 @@ fn lookup(db: &Connection, id: &str, network: bool) -> Result<Option<Record>> {
             }
             Some(format!("refs/agentscm-fetch/{id}"))
         }
-        Request::Publish { .. } => None,
+        Request::Publish { .. } | Request::PublishCandidate { .. } => None,
     };
     if record.local_ref != expected_ref {
         return Err(invalid("remote operation ref does not match request"));
     }
     let expected = match &record.request {
         Request::Fetch { expected_oid, .. } => Some(expected_oid),
-        Request::Publish { expected_oid, .. } => expected_oid.as_ref(),
+        Request::Publish { expected_oid, .. } | Request::PublishCandidate { expected_oid, .. } => {
+            expected_oid.as_ref()
+        }
     };
     let desired_observed = record.observed_oid.as_ref() == Some(&record.commit);
     let valid_state = match record.state {
         State::Pending | State::Unknown => record.observed_oid.is_none(),
-        State::Published => matches!(record.request, Request::Publish { .. }) && desired_observed,
+        State::Published => {
+            matches!(
+                record.request,
+                Request::Publish { .. } | Request::PublishCandidate { .. }
+            ) && desired_observed
+        }
         State::Fetched => matches!(record.request, Request::Fetch { .. }) && desired_observed,
         State::ObservedDesired => desired_observed,
         State::ObservedExpected => {
@@ -694,10 +858,19 @@ fn validate_request(request: &Request) -> Result<()> {
             expected_oid.as_deref().map(validate_oid).transpose()?;
             Ok(())
         }
+        Request::PublishCandidate {
+            candidate_id,
+            expected_oid,
+            ..
+        } => {
+            crate::store::validate_id(candidate_id)?;
+            expected_oid.as_deref().map(validate_oid).transpose()?;
+            Ok(())
+        }
     }
 }
 
-fn validate_id(id: &str) -> Result<()> {
+pub(super) fn validate_id(id: &str) -> Result<()> {
     if id.is_empty()
         || id.len() > 64
         || !id
