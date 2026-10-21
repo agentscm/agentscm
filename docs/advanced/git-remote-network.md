@@ -131,4 +131,4 @@ explicitly under a new ID and preserve the old receipt.
 Local processes retain the reviewed timeout/output/process-group bounds.
 Network transfer has no hard disk quota or whole-workflow latency guarantee.
 The remote transport does not add a scheduler, automatic reconciliation/landing,
-GitLab MR creation, repository archival or live authority cutover.
+GitLab MR creation (the Hub candidate path creates MRs separately), repository archival or live authority cutover.
