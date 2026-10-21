@@ -51,6 +51,8 @@ struct Env {
     context: ReviewContext,
     subject: CandidateSubject,
     tree: String,
+    token: String,
+    publication: String,
 }
 
 /// The tree Git builds for the native revision's two files.
@@ -243,7 +245,7 @@ impl Env {
         // Outbound writes stay off: statuses have their own opt-in.
         let (setup, setup_subject, setup_host) = (store.clone(), subject.clone(), host.clone());
         let setup_endpoint = endpoint;
-        tokio::task::spawn_blocking(move || {
+        let (token, publication) = tokio::task::spawn_blocking(move || {
             let store = setup;
             let connection = store.pat_connection(&setup_host).unwrap().unwrap().id;
             store
@@ -259,7 +261,7 @@ impl Env {
                     "alice",
                 )
                 .unwrap();
-            let (token, _) = mint_agent_token(&*store, &owner.id, "agent-a", REPO, 3600).unwrap();
+            let (token, secret) = mint_agent_token(&*store, &owner.id, "agent-a", REPO, 3600).unwrap();
             let id = derive_candidate_id(REPO, &setup_subject.id, COMMIT, BRANCH);
             let manifest = serde_json::from_value(json!({
                 "revision": setup_subject.revision, "commit": COMMIT, "tree": "c".repeat(40),
@@ -289,6 +291,7 @@ impl Env {
                     unix_now(),
                 )
                 .unwrap();
+            (secret.expose().to_owned(), id)
         })
         .await
         .unwrap();
@@ -301,6 +304,8 @@ impl Env {
             context,
             subject,
             tree,
+            token,
+            publication,
         }
     }
 
@@ -386,6 +391,55 @@ async fn a_qualified_candidate_with_a_matching_head_gets_exactly_one_success() {
     env.poll().await;
     env.poll().await;
     assert_eq!(env.status_posts(), 1);
+}
+
+impl Env {
+    /// The publication as the Hub API shows it.
+    async fn show(&self) -> serde_json::Value {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = agentscm::hub::router(self.state.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let path = format!(
+            "{url}/v1/hub/repos/acme%2Fwidgets/publications/{}",
+            self.publication
+        );
+        let response = reqwest::Client::new()
+            .get(path)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        serde_json::from_str(&response.text().await.unwrap()).unwrap()
+    }
+}
+
+#[tokio::test]
+async fn the_publication_reports_its_forge_check_read_only() {
+    let env = Env::start(true).await;
+    let before = env.show().await["forge_check"].clone();
+    assert_eq!(
+        (before["enabled"].clone(), before["state"].clone()),
+        (json!(true), json!(null))
+    );
+    assert_eq!(before["context"], CONTEXT);
+    env.qualify();
+    env.poll().await;
+    let shown = env.show().await["forge_check"].clone();
+    assert_eq!(shown["mode"], "git_default");
+    assert_eq!(shown["provider"], "github");
+    assert_eq!(shown["state"], "success");
+    assert_eq!(shown["head_sha"], COMMIT);
+    assert_eq!(shown["posting"], "posted");
+    assert_eq!(shown["protection"], "unverified");
+    assert!(shown["note"].as_str().unwrap().contains("not enforced"));
+    assert_eq!(env.status_posts(), 1, "showing posts nothing");
+
+    let off = Env::start(false).await;
+    let view = off.show().await["forge_check"].clone();
+    assert_eq!(view["enabled"], false);
+    assert!(view.get("context").is_none() && view["protection"] == "unverified");
 }
 
 #[tokio::test]

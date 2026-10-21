@@ -686,7 +686,9 @@ to say none. A write happens only when the text or status changed. Only the
 poller (and an administrator's refresh) writes, so a comment or status lags an intent
 change by at most one poll interval. An existing comment is adopted only if its author
 is the connection's own login (`<app slug>[bot]`, or the PAT's login) and its first line
-is the marker; if editing it fails, a new one is written.
+is the marker; if editing it fails, a new one is written. The `agentscm/coordination`
+status is always `success`, so never mark it as a required check. The separate
+[workflow status](#workflow-status-for-candidate-pull-requests) is opt-in.
 
 Failures. A 401, or a 403 with no rate-limit headers, on the app JWT, an
 installation token or discovery marks the connection `auth_failed` (status code and
@@ -791,6 +793,54 @@ commit, the ref and, for a rejection, the forge's message), and `pull_request`
 (`pending`, `opened` with number, node id and URL, or `merged` with the merge commit),
 plus the last run's `error`, if any. The command prints that JSON and exits non-zero
 while the publication is incomplete or the branch was rejected.
+
+### Workflow status for candidate pull requests
+
+_Experimental: GitHub only, Unix only, tested only against in-process fakes and a local
+native store; not verified against live GitHub._
+
+A candidate publication that has a pull request can get a GitHub commit status
+`agentscm/workflow/<target>` on the pull request head. It is off by default. To enable it,
+set `"publish_forge_status": true` on an `agent_task_profiles` entry of the Hub's
+workspace-execution configuration (see [agent workflow tasks](advanced/agent-workflow-tasks.md#workspace-http-and-mcp-adapter));
+the profile's `repository_id` must name the connected repository, its `target` must be
+the candidate's target, and its `data_dir` must be a native store on the Hub host that
+the operator pinned there. The Hub reads that store read-only. The poller and
+`pull_request` and `push` webhooks reconcile the status; the connection's outbound switch is not
+required, but the credential needs commit statuses write.
+
+The Hub posts `success` only when it verifies, from the pinned store, that the exact
+candidate is currently qualified for the profile's requirement and that the pull request
+head's tree and parents equal the native revision's, and the live base tip equals the
+candidate's baseline. States:
+
+- `pending`: the candidate is not (yet) qualified in the pinned store.
+- `failure`: the requirement, change or candidate context no longer matches the pin
+  (including a refreshed target), the live base tip differs from the candidate
+  baseline, the head is not the published commit, its tree or parents differ from the
+  native revision, or the pull request is from a fork or has another base. A `success`
+  on an earlier head is flipped to `failure` when the pull request head changes.
+- `error`: the pinned native store, requirement or qualification could not be read.
+- `success`: all of the above hold. The Hub then reads the pull request again before
+  trusting it.
+
+Closed or missing pull requests get no new status. A post whose reply is lost is
+journalled as `attempting` (reported as `uncertain`), and the next pass posts the
+current status again. The journal is `hub_forge_checks` (migration 16).
+
+AgentSCM never creates or changes branch protection or rulesets. To make the status
+binding, the operator must require the `agentscm/workflow/<target>` context in GitHub
+branch protection or rulesets. Where possible pin the required check to the posting
+App or source: anyone with `statuses:write` on the repository can post the same context.
+Merge queue (`merge_group`) is not supported; a required context will block queued
+merges. Verification that a protected branch actually requires the check, and that
+raw pushes and administrator bypass are closed, is pending: the Hub reports
+`protection: "unverified"` and does not enforce it. GitLab is unsupported. A native
+store that exists only on a laptop cannot be pinned here; signed local attestations
+for that case are tracked separately and are not implemented.
+
+`GET .../publications/{id}` adds a read-only `forge_check` object for a candidate
+publication with a pull request (see the [API notes](api.md#hub-publication-forge-check)).
 
 The forge steps never force anything. The hub reads the branch first: absent, it uploads
 the file blobs, a tree on top of the base commit's tree and a commit with the manifest's

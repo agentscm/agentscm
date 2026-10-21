@@ -916,7 +916,73 @@ async fn show(
             }
         }
     }
-    Ok(Json(publication.to_json()))
+    let mut reply = publication.to_json();
+    if let Some(view) = forge_check_view(&state, &principal, &publication).await? {
+        reply["forge_check"] = view;
+    }
+    Ok(Json(reply))
+}
+
+/// What the Hub does about a forge check for this publication's pull request. Read-only:
+/// it reads the journal and the configuration and posts nothing.
+async fn forge_check_view(
+    state: &HubState,
+    principal: &Principal,
+    publication: &Publication,
+) -> std::result::Result<Option<Value>, ApiError> {
+    let (Some(number), Ok(manifest)) = (publication.pr_number, publication.manifest()) else {
+        return Ok(None);
+    };
+    let Some(candidate) = manifest.candidate else {
+        return Ok(None);
+    };
+    let (host, name, repository_id) = (
+        principal.owner.identity.host.clone(),
+        principal.repository.clone(),
+        principal.repository_id,
+    );
+    let store = state.store.clone();
+    let found = blocking(state, move || {
+        let Some(repo) = find_repository(&*store, &host, &name, repository_id)? else {
+            return Ok(None);
+        };
+        Ok(store.connection(&repo.connection)?.map(|conn| (conn, repo)))
+    })
+    .await?;
+    let Some((conn, repo)) = found else {
+        return Ok(None);
+    };
+    let target = &candidate.subject.target;
+    let mut view = json!({"mode": "git_default", "enabled": false,
+        "provider": if conn.provider == "github" { "github" } else { "unsupported" },
+        "protection": "unverified",
+        "note": "Branch protection, raw pushes and administrator bypass are not enforced or verified by AgentSCM."});
+    let enabled = conn.provider == "github"
+        && state.workspace_execution.as_ref().is_some_and(|service| {
+            service.agent_task_profiles.values().any(|p| {
+                p.publish_forge_status
+                    && p.target == *target
+                    && p.repository_id.eq_ignore_ascii_case(&repo.full_name)
+            })
+        });
+    if !enabled {
+        return Ok(Some(view));
+    }
+    let context = super::forge_check::status_context(target)?;
+    let (store, id, ctx) = (state.store.clone(), repo.id.clone(), context.clone());
+    let row = blocking(state, move || store.forge_check(&id, number, &ctx)).await?;
+    view["enabled"] = json!(true);
+    view["context"] = json!(context);
+    view["state"] = json!(row.as_ref().map(|r| r.state.as_str()));
+    view["head_sha"] = json!(row.as_ref().map(|r| r.head_sha.as_str()));
+    view["posting"] = json!(row.as_ref().map(|r| {
+        if r.phase == "posted" {
+            "posted"
+        } else {
+            "uncertain"
+        }
+    }));
+    Ok(Some(view))
 }
 
 async fn merged_commit(

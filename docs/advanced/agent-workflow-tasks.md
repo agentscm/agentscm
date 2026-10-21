@@ -118,7 +118,7 @@ Synthetic tests use fixture keys, a fake Docker control plane and explicitly fab
 
 ## Workspace HTTP and MCP adapter
 
-Operator startup configuration may add `agent_task_profiles` alongside existing `profiles`, or use it alone. Each entry pins only `repository_id`, `profile_id`, `native_repository`, absolute `data_dir`, `target` and `requirement_digest`. A task-only profile needs no Docker socket, command executable or model executable. Existing server profiles are automatically available to the same facade without changing server-executed workflow behavior.
+Operator startup configuration may add `agent_task_profiles` alongside existing `profiles`, or use it alone. Each entry pins only `repository_id`, `profile_id`, `native_repository`, absolute `data_dir`, `target` and `requirement_digest`, plus an optional `publish_forge_status` (default `false`) that makes the Hub publish a GitHub commit status for candidate pull requests; see [workflow status](../hub.md#workflow-status-for-candidate-pull-requests). A task-only profile needs no Docker socket, command executable or model executable. Existing server profiles are automatically available to the same facade without changing server-executed workflow behavior.
 
 The strict HTTP operation endpoint is `POST /v1/hub/workspace/repositories/{repository}/profiles/{profile}/agent-tasks`. Signed collector transfers use the separate bounded `.../agent-tasks/collector-upload` endpoint. The server derives the task actor and live origin grant from the workspace bearer credential; request JSON cannot select an actor, native path, executable, provider, model or source path. The response names capability `agentscm.agent-workflow-tasks/v1` and schema version 1.
 
