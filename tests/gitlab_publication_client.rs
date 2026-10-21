@@ -264,8 +264,12 @@ async fn pull_head_decodes_the_merge_request() {
     let (sha, base_tip) = fake.with(|s| {
         let p = s.projects.get_mut(&1).unwrap();
         let mut mr = Mr::new(5, "agent/x", &[]);
-        mr.source_project_id = Some(2);
+        mr.source_project_id = Some(1);
+        mr.sha = p.branches[1].sha.clone();
         let sha = mr.sha.clone();
+        let mut fork = Mr::new(8, "agent/f", &[]);
+        fork.source_project_id = Some(2);
+        p.mrs.insert(8, fork);
         p.commits.insert(
             sha.clone(),
             FakeCommit {
@@ -286,10 +290,22 @@ async fn pull_head_decodes_the_merge_request() {
     let pull = head(&api, 5).await.unwrap().unwrap();
     assert!(pull.open && !pull.merged);
     assert_eq!(pull.head_sha, sha);
-    assert_eq!((pull.head_repo_id, pull.base_repo_id), (2, 1));
+    assert_eq!((pull.head_repo_id, pull.base_repo_id), (1, 1));
     assert_eq!((pull.base_ref.as_str(), pull.base_tip), ("main", base_tip));
     assert_eq!(pull.head_parents, vec![parent]);
     assert_eq!(pull.head_tree.len(), 40);
+
+    // A fork's merge request is answered from the merge request alone.
+    let before = fake.with(|s| s.requests.len());
+    let fork = head(&api, 8).await.unwrap().unwrap();
+    assert!(fork.open && fork.head_repo_id == 2 && fork.head_tree.is_empty());
+    let paths = fake.with(|s| {
+        s.requests[before..]
+            .iter()
+            .map(|r| r.path_and_query.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(paths.len(), 1, "{paths:?}");
 
     let err = head(&api, 6).await.unwrap_err();
     assert!(matches!(err, GhError::Failed(d) if d.contains("locked")));
@@ -430,6 +446,11 @@ async fn status_post_and_read_back() {
         .await
         .unwrap()
         .unwrap();
+    // Only a status still pending refuses its own state again.
+    assert_eq!(
+        post(&api, &sha, StatusState::Pending).await.unwrap(),
+        Err(400)
+    );
     post(&api, &sha, StatusState::Error).await.unwrap().unwrap();
     let latest = listed(&api, &sha).await.unwrap().unwrap();
     assert_eq!(
@@ -442,12 +463,12 @@ async fn status_post_and_read_back() {
         .await
         .unwrap();
     assert_eq!(other, None);
-    // Reposting the same state is a transition error, not a refusal.
-    assert_eq!(
-        post(&api, &sha, StatusState::Failure).await.unwrap(),
-        Err(400)
-    );
-    assert_eq!(fake.with(|s| s.projects[&1].statuses.len()), 2);
+    // A finished status is not reused: reposting its state makes a new status.
+    post(&api, &sha, StatusState::Failure)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fake.with(|s| s.projects[&1].statuses.len()), 3);
 }
 
 #[tokio::test]

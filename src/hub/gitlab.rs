@@ -362,14 +362,29 @@ impl Api {
             .as_str()
             .filter(|name| valid_ref_name(name))
             .ok_or_else(bad)?;
+        // A fork's merge request is not this project's candidate: its branch, commit and tree are
+        // not in this project, so none of them are read.
+        if head_repo_id != project as u64 {
+            return Ok(Some(PullHead {
+                open,
+                merged,
+                merge_commit: None,
+                head_sha,
+                head_repo_id,
+                base_repo_id,
+                base_ref: String::new(),
+                base_tip: String::new(),
+                head_tree: String::new(),
+                head_parents: Vec::new(),
+            }));
+        }
         // The merge request's `sha` can lag a new push. A head that is not the source branch's tip
-        // is superseded, so nothing may be judged on it. A fork's branch is not in this project.
-        if head_repo_id == project as u64
-            && self
-                .ref_sha(token, project, source_branch)
-                .await?
-                .as_deref()
-                != Some(head_sha.as_str())
+        // is superseded, so nothing may be judged on it.
+        if self
+            .ref_sha(token, project, source_branch)
+            .await?
+            .as_deref()
+            != Some(head_sha.as_str())
         {
             return Err(GhError::Failed(
                 "merge request head lags its source branch".into(),
@@ -423,9 +438,10 @@ impl Api {
     }
 
     /// Posts a commit status on the commit with `ref_name` (the merge request's source branch).
-    /// `Ok(Err(status))`: 403 or 404 is a definite refusal. 400 is GitLab's "cannot transition"
-    /// (for instance reposting the same state): it does not refuse the desired state, so the
-    /// caller must read [`commit_statuses`](Self::commit_statuses) to resolve it. `Limited` and
+    /// `Ok(Err(status))`: 403 or 404 is a definite refusal. 400 is GitLab's "cannot transition",
+    /// which it returns only for a state posted onto a status that is still pending or running
+    /// in that state; the caller decides from the desired state whether to resolve it with
+    /// [`commit_statuses`](Self::commit_statuses). `Limited` and
     /// `Auth` mean it was not applied; any other error (5xx, no reply, a reply that is not this
     /// status in the sent state) is uncertain.
     pub async fn post_commit_status(
@@ -438,17 +454,17 @@ impl Api {
         if !valid_ref_name(ref_name) {
             return Err(GhError::Failed("bad branch name".into()));
         }
-        let url = format!("{}/projects/{project}/statuses/{}", self.base, status.sha);
-        let state = status_state(status.state);
-        let body = json!({"state": state, "name": status.context,
-            "description": status.description, "ref": ref_name});
+        let url = format!("{}/projects/{project}/statuses/{}", self.base, status.sha());
+        let state = status_state(status.state());
+        let body = json!({"state": state, "name": status.context(),
+            "description": status.description(), "ref": ref_name});
         let reply = self.call(token, Method::POST, &url, Some(body)).await?;
         if matches!(reply.status, 400 | 403 | 404) {
             return Ok(Err(reply.status));
         }
         if !matches!(reply.status, 200 | 201)
             || reply.body["status"] != state
-            || reply.body["name"] != status.context.as_str()
+            || reply.body["name"] != status.context()
         {
             return Err(GhError::Failed(format!("{} from statuses", reply.status)));
         }

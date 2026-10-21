@@ -67,13 +67,29 @@ impl StatusState {
 /// A commit status checked before any request: 40-hex sha, bounded context and description.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitStatus {
-    pub(super) sha: String,
-    pub(super) state: StatusState,
-    pub(super) context: String,
-    pub(super) description: String,
+    sha: String,
+    state: StatusState,
+    context: String,
+    description: String,
 }
 
 impl CommitStatus {
+    pub(super) fn sha(&self) -> &str {
+        &self.sha
+    }
+
+    pub(super) fn state(&self) -> StatusState {
+        self.state
+    }
+
+    pub(super) fn context(&self) -> &str {
+        &self.context
+    }
+
+    pub(super) fn description(&self) -> &str {
+        &self.description
+    }
+
     pub fn new(sha: &str, state: StatusState, context: &str, description: &str) -> Result<Self> {
         let text_ok = |text: &str, max: usize| {
             text.chars().count() <= max && !text.chars().any(char::is_control)

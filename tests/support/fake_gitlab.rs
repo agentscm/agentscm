@@ -755,12 +755,20 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
             let b = json_body();
             let (name, wanted) = (b["name"].clone(), b["state"].clone());
             let ref_name = b["ref"].clone();
-            // GitLab refuses to move a status to the state it already has. Only a status posted
-            // with a ref is checked; the coordination status carries none.
+            // GitLab reuses a status that is still pending or running and refuses to move it to
+            // the state it already has; a finished status is never reused, so a post then makes a
+            // new one. Only a status posted with a ref is checked; the coordination status
+            // carries none.
             if !ref_name.is_null()
-                && project.statuses.iter().rev().any(|(s, v)| {
-                    s == sha && v["name"] == name && v["ref"] == ref_name && v["state"] == wanted
-                })
+                && project
+                    .statuses
+                    .iter()
+                    .rev()
+                    .find(|(s, v)| s == sha && v["name"] == name && v["ref"] == ref_name)
+                    .is_some_and(|(_, v)| {
+                        v["state"] == wanted
+                            && matches!(wanted.as_str(), Some("pending" | "running"))
+                    })
             {
                 return json_reply(
                     400,

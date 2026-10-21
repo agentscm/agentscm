@@ -423,9 +423,9 @@ async fn retire_disabled(
     let api = state.sync.forge(conn)?;
     for (number, context, row) in rows {
         // The store knows only merges the Hub recorded; ask the forge, and skip on a failed read.
-        match api.pull(token, repo, number).await {
+        let source = match api.pull(token, repo, number).await {
             Ok(Some(pull)) => match pull["merged"].as_bool() {
-                Some(false) => {}
+                Some(false) => pull["head"]["ref"].as_str().map(str::to_owned),
                 Some(true) => {
                     let merge_commit = pull["merge_commit_sha"].as_str().map(str::to_owned);
                     let head = pull["head"]["sha"].as_str().unwrap_or_default();
@@ -448,18 +448,24 @@ async fn retire_disabled(
                     continue;
                 }
             },
-            Ok(None) => {}
+            Ok(None) => None,
             Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
             Err(GhError::Failed(detail)) => {
                 eprintln!("hub: forge check for {}#{number}: {detail}", repo.full_name);
                 continue;
             }
-        }
-        // GitLab posts on the merge request's source branch, which only its publication names.
+        };
+        // GitLab posts on the merge request's source branch, read with the merge request.
         let branch = if conn.provider == "gitlab" {
-            match newest_publication(state, repo, number).await? {
-                Some(publication) => publication.branch,
-                None => continue,
+            match source.filter(|b| super::github::valid_ref_name(b)) {
+                Some(branch) => branch,
+                None => {
+                    eprintln!(
+                        "hub: forge check for {}#{number}: unusable source branch",
+                        repo.full_name
+                    );
+                    continue;
+                }
             }
         } else {
             String::new()
@@ -777,8 +783,10 @@ async fn post(
         .await
     {
         Ok(Ok(())) => "posted",
-        // GitLab's "cannot transition": the status list says whether the desired one is there.
-        Ok(Err(400)) if gitlab => match shows(false).await {
+        // GitLab's "cannot transition" only answers a repeated `pending`: the status list says
+        // whether the desired one is there. A 400 for any other state is a definite refusal.
+        Ok(Err(400)) if gitlab && desired.state == StatusState::Pending => match shows(false).await
+        {
             Ok(true) => "posted",
             Ok(false) => return uncertain("cannot transition to the desired status"),
             Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),

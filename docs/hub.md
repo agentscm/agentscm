@@ -934,8 +934,10 @@ candidate's source branch and journalled in the same `hub_forge_checks` table (n
 
 A lost reply is never re-posted blindly on GitLab. An `attempting` row reads the commit's
 status list for that name and ref (at most 2 pages; a longer list is unreadable) and adopts the newest entry when it exactly matches the desired status. A 400
-"cannot transition" reply is resolved by the same list, and an unreadable list leaves the row
-uncertain. A 429 stops the pass. A 403 or 404 is recorded as refused. GitHub keeps its repost
+"cannot transition" reply to a repeated `pending` post (GitLab only refuses a state posted onto
+a status still pending or running in that state) is resolved by the same list, and an unreadable
+list leaves the row uncertain. A finished status is never reused, so a new post makes a new
+status. A 400 for any other state, a 403 or a 404 is recorded as refused. A 429 stops the pass. GitHub keeps its repost
 recovery. A fast-forward merge, which has no merge commit SHA, is recorded as merged when the
 merged head equals the published commit. The triggers are the poll and verified GitLab
 `Merge Request Hook` and `Push Hook` webhooks (the existing token verification; events for
@@ -948,6 +950,9 @@ for that ref. Configuring GitLab "required status checks" or "pipelines must suc
 operator-owned and unverified; the Hub reports `protection: "unverified"`. AgentSCM never
 alters protections, approves, merges or uses administrator bypass. Any user with the
 Developer role can post a status with the same name, the same trust model as GitHub statuses.
+Retiring a status with `failed` can fail the MR head pipeline that the external status joined,
+which under "pipelines must succeed" blocks merge until a new pipeline runs; `failed` is chosen
+because `skipped` or `canceled` could read as passing.
 Live GitLab verification is pending separate authority (see the
 [qualification checklist](advanced/attached-git-worktrees.md#live-gitlab-qualification-checklist-opt-in)).
 

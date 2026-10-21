@@ -833,18 +833,35 @@ async fn a_cannot_transition_reply_is_resolved_by_reading_the_list() {
     assert_eq!(env.phase(), "posted");
     assert_eq!((env.statuses().len(), env.status_posts()), (1, 1));
 
-    // A success with another binding is not the desired one: left uncertain, never claimed.
+    // A finished success with another binding is never reused by GitLab: the desired success is
+    // a new status, accepted and recorded.
     let env = ready().await;
     env.seed_status(
         "success",
         "Qualified in the pinned native store; binding 000000000000",
     );
     env.poll().await;
-    assert_eq!(env.phase(), "attempting");
+    assert_eq!(env.phase(), "posted");
+    assert_eq!((env.statuses().len(), env.status_posts()), (2, 1));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_status_can_return_to_success_on_the_same_head() {
+    let env = ready().await;
     env.poll().await;
-    assert_eq!(env.phase(), "attempting");
-    assert_eq!(env.statuses().len(), 1);
-    assert_eq!(env.status_posts(), 2, "one bounded attempt per pass");
+    assert_eq!(env.statuses()[0].1, "success");
+    // The target moves on, so the same head is no longer a success.
+    let tip = env.advance_main();
+    env.poll().await;
+    assert_eq!(env.statuses().last().unwrap().1, "failed");
+    // The target returns to where the head was qualified: a new success replaces the failure.
+    git(&env.bare, &["update-ref", "refs/heads/main", &env.seed]);
+    env.poll().await;
+    let posted = env.statuses();
+    assert_eq!(posted.len(), 3, "{posted:?}");
+    assert_eq!(posted[2].1, "success");
+    assert_eq!(env.phase(), "posted");
+    assert_ne!(tip, env.seed);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
