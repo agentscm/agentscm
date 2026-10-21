@@ -867,7 +867,7 @@ async fn a_status_can_return_to_success_on_the_same_head() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_status_is_recorded_and_not_posted_again() {
     let env = ready().await;
-    env.fake.with(|s| s.refuse_next_status = true);
+    env.fake.with(|s| s.refuse_next_status = Some(403));
     env.poll().await;
     let row = env.row().unwrap();
     assert_eq!(
@@ -879,6 +879,44 @@ async fn a_refused_status_is_recorded_and_not_posted_again() {
     env.poll().await;
     assert_eq!(env.status_posts(), 1);
     assert_eq!(env.show().await["forge_check"]["posting"], "refused");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_400_on_a_retiring_failure_is_final_and_on_a_replacing_failure_is_retried() {
+    // Retiring a closed merge request: the 400 is a definite refusal and settles.
+    let env = ready().await;
+    env.poll().await;
+    env.edit_mr(|mr| mr.state = "closed".into());
+    env.fake.with(|s| s.refuse_next_status = Some(400));
+    env.poll().await;
+    assert_eq!(env.phase(), "refused");
+    env.poll().await;
+    assert_eq!(env.status_posts(), 2);
+
+    // Replacing a shown success with a failure: the success is still there, so the row stays
+    // `attempting` and the next pass posts again.
+    let env = ready().await;
+    env.poll().await;
+    env.advance_policy();
+    env.fake.with(|s| s.refuse_next_status = Some(400));
+    env.poll().await;
+    assert_eq!(env.phase(), "attempting");
+    env.poll().await;
+    assert_eq!(env.statuses().last().unwrap().1, "failed");
+    assert_eq!(env.status_posts(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pending_refused_over_a_running_status_stays_uncertain() {
+    let env = Env::start(true).await;
+    env.seed_status("running", "another system");
+    env.poll().await;
+    assert_eq!(env.status_posts(), 1);
+    assert_eq!(env.statuses().len(), 1, "the pending status was refused");
+    assert_eq!(env.phase(), "attempting");
+    assert_eq!(env.show().await["forge_check"]["posting"], "uncertain");
+    env.poll().await;
+    assert_eq!(env.status_posts(), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -947,6 +985,25 @@ async fn disabling_the_profile_retires_its_success_once() {
     env.poll().await;
     assert_eq!(env.statuses()[0].1, "success");
     env.reconfigure(|p| p.publish_forge_status = false);
+    env.poll().await;
+    let posted = env.statuses();
+    assert_eq!(posted.len(), 2, "{posted:?}");
+    assert_eq!(
+        (posted[1].0.as_str(), posted[1].1.as_str()),
+        (env.commit.as_str(), "failed")
+    );
+    assert!(posted[1].2.contains("forge check disabled"));
+    env.poll().await;
+    assert_eq!(env.status_posts(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deleted_merge_request_still_has_its_success_retired_on_the_publication_branch() {
+    let mut env = ready().await;
+    env.poll().await;
+    env.reconfigure(|p| p.publish_forge_status = false);
+    env.fake
+        .with(|s| s.projects.get_mut(&REPO_ID).unwrap().mrs.remove(&1));
     env.poll().await;
     let posted = env.statuses();
     assert_eq!(posted.len(), 2, "{posted:?}");

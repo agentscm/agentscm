@@ -448,6 +448,11 @@ async fn retire_disabled(
                     continue;
                 }
             },
+            // A deleted GitLab merge request no longer reads, but its publication still names
+            // the branch the status was posted on.
+            Ok(None) if conn.provider == "gitlab" => newest_publication(state, repo, number)
+                .await?
+                .map(|p| p.branch),
             Ok(None) => None,
             Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
             Err(GhError::Failed(detail)) => {

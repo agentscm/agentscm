@@ -475,7 +475,7 @@ async fn status_post_and_read_back() {
 async fn status_post_failures_are_classified() {
     let (fake, api) = setup().await;
     let sha = "d".repeat(40);
-    fake.with(|s| s.refuse_next_status = true);
+    fake.with(|s| s.refuse_next_status = Some(403));
     assert_eq!(
         post(&api, &sha, StatusState::Success).await.unwrap(),
         Err(403)

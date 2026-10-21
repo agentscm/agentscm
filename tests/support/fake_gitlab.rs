@@ -216,8 +216,8 @@ pub struct FakeState {
     pub omit_mr_list_project_ids: bool,
     /// Store the next status, then answer 502 with no body.
     pub lose_next_status_reply: bool,
-    /// Answer the next status POST with 403 and store nothing.
-    pub refuse_next_status: bool,
+    /// Answer the next status POST with this status and store nothing.
+    pub refuse_next_status: Option<u16>,
     /// Answer the next status POST with 429 and `retry-after: 120`, storing nothing.
     pub limit_next_status: bool,
     /// After the next status is stored, `main` moves to this commit (which a git-backed project
@@ -746,8 +746,8 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
             }
         }
         (&Method::POST, ["statuses", sha]) => {
-            if std::mem::take(&mut state.refuse_next_status) {
-                return json_reply(403, json!({"message": "403 Forbidden"}));
+            if let Some(status) = state.refuse_next_status.take() {
+                return json_reply(status, json!({"message": format!("{status} refused")}));
             }
             if std::mem::take(&mut state.limit_next_status) {
                 return reply(429, &[("retry-after".into(), "120".into())], None);
@@ -756,7 +756,7 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
             let (name, wanted) = (b["name"].clone(), b["state"].clone());
             let ref_name = b["ref"].clone();
             // GitLab reuses a status that is still pending or running and refuses to move it to
-            // the state it already has; a finished status is never reused, so a post then makes a
+            // the state it already has, or a running one back to pending; a finished status is never reused, so a post then makes a
             // new one. Only a status posted with a ref is checked; the coordination status
             // carries none.
             if !ref_name.is_null()
@@ -766,8 +766,9 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                     .rev()
                     .find(|(s, v)| s == sha && v["name"] == name && v["ref"] == ref_name)
                     .is_some_and(|(_, v)| {
-                        v["state"] == wanted
-                            && matches!(wanted.as_str(), Some("pending" | "running"))
+                        (v["state"] == wanted
+                            && matches!(wanted.as_str(), Some("pending" | "running")))
+                            || (v["state"] == "running" && wanted == "pending")
                     })
             {
                 return json_reply(
