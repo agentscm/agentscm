@@ -836,7 +836,7 @@ GitHub definitely refuses (for example a collected or forbidden old commit) ther
 cannot block the new head, and can leave a `success` on a commit that is no longer the
 head. A merged pull request (the forge says `merged`, or the Hub recorded the merge) is left
 alone: no retire is posted onto its head. If a pull request's newest publication is no
-longer a candidate for a target, the earlier context row is not superseded and stays on a
+longer a candidate, or is a candidate for a target no opted-in profile publishes, the earlier context row is not superseded and stays on a
 non-head commit. A post whose reply is lost is journalled as
 `attempting` (reported as `uncertain`), and the next pass posts the current status
 again, for an old head too. A definite refusal (403, 404 or 422) is journalled as
@@ -853,16 +853,20 @@ They are reflected on the next poll or webhook for the repository, and not while
 connection is in backoff. A `pull_request` webhook reconciles only that pull request; a
 `push` webhook and each poll reconcile the repository. A pass examines the newest
 publication of up to 50 pull requests and continues after the last one on the next pass,
-wrapping at the end, so a busy repository is covered over several passes. Merged
-pull requests are skipped; closed ones are read again only to retire an earlier success,
-using only the pull request itself (a deleted base branch or gone head does not block it).
+wrapping at the end, so a busy repository is covered over several passes. A pull
+request the forge reports merged is recorded as merged on its newest publication (a Hub
+store write only) on first observation and skipped afterwards; closed ones are read again
+only to retire an earlier success, using only the pull request itself (a deleted base
+branch or gone head does not block it).
 After a push to a base branch with more than one window of pull requests, every status is
 rechecked only after up to ceil(N/50) passes. A poll or push also retires successes on contexts
 that are no longer published (at most 50 rows per pass). Rows on contexts that are still
 published, and rows of pull requests whose merge the Hub recorded, are excluded by the
 query, so they cannot crowd out a disabled context. Each such row costs one pull request
-read first: a pull request the forge reports merged, or whose read fails, is skipped. At most one profile may enable `publish_forge_status` for a
-repository (compared case-insensitively) and target; the Hub refuses to start otherwise.
+read first: a pull request the forge reports merged is recorded as merged and left alone,
+and one whose read fails is skipped. At most one profile may enable
+`publish_forge_status` for a repository (compared case-insensitively) and target; the Hub
+refuses to start otherwise.
 
 Cost: each pass makes one pull request read per examined pull request, one base ref read
 per distinct base branch plus one fresh base ref read per confirmed success, and one commit read per head not seen before (commit trees and

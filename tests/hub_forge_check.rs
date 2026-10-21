@@ -961,3 +961,65 @@ async fn a_pull_request_the_forge_reports_merged_is_not_retired_when_disabled() 
     assert_eq!(env.status_posts(), 1);
     assert_eq!(env.row().unwrap().state, "success");
 }
+
+fn merged_in_forge(env: &Env, number: u64) {
+    env.fake.with(|s| {
+        let pull = s
+            .repos
+            .get_mut(&REPO_ID)
+            .unwrap()
+            .pulls
+            .get_mut(&number)
+            .unwrap();
+        pull.state = "closed".into();
+        pull.merged = true;
+        pull.merge_commit_sha = Some("e".repeat(40));
+    });
+}
+
+fn pull_reads(env: &Env, number: u64) -> usize {
+    let path = format!("/repos/{REPO}/pulls/{number}");
+    env.fake.with(|s| {
+        s.requests
+            .iter()
+            .filter(|r| r.method == "GET" && r.path_and_query == path)
+            .count()
+    })
+}
+
+#[tokio::test]
+async fn forge_merged_rows_do_not_crowd_out_an_open_disabled_context_retire() {
+    let env = Env::start(true).await;
+    let old = "agentscm/workflow/old";
+    // Merged in the forge only, numbered ahead of the one open pull request.
+    for number in 2..=52 {
+        env.add_pull(number, COMMIT, false);
+        merged_in_forge(&env, number);
+        env.seed_success(number as i64, old);
+    }
+    env.add_pull(70, COMMIT, true);
+    env.seed_success(70, old);
+    env.poll().await;
+    env.poll().await;
+    assert_eq!(env.posts_to(old), 1);
+}
+
+#[tokio::test]
+async fn a_forge_merged_pull_request_in_the_window_is_recorded_and_not_read_again() {
+    let env = Env::start(true).await;
+    env.qualify();
+    merged_in_forge(&env, 1);
+    env.poll().await;
+    let merged = env
+        .store
+        .publication(REPO, &env.publication)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        merged.merge_commit.as_deref(),
+        Some("e".repeat(40).as_str())
+    );
+    let reads = pull_reads(&env, 1);
+    env.poll().await;
+    assert_eq!(pull_reads(&env, 1), reads);
+}

@@ -102,6 +102,8 @@ pub struct PullHead {
     pub open: bool,
     /// Merged pull requests are left alone: their head is history, not a candidate.
     pub merged: bool,
+    /// The merge commit of a merged pull request, when the forge names one.
+    pub merge_commit: Option<String>,
     pub head_sha: String,
     pub head_repo_id: u64,
     pub base_repo_id: u64,
@@ -723,11 +725,18 @@ impl Api {
             _ => return Err(bad()),
         };
         let merged = pull["merged"].as_bool().ok_or_else(bad)?;
+        let merge_commit = match &pull["merge_commit_sha"] {
+            Value::String(sha) if merged => Some(sha.clone()),
+            Value::Null => None,
+            _ if !merged => None,
+            _ => return Err(bad()),
+        };
         if !open {
             // Only the head matters to retire a success; the base and head commit may be gone.
             return Ok(Some(PullHead {
                 open,
                 merged,
+                merge_commit,
                 head_sha: sha_of(&pull["head"])?,
                 head_repo_id: 0,
                 base_repo_id: 0,
@@ -771,6 +780,7 @@ impl Api {
         Ok(Some(PullHead {
             open,
             merged,
+            merge_commit,
             head_sha,
             head_repo_id,
             base_repo_id,

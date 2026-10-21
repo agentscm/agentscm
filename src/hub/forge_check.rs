@@ -14,6 +14,7 @@ use super::connection::{
 };
 use super::github::{CommitStatus, Gh, GhError, StatusState};
 use super::http::blocking;
+use super::publish::Update;
 use super::store::unix_now;
 use super::workspace_execution::AgentTaskProfile;
 use super::{HubError, HubState, Result};
@@ -381,8 +382,9 @@ pub(super) async fn reconcile_repo(
 /// Retires a success (or uncertain post) on a context no enabled profile of `repo` publishes
 /// any more: the flag was turned off, the profile removed or its target changed. The store
 /// leaves out enabled contexts and merges the Hub recorded, so neither crowds out the rest; a
-/// pull request the forge reports merged (or cannot be read) is skipped this pass. At
-/// most `MAX_PULLS_PER_PASS` rows per pass; a retired row no longer qualifies, so none repeats.
+/// pull request the forge reports merged is recorded as merged and one that cannot be read is
+/// skipped this pass; both leave the row. At most `MAX_PULLS_PER_PASS` rows per pass; a
+/// retired row no longer qualifies, so none repeats.
 async fn retire_disabled(
     state: &HubState,
     repo: &ConnectedRepository,
@@ -402,8 +404,22 @@ async fn retire_disabled(
     for (number, context, row) in rows {
         // The store knows only merges the Hub recorded; ask the forge, and skip on a failed read.
         match api.pull(token, &repo.full_name, number).await {
-            Ok(Some(pull)) if pull["merged"] != false => continue,
-            Ok(_) => {}
+            Ok(Some(pull)) => match pull["merged"].as_bool() {
+                Some(false) => {}
+                Some(true) => {
+                    let merge_commit = pull["merge_commit_sha"].as_str().map(str::to_owned);
+                    record_merge(state, repo, number, merge_commit).await?;
+                    continue;
+                }
+                None => {
+                    eprintln!(
+                        "hub: forge check for {}#{number}: unreadable reply from pulls",
+                        repo.full_name
+                    );
+                    continue;
+                }
+            },
+            Ok(None) => {}
             Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
             Err(GhError::Failed(detail)) => {
                 eprintln!("hub: forge check for {}#{number}: {detail}", repo.full_name);
@@ -413,6 +429,34 @@ async fn retire_disabled(
         retire(state, repo, token, number, &context, &row, DISABLED).await?;
     }
     Ok(())
+}
+
+/// Records a merge the forge reported on the pull request's newest publication, as the
+/// publication read does. A Hub-store write only. A merge the forge names no commit for is not
+/// recorded, since the publication needs one.
+async fn record_merge(
+    state: &HubState,
+    repo: &ConnectedRepository,
+    number: i64,
+    merge_commit: Option<String>,
+) -> Result<()> {
+    let Some(merge_commit) = merge_commit else {
+        return Ok(());
+    };
+    let (store, name) = (state.store.clone(), repo.full_name.clone());
+    blocking(state, move || {
+        // The listing omits merged pull requests, so a match is the unrecorded newest one.
+        let newest = store.pull_publications(&name, number.saturating_sub(1), 1)?;
+        if let Some(publication) = newest.iter().find(|p| p.pr_number == Some(number)) {
+            store.update_publication(
+                &publication.id,
+                &Update::Merged { merge_commit },
+                unix_now(),
+            )?;
+        }
+        Ok(())
+    })
+    .await
 }
 
 /// One read-decide-post round for one pull request. True when it posted a success, so the
@@ -435,8 +479,10 @@ async fn pull_step(
     else {
         return Ok(false);
     };
-    // A merged head is history, not a candidate: leave whatever it shows alone.
+    // A merged head is history, not a candidate: leave whatever it shows alone, and record the
+    // merge so later passes skip this pull request.
     if head.merged {
+        record_merge(state, repo, number, head.merge_commit).await?;
         return Ok(false);
     }
     let context = status_context(&profile.target)?;
