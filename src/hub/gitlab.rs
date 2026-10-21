@@ -215,6 +215,7 @@ impl Api {
         for mr in &paged.items {
             // An item that cannot be read could be the merge request being looked for.
             if mr["iid"].as_i64().is_none()
+                || mr["id"].as_i64().is_none()
                 || mr["source_project_id"].as_i64().is_none()
                 || mr["target_project_id"].as_i64().is_none()
             {

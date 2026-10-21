@@ -898,7 +898,7 @@ fn read_due(id: &str) -> bool {
 }
 
 /// Whether the candidate's endpoint is this repository's host and no other host shares its name.
-async fn candidate_on_host(
+pub(super) async fn candidate_on_host(
     state: &HubState,
     publication: &Publication,
     repository: &ConnectedRepository,
@@ -910,6 +910,22 @@ async fn candidate_on_host(
         .and_then(|c| candidate_repository(&c.endpoint).ok())
         .is_some_and(|(host, _)| host == repository.host);
     on_host && matches!(name_shared_across_hosts(state, repository).await, Ok(false))
+}
+
+/// Whether a forge-side read or post for `publication` may use `repository`'s pull request of the
+/// same number. Event publications are GitHub-only. A candidate publication is keyed by name alone,
+/// so it counts only on the host it was published to and where no other host shares the name.
+pub(super) async fn publication_on_forge(
+    state: &HubState,
+    publication: &Publication,
+    repository: &ConnectedRepository,
+) -> bool {
+    let candidate = publication.manifest().ok().map(|m| m.candidate.is_some());
+    match candidate {
+        Some(false) => true,
+        Some(true) => candidate_on_host(state, publication, repository).await,
+        None => false,
+    }
 }
 
 async fn show(
@@ -981,6 +997,9 @@ async fn forge_check_view(
     let Some((conn, repo)) = found else {
         return Ok(None);
     };
+    if !publication_on_forge(state, publication, &repo).await {
+        return Ok(None);
+    }
     let target = &candidate.subject.target;
     let mut view = json!({"mode": "git_default", "enabled": false,
         "provider": if conn.provider == "github" { "github" } else { "unsupported" },

@@ -628,9 +628,17 @@ async fn an_external_merge_ends_the_lineage_only_for_the_published_commit() {
             let next = lineage_manifest(&env, branch, 2, Some(&id), &env.seed);
             let (status, refused) = env.api(Method::POST, &env.base(), Some(next)).await;
             assert_eq!(status, 409, "{branch}: {refused}");
+            assert_eq!(
+                refused["error"], "publication_conflict",
+                "{branch}: {refused}"
+            );
         } else {
             assert_eq!(pull["state"], "opened", "{branch}: {shown}");
             assert!(pull["merge_commit"].is_null());
+            // Control: the same successor is accepted while the predecessor is not merged.
+            let next = lineage_manifest(&env, branch, 2, Some(&id), &env.seed);
+            let (status, accepted) = env.api(Method::POST, &env.base(), Some(next)).await;
+            assert_eq!(status, 200, "{branch}: {accepted}");
         }
     }
 }
