@@ -220,6 +220,9 @@ pub struct FakeState {
     pub refuse_next_status: bool,
     /// Answer the next status POST with 429 and `retry-after: 120`, storing nothing.
     pub limit_next_status: bool,
+    /// After the next status is stored, `main` moves to this commit (which a git-backed project
+    /// must already hold), as when the target advances between a post and the confirming read.
+    pub advance_main_after_status: Option<String>,
     pub requests: Vec<Request>,
 }
 
@@ -772,6 +775,18 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                 status["ref"] = ref_name.clone();
             }
             project.statuses.push((sha.to_string(), status));
+            if let Some(tip) = state.advance_main_after_status.take() {
+                match &project.git {
+                    Some(dir) => {
+                        git_text(dir, &["update-ref", "refs/heads/main", &tip]);
+                    }
+                    None => project.branches.iter_mut().for_each(|b| {
+                        if b.name == "main" {
+                            b.sha = tip.clone();
+                        }
+                    }),
+                }
+            }
             if std::mem::take(&mut state.lose_next_status_reply) {
                 return reply(502, &[], None);
             }
