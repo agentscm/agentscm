@@ -165,6 +165,7 @@ fn hex(bytes: &[u8]) -> String {
 /// The SHA-1 Git tree OID `build_and_verify` would produce, computed without Git or
 /// writing any object. Same listing validation and bounds; no readback is needed
 /// because nothing is stored.
+#[cfg(unix)]
 pub(crate) fn native_tree_oid(engine: &Engine, revision: &str) -> Result<String> {
     let mut directory = Directory::default();
     walk_entries(engine, revision, super::PROFILE, |path, mode, bytes| {
@@ -236,6 +237,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn native_tree_oid_matches_git_mktree() {
         let git_path = PathBuf::from(

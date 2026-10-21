@@ -78,6 +78,74 @@ pub struct Outbound {
     pub status_description: Option<String>,
 }
 
+/// One Hub-posted commit status per (repository, pull request, context).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForgeCheck {
+    pub head_sha: String,
+    pub state: String,
+    pub binding_digest: Option<String>,
+    pub description: String,
+    /// `attempting` (reserved, reply not recorded: uncertain) or `posted`.
+    pub phase: String,
+    pub generation: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewForgeCheck {
+    pub head_sha: String,
+    pub state: String,
+    pub binding_digest: Option<String>,
+    pub description: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForgeCheckReserve {
+    Reserved(i64),
+    Conflict,
+}
+
+const MAX_CHECK_CONTEXT_BYTES: usize = 120;
+const MAX_CHECK_DESCRIPTION_CHARS: usize = 140;
+
+fn is_lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+pub(super) fn validate_check_key(number: i64, context: &str) -> Result<()> {
+    if number < 1
+        || context.is_empty()
+        || context.len() > MAX_CHECK_CONTEXT_BYTES
+        || !context
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'.' | b'-'))
+    {
+        return Err(invalid("forge check key is out of bounds"));
+    }
+    Ok(())
+}
+
+impl NewForgeCheck {
+    pub(super) fn validate(&self) -> Result<()> {
+        let digest_ok = match (self.state.as_str(), &self.binding_digest) {
+            ("success", Some(digest)) => is_lower_hex(digest, 64),
+            ("pending" | "failure" | "error", None) => true,
+            _ => false,
+        };
+        if !is_lower_hex(&self.head_sha, 40)
+            || !digest_ok
+            || self.description.chars().count() > MAX_CHECK_DESCRIPTION_CHARS
+            || self.description.chars().any(char::is_control)
+        {
+            return Err(invalid("forge check is out of bounds"));
+        }
+        Ok(())
+    }
+}
+
 impl NewConnection {
     pub(super) fn validate(&self) -> Result<()> {
         let id_ok = self.id.strip_prefix("con_").is_some_and(|hex| {

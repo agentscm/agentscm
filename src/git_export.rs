@@ -7,6 +7,7 @@ pub mod publish;
 pub mod remote;
 mod seed;
 mod tree;
+#[cfg(unix)]
 pub(crate) use tree::native_tree_oid;
 
 use std::fs;

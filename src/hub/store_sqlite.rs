@@ -8,8 +8,9 @@ use serde_json::json;
 
 use super::connection::{
     CONNECTION_SELECT, ConnectedRepository, Connection as ForgeConnection, DELIVERY_KEEP_SECONDS,
-    NewConnection, Observation, Observed, Outbound, REPOSITORY_SELECT, gone_event,
-    observation_kinds, validate_observation, validate_repository_row, validate_status,
+    ForgeCheck, ForgeCheckReserve, NewConnection, NewForgeCheck, Observation, Observed, Outbound,
+    REPOSITORY_SELECT, gone_event, observation_kinds, validate_check_key, validate_observation,
+    validate_repository_row, validate_status,
 };
 use super::coordination::{
     CoordinationAck, CoordinationAcknowledgement, CoordinationAgent, CoordinationInbox,
@@ -4067,6 +4068,105 @@ impl Store for SqliteStore {
             &Event::pr_status_written(&repository, number, sha, description)?,
         )?;
         Ok(tx.commit()?)
+    }
+
+    fn forge_check(&self, repo: &str, number: i64, context: &str) -> Result<Option<ForgeCheck>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT head_sha, state, binding_digest, description, phase, generation, updated_at
+                 FROM hub_forge_checks WHERE repository = ?1 AND number = ?2 AND context = ?3",
+                params![repo, number, context],
+                |row| {
+                    Ok(ForgeCheck {
+                        head_sha: row.get(0)?,
+                        state: row.get(1)?,
+                        binding_digest: row.get(2)?,
+                        description: row.get(3)?,
+                        phase: row.get(4)?,
+                        generation: row.get(5)?,
+                        updated_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    fn reserve_forge_check(
+        &self,
+        repo: &str,
+        number: i64,
+        context: &str,
+        expected: Option<i64>,
+        new: &NewForgeCheck,
+        now: i64,
+    ) -> Result<ForgeCheckReserve> {
+        validate_check_key(number, context)?;
+        new.validate()?;
+        let conn = self.conn();
+        let (changed, generation) = match expected {
+            None => (
+                conn.execute(
+                    "INSERT INTO hub_forge_checks (repository, number, context, head_sha, state,
+                         binding_digest, description, phase, generation, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'attempting', 1, ?8)
+                     ON CONFLICT (repository, number, context) DO NOTHING",
+                    params![
+                        repo,
+                        number,
+                        context,
+                        new.head_sha,
+                        new.state,
+                        new.binding_digest,
+                        new.description,
+                        now
+                    ],
+                )?,
+                1,
+            ),
+            Some(expected) => (
+                conn.execute(
+                    "UPDATE hub_forge_checks SET head_sha = ?5, state = ?6, binding_digest = ?7,
+                         description = ?8, phase = 'attempting', generation = generation + 1,
+                         updated_at = ?9
+                     WHERE repository = ?1 AND number = ?2 AND context = ?3 AND generation = ?4",
+                    params![
+                        repo,
+                        number,
+                        context,
+                        expected,
+                        new.head_sha,
+                        new.state,
+                        new.binding_digest,
+                        new.description,
+                        now
+                    ],
+                )?,
+                expected.saturating_add(1),
+            ),
+        };
+        Ok(if changed == 1 {
+            ForgeCheckReserve::Reserved(generation)
+        } else {
+            ForgeCheckReserve::Conflict
+        })
+    }
+
+    fn complete_forge_check(
+        &self,
+        repo: &str,
+        number: i64,
+        context: &str,
+        generation: i64,
+        now: i64,
+    ) -> Result<bool> {
+        validate_check_key(number, context)?;
+        Ok(self.conn().execute(
+            "UPDATE hub_forge_checks SET phase = 'posted', generation = generation + 1,
+                 updated_at = ?5
+             WHERE repository = ?1 AND number = ?2 AND context = ?3 AND generation = ?4",
+            params![repo, number, context, generation, now],
+        )? == 1)
     }
 
     fn append_pr_notices(&self, notices: &[(String, String)]) -> Result<()> {

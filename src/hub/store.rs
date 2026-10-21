@@ -6,7 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 use super::connection::{
-    ConnectedRepository, Connection, NewConnection, Observation, Observed, Outbound,
+    ConnectedRepository, Connection, ForgeCheck, ForgeCheckReserve, NewConnection, NewForgeCheck,
+    Observation, Observed, Outbound,
 };
 use super::coordination::{
     CoordinationAck, CoordinationInbox, CoordinationInboxQuery, CoordinationListQuery,
@@ -316,6 +317,27 @@ pub trait Store: Send + Sync {
         sha: &str,
         description: &str,
     ) -> Result<()>;
+    fn forge_check(&self, repo: &str, number: i64, context: &str) -> Result<Option<ForgeCheck>>;
+    /// Compare-and-set on `expected` (`None` for an absent row): records the desired post as
+    /// `attempting` and returns the new generation, or `Conflict` when another writer won.
+    fn reserve_forge_check(
+        &self,
+        repo: &str,
+        number: i64,
+        context: &str,
+        expected: Option<i64>,
+        new: &NewForgeCheck,
+        now: i64,
+    ) -> Result<ForgeCheckReserve>;
+    /// Marks the post `posted` only if `generation` is still current; returns whether it did.
+    fn complete_forge_check(
+        &self,
+        repo: &str,
+        number: i64,
+        context: &str,
+        generation: i64,
+        now: i64,
+    ) -> Result<bool>;
     /// `pr_notice` events as `(intent id, data JSON)`, in one transaction.
     fn append_pr_notices(&self, notices: &[(String, String)]) -> Result<()>;
     /// Idempotent by `new.id`: the first call records the publication for the active token's
@@ -785,6 +807,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 15,
         sqlite: include_str!("migrations/0015_candidate_publications.sqlite.sql"),
         postgres: include_str!("migrations/0015_candidate_publications.pg.sql"),
+    },
+    Migration {
+        version: 16,
+        sqlite: include_str!("migrations/0016_forge_checks.sqlite.sql"),
+        postgres: include_str!("migrations/0016_forge_checks.pg.sql"),
     },
 ];
 
