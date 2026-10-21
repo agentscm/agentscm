@@ -268,9 +268,8 @@ impl Env {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn attached_candidate_pushes_a_branch_and_adopts_a_lost_merge_request_in_a_nested_group() {
-    let env = Env::start().await;
+/// Attach, capture, qualify and prepare a candidate: (id, generation, mirror, candidate, commit).
+async fn prepared_candidate(env: &Env) -> (String, String, PathBuf, String, String) {
     let worktree = env.root.path().join("worktree");
     let attached = env
         .ok(&[
@@ -339,6 +338,13 @@ async fn attached_candidate_pushes_a_branch_and_adopts_a_lost_merge_request_in_a
         .unwrap()
         .to_owned();
     let commit = prepared["candidate"]["commit"].as_str().unwrap().to_owned();
+    (id, generation, mirror, candidate, commit)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn attached_candidate_pushes_a_branch_and_adopts_a_lost_merge_request_in_a_nested_group() {
+    let env = Env::start().await;
+    let (id, generation, mirror, candidate, commit) = prepared_candidate(&env).await;
     let transport = &env.transport;
     let publish = |verb: &str| {
         let mut args: Vec<String> = [
@@ -429,4 +435,60 @@ async fn attached_candidate_pushes_a_branch_and_adopts_a_lost_merge_request_in_a
             .contains(&format!("agentscm-candidate:{publication}:{commit}"))
     );
     assert_eq!(env.fake.with(|s| s.mr_creates()), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn attached_branch_push_refused_by_a_remote_hook_is_rejected_and_blocks_the_merge_request() {
+    let env = Env::start().await;
+    let (id, generation, mirror, candidate, _) = prepared_candidate(&env).await;
+    let hooks = env.transport.remote.join("hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("pre-receive");
+    fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let transport = &env.transport;
+    let args = |verb: &str| -> Vec<String> {
+        let mut args: Vec<String> = [
+            "attached-worktree",
+            verb,
+            "--id",
+            &id,
+            "--expected-generation",
+            &generation,
+            "--mirror",
+            mirror.to_str().unwrap(),
+            "--candidate",
+            &candidate,
+            "--operation-id",
+            "push-1",
+            "--credential-file",
+            transport.credential.to_str().unwrap(),
+            "--ca-file",
+            transport.ca.to_str().unwrap(),
+        ]
+        .map(String::from)
+        .into();
+        if verb == "publish-pr" {
+            args.extend(["--title".into(), "Synthetic attached change".into()]);
+        }
+        args
+    };
+    let pushed = env.ok_args(args("publish-branch")).await;
+    assert_eq!(pushed["ok"], false, "{pushed}");
+    assert_eq!(pushed["record"]["state"], "rejected", "{pushed}");
+    assert_eq!(pushed["record"]["rejection"], "hook_declined", "{pushed}");
+    assert_eq!(
+        run(&transport.remote, &["for-each-ref", "refs/heads/agents"]),
+        ""
+    );
+    let (ok, _, _) = env
+        .cli(
+            &args("publish-pr")
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        )
+        .await;
+    assert!(!ok, "publish-pr must refuse a rejected branch receipt");
+    assert_eq!(env.fake.with(|s| s.mr_creates()), 0);
 }

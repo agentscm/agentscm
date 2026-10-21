@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use super::git::{Git, MAX_CLOSURE_OBJECTS, validate_oid};
+use super::git::{Git, MAX_CLOSURE_OBJECTS, PushExit, validate_oid};
 use super::{ExportState, LOCK, Mirror};
 use crate::lease::Lease;
 use crate::{Error, Result};
@@ -79,6 +79,26 @@ pub enum State {
     /// A network peer advertised no matching ref; this does not prove absence.
     ObservedUnadvertised,
     Diverged,
+    /// The remote conclusively refused the push and a re-read shows the expected preimage.
+    /// Terminal and without effect; it does not fence new operations.
+    Rejected,
+}
+
+/// Closed classification of a conclusive refusal. Server text is never retained.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RejectionKind {
+    HookDeclined,
+    ProtectedBranch,
+    StaleInfo,
+    NonFastForward,
+    FetchFirst,
+    Other,
+}
+
+enum Dispatched {
+    Done(Option<String>),
+    Refused(RejectionKind),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -91,6 +111,9 @@ pub struct Record {
     pub observed_oid: Option<String>,
     /// Only fetch operations have a retained local ref.
     pub local_ref: Option<String>,
+    /// Present only with `State::Rejected`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection: Option<RejectionKind>,
 }
 
 impl Mirror {
@@ -295,6 +318,7 @@ impl Mirror {
             state: State::Pending,
             observed_oid: None,
             local_ref,
+            rejection: None,
         };
         db.execute(
             "INSERT INTO operations(id,record) VALUES (?1,?2)",
@@ -314,19 +338,55 @@ impl Mirror {
                 _ => Ok(record),
             };
         }
-        // All failures after reservation retain Unknown, including a lost push response.
+        // Failures after reservation retain Unknown, including a lost push response.
+        // Only a parsed, conclusive refusal can become Rejected.
         match self.dispatch_remote(&binding, &record, access, &mut qualify) {
-            Ok(observed) => {
+            Ok(Dispatched::Done(observed)) => {
                 record.observed_oid = observed;
                 record.state = match request {
                     Request::Fetch { .. } => State::Fetched,
                     Request::Publish { .. } | Request::PublishCandidate { .. } => State::Published,
                 };
             }
+            Ok(Dispatched::Refused(kind)) => {
+                self.classify_refusal(&mut record, &binding, access, kind)
+            }
             Err(_) => record.state = State::Unknown,
         }
         save(&db, &record)?;
         Ok(record)
+    }
+
+    // The refusal came from the server's report; the re-read must agree with it.
+    // A network create-only push has no preimage to compare beyond "not advertised",
+    // which is accepted because every later push still uses the exact lease.
+    fn classify_refusal(
+        &self,
+        record: &mut Record,
+        binding: &Binding,
+        access: &Access,
+        kind: RejectionKind,
+    ) {
+        let Ok(current) = self.observe_remote(binding, access) else {
+            record.state = State::Unknown;
+            return;
+        };
+        let expected = match &record.request {
+            Request::Fetch { expected_oid, .. } => Some(expected_oid),
+            Request::Publish { expected_oid, .. }
+            | Request::PublishCandidate { expected_oid, .. } => expected_oid.as_ref(),
+        };
+        record.state = if current.as_ref() == expected {
+            record.rejection = Some(kind);
+            State::Rejected
+        } else if current.as_deref() == Some(record.commit.as_str()) {
+            State::ObservedDesired
+        } else if current.is_none() && binding.network.is_some() {
+            State::ObservedUnadvertised
+        } else {
+            State::Diverged
+        };
+        record.observed_oid = current;
     }
 
     /// Explicit, read-only resolution of uncertain publication. Never repeats a push.
@@ -597,7 +657,7 @@ impl Mirror {
         record: &Record,
         access: &Access,
         qualify: &mut impl FnMut() -> Result<()>,
-    ) -> Result<Option<String>> {
+    ) -> Result<Dispatched> {
         let current = self.observe_remote(binding, access)?;
         match &record.request {
             Request::Fetch { expected_oid, .. } => {
@@ -622,7 +682,7 @@ impl Mirror {
                     None,
                     8192,
                 )?;
-                Ok(current)
+                Ok(Dispatched::Done(current))
             }
             Request::Publish { expected_oid, .. }
             | Request::PublishCandidate { expected_oid, .. } => {
@@ -644,7 +704,7 @@ impl Mirror {
                 if matches!(record.request, Request::PublishCandidate { .. })
                     && current.as_deref() == Some(&record.commit)
                 {
-                    return Ok(current);
+                    return Ok(Dispatched::Done(current));
                 }
                 // The exact lease is a compare-and-swap; the ancestry check above
                 // refuses a rewind. Remote hooks and receive policy remain in force.
@@ -654,8 +714,9 @@ impl Mirror {
                     expected_oid.as_deref().unwrap_or("")
                 );
                 let refspec = format!("{}:refs/heads/{}", record.commit, binding.branch);
-                if let Some(endpoint) = &binding.network {
-                    endpoint.run(
+                let reference = format!("refs/heads/{}", binding.branch);
+                let exit = if let Some(endpoint) = &binding.network {
+                    endpoint.run_exit(
                         &self.git,
                         access,
                         &[
@@ -667,10 +728,10 @@ impl Mirror {
                             &refspec,
                         ],
                         16384,
-                    )?;
+                    )?
                 } else {
                     let receive = server_command(&self.git.executable(), "receive-pack")?;
-                    self.git.run(
+                    self.git.run_push(
                         &[
                             "push",
                             "--porcelain",
@@ -680,9 +741,14 @@ impl Mirror {
                             path_text(&binding.remote)?,
                             &refspec,
                         ],
-                        None,
                         16384,
-                    )?;
+                    )?
+                };
+                if let Some(kind) = parse_porcelain(&exit, &reference) {
+                    return Ok(Dispatched::Refused(kind));
+                }
+                if !exit.finished || exit.code != Some(0) {
+                    return Err(Error::Conflict("push did not complete".into()));
                 }
                 self.check_candidate_target(binding, record, access)?;
                 qualify()?;
@@ -692,7 +758,7 @@ impl Mirror {
                         "remote ref could not be confirmed after push".into(),
                     ));
                 }
-                Ok(observed)
+                Ok(Dispatched::Done(observed))
             }
         }
     }
@@ -732,6 +798,51 @@ impl Mirror {
         )?;
         Ok(())
     }
+}
+
+/// Classify `git push --porcelain` output as a conclusive refusal of exactly `reference`.
+/// Anything unfinished, unparseable or ambiguous is not a refusal. The exit code is not trusted.
+fn parse_porcelain(exit: &PushExit, reference: &str) -> Option<RejectionKind> {
+    if !exit.finished {
+        return None;
+    }
+    let text = std::str::from_utf8(&exit.stdout).ok()?;
+    if text.contains('\r') {
+        return None;
+    }
+    let mut refusal = None;
+    for line in text.lines() {
+        if line.is_empty() || line == "Done" || line.starts_with("To ") {
+            continue;
+        }
+        if refusal.is_some() {
+            return None;
+        }
+        let mut fields = line.splitn(3, '\t');
+        let (flag, refs, summary) = (fields.next()?, fields.next()?, fields.next()?);
+        let (_, to) = refs.split_once(':')?;
+        if flag != "!" || to != reference {
+            return None;
+        }
+        let reason = summary
+            .strip_prefix("[remote rejected]")
+            .or_else(|| summary.strip_prefix("[rejected]"))?
+            .to_ascii_lowercase();
+        refusal = Some(if reason.contains("protected branch") {
+            RejectionKind::ProtectedBranch
+        } else if reason.contains("hook declined") {
+            RejectionKind::HookDeclined
+        } else if reason.contains("stale info") {
+            RejectionKind::StaleInfo
+        } else if reason.contains("non-fast-forward") {
+            RejectionKind::NonFastForward
+        } else if reason.contains("fetch first") {
+            RejectionKind::FetchFirst
+        } else {
+            RejectionKind::Other
+        });
+    }
+    refusal
 }
 
 fn advertised_ref(bytes: &[u8], reference: &str) -> Result<Option<String>> {
@@ -825,7 +936,15 @@ fn lookup(db: &Connection, id: &str, network: bool) -> Result<Option<Record>> {
                 && record.observed_oid.as_ref() != expected
                 && (!network || record.observed_oid.is_some())
         }
-    };
+        State::Rejected => {
+            matches!(
+                record.request,
+                Request::Publish { .. } | Request::PublishCandidate { .. }
+            ) && record.rejection.is_some()
+                && !desired_observed
+                && record.observed_oid.as_ref() == expected
+        }
+    } && (record.state == State::Rejected) == record.rejection.is_some();
     if !valid_state {
         return Err(invalid("inconsistent remote operation state"));
     }
@@ -985,4 +1104,89 @@ fn shell_quote(text: &str) -> String {
 
 fn invalid(message: &str) -> Error {
     Error::Invalid(message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const REF: &str = "refs/heads/work";
+    const OID: &str = "0123456789012345678901234567890123456789";
+
+    fn parse(stdout: &[u8], finished: bool) -> Option<RejectionKind> {
+        let exit = PushExit {
+            finished,
+            code: Some(1),
+            stdout: stdout.to_vec(),
+        };
+        parse_porcelain(&exit, REF)
+    }
+
+    fn report(summary: &str) -> Vec<u8> {
+        format!("To /srv/synthetic\n!\t{OID}:{REF}\t{summary}\nDone\n").into_bytes()
+    }
+
+    #[test]
+    fn classifies_conclusive_refusals() {
+        for (summary, kind) in [
+            (
+                "[remote rejected] (pre-receive hook declined)",
+                RejectionKind::HookDeclined,
+            ),
+            (
+                "[remote rejected] (hook declined)",
+                RejectionKind::HookDeclined,
+            ),
+            (
+                "[remote rejected] (protected branch hook declined)",
+                RejectionKind::ProtectedBranch,
+            ),
+            ("[rejected] (stale info)", RejectionKind::StaleInfo),
+            (
+                "[rejected] (non-fast-forward)",
+                RejectionKind::NonFastForward,
+            ),
+            ("[rejected] (fetch first)", RejectionKind::FetchFirst),
+            ("[remote rejected] (something new)", RejectionKind::Other),
+        ] {
+            assert_eq!(parse(&report(summary), true), Some(kind), "{summary}");
+        }
+    }
+
+    #[test]
+    fn everything_ambiguous_is_not_a_refusal() {
+        let ok = report("[remote rejected] (pre-receive hook declined)");
+        let text = String::from_utf8(ok.clone()).unwrap();
+        assert!(parse(&ok, true).is_some());
+        assert_eq!(parse(&ok, false), None, "stopped");
+        assert_eq!(
+            parse(&report("[remote failure] (unpack failed)"), true),
+            None
+        );
+        assert_eq!(parse(&report("[up to date]"), true), None);
+        assert_eq!(
+            parse(b"To /srv/synthetic\nDone\n", true),
+            None,
+            "missing line"
+        );
+        assert_eq!(parse(b"", true), None, "empty");
+        let two = text.replace(
+            "Done\n",
+            &format!("!\t{OID}:{REF}\t[rejected] (fetch first)\nDone\n"),
+        );
+        assert_eq!(parse(two.as_bytes(), true), None, "two lines");
+        let other = text.replace(REF, "refs/heads/other");
+        assert_eq!(parse(other.as_bytes(), true), None, "other ref");
+        assert_eq!(
+            parse(text.replace('\n', "\r\n").as_bytes(), true),
+            None,
+            "crlf"
+        );
+        let mut bytes = ok.clone();
+        bytes.extend_from_slice(&[0xff, b'\n']);
+        assert_eq!(parse(&bytes, true), None, "non-utf8");
+        let flag = text.replace("!\t", "=\t");
+        assert_eq!(parse(flag.as_bytes(), true), None, "wrong flag");
+        assert_eq!(parse(&vec![b'x'; 20000], false), None, "oversized");
+    }
 }

@@ -1,6 +1,6 @@
 use super::*;
 use agentscm::git_export::remote::network::trust_digest;
-use agentscm::git_export::remote::{Access, Endpoint, HttpsTrust, SshAccess};
+use agentscm::git_export::remote::{Access, Endpoint, HttpsTrust, RejectionKind, SshAccess};
 use serde_json::json;
 use std::process::Stdio;
 
@@ -119,7 +119,9 @@ fn https_authenticated_native_export_fetch_and_hook_rejection() {
             &access,
         )
         .unwrap();
-    assert_eq!(rejected.state, State::Unknown);
+    assert_eq!(rejected.state, State::Rejected);
+    assert_eq!(rejected.rejection, Some(RejectionKind::HookDeclined));
+    assert_eq!(rejected.observed_oid.as_deref(), Some(first.as_str()));
     assert_eq!(
         run(&fixture.remote, &["rev-parse", "refs/heads/main"]),
         first
@@ -127,9 +129,35 @@ fn https_authenticated_native_export_fetch_and_hook_rejection() {
     assert_eq!(
         mirror
             .remote_recover_with("https-rejected", &access)
-            .unwrap()
-            .state,
-        State::ObservedExpected
+            .unwrap(),
+        rejected
+    );
+    // A talkative hook must neither change the outcome nor leak into the journal.
+    let leak = "synthetic-hook-secret-4821";
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\necho 'https://user:{leak}@example.invalid/x' >&2\necho {leak}\nexit 1\n"
+        ),
+    )
+    .unwrap();
+    let chatty = mirror
+        .remote_run_with(
+            &Request::Publish {
+                operation_id: "https-chatty".into(),
+                event_sequence: two.sequence,
+                expected_oid: Some(first.clone()),
+            },
+            &access,
+        )
+        .unwrap();
+    assert_eq!(chatty.state, State::Rejected);
+    assert!(!serde_json::to_string(&chatty).unwrap().contains(leak));
+    let bytes = fs::read(path.join("agentscm-remote.sqlite")).unwrap();
+    assert!(
+        !bytes
+            .windows(leak.len())
+            .any(|part| part == leak.as_bytes())
     );
     let secret: serde_json::Value =
         serde_json::from_slice(&fs::read(&fixture.credential).unwrap()).unwrap();
@@ -138,6 +166,51 @@ fn https_authenticated_native_export_fetch_and_hook_rejection() {
         !bytes
             .windows(secret["password"].as_str().unwrap().len())
             .any(|part| part == secret["password"].as_str().unwrap().as_bytes())
+    );
+}
+
+#[test]
+fn https_create_only_hook_rejection_is_recorded_with_nothing_observed() {
+    if isolated_test(
+        "network_tests::https_create_only_hook_rejection_is_recorded_with_nothing_observed",
+    ) {
+        return;
+    }
+    let fixture = HttpsFixture::new(false);
+    let (_root, engine, mut authority, _, mut mirror) = setup();
+    mirror
+        .remote_bind_network(fixture.endpoint(), "main")
+        .unwrap();
+    let access = fixture.access();
+    let one = publish(&engine, &mut authority, vec![change("file", Some(b"one"))]);
+    mirror
+        .export(&engine, &authority, &request(&one, None))
+        .unwrap();
+    let hooks = fixture.remote.join("hooks");
+    fs::create_dir(&hooks).unwrap();
+    let hook = hooks.join("pre-receive");
+    fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+    let rejected = mirror
+        .remote_run_with(
+            &Request::Publish {
+                operation_id: "create".into(),
+                event_sequence: one.sequence,
+                expected_oid: None,
+            },
+            &access,
+        )
+        .unwrap();
+    assert_eq!(rejected.state, State::Rejected);
+    assert_eq!(rejected.rejection, Some(RejectionKind::HookDeclined));
+    assert_eq!(rejected.observed_oid, None);
+    assert_eq!(
+        run(&fixture.remote, &["for-each-ref", "refs/heads/main"]),
+        ""
+    );
+    assert_eq!(
+        mirror.remote_recover_with("create", &access).unwrap(),
+        rejected
     );
 }
 
@@ -577,7 +650,10 @@ fn network_hidden_advertisement_never_becomes_an_absence_claim() {
             &access,
         )
         .unwrap();
-    assert_eq!(attempted.state, State::Unknown);
+    // The server's refusal is conclusive; the hidden ref is still not reported as absent.
+    assert_eq!(attempted.state, State::Rejected);
+    assert_eq!(attempted.rejection, Some(RejectionKind::StaleInfo));
+    assert_eq!(attempted.observed_oid, None);
     assert_eq!(run(&fixture.remote, &["rev-parse", "refs/heads/main"]), oid);
 }
 

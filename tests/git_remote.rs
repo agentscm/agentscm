@@ -6,7 +6,7 @@ use std::process::Command;
 
 use agentscm::authority::Authority;
 use agentscm::context::ReviewContext;
-use agentscm::git_export::remote::{Request, State};
+use agentscm::git_export::remote::{RejectionKind, Request, State};
 use agentscm::git_export::{CommitMetadata, ExportRequest, Mirror};
 use agentscm::git_snapshot::{self, SnapshotRequest};
 use agentscm::model::{Approval, FileChange, IntegrateRequest, IntegrationEvent};
@@ -544,7 +544,9 @@ fn exact_lease_refuses_a_branch_move_between_observation_and_push() {
             expected_oid: Some(first),
         })
         .unwrap();
-    assert_eq!(result.state, State::Unknown);
+    assert_eq!(result.state, State::Diverged);
+    assert_eq!(result.observed_oid.as_deref(), Some(third.as_str()));
+    assert_eq!(result.rejection, None);
     assert_eq!(run(&remote, &["rev-parse", "refs/heads/main"]), third);
     assert_eq!(
         mirror.remote_recover("race").unwrap().state,
@@ -602,12 +604,24 @@ fn remote_pre_receive_hook_is_honored_despite_owned_mirror_hook_isolation() {
             expected_oid: Some(first.clone()),
         })
         .unwrap();
-    assert_eq!(rejected.state, State::Unknown);
+    assert_eq!(rejected.state, State::Rejected);
+    assert_eq!(rejected.rejection, Some(RejectionKind::HookDeclined));
+    assert_eq!(rejected.observed_oid.as_deref(), Some(first.as_str()));
     assert_eq!(run(&remote, &["rev-parse", "refs/heads/main"]), first);
     assert_eq!(fs::read_to_string(&hook).unwrap(), "#!/bin/sh\nexit 1\n");
+    assert_eq!(mirror.remote_recover("rejected").unwrap(), rejected);
+    // A rejection is terminal and does not fence new operations.
+    fs::remove_file(&hook).unwrap();
     assert_eq!(
-        mirror.remote_recover("rejected").unwrap().state,
-        State::ObservedExpected
+        mirror
+            .remote_run(&Request::Publish {
+                operation_id: "retry".into(),
+                event_sequence: second_event.sequence,
+                expected_oid: Some(first),
+            })
+            .unwrap()
+            .state,
+        State::Published
     );
 }
 
@@ -782,11 +796,13 @@ fn rejecting_operator_hook_at(config: PathBuf) {
             expected_oid: None,
         })
         .unwrap();
-    assert_eq!(rejected.state, State::Unknown);
+    assert_eq!(rejected.state, State::Rejected);
+    assert_eq!(rejected.rejection, Some(RejectionKind::HookDeclined));
+    assert_eq!(rejected.observed_oid, None);
     assert_eq!(run(&remote, &["for-each-ref", "refs/heads/main"]), "");
     assert_eq!(
-        mirror.remote_recover("operator-rejected").unwrap().state,
-        State::ObservedExpected
+        mirror.remote_recover("operator-rejected").unwrap(),
+        rejected
     );
 }
 
