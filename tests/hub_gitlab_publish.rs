@@ -678,3 +678,123 @@ async fn an_endpoint_under_a_url_root_or_a_name_shared_with_another_forge_fails_
     );
     assert_eq!(env.fake.with(|s| s.requests.len()), before);
 }
+
+/// `manifest` with a new change version, previous publication and baseline, re-identified.
+fn lineage_manifest(
+    env: &Env,
+    branch: &str,
+    version: u64,
+    previous: Option<&str>,
+    baseline: &str,
+) -> Value {
+    let mut m = env.manifest(branch);
+    let mut subject: agentscm::candidate::CandidateSubject =
+        serde_json::from_value(m["candidate"]["subject"].clone()).unwrap();
+    subject.change_version = version;
+    subject.baseline_commit = baseline.to_owned();
+    subject.id = subject.canonical_id().unwrap();
+    m["publication_id"] = json!(derive_candidate_id(
+        &env.repo,
+        &subject.id,
+        &env.commit,
+        branch
+    ));
+    m["candidate"]["subject"] = json!(subject);
+    m["candidate"]["previous_publication"] = json!(previous);
+    m
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recovery_after_the_head_and_target_move_reports_history_without_creating() {
+    let env = Env::start().await;
+    for mode in 0..2 {
+        let branch = format!("agents/moved-{mode}");
+        let id = env.create(&branch).await;
+        let before = env.creates();
+        env.fake.with(|s| {
+            if mode == 0 {
+                s.lose_next_mr_reply = true;
+            } else {
+                s.malformed_next_mr_reply = true;
+            }
+        });
+        env.run(&id).await;
+        assert_eq!(env.stored(&id).branch_state, "pr_attempting");
+        // Both head and target move: the immutable create marker still associates the
+        // historical merge request, while the result explicitly reports stale history.
+        bare_ref(&env.bare, "main", &env.commit);
+        bare_ref(&env.bare, &branch, &env.seed);
+        env.fake.with(|s| {
+            for mr in s.projects.get_mut(&REPO_ID).unwrap().mrs.values_mut() {
+                if mr.source_branch == branch {
+                    mr.sha = env.seed.clone();
+                }
+            }
+        });
+        let (status, recovered) = env.recover(&id).await;
+        assert_eq!(status, 200, "{recovered}");
+        assert!(
+            recovered["states"]["pull_request"]["number"].is_i64(),
+            "{recovered}"
+        );
+        assert!(
+            recovered["error"].as_str().unwrap().contains("historical"),
+            "{recovered}"
+        );
+        assert_eq!(env.creates(), before + 1);
+        bare_ref(&env.bare, "main", &env.seed);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_published_merge_request_is_never_recreated_after_a_rewrite_or_target_advance() {
+    let env = Env::start().await;
+    let id = env.create("agents/feat").await;
+    let (_, opened) = env.run(&id).await;
+    assert_eq!(opened["states"]["pull_request"]["number"], 1, "{opened}");
+    // The branch is rewritten and the target advances after publication. The receipt keeps
+    // naming the merge request that was published; nothing is created in its place.
+    bare_ref(&env.bare, "agents/feat", &env.seed);
+    bare_ref(&env.bare, "main", &env.commit);
+    for (name, (_, out)) in [
+        ("run", env.run(&id).await),
+        ("recover", env.recover(&id).await),
+        ("show", env.show(&id).await),
+    ] {
+        assert_eq!(out["states"]["pull_request"]["number"], 1, "{name}: {out}");
+    }
+    assert_eq!(env.creates(), 1);
+    assert_eq!(env.mrs().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_unattempted_candidate_continues_the_prior_merge_request() {
+    let env = Env::start().await;
+    let branch = "agents/lineage";
+    bare_ref(&env.bare, branch, &env.commit);
+    let a = lineage_manifest(&env, branch, 1, None, &env.seed);
+    let aid = a["publication_id"].as_str().unwrap().to_owned();
+    assert_eq!(env.api(Method::POST, &env.base(), Some(a)).await.0, 200);
+    let (_, opened) = env.run(&aid).await;
+    assert_eq!(opened["states"]["pull_request"]["number"], 1, "{opened}");
+    let b = lineage_manifest(&env, branch, 2, Some(&aid), &env.seed);
+    let bid = b["publication_id"].as_str().unwrap().to_owned();
+    assert_eq!(env.api(Method::POST, &env.base(), Some(b)).await.0, 200);
+    bare_ref(&env.bare, "main", &env.commit);
+    let (_, stale) = env.run(&bid).await;
+    assert!(
+        stale["error"].as_str().unwrap().contains("target differs"),
+        "{stale}"
+    );
+    assert!(env.stored(&bid).pr_number.is_none());
+    // A candidate rebuilt on the advanced target keeps the same merge request.
+    let c = lineage_manifest(&env, branch, 3, Some(&bid), &env.commit);
+    let cid = c["publication_id"].as_str().unwrap().to_owned();
+    assert_eq!(env.api(Method::POST, &env.base(), Some(c)).await.0, 200);
+    let (_, continued) = env.run(&cid).await;
+    assert_eq!(
+        continued["states"]["pull_request"]["number"], 1,
+        "{continued}"
+    );
+    assert_eq!(env.creates(), 1);
+}
