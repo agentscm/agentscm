@@ -930,3 +930,34 @@ async fn a_merged_pull_request_keeps_whatever_its_head_shows() {
     assert_eq!(env.status_posts(), 1);
     assert_eq!(env.row().unwrap().state, "success");
 }
+
+#[tokio::test]
+async fn a_base_that_advances_after_the_success_post_is_caught_in_the_same_pass() {
+    let env = Env::start(true).await;
+    env.qualify();
+    env.fake
+        .with(|s| s.advance_base_after_status = Some("9".repeat(40)));
+    env.poll().await;
+    let posted = env.statuses();
+    assert_eq!(posted.len(), 2, "{posted:?}");
+    assert_eq!(posted[0].1, "success");
+    assert_eq!(posted[1].1, "failure");
+    assert!(posted[1].2.contains("advanced"), "{posted:?}");
+}
+
+#[tokio::test]
+async fn a_pull_request_the_forge_reports_merged_is_not_retired_when_disabled() {
+    let mut env = Env::start(true).await;
+    env.qualify();
+    env.poll().await;
+    assert_eq!(env.status_posts(), 1);
+    // Nothing recorded the merge in the Hub; only the forge knows.
+    env.edit_pull(|pull| {
+        pull.state = "closed".into();
+        pull.merged = true;
+    });
+    env.reconfigure(|p| p.publish_forge_status = false);
+    env.poll().await;
+    assert_eq!(env.status_posts(), 1);
+    assert_eq!(env.row().unwrap().state, "success");
+}

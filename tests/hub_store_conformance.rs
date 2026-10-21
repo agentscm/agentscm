@@ -1616,6 +1616,58 @@ fn pull_publications_are_newest_per_pull_request(db: &Db) {
     assert_eq!(ids(4, 50), Vec::<String>::new());
 }
 
+fn forge_checks_showing_success_leave_out_merged_pull_requests(db: &Db) {
+    let store = db.open();
+    let con = store
+        .insert_connection(&app("github.com"), "usr_admin")
+        .unwrap();
+    let repo = store
+        .upsert_repository(&con.id, "github.com", 4242, "acme/widgets", None, None)
+        .unwrap();
+    let mut sql = String::from(
+        "INSERT INTO hub_users (id,provider,host,forge_user_id,login,created_at)
+            VALUES ('usr_fm','github','github.com',9,'alice',0);
+         INSERT INTO hub_agent_tokens (id,owner,name,repository,digest,expires_at,created_at)
+            VALUES ('tok_fm','usr_fm','builder','Acme/Widgets','fm',4102444800,0);",
+    );
+    for (id, pr, merged, created) in [
+        ("m1-old", 11, "NULL", 1),
+        ("m1-new", 11, "'c'", 2),
+        ("m2-old", 12, "'c'", 3),
+        ("m2-new", 12, "NULL", 4),
+        ("m3", 13, "NULL", 5),
+    ] {
+        sql.push_str(&format!(
+            "INSERT INTO hub_publications (id,repository,token,revision,event_seq,commit_sha,branch,
+                base,manifest,branch_state,pr_number,merge_commit,created_at,updated_at)
+             VALUES ('{id}','Acme/Widgets','tok_fm','{}',1,'{}','b-{id}','main','{{}}','created',{pr},
+                {merged},{created},{created});",
+            "a".repeat(64),
+            "b".repeat(40)
+        ));
+    }
+    db.exec(&sql).unwrap();
+    let new = NewForgeCheck {
+        head_sha: "a".repeat(40),
+        state: "success".into(),
+        binding_digest: Some("d".repeat(64)),
+        description: "qualified".into(),
+    };
+    for number in [11, 12, 13] {
+        store
+            .reserve_forge_check(&repo.id, number, "agentscm/workflow/main", None, &new, 20)
+            .unwrap();
+    }
+    let numbers = store
+        .forge_checks_showing_success(&repo.id, "acme/widgets", &[], 10)
+        .unwrap()
+        .into_iter()
+        .map(|(n, _, _)| n)
+        .collect::<Vec<_>>();
+    // 11: newest publication merged, excluded. 12: older merged, newer not, included.
+    assert_eq!(numbers, [12, 13]);
+}
+
 macro_rules! conformance {
     ($($case:ident),* $(,)?) => {
         mod on_sqlite {
@@ -1650,6 +1702,7 @@ conformance!(
     deliveries_outbound_and_notices,
     forge_check_journal,
     pull_publications_are_newest_per_pull_request,
+    forge_checks_showing_success_leave_out_merged_pull_requests,
     upgrade_from_migration_3,
     upgrade_from_migration_14_with_publication,
     url_errors,

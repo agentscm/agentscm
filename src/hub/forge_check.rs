@@ -342,7 +342,12 @@ pub(super) async fn reconcile_repo(
             .filter(|p| p.target == candidate.subject.target)
         {
             // Two passes at most: the second is the re-read after a success was posted.
-            for _ in 0..2 {
+            for attempt in 0..2 {
+                if attempt == 1 {
+                    // The confirming read judges the base as it is now, and later pull
+                    // requests in this pass reuse that fresh tip.
+                    base_tips.clear();
+                }
                 let step = pull_step(
                     state,
                     repo,
@@ -375,7 +380,8 @@ pub(super) async fn reconcile_repo(
 
 /// Retires a success (or uncertain post) on a context no enabled profile of `repo` publishes
 /// any more: the flag was turned off, the profile removed or its target changed. The store
-/// leaves out enabled contexts and merged pull requests, so neither crowds out the rest. At
+/// leaves out enabled contexts and merges the Hub recorded, so neither crowds out the rest; a
+/// pull request the forge reports merged (or cannot be read) is skipped this pass. At
 /// most `MAX_PULLS_PER_PASS` rows per pass; a retired row no longer qualifies, so none repeats.
 async fn retire_disabled(
     state: &HubState,
@@ -392,7 +398,18 @@ async fn retire_disabled(
         store.forge_checks_showing_success(&id, &name, &enabled, MAX_PULLS_PER_PASS)
     })
     .await?;
+    let api = state.sync.api()?;
     for (number, context, row) in rows {
+        // The store knows only merges the Hub recorded; ask the forge, and skip on a failed read.
+        match api.pull(token, &repo.full_name, number).await {
+            Ok(Some(pull)) if pull["merged"] != false => continue,
+            Ok(_) => {}
+            Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
+            Err(GhError::Failed(detail)) => {
+                eprintln!("hub: forge check for {}#{number}: {detail}", repo.full_name);
+                continue;
+            }
+        }
         retire(state, repo, token, number, &context, &row, DISABLED).await?;
     }
     Ok(())

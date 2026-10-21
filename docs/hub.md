@@ -859,12 +859,13 @@ using only the pull request itself (a deleted base branch or gone head does not 
 After a push to a base branch with more than one window of pull requests, every status is
 rechecked only after up to ceil(N/50) passes. A poll or push also retires successes on contexts
 that are no longer published (at most 50 rows per pass). Rows on contexts that are still
-published, and rows of merged pull requests, are excluded by the query, so they cannot
-crowd out a disabled context. At most one profile may enable `publish_forge_status` for a
+published, and rows of pull requests whose merge the Hub recorded, are excluded by the
+query, so they cannot crowd out a disabled context. Each such row costs one pull request
+read first: a pull request the forge reports merged, or whose read fails, is skipped. At most one profile may enable `publish_forge_status` for a
 repository (compared case-insensitively) and target; the Hub refuses to start otherwise.
 
 Cost: each pass makes one pull request read per examined pull request, one base ref read
-per distinct base branch, and one commit read per head not seen before (commit trees and
+per distinct base branch plus one fresh base ref read per confirmed success, and one commit read per head not seen before (commit trees and
 parents are cached in memory, bounded at 256). A closed, unmerged pull request is still
 read once per pass until its earlier success is retired and the window moves on; no
 state skips it. GitHub's documented installation budget is 5000 requests per hour, so

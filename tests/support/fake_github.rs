@@ -312,6 +312,8 @@ pub struct FakeState {
     pub lose_next_ref_reply: bool,
     /// Record the next commit status, then answer 502 with no body.
     pub lose_next_status_reply: bool,
+    /// After recording the next commit status, move the first branch's tip to this sha.
+    pub advance_base_after_status: Option<String>,
     /// Leave `head.repo` and `base.repo` out of pull request JSON.
     pub omit_pull_repos: bool,
     /// Build every created commit with a different message, so its SHA differs from the client's.
@@ -1210,6 +1212,9 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                         .unwrap()
                         .statuses
                         .push((sha.to_string(), status.clone()));
+                    if let Some(tip) = state.advance_base_after_status.take() {
+                        state.repos.get_mut(&id).unwrap().branches[0].sha = tip;
+                    }
                     if std::mem::take(&mut state.lose_next_status_reply) {
                         return reply(502, &[], None);
                     }
