@@ -452,7 +452,7 @@ fully usable if the team decides against it or reverses it.
    GitHub and GitLab (fake-tested); still needed are exact commit SHA ↔
    revision and pull request ↔ Change mappings in the ledger.
 2. Publish out: a native Change becomes a forge branch and pull request on
-   GitHub; for attached-worktree candidates also a GitLab merge request (fake-tested only; event publication and status projection stay GitHub-only). Native landing, remote publication, request creation and forge
+   GitHub; for attached-worktree candidates also a GitLab merge request (fake-tested only; event publication stays GitHub-only and the opt-in workflow status is fake-tested only). Native landing, remote publication, request creation and forge
    acceptance (including squash and rebase) stay distinct outcomes.
 3. Join the hub and the native ledger, so authenticated people approve and
    land, not a local operator.
