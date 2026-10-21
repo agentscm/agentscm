@@ -5,7 +5,7 @@
 mod workspace_hub;
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -864,22 +864,30 @@ async fn source_routes_reject_scope_before_body_and_preserve_rejected_operations
         3600,
     )
     .unwrap();
-    let oversized_invalid_json = vec![b'x'; 96 * 1024];
     let offers = format!(
         "{}/v1/hub/workspace/repositories/{REPOSITORY_PATH}/profiles/{PROFILE}/source/offers",
         env.base
     );
     for denied in [read_only.expose(), wrong_scope.expose()] {
-        let response = env
-            .client
-            .post(&offers)
-            .bearer_auth(denied)
-            .header("content-type", "application/json")
-            .body(oversized_invalid_json.clone())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let url = reqwest::Url::parse(&offers).unwrap();
+        let denied = denied.to_owned();
+        let status = tokio::task::spawn_blocking(move || {
+            let address = format!("{}:{}", url.host_str().unwrap(), url.port().unwrap());
+            let timeout = std::time::Duration::from_secs(5);
+            let mut stream =
+                std::net::TcpStream::connect_timeout(&address.parse().unwrap(), timeout).unwrap();
+            stream.set_read_timeout(Some(timeout)).unwrap();
+            stream.set_write_timeout(Some(timeout)).unwrap();
+            // Withhold the oversized body: authorization must reject from headers alone.
+            // Uploading it races the early response and can produce a client broken pipe.
+            write!(stream, "POST {} HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {denied}\r\nContent-Type: application/json\r\nContent-Length: 98304\r\nConnection: close\r\n\r\n", url.path()).unwrap();
+            let mut status = [0; 13];
+            stream.read_exact(&mut status).unwrap();
+            status
+        })
+        .await
+        .unwrap();
+        assert_eq!(&status, b"HTTP/1.1 403 ");
     }
 
     let source = format!(
