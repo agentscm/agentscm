@@ -95,11 +95,24 @@ means the operation receipt was obtained:
 - `fetched`: objects and the operation ref were retained locally.
 - `published`: Git acknowledged the push and a subsequent read saw the exact commit.
 - `unknown`: a command failed or the post-write read could not confirm it.
+- `rejected`: a leased push finished with exactly one `!` line for the target ref
+  marked `[remote rejected]` or `[rejected]` (UTF-8, no CR; the exit code is not
+  trusted), and a re-read still showed the expected preimage. The record carries
+  a closed `rejection` kind: `hook_declined`, `protected_branch`, `stale_info`,
+  `non_fast_forward`, `fetch_first` or `other`. The kind is derived from Git and
+  server summary text and no server text or stderr is stored, so
+  `protected_branch` appears only when the server's reason says "protected
+  branch". It is terminal, had no effect and does not fence new operations. If
+  the re-read shows the desired commit the record is `observed_desired`; if
+  the ref is unadvertised on a network remote, `observed_unadvertised`; any other
+  state, `diverged`; a failed re-read, `unknown`. Lost or partial replies,
+  timeouts, output over budget (stderr shares the 16 KiB budget, so a very chatty
+  hook yields `unknown`) and transport failures also stay `unknown`.
 - `observed_desired`, `observed_expected`, `diverged`: explicit recovery saw the
   desired commit, the expected preimage, or a different branch state.
 
 An identical operation ID returns its saved receipt and never replays a push.
-Changed input under that ID is rejected. Pending/unknown operations fence new
+Changed input under that ID is rejected. Pending/unknown operations (not `rejected`) fence new
 work until explicit recovery:
 
 ```sh

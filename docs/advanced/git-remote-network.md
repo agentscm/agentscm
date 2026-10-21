@@ -120,6 +120,10 @@ observation, after which an operator may choose a new operation ID. Every new
 publication still has an exact current-ref/create-only lease and ancestry
 check. It cannot overwrite a hidden existing branch by assuming absence.
 
+A `rejected` create-only push with no observed oid relies on the server's report
+plus the ref not being advertised; absence is not proven, and later pushes still
+use the exact lease. `rejected` does not fence new operations.
+
 `pending`/`unknown` operations are never automatically retried, and repeating the
 same ID returns its saved result. Recovery only reads; it does not repeat a
 push. A remote server may finish a request after the client terminates, so a

@@ -955,8 +955,8 @@ Limits:
   publications of that name, so a status posted before the name became shared is neither
   superseded nor retired; remove the duplicate connection to resume them.
   A self-managed GitLab under a relative URL root is refused (400/409).
-  The branch push is the provider-neutral Git transport; a protected-branch rejection stays
-  Unknown rather than a typed refusal. AgentSCM never changes protections, merges or bypasses a
+  The branch push is the provider-neutral Git transport; a conclusive protected-branch or hook
+  rejection is recorded as `rejected` (kind unverified against live GitLab; Unknown if the outcome is unclear). AgentSCM never changes protections, merges or bypasses a
   target. This is neither full-history migration nor native authority cutover.
 - Existing Git export profile v1 mirrors write regular `100644` files only. New mirrors use v2, which also preserves executable `100755` entries and symbolic links as `120000` target blobs. The hub and client accept these modes and deletions in a manifest; submodules and other entry kinds are refused before upload. Live GitHub publication of v2 exports remains unqualified.
 - At most 1000 changed paths, 8 MiB per file and 64 MiB in total. An upload over a cap is
