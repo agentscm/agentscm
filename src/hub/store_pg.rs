@@ -2280,6 +2280,7 @@ fn publication_row(row: &postgres::Row) -> Result<Publication> {
         repository: row.get(1),
         token: row.get(2),
         owner: row.get(20),
+        authorization_binding: row.get(21),
         agent: row.get(3),
         owner_login: row.get(4),
         revision: row.get(5),
@@ -4519,7 +4520,20 @@ impl Store for PgStore {
         })
     }
 
-    fn create_publication(&self, token: &str, new: &NewPublication, now: i64) -> Result<Create> {
+    fn create_bound_publication(
+        &self,
+        token: &str,
+        new: &NewPublication,
+        binding: Option<&str>,
+        now: i64,
+    ) -> Result<Create> {
+        if binding.is_some_and(|value| {
+            value.len() > 65536 || serde_json::from_str::<serde_json::Value>(value).is_err()
+        }) {
+            return Err(HubError::Invalid(
+                "invalid publication authorization binding".into(),
+            ));
+        }
         self.run(false, |client| {
             let mut tx = client.transaction()?;
             let who = active_token(&mut tx, token, now)?;
@@ -4531,7 +4545,7 @@ impl Store for PgStore {
             let m = &new.manifest;
             let manifest = m.canonical();
             if let Some(found) = publication_by_id(&mut tx, &new.id, false)? {
-                return Ok(Create::of_existing(found, &who.repository, &manifest));
+                return Ok(if found.authorization_binding.as_deref() == binding { Create::of_existing(found, &who.repository, &manifest) } else { Create::Conflict });
             }
             // Serialize candidate/integrated reservations for this repository/branch,
             // including tokens owned by different actors.
@@ -4539,6 +4553,9 @@ impl Store for PgStore {
             let head: Option<String> = tx.query_opt("SELECT publication FROM hub_candidate_heads WHERE repository=$1 AND branch=$2", &[&who.repository, &m.branch])?.map(|r| r.get(0));
             let previous = match &head { Some(id) => publication_by_id(&mut tx,id,false)?, None => None };
             if head.is_some() && previous.is_none() { return Err(HubError::Unavailable("candidate lineage record missing".into())); }
+            if binding.is_none() && previous.as_ref().is_some_and(|p| p.authorization_binding.is_some()) {
+                return Ok(Create::Conflict);
+            }
             if !super::publish::candidate_continuation(new, previous.as_ref(), &who.owner.id)? { return Ok(Create::Conflict); }
             if m.candidate.is_some() && head.is_none() {
                 let occupied: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM hub_publications WHERE repository=$1 AND branch=$2)", &[&who.repository, &m.branch])?.get(0);
@@ -4559,8 +4576,8 @@ impl Store for PgStore {
             }
             let inserted = tx.execute(
                 "INSERT INTO hub_publications (id, repository, token, revision, event_seq,
-                     commit_sha, branch, base, manifest, created_at, updated_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10) ON CONFLICT (id) DO NOTHING",
+                     commit_sha, branch, base, manifest, created_at, updated_at, authorization_binding)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, $11) ON CONFLICT (id) DO NOTHING",
                 &[
                     &new.id,
                     &who.repository,
@@ -4572,6 +4589,7 @@ impl Store for PgStore {
                     &m.base,
                     &manifest,
                     &now,
+                    &binding,
                 ],
             )?;
             if inserted > 0 {
@@ -4584,7 +4602,7 @@ impl Store for PgStore {
                 HubError::Unavailable("publication not found after insert".into())
             })?;
             tx.commit()?;
-            Ok(Create::of_existing(found, &who.repository, &manifest))
+            Ok(if found.authorization_binding.as_deref() == binding { Create::of_existing(found, &who.repository, &manifest) } else { Create::Conflict })
         })
     }
 

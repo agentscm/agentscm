@@ -204,7 +204,9 @@ fn idempotent_migrations(db: &Db) {
     }
     assert_eq!(
         db.versions(),
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+        vec![
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
+        ]
     );
     db.exec("INSERT INTO hub_schema_migrations (version, applied_at) VALUES (999, 0)")
         .unwrap();
@@ -227,7 +229,9 @@ fn concurrent_startup(db: &Db) {
     }
     assert_eq!(
         db.versions(),
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+        vec![
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
+        ]
     );
 }
 
@@ -605,7 +609,9 @@ fn upgrade_from_migration_1(db: &Db) {
     let store = db.open();
     assert_eq!(
         db.versions(),
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+        vec![
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
+        ]
     );
     let principal = store
         .authenticate(&agent_token_digest(&raw).unwrap(), unix_now())
@@ -1430,7 +1436,9 @@ fn upgrade_from_migration_3(db: &Db) {
     let store = db.open();
     assert_eq!(
         db.versions(),
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+        vec![
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
+        ]
     );
     let intents = store.live_intents("acme/widgets", unix_now(), 10).unwrap();
     assert_eq!(intents.len(), 1);
@@ -1538,7 +1546,7 @@ fn upgrade_from_migration_14_with_publication(db: &Db) {
         INSERT INTO hub_publications (id,repository,token,revision,event_seq,commit_sha,branch,base,manifest,branch_state,pr_number,pr_node_id,pr_url,created_at,updated_at) VALUES ('{id}','acme/widgets','tok_legacy','{}',3,'{}','feat/legacy','main','{}','created',7,'PR_7','https://github.com/acme/widgets/pull/7',10,11);
         INSERT INTO hub_events (id,at,kind,subject,data) VALUES ('evt_legacy',10,'publication_pr_opened','{id}','{{\"number\":7}}')", manifest.revision,manifest.commit,canonical.replace('\'', "''"))).unwrap();
     let store = db.open();
-    assert_eq!(db.versions(), (1..=17).collect::<Vec<_>>());
+    assert_eq!(db.versions(), (1..=18).collect::<Vec<_>>());
     let p = store.publication(REPO, &id).unwrap().unwrap();
     assert_eq!(p.event_seq, Some(3));
     assert_eq!(p.manifest, canonical);

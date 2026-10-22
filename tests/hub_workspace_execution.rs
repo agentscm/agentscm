@@ -1,6 +1,8 @@
 #![cfg(unix)]
 //! Real Hub HTTP controls with a local synthetic forge and source-only native state.
 //! Source-only service execution uses an inert socket; no Docker or provider process runs.
+#[path = "support/fake_github.rs"]
+mod fake_github;
 #[path = "common/workspace_hub.rs"]
 mod workspace_hub;
 
@@ -84,6 +86,19 @@ fn isolated_git(repo: &Path) -> PathBuf {
     ));
     let wrapper = common.join("synthetic-git");
     let executable = git_path().to_string_lossy().replace('\'', "'\\''");
+    let transport = common.join("synthetic-transport.json");
+    if transport.exists() {
+        let mapping: Value = serde_json::from_slice(&fs::read(transport).unwrap()).unwrap();
+        let script = format!(
+            "#!/usr/bin/python3\nimport os,sys\nos.environ['GIT_CONFIG_GLOBAL']='/dev/null'\nos.environ['GIT_CONFIG_NOSYSTEM']='1'\na=[{remote} if x=={endpoint} else ('protocol.file.allow=always' if x=='protocol.file.allow=never' else x) for x in sys.argv[1:]]\nos.execv({exe},[{exe},'-c','protocol.file.allow=always']+a)\n",
+            remote = mapping["remote"],
+            endpoint = mapping["endpoint"],
+            exe = serde_json::to_string(&git_path()).unwrap()
+        );
+        fs::write(&wrapper, script).unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+        return wrapper;
+    }
     fs::write(
         &wrapper,
         format!(
@@ -1255,7 +1270,27 @@ async fn two_git_worktrees_exercise_shared_candidate_branch_publication() {
     agent_owned_transport_lifecycle(true).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_git_worktrees_require_independent_exact_human_merge() {
+    agent_owned_transport_lifecycle_mode(true, "merge").await;
+}
+
 async fn agent_owned_transport_lifecycle(attached: bool) {
+    agent_owned_transport_lifecycle_mode(attached, "member").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_git_worktrees_refuse_revoked_executor() {
+    agent_owned_transport_lifecycle_mode(true, "executor").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_git_worktrees_refuse_revoked_publication_token() {
+    agent_owned_transport_lifecycle_mode(true, "token").await;
+}
+
+async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) {
+    let human_merge = revocation == "merge";
     let root = tempfile::tempdir().unwrap();
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let docker_home = root.path().join("fake-docker-home");
@@ -1280,6 +1315,7 @@ async fn agent_owned_transport_lifecycle(attached: bool) {
     let (mut native, collector_profile) =
         source_command_profile(root.path(), &docker, &docker_socket, &docker_config);
     let engine = Engine::open(&native.profile.data_dir).unwrap();
+    let (env, service) = agent_only_env(root.path(), &native).await;
     let git_fixture = if attached {
         let git_repository = root.path().join("git-repository");
         let contributor_a = root.path().join("contributor-a");
@@ -1327,7 +1363,12 @@ async fn agent_owned_transport_lifecycle(attached: bool) {
         );
         git(
             &git_repository,
-            &["remote", "add", "origin", remote.to_str().unwrap()],
+            &[
+                "remote",
+                "add",
+                "origin",
+                &format!("https://{}/synthetic/project.git", env.host),
+            ],
         );
         git(
             &git_repository,
@@ -1367,6 +1408,9 @@ async fn agent_owned_transport_lifecycle(attached: bool) {
             ],
         );
         let engine = Engine::open(&native.profile.data_dir).unwrap();
+        // A synthetic transport adapter connects the pinned HTTPS identity to real bare Git.
+        // TLS itself is qualified separately by git_remote/network, not by this scenario.
+        fs::write(git_repository.join(".git/synthetic-transport.json"), serde_json::to_vec(&json!({"remote":remote,"endpoint":format!("https://{}/synthetic/project.git", env.host)})).unwrap()).unwrap();
         let attachments =
             AttachmentJournal::open(&native.profile.data_dir, &native.context.change.repository)
                 .unwrap();
@@ -1417,7 +1461,6 @@ async fn agent_owned_transport_lifecycle(attached: bool) {
     } else {
         None
     };
-    let (env, service) = agent_only_env(root.path(), &native).await;
     assert!(
         !service.server_execution_enabled(),
         "the task-only profile must not enable server model or command dispatch"
@@ -2663,17 +2706,25 @@ async fn agent_owned_transport_lifecycle(attached: bool) {
             b"independent target advancement\n",
         )
         .unwrap();
-        git(&target_writer, &["add", "target-advance.txt"]);
+        git(target_writer, &["add", "target-advance.txt"]);
         git(
-            &target_writer,
+            target_writer,
             &["commit", "-q", "-m", "advance synthetic target"],
         );
-        let advanced_target = git(&target_writer, &["rev-parse", "HEAD"]);
+        let advanced_target = git(target_writer, &["rev-parse", "HEAD"]);
         git(
-            &git_repository,
+            git_repository,
             &["update-ref", "refs/remotes/origin/main", &advanced_target],
         );
-        git(&target_writer, &["push", "-q", "origin", "HEAD:main"]);
+        git(
+            target_writer,
+            &[
+                "push",
+                "-q",
+                root.path().join("provider.git").to_str().unwrap(),
+                "HEAD:main",
+            ],
+        );
         let target_error = attachments
             .validate_current(&engine, &fixed.id, fixed.generation)
             .unwrap_err()
@@ -3158,7 +3209,13 @@ async fn agent_owned_transport_lifecycle(attached: bool) {
         )
         .unwrap();
         mirror
-            .remote_bind(Path::new(&state.remote_url), &state.output)
+            .remote_bind_network(
+                agentscm::git_export::remote::Endpoint::Https {
+                    url: state.remote_url.clone(),
+                    trust: agentscm::git_export::remote::HttpsTrust::System,
+                },
+                &state.output,
+            )
             .unwrap();
         let owner_user = env
             .store
@@ -3167,6 +3224,13 @@ async fn agent_owned_transport_lifecycle(attached: bool) {
             .into_iter()
             .find(|user| user.identity.user_id == 202)
             .unwrap();
+        let credential = root.path().join("synthetic-git-credential.json");
+        fs::write(
+            &credential,
+            br#"{"username":"synthetic","password":"synthetic-fixture-only"}"#,
+        )
+        .unwrap();
+        fs::set_permissions(&credential, fs::Permissions::from_mode(0o600)).unwrap();
         let publication_profile = AttachedPublicationProfile {
             repository_id: native.profile.repository_id.clone(),
             profile_id: native.profile.profile_id.clone(),
@@ -3181,7 +3245,7 @@ async fn agent_owned_transport_lifecycle(attached: bool) {
             endpoint: state.remote_url.clone(),
             target: state.target.clone(),
             output: state.output.clone(),
-            credential_file: None,
+            credential_file: Some(credential),
             ca_file: None,
         };
         let publication_service = Arc::new(
@@ -3198,7 +3262,7 @@ async fn agent_owned_transport_lifecycle(attached: bool) {
                         data_dir: native.profile.data_dir.clone(),
                         target: native.profile.target.clone(),
                         requirement_digest: native.profile.requirement_digest.clone(),
-                        publish_forge_status: false,
+                        publish_forge_status: true,
                     }],
                     attached_publication_profiles: vec![publication_profile],
                 },
@@ -3208,17 +3272,58 @@ async fn agent_owned_transport_lifecycle(attached: bool) {
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let publication_base = format!("http://{}", listener.local_addr().unwrap());
-        let publication_app = agentscm::hub::router(
-            agentscm::hub::HubState::new(
-                env.store.clone(),
-                Arc::new(
-                    agentscm::backend::LocalBackend::open(root.path().join("publication-objects"))
-                        .unwrap(),
-                ),
+        let fake = fake_github::FakeGithub::start().await;
+        fake.with(|s| {
+            let mut repo = fake_github::Repo::new(100, "synthetic/project");
+            repo.git = Some(root.path().join("provider.git"));
+            s.repos.insert(100, repo);
+            s.pats.insert(
+                "synthetic-publication-pat".into(),
+                ("robot".into(), 77, [100].into()),
+            );
+        });
+        let secrets = root.path().join("publication-secrets");
+        agentscm::hub::sync::prepare_secrets_dir(&secrets, true).unwrap();
+        let sync_config = agentscm::hub::sync::SyncConfig::from_lookup(
+            "http://127.0.0.1:1",
+            secrets,
+            14,
+            |name| match name {
+                "AGENTSCM_GITHUB_URL" => Some(format!("http://{}", env.host)),
+                "AGENTSCM_GITHUB_API_URL" => Some(fake.base.clone()),
+                "AGENTSCM_GITHUB_PAT" => Some("synthetic-publication-pat".into()),
+                _ => None,
+            },
+        )
+        .unwrap();
+        let publication_state = agentscm::hub::HubState::new(
+            env.store.clone(),
+            Arc::new(
+                agentscm::backend::LocalBackend::open(root.path().join("publication-objects"))
+                    .unwrap(),
+            ),
+        )
+        .with_workspace(env.workspace.clone())
+        .with_workspace_execution(publication_service)
+        .with_sync(agentscm::hub::sync::Sync::new(sync_config).unwrap());
+        agentscm::hub::sync::start(&publication_state)
+            .await
+            .unwrap();
+        let connection = env.store.pat_connection(&env.host).unwrap().unwrap();
+        env.store
+            .upsert_repository(
+                &connection.id,
+                &env.host,
+                100,
+                "synthetic/project",
+                None,
+                None,
             )
-            .with_workspace(env.workspace.clone())
-            .with_workspace_execution(publication_service),
-        );
+            .unwrap();
+        env.store
+            .set_connection_outbound(&connection.id, true, "synthetic")
+            .unwrap();
+        let publication_app = agentscm::hub::router(publication_state.clone());
         let publication_server = tokio::spawn(async move {
             axum::serve(listener, publication_app).await.unwrap();
         });
@@ -3314,7 +3419,7 @@ async fn agent_owned_transport_lifecycle(attached: bool) {
         assert_eq!(published["currentness"], "current");
         assert_eq!(
             git(
-                Path::new(&state.remote_url),
+                &root.path().join("provider.git"),
                 &["rev-parse", &format!("refs/heads/{}", state.output)]
             ),
             first["candidate"]["commit"].as_str().unwrap()
@@ -3328,6 +3433,292 @@ async fn agent_owned_transport_lifecycle(attached: bool) {
             serde_json::from_slice::<Value>(&repeated.bytes().await.unwrap()).unwrap(),
             published
         );
+        let forge_path = format!("{path}/forge");
+        let forge_request = json!({
+            "request_id":"publish-imported-pr", "prepare_request_id":prepare["request_id"],
+            "branch_request_id":branch["request_id"], "candidate_id":first["candidate"]["candidate_id"],
+            "expected_generation":state.generation,"title":"Imported candidate","body":"Synthetic independent human landing"
+        });
+        let provider = root.path().join("provider.git");
+        let prepared_head = first["candidate"]["commit"].as_str().unwrap();
+        let provider_base = git(&provider, &["rev-parse", "refs/heads/main"]);
+        for (reference, replacement, original) in [
+            (
+                format!("refs/heads/{}", state.output),
+                provider_base.as_str(),
+                prepared_head,
+            ),
+            (
+                "refs/heads/main".into(),
+                prepared_head,
+                provider_base.as_str(),
+            ),
+        ] {
+            git(
+                &provider,
+                &["update-ref", &reference, replacement, original],
+            );
+            let response = json_request(
+                env.client.post(&forge_path).bearer_auth(&token),
+                &forge_request,
+            )
+            .send()
+            .await
+            .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            let refused: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+            assert!(refused["error"].is_string(), "{refused}");
+            assert!(fake.with(|s| s.repos[&100].pulls.is_empty()));
+            git(
+                &provider,
+                &["update-ref", &reference, original, replacement],
+            );
+        }
+        fake.with(|s| s.lose_next_pull_reply = true);
+        let result = json_request(
+            env.client.post(&forge_path).bearer_auth(&token),
+            &forge_request,
+        )
+        .send()
+        .await
+        .unwrap();
+        let code = result.status();
+        let result: Value = serde_json::from_slice(&result.bytes().await.unwrap()).unwrap();
+        assert_eq!(code.as_u16(), 200, "{result}");
+        let publication_id = result["id"].as_str().unwrap();
+        assert_eq!(
+            env.store
+                .publication("synthetic/project", publication_id)
+                .unwrap()
+                .unwrap()
+                .branch_state,
+            "pr_attempting"
+        );
+        let recovery = json!({"publication_id":publication_id});
+        let hidden_pull = fake.with(|s| s.repos.get_mut(&100).unwrap().pulls.remove(&1).unwrap());
+        for (url, request) in [
+            (forge_path.clone(), &forge_request),
+            (format!("{forge_path}/recover"), &recovery),
+        ] {
+            let response = json_request(env.client.post(url).bearer_auth(&token), request)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            let unknown: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+            assert!(unknown["error"].is_string());
+        }
+        assert!(fake.with(|s| s.repos[&100].pulls.is_empty()));
+        fake.with(|s| s.repos.get_mut(&100).unwrap().pulls.insert(1, hidden_pull));
+        // Concurrent retries adopt the one exact PR; durable attempting forbids another create.
+        let (a, b) = tokio::join!(
+            json_request(
+                env.client
+                    .post(format!("{forge_path}/recover"))
+                    .bearer_auth(&token),
+                &recovery
+            )
+            .send(),
+            json_request(
+                env.client.post(&forge_path).bearer_auth(&token),
+                &forge_request
+            )
+            .send()
+        );
+        for response in [a.unwrap(), b.unwrap()] {
+            let code = response.status();
+            let value: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+            assert_eq!(code.as_u16(), 200, "{value}");
+            assert_eq!(
+                value["states"]["pull_request"]["state"], "opened",
+                "{value}"
+            );
+        }
+        assert_eq!(
+            fake.with(|s| s
+                .requests
+                .iter()
+                .filter(|r| r.method == "POST" && r.path_and_query.ends_with("/pulls"))
+                .count()),
+            1
+        );
+        for suffix in ["run", "recover"] {
+            assert_eq!(env.client.post(format!("{publication_base}/v1/hub/repos/synthetic%2Fproject/publications/{publication_id}/{suffix}")).bearer_auth(&token).send().await.unwrap().status().as_u16(), 409);
+        }
+        fake.with(|s| s.lose_next_status_reply = true);
+        agentscm::hub::sync::poll_once(&publication_state)
+            .await
+            .unwrap();
+        agentscm::hub::sync::poll_once(&publication_state)
+            .await
+            .unwrap();
+        let statuses = fake.with(|s| s.repos[&100].statuses.clone());
+        assert_eq!(
+            statuses.last().unwrap().1["state"],
+            "success",
+            "{statuses:?}"
+        );
+        assert_eq!(statuses.last().unwrap().0, first["candidate"]["commit"]);
+
+        if matches!(revocation, "executor" | "token") {
+            if revocation == "executor" {
+                let mut authority = Authority::open(&native.profile.data_dir).unwrap();
+                let epoch = authority.policy_epoch().unwrap() + 1;
+                authority
+                    .revoke_workflow_executor(&agentscm::skill_workflow::ExecutorRevocation {
+                        version: 1,
+                        registration_id: "registration-http-1".into(),
+                        repository: native.profile.native_repository.clone(),
+                        registration_epoch: 1,
+                        revoked_at_policy_epoch: epoch,
+                        reason: "synthetic operator revocation".into(),
+                    })
+                    .unwrap();
+            } else {
+                let principal = env
+                    .store
+                    .authenticate(
+                        &agentscm::hub::store::agent_token_digest(&token).unwrap(),
+                        agentscm::hub::store::unix_now(),
+                    )
+                    .unwrap()
+                    .unwrap();
+                env.store.revoke_agent_token(&principal.token_id).unwrap();
+            }
+            let response = json_request(
+                env.client.post(&forge_path).bearer_auth(&token),
+                &forge_request,
+            )
+            .send()
+            .await
+            .unwrap();
+            assert!(response.status().is_client_error(), "{revocation}");
+            agentscm::hub::sync::poll_once(&publication_state)
+                .await
+                .unwrap();
+            assert_eq!(
+                fake.with(|s| s.repos[&100].statuses.last().unwrap().1["state"].clone()),
+                "failure",
+                "{revocation}"
+            );
+            let (_, observer) = mint_agent_token(
+                &*env.store,
+                &owner_user.id,
+                "historical-observer",
+                "synthetic/project",
+                3600,
+            )
+            .unwrap();
+            let response = json_request(
+                env.client
+                    .post(format!("{forge_path}/recover"))
+                    .bearer_auth(observer.expose()),
+                &recovery,
+            )
+            .send()
+            .await
+            .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            assert_eq!(
+                fake.with(|s| s
+                    .requests
+                    .iter()
+                    .filter(|r| r.method == "POST" && r.path_and_query.ends_with("/pulls"))
+                    .count()),
+                1
+            );
+            let (_, _, contributor_b, _, _, _, _) = git_fixture.as_ref().unwrap();
+            assert_eq!(
+                fs::read(contributor_b.join("notes/contributor-b.txt")).unwrap(),
+                b"independent concurrent edit\n"
+            );
+            publication_server.abort();
+            return;
+        }
+        let baseline = git(
+            &root.path().join("provider.git"),
+            &["rev-parse", "refs/heads/main"],
+        );
+        let head = first["candidate"]["commit"].as_str().unwrap();
+        // A reviewer approves a specific head and baseline, never a branch name alone.
+        let human_can_merge = |approved: bool, expected_head: &str, expected_base: &str| {
+            fake.with(|s| {
+                let repo = &s.repos[&100];
+                let pull = &repo.pulls[&1];
+                approved
+                    && pull.head_sha == expected_head
+                    && pull.base_ref == "main"
+                    && git(
+                        &root.path().join("provider.git"),
+                        &["rev-parse", "refs/heads/main"],
+                    ) == expected_base
+                    && repo
+                        .statuses
+                        .iter()
+                        .rev()
+                        .find(|(sha, v)| {
+                            sha == expected_head && v["context"] == "agentscm/workflow/main"
+                        })
+                        .is_some_and(|(_, v)| v["state"] == "success")
+            })
+        };
+        assert!(!human_can_merge(false, head, &baseline));
+        assert!(!human_can_merge(true, &"0".repeat(40), &baseline));
+        assert!(!human_can_merge(true, head, &"0".repeat(40)));
+        // Provider head/base drift produces a nonpassing status. Returning to the exact
+        // qualified tuple permits a fresh success; old green status alone is insufficient.
+        fake.with(|s| {
+            s.repos
+                .get_mut(&100)
+                .unwrap()
+                .pulls
+                .get_mut(&1)
+                .unwrap()
+                .base_ref = "other".into()
+        });
+        agentscm::hub::sync::poll_once(&publication_state)
+            .await
+            .unwrap();
+        assert!(!human_can_merge(true, head, &baseline));
+        fake.with(|s| {
+            s.repos
+                .get_mut(&100)
+                .unwrap()
+                .pulls
+                .get_mut(&1)
+                .unwrap()
+                .base_ref = "main".into()
+        });
+        agentscm::hub::sync::poll_once(&publication_state)
+            .await
+            .unwrap();
+        assert!(human_can_merge(true, head, &baseline));
+        if human_merge {
+            // Explicit synthetic human action, outside every agent API and native authority.
+            // The provider applies its exact-head, baseline and status guard before landing.
+            git(
+                &root.path().join("provider.git"),
+                &["update-ref", "refs/heads/main", head, &baseline],
+            );
+            fake.with(|s| {
+                let pull = s.repos.get_mut(&100).unwrap().pulls.get_mut(&1).unwrap();
+                pull.merged = true;
+                pull.state = "closed".into();
+                pull.merge_commit_sha = Some(head.into());
+            });
+            agentscm::hub::sync::poll_once(&publication_state)
+                .await
+                .unwrap();
+            assert_eq!(
+                env.store
+                    .publication("synthetic/project", publication_id)
+                    .unwrap()
+                    .unwrap()
+                    .merge_commit
+                    .as_deref(),
+                Some(head)
+            );
+        }
         let (_, read_only, _) = mint_bound_agent_token(
             &*env.store,
             &owner_user.id,
@@ -3377,6 +3768,50 @@ async fn agent_owned_transport_lifecycle(attached: bool) {
             .as_u16(),
             401
         );
+        for secret in [read_only.expose(), wrong_owner.expose()] {
+            let response = json_request(
+                env.client.post(&forge_path).bearer_auth(secret),
+                &forge_request,
+            )
+            .send()
+            .await
+            .unwrap();
+            assert!(matches!(response.status().as_u16(), 401 | 403 | 409));
+        }
+        let (_, cross_repo) = mint_agent_token(
+            &*env.store,
+            &owner_user.id,
+            "publication-cross-repo",
+            "synthetic/other",
+            3600,
+        )
+        .unwrap();
+        assert!(
+            json_request(
+                env.client
+                    .post(&forge_path)
+                    .bearer_auth(cross_repo.expose()),
+                &forge_request
+            )
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_client_error()
+        );
+        let mut wrong_generation = forge_request.clone();
+        wrong_generation["expected_generation"] = json!(state.generation + 1);
+        assert!(
+            json_request(
+                env.client.post(&forge_path).bearer_auth(&token),
+                &wrong_generation
+            )
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_client_error()
+        );
         let reader_only = env.member(
             202,
             &[Role::Reader],
@@ -3419,6 +3854,61 @@ async fn agent_owned_transport_lifecycle(attached: bool) {
             .as_u16(),
             409
         );
+        if !human_merge {
+            // A refused downgrade must retain the possibility of visible success.
+            fake.with(|s| {
+                s.fail.push_back(fake_github::Failure {
+                    path_contains: "/statuses/".into(),
+                    status: 403,
+                    headers: vec![],
+                })
+            });
+            agentscm::hub::sync::poll_once(&publication_state)
+                .await
+                .unwrap();
+            let connected = env
+                .store
+                .repository_named(&env.host, "synthetic/project")
+                .unwrap()
+                .unwrap();
+            let row = env
+                .store
+                .forge_check(&connected.id, 1, "agentscm/workflow/main")
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.phase, "attempting");
+            agentscm::hub::sync::poll_once(&publication_state)
+                .await
+                .unwrap();
+            assert_eq!(
+                fake.with(|s| s.repos[&100].statuses.last().unwrap().1["state"].clone()),
+                "failure"
+            );
+            assert!(!human_can_merge(true, head, &baseline));
+        }
+        assert!(
+            json_request(
+                env.client
+                    .post(&forge_path)
+                    .bearer_auth(reader_token.expose()),
+                &forge_request
+            )
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_client_error()
+        );
+        let observed = json_request(
+            env.client
+                .post(format!("{forge_path}/recover"))
+                .bearer_auth(reader_token.expose()),
+            &recovery,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(observed.status().as_u16(), 200);
         let regrant = env.member(
             202,
             &[Role::Reader, Role::Contributor],

@@ -388,7 +388,17 @@ pub trait Store: Send + Sync {
     /// Idempotent by `new.id`: the first call records the publication for the active token's
     /// repository and its `publication_requested` event; a repeat with the same manifest returns the
     /// row. A token may have at most `MAX_UNFINISHED` open publications.
-    fn create_publication(&self, token: &str, new: &NewPublication, now: i64) -> Result<Create>;
+    fn create_publication(&self, token: &str, new: &NewPublication, now: i64) -> Result<Create> {
+        self.create_bound_publication(token, new, None, now)
+    }
+    /// Binding is server-created authorization context, never part of a client manifest.
+    fn create_bound_publication(
+        &self,
+        token: &str,
+        new: &NewPublication,
+        binding: Option<&str>,
+        now: i64,
+    ) -> Result<Create>;
     fn publication(&self, repository: &str, id: &str) -> Result<Option<Publication>>;
     /// The newest publication of each pull request number above `after` in `repository`
     /// (matched case-insensitively), omitting pull requests whose newest publication is merged,
@@ -872,6 +882,11 @@ const MIGRATIONS: &[Migration] = &[
         sqlite: include_str!("migrations/0017_external_runs.sqlite.sql"),
         postgres: include_str!("migrations/0017_external_runs.pg.sql"),
     },
+    Migration {
+        version: 18,
+        sqlite: include_str!("migrations/0018_publication_binding.sqlite.sql"),
+        postgres: include_str!("migrations/0018_publication_binding.pg.sql"),
+    },
 ];
 
 /// Migrations not yet applied. The registry must be numbered 1..n and the
@@ -910,18 +925,18 @@ mod tests {
 
     #[test]
     fn pending_requires_an_applied_prefix() {
-        assert_eq!(pending(&[]).unwrap().len(), 17);
-        assert_eq!(pending(&[1]).unwrap().len(), 16);
-        assert_eq!(pending(&[1, 2, 3]).unwrap().len(), 14);
-        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap().len(), 9);
-        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap().len(), 8);
+        assert_eq!(pending(&[]).unwrap().len(), 18);
+        assert_eq!(pending(&[1]).unwrap().len(), 17);
+        assert_eq!(pending(&[1, 2, 3]).unwrap().len(), 15);
+        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap().len(), 10);
+        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap().len(), 9);
         assert_eq!(
             pending(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14])
                 .unwrap()
                 .len(),
-            3
+            4
         );
-        assert!(pending(&(1..=17).collect::<Vec<_>>()).unwrap().is_empty());
+        assert!(pending(&(1..=18).collect::<Vec<_>>()).unwrap().is_empty());
         assert!(pending(&[2]).is_err());
         let newer = pending(&[1, 999]).err().unwrap().to_string();
         assert!(newer.contains("newer than this binary"), "{newer}");

@@ -1,7 +1,6 @@
 //! Authenticated preparation of an operator-pinned attached Git candidate.
 //!
-//! This phase writes only the existing owned Mirror journal/ref. It never contacts a remote,
-//! pushes a ref, opens a pull request, or posts forge status.
+//! Operator-pinned preparation, branch transport and bound forge publication.
 
 use std::sync::Arc;
 
@@ -125,6 +124,14 @@ pub fn routes() -> Router<HubState> {
         .route(
             "/v1/hub/workspace/repositories/{repository}/profiles/{profile}/attachments/{attachment}/publication/branch/recover",
             post(recover_branch),
+        )
+        .route(
+            "/v1/hub/workspace/repositories/{repository}/profiles/{profile}/attachments/{attachment}/publication/forge",
+            post(forge_publish),
+        )
+        .route(
+            "/v1/hub/workspace/repositories/{repository}/profiles/{profile}/attachments/{attachment}/publication/forge/recover",
+            post(forge_recover),
         )
         .route(
             "/v1/hub/workspace/repositories/{repository}/profiles/{profile}/attachments/{attachment}/publication/mcp",
@@ -591,6 +598,14 @@ impl ExecutionService {
                 "candidate differs from retained prepare".into(),
             ));
         }
+        let retained = publication(mirror.remote_lookup(&operation))?
+            .ok_or_else(|| HubError::Invalid("branch attempt was not found".into()))?;
+        if !matches!(&retained.request, RemoteRequest::PublishCandidate { candidate_id, .. } if candidate_id == &candidate.subject.id)
+        {
+            return Err(HubError::Invalid(
+                "branch attempt belongs to another candidate".into(),
+            ));
+        }
         let record = publication(mirror.remote_recover_with(&operation, &access(&profile)?))?;
         Ok(branch_status(
             request.request_id,
@@ -705,6 +720,8 @@ async fn mcp(
             {"name":"agentscm_prepare_attached_publication","description":"Prepare one exact operator-pinned unlanded Git candidate; does not push or open a pull request.","inputSchema":prepare_schema()},
             {"name":"agentscm_attached_publication_status","description":"Read a retained prepare outcome without re-running it.","inputSchema":status_schema()},
             {"name":"agentscm_publish_attached_branch","description":"Publish the exact retained candidate branch under fresh workspace authorization.","inputSchema":publish_branch_schema()},
+            {"name":"agentscm_publish_attached_forge","description":"Open or adopt the exact bound candidate PR/MR under live authorization.","inputSchema":forge_schema()},
+            {"name":"agentscm_recover_attached_forge","description":"Observe a retained PR/MR attempt without creating another.","inputSchema":forge_recover_schema()},
             {"name":"agentscm_recover_attached_branch","description":"Observe an uncertain retained branch publication without repeating a push.","inputSchema":recover_branch_schema()}
         ]}),
         Some("tools/call") => {
@@ -723,6 +740,32 @@ async fn mcp(
                 )
             })?;
             let value = match name {
+                Some("agentscm_publish_attached_forge") => {
+                    let request =
+                        serde_json::from_value(arguments).map_err(|_| ApiError::invalid())?;
+                    forge_call(
+                        state.clone(),
+                        actor,
+                        repository,
+                        profile,
+                        attachment,
+                        request,
+                    )
+                    .await?
+                }
+                Some("agentscm_recover_attached_forge") => {
+                    let request =
+                        serde_json::from_value(arguments).map_err(|_| ApiError::invalid())?;
+                    forge_recover_call(
+                        state.clone(),
+                        actor,
+                        repository,
+                        profile,
+                        attachment,
+                        request,
+                    )
+                    .await?
+                }
                 Some("agentscm_prepare_attached_publication") => {
                     let request: PrepareRequest =
                         serde_json::from_value(arguments).map_err(|_| {
@@ -897,6 +940,433 @@ fn mcp_error(id: &serde_json::Value, code: i32, message: &str) -> Response {
     Json(json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})).into_response()
 }
 
+/// Only the server constructs this value. It is stored separately from the manifest.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ForgeBinding {
+    actor: WorkspaceActor,
+    repository: String,
+    profile: String,
+    attachment: String,
+    config_digest: String,
+    request: ForgeRequest,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForgeRequest {
+    pub request_id: String,
+    pub prepare_request_id: String,
+    pub branch_request_id: String,
+    pub candidate_id: String,
+    pub expected_generation: u64,
+    pub title: String,
+    pub body: String,
+    #[serde(default)]
+    pub previous_publication: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoverForgeRequest {
+    pub publication_id: String,
+}
+
+fn forge_config(
+    profile: &AttachedPublicationProfile,
+    task: &super::workspace_execution::AgentTaskProfile,
+) -> Result<String> {
+    Ok(crate::store::digest(
+        &serde_json::to_vec(&(profile, task)).map_err(crate::Error::from)?,
+    ))
+}
+
+impl ExecutionService {
+    fn forge_parts(
+        &self,
+        binding: &ForgeBinding,
+    ) -> Result<(
+        AttachedPublicationProfile,
+        super::workspace_execution::AgentTaskProfile,
+    )> {
+        let (profile, task) =
+            self.publication_profile(&binding.repository, &binding.profile, &binding.attachment)?;
+        if profile.owner_id != binding.actor.user_id()
+            || forge_config(&profile, &task)? != binding.config_digest
+        {
+            return Err(HubError::Unauthorized);
+        }
+        Ok((profile, task))
+    }
+
+    pub(super) fn check_forge_binding(
+        &self,
+        binding: &ForgeBinding,
+        retained: &super::publish::Publication,
+    ) -> Result<()> {
+        let (profile, task) = self.forge_parts(binding)?;
+        let candidate = retained
+            .manifest()?
+            .candidate
+            .ok_or_else(|| HubError::Invalid("bound candidate missing".into()))?;
+        if retained.owner != binding.actor.user_id()
+            || retained.repository != binding.repository
+            || candidate.subject.id != binding.request.candidate_id
+            || candidate.subject.attachment != binding.attachment
+        {
+            return Err(HubError::Unauthorized);
+        }
+        self.current_candidate(
+            &binding.actor,
+            &task,
+            &profile,
+            &binding.attachment,
+            binding.request.expected_generation,
+            &candidate.subject,
+        )
+    }
+
+    pub(super) fn bound_native_state(
+        &self,
+        binding: &ForgeBinding,
+        retained: &super::publish::Publication,
+        requested_profile: &super::workspace_execution::AgentTaskProfile,
+    ) -> super::forge_check::NativeState {
+        use super::forge_check::NativeState;
+        let result = (|| -> Result<NativeState> {
+            let (profile, task) = self.forge_parts(binding)?;
+            if task.profile_id != requested_profile.profile_id
+                || task.repository_id != requested_profile.repository_id
+            {
+                return Err(HubError::Unauthorized);
+            }
+            self.check_forge_binding(binding, retained)?;
+            let subject = retained
+                .manifest()?
+                .candidate
+                .ok_or(HubError::Unauthorized)?
+                .subject;
+            let context = task.action_subject(&RunSubject {
+                change_id: subject.change.id.clone(),
+                change_version: subject.change_version,
+                context_digest: subject.context_digest.clone(),
+                revision: subject.revision.clone(),
+                requirement_digest: task.requirement_digest.clone(),
+            })?;
+            let (_, guard) = self.task_parts(&binding.actor, &profile.repository_id, &task)?;
+            let clock = Clock;
+            let service = publication(AgentTaskService::new_with_collector_authorization(
+                &task.data_dir,
+                &task.profile_id,
+                &clock,
+                &guard,
+            ))?;
+            publication(service.with_live_imported_origins(
+                &binding.actor.authorization_identity(),
+                &context,
+                CollectorAction::PublishCandidate,
+                |origins| {
+                    Ok(super::forge_check::native_state_with_origins(
+                        &task, &subject, origins,
+                    ))
+                },
+            ))
+        })();
+        match result {
+            Ok(state) => state,
+            Err(HubError::Unauthorized | HubError::Invalid(_)) => {
+                NativeState::Stale("publication authorization revoked or subject stale")
+            }
+            Err(_) => NativeState::Unavailable("publication authorization unavailable"),
+        }
+    }
+
+    fn forge_publication(&self, binding: &ForgeBinding) -> Result<super::publish::NewPublication> {
+        use super::publish::{
+            Candidate, Change, Manifest, NewPublication, Person, derive_candidate_id,
+        };
+        let (profile, task) = self.forge_parts(binding)?;
+        let request = &binding.request;
+        operation_id(
+            binding.actor.user_id(),
+            &binding.attachment,
+            &request.request_id,
+        )?;
+        let prepare = operation_id(
+            binding.actor.user_id(),
+            &binding.attachment,
+            &request.prepare_request_id,
+        )?;
+        let branch = operation_id(
+            binding.actor.user_id(),
+            &binding.attachment,
+            &request.branch_request_id,
+        )?;
+        let mirror = publication(Mirror::open(
+            &profile.git,
+            &profile.mirror,
+            &task.native_repository,
+        ))?;
+        let candidate = publication(mirror.retained_candidate_operation(&prepare))?
+            .ok_or(HubError::Unauthorized)?;
+        let input =
+            publication(mirror.candidate_binding_input(&branch))?.ok_or(HubError::Unauthorized)?;
+        let config =
+            crate::store::digest(&serde_json::to_vec(&profile).map_err(crate::Error::from)?);
+        if candidate.subject.id != request.candidate_id
+            || input["config_digest"] != config
+            || input["actor"]
+                != serde_json::to_value(binding.actor.authorization_identity())
+                    .map_err(crate::Error::from)?
+            || input["repository_id"] != binding.repository
+            || input["profile_id"] != binding.profile
+            || input["attachment_id"] != binding.attachment
+            || input["request"]["prepare_request_id"] != request.prepare_request_id
+            || input["request"]["candidate_id"] != request.candidate_id
+            || input["request"]["expected_generation"] != request.expected_generation
+        {
+            return Err(HubError::Unauthorized);
+        }
+        let receipt = publication(mirror.remote_lookup(&branch))?.ok_or(HubError::Unauthorized)?;
+        if !matches!(
+            receipt.state,
+            RemoteState::Published | RemoteState::ObservedDesired
+        ) || !matches!(&receipt.request, RemoteRequest::PublishCandidate { candidate_id, .. } if candidate_id == &request.candidate_id)
+        {
+            return Err(HubError::Invalid(
+                "branch publication is not confirmed".into(),
+            ));
+        }
+        self.current_candidate(
+            &binding.actor,
+            &task,
+            &profile,
+            &binding.attachment,
+            request.expected_generation,
+            &candidate.subject,
+        )?;
+        let export = publication(mirror.candidate_publication(&request.candidate_id))?;
+        if export.commit != receipt.commit {
+            return Err(HubError::Invalid("branch receipt commit differs".into()));
+        }
+        let mut changes = Vec::new();
+        for change in export.changes {
+            let sha256 = change
+                .blob
+                .as_ref()
+                .map(|oid| {
+                    mirror
+                        .blob(oid, change.size)
+                        .map(|bytes| crate::store::digest(&bytes))
+                })
+                .transpose()?;
+            changes.push(Change {
+                path: change.path,
+                mode: change.mode,
+                blob: change.blob,
+                sha256,
+                size: change.size,
+            });
+        }
+        let person = |p: crate::git_export::publish::Person| Person {
+            name: p.name,
+            email: p.email,
+            date: p.date,
+        };
+        let new = NewPublication {
+            id: derive_candidate_id(
+                &binding.repository,
+                &request.candidate_id,
+                &export.commit,
+                &profile.output,
+            ),
+            manifest: Manifest {
+                revision: export.revision,
+                event_seq: None,
+                candidate: Some(Candidate {
+                    subject: candidate.subject,
+                    endpoint: profile.endpoint,
+                    previous_publication: request.previous_publication.clone(),
+                }),
+                commit: export.commit,
+                tree: export.tree,
+                parent: export.parent,
+                branch: profile.output,
+                base: profile.target,
+                title: request.title.clone(),
+                body: request.body.clone(),
+                author: person(export.author),
+                committer: person(export.committer),
+                message: export.message,
+                changes,
+            },
+        };
+        new.validate(&binding.repository)?;
+        Ok(new)
+    }
+}
+
+async fn forge_publish(
+    State(state): State<HubState>,
+    actor: WorkspaceActor,
+    Path((repository, profile, attachment)): Path<(String, String, String)>,
+    JsonBody(request): JsonBody<ForgeRequest>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    forge_call(state, actor, repository, profile, attachment, request)
+        .await
+        .map(Json)
+}
+
+async fn forge_call(
+    state: HubState,
+    actor: WorkspaceActor,
+    repository: String,
+    profile: String,
+    attachment: String,
+    request: ForgeRequest,
+) -> std::result::Result<serde_json::Value, ApiError> {
+    let service = state
+        .workspace_execution
+        .clone()
+        .ok_or(HubError::Unauthorized)?;
+    let (publication_profile, task) =
+        service.publication_profile(&repository, &profile, &attachment)?;
+    let binding = ForgeBinding {
+        actor: actor.clone(),
+        repository: repository.clone(),
+        profile,
+        attachment,
+        config_digest: forge_config(&publication_profile, &task)?,
+        request,
+    };
+    let principal = forge_principal(&state, &actor, &repository).await?;
+    let (_, connected) = super::publish::target(&state, &principal, true, true).await?;
+    // Admission and execution use the same lock as provider sync; never retain a workspace guard.
+    let lock = state.sync.lock_repo(&connected.id).await;
+    let b = binding.clone();
+    let new = blocking(&state, move || service.forge_publication(&b))
+        .await
+        .map_err(super::workspace::api_error)?;
+    let (host, full) = super::publish::candidate_repository(
+        &new.manifest
+            .candidate
+            .as_ref()
+            .ok_or(HubError::Unauthorized)?
+            .endpoint,
+    )?;
+    if host != connected.host || full != connected.full_name {
+        return Err(HubError::Unauthorized.into());
+    }
+    let store = state.store.clone();
+    let encoded = serde_json::to_string(&binding)
+        .map_err(|_| HubError::Invalid("binding encoding failed".into()))?;
+    let retained = blocking(&state, move || {
+        store.create_bound_publication(
+            &principal.token_id,
+            &new,
+            Some(&encoded),
+            super::store::unix_now(),
+        )
+    })
+    .await?;
+    let super::publish::Create::Done(retained) = retained else {
+        return Err(HubError::Invalid("publication binding conflicts".into()).into());
+    };
+    drop(lock);
+    let job = tokio::spawn(super::publish::execute(state, connected, retained, false));
+    let retained = job
+        .await
+        .map_err(|_| HubError::Unavailable("publication task failed".into()))??;
+    Ok(retained.to_json())
+}
+
+async fn forge_principal(
+    state: &HubState,
+    actor: &WorkspaceActor,
+    repository: &str,
+) -> Result<super::store::Principal> {
+    let identity = actor.agent_identity()?;
+    let digest = super::store::TokenDigest::from_persisted(&identity.agent_id)?;
+    let store = state.store.clone();
+    let principal = blocking(state, move || {
+        store.authenticate(&digest, super::store::unix_now())
+    })
+    .await?
+    .ok_or(HubError::Unauthorized)?;
+    if principal.owner.id != actor.user_id() || principal.repository != repository {
+        return Err(HubError::Unauthorized);
+    }
+    Ok(principal)
+}
+
+async fn forge_recover(
+    State(state): State<HubState>,
+    actor: WorkspaceActor,
+    Path((repository, profile, attachment)): Path<(String, String, String)>,
+    JsonBody(request): JsonBody<RecoverForgeRequest>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    forge_recover_call(state, actor, repository, profile, attachment, request)
+        .await
+        .map(Json)
+}
+
+async fn forge_recover_call(
+    state: HubState,
+    actor: WorkspaceActor,
+    repository: String,
+    profile: String,
+    attachment: String,
+    request: RecoverForgeRequest,
+) -> std::result::Result<serde_json::Value, ApiError> {
+    let service = state
+        .workspace_execution
+        .clone()
+        .ok_or(HubError::Unauthorized)?;
+    let (p, _) = service.publication_profile(&repository, &profile, &attachment)?;
+    if p.owner_id != actor.user_id() {
+        return Err(HubError::Unauthorized.into());
+    }
+    service.workspace.authorize(
+        &actor,
+        &repository,
+        super::workspace::WorkspaceAction::ReadRepository,
+    )?;
+    let principal = forge_principal(&state, &actor, &repository).await?;
+    let store = state.store.clone();
+    let repo = repository.clone();
+    let retained = blocking(&state, move || {
+        store.publication(&repo, &request.publication_id)
+    })
+    .await?
+    .ok_or(HubError::Unauthorized)?;
+    let binding: ForgeBinding = serde_json::from_str(
+        retained
+            .authorization_binding
+            .as_deref()
+            .ok_or(HubError::Unauthorized)?,
+    )
+    .map_err(|_| HubError::Unauthorized)?;
+    if binding.repository != repository
+        || binding.profile != profile
+        || binding.attachment != attachment
+        || retained.owner != actor.user_id()
+    {
+        return Err(HubError::Unauthorized.into());
+    }
+    let (_, connected) = super::publish::target(&state, &principal, false, true).await?;
+    let retained = super::publish::execute(state, connected, retained, true).await?;
+    Ok(retained.to_json())
+}
+
+fn forge_schema() -> serde_json::Value {
+    json!({"type":"object","additionalProperties":false,
+        "required":["request_id","prepare_request_id","branch_request_id","candidate_id","expected_generation","title","body"],
+        "properties":{"request_id":{"type":"string"},"prepare_request_id":{"type":"string"},"branch_request_id":{"type":"string"},"candidate_id":{"type":"string"},"expected_generation":{"type":"integer","minimum":0},"title":{"type":"string","minLength":1,"maxLength":256},"body":{"type":"string","maxLength":65536},"previous_publication":{"type":["string","null"]}}})
+}
+fn forge_recover_schema() -> serde_json::Value {
+    json!({"type":"object","additionalProperties":false,"required":["publication_id"],"properties":{"publication_id":{"type":"string"}}})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1062,6 +1532,27 @@ mod tests {
             false
         );
         assert_eq!(publish_branch_schema()["additionalProperties"], false);
+        assert_eq!(forge_schema()["additionalProperties"], false);
+        assert_eq!(forge_recover_schema()["additionalProperties"], false);
+        let request = json!({"request_id":"forge", "prepare_request_id":"prepare", "branch_request_id":"branch", "candidate_id":"candidate", "expected_generation":1, "title":"title", "body":""});
+        assert!(serde_json::from_value::<ForgeRequest>(request.clone()).is_ok());
+        for field in [
+            "endpoint",
+            "worktree",
+            "credential_file",
+            "branch",
+            "authorization_binding",
+        ] {
+            let mut injected = request.clone();
+            injected[field] = json!("untrusted");
+            assert!(serde_json::from_value::<ForgeRequest>(injected).is_err());
+        }
+        assert!(
+            serde_json::from_value::<RecoverForgeRequest>(
+                json!({"publication_id":"pub", "create":true})
+            )
+            .is_err()
+        );
         assert!(serde_json::from_value::<PrepareRequest>(json!({
             "request_id":"request","expected_generation":1,
             "subject":{"change_id":"change","change_version":1,"context_digest":"a".repeat(64),

@@ -126,6 +126,8 @@ pub struct Publication {
     /// The token's name and its owner's login, for the pull request footer.
     pub agent: String,
     pub owner_login: String,
+    /// Server-owned bounded JSON; never accepted from or exposed as a client manifest.
+    pub authorization_binding: Option<String>,
     pub revision: String,
     pub event_seq: Option<i64>,
     pub commit: String,
@@ -654,7 +656,7 @@ impl Publication {
 pub(super) const PUBLICATION_SELECT: &str = "SELECT p.id, p.repository, p.token, t.name, u.login,
         p.revision, p.event_seq, p.commit_sha, p.branch, p.base, CASE WHEN octet_length(p.manifest)<=2097152 THEN p.manifest END, p.branch_state,
         p.branch_message, p.pr_number, p.pr_node_id, p.pr_url, p.merge_commit, p.error,
-        p.created_at, p.updated_at, t.owner
+        p.created_at, p.updated_at, t.owner, CASE WHEN p.authorization_binding IS NULL THEN NULL WHEN octet_length(p.authorization_binding)<=65536 THEN p.authorization_binding ELSE 'invalid oversized binding' END
     FROM hub_publications p JOIN hub_agent_tokens t ON t.id = p.token
     JOIN hub_users u ON u.id = t.owner";
 
@@ -693,7 +695,7 @@ fn blob_key(publication: &str, sha256: &str) -> Result<ObjectKey> {
 
 /// The connected repository and its connection for `principal`; 409 unless connected
 /// (and, with `outbound`, the connection has opted in to writes).
-async fn target(
+pub(super) async fn target(
     state: &HubState,
     principal: &Principal,
     outbound: bool,
@@ -1200,6 +1202,9 @@ async fn run(
     scope(&principal, &repo)?;
     let publication = load(&state, &repo, &id).await?;
     owned(&principal, &publication)?;
+    if publication.authorization_binding.is_some() {
+        return Err(conflict("workspace_publication_required"));
+    }
     let candidate = publication.manifest()?.candidate.is_some();
     let (_, repository) = target(&state, &principal, true, candidate).await?;
     if !missing_blobs(&state, &publication).await?.is_empty() {
@@ -1222,6 +1227,9 @@ async fn recover(
     scope(&principal, &repo)?;
     let publication = load(&state, &repo, &id).await?;
     owned(&principal, &publication)?;
+    if publication.authorization_binding.is_some() {
+        return Err(conflict("workspace_publication_required"));
+    }
     if publication.manifest()?.candidate.is_none() {
         return Err(conflict("candidate_required"));
     }
@@ -1254,7 +1262,7 @@ impl From<HubError> for Stop {
 
 /// Runs the forge steps for `publication` under the repository's lock, which sync of that
 /// repository also takes: it waits for a run in progress.
-async fn execute(
+pub(super) async fn execute(
     state: HubState,
     repository: ConnectedRepository,
     publication: Publication,
@@ -1719,8 +1727,12 @@ async fn candidate_pull(
                     "connection no longer permits publication".into(),
                 ));
             }
+            bound_effect(state, publication).await?;
             record(state, &publication.id, Update::BranchCreated).await?;
             record(state, &publication.id, Update::PullRequestAttempt).await?;
+            // Reservation is durable even if authorization changes while writing it. Never
+            // dispatch from the earlier check after those database awaits.
+            bound_effect(state, publication).await?;
             let result = api
                 .create_candidate_pull(
                     &token,
@@ -1782,6 +1794,9 @@ async fn candidate_pull(
         },
     )
     .await?;
+    if !recovery {
+        bound_effect(state, publication).await?;
+    }
     if api
         .ref_sha(&token, repository, &manifest.base)
         .await?
@@ -1796,6 +1811,29 @@ async fn candidate_pull(
         return Err(Stop::Message(
             "historical PR receipt: source/target changed after effect".into(),
         ));
+    }
+    Ok(())
+}
+
+/// Fresh dispatch authorization; no workspace mutex spans provider I/O.
+async fn bound_effect(state: &HubState, publication: &Publication) -> Result<()> {
+    #[cfg(unix)]
+    if let Some(binding) = &publication.authorization_binding {
+        let binding: super::workspace_publication::ForgeBinding = serde_json::from_str(binding)
+            .map_err(|_| invalid("invalid retained publication binding"))?;
+        let service = state
+            .workspace_execution
+            .clone()
+            .ok_or_else(|| invalid("publication executor unavailable"))?;
+        let publication = publication.clone();
+        blocking(state, move || {
+            service.check_forge_binding(&binding, &publication)
+        })
+        .await?;
+    }
+    #[cfg(not(unix))]
+    if publication.authorization_binding.is_some() {
+        return Err(invalid("publication executor unavailable"));
     }
     Ok(())
 }
