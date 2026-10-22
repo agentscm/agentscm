@@ -24,6 +24,9 @@ use super::coordination::{
     MAX_PROJECTED_COORDINATION_UPDATES, parse_response_kind, parse_status, response_kind_name,
     status_name,
 };
+use super::external_runs::{
+    EXTERNAL_RUN_COLUMNS, ExternalKind, ExternalObserved, ExternalOutcome, ExternalRun, supersedes,
+};
 use super::handoff::{
     Answered, Asked, HandoffNote, MAX_OPEN, PER_TOUCH, Request, Verdict, answer_kind, clean_note,
     cutoff, file_key, grant_call, judge, remaining, still_holds,
@@ -2247,6 +2250,30 @@ fn active_token(tx: &mut postgres::Transaction<'_>, token: &str, now: i64) -> Re
     })
 }
 
+fn external_run_row(row: &postgres::Row) -> Result<ExternalRun> {
+    let (Some(kind), Some(outcome)) = (
+        ExternalKind::parse(row.get(1)),
+        ExternalOutcome::parse(row.get(8)),
+    ) else {
+        return Err(HubError::Unavailable(
+            "stored external run is invalid".into(),
+        ));
+    };
+    Ok(ExternalRun {
+        provider: row.get(0),
+        kind,
+        run_id: row.get(2),
+        attempt: row.get(3),
+        commit_sha: row.get(4),
+        branch: row.get(5),
+        environment: row.get(6),
+        name: row.get(7),
+        outcome,
+        provider_updated_at: row.get(9),
+        html_url: row.get(10),
+    })
+}
+
 fn publication_row(row: &postgres::Row) -> Result<Publication> {
     Ok(Publication {
         id: row.get(0),
@@ -4339,6 +4366,139 @@ impl Store for PgStore {
                  WHERE repository = $1 AND number = $2 AND context = $3 AND generation = $4",
                 &[&repo, &number, &context, &generation, &now, &phase],
             )? == 1)
+        })
+    }
+
+    fn observe_external_run(&self, repo: &str, run: &ExternalRun) -> Result<ExternalObserved> {
+        run.validate()?;
+        let kind = run.kind.as_str();
+        let outcome = run.outcome.as_str();
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            // The repository row lock serializes its observations.
+            repository_by_rep(&mut tx, repo)?;
+            let stored = tx
+                .query_opt(
+                    &format!(
+                        "SELECT {EXTERNAL_RUN_COLUMNS} FROM hub_external_runs
+                         WHERE repository = $1 AND provider = $2 AND kind = $3 AND run_id = $4
+                             AND attempt = $5"
+                    ),
+                    &[&repo, &run.provider, &kind, &run.run_id, &run.attempt],
+                )?
+                .map(|row| external_run_row(&row))
+                .transpose()?;
+            match &stored {
+                Some(stored) if stored == run => return Ok(ExternalObserved::Unchanged),
+                Some(stored) if !supersedes(stored, run) => return Ok(ExternalObserved::Stale),
+                _ => {}
+            }
+            tx.execute(
+                "INSERT INTO hub_external_runs (repository, provider, kind, run_id, attempt,
+                     commit_sha, branch, environment, name, outcome, provider_updated_at,
+                     html_url)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                 ON CONFLICT (repository, provider, kind, run_id, attempt) DO UPDATE SET
+                     commit_sha = excluded.commit_sha, branch = excluded.branch,
+                     environment = excluded.environment, name = excluded.name,
+                     outcome = excluded.outcome,
+                     provider_updated_at = excluded.provider_updated_at,
+                     html_url = excluded.html_url",
+                &[
+                    &repo,
+                    &run.provider,
+                    &kind,
+                    &run.run_id,
+                    &run.attempt,
+                    &run.commit_sha,
+                    &run.branch,
+                    &run.environment,
+                    &run.name,
+                    &outcome,
+                    &run.provider_updated_at,
+                    &run.html_url,
+                ],
+            )?;
+            append(&mut tx, &Event::external_run_observed(repo, run)?)?;
+            tx.commit()?;
+            Ok(ExternalObserved::Changed)
+        })
+    }
+
+    fn external_runs(
+        &self,
+        repo: &str,
+        commit_sha: &str,
+        limit: usize,
+    ) -> Result<Vec<ExternalRun>> {
+        self.run(true, |client| {
+            let limit = limit as i64;
+            client
+                .query(
+                    &format!(
+                        "SELECT {EXTERNAL_RUN_COLUMNS} FROM hub_external_runs
+                         WHERE repository = $1 AND commit_sha = $2
+                         ORDER BY kind, COALESCE(environment, ''), run_id, attempt LIMIT $3"
+                    ),
+                    &[&repo, &commit_sha, &limit],
+                )?
+                .iter()
+                .map(external_run_row)
+                .collect()
+        })
+    }
+
+    fn mark_external_reconciled(
+        &self,
+        repo: &str,
+        commit_sha: &str,
+        at: i64,
+        complete: bool,
+    ) -> Result<()> {
+        self.run(false, |client| {
+            client.execute(
+                "INSERT INTO hub_external_reconciles
+                     (repository, commit_sha, reconciled_at, complete)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (repository, commit_sha) DO UPDATE SET
+                     reconciled_at = excluded.reconciled_at, complete = excluded.complete",
+                &[&repo, &commit_sha, &at, &complete],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn external_reconciled(&self, repo: &str, commit_sha: &str) -> Result<Option<(i64, bool)>> {
+        self.run(true, |client| {
+            Ok(client
+                .query_opt(
+                    "SELECT reconciled_at, complete FROM hub_external_reconciles
+                     WHERE repository = $1 AND commit_sha = $2",
+                    &[&repo, &commit_sha],
+                )?
+                .map(|row| (row.get(0), row.get(1))))
+        })
+    }
+
+    fn merged_publications(
+        &self,
+        repository: &str,
+        after: &str,
+        limit: usize,
+    ) -> Result<Vec<Publication>> {
+        self.run(true, |client| {
+            let limit = limit as i64;
+            client
+                .query(
+                    &format!(
+                        "{PUBLICATION_SELECT} WHERE lower(p.repository) = lower($1) AND p.id > $2
+                         AND p.merge_commit IS NOT NULL ORDER BY p.id LIMIT $3"
+                    ),
+                    &[&repository, &after, &limit],
+                )?
+                .iter()
+                .map(publication_row)
+                .collect()
         })
     }
 

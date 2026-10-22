@@ -3,6 +3,7 @@ pub mod advice;
 pub mod connection;
 pub mod coordination;
 mod coordination_http;
+pub mod external_runs;
 pub mod forge_api;
 #[cfg(unix)]
 pub mod forge_check;
