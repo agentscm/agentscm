@@ -177,3 +177,5 @@ export type SkillWorkflowListEnvelope =
 export type SkillWorkflowEnvelope =
   | { version: 1; availability: 'available'; projection: SkillWorkflowProjection }
   | { version: 1; availability: 'unavailable'; reason: string }
+
+export interface ViewSettings { enabled: boolean; work_overview: boolean; coordination_inbox: boolean }

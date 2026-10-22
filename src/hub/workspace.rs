@@ -1040,6 +1040,10 @@ pub fn routes() -> Router<HubState> {
             "/v1/hub/workspace/settings",
             get(get_settings).put(update_settings),
         )
+        .route(
+            "/v1/hub/workspace/view-settings",
+            axum::routing::put(put_view_settings),
+        )
 }
 type ApiResult<T> = std::result::Result<T, ApiError>;
 fn configured(state: &HubState) -> ApiResult<Arc<Workspace>> {
@@ -1146,6 +1150,23 @@ async fn put_members(
         .await
         .map_err(api_error)?;
     Ok(Json(json!({"generation":generation})))
+}
+async fn put_view_settings(
+    State(state): State<HubState>,
+    actor: WorkspaceActor,
+    JsonBody(settings): JsonBody<super::view_settings::ViewSettings>,
+) -> ApiResult<Json<super::view_settings::ViewSettings>> {
+    let workspace = configured(&state)?;
+    let store = state.store.clone();
+    blocking(&state, move || {
+        let conn = workspace.conn()?;
+        let member = workspace.require_admin(&conn, &actor)?;
+        super::view_settings::ViewSettings::save(&*store, &settings, &member.identity.key()?)?;
+        Ok(settings)
+    })
+    .await
+    .map(Json)
+    .map_err(api_error)
 }
 async fn update_settings(
     State(state): State<HubState>,

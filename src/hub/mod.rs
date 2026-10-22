@@ -25,6 +25,7 @@ mod store_pg;
 mod store_sqlite;
 pub mod sync;
 mod ui;
+pub mod view_settings;
 pub mod work;
 pub mod work_http;
 pub mod workspace;

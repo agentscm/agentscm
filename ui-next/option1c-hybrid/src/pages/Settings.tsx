@@ -1,5 +1,6 @@
 import type { ThemePref } from '../../../../ui/src/storage.ts'
 import type { Whoami } from '../../../../ui/src/types.ts'
+import { ViewSettingsBox } from '../ViewSettings.tsx'
 import { Box, Icon, Pill, Skeleton, localDate } from '../ui.tsx'
 
 const CADENCE = [
@@ -8,7 +9,7 @@ const CADENCE = [
   ['heart-pulse', 'Hub health', 'Every 15 seconds'],
 ] as const
 
-export function SettingsPage({ whoami, pref, onPref, railCollapsed, onRail, onForget }: { whoami: Whoami | null; pref: ThemePref; onPref: (p: ThemePref) => void; railCollapsed: boolean; onRail: (collapsed: boolean) => void; onForget: () => void }) {
+export function SettingsPage({ token, whoami, pref, onPref, railCollapsed, onRail, onForget }: { token: string; whoami: Whoami | null; pref: ThemePref; onPref: (p: ThemePref) => void; railCollapsed: boolean; onRail: (collapsed: boolean) => void; onForget: () => void }) {
   const themes: { v: ThemePref; icon: string; label: string; hint: string }[] = [
     { v: 'light', icon: 'sun', label: 'Light', hint: 'Always light' },
     { v: 'system', icon: 'circle-half', label: 'System', hint: 'Follows your device' },
@@ -18,7 +19,7 @@ export function SettingsPage({ whoami, pref, onPref, railCollapsed, onRail, onFo
     <div className="page">
       <div className="answer">
         <h1 className="page-question">How is this page set up for me?</h1>
-        <p className="answer-text">These settings live in this browser only. Nothing here changes the hub, your agents or your token.</p>
+        <p className="answer-text">Appearance and token settings live in this browser only and never change the hub. Inline agent views are a hub setting shared by everyone.</p>
       </div>
       <div className="stack">
         <Box icon="palette" title="Appearance" explain="Saved in this browser. Other people see their own choice.">
@@ -73,6 +74,8 @@ export function SettingsPage({ whoami, pref, onPref, railCollapsed, onRail, onFo
             </button>
           </div>
         </Box>
+
+        <ViewSettingsBox token={token} />
 
         <Box icon="arrow-repeat" title="Refresh" explain="Refreshing pauses while this tab is hidden and slows down after errors. A failed refresh keeps the last data and labels it.">
           <ul className="cadence">

@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Work overview</title>
+<style>
+:root{--bg:#fff;--card:#fff;--fg:#1c1b22;--mut:#5d5b6b;--bd:#e3e1ec;--acc:#6d4aff;--accbg:#efeaff;--ok:#1b7a43;--okbg:#e5f5ec;--warn:#8a5a00;--warnbg:#fff3d6;--bad:#b3261e;--badbg:#fde8e6;color-scheme:light}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#15141a;--card:#1d1b25;--fg:#ececf3;--mut:#a9a6b8;--bd:#34314a;--acc:#a28cff;--accbg:#2c2550;--ok:#6fd49a;--okbg:#17301f;--warn:#f1c36a;--warnbg:#38290a;--bad:#ff8f87;--badbg:#3d1916;color-scheme:dark}}
+:root[data-theme=dark]{--bg:#15141a;--card:#1d1b25;--fg:#ececf3;--mut:#a9a6b8;--bd:#34314a;--acc:#a28cff;--accbg:#2c2550;--ok:#6fd49a;--okbg:#17301f;--warn:#f1c36a;--warnbg:#38290a;--bad:#ff8f87;--badbg:#3d1916;color-scheme:dark}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+.card{margin:8px;padding:14px;background:var(--card);border:.5px solid var(--bd);border-radius:12px}
+header{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+h1{font-size:15px;margin:0;font-weight:650}h2{font-size:13px;margin:16px 0 6px;color:var(--mut);font-weight:650;text-transform:uppercase;letter-spacing:.04em}
+.sp{flex:1}.mut{color:var(--mut)}button{font:inherit;color:var(--acc);background:var(--accbg);border:.5px solid var(--acc);border-radius:8px;padding:4px 12px;cursor:pointer}
+button:focus-visible,summary:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+.tiles{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.tile{border:.5px solid var(--bd);border-radius:10px;padding:8px 10px}
+.num{font-size:28px;font-weight:650;line-height:1.1}.warn{background:var(--warnbg);color:var(--warn);border-radius:8px;padding:6px 10px;margin:8px 0}
+.note{color:var(--mut);margin:4px 0}ul{margin:0;padding:0;list-style:none}li.att{padding:5px 0;border-bottom:.5px solid var(--bd)}
+.row{display:flex;gap:10px;align-items:center;padding:8px 0;border-bottom:.5px solid var(--bd)}.row:last-child{border:0}
+.av{flex:none;width:30px;height:30px;border-radius:50%;background:var(--accbg);color:var(--acc);display:grid;place-items:center;font-weight:650;font-size:13px}
+.main{flex:1;min-width:0}.t{font-size:15px;font-weight:600;overflow-wrap:anywhere}.s{color:var(--mut);overflow-wrap:anywhere}
+.right{flex:none;text-align:right}.pill{display:inline-block;border-radius:999px;padding:1px 9px;font-size:13px;background:var(--accbg);color:var(--acc);white-space:nowrap}
+.pill.ok{background:var(--okbg);color:var(--ok)}.pill.warn{background:var(--warnbg);color:var(--warn)}.pill.bad{background:var(--badbg);color:var(--bad)}
+.dots{display:inline-flex;gap:4px;vertical-align:middle;margin-right:6px}.dot{width:9px;height:9px;border-radius:50%;border:1px solid var(--acc)}.dot.on{background:var(--acc)}
+details{margin-top:6px}summary{cursor:pointer;color:var(--acc)}footer{margin-top:14px;color:var(--mut)}.quiet{margin-top:8px;font-size:13px;color:var(--mut)}
+@media (max-width:420px){.tiles{grid-template-columns:1fr}.row{flex-wrap:wrap}.right{text-align:left}}
+</style></head><body><div class="card" id="app"></div>
+<script>
+"use strict";
+var TOOL='agentscm_work_overview';
+var STATE={active:['In progress','▶',''],blocked:['Blocked','⊘','bad'],handover:['Handover','⇄','warn'],paused:['Paused','‖','warn']};
+function who(i){return i.lead_agent||i.owner_login||'unknown agent'}
+function initials(n){var p=String(n).split(/[\s._-]+/).filter(Boolean);return ((p[0]||'?')[0]+(p[1]?p[1][0]:'')).toUpperCase()}
+function render(root,d,at){
+var cur=Array.isArray(d.current)?d.current:[],ov=Array.isArray(d.overlaps)?d.overlaps:[],rec=Array.isArray(d.recent)?d.recent:[];
+var n=function(s){return cur.filter(function(i){return i.state===s}).length};
+var hd=h('header');add(hd,h('h1',null,'Work overview'),h('span','sp'),h('span','mut','Updated '+pad(at.getHours())+':'+pad(at.getMinutes())),refreshBtn());add(root,hd,failNote());
+if(d.current_complete===false)add(root,h('div','warn','⚠ Showing a partial list.'));
+var tl=h('div','tiles');
+[['Working',n('active'),'▶',''],['Blocked',n('blocked'),'⊘',''],['Overlap to settle',ov.length+(d.overlaps_complete===false?'+':''),'≠',d.overlaps_complete===false?'Check incomplete':'']].forEach(function(t){var x=h('div','tile');add(x,h('div','num',t[1]),h('div','mut',t[2]+' '+t[0]),t[3]?h('div','mut',t[3]):null);tl.appendChild(x)});add(root,tl);
+add(root,h('h2',null,'Needs attention'));var ul=h('ul'),k=0;
+ov.forEach(function(p){var ps=(p.reasons||[]).map(function(r){return r.left_path===r.right_path?r.left_path:r.left_path+' / '+r.right_path});
+var shown=ps.slice(0,3).map(clip).join(', ')||'a path';var more=ps.length>3?' and '+(ps.length-3)+' more':'';
+var li=h('li','att','≠ '+who(p.left)+' and '+who(p.right)+' both declare '+shown+more+(p.reasons_complete===false?' (more paths not shown)':'')+'. ');add(li,h('span','mut','Coordination signal, not a Git conflict.'));ul.appendChild(li);k++});
+cur.forEach(function(i){var w=who(i),t=clip(i.title),s=null;
+if(i.state==='blocked')s='⊘ '+w+' is blocked on “'+t+'”'+(i.blocker&&i.blocker.summary?': '+clip(i.blocker.summary):'')+'.';
+else if(i.state==='paused'||i.state==='handover')s='⇄ “'+t+'” is still assigned to '+w+', who '+(i.state==='paused'?'paused':'handed over')+'. The claim stays claimed.';
+else if(i.claim_status==='stale'||i.claim_status==='unknown')s='⏱ “'+t+'” has a '+i.claim_status+' claim by '+w+'. The claim stays claimed.';
+if(s){ul.appendChild(h('li','att',s));k++}});
+if(!k)ul.appendChild(h('li','att',d.overlaps_complete===false||d.current_complete===false?'Nothing flagged in the data shown.':'Nothing needs attention.'));add(root,ul,h('h2',null,'All work'));
+if(!cur.length)add(root,h('p','note','No current work reported.'));
+cur.forEach(function(i){var st=STATE[i.state]||[String(i.state),'●',''],w=who(i),r=h('div','row'),m=h('div','main'),x=h('div','right');
+add(m,h('div','t',clip(i.title)),h('div','s',clip(w)+' · Next: '+(i.next_action?clip(i.next_action):'none reported')),i.claim_status!=='active'?h('div','s','Claim '+i.claim_status+' · stays claimed'):null);
+add(x,pill(st[2],st[1],st[0]),h('div','s',ago(i.last_checkin_at)));add(r,h('div','av',initials(w)),m,x);root.appendChild(r)});
+if(d.history_retention_gap)add(root,h('div','warn','⚠ Some history is no longer retained, so recently finished work may be missing.'));
+var dt=h('details');add(dt,h('summary',null,'Recently finished ('+rec.length+')'));
+rec.forEach(function(o){var i=o.item||{},r=h('div','row'),m=h('div','main');add(m,h('div','t',clip(i.title)),h('div','s',clip(who(i))+' · '+(o.kind==='decision'?'Decision':'Completed')));add(r,m,h('div','s',ago(o.at)));dt.appendChild(r)});
+if(d.recent_complete===false)add(dt,h('p','note','This list may be partial.'));add(root,dt);
+add(root,h('footer',null,'Read-only. Stale claims stay claimed. '+(d.overlaps_complete===false?'⚠ Overlap check incomplete':'✓ Overlap check complete')),h('div','quiet',manage))}
+function h(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=String(text);return e}
+function add(p){for(var i=1;i<arguments.length;i++)if(arguments[i])p.appendChild(arguments[i]);return p}
+function clip(s){s=String(s==null?'':s);return s.length>300?s.slice(0,300)+'…':s}
+function pad(n){return n<10?'0'+n:''+n}
+function hms(d){return pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds())}
+function ago(at){var s=Math.max(0,Math.floor(Date.now()/1000-at));if(s<60)return 'just now';var m=Math.floor(s/60);if(m<60)return m+' min ago';var x=Math.floor(m/60);return x<24?x+' h ago':Math.floor(x/24)+' d ago'}
+function pill(cls,icon,label){return h('span','pill '+cls,icon+' '+label)}
+var nextId=1,pending={},last=null,lastAt=null,lastH=0;
+function send(m){window.parent.postMessage(m,'*')}
+function rpc(method,params){return new Promise(function(ok,no){var id=nextId++;pending[id]={ok:ok,no:no};send({jsonrpc:'2.0',id:id,method:method,params:params})})}
+function parse(r){if(!r||r.isError)return null;var s=r.structuredContent;if(s&&typeof s==='object')return s;var c=r.content;if(c&&c[0]&&typeof c[0].text==='string'){try{var v=JSON.parse(c[0].text);if(v&&typeof v==='object')return v}catch(e){}}return null}
+function theme(c){if(c&&(c.theme==='dark'||c.theme==='light'))document.documentElement.setAttribute('data-theme',c.theme)}
+function size(){var v=Math.ceil(document.body.scrollHeight);if(v!==lastH){lastH=v;send({jsonrpc:'2.0',method:'ui/notifications/size-changed',params:{height:v}})}}
+function paint(){var root=document.getElementById('app');root.textContent='';if(!last){add(root,h('p','note','No data returned.'))}else render(root,last,lastAt);size()}
+function take(r,silent){var d=parse(r);if(d){last=d;lastAt=new Date();failedAt=null;paint();return}if(silent){if(!last)paint();return}fail()}
+var failedAt=null;
+function fail(){failedAt=lastAt;paint()}
+function call(args,keep){return rpc('tools/call',{name:TOOL,arguments:args}).then(function(r){var d=parse(r);if(d){last=d;lastAt=new Date();failedAt=null;paint()}else fail()},fail)}
+function refreshBtn(){var b=h('button',null,'Refresh');b.type='button';b.addEventListener('click',function(){call({})});return b}
+function failNote(){return failedAt?h('div','warn','Could not refresh. Showing data from '+hms(failedAt)):null}
+window.addEventListener('message',function(e){if(e.source!==window.parent)return;var m=e.data;if(!m||m.jsonrpc!=='2.0')return;
+if(m.id!=null&&pending[m.id]&&!m.method){var p=pending[m.id];delete pending[m.id];if(m.error)p.no(m.error);else p.ok(m.result);return}
+if(m.method==='ui/notifications/tool-result')take(m.params,true);
+else if(m.method==='ui/notifications/host-context-changed')theme(m.params&&(m.params.theme?m.params:m.params.hostContext))});
+var manage='Manage these views: ask your agent to run agentscm_view_settings, or open Settings in the hub.';
+function start(){if(typeof ResizeObserver==='function')new ResizeObserver(size).observe(document.body);
+rpc('ui/initialize',{appInfo:{name:TOOL+'-view',version:'1.0.0'},appCapabilities:{},protocolVersion:'2026-01-26'}).then(function(r){theme(r&&r.hostContext);send({jsonrpc:'2.0',method:'ui/notifications/initialized',params:{}})},function(){});
+paint()}
+start();
+</script></body></html>

@@ -37,6 +37,7 @@ pub fn routes() -> Router<HubState> {
     Router::new()
         .route("/v1/hub/health", get(health))
         .route("/v1/hub/whoami", get(whoami))
+        .route("/v1/hub/view-settings", get(view_settings))
         .route("/v1/hub/skill-workflows", get(skill_workflows))
         .route("/v1/hub/skill-workflows/{run_id}", get(skill_workflow))
 }
@@ -360,6 +361,18 @@ async fn health(State(state): State<HubState>) -> Response {
                 .into_response()
         }
     }
+}
+
+async fn view_settings(
+    State(state): State<HubState>,
+    Reader(_): Reader,
+) -> std::result::Result<Json<super::view_settings::ViewSettings>, ApiError> {
+    let store = state.store.clone();
+    let settings = blocking(&state, move || {
+        super::view_settings::ViewSettings::load(&*store)
+    })
+    .await?;
+    Ok(Json(settings))
 }
 
 async fn whoami(Reader(principal): Reader) -> Json<serde_json::Value> {

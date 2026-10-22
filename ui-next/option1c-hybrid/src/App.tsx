@@ -121,7 +121,7 @@ function Shell({ token, dark, pref, onPref, onUnauthorized, onForget }: { token:
       {section === 'setup' && <SetupPage token={token} />}
       {section === 'workspace' && <WorkspacePage />}
       {section === 'health' && <HealthPage health={data.health} />}
-      {section === 'settings' && <SettingsPage whoami={data.whoami} pref={pref} onPref={onPref} railCollapsed={rail} onRail={changeRail} onForget={onForget} />}
+      {section === 'settings' && <SettingsPage token={token} whoami={data.whoami} pref={pref} onPref={onPref} railCollapsed={rail} onRail={changeRail} onForget={onForget} />}
     </AppChrome>
   )
 }
