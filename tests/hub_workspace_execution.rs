@@ -289,6 +289,38 @@ async fn agent_only_env(
     (env, installed.get().unwrap().clone())
 }
 
+async fn mixed_execution_env(
+    root: &std::path::Path,
+    native: &NativeSourceProfile,
+) -> (Env, Arc<ExecutionService>) {
+    let server = native.profile.clone();
+    let mut task = AgentTaskProfile::from(&server);
+    task.profile_id = "agent-checks".into();
+    let queue = root.join("mixed-execution.sqlite");
+    let installed = Arc::new(std::sync::OnceLock::new());
+    let retain = installed.clone();
+    let env = Env::with_state(move |state, workspace| {
+        let service = Arc::new(
+            ExecutionService::open(
+                &queue,
+                ExecutionConfig {
+                    attached_publication_profiles: vec![],
+                    version: 1,
+                    profiles: vec![server],
+                    source_profiles: vec![],
+                    agent_task_profiles: vec![task],
+                },
+                workspace,
+            )
+            .unwrap(),
+        );
+        retain.set(service.clone()).ok().unwrap();
+        state.with_workspace_execution(service)
+    })
+    .await;
+    (env, installed.get().unwrap().clone())
+}
+
 fn install_executor(native: &NativeSourceProfile) -> serde_json::Value {
     let public = SigningKey::from_bytes(&[7_u8; 32])
         .verifying_key()
@@ -4402,6 +4434,198 @@ async fn task_http_and_mcp_distinguish_invalid_claims_from_unavailable_journal()
 
 fn start_request(native: &NativeSourceProfile, generation: &Value, id: &str) -> Value {
     json!({"request_id":id,"expected_generation":generation,"profile_id":"checks","subject":native.subject})
+}
+
+#[tokio::test]
+async fn task_only_repository_exposes_authorized_empty_server_queue_without_enabling_dispatch() {
+    let root = tempfile::tempdir().unwrap();
+    let native = native_source_profile(root.path());
+    let (env, service) = agent_only_env(root.path(), &native).await;
+    assert!(!service.server_execution_enabled());
+    let (_, owner) = env.signin(101).await;
+    let session = env.session(&owner).await;
+    let csrf = session["csrf_token"].as_str().unwrap();
+
+    let repositories = env
+        .request(
+            Method::GET,
+            "/v1/hub/workspace/repositories",
+            Some(&owner),
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(repositories.0, 200, "{repositories:?}");
+    assert_eq!(
+        repositories.1["repositories"][0]["repository_id"],
+        "synthetic/project"
+    );
+    assert_eq!(
+        repositories.1["repositories"][0]["profiles"][0]["server_execution"],
+        false
+    );
+    assert_eq!(
+        env.request(
+            Method::GET,
+            &format!("{REPO}/runs"),
+            Some(&owner),
+            None,
+            None,
+            None
+        )
+        .await,
+        (200, json!({"runs":[],"next_cursor":null}))
+    );
+    for query in ["?limit=0", "?limit=51", "?before=0", "?before=not-a-number"] {
+        assert_eq!(
+            env.request(
+                Method::GET,
+                &format!("{REPO}/runs{query}"),
+                Some(&owner),
+                None,
+                None,
+                None
+            )
+            .await
+            .0,
+            400,
+            "{query}"
+        );
+    }
+    assert_eq!(
+        env.request(Method::GET, &format!("{REPO}/runs"), None, None, None, None)
+            .await
+            .0,
+        401
+    );
+    assert_eq!(
+        env.request(
+            Method::GET,
+            "/v1/hub/workspace/repositories/unconfigured%2Frepository/runs",
+            Some(&owner),
+            None,
+            None,
+            None,
+        )
+        .await
+        .0,
+        401
+    );
+    assert_eq!(
+        env.request(
+            Method::POST,
+            &format!("{REPO}/runs"),
+            Some(&owner),
+            Some(csrf),
+            None,
+            Some(start_request(
+                &native,
+                &session["actor"]["generation"],
+                "task-only-refusal"
+            )),
+        )
+        .await
+        .0,
+        401,
+        "task-only profiles must never enter the server queue"
+    );
+
+    let grant = env.member(
+        202,
+        &[Role::Reader],
+        true,
+        env.workspace.settings().unwrap().generation,
+        "task-only-reader",
+    );
+    assert_eq!(
+        env.request(
+            Method::PUT,
+            "/v1/hub/workspace/members",
+            Some(&owner),
+            Some(csrf),
+            None,
+            Some(grant)
+        )
+        .await
+        .0,
+        200
+    );
+    let (_, reader) = env.signin(202).await;
+    assert_eq!(
+        env.request(
+            Method::GET,
+            "/v1/hub/workspace/repositories/other%2Frepository/runs",
+            Some(&reader),
+            None,
+            None,
+            None,
+        )
+        .await
+        .0,
+        403
+    );
+    let revoke = env.member(
+        202,
+        &[Role::Reader],
+        false,
+        env.workspace.settings().unwrap().generation,
+        "revoke-task-only-reader",
+    );
+    assert_eq!(
+        env.request(
+            Method::PUT,
+            "/v1/hub/workspace/members",
+            Some(&owner),
+            Some(csrf),
+            None,
+            Some(revoke)
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        env.request(
+            Method::GET,
+            &format!("{REPO}/runs"),
+            Some(&reader),
+            None,
+            None,
+            None
+        )
+        .await
+        .0,
+        401
+    );
+}
+
+#[tokio::test]
+async fn repository_profile_views_distinguish_server_and_task_only_execution() {
+    let root = tempfile::tempdir().unwrap();
+    let native = native_source_profile(root.path());
+    let (env, service) = mixed_execution_env(root.path(), &native).await;
+    assert!(service.server_execution_enabled());
+    let (_, owner) = env.signin(101).await;
+    let repositories = env
+        .request(
+            Method::GET,
+            "/v1/hub/workspace/repositories",
+            Some(&owner),
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(repositories.0, 200, "{repositories:?}");
+    let profiles = repositories.1["repositories"][0]["profiles"]
+        .as_array()
+        .unwrap();
+    assert_eq!(profiles.len(), 2);
+    assert_eq!(profiles[0]["profile_id"], "agent-checks");
+    assert_eq!(profiles[0]["server_execution"], false);
+    assert_eq!(profiles[1]["profile_id"], "checks");
+    assert_eq!(profiles[1]["server_execution"], true);
 }
 
 #[tokio::test]
