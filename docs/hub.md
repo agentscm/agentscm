@@ -1094,7 +1094,8 @@ past the status cap, and a list reply without its array all count. Runs of other
 events or repositories are ignored and do not.
 
 Request budget: a commit read in full whose stored rows are all terminal is read again only
-after an hour (a deployment can still arrive later); a commit with no stored row, an open
+after an hour (a new deployment, a rerun or a later status change on a settled commit can
+appear up to an hour plus one poll interval late); a commit with no stored row, an open
 row or an incomplete read is read every pass. Per repository, one pass makes at most 20
 pull request reads plus, for each of 20 commits, 3 + 3 list pages and 50 status reads, so at
 most 1140 requests; typically a handful per commit. A rate limit (429, or 403 with

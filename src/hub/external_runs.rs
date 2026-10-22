@@ -18,7 +18,8 @@ const MAX_PER_PASS: usize = 20;
 /// Deployment statuses read per commit; the rest are dropped and the read is incomplete.
 const MAX_STATUSES: usize = 50;
 /// A commit whose last read was complete and whose stored runs are all terminal is read again
-/// only after this many seconds; a deployment can still arrive later.
+/// only after this many seconds, so a new deployment, a rerun (new attempt) or a later status
+/// change on it can appear up to this long (plus one poll interval) late.
 const SETTLED_SECONDS: i64 = 3600;
 /// Stored runs of one kind loaded to judge whether a commit has settled.
 const SETTLED_ROWS: usize = 1000;
@@ -393,6 +394,10 @@ async fn pass(
             }
         }
     }
+    // Saved now so a stop in the run reads below keeps this progress; stage two keeps its own.
+    state
+        .sync
+        .set_external_cursor(&repo.id, (if full { last } else { 0 }, after_id.clone()));
 
     let (store, name) = (state.store.clone(), repo.full_name.clone());
     let merged = blocking(state, move || {

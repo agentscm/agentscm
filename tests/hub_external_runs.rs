@@ -348,6 +348,33 @@ async fn only_the_merged_commits_own_runs_and_deployments_are_recorded() {
 }
 
 #[tokio::test]
+async fn a_persistent_run_read_403_does_not_stall_merge_detection() {
+    let env = Env::start(true).await;
+    for n in 1..=22 {
+        env.publish(n, &format!("{n:040x}"), None).await;
+    }
+    env.publish(100, OTHER, Some(MERGED)).await;
+    let late = env.store.pull_publications(REPO, 20, 1).unwrap()[0]
+        .id
+        .clone();
+    env.seed(|r| {
+        let mut pull = Pull::new(21, "agents/work-21", &["a.txt"]);
+        pull.state = "closed".into();
+        pull.merged = true;
+        pull.merge_commit_sha = Some("9".repeat(40));
+        r.pulls.insert(21, pull);
+    });
+    // A permission refusal on every pass.
+    for _ in 0..2 {
+        env.fail("/actions/runs", 403);
+    }
+    env.pass().await;
+    env.pass().await;
+    let publication = env.store.publication(REPO, &late).unwrap().unwrap();
+    assert_eq!(publication.merge_commit, Some("9".repeat(40)));
+}
+
+#[tokio::test]
 async fn a_forge_reported_merge_is_recorded_then_its_runs_are_read() {
     let env = Env::start(true).await;
     let id = env.publish(1, OTHER, None).await;
