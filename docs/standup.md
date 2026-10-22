@@ -127,6 +127,11 @@ Pages contain at most 100 current items and 100 events. Titles and checkpoint su
 
 ## Current support and limits
 
+The read-only [work insights](work-insights.md) projection adds bounded timing, coordination
+signals, usage reports and stored publication observations to retained stand-up work. Reported
+completion remains separate from publication state, checks, approval and landing. Missing history
+and usage remain explicit rather than being counted as zero.
+
 | Surface | Current behavior |
 | --- | --- |
 | Hub storage | Durable SQLite and PostgreSQL work and directed-request records, repository-scoped authorization, atomic claims, generation fencing and bounded pages. Required schema migrations run when the store opens; a migration failure prevents the store and API from starting with partial coordination support. |

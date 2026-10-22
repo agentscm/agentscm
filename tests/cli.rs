@@ -19,6 +19,61 @@ fn json_output(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).expect("JSON standard output")
 }
 
+#[cfg(unix)]
+fn agentscm_with_small_stack(args: &[&str]) -> Output {
+    Command::new("/bin/sh")
+        .args(["-c", "ulimit -s 1024 && exec \"$@\"", "agentscm"])
+        .arg(env!("CARGO_BIN_EXE_agentscm"))
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run agentscm with a small main-thread stack")
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_parsing_works_with_a_small_main_thread_stack() {
+    let version = agentscm_with_small_stack(&["--version"]);
+    assert!(
+        version.status.success(),
+        "{}",
+        String::from_utf8_lossy(&version.stderr)
+    );
+    assert!(String::from_utf8_lossy(&version.stdout).starts_with("agentscm "));
+
+    let data = TempDir::new().unwrap();
+    let init = agentscm_with_small_stack(&[
+        "--no-telemetry",
+        "--data-dir",
+        data.path().to_str().unwrap(),
+        "init",
+    ]);
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    assert_eq!(json_output(&init)["ok"], true);
+
+    let invalid = agentscm_with_small_stack(&["init-repo", "--invalid-option"]);
+    assert_eq!(invalid.status.code(), Some(2));
+    let error: Value = serde_json::from_slice(&invalid.stderr).expect("JSON standard error");
+    assert_eq!(error["ok"], false);
+    assert_eq!(error["error_kind"], "invalid");
+
+    let capture = agentscm_with_small_stack(&["workspace-client", "hook", "--unknown-option"]);
+    assert!(capture.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&capture.stdout).unwrap(),
+        serde_json::json!({})
+    );
+    let stop = agentscm_with_small_stack(&["skill-workflow", "claude-stop", "--unknown-option"]);
+    assert_eq!(stop.status.code(), Some(1));
+    let error: Value = serde_json::from_slice(&stop.stderr).expect("JSON stop-hook error");
+    assert_eq!(error["error_kind"], "invalid");
+}
+
 #[test]
 fn init_checkpoint_and_read_are_machine_readable() {
     let data_dir = TempDir::new().unwrap();

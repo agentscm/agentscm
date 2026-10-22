@@ -29,6 +29,11 @@ use super::handoff::{
     Answered, Asked, HandoffNote, MAX_OPEN, PER_TOUCH, Request, Verdict, answer_kind, clean_note,
     cutoff, file_key, grant_call, judge, remaining, still_holds,
 };
+use super::insights::{
+    CostGroup, HistoryPoint, InsightCursor, InsightInput, InsightPage, InsightQuery, MAX_HISTORY,
+    MAX_OBSERVATIONS, MAX_PUBLICATIONS, PublicationEvidence, RecordedCheck, TokenGroup,
+    UsageReceipt, UsageRecord, UsageSummary, WorkInsight,
+};
 use super::intent::{
     Announced, Existing, INTENT_SELECT, Intent, NewIntent, Plan, Who, announced, display_all,
     finish, notice_events, plan, probe_set, validate_ttl,
@@ -42,8 +47,8 @@ use super::session::{
 };
 use super::store::{
     ACTIVITY_KINDS, ActivityEvent, AgentToken, Event, ForgeIdentity, HubEvent, LIST_LIMIT,
-    NewAgentToken, Principal, SessionView, Store, TokenDigest, User, event_limit, lower_hex_of,
-    new_id, pending, session_key, unix_now, validate_login,
+    NAMED_MIGRATIONS, NewAgentToken, Principal, SessionView, Store, TokenDigest, User, event_limit,
+    lower_hex_of, new_id, pending, plan_named, session_key, unix_now, validate_login,
 };
 use super::work::{
     Briefing, BriefingAck, BriefingQuery, CLAIM_STALE_SECONDS, Checkpoint, CheckpointReceipt,
@@ -170,6 +175,22 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             params![migration.version, unix_now()],
         )?;
     }
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS hub_named_migrations (
+            name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL)",
+    )?;
+    let applied_names: Vec<String> = tx
+        .prepare("SELECT name FROM hub_named_migrations")?
+        .query_map([], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let applied_refs: Vec<&str> = applied_names.iter().map(String::as_str).collect();
+    for migration in plan_named(NAMED_MIGRATIONS, &applied_refs)? {
+        tx.execute_batch(migration.sqlite)?;
+        tx.execute(
+            "INSERT INTO hub_named_migrations (name, applied_at) VALUES (?1, ?2)",
+            params![migration.name, unix_now()],
+        )?;
+    }
     Ok(tx.commit()?)
 }
 
@@ -244,6 +265,323 @@ fn json_string<T: serde::Serialize>(value: &T) -> Result<String> {
 
 fn json_value<T: serde::de::DeserializeOwned>(value: &str) -> Result<T> {
     serde_json::from_str(value).map_err(|error| HubError::Unavailable(error.to_string()))
+}
+
+fn enum_name<T: serde::Serialize>(value: &T) -> Result<String> {
+    let value = json_string(value)?;
+    Ok(value.trim_matches('"').to_owned())
+}
+
+fn sqlite_usage_summary(
+    tx: &Transaction<'_>,
+    work: &str,
+    group_limit: usize,
+) -> Result<UsageSummary> {
+    let (
+        observations,
+        input_tokens,
+        output_tokens,
+        input_known,
+        output_known,
+        missing_cost,
+        failed,
+    ): (i64, Option<i64>, Option<i64>, i64, i64, i64, i64) = tx.query_row(
+        "SELECT COUNT(*), SUM(input_tokens), SUM(output_tokens),
+                COUNT(input_tokens), COUNT(output_tokens),
+                COALESCE(SUM(CASE WHEN cost_amount_micros IS NULL THEN 1 ELSE 0 END),0),
+                COALESCE(SUM(CASE WHEN outcome='failed' THEN 1 ELSE 0 END),0)
+           FROM hub_work_model_usage WHERE work=?1",
+        [work],
+        |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+            ))
+        },
+    )?;
+    let mut statement = tx.prepare(
+        "SELECT agent,model_provider,model,usage_basis,COUNT(*),SUM(input_tokens),SUM(output_tokens),COUNT(input_tokens),COUNT(output_tokens)
+           FROM hub_work_model_usage WHERE work=?1
+          GROUP BY agent,model_provider,model,usage_basis ORDER BY agent,model_provider,model,usage_basis LIMIT ?2")?;
+    let mut token_groups = statement
+        .query_map(params![work, (group_limit + 1) as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, Option<i64>>(5)?,
+                r.get::<_, Option<i64>>(6)?,
+                r.get::<_, i64>(7)?,
+                r.get::<_, i64>(8)?,
+            ))
+        })?
+        .map(|row| {
+            let (agent, provider, model, basis, n, input, output, ik, ok) = row?;
+            Ok(TokenGroup {
+                agent,
+                provider,
+                model,
+                usage_basis: serde_json::from_str(&format!("\"{basis}\""))
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                observations: n as usize,
+                input_tokens: input,
+                output_tokens: output,
+                input_known_observations: ik as usize,
+                output_known_observations: ok as usize,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+    let mut statement = tx.prepare(
+        "SELECT cost_kind,cost_currency,cost_basis,usage_basis,agent,model_provider,model,SUM(cost_amount_micros),COUNT(*)
+           FROM hub_work_model_usage WHERE work=?1 AND cost_amount_micros IS NOT NULL
+          GROUP BY cost_kind,cost_currency,cost_basis,usage_basis,agent,model_provider,model
+          ORDER BY agent,model_provider,model,usage_basis,cost_kind,cost_currency,cost_basis LIMIT ?2")?;
+    let mut cost_groups = statement
+        .query_map(params![work, (group_limit + 1) as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, i64>(7)?,
+                r.get::<_, i64>(8)?,
+            ))
+        })?
+        .map(|row| {
+            let (kind, currency, basis, usage_basis, agent, provider, model, amount, n) = row?;
+            Ok(CostGroup {
+                kind: serde_json::from_str(&format!("\"{kind}\""))
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                currency,
+                basis,
+                usage_basis: serde_json::from_str(&format!("\"{usage_basis}\""))
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                agent,
+                provider,
+                model,
+                amount_micros: amount,
+                observations: n as usize,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+    let groups_complete = token_groups.len() <= group_limit && cost_groups.len() <= group_limit;
+    token_groups.truncate(group_limit);
+    cost_groups.truncate(group_limit);
+    Ok(UsageSummary {
+        observations: observations as usize,
+        coverage: if observations == 0 {
+            "unknown"
+        } else {
+            "partial"
+        }
+        .into(),
+        input_tokens,
+        output_tokens,
+        input_known_observations: input_known as usize,
+        output_known_observations: output_known as usize,
+        missing_cost_observations: missing_cost as usize,
+        reported_failed_attempts: failed as usize,
+        groups_complete,
+        cost_groups,
+        token_groups,
+    })
+}
+
+fn sqlite_insight_input(
+    tx: &Transaction<'_>,
+    mut item: WorkItem,
+    now: i64,
+    group_limit: usize,
+) -> Result<InsightInput> {
+    let mut statement=tx.prepare("SELECT event_seq,json_extract(snapshot,'$.updated_at','$.state','$.generation','$.last_checkin_at','$.current.source_refs') FROM hub_work_versions WHERE work=?1 ORDER BY event_seq LIMIT 257")?;
+    let rows = statement
+        .query_map([&item.id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut history = Vec::with_capacity(rows.len().min(MAX_HISTORY));
+    let mut projections = Vec::with_capacity(rows.len());
+    for (_, projection) in &rows {
+        projections.push(json_value::<(
+            i64,
+            WorkState,
+            i64,
+            i64,
+            Option<Vec<SourceRef>>,
+        )>(projection)?);
+    }
+    for ((seq, _), (at, state, generation, last_checkin_at, _)) in
+        rows.iter().zip(&projections).take(MAX_HISTORY)
+    {
+        history.push(HistoryPoint {
+            seq: *seq,
+            at: *at,
+            state: *state,
+            generation: *generation,
+            last_checkin_at: *last_checkin_at,
+        });
+    }
+    let floors:(i64,i64)=tx.query_row("SELECT COALESCE(event_floor_seq,0),COALESCE(snapshot_floor_seq,0) FROM hub_work_retention WHERE provider=(SELECT provider FROM hub_work_items WHERE id=?1) AND host=(SELECT host FROM hub_work_items WHERE id=?1) AND repository=(SELECT repository FROM hub_work_items WHERE id=?1) AND repository_id IS (SELECT repository_id FROM hub_work_items WHERE id=?1)",[&item.id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?.unwrap_or((0,0));
+    let retention_gap =
+        item.created_seq <= 0 || floors.0 >= item.created_seq || floors.1 >= item.created_seq;
+    let mut checkpoint_commits = Vec::new();
+    let mut seen_commits = BTreeSet::new();
+    let mut checkpoint_overflow = false;
+    for source in item
+        .current
+        .as_ref()
+        .into_iter()
+        .flat_map(|c| &c.source_refs)
+    {
+        if let SourceRef::Commit { oid, .. } = source
+            && super::insights::valid_oid(oid)
+            && seen_commits.insert(oid.clone())
+        {
+            checkpoint_commits.push(oid.clone());
+            if checkpoint_commits.len() > MAX_PUBLICATIONS {
+                checkpoint_overflow = true;
+                break;
+            }
+        }
+    }
+    'history_commits: for (_, _, _, _, refs) in projections.iter().take(MAX_HISTORY) {
+        for source in refs.iter().flatten() {
+            if let SourceRef::Commit { oid, .. } = source
+                && super::insights::valid_oid(oid)
+                && seen_commits.insert(oid.clone())
+            {
+                checkpoint_commits.push(oid.clone());
+                if checkpoint_commits.len() > MAX_PUBLICATIONS {
+                    checkpoint_overflow = true;
+                    break 'history_commits;
+                }
+            }
+        }
+    }
+    checkpoint_overflow |= rows.len() > MAX_HISTORY;
+    checkpoint_commits.truncate(MAX_PUBLICATIONS);
+    let mut commits = checkpoint_commits.clone();
+    let mut usage_commits = tx.prepare("SELECT source_commit FROM hub_work_model_usage WHERE work=?1 AND source_commit IS NOT NULL GROUP BY source_commit ORDER BY MIN(received_at),source_commit LIMIT 17")?;
+    for oid in usage_commits.query_map([&item.id], |r| r.get::<_, String>(0))? {
+        let oid = oid?;
+        if !commits.contains(&oid) {
+            commits.push(oid);
+        }
+    }
+    let commits_truncated = checkpoint_overflow || commits.len() > MAX_PUBLICATIONS;
+    commits.truncate(MAX_PUBLICATIONS);
+    let (provider, host, repository_id): (String, String, Option<i64>) = tx.query_row(
+        "SELECT provider,host,repository_id FROM hub_work_items WHERE id=?1",
+        [&item.id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let mut publications = Vec::new();
+    let mut publications_complete = !commits_truncated;
+    if let Some(repository_id) = repository_id {
+        let connected: Option<String> = tx.query_row("SELECT r.id FROM hub_repositories r JOIN hub_connections c ON c.id=r.connection WHERE r.host=?1 AND r.repository_id=?2 AND c.provider=?3", params![host,repository_id,provider], |r| r.get(0)).optional()?;
+        let connected = connected.unwrap_or_default();
+        {
+            for commit in &commits {
+                let remaining = MAX_PUBLICATIONS.saturating_sub(publications.len());
+                if remaining == 0 {
+                    publications_complete = false;
+                    break;
+                }
+                let mut s=tx.prepare("SELECT p.id,p.branch_state,p.pr_number,p.merge_commit,p.updated_at FROM hub_publications p JOIN hub_agent_tokens t ON t.id=p.token JOIN hub_users u ON u.id=t.owner WHERE p.commit_sha=?1 AND p.repository=?2 AND t.repository=?2 AND t.repository_id=?3 AND u.provider=?4 AND u.host=?5 ORDER BY p.updated_at,p.id LIMIT ?6")?;
+                let found = s
+                    .query_map(
+                        params![
+                            commit,
+                            item.repository,
+                            repository_id,
+                            provider,
+                            host,
+                            (remaining + 1) as i64
+                        ],
+                        |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, Option<i64>>(2)?,
+                                r.get::<_, Option<String>>(3)?,
+                                r.get::<_, i64>(4)?,
+                            ))
+                        },
+                    )?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                if found.len() > remaining {
+                    publications_complete = false;
+                }
+                for (id, branch_state, pr_number, merge_commit, observed_at) in
+                    found.into_iter().take(remaining)
+                {
+                    if pr_number.is_some() && connected.is_empty() {
+                        publications_complete = false;
+                    }
+                    let mut checks = if let Some(number) =
+                        pr_number.filter(|_| !connected.is_empty())
+                    {
+                        let mut cs=tx.prepare("SELECT head_sha,state,phase,binding_digest,updated_at FROM hub_forge_checks WHERE repository=?1 AND number=?2 AND head_sha=?3 ORDER BY context LIMIT 17")?;
+                        cs.query_map(params![connected, number, commit], |r| {
+                            Ok(RecordedCheck {
+                                head_sha: r.get(0)?,
+                                state: r.get(1)?,
+                                phase: r.get(2)?,
+                                binding_digest: r.get(3)?,
+                                observed_at: r.get(4)?,
+                            })
+                        })?
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                    } else {
+                        Vec::new()
+                    };
+                    if checks.len() > 16 {
+                        publications_complete = false;
+                        checks.truncate(16);
+                    }
+                    publications.push(PublicationEvidence {
+                        publication_id: id,
+                        commit: commit.clone(),
+                        branch_state,
+                        pr_number,
+                        merge_commit,
+                        observed_at,
+                        checks,
+                        association: if checkpoint_commits.contains(commit) {
+                            "claimed_by_checkpoint"
+                        } else {
+                            "claimed_by_usage"
+                        }
+                        .into(),
+                    });
+                }
+            }
+        }
+    } else {
+        publications_complete = false;
+    }
+    project_claim(tx, &mut item, now)?;
+    Ok(InsightInput {
+        usage: sqlite_usage_summary(tx, &item.id, group_limit)?,
+        item,
+        history,
+        history_complete: rows.len() <= MAX_HISTORY && !retention_gap,
+        retention_gap,
+        publications,
+        publications_complete,
+        commits_truncated,
+        as_of: now,
+    })
 }
 
 fn project_claim(tx: &Transaction<'_>, item: &mut WorkItem, now: i64) -> Result<()> {
@@ -420,6 +758,11 @@ fn work_payload_bytes(
              UNION ALL
              SELECT length(CAST(o.request AS BLOB)) + 256 FROM hub_work_checkpoint_ops o
               JOIN hub_work_items w ON w.id = o.work
+              WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
+                AND w.repository_id IS ?4
+             UNION ALL
+             SELECT length(CAST(u.request AS BLOB)) + 256 FROM hub_work_model_usage u
+              JOIN hub_work_items w ON w.id = u.work
               WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3
                 AND w.repository_id IS ?4
              UNION ALL
@@ -4825,6 +5168,153 @@ impl Store for SqliteStore {
         let item = scoped_work(&tx, &who, id, now)?;
         tx.commit()?;
         Ok(item)
+    }
+
+    fn work_usage(&self, token: &str, usage: &UsageRecord, now: i64) -> Result<UsageReceipt> {
+        usage.validate()?;
+        let request = json_string(usage)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let who = work_who(&tx, token, now)?;
+        if who.read_only {
+            return Err(HubError::Unauthorized);
+        }
+        let item = scoped_work(&tx, &who, &usage.work_id, now)?
+            .ok_or_else(|| HubError::Invalid("unknown work".into()))?;
+        if let Some((author,existing,received))=tx.query_row("SELECT author_token,request,received_at FROM hub_work_model_usage WHERE work=?1 AND observation_id=?2",params![usage.work_id,usage.observation_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?))).optional()? {
+            if author==token && existing==request { tx.commit()?; return Ok(UsageReceipt { work_id:usage.work_id.clone(),observation_id:usage.observation_id.clone(),received_at:received,replayed:true }); }
+            return Err(HubError::Invalid("observation_id is already used by different usage".into()));
+        }
+        let authorized = if item.state == WorkState::Finished {
+            item.lead_token == token
+                && item.lead_session == usage.session
+                && item.generation == usage.generation
+        } else {
+            item.generation == usage.generation
+                && tx
+                    .query_row(
+                        "SELECT 1 FROM hub_work_participants
+                         WHERE work=?1 AND token=?2 AND session=?3 AND generation=?4",
+                        params![usage.work_id, token, usage.session, usage.generation],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some()
+        };
+        if !authorized {
+            return Err(HubError::Invalid(
+                "usage author is not a current work participant".into(),
+            ));
+        }
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM hub_work_model_usage WHERE work=?1",
+            [&usage.work_id],
+            |r| r.get(0),
+        )?;
+        if count >= MAX_OBSERVATIONS as i64 {
+            return Err(HubError::Invalid(
+                "work has reached the usage observation limit".into(),
+            ));
+        }
+        let cost = usage.cost.as_ref();
+        tx.execute("INSERT INTO hub_work_model_usage (work,observation_id,author_token,request,generation,session,phase,outcome,agent,model_provider,model,usage_basis,source_commit,input_tokens,output_tokens,cost_kind,cost_currency,cost_amount_micros,cost_basis,received_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",params![usage.work_id,usage.observation_id,token,request,usage.generation,usage.session,enum_name(&usage.phase)?,enum_name(&usage.outcome)?,usage.agent,usage.provider,usage.model,enum_name(&usage.usage_basis)?,usage.source_commit,usage.input_tokens,usage.output_tokens,cost.map(|c|enum_name(&c.kind)).transpose()?,cost.map(|c|c.currency.as_str()),cost.map(|c|c.amount_micros),cost.map(|c|c.basis.as_str()),now])?;
+        let delta = work_payload_row_bytes(request.len())?;
+        adjust_work_payload_capacity(&tx, &who, delta, now)?;
+        tx.commit()?;
+        Ok(UsageReceipt {
+            work_id: usage.work_id.clone(),
+            observation_id: usage.observation_id.clone(),
+            received_at: now,
+            replayed: false,
+        })
+    }
+
+    fn work_insight(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkInsight>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let who = work_who(&tx, token, now)?;
+        let Some(item) = scoped_work(&tx, &who, id, now)? else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let insight =
+            super::insights::project(sqlite_insight_input(&tx, item, now, MAX_OBSERVATIONS)?);
+        tx.commit()?;
+        Ok(Some(insight))
+    }
+
+    fn work_insights(&self, token: &str, query: &InsightQuery, now: i64) -> Result<InsightPage> {
+        let (since, until) = query.window(now)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let who = work_who(&tx, token, now)?;
+        let through = query.through.unwrap_or(tx.query_row(
+            "SELECT COALESCE(MAX(seq),0) FROM hub_events",
+            [],
+            |r| r.get(0),
+        )?);
+        let cursor = query
+            .after
+            .as_ref()
+            .map(|v| InsightCursor::decode(v, since, until, through))
+            .transpose()?;
+        let (after_at, after_id) = cursor
+            .as_ref()
+            .map(|c| (Some(c.created_at), Some(c.id.as_str())))
+            .unwrap_or((None, None));
+        let snapshots = {
+            let mut statement=tx.prepare("SELECT snapshot FROM hub_work_items WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_id IS ?4 AND created_at>=?5 AND created_at<=?6 AND (created_seq IS NULL OR created_seq<=0 OR created_seq<=?7) AND (?8 IS NULL OR created_at>?8 OR (created_at=?8 AND id>?9)) ORDER BY created_at,id LIMIT ?10")?;
+            statement
+                .query_map(
+                    params![
+                        who.owner.identity.provider,
+                        who.owner.identity.host,
+                        who.repository,
+                        who.repository_id,
+                        since,
+                        until,
+                        through,
+                        after_at,
+                        after_id,
+                        (query.limit + 1) as i64
+                    ],
+                    |r| r.get::<_, String>(0),
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let complete = snapshots.len() <= query.limit;
+        let mut items = Vec::new();
+        for snapshot in snapshots.iter().take(query.limit) {
+            let item: WorkItem = json_value(snapshot)?;
+            items.push(super::insights::project(sqlite_insight_input(
+                &tx, item, now, 20,
+            )?));
+        }
+        let next_after = if complete {
+            None
+        } else {
+            items.last().map(|i| {
+                InsightCursor {
+                    since,
+                    until,
+                    through,
+                    created_at: i.created_at,
+                    id: i.work_id.clone(),
+                }
+                .encode()
+            })
+        };
+        tx.commit()?;
+        Ok(InsightPage {
+            version: 1,
+            as_of: now,
+            since,
+            until,
+            through,
+            next_after,
+            complete,
+            items,
+        })
     }
 
     fn work_for_session(&self, token: &str, session: &str, now: i64) -> Result<Option<WorkItem>> {

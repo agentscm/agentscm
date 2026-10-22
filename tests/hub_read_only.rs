@@ -56,11 +56,15 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&get, "/v1/hub/skill-workflows".into(), "".into(), Allowed);
     row(&get, "/v1/hub/skill-workflows/missing".into(), "".into(), Allowed);
     row(&get, "/v1/hub/standup/briefing".into(), "".into(), Allowed);
+    row(&get, "/v1/hub/standup/insights".into(), "".into(), Allowed);
+    row(&get, "/v1/hub/standup/work/missing/insights".into(), "".into(), Status(404));
     row(&get, "/v1/hub/standup/work/missing".into(), "".into(), Status(404));
     for path in ["start", "checkpoint", "ack"] {
         row(&post, format!("/v1/hub/standup/{path}"), "{}".into(), AgentOnly);
     }
+    row(&post, "/v1/hub/standup/usage".into(), "{}".into(), AgentOnly);
     row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_work_briefing","arguments":{}}}"#.into(), Allowed);
+    row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_work_insights","arguments":{}}}"#.into(), Allowed);
     // Agent-token routes.
     row(&post, format!("{REPO}/intents"), announce.to_string(), AgentOnly);
     row(&post, format!("{REPO}/intents/{intent}/renew"), r#"{"ttl_s":60}"#.into(), AgentOnly);
@@ -87,6 +91,7 @@ fn routes() -> Vec<(Method, String, String, Want)> {
         "agentscm_handoff",
         "agentscm_work_checkpoint",
         "agentscm_work_ack",
+        "agentscm_work_usage",
     ] {
         row(&post, "/mcp".into(), rpc(tool), AgentOnly);
     }

@@ -504,6 +504,9 @@ async fn protocol_basics() {
             "agentscm_work_overview",
             "agentscm_work_briefing",
             "agentscm_coordination_inbox",
+            "agentscm_work_insight",
+            "agentscm_work_insights",
+            "agentscm_work_usage",
             "agentscm_work_checkpoint",
             "agentscm_work_ack",
             "agentscm_workflow_status",
@@ -554,10 +557,24 @@ async fn protocol_basics() {
         "agentscm_workflow_status",
         "agentscm_work_overview",
         "agentscm_work_briefing",
+        "agentscm_work_insight",
+        "agentscm_work_insights",
         "agentscm_coordination_inbox",
     ] {
         assert_eq!(tool(name)["annotations"]["readOnlyHint"], true);
     }
+    assert_eq!(
+        tool("agentscm_work_usage")["inputSchema"]["properties"]["observation_id"]["maxLength"],
+        255
+    );
+    assert_eq!(
+        tool("agentscm_work_usage")["inputSchema"]["properties"]["source_commit"]["pattern"],
+        "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    );
+    assert_eq!(
+        tool("agentscm_work_insights")["inputSchema"]["properties"]["after"]["maxLength"],
+        512
+    );
     assert_eq!(
         tool("agentscm_work_checkpoint")["inputSchema"]["required"],
         json!([

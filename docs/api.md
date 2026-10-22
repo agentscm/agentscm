@@ -37,6 +37,17 @@ The [local workspace snapshot timeline](workspace-timeline.md) is exposed throug
 `agentscm serve` or the Hub, and it adds no HTTP path to this API or its OpenAPI surface. Capture
 and fork are local mutations and are not available over HTTP.
 
+Its repository-authenticated stand-up routes also include `POST /v1/hub/standup/usage`,
+`GET /v1/hub/standup/insights` and `GET /v1/hub/standup/work/{work_id}/insights`.
+The first stores one idempotent partial usage report; the GET routes return bounded
+work projections. See [work insights](work-insights.md) for pagination and evidence limits.
+
+Completion calls on `/mcp`, `/v1/hub/hook/{agent}` and `/v1/hub/standup/checkpoint`
+accept the optional `x-agentscm-completion-reporting: true` header. Exactly one literal `true`
+enables a best-effort, idempotent completion observation; the default is off. It adds no response
+fields and does not alter completion success. See [completion reporting](work-insights.md#optional-completion-reporting)
+for the local toggle and the distinction between completion metadata and measured usage.
+
 ## Guided workflow observations
 
 The status route accepts no query fields. Inspection accepts only one `limit`

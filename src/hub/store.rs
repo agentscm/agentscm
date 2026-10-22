@@ -15,6 +15,7 @@ use super::coordination::{
 };
 use super::external_runs::{ExternalKind, ExternalObserved, ExternalRun};
 use super::handoff::{Answered, Asked};
+use super::insights::{InsightPage, InsightQuery, UsageReceipt, UsageRecord, WorkInsight};
 use super::intent::{Announced, Intent, NewIntent};
 use super::publish::{Create, NewPublication, Publication, Update};
 use super::session::{SessionCall, Touched};
@@ -428,6 +429,9 @@ pub trait Store: Send + Sync {
         now: i64,
     ) -> Result<WorkCheckpointResult>;
     fn work_get(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkItem>>;
+    fn work_usage(&self, token: &str, usage: &UsageRecord, now: i64) -> Result<UsageReceipt>;
+    fn work_insight(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkInsight>>;
+    fn work_insights(&self, token: &str, query: &InsightQuery, now: i64) -> Result<InsightPage>;
     /// The token/session's one unfinished lead claim. Multiple matches are invalid.
     fn work_for_session(&self, token: &str, session: &str, now: i64) -> Result<Option<WorkItem>>;
     /// Resolve the explicit or most recently touched session without touching it.
@@ -800,6 +804,12 @@ pub(super) struct Migration {
     pub postgres: &'static str,
 }
 
+/// Integer hub migrations. This list is frozen.
+///
+/// A later schema change is a pair of files, `migrations/named/<name>.sqlite.sql`
+/// and `migrations/named/<name>.pg.sql`. A `-- requires: <name>` comment names
+/// another named migration that must already be applied. Applied names are a
+/// set, so two branches can each add a file without taking the next integer.
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -893,13 +903,81 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 19,
-        sqlite: include_str!("migrations/0019_publication_binding.sqlite.sql"),
-        postgres: include_str!("migrations/0019_publication_binding.pg.sql"),
+        sqlite: include_str!("migrations/0019_work_insights.sqlite.sql"),
+        postgres: include_str!("migrations/0019_work_insights.pg.sql"),
     },
 ];
 
-/// Migrations not yet applied. The registry must be numbered 1..n and the
-/// applied set must be a prefix of it; a newer database is refused.
+#[derive(Debug)]
+pub(super) struct NamedMigration {
+    pub name: &'static str,
+    pub requires: &'static [&'static str],
+    pub sqlite: &'static str,
+    pub postgres: &'static str,
+}
+
+include!(concat!(env!("OUT_DIR"), "/hub_named_migrations.rs"));
+
+/// Integer migration versions compiled into this binary, in apply order.
+pub fn integer_migration_versions() -> Vec<i64> {
+    MIGRATIONS
+        .iter()
+        .map(|migration| migration.version)
+        .collect()
+}
+
+/// Named migration ids compiled into this binary, in name order.
+pub fn named_migration_names() -> Vec<&'static str> {
+    let mut names: Vec<&str> = NAMED_MIGRATIONS
+        .iter()
+        .map(|migration| migration.name)
+        .collect();
+    names.sort_unstable();
+    names
+}
+
+/// Named migrations still to apply. Already-applied names stay applied in any
+/// order. A name this binary does not know means a newer database.
+pub(super) fn plan_named<'a>(
+    registry: &'a [NamedMigration],
+    applied: &[&str],
+) -> Result<Vec<&'a NamedMigration>> {
+    for migration in registry {
+        for requirement in migration.requires {
+            if !registry.iter().any(|known| known.name == *requirement) {
+                return Err(invalid("named migration requires an unknown migration"));
+            }
+        }
+    }
+    if applied
+        .iter()
+        .any(|name| !registry.iter().any(|known| known.name == *name))
+    {
+        return Err(invalid("database schema is newer than this binary"));
+    }
+    let mut pending: Vec<&NamedMigration> = registry
+        .iter()
+        .filter(|migration| !applied.contains(&migration.name))
+        .collect();
+    let mut ordered: Vec<&NamedMigration> = Vec::with_capacity(pending.len());
+    while !pending.is_empty() {
+        let ready = pending.iter().position(|migration| {
+            migration.requires.iter().all(|requirement| {
+                applied.contains(requirement)
+                    || ordered.iter().any(|done| done.name == *requirement)
+            })
+        });
+        let Some(index) = ready else {
+            return Err(invalid("named migrations have a cycle"));
+        };
+        ordered.push(pending.remove(index));
+    }
+    Ok(ordered)
+}
+
+/// Integer migrations not yet applied. The registry must be numbered 1..n and
+/// the applied set must be a prefix of it; a newer database is refused.
+/// Named migrations are not part of this prefix.
 pub(super) fn pending(applied: &[i64]) -> Result<&'static [Migration]> {
     if MIGRATIONS
         .iter()
@@ -934,20 +1012,104 @@ mod tests {
 
     #[test]
     fn pending_requires_an_applied_prefix() {
-        assert_eq!(pending(&[]).unwrap().len(), 19);
-        assert_eq!(pending(&[1]).unwrap().len(), 18);
-        assert_eq!(pending(&[1, 2, 3]).unwrap().len(), 16);
-        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap().len(), 11);
-        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap().len(), 10);
+        let count = MIGRATIONS.len();
+        assert_eq!(pending(&[]).unwrap().len(), count);
+        assert_eq!(pending(&[1]).unwrap().len(), count - 1);
+        assert_eq!(pending(&[1, 2, 3]).unwrap().len(), count - 3);
+        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap().len(), count - 8);
+        assert_eq!(
+            pending(&[1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap().len(),
+            count - 9
+        );
         assert_eq!(
             pending(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14])
                 .unwrap()
                 .len(),
-            5
+            count - 14
         );
-        assert!(pending(&(1..=19).collect::<Vec<_>>()).unwrap().is_empty());
+        let after_hub_settings = pending(&(1..=18).collect::<Vec<_>>()).unwrap();
+        assert_eq!(after_hub_settings.len(), 1);
+        assert_eq!(after_hub_settings[0].version, 19);
+        assert!(
+            after_hub_settings[0]
+                .sqlite
+                .contains("hub_work_model_usage")
+        );
+        assert!(
+            after_hub_settings[0]
+                .postgres
+                .contains("hub_work_model_usage")
+        );
+        assert!(
+            pending(&(1..=i64::try_from(count).unwrap()).collect::<Vec<_>>())
+                .unwrap()
+                .is_empty()
+        );
         assert!(pending(&[2]).is_err());
         let newer = pending(&[1, 999]).err().unwrap().to_string();
         assert!(newer.contains("newer than this binary"), "{newer}");
+    }
+
+    fn named(name: &'static str, requires: &'static [&'static str]) -> NamedMigration {
+        NamedMigration {
+            name,
+            requires,
+            sqlite: "",
+            postgres: "",
+        }
+    }
+
+    #[test]
+    fn named_migrations_apply_as_a_set() {
+        let registry = [named("aaa", &[]), named("bbb", &["zzz"]), named("zzz", &[])];
+        let names = |pending: Vec<&NamedMigration>| {
+            pending
+                .iter()
+                .map(|migration| migration.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(plan_named(&registry, &[]).unwrap()),
+            ["aaa", "zzz", "bbb"]
+        );
+        assert_eq!(
+            names(plan_named(&registry, &["zzz"]).unwrap()),
+            ["aaa", "bbb"]
+        );
+        assert!(
+            plan_named(&registry, &["aaa", "bbb", "zzz"])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn named_migrations_reject_a_cycle_an_unknown_requirement_and_a_newer_database() {
+        let cycle = [named("aaa", &["bbb"]), named("bbb", &["aaa"])];
+        let cyclic = plan_named(&cycle, &[]).unwrap_err().to_string();
+        assert!(cyclic.contains("cycle"), "{cyclic}");
+        let unknown = [named("aaa", &["missing"])];
+        let missing = plan_named(&unknown, &[]).unwrap_err().to_string();
+        assert!(missing.contains("unknown"), "{missing}");
+        let registry = [named("aaa", &[])];
+        let newer = plan_named(&registry, &["later"]).unwrap_err().to_string();
+        assert!(newer.contains("newer than this binary"), "{newer}");
+    }
+
+    #[test]
+    fn publication_binding_is_a_named_migration() {
+        let pending = plan_named(NAMED_MIGRATIONS, &[]).unwrap();
+        let binding = pending
+            .iter()
+            .find(|migration| migration.name == "publication_binding")
+            .unwrap();
+        assert!(binding.requires.is_empty());
+        assert!(binding.sqlite.contains("authorization_binding"));
+        assert!(binding.postgres.contains("authorization_binding"));
+        assert!(
+            MIGRATIONS
+                .iter()
+                .all(|migration| !migration.sqlite.contains("authorization_binding"))
+        );
     }
 }
