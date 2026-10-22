@@ -261,6 +261,10 @@ pub struct Repo {
     pub git: Option<std::path::PathBuf>,
     /// Without `git`: commit sha to (tree sha, parent shas) for `GET git/commits/{sha}`.
     pub commits: BTreeMap<String, (String, Vec<String>)>,
+    /// Raw `actions/runs` entries; `head_sha` selects them.
+    pub runs: Vec<Value>,
+    /// Raw deployments with their statuses, newest first; `sha` selects them.
+    pub deployments: Vec<(Value, Vec<Value>)>,
 }
 
 impl Repo {
@@ -278,8 +282,36 @@ impl Repo {
             statuses: Vec::new(),
             git: None,
             commits: BTreeMap::new(),
+            runs: Vec::new(),
+            deployments: Vec::new(),
         }
     }
+}
+
+/// A workflow run as GitHub lists it; seed it with `Repo::runs`.
+pub fn run_json(
+    repo_id: i64,
+    id: i64,
+    sha: &str,
+    branch: &str,
+    status: &str,
+    conclusion: Option<&str>,
+) -> Value {
+    json!({"id": id, "run_attempt": 1, "head_sha": sha, "head_branch": branch, "event": "push",
+        "status": status, "conclusion": conclusion, "path": ".github/workflows/ci.yml",
+        "html_url": format!("https://github.com/acme/widgets/actions/runs/{id}"),
+        "updated_at": rfc3339(1_700_000_000), "repository": {"id": repo_id}})
+}
+
+/// A deployment and one status as GitHub lists them; seed with `Repo::deployments`.
+pub fn deployment_json(id: i64, sha: &str, environment: &str) -> Value {
+    json!({"id": id, "sha": sha, "ref": "main", "environment": environment,
+        "description": "deploy", "updated_at": rfc3339(1_700_000_000)})
+}
+
+pub fn status_json(id: i64, state: &str) -> Value {
+    json!({"id": id, "state": state, "updated_at": rfc3339(1_700_000_100),
+        "log_url": null, "target_url": null})
 }
 
 #[derive(Default)]
@@ -1070,6 +1102,48 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                     let (page, mut link) = paginate(ctx, uri, &query, open);
                     link.push(("etag".into(), etag));
                     reply(200, &link, Some(Value::Array(page)))
+                }
+                (&Method::GET, ["actions", "runs"]) => {
+                    let wanted = query.iter().find(|(k, _)| k == "head_sha").map(|(_, v)| v);
+                    let runs: Vec<Value> = state.repos[&id]
+                        .runs
+                        .iter()
+                        .filter(|r| wanted.is_none_or(|w| r["head_sha"].as_str() == Some(w)))
+                        .cloned()
+                        .collect();
+                    let total = runs.len();
+                    let (page, link) = paginate(ctx, uri, &query, runs);
+                    reply(
+                        200,
+                        &link,
+                        Some(json!({"total_count": total, "workflow_runs": page})),
+                    )
+                }
+                (&Method::GET, ["deployments"]) => {
+                    let wanted = query.iter().find(|(k, _)| k == "sha").map(|(_, v)| v);
+                    let found: Vec<Value> = state.repos[&id]
+                        .deployments
+                        .iter()
+                        .filter(|(d, _)| wanted.is_none_or(|w| d["sha"].as_str() == Some(w)))
+                        .map(|(d, _)| d.clone())
+                        .collect();
+                    let (page, link) = paginate(ctx, uri, &query, found);
+                    reply(200, &link, Some(Value::Array(page)))
+                }
+                (&Method::GET, ["deployments", deployment, "statuses"]) => {
+                    let found = deployment.parse::<i64>().ok().and_then(|n| {
+                        state.repos[&id]
+                            .deployments
+                            .iter()
+                            .find(|(d, _)| d["id"].as_i64() == Some(n))
+                    });
+                    match found {
+                        Some((_, statuses)) => {
+                            let (page, link) = paginate(ctx, uri, &query, statuses.clone());
+                            reply(200, &link, Some(Value::Array(page)))
+                        }
+                        None => not_found(),
+                    }
                 }
                 (&Method::GET, ["pulls", num]) => {
                     let repo = &state.repos[&id];

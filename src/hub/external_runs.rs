@@ -1,8 +1,10 @@
 //! Optional external CI and deployment outcomes seen for a landed revision.
 //! Observations only: nothing here feeds checks, admission or publication updates.
-use serde_json::json;
+use serde::Deserialize;
+use serde_json::{Value, json};
 
 use super::connection::is_lower_hex;
+use super::github::parse_rfc3339;
 use super::store::Event;
 use super::{HubError, Result};
 
@@ -160,6 +162,142 @@ impl ExternalRun {
     }
 }
 
+// The wire shapes below are from the GitHub REST documentation (workflow runs, deployments
+// and deployment statuses), not verified against a live GitHub.
+
+#[derive(Deserialize)]
+struct WireRepository {
+    id: i64,
+}
+
+#[derive(Deserialize)]
+struct WireRun {
+    id: i64,
+    run_attempt: Option<i64>,
+    head_sha: String,
+    head_branch: Option<String>,
+    event: String,
+    status: String,
+    conclusion: Option<String>,
+    path: String,
+    html_url: Option<String>,
+    updated_at: String,
+    repository: WireRepository,
+}
+
+#[derive(Deserialize)]
+struct WireDeployment {
+    id: i64,
+    sha: String,
+    environment: String,
+    description: Option<String>,
+    updated_at: String,
+}
+
+#[derive(Deserialize)]
+struct WireStatus {
+    state: String,
+    updated_at: String,
+    log_url: Option<String>,
+    target_url: Option<String>,
+}
+
+/// Keeps a link only when it is https on the connection's own web host.
+fn on_host(url: Option<&str>, web: &str) -> Option<String> {
+    let prefix = format!("{}/", web.trim_end_matches('/'));
+    url.filter(|url| prefix.starts_with("https://") && url.starts_with(&prefix))
+        .map(str::to_owned)
+}
+
+fn clipped(text: &str) -> String {
+    text.chars().take(MAX_TEXT_CHARS).collect()
+}
+
+/// A push-event workflow run for exactly `sha` on `branch` in repository `repo_id`, or `None`
+/// when it is some other run, malformed, or out of bounds. `web` is the connection's web base.
+pub fn ci_run(
+    value: &Value,
+    repo_id: i64,
+    sha: &str,
+    branch: &str,
+    web: &str,
+) -> Option<ExternalRun> {
+    let run = WireRun::deserialize(value).ok()?;
+    if run.repository.id != repo_id
+        || run.head_sha != sha
+        || run.head_branch.as_deref() != Some(branch)
+        || run.event != "push"
+    {
+        return None;
+    }
+    let outcome = match (run.status.as_str(), run.conclusion.as_deref()) {
+        ("queued" | "waiting" | "requested" | "pending", _) => ExternalOutcome::Pending,
+        ("in_progress", _) => ExternalOutcome::Running,
+        ("completed", Some("success")) => ExternalOutcome::Succeeded,
+        ("completed", Some("failure" | "timed_out" | "startup_failure")) => ExternalOutcome::Failed,
+        ("completed", Some("cancelled")) => ExternalOutcome::Cancelled,
+        _ => ExternalOutcome::Unknown,
+    };
+    let run = ExternalRun {
+        provider: "github".into(),
+        kind: ExternalKind::Ci,
+        run_id: run.id,
+        attempt: run.run_attempt.unwrap_or(1),
+        commit_sha: run.head_sha,
+        branch: Some(branch.to_owned()),
+        environment: None,
+        name: clipped(&run.path),
+        outcome,
+        provider_updated_at: parse_rfc3339(&run.updated_at)?,
+        html_url: on_host(run.html_url.as_deref(), web),
+    };
+    run.validate().ok()?;
+    Some(run)
+}
+
+/// A deployment of exactly `sha` with its newest status (`None` reads as pending).
+pub fn deployment(
+    value: &Value,
+    status: Option<&Value>,
+    sha: &str,
+    web: &str,
+) -> Option<ExternalRun> {
+    let deployment = WireDeployment::deserialize(value).ok()?;
+    let status = status.map(WireStatus::deserialize).transpose().ok()?;
+    if deployment.sha != sha {
+        return None;
+    }
+    let outcome = match status.as_ref().map(|status| status.state.as_str()) {
+        None | Some("queued" | "pending") => ExternalOutcome::Pending,
+        Some("in_progress") => ExternalOutcome::Running,
+        Some("success") => ExternalOutcome::Succeeded,
+        Some("failure" | "error") => ExternalOutcome::Failed,
+        Some("inactive") => ExternalOutcome::Superseded,
+        Some(_) => ExternalOutcome::Unknown,
+    };
+    let updated = |text: &str| parse_rfc3339(text);
+    let provider_updated_at = match &status {
+        Some(status) => updated(&status.updated_at)?.max(updated(&deployment.updated_at)?),
+        None => updated(&deployment.updated_at)?,
+    };
+    let link = |status: &WireStatus| status.log_url.clone().or_else(|| status.target_url.clone());
+    let run = ExternalRun {
+        provider: "github".into(),
+        kind: ExternalKind::Deployment,
+        run_id: deployment.id,
+        attempt: 1,
+        commit_sha: deployment.sha,
+        branch: None,
+        environment: Some(deployment.environment),
+        name: clipped(deployment.description.as_deref().unwrap_or_default()),
+        outcome,
+        provider_updated_at,
+        html_url: on_host(status.as_ref().and_then(link).as_deref(), web),
+    };
+    run.validate().ok()?;
+    Some(run)
+}
+
 impl Event {
     /// Carries identifiers and the outcome only; the provider's text stays in the table.
     pub(super) fn external_run_observed(repository: &str, run: &ExternalRun) -> Result<Self> {
@@ -278,5 +416,202 @@ mod tests {
             change(&mut candidate);
             assert!(candidate.validate().is_err(), "{candidate:?}");
         }
+    }
+
+    const WEB: &str = "https://github.com";
+
+    fn wire_run() -> Value {
+        json!({"id": 9, "run_attempt": 2, "head_sha": "a".repeat(40), "head_branch": "main",
+            "event": "push", "status": "completed", "conclusion": "success",
+            "path": ".github/workflows/ci.yml", "updated_at": "2026-10-16T12:30:05Z",
+            "html_url": "https://github.com/acme/widgets/actions/runs/9",
+            "repository": {"id": 5}})
+    }
+
+    fn ci(value: &Value) -> Option<ExternalRun> {
+        ci_run(value, 5, &"a".repeat(40), "main", WEB)
+    }
+
+    #[test]
+    fn ci_run_maps_a_good_run() {
+        let got = ci(&wire_run()).unwrap();
+        assert_eq!(got.run_id, 9);
+        assert_eq!(got.attempt, 2);
+        assert_eq!(got.branch.as_deref(), Some("main"));
+        assert_eq!(got.name, ".github/workflows/ci.yml");
+        assert_eq!(got.provider_updated_at, 1_792_153_805);
+        assert!(got.html_url.is_some());
+    }
+
+    #[test]
+    fn ci_status_and_conclusion_map_to_outcomes() {
+        let cases = [
+            ("queued", None, ExternalOutcome::Pending),
+            ("waiting", None, ExternalOutcome::Pending),
+            ("requested", None, ExternalOutcome::Pending),
+            ("pending", None, ExternalOutcome::Pending),
+            ("in_progress", None, ExternalOutcome::Running),
+            ("completed", Some("success"), ExternalOutcome::Succeeded),
+            ("completed", Some("failure"), ExternalOutcome::Failed),
+            ("completed", Some("timed_out"), ExternalOutcome::Failed),
+            (
+                "completed",
+                Some("startup_failure"),
+                ExternalOutcome::Failed,
+            ),
+            ("completed", Some("cancelled"), ExternalOutcome::Cancelled),
+            ("completed", Some("skipped"), ExternalOutcome::Unknown),
+            ("completed", Some("neutral"), ExternalOutcome::Unknown),
+            (
+                "completed",
+                Some("action_required"),
+                ExternalOutcome::Unknown,
+            ),
+            ("completed", Some("stale"), ExternalOutcome::Unknown),
+            ("completed", Some("novel"), ExternalOutcome::Unknown),
+            ("completed", None, ExternalOutcome::Unknown),
+            ("novel", None, ExternalOutcome::Unknown),
+        ];
+        for (status, conclusion, want) in cases {
+            let mut value = wire_run();
+            value["status"] = status.into();
+            value["conclusion"] = conclusion.map_or(Value::Null, Into::into);
+            assert_eq!(ci(&value).unwrap().outcome, want, "{status} {conclusion:?}");
+        }
+    }
+
+    #[test]
+    fn ci_run_drops_other_runs_and_bad_data() {
+        let edits: &[fn(&mut Value)] = &[
+            |v| v["repository"]["id"] = 6.into(),
+            |v| v["head_sha"] = "b".repeat(40).into(),
+            |v| v["head_branch"] = "dev".into(),
+            |v| v["head_branch"] = Value::Null,
+            |v| v["event"] = "pull_request".into(),
+            |v| v["id"] = "9".into(),
+            |v| v["updated_at"] = "yesterday".into(),
+            |v| v["path"] = "ci\u{1b}[31m".into(),
+            |v| v["id"] = 0.into(),
+            |v| {
+                v.as_object_mut().unwrap().remove("repository");
+            },
+        ];
+        for edit in edits {
+            let mut value = wire_run();
+            edit(&mut value);
+            assert_eq!(ci(&value), None, "{value}");
+        }
+    }
+
+    #[test]
+    fn ci_defaults_attempt_clips_name_and_filters_links() {
+        let mut value = wire_run();
+        value["run_attempt"] = Value::Null;
+        value["path"] = "p".repeat(300).into();
+        let got = ci(&value).unwrap();
+        assert_eq!((got.attempt, got.name.len()), (1, 200));
+        for url in [
+            "http://github.com/a",
+            "https://github.com.evil.test/a",
+            "https://example.com/a",
+            "https://github.com",
+        ] {
+            value["html_url"] = url.into();
+            assert_eq!(ci(&value).unwrap().html_url, None, "{url}");
+        }
+        value["html_url"] = Value::Null;
+        assert_eq!(ci(&value).unwrap().html_url, None);
+        // A plain-http web host never yields a link.
+        let got = ci_run(&wire_run(), 5, &"a".repeat(40), "main", "http://github.com");
+        assert_eq!(got.unwrap().html_url, None);
+    }
+
+    fn wire_deployment() -> Value {
+        json!({"id": 3, "sha": "a".repeat(40), "ref": "main", "environment": "production",
+            "description": "ship it", "updated_at": "2026-10-16T12:30:05Z"})
+    }
+
+    fn wire_status(state: &str) -> Value {
+        json!({"id": 1, "state": state, "updated_at": "2026-10-16T12:31:05Z",
+            "log_url": "https://github.com/acme/widgets/runs/1", "target_url": null})
+    }
+
+    fn deploy(value: &Value, status: Option<&Value>) -> Option<ExternalRun> {
+        deployment(value, status, &"a".repeat(40), WEB)
+    }
+
+    #[test]
+    fn deployment_status_maps_to_outcomes() {
+        let cases = [
+            ("queued", ExternalOutcome::Pending),
+            ("pending", ExternalOutcome::Pending),
+            ("in_progress", ExternalOutcome::Running),
+            ("success", ExternalOutcome::Succeeded),
+            ("failure", ExternalOutcome::Failed),
+            ("error", ExternalOutcome::Failed),
+            ("inactive", ExternalOutcome::Superseded),
+            ("novel", ExternalOutcome::Unknown),
+        ];
+        for (state, want) in cases {
+            let got = deploy(&wire_deployment(), Some(&wire_status(state))).unwrap();
+            assert_eq!(got.outcome, want, "{state}");
+            assert_eq!(got.provider_updated_at, 1_792_153_865);
+            assert_eq!(got.environment.as_deref(), Some("production"));
+            assert_eq!(
+                (got.attempt, got.run_id, got.name.as_str()),
+                (1, 3, "ship it")
+            );
+        }
+        let got = deploy(&wire_deployment(), None).unwrap();
+        assert_eq!(got.outcome, ExternalOutcome::Pending);
+        assert_eq!(got.provider_updated_at, 1_792_153_805);
+        assert_eq!(got.html_url, None);
+    }
+
+    #[test]
+    fn deployment_link_prefers_log_url_then_target_url_on_host_only() {
+        let mut status = wire_status("success");
+        assert_eq!(
+            deploy(&wire_deployment(), Some(&status))
+                .unwrap()
+                .html_url
+                .as_deref(),
+            Some("https://github.com/acme/widgets/runs/1")
+        );
+        status["log_url"] = Value::Null;
+        status["target_url"] = "https://github.com/acme/widgets/deployments".into();
+        assert!(
+            deploy(&wire_deployment(), Some(&status))
+                .unwrap()
+                .html_url
+                .is_some()
+        );
+        status["target_url"] = "https://example.com/x".into();
+        assert_eq!(
+            deploy(&wire_deployment(), Some(&status)).unwrap().html_url,
+            None
+        );
+    }
+
+    #[test]
+    fn deployment_drops_other_commits_and_bad_data() {
+        let edits: &[fn(&mut Value)] = &[
+            |v| v["sha"] = "b".repeat(40).into(),
+            |v| v["environment"] = "".into(),
+            |v| v["environment"] = "e".repeat(201).into(),
+            |v| v["environment"] = Value::Null,
+            |v| v["updated_at"] = "soon".into(),
+            |v| v["id"] = (-1).into(),
+        ];
+        for edit in edits {
+            let mut value = wire_deployment();
+            edit(&mut value);
+            assert_eq!(deploy(&value, None), None, "{value}");
+        }
+        // A status that does not parse drops the deployment rather than guessing.
+        assert_eq!(deploy(&wire_deployment(), Some(&json!({"state": 4}))), None);
+        let mut value = wire_deployment();
+        value["description"] = Value::Null;
+        assert_eq!(deploy(&value, None).unwrap().name, "");
     }
 }

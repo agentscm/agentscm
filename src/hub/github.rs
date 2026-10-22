@@ -22,6 +22,7 @@ pub(super) const API_BODY_BYTES: usize = 1 << 20;
 pub(super) const PER_PAGE: u32 = 100;
 pub const MAX_PULL_PAGES: u32 = 3;
 pub const MAX_FILE_PAGES: u32 = 3;
+pub const MAX_EXTERNAL_PAGES: u32 = 3;
 pub(super) const MAX_COMMENT_PAGES: u32 = 3;
 const MAX_REPO_PAGES: u32 = 10;
 pub const MAX_RECENT_BRANCHES: usize = 200;
@@ -462,6 +463,61 @@ impl Api {
             return Ok(None);
         }
         reply.ok("repos").map(Some)
+    }
+
+    /// Workflow runs for exactly `sha`, at most [`MAX_EXTERNAL_PAGES`] pages, and whether the
+    /// list is complete. Read-only: no logs, no reruns.
+    pub async fn workflow_runs(
+        &self,
+        token: &str,
+        full_name: &str,
+        sha: &str,
+    ) -> Gh<(Vec<Value>, bool)> {
+        let path = format!("/repos/{full_name}/actions/runs?head_sha={sha}");
+        self.external_list(&path, Some("workflow_runs"), token)
+            .await
+    }
+
+    /// Deployments of exactly `sha`; bounded like [`workflow_runs`](Self::workflow_runs).
+    pub async fn deployments(
+        &self,
+        token: &str,
+        full_name: &str,
+        sha: &str,
+    ) -> Gh<(Vec<Value>, bool)> {
+        let path = format!("/repos/{full_name}/deployments?sha={sha}");
+        self.external_list(&path, None, token).await
+    }
+
+    /// The newest status of a deployment; `None` when it has none or is gone.
+    pub async fn deployment_status(
+        &self,
+        token: &str,
+        full_name: &str,
+        id: i64,
+    ) -> Gh<Option<Value>> {
+        let path = format!("/repos/{full_name}/deployments/{id}/statuses?per_page=1");
+        let reply = self.get(token, &path).await?;
+        if reply.status == 404 {
+            return Ok(None);
+        }
+        Ok(reply
+            .ok("repos")?
+            .as_array()
+            .and_then(|list| list.first().cloned()))
+    }
+
+    async fn external_list(
+        &self,
+        path: &str,
+        key: Option<&str>,
+        token: &str,
+    ) -> Gh<(Vec<Value>, bool)> {
+        let paged = self
+            .paged(token, path, key, MAX_EXTERNAL_PAGES, None)
+            .await?;
+        let paged = paged.ok_or_else(|| GhError::Failed("unexpected 304 from repos".into()))?;
+        Ok((paged.items, paged.unread == 0))
     }
 
     /// Changed paths (renames count both names), and whether more files exist.
