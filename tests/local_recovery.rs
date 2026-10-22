@@ -7,7 +7,7 @@ use agentscm::skill_workflow::{
     RunState, SkillReference, StepAction, StepDefinition, WorkflowDefinition, WorkflowSource,
 };
 use agentscm::store::{Engine, digest};
-use agentscm::workspace::Workspace;
+use agentscm::workspace::{CaptureResult, SnapshotTrigger, TimelineEntry, Workspace};
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
@@ -124,6 +124,54 @@ fn populated(root: &Path) -> (String, String, ReviewContext, Approval) {
     };
     authority.approve(&approval).unwrap();
     (repository, revision, context, approval)
+}
+
+#[test]
+fn workspace_timeline_survives_offline_backup_and_restore() {
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    let (_, revision, context, _) = populated(&data);
+    let work = temp.path().join("work");
+    let captured_revision = {
+        let engine = Engine::open(&data).unwrap();
+        let workspace = Workspace::create(&engine, &work, context.change, &revision).unwrap();
+        fs::write(work.join("hello.txt"), b"timeline edit").unwrap();
+        match workspace.capture(&engine, SnapshotTrigger::Manual).unwrap() {
+            CaptureResult::Captured { entry } => entry.revision,
+            other => panic!("unexpected capture result: {other:?}"),
+        }
+    };
+    let probe_directory = work.join(".agentscm-workspace/timeline-probes");
+    fs::create_dir(&probe_directory).unwrap();
+    fs::write(probe_directory.join(".agentscm-probe-stale"), b"stale").unwrap();
+
+    let backup = temp.path().join("backup");
+    let manifest =
+        local_recovery::backup(&data, &backup, std::slice::from_ref(&work), &[], true).unwrap();
+    assert!(manifest.entries.iter().all(|entry| {
+        !entry.path.ends_with(".agentscm-timeline.lock") && !entry.path.contains("/timeline-probes")
+    }));
+    let restored = temp.path().join("restored");
+    local_recovery::restore(&backup, &restored).unwrap();
+    local_recovery::activate(&restored, true, true).unwrap();
+    assert!(
+        !restored
+            .join("workspaces/0/.agentscm-workspace/timeline-probes")
+            .exists()
+    );
+    let restored_workspace = Workspace::open(restored.join("workspaces/0")).unwrap();
+    let page = restored_workspace.timeline(10, None).unwrap();
+    assert!(matches!(
+        page.entries.as_slice(),
+        [TimelineEntry::Snapshot(entry)] if entry.revision == captured_revision
+    ));
+    assert_eq!(
+        Engine::open(restored.join("data"))
+            .unwrap()
+            .read_file(&captured_revision, "hello.txt")
+            .unwrap(),
+        b"timeline edit"
+    );
 }
 
 fn populated_with_workflow(root: &Path, run_id: &str) {
@@ -1329,8 +1377,14 @@ fn schema_four_workspace_backup_rejects_missing_scope_relations() {
         drop(workspace);
         drop(engine);
         let db = rusqlite::Connection::open(root.join(".agentscm-workspace/state.sqlite")).unwrap();
-        db.execute_batch(&format!("PRAGMA foreign_keys=OFF; DROP TABLE {table};"))
-            .unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA foreign_keys=OFF;
+             DROP INDEX timeline_check_link_identity;
+             DROP TABLE timeline_entries;
+             PRAGMA user_version=4;
+             DROP TABLE {table};"
+        ))
+        .unwrap();
         drop(db);
         let backup = temp.path().join("backup");
         assert!(
@@ -1358,6 +1412,12 @@ fn schema_four_backup_rejects_a_pending_scope_shrink() {
     drop(workspace);
     drop(engine);
     let db = rusqlite::Connection::open(root.join(".agentscm-workspace/state.sqlite")).unwrap();
+    db.execute_batch(
+        "DROP INDEX timeline_check_link_identity;
+         DROP TABLE timeline_entries;
+         PRAGMA user_version=4;",
+    )
+    .unwrap();
     db.execute("INSERT INTO scope_expansions(operation_id,request_digest,status,expected_generation,before_roots_json,after_roots_json) VALUES ('bad',?1,'pending',0,?2,?3)", rusqlite::params!["0".repeat(64), &b"[\"hello.txt\"]"[..], &b"[\"later\"]"[..]]).unwrap();
     drop(db);
     assert!(

@@ -632,3 +632,190 @@ fn an_empty_core_excludes_file_means_no_global_file() {
     assert_eq!(excluded(""), 1);
     assert_eq!(excluded("[core]\n\texcludesFile =\n"), 0);
 }
+
+#[test]
+fn timeline_capture_is_nonadvancing_and_fork_requires_exact_new_change() {
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("source");
+    let root = temp.path().join("work");
+    let (repository, revision) = initialize(&data);
+    let context_path = temp.path().join("context.json");
+    input(&context_path, &context(&repository, &revision));
+    success(&data, &["start", context_path.to_str().unwrap()]);
+    success(
+        &data,
+        &[
+            "workspace",
+            "create",
+            root.to_str().unwrap(),
+            "work",
+            &revision,
+        ],
+    );
+    let original = success(&data, &["workspace", "state", root.to_str().unwrap()]);
+    fs::write(root.join("a.txt"), b"captured").unwrap();
+    let capture = success(&data, &["workspace", "capture", root.to_str().unwrap()]);
+    assert_eq!(capture["outcome"]["outcome"], "captured");
+    let id = capture["outcome"]["entry"]["id"]
+        .as_u64()
+        .unwrap()
+        .to_string();
+    let captured_revision = capture["outcome"]["entry"]["revision"].as_str().unwrap();
+    assert_ne!(captured_revision, revision);
+    assert_eq!(
+        success(&data, &["workspace", "state", root.to_str().unwrap()]),
+        original
+    );
+    assert_eq!(
+        success(&data, &["workspace", "capture", root.to_str().unwrap()])["outcome"]["outcome"],
+        "unchanged"
+    );
+    let entry = success(&data, &["workspace", "entry", root.to_str().unwrap(), &id]);
+    assert_eq!(entry["evidence"]["state"], "not_run");
+    assert_eq!(entry["entry"]["revision"], captured_revision);
+    let list = success(
+        &data,
+        &[
+            "workspace",
+            "timeline",
+            root.to_str().unwrap(),
+            "--limit",
+            "1",
+        ],
+    );
+    assert_eq!(list["timeline"]["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        list["timeline"]["coverage"]["includes_pre_feature_history"],
+        false
+    );
+    fs::write(root.join("a.txt"), b"later").unwrap();
+    let second = success(&data, &["workspace", "capture", root.to_str().unwrap()]);
+    let second_id = second["outcome"]["entry"]["id"]
+        .as_u64()
+        .unwrap()
+        .to_string();
+    let diff = success(
+        &data,
+        &["workspace", "diff", root.to_str().unwrap(), &id, &second_id],
+    );
+    assert_eq!(diff["diff"]["entries"][0]["path"], "a.txt");
+    let mut fork_context = context(&repository, captured_revision);
+    fork_context["change"]["id"] = json!("forked");
+    input(&context_path, &fork_context);
+    success(&data, &["start", context_path.to_str().unwrap()]);
+    let parent = temp.path().to_str().unwrap();
+    let fork = success(
+        &data,
+        &[
+            "workspace",
+            "fork",
+            root.to_str().unwrap(),
+            &id,
+            "fork-work",
+            "forked",
+            "--fork-root",
+            parent,
+        ],
+    );
+    assert_eq!(fork["workspace"]["base_revision"], captured_revision);
+    assert_eq!(
+        fs::read(temp.path().join("fork-work/a.txt")).unwrap(),
+        b"captured"
+    );
+    assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"later");
+    assert!(
+        !run(
+            &data,
+            &[
+                "workspace",
+                "fork",
+                root.to_str().unwrap(),
+                &id,
+                "../escape",
+                "forked",
+                "--fork-root",
+                parent
+            ]
+        )
+        .status
+        .success()
+    );
+    assert!(
+        !run(
+            &data,
+            &[
+                "workspace",
+                "fork",
+                root.to_str().unwrap(),
+                &id,
+                "another",
+                "work",
+                "--fork-root",
+                parent
+            ]
+        )
+        .status
+        .success()
+    );
+    assert!(
+        !run(
+            &data,
+            &[
+                "workspace",
+                "fork",
+                root.to_str().unwrap(),
+                &id,
+                "fork-work",
+                "forked",
+                "--fork-root",
+                parent
+            ]
+        )
+        .status
+        .success()
+    );
+}
+
+#[test]
+fn timeline_capture_enrolls_existing_v4_workspace_without_mutating_read() {
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("source");
+    let root = temp.path().join("work");
+    let (repository, revision) = initialize(&data);
+    let context_path = temp.path().join("context.json");
+    input(&context_path, &context(&repository, &revision));
+    success(&data, &["start", context_path.to_str().unwrap()]);
+    success(
+        &data,
+        &[
+            "workspace",
+            "create",
+            root.to_str().unwrap(),
+            "work",
+            &revision,
+        ],
+    );
+    let database = root.join(".agentscm-workspace/state.sqlite");
+    let db = rusqlite::Connection::open(&database).unwrap();
+    db.execute_batch("DROP INDEX timeline_check_link_identity; DROP TABLE timeline_entries; PRAGMA user_version=4;").unwrap();
+    drop(db);
+    assert!(
+        success(&data, &["workspace", "timeline", root.to_str().unwrap()])["timeline"]["entries"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let db = rusqlite::Connection::open(&database).unwrap();
+    assert_eq!(
+        db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        4
+    );
+    drop(db);
+    fs::write(root.join("a.txt"), b"new observation").unwrap();
+    let result = success(&data, &["workspace", "capture", root.to_str().unwrap()]);
+    assert_eq!(result["outcome"]["outcome"], "captured");
+    let state = success(&data, &["workspace", "state", root.to_str().unwrap()]);
+    assert_eq!(state["workspace"]["base_revision"], revision);
+    assert_eq!(state["workspace"]["generation"], 0);
+}

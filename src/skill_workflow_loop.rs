@@ -29,12 +29,12 @@ pub struct LoopArgs {
     pub change: String,
     #[arg(long)]
     pub workspace: Option<PathBuf>,
+    #[arg(long, requires = "docker_socket")]
+    pub docker: Option<PathBuf>,
+    #[arg(long, requires = "docker")]
+    pub docker_socket: Option<PathBuf>,
     #[arg(long)]
-    pub docker: PathBuf,
-    #[arg(long)]
-    pub docker_socket: PathBuf,
-    #[arg(long)]
-    pub claude: PathBuf,
+    pub claude: Option<PathBuf>,
 }
 
 pub fn check(data_dir: &Path, args: LoopArgs) -> Result<Value> {
@@ -48,6 +48,35 @@ pub fn check(data_dir: &Path, args: LoopArgs) -> Result<Value> {
     let mut context = authority.review_context(&state.context_digest)?;
     let current_policy = authority.policy_epoch()?;
     let target = authority.target(&context.target)?;
+    let installed = authority
+        .workflow_requirement(&context.target)?
+        .ok_or_else(|| {
+            Error::Conflict(format!(
+                "target {} has no installed workflow requirement",
+                context.target
+            ))
+        })?;
+    let needs_command = installed
+        .definition
+        .steps
+        .iter()
+        .any(|step| matches!(step.action, skill_workflow::StepAction::Command { .. }));
+    let needs_claude = installed.definition.steps.iter().any(|step| {
+        matches!(
+            step.action,
+            skill_workflow::StepAction::ClaudeCodeReview { .. }
+        )
+    });
+    if needs_command && (args.docker.is_none() || args.docker_socket.is_none()) {
+        return Err(Error::Invalid(
+            "command steps require --docker and --docker-socket".into(),
+        ));
+    }
+    if needs_claude && args.claude.is_none() {
+        return Err(Error::Invalid(
+            "Claude review steps require --claude".into(),
+        ));
+    }
 
     let mut workspace = args.workspace.as_ref().map(Workspace::open).transpose()?;
     let mut workspace_binding = None;
@@ -159,40 +188,91 @@ pub fn check(data_dir: &Path, args: LoopArgs) -> Result<Value> {
     }
     let context_digest = context.digest()?;
     let run_id = stable_run_id(&requirement.digest()?, &context_digest);
+    // Try to retain an exact reference before execution, including for interrupted runs.
+    // Timeline availability never weakens or blocks the required workflow itself.
+    let timeline_record = workspace
+        .as_ref()
+        .map(|workspace| {
+            let request = agentscm::workspace::CheckLinkRequest {
+                source_revision: source_tip.clone(),
+                tested_revision: context.revision.clone(),
+                change: context.change.clone(),
+                change_version: context.change_version,
+                context_digest: context_digest.clone(),
+                policy_epoch: context.policy_epoch,
+                target: context.target.clone(),
+                target_revision: context.base.as_ref().map(|base| base.revision.clone()),
+                target_version: context.base.as_ref().map(|base| base.target_version),
+                requirement_digest: requirement.digest()?,
+                run_id: run_id.clone(),
+            };
+            workspace.record_check_start(&engine, &request)
+        })
+        .map(|result| match result {
+            Ok(outcome) => {
+                if matches!(
+                    outcome,
+                    agentscm::workspace::CheckLinkResult::Paused { .. }
+                        | agentscm::workspace::CheckLinkResult::Skipped { .. }
+                ) {
+                    eprintln!(
+                        "workspace timeline did not retain this check reference: {}",
+                        serde_json::to_string(&outcome).unwrap_or_default()
+                    );
+                }
+                json!({"outcome":outcome})
+            }
+            Err(_) => {
+                eprintln!(
+                    "workspace timeline could not retain this check reference; workflow continues"
+                );
+                json!({"outcome":"unavailable"})
+            }
+        });
     skill_workflow::start(data_dir, &run_id, &plan)?;
 
-    let work_dir = crate::private_execution_dir(data_dir)?;
-    let Some((_docker_config, backend)) = crate::optional_backend(
-        Some(args.docker.clone()),
-        Some(args.docker_socket.clone()),
-        &work_dir,
-    )?
-    else {
-        return Err(Error::Invalid(
-            "--docker and --docker-socket are required".into(),
-        ));
+    let work_dir = if needs_command || needs_claude {
+        Some(crate::private_execution_dir(data_dir)?)
+    } else {
+        None
     };
-    let claude_dir = crate::PrivateExecutionDirectory::create(&work_dir)?;
+    let backend = match work_dir.as_ref() {
+        Some(work_dir) if needs_command => {
+            crate::optional_backend(args.docker.clone(), args.docker_socket.clone(), work_dir)?
+        }
+        _ => None,
+    };
+    let claude_dir = match work_dir.as_ref() {
+        Some(work_dir) if needs_claude => Some(crate::PrivateExecutionDirectory::create(work_dir)?),
+        _ => None,
+    };
     let command_cancellation = Cancellation::default();
     let review_cancellation = ReviewCancellation::default();
     let signals = signal_bridge(command_cancellation.clone(), review_cancellation.clone())?;
-    let command = CommandExecutor {
-        backend: &backend,
-        work_dir: &work_dir,
-        cancellation: &command_cancellation,
-    };
-    let claude = ClaudeExecutor {
-        executable: &args.claude,
-        work_dir: &claude_dir.0,
-        cancellation: &review_cancellation,
-    };
+    let command = backend
+        .as_ref()
+        .zip(work_dir.as_ref())
+        .map(|((_, backend), work_dir)| CommandExecutor {
+            backend,
+            work_dir,
+            cancellation: &command_cancellation,
+        });
+    let claude = args
+        .claude
+        .as_ref()
+        .zip(claude_dir.as_ref())
+        .map(|(executable, directory)| ClaudeExecutor {
+            executable,
+            work_dir: &directory.0,
+            cancellation: &review_cancellation,
+        });
     let advanced = tokio::task::block_in_place(|| {
         skill_workflow::runtime::advance_with_backends(
             data_dir,
             &run_id,
             32,
-            Some(&command),
-            Some(&claude),
+            command.as_ref(),
+            claude.as_ref(),
         )
     });
     signals.abort();
@@ -252,6 +332,7 @@ pub fn check(data_dir: &Path, args: LoopArgs) -> Result<Value> {
     Ok(json!({
         "context": context,
         "run": run,
+        "timeline_record": timeline_record,
         "receipt": receipt,
         "workspace_changed_during_run": workspace_changed,
         "failures": failures,

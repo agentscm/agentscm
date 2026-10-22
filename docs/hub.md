@@ -28,6 +28,9 @@ GitHub. To warn agents from Claude Code, see [work intents](intents.md).
   PostgreSQL and objects go to the S3-compatible store. Outside compose, give a
   read-only container a writable volume here (owned by uid 10001, mode 0700)
   before setting up an app.
+- `AGENTSCM_GITHUB_EXTERNAL_RUNS`: comma-separated `owner/name` GitHub repositories whose
+  external CI and deployment outcomes are read for merged publications (off when unset). See
+  [External CI and deployment outcomes](#external-ci-and-deployment-outcomes).
 - `--poll-seconds N` (default 300, at least 10): how often connections are polled.
 - `--activity-days N` (default 14, 1 to 365): how far back a branch's tip commit
   counts as recent.
@@ -1043,6 +1046,77 @@ Limits:
   Once a pull request is recorded, a rerun makes no forge call at all.
 - Not yet verified against live GitHub.
 
+### External CI and deployment outcomes
+
+_Experimental, off by default, fake-tested only: the implementation has run against an
+in-process fake GitHub, never a live GitHub. The REST response shapes are not live-verified._
+
+Set `AGENTSCM_GITHUB_EXTERNAL_RUNS` to a comma-separated list of `owner/name` GitHub
+repositories (case-insensitive; anything else refuses to start, including an empty entry such as a trailing
+comma). For those repositories each
+poll records a merge the forge reports for a publication's pull request (at most 20 per pass),
+then reads what GitHub shows for the exact recorded merge commit of up to 20 merged
+publications per pass, taken in turn. Only publications updated within `--activity-days` are
+paged, so old merges never occupy a page:
+
+- Actions workflow runs (`actions/runs?head_sha=`) kept only if the run is a `push` event on the
+  publication's base branch in this repository, for exactly that commit. Runs for pull
+  requests, other branches or other repositories are dropped.
+- Deployments for that commit (`deployments?sha=`), each with its newest deployment status.
+  Deployments carry no repository id, so they are matched by the repository name in the
+  request and the exact sha, the same exposure as the `pulls/{n}` merge read.
+
+Outcomes are `pending`, `running`, `succeeded`, `failed`, `cancelled`, `superseded` (a
+deployment that went `inactive`) or `unknown`; anything the Hub does not recognise is
+`unknown`, never success. A run is keyed by provider, kind, run id and attempt, so a rerun
+is a separate row. A stored row is replaced only by a different state the provider updated
+no earlier (at the same time only a terminal state replaces), and a terminal state is never
+replaced by a non-terminal one. A repeat pass that
+changes nothing appends nothing. Links are kept only if they are `https` on the connection's
+own web host. Provider text is untrusted display data (control characters are refused and
+text is cut to 200 characters).
+
+`GET .../publications/{id}` adds an `external` object beside the landed revision (see the
+[API notes](api.md#hub-publication-external-outcomes)). It separates `ci` from
+`deployments`, one entry per deployment (an environment can have several), and is distinct
+from source approval and from `forge_check`. Its `state` is `unobserved` (no pass has read
+this commit), `incomplete` (the last read was cut short, or more rows exist than one reply
+shows) or `observed`. Missing CI or deployment is never read as success: an empty list under
+`observed` means the provider showed none, and under `unobserved` or `incomplete` it means
+the Hub does not know. `reconciled_at` is the staleness signal: the time of the last
+completed read of the commit. A later read that fails (a rate limit, 401, 403 or an error)
+changes nothing, so the previous marker and rows stay.
+
+Bounds: 3 pages of 100 for each list, 50 deployment statuses read per commit, 200 rows of each
+kind shown per publication. Anything dropped or unread marks the commit's read `incomplete`:
+a run or deployment of the commit that cannot be decoded or is out of bounds, a deployment
+past the status cap, and a list reply without its array all count. Runs of other branches,
+events or repositories are ignored and do not.
+
+Request budget: a commit read in full whose stored rows are all terminal is read again only
+after an hour (a new deployment, a rerun or a later status change on a settled commit can
+appear up to an hour plus one poll interval late); a commit with no stored row, an open
+row or an incomplete read is read every pass. Per repository, one pass makes at most 20
+pull request reads plus, for each of 20 commits, 3 + 3 list pages and 50 status reads, so at
+most 1140 requests; typically a handful per commit. A rate limit (429, or 403 with
+`retry-after` or no quota left) or a 401 hit by this pass backs off the whole connection like
+any other sync read; that stage re-reads its page next pass, and merge-detection progress made
+before a stop in the run reads is kept. Any other 403
+(including one that carries rate-limit headers) skips the repository for this pass without
+blaming the connection or marking anything read. The token needs `actions: read` and `deployments: read` (a fine-grained
+PAT, or an App installation); the GitHub App manifest does not request them yet, so an App
+installation gets 403 and the repository is skipped.
+
+Observation only. The Hub never fetches logs, dispatches or reruns workflows, creates
+deployments or posts to either; the outcomes never feed a forge check, native admission or
+a publication's state. Rows (`hub_external_runs`) and the per-commit read marker
+(`hub_external_reconciles`) are kept with the repository, and each new or changed row appends
+an `external_run_observed` event with identifiers and the outcome only; events are
+append-only like the others.
+
+Not supported: GitLab pipelines, Jenkins or other CI, and webhook hints (the poll is the only
+trigger, so an outcome shows up after the next poll).
+
 ## Running in containers
 
 [`compose.hub.yaml`](../compose.hub.yaml) has two profiles; run one at a time, because both publish
@@ -1127,6 +1201,10 @@ The container test does not include a forge. Pull-request overlaps (webhook and 
   keeps at most 8 live sessions. Sessions are not rechecked per request: a user
   disabled by other means keeps an existing session until it expires and can
   still list and revoke their tokens, though not mint.
+- External CI and deployment outcomes are GitHub only, polled (no webhook hints), tested only
+  against an in-process fake and not live-verified; the GitHub App manifest does not request
+  `actions: read` or `deployments: read`, so only a PAT that has them is read. GitLab
+  pipelines and Jenkins are not supported.
 - GitLab: a merge without a merge commit (fast-forward or merged by push) records `merge_commit_sha` null. After a project is
   renamed, the stored name refreshes only when it is added again (`add-repo`), and
   tokens must then be re-minted. Note adoption scans the first 300 notes, system
@@ -1244,6 +1322,12 @@ What the hub keeps, in its database and object store:
 - Forge observations: repository names and ids, pull or merge request numbers,
   titles, draft state, branches, commit ids, changed paths and author logins
   and ids, as read from GitHub or GitLab.
+- External runs (`hub_external_runs`, `hub_external_reconciles`, only for repositories in
+  `AGENTSCM_GITHUB_EXTERNAL_RUNS`): per merge commit, each GitHub workflow run or
+  deployment's id, attempt, branch or environment, workflow path or description (cut to 200
+  characters), outcome, provider update time and `https` link, and when the commit was last
+  read and whether that read was complete. No logs or payloads. The
+  `external_run_observed` event keeps identifiers and the outcome only.
 - Publications: the files, commit message, branch and pull request you publish,
   and the author and committer names and emails on that commit.
 - Connections: the forge installation or token reference for each connected

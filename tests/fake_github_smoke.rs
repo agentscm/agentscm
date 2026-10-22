@@ -5,7 +5,9 @@ mod fake_github;
 use agentscm::hub::github::{Api, CommitStatus, GhError, StatusState};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use fake_github::{Branch, FakeGithub, Pull, Repo, private_pem};
+use fake_github::{
+    Branch, FakeGithub, Pull, Repo, deployment_json, private_pem, run_json, status_json,
+};
 use ring::rand::SystemRandom;
 use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
 use serde_json::{Value, json};
@@ -448,4 +450,63 @@ async fn pull_head_reads_ids_live_base_tip_tree_and_parents() {
         .unwrap()
         .unwrap();
     assert!((!merged.open, merged.merged) == (true, true));
+}
+
+#[tokio::test]
+async fn runs_and_deployments_are_listed_for_the_exact_commit() {
+    let fake = FakeGithub::start().await;
+    with_pulls(&fake, 0);
+    let (a, b) = (sha('a'), sha('b'));
+    fake.with(|s| {
+        let repo = s.repos.get_mut(&1).unwrap();
+        repo.runs
+            .push(run_json(1, 10, &a, "main", "completed", Some("success")));
+        repo.runs.push(run_json(1, 11, &b, "main", "queued", None));
+        repo.deployments.push((
+            deployment_json(20, &a, "production"),
+            vec![status_json(2, "success"), status_json(1, "pending")],
+        ));
+        repo.deployments
+            .push((deployment_json(21, &b, "staging"), vec![]));
+    });
+    let api = api(&fake);
+    let (runs, complete) = api.workflow_runs("pat", "Acme/Widgets", &a).await.unwrap();
+    assert_eq!((runs.len(), complete), (1, true));
+    assert_eq!(runs[0]["id"], 10);
+    let (deployments, complete) = api.deployments("pat", "Acme/Widgets", &a).await.unwrap();
+    assert_eq!((deployments.len(), complete), (1, true));
+    let status = api
+        .deployment_status("pat", "Acme/Widgets", 20)
+        .await
+        .unwrap();
+    assert_eq!(status.unwrap()["state"], "success");
+    assert!(
+        api.deployment_status("pat", "Acme/Widgets", 21)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        api.deployment_status("pat", "Acme/Widgets", 99)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    fake.with(|s| {
+        let repo = s.repos.get_mut(&1).unwrap();
+        for id in 100..400 {
+            repo.runs.push(run_json(1, id, &a, "main", "queued", None));
+        }
+    });
+    let (runs, complete) = api.workflow_runs("pat", "Acme/Widgets", &a).await.unwrap();
+    assert_eq!((runs.len(), complete), (300, false));
+    let paths = fake.with(|s| {
+        s.requests
+            .iter()
+            .map(|r| r.path_and_query.clone())
+            .collect::<Vec<_>>()
+    });
+    assert!(paths.iter().any(|p| p.contains("/actions/runs?head_sha=")));
+    assert!(paths.iter().any(|p| p.contains("/deployments?sha=")));
 }

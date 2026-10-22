@@ -132,6 +132,49 @@ fn install_is_previewed_idempotent_replaceable_and_removable() {
 }
 
 #[test]
+fn source_only_codex_stop_installs_without_execution_backends() {
+    let f = Fixture::new();
+    let workspace = f.ws();
+    let words = [
+        "codex-stop",
+        "source-only",
+        "--workspace",
+        workspace.to_str().unwrap(),
+    ]
+    .map(String::from)
+    .to_vec();
+
+    let preview = json_out(&invoke(&f.data(), &f.settings(), &[], &refs(&words)));
+    assert_eq!(preview["agent"], "codex");
+    assert_eq!(preview["action"], "add");
+    assert_eq!(preview["applied"], false);
+    assert!(!f.settings().exists());
+    let preview_command = preview["entry"]["hooks"][0]["command"].as_str().unwrap();
+    assert!(preview_command.contains(" skill-workflow codex-stop source-only --workspace "));
+    assert!(preview_command.ends_with(workspace.to_str().unwrap()));
+    for absent in ["--docker", "--docker-socket", "--claude"] {
+        assert!(!preview_command.contains(absent), "unexpected {absent}");
+    }
+
+    let applied = json_out(&invoke(
+        &f.data(),
+        &f.settings(),
+        &["--apply"],
+        &refs(&words),
+    ));
+    assert_eq!(applied["agent"], "codex");
+    assert_eq!(applied["action"], "add");
+    assert_eq!(applied["applied"], true);
+    assert_eq!(applied["entry"], preview["entry"]);
+    let stored = settings_json(&f);
+    assert_eq!(stored["hooks"]["Stop"][0], applied["entry"]);
+    assert_eq!(
+        stored["hooks"]["Stop"][0]["hooks"][0]["command"],
+        preview_command
+    );
+}
+
+#[test]
 fn new_file_is_private_and_removal_restores_empty_object() {
     let f = Fixture::new();
     let settings = f.root.path().join("new/dir/hooks.json");
