@@ -114,6 +114,20 @@ These are not generated and not tested here. The shape is always the same:
 2. Make sure the agent reads `AGENTS.md` (or paste the snippet from it into the agent's own instructions file).
 3. If the agent can run a command before edits and wants a JSON answer, `agentscm hook generic` accepts `{"agent", "session", "event", "tool", "paths", "task"}` on standard input.
 
+### Report usage to work insights
+
+All supported clients can use the provider-neutral `agentscm_work_usage` tool on the Hub MCP,
+including through the local client proxy. The native workspace task MCP is a separate surface and
+does not expose Hub work tools. The equivalent universal CLI path is
+`agentscm work usage --request FILE|-`. Claude Code, Codex CLI, Gemini CLI, Cursor and Copilot use
+the same record. Grok has no native AgentSCM adapter; when configured as a Hub MCP client, it can
+use the same MCP tool.
+
+These are structured reports, not automatic usage capture. Use `unknown` for an agent, provider or
+model label the client cannot determine, and omit token or cost fields that are unavailable. Do not
+treat missing values as zero. A `provider_result` basis is still a caller report; the Hub does not
+verify it against a provider. See [work insights](work-insights.md) for the record and evidence limits.
+
 ## Workflow lifecycle capability matrix
 
 Matrix version 2, verified 2026-10-20 (see [Verified against](#verified-against)). It records, per client surface, what this repository's code and tests cover for the workflow lifecycle. Only the two CLI rows' Stop cells rest on a run in the real client product; every other cell is fixture-tested, unverified or unsupported.

@@ -101,6 +101,8 @@ source transfer profile. These are trusted-team alpha paths, not a finished host
 
 The Hub shows agent coordination and, when configured, workflow runs, source freshness,
 retained step evidence and workspace permissions.
+Its [work insights](docs/work-insights.md) view separately presents bounded reported duration,
+partial usage reports and stored publication observations without turning them into approval or landing claims.
 
 <a href="docs/assets/hub-workflow.jpg">
   <img src="docs/assets/hub-workflow.jpg" alt="AgentSCM Hub inspecting a source-check workflow, revision freshness and separate native landing status" width="640">

@@ -12,6 +12,7 @@ pub mod gitlab;
 pub mod handoff;
 pub mod hook;
 pub mod http;
+pub mod insights;
 pub mod intent;
 pub mod login;
 pub mod mcp;

@@ -20,6 +20,7 @@
 - [Autopsy: how often your own sessions collided](autopsy.md)
 - [Work intents](intents.md) and the Claude Code hook
 - [Asynchronous agent stand-up](standup.md): durable work claims, checkpoint handovers and bounded catch-up
+- [Work insights](work-insights.md): bounded timing, coordination, usage reports and stored publication observations
 - [Supported coding agents](agents.md): Claude Code, Codex, Cursor, Copilot and others; `agentscm init-repo` and `agentscm hook`
 - [Multi-user coordination hub](hub.md), including [what the hub stores](hub.md#data-the-hub-stores)
 - [Deployment](deployment.md)

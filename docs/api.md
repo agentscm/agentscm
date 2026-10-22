@@ -32,6 +32,11 @@ own routes, including the agent MCP endpoint `POST /mcp` and the hook endpoints
 `POST /v1/hub/hook/{agent}`; see the [hub guide](hub.md#routes) and
 [agent sessions](hub.md#agent-sessions-mcp-and-hook-endpoints).
 
+Its repository-authenticated stand-up routes also include `POST /v1/hub/standup/usage`,
+`GET /v1/hub/standup/insights` and `GET /v1/hub/standup/work/{work_id}/insights`.
+The first stores one idempotent partial usage report; the GET routes return bounded
+work projections. See [work insights](work-insights.md) for pagination and evidence limits.
+
 ## Guided workflow observations
 
 The status route accepts no query fields. Inspection accepts only one `limit`

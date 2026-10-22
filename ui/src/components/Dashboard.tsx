@@ -3,6 +3,7 @@ import {
   BranchesOutlined,
   HeartOutlined,
   HistoryOutlined,
+  BarChartOutlined,
   TeamOutlined,
   UnorderedListOutlined,
 } from '@ant-design/icons'
@@ -21,18 +22,20 @@ import { Workspace } from './Workspace.tsx'
 import { SkillWorkflow } from './SkillWorkflow.tsx'
 import { Standup } from './Standup.tsx'
 import { AgentSetup } from './AgentSetup.tsx'
+import { WorkInsights } from './WorkInsights.tsx'
 
-type HubSection = 'coordination' | 'work' | 'workflows' | 'activity' | 'health' | 'workspace'
+type HubSection = 'coordination' | 'work' | 'insights' | 'workflows' | 'activity' | 'health' | 'workspace'
 
 const sectionFromHash = (): HubSection => {
   if (window.location.hash.startsWith('#coordination/work/')) return 'work'
   const section = window.location.hash.slice(1).split('/')[0]
-  return section === 'work' || section === 'workflows' || section === 'activity' || section === 'health' || section === 'workspace' ? section : 'coordination'
+  return section === 'work' || section === 'insights' || section === 'workflows' || section === 'activity' || section === 'health' || section === 'workspace' ? section : 'coordination'
 }
 
 const navigation = [
   { key: 'coordination', label: <span><ApartmentOutlined /> Coordination</span> },
   { key: 'work', label: <span><UnorderedListOutlined /> Work</span> },
+  { key: 'insights', label: <span><BarChartOutlined /> Insights</span> },
   { key: 'workflows', label: <span><BranchesOutlined /> Workflows</span> },
   { key: 'activity', label: <span><HistoryOutlined /> Activity</span> },
   { key: 'workspace', label: <span><TeamOutlined /> Workspace</span> },
@@ -91,6 +94,8 @@ export function Dashboard({ data, token }: { data: HubData; token: string }) {
       )}
 
       {section === 'work' && <Standup key={repo} token={token} repository={repo} />}
+
+      {section === 'insights' && <WorkInsights key={repo} token={token} />}
 
       {section === 'workflows' && (
         <SkillWorkflow
