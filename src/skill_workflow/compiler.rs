@@ -79,20 +79,6 @@ struct CanonicalPlan<'a> {
 pub fn compile(data_dir: &Path, definition: &WorkflowDefinition) -> Result<CompiledPlan> {
     validate_definition_size(definition)?;
     let ordered_steps = validate_definition(definition)?;
-    if definition
-        .steps
-        .iter()
-        .any(|step| matches!(step.action, StepAction::ClaudeCodeReview { .. }))
-        && !definition
-            .steps
-            .iter()
-            .any(|step| matches!(step.action, StepAction::Command { .. }))
-    {
-        return Err(Error::Invalid(
-            "Claude review requires an exact command review context".into(),
-        ));
-    }
-
     // Open authority first so a nonexistent or incomplete root is not created by
     // the engine. Both handles are then rooted in the same operator-selected path.
     let authority = Authority::open_read_only(data_dir)?;
@@ -203,7 +189,7 @@ fn validate_definition_size(definition: &WorkflowDefinition) -> Result<()> {
     Ok(())
 }
 
-fn validate_definition(definition: &WorkflowDefinition) -> Result<Vec<StepDefinition>> {
+pub(super) fn validate_definition(definition: &WorkflowDefinition) -> Result<Vec<StepDefinition>> {
     if definition.version != WORKFLOW_VERSION {
         return Err(Error::Invalid(format!(
             "unsupported workflow definition version {}",
@@ -214,6 +200,19 @@ fn validate_definition(definition: &WorkflowDefinition) -> Result<Vec<StepDefini
     validate_repository(&definition.source.repository)?;
     validate_id(&definition.source.revision)?;
     validate_skill_reference(definition)?;
+    if definition
+        .steps
+        .iter()
+        .any(|step| matches!(step.action, StepAction::ClaudeCodeReview { .. }))
+        && !definition
+            .steps
+            .iter()
+            .any(|step| matches!(step.action, StepAction::Command { .. }))
+    {
+        return Err(Error::Invalid(
+            "Claude review requires an exact command review context".into(),
+        ));
+    }
 
     if definition.steps.is_empty() || definition.steps.len() > MAX_STEPS {
         return Err(Error::Limit(format!(
@@ -645,7 +644,7 @@ fn plan_digest(definition: &WorkflowDefinition, skill_digest: &str) -> Result<St
     Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
-fn validate_identifier(kind: &str, value: &str) -> Result<()> {
+pub(super) fn validate_identifier(kind: &str, value: &str) -> Result<()> {
     if value.is_empty()
         || value.len() > MAX_IDENTIFIER_BYTES
         || !value.bytes().all(|byte| {

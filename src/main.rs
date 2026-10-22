@@ -79,6 +79,8 @@ mod setup_cli;
 mod skill_workflow_cli;
 #[cfg(unix)]
 mod skill_workflow_loop;
+#[cfg(unix)]
+mod skill_workflow_mcp;
 mod team_cli;
 mod telemetry;
 mod telemetry_cli;
