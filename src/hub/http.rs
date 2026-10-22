@@ -365,14 +365,14 @@ async fn health(State(state): State<HubState>) -> Response {
 
 async fn view_settings(
     State(state): State<HubState>,
-    Reader(_): Reader,
-) -> std::result::Result<Json<super::view_settings::ViewSettings>, ApiError> {
+    Reader(principal): Reader,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
     let store = state.store.clone();
-    let settings = blocking(&state, move || {
-        super::view_settings::ViewSettings::load(&*store)
+    let report = blocking(&state, move || {
+        super::view_settings::ViewSettings::report(&*store, &principal.owner.id)
     })
     .await?;
-    Ok(Json(settings))
+    Ok(Json(report))
 }
 
 async fn whoami(Reader(principal): Reader) -> Json<serde_json::Value> {

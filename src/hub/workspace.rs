@@ -1044,6 +1044,10 @@ pub fn routes() -> Router<HubState> {
             "/v1/hub/workspace/view-settings",
             axum::routing::put(put_view_settings),
         )
+        .route(
+            "/v1/hub/workspace/view-settings/me",
+            axum::routing::put(put_my_view_settings),
+        )
 }
 type ApiResult<T> = std::result::Result<T, ApiError>;
 fn configured(state: &HubState) -> ApiResult<Arc<Workspace>> {
@@ -1163,6 +1167,41 @@ async fn put_view_settings(
         let member = workspace.require_admin(&conn, &actor)?;
         super::view_settings::ViewSettings::save(&*store, &settings, &member.identity.key()?)?;
         Ok(settings)
+    })
+    .await
+    .map(Json)
+    .map_err(api_error)
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MyViewSettings {
+    #[serde(flatten)]
+    choices: super::view_settings::ViewOverride,
+    #[serde(default)]
+    reset: bool,
+}
+/// Any signed-in member patches their own override; `reset` returns to the hub default.
+async fn put_my_view_settings(
+    State(state): State<HubState>,
+    actor: WorkspaceActor,
+    JsonBody(body): JsonBody<MyViewSettings>,
+) -> ApiResult<Json<Value>> {
+    let workspace = configured(&state)?;
+    let store = state.store.clone();
+    blocking(&state, move || {
+        let conn = workspace.conn()?;
+        let (user, _) = workspace.current(&conn, &actor)?;
+        let owner = user.id;
+        let choices = if body.reset {
+            Default::default()
+        } else {
+            // A patch: fields the caller leaves out keep their current override.
+            super::view_settings::ViewSettings::load_override(&*store, &owner)?
+                .unwrap_or_default()
+                .merge(body.choices)
+        };
+        super::view_settings::ViewSettings::save_override(&*store, &owner, &choices)?;
+        super::view_settings::ViewSettings::report(&*store, &owner)
     })
     .await
     .map(Json)

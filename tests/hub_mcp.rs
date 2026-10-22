@@ -1339,7 +1339,12 @@ async fn inline_views_are_offered_only_to_ui_clients_and_can_be_switched_off() {
         .as_array()
         .unwrap()
         .iter()
-        .filter(|c| c["text"].as_str().unwrap().starts_with("Inline views: on."))
+        .filter(|c| {
+            c["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Inline views: on (your setting).")
+        })
         .collect();
     assert_eq!(hints.len(), 1);
 
@@ -1354,7 +1359,11 @@ async fn inline_views_are_offered_only_to_ui_clients_and_can_be_switched_off() {
     assert_eq!(http.status, 200);
     assert_eq!(
         http.json(),
-        json!({"enabled": true, "work_overview": true, "coordination_inbox": true})
+        json!({
+            "effective": {"enabled": true, "work_overview": true, "coordination_inbox": true},
+            "hub_default": {"enabled": true, "work_overview": true, "coordination_inbox": true},
+            "override": null
+        })
     );
 
     // Read-only tokens read resources but cannot change the hub-wide setting.
@@ -1398,7 +1407,10 @@ async fn inline_views_are_offered_only_to_ui_clients_and_can_be_switched_off() {
             json!({"coordination_inbox": false}),
         )
         .await;
-    assert_eq!(changed["structuredContent"]["coordination_inbox"], false);
+    assert_eq!(
+        changed["structuredContent"]["effective"]["coordination_inbox"],
+        false
+    );
     let list = hub
         .rpc(&secret, &rpc_body("resources/list", json!({})))
         .await
@@ -1407,7 +1419,7 @@ async fn inline_views_are_offered_only_to_ui_clients_and_can_be_switched_off() {
     let off = hub
         .tool_result(&secret, "agentscm_view_settings", json!({"enabled": false}))
         .await;
-    assert_eq!(off["structuredContent"]["enabled"], false);
+    assert_eq!(off["structuredContent"]["effective"]["enabled"], false);
     let tools = hub
         .rpc(&secret, &rpc_body("tools/list", json!({})))
         .await
@@ -1448,9 +1460,68 @@ async fn inline_views_are_offered_only_to_ui_clients_and_can_be_switched_off() {
             .iter()
             .any(|c| {
                 c["text"].as_str().unwrap()
-                    == "Inline views: off. Turn on with agentscm_view_settings."
+                    == "Inline views: off (your setting). Change with agentscm_view_settings."
             }),
         (),
     );
     assert!(hint);
+}
+
+async fn resources(hub: &Hub, secret: &str) -> usize {
+    let list = hub
+        .rpc(secret, &rpc_body("resources/list", json!({})))
+        .await
+        .json();
+    list["result"]["resources"].as_array().unwrap().len()
+}
+
+#[tokio::test]
+async fn view_settings_are_per_user_over_a_hub_default() {
+    use agentscm::hub::view_settings::ViewSettings;
+    let hub = Hub::start().await;
+    let (a, b) = (hub.secret(10, "a"), hub.secret(11, "b"));
+    let off = ViewSettings {
+        enabled: false,
+        ..ViewSettings::default()
+    };
+    ViewSettings::save(&*hub.store, &off, "test").unwrap();
+    assert_eq!(resources(&hub, &a).await, 0);
+
+    // A's choice beats a hub default that is off; B is unaffected.
+    let on = hub
+        .tool_result(&a, "agentscm_view_settings", json!({"enabled": true}))
+        .await;
+    assert_eq!(on["structuredContent"]["effective"]["enabled"], true);
+    assert_eq!(on["structuredContent"]["hub_default"]["enabled"], false);
+    assert_eq!(on["structuredContent"]["override"]["enabled"], true);
+    assert_eq!(resources(&hub, &a).await, 2);
+    assert_eq!(resources(&hub, &b).await, 0);
+
+    // Partial updates merge; a user's off beats a default that is on.
+    ViewSettings::save(&*hub.store, &ViewSettings::default(), "test").unwrap();
+    let merged = hub
+        .tool_result(
+            &a,
+            "agentscm_view_settings",
+            json!({"work_overview": false}),
+        )
+        .await;
+    assert_eq!(merged["structuredContent"]["override"]["enabled"], true);
+    assert_eq!(resources(&hub, &a).await, 1);
+    assert_eq!(resources(&hub, &b).await, 2);
+    let tools = hub.rpc(&b, &rpc_body("tools/list", json!({}))).await.json();
+    assert!(
+        tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t.get("_meta").is_some())
+    );
+
+    // Reset follows the hub default again.
+    let reset = hub
+        .tool_result(&a, "agentscm_view_settings", json!({"reset": true}))
+        .await;
+    assert_eq!(reset["structuredContent"]["override"], Value::Null);
+    assert_eq!(resources(&hub, &a).await, 2);
 }

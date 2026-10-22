@@ -179,3 +179,6 @@ export type SkillWorkflowEnvelope =
   | { version: 1; availability: 'unavailable'; reason: string }
 
 export interface ViewSettings { enabled: boolean; work_overview: boolean; coordination_inbox: boolean }
+/** A member's own choices; null or absent inherits the hub default. */
+export type ViewOverride = Partial<Record<keyof ViewSettings, boolean | null>>
+export interface ViewSettingsReport { effective: ViewSettings; hub_default: ViewSettings; override: ViewOverride | null }

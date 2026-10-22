@@ -23,7 +23,7 @@ use super::http::{ApiError, Reader, blocking};
 use super::session::{SessionCall, announce_for, done_for, others_for, status_for};
 use super::skill_workflow::ReadError as SkillWorkflowReadError;
 use super::store::{Principal, unix_now};
-use super::view_settings::ViewSettings;
+use super::view_settings::{ViewOverride, ViewSettings};
 use super::work::{
     Briefing, BriefingAck, BriefingQuery, CheckpointKind, ForgeWorkRef, WorkCheckpoint,
     WorkConflictKind, WorkOverviewQuery, WorkRole, WorkStart, WorkStartResult, WorkState,
@@ -129,6 +129,7 @@ struct SessionArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ViewSettingsArgs {
+    reset: Option<bool>,
     enabled: Option<bool>,
     work_overview: Option<bool>,
     coordination_inbox: Option<bool>,
@@ -210,7 +211,8 @@ async fn mcp(
         "initialize" | "tools/list" | "resources/list" | "resources/read"
     ) {
         let store = state.store.clone();
-        match blocking(&state, move || ViewSettings::load(&*store)).await {
+        let owner = principal.owner.id.clone();
+        match blocking(&state, move || ViewSettings::effective(&*store, &owner)).await {
             Ok(settings) => settings,
             Err(error) => return Err(ApiError::from(error)),
         }
@@ -492,8 +494,9 @@ fn tools(read_only: bool, settings: &ViewSettings) -> Value {
          "inputSchema": schema(json!({"delivery": {"type": "string"}}), &["delivery"])},
         workflow,
         {"name": "agentscm_view_settings",
-         "description": "Reads or changes the hub-wide setting for inline views (MCP Apps) of work overview and coordination inbox. This affects every agent and user of this hub. Omit all arguments to read the current settings.",
+         "description": "Reads or changes your own setting for inline views (MCP Apps) of work overview and coordination inbox. It affects only your own agents, not other users; your choice wins over the hub default, which a workspace administrator changes in the hub UI. Omit all arguments to read. Returns effective, hub_default and override.",
          "inputSchema": schema(json!({
+             "reset": {"type": "boolean", "description": "Clear your own choices and follow the hub default."},
              "enabled": {"type": "boolean", "description": "Master switch for all inline views."},
              "work_overview": {"type": "boolean"},
              "coordination_inbox": {"type": "boolean"}}), &[])},
@@ -569,7 +572,8 @@ async fn call(
         "agentscm_work_overview" | "agentscm_coordination_inbox"
     ) {
         let store = state.store.clone();
-        let settings = blocking(state, move || ViewSettings::load(&*store))
+        let owner = principal.owner.id.clone();
+        let settings = blocking(state, move || ViewSettings::effective(&*store, &owner))
             .await
             .unwrap_or_default();
         let on = settings.enabled
@@ -579,9 +583,9 @@ async fn call(
                 settings.coordination_inbox
             };
         let hint = if on {
-            "Inline views: on. Change with agentscm_view_settings (enabled, work_overview, coordination_inbox)."
+            "Inline views: on (your setting). Change with agentscm_view_settings."
         } else {
-            "Inline views: off. Turn on with agentscm_view_settings."
+            "Inline views: off (your setting). Change with agentscm_view_settings."
         };
         if let Some(content) = value["content"].as_array_mut() {
             content.push(json!({"type": "text", "text": hint}));
@@ -772,26 +776,28 @@ async fn call_inner(
             return Ok(refused("invalid arguments"));
         };
         let store = state.store.clone();
-        let actor = principal.owner.id.clone();
+        let owner = principal.owner.id.clone();
         return Ok(
             match blocking(state, move || {
-                let mut settings = ViewSettings::load(&*store)?;
-                if change.enabled.is_some()
-                    || change.work_overview.is_some()
-                    || change.coordination_inbox.is_some()
-                {
-                    settings.enabled = change.enabled.unwrap_or(settings.enabled);
-                    settings.work_overview = change.work_overview.unwrap_or(settings.work_overview);
-                    settings.coordination_inbox = change
-                        .coordination_inbox
-                        .unwrap_or(settings.coordination_inbox);
-                    ViewSettings::save(&*store, &settings, &actor)?;
+                let change_set = ViewOverride {
+                    enabled: change.enabled,
+                    work_overview: change.work_overview,
+                    coordination_inbox: change.coordination_inbox,
+                };
+                if change.reset == Some(true) || change_set != ViewOverride::default() {
+                    let current = ViewSettings::load_override(&*store, &owner)?.unwrap_or_default();
+                    let next = if change.reset == Some(true) {
+                        change_set
+                    } else {
+                        current.merge(change_set)
+                    };
+                    ViewSettings::save_override(&*store, &owner, &next)?;
                 }
-                Ok(settings)
+                ViewSettings::report(&*store, &owner)
             })
             .await
             {
-                Ok(settings) => structured(&settings),
+                Ok(report) => structured(&report),
                 Err(error) => work_failure(&error),
             },
         );
