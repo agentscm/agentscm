@@ -230,7 +230,9 @@ changes), `connection_outbound`, `repository_connected` and
 `repository_id` and `full_name`; a close carries `state`, `merged` and
 `merge_commit_sha`), `branch_observed`, `branch_deleted` and `branch_unobserved`, `pr_comment_written`
 and `pr_status_written`, and `pr_notice` (addressed to an intent, like
-`intent_notice`). Publishing adds the `publication_*` events described under
+`intent_notice`; `"merged": true` when the pull request was just merged). An `agentscm_start`
+whose task reads like other work adds `task_overlap` (subject: the starting token; data: `task`,
+the matching `work` ids and pull request numbers `pulls`). Publishing adds the `publication_*` events described under
 [Publishing a revision](#publishing-a-revision). An unchanged observation, a repeated delivery and a
 poll that finds nothing new write no event.
 
@@ -288,7 +290,7 @@ body or query string is a 400 with a fixed body.
   anything else is 400): `{seq, id, at, kind, agent: {token, name}, owner:
   {login}, data}`. The kinds are `session_started`, `session_connected`,
   `session_ended`, `edit_denied`, `edit_repeated`, `hold_expired`,
-  `intent_announced`, `intent_released`, `intent_notice` and `pr_notice`;
+  `intent_announced`, `intent_released`, `intent_notice`, `pr_notice` and `task_overlap`;
   `agent` and `owner` are the token's that the event is about (for a notice,
   its recipient's), and `data` is the event's JSON without its `session` field.
   It is what the [status page](#status-page) reads.
@@ -450,6 +452,18 @@ Both routes accept an optional `?repo=owner/name`. When it is not the token's
 repository the call records nothing and answers "coordination unknown (this
 token is for another repository)", so one token set in a shell environment
 cannot write another repository's intents.
+
+### Similar work at start
+
+An `agentscm_start` that creates new work (not a join, takeover or resumed start) compares its
+task with the titles of other agents' ongoing work (from the same
+overview `work.context` shows) and of the repository's open observed pull requests. Two titles
+match when they share at least two words of three or more letters, ignoring a few filler words
+("fix", "add", "update", "work" ...), and those shared words are at least half of both together.
+On a match the reply lists them and tells the agent to ask the user whether it is the same work
+before going on, and the hub records a `task_overlap` event. It never refuses the start. The
+match is on words, not meaning: two tasks phrased differently are missed, and two different tasks
+that share their nouns are flagged.
 
 ### `POST /mcp`
 
@@ -682,6 +696,15 @@ are ignored. Notices come from the notices route with
 The notice has the pull's number, node id, title, URL, branch, head SHA, author,
 and `their_paths` and `your_paths`. The announce reply gains `pull_requests`: open
 observed pulls in that repository overlapping the announced paths.
+
+Merge. When a re-read finds a pull request closed and merged, every live intent whose paths
+overlap the files last observed for it gets one more `pr_notice`, with `"merged": true`,
+`base_ref` and `merge_commit_sha`, except an intent on the pull request's own head branch. The
+agent sees it with its next hook or MCP reply, while it is still working: "@alice's PR #5 ... was
+merged into main, changing src/billing.rs (which you are changing). Merge or rebase onto main
+before you continue." A pull request closed without merging tells nobody. The files are those of
+the last observation, so a merge that lands between polls with files the hub never saw is
+noticed only for the files it did see.
 
 Outbound, opt-in per connection and off by default
 (`agentscm hub connections outbound <id> on|off`). When on, each pull request that

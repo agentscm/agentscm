@@ -4735,10 +4735,10 @@ impl Store for SqliteStore {
         Ok(rows)
     }
 
-    fn append_pr_notices(&self, notices: &[(String, String)]) -> Result<()> {
+    fn append_notices(&self, kind: &'static str, notices: &[(String, String)]) -> Result<()> {
         let events = notices
             .iter()
-            .map(|(intent, data)| Event::pr_notice(intent, data))
+            .map(|(subject, data)| Event::notice(kind, subject, data))
             .collect::<Result<Vec<_>>>()?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;

@@ -1542,3 +1542,58 @@ async fn view_settings_are_per_user_over_a_hub_default() {
     assert_eq!(reset["structuredContent"]["override"], Value::Null);
     assert_eq!(resources(&hub, &a).await, 2);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_that_reads_like_live_work_says_to_ask_the_user() {
+    let hub = Hub::start().await;
+    let alice = hub.secret(1, "alice-agent");
+    let bob = hub.secret(2, "bob-agent");
+    let start = |secret: String, arguments: Value| {
+        let hub = &hub;
+        async move { hub.tool_result(&secret, "agentscm_start", arguments).await }
+    };
+    let text = |result: &Value| result["content"][0]["text"].as_str().unwrap().to_owned();
+    let first = start(
+        alice.clone(),
+        json!({"task": "make db migrations filename based"}),
+    )
+    .await;
+    assert!(!text(&first).contains("reads like work"), "{first}");
+    let work_id = first["structuredContent"]["work"]["item"]["id"].clone();
+
+    let similar = json!({"task": "switch migrations to filename-based discovery", "session": "b"});
+    let second = start(bob.clone(), similar.clone()).await;
+    let said = text(&second);
+    assert!(
+        said.contains("this task reads like work already under way")
+            && said.contains("\"make db migrations filename based\"")
+            && said.contains("Ask the user whether this is the same work"),
+        "{said}"
+    );
+    let events = |kind: &str| {
+        hub.store
+            .events_after(0, 1000)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == kind)
+            .count()
+    };
+    assert_eq!(events("task_overlap"), 1);
+
+    // Resuming the same work, or joining the matched work on purpose, is not new work.
+    let again = start(bob.clone(), similar).await;
+    assert_eq!(again["structuredContent"]["work"]["created"], false);
+    assert!(!text(&again).contains("reads like work"), "{again}");
+    let join = start(
+        bob.clone(),
+        json!({"task": "make db migrations filename based", "session": "c",
+            "work_id": work_id, "role": "helper"}),
+    )
+    .await;
+    assert_eq!(join["structuredContent"]["work"]["joined"], true, "{join}");
+    assert!(!text(&join).contains("reads like work"), "{join}");
+    assert_eq!(events("task_overlap"), 1);
+
+    let unrelated = start(bob, json!({"task": "refactor docs", "session": "d"})).await;
+    assert!(!text(&unrelated).contains("reads like work"), "{unrelated}");
+}
