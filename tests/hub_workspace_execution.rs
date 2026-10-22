@@ -3638,6 +3638,18 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
                 .unwrap()
                 .unwrap()
                 .token_id;
+            let task_state_before_recovery_staging = task_state_snapshot(&native.profile.data_dir);
+            let (recovery_service, recovery_queue) = cold_restore::stage_optional_server_recovery(
+                root.path(),
+                &native,
+                env.workspace.clone(),
+                &maintenance_actor,
+            );
+            assert_eq!(
+                task_state_snapshot(&native.profile.data_dir),
+                task_state_before_recovery_staging,
+                "server queue and injected source-admission staging must not mutate agent-task state"
+            );
             publication_server.abort();
             let stopped =
                 tokio::time::timeout(std::time::Duration::from_secs(5), publication_server)
@@ -3646,6 +3658,7 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
             assert!(stopped.is_ok() || stopped.unwrap_err().is_cancelled());
             fake.stop().await;
             drop(publication_state);
+            drop(recovery_service);
             drop(mirror);
             drop(collector);
             drop(service);
@@ -3671,6 +3684,7 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
                 publication_id,
                 &forge_request,
                 &recovery,
+                &recovery_queue,
                 &docker_home,
             )
             .await;
