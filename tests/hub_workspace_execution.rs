@@ -1,6 +1,8 @@
 #![cfg(unix)]
 //! Real Hub HTTP controls with a local synthetic forge and source-only native state.
 //! Source-only service execution uses an inert socket; no Docker or provider process runs.
+#[path = "common/cold_restore.rs"]
+mod cold_restore;
 #[path = "support/fake_github.rs"]
 mod fake_github;
 #[path = "common/workspace_hub.rs"]
@@ -90,7 +92,11 @@ fn isolated_git(repo: &Path) -> PathBuf {
     if transport.exists() {
         let mapping: Value = serde_json::from_slice(&fs::read(transport).unwrap()).unwrap();
         let script = format!(
-            "#!/usr/bin/python3\nimport os,sys\nos.environ['GIT_CONFIG_GLOBAL']='/dev/null'\nos.environ['GIT_CONFIG_NOSYSTEM']='1'\na=[{remote} if x=={endpoint} else ('protocol.file.allow=always' if x=='protocol.file.allow=never' else x) for x in sys.argv[1:]]\nos.execv({exe},[{exe},'-c','protocol.file.allow=always']+a)\n",
+            "#!/usr/bin/python3\nimport os,sys\nif 'push' in sys.argv[1:]:\n with open({push_log},'a') as f: f.write('push\\n')\nos.environ['GIT_CONFIG_GLOBAL']='/dev/null'\nos.environ['GIT_CONFIG_NOSYSTEM']='1'\na=[{remote} if x=={endpoint} else ('protocol.file.allow=always' if x=='protocol.file.allow=never' else x) for x in sys.argv[1:]]\nos.execv({exe},[{exe},'-c','protocol.file.allow=always']+a)\n",
+            push_log = serde_json::to_string(
+                &PathBuf::from(mapping["remote"].as_str().unwrap()).with_extension("push-log")
+            )
+            .unwrap(),
             remote = mapping["remote"],
             endpoint = mapping["endpoint"],
             exe = serde_json::to_string(&git_path()).unwrap()
@@ -1289,11 +1295,17 @@ async fn two_git_worktrees_refuse_revoked_publication_token() {
     agent_owned_transport_lifecycle_mode(true, "token").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_git_worktrees_cold_restore_at_same_paths() {
+    agent_owned_transport_lifecycle_mode(true, "cold").await;
+}
+
 async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) {
     let human_merge = revocation == "merge";
     let root = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let docker_home = root.path().join("fake-docker-home");
+    let docker_home = external.path().join("fake-docker-home");
     let docker_config = root.path().join("fake-docker-config");
     let collector_state = root.path().join("collector-state");
     for directory in [&docker_home, &docker_config, &collector_state] {
@@ -1350,7 +1362,7 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
         git(&git_repository, &["add", "."]);
         git(&git_repository, &["commit", "-q", "-m", "synthetic base"]);
         git(&git_repository, &["update-ref", "refs/heads/main", "HEAD"]);
-        let remote = root.path().join("provider.git");
+        let remote = external.path().join("provider.git");
         git(
             root.path(),
             &[
@@ -2721,7 +2733,7 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
             &[
                 "push",
                 "-q",
-                root.path().join("provider.git").to_str().unwrap(),
+                external.path().join("provider.git").to_str().unwrap(),
                 "HEAD:main",
             ],
         );
@@ -3248,34 +3260,35 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
             credential_file: Some(credential),
             ca_file: None,
         };
+        let config_file = root.path().join("publication-config.json");
+        fs::write(&config_file, serde_json::to_vec(&json!({
+            "version":1, "profiles":[], "source_profiles":[],
+            "agent_task_profiles":[AgentTaskProfile {
+                repository_id:native.profile.repository_id.clone(), profile_id:native.profile.profile_id.clone(),
+                native_repository:native.profile.native_repository.clone(), data_dir:native.profile.data_dir.clone(),
+                target:native.profile.target.clone(), requirement_digest:native.profile.requirement_digest.clone(),
+                publish_forge_status:true,
+            }], "attached_publication_profiles":[publication_profile]
+        })).unwrap()).unwrap();
         let publication_service = Arc::new(
             ExecutionService::open(
                 &root.path().join("publication.sqlite"),
-                ExecutionConfig {
-                    version: 1,
-                    profiles: vec![],
-                    source_profiles: vec![],
-                    agent_task_profiles: vec![AgentTaskProfile {
-                        repository_id: native.profile.repository_id.clone(),
-                        profile_id: native.profile.profile_id.clone(),
-                        native_repository: native.profile.native_repository.clone(),
-                        data_dir: native.profile.data_dir.clone(),
-                        target: native.profile.target.clone(),
-                        requirement_digest: native.profile.requirement_digest.clone(),
-                        publish_forge_status: true,
-                    }],
-                    attached_publication_profiles: vec![publication_profile],
-                },
+                ExecutionConfig::from_file(&config_file).unwrap(),
                 env.workspace.clone(),
             )
             .unwrap(),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let publication_base = format!("http://{}", listener.local_addr().unwrap());
-        let fake = fake_github::FakeGithub::start().await;
+        fs::write(
+            root.path().join("publication-listen.json"),
+            serde_json::to_vec(&listener.local_addr().unwrap().to_string()).unwrap(),
+        )
+        .unwrap();
+        let mut fake = fake_github::FakeGithub::start().await;
         fake.with(|s| {
             let mut repo = fake_github::Repo::new(100, "synthetic/project");
-            repo.git = Some(root.path().join("provider.git"));
+            repo.git = Some(external.path().join("provider.git"));
             s.repos.insert(100, repo);
             s.pats.insert(
                 "synthetic-publication-pat".into(),
@@ -3284,18 +3297,21 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
         });
         let secrets = root.path().join("publication-secrets");
         agentscm::hub::sync::prepare_secrets_dir(&secrets, true).unwrap();
-        let sync_config = agentscm::hub::sync::SyncConfig::from_lookup(
-            "http://127.0.0.1:1",
-            secrets,
-            14,
-            |name| match name {
-                "AGENTSCM_GITHUB_URL" => Some(format!("http://{}", env.host)),
-                "AGENTSCM_GITHUB_API_URL" => Some(fake.base.clone()),
-                "AGENTSCM_GITHUB_PAT" => Some("synthetic-publication-pat".into()),
-                _ => None,
-            },
+        let pat_file = root.path().join("publication.pat");
+        fs::write(&pat_file, "synthetic-publication-pat").unwrap();
+        fs::set_permissions(&pat_file, fs::Permissions::from_mode(0o600)).unwrap();
+        let sync_file = root.path().join("sync-config.json");
+        fs::write(
+            &sync_file,
+            serde_json::to_vec(&json!({
+                "AGENTSCM_GITHUB_URL":format!("http://{}", env.host),
+                "AGENTSCM_GITHUB_API_URL":fake.base,
+                "AGENTSCM_GITHUB_PAT_FILE":pat_file,
+            }))
+            .unwrap(),
         )
         .unwrap();
+        let sync_config = cold_restore::sync_config(root.path());
         let publication_state = agentscm::hub::HubState::new(
             env.store.clone(),
             Arc::new(
@@ -3419,7 +3435,7 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
         assert_eq!(published["currentness"], "current");
         assert_eq!(
             git(
-                &root.path().join("provider.git"),
+                &external.path().join("provider.git"),
                 &["rev-parse", &format!("refs/heads/{}", state.output)]
             ),
             first["candidate"]["commit"].as_str().unwrap()
@@ -3439,7 +3455,7 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
             "branch_request_id":branch["request_id"], "candidate_id":first["candidate"]["candidate_id"],
             "expected_generation":state.generation,"title":"Imported candidate","body":"Synthetic independent human landing"
         });
-        let provider = root.path().join("provider.git");
+        let provider = external.path().join("provider.git");
         let prepared_head = first["candidate"]["commit"].as_str().unwrap();
         let provider_base = git(&provider, &["rev-parse", "refs/heads/main"]);
         for (reference, replacement, original) in [
@@ -3560,6 +3576,75 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
         );
         assert_eq!(statuses.last().unwrap().0, first["candidate"]["commit"]);
 
+        if revocation == "cold" {
+            // All production state above is real; this branch only changes the stop/restore boundary.
+            cold_restore::browser_hold(&env.base).await;
+            let retained_transfer = collector.retained_transfer("transfer-success").unwrap();
+            let retained_attachments = {
+                let (_, _, _, _, journal, a, b) = git_fixture.as_ref().unwrap();
+                [journal.state(&a.id).unwrap(), journal.state(&b.id).unwrap()]
+            };
+            let mut parts = axum::http::Request::builder()
+                .header(header::COOKIE, &owner)
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0;
+            let maintenance_actor =
+                <agentscm::hub::workspace::WorkspaceActor as axum::extract::FromRequestParts<
+                    agentscm::hub::HubState,
+                >>::from_request_parts(&mut parts, &publication_state)
+                .await
+                .ok()
+                .expect("authenticated maintenance actor");
+            let token_id = env
+                .store
+                .authenticate(
+                    &agentscm::hub::store::agent_token_digest(&token).unwrap(),
+                    agentscm::hub::store::unix_now(),
+                )
+                .unwrap()
+                .unwrap()
+                .token_id;
+            publication_server.abort();
+            let stopped =
+                tokio::time::timeout(std::time::Duration::from_secs(5), publication_server)
+                    .await
+                    .unwrap();
+            assert!(stopped.is_ok() || stopped.unwrap_err().is_cancelled());
+            fake.stop().await;
+            drop(publication_state);
+            drop(mirror);
+            drop(collector);
+            drop(service);
+            drop(engine);
+            drop(git_fixture);
+            drop(no_http);
+            drop(_socket);
+            fs::remove_file(&docker_socket).unwrap();
+            let storage = env.stop().await;
+            cold_restore::qualify(
+                &root,
+                storage,
+                &native,
+                &collector_profile,
+                &mut fake,
+                maintenance_actor,
+                token_id,
+                &token,
+                &current_member,
+                &retained_transfer,
+                &retained_attachments,
+                &first,
+                publication_id,
+                &forge_request,
+                &recovery,
+                &docker_home,
+            )
+            .await;
+            return;
+        }
+
         if matches!(revocation, "executor" | "token") {
             if revocation == "executor" {
                 let mut authority = Authority::open(&native.profile.data_dir).unwrap();
@@ -3636,7 +3721,7 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
             return;
         }
         let baseline = git(
-            &root.path().join("provider.git"),
+            &external.path().join("provider.git"),
             &["rev-parse", "refs/heads/main"],
         );
         let head = first["candidate"]["commit"].as_str().unwrap();
@@ -3649,7 +3734,7 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
                     && pull.head_sha == expected_head
                     && pull.base_ref == "main"
                     && git(
-                        &root.path().join("provider.git"),
+                        &external.path().join("provider.git"),
                         &["rev-parse", "refs/heads/main"],
                     ) == expected_base
                     && repo
@@ -3697,7 +3782,7 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
             // Explicit synthetic human action, outside every agent API and native authority.
             // The provider applies its exact-head, baseline and status guard before landing.
             git(
-                &root.path().join("provider.git"),
+                &external.path().join("provider.git"),
                 &["update-ref", "refs/heads/main", head, &baseline],
             );
             fake.with(|s| {

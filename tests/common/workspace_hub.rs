@@ -10,7 +10,7 @@ use agentscm::backend::LocalBackend;
 use agentscm::hub::login::{Login, LoginConfig};
 use agentscm::hub::store::{self, Store};
 use agentscm::hub::workspace::{
-    Identity, Workspace, WorkspaceAction, WorkspaceActor, WorkspaceConfig, api_error,
+    Workspace, WorkspaceAction, WorkspaceActor, WorkspaceConfig, api_error,
 };
 use agentscm::hub::{HubState, router};
 use agentscm::team::auth::Role;
@@ -23,8 +23,14 @@ use reqwest::{Client, Method, Url};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+pub(super) struct EnvStorage {
+    pub(super) dir: Arc<TempDir>,
+    forge_addr: std::net::SocketAddr,
+    hub_addr: std::net::SocketAddr,
+}
+
 pub(super) struct Env {
-    pub(super) dir: TempDir,
+    pub(super) dir: Arc<TempDir>,
     pub(super) store: Arc<dyn Store>,
     pub(super) workspace: Arc<Workspace>,
     pub(super) host: String,
@@ -49,9 +55,37 @@ impl Env {
     pub(super) async fn with_state(
         build: impl FnOnce(HubState, Arc<Workspace>) -> HubState,
     ) -> Self {
+        let dir = Arc::new(TempDir::new().unwrap());
         let forge_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let forge_base = format!("http://{}", forge_listener.local_addr().unwrap());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let storage = EnvStorage {
+            dir,
+            forge_addr: forge_listener.local_addr().unwrap(),
+            hub_addr: listener.local_addr().unwrap(),
+        };
+        Self::open_existing_with_listeners(storage, forge_listener, listener, build).await
+    }
+
+    pub(super) async fn open_existing(
+        storage: EnvStorage,
+        build: impl FnOnce(HubState, Arc<Workspace>) -> HubState,
+    ) -> Self {
+        let forge_listener = tokio::net::TcpListener::bind(storage.forge_addr)
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind(storage.hub_addr)
+            .await
+            .unwrap();
+        Self::open_existing_with_listeners(storage, forge_listener, listener, build).await
+    }
+
+    async fn open_existing_with_listeners(
+        storage: EnvStorage,
+        forge_listener: tokio::net::TcpListener,
+        listener: tokio::net::TcpListener,
+        build: impl FnOnce(HubState, Arc<Workspace>) -> HubState,
+    ) -> Self {
+        let forge_base = format!("http://{}", forge_listener.local_addr().unwrap());
         let base = format!("http://{}", listener.local_addr().unwrap());
         let registered_redirect = format!("{base}/v1/hub/login/github/callback");
         let forge=Router::new()
@@ -69,23 +103,27 @@ impl Env {
         let forge_task = tokio::spawn(async move {
             axum::serve(forge_listener, forge).await.unwrap();
         });
-        let dir = TempDir::new().unwrap();
+        let dir = storage.dir;
         let store = store::open(&format!(
             "sqlite://{}",
             dir.path().join("hub.sqlite").display()
         ))
         .unwrap();
         let host = forge_base.trim_start_matches("http://").to_owned();
-        let config = WorkspaceConfig {
-            workspace_id: "synthetic-workspace".into(),
-            name: "Synthetic workspace".into(),
-            database: dir.path().join("workspace.sqlite"),
-            initial_owner: Identity {
-                provider: "github".into(),
-                host: host.clone(),
-                user_id: 101,
-            },
-        };
+        let config_path = dir.path().join("workspace.json");
+        if !config_path.exists() {
+            std::fs::write(
+                &config_path,
+                serde_json::to_vec(&json!({
+                    "workspace_id":"synthetic-workspace", "name":"Synthetic workspace",
+                    "database":dir.path().join("workspace.sqlite"),
+                    "initial_owner":{"provider":"github","host":host,"user_id":101}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let config = WorkspaceConfig::from_file(&config_path).unwrap();
         let workspace = Arc::new(Workspace::open(config, store.clone()).unwrap());
         let vars = HashMap::from([
             ("AGENTSCM_GITHUB_CLIENT_ID", "synthetic-client".to_owned()),
@@ -96,6 +134,18 @@ impl Env {
             ("AGENTSCM_GITHUB_URL", forge_base.clone()),
             ("AGENTSCM_GITHUB_API_URL", forge_base),
         ]);
+        let login_file = dir.path().join("login.json");
+        if !login_file.exists() {
+            std::fs::write(&login_file, serde_json::to_vec(&vars).unwrap()).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&login_file, std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+            }
+        }
+        let vars: HashMap<String, String> =
+            serde_json::from_slice(&std::fs::read(&login_file).unwrap()).unwrap();
         let login =
             Login::new(LoginConfig::from_lookup(&base, |key| vars.get(key).cloned()).unwrap())
                 .unwrap();
@@ -133,6 +183,7 @@ impl Env {
             axum::serve(listener, app).await.unwrap();
         });
         let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -145,6 +196,34 @@ impl Env {
             base,
             client,
             tasks: vec![forge_task, hub_task],
+        }
+    }
+
+    pub(super) async fn stop(mut self) -> EnvStorage {
+        for task in &self.tasks {
+            task.abort();
+        }
+        for task in self.tasks.drain(..) {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .unwrap();
+            assert!(result.is_ok() || result.unwrap_err().is_cancelled());
+        }
+        // Closing the client pool lets accepted HTTP connections release their router state.
+        self.client = Client::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while Arc::strong_count(&self.workspace) != 1 || Arc::strong_count(&self.store) != 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("all accepted connections and service handles must be released");
+        let forge_addr = self.host.parse().unwrap();
+        let hub_addr = self.base.trim_start_matches("http://").parse().unwrap();
+        EnvStorage {
+            dir: self.dir.clone(),
+            forge_addr,
+            hub_addr,
         }
     }
     pub(super) fn identity(&self, id: i64) -> Value {
