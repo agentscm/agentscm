@@ -1099,6 +1099,8 @@ async fn a_same_named_repository_on_another_host_stops_the_reconcile() {
         202
     );
     eventually("the success", || env.statuses().len() == 1).await;
+    // Take the repository lock once more so the initial reconcile's confirming pass has finished.
+    env.poll().await;
     // Publications are keyed by name alone: once another host shares the name, none is trusted.
     let other = NewConnection {
         id: format!("con_{}", "f".repeat(32)),

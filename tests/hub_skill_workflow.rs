@@ -289,6 +289,8 @@ async fn valid_run_has_the_same_envelope_over_http_and_mcp_for_a_read_only_token
         [
             "agentscm_coordination_inbox",
             "agentscm_work_briefing",
+            "agentscm_work_insight",
+            "agentscm_work_insights",
             "agentscm_work_overview",
             "agentscm_workflow_status"
         ]

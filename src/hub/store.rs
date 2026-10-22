@@ -15,6 +15,7 @@ use super::coordination::{
 };
 use super::external_runs::{ExternalKind, ExternalObserved, ExternalRun};
 use super::handoff::{Answered, Asked};
+use super::insights::{InsightPage, InsightQuery, UsageReceipt, UsageRecord, WorkInsight};
 use super::intent::{Announced, Intent, NewIntent};
 use super::publish::{Create, NewPublication, Publication, Update};
 use super::session::{SessionCall, Touched};
@@ -414,6 +415,9 @@ pub trait Store: Send + Sync {
         now: i64,
     ) -> Result<WorkCheckpointResult>;
     fn work_get(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkItem>>;
+    fn work_usage(&self, token: &str, usage: &UsageRecord, now: i64) -> Result<UsageReceipt>;
+    fn work_insight(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkInsight>>;
+    fn work_insights(&self, token: &str, query: &InsightQuery, now: i64) -> Result<InsightPage>;
     /// The token/session's one unfinished lead claim. Multiple matches are invalid.
     fn work_for_session(&self, token: &str, session: &str, now: i64) -> Result<Option<WorkItem>>;
     /// Resolve the explicit or most recently touched session without touching it.
@@ -872,6 +876,11 @@ const MIGRATIONS: &[Migration] = &[
         sqlite: include_str!("migrations/0017_external_runs.sqlite.sql"),
         postgres: include_str!("migrations/0017_external_runs.pg.sql"),
     },
+    Migration {
+        version: 18,
+        sqlite: include_str!("migrations/0018_work_insights.sqlite.sql"),
+        postgres: include_str!("migrations/0018_work_insights.pg.sql"),
+    },
 ];
 
 /// Migrations not yet applied. The registry must be numbered 1..n and the
@@ -910,18 +919,31 @@ mod tests {
 
     #[test]
     fn pending_requires_an_applied_prefix() {
-        assert_eq!(pending(&[]).unwrap().len(), 17);
-        assert_eq!(pending(&[1]).unwrap().len(), 16);
-        assert_eq!(pending(&[1, 2, 3]).unwrap().len(), 14);
-        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap().len(), 9);
-        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap().len(), 8);
+        assert_eq!(pending(&[]).unwrap().len(), 18);
+        assert_eq!(pending(&[1]).unwrap().len(), 17);
+        assert_eq!(pending(&[1, 2, 3]).unwrap().len(), 15);
+        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap().len(), 10);
+        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap().len(), 9);
         assert_eq!(
             pending(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14])
                 .unwrap()
                 .len(),
-            3
+            4
         );
-        assert!(pending(&(1..=17).collect::<Vec<_>>()).unwrap().is_empty());
+        let after_external_runs = pending(&(1..=17).collect::<Vec<_>>()).unwrap();
+        assert_eq!(after_external_runs.len(), 1);
+        assert_eq!(after_external_runs[0].version, 18);
+        assert!(
+            after_external_runs[0]
+                .sqlite
+                .contains("hub_work_model_usage")
+        );
+        assert!(
+            after_external_runs[0]
+                .postgres
+                .contains("hub_work_model_usage")
+        );
+        assert!(pending(&(1..=18).collect::<Vec<_>>()).unwrap().is_empty());
         assert!(pending(&[2]).is_err());
         let newer = pending(&[1, 999]).err().unwrap().to_string();
         assert!(newer.contains("newer than this binary"), "{newer}");

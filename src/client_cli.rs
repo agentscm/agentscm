@@ -41,6 +41,21 @@ pub(crate) enum ClientCommand {
     Doctor(DoctorArgs),
     /// Serve the checkout-bound Hub MCP transport over standard input/output.
     Mcp(RootArgs),
+    /// Control silent completion reporting for one saved checkout connection.
+    Reporting {
+        #[command(subcommand)]
+        command: ReportingCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ReportingCommand {
+    /// Enable completion reporting for native hooks and the Hub MCP proxy.
+    On(RootArgs),
+    /// Disable completion reporting.
+    Off(RootArgs),
+    /// Print only `on` or `off` for the selected checkout.
+    Status(RootArgs),
 }
 
 #[derive(Debug, Args)]
@@ -120,6 +135,7 @@ pub(crate) async fn run(command: ClientCommand) -> Result<()> {
         ClientCommand::Check(args) => check(args).await,
         ClientCommand::Doctor(args) => doctor(args).await,
         ClientCommand::Mcp(args) => crate::client_mcp::run(args.root.as_deref()).await,
+        ClientCommand::Reporting { command } => reporting(command),
     }
 }
 
@@ -602,6 +618,9 @@ async fn connect(args: ConnectArgs, root: PathBuf) -> Result<()> {
         hub,
         repo,
         token_file: supplied_token.clone().unwrap_or_default(),
+        report_completion: existing
+            .as_ref()
+            .is_some_and(|saved| !changed && saved.report_completion),
         owned_token_id: None,
         owned_token_expires_at: None,
     };
@@ -683,6 +702,49 @@ async fn connect(args: ConnectArgs, root: PathBuf) -> Result<()> {
         verified.login,
         verified.host,
         verified.expires_at
+    );
+    Ok(())
+}
+
+fn reporting(command: ReportingCommand) -> Result<()> {
+    let (args, enabled) = match command {
+        ReportingCommand::On(args) => (args, Some(true)),
+        ReportingCommand::Off(args) => (args, Some(false)),
+        ReportingCommand::Status(args) => (args, None),
+    };
+    let root = selected_root(args.root.as_deref())?;
+    let connection = load()?
+        .into_iter()
+        .find(|connection| connection.root == root)
+        .ok_or_else(|| invalid("no client connection for this checkout"))?;
+    if !is_current(&connection) {
+        return Err(invalid(
+            "the saved client connection no longer matches this checkout",
+        ));
+    }
+    read_token(&connection.token_file)?;
+    let Some(enabled) = enabled else {
+        println!(
+            "{}",
+            if connection.report_completion {
+                "on"
+            } else {
+                "off"
+            }
+        );
+        return Ok(());
+    };
+    if connection.report_completion == enabled {
+        println!("{}", if enabled { "on" } else { "off" });
+        return Ok(());
+    }
+    let mut replacement = connection.clone();
+    replacement.report_completion = enabled;
+    update(&root, Some(&connection), Some(replacement))?;
+    println!(
+        "Completion reporting is {} for {}. A running AgentSCM MCP proxy will stop on its next request because the connection changed; restart it.",
+        if enabled { "on" } else { "off" },
+        root.display()
     );
     Ok(())
 }
@@ -920,6 +982,7 @@ mod tests {
             hub,
             repo: "acme/widgets".into(),
             token_file: std::env::temp_dir().join("unused-token"),
+            report_completion: false,
             owned_token_id: None,
             owned_token_expires_at: None,
         };

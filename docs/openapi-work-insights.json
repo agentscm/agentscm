@@ -1,0 +1,109 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "AgentSCM work insights API",
+    "version": "1",
+    "description": "Repository scope comes from the bearer token. Usage and cost values are caller-reported observations; the API does not discover billing or transcripts. Insight projections do not establish exhaustive capture, work acceptance, approval, or merge status."
+  },
+  "servers": [{"url": "/"}],
+  "security": [{"bearerAuth": []}],
+  "x-completion-reporting": {
+    "header": "x-agentscm-completion-reporting",
+    "enabledValue": "true",
+    "default": false,
+    "paths": ["/mcp", "/v1/hub/hook/{agent}", "/v1/hub/standup/checkpoint"],
+    "description": "Exactly one literal true header opts completion calls into best-effort observations, deduplicated per token, canonical session, work and generation. Applies to native session-end, agentscm_done and finish checkpoints. No response change; report failures do not fail completion. Counts, cost, provider, model and outcome remain unknown. This caller preference is not repository enforcement; manual usage reporting is independent."
+  },
+  "paths": {
+    "/v1/hub/standup/usage": {
+      "post": {
+        "summary": "Record an idempotent usage observation",
+        "description": "Requires a writer agent token for the authenticated repository. Reusing observation_id with the same request returns replayed=true; changed input is rejected.",
+        "operationId": "workUsage",
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/UsageRecord"}}}},
+        "responses": {
+          "200": {"description": "Stored or exactly replayed", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/UsageReceipt"}}}},
+          "400": {"$ref": "#/components/responses/Invalid"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "403": {"$ref": "#/components/responses/ReadOnly"},
+          "503": {"$ref": "#/components/responses/Unavailable"}
+        }
+      }
+    },
+    "/v1/hub/standup/work/{id}/insights": {
+      "get": {
+        "summary": "Read one work insight",
+        "description": "Writer and read-only agent tokens may read. The read is side-effect-free and does not acknowledge or touch activity.",
+        "operationId": "workInsight",
+        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+        "responses": {
+          "200": {"description": "Insight projection", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/WorkInsight"}}}},
+          "400": {"$ref": "#/components/responses/Invalid"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "404": {"$ref": "#/components/responses/NotFound"},
+          "503": {"$ref": "#/components/responses/Unavailable"}
+        }
+      }
+    },
+    "/v1/hub/standup/insights": {
+      "get": {
+        "summary": "List work insights",
+        "description": "Defaults to the preceding seven days and at most 20 items. A continuation must repeat the exact since, until and through values returned with next_after. The maximum window is 90 days. Reads are side-effect-free.",
+        "operationId": "workInsights",
+        "parameters": [
+          {"name": "since", "in": "query", "schema": {"type": "integer", "minimum": 0}},
+          {"name": "until", "in": "query", "schema": {"type": "integer", "minimum": 0}},
+          {"name": "after", "in": "query", "schema": {"type": "string", "maxLength": 512}},
+          {"name": "through", "in": "query", "schema": {"type": "integer", "minimum": 0}},
+          {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 20, "default": 20}}
+        ],
+        "responses": {
+          "200": {"description": "Bounded page", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/InsightPage"}}}},
+          "400": {"$ref": "#/components/responses/Invalid"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "503": {"$ref": "#/components/responses/Unavailable"}
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {"bearerAuth": {"type": "http", "scheme": "bearer"}},
+    "responses": {
+      "Invalid": {"description": "Malformed, out-of-bounds, changed replay, or mismatched continuation", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
+      "Unauthorized": {"description": "Token absent, expired, revoked, or not accepted", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
+      "ReadOnly": {"description": "A read-only token cannot submit usage", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
+      "NotFound": {"description": "No work item in the authenticated repository scope", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
+      "Unavailable": {"description": "Hub storage unavailable", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}}
+    },
+    "schemas": {
+      "Error": {"type": "object", "additionalProperties": false, "required": ["error"], "properties": {"error": {"type": "string"}}},
+      "UsageRecord": {
+        "type": "object", "additionalProperties": false,
+        "required": ["work_id", "observation_id", "generation", "session", "phase", "outcome", "agent", "provider", "model", "usage_basis"],
+        "properties": {
+          "work_id": {"type": "string"}, "observation_id": {"type": "string", "maxLength": 255},
+          "generation": {"type": "integer", "minimum": 1}, "session": {"type": "string", "maxLength": 255},
+          "phase": {"enum": ["implementation", "review", "test", "repair", "other"]},
+          "outcome": {"enum": ["succeeded", "failed", "cancelled", "unknown"]},
+          "agent": {"type": "string", "maxLength": 255, "description": "Client/runtime label; use the literal unknown when unavailable."}, "provider": {"type": "string", "maxLength": 255, "description": "Model provider label; use the literal unknown when unavailable."}, "model": {"type": "string", "maxLength": 255, "description": "Model label; use the literal unknown when unavailable."},
+          "usage_basis": {"enum": ["reported", "provider_result"]},
+          "source_commit": {"type": ["string", "null"], "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},
+          "input_tokens": {"type": ["integer", "null"], "minimum": 0, "maximum": 1000000000000},
+          "output_tokens": {"type": ["integer", "null"], "minimum": 0, "maximum": 1000000000000},
+          "cost": {"oneOf": [{"type": "null"}, {"$ref": "#/components/schemas/ReportedCost"}]}
+        }
+      },
+      "ReportedCost": {"type": "object", "additionalProperties": false, "required": ["kind", "currency", "amount_micros", "basis"], "properties": {"kind": {"enum": ["reported_charge", "list_price_estimate"]}, "currency": {"type": "string", "pattern": "^[A-Z]{3}$"}, "amount_micros": {"type": "integer", "minimum": 0, "maximum": 1000000000000}, "basis": {"type": "string", "maxLength": 255}}},
+      "UsageReceipt": {"type": "object", "additionalProperties": false, "required": ["work_id", "observation_id", "received_at", "replayed"], "properties": {"work_id": {"type": "string"}, "observation_id": {"type": "string"}, "received_at": {"type": "integer"}, "replayed": {"type": "boolean"}}},
+      "InsightTiming": {"type": "object", "additionalProperties": false, "required": ["elapsed_seconds", "active_seconds", "blocked_seconds", "paused_seconds", "handover_seconds", "finished_seconds", "unknown_seconds"], "properties": {"elapsed_seconds": {"type": ["integer", "null"]}, "active_seconds": {"type": ["integer", "null"]}, "blocked_seconds": {"type": ["integer", "null"]}, "paused_seconds": {"type": ["integer", "null"]}, "handover_seconds": {"type": ["integer", "null"]}, "finished_seconds": {"type": ["integer", "null"]}, "unknown_seconds": {"type": ["integer", "null"]}}},
+      "InsightSignals": {"type": "object", "additionalProperties": false, "required": ["takeovers", "handovers", "reopened"], "properties": {"takeovers": {"type": ["integer", "null"], "minimum": 0}, "handovers": {"type": ["integer", "null"], "minimum": 0}, "reopened": {"type": ["integer", "null"], "minimum": 0}}},
+      "TokenGroup": {"type": "object", "additionalProperties": false, "required": ["agent", "provider", "model", "usage_basis", "observations", "input_tokens", "output_tokens", "input_known_observations", "output_known_observations"], "properties": {"agent": {"type": "string"}, "provider": {"type": "string"}, "model": {"type": "string"}, "usage_basis": {"enum": ["reported", "provider_result"]}, "observations": {"type": "integer", "minimum": 0}, "input_tokens": {"type": ["integer", "null"]}, "output_tokens": {"type": ["integer", "null"]}, "input_known_observations": {"type": "integer", "minimum": 0}, "output_known_observations": {"type": "integer", "minimum": 0}}},
+      "CostGroup": {"type": "object", "additionalProperties": false, "required": ["kind", "currency", "basis", "usage_basis", "agent", "provider", "model", "amount_micros", "observations"], "properties": {"kind": {"enum": ["reported_charge", "list_price_estimate"]}, "currency": {"type": "string"}, "basis": {"type": "string"}, "usage_basis": {"enum": ["reported", "provider_result"]}, "agent": {"type": "string"}, "provider": {"type": "string"}, "model": {"type": "string"}, "amount_micros": {"type": "integer"}, "observations": {"type": "integer", "minimum": 0}}},
+      "UsageSummary": {"type": "object", "additionalProperties": false, "required": ["observations", "coverage", "input_tokens", "output_tokens", "input_known_observations", "output_known_observations", "missing_cost_observations", "reported_failed_attempts", "groups_complete", "cost_groups", "token_groups"], "properties": {"observations": {"type": "integer", "minimum": 0}, "coverage": {"enum": ["unknown", "partial"]}, "input_tokens": {"type": ["integer", "null"]}, "output_tokens": {"type": ["integer", "null"]}, "input_known_observations": {"type": "integer", "minimum": 0}, "output_known_observations": {"type": "integer", "minimum": 0}, "missing_cost_observations": {"type": "integer", "minimum": 0}, "reported_failed_attempts": {"type": "integer", "minimum": 0}, "groups_complete": {"type": "boolean", "description": "False when token_groups or cost_groups were truncated; aggregate counts and sums still cover all retained observations. List-page summaries retain at most 20 groups of each kind; a single-work detail may retain up to 500."}, "cost_groups": {"type": "array", "maxItems": 500, "items": {"$ref": "#/components/schemas/CostGroup"}}, "token_groups": {"type": "array", "maxItems": 500, "items": {"$ref": "#/components/schemas/TokenGroup"}}}},
+      "RecordedCheck": {"type": "object", "additionalProperties": false, "required": ["head_sha", "state", "phase", "binding_digest", "observed_at"], "properties": {"head_sha": {"type": "string"}, "state": {"type": "string"}, "phase": {"type": "string"}, "binding_digest": {"type": ["string", "null"]}, "observed_at": {"type": "integer"}}},
+      "PublicationEvidence": {"type": "object", "additionalProperties": false, "required": ["publication_id", "commit", "branch_state", "pr_number", "merge_commit", "observed_at", "checks", "association"], "properties": {"publication_id": {"type": "string"}, "commit": {"type": "string"}, "branch_state": {"type": "string"}, "pr_number": {"type": ["integer", "null"]}, "merge_commit": {"type": ["string", "null"]}, "observed_at": {"type": "integer"}, "checks": {"type": "array", "maxItems": 16, "description": "Current stored checks whose head matches this publication commit; this is not a historical check archive.", "items": {"$ref": "#/components/schemas/RecordedCheck"}}, "association": {"type": "string", "description": "Whether this commit was claimed by a retained checkpoint or caller-reported usage observation."}}},
+      "WorkInsight": {"type": "object", "additionalProperties": false, "required": ["version", "as_of", "work_id", "title", "state", "claim_status", "created_at", "updated_at", "reported_finished", "history_complete", "history_retention_gap", "scanned_events", "timing", "signals", "usage", "publications", "publications_complete", "commits_truncated", "evidence_basis", "approval"], "properties": {"version": {"const": 1}, "as_of": {"type": "integer"}, "work_id": {"type": "string"}, "title": {"type": "string"}, "state": {"enum": ["active", "blocked", "paused", "finished", "handover"]}, "claim_status": {"enum": ["active", "stale", "unknown"]}, "created_at": {"type": "integer"}, "updated_at": {"type": "integer"}, "reported_finished": {"type": "boolean"}, "history_complete": {"type": "boolean"}, "history_retention_gap": {"type": "boolean"}, "scanned_events": {"type": "integer", "minimum": 0}, "timing": {"$ref": "#/components/schemas/InsightTiming"}, "signals": {"$ref": "#/components/schemas/InsightSignals"}, "usage": {"$ref": "#/components/schemas/UsageSummary"}, "publications": {"type": "array", "maxItems": 16, "description": "Current retained publication records associated through at most 16 distinct checkpoint-first commit claims; superseded publication heads and prior check states are not retained as a historical archive.", "items": {"$ref": "#/components/schemas/PublicationEvidence"}}, "publications_complete": {"type": "boolean", "description": "False when associated commits, publications, or matching checks exceeded a bound, or when a PR exists but its connected check source is unavailable."}, "commits_truncated": {"type": "boolean", "description": "True when more than 16 distinct valid commit claims were found within the bounded retained checkpoint and usage history, or more than 256 retained versions exist."}, "evidence_basis": {"type": "string"}, "approval": {"type": "string"}}},
+      "InsightPage": {"type": "object", "additionalProperties": false, "required": ["version", "as_of", "since", "until", "through", "next_after", "complete", "items"], "properties": {"version": {"const": 1}, "as_of": {"type": "integer"}, "since": {"type": "integer"}, "until": {"type": "integer"}, "through": {"type": "integer"}, "next_after": {"type": ["string", "null"]}, "complete": {"type": "boolean"}, "items": {"type": "array", "items": {"$ref": "#/components/schemas/WorkInsight"}}}}
+    }
+  }
+}
