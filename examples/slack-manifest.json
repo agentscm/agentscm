@@ -1,0 +1,49 @@
+{
+  "display_information": {
+    "name": "AgentSCM"
+  },
+  "features": {
+    "app_home": {
+      "home_tab_enabled": true,
+      "messages_tab_enabled": false,
+      "messages_tab_read_only_enabled": false
+    },
+    "bot_user": {
+      "display_name": "AgentSCM",
+      "always_online": false
+    },
+    "slash_commands": [
+      {
+        "command": "/agentscm",
+        "description": "Open private AgentSCM work and coordination views",
+        "usage_hint": "[status|work [id]|briefing|coordination|handoffs|workflows|start|checkpoint <id>]",
+        "url": "https://example.invalid/v1/hub/slack",
+        "should_escape": false
+      }
+    ]
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "commands"
+      ]
+    }
+  },
+  "settings": {
+    "event_subscriptions": {
+      "request_url": "https://example.invalid/v1/hub/slack",
+      "bot_events": [
+        "app_home_opened",
+        "tokens_revoked",
+        "app_uninstalled"
+      ]
+    },
+    "interactivity": {
+      "is_enabled": true,
+      "request_url": "https://example.invalid/v1/hub/slack"
+    },
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": false,
+    "token_rotation_enabled": false
+  }
+}

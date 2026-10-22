@@ -122,6 +122,8 @@ pagination, large histories, search and navigation still need substantial refine
 
 </details>
 
+The optional [Slack adapter](docs/slack.md) provides private status, catch-up, coordination and evidence views, plus scoped work/checkpoint forms. See its [capability map](docs/slack-capabilities.md) for implemented journeys and browser fallbacks. Live Slack installation remains a separate operator check.
+
 ## Git, GitHub and GitLab
 
 Keep Git and your forge in charge of their existing merge path. Experimental bridges
