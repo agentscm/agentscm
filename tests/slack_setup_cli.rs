@@ -82,7 +82,6 @@ fn setup_derives_identity_is_idempotent_and_doctor_does_not_create_a_journal() {
         signing.to_str().unwrap(),
         "--bot-token-file",
         bot.to_str().unwrap(),
-        "--allow-coordination-writes",
     ];
     for _ in 0..2 {
         let output = cli(&args);
@@ -100,7 +99,6 @@ fn setup_derives_identity_is_idempotent_and_doctor_does_not_create_a_journal() {
     let config: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(config["bindings"][0]["repository_id"], 101);
     assert_eq!(config["bindings"][0]["forge_user_id"], 42);
-    assert_eq!(config["bindings"][0]["allow_coordination_writes"], true);
     let denied = cli(&args);
     assert!(!denied.status.success());
     assert_eq!(
@@ -177,9 +175,9 @@ exit 0
     assert_eq!(manifest["settings"]["org_deploy_enabled"], false);
     assert_eq!(
         manifest["oauth_config"]["scopes"]["bot"],
-        json!(["commands"])
+        json!(["chat:write"])
     );
-    assert!(manifest["features"]["slash_commands"].is_null());
+    assert!(manifest["settings"]["interactivity"].is_null());
     assert!(!project.join("package.json").exists());
 
     // A cached app record and a new icon acknowledgement do not establish approval.

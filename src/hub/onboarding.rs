@@ -537,41 +537,6 @@ async fn list(
 ) -> std::result::Result<Json<Vec<Status>>, ApiError> {
     let now = unix_now();
     let selected_client = client(&headers).map(str::to_owned);
-    let read_state = state.clone();
-    let statuses = blocking(&state, move || {
-        repository_status_selected(
-            &read_state,
-            &principal,
-            now,
-            selected_client.as_deref(),
-            query.agent,
-            query.session.as_deref(),
-        )
-    })
-    .await?;
-    Ok(Json(statuses))
-}
-
-/// Read-only repository readiness projection for private first-party surfaces.
-///
-/// This applies the same repository, lifetime, revocation and owner checks as the HTTP list.
-/// It deliberately omits client, session and token identifiers and never records transport proof.
-pub(super) fn repository_status(
-    state: &HubState,
-    principal: &Principal,
-    now: i64,
-) -> Result<Vec<Status>> {
-    repository_status_selected(state, principal, now, None, None, None)
-}
-
-fn repository_status_selected(
-    state: &HubState,
-    principal: &Principal,
-    now: i64,
-    selected_client: Option<&str>,
-    selected_agent: Option<Agent>,
-    selected_session: Option<&str>,
-) -> Result<Vec<Status>> {
     let rows: Vec<Row> = state
         .onboarding
         .0
@@ -579,53 +544,59 @@ fn repository_status_selected(
         .map_err(|_| HubError::Busy)?
         .values()
         .filter(|row| {
-            same_repository(&row.principal, principal)
+            same_repository(&row.principal, &principal)
                 && (!row.closed || row.call.blocker.is_some())
                 && row.updated <= now
                 && now - row.updated < TTL
                 && row.principal.expires_at > now
-                && selected_agent.is_none_or(|agent| row.call.agent == agent)
-                && selected_session.is_none_or(|session| row.call.session == session)
-                && selected_client.is_none_or(|client| {
-                    row.client == client && row.principal.token_id == principal.token_id
+                && query.agent.is_none_or(|agent| row.call.agent == agent)
+                && query
+                    .session
+                    .as_ref()
+                    .is_none_or(|session| &row.call.session == session)
+                && selected_client.as_ref().is_none_or(|client| {
+                    row.client == *client && row.principal.token_id == principal.token_id
                 })
         })
         .cloned()
         .collect();
+    let store = state.store.clone();
     // Recheck each observed token's current revocation and owner status before showing readiness.
-    let mut out = Vec::new();
-    let mut valid = BTreeMap::new();
-    for row in rows {
-        let owner = &row.principal.owner;
-        if !valid.contains_key(&owner.id) {
-            let tokens: Vec<_> = if state
-                .store
-                .user_by_id(&owner.id)?
-                .is_some_and(|user| !user.disabled)
-            {
-                state
-                    .store
-                    .list_agent_tokens(&owner.id)?
-                    .into_iter()
-                    .filter(|token| !token.revoked && token.expires_at > now)
-                    .map(|token| token.id)
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            valid.insert(owner.id.clone(), tokens);
-        }
-        if valid[&owner.id].contains(&row.principal.token_id) {
-            let mut status = row.status(now);
-            if selected_client.is_none() {
-                status.session = None;
-                status.token = None;
-                status.client = None;
+    let statuses = blocking(&state, move || {
+        let mut out = Vec::new();
+        let mut valid = BTreeMap::new();
+        for row in rows {
+            let owner = &row.principal.owner;
+            if !valid.contains_key(&owner.id) {
+                let tokens: Vec<_> = if store
+                    .user_by_id(&owner.id)?
+                    .is_some_and(|user| !user.disabled)
+                {
+                    store
+                        .list_agent_tokens(&owner.id)?
+                        .into_iter()
+                        .filter(|token| !token.revoked && token.expires_at > now)
+                        .map(|token| token.id)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                valid.insert(owner.id.clone(), tokens);
             }
-            out.push(status);
+            if valid[&owner.id].contains(&row.principal.token_id) {
+                let mut status = row.status(now);
+                if selected_client.is_none() {
+                    status.session = None;
+                    status.token = None;
+                    status.client = None;
+                }
+                out.push(status);
+            }
         }
-    }
-    Ok(out)
+        Ok(out)
+    })
+    .await?;
+    Ok(Json(statuses))
 }
 
 async fn report(

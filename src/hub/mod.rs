@@ -3,7 +3,6 @@ pub mod advice;
 pub mod connection;
 pub mod coordination;
 mod coordination_http;
-pub mod delegation;
 pub mod external_runs;
 pub mod forge_api;
 #[cfg(unix)]
@@ -23,7 +22,6 @@ pub mod session;
 pub mod skill_workflow;
 pub mod slack;
 pub mod slack_protocol;
-mod slack_views;
 pub mod store;
 mod store_pg;
 mod store_sqlite;

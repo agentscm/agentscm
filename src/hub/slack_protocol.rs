@@ -13,7 +13,6 @@ pub const MAX_FORM_VALUE_BYTES: usize = MAX_BODY_BYTES;
 pub const MAX_BLOCK_TEXT_CHARS: usize = 3_000;
 pub const REPLAY_WINDOW_SECONDS: u64 = 300;
 
-const MAX_COMMAND_BYTES: usize = 512;
 const SIGNED_VERSION_PREFIX: &str = "v0:";
 const SIGNATURE_HEADER_PREFIX: &str = "v0=";
 const SHA256_HEX_BYTES: usize = 64;
@@ -23,13 +22,10 @@ pub enum ProtocolError {
     BodyTooLarge,
     DuplicateField,
     FieldTooLarge,
-    InvalidCommand,
-    InvalidJson,
     InvalidSignature,
     InvalidTimestamp,
     InvalidUtf8,
     MalformedForm,
-    MissingField,
     StaleTimestamp,
     TooManyFields,
 }
@@ -40,13 +36,10 @@ impl fmt::Display for ProtocolError {
             Self::BodyTooLarge => "request body is too large",
             Self::DuplicateField => "form contains a duplicate field",
             Self::FieldTooLarge => "form field is too large",
-            Self::InvalidCommand => "invalid command",
-            Self::InvalidJson => "invalid JSON payload",
             Self::InvalidSignature => "invalid request signature",
             Self::InvalidTimestamp => "invalid request timestamp",
             Self::InvalidUtf8 => "form field is not valid UTF-8",
             Self::MalformedForm => "malformed form body",
-            Self::MissingField => "required form field is missing",
             Self::StaleTimestamp => "request timestamp is outside the allowed window",
             Self::TooManyFields => "form contains too many fields",
         })
@@ -211,19 +204,6 @@ fn form_hex_value(byte: u8) -> Option<u8> {
 }
 
 /// Parses a bounded JSON request body.
-pub fn parse_json(body: &[u8]) -> Result<Value, ProtocolError> {
-    if body.len() > MAX_BODY_BYTES {
-        return Err(ProtocolError::BodyTooLarge);
-    }
-    serde_json::from_slice(body).map_err(|_| ProtocolError::InvalidJson)
-}
-
-/// Extracts and parses the JSON `payload` field used by Slack interactions.
-pub fn interaction_payload(fields: &BTreeMap<String, String>) -> Result<Value, ProtocolError> {
-    let payload = fields.get("payload").ok_or(ProtocolError::MissingField)?;
-    serde_json::from_str(payload).map_err(|_| ProtocolError::InvalidJson)
-}
-
 /// Returns a Block Kit `plain_text` object with bounded, control-free text.
 ///
 /// The object type is fixed rather than caller-controlled so Slack does not
@@ -256,53 +236,6 @@ pub fn clip_plain_text(input: &str, max_chars: usize) -> String {
         output.push('…');
     }
     output
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Command {
-    Briefing,
-    Checkpoint(String),
-    Coordination,
-    Handoffs,
-    Help,
-    Start,
-    Status,
-    Work(Option<String>),
-    Workflows,
-}
-
-/// Parses the text following `/agentscm` without accepting extra arguments.
-pub fn parse_command(input: &str) -> Result<Command, ProtocolError> {
-    if input.len() > MAX_COMMAND_BYTES {
-        return Err(ProtocolError::InvalidCommand);
-    }
-    let parts = input.split_ascii_whitespace().collect::<Vec<_>>();
-    match parts.as_slice() {
-        [] | ["help"] => Ok(Command::Help),
-        ["status"] => Ok(Command::Status),
-        ["work"] => Ok(Command::Work(None)),
-        ["work", work_id] if valid_work_id(work_id) => {
-            Ok(Command::Work(Some((*work_id).to_owned())))
-        }
-        ["briefing"] => Ok(Command::Briefing),
-        ["coordination"] => Ok(Command::Coordination),
-        ["handoffs"] => Ok(Command::Handoffs),
-        ["workflows"] => Ok(Command::Workflows),
-        ["start"] => Ok(Command::Start),
-        ["checkpoint", work_id] if valid_work_id(work_id) => {
-            Ok(Command::Checkpoint((*work_id).to_owned()))
-        }
-        _ => Err(ProtocolError::InvalidCommand),
-    }
-}
-
-fn valid_work_id(value: &str) -> bool {
-    value.strip_prefix("wrk_").is_some_and(|hex| {
-        hex.len() == 32
-            && hex
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    })
 }
 
 #[cfg(test)]
@@ -456,25 +389,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_bounded_json_and_interaction_payload() {
-        assert_eq!(
-            parse_json(br#"{"type":"url_verification"}"#).unwrap()["type"],
-            "url_verification"
-        );
-        assert_eq!(parse_json(b"{"), Err(ProtocolError::InvalidJson));
-
-        let fields = parse_form(b"payload=%7B%22type%22%3A%22block_actions%22%7D").unwrap();
-        assert_eq!(
-            interaction_payload(&fields).unwrap()["type"],
-            "block_actions"
-        );
-        assert_eq!(
-            interaction_payload(&BTreeMap::new()),
-            Err(ProtocolError::MissingField)
-        );
-    }
-
-    #[test]
     fn builds_control_free_unicode_plain_text() {
         assert_eq!(clip_plain_text("a\n🙂bc", 4), "a 🙂…");
         assert_eq!(clip_plain_text("🙂🙃", 2), "🙂🙃");
@@ -484,38 +398,5 @@ mod tests {
         assert_eq!(object["type"], "plain_text");
         assert_eq!(object["text"], "*not bold* <@U123>");
         assert_eq!(object.get("mrkdwn"), None);
-    }
-
-    #[test]
-    fn parses_only_the_command_grammar() {
-        let work_id = "wrk_0123456789abcdef0123456789abcdef";
-        assert_eq!(parse_command(""), Ok(Command::Help));
-        assert_eq!(parse_command("status"), Ok(Command::Status));
-        assert_eq!(parse_command("work"), Ok(Command::Work(None)));
-        assert_eq!(
-            parse_command(&format!("work {work_id}")),
-            Ok(Command::Work(Some(work_id.to_owned())))
-        );
-        assert_eq!(
-            parse_command(&format!("checkpoint {work_id}")),
-            Ok(Command::Checkpoint(work_id.to_owned()))
-        );
-        assert_eq!(parse_command("briefing"), Ok(Command::Briefing));
-        assert_eq!(parse_command("coordination"), Ok(Command::Coordination));
-        assert_eq!(parse_command("handoffs"), Ok(Command::Handoffs));
-        assert_eq!(parse_command("workflows"), Ok(Command::Workflows));
-        assert_eq!(parse_command("start"), Ok(Command::Start));
-        assert_eq!(parse_command("help"), Ok(Command::Help));
-
-        for invalid in [
-            "STATUS",
-            "status now",
-            "work wrk_0123456789ABCDEF0123456789ABCDEF",
-            "checkpoint",
-            "checkpoint wrk_short",
-            "unknown",
-        ] {
-            assert_eq!(parse_command(invalid), Err(ProtocolError::InvalidCommand));
-        }
     }
 }

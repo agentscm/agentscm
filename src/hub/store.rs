@@ -13,7 +13,6 @@ use super::coordination::{
     CoordinationAck, CoordinationInbox, CoordinationInboxQuery, CoordinationListQuery,
     CoordinationReply, CoordinationRequest, CoordinationResolve, CoordinationWithdraw,
 };
-use super::delegation::CoordinationGrant;
 use super::external_runs::{ExternalKind, ExternalObserved, ExternalRun};
 use super::handoff::{Answered, Asked};
 use super::intent::{Announced, Intent, NewIntent};
@@ -405,16 +404,9 @@ pub trait Store: Send + Sync {
     /// Events with `seq` greater than the argument, oldest first, at most 1000.
     /// Retained events in sequence order; operator-compacted work events can leave gaps.
     fn events_after(&self, seq: i64, limit: usize) -> Result<Vec<HubEvent>>;
+    /// The highest event `seq`, or 0 with no events.
+    fn latest_event_seq(&self) -> Result<i64>;
     fn work_start(&self, token: &str, start: &WorkStart, now: i64) -> Result<WorkStartResult>;
-    /// Starts only a narrowly shaped Slack-owned assignment using an opaque in-process grant.
-    fn work_start_delegated(
-        &self,
-        _grant: &CoordinationGrant,
-        _start: &WorkStart,
-        _now: i64,
-    ) -> Result<WorkStartResult> {
-        Err(HubError::Unauthorized)
-    }
     /// Atomic compatibility start: reuse this session's unfinished lead work, or create one.
     fn work_start_auto(&self, token: &str, start: &WorkStart, now: i64) -> Result<WorkStartResult>;
     fn work_checkpoint(
@@ -423,15 +415,6 @@ pub trait Store: Send + Sync {
         checkpoint: &WorkCheckpoint,
         now: i64,
     ) -> Result<WorkCheckpointResult>;
-    /// Checkpoints only Slack-owned active or blocked work using an opaque in-process grant.
-    fn work_checkpoint_delegated(
-        &self,
-        _grant: &CoordinationGrant,
-        _checkpoint: &WorkCheckpoint,
-        _now: i64,
-    ) -> Result<WorkCheckpointResult> {
-        Err(HubError::Unauthorized)
-    }
     fn work_get(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkItem>>;
     /// The token/session's one unfinished lead claim. Multiple matches are invalid.
     fn work_for_session(&self, token: &str, session: &str, now: i64) -> Result<Option<WorkItem>>;

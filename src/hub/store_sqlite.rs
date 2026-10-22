@@ -22,7 +22,6 @@ use super::coordination::{
     MAX_PROJECTED_COORDINATION_UPDATES, parse_response_kind, parse_status, response_kind_name,
     status_name,
 };
-use super::delegation::CoordinationGrant;
 use super::external_runs::{
     EXTERNAL_RUN_COLUMNS, ExternalKind, ExternalObserved, ExternalOutcome, ExternalRun, supersedes,
 };
@@ -3093,220 +3092,6 @@ fn lapse(tx: &Transaction<'_>, request: &str, now: i64) -> Result<()> {
 const TOKEN_SCOPE: &str =
     "t.repository = ?1 AND t.repository_id IS ?2 AND u.host = ?3 AND u.provider = ?4";
 
-impl SqliteStore {
-    fn work_start_with_grant(
-        &self,
-        token: &str,
-        start: &WorkStart,
-        now: i64,
-        grant: Option<&CoordinationGrant>,
-    ) -> Result<WorkStartResult> {
-        let mut conn = self.conn();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut who = work_who(&tx, token, now)?;
-        if let Some(grant) = grant {
-            grant.authorize_who(&mut who)?;
-            grant.validate_start(start)?;
-        }
-        let result = start_in(&tx, &who, start, now)?;
-        tx.commit()?;
-        Ok(result)
-    }
-
-    fn work_checkpoint_with_grant(
-        &self,
-        token: &str,
-        checkpoint: &WorkCheckpoint,
-        now: i64,
-        grant: Option<&CoordinationGrant>,
-    ) -> Result<WorkCheckpointResult> {
-        checkpoint.validate()?;
-        let request = json_string(checkpoint)?;
-        let mut conn = self.conn();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut who = work_who(&tx, token, now)?;
-        if let Some(grant) = grant {
-            grant.authorize_who(&mut who)?;
-            grant.validate_checkpoint(checkpoint)?;
-        }
-        if who.read_only {
-            return Err(HubError::Unauthorized);
-        }
-        let mut item = scoped_work(&tx, &who, &checkpoint.work_id, now)?
-            .ok_or_else(|| HubError::Invalid("unknown work item".into()))?;
-        if let Some((previous, snapshot, event_seq)) = tx
-            .query_row(
-                "SELECT o.request, v.snapshot, o.event_seq FROM hub_work_checkpoint_ops o
-                 JOIN hub_work_versions v ON v.work = o.work AND v.event_seq = o.event_seq
-                 WHERE o.work = ?1 AND o.operation_id = ?2",
-                params![checkpoint.work_id, checkpoint.operation_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                },
-            )
-            .optional()?
-        {
-            if previous != request {
-                return Err(HubError::Invalid(
-                    "checkpoint operation_id was already used for another request".into(),
-                ));
-            }
-            let committed: WorkItem = json_value(&snapshot)?;
-            if committed.lead_token != token
-                || committed.lead_session != checkpoint.session
-                || committed.generation != checkpoint.generation
-            {
-                return Err(HubError::Invalid(
-                    "checkpoint operation belongs to another lead session".into(),
-                ));
-            }
-            tx.commit()?;
-            return Ok(WorkCheckpointResult {
-                item,
-                receipt: CheckpointReceipt {
-                    work_id: checkpoint.work_id.clone(),
-                    operation_id: checkpoint.operation_id.clone(),
-                    generation: committed.generation,
-                    event_seq,
-                    replayed: true,
-                },
-            });
-        }
-        if let Some(grant) = grant {
-            grant.validate_checkpoint_item(&item)?;
-        }
-        if item.generation != checkpoint.generation {
-            return Err(HubError::Invalid(format!(
-                "checkpoint generation is fenced; current generation is {}",
-                item.generation
-            )));
-        }
-        if item.lead_token != token || item.lead_session != checkpoint.session {
-            return Err(HubError::Invalid(
-                "only the current lead session may checkpoint work".into(),
-            ));
-        }
-        let expected = checkpoint.expected_updated_seq.ok_or_else(|| {
-            HubError::Invalid("expected_updated_seq is required for a new checkpoint".into())
-        })?;
-        if expected != item.updated_seq {
-            return Err(HubError::Invalid(format!(
-                "checkpoint receipt expired or work changed; current updated_seq is {}",
-                item.updated_seq
-            )));
-        }
-        if let Some(scope) = checkpoint.normalized_scope()? {
-            let overlaps = work_scope_overlaps(&tx, &who, &scope, Some(&item.id), now)?;
-            if !overlaps.is_empty() {
-                let request = create_coordination_request(
-                    &tx,
-                    &who,
-                    &checkpoint.session,
-                    CoordinationProposal {
-                        work_id: Some(item.id.clone()),
-                        source: None,
-                        request_key: None,
-                        title: item.title.clone(),
-                        scope,
-                    },
-                    &overlaps,
-                    now,
-                )?;
-                tx.commit()?;
-                return Err(HubError::WorkCoordinationRequired {
-                    overlaps,
-                    request: Box::new(request),
-                });
-            }
-        }
-        let previous_item_bytes = stored_work_item_bytes(&tx, &item.id)?;
-        let referenced = checkpoint
-            .source_refs
-            .iter()
-            .filter_map(|source| match source {
-                SourceRef::Work { work_id } => Some(work_id.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        relation_targets(&tx, &who, &referenced)?;
-        replace_relations(
-            &tx,
-            &who,
-            &item.id,
-            &checkpoint.depends_on,
-            &checkpoint.related_work,
-        )?;
-        item.state = checkpoint.state();
-        item.claim_status = ClaimStatus::Active;
-        item.last_checkin_at = now;
-        item.next_action = checkpoint.next_action.clone();
-        if let Some(scope) = checkpoint.normalized_scope()? {
-            item.scope = scope;
-        }
-        if checkpoint.branch.is_some() {
-            item.branch = checkpoint.branch.clone();
-        }
-        if checkpoint.worktree.is_some() {
-            item.worktree = checkpoint.worktree.clone();
-        }
-        let current = Checkpoint {
-            kind: checkpoint.kind,
-            summary: checkpoint.summary.clone(),
-            next_action: checkpoint.next_action.clone(),
-            source_refs: checkpoint.source_refs.clone(),
-            at: now,
-            token: token.to_owned(),
-            agent: who.agent.clone(),
-            session: checkpoint.session.clone(),
-            generation: checkpoint.generation,
-        };
-        if checkpoint.kind == super::work::CheckpointKind::Blocker {
-            item.blocker = Some(current.clone());
-        } else if checkpoint.resolve_blocker {
-            item.blocker = None;
-        }
-        item.current = Some(current);
-        item.depends_on = checkpoint.depends_on.clone();
-        item.related_work = checkpoint.related_work.clone();
-        item.updated_at = now;
-        let event = work_event("work_checkpoint", &item)?;
-        let seq = append(&tx, &event)?;
-        item.updated_seq = seq;
-        save_work_version(&tx, &item, seq)?;
-        tx.execute(
-            "INSERT INTO hub_work_checkpoint_ops
-                (work, operation_id, request, event_seq)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![item.id, checkpoint.operation_id, request, seq],
-        )?;
-        let snapshot = json_string(&item)?;
-        let request_bytes = work_payload_row_bytes(request.len())?;
-        let delta = work_transition_payload_bytes(&snapshot, &event)?
-            .checked_sub(previous_item_bytes)
-            .and_then(|bytes| bytes.checked_add(request_bytes))
-            .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
-        adjust_work_payload_capacity(&tx, &who, delta, now)?;
-        if checkpoint.kind == super::work::CheckpointKind::Finish {
-            release_session_intent(&tx, token, &checkpoint.session, now)?;
-        }
-        tx.commit()?;
-        Ok(WorkCheckpointResult {
-            item,
-            receipt: CheckpointReceipt {
-                work_id: checkpoint.work_id.clone(),
-                operation_id: checkpoint.operation_id.clone(),
-                generation: checkpoint.generation,
-                event_seq: seq,
-                replayed: false,
-            },
-        })
-    }
-}
-
 impl Store for SqliteStore {
     fn backend(&self) -> &'static str {
         "sqlite"
@@ -4739,16 +4524,12 @@ impl Store for SqliteStore {
     }
 
     fn work_start(&self, token: &str, start: &WorkStart, now: i64) -> Result<WorkStartResult> {
-        self.work_start_with_grant(token, start, now, None)
-    }
-
-    fn work_start_delegated(
-        &self,
-        grant: &CoordinationGrant,
-        start: &WorkStart,
-        now: i64,
-    ) -> Result<WorkStartResult> {
-        self.work_start_with_grant(grant.token(), start, now, Some(grant))
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let who = work_who(&tx, token, now)?;
+        let result = start_in(&tx, &who, start, now)?;
+        tx.commit()?;
+        Ok(result)
     }
 
     fn work_start_auto(&self, token: &str, start: &WorkStart, now: i64) -> Result<WorkStartResult> {
@@ -4808,16 +4589,183 @@ impl Store for SqliteStore {
         checkpoint: &WorkCheckpoint,
         now: i64,
     ) -> Result<WorkCheckpointResult> {
-        self.work_checkpoint_with_grant(token, checkpoint, now, None)
-    }
-
-    fn work_checkpoint_delegated(
-        &self,
-        grant: &CoordinationGrant,
-        checkpoint: &WorkCheckpoint,
-        now: i64,
-    ) -> Result<WorkCheckpointResult> {
-        self.work_checkpoint_with_grant(grant.token(), checkpoint, now, Some(grant))
+        checkpoint.validate()?;
+        let request = json_string(checkpoint)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let who = work_who(&tx, token, now)?;
+        if who.read_only {
+            return Err(HubError::Unauthorized);
+        }
+        let mut item = scoped_work(&tx, &who, &checkpoint.work_id, now)?
+            .ok_or_else(|| HubError::Invalid("unknown work item".into()))?;
+        if let Some((previous, snapshot, event_seq)) = tx
+            .query_row(
+                "SELECT o.request, v.snapshot, o.event_seq FROM hub_work_checkpoint_ops o
+                 JOIN hub_work_versions v ON v.work = o.work AND v.event_seq = o.event_seq
+                 WHERE o.work = ?1 AND o.operation_id = ?2",
+                params![checkpoint.work_id, checkpoint.operation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+        {
+            if previous != request {
+                return Err(HubError::Invalid(
+                    "checkpoint operation_id was already used for another request".into(),
+                ));
+            }
+            let committed: WorkItem = json_value(&snapshot)?;
+            if committed.lead_token != token
+                || committed.lead_session != checkpoint.session
+                || committed.generation != checkpoint.generation
+            {
+                return Err(HubError::Invalid(
+                    "checkpoint operation belongs to another lead session".into(),
+                ));
+            }
+            tx.commit()?;
+            return Ok(WorkCheckpointResult {
+                item,
+                receipt: CheckpointReceipt {
+                    work_id: checkpoint.work_id.clone(),
+                    operation_id: checkpoint.operation_id.clone(),
+                    generation: committed.generation,
+                    event_seq,
+                    replayed: true,
+                },
+            });
+        }
+        if item.generation != checkpoint.generation {
+            return Err(HubError::Invalid(format!(
+                "checkpoint generation is fenced; current generation is {}",
+                item.generation
+            )));
+        }
+        if item.lead_token != token || item.lead_session != checkpoint.session {
+            return Err(HubError::Invalid(
+                "only the current lead session may checkpoint work".into(),
+            ));
+        }
+        let expected = checkpoint.expected_updated_seq.ok_or_else(|| {
+            HubError::Invalid("expected_updated_seq is required for a new checkpoint".into())
+        })?;
+        if expected != item.updated_seq {
+            return Err(HubError::Invalid(format!(
+                "checkpoint receipt expired or work changed; current updated_seq is {}",
+                item.updated_seq
+            )));
+        }
+        if let Some(scope) = checkpoint.normalized_scope()? {
+            let overlaps = work_scope_overlaps(&tx, &who, &scope, Some(&item.id), now)?;
+            if !overlaps.is_empty() {
+                let request = create_coordination_request(
+                    &tx,
+                    &who,
+                    &checkpoint.session,
+                    CoordinationProposal {
+                        work_id: Some(item.id.clone()),
+                        source: None,
+                        request_key: None,
+                        title: item.title.clone(),
+                        scope,
+                    },
+                    &overlaps,
+                    now,
+                )?;
+                tx.commit()?;
+                return Err(HubError::WorkCoordinationRequired {
+                    overlaps,
+                    request: Box::new(request),
+                });
+            }
+        }
+        let previous_item_bytes = stored_work_item_bytes(&tx, &item.id)?;
+        let referenced = checkpoint
+            .source_refs
+            .iter()
+            .filter_map(|source| match source {
+                SourceRef::Work { work_id } => Some(work_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        relation_targets(&tx, &who, &referenced)?;
+        replace_relations(
+            &tx,
+            &who,
+            &item.id,
+            &checkpoint.depends_on,
+            &checkpoint.related_work,
+        )?;
+        item.state = checkpoint.state();
+        item.claim_status = ClaimStatus::Active;
+        item.last_checkin_at = now;
+        item.next_action = checkpoint.next_action.clone();
+        if let Some(scope) = checkpoint.normalized_scope()? {
+            item.scope = scope;
+        }
+        if checkpoint.branch.is_some() {
+            item.branch = checkpoint.branch.clone();
+        }
+        if checkpoint.worktree.is_some() {
+            item.worktree = checkpoint.worktree.clone();
+        }
+        let current = Checkpoint {
+            kind: checkpoint.kind,
+            summary: checkpoint.summary.clone(),
+            next_action: checkpoint.next_action.clone(),
+            source_refs: checkpoint.source_refs.clone(),
+            at: now,
+            token: token.to_owned(),
+            agent: who.agent.clone(),
+            session: checkpoint.session.clone(),
+            generation: checkpoint.generation,
+        };
+        if checkpoint.kind == super::work::CheckpointKind::Blocker {
+            item.blocker = Some(current.clone());
+        } else if checkpoint.resolve_blocker {
+            item.blocker = None;
+        }
+        item.current = Some(current);
+        item.depends_on = checkpoint.depends_on.clone();
+        item.related_work = checkpoint.related_work.clone();
+        item.updated_at = now;
+        let event = work_event("work_checkpoint", &item)?;
+        let seq = append(&tx, &event)?;
+        item.updated_seq = seq;
+        save_work_version(&tx, &item, seq)?;
+        tx.execute(
+            "INSERT INTO hub_work_checkpoint_ops
+                (work, operation_id, request, event_seq)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![item.id, checkpoint.operation_id, request, seq],
+        )?;
+        let snapshot = json_string(&item)?;
+        let request_bytes = work_payload_row_bytes(request.len())?;
+        let delta = work_transition_payload_bytes(&snapshot, &event)?
+            .checked_sub(previous_item_bytes)
+            .and_then(|bytes| bytes.checked_add(request_bytes))
+            .ok_or_else(|| HubError::Invalid("work payload size is too large".into()))?;
+        adjust_work_payload_capacity(&tx, &who, delta, now)?;
+        if checkpoint.kind == super::work::CheckpointKind::Finish {
+            release_session_intent(&tx, token, &checkpoint.session, now)?;
+        }
+        tx.commit()?;
+        Ok(WorkCheckpointResult {
+            item,
+            receipt: CheckpointReceipt {
+                work_id: checkpoint.work_id.clone(),
+                operation_id: checkpoint.operation_id.clone(),
+                generation: checkpoint.generation,
+                event_seq: seq,
+                replayed: false,
+            },
+        })
     }
 
     fn work_get(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkItem>> {
@@ -6366,6 +6314,14 @@ impl Store for SqliteStore {
             .ok_or_else(|| HubError::Unavailable("coordination request disappeared".into()))?;
         tx.commit()?;
         Ok(updated)
+    }
+
+    fn latest_event_seq(&self) -> Result<i64> {
+        Ok(self
+            .conn()
+            .query_row("SELECT COALESCE(MAX(seq), 0) FROM hub_events", [], |row| {
+                row.get(0)
+            })?)
     }
 
     fn events_after(&self, seq: i64, limit: usize) -> Result<Vec<HubEvent>> {

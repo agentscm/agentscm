@@ -76,9 +76,6 @@ pub struct SetupArgs {
     bot_token_file: PathBuf,
     #[arg(long)]
     agent_token_file: PathBuf,
-    /// Explicitly enable only the two structured coordination forms.
-    #[arg(long)]
-    allow_coordination_writes: bool,
 }
 
 fn invalid(message: &str) -> Error {
@@ -151,7 +148,6 @@ fn binding(
     repo: &str,
     slack_user: String,
     token_file: PathBuf,
-    writes: bool,
 ) -> Result<BindingConfig> {
     let token = &who["token"];
     let owner = &who["owner"];
@@ -186,7 +182,6 @@ fn binding(
         repository: repo.into(),
         repository_id: repository.unwrap(),
         agent_token_file: token_file,
-        allow_coordination_writes: writes,
     })
 }
 
@@ -200,7 +195,6 @@ async fn configure(args: SetupArgs) -> Result<Value> {
         &args.repo,
         args.slack_user,
         args.agent_token_file,
-        args.allow_coordination_writes,
     )?;
     let config = SlackConfig {
         version: 1,
@@ -240,7 +234,6 @@ async fn doctor(path: &Path, verify: bool, api_url: Option<&str>) -> Result<Valu
             &expected.repository,
             expected.slack_user.clone(),
             expected.agent_token_file.clone(),
-            expected.allow_coordination_writes,
         )?;
         if actual != *expected {
             return Err(invalid(
@@ -301,7 +294,7 @@ async fn doctor(path: &Path, verify: bool, api_url: Option<&str>) -> Result<Valu
     Ok(
         json!({"ok":true,"configuration":report,"hub_identity_verified":true,
         "slack_bot_verified":true,"public_callback_verified":false,"callback_challenge_echoed":true,"live_verified":false,
-        "private_view_verified":false,"next_action":"Open AgentSCM Home and exercise the typed forms. The callback echo proves reachability, not signature enforcement, intended server identity, Slack-origin delivery, rendering or human approval."}),
+        "direct_message_verified":false,"next_action":"Make one agent edit a file another agent holds, twice, and check that both people get a direct message and the holder's buttons answer the handoff. The callback echo proves reachability, not signature enforcement, intended server identity, Slack-origin delivery, rendering or human approval."}),
     )
 }
 
@@ -428,12 +421,10 @@ mod tests {
             "acme/widgets",
             "U123".into(),
             "/private/token".into(),
-            true,
         )
         .unwrap();
         assert_eq!(actual.repository_id, 101);
         assert_eq!(actual.forge_user_id, 42);
-        assert!(actual.allow_coordination_writes);
         for (field, value) in [
             ("read_only", json!(false)),
             ("repository", json!("other/repo")),
@@ -448,7 +439,6 @@ mod tests {
                     "acme/widgets",
                     "U123".into(),
                     "/private/token".into(),
-                    false
                 )
                 .is_err()
             );

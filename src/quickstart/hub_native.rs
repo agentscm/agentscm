@@ -2253,8 +2253,7 @@ mod tests {
                 "forge_user_id": 42,
                 "repository": "acme/widgets",
                 "repository_id": 101,
-                "agent_token_file": target.join("agent-0.token"),
-                "allow_coordination_writes": false
+                "agent_token_file": target.join("agent-0.token")
             }]
         }))
         .unwrap();

@@ -154,16 +154,11 @@ pub fn manifest(hub_origin: Option<&str>) -> Result<Value> {
                 .join("v1/hub/slack")
                 .map_err(|_| invalid())?
                 .to_string();
-            manifest["features"]["slash_commands"][0]["url"] = Value::String(callback.clone());
             manifest["settings"]["event_subscriptions"]["request_url"] =
                 Value::String(callback.clone());
             manifest["settings"]["interactivity"]["request_url"] = Value::String(callback);
         }
         None => {
-            manifest["features"]
-                .as_object_mut()
-                .ok_or_else(invalid)?
-                .remove("slash_commands");
             let settings = manifest["settings"].as_object_mut().ok_or_else(invalid)?;
             settings.remove("event_subscriptions");
             settings.remove("interactivity");
@@ -568,7 +563,6 @@ mod tests {
                 repository: "acme/widgets".into(),
                 repository_id: 101,
                 agent_token_file: directory.path().join("agent"),
-                allow_coordination_writes: false,
             }],
         };
         (directory, config)
@@ -720,18 +714,19 @@ mod tests {
     #[test]
     fn manifests_separate_bootstrap_from_live_callbacks() {
         let bootstrap = manifest(None).unwrap();
-        assert!(bootstrap["features"].get("slash_commands").is_none());
         assert!(bootstrap["settings"].get("event_subscriptions").is_none());
         assert!(bootstrap["settings"].get("interactivity").is_none());
         assert_eq!(
             bootstrap["oauth_config"]["scopes"],
-            serde_json::json!({"bot":["commands"]})
+            serde_json::json!({"bot":["chat:write"]})
         );
-        assert_eq!(bootstrap["features"]["app_home"]["home_tab_enabled"], true);
+        let home = &bootstrap["features"]["app_home"];
+        assert_eq!(home["home_tab_enabled"], false);
+        assert_eq!(home["messages_tab_enabled"], true);
+        assert_eq!(home["messages_tab_read_only_enabled"], true);
 
         let live = manifest(Some("https://hub.example.test/")).unwrap();
         let callback = "https://hub.example.test/v1/hub/slack";
-        assert_eq!(live["features"]["slash_commands"][0]["url"], callback);
         assert_eq!(
             live["settings"]["event_subscriptions"]["request_url"],
             callback
@@ -755,9 +750,9 @@ mod tests {
             serde_json::from_slice(&fs::read(&report.manifest_file).unwrap()).unwrap();
         assert_eq!(
             value["oauth_config"]["scopes"],
-            serde_json::json!({"bot":["commands"]})
+            serde_json::json!({"bot":["chat:write"]})
         );
-        assert!(value["features"].get("slash_commands").is_none());
+        assert!(value["settings"].get("interactivity").is_none());
         assert_eq!(
             fs::read(directory.join(".slack/hooks.json")).unwrap(),
             b"{}\n"

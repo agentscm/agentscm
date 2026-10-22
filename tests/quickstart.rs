@@ -1325,7 +1325,7 @@ fn slack_install_fixture(machine: &Machine) -> PathBuf {
             "bot_token_file": dir.join("bot"), "database": dir.join("install.sqlite"),
             "bindings": [{"slack_user":"U123","provider":"github","host":"github.com",
                 "forge_user_id":42,"repository":"acme/widgets","repository_id":101,
-                "agent_token_file":dir.join("agent"),"allow_coordination_writes":false}]
+                "agent_token_file":dir.join("agent")}]
         }))
         .unwrap(),
     )
