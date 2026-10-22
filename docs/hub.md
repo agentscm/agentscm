@@ -797,8 +797,9 @@ while the publication is incomplete or the branch was rejected.
 
 ### Workflow status for candidate pull requests
 
-_Experimental: GitHub only, Unix only, tested only against in-process fakes and a local
-native store; not verified against live GitHub._
+_Experimental: Unix only, tested only against in-process fakes (GitHub and GitLab) and a local
+native store; not verified against live GitHub or live GitLab. GitLab is described in
+[GitLab merge requests](#gitlab-merge-requests)._
 
 A candidate publication that has a pull request can get a GitHub commit status
 `agentscm/workflow/<target>` on the pull request head. It is off by default. To enable it,
@@ -898,13 +899,62 @@ App or source: anyone with `statuses:write` on the repository can post the same 
 Merge queue (`merge_group`) is not supported; a required context will block queued
 merges. Verification that a protected branch actually requires the check, and that
 raw pushes and administrator bypass are closed, is pending: the Hub reports
-`protection: "unverified"` and does not enforce it. GitLab is unsupported: `forge_check.provider` is `unsupported`, and a SHA
-status is not a verified merge-request merged-result pipeline. A native
+`protection: "unverified"` and does not enforce it. For GitLab see the next subsection. A native
 store that exists only on a laptop cannot be pinned here; signed local attestations
 for that case are tracked separately and are not implemented.
 
 `GET .../publications/{id}` adds a read-only `forge_check` object for a candidate
 publication with a pull request (see the [API notes](api.md#hub-publication-forge-check)).
+
+#### GitLab merge requests
+
+_Fake-tested only: the implementation has run against an in-process fake GitLab, never a
+live or self-managed GitLab._
+
+A GitLab connection reconciles the same opt-in `agentscm/workflow/<target>` status on a
+candidate merge request (MR), with the same profile, states and retire rules as above:
+`pending`, `failure` (including a stale head), `error` and `success`, and a retire
+(superseded, closed or disabled) posts `failed` on the old head. GitLab has no `failure` or
+`error` state, so the provider-neutral states map to GitLab `pending`, `success` and
+`failed`; failure and error both post `failed`. The status is posted with `ref` set to the
+candidate's source branch and journalled in the same `hub_forge_checks` table (no new migration).
+
+`success` needs all of these, read live:
+
+- the MR is open (`locked` is undetermined and skipped);
+- the MR source and target project both equal the connected project (a fork MR is ignored
+  entirely: no status, no journal row);
+- the target branch is the candidate's target and its tip equals the candidate baseline;
+- the MR `sha` equals the source branch tip (an MR head that lags the branch is skipped) and
+  is the published commit;
+- the commit's parents equal the expected parents;
+- the root tree OID, rebuilt from a bounded top-level `repository/tree` listing (at most 5
+  pages; a larger tree is undetermined), equals the native revision's tree;
+- the pinned native store shows the exact candidate qualified.
+
+A lost reply is never re-posted blindly on GitLab. An `attempting` row reads the commit's
+status list for that name and ref (at most 2 pages; a longer list is unreadable) and adopts the newest entry when it exactly matches the desired status. A 400
+"cannot transition" reply to a repeated `pending` post (GitLab only refuses a state posted onto
+a status still pending or running in that state) is resolved by the same list, and an unreadable
+list leaves the row uncertain. A finished status is never reused, so a new post makes a new
+status. A 400 for any other state, a 403 or a 404 is recorded as refused. A 429 stops the pass. GitHub keeps its repost
+recovery. A fast-forward merge, which has no merge commit SHA, is recorded as merged when the
+merged head equals the published commit. The triggers are the poll and verified GitLab
+`Merge Request Hook` and `Push Hook` webhooks (the existing token verification; events for
+another project are ignored). Event publication (`hub publish --event`) stays GitHub only.
+Shared-name and other-host isolation, and the shared-name limit above, apply as for GitHub.
+
+A GitLab commit status on the MR head SHA is not a verified merged-result pipeline, merge-train
+result or "pipelines must succeed" result. An external status may join or create a pipeline
+for that ref. Configuring GitLab "required status checks" or "pipelines must succeed" is
+operator-owned and unverified; the Hub reports `protection: "unverified"`. AgentSCM never
+alters protections, approves, merges or uses administrator bypass. Any user with the
+Developer role can post a status with the same name, the same trust model as GitHub statuses.
+Retiring a status with `failed` can fail the MR head pipeline that the external status joined,
+which under "pipelines must succeed" blocks merge until a new pipeline runs; `failed` is chosen
+because `skipped` or `canceled` could read as passing.
+Live GitLab verification is pending separate authority (see the
+[qualification checklist](advanced/attached-git-worktrees.md#live-gitlab-qualification-checklist-opt-in)).
 
 The forge steps never force anything. The hub reads the branch first: absent, it uploads
 the file blobs, a tree on top of the base commit's tree and a commit with the manifest's
@@ -1084,7 +1134,7 @@ The container test does not include a forge. Pull-request overlaps (webhook and 
 - GitLab sync needs GitLab 15.7 or newer for the MR `diffs` endpoint. It has been run
   only against an in-process fake, never a live or self-managed GitLab; commit status
   is posted by SHA and does not attach to a merge request pipeline. Candidate MR publication
-  has the same fake-only limit.
+  and its [workflow status](#gitlab-merge-requests) have the same fake-only limit.
 - GitLab sign-in uses OAuth and the REST user endpoint; there is no OIDC
   id_token validation. There are no refresh tokens: sign in again.
 - Tokens are not revoked when a person later loses forge access. They expire

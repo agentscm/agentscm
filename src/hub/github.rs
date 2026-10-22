@@ -74,6 +74,22 @@ pub struct CommitStatus {
 }
 
 impl CommitStatus {
+    pub(super) fn sha(&self) -> &str {
+        &self.sha
+    }
+
+    pub(super) fn state(&self) -> StatusState {
+        self.state
+    }
+
+    pub(super) fn context(&self) -> &str {
+        &self.context
+    }
+
+    pub(super) fn description(&self) -> &str {
+        &self.description
+    }
+
     pub fn new(sha: &str, state: StatusState, context: &str, description: &str) -> Result<Self> {
         let text_ok = |text: &str, max: usize| {
             text.chars().count() <= max && !text.chars().any(char::is_control)
