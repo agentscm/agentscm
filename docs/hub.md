@@ -1100,7 +1100,8 @@ row or an incomplete read is read every pass. Per repository, one pass makes at 
 pull request reads plus, for each of 20 commits, 3 + 3 list pages and 50 status reads, so at
 most 1140 requests; typically a handful per commit. A rate limit (429, or 403 with
 `retry-after` or no quota left) or a 401 hit by this pass backs off the whole connection like
-any other sync read, and the cursor does not advance past the page being read. Any other 403
+any other sync read; that stage re-reads its page next pass, and merge-detection progress made
+before a stop in the run reads is kept. Any other 403
 (including one that carries rate-limit headers) skips the repository for this pass without
 blaming the connection or marking anything read. The token needs `actions: read` and `deployments: read` (a fine-grained
 PAT, or an App installation); the GitHub App manifest does not request them yet, so an App
