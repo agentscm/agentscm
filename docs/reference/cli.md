@@ -219,6 +219,36 @@ dashboard inspect retained runs. The optional [Claude Code loop](../advanced/cla
 adds `skill-workflow configure`, `check`, `claude-stop` and `require`. Configured native targets
 require an exact-current finalized graph receipt; a standalone successful run is not an approval.
 
+The [reusable workflow library](../advanced/reusable-workflows.md) loads one strict, named and
+versioned manifest at an explicit native path. `inspect` is read-only, `configure` binds the
+template to the existing Change and installs the first immutable target requirement, and
+`handoff` reads a retained run without advancing it:
+
+```sh
+agentscm --data-dir ./agentscm-data skill-workflow library inspect CHANGE \
+  --library skills/checks/v1/workflow.json
+agentscm --data-dir ./agentscm-data skill-workflow library configure CHANGE \
+  --library skills/checks/v1/workflow.json
+agentscm --data-dir ./agentscm-data skill-workflow handoff RUN_ID
+```
+
+Manifest and package bytes come from the Change's exact native revision. Review the inspected
+graph, skill, resources and recipes before configuring it. Separate manifest files are recommended
+for separate versions; there is no mutable tag or update command. Explicit configuration refreshes
+a valid stale policy epoch. It rejects a stale target base, an existing target requirement and a
+source-only graph paired with command requirements before changing the Change. Inspect a stale base
+with `show REPOSITORY CHANGE`, `policy` and `target TARGET`, then publish a reviewed next context
+with `context EXPECTED_VERSION FILE`; these state checks do not establish source or rebase
+correctness. An interruption during the later multi-transaction installation can leave partial
+retained state and is reported for inspection. Source-only `check` needs no execution flags;
+command and Claude-review steps require their respective operator-selected backends.
+
+Handoff preserves failed, unknown and omitted results and never executes, approves or lands source.
+It reports only bindings retained by the definition: command actions carry a historical
+Change/context binding that may no longer be current, while a source-only handoff carries source
+and run identity without inventing Change attribution. The configured `check` output carries its
+current context and receipt.
+
 Further `skill-workflow` commands support the Stop triggers. `codex-stop` takes the arguments of `check` and `claude-stop` and is a Codex CLI Stop hook with the same pass/block behavior. `remote-codex-stop` takes the arguments of `remote-check` and `remote-stop` for hosted workspaces. `task-stop` and `task-codex-stop CHANGE --endpoint URL --repository OWNER/NAME --profile ID --token-file ABS_PATH --workspace PATH` are read-only Stop hooks for agent-owned tasks: they pass only when the facade `qualification` is current and qualified and the clean workspace base is the qualified revision, and never run, upload, finalize or checkpoint (see [agent workflow tasks](../advanced/agent-workflow-tasks.md#stop-hook-agent-owned-mode)). `install-stop --settings FILE [--apply] [--remove [--workspace PATH]] -- <claude-stop|remote-stop|codex-stop|remote-codex-stop|task-stop|task-codex-stop> ARGS...` previews by default and writes the hook entry into an operator-local Claude Code or Codex hook file only with `--apply`; it replaces only the same workspace's entry, whatever the stop subcommand or change, and `--remove` removes all its entries or only those for `--workspace`. The Stop handlers require `stop_hook_active` and allow at most 8 consecutive automatic continuations per agent, session, workspace and change; a parse error in a Stop subcommand exits 1, a non-blocking error. See the [Stop hook guide](../advanced/claude-code-workflows.md#opt-in-claude-code-stop-hook) and the [hosted variant](../advanced/hosted-laptop-workflows.md#optional-stop-hooks).
 
 ## Agent-owned workflow tasks

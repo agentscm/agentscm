@@ -156,7 +156,10 @@ fn parse(words: &[String]) -> Result<(StopAgent, PathBuf)> {
             ("--docker", args.docker),
             ("--docker-socket", args.docker_socket),
             ("--claude", args.claude),
-        ];
+        ]
+        .into_iter()
+        .filter_map(|(flag, path)| path.map(|path| (flag, path)))
+        .collect();
         (agent, args.workspace, absolute)
     };
     let (agent, workspace, absolute) = match stop.command {

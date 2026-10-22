@@ -96,6 +96,8 @@ Use the [local workflow guide](docs/advanced/claude-code-workflows.md) or the ex
 independent member roles, run inspection and explicit approval/integration. The
 [laptop-to-hosted guide](docs/advanced/hosted-laptop-workflows.md) covers the opt-in native
 source transfer profile. These are trusted-team alpha paths, not a finished hosted service.
+For repeated local graphs, the [reusable workflow library](docs/advanced/reusable-workflows.md)
+binds one explicit, versioned manifest from immutable native source to an existing Change.
 
 ## Inspect work and evidence in the Hub
 
