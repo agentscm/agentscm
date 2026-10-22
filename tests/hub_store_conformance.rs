@@ -205,7 +205,7 @@ fn idempotent_migrations(db: &Db) {
     assert_eq!(
         db.versions(),
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
         ]
     );
     db.exec("INSERT INTO hub_schema_migrations (version, applied_at) VALUES (999, 0)")
@@ -230,7 +230,7 @@ fn concurrent_startup(db: &Db) {
     assert_eq!(
         db.versions(),
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
         ]
     );
 }
@@ -610,7 +610,7 @@ fn upgrade_from_migration_1(db: &Db) {
     assert_eq!(
         db.versions(),
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
         ]
     );
     let principal = store
@@ -627,7 +627,7 @@ fn upgrade_from_migration_1(db: &Db) {
     mint_bound_agent_token(&*store, &alice.id, "bound", REPO, 9, TTL, false).unwrap();
 }
 
-fn upgrade_from_external_runs_migration(db: &Db) {
+fn upgrade_from_hub_settings_migration(db: &Db) {
     let migrations = if db.pg.is_some() {
         [
             include_str!("../src/hub/migrations/0001_core.pg.sql"),
@@ -647,6 +647,7 @@ fn upgrade_from_external_runs_migration(db: &Db) {
             include_str!("../src/hub/migrations/0015_candidate_publications.pg.sql"),
             include_str!("../src/hub/migrations/0016_forge_checks.pg.sql"),
             include_str!("../src/hub/migrations/0017_external_runs.pg.sql"),
+            include_str!("../src/hub/migrations/0018_hub_settings.pg.sql"),
         ]
     } else {
         [
@@ -667,6 +668,7 @@ fn upgrade_from_external_runs_migration(db: &Db) {
             include_str!("../src/hub/migrations/0015_candidate_publications.sqlite.sql"),
             include_str!("../src/hub/migrations/0016_forge_checks.sqlite.sql"),
             include_str!("../src/hub/migrations/0017_external_runs.sqlite.sql"),
+            include_str!("../src/hub/migrations/0018_hub_settings.sqlite.sql"),
         ]
     };
     for sql in migrations {
@@ -676,7 +678,7 @@ fn upgrade_from_external_runs_migration(db: &Db) {
         "CREATE TABLE hub_schema_migrations (version BIGINT PRIMARY KEY, applied_at BIGINT NOT NULL)",
     )
     .unwrap();
-    for version in 1..=17 {
+    for version in 1..=18 {
         db.exec(&format!(
             "INSERT INTO hub_schema_migrations VALUES ({version},0)"
         ))
@@ -684,8 +686,8 @@ fn upgrade_from_external_runs_migration(db: &Db) {
     }
 
     db.open();
-    assert_eq!(db.versions(), (1..=18).collect::<Vec<_>>());
-    db.exec("SELECT COUNT(*) FROM hub_external_runs; SELECT COUNT(*) FROM hub_work_model_usage;")
+    assert_eq!(db.versions(), (1..=19).collect::<Vec<_>>());
+    db.exec("SELECT COUNT(*) FROM hub_external_runs; SELECT COUNT(*) FROM hub_settings; SELECT COUNT(*) FROM hub_work_model_usage;")
         .unwrap();
 }
 
@@ -1499,7 +1501,7 @@ fn upgrade_from_migration_3(db: &Db) {
     assert_eq!(
         db.versions(),
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
         ]
     );
     let intents = store.live_intents("acme/widgets", unix_now(), 10).unwrap();
@@ -1608,7 +1610,7 @@ fn upgrade_from_migration_14_with_publication(db: &Db) {
         INSERT INTO hub_publications (id,repository,token,revision,event_seq,commit_sha,branch,base,manifest,branch_state,pr_number,pr_node_id,pr_url,created_at,updated_at) VALUES ('{id}','acme/widgets','tok_legacy','{}',3,'{}','feat/legacy','main','{}','created',7,'PR_7','https://github.com/acme/widgets/pull/7',10,11);
         INSERT INTO hub_events (id,at,kind,subject,data) VALUES ('evt_legacy',10,'publication_pr_opened','{id}','{{\"number\":7}}')", manifest.revision,manifest.commit,canonical.replace('\'', "''"))).unwrap();
     let store = db.open();
-    assert_eq!(db.versions(), (1..=18).collect::<Vec<_>>());
+    assert_eq!(db.versions(), (1..=19).collect::<Vec<_>>());
     let p = store.publication(REPO, &id).unwrap().unwrap();
     assert_eq!(p.event_seq, Some(3));
     assert_eq!(p.manifest, canonical);
@@ -1933,7 +1935,7 @@ conformance!(
     list_and_owned_revoke,
     admin_actions_and_sign_in,
     upgrade_from_migration_1,
-    upgrade_from_external_runs_migration,
+    upgrade_from_hub_settings_migration,
     connections_and_repositories,
     observations,
     deliveries_outbound_and_notices,

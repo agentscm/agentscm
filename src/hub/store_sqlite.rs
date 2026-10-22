@@ -4097,6 +4097,26 @@ impl Store for SqliteStore {
         Ok(tx.commit()?)
     }
 
+    fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT value FROM hub_settings WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    fn set_setting(&self, key: &str, value: &str, actor: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO hub_settings (key, value, updated_at, updated_by) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (key) DO UPDATE SET value = ?2, updated_at = ?3, updated_by = ?4",
+            params![key, value, unix_now(), actor],
+        )?;
+        Ok(())
+    }
+
     fn set_next_poll(&self, id: &str, at: i64) -> Result<()> {
         self.conn().execute(
             "UPDATE hub_connections SET next_poll_at = ?2 WHERE id = ?1",

@@ -252,6 +252,10 @@ pub trait Store: Send + Sync {
     fn set_connection_status(&self, id: &str, status: &str, detail: Option<&str>) -> Result<()>;
     /// An event only when the flag changes; unknown connection is `Invalid`.
     fn set_connection_outbound(&self, id: &str, enabled: bool, actor: &str) -> Result<()>;
+    /// A hub-wide setting's raw text; the owning module validates it.
+    fn get_setting(&self, key: &str) -> Result<Option<String>>;
+    /// Upserts a hub-wide setting; no event, `updated_by` records the actor.
+    fn set_setting(&self, key: &str, value: &str, actor: &str) -> Result<()>;
     /// Unix seconds; no event.
     fn set_next_poll(&self, id: &str, at: i64) -> Result<()>;
     /// Keyed by (host, repository_id): a rename updates the row. A repository already held by
@@ -878,8 +882,13 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 18,
-        sqlite: include_str!("migrations/0018_work_insights.sqlite.sql"),
-        postgres: include_str!("migrations/0018_work_insights.pg.sql"),
+        sqlite: include_str!("migrations/0018_hub_settings.sqlite.sql"),
+        postgres: include_str!("migrations/0018_hub_settings.pg.sql"),
+    },
+    Migration {
+        version: 19,
+        sqlite: include_str!("migrations/0019_work_insights.sqlite.sql"),
+        postgres: include_str!("migrations/0019_work_insights.pg.sql"),
     },
 ];
 
@@ -919,31 +928,31 @@ mod tests {
 
     #[test]
     fn pending_requires_an_applied_prefix() {
-        assert_eq!(pending(&[]).unwrap().len(), 18);
-        assert_eq!(pending(&[1]).unwrap().len(), 17);
-        assert_eq!(pending(&[1, 2, 3]).unwrap().len(), 15);
-        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap().len(), 10);
-        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap().len(), 9);
+        assert_eq!(pending(&[]).unwrap().len(), 19);
+        assert_eq!(pending(&[1]).unwrap().len(), 18);
+        assert_eq!(pending(&[1, 2, 3]).unwrap().len(), 16);
+        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap().len(), 11);
+        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap().len(), 10);
         assert_eq!(
             pending(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14])
                 .unwrap()
                 .len(),
-            4
+            5
         );
-        let after_external_runs = pending(&(1..=17).collect::<Vec<_>>()).unwrap();
-        assert_eq!(after_external_runs.len(), 1);
-        assert_eq!(after_external_runs[0].version, 18);
+        let after_hub_settings = pending(&(1..=18).collect::<Vec<_>>()).unwrap();
+        assert_eq!(after_hub_settings.len(), 1);
+        assert_eq!(after_hub_settings[0].version, 19);
         assert!(
-            after_external_runs[0]
+            after_hub_settings[0]
                 .sqlite
                 .contains("hub_work_model_usage")
         );
         assert!(
-            after_external_runs[0]
+            after_hub_settings[0]
                 .postgres
                 .contains("hub_work_model_usage")
         );
-        assert!(pending(&(1..=18).collect::<Vec<_>>()).unwrap().is_empty());
+        assert!(pending(&(1..=19).collect::<Vec<_>>()).unwrap().is_empty());
         assert!(pending(&[2]).is_err());
         let newer = pending(&[1, 999]).err().unwrap().to_string();
         assert!(newer.contains("newer than this binary"), "{newer}");

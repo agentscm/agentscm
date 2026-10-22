@@ -6,7 +6,8 @@ use axum::routing::get;
 
 use super::HubState;
 
-// `'unsafe-inline'` for styles only: Ant Design injects style tags at runtime.
+// `'unsafe-inline'` for styles only: React sets inline `style` attributes, which `style-src` governs.
+// Fonts and images are inlined into app.css as `data:` URIs, hence `font-src` and `img-src` allow `data:`.
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
     img-src 'self' data:; font-src 'self' data:; connect-src 'self'; base-uri 'none'; \
     form-action 'none'; frame-ancestors 'none'";

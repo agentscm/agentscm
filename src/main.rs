@@ -1,6 +1,7 @@
 // The native workspace and the Unix-only commands leave some code unused on Windows.
 #![cfg_attr(not(unix), allow(dead_code))]
 
+use std::ffi::OsString;
 #[cfg(unix)]
 use std::fs::DirBuilder;
 use std::fs::File;
@@ -501,10 +502,10 @@ struct CheckpointInput {
 }
 
 /// Whether argv structurally parses to a Stop-hook subcommand of `skill-workflow`.
-fn is_stop_hook_invocation() -> bool {
+fn is_stop_hook_invocation(argv: &[OsString]) -> bool {
     let Ok(root) = <Cli as clap::CommandFactory>::command()
         .ignore_errors(true)
-        .try_get_matches_from(std::env::args_os())
+        .try_get_matches_from(argv)
     else {
         return false;
     };
@@ -525,16 +526,57 @@ fn is_stop_hook_invocation() -> bool {
 }
 
 /// Recognize capture hooks structurally even when one of their options is invalid.
-fn is_capture_hook_invocation() -> bool {
+fn is_capture_hook_invocation(argv: &[OsString]) -> bool {
     let Ok(root) = <Cli as clap::CommandFactory>::command()
         .ignore_errors(true)
-        .try_get_matches_from(std::env::args_os())
+        .try_get_matches_from(argv)
     else {
         return false;
     };
     root.subcommand().is_some_and(|(name, sub)| {
         name == "workspace-client" && sub.subcommand_name() == Some("hook")
     })
+}
+
+enum ParsedCli {
+    Run(Box<Cli>),
+    Return,
+    Exit(i32),
+}
+
+fn parse_cli(argv: Vec<OsString>) -> ParsedCli {
+    match Cli::try_parse_from(&argv) {
+        Ok(cli) => ParsedCli::Run(Box::new(cli)),
+        Err(error) if error.use_stderr() => {
+            if is_capture_hook_invocation(&argv) {
+                eprintln!("AgentSCM capture skipped: invalid hook command options");
+                println!("{{}}");
+                return ParsedCli::Return;
+            }
+            print_error(&Error::Invalid(error.to_string()));
+            // Exit 2 blocks a Stop hook, so a parse error there is a non-blocking error.
+            ParsedCli::Exit(if is_stop_hook_invocation(&argv) { 1 } else { 2 })
+        }
+        Err(error) => {
+            let _ = error.print();
+            ParsedCli::Return
+        }
+    }
+}
+
+fn parse_cli_on_bounded_stack() -> Result<ParsedCli> {
+    // Debug builds of the derived command graph exceed a 1 MiB main-thread stack.
+    // Keep both the primary parse and hook-error recognition on this bounded stack.
+    const PARSER_STACK_BYTES: usize = 4 * 1024 * 1024;
+    let argv = std::env::args_os().collect();
+    let thread = std::thread::Builder::new()
+        .name("agentscm-cli-parser".into())
+        .stack_size(PARSER_STACK_BYTES)
+        .spawn(move || parse_cli(argv))?;
+    match thread.join() {
+        Ok(parsed) => Ok(parsed),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 #[tokio::main]
@@ -544,21 +586,13 @@ async fn main() {
         let args = std::env::args_os().skip(2);
         hook_cli::run_unparsed(args.map(|a| a.to_string_lossy().into_owned()).collect()).await;
     }
-    let cli = match Cli::try_parse() {
-        Ok(cli) => cli,
-        Err(error) if error.use_stderr() => {
-            if is_capture_hook_invocation() {
-                eprintln!("AgentSCM capture skipped: invalid hook command options");
-                println!("{{}}");
-                return;
-            }
-            print_error(&Error::Invalid(error.to_string()));
-            // Exit 2 blocks a Stop hook, so a parse error there is a non-blocking error.
-            std::process::exit(if is_stop_hook_invocation() { 1 } else { 2 });
-        }
+    let cli = match parse_cli_on_bounded_stack() {
+        Ok(ParsedCli::Run(cli)) => *cli,
+        Ok(ParsedCli::Return) => return,
+        Ok(ParsedCli::Exit(code)) => std::process::exit(code),
         Err(error) => {
-            let _ = error.print();
-            return;
+            print_error(&error);
+            std::process::exit(1);
         }
     };
 
