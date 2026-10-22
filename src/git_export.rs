@@ -1159,6 +1159,77 @@ impl Mirror {
         Ok(())
     }
 
+    /// Bind fixed caller inputs to an already completed candidate without reusing the prepare
+    /// reservation's parent guard. The candidate and owned ref must still be the retained
+    /// mirrored result. This records no remote effect; the remote journal remains authoritative
+    /// for dispatch and recovery.
+    pub fn bind_mirrored_candidate_operation(
+        &self,
+        operation: &str,
+        input: &serde_json::Value,
+        request: &CandidateExportRequest,
+    ) -> Result<()> {
+        remote::validate_id(operation)?;
+        self.validate()?;
+        validate_candidate_request(request, &self.owner)?;
+        let _lease = crate::lease::Lease::try_exclusive(
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(self.owner.destination.join(LOCK))?,
+        )
+        .map_err(|_| Error::Conflict("mirror already in use".into()))?;
+        self.journal.execute_batch("CREATE TABLE IF NOT EXISTS candidate_bindings(id TEXT PRIMARY KEY, record BLOB NOT NULL) STRICT;")?;
+        let prior: Option<Vec<u8>> = self
+            .journal
+            .query_row(
+                "SELECT CASE WHEN typeof(record)='blob' AND octet_length(record)<=65536 THEN record END FROM candidate_bindings WHERE id=?1",
+                [operation],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let bytes = serde_json::to_vec(&(operation, input, request))?;
+        if let Some(prior) = prior {
+            return if prior == bytes {
+                Ok(())
+            } else {
+                Err(Error::Conflict(
+                    "candidate binding has different fixed inputs".into(),
+                ))
+            };
+        }
+        let record = self
+            .candidate_record(&request.subject.id)?
+            .ok_or_else(|| Error::NotFound("candidate export record".into()))?;
+        if record.request != *request
+            || record.state != ExportState::Mirrored
+            || self.owned_oid()? != record.commit
+        {
+            return Err(Error::Conflict(
+                "candidate binding requires the intact mirrored candidate".into(),
+            ));
+        }
+        let (count, total): (i64, i64) = self.journal.query_row(
+            "SELECT count(*), coalesce(sum(octet_length(record)),0) FROM candidate_bindings",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if count >= 4096
+            || bytes.len() > MAX_EXPORT_RECORD_BYTES
+            || total < 0
+            || total as usize + bytes.len() > MAX_EXPORT_SCAN_BYTES
+        {
+            return Err(Error::Limit(
+                "candidate binding journal capacity exceeded".into(),
+            ));
+        }
+        self.journal.execute(
+            "INSERT INTO candidate_bindings VALUES(?1,?2)",
+            params![operation, bytes],
+        )?;
+        Ok(())
+    }
+
     /// Import a qualified target closure into the owned mirror, without touching
     /// any attached checkout refs, index, or files. Ref advancement happens only
     /// through the journaled candidate export.

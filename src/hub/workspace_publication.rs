@@ -18,6 +18,9 @@ use super::workspace::WorkspaceActor;
 use super::workspace_agent_tasks::Clock;
 use super::workspace_execution::{AttachedPublicationProfile, ExecutionService, RunSubject};
 use super::{HubError, HubState, Result};
+use crate::git_export::remote::{
+    Access, Record as RemoteRecord, Request as RemoteRequest, State as RemoteState,
+};
 use crate::git_export::{
     CandidateExportRecord, CandidateExportRequest, CommitMetadata, ExportState, Mirror,
 };
@@ -33,7 +36,7 @@ fn publication<T>(result: crate::Result<T>) -> Result<T> {
     })
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrepareRequest {
     pub request_id: String,
@@ -46,6 +49,35 @@ pub struct PrepareRequest {
 #[serde(deny_unknown_fields)]
 pub struct StatusRequest {
     pub request_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishBranchRequest {
+    pub request_id: String,
+    pub prepare_request_id: String,
+    pub candidate_id: String,
+    pub expected_generation: u64,
+    #[serde(default)]
+    pub previous_branch_request_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoverBranchRequest {
+    pub request_id: String,
+    pub prepare_request_id: String,
+    pub candidate_id: String,
+}
+
+#[derive(Serialize)]
+pub struct BranchStatus {
+    pub request_id: String,
+    pub candidate_id: String,
+    pub state: RemoteState,
+    pub commit: String,
+    pub observed_oid: Option<String>,
+    pub currentness: &'static str,
 }
 
 #[derive(Serialize)]
@@ -87,9 +119,46 @@ pub fn routes() -> Router<HubState> {
             post(status),
         )
         .route(
+            "/v1/hub/workspace/repositories/{repository}/profiles/{profile}/attachments/{attachment}/publication/branch",
+            post(publish_branch),
+        )
+        .route(
+            "/v1/hub/workspace/repositories/{repository}/profiles/{profile}/attachments/{attachment}/publication/branch/recover",
+            post(recover_branch),
+        )
+        .route(
             "/v1/hub/workspace/repositories/{repository}/profiles/{profile}/attachments/{attachment}/publication/mcp",
             post(mcp),
         )
+}
+
+fn access(profile: &AttachedPublicationProfile) -> Result<Access> {
+    Ok(Access {
+        credential_file: profile.credential_file.clone(),
+        credential_helper: profile
+            .credential_file
+            .as_ref()
+            .map(|_| std::env::current_exe())
+            .transpose()?,
+        ca_file: profile.ca_file.clone(),
+        ssh: None,
+    })
+}
+
+fn branch_status(
+    request_id: String,
+    candidate_id: String,
+    record: RemoteRecord,
+    currentness: &'static str,
+) -> BranchStatus {
+    BranchStatus {
+        request_id,
+        candidate_id,
+        state: record.state,
+        commit: record.commit,
+        observed_oid: record.observed_oid,
+        currentness,
+    }
 }
 
 fn operation_id(owner: &str, attachment: &str, request: &str) -> Result<String> {
@@ -320,6 +389,216 @@ impl ExecutionService {
             currentness: "not_rechecked",
         })
     }
+
+    fn current_candidate(
+        &self,
+        actor: &WorkspaceActor,
+        task: &super::workspace_execution::AgentTaskProfile,
+        profile: &AttachedPublicationProfile,
+        attachment: &str,
+        expected_generation: u64,
+        expected: &crate::candidate::CandidateSubject,
+    ) -> Result<()> {
+        let context = task.action_subject(&RunSubject {
+            change_id: expected.change.id.clone(),
+            change_version: expected.change_version,
+            context_digest: expected.context_digest.clone(),
+            revision: expected.revision.clone(),
+            requirement_digest: task.requirement_digest.clone(),
+        })?;
+        // Source comparison may run Git and is deliberately outside the workspace mutex.
+        let compared = publication(crate::candidate::compare_attached_candidate(
+            &task.data_dir,
+            &crate::store::Engine::open(&task.data_dir)?,
+            &task.native_repository,
+            attachment,
+            expected_generation,
+        ))?;
+        let (_, guard) = self.task_parts(actor, &profile.repository_id, task)?;
+        let clock = Clock;
+        let service = publication(AgentTaskService::new_with_collector_authorization(
+            &task.data_dir,
+            &task.profile_id,
+            &clock,
+            &guard,
+        ))?;
+        let mut current = publication(service.with_live_imported_origins(
+            &actor.authorization_identity(),
+            &context,
+            CollectorAction::PublishCandidate,
+            |origins| {
+                crate::candidate::qualify_attached_candidate_from_comparison(
+                    &task.data_dir,
+                    &task.native_repository,
+                    &compared,
+                    Some(origins),
+                )
+            },
+        ))?;
+        current.id = expected.id.clone();
+        current.parent_commit = expected.parent_commit.clone();
+        if &current != expected {
+            return Err(HubError::Invalid(
+                "publication subject is no longer current".into(),
+            ));
+        }
+        if current.endpoint != profile.endpoint
+            || current.target != profile.target
+            || current.output != profile.output
+        {
+            return Err(HubError::Invalid(
+                "publication subject is no longer current".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn publish_attached_branch(
+        &self,
+        actor: &WorkspaceActor,
+        repository: &str,
+        profile_id: &str,
+        attachment: &str,
+        request: PublishBranchRequest,
+    ) -> Result<BranchStatus> {
+        let (profile, task) = self.publication_profile(repository, profile_id, attachment)?;
+        if actor.user_id() != profile.owner_id {
+            return Err(HubError::Unauthorized);
+        }
+        let prepare_operation =
+            operation_id(actor.user_id(), attachment, &request.prepare_request_id)?;
+        let operation = operation_id(actor.user_id(), attachment, &request.request_id)?;
+        let mirror = publication(Mirror::open(
+            &profile.git,
+            &profile.mirror,
+            &task.native_repository,
+        ))?;
+        let candidate = publication(mirror.retained_candidate_operation(&prepare_operation))?
+            .ok_or_else(|| HubError::Invalid("publication prepare was not found".into()))?;
+        if candidate.subject.id != request.candidate_id {
+            return Err(HubError::Invalid(
+                "candidate differs from retained prepare".into(),
+            ));
+        }
+        self.current_candidate(
+            actor,
+            &task,
+            &profile,
+            attachment,
+            request.expected_generation,
+            &candidate.subject,
+        )?;
+        let config_digest =
+            crate::store::digest(&serde_json::to_vec(&profile).map_err(crate::Error::from)?);
+        let input = json!({
+            "config_digest": config_digest,
+            "actor": actor.authorization_identity(),
+            "repository_id": repository,
+            "profile_id": profile_id,
+            "attachment_id": attachment,
+            "request": request,
+            "subject": candidate.subject,
+        });
+        publication(mirror.bind_mirrored_candidate_operation(&operation, &input, &candidate))?;
+        let expected_oid = if let Some(previous) = request.previous_branch_request_id.as_deref() {
+            let previous = operation_id(actor.user_id(), attachment, previous)?;
+            let receipt = publication(mirror.remote_lookup(&previous))?
+                .ok_or_else(|| HubError::Invalid("branch predecessor was not found".into()))?;
+            if !matches!(
+                receipt.state,
+                RemoteState::Published | RemoteState::ObservedDesired
+            ) || receipt.commit != candidate.subject.parent_commit
+                || !matches!(receipt.request, RemoteRequest::PublishCandidate { .. })
+            {
+                return Err(HubError::Invalid(
+                    "branch predecessor does not prove the expected preimage".into(),
+                ));
+            }
+            Some(candidate.subject.parent_commit.clone())
+        } else {
+            // An unpublished merge candidate can have a parent other than its captured baseline.
+            // Only an explicit retained predecessor proves a remote preimage; without one this
+            // stays create-only and never adopts an observed branch.
+            None
+        };
+        let remote = RemoteRequest::PublishCandidate {
+            operation_id: operation,
+            candidate_id: candidate.subject.id.clone(),
+            expected_oid,
+        };
+        let transport = access(&profile)?;
+        let record = publication(mirror.remote_run_guarded(&remote, &transport, || {
+            self.current_candidate(
+                actor,
+                &task,
+                &profile,
+                attachment,
+                request.expected_generation,
+                &candidate.subject,
+            )
+            .map_err(|error| crate::Error::Conflict(error.to_string()))
+        }))?;
+        let current = self.current_candidate(
+            actor,
+            &task,
+            &profile,
+            attachment,
+            request.expected_generation,
+            &candidate.subject,
+        );
+        let currentness = match current {
+            Ok(()) => "current",
+            Err(HubError::Invalid(_) | HubError::Unauthorized) => "revoked_or_stale",
+            Err(_) => "unavailable_or_unknown",
+        };
+        Ok(branch_status(
+            request.request_id,
+            candidate.subject.id,
+            record,
+            currentness,
+        ))
+    }
+
+    pub fn recover_attached_branch(
+        &self,
+        actor: &WorkspaceActor,
+        repository: &str,
+        profile_id: &str,
+        attachment: &str,
+        request: RecoverBranchRequest,
+    ) -> Result<BranchStatus> {
+        let (profile, task) = self.publication_profile(repository, profile_id, attachment)?;
+        if actor.user_id() != profile.owner_id {
+            return Err(HubError::Unauthorized);
+        }
+        self.workspace.authorize(
+            actor,
+            repository,
+            super::workspace::WorkspaceAction::ReadRepository,
+        )?;
+        let prepare_operation =
+            operation_id(actor.user_id(), attachment, &request.prepare_request_id)?;
+        let operation = operation_id(actor.user_id(), attachment, &request.request_id)?;
+        let mirror = publication(Mirror::open(
+            &profile.git,
+            &profile.mirror,
+            &task.native_repository,
+        ))?;
+        let candidate = publication(mirror.retained_candidate_operation(&prepare_operation))?
+            .ok_or_else(|| HubError::Invalid("publication prepare was not found".into()))?;
+        if candidate.subject.id != request.candidate_id {
+            return Err(HubError::Invalid(
+                "candidate differs from retained prepare".into(),
+            ));
+        }
+        let record = publication(mirror.remote_recover_with(&operation, &access(&profile)?))?;
+        Ok(branch_status(
+            request.request_id,
+            candidate.subject.id,
+            record,
+            "not_rechecked",
+        ))
+    }
 }
 
 fn compared_state_worktree(
@@ -354,6 +633,30 @@ async fn status(
 ) -> std::result::Result<Json<PublicationStatus>, ApiError> {
     call(&state, move |service| {
         service.attached_publication_status(&actor, &repository, &profile, &attachment, request)
+    })
+    .await
+}
+
+async fn publish_branch(
+    State(state): State<HubState>,
+    actor: WorkspaceActor,
+    Path((repository, profile, attachment)): Path<(String, String, String)>,
+    JsonBody(request): JsonBody<PublishBranchRequest>,
+) -> std::result::Result<Json<BranchStatus>, ApiError> {
+    call(&state, move |service| {
+        service.publish_attached_branch(&actor, &repository, &profile, &attachment, request)
+    })
+    .await
+}
+
+async fn recover_branch(
+    State(state): State<HubState>,
+    actor: WorkspaceActor,
+    Path((repository, profile, attachment)): Path<(String, String, String)>,
+    JsonBody(request): JsonBody<RecoverBranchRequest>,
+) -> std::result::Result<Json<BranchStatus>, ApiError> {
+    call(&state, move |service| {
+        service.recover_attached_branch(&actor, &repository, &profile, &attachment, request)
     })
     .await
 }
@@ -399,8 +702,10 @@ async fn mcp(
         }
         Some("ping") => json!({}),
         Some("tools/list") => json!({"tools":[
-            {"name":"agentscm_prepare_attached_publication","description":"Prepare one exact operator-pinned unlanded Git candidate; does not push or open a pull request.","inputSchema":{"type":"object","additionalProperties":false,"required":["request_id","expected_generation","subject","metadata"],"properties":{"request_id":{"type":"string"},"expected_generation":{"type":"integer","minimum":0},"subject":{"type":"object"},"metadata":{"type":"object"}}}},
-            {"name":"agentscm_attached_publication_status","description":"Read a retained prepare outcome without re-running it.","inputSchema":{"type":"object","additionalProperties":false,"required":["request_id"],"properties":{"request_id":{"type":"string"}}}}
+            {"name":"agentscm_prepare_attached_publication","description":"Prepare one exact operator-pinned unlanded Git candidate; does not push or open a pull request.","inputSchema":prepare_schema()},
+            {"name":"agentscm_attached_publication_status","description":"Read a retained prepare outcome without re-running it.","inputSchema":status_schema()},
+            {"name":"agentscm_publish_attached_branch","description":"Publish the exact retained candidate branch under fresh workspace authorization.","inputSchema":publish_branch_schema()},
+            {"name":"agentscm_recover_attached_branch","description":"Observe an uncertain retained branch publication without repeating a push.","inputSchema":recover_branch_schema()}
         ]}),
         Some("tools/call") => {
             let params = object.get("params").and_then(serde_json::Value::as_object);
@@ -423,34 +728,100 @@ async fn mcp(
                         serde_json::from_value(arguments).map_err(|_| {
                             ApiError::new(axum::http::StatusCode::BAD_REQUEST, "invalid_params")
                         })?;
-                    blocking(&state, move || {
-                        execution.prepare_attached_publication(
-                            &actor,
-                            &repository,
-                            &profile,
-                            &attachment,
-                            request,
+                    serde_json::to_value(
+                        blocking(&state, move || {
+                            execution.prepare_attached_publication(
+                                &actor,
+                                &repository,
+                                &profile,
+                                &attachment,
+                                request,
+                            )
+                        })
+                        .await
+                        .map_err(super::workspace::api_error)?,
+                    )
+                    .map_err(|_| {
+                        ApiError::new(
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            "encoding_failed",
                         )
-                    })
-                    .await
-                    .map_err(super::workspace::api_error)?
+                    })?
                 }
                 Some("agentscm_attached_publication_status") => {
                     let request: StatusRequest =
                         serde_json::from_value(arguments).map_err(|_| {
                             ApiError::new(axum::http::StatusCode::BAD_REQUEST, "invalid_params")
                         })?;
-                    blocking(&state, move || {
-                        execution.attached_publication_status(
-                            &actor,
-                            &repository,
-                            &profile,
-                            &attachment,
-                            request,
+                    serde_json::to_value(
+                        blocking(&state, move || {
+                            execution.attached_publication_status(
+                                &actor,
+                                &repository,
+                                &profile,
+                                &attachment,
+                                request,
+                            )
+                        })
+                        .await
+                        .map_err(super::workspace::api_error)?,
+                    )
+                    .map_err(|_| {
+                        ApiError::new(
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            "encoding_failed",
                         )
-                    })
-                    .await
-                    .map_err(super::workspace::api_error)?
+                    })?
+                }
+                Some("agentscm_publish_attached_branch") => {
+                    let request: PublishBranchRequest =
+                        serde_json::from_value(arguments).map_err(|_| {
+                            ApiError::new(axum::http::StatusCode::BAD_REQUEST, "invalid_params")
+                        })?;
+                    serde_json::to_value(
+                        blocking(&state, move || {
+                            execution.publish_attached_branch(
+                                &actor,
+                                &repository,
+                                &profile,
+                                &attachment,
+                                request,
+                            )
+                        })
+                        .await
+                        .map_err(super::workspace::api_error)?,
+                    )
+                    .map_err(|_| {
+                        ApiError::new(
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            "encoding_failed",
+                        )
+                    })?
+                }
+                Some("agentscm_recover_attached_branch") => {
+                    let request: RecoverBranchRequest =
+                        serde_json::from_value(arguments).map_err(|_| {
+                            ApiError::new(axum::http::StatusCode::BAD_REQUEST, "invalid_params")
+                        })?;
+                    serde_json::to_value(
+                        blocking(&state, move || {
+                            execution.recover_attached_branch(
+                                &actor,
+                                &repository,
+                                &profile,
+                                &attachment,
+                                request,
+                            )
+                        })
+                        .await
+                        .map_err(super::workspace::api_error)?,
+                    )
+                    .map_err(|_| {
+                        ApiError::new(
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            "encoding_failed",
+                        )
+                    })?
                 }
                 _ => return Ok(mcp_error(id, -32602, "invalid params")),
             };
@@ -465,6 +836,61 @@ async fn mcp(
         _ => return Ok(mcp_error(id, -32601, "method not found")),
     };
     Ok(Json(json!({"jsonrpc":"2.0","id":id,"result":result})).into_response())
+}
+
+fn id_schema() -> serde_json::Value {
+    json!({"type":"string","minLength":1,"maxLength":48,"pattern":"^[A-Za-z0-9_-]+$"})
+}
+
+fn subject_schema() -> serde_json::Value {
+    json!({"type":"object","additionalProperties":false,
+    "required":["change_id","change_version","context_digest","revision","requirement_digest"],
+    "properties":{
+        "change_id":{"type":"string","minLength":1},
+        "change_version":{"type":"integer","minimum":0},
+        "context_digest":{"type":"string","minLength":64,"maxLength":64},
+        "revision":{"type":"string","minLength":64,"maxLength":64},
+        "requirement_digest":{"type":"string","minLength":64,"maxLength":64}
+    }})
+}
+
+fn metadata_schema() -> serde_json::Value {
+    json!({"type":"object","additionalProperties":false,
+    "required":["name","email","timestamp","message"],
+    "properties":{
+        "name":{"type":"string","minLength":1},
+        "email":{"type":"string","minLength":1},
+        "timestamp":{"type":"integer","minimum":0},
+        "message":{"type":"string","minLength":1}
+    }})
+}
+
+fn prepare_schema() -> serde_json::Value {
+    json!({"type":"object","additionalProperties":false,
+        "required":["request_id","expected_generation","subject","metadata"],
+        "properties":{"request_id":id_schema(),"expected_generation":{"type":"integer","minimum":0},
+            "subject":subject_schema(),"metadata":metadata_schema()}})
+}
+
+fn status_schema() -> serde_json::Value {
+    json!({"type":"object","additionalProperties":false,"required":["request_id"],
+        "properties":{"request_id":id_schema()}})
+}
+
+fn publish_branch_schema() -> serde_json::Value {
+    json!({"type":"object","additionalProperties":false,
+        "required":["request_id","prepare_request_id","candidate_id","expected_generation"],
+        "properties":{"request_id":id_schema(),"prepare_request_id":id_schema(),
+            "candidate_id":{"type":"string","minLength":1,"maxLength":128},
+            "expected_generation":{"type":"integer","minimum":0},
+            "previous_branch_request_id":id_schema()}})
+}
+
+fn recover_branch_schema() -> serde_json::Value {
+    json!({"type":"object","additionalProperties":false,
+        "required":["request_id","prepare_request_id","candidate_id"],
+        "properties":{"request_id":id_schema(),"prepare_request_id":id_schema(),
+            "candidate_id":{"type":"string","minLength":1,"maxLength":128}}})
 }
 
 fn mcp_error(id: &serde_json::Value, code: i32, message: &str) -> Response {
@@ -623,5 +1049,38 @@ mod tests {
         let mut drifted = current;
         drifted.revision = "e".repeat(64);
         assert!(resume_candidate(&drifted, &metadata, retained).is_err());
+    }
+
+    #[test]
+    fn mcp_schemas_describe_nested_inputs_and_requests_reject_injected_fields() {
+        assert_eq!(
+            prepare_schema()["properties"]["subject"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            prepare_schema()["properties"]["metadata"]["additionalProperties"],
+            false
+        );
+        assert_eq!(publish_branch_schema()["additionalProperties"], false);
+        assert!(serde_json::from_value::<PrepareRequest>(json!({
+            "request_id":"request","expected_generation":1,
+            "subject":{"change_id":"change","change_version":1,"context_digest":"a".repeat(64),
+                "revision":"b".repeat(64),"requirement_digest":"c".repeat(64),"injected":true},
+            "metadata":{"name":"Synthetic","email":"synthetic@example.invalid","timestamp":1,"message":"test"}
+        })).is_err());
+        assert!(
+            serde_json::from_value::<PublishBranchRequest>(json!({
+                "request_id":"branch","prepare_request_id":"prepare","candidate_id":"candidate",
+                "expected_generation":1,"injected":true
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<RecoverBranchRequest>(json!({
+                "request_id":"branch","prepare_request_id":"prepare","candidate_id":"candidate",
+                "injected":true
+            }))
+            .is_err()
+        );
     }
 }

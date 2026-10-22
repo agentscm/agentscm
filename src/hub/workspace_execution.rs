@@ -379,6 +379,8 @@ impl ExecutionService {
             }
         }
         let mut attached_publication_profiles = BTreeMap::new();
+        let mut attached_outputs = BTreeSet::new();
+        let mut attached_mirrors = BTreeSet::new();
         for profile in config.attached_publication_profiles {
             super::store::validate_repository(&profile.repository_id)?;
             validate_id(&profile.profile_id)?;
@@ -390,6 +392,18 @@ impl ExecutionService {
                     HubError::Invalid("attached publication has no agent task profile".into())
                 })?;
             validate_attached_publication_profile(&profile, task)?;
+            let output_owner = (
+                profile.repository_id.to_ascii_lowercase(),
+                profile.endpoint.clone(),
+                profile.output.clone(),
+            );
+            if !attached_outputs.insert(output_owner)
+                || !attached_mirrors.insert(profile.mirror.clone())
+            {
+                return Err(HubError::Invalid(
+                    "attached publications must have distinct mirrors and output ownership".into(),
+                ));
+            }
             let key = (
                 profile.repository_id.clone(),
                 profile.profile_id.clone(),

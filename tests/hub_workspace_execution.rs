@@ -1251,7 +1251,7 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn two_git_worktrees_qualify_but_imported_receipts_cannot_publish_candidates() {
+async fn two_git_worktrees_exercise_shared_candidate_branch_publication() {
     agent_owned_transport_lifecycle(true).await;
 }
 
@@ -1313,14 +1313,21 @@ async fn agent_owned_transport_lifecycle(attached: bool) {
         .unwrap();
         git(&git_repository, &["add", "."]);
         git(&git_repository, &["commit", "-q", "-m", "synthetic base"]);
+        git(&git_repository, &["update-ref", "refs/heads/main", "HEAD"]);
+        let remote = root.path().join("provider.git");
+        git(
+            root.path(),
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                git_repository.to_str().unwrap(),
+                remote.to_str().unwrap(),
+            ],
+        );
         git(
             &git_repository,
-            &[
-                "remote",
-                "add",
-                "origin",
-                "https://example.invalid/synthetic/project.git",
-            ],
+            &["remote", "add", "origin", remote.to_str().unwrap()],
         );
         git(
             &git_repository,
@@ -2666,6 +2673,7 @@ async fn agent_owned_transport_lifecycle(attached: bool) {
             &git_repository,
             &["update-ref", "refs/remotes/origin/main", &advanced_target],
         );
+        git(&target_writer, &["push", "-q", "origin", "HEAD:main"]);
         let target_error = attachments
             .validate_current(&engine, &fixed.id, fixed.generation)
             .unwrap_err()
@@ -3140,7 +3148,7 @@ async fn agent_owned_transport_lifecycle(attached: bool) {
     assert_eq!(agent_integration.0, 403, "{agent_integration:?}");
     if let Some((state, _, concurrent_context)) = &attached_current {
         let mirror_path = root.path().join("hub-candidate.git");
-        Mirror::initialize_with_seed(
+        let mirror = Mirror::initialize_with_seed(
             Path::new(&state.git),
             &mirror_path,
             &native.profile.native_repository,
@@ -3149,6 +3157,9 @@ async fn agent_owned_transport_lifecycle(attached: bool) {
             &state.target_commit,
         )
         .unwrap();
+        mirror
+            .remote_bind(Path::new(&state.remote_url), &state.output)
+            .unwrap();
         let owner_user = env
             .store
             .list_users()
@@ -3278,6 +3289,44 @@ async fn agent_owned_transport_lifecycle(attached: bool) {
         assert_eq!(
             serde_json::from_slice::<Value>(&status.bytes().await.unwrap()).unwrap()["candidate"],
             first["candidate"]
+        );
+        let branch_path = format!("{path}/branch");
+        let branch = json!({
+            "request_id":"publish-imported-branch",
+            "prepare_request_id":"prepare-imported-receipt",
+            "candidate_id":first["candidate"]["candidate_id"],
+            "expected_generation":state.generation
+        });
+        let published = json_request(env.client.post(&branch_path).bearer_auth(&token), &branch)
+            .send()
+            .await
+            .unwrap();
+        let published_status = published.status().as_u16();
+        let published_bytes = published.bytes().await.unwrap();
+        assert_eq!(
+            published_status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&published_bytes)
+        );
+        let published: Value = serde_json::from_slice(&published_bytes).unwrap();
+        assert_eq!(published["state"], "published");
+        assert_eq!(published["currentness"], "current");
+        assert_eq!(
+            git(
+                Path::new(&state.remote_url),
+                &["rev-parse", &format!("refs/heads/{}", state.output)]
+            ),
+            first["candidate"]["commit"].as_str().unwrap()
+        );
+        let repeated = json_request(env.client.post(&branch_path).bearer_auth(&token), &branch)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(repeated.status().as_u16(), 200);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&repeated.bytes().await.unwrap()).unwrap(),
+            published
         );
         let (_, read_only, _) = mint_bound_agent_token(
             &*env.store,
