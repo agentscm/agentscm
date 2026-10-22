@@ -52,6 +52,7 @@ async fn hosted_env(root: &Path, native: &NativeSourceProfile) -> (Env, Arc<Exec
             ExecutionService::open(
                 &queue,
                 ExecutionConfig {
+                    attached_publication_profiles: vec![],
                     version: 1,
                     profiles: vec![profile],
                     source_profiles: vec![source],

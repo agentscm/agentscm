@@ -299,6 +299,42 @@ fn candidate_suite(store: Arc<dyn Store>) {
         .unwrap();
     let (token, _) = mint_agent_token(&*store, &owner.id, "candidate", REPO, 3600).unwrap();
     let now = unix_now();
+    let bound = candidate(90, "agents/bound", None);
+    let binding = r#"{"server_binding":"synthetic"}"#;
+    let row = done(
+        store
+            .create_bound_publication(&token, &bound, Some(binding), now)
+            .unwrap(),
+    );
+    assert_eq!(row.authorization_binding.as_deref(), Some(binding));
+    assert_eq!(
+        store.create_publication(&token, &bound, now).unwrap(),
+        Create::Conflict
+    );
+    assert_eq!(
+        store
+            .create_bound_publication(&token, &bound, Some("{}"), now)
+            .unwrap(),
+        Create::Conflict
+    );
+    assert_eq!(
+        done(
+            store
+                .create_bound_publication(&token, &bound, Some(binding), now)
+                .unwrap()
+        ),
+        row
+    );
+    assert!(
+        store
+            .create_bound_publication(&token, &bound, Some(&"x".repeat(65537)), now)
+            .is_err()
+    );
+    assert!(
+        store
+            .create_bound_publication(&token, &bound, Some("not json"), now)
+            .is_err()
+    );
     let a = candidate(1, "agents/lineage", None);
     done(store.create_publication(&token, &a, now).unwrap());
     store

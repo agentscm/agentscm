@@ -454,7 +454,10 @@ impl Workspace {
     ) -> Result<T> {
         let workspace_action = match binding.action {
             crate::skill_workflow::CollectorAction::Submit
-            | crate::skill_workflow::CollectorAction::Finalize => WorkspaceAction::ExecuteWorkflow,
+            | crate::skill_workflow::CollectorAction::Finalize
+            | crate::skill_workflow::CollectorAction::PublishCandidate => {
+                WorkspaceAction::ExecuteWorkflow
+            }
             crate::skill_workflow::CollectorAction::Approve => WorkspaceAction::ApproveRevision,
             crate::skill_workflow::CollectorAction::Integrate => WorkspaceAction::IntegrateRevision,
         };

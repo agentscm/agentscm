@@ -37,6 +37,8 @@ pub mod workspace_execution;
 #[cfg(unix)]
 pub mod workspace_http;
 #[cfg(unix)]
+pub mod workspace_publication;
+#[cfg(unix)]
 pub mod workspace_source_http;
 
 use std::fmt;
@@ -280,6 +282,7 @@ pub fn router(state: HubState) -> Router {
     let workspace_routes = workspace::routes()
         .merge(workspace_http::routes())
         .merge(workspace_agent_tasks::routes())
+        .merge(workspace_publication::routes())
         .merge(workspace_source_http::routes());
     #[cfg(not(unix))]
     let workspace_routes = workspace::routes();

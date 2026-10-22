@@ -108,6 +108,7 @@ impl Fixture {
         );
         let owner = browser_actor(&root, &workspace, &*store, &identity);
         let config = ExecutionConfig {
+            attached_publication_profiles: vec![],
             version: 1,
             source_profiles: vec![],
             agent_task_profiles: vec![],

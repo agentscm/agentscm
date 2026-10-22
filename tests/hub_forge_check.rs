@@ -231,6 +231,7 @@ impl Env {
         let service = ExecutionService::open(
             &dir.join("execution.sqlite"),
             ExecutionConfig {
+                attached_publication_profiles: vec![],
                 version: 1,
                 source_profiles: vec![],
                 agent_task_profiles: vec![profile.clone()],
@@ -324,6 +325,7 @@ impl Env {
         let service = ExecutionService::open(
             &self.dir.join("execution-2.sqlite"),
             ExecutionConfig {
+                attached_publication_profiles: vec![],
                 version: 1,
                 source_profiles: vec![],
                 agent_task_profiles: vec![self.profile.clone()],
