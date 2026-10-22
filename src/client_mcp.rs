@@ -121,6 +121,7 @@ async fn forward(
     token: &str,
     body: Vec<u8>,
     client_id: &str,
+    report_completion: bool,
 ) -> Result<(u16, bool, Value)> {
     let request = client
         .post(url.clone())
@@ -128,6 +129,7 @@ async fn forward(
         .header(agentscm::hub::onboarding::CLIENT_HEADER, client_id)
         .header(CONTENT_TYPE, "application/json")
         .body(body);
+    let request = crate::client_config::with_completion_reporting(request, report_completion);
     let reply = send_full(request, RESPONSE_BYTES)
         .await
         .map_err(map_hub_error)?;
@@ -187,7 +189,15 @@ async fn serve(
             ));
         }
         let client_id = crate::client_config::onboarding_client(&connection.root, token);
-        let forwarded = forward(&client, &url, token, line, &client_id).await;
+        let forwarded = forward(
+            &client,
+            &url,
+            token,
+            line,
+            &client_id,
+            connection.report_completion,
+        )
+        .await;
         match (id, forwarded) {
             (None, Ok((202 | 204, _, _))) => {}
             (None, _) => eprintln!("AgentSCM MCP: Hub notification failed"),
@@ -234,6 +244,7 @@ mod tests {
             hub,
             repo: repo.into(),
             token_file: PathBuf::from("/unused-token"),
+            report_completion: false,
             owned_token_id: None,
             owned_token_expires_at: None,
         }
@@ -352,30 +363,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forwards_exact_destination_repo_credential_and_id() {
-        let (hub, request) = server(
-            200,
-            "application/json; charset=utf-8",
-            r#"{"jsonrpc":"2.0","id":"local-7","result":{"tools":[]}}"#,
-        );
-        let connection = saved(hub, "/checkout", "Owner/project with space");
-        let output = proxied(
-            "{\"jsonrpc\":\"2.0\",\"id\":\"local-7\",\"method\":\"tools/list\"}\n",
-            &connection,
-            "private-token",
-        )
-        .await;
-        assert_eq!(
-            serde_json::from_str::<Value>(&output).unwrap()["id"],
-            "local-7"
-        );
-        let request = request.recv().unwrap();
-        assert!(request.starts_with("POST /mcp?repo=Owner%2Fproject+with+space HTTP/1.1"));
-        assert!(
-            request
-                .to_ascii_lowercase()
-                .contains("authorization: bearer private-token")
-        );
+    async fn forwards_exact_destination_credential_id_and_completion_setting() {
+        for enabled in [false, true] {
+            let (hub, request) = server(
+                200,
+                "application/json; charset=utf-8",
+                r#"{"jsonrpc":"2.0","id":"local-7","result":{"tools":[]}}"#,
+            );
+            let mut connection = saved(hub, "/checkout", "Owner/project with space");
+            connection.report_completion = enabled;
+            let output = proxied(
+                "{\"jsonrpc\":\"2.0\",\"id\":\"local-7\",\"method\":\"tools/list\"}\n",
+                &connection,
+                "private-token",
+            )
+            .await;
+            assert_eq!(
+                serde_json::from_str::<Value>(&output).unwrap()["id"],
+                "local-7"
+            );
+            let request = request.recv().unwrap();
+            assert!(request.starts_with("POST /mcp?repo=Owner%2Fproject+with+space HTTP/1.1"));
+            let request = request.to_ascii_lowercase();
+            assert!(request.contains("authorization: bearer private-token"));
+            assert_eq!(
+                request.contains("x-agentscm-completion-reporting: true"),
+                enabled
+            );
+        }
     }
 
     #[tokio::test]

@@ -28,6 +28,17 @@ pub(crate) fn onboarding_client(root: &Path, token: &str) -> String {
     digest.update(root.as_os_str().as_encoded_bytes());
     format!("{:x}", digest.finalize())
 }
+
+pub(crate) fn with_completion_reporting(
+    request: reqwest::RequestBuilder,
+    enabled: bool,
+) -> reqwest::RequestBuilder {
+    if enabled {
+        request.header(agentscm::hub::insights::COMPLETION_HEADER, "true")
+    } else {
+        request
+    }
+}
 const MAX_CONNECTIONS: usize = 128;
 const FILE_BYTES: u64 = 64 * 1024;
 const LOCK_WAIT: Duration = Duration::from_secs(2);
@@ -49,6 +60,8 @@ pub(crate) struct Connection {
     pub(crate) hub: String,
     pub(crate) repo: String,
     pub(crate) token_file: PathBuf,
+    #[serde(default)]
+    pub(crate) report_completion: bool,
     /// Present only for tokens minted and owned by this client connection flow.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) owned_token_id: Option<String>,
@@ -575,6 +588,7 @@ mod tests {
             hub: "https://hub.example.test".into(),
             repo: repo.into(),
             token_file: std::env::temp_dir().join("token"),
+            report_completion: false,
             owned_token_id: None,
             owned_token_expires_at: None,
         }
@@ -623,6 +637,40 @@ mod tests {
         assert!(connections.contains(&two));
         assert!(connections.contains(&replacement));
         assert!(replace(&mut connections, &one.root, Some(&one), None).is_err());
+    }
+
+    #[test]
+    fn reporting_toggle_is_a_compare_and_replace_update() {
+        let parent = tempfile::tempdir().unwrap();
+        let config_path = parent.path().join("connections.json");
+        let lock_path = parent.path().join("connections.lock");
+        let token_file = parent.path().join("token");
+        write_private(&token_file, "synthetic-token\n").unwrap();
+        let mut original = connection(parent.path().join("checkout"), "acme/widgets");
+        original.token_file = token_file;
+        save_to(&config_path, &[original.clone()]).unwrap();
+
+        let mut enabled = original.clone();
+        enabled.report_completion = true;
+        update_at(
+            &config_path,
+            &lock_path,
+            &original.root,
+            Some(&original),
+            Some(enabled.clone()),
+        )
+        .unwrap();
+        assert_eq!(load_from(&config_path).unwrap(), vec![enabled.clone()]);
+        assert!(
+            update_at(
+                &config_path,
+                &lock_path,
+                &original.root,
+                Some(&original),
+                Some(enabled),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -722,6 +770,7 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert!(parsed[0].owned_token_id.is_none());
         assert!(parsed[0].owned_token_expires_at.is_none());
+        assert!(!parsed[0].report_completion);
     }
 
     #[test]
@@ -783,6 +832,7 @@ mod tests {
             hub: "https://hub.example.test".into(),
             repo: "acme/widgets".into(),
             token_file: std::env::temp_dir().join("token"),
+            report_completion: false,
             owned_token_id: None,
             owned_token_expires_at: None,
         };

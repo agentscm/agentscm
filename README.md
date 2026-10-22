@@ -103,6 +103,8 @@ binds one explicit, versioned manifest from immutable native source to an existi
 
 The Hub shows agent coordination and, when configured, workflow runs, source freshness,
 retained step evidence and workspace permissions.
+Its [work insights](docs/work-insights.md) API exposes bounded reported duration,
+partial usage reports and stored publication observations without turning them into approval or landing claims.
 
 <a href="docs/assets/hub-workflow.jpg">
   <img src="docs/assets/hub-workflow.jpg" alt="AgentSCM Hub inspecting a source-check workflow, revision freshness and separate native landing status" width="640">

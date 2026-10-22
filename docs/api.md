@@ -26,16 +26,83 @@ curl http://127.0.0.1:7331/health
 | `GET /v1/workflow` | Guided workflow status |
 | `GET /v1/workflow/inspection?limit=4096` | Recorded before/after bytes of the workflow's subject |
 | `GET /v1/collisions` | Git collision report (off unless `--collisions-repo` is set) |
+| `GET /v1/local/skill-workflow-library?change=…&library=…` | `skill-workflow library inspect` output for one template manifest |
+| `GET /v1/local/skill-workflows/{run_id}/handoff` | `skill-workflow handoff` output for one retained run |
+| `GET /v1/local/workspace/timeline?limit=25&before=…` | `workspace timeline` page (off unless `--timeline-workspace` is set) |
+| `GET /v1/local/workspace/timeline/{id}` | `workspace entry` view |
+| `GET /v1/local/workspace/diff?left=…&right=…&limit=100&after=…` | `workspace diff` page |
 
 The coordination hub (`agentscm hub serve`) is a separate server with its
 own routes, including the agent MCP endpoint `POST /mcp` and the hook endpoints
 `POST /v1/hub/hook/{agent}`; see the [hub guide](hub.md#routes) and
 [agent sessions](hub.md#agent-sessions-mcp-and-hook-endpoints).
 
-The [local workspace snapshot timeline](workspace-timeline.md) is exposed through the native
-`workspace` CLI and a separate local stdio `workspace-client mcp` process. It adds no route to
-`agentscm serve` or the Hub, and it adds no HTTP path to this API or its OpenAPI surface. Capture
-and fork are local mutations and are not available over HTTP.
+## Local template and timeline reads
+
+The `/v1/local` routes return exactly the JSON that the matching CLI command prints, without the
+CLI's `ok` envelope, so a local status page can show
+[reusable workflow templates](advanced/reusable-workflows.md) and the
+[workspace snapshot timeline](workspace-timeline.md). They are read-only: only GET is routed (other
+methods get 405). Capture, fork, configure, check, resume and cancel stay in the CLI and the local
+stdio MCP servers. The Hub has no copy of this local data and serves none of these routes.
+
+No request can choose a data directory or host path. The library route takes a Change ID and a
+native manifest path, read at that Change's current revision. The timeline routes read the one
+native workspace that the operator names at startup (Unix only), and return 404 without the flag:
+
+```sh
+agentscm --data-dir ./agentscm-data serve --timeline-workspace ./work
+```
+
+Bounds are the CLI's. Timeline `limit` is 1 through 100 (default 25) and `before` is a positive
+entry ID taken from `next_before`. Diff `limit` is 1 through 100 (default 100) and `after` is the
+opaque `next` cursor. Unknown or repeated query fields return 400. A timeline response is limited
+to 1 MiB and any `/v1/local` response to 4 MiB; a larger one returns 400.
+
+Read the completeness signals before showing a result as complete:
+
+- `next_before` (timeline) or `next` (diff) is present while more pages exist. A diff page can be
+  empty and still carry `next`.
+- A non-empty `needed_objects` means the comparison could not read a local source object. That page
+  is incomplete, not "no changes".
+- `coverage.includes_pre_feature_history` is always false. The timeline never covers activity
+  before capture began.
+- `admission` is always `not_assessed`. Neither inspect nor handoff is an approval.
+
+### Browser access
+
+When `AGENTSCM_SERVE_READ_TOKEN` is set at startup (at least 32 bytes), every `/v1/local` request
+needs `Authorization: Bearer TOKEN`. Otherwise the request gets 401 with
+`WWW-Authenticate: Bearer`. Without the variable, these routes are unauthenticated like the rest of
+this API. The token is a separate local secret, not a Hub token. A page that reaches `serve`
+through a same-origin development proxy needs no CORS. A page on another origin needs the operator
+to allow that exact origin:
+
+```sh
+AGENTSCM_SERVE_READ_TOKEN="$(cat token-file)" agentscm --data-dir ./agentscm-data serve \
+  --timeline-workspace ./work --browser-origin http://127.0.0.1:7332
+```
+
+`--browser-origin` is repeatable and requires the token. For a listed origin, `/v1/local` replies
+carry `Access-Control-Allow-Origin` for GET with the `authorization` header, without credentials,
+and an `OPTIONS` preflight gets 204. A preflight from any other origin gets 403 and no CORS headers,
+so the browser cannot read the reply. The other routes of this API never send CORS headers.
+
+Every `/v1/local` request must carry a loopback `Host` (`127.0.0.1`, `localhost` or `[::1]`, any
+port), or it gets 421. This stops a page whose DNS name was rebound to the loopback address from
+reading these routes as its own origin, with or without a token. A proxy in front of a `--public`
+bind must forward a loopback `Host`.
+
+Its repository-authenticated stand-up routes also include `POST /v1/hub/standup/usage`,
+`GET /v1/hub/standup/insights` and `GET /v1/hub/standup/work/{work_id}/insights`.
+The first stores one idempotent partial usage report; the GET routes return bounded
+work projections. See [work insights](work-insights.md) for pagination and evidence limits.
+
+Completion calls on `/mcp`, `/v1/hub/hook/{agent}` and `/v1/hub/standup/checkpoint`
+accept the optional `x-agentscm-completion-reporting: true` header. Exactly one literal `true`
+enables a best-effort, idempotent completion observation; the default is off. It adds no response
+fields and does not alter completion success. See [completion reporting](work-insights.md#optional-completion-reporting)
+for the local toggle and the distinction between completion metadata and measured usage.
 
 ## Guided workflow observations
 
@@ -91,9 +158,22 @@ user. Only configure a repository whose writers you trust that far. See
 [collisions](collisions.md) for the profile and its limits. The result is a
 warning, never a lock or a native record.
 
+## Workspace attached-candidate publication
+
+With an operator-pinned `attached_publication_profiles` entry, the authenticated workspace Hub exposes `POST /v1/hub/workspace/repositories/{repository}/profiles/{profile}/attachments/{attachment}/publication`. Preparation accepts only `request_id`, `expected_generation`, an exact `RunSubject`, and `CommitMetadata`. `POST .../publication/status` accepts `request_id` and reads retained preparation without asserting current qualification.
+
+`POST .../publication/branch` accepts `request_id`, `prepare_request_id`, `candidate_id`, `expected_generation`, and optional `previous_branch_request_id`. It publishes the retained candidate through the pinned Mirror transport under fresh authorization. `POST .../publication/branch/recover` accepts `request_id`, `prepare_request_id`, and `candidate_id`; it observes a retained attempt without pushing again.
+
+`POST .../publication/forge` accepts `request_id`, `prepare_request_id`, `branch_request_id`, `candidate_id`, `expected_generation`, `title`, `body`, and optional `previous_publication`. The Hub constructs the manifest from the retained candidate and confirmed branch receipt, atomically stores a separate trusted authorization binding, then uses the existing GitHub PR/GitLab MR publisher. No request can choose a path, endpoint, credential, ref or branch preimage. The endpoint must match the connected forge host and repository; a bare local endpoint cannot establish this mapping. `POST .../publication/forge/recover` accepts only `publication_id` and observes an existing attempt. An absent search result after durable `pr_attempting` never authorizes another create. Valid owners can recover historical attempts after the subject becomes stale; recovery grants no new write authority.
+
+The sibling `/publication/mcp` exposes `agentscm_prepare_attached_publication`, `agentscm_attached_publication_status`, `agentscm_publish_attached_branch`, `agentscm_recover_attached_branch`, `agentscm_publish_attached_forge`, and `agentscm_recover_attached_forge`, with the same strict input schemas. Current Contributor membership, writable repository-scoped agent credentials, configured ownership, executor registrations, all imported-origin grants, attachment/source identity and exact native requirements are rechecked at effect boundaries. The trusted binding retains actor digests and configuration digests, not bearer tokens, credential contents or live authorization proof. Bound publications and their unbound successors cannot use legacy run/recover to bypass this guard.
+
+Opt-in forge status uses current imported-origin authorization only for server-bound publications; unbound publications retain native-only qualification. Success additionally requires the exact provider repository, head, base baseline, tree and parents. Definite revocation or stale source is nonpassing; unavailable authorization is unknown/error. A failed downgrade retains the possibility that a success remains visible. Dispatch authorization is not an atomic provider transaction: a revocation during a dispatched write may leave an observable effect, and subsequent effects stop without claiming rollback. Neither agent publication nor native approval performs provider review or merge. Synthetic qualification does not establish live provider protection enforcement, SSH, cold restore or UI support.
+
 ## Hub publication forge check
 
-This is the Hub, not `serve`. `GET /v1/hub/repos/{repo}/publications/{id}` adds a
+This is the Hub, not `serve`. Agent and read-only tokens can read publications; see
+[publishing](hub.md#publishing-a-revision) for the list route. `GET /v1/hub/repos/{repo}/publications/{id}` adds a
 read-only `forge_check` object when the publication is a candidate with a pull request.
 It posts and changes nothing. `mode` is always `git_default`. `provider` is `github`, `gitlab`
 (fake-tested only) or `unsupported`. `enabled` is false unless an agent-task profile for the target
@@ -125,13 +205,13 @@ These outcomes are separate from source approval and from `forge_check`. See
 
 ## HTTP boundaries
 
-Workflow and collision responses carry `nosniff`, no referrer, `no-store` and a
+Workflow, collision and `/v1/local` responses carry `nosniff`, no referrer, `no-store` and a
 restrictive content-security policy; the revision, file, diff and `/health`
 responses do not. Every read takes one of the `--max-concurrency` work
 slots and keeps it through response transmission; cancellation does not release
 it while native work is still running. A busy service returns 503. Malformed or
-over-limit input returns 400, missing records 404 and conflicts 409. Workflow and
-collision reads that fail unexpectedly return a sanitized 500 with the detail in
+over-limit input returns 400, missing records 404 and conflicts 409. Workflow,
+collision and `/v1/local` reads that fail unexpectedly return a sanitized 500 with the detail in
 the local service log.
 
 `serve` opens the source engine and initializes a missing data directory, but

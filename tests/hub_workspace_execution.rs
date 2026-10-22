@@ -1,13 +1,19 @@
 #![cfg(unix)]
 //! Real Hub HTTP controls with a local synthetic forge and source-only native state.
 //! Source-only service execution uses an inert socket; no Docker or provider process runs.
+#[path = "common/cold_restore.rs"]
+mod cold_restore;
+#[path = "support/fake_github.rs"]
+mod fake_github;
 #[path = "common/workspace_hub.rs"]
 mod workspace_hub;
 
 use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fs, process::Command};
 
+use agentscm::attached_worktree::{AttachRequest, AttachmentJournal, SourceMode};
 use agentscm::authority::Authority;
 use agentscm::checks::SourcePathExpectation;
 use agentscm::context::{
@@ -17,8 +23,11 @@ use agentscm::execution::{
     COMMAND_CAPABILITY, COMMAND_EVIDENCE, CommandRecipe, ExecutionLimits, OciBackend,
     SyscallPolicy, environment_digest,
 };
+use agentscm::git_export::{CommitMetadata, Mirror};
 use agentscm::hub::store::{mint_agent_token, mint_bound_agent_token};
-use agentscm::hub::workspace_execution::{AgentTaskProfile, ExecutionConfig, ExecutionService};
+use agentscm::hub::workspace_execution::{
+    AgentTaskProfile, AttachedPublicationProfile, ExecutionConfig, ExecutionService,
+};
 use agentscm::model::FileChange;
 use agentscm::skill_workflow::{
     self, CollectorPayload, CollectorProfile, CollectorProfileAction, CriterionOutcome,
@@ -35,6 +44,176 @@ use serde_json::{Value, json};
 use workspace_hub::{Env, NativeSourceProfile, native_source_profile};
 
 const REPO: &str = "/v1/hub/workspace/repositories/synthetic%2Fproject";
+
+fn git_path() -> PathBuf {
+    PathBuf::from(std::env::var("AGENTSCM_TEST_GIT").unwrap_or_else(|_| "/usr/bin/git".into()))
+}
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new(git_path())
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .current_dir(dir)
+        .args([
+            "-c",
+            "user.name=synthetic contributor",
+            "-c",
+            "user.email=contributor@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().into()
+}
+
+fn json_request(builder: reqwest::RequestBuilder, value: &Value) -> reqwest::RequestBuilder {
+    builder
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(serde_json::to_vec(value).unwrap())
+}
+
+fn isolated_git(repo: &Path) -> PathBuf {
+    let common = PathBuf::from(git(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    ));
+    let wrapper = common.join("synthetic-git");
+    let executable = git_path().to_string_lossy().replace('\'', "'\\''");
+    let transport = common.join("synthetic-transport.json");
+    if transport.exists() {
+        let mapping: Value = serde_json::from_slice(&fs::read(transport).unwrap()).unwrap();
+        let script = format!(
+            "#!/usr/bin/python3\nimport os,sys\nif 'push' in sys.argv[1:]:\n with open({push_log},'a') as f: f.write('push\\n')\nos.environ['GIT_CONFIG_GLOBAL']='/dev/null'\nos.environ['GIT_CONFIG_NOSYSTEM']='1'\na=[{remote} if x=={endpoint} else ('protocol.file.allow=always' if x=='protocol.file.allow=never' else x) for x in sys.argv[1:]]\nos.execv({exe},[{exe},'-c','protocol.file.allow=always']+a)\n",
+            push_log = serde_json::to_string(
+                &PathBuf::from(mapping["remote"].as_str().unwrap()).with_extension("push-log")
+            )
+            .unwrap(),
+            remote = mapping["remote"],
+            endpoint = mapping["endpoint"],
+            exe = serde_json::to_string(&git_path()).unwrap()
+        );
+        fs::write(&wrapper, script).unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+        return wrapper;
+    }
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexport GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1\nexec '{executable}' \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+    wrapper
+}
+
+fn attachment_request(worktree: &Path, actor: &str, output: &str, paths: &[&str]) -> AttachRequest {
+    AttachRequest {
+        git: isolated_git(worktree),
+        worktree: worktree.into(),
+        actor: actor.into(),
+        remote: "origin".into(),
+        target: "main".into(),
+        output: output.into(),
+        source: SourceMode::Worktree,
+        paths: paths.iter().map(|path| (*path).into()).collect(),
+    }
+}
+
+/// Probe the existing publication boundaries without inventing a published candidate or
+/// replacing the imported receipt with a controller-native workflow run.
+fn assert_attached_publication_boundary(
+    native: &NativeSourceProfile,
+    state: &agentscm::attached_worktree::AttachmentState,
+) {
+    use agentscm::candidate::CandidateSubject;
+    use agentscm::hub::forge_check::{NativeState, native_state};
+
+    let authority = Authority::open_read_only(&native.profile.data_dir).unwrap();
+    let expected =
+        "requires a successful workflow for the exact current revision and review context";
+    let error = authority
+        .qualify_draft_candidate(&native.context.change)
+        .unwrap_err();
+    assert!(error.to_string().contains(expected), "{error}");
+    let mirror = native.profile.data_dir.join("candidate.git");
+    let output = Command::new(env!("CARGO_BIN_EXE_agentscm"))
+        .arg("--data-dir")
+        .arg(&native.profile.data_dir)
+        .args([
+            "attached-worktree",
+            "prepare",
+            "--id",
+            &state.id,
+            "--expected-generation",
+            &state.generation.to_string(),
+            "--mirror",
+        ])
+        .arg(&mirror)
+        .args([
+            "--operation-id",
+            "prepare-imported-current",
+            "--name",
+            "Synthetic",
+            "--email",
+            "synthetic@example.invalid",
+            "--timestamp",
+            "1780000000",
+            "--message",
+            "Current imported check",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(expected), "{stderr}");
+
+    let engine = Engine::open(&native.profile.data_dir).unwrap();
+    let journal =
+        AttachmentJournal::open_existing(&native.profile.data_dir, &state.repository).unwrap();
+    let comparison = journal
+        .validate_current(&engine, &state.id, state.generation)
+        .unwrap();
+    let mut subject = CandidateSubject {
+        id: String::new(),
+        attachment: state.id.clone(),
+        endpoint: state.remote_url.clone(),
+        output: state.output.clone(),
+        change: native.context.change.clone(),
+        change_version: native.subject.change_version,
+        context_digest: native.subject.context_digest.clone(),
+        policy_epoch: native.context.policy_epoch,
+        revision: native.subject.revision.clone(),
+        target: state.target.clone(),
+        baseline_commit: state.target_commit.clone(),
+        parent_commit: state.target_commit.clone(),
+        source_commit: state.head_commit.clone(),
+        source_fingerprint: state.source_fingerprint.clone(),
+        comparison_fingerprint: comparison,
+    };
+    subject.id = subject.canonical_id().unwrap();
+    let profile = AgentTaskProfile {
+        repository_id: native.profile.repository_id.clone(),
+        profile_id: native.profile.profile_id.clone(),
+        native_repository: native.profile.native_repository.clone(),
+        data_dir: native.profile.data_dir.clone(),
+        target: native.profile.target.clone(),
+        requirement_digest: native.profile.requirement_digest.clone(),
+        publish_forge_status: true,
+    };
+    assert_eq!(native_state(&profile, &subject), NativeState::NotQualified);
+    assert_eq!(journal.state(&state.id).unwrap(), *state);
+    assert!(authority.target("main").unwrap().is_none());
+}
 
 mod fake_docker {
     include!(concat!(
@@ -55,6 +234,7 @@ async fn execution_env(
         let service = ExecutionService::open(
             &queue,
             ExecutionConfig {
+                attached_publication_profiles: vec![],
                 version: 1,
                 source_profiles: vec![],
                 agent_task_profiles: vec![],
@@ -92,6 +272,7 @@ async fn agent_only_env(
             ExecutionService::open(
                 &queue,
                 ExecutionConfig {
+                    attached_publication_profiles: vec![],
                     version: 1,
                     profiles: vec![],
                     source_profiles: vec![],
@@ -1087,9 +1268,44 @@ async fn public_cli_uses_the_real_authenticated_task_route_without_server_execut
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_owned_transport_failure_revision_success_and_native_landing_are_end_to_end() {
+    agent_owned_transport_lifecycle(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_git_worktrees_exercise_shared_candidate_branch_publication() {
+    agent_owned_transport_lifecycle(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_git_worktrees_require_independent_exact_human_merge() {
+    agent_owned_transport_lifecycle_mode(true, "merge").await;
+}
+
+async fn agent_owned_transport_lifecycle(attached: bool) {
+    agent_owned_transport_lifecycle_mode(attached, "member").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_git_worktrees_refuse_revoked_executor() {
+    agent_owned_transport_lifecycle_mode(true, "executor").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_git_worktrees_refuse_revoked_publication_token() {
+    agent_owned_transport_lifecycle_mode(true, "token").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_git_worktrees_cold_restore_at_same_paths() {
+    agent_owned_transport_lifecycle_mode(true, "cold").await;
+}
+
+async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) {
+    let human_merge = revocation == "merge";
     let root = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let docker_home = root.path().join("fake-docker-home");
+    let docker_home = external.path().join("fake-docker-home");
     let docker_config = root.path().join("fake-docker-config");
     let collector_state = root.path().join("collector-state");
     for directory in [&docker_home, &docker_config, &collector_state] {
@@ -1110,7 +1326,153 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
     let _socket = std::os::unix::net::UnixListener::bind(&docker_socket).unwrap();
     let (mut native, collector_profile) =
         source_command_profile(root.path(), &docker, &docker_socket, &docker_config);
+    let engine = Engine::open(&native.profile.data_dir).unwrap();
     let (env, service) = agent_only_env(root.path(), &native).await;
+    let git_fixture = if attached {
+        let git_repository = root.path().join("git-repository");
+        let contributor_a = root.path().join("contributor-a");
+        let contributor_b = root.path().join("contributor-b");
+        let target_writer = root.path().join("target-writer");
+        fs::create_dir(&git_repository).unwrap();
+        git(&git_repository, &["init", "-q"]);
+        git(&git_repository, &["config", "core.excludesFile", ""]);
+        for (path, contents) in [
+            (
+                "skills/check/SKILL.md",
+                b"# Run the pinned local check\n".as_slice(),
+            ),
+            (
+                "src/example.rs",
+                b"fn example() -> bool { false }\n".as_slice(),
+            ),
+        ] {
+            let full = git_repository.join(path);
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(full, contents).unwrap();
+        }
+        let recipe = match &collector_profile.action {
+            CollectorProfileAction::Command { recipe, .. } => recipe,
+            _ => unreachable!(),
+        };
+        fs::write(
+            git_repository.join("skills/check/runner.json"),
+            serde_json::to_vec(recipe).unwrap(),
+        )
+        .unwrap();
+        git(&git_repository, &["add", "."]);
+        git(&git_repository, &["commit", "-q", "-m", "synthetic base"]);
+        git(&git_repository, &["update-ref", "refs/heads/main", "HEAD"]);
+        let remote = external.path().join("provider.git");
+        git(
+            root.path(),
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                git_repository.to_str().unwrap(),
+                remote.to_str().unwrap(),
+            ],
+        );
+        git(
+            &git_repository,
+            &[
+                "remote",
+                "add",
+                "origin",
+                &format!("https://{}/synthetic/project.git", env.host),
+            ],
+        );
+        git(
+            &git_repository,
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        git(
+            &git_repository,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "contributor-a",
+                contributor_a.to_str().unwrap(),
+            ],
+        );
+        git(
+            &git_repository,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "contributor-b",
+                contributor_b.to_str().unwrap(),
+            ],
+        );
+        git(
+            &git_repository,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "target-writer",
+                target_writer.to_str().unwrap(),
+            ],
+        );
+        let engine = Engine::open(&native.profile.data_dir).unwrap();
+        // A synthetic transport adapter connects the pinned HTTPS identity to real bare Git.
+        // TLS itself is qualified separately by git_remote/network, not by this scenario.
+        fs::write(git_repository.join(".git/synthetic-transport.json"), serde_json::to_vec(&json!({"remote":remote,"endpoint":format!("https://{}/synthetic/project.git", env.host)})).unwrap()).unwrap();
+        let attachments =
+            AttachmentJournal::open(&native.profile.data_dir, &native.context.change.repository)
+                .unwrap();
+        let attached_a = attachments
+            .attach(
+                &engine,
+                "attach-contributor-a",
+                &attachment_request(
+                    &contributor_a,
+                    "forge-user-202",
+                    "agents/contributor-a",
+                    &["src/example.rs"],
+                ),
+            )
+            .unwrap();
+        let attached_b = attachments
+            .attach(
+                &engine,
+                "attach-contributor-b",
+                &attachment_request(
+                    &contributor_b,
+                    "forge-user-303",
+                    "agents/contributor-b",
+                    &["notes/contributor-b.txt"],
+                ),
+            )
+            .unwrap();
+        assert_eq!(attached_a.candidate_revision, native.subject.revision);
+        assert_eq!(attached_b.candidate_revision, native.subject.revision);
+        let attached_a = attachments
+            .bind_context(
+                &Authority::open(&native.profile.data_dir).unwrap(),
+                "bind-contributor-a-initial",
+                &attached_a.id,
+                attached_a.generation,
+                &native.context.change,
+            )
+            .unwrap();
+        Some((
+            git_repository,
+            contributor_a,
+            contributor_b,
+            target_writer,
+            attachments,
+            attached_a,
+            attached_b,
+        ))
+    } else {
+        None
+    };
     assert!(
         !service.server_execution_enabled(),
         "the task-only profile must not enable server model or command dispatch"
@@ -1119,12 +1481,16 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
     let (_, owner) = env.signin(101).await;
     let owner_session = env.session(&owner).await;
     let owner_csrf = owner_session["csrf_token"].as_str().unwrap();
-    let roles = [
-        Role::Reader,
-        Role::Contributor,
-        Role::Reviewer,
-        Role::Integrator,
-    ];
+    let roles = if attached {
+        vec![Role::Reader, Role::Contributor]
+    } else {
+        vec![
+            Role::Reader,
+            Role::Contributor,
+            Role::Reviewer,
+            Role::Integrator,
+        ]
+    };
     let grant = env.member(
         202,
         &roles,
@@ -1145,6 +1511,79 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
         .0,
         200
     );
+    let reviewer_grant = env.member(
+        404,
+        &[Role::Reader, Role::Reviewer],
+        true,
+        env.workspace.settings().unwrap().generation,
+        "grant-independent-native-reviewer",
+    );
+    assert_eq!(
+        env.request(
+            Method::PUT,
+            "/v1/hub/workspace/members",
+            Some(&owner),
+            Some(owner_csrf),
+            None,
+            Some(reviewer_grant),
+        )
+        .await
+        .0,
+        200
+    );
+    let integrator_grant = env.member(
+        505,
+        &[Role::Reader, Role::Integrator],
+        true,
+        env.workspace.settings().unwrap().generation,
+        "grant-independent-native-integrator",
+    );
+    assert_eq!(
+        env.request(
+            Method::PUT,
+            "/v1/hub/workspace/members",
+            Some(&owner),
+            Some(owner_csrf),
+            None,
+            Some(integrator_grant),
+        )
+        .await
+        .0,
+        200
+    );
+    let (_, reviewer) = env.signin(404).await;
+    let reviewer_session = env.session(&reviewer).await;
+    let (_, integrator) = env.signin(505).await;
+    let integrator_session = env.session(&integrator).await;
+    let integrate_path = format!("{REPO}/profiles/checks/integrate");
+
+    if attached {
+        let grant = env.member(
+            303,
+            &[Role::Reader, Role::Contributor],
+            true,
+            env.workspace.settings().unwrap().generation,
+            "second-contributor",
+        );
+        assert_eq!(
+            env.request(
+                Method::PUT,
+                "/v1/hub/workspace/members",
+                Some(&owner),
+                Some(owner_csrf),
+                None,
+                Some(grant)
+            )
+            .await
+            .0,
+            200
+        );
+        let (_, second) = env.signin(303).await;
+        assert_ne!(
+            env.session(&second).await["actor"],
+            reviewer_session["actor"]
+        );
+    }
     let (_, member) = env.signin(202).await;
     let mut member_session = env.session(&member).await;
     let user = env
@@ -1210,6 +1649,127 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
             .clone(),
     )
     .unwrap();
+    let reads_before = task_state_snapshot(&native.profile.data_dir);
+    let instructions = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_instructions",
+                json!({
+                    "subject":native.subject,
+                    "task_id":first_task.task_id,
+                    "task_digest":first_task.digest().unwrap(),
+                    "supported_schema_versions":[1]
+                }),
+            )),
+        )
+        .await;
+    assert_eq!(instructions.0, 200, "{instructions:?}");
+    assert_eq!(
+        mcp_envelope(&instructions.1)["result"]["status"],
+        "available"
+    );
+    let entrypoint = &first_task.entrypoint.references[0];
+    let reference = json!({
+        "subject":native.subject,
+        "task_id":first_task.task_id,
+        "task_digest":first_task.digest().unwrap(),
+        "reference_name":entrypoint.name,
+        "expected_sha256":entrypoint.sha256,
+        "expected_schema_version":1
+    });
+    let fetched = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call("agentscm_task_reference", reference.clone())),
+        )
+        .await;
+    assert_eq!(fetched.0, 200, "{fetched:?}");
+    let fetched = mcp_envelope(&fetched.1)["result"].clone();
+    assert_eq!(fetched["status"], "available");
+    assert_eq!(fetched["task_id"], first_task.task_id);
+    assert_eq!(fetched["task_digest"], first_task.digest().unwrap());
+    assert_eq!(fetched["sha256"], entrypoint.sha256);
+    assert!(fetched["content"].as_str().unwrap().len() <= 128 * 1024);
+
+    let mut stale_digest = reference.clone();
+    stale_digest["task_digest"] = json!("0".repeat(64));
+    let rejected = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call("agentscm_task_reference", stale_digest)),
+        )
+        .await;
+    assert_eq!(rejected.0, 200, "{rejected:?}");
+    assert_eq!(rejected.1["result"]["isError"], true, "{rejected:?}");
+    let mut stale_subject = reference.clone();
+    stale_subject["subject"]["context_digest"] = json!("0".repeat(64));
+    let rejected = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call("agentscm_task_reference", stale_subject)),
+        )
+        .await;
+    assert_eq!(rejected.0, 200, "{rejected:?}");
+    assert_eq!(rejected.1["error"]["code"], -32603, "{rejected:?}");
+    let mut stale_schema = reference.clone();
+    stale_schema["expected_schema_version"] = json!(2);
+    let rejected = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call("agentscm_task_reference", stale_schema)),
+        )
+        .await;
+    assert_eq!(rejected.0, 200, "{rejected:?}");
+    assert_eq!(
+        mcp_envelope(&rejected.1)["result"]["status"],
+        "schema_mismatch"
+    );
+    let (_, cross_repository_token) = mint_agent_token(
+        &*env.store,
+        &user.id,
+        "cross-repository-reference",
+        "synthetic/other",
+        3_600,
+    )
+    .unwrap();
+    let rejected = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(cross_repository_token.expose()),
+            Some(mcp_call("agentscm_task_reference", reference)),
+        )
+        .await;
+    assert_eq!(rejected.0, 200, "{rejected:?}");
+    assert_eq!(rejected.1["result"]["isError"], true, "{rejected:?}");
+    assert_eq!(
+        task_state_snapshot(&native.profile.data_dir),
+        reads_before,
+        "instruction/reference reads and refusals must not mutate native state"
+    );
     let next = env
         .request(
             Method::POST,
@@ -1464,8 +2024,8 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
         .await;
     assert_eq!(reconciled.0, 200, "{reconciled:?}");
 
-    let mut expiry_claim = claim_input(&first_task, &executor, "expiry-refusal");
-    expiry_claim["requested_lease_ms"] = json!(1);
+    let mut expiry_claim_request = claim_input(&first_task, &executor, "expiry-refusal");
+    expiry_claim_request["requested_lease_ms"] = json!(1);
     let expiry_claim = env
         .request(
             Method::POST,
@@ -1475,7 +2035,7 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
             Some(&token),
             Some(mcp_call(
                 "agentscm_task_collector_claim",
-                json!({"subject":native.subject,"claim":expiry_claim,"collector_profile_id":"command-profile"}),
+                json!({"subject":native.subject,"claim":expiry_claim_request,"collector_profile_id":"command-profile"}),
             )),
         )
         .await;
@@ -1549,6 +2109,54 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
     );
     assert_eq!(expired_report["failures"][0]["code"], "attempt_expired");
     assert_eq!(expired_report["next"]["operation"], "reconcile");
+    let exact_transport_retry = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_collector_claim",
+                json!({"subject":native.subject,"claim":expiry_claim_request,"collector_profile_id":"command-profile"}),
+            )),
+        )
+        .await;
+    assert_eq!(exact_transport_retry.0, 200, "{exact_transport_retry:?}");
+    assert_eq!(
+        exact_transport_retry.1["result"]["isError"], false,
+        "{exact_transport_retry:?}"
+    );
+    let exact_transport_retry: TaskAttemptView =
+        serde_json::from_value(mcp_envelope(&exact_transport_retry.1)["result"].clone()).unwrap();
+    assert_eq!(exact_transport_retry.attempt, expired_attempt.attempt);
+    assert_eq!(exact_transport_retry.state, expired_attempt.state);
+    assert!(!exact_transport_retry.currently_applicable);
+    let unauthorized_new_attempt = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_collector_claim",
+                json!({
+                    "subject":native.subject,
+                    "claim":claim_input(&first_task,&executor,"expiry-is-not-replacement"),
+                    "collector_profile_id":"command-profile"
+                }),
+            )),
+        )
+        .await;
+    assert_eq!(
+        unauthorized_new_attempt.0, 200,
+        "{unauthorized_new_attempt:?}"
+    );
+    assert_eq!(
+        unauthorized_new_attempt.1["result"]["isError"], true,
+        "{unauthorized_new_attempt:?}"
+    );
     let expired_collect = cli(
         "collect",
         &expired_descriptor_file,
@@ -1574,6 +2182,183 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
         )
         .await;
     assert_eq!(reconciled_expiry.0, 200, "{reconciled_expiry:?}");
+    let state_after_reconcile = task_state_snapshot(&native.profile.data_dir);
+    let reconcile_mutation = mutation_input(&expired_attempt, "reconcile-expired-cli", "reconcile");
+    let recovery_http = env
+        .request(
+            Method::POST,
+            &task_path,
+            None,
+            None,
+            Some(&token),
+            Some(json!({
+                "operation":"recovery",
+                "subject":native.subject,
+                "mutation":reconcile_mutation
+            })),
+        )
+        .await;
+    assert_eq!(recovery_http.0, 200, "{recovery_http:?}");
+    let recovery_mcp = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_recovery",
+                json!({"subject":native.subject,"mutation":reconcile_mutation}),
+            )),
+        )
+        .await;
+    assert_eq!(recovery_mcp.0, 200, "{recovery_mcp:?}");
+    assert_eq!(
+        recovery_mcp.1["result"]["isError"], false,
+        "{recovery_mcp:?}"
+    );
+    let recovered = recovery_http.1["result"].clone();
+    assert_eq!(mcp_envelope(&recovery_mcp.1)["result"], recovered);
+    assert_eq!(recovered["disposition"], "uncertain_effect");
+    assert_eq!(recovered["observed_state"], "replaced");
+    assert_eq!(recovered["next_action"], "prepare_fresh_attempt");
+    assert_eq!(
+        recovered["unresolved_effects"],
+        json!([{"effect":"execution_may_still_run"}])
+    );
+    for (field, expected) in [
+        ("request_id", json!("reconcile-expired-cli")),
+        (
+            "execution_operation_id",
+            json!(expired_attempt.attempt.execution_operation_id),
+        ),
+        ("task_id", json!(expired_attempt.attempt.task_id)),
+        ("task_digest", json!(expired_attempt.attempt.task_digest)),
+        ("attempt_id", json!(expired_attempt.attempt.attempt_id)),
+        (
+            "attempt_digest",
+            json!(expired_attempt.attempt.digest().unwrap()),
+        ),
+        ("fence", json!(expired_attempt.attempt.lease.fence)),
+    ] {
+        assert_eq!(recovered[field], expected, "recovery field {field}");
+    }
+    let replaced_before_late = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_status",
+                json!({"subject":native.subject,"status":{
+                    "version":1,
+                    "task_id":expired_attempt.attempt.task_id,
+                    "task_digest":expired_attempt.attempt.task_digest,
+                    "attempt_id":expired_attempt.attempt.attempt_id,
+                    "attempt_digest":expired_attempt.attempt.digest().unwrap(),
+                    "fence":expired_attempt.attempt.lease.fence,
+                    "executor":expired_attempt.attempt.executor
+                }}),
+            )),
+        )
+        .await;
+    assert_eq!(replaced_before_late.0, 200, "{replaced_before_late:?}");
+    assert_eq!(
+        replaced_before_late.1["result"]["isError"], false,
+        "{replaced_before_late:?}"
+    );
+    let replaced_before_late = mcp_envelope(&replaced_before_late.1)["result"].clone();
+    let receipt_before_late = qualification(
+        &env,
+        &token,
+        &native.profile.data_dir,
+        &native.subject,
+    )
+    .await["receipt_digest"]
+        .clone();
+    let late_heartbeat = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_heartbeat",
+                json!({
+                    "subject":native.subject,
+                    "mutation":mutation_input(&expired_attempt,"late-heartbeat-after-replacement","heartbeat")
+                }),
+            )),
+        )
+        .await;
+    assert_eq!(late_heartbeat.0, 200, "{late_heartbeat:?}");
+    assert_eq!(
+        late_heartbeat.1["result"]["isError"], true,
+        "{late_heartbeat:?}"
+    );
+    let late_result = env
+        .request(
+            Method::POST,
+            &task_path,
+            None,
+            None,
+            Some(&token),
+            Some(json!({
+                "operation":"result",
+                "subject":native.subject,
+                "assertion":large_assertion_input(&first_task,&expired_attempt,"late-result-after-replacement")
+            })),
+        )
+        .await;
+    assert_eq!(late_result.0, 409, "{late_result:?}");
+    let replaced_after_late = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_status",
+                json!({"subject":native.subject,"status":{
+                    "version":1,
+                    "task_id":expired_attempt.attempt.task_id,
+                    "task_digest":expired_attempt.attempt.task_digest,
+                    "attempt_id":expired_attempt.attempt.attempt_id,
+                    "attempt_digest":expired_attempt.attempt.digest().unwrap(),
+                    "fence":expired_attempt.attempt.lease.fence,
+                    "executor":expired_attempt.attempt.executor
+                }}),
+            )),
+        )
+        .await;
+    assert_eq!(replaced_after_late.0, 200, "{replaced_after_late:?}");
+    assert_eq!(
+        replaced_after_late.1["result"]["isError"], false,
+        "{replaced_after_late:?}"
+    );
+    assert_eq!(
+        mcp_envelope(&replaced_after_late.1)["result"],
+        replaced_before_late
+    );
+    assert_eq!(replaced_before_late["state"], "replaced");
+    assert_eq!(
+        qualification(&env, &token, &native.profile.data_dir, &native.subject).await["receipt_digest"],
+        receipt_before_late
+    );
+    assert_eq!(
+        task_state_snapshot(&native.profile.data_dir),
+        state_after_reconcile,
+        "recovery reads and fenced late traffic must not mutate native state"
+    );
+    assert_eq!(
+        fake_docker_effect_counts(&docker_home.join("calls.jsonl")),
+        effects_before_refusals,
+        "expiry, recovery reads and fenced late traffic must not execute externally"
+    );
 
     let replacement_claim = env
         .request(
@@ -1754,7 +2539,7 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
             })),
         )
         .await;
-    assert_eq!(blocked.0, 409, "{blocked:?}");
+    assert_eq!(blocked.0, if attached { 403 } else { 409 }, "{blocked:?}");
 
     let retried = cli(
         "retry-upload",
@@ -1837,40 +2622,209 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
     fs::write(&token_file, &token).unwrap();
     fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600)).unwrap();
 
-    let engine = Engine::open(&native.profile.data_dir).unwrap();
-    let CollectorProfileAction::Command { recipe, .. } = &collector_profile.action else {
-        unreachable!()
-    };
-    let next_revision = engine
-        .checkpoint(
-            None,
-            &[
-                FileChange {
-                    path: "skills/check/SKILL.md".into(),
-                    content: Some(b"# Run the pinned local check\n".to_vec()),
-                },
-                FileChange {
-                    path: "skills/check/runner.json".into(),
-                    content: Some(serde_json::to_vec(recipe).unwrap()),
-                },
-                FileChange {
-                    path: "src/example.rs".into(),
-                    content: Some(b"fn example() -> bool { true }\n".to_vec()),
-                },
-            ],
+    let old_subject = native.subject.clone();
+    let attached_current = if let Some((
+        git_repository,
+        contributor_a,
+        contributor_b,
+        target_writer,
+        attachments,
+        attached_a,
+        attached_b,
+    )) = &git_fixture
+    {
+        fs::write(
+            contributor_a.join("src/example.rs"),
+            b"fn example() -> bool { true }\n",
         )
         .unwrap();
-    let old_subject = native.subject.clone();
-    let previous_version = native.context.change_version;
-    native.context.change_version += 1;
-    native.context.revision = next_revision.clone();
-    let changed = Authority::open(&native.profile.data_dir)
-        .unwrap()
-        .update_change_context(previous_version, &native.context)
+        let fixed = attachments
+            .capture(
+                &engine,
+                "capture-contributor-a-fix",
+                &attached_a.id,
+                attached_a.generation,
+            )
+            .unwrap();
+        assert_eq!(fixed.changed_paths, ["src/example.rs"]);
+
+        fs::create_dir_all(contributor_b.join("notes")).unwrap();
+        fs::write(
+            contributor_b.join("notes/contributor-b.txt"),
+            b"independent concurrent edit\n",
+        )
         .unwrap();
-    native.subject.change_version = changed.version;
-    native.subject.context_digest = changed.context_digest;
-    native.subject.revision = next_revision;
+        let concurrent = attachments
+            .capture(
+                &engine,
+                "capture-contributor-b-concurrent-edit",
+                &attached_b.id,
+                attached_b.generation,
+            )
+            .unwrap();
+        assert_eq!(concurrent.changed_paths, ["notes/contributor-b.txt"]);
+        assert_eq!(
+            engine
+                .read_file(&concurrent.revision, "notes/contributor-b.txt")
+                .unwrap(),
+            b"independent concurrent edit\n"
+        );
+        let mut concurrent_context = native.context.clone();
+        concurrent_context.change = ChangeId {
+            repository: native.context.change.repository.clone(),
+            id: "contributor-b-concurrent-work".into(),
+        };
+        concurrent_context.change_version = 1;
+        concurrent_context.revision = concurrent.revision.clone();
+        concurrent_context.intent = "preserve the second contributor's concurrent work".into();
+        concurrent_context.acceptance_criteria =
+            vec!["the independent note remains attached to its exact source".into()];
+        concurrent_context.scope = vec!["notes/contributor-b.txt".into()];
+        let mut authority = Authority::open(&native.profile.data_dir).unwrap();
+        authority.start_change(&concurrent_context).unwrap();
+        attachments
+            .bind_context(
+                &authority,
+                "bind-contributor-b-concurrent-change",
+                &concurrent.attachment.id,
+                concurrent.attachment.generation,
+                &concurrent_context.change,
+            )
+            .unwrap();
+
+        let previous_version = native.context.change_version;
+        native.context.change_version += 1;
+        native.context.revision = fixed.revision.clone();
+        let changed = Authority::open(&native.profile.data_dir)
+            .unwrap()
+            .update_change_context(previous_version, &native.context)
+            .unwrap();
+        native.subject.change_version = changed.version;
+        native.subject.context_digest = changed.context_digest;
+        native.subject.revision = fixed.revision;
+        let fixed_subject = native.subject.clone();
+        let fixed = attachments
+            .bind_context(
+                &Authority::open(&native.profile.data_dir).unwrap(),
+                "bind-contributor-a-fix",
+                &fixed.attachment.id,
+                fixed.attachment.generation,
+                &native.context.change,
+            )
+            .unwrap();
+
+        fs::write(
+            target_writer.join("target-advance.txt"),
+            b"independent target advancement\n",
+        )
+        .unwrap();
+        git(target_writer, &["add", "target-advance.txt"]);
+        git(
+            target_writer,
+            &["commit", "-q", "-m", "advance synthetic target"],
+        );
+        let advanced_target = git(target_writer, &["rev-parse", "HEAD"]);
+        git(
+            git_repository,
+            &["update-ref", "refs/remotes/origin/main", &advanced_target],
+        );
+        git(
+            target_writer,
+            &[
+                "push",
+                "-q",
+                external.path().join("provider.git").to_str().unwrap(),
+                "HEAD:main",
+            ],
+        );
+        let target_error = attachments
+            .validate_current(&engine, &fixed.id, fixed.generation)
+            .unwrap_err()
+            .to_string();
+        assert!(target_error.contains("target advanced"), "{target_error}");
+        let refreshed = attachments
+            .refresh(
+                &engine,
+                "refresh-contributor-a-target",
+                &fixed.id,
+                fixed.generation,
+            )
+            .unwrap();
+        assert_eq!(refreshed.target_commit, advanced_target);
+        assert_eq!(
+            engine
+                .read_file(&refreshed.candidate_revision, "src/example.rs")
+                .unwrap(),
+            b"fn example() -> bool { true }\n"
+        );
+        assert_eq!(
+            engine
+                .read_file(&refreshed.candidate_revision, "target-advance.txt")
+                .unwrap(),
+            b"independent target advancement\n"
+        );
+        assert_eq!(
+            fs::read(contributor_b.join("notes/contributor-b.txt")).unwrap(),
+            b"independent concurrent edit\n",
+            "target refresh must not overwrite the other contributor's worktree"
+        );
+        let previous_version = native.context.change_version;
+        native.context.change_version += 1;
+        native.context.revision = refreshed.candidate_revision.clone();
+        let changed = Authority::open(&native.profile.data_dir)
+            .unwrap()
+            .update_change_context(previous_version, &native.context)
+            .unwrap();
+        native.subject.change_version = changed.version;
+        native.subject.context_digest = changed.context_digest;
+        native.subject.revision = refreshed.candidate_revision.clone();
+        let refreshed = attachments
+            .bind_context(
+                &Authority::open(&native.profile.data_dir).unwrap(),
+                "bind-contributor-a-refreshed-target",
+                &refreshed.id,
+                refreshed.generation,
+                &native.context.change,
+            )
+            .unwrap();
+
+        Some((refreshed, fixed_subject, concurrent_context))
+    } else {
+        let CollectorProfileAction::Command { recipe, .. } = &collector_profile.action else {
+            unreachable!()
+        };
+        let next_revision = engine
+            .checkpoint(
+                None,
+                &[
+                    FileChange {
+                        path: "skills/check/SKILL.md".into(),
+                        content: Some(b"# Run the pinned local check\n".to_vec()),
+                    },
+                    FileChange {
+                        path: "skills/check/runner.json".into(),
+                        content: Some(serde_json::to_vec(recipe).unwrap()),
+                    },
+                    FileChange {
+                        path: "src/example.rs".into(),
+                        content: Some(b"fn example() -> bool { true }\n".to_vec()),
+                    },
+                ],
+            )
+            .unwrap();
+        let previous_version = native.context.change_version;
+        native.context.change_version += 1;
+        native.context.revision = next_revision.clone();
+        let changed = Authority::open(&native.profile.data_dir)
+            .unwrap()
+            .update_change_context(previous_version, &native.context)
+            .unwrap();
+        native.subject.change_version = changed.version;
+        native.subject.context_digest = changed.context_digest;
+        native.subject.revision = next_revision;
+
+        None
+    };
 
     let stale_retry = cli(
         "retry-upload",
@@ -1893,7 +2847,19 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
             })),
         )
         .await;
-    assert_eq!(stale_blocked.0, 409, "{stale_blocked:?}");
+    assert_eq!(
+        stale_blocked.0,
+        if attached { 403 } else { 409 },
+        "{stale_blocked:?}"
+    );
+
+    if let Some((_, fixed_subject, _)) = &attached_current {
+        let stale_fixed =
+            qualification(&env, &token, &native.profile.data_dir, fixed_subject).await;
+        assert_eq!(stale_fixed["qualified"], false);
+        assert_eq!(stale_fixed["subject_current"], false);
+        assert_eq!(stale_fixed["receipt_digest"], Value::Null);
+    }
 
     let fresh_requirements = env
         .request(
@@ -2165,69 +3131,961 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
     assert_eq!(superseded["revision"], old_subject.revision);
     assert_eq!(superseded["next"], json!({"operation":"checkpoint"}));
 
-    let approval = env
+    let agent_approval = env
         .request(
             Method::POST,
             &approve_path,
-            Some(&current_member),
-            Some(member_session["csrf_token"].as_str().unwrap()),
             None,
+            None,
+            Some(&token),
             Some(json!({
-                "request_id":"approve-agent-owned-success",
+                "request_id":"agent-token-cannot-approve",
                 "expected_generation":member_session["actor"]["generation"],
                 "subject":native.subject
             })),
         )
         .await;
-    assert_eq!(approval.0, 200, "{approval:?}");
-    let integration = env
+    assert_eq!(agent_approval.0, 403, "{agent_approval:?}");
+    let integrator_approval = env
         .request(
             Method::POST,
-            &format!("{REPO}/profiles/checks/integrate"),
-            Some(&current_member),
-            Some(member_session["csrf_token"].as_str().unwrap()),
+            &approve_path,
+            Some(&integrator),
+            Some(integrator_session["csrf_token"].as_str().unwrap()),
             None,
             Some(json!({
-                "request_id":"integrate-agent-owned-success",
+                "request_id":"integrator-cannot-approve",
+                "expected_generation":integrator_session["actor"]["generation"],
+                "subject":native.subject
+            })),
+        )
+        .await;
+    assert_eq!(integrator_approval.0, 403, "{integrator_approval:?}");
+
+    let approval = env
+        .request(
+            Method::POST,
+            &approve_path,
+            Some(&reviewer),
+            Some(reviewer_session["csrf_token"].as_str().unwrap()),
+            None,
+            Some(json!({
+                "request_id":"approve-agent-owned-success",
+                "expected_generation":reviewer_session["actor"]["generation"],
+                "subject":native.subject
+            })),
+        )
+        .await;
+    assert_eq!(approval.0, 200, "{approval:?}");
+    let reviewer_integration = env
+        .request(
+            Method::POST,
+            &integrate_path,
+            Some(&reviewer),
+            Some(reviewer_session["csrf_token"].as_str().unwrap()),
+            None,
+            Some(json!({
+                "request_id":"reviewer-cannot-integrate",
+                "expected_generation":reviewer_session["actor"]["generation"],
+                "subject":native.subject,
+                "approval_id":approval.1["approval_id"]
+            })),
+        )
+        .await;
+    assert_eq!(reviewer_integration.0, 403, "{reviewer_integration:?}");
+    let agent_integration = env
+        .request(
+            Method::POST,
+            &integrate_path,
+            None,
+            None,
+            Some(&token),
+            Some(json!({
+                "request_id":"agent-token-cannot-integrate",
                 "expected_generation":member_session["actor"]["generation"],
                 "subject":native.subject,
                 "approval_id":approval.1["approval_id"]
             })),
         )
         .await;
-    assert_eq!(integration.0, 200, "{integration:?}");
-    assert_eq!(
-        Authority::open(&native.profile.data_dir)
-            .unwrap()
-            .target("main")
-            .unwrap()
-            .unwrap()
-            .revision,
-        native.context.revision
-    );
-
-    let independent_human = env.member(
-        303,
-        &[Role::Reader, Role::Reviewer, Role::Integrator],
-        true,
-        env.workspace.settings().unwrap().generation,
-        "grant-independent-native-reviewer",
-    );
-    assert_eq!(
-        env.request(
-            Method::PUT,
-            "/v1/hub/workspace/members",
-            Some(&owner),
-            Some(owner_csrf),
-            None,
-            Some(independent_human),
+    assert_eq!(agent_integration.0, 403, "{agent_integration:?}");
+    if let Some((state, _, concurrent_context)) = &attached_current {
+        let mirror_path = root.path().join("hub-candidate.git");
+        let mirror = Mirror::initialize_with_seed(
+            Path::new(&state.git),
+            &mirror_path,
+            &native.profile.native_repository,
+            &state.target,
+            Path::new(&state.worktree),
+            &state.target_commit,
         )
+        .unwrap();
+        mirror
+            .remote_bind_network(
+                agentscm::git_export::remote::Endpoint::Https {
+                    url: state.remote_url.clone(),
+                    trust: agentscm::git_export::remote::HttpsTrust::System,
+                },
+                &state.output,
+            )
+            .unwrap();
+        let owner_user = env
+            .store
+            .list_users()
+            .unwrap()
+            .into_iter()
+            .find(|user| user.identity.user_id == 202)
+            .unwrap();
+        let credential = root.path().join("synthetic-git-credential.json");
+        fs::write(
+            &credential,
+            br#"{"username":"synthetic","password":"synthetic-fixture-only"}"#,
+        )
+        .unwrap();
+        fs::set_permissions(&credential, fs::Permissions::from_mode(0o600)).unwrap();
+        let publication_profile = AttachedPublicationProfile {
+            repository_id: native.profile.repository_id.clone(),
+            profile_id: native.profile.profile_id.clone(),
+            attachment_id: state.id.clone(),
+            owner_id: owner_user.id.clone(),
+            git: PathBuf::from(&state.git),
+            worktree: PathBuf::from(&state.worktree),
+            git_common_dir: PathBuf::from(&state.git_common_dir),
+            git_dir: PathBuf::from(&state.git_dir),
+            index: PathBuf::from(&state.index),
+            mirror: mirror_path,
+            endpoint: state.remote_url.clone(),
+            target: state.target.clone(),
+            output: state.output.clone(),
+            credential_file: Some(credential),
+            ca_file: None,
+        };
+        let config_file = root.path().join("publication-config.json");
+        fs::write(&config_file, serde_json::to_vec(&json!({
+            "version":1, "profiles":[], "source_profiles":[],
+            "agent_task_profiles":[AgentTaskProfile {
+                repository_id:native.profile.repository_id.clone(), profile_id:native.profile.profile_id.clone(),
+                native_repository:native.profile.native_repository.clone(), data_dir:native.profile.data_dir.clone(),
+                target:native.profile.target.clone(), requirement_digest:native.profile.requirement_digest.clone(),
+                publish_forge_status:true,
+            }], "attached_publication_profiles":[publication_profile]
+        })).unwrap()).unwrap();
+        let publication_service = Arc::new(
+            ExecutionService::open(
+                &root.path().join("publication.sqlite"),
+                ExecutionConfig::from_file(&config_file).unwrap(),
+                env.workspace.clone(),
+            )
+            .unwrap(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let publication_base = format!("http://{}", listener.local_addr().unwrap());
+        fs::write(
+            root.path().join("publication-listen.json"),
+            serde_json::to_vec(&listener.local_addr().unwrap().to_string()).unwrap(),
+        )
+        .unwrap();
+        let mut fake = fake_github::FakeGithub::start().await;
+        fake.with(|s| {
+            let mut repo = fake_github::Repo::new(100, "synthetic/project");
+            repo.git = Some(external.path().join("provider.git"));
+            s.repos.insert(100, repo);
+            s.pats.insert(
+                "synthetic-publication-pat".into(),
+                ("robot".into(), 77, [100].into()),
+            );
+        });
+        let secrets = root.path().join("publication-secrets");
+        agentscm::hub::sync::prepare_secrets_dir(&secrets, true).unwrap();
+        let pat_file = root.path().join("publication.pat");
+        fs::write(&pat_file, "synthetic-publication-pat").unwrap();
+        fs::set_permissions(&pat_file, fs::Permissions::from_mode(0o600)).unwrap();
+        let sync_file = root.path().join("sync-config.json");
+        fs::write(
+            &sync_file,
+            serde_json::to_vec(&json!({
+                "AGENTSCM_GITHUB_URL":format!("http://{}", env.host),
+                "AGENTSCM_GITHUB_API_URL":fake.base,
+                "AGENTSCM_GITHUB_PAT_FILE":pat_file,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let sync_config = cold_restore::sync_config(root.path());
+        let publication_state = agentscm::hub::HubState::new(
+            env.store.clone(),
+            Arc::new(
+                agentscm::backend::LocalBackend::open(root.path().join("publication-objects"))
+                    .unwrap(),
+            ),
+        )
+        .with_workspace(env.workspace.clone())
+        .with_workspace_execution(publication_service)
+        .with_sync(agentscm::hub::sync::Sync::new(sync_config).unwrap());
+        agentscm::hub::sync::start(&publication_state)
+            .await
+            .unwrap();
+        let connection = env.store.pat_connection(&env.host).unwrap().unwrap();
+        env.store
+            .upsert_repository(
+                &connection.id,
+                &env.host,
+                100,
+                "synthetic/project",
+                None,
+                None,
+            )
+            .unwrap();
+        env.store
+            .set_connection_outbound(&connection.id, true, "synthetic")
+            .unwrap();
+        let publication_app = agentscm::hub::router(publication_state.clone());
+        let publication_server = tokio::spawn(async move {
+            axum::serve(listener, publication_app).await.unwrap();
+        });
+        let path = format!(
+            "{publication_base}{REPO}/profiles/checks/attachments/{}/publication",
+            state.id
+        );
+        let prepare = json!({
+            "request_id":"prepare-imported-receipt",
+            "expected_generation":state.generation,
+            "subject":native.subject,
+            "metadata":CommitMetadata { name:"Synthetic".into(), email:"synthetic@example.invalid".into(), timestamp:1780000001, message:"Prepare imported receipt".into() }
+        });
+        let first = json_request(env.client.post(&path).bearer_auth(&token), &prepare)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            first.status().as_u16(),
+            200,
+            "{}",
+            first.text().await.unwrap()
+        );
+        let first: Value = serde_json::from_slice(&first.bytes().await.unwrap()).unwrap();
+        assert_eq!(first["currentness"], "current_at_prepare");
+        let encoded = first.to_string();
+        for private in ["endpoint", "worktree", "credential", "ca_file"] {
+            assert!(!encoded.contains(private), "{encoded}");
+        }
+        for private in [
+            &state.worktree,
+            &state.git_dir,
+            &state.git_common_dir,
+            &state.index,
+        ] {
+            assert!(!encoded.contains(private), "{encoded}");
+        }
+        let exact = json_request(env.client.post(&path).bearer_auth(&token), &prepare)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(exact.status().as_u16(), 200);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&exact.bytes().await.unwrap()).unwrap(),
+            first
+        );
+        let mut changed = prepare.clone();
+        changed["expected_generation"] = json!(state.generation + 1);
+        assert_eq!(
+            json_request(env.client.post(&path).bearer_auth(&token), &changed)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            409
+        );
+        let status_path = format!("{path}/status");
+        let status_request = json!({"request_id":"prepare-imported-receipt"});
+        let status = json_request(
+            env.client.post(&status_path).bearer_auth(&token),
+            &status_request,
+        )
+        .send()
         .await
-        .0,
-        200
-    );
-    let (_, independent_human) = env.signin(303).await;
-    let independent_session = env.session(&independent_human).await;
+        .unwrap();
+        assert_eq!(status.status().as_u16(), 200);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&status.bytes().await.unwrap()).unwrap()["candidate"],
+            first["candidate"]
+        );
+        let branch_path = format!("{path}/branch");
+        let branch = json!({
+            "request_id":"publish-imported-branch",
+            "prepare_request_id":"prepare-imported-receipt",
+            "candidate_id":first["candidate"]["candidate_id"],
+            "expected_generation":state.generation
+        });
+        let published = json_request(env.client.post(&branch_path).bearer_auth(&token), &branch)
+            .send()
+            .await
+            .unwrap();
+        let published_status = published.status().as_u16();
+        let published_bytes = published.bytes().await.unwrap();
+        assert_eq!(
+            published_status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&published_bytes)
+        );
+        let published: Value = serde_json::from_slice(&published_bytes).unwrap();
+        assert_eq!(published["state"], "published");
+        assert_eq!(published["currentness"], "current");
+        assert_eq!(
+            git(
+                &external.path().join("provider.git"),
+                &["rev-parse", &format!("refs/heads/{}", state.output)]
+            ),
+            first["candidate"]["commit"].as_str().unwrap()
+        );
+        let repeated = json_request(env.client.post(&branch_path).bearer_auth(&token), &branch)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(repeated.status().as_u16(), 200);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&repeated.bytes().await.unwrap()).unwrap(),
+            published
+        );
+        let forge_path = format!("{path}/forge");
+        let forge_request = json!({
+            "request_id":"publish-imported-pr", "prepare_request_id":prepare["request_id"],
+            "branch_request_id":branch["request_id"], "candidate_id":first["candidate"]["candidate_id"],
+            "expected_generation":state.generation,"title":"Imported candidate","body":"Synthetic independent human landing"
+        });
+        let provider = external.path().join("provider.git");
+        let prepared_head = first["candidate"]["commit"].as_str().unwrap();
+        let provider_base = git(&provider, &["rev-parse", "refs/heads/main"]);
+        for (reference, replacement, original) in [
+            (
+                format!("refs/heads/{}", state.output),
+                provider_base.as_str(),
+                prepared_head,
+            ),
+            (
+                "refs/heads/main".into(),
+                prepared_head,
+                provider_base.as_str(),
+            ),
+        ] {
+            git(
+                &provider,
+                &["update-ref", &reference, replacement, original],
+            );
+            let response = json_request(
+                env.client.post(&forge_path).bearer_auth(&token),
+                &forge_request,
+            )
+            .send()
+            .await
+            .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            let refused: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+            assert!(refused["error"].is_string(), "{refused}");
+            assert!(fake.with(|s| s.repos[&100].pulls.is_empty()));
+            git(
+                &provider,
+                &["update-ref", &reference, original, replacement],
+            );
+        }
+        fake.with(|s| s.lose_next_pull_reply = true);
+        let result = json_request(
+            env.client.post(&forge_path).bearer_auth(&token),
+            &forge_request,
+        )
+        .send()
+        .await
+        .unwrap();
+        let code = result.status();
+        let result: Value = serde_json::from_slice(&result.bytes().await.unwrap()).unwrap();
+        assert_eq!(code.as_u16(), 200, "{result}");
+        let publication_id = result["id"].as_str().unwrap();
+        assert_eq!(
+            env.store
+                .publication("synthetic/project", publication_id)
+                .unwrap()
+                .unwrap()
+                .branch_state,
+            "pr_attempting"
+        );
+        let recovery = json!({"publication_id":publication_id});
+        let hidden_pull = fake.with(|s| s.repos.get_mut(&100).unwrap().pulls.remove(&1).unwrap());
+        for (url, request) in [
+            (forge_path.clone(), &forge_request),
+            (format!("{forge_path}/recover"), &recovery),
+        ] {
+            let response = json_request(env.client.post(url).bearer_auth(&token), request)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            let unknown: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+            assert!(unknown["error"].is_string());
+        }
+        assert!(fake.with(|s| s.repos[&100].pulls.is_empty()));
+        fake.with(|s| s.repos.get_mut(&100).unwrap().pulls.insert(1, hidden_pull));
+        // Concurrent retries adopt the one exact PR; durable attempting forbids another create.
+        let (a, b) = tokio::join!(
+            json_request(
+                env.client
+                    .post(format!("{forge_path}/recover"))
+                    .bearer_auth(&token),
+                &recovery
+            )
+            .send(),
+            json_request(
+                env.client.post(&forge_path).bearer_auth(&token),
+                &forge_request
+            )
+            .send()
+        );
+        for response in [a.unwrap(), b.unwrap()] {
+            let code = response.status();
+            let value: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+            assert_eq!(code.as_u16(), 200, "{value}");
+            assert_eq!(
+                value["states"]["pull_request"]["state"], "opened",
+                "{value}"
+            );
+        }
+        assert_eq!(
+            fake.with(|s| s
+                .requests
+                .iter()
+                .filter(|r| r.method == "POST" && r.path_and_query.ends_with("/pulls"))
+                .count()),
+            1
+        );
+        for suffix in ["run", "recover"] {
+            assert_eq!(env.client.post(format!("{publication_base}/v1/hub/repos/synthetic%2Fproject/publications/{publication_id}/{suffix}")).bearer_auth(&token).send().await.unwrap().status().as_u16(), 409);
+        }
+        fake.with(|s| s.lose_next_status_reply = true);
+        agentscm::hub::sync::poll_once(&publication_state)
+            .await
+            .unwrap();
+        agentscm::hub::sync::poll_once(&publication_state)
+            .await
+            .unwrap();
+        let statuses = fake.with(|s| s.repos[&100].statuses.clone());
+        assert_eq!(
+            statuses.last().unwrap().1["state"],
+            "success",
+            "{statuses:?}"
+        );
+        assert_eq!(statuses.last().unwrap().0, first["candidate"]["commit"]);
+
+        if revocation == "cold" {
+            // All production state above is real; this branch only changes the stop/restore boundary.
+            cold_restore::browser_hold(&env.base).await;
+            let retained_transfer = collector.retained_transfer("transfer-success").unwrap();
+            let retained_attachments = {
+                let (_, _, _, _, journal, a, b) = git_fixture.as_ref().unwrap();
+                [journal.state(&a.id).unwrap(), journal.state(&b.id).unwrap()]
+            };
+            let mut parts = axum::http::Request::builder()
+                .header(header::COOKIE, &owner)
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0;
+            let maintenance_actor =
+                <agentscm::hub::workspace::WorkspaceActor as axum::extract::FromRequestParts<
+                    agentscm::hub::HubState,
+                >>::from_request_parts(&mut parts, &publication_state)
+                .await
+                .ok()
+                .expect("authenticated maintenance actor");
+            let token_id = env
+                .store
+                .authenticate(
+                    &agentscm::hub::store::agent_token_digest(&token).unwrap(),
+                    agentscm::hub::store::unix_now(),
+                )
+                .unwrap()
+                .unwrap()
+                .token_id;
+            publication_server.abort();
+            let stopped =
+                tokio::time::timeout(std::time::Duration::from_secs(5), publication_server)
+                    .await
+                    .unwrap();
+            assert!(stopped.is_ok() || stopped.unwrap_err().is_cancelled());
+            fake.stop().await;
+            drop(publication_state);
+            drop(mirror);
+            drop(collector);
+            drop(service);
+            drop(engine);
+            drop(git_fixture);
+            drop(no_http);
+            drop(_socket);
+            fs::remove_file(&docker_socket).unwrap();
+            let storage = env.stop().await;
+            cold_restore::qualify(
+                &root,
+                storage,
+                &native,
+                &collector_profile,
+                &mut fake,
+                maintenance_actor,
+                token_id,
+                &token,
+                &current_member,
+                &retained_transfer,
+                &retained_attachments,
+                &first,
+                publication_id,
+                &forge_request,
+                &recovery,
+                &docker_home,
+            )
+            .await;
+            return;
+        }
+
+        if matches!(revocation, "executor" | "token") {
+            if revocation == "executor" {
+                let mut authority = Authority::open(&native.profile.data_dir).unwrap();
+                let epoch = authority.policy_epoch().unwrap() + 1;
+                authority
+                    .revoke_workflow_executor(&agentscm::skill_workflow::ExecutorRevocation {
+                        version: 1,
+                        registration_id: "registration-http-1".into(),
+                        repository: native.profile.native_repository.clone(),
+                        registration_epoch: 1,
+                        revoked_at_policy_epoch: epoch,
+                        reason: "synthetic operator revocation".into(),
+                    })
+                    .unwrap();
+            } else {
+                let principal = env
+                    .store
+                    .authenticate(
+                        &agentscm::hub::store::agent_token_digest(&token).unwrap(),
+                        agentscm::hub::store::unix_now(),
+                    )
+                    .unwrap()
+                    .unwrap();
+                env.store.revoke_agent_token(&principal.token_id).unwrap();
+            }
+            let response = json_request(
+                env.client.post(&forge_path).bearer_auth(&token),
+                &forge_request,
+            )
+            .send()
+            .await
+            .unwrap();
+            assert!(response.status().is_client_error(), "{revocation}");
+            agentscm::hub::sync::poll_once(&publication_state)
+                .await
+                .unwrap();
+            assert_eq!(
+                fake.with(|s| s.repos[&100].statuses.last().unwrap().1["state"].clone()),
+                "failure",
+                "{revocation}"
+            );
+            let (_, observer) = mint_agent_token(
+                &*env.store,
+                &owner_user.id,
+                "historical-observer",
+                "synthetic/project",
+                3600,
+            )
+            .unwrap();
+            let response = json_request(
+                env.client
+                    .post(format!("{forge_path}/recover"))
+                    .bearer_auth(observer.expose()),
+                &recovery,
+            )
+            .send()
+            .await
+            .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            assert_eq!(
+                fake.with(|s| s
+                    .requests
+                    .iter()
+                    .filter(|r| r.method == "POST" && r.path_and_query.ends_with("/pulls"))
+                    .count()),
+                1
+            );
+            let (_, _, contributor_b, _, _, _, _) = git_fixture.as_ref().unwrap();
+            assert_eq!(
+                fs::read(contributor_b.join("notes/contributor-b.txt")).unwrap(),
+                b"independent concurrent edit\n"
+            );
+            publication_server.abort();
+            return;
+        }
+        let baseline = git(
+            &external.path().join("provider.git"),
+            &["rev-parse", "refs/heads/main"],
+        );
+        let head = first["candidate"]["commit"].as_str().unwrap();
+        // A reviewer approves a specific head and baseline, never a branch name alone.
+        let human_can_merge = |approved: bool, expected_head: &str, expected_base: &str| {
+            fake.with(|s| {
+                let repo = &s.repos[&100];
+                let pull = &repo.pulls[&1];
+                approved
+                    && pull.head_sha == expected_head
+                    && pull.base_ref == "main"
+                    && git(
+                        &external.path().join("provider.git"),
+                        &["rev-parse", "refs/heads/main"],
+                    ) == expected_base
+                    && repo
+                        .statuses
+                        .iter()
+                        .rev()
+                        .find(|(sha, v)| {
+                            sha == expected_head && v["context"] == "agentscm/workflow/main"
+                        })
+                        .is_some_and(|(_, v)| v["state"] == "success")
+            })
+        };
+        assert!(!human_can_merge(false, head, &baseline));
+        assert!(!human_can_merge(true, &"0".repeat(40), &baseline));
+        assert!(!human_can_merge(true, head, &"0".repeat(40)));
+        // Provider head/base drift produces a nonpassing status. Returning to the exact
+        // qualified tuple permits a fresh success; old green status alone is insufficient.
+        fake.with(|s| {
+            s.repos
+                .get_mut(&100)
+                .unwrap()
+                .pulls
+                .get_mut(&1)
+                .unwrap()
+                .base_ref = "other".into()
+        });
+        agentscm::hub::sync::poll_once(&publication_state)
+            .await
+            .unwrap();
+        assert!(!human_can_merge(true, head, &baseline));
+        fake.with(|s| {
+            s.repos
+                .get_mut(&100)
+                .unwrap()
+                .pulls
+                .get_mut(&1)
+                .unwrap()
+                .base_ref = "main".into()
+        });
+        agentscm::hub::sync::poll_once(&publication_state)
+            .await
+            .unwrap();
+        assert!(human_can_merge(true, head, &baseline));
+        if human_merge {
+            // Explicit synthetic human action, outside every agent API and native authority.
+            // The provider applies its exact-head, baseline and status guard before landing.
+            git(
+                &external.path().join("provider.git"),
+                &["update-ref", "refs/heads/main", head, &baseline],
+            );
+            fake.with(|s| {
+                let pull = s.repos.get_mut(&100).unwrap().pulls.get_mut(&1).unwrap();
+                pull.merged = true;
+                pull.state = "closed".into();
+                pull.merge_commit_sha = Some(head.into());
+            });
+            agentscm::hub::sync::poll_once(&publication_state)
+                .await
+                .unwrap();
+            assert_eq!(
+                env.store
+                    .publication("synthetic/project", publication_id)
+                    .unwrap()
+                    .unwrap()
+                    .merge_commit
+                    .as_deref(),
+                Some(head)
+            );
+        }
+        let (_, read_only, _) = mint_bound_agent_token(
+            &*env.store,
+            &owner_user.id,
+            "publication-read-only",
+            "synthetic/project",
+            1,
+            3600,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            json_request(
+                env.client.post(&path).bearer_auth(read_only.expose()),
+                &prepare
+            )
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+            403
+        );
+        let hub_owner = env
+            .store
+            .list_users()
+            .unwrap()
+            .into_iter()
+            .find(|user| user.identity.user_id == 101)
+            .unwrap();
+        let (_, wrong_owner) = mint_agent_token(
+            &*env.store,
+            &hub_owner.id,
+            "publication-wrong-owner",
+            "synthetic/project",
+            3600,
+        )
+        .unwrap();
+        assert_eq!(
+            json_request(
+                env.client.post(&path).bearer_auth(wrong_owner.expose()),
+                &prepare
+            )
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+            401
+        );
+        for secret in [read_only.expose(), wrong_owner.expose()] {
+            let response = json_request(
+                env.client.post(&forge_path).bearer_auth(secret),
+                &forge_request,
+            )
+            .send()
+            .await
+            .unwrap();
+            assert!(matches!(response.status().as_u16(), 401 | 403 | 409));
+        }
+        let (_, cross_repo) = mint_agent_token(
+            &*env.store,
+            &owner_user.id,
+            "publication-cross-repo",
+            "synthetic/other",
+            3600,
+        )
+        .unwrap();
+        assert!(
+            json_request(
+                env.client
+                    .post(&forge_path)
+                    .bearer_auth(cross_repo.expose()),
+                &forge_request
+            )
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_client_error()
+        );
+        let mut wrong_generation = forge_request.clone();
+        wrong_generation["expected_generation"] = json!(state.generation + 1);
+        assert!(
+            json_request(
+                env.client.post(&forge_path).bearer_auth(&token),
+                &wrong_generation
+            )
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_client_error()
+        );
+        let reader_only = env.member(
+            202,
+            &[Role::Reader],
+            true,
+            env.workspace.settings().unwrap().generation,
+            "publication-remove-contributor",
+        );
+        assert_eq!(
+            env.request(
+                Method::PUT,
+                "/v1/hub/workspace/members",
+                Some(&owner),
+                Some(owner_csrf),
+                None,
+                Some(reader_only)
+            )
+            .await
+            .0,
+            200
+        );
+        let mut new_request = prepare.clone();
+        new_request["request_id"] = json!("prepare-without-contributor");
+        let (_, reader_token) = mint_agent_token(
+            &*env.store,
+            &owner_user.id,
+            "publication-reader-role",
+            "synthetic/project",
+            3600,
+        )
+        .unwrap();
+        assert_eq!(
+            json_request(
+                env.client.post(&path).bearer_auth(reader_token.expose()),
+                &new_request,
+            )
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+            409
+        );
+        if !human_merge {
+            // A refused downgrade must retain the possibility of visible success.
+            fake.with(|s| {
+                s.fail.push_back(fake_github::Failure {
+                    path_contains: "/statuses/".into(),
+                    status: 403,
+                    headers: vec![],
+                })
+            });
+            agentscm::hub::sync::poll_once(&publication_state)
+                .await
+                .unwrap();
+            let connected = env
+                .store
+                .repository_named(&env.host, "synthetic/project")
+                .unwrap()
+                .unwrap();
+            let row = env
+                .store
+                .forge_check(&connected.id, 1, "agentscm/workflow/main")
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.phase, "attempting");
+            agentscm::hub::sync::poll_once(&publication_state)
+                .await
+                .unwrap();
+            assert_eq!(
+                fake.with(|s| s.repos[&100].statuses.last().unwrap().1["state"].clone()),
+                "failure"
+            );
+            assert!(!human_can_merge(true, head, &baseline));
+        }
+        assert!(
+            json_request(
+                env.client
+                    .post(&forge_path)
+                    .bearer_auth(reader_token.expose()),
+                &forge_request
+            )
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_client_error()
+        );
+        let observed = json_request(
+            env.client
+                .post(format!("{forge_path}/recover"))
+                .bearer_auth(reader_token.expose()),
+            &recovery,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(observed.status().as_u16(), 200);
+        let regrant = env.member(
+            202,
+            &[Role::Reader, Role::Contributor],
+            true,
+            env.workspace.settings().unwrap().generation,
+            "publication-regrant-contributor",
+        );
+        assert_eq!(
+            env.request(
+                Method::PUT,
+                "/v1/hub/workspace/members",
+                Some(&owner),
+                Some(owner_csrf),
+                None,
+                Some(regrant)
+            )
+            .await
+            .0,
+            200
+        );
+        let (_, fresh_token) = mint_agent_token(
+            &*env.store,
+            &owner_user.id,
+            "publication-fresh-actor",
+            "synthetic/project",
+            3600,
+        )
+        .unwrap();
+        new_request["request_id"] = json!("prepare-with-revoked-origin");
+        assert_eq!(
+            json_request(
+                env.client.post(&path).bearer_auth(fresh_token.expose()),
+                &new_request
+            )
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+            409
+        );
+        publication_server.abort();
+        assert_attached_publication_boundary(&native, state);
+        let (_, _, contributor_b, _, attachments, _, attached_b) = git_fixture.as_ref().unwrap();
+        assert_eq!(
+            fs::read(contributor_b.join("notes/contributor-b.txt")).unwrap(),
+            b"independent concurrent edit\n"
+        );
+        let second = attachments.state(&attached_b.id).unwrap();
+        assert_eq!(second.change_id.as_ref(), Some(&concurrent_context.change));
+        assert_eq!(second.candidate_revision, concurrent_context.revision);
+        assert_eq!(
+            engine
+                .read_file(&second.candidate_revision, "notes/contributor-b.txt")
+                .unwrap(),
+            b"independent concurrent edit\n"
+        );
+        assert!(
+            Authority::open_read_only(&native.profile.data_dir)
+                .unwrap()
+                .target("main")
+                .unwrap()
+                .is_none()
+        );
+    } else {
+        let integration = env
+            .request(
+                Method::POST,
+                &integrate_path,
+                Some(&integrator),
+                Some(integrator_session["csrf_token"].as_str().unwrap()),
+                None,
+                Some(json!({
+                    "request_id":"integrate-agent-owned-success",
+                    "expected_generation":integrator_session["actor"]["generation"],
+                    "subject":native.subject,
+                    "approval_id":approval.1["approval_id"]
+                })),
+            )
+            .await;
+        assert_eq!(integration.0, 200, "{integration:?}");
+        assert_eq!(
+            Authority::open(&native.profile.data_dir)
+                .unwrap()
+                .target("main")
+                .unwrap()
+                .unwrap()
+                .revision,
+            native.context.revision
+        );
+    }
+
     let revoke_success_origin = env.member(
         202,
         &roles,
@@ -2248,16 +4106,47 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
         .0,
         200
     );
+    let fresh_entrypoint = &fresh_task.entrypoint.references[0];
+    let before_revoked_read = task_state_snapshot(&native.profile.data_dir);
+    let revoked_reference = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_reference",
+                json!({
+                    "subject":native.subject,
+                    "task_id":fresh_task.task_id,
+                    "task_digest":fresh_task.digest().unwrap(),
+                    "reference_name":fresh_entrypoint.name,
+                    "expected_sha256":fresh_entrypoint.sha256,
+                    "expected_schema_version":1
+                }),
+            )),
+        )
+        .await;
+    assert!(
+        matches!(revoked_reference.0, 401 | 403),
+        "{revoked_reference:?}"
+    );
+    assert_eq!(
+        task_state_snapshot(&native.profile.data_dir),
+        before_revoked_read,
+        "revoked reference read must not mutate native state"
+    );
     let revoked_origin_approval = env
         .request(
             Method::POST,
             &approve_path,
-            Some(&independent_human),
-            Some(independent_session["csrf_token"].as_str().unwrap()),
+            Some(&reviewer),
+            Some(reviewer_session["csrf_token"].as_str().unwrap()),
             None,
             Some(json!({
                 "request_id":"successful-receipt-revoked-origin",
-                "expected_generation":independent_session["actor"]["generation"],
+                "expected_generation":reviewer_session["actor"]["generation"],
                 "subject":native.subject
             })),
         )

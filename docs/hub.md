@@ -200,10 +200,12 @@ on no others:
 - `GET /v1/hub/skill-workflows` for recent runs in an operator-mapped native repository
 - `GET /v1/hub/skill-workflows/{run_id}` for an operator-mapped native repository
 - `GET /v1/hub/standup/briefing` and `GET /v1/hub/standup/work/{id}` for the token's repository
+- `GET /v1/hub/repos/{repo}/publications` and `GET /v1/hub/repos/{repo}/publications/{id}`
+  (stored state only; see [publications](#publishing-a-revision))
 - MCP `initialize`, `ping`, `tools/list`, `agentscm_workflow_status`, and `agentscm_work_briefing`
 
 Every other route that takes an agent token (announcing, renewing and releasing intents, `notices`,
-publications, and coordination MCP mutation tools, including `agentscm_status`, which also renews a hold)
+creating, uploading to and running publications, and coordination MCP mutation tools, including `agentscm_status`, which also renews a hold)
 answers 403 `{"error":"read_only"}` and writes nothing. `POST /v1/hub/hook/{agent}` treats a
 read-only token as an unknown one: the same "token not accepted" reply, and no session or event.
 Routes for human sessions still answer 401 to any agent token. `tests/hub_read_only.rs` walks every
@@ -469,6 +471,9 @@ is 64 KiB. Tools:
 | `agentscm_ask` | `path`, `note?` (at most 200 characters), `session?` | Asks the agent that holds a file to hand it over to this session (see [Handoff](#handoff)). |
 | `agentscm_handoff` | `path`, `accept`, `reason?` (at most 200 characters, with `accept` false), `session?` | Answers a request for a file this session holds: `true` hands it over, `false` keeps it. |
 | `agentscm_workflow_status` | `run_id` | Reads a retained skill workflow from the operator-mapped native repository, with historical state and present applicability separate. |
+| `agentscm_work_insights` | bounded window and continuation | Reads one page of repository work insights. A continuation repeats the exact returned window and watermark. |
+| `agentscm_work_insight` | `work_id` | Reads one bounded work insight projection. |
+| `agentscm_work_usage` | strict usage record | Idempotently reports partial token, attempt and optional cost evidence for the caller's current repository work. It does not prove complete capture or a verified bill. |
 
 The six coordination tools use repo-relative path specs and carry the session's new notices.
 The workflow reads use no session and write no coordination events. `GET /v1/hub/skill-workflows`
@@ -537,7 +542,8 @@ agentscm hub token create --read-only --name status-page --repo owner/name
 
 Every `/ui/` response carries a `Content-Security-Policy` that allows scripts only from the hub
 itself, plus `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and `Cache-Control:
-no-cache`. Styles may be inline, because the component library injects style tags at runtime.
+no-cache`. Styles may be inline, because the page sets inline `style` attributes; fonts and images are
+inlined into the stylesheet as `data:` URIs.
 
 ### Try it locally: `agentscm demo`
 
@@ -789,7 +795,16 @@ from it. The command authenticates with the agent token, configured as for
    connection has [outbound](#github-and-gitlab-connections-and-sync) turned on. The GitHub App or
    PAT needs contents and pull requests write.
 4. `GET .../publications/{id}` shows the publication; while its pull request is open
-   it re-reads it, and records the merge once when GitHub reports it merged.
+   it re-reads it, and records the merge once when GitHub reports it merged. Only an agent
+   token's read does this. A read-only token gets the stored row with no forge call and no write.
+   Its view of `pull_request` can lag until an agent read or the sync records the merge.
+5. `GET /v1/hub/repos/{repo}/publications?limit=25&before=ID` lists the repository's
+   publications, newest first by creation time, then id. `limit` is 1 through 100. `before` is the
+   previous page's `next_cursor`, which is a publication id; an unknown id is a 400. The reply is
+   `{"publications": [...], "next_cursor": ID|null, "complete": bool}`, and `complete` is true
+   exactly when `next_cursor` is null. Each item is the show reply plus `created_at` and
+   `updated_at` (unix seconds), without `forge_check` or `external`; fetch the publication for
+   those. The list reads the store only and calls no forge.
 
 The publication reports four states: `native_landed` (always true: the revision is
 already integrated natively), `branch` (`pending`, `created` or `rejected`, with the
@@ -1274,6 +1289,12 @@ workflow text, and it is inactive until an endpoint and data-handling profile
 are configured.
 
 What the hub keeps, in its database and object store:
+
+- Work usage observations: at most 500 immutable reports per work item, containing bounded
+  agent/provider/model labels, attempt phase and outcome, optional token counts, optional
+  caller-supplied cost evidence and an optional source commit. The stored record also retains
+  its native session label and an author token ID reference for authorization and retry handling
+  (not the token secret). Insight responses omit those session labels and token references. The Hub does not capture prompts, responses or transcript contents for this feature.
 
 - People: forge provider and host, numeric forge user id, login name, whether
   the account is disabled, and when it was created. No name, email address,

@@ -61,6 +61,15 @@ pub enum Verdict {
 }
 
 pub fn native_state(profile: &AgentTaskProfile, subject: &CandidateSubject) -> NativeState {
+    let origins = LiveImportedOrigins::native_only(profile.native_repository.clone());
+    native_state_with_origins(profile, subject, &origins)
+}
+
+pub(super) fn native_state_with_origins(
+    profile: &AgentTaskProfile,
+    subject: &CandidateSubject,
+    origins: &LiveImportedOrigins,
+) -> NativeState {
     let Ok(authority) = profile.stable_mapping() else {
         return NativeState::Unavailable("native store unavailable");
     };
@@ -96,8 +105,7 @@ pub fn native_state(profile: &AgentTaskProfile, subject: &CandidateSubject) -> N
         Ok(_) => return NativeState::Stale("change moved"),
         Err(_) => return NativeState::Unavailable("native change unreadable"),
     }
-    let origins = LiveImportedOrigins::native_only(profile.native_repository.clone());
-    let receipt = match authority.current_qualification(&context, &origins) {
+    let receipt = match authority.current_qualification(&context, origins) {
         Ok(CurrentEvidence::Receipt(receipt)) => receipt,
         Ok(CurrentEvidence::NotQualified) => return NativeState::NotQualified,
         Ok(CurrentEvidence::SubjectChanged) => {
@@ -266,6 +274,8 @@ const DISABLED: &str = "not applicable: forge check disabled";
 /// How one status post ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Posting {
+    /// Re-evaluate authorization immediately; no provider write was dispatched.
+    AuthorizationChanged,
     /// The forge accepted it and the journal says `posted`.
     Posted,
     /// The forge accepted it but the journal write lost a race; read again.
@@ -374,6 +384,7 @@ pub(super) async fn reconcile_repo(
                         &candidate.subject,
                         &publication.commit,
                         &publication.branch,
+                        &publication,
                     ),
                     &mut base_tips,
                 )
@@ -546,7 +557,13 @@ async fn pull_step(
     repo: &ConnectedRepository,
     token: &str,
     profile: &AgentTaskProfile,
-    (number, subject, commit, branch): (i64, &CandidateSubject, &str, &str),
+    (number, subject, commit, branch, publication): (
+        i64,
+        &CandidateSubject,
+        &str,
+        &str,
+        &Publication,
+    ),
     base_tips: &mut HashMap<String, String>,
 ) -> Gh<bool> {
     let api = state.sync.forge(conn)?;
@@ -589,8 +606,7 @@ async fn pull_step(
         head_tree: head.head_tree,
         head_parents: head.head_parents,
     };
-    let (task, task_subject) = (profile.clone(), subject.clone());
-    let native = blocking(state, move || Ok(native_state(&task, &task_subject))).await?;
+    let native = publication_native(state, publication, profile, subject).await?;
     let verdict = evaluate(connected, subject, commit, &live, &native);
     let desired = desired(connected, number, profile, subject, &live, &native, verdict);
 
@@ -616,9 +632,28 @@ async fn pull_step(
     }) {
         return Ok(false);
     }
-    let posted = post(state, conn, repo, token, &pr, row.as_ref(), &desired).await?;
-    Ok(matches!(posted, Posting::Posted | Posting::Unrecorded)
-        && desired.state == StatusState::Success)
+    let posted = post(
+        state,
+        conn,
+        repo,
+        token,
+        &pr,
+        row.as_ref(),
+        (
+            &desired,
+            Some(StatusAuthorization {
+                publication,
+                profile,
+                subject,
+                native: &native,
+            }),
+        ),
+    )
+    .await?;
+    Ok(matches!(
+        posted,
+        Posting::Posted | Posting::Unrecorded | Posting::AuthorizationChanged
+    ) && desired.state == StatusState::Success)
 }
 
 /// Posts a failure on the head `old` names. True when that failure is settled (the forge
@@ -643,7 +678,7 @@ async fn retire(
         state: StatusState::Failure,
         final_on_refusal: true,
     };
-    let posting = post(state, conn, repo, token, pr, Some(old), &stale).await?;
+    let posting = post(state, conn, repo, token, pr, Some(old), (&stale, None)).await?;
     Ok(matches!(posting, Posting::Posted | Posting::Refused))
 }
 
@@ -746,7 +781,7 @@ async fn post(
     token: &str,
     pr: &Pr<'_>,
     row: Option<&ForgeCheck>,
-    desired: &Desired,
+    (desired, binding): (&Desired, Option<StatusAuthorization<'_>>),
 ) -> Gh<Posting> {
     let (number, context) = (pr.number, pr.context);
     let status = CommitStatus::new(
@@ -777,11 +812,21 @@ async fn post(
     let shows = |exact| gitlab_shows(forge, token, repo, pr, desired, exact);
     if gitlab && row.is_some_and(|r| r.phase == "attempting") {
         match shows(true).await {
-            Ok(true) => return complete(state, repo, pr, generation, "posted").await,
+            Ok(true) => {
+                if desired.state == StatusState::Success
+                    && !status_authorized(state, binding.as_ref()).await?
+                {
+                    return Ok(Posting::AuthorizationChanged);
+                }
+                return complete(state, repo, pr, generation, "posted").await;
+            }
             Ok(false) => {}
             Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
             Err(GhError::Failed(detail)) => return uncertain(&detail),
         }
+    }
+    if desired.state == StatusState::Success && !status_authorized(state, binding.as_ref()).await? {
+        return Ok(Posting::AuthorizationChanged);
     }
     let phase = match forge
         .post_commit_status(token, repo, &status, pr.branch)
@@ -836,6 +881,54 @@ async fn complete(
         // Refused but unrecorded: the row stays `attempting` and is retried.
         _ => Posting::Unknown,
     })
+}
+
+struct StatusAuthorization<'a> {
+    publication: &'a Publication,
+    profile: &'a AgentTaskProfile,
+    subject: &'a CandidateSubject,
+    native: &'a NativeState,
+}
+
+async fn status_authorized(
+    state: &HubState,
+    binding: Option<&StatusAuthorization<'_>>,
+) -> Result<bool> {
+    match binding {
+        Some(binding) => {
+            Ok(
+                &publication_native(state, binding.publication, binding.profile, binding.subject)
+                    .await?
+                    == binding.native,
+            )
+        }
+        None => Ok(true),
+    }
+}
+
+async fn publication_native(
+    state: &HubState,
+    publication: &super::publish::Publication,
+    profile: &AgentTaskProfile,
+    subject: &CandidateSubject,
+) -> Result<NativeState> {
+    let (publication, profile, subject) = (publication.clone(), profile.clone(), subject.clone());
+    let service = state.workspace_execution.clone();
+    blocking(state, move || {
+        Ok(match publication.authorization_binding.as_deref() {
+            None => native_state(&profile, &subject),
+            Some(encoded) => match (
+                service,
+                serde_json::from_str::<super::workspace_publication::ForgeBinding>(encoded),
+            ) {
+                (Some(service), Ok(binding)) => {
+                    service.bound_native_state(&binding, &publication, &profile)
+                }
+                _ => NativeState::Unavailable("bound publication executor unavailable"),
+            },
+        })
+    })
+    .await
 }
 
 #[cfg(test)]

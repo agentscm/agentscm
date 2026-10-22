@@ -268,6 +268,7 @@ impl Env {
         let service = ExecutionService::open(
             &dir.join("execution.sqlite"),
             ExecutionConfig {
+                attached_publication_profiles: vec![],
                 version: 1,
                 source_profiles: vec![],
                 agent_task_profiles: vec![profile.clone()],
@@ -379,6 +380,7 @@ impl Env {
         let service = ExecutionService::open(
             &self.dir.join("execution-2.sqlite"),
             ExecutionConfig {
+                attached_publication_profiles: vec![],
                 version: 1,
                 source_profiles: vec![],
                 agent_task_profiles: vec![self.profile.clone()],
@@ -1099,6 +1101,8 @@ async fn a_same_named_repository_on_another_host_stops_the_reconcile() {
         202
     );
     eventually("the success", || env.statuses().len() == 1).await;
+    // Take the repository lock once more so the initial reconcile's confirming pass has finished.
+    env.poll().await;
     // Publications are keyed by name alone: once another host shares the name, none is trusted.
     let other = NewConnection {
         id: format!("con_{}", "f".repeat(32)),

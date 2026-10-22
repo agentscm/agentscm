@@ -44,10 +44,16 @@ const mock = MOCK === '1' || MOCK === 'empty' || MOCK === 'down' || MOCK === 'de
 export default defineConfig({
   base: './',
   plugins: [packagesManifest(), ...(mock ? [mockHub(MOCK === 'empty' || MOCK === 'down' || MOCK === 'demo' ? MOCK : 'full')] : [])],
+  // One React instance for the app and its tests.
+  resolve: { dedupe: ['react', 'react-dom'] },
   server: {
     host: '127.0.0.1',
+    port: 5184,
+    strictPort: true,
     proxy: mock ? undefined : { '/v1': { target: process.env['AGENTSCM_HUB'] ?? 'http://127.0.0.1:7332', changeOrigin: true } },
   },
+  // The hub embeds exactly dist/index.html, app.js and app.css. Fonts and images inline as data: URIs
+  // because the hub's CSP is font-src 'self' data:.
   build: {
     assetsDir: '',
     assetsInlineLimit: 100_000_000,
@@ -55,10 +61,6 @@ export default defineConfig({
     cssCodeSplit: false,
     chunkSizeWarningLimit: 2000,
     rollupOptions: {
-      // antd ships "use client" directives; they carry no meaning in a plain SPA bundle.
-      onwarn(w, next) {
-        if (w.code !== 'MODULE_LEVEL_DIRECTIVE') next(w)
-      },
       output: {
         entryFileNames: 'app.js',
         assetFileNames: 'app[extname]',

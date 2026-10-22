@@ -51,6 +51,11 @@ human approval and landing requirements are unchanged. Recording a check link is
 if the timeline is full or a capture holds its writer lease, the check still runs and reports
 that its link was not retained. Inspect the workflow by its run ID in that case.
 
+The same three reads are available over HTTP when the operator starts
+`agentscm serve --timeline-workspace ROOT`. That pins one workspace, and requests cannot name
+another. See [local template and timeline reads](api.md#local-template-and-timeline-reads).
+Capture and fork are not available over HTTP.
+
 ## Fork an earlier observation
 
 Forking materializes the selected entry's source revision into a new directory and preserves the
@@ -80,7 +85,8 @@ The common tools are `agentscm_snapshot_capture`, `agentscm_snapshot_timeline`,
 `agentscm_snapshot_entry` and `agentscm_snapshot_diff`. `agentscm_snapshot_fork` is enabled only
 when the operator starts the server with `--fork-root`. Tool calls cannot choose another data
 directory, workspace, fork root, executable or model. The server is local stdio; it is not the
-Hub MCP endpoint and does not add a network listener.
+Hub MCP endpoint and does not add a network listener. The optional HTTP reads above are served by
+`agentscm serve`, not by this process.
 
 Five local clients have completion-hook adapters. Use user-level settings so these files remain
 outside the source workspace:

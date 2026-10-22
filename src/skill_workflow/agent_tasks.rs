@@ -56,6 +56,7 @@ pub enum CollectorAction {
     Finalize,
     Approve,
     Integrate,
+    PublishCandidate,
 }
 
 /// One atomic authorization boundary: actor/action and ALL originating grants, then
@@ -318,6 +319,36 @@ impl<'a> AgentTaskService<'a> {
                 "imported workflow requires combined live authorization".into(),
             ))
         }
+    }
+
+    pub(crate) fn with_live_imported_origins<T>(
+        &self,
+        actor: &AuthenticatedAgentIdentity,
+        context: &ReviewContext,
+        action: CollectorAction,
+        callback: impl FnOnce(&LiveImportedOrigins) -> Result<T>,
+    ) -> Result<T> {
+        let origins =
+            Authority::open_read_only(self.data_dir)?.imported_workflow_origins(context)?;
+        let mut callback = Some(callback);
+        let mut result = None;
+        self.with_combined_authorization(
+            actor,
+            action,
+            &origins,
+            &context.change.repository,
+            &mut || {
+                let live = LiveImportedOrigins {
+                    repository: context.change.repository.clone(),
+                    origins: origins.clone(),
+                };
+                result = Some(callback.take().ok_or_else(|| {
+                    Error::Invalid("authorization callback was invoked more than once".into())
+                })?(&live));
+                Ok(())
+            },
+        )?;
+        result.ok_or_else(|| Error::Invalid("authorization callback was not invoked".into()))?
     }
 
     pub fn approve_with_live_imported_origins(

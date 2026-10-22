@@ -93,6 +93,14 @@ agentscm client check --root '/path/to/clone'
 agentscm client remove --root '/path/to/clone'
 ```
 
+Optional [completion reporting](work-insights.md#optional-completion-reporting) is off by default.
+Use `agentscm client reporting on`, `off` or `status`, optionally with `--root`, to change or
+inspect the checkout preference. After a setting change, a running MCP proxy stops on its next
+request without forwarding it; restart it before continuing. Reconnecting to the same binding
+preserves the preference; replacing the Hub, repository, forge origin or token-file binding resets
+it to off. Completion observations are silent and do not supply missing model usage or billing
+information.
+
 `list` is local and never prints a token. It labels a setup-created token with its nonsecret ID and
 expiry; a supplied token is labelled as externally managed. `check` verifies the selected binding
 against its Hub.

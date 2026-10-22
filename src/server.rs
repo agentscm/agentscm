@@ -9,8 +9,9 @@ use agentscm::model::Revision;
 use agentscm::store::Engine;
 use agentscm::{Error, Result};
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, RawQuery, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::extract::{Path, RawQuery, Request, State};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -33,7 +34,18 @@ struct AppState {
     work: Arc<Semaphore>,
     /// Git checkout for collision warnings, chosen by the operator at startup.
     collisions: Option<Arc<PathBuf>>,
+    /// Native workspace whose timeline `/v1/local/workspace` reads, chosen by the operator.
+    timeline: Option<Arc<PathBuf>>,
 }
+
+/// Token and browser origins guarding `/v1/local`, fixed at startup.
+struct LocalAccess {
+    token: Option<String>,
+    origins: Vec<HeaderValue>,
+}
+
+const READ_TOKEN_ENV: &str = "AGENTSCM_SERVE_READ_TOKEN";
+const MIN_READ_TOKEN_BYTES: usize = 32;
 
 /// Bounds the serialized report before it is returned.
 const MAX_COLLISIONS_BYTES: usize = 4 * 1024 * 1024;
@@ -74,6 +86,8 @@ pub async fn serve(
     public: bool,
     max_concurrency: usize,
     collisions: Option<PathBuf>,
+    timeline: Option<PathBuf>,
+    browser_origins: Vec<String>,
 ) -> Result<()> {
     if !bind.ip().is_loopback() && !public {
         return Err(Error::Invalid(
@@ -97,14 +111,85 @@ pub async fn serve(
         }
         path => path.map(Arc::new),
     };
+    let access = local_access(std::env::var(READ_TOKEN_ENV).ok(), browser_origins)?;
+    let timeline = match timeline {
+        Some(root) => {
+            let root = std::fs::canonicalize(root)?;
+            // Fail at startup, as the CLI would, rather than on the first request.
+            timeline_value(
+                &data_dir,
+                &root,
+                TimelineRead::Page {
+                    limit: 1,
+                    before: None,
+                },
+            )?;
+            Some(Arc::new(root))
+        }
+        None => None,
+    };
 
     let state = AppState {
         data_dir,
         engine,
         work: Arc::new(Semaphore::new(max_concurrency)),
         collisions,
+        timeline,
     };
-    let app = Router::new()
+    let app = router(state, access);
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    eprintln!("listening on {}", listener.local_addr()?);
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .map_err(Error::Io)
+}
+
+fn local_access(token: Option<String>, origins: Vec<String>) -> Result<LocalAccess> {
+    if token
+        .as_ref()
+        .is_some_and(|token| token.len() < MIN_READ_TOKEN_BYTES)
+    {
+        return Err(Error::Invalid(format!(
+            "{READ_TOKEN_ENV} must contain at least {MIN_READ_TOKEN_BYTES} bytes"
+        )));
+    }
+    if !origins.is_empty() && token.is_none() {
+        return Err(Error::Invalid(format!(
+            "--browser-origin requires {READ_TOKEN_ENV}"
+        )));
+    }
+    let origins = origins
+        .into_iter()
+        .map(|origin| {
+            let host = origin
+                .strip_prefix("http://")
+                .or_else(|| origin.strip_prefix("https://"))
+                .filter(|host| !host.is_empty() && !host.contains('/'));
+            host.and_then(|_| HeaderValue::from_str(&origin).ok())
+                .ok_or_else(|| {
+                    Error::Invalid(format!(
+                        "browser origin must be scheme://host[:port], got {origin:?}"
+                    ))
+                })
+        })
+        .collect::<Result<_>>()?;
+    Ok(LocalAccess { token, origins })
+}
+
+fn router(state: AppState, access: LocalAccess) -> Router {
+    let local = Router::new()
+        .route("/v1/local/skill-workflow-library", get(library_inspect))
+        .route("/v1/local/skill-workflows/{run_id}/handoff", get(handoff))
+        .route("/v1/local/workspace/timeline", get(timeline_page))
+        .route("/v1/local/workspace/timeline/{id}", get(timeline_entry))
+        .route("/v1/local/workspace/diff", get(timeline_diff))
+        .layer(middleware::from_fn_with_state(
+            Arc::new(access),
+            local_guard,
+        ))
+        .with_state(state.clone());
+    Router::new()
         .route("/health", get(health))
         .route("/v1/revisions/{revision}", get(revision))
         .route("/v1/revisions/{revision}/file", get(read_file))
@@ -113,13 +198,326 @@ pub async fn serve(
         .route("/v1/collisions", get(collisions_status))
         .route("/v1/workflow/inspection", get(workflow_inspection))
         .route("/v1/skill-workflows/{run_id}", get(skill_workflow))
-        .with_state(state);
-    let listener = tokio::net::TcpListener::bind(bind).await?;
-    eprintln!("listening on {}", listener.local_addr()?);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(Error::Io)
+        .with_state(state)
+        .merge(local)
+}
+
+/// Answers CORS preflight for configured origins and checks the read token before any
+/// `/v1/local` handler runs. Only GET handlers are routed, so other methods get 405.
+async fn local_guard(
+    State(access): State<Arc<LocalAccess>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let origin = request
+        .headers()
+        .get(header::ORIGIN)
+        .filter(|origin| access.origins.contains(origin))
+        .cloned();
+    let mut response = if !loopback_host(request.headers()) {
+        // A rebound DNS name reaches this loopback listener with its own Host.
+        read_error(
+            ApiError {
+                status: StatusCode::MISDIRECTED_REQUEST,
+                message: "local reads require a loopback Host (127.0.0.1, localhost or [::1])"
+                    .into(),
+            },
+            "local",
+        )
+    } else if request.method() == Method::OPTIONS {
+        if origin.is_some() {
+            StatusCode::NO_CONTENT.into_response()
+        } else {
+            read_error(
+                ApiError {
+                    status: StatusCode::FORBIDDEN,
+                    message: "origin is not allowed; start serve with --browser-origin".into(),
+                },
+                "local",
+            )
+        }
+    } else if !authorized(access.token.as_deref(), request.headers()) {
+        let mut response = read_error(
+            ApiError {
+                status: StatusCode::UNAUTHORIZED,
+                message: format!("a valid bearer token from {READ_TOKEN_ENV} is required"),
+            },
+            "local",
+        );
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        response
+    } else {
+        next.run(request).await
+    };
+    let headers = response.headers_mut();
+    headers.insert(header::VARY, HeaderValue::from_static("origin"));
+    if let Some(origin) = origin {
+        headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("GET"),
+        );
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            HeaderValue::from_static("authorization"),
+        );
+        headers.insert(
+            header::ACCESS_CONTROL_MAX_AGE,
+            HeaderValue::from_static("600"),
+        );
+    }
+    response
+}
+
+fn loopback_host(headers: &HeaderMap) -> bool {
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|host| host.to_str().ok())
+    else {
+        return false;
+    };
+    let name = match host.rsplit_once(':') {
+        Some((name, port)) if !port.contains(']') => name,
+        _ => host,
+    };
+    matches!(name, "127.0.0.1" | "localhost" | "[::1]")
+}
+
+fn authorized(token: Option<&str>, headers: &HeaderMap) -> bool {
+    let Some(token) = token else {
+        return true;
+    };
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or_default()
+        .as_bytes();
+    // Constant time for equal lengths, as agentscm's hmac comparison.
+    presented.len() == token.len()
+        && presented
+            .iter()
+            .zip(token.as_bytes())
+            .fold(0, |acc, (x, y)| acc | (x ^ y))
+            == 0
+}
+
+async fn library_inspect(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
+    let (change, library) = match named_fields(raw.as_deref(), &["change", "library"]) {
+        Ok(mut fields) => match (fields.remove("change"), fields.remove("library")) {
+            (Some(change), Some(library)) => (change, library),
+            _ => {
+                return read_error(
+                    ApiError::limit("query requires change and library"),
+                    "workflow library",
+                );
+            }
+        },
+        Err(error) => return read_error(error, "workflow library"),
+    };
+    if let Err(error) = check_text(&change, "change").and(check_text(&library, "library")) {
+        return read_error(error, "workflow library");
+    }
+    let data_dir = state.data_dir.clone();
+    local_read(state, "workflow library", move || {
+        crate::skill_workflow_cli::library_value(
+            &data_dir,
+            crate::skill_workflow_cli::LibraryCommand::Inspect { change, library },
+        )
+    })
+    .await
+}
+
+async fn handoff(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    if let Err(error) = named_fields(raw.as_deref(), &[]) {
+        return read_error(error, "workflow handoff");
+    }
+    if let Err(error) = agentscm::skill_workflow_service::validate_run_id(&run_id) {
+        return read_error(ApiError::from(error), "workflow handoff");
+    }
+    let data_dir = state.data_dir.clone();
+    local_read(state, "workflow handoff", move || {
+        crate::skill_workflow_cli::handoff_value(&data_dir, &run_id)
+    })
+    .await
+}
+
+enum TimelineRead {
+    Page {
+        limit: usize,
+        before: Option<u64>,
+    },
+    Entry(u64),
+    Diff {
+        left: u64,
+        right: u64,
+        limit: usize,
+        after: Option<String>,
+    },
+}
+
+#[cfg(unix)]
+fn timeline_value(
+    data_dir: &std::path::Path,
+    root: &std::path::Path,
+    read: TimelineRead,
+) -> Result<serde_json::Value> {
+    // A fresh service per read revalidates the pinned paths, as each CLI invocation does.
+    let service =
+        agentscm::workspace_timeline_service::WorkspaceTimelineService::new(data_dir, root, None)?;
+    match read {
+        TimelineRead::Page { limit, before } => service.timeline(limit, before),
+        TimelineRead::Entry(id) => service.entry(id),
+        TimelineRead::Diff {
+            left,
+            right,
+            limit,
+            after,
+        } => service.diff(left, right, limit, after),
+    }
+}
+
+#[cfg(not(unix))]
+fn timeline_value(
+    _: &std::path::Path,
+    _: &std::path::Path,
+    _: TimelineRead,
+) -> Result<serde_json::Value> {
+    Err(Error::Invalid(
+        "workspace timelines need a Unix host".into(),
+    ))
+}
+
+async fn timeline_page(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
+    let read = named_fields(raw.as_deref(), &["limit", "before"]).and_then(|fields| {
+        Ok(TimelineRead::Page {
+            limit: optional_number(&fields, "limit")?.unwrap_or(25),
+            before: optional_number(&fields, "before")?,
+        })
+    });
+    timeline_read(state, read).await
+}
+
+async fn timeline_entry(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let read = named_fields(raw.as_deref(), &[]).and_then(|_| {
+        id.parse()
+            .map(TimelineRead::Entry)
+            .map_err(|_| ApiError::limit("timeline entry id must be an integer"))
+    });
+    timeline_read(state, read).await
+}
+
+async fn timeline_diff(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
+    let read = named_fields(raw.as_deref(), &["left", "right", "limit", "after"]).and_then(
+        |mut fields| {
+            let required = |name| {
+                optional_number(&fields, name)?
+                    .ok_or_else(|| ApiError::limit(format!("query is missing {name}")))
+            };
+            let (left, right) = (required("left")?, required("right")?);
+            let limit = optional_number(&fields, "limit")?.unwrap_or(100);
+            let after = fields.remove("after");
+            if let Some(after) = &after {
+                check_text(after, "after")?;
+            }
+            Ok(TimelineRead::Diff {
+                left,
+                right,
+                limit,
+                after,
+            })
+        },
+    );
+    timeline_read(state, read).await
+}
+
+async fn timeline_read(
+    state: AppState,
+    read: std::result::Result<TimelineRead, ApiError>,
+) -> Response {
+    // The workspace comes from the serve flag, never from an HTTP parameter.
+    let Some(root) = state.timeline.clone() else {
+        let error = ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: "workspace timeline is off; start serve with --timeline-workspace".into(),
+        };
+        return read_error(error, "workspace timeline");
+    };
+    let read = match read {
+        Ok(read) => read,
+        Err(error) => return read_error(error, "workspace timeline"),
+    };
+    let data_dir = state.data_dir.clone();
+    local_read(state, "workspace timeline", move || {
+        timeline_value(&data_dir, &root, read)
+    })
+    .await
+}
+
+/// Runs one CLI read in a work slot and returns its JSON unchanged, without the CLI envelope.
+async fn local_read<F>(state: AppState, what: &'static str, read: F) -> Response
+where
+    F: FnOnce() -> Result<serde_json::Value> + Send + 'static,
+{
+    let result = blocking(state, move |_| {
+        let body = serde_json::to_string(&read()?)?;
+        if body.len() > MAX_SKILL_WORKFLOW_BYTES {
+            return Err(Error::Limit(format!(
+                "{what} response exceeds {MAX_SKILL_WORKFLOW_BYTES} bytes"
+            )));
+        }
+        Ok(body)
+    })
+    .await;
+    match result {
+        Ok((body, permit)) => guard_response(
+            api_response(StatusCode::OK, body, "application/json"),
+            permit,
+        ),
+        Err(error) => read_error(error, what),
+    }
+}
+
+/// Parses an optional query whose fields must be distinct names from `allowed`.
+fn named_fields(
+    raw: Option<&str>,
+    allowed: &[&str],
+) -> std::result::Result<std::collections::BTreeMap<String, String>, ApiError> {
+    let mut fields = std::collections::BTreeMap::new();
+    if raw.is_none_or(str::is_empty) {
+        return Ok(fields);
+    }
+    for (name, value) in query_fields(raw)? {
+        if !allowed.contains(&name.as_str()) || fields.contains_key(&name) {
+            return Err(ApiError::limit("query has an unknown or duplicate field"));
+        }
+        fields.insert(name, value);
+    }
+    Ok(fields)
+}
+
+fn optional_number<T: std::str::FromStr>(
+    fields: &std::collections::BTreeMap<String, String>,
+    name: &str,
+) -> std::result::Result<Option<T>, ApiError> {
+    fields
+        .get(name)
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|_| ApiError::limit(format!("{name} must be a non-negative integer")))
+        })
+        .transpose()
 }
 
 async fn skill_workflow(
@@ -690,6 +1088,7 @@ mod tests {
             engine: Engine::open(directory.path()).unwrap(),
             work: Arc::new(Semaphore::new(1)),
             collisions: None,
+            timeline: None,
         };
         let permit = reserve_work(&state).unwrap();
         let response = workflow_status(State(state.clone()), RawQuery(None)).await;
@@ -709,6 +1108,7 @@ mod tests {
             engine: Engine::open(directory.path()).unwrap(),
             work: Arc::new(Semaphore::new(1)),
             collisions: None,
+            timeline: None,
         };
         let permit = reserve_work(&state).unwrap();
         let response = skill_workflow(
@@ -734,6 +1134,7 @@ mod tests {
             engine: Engine::open(data_dir.path()).unwrap(),
             work: Arc::clone(&work),
             collisions: None,
+            timeline: None,
         };
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();

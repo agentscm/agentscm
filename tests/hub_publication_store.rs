@@ -227,6 +227,31 @@ fn suite(store: Arc<dyn Store>) {
         .unwrap();
     done(store.create_publication(&capped, &over, now).unwrap());
 
+    // Listing is newest first by created time, then id, and pages strictly before a cursor.
+    let all = store.publications(REPO, None, 100).unwrap();
+    assert!(all.len() > 2);
+    assert!(
+        all.windows(2)
+            .all(|w| (w[0].created_at, &w[0].id) > (w[1].created_at, &w[1].id))
+    );
+    assert_eq!(store.publications(REPO, None, 1).unwrap(), all[..1]);
+    assert_eq!(
+        store.publications(REPO, Some(&all[1].id), 100).unwrap(),
+        all[2..]
+    );
+    assert!(
+        store
+            .publications(REPO, Some("pub_missing"), 100)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .publications("acme/other", None, 100)
+            .unwrap()
+            .is_empty()
+    );
+
     // A revoked token cannot create.
     assert!(store.revoke_agent_token(&token).unwrap());
     let mut again = new("t");
@@ -299,6 +324,42 @@ fn candidate_suite(store: Arc<dyn Store>) {
         .unwrap();
     let (token, _) = mint_agent_token(&*store, &owner.id, "candidate", REPO, 3600).unwrap();
     let now = unix_now();
+    let bound = candidate(90, "agents/bound", None);
+    let binding = r#"{"server_binding":"synthetic"}"#;
+    let row = done(
+        store
+            .create_bound_publication(&token, &bound, Some(binding), now)
+            .unwrap(),
+    );
+    assert_eq!(row.authorization_binding.as_deref(), Some(binding));
+    assert_eq!(
+        store.create_publication(&token, &bound, now).unwrap(),
+        Create::Conflict
+    );
+    assert_eq!(
+        store
+            .create_bound_publication(&token, &bound, Some("{}"), now)
+            .unwrap(),
+        Create::Conflict
+    );
+    assert_eq!(
+        done(
+            store
+                .create_bound_publication(&token, &bound, Some(binding), now)
+                .unwrap()
+        ),
+        row
+    );
+    assert!(
+        store
+            .create_bound_publication(&token, &bound, Some(&"x".repeat(65537)), now)
+            .is_err()
+    );
+    assert!(
+        store
+            .create_bound_publication(&token, &bound, Some("not json"), now)
+            .is_err()
+    );
     let a = candidate(1, "agents/lineage", None);
     done(store.create_publication(&token, &a, now).unwrap());
     store

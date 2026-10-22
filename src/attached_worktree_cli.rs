@@ -645,52 +645,7 @@ fn qualify(
     id: &str,
     generation: u64,
 ) -> Result<CandidateSubject> {
-    let journal = AttachmentJournal::open_existing(data, repository)?;
-    let authority = Authority::open_read_only(data)?;
-    let state = journal.state(id)?;
-    if state.generation != generation {
-        return Err(Error::Conflict("attachment generation changed".into()));
-    }
-    let change = state
-        .change_id
-        .clone()
-        .ok_or_else(|| Error::Conflict("bind an actual Authority Change first".into()))?;
-    let retained = state
-        .context
-        .ok_or_else(|| Error::Conflict("bind current context first".into()))?;
-    let context = authority.qualify_draft_candidate(&change)?;
-    if context.digest()? != retained.context_digest
-        || context.change_version != retained.version
-        || context.revision != state.candidate_revision
-    {
-        return Err(Error::Conflict(
-            "Authority context no longer matches attachment".into(),
-        ));
-    }
-    let comparison = journal.validate_current(engine, id, generation)?;
-    // Re-read after the potentially lengthy source comparison.
-    if authority.qualify_draft_candidate(&change)? != context {
-        return Err(Error::Conflict(
-            "Authority changed during source comparison".into(),
-        ));
-    }
-    Ok(CandidateSubject {
-        id: String::new(),
-        attachment: id.into(),
-        endpoint: state.remote_url,
-        output: state.output,
-        change,
-        change_version: context.change_version,
-        context_digest: context.digest()?,
-        policy_epoch: context.policy_epoch,
-        revision: context.revision,
-        target: context.target,
-        baseline_commit: state.target_commit,
-        parent_commit: String::new(),
-        source_commit: state.head_commit,
-        source_fingerprint: state.source_fingerprint,
-        comparison_fingerprint: comparison,
-    })
+    agentscm::candidate::qualify_attached_candidate_native(data, engine, repository, id, generation)
 }
 
 fn require_current(

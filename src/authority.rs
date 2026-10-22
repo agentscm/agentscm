@@ -40,6 +40,22 @@ impl Authority {
     /// This is a read-only Git-candidate boundary; it creates no integration event and moves
     /// no native target.
     pub fn qualify_draft_candidate(&self, change: &ChangeId) -> Result<ReviewContext> {
+        self.qualify_draft_candidate_inner(change, None)
+    }
+
+    pub fn qualify_draft_candidate_with_imported_origins(
+        &self,
+        change: &ChangeId,
+        origins: &crate::skill_workflow::LiveImportedOrigins,
+    ) -> Result<ReviewContext> {
+        self.qualify_draft_candidate_inner(change, Some(origins))
+    }
+
+    fn qualify_draft_candidate_inner(
+        &self,
+        change: &ChangeId,
+        origins: Option<&crate::skill_workflow::LiveImportedOrigins>,
+    ) -> Result<ReviewContext> {
         let current = self.change(change)?;
         let context = self.review_context(&current.context_digest)?;
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
@@ -53,7 +69,7 @@ impl Authority {
                 revision: &context.revision,
                 policy_epoch: sql_i64("policy epoch", context.policy_epoch)?,
             },
-            None,
+            origins,
         )
     }
 

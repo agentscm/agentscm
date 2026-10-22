@@ -8,7 +8,7 @@ RUN npm run build
 
 FROM rust:1.96.0-slim-bookworm@sha256:4732ca96fd086cb9be682050c3f0176288eebaac2b80aa2bcefccfaf198e1950 AS build
 WORKDIR /build
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY LICENSE THIRD_PARTY_NOTICES.md ./
 COPY src ./src
 COPY examples/slack-manifest.json ./examples/slack-manifest.json

@@ -2086,3 +2086,98 @@ async fn candidate_endpoint_and_actual_default_are_checked_before_reservation() 
     );
     assert_eq!(env.writes(), 0);
 }
+
+#[tokio::test]
+async fn publications_list_newest_first_and_read_only_reads_call_no_forge() {
+    let env = Env::start().await;
+    let (ok, out, err) = env.publish("feat/listed").await;
+    assert!(ok, "{err}");
+    let published = out["id"].as_str().unwrap().to_owned();
+    let mut created = vec![published.clone()];
+    for n in 0..4 {
+        let manifest = manifest(&hello(), &format!("feat/l{n}"));
+        let (status, reply) = env
+            .api(Method::POST, BASE, &env.token, Some(manifest))
+            .await;
+        assert_eq!(status, 200, "{reply}");
+        created.push(reply["id"].as_str().unwrap().to_owned());
+    }
+    let (_, reader, _) =
+        store::mint_bound_agent_token(&*env.store, &env.owner, "status-page", REPO, 1, 3600, true)
+            .unwrap();
+    let reader = reader.expose().to_owned();
+
+    let mut listed = Vec::new();
+    let mut path = format!("{BASE}?limit=2");
+    for _ in 0..5 {
+        let (status, page) = env.api(Method::GET, &path, &reader, None).await;
+        assert_eq!(status, 200, "{page}");
+        let items = page["publications"].as_array().unwrap();
+        assert!(items.len() <= 2);
+        for item in items {
+            assert!(item.get("external").is_none() && item.get("forge_check").is_none());
+            assert!(item["created_at"].is_i64() && item["updated_at"].is_i64());
+            listed.push(item.clone());
+        }
+        assert_eq!(page["complete"], page["next_cursor"].is_null());
+        match page["next_cursor"].as_str() {
+            Some(cursor) => path = format!("{BASE}?limit=2&before={cursor}"),
+            None => break,
+        }
+    }
+    let ids: Vec<&str> = listed.iter().map(|p| p["id"].as_str().unwrap()).collect();
+    let mut sorted = ids.clone();
+    sorted.sort();
+    let mut expected: Vec<&str> = created.iter().map(String::as_str).collect();
+    expected.sort();
+    assert_eq!(sorted, expected);
+    let keys: Vec<(i64, &str)> = listed
+        .iter()
+        .map(|p| (p["created_at"].as_i64().unwrap(), p["id"].as_str().unwrap()))
+        .collect();
+    assert!(
+        keys.windows(2).all(|w| w[0] > w[1]),
+        "newest first: {keys:?}"
+    );
+    let listed_published = listed.iter().find(|p| p["id"] == published).unwrap();
+    assert_eq!(
+        listed_published["states"]["pull_request"]["state"],
+        "opened"
+    );
+    let (_, whole) = env.api(Method::GET, BASE, &env.token, None).await;
+    assert_eq!(whole["publications"].as_array().unwrap().len(), 5);
+    assert_eq!(whole["complete"], true);
+
+    // A read-only show returns the stored row and never reads the forge.
+    let show = format!("{BASE}/{published}");
+    let before = env.requests("GET", "/pulls/1");
+    let (status, shown) = env.api(Method::GET, &show, &reader, None).await;
+    assert_eq!(status, 200, "{shown}");
+    assert_eq!(shown["states"]["pull_request"]["state"], "opened");
+    assert_eq!(env.requests("GET", "/pulls/1"), before);
+
+    for query in [
+        "?limit=0",
+        "?limit=101",
+        "?limit=x",
+        "?before=pub_missing",
+        "?other=1",
+        "?limit=1&limit=2",
+    ] {
+        let (status, _) = env
+            .api(Method::GET, &format!("{BASE}{query}"), &reader, None)
+            .await;
+        assert_eq!(status, 400, "{query}");
+    }
+    let (status, _) = env
+        .api(
+            Method::GET,
+            "/v1/hub/repos/acme%2Fother/publications",
+            &reader,
+            None,
+        )
+        .await;
+    assert_eq!(status, 404);
+    let (status, _) = env.api(Method::GET, BASE, "not-a-token", None).await;
+    assert_eq!(status, 401);
+}

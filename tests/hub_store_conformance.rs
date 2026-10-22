@@ -80,6 +80,42 @@ impl Db {
                 .collect()
         }
     }
+
+    fn named(&self) -> Vec<String> {
+        let sql = "SELECT name FROM hub_named_migrations ORDER BY name";
+        if self.pg.is_some() {
+            let rows = postgres::Client::connect(&self.url, postgres::NoTls)
+                .unwrap()
+                .query(sql, &[])
+                .unwrap();
+            rows.iter().map(|row| row.get(0)).collect()
+        } else {
+            let path = self.url.strip_prefix("sqlite://").unwrap();
+            let conn = rusqlite::Connection::open(path).unwrap();
+            let mut statement = conn.prepare(sql).unwrap();
+            statement
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        }
+    }
+
+    fn count(&self, sql: &str) -> i64 {
+        if self.pg.is_some() {
+            postgres::Client::connect(&self.url, postgres::NoTls)
+                .unwrap()
+                .query_one(sql, &[])
+                .unwrap()
+                .get(0)
+        } else {
+            let path = self.url.strip_prefix("sqlite://").unwrap();
+            rusqlite::Connection::open(path)
+                .unwrap()
+                .query_row(sql, [], |row| row.get(0))
+                .unwrap()
+        }
+    }
 }
 
 fn identity(user_id: i64) -> ForgeIdentity {
@@ -202,9 +238,13 @@ fn idempotent_migrations(db: &Db) {
     for _ in 0..3 {
         db.open();
     }
+    assert_eq!(db.versions(), store::integer_migration_versions());
     assert_eq!(
-        db.versions(),
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+        db.named(),
+        store::named_migration_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
     );
     db.exec("INSERT INTO hub_schema_migrations (version, applied_at) VALUES (999, 0)")
         .unwrap();
@@ -225,10 +265,7 @@ fn concurrent_startup(db: &Db) {
     for open in opens {
         open.join().unwrap().unwrap();
     }
-    assert_eq!(
-        db.versions(),
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
-    );
+    assert_eq!(db.versions(), store::integer_migration_versions());
 }
 
 fn restart_persistence(db: &Db) {
@@ -603,10 +640,7 @@ fn upgrade_from_migration_1(db: &Db) {
     ))
     .unwrap();
     let store = db.open();
-    assert_eq!(
-        db.versions(),
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
-    );
+    assert_eq!(db.versions(), store::integer_migration_versions());
     let principal = store
         .authenticate(&agent_token_digest(&raw).unwrap(), unix_now())
         .unwrap()
@@ -619,6 +653,99 @@ fn upgrade_from_migration_1(db: &Db) {
     let alice = store.upsert_user(&identity(7), "alice").unwrap();
     assert_eq!(alice.id, "usr_legacy");
     mint_bound_agent_token(&*store, &alice.id, "bound", REPO, 9, TTL, false).unwrap();
+}
+
+fn upgrade_from_hub_settings_migration(db: &Db) {
+    let migrations = if db.pg.is_some() {
+        [
+            include_str!("../src/hub/migrations/0001_core.pg.sql"),
+            include_str!("../src/hub/migrations/0002_login.pg.sql"),
+            include_str!("../src/hub/migrations/0003_intents.pg.sql"),
+            include_str!("../src/hub/migrations/0004_github.pg.sql"),
+            include_str!("../src/hub/migrations/0005_publish.pg.sql"),
+            include_str!("../src/hub/migrations/0006_sessions.pg.sql"),
+            include_str!("../src/hub/migrations/0007_warn_once.pg.sql"),
+            include_str!("../src/hub/migrations/0008_read_only_tokens.pg.sql"),
+            include_str!("../src/hub/migrations/0009_handoffs.pg.sql"),
+            include_str!("../src/hub/migrations/0010_work.pg.sql"),
+            include_str!("../src/hub/migrations/0011_work_subscribers.pg.sql"),
+            include_str!("../src/hub/migrations/0012_work_subscriber_sessions.pg.sql"),
+            include_str!("../src/hub/migrations/0013_coordination_requests.pg.sql"),
+            include_str!("../src/hub/migrations/0014_coordination_retention.pg.sql"),
+            include_str!("../src/hub/migrations/0015_candidate_publications.pg.sql"),
+            include_str!("../src/hub/migrations/0016_forge_checks.pg.sql"),
+            include_str!("../src/hub/migrations/0017_external_runs.pg.sql"),
+            include_str!("../src/hub/migrations/0018_hub_settings.pg.sql"),
+        ]
+    } else {
+        [
+            include_str!("../src/hub/migrations/0001_core.sqlite.sql"),
+            include_str!("../src/hub/migrations/0002_login.sqlite.sql"),
+            include_str!("../src/hub/migrations/0003_intents.sqlite.sql"),
+            include_str!("../src/hub/migrations/0004_github.sqlite.sql"),
+            include_str!("../src/hub/migrations/0005_publish.sqlite.sql"),
+            include_str!("../src/hub/migrations/0006_sessions.sqlite.sql"),
+            include_str!("../src/hub/migrations/0007_warn_once.sqlite.sql"),
+            include_str!("../src/hub/migrations/0008_read_only_tokens.sqlite.sql"),
+            include_str!("../src/hub/migrations/0009_handoffs.sqlite.sql"),
+            include_str!("../src/hub/migrations/0010_work.sqlite.sql"),
+            include_str!("../src/hub/migrations/0011_work_subscribers.sqlite.sql"),
+            include_str!("../src/hub/migrations/0012_work_subscriber_sessions.sqlite.sql"),
+            include_str!("../src/hub/migrations/0013_coordination_requests.sqlite.sql"),
+            include_str!("../src/hub/migrations/0014_coordination_retention.sqlite.sql"),
+            include_str!("../src/hub/migrations/0015_candidate_publications.sqlite.sql"),
+            include_str!("../src/hub/migrations/0016_forge_checks.sqlite.sql"),
+            include_str!("../src/hub/migrations/0017_external_runs.sqlite.sql"),
+            include_str!("../src/hub/migrations/0018_hub_settings.sqlite.sql"),
+        ]
+    };
+    for sql in migrations {
+        db.exec(sql).unwrap();
+    }
+    db.exec(
+        "CREATE TABLE hub_schema_migrations (version BIGINT PRIMARY KEY, applied_at BIGINT NOT NULL)",
+    )
+    .unwrap();
+    for version in 1..=18 {
+        db.exec(&format!(
+            "INSERT INTO hub_schema_migrations VALUES ({version},0)"
+        ))
+        .unwrap();
+    }
+
+    db.open();
+    assert_eq!(db.versions(), store::integer_migration_versions());
+    db.exec("SELECT COUNT(*) FROM hub_external_runs; SELECT COUNT(*) FROM hub_settings; SELECT COUNT(*) FROM hub_work_model_usage;")
+        .unwrap();
+}
+
+fn named_migrations_are_a_set(db: &Db) {
+    db.open();
+    assert_eq!(
+        db.named(),
+        store::named_migration_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    );
+    let columns = if db.pg.is_some() {
+        "SELECT COUNT(*) FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = 'hub_publications' \
+         AND column_name = 'authorization_binding'"
+    } else {
+        "SELECT COUNT(*) FROM pragma_table_info('hub_publications') \
+         WHERE name = 'authorization_binding'"
+    };
+    assert_eq!(db.count(columns), 1);
+    db.exec(
+        "INSERT INTO hub_named_migrations (name, applied_at) VALUES ('from_a_newer_binary', 0)",
+    )
+    .unwrap();
+    let error = store::open(&db.url).err().unwrap();
+    assert!(
+        error.to_string().contains("newer than this binary"),
+        "{error}"
+    );
 }
 
 fn app(host: &str) -> NewConnection {
@@ -1428,10 +1555,7 @@ fn upgrade_from_migration_3(db: &Db) {
     ))
     .unwrap();
     let store = db.open();
-    assert_eq!(
-        db.versions(),
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
-    );
+    assert_eq!(db.versions(), store::integer_migration_versions());
     let intents = store.live_intents("acme/widgets", unix_now(), 10).unwrap();
     assert_eq!(intents.len(), 1);
     let con = store
@@ -1538,7 +1662,7 @@ fn upgrade_from_migration_14_with_publication(db: &Db) {
         INSERT INTO hub_publications (id,repository,token,revision,event_seq,commit_sha,branch,base,manifest,branch_state,pr_number,pr_node_id,pr_url,created_at,updated_at) VALUES ('{id}','acme/widgets','tok_legacy','{}',3,'{}','feat/legacy','main','{}','created',7,'PR_7','https://github.com/acme/widgets/pull/7',10,11);
         INSERT INTO hub_events (id,at,kind,subject,data) VALUES ('evt_legacy',10,'publication_pr_opened','{id}','{{\"number\":7}}')", manifest.revision,manifest.commit,canonical.replace('\'', "''"))).unwrap();
     let store = db.open();
-    assert_eq!(db.versions(), (1..=17).collect::<Vec<_>>());
+    assert_eq!(db.versions(), store::integer_migration_versions());
     let p = store.publication(REPO, &id).unwrap().unwrap();
     assert_eq!(p.event_seq, Some(3));
     assert_eq!(p.manifest, canonical);
@@ -1854,6 +1978,7 @@ conformance!(
     owner_disable_cascades,
     rename_keeps_identity,
     idempotent_migrations,
+    named_migrations_are_a_set,
     concurrent_startup,
     restart_persistence,
     events_record_each_change,
@@ -1863,6 +1988,7 @@ conformance!(
     list_and_owned_revoke,
     admin_actions_and_sign_in,
     upgrade_from_migration_1,
+    upgrade_from_hub_settings_migration,
     connections_and_repositories,
     observations,
     deliveries_outbound_and_notices,

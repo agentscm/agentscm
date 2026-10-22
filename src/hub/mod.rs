@@ -13,6 +13,7 @@ pub mod gitlab;
 pub mod handoff;
 pub mod hook;
 pub mod http;
+pub mod insights;
 pub mod intent;
 pub mod login;
 pub mod mcp;
@@ -27,6 +28,7 @@ mod store_pg;
 mod store_sqlite;
 pub mod sync;
 mod ui;
+pub mod view_settings;
 pub mod work;
 pub mod work_http;
 pub mod workspace;
@@ -36,6 +38,8 @@ pub mod workspace_agent_tasks;
 pub mod workspace_execution;
 #[cfg(unix)]
 pub mod workspace_http;
+#[cfg(unix)]
+pub mod workspace_publication;
 #[cfg(unix)]
 pub mod workspace_source_http;
 
@@ -287,6 +291,7 @@ pub fn router(state: HubState) -> Router {
     let workspace_routes = workspace::routes()
         .merge(workspace_http::routes())
         .merge(workspace_agent_tasks::routes())
+        .merge(workspace_publication::routes())
         .merge(workspace_source_http::routes());
     #[cfg(not(unix))]
     let workspace_routes = workspace::routes();
@@ -305,7 +310,29 @@ pub fn router(state: HubState) -> Router {
         .merge(workspace_routes)
         .fallback(http::not_found)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(axum::middleware::from_fn(request_timeout))
         .with_state(state)
+}
+
+/// Longest any request may run; the notices long-poll caps at 25 seconds and uploads at 8 MiB.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn request_timeout(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    timeout_after(REQUEST_TIMEOUT, request, next).await
+}
+
+async fn timeout_after(
+    limit: std::time::Duration,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    tokio::time::timeout(limit, next.run(request))
+        .await
+        .unwrap_or_else(|_| axum::http::StatusCode::REQUEST_TIMEOUT.into_response())
 }
 
 #[cfg(test)]
@@ -313,6 +340,31 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    #[tokio::test]
+    async fn a_handler_past_the_limit_gets_408() {
+        let limit = std::time::Duration::from_millis(50);
+        let app = Router::new()
+            .route(
+                "/slow",
+                axum::routing::get(|| async {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await
+                }),
+            )
+            .route("/fast", axum::routing::get(|| async {}))
+            .layer(axum::middleware::from_fn(move |request, next| {
+                timeout_after(limit, request, next)
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let status = |path: &str| {
+            let url = format!("http://{address}{path}");
+            async move { reqwest::get(url).await.unwrap().status().as_u16() }
+        };
+        assert_eq!(status("/slow").await, 408);
+        assert_eq!(status("/fast").await, 200);
+    }
 
     fn config(extra: &[(&str, &str)]) -> Result<Option<S3Config>> {
         let mut vars: HashMap<String, String> = [

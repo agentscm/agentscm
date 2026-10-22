@@ -21,6 +21,7 @@
 - [Work intents](intents.md) and the Claude Code hook
 - [Local workspace snapshot timeline](workspace-timeline.md): capture and inspect bounded native-workspace observations, or fork an earlier observation into another Change
 - [Asynchronous agent stand-up](standup.md): durable work claims, checkpoint handovers and bounded catch-up
+- [Work insights](work-insights.md): bounded timing, coordination, usage reports and stored publication observations
 - [Supported coding agents](agents.md): Claude Code, Codex, Cursor, Copilot and others; `agentscm init-repo` and `agentscm hook`
 - [Slack adapter](slack.md) and [capability map](slack-capabilities.md): optional private App Home, scoped work and checkpoint forms.
 - [Multi-user coordination hub](hub.md), including [what the hub stores](hub.md#data-the-hub-stores)

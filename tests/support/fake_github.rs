@@ -364,6 +364,7 @@ pub struct FakeGithub {
     /// Used as both the web and the API base.
     pub base: String,
     pub state: Arc<Mutex<FakeState>>,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Clone)]
@@ -382,8 +383,35 @@ impl FakeGithub {
             state: state.clone(),
         };
         let app = Router::new().fallback(entry).with_state(ctx);
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        FakeGithub { base, state }
+        let task = Some(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap()
+        }));
+        FakeGithub { base, state, task }
+    }
+
+    pub async fn stop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .unwrap();
+            assert!(result.is_ok() || result.unwrap_err().is_cancelled());
+        }
+    }
+
+    pub async fn restart(&mut self) {
+        assert!(self.task.is_none());
+        let listener = tokio::net::TcpListener::bind(self.base.trim_start_matches("http://"))
+            .await
+            .unwrap();
+        let ctx = Ctx {
+            base: self.base.clone(),
+            state: self.state.clone(),
+        };
+        let app = Router::new().fallback(entry).with_state(ctx);
+        self.task = Some(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap()
+        }));
     }
 
     pub fn with<R>(&self, f: impl FnOnce(&mut FakeState) -> R) -> R {
@@ -1305,5 +1333,13 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
             }
         }
         _ => not_found(),
+    }
+}
+
+impl Drop for FakeGithub {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
     }
 }
