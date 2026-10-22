@@ -923,6 +923,51 @@ fn invalid_calls_are_rejected_without_events(db: &Db) {
     assert!(store.live_intents(REPO, T0, 10).unwrap().is_empty());
 }
 
+fn a_file_held_through_mcp_is_still_refused_on_the_first_hook_edit(db: &Db) {
+    let store = db.open();
+    let alice = agent(&*store, 1, "a");
+    let bob = agent(&*store, 2, "b");
+    let carol = agent(&*store, 3, "c");
+    hook_touch(&*store, &alice, "s", &["src/a.rs"], T0);
+    // The hook joins first, then the agent's MCP start names alice's file: held, with the note.
+    hook_touch(&*store, &bob, "s", &["src/b.rs"], T0 + 1);
+    let claim = store
+        .touch_session(&bob.token, &call("mcp", Some("s"), &["src/a.rs"]), T0 + 2)
+        .unwrap();
+    assert_eq!(claim.added, ["src/a.rs"]);
+    assert_eq!(claim.overlaps.len(), 1);
+    // The first hook edit of it is still refused once; the repeat passes.
+    let edit = hook_touch(&*store, &bob, "s", &["src/a.rs"], T0 + 3);
+    assert_eq!(edit.denied.len(), 1);
+    let again = hook_touch(&*store, &bob, "s", &["src/a.rs"], T0 + 4);
+    assert!(again.denied.is_empty());
+    assert_eq!(again.repeated, ["src/a.rs"]);
+    assert!(
+        hook_touch(&*store, &bob, "s", &["src/a.rs"], T0 + 5)
+            .repeated
+            .is_empty()
+    );
+
+    // MCP before the first hook: the hook adopts the MCP session, and is still refused once.
+    touch(&*store, &carol, &["src/a.rs"], T0 + 6);
+    let adopted = hook_touch(&*store, &carol, "t", &["src/a.rs"], T0 + 7);
+    // One overlap per holder: alice and bob both hold it by now.
+    assert_eq!(adopted.denied.len(), 2);
+    assert!(adopted.denied.iter().all(|o| o.your_paths == ["src/a.rs"]));
+
+    // A file a refusing edit checked while nobody else held it is never refused later.
+    let dave = agent(&*store, 4, "d");
+    hook_touch(&*store, &alice, "s", &["src/z.rs"], T0 + 8);
+    let late = hook_touch(&*store, &dave, "u", &["src/z.rs"], T0 + 9);
+    assert_eq!(late.denied.len(), 1);
+    hook_touch(&*store, &dave, "u", &["src/z.rs"], T0 + 10);
+    assert!(
+        hook_touch(&*store, &alice, "s", &["src/z.rs"], T0 + 11)
+            .denied
+            .is_empty()
+    );
+}
+
 macro_rules! conformance {
     ($($case:ident),* $(,)?) => {
         mod on_sqlite {
@@ -951,6 +996,7 @@ conformance!(
     the_path_cap_keeps_the_call_paths,
     sessions_hold_files_and_never_the_defaults,
     the_first_contested_edit_is_refused_and_a_repeat_passes,
+    a_file_held_through_mcp_is_still_refused_on_the_first_hook_edit,
     a_refused_file_stays_acknowledged_after_its_hold_lapses,
     every_touch_keeps_last_active_fresh,
     only_session_intents_refuse,

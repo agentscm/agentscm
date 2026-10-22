@@ -116,6 +116,8 @@ pub(super) struct Row {
     pub denied: String,
     /// JSON array of unix seconds of recent refusals.
     pub deny_times: String,
+    /// JSON array of held paths that no refusing pre-edit check has seen yet.
+    pub unchecked: String,
 }
 
 /// The session's current intent when it is live: its id, index keys and creation time.
@@ -375,7 +377,7 @@ fn contested(token: &str, via: &[String], keys: &[String], intents: Vec<Intent>)
     found
 }
 
-/// What to do with a call's new files, given the session's refusals so far.
+/// What to do with the files a call edits for the first time, given the session's refusals so far.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Decision {
     /// Contested files to refuse now; when non-empty the whole call is refused.
@@ -386,16 +388,16 @@ pub(super) struct Decision {
     pub rate_limited: bool,
 }
 
-/// `added` are the call's new files, `contested` those of them another agent holds that were
-/// not refused before (the others are repeats).
+/// `first` are the call's files no refusing call has checked yet, `contested` those of them another
+/// agent holds that were not refused before (the others are repeats).
 pub(super) fn decide(
     denied: &[String],
     times: &[i64],
-    added: &[String],
+    first: &[String],
     contested: &[String],
     now: i64,
 ) -> Decision {
-    let repeat: Vec<String> = added
+    let repeat: Vec<String> = first
         .iter()
         .filter(|key| denied.contains(key))
         .cloned()
@@ -423,9 +425,10 @@ pub(super) struct Guarded {
     denied: Vec<Overlap>,
     repeated: Vec<String>,
     rate_limited: bool,
-    /// The session row's new `denied` and `deny_times`.
+    /// The session row's new `denied`, `deny_times` and `unchecked`.
     pub denied_json: String,
     pub times_json: String,
+    pub unchecked_json: String,
 }
 
 fn list<T: DeserializeOwned>(json: &str) -> Result<Vec<T>> {
@@ -433,8 +436,10 @@ fn list<T: DeserializeOwned>(json: &str) -> Result<Vec<T>> {
 }
 
 /// Warn-once for a deny-capable call: a contested file's first attempt is refused (the call then
-/// only heartbeats the held intent), a repeat of a refused file passes. `load` returns the live
-/// intents of other holders overlapping the keys it is given.
+/// only heartbeats the held intent), a repeat of a refused file passes. A file the session already
+/// holds through a call that cannot refuse (MCP, a hook after the edit) counts as a first attempt
+/// until a refusing call has checked it. `load` returns the live intents of other holders
+/// overlapping the keys it is given.
 pub(super) fn guard(
     token: &str,
     row: Option<&Row>,
@@ -447,6 +452,7 @@ pub(super) fn guard(
     let mut denied: Vec<String> = row.map_or(Ok(Vec::new()), |row| list(&row.denied))?;
     let mut times: Vec<i64> = row.map_or(Ok(Vec::new()), |row| list(&row.deny_times))?;
     times.retain(|at| *at > now - DENY_WINDOW_SECONDS);
+    let mut unchecked: Vec<String> = row.map_or(Ok(Vec::new()), |row| list(&row.unchecked))?;
     let mut out = Guarded {
         step,
         denied: Vec::new(),
@@ -454,12 +460,24 @@ pub(super) fn guard(
         rate_limited: false,
         denied_json: String::new(),
         times_json: String::new(),
+        unchecked_json: String::new(),
     };
-    if call.deny && !out.step.added.is_empty() {
-        // Files hold no directories, so a display spec is its key.
-        let fresh: Vec<String> = out
-            .step
-            .added
+    // Files hold no directories, so a display spec is its key.
+    let first: Vec<String> = call
+        .keys
+        .iter()
+        .filter(|key| out.step.added.contains(key) || unchecked.contains(key))
+        .cloned()
+        .collect();
+    if !call.deny {
+        // Left for the first refusing edit to check.
+        for key in &out.step.added {
+            if !unchecked.contains(key) {
+                unchecked.push(key.clone());
+            }
+        }
+    } else if !first.is_empty() {
+        let fresh: Vec<String> = first
             .iter()
             .filter(|key| !denied.contains(key))
             .cloned()
@@ -474,10 +492,11 @@ pub(super) fn guard(
             .flat_map(|overlap| overlap.your_paths.clone())
             .collect();
         let keys: Vec<String> = keys.into_iter().collect();
-        let decision = decide(&denied, &times, &out.step.added, &keys, now);
+        let decision = decide(&denied, &times, &first, &keys, now);
         if decision.deny.is_empty() {
             out.repeated = decision.repeat;
             out.rate_limited = decision.rate_limited;
+            unchecked.retain(|key| !first.contains(key));
         } else {
             out.step = plan(
                 row,
@@ -496,8 +515,10 @@ pub(super) fn guard(
             times.push(now);
         }
     }
+    unchecked.retain(|key| out.step.keys.contains(key));
     out.denied_json = json!(denied).to_string();
     out.times_json = json!(times).to_string();
+    out.unchecked_json = json!(unchecked).to_string();
     Ok(out)
 }
 
@@ -960,6 +981,7 @@ mod tests {
             cursor: 0,
             denied: "[]".into(),
             deny_times: "[]".into(),
+            unchecked: "[]".into(),
         };
         let step = plan(Some(&row), None, &check(&call("mcp", &[])).unwrap(), 0).unwrap();
         assert_eq!(
