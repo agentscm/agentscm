@@ -159,6 +159,47 @@ pub fn check(data_dir: &Path, args: LoopArgs) -> Result<Value> {
     }
     let context_digest = context.digest()?;
     let run_id = stable_run_id(&requirement.digest()?, &context_digest);
+    // Try to retain an exact reference before execution, including for interrupted runs.
+    // Timeline availability never weakens or blocks the required workflow itself.
+    let timeline_record = workspace
+        .as_ref()
+        .map(|workspace| {
+            let request = agentscm::workspace::CheckLinkRequest {
+                source_revision: source_tip.clone(),
+                tested_revision: context.revision.clone(),
+                change: context.change.clone(),
+                change_version: context.change_version,
+                context_digest: context_digest.clone(),
+                policy_epoch: context.policy_epoch,
+                target: context.target.clone(),
+                target_revision: context.base.as_ref().map(|base| base.revision.clone()),
+                target_version: context.base.as_ref().map(|base| base.target_version),
+                requirement_digest: requirement.digest()?,
+                run_id: run_id.clone(),
+            };
+            workspace.record_check_start(&engine, &request)
+        })
+        .map(|result| match result {
+            Ok(outcome) => {
+                if matches!(
+                    outcome,
+                    agentscm::workspace::CheckLinkResult::Paused { .. }
+                        | agentscm::workspace::CheckLinkResult::Skipped { .. }
+                ) {
+                    eprintln!(
+                        "workspace timeline did not retain this check reference: {}",
+                        serde_json::to_string(&outcome).unwrap_or_default()
+                    );
+                }
+                json!({"outcome":outcome})
+            }
+            Err(_) => {
+                eprintln!(
+                    "workspace timeline could not retain this check reference; workflow continues"
+                );
+                json!({"outcome":"unavailable"})
+            }
+        });
     skill_workflow::start(data_dir, &run_id, &plan)?;
 
     let work_dir = crate::private_execution_dir(data_dir)?;
@@ -252,6 +293,7 @@ pub fn check(data_dir: &Path, args: LoopArgs) -> Result<Value> {
     Ok(json!({
         "context": context,
         "run": run,
+        "timeline_record": timeline_record,
         "receipt": receipt,
         "workspace_changed_during_run": workspace_changed,
         "failures": failures,

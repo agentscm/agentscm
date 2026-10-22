@@ -32,6 +32,11 @@ own routes, including the agent MCP endpoint `POST /mcp` and the hook endpoints
 `POST /v1/hub/hook/{agent}`; see the [hub guide](hub.md#routes) and
 [agent sessions](hub.md#agent-sessions-mcp-and-hook-endpoints).
 
+The [local workspace snapshot timeline](workspace-timeline.md) is exposed through the native
+`workspace` CLI and a separate local stdio `workspace-client mcp` process. It adds no route to
+`agentscm serve` or the Hub, and it adds no HTTP path to this API or its OpenAPI surface. Capture
+and fork are local mutations and are not available over HTTP.
+
 ## Guided workflow observations
 
 The status route accepts no query fields. Inspection accepts only one `limit`
