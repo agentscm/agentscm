@@ -1,3 +1,6 @@
+import { useState } from 'react'
+import { loadLocalBase, loadLocalToken, localStatus, saveLocalBase, saveLocalToken, validLocalBase } from '../localApi.ts'
+import { usePoll } from '../usePoll.ts'
 import type { ThemePref } from '../storage.ts'
 import type { Whoami } from '../types.ts'
 import { ViewSettingsBox } from '../ViewSettings.tsx'
@@ -52,6 +55,8 @@ export function SettingsPage({ token, whoami, pref, onPref, railCollapsed, onRai
           </div>
         </Box>
 
+        <LocalServer />
+
         <Box icon="key" title="Your token" explain="The token decides which repository you see. A read-only token can look but never change coordination.">
           {!whoami ? (
             <Skeleton rows={2} />
@@ -90,5 +95,59 @@ export function SettingsPage({ token, whoami, pref, onPref, railCollapsed, onRai
         </Box>
       </div>
     </div>
+  )
+}
+
+const STATUS = {
+  live: { tone: 'ok', icon: 'check-circle', word: 'Connected' },
+  preview: { tone: 'muted', icon: 'easel', word: 'Not found — showing preview data' },
+  off: { tone: 'warn', icon: 'exclamation-circle', word: 'Connected, but Timeline is off' },
+  refused: { tone: 'bad', icon: 'lock', word: 'Refused — check the address or token' },
+  error: { tone: 'bad', icon: 'x-octagon', word: 'Not answering properly' },
+} as const
+
+/** Where Templates and Timeline read from: `agentscm serve` on this computer. Loopback only, its own token. */
+function LocalServer() {
+  const [saved, setSaved] = useState(loadLocalBase)
+  const [draft, setDraft] = useState(saved)
+  const [token, setToken] = useState(loadLocalToken)
+  const [nonce, setNonce] = useState(0)
+  const value = draft.trim().replace(/\/$/, '')
+  const valid = validLocalBase(value)
+  const status = usePoll((signal) => localStatus(signal), 0, `${saved}|${nonce}`)
+  return (
+    <Box icon="laptop" title="This computer" explain="Templates and Timeline read from agentscm serve on this machine, never from the hub.">
+      <form
+        className="settings-row"
+        onSubmit={(e) => {
+          e.preventDefault()
+          if (!valid) return
+          saveLocalBase(value)
+          saveLocalToken(token.trim())
+          setSaved(value)
+          setNonce((n) => n + 1)
+        }}
+      >
+        <div>
+          <label className="settings-label" htmlFor="local-base">Local read API</label>
+          <div className="muted small">Leave the address empty to use this page’s own address. Only addresses on this computer are allowed, such as http://127.0.0.1:7331. A token is needed only for a different address: it is agentscm serve’s own read token, never your hub token, and is kept for this tab only.</div>
+          <div className="mt-2">
+            {status.kind === 'ready' ? <Pill tone={STATUS[status.value].tone} icon={STATUS[status.value].icon}>{STATUS[status.value].word}</Pill> : status.kind === 'loading' ? <span className="small muted">Checking…</span> : <Pill tone="bad">Could not check</Pill>}
+          </div>
+        </div>
+        <div className="d-flex flex-column gap-2">
+          <div>
+            <label className="visually-hidden" htmlFor="local-base">Local read API address</label>
+            <input id="local-base" className={`form-control${valid ? '' : ' is-invalid'}`} placeholder="Same address as this page" value={draft} onChange={(e) => setDraft(e.target.value)} spellCheck={false} aria-describedby="local-base-help" />
+            {!valid && <div id="local-base-help" className="invalid-feedback d-block">Use http://127.0.0.1, localhost or [::1], with an optional port.</div>}
+          </div>
+          <div>
+            <label className="visually-hidden" htmlFor="local-token">Local read token</label>
+            <input id="local-token" type="password" className="form-control" placeholder="Local read token (optional)" value={token} onChange={(e) => setToken(e.target.value)} autoComplete="off" disabled={value === ''} />
+          </div>
+          <button type="submit" className="btn btn-outline-secondary" disabled={!valid}>Save and check</button>
+        </div>
+      </form>
+    </Box>
   )
 }

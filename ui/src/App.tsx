@@ -13,6 +13,9 @@ import { SignIn } from './pages/SignIn.tsx'
 import { WorkPage } from './pages/Work.tsx'
 import { WorkflowsPage } from './pages/Workflows.tsx'
 import { WorkspacePage } from './pages/Workspace.tsx'
+import { LandedPage } from './pages/Landed.tsx'
+import { TemplatesPage } from './pages/Templates.tsx'
+import { TimelinePage } from './pages/Timeline.tsx'
 import { SettingsPage } from './pages/Settings.tsx'
 import { AppChrome, type Badges, type SectionDef } from './TopNav.tsx'
 import { Icon, Notice } from './ui.tsx'
@@ -26,13 +29,16 @@ const subscribeDark = (cb: () => void) => {
 }
 const systemDark = () => window.matchMedia(darkQuery).matches
 
-export type Section = 'now' | 'work' | 'activity' | 'workflows' | 'setup' | 'workspace' | 'health' | 'settings'
+export type Section = 'now' | 'work' | 'activity' | 'workflows' | 'landed' | 'templates' | 'timeline' | 'setup' | 'workspace' | 'health' | 'settings'
 
 export const SECTIONS: SectionDef[] = [
   { key: 'now', icon: 'broadcast', label: 'Right now', question: 'Who is editing which files?', group: 'Coordinate' },
   { key: 'work', icon: 'kanban', label: 'Work', question: 'Who owns which task?', group: 'Coordinate' },
   { key: 'activity', icon: 'clock-history', label: 'Activity', question: 'What just happened?', group: 'Coordinate' },
   { key: 'workflows', icon: 'diagram-3', label: 'Workflows', question: 'Did the checks pass?', group: 'Verify' },
+  { key: 'landed', icon: 'rocket-takeoff', label: 'Landed changes', question: 'Did our changes land, and did checks pass after?', group: 'Verify' },
+  { key: 'templates', icon: 'journal-code', label: 'Templates', question: 'Which workflow recipes can agents reuse?', group: 'This computer' },
+  { key: 'timeline', icon: 'camera', label: 'Timeline', question: 'What did this workspace look like earlier?', group: 'This computer' },
   { key: 'workspace', icon: 'people', label: 'Workspace', question: 'Who can run what?', group: 'Manage' },
   { key: 'setup', icon: 'plug', label: 'Connect agents', question: 'Is my agent set up?', group: 'Manage' },
   { key: 'health', icon: 'heart-pulse', label: 'Hub health', question: 'Is the hub OK?', group: 'Manage' },
@@ -118,6 +124,9 @@ function Shell({ token, dark, pref, onPref, onUnauthorized, onForget }: { token:
       {section === 'work' && <WorkPage token={token} overview={overview} />}
       {section === 'activity' && <ActivityPage d={d} events={data.activity?.events ?? null} fresh={data.fresh} />}
       {section === 'workflows' && <WorkflowsPage token={token} repository={data.whoami?.token.repository ?? null} />}
+      {section === 'landed' && <LandedPage repo={data.whoami?.token.repository ?? null} token={token} />}
+      {section === 'templates' && <TemplatesPage />}
+      {section === 'timeline' && <TimelinePage />}
       {section === 'setup' && <SetupPage token={token} />}
       {section === 'workspace' && <WorkspacePage />}
       {section === 'health' && <HealthPage health={data.health} />}

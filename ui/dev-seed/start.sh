@@ -3,22 +3,29 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(git -C "$here" rev-parse --show-toplevel)"
-bin="$root/target/debug/agentscm"
+# AGENTSCM_BIN runs the hub from another build (e.g. a PR worktree); it must share this schema.
+bin="${AGENTSCM_BIN:-$root/target/debug/agentscm}"
 data="$here/.data"
 
 health=http://127.0.0.1:7332/v1/hub/health
 if curl -sf "$health" >/dev/null; then echo "start.sh: something already answers on 127.0.0.1:7332; stop it first" >&2; exit 1; fi
 
-[ -x "$bin" ] || (cd "$root" && cargo build --locked --bin agentscm)
+# Always build: a stale binary refuses a database the freshly built mint has already migrated.
+[ -n "${AGENTSCM_BIN:-}" ] || (cd "$root" && cargo build --locked -q --bin agentscm)
 (cd "$here/mint" && CARGO_TARGET_DIR="$root/target" cargo build --offline -q)
 
 rm -rf "$data"
 mkdir -p "$data/objects" "$data/secrets"
 chmod 700 "$data" "$data/secrets"
 export AGENTSCM_DATABASE_URL="sqlite://$data/hub.sqlite"
-"$root/target/debug/agentscm-dev-seed-mint" "$data/tokens.env"
+"$root/target/debug/agentscm-dev-seed-mint" "$data/tokens.env" > "$data/publications.txt"
 (umask 077; rm -f "$here/.hub.env"; printf 'AGENTSCM_HUB=http://127.0.0.1:7332\nREAD_TOKEN=%s\n' "$(sed -n 's/^READ=//p' "$data/tokens.env")" > "$here/.hub.env")
 
+# External CI/deployment outcomes are shown only for repositories listed here. The seeded GitHub
+# connection never polls (mint pushes next_poll_at ten years out) and the API URL points at a dead
+# local port, so nothing here can reach real GitHub (the PR-opened publication's merge check fails closed).
+export AGENTSCM_GITHUB_EXTERNAL_RUNS=counterbranch/agentscm
+export AGENTSCM_GITHUB_API_URL=http://127.0.0.1:9
 "$bin" hub --no-telemetry serve --objects "$data/objects" --secrets "$data/secrets" &
 hub=$!
 trap 'kill $hub 2>/dev/null' EXIT
