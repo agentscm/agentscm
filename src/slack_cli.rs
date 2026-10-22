@@ -190,12 +190,7 @@ async fn configure(args: SetupArgs) -> Result<Value> {
     let credential =
         setup::read_agent_token(&args.agent_token_file).map_err(crate::hub_cli::map_hub_error)?;
     let who = identity(&client()?, &origin, &credential).await?;
-    let binding = binding(
-        &who,
-        &args.repo,
-        args.slack_user,
-        args.agent_token_file,
-    )?;
+    let binding = binding(&who, &args.repo, args.slack_user, args.agent_token_file)?;
     let config = SlackConfig {
         version: 1,
         app_id: args.app_id,

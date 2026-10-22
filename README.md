@@ -126,7 +126,7 @@ pagination, large histories, search and navigation still need substantial refine
 
 </details>
 
-The optional [Slack adapter](docs/slack.md) provides private status, catch-up, coordination and evidence views, plus scoped work/checkpoint forms. Its CLI prepares the app, invokes the official installer with the bundled icon and configures a managed local Hub from private credential files. See its [capability map](docs/slack-capabilities.md) for implemented journeys and browser fallbacks. Live Slack delivery and rendering remain separate operator checks.
+The optional [Slack adapter](docs/slack.md) sends each person a direct message when a coordination moment needs them: an agent edits a file again after AgentSCM refused it, a handoff is declined, or new work reads like work already under way. A file's holder can hand it over with a button. Its CLI prepares the app, invokes the official installer with the bundled icon and configures a managed local Hub from private credential files. See its [capability map](docs/slack-capabilities.md) for implemented journeys and browser fallbacks. Live Slack delivery and rendering remain separate operator checks.
 
 ## Git, GitHub and GitLab
 

@@ -106,7 +106,10 @@ struct Person {
 
 impl Person {
     fn label(&self, token: &str) -> String {
-        label(&self.login, self.agents.get(token).map_or("agent", String::as_str))
+        label(
+            &self.login,
+            self.agents.get(token).map_or("agent", String::as_str),
+        )
     }
 }
 
@@ -194,6 +197,7 @@ fn secret(path: &Path) -> Result<String> {
 
 struct ValidatedConfig {
     hub_url: String,
+    callback_url: String,
     signing: String,
     bot: String,
     digests: Vec<TokenDigest>,
@@ -232,6 +236,7 @@ fn validate_config(config: &SlackConfig) -> Result<ValidatedConfig> {
     }
     let url = origin(&config.hub_url)?;
     let hub_url = url.join("ui/").map_err(|_| invalid())?.to_string();
+    let callback_url = url.join("v1/hub/slack").map_err(|_| invalid())?.to_string();
     let signing = secret(&config.signing_secret_file)?;
     let bot = secret(&config.bot_token_file)?;
     let mut users = BTreeSet::new();
@@ -273,6 +278,7 @@ fn validate_config(config: &SlackConfig) -> Result<ValidatedConfig> {
     }
     Ok(ValidatedConfig {
         hub_url,
+        callback_url,
         signing,
         bot,
         digests: binding_digests,
@@ -616,7 +622,13 @@ impl Slack {
         };
         Ok(messages
             .into_iter()
-            .map(|(user, key, body)| (hash(format!("{}\n{user}\n{key}", event.id).as_bytes()), user, body))
+            .map(|(user, key, body)| {
+                (
+                    hash(format!("{}\n{user}\n{key}", event.id).as_bytes()),
+                    user,
+                    body,
+                )
+            })
             .collect())
     }
 
@@ -634,7 +646,9 @@ impl Slack {
         };
         let mut found = Vec::new();
         for name in names {
-            let intents = state.store.live_intents(name, unix_now(), MAX_LIVE_INTENTS)?;
+            let intents = state
+                .store
+                .live_intents(name, unix_now(), MAX_LIVE_INTENTS)?;
             if bound.is_some() || intents.iter().any(|i| i.token == token) {
                 found.push((name.to_owned(), intents));
             }
@@ -700,7 +714,10 @@ impl Slack {
             {
                 let text = format!(
                     "Your agent {} edited {} in {repository} after AgentSCM said {} {} working on it. Agree with them who goes first.",
-                    sanitize(person.agents.get(token).map_or("agent", String::as_str), NAME_CHARS),
+                    sanitize(
+                        person.agents.get(token).map_or("agent", String::as_str),
+                        NAME_CHARS
+                    ),
                     paths_text(&paths),
                     holders.join(", "),
                     if holders.len() == 1 { "is" } else { "are" },
@@ -732,9 +749,9 @@ impl Slack {
         ) else {
             return Ok(Vec::new());
         };
-        let reason = data["reason"]
-            .as_str()
-            .map_or(String::new(), |reason| format!(" (reason: {})", quoted(reason)));
+        let reason = data["reason"].as_str().map_or(String::new(), |reason| {
+            format!(" (reason: {})", quoted(reason))
+        });
         let mut out = Vec::new();
         for (repository, intents) in Self::repositories(state, people, holder)? {
             let holder_person = Self::bound(people, &repository, holder);
@@ -764,7 +781,10 @@ impl Slack {
             {
                 let text = format!(
                     "Your agent {} kept {paths} in {repository}, which {} asked for{reason}. Agree with them who goes first.",
-                    sanitize(person.agents.get(holder).map_or("agent", String::as_str), NAME_CHARS),
+                    sanitize(
+                        person.agents.get(holder).map_or("agent", String::as_str),
+                        NAME_CHARS
+                    ),
                     label(login, agent),
                 );
                 out.push((
@@ -827,7 +847,13 @@ impl Slack {
             let starter_label = starter_label.unwrap_or_else(|| "another agent".into());
             let mut like: Vec<String> = items
                 .iter()
-                .map(|item| format!("{} {}", label(&item.owner_login, &item.lead_agent), quoted(&item.title)))
+                .map(|item| {
+                    format!(
+                        "{} {}",
+                        label(&item.owner_login, &item.lead_agent),
+                        quoted(&item.title)
+                    )
+                })
                 .collect();
             like.extend(pulls.iter().map(|n| format!("open pull request #{n}")));
             if let Some(person) = starter_person
@@ -835,7 +861,10 @@ impl Slack {
             {
                 let text = format!(
                     "Your agent {} started {} in {repository}, which reads like {}. Check whether it is the same work.",
-                    sanitize(person.agents.get(starter).map_or("agent", String::as_str), NAME_CHARS),
+                    sanitize(
+                        person.agents.get(starter).map_or("agent", String::as_str),
+                        NAME_CHARS
+                    ),
                     quoted(task),
                     like.join("; "),
                 );

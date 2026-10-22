@@ -91,10 +91,10 @@ impl Fixture {
                             axum::Json(json!({"ok":true,"team_id":team,"bot_id":"B123"})),
                         );
                     }
-                    capture
-                        .lock()
-                        .unwrap()
-                        .push((uri.path().to_owned(), serde_json::from_slice(&body).unwrap()));
+                    capture.lock().unwrap().push((
+                        uri.path().to_owned(),
+                        serde_json::from_slice(&body).unwrap(),
+                    ));
                     let (status, reply) = outcomes
                         .lock()
                         .unwrap()
@@ -188,7 +188,10 @@ impl Fixture {
             .filter(|(path, _)| path == "/api/chat.postMessage")
             .map(|(_, body)| {
                 let text = body["blocks"][0]["text"]["text"].as_str().unwrap();
-                (body["channel"].as_str().unwrap().to_owned(), text.to_owned())
+                (
+                    body["channel"].as_str().unwrap().to_owned(),
+                    text.to_owned(),
+                )
             })
             .collect()
     }
@@ -208,7 +211,9 @@ impl Fixture {
     fn state_of_messages(&self) -> Vec<String> {
         let db = self.slack();
         let db = db.database().unwrap();
-        let mut query = db.prepare("SELECT state FROM messages ORDER BY id").unwrap();
+        let mut query = db
+            .prepare("SELECT state FROM messages ORDER BY id")
+            .unwrap();
         query
             .query_map([], |r| r.get(0))
             .unwrap()
@@ -242,7 +247,10 @@ impl Fixture {
             .unwrap();
         let status = response.status();
         let bytes = response.bytes().await.unwrap();
-        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
     }
 
     /// `user` clicks the button `action_id` of their latest direct message.
@@ -270,8 +278,9 @@ impl Fixture {
             "user":{"id":user},"channel":{"id":"D1"},
             "message":{"ts":"1.2","blocks":message["blocks"]},
             "actions":[{"action_id":action_id,"value":value}]});
-        let form = reqwest::Url::parse_with_params("http://localhost", [("payload", payload.to_string())])
-            .unwrap();
+        let form =
+            reqwest::Url::parse_with_params("http://localhost", [("payload", payload.to_string())])
+                .unwrap();
         self.post(form.query().unwrap().into(), false).await.0
     }
 }
@@ -280,16 +289,27 @@ impl Fixture {
 async fn ingress_checks_signature_workspace_app_and_request_shape() {
     let f = Fixture::new().await;
     let url = format!("http://{}/v1/hub/slack", f.address);
-    let unsigned = reqwest::Client::new().post(&url).body("{}").send().await.unwrap();
+    let unsigned = reqwest::Client::new()
+        .post(&url)
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(unsigned.status(), StatusCode::UNAUTHORIZED);
     let challenge = json!({"type":"url_verification","challenge":"synthetic"}).to_string();
     assert_eq!(f.post(challenge, true).await.1["challenge"], "synthetic");
     let foreign = json!({"type":"event_callback","team_id":"T999","api_app_id":"A123",
         "event":{"type":"app_uninstalled"}});
-    assert_eq!(f.post(foreign.to_string(), true).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(
+        f.post(foreign.to_string(), true).await.0,
+        StatusCode::FORBIDDEN
+    );
     // Slash commands are gone: a form without an interaction payload is refused.
     let command = "team_id=T123&api_app_id=A123&user_id=U1&command=%2Fagentscm&text=status";
-    assert_eq!(f.post(command.into(), false).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        f.post(command.into(), false).await.0,
+        StatusCode::BAD_REQUEST
+    );
     assert_eq!(
         f.post("x".repeat(65537), true).await.0,
         StatusCode::PAYLOAD_TOO_LARGE
@@ -359,7 +379,7 @@ async fn a_repeated_edit_messages_both_people_and_the_holder_hands_over_with_a_b
             .map(|i| i.token)
             .collect()
     });
-    assert_eq!(holders, [f.bob.clone()]);
+    assert_eq!(holders, std::slice::from_ref(&f.bob));
     // A second click finds nothing open; the same events never message again.
     assert_eq!(f.click("U1", NO).await, StatusCode::OK);
     f.run().await;
@@ -375,7 +395,14 @@ async fn a_declined_handoff_messages_both_people_with_the_reason() {
     assert!(f.sent().is_empty(), "a refusal alone is for the agents");
     tokio::task::block_in_place(|| {
         f.store()
-            .answer_handoff(&f.alice, None, PATH, false, Some("<!channel> mid-refactor"), unix_now())
+            .answer_handoff(
+                &f.alice,
+                None,
+                PATH,
+                false,
+                Some("mid-refactor"),
+                unix_now(),
+            )
             .unwrap()
     });
     f.run().await;
@@ -383,19 +410,12 @@ async fn a_declined_handoff_messages_both_people_with_the_reason() {
     assert_eq!(sent.len(), 2, "{sent:?}");
     assert!(sent.contains(&(
         "U2".into(),
-        "alice's agent claude kept src/widget.rs in acme/widgets, which your agent codex asked for (reason: \"<!channel> mid-refactor\"). Agree with them who goes first.".into()
+        "alice's agent claude kept src/widget.rs in acme/widgets, which your agent codex asked for (reason: \"mid-refactor\"). Agree with them who goes first.".into()
     )));
     assert!(sent.contains(&(
         "U1".into(),
-        "Your agent claude kept src/widget.rs in acme/widgets, which bob's agent codex asked for (reason: \"<!channel> mid-refactor\"). Agree with them who goes first.".into()
+        "Your agent claude kept src/widget.rs in acme/widgets, which bob's agent codex asked for (reason: \"mid-refactor\"). Agree with them who goes first.".into()
     )));
-    // The notification text Slack reads as markup cannot mention a channel.
-    assert!(
-        f.sent_body("U2")["text"]
-            .as_str()
-            .unwrap()
-            .contains("&lt;!channel&gt;")
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -454,8 +474,24 @@ async fn rate_limits_retry_and_a_wrong_bot_or_revoked_binding_sends_nothing() {
     assert!(f.state_of_messages().contains(&"failed".to_owned()));
 
     // Revoking a person's binding token fails their queued message instead of sending it.
+    let waiting: String = f
+        .slack()
+        .database()
+        .unwrap()
+        .query_row("SELECT user FROM messages WHERE state='queued'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let binding = f
+        .slack()
+        .bindings
+        .iter()
+        .position(|b| b.config.slack_user == waiting)
+        .unwrap();
     let tokens = tokio::task::block_in_place(|| {
-        let owner = f.store().authenticate(&f.slack().bindings[1].digest, unix_now());
+        let owner = f
+            .store()
+            .authenticate(&f.slack().bindings[binding].digest, unix_now());
         let owner = owner.unwrap().unwrap().owner.id;
         f.store().list_agent_tokens(&owner).unwrap()
     });
@@ -482,6 +518,17 @@ async fn uninstall_stops_messages_and_survives_restart() {
     let reopened = Slack::from_file(&f.dir.path().join("config")).unwrap();
     assert!(reopened.active().is_err());
     assert!(f.sent().is_empty());
+}
+
+#[test]
+fn message_text_cannot_mention_or_link() {
+    let body = message(
+        "<!channel> & <http://x|y>",
+        None,
+        "https://hub.example.test/ui/",
+    );
+    assert_eq!(body["text"], "&lt;!channel&gt; &amp; &lt;http://x|y&gt;");
+    assert_eq!(body["blocks"][0]["text"]["type"], "plain_text");
 }
 
 #[test]
