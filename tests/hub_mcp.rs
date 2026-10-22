@@ -2,7 +2,9 @@
 use std::sync::Arc;
 
 use agentscm::backend::LocalBackend;
-use agentscm::hub::store::{self, ForgeIdentity, Store, mint_agent_token, unix_now};
+use agentscm::hub::store::{
+    self, ForgeIdentity, Store, mint_agent_token, mint_bound_agent_token, unix_now,
+};
 use agentscm::hub::{HubState, router};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -505,6 +507,7 @@ async fn protocol_basics() {
             "agentscm_work_checkpoint",
             "agentscm_work_ack",
             "agentscm_workflow_status",
+            "agentscm_view_settings",
             "agentscm_coordination_ack",
             "agentscm_coordination_reply",
             "agentscm_coordination_resolve",
@@ -585,7 +588,7 @@ async fn protocol_basics() {
     let unknown = hub
         .rpc(
             &key,
-            &json!({"jsonrpc": "2.0", "id": 4, "method": "resources/list"}),
+            &json!({"jsonrpc": "2.0", "id": 4, "method": "prompts/list"}),
         )
         .await
         .json();
@@ -1233,4 +1236,292 @@ async fn errors_are_tool_results_with_fixed_text() {
             .await;
         assert_eq!(reply.json()["error"]["code"], -32602);
     }
+}
+
+fn rpc_body(method: &str, params: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+}
+
+fn ui_init() -> Value {
+    rpc_body(
+        "initialize",
+        json!({"protocolVersion": "2025-06-18",
+            "capabilities": {"extensions": {"io.modelcontextprotocol/ui": {}}}}),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inline_views_are_offered_only_to_ui_clients_and_can_be_switched_off() {
+    let hub = Hub::start().await;
+    let secret = hub.secret(1, "writer");
+    let plain = hub
+        .rpc(
+            &secret,
+            &rpc_body("initialize", json!({"protocolVersion": "2025-06-18"})),
+        )
+        .await
+        .json();
+    assert_eq!(
+        plain["result"]["capabilities"],
+        json!({"tools": {"listChanged": false}})
+    );
+    let ui = hub.rpc(&secret, &ui_init()).await.json();
+    assert_eq!(
+        ui["result"]["capabilities"]["resources"],
+        json!({"listChanged": false})
+    );
+
+    let tools = hub
+        .rpc(&secret, &rpc_body("tools/list", json!({})))
+        .await
+        .json();
+    let with_meta: Vec<_> = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t.get("_meta").is_some())
+        .map(|t| {
+            (
+                t["name"].as_str().unwrap(),
+                t["_meta"]["ui"]["resourceUri"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        with_meta,
+        [
+            ("agentscm_work_overview", "ui://agentscm/work-overview"),
+            (
+                "agentscm_coordination_inbox",
+                "ui://agentscm/coordination-inbox"
+            )
+        ]
+    );
+
+    let list = hub
+        .rpc(&secret, &rpc_body("resources/list", json!({})))
+        .await
+        .json();
+    let uris: Vec<_> = list["result"]["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["uri"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        uris,
+        [
+            "ui://agentscm/work-overview",
+            "ui://agentscm/coordination-inbox"
+        ]
+    );
+    let read = hub
+        .rpc(
+            &secret,
+            &rpc_body(
+                "resources/read",
+                json!({"uri": "ui://agentscm/work-overview"}),
+            ),
+        )
+        .await
+        .json();
+    let content = &read["result"]["contents"][0];
+    assert_eq!(content["mimeType"], "text/html;profile=mcp-app");
+    assert!(
+        content["text"].as_str().unwrap().contains("<html")
+            || content["text"].as_str().unwrap().contains("<!doctype")
+    );
+
+    let overview = hub
+        .tool_result(&secret, "agentscm_work_overview", json!({}))
+        .await;
+    let hints: Vec<_> = overview["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| {
+            c["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Inline views: on (your setting).")
+        })
+        .collect();
+    assert_eq!(hints.len(), 1);
+
+    let http = hub
+        .send(
+            reqwest::Method::GET,
+            "/v1/hub/view-settings",
+            Some(&secret),
+            "",
+        )
+        .await;
+    assert_eq!(http.status, 200);
+    assert_eq!(
+        http.json(),
+        json!({
+            "effective": {"enabled": true, "work_overview": true, "coordination_inbox": true},
+            "hub_default": {"enabled": true, "work_overview": true, "coordination_inbox": true},
+            "override": null
+        })
+    );
+
+    // Read-only tokens read resources but cannot change the hub-wide setting.
+    let user = hub
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 2,
+            },
+            "reader",
+        )
+        .unwrap();
+    let (_, reader, _) =
+        mint_bound_agent_token(&*hub.store, &user.id, "reader", REPO, 1, 600, true).unwrap();
+    let reader = reader.expose().to_owned();
+    let read = hub
+        .rpc(&reader, &rpc_body("resources/list", json!({})))
+        .await;
+    assert_eq!(read.status, 200);
+    let denied = hub
+        .send(
+            reqwest::Method::POST,
+            "/mcp",
+            Some(&reader),
+            &rpc_body(
+                "tools/call",
+                json!({"name": "agentscm_view_settings", "arguments": {}}),
+            )
+            .to_string(),
+        )
+        .await;
+    assert_eq!(denied.status, 403);
+
+    // Toggle one view off, then everything.
+    let changed = hub
+        .tool_result(
+            &secret,
+            "agentscm_view_settings",
+            json!({"coordination_inbox": false}),
+        )
+        .await;
+    assert_eq!(
+        changed["structuredContent"]["effective"]["coordination_inbox"],
+        false
+    );
+    let list = hub
+        .rpc(&secret, &rpc_body("resources/list", json!({})))
+        .await
+        .json();
+    assert_eq!(list["result"]["resources"].as_array().unwrap().len(), 1);
+    let off = hub
+        .tool_result(&secret, "agentscm_view_settings", json!({"enabled": false}))
+        .await;
+    assert_eq!(off["structuredContent"]["effective"]["enabled"], false);
+    let tools = hub
+        .rpc(&secret, &rpc_body("tools/list", json!({})))
+        .await
+        .json();
+    assert!(
+        tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t.get("_meta").is_none())
+    );
+    let ui = hub.rpc(&secret, &ui_init()).await.json();
+    assert_eq!(
+        ui["result"]["capabilities"],
+        plain["result"]["capabilities"]
+    );
+    let list = hub
+        .rpc(&secret, &rpc_body("resources/list", json!({})))
+        .await
+        .json();
+    assert!(list["result"]["resources"].as_array().unwrap().is_empty());
+    let gone = hub
+        .rpc(
+            &secret,
+            &rpc_body(
+                "resources/read",
+                json!({"uri": "ui://agentscm/work-overview"}),
+            ),
+        )
+        .await
+        .json();
+    assert_eq!(gone["error"]["code"], -32602);
+    let (hint, _) = (
+        hub.tool_result(&secret, "agentscm_coordination_inbox", json!({}))
+            .await["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| {
+                c["text"].as_str().unwrap()
+                    == "Inline views: off (your setting). Change with agentscm_view_settings."
+            }),
+        (),
+    );
+    assert!(hint);
+}
+
+async fn resources(hub: &Hub, secret: &str) -> usize {
+    let list = hub
+        .rpc(secret, &rpc_body("resources/list", json!({})))
+        .await
+        .json();
+    list["result"]["resources"].as_array().unwrap().len()
+}
+
+#[tokio::test]
+async fn view_settings_are_per_user_over_a_hub_default() {
+    use agentscm::hub::view_settings::ViewSettings;
+    let hub = Hub::start().await;
+    let (a, b) = (hub.secret(10, "a"), hub.secret(11, "b"));
+    let off = ViewSettings {
+        enabled: false,
+        ..ViewSettings::default()
+    };
+    ViewSettings::save(&*hub.store, &off, "test").unwrap();
+    assert_eq!(resources(&hub, &a).await, 0);
+
+    // A's choice beats a hub default that is off; B is unaffected.
+    let on = hub
+        .tool_result(&a, "agentscm_view_settings", json!({"enabled": true}))
+        .await;
+    assert_eq!(on["structuredContent"]["effective"]["enabled"], true);
+    assert_eq!(on["structuredContent"]["hub_default"]["enabled"], false);
+    assert_eq!(on["structuredContent"]["override"]["enabled"], true);
+    assert_eq!(resources(&hub, &a).await, 2);
+    assert_eq!(resources(&hub, &b).await, 0);
+
+    // Partial updates merge; a user's off beats a default that is on.
+    ViewSettings::save(&*hub.store, &ViewSettings::default(), "test").unwrap();
+    let merged = hub
+        .tool_result(
+            &a,
+            "agentscm_view_settings",
+            json!({"work_overview": false}),
+        )
+        .await;
+    assert_eq!(merged["structuredContent"]["override"]["enabled"], true);
+    assert_eq!(resources(&hub, &a).await, 1);
+    assert_eq!(resources(&hub, &b).await, 2);
+    let tools = hub.rpc(&b, &rpc_body("tools/list", json!({}))).await.json();
+    assert!(
+        tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t.get("_meta").is_some())
+    );
+
+    // Reset follows the hub default again.
+    let reset = hub
+        .tool_result(&a, "agentscm_view_settings", json!({"reset": true}))
+        .await;
+    assert_eq!(reset["structuredContent"]["override"], Value::Null);
+    assert_eq!(resources(&hub, &a).await, 2);
 }
