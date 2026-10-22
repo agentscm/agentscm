@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::thread;
 
 use agentscm::hub::connection::{ForgeCheckReserve, NewConnection, NewForgeCheck, Observed};
+use agentscm::hub::external_runs::{ExternalKind, ExternalObserved, ExternalOutcome, ExternalRun};
 use agentscm::hub::intent::NewIntent;
 use agentscm::hub::store::{
     self, ForgeIdentity, MAX_AGENT_TOKEN_TTL_SECONDS, NewAgentToken, Store, agent_token_digest,
@@ -203,7 +204,7 @@ fn idempotent_migrations(db: &Db) {
     }
     assert_eq!(
         db.versions(),
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
     );
     db.exec("INSERT INTO hub_schema_migrations (version, applied_at) VALUES (999, 0)")
         .unwrap();
@@ -226,7 +227,7 @@ fn concurrent_startup(db: &Db) {
     }
     assert_eq!(
         db.versions(),
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
     );
 }
 
@@ -604,7 +605,7 @@ fn upgrade_from_migration_1(db: &Db) {
     let store = db.open();
     assert_eq!(
         db.versions(),
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
     );
     let principal = store
         .authenticate(&agent_token_digest(&raw).unwrap(), unix_now())
@@ -1429,7 +1430,7 @@ fn upgrade_from_migration_3(db: &Db) {
     let store = db.open();
     assert_eq!(
         db.versions(),
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
     );
     let intents = store.live_intents("acme/widgets", unix_now(), 10).unwrap();
     assert_eq!(intents.len(), 1);
@@ -1537,7 +1538,7 @@ fn upgrade_from_migration_14_with_publication(db: &Db) {
         INSERT INTO hub_publications (id,repository,token,revision,event_seq,commit_sha,branch,base,manifest,branch_state,pr_number,pr_node_id,pr_url,created_at,updated_at) VALUES ('{id}','acme/widgets','tok_legacy','{}',3,'{}','feat/legacy','main','{}','created',7,'PR_7','https://github.com/acme/widgets/pull/7',10,11);
         INSERT INTO hub_events (id,at,kind,subject,data) VALUES ('evt_legacy',10,'publication_pr_opened','{id}','{{\"number\":7}}')", manifest.revision,manifest.commit,canonical.replace('\'', "''"))).unwrap();
     let store = db.open();
-    assert_eq!(db.versions(), (1..=16).collect::<Vec<_>>());
+    assert_eq!(db.versions(), (1..=17).collect::<Vec<_>>());
     let p = store.publication(REPO, &id).unwrap().unwrap();
     assert_eq!(p.event_seq, Some(3));
     assert_eq!(p.manifest, canonical);
@@ -1614,6 +1615,171 @@ fn pull_publications_are_newest_per_pull_request(db: &Db) {
     assert_eq!(ids(1, 50), ["p2", "p4"]);
     assert_eq!(ids(0, 2), ["p1-new", "p2"]);
     assert_eq!(ids(4, 50), Vec::<String>::new());
+}
+
+fn external_run_journal(db: &Db) {
+    let store = db.open();
+    let con = store
+        .insert_connection(&app("github.com"), "usr_admin")
+        .unwrap();
+    let repo = store
+        .upsert_repository(&con.id, "github.com", 4242, "acme/widgets", None, None)
+        .unwrap();
+    let sha = "a".repeat(40);
+    let ci = |run_id: i64, attempt: i64, outcome: ExternalOutcome, at: i64| ExternalRun {
+        provider: "github".into(),
+        kind: ExternalKind::Ci,
+        run_id,
+        attempt,
+        commit_sha: sha.clone(),
+        branch: Some("main".into()),
+        environment: None,
+        name: ".github/workflows/ci.yml".into(),
+        outcome,
+        provider_updated_at: at,
+        html_url: Some(format!(
+            "https://github.com/acme/widgets/actions/runs/{run_id}"
+        )),
+    };
+    let deploy = |run_id: i64, environment: &str| ExternalRun {
+        kind: ExternalKind::Deployment,
+        branch: None,
+        environment: Some(environment.into()),
+        ..ci(run_id, 1, ExternalOutcome::Succeeded, 5)
+    };
+    let observe = |run: &ExternalRun| store.observe_external_run(&repo.id, run).unwrap();
+    let events = || events_of(&*store, "external_run_observed").len();
+
+    let running = ci(7, 1, ExternalOutcome::Running, 10);
+    assert_eq!(observe(&running), ExternalObserved::Changed);
+    assert_eq!(events(), 1);
+    assert_eq!(observe(&running), ExternalObserved::Unchanged);
+    assert_eq!(events(), 1);
+
+    // An older provider update is ignored; a newer one replaces.
+    assert_eq!(
+        observe(&ci(7, 1, ExternalOutcome::Pending, 9)),
+        ExternalObserved::Stale
+    );
+    let done = ci(7, 1, ExternalOutcome::Succeeded, 11);
+    assert_eq!(observe(&done), ExternalObserved::Changed);
+    assert_eq!(events(), 2);
+
+    // A terminal outcome is not regressed, even by a later non-terminal read.
+    assert_eq!(
+        observe(&ci(7, 1, ExternalOutcome::Running, 12)),
+        ExternalObserved::Stale
+    );
+    assert_eq!(events(), 2);
+
+    // A higher attempt is a separate row.
+    let retry = ci(7, 2, ExternalOutcome::Running, 13);
+    assert_eq!(observe(&retry), ExternalObserved::Changed);
+    assert_eq!(observe(&deploy(9, "production")), ExternalObserved::Changed);
+    assert_eq!(observe(&deploy(8, "production")), ExternalObserved::Changed);
+    assert_eq!(observe(&deploy(10, "dev")), ExternalObserved::Changed);
+    let mut other = ci(3, 1, ExternalOutcome::Failed, 1);
+    other.commit_sha = "b".repeat(40);
+    assert_eq!(observe(&other), ExternalObserved::Changed);
+
+    // Each kind is listed apart: environment, then run id, then attempt.
+    let of = |kind, limit| store.external_runs(&repo.id, &sha, kind, limit).unwrap();
+    assert_eq!(of(ExternalKind::Ci, 50), [done, retry]);
+    assert_eq!(
+        of(ExternalKind::Deployment, 50),
+        [
+            deploy(10, "dev"),
+            deploy(8, "production"),
+            deploy(9, "production")
+        ]
+    );
+    assert_eq!(of(ExternalKind::Deployment, 2).len(), 2);
+    assert_eq!(
+        store
+            .external_runs(&repo.id, &"c".repeat(40), ExternalKind::Ci, 50)
+            .unwrap(),
+        []
+    );
+
+    // The event carries identifiers and the outcome, not provider text.
+    let first = &events_of(&*store, "external_run_observed")[0];
+    assert_eq!(first["outcome"], "running");
+    assert_eq!(first["run_id"], 7);
+    assert!(first.get("name").is_none() && first.get("html_url").is_none());
+
+    // Invalid runs and unknown repositories are refused.
+    let mut bad = ci(1, 1, ExternalOutcome::Running, 1);
+    bad.html_url = Some("http://example.com".into());
+    assert!(store.observe_external_run(&repo.id, &bad).is_err());
+    assert!(
+        store
+            .observe_external_run("rep_missing", &ci(1, 1, ExternalOutcome::Running, 1))
+            .is_err()
+    );
+
+    assert_eq!(store.external_reconciled(&repo.id, &sha).unwrap(), None);
+    store
+        .mark_external_reconciled(&repo.id, &sha, 100, false)
+        .unwrap();
+    assert_eq!(
+        store.external_reconciled(&repo.id, &sha).unwrap(),
+        Some((100, false))
+    );
+    store
+        .mark_external_reconciled(&repo.id, &sha, 200, true)
+        .unwrap();
+    assert_eq!(
+        store.external_reconciled(&repo.id, &sha).unwrap(),
+        Some((200, true))
+    );
+}
+
+fn merged_publications_skip_unmerged_ones(db: &Db) {
+    let store = db.open();
+    let mut sql = String::from(
+        "INSERT INTO hub_users (id,provider,host,forge_user_id,login,created_at)
+            VALUES ('usr_mp','github','github.com',9,'alice',0);
+         INSERT INTO hub_agent_tokens (id,owner,name,repository,digest,expires_at,created_at)
+            VALUES ('tok_mp','usr_mp','builder','Acme/Widgets','mp',4102444800,0);",
+    );
+    for (id, repository, merged) in [
+        ("m2", "Acme/Widgets", "'c'"),
+        ("m1", "Acme/Widgets", "'d'"),
+        ("open", "Acme/Widgets", "NULL"),
+        ("other", "acme/other", "'e'"),
+        ("stale", "Acme/Widgets", "'f'"),
+    ] {
+        let updated = if id == "stale" { 0 } else { 5 };
+        sql.push_str(&format!(
+            "INSERT INTO hub_publications (id,repository,token,revision,event_seq,commit_sha,
+                branch,base,manifest,branch_state,pr_number,merge_commit,created_at,updated_at)
+             VALUES ('{id}','{repository}','tok_mp','{}',1,'{}','b-{id}','main','{{}}','created',
+                1,{merged},1,{updated});",
+            "a".repeat(64),
+            "b".repeat(40)
+        ));
+    }
+    db.exec(&sql).unwrap();
+    let ids = |after: &str, limit: usize| {
+        store
+            .merged_publications("acme/widgets", after, 1, limit)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect::<Vec<_>>()
+    };
+    // The stale one is outside the window, so it cannot fill a page.
+    assert_eq!(ids("", 50), ["m1", "m2"]);
+    assert_eq!(
+        store
+            .merged_publications("acme/widgets", "", 0, 50)
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(ids("m1", 50), ["m2"]);
+    assert_eq!(ids("", 1), ["m1"]);
+    assert_eq!(ids("m2", 50), Vec::<String>::new());
 }
 
 fn forge_checks_showing_success_leave_out_merged_pull_requests(db: &Db) {
@@ -1701,6 +1867,8 @@ conformance!(
     observations,
     deliveries_outbound_and_notices,
     forge_check_journal,
+    external_run_journal,
+    merged_publications_skip_unmerged_ones,
     pull_publications_are_newest_per_pull_request,
     forge_checks_showing_success_leave_out_merged_pull_requests,
     upgrade_from_migration_3,

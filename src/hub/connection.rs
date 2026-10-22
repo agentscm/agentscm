@@ -109,7 +109,7 @@ pub enum ForgeCheckReserve {
 const MAX_CHECK_CONTEXT_BYTES: usize = 120;
 const MAX_CHECK_DESCRIPTION_CHARS: usize = 140;
 
-fn is_lower_hex(value: &str, len: usize) -> bool {
+pub(super) fn is_lower_hex(value: &str, len: usize) -> bool {
     value.len() == len
         && value
             .bytes()

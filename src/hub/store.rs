@@ -13,6 +13,7 @@ use super::coordination::{
     CoordinationAck, CoordinationInbox, CoordinationInboxQuery, CoordinationListQuery,
     CoordinationReply, CoordinationRequest, CoordinationResolve, CoordinationWithdraw,
 };
+use super::external_runs::{ExternalKind, ExternalObserved, ExternalRun};
 use super::handoff::{Answered, Asked};
 use super::intent::{Announced, Intent, NewIntent};
 use super::publish::{Create, NewPublication, Publication, Update};
@@ -351,6 +352,37 @@ pub trait Store: Send + Sync {
         phase: &str,
         now: i64,
     ) -> Result<bool>;
+    /// Records one external CI or deployment run of `repo` (a repository id) unless
+    /// [`supersedes`](super::external_runs::supersedes) rejects it; an event only on `Changed`.
+    fn observe_external_run(&self, repo: &str, run: &ExternalRun) -> Result<ExternalObserved>;
+    /// Runs of `kind` seen for `commit_sha`, by environment, run id, then attempt, at most `limit`.
+    fn external_runs(
+        &self,
+        repo: &str,
+        commit_sha: &str,
+        kind: ExternalKind,
+        limit: usize,
+    ) -> Result<Vec<ExternalRun>>;
+    /// Notes that the provider was read for `commit_sha` at `at` (unix seconds); `complete` is
+    /// false when the read was cut short.
+    fn mark_external_reconciled(
+        &self,
+        repo: &str,
+        commit_sha: &str,
+        at: i64,
+        complete: bool,
+    ) -> Result<()>;
+    fn external_reconciled(&self, repo: &str, commit_sha: &str) -> Result<Option<(i64, bool)>>;
+    /// Publications of `repository` (a full name, matched case-insensitively) with a merge
+    /// commit, last updated at or after `oldest` (unix seconds), by id, ids above `after`, at
+    /// most `limit`.
+    fn merged_publications(
+        &self,
+        repository: &str,
+        after: &str,
+        oldest: i64,
+        limit: usize,
+    ) -> Result<Vec<Publication>>;
     /// `pr_notice` events as `(intent id, data JSON)`, in one transaction.
     fn append_pr_notices(&self, notices: &[(String, String)]) -> Result<()>;
     /// Idempotent by `new.id`: the first call records the publication for the active token's
@@ -835,6 +867,11 @@ const MIGRATIONS: &[Migration] = &[
         sqlite: include_str!("migrations/0016_forge_checks.sqlite.sql"),
         postgres: include_str!("migrations/0016_forge_checks.pg.sql"),
     },
+    Migration {
+        version: 17,
+        sqlite: include_str!("migrations/0017_external_runs.sqlite.sql"),
+        postgres: include_str!("migrations/0017_external_runs.pg.sql"),
+    },
 ];
 
 /// Migrations not yet applied. The registry must be numbered 1..n and the
@@ -873,18 +910,18 @@ mod tests {
 
     #[test]
     fn pending_requires_an_applied_prefix() {
-        assert_eq!(pending(&[]).unwrap().len(), 16);
-        assert_eq!(pending(&[1]).unwrap().len(), 15);
-        assert_eq!(pending(&[1, 2, 3]).unwrap().len(), 13);
-        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap().len(), 8);
-        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap().len(), 7);
+        assert_eq!(pending(&[]).unwrap().len(), 17);
+        assert_eq!(pending(&[1]).unwrap().len(), 16);
+        assert_eq!(pending(&[1, 2, 3]).unwrap().len(), 14);
+        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap().len(), 9);
+        assert_eq!(pending(&[1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap().len(), 8);
         assert_eq!(
             pending(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14])
                 .unwrap()
                 .len(),
-            2
+            3
         );
-        assert!(pending(&(1..=16).collect::<Vec<_>>()).unwrap().is_empty());
+        assert!(pending(&(1..=17).collect::<Vec<_>>()).unwrap().is_empty());
         assert!(pending(&[2]).is_err());
         let newer = pending(&[1, 999]).err().unwrap().to_string();
         assert!(newer.contains("newer than this binary"), "{newer}");

@@ -64,6 +64,8 @@ pub struct SyncConfig {
     pub public_url: String,
     pub secrets: PathBuf,
     pub activity_days: i64,
+    /// Lowercase `owner/name` of the GitHub repositories whose external runs are read.
+    external_runs: BTreeSet<String>,
     pat: Option<Pat>,
     gitlab: Option<GitlabConfig>,
 }
@@ -83,7 +85,8 @@ struct Pat {
 impl SyncConfig {
     /// Reads `AGENTSCM_GITHUB_URL`, `_API_URL`, `AGENTSCM_GITHUB_PAT[_FILE]` and
     /// `AGENTSCM_GITHUB_PAT_WEBHOOK_SECRET[_FILE]`, and `AGENTSCM_GITLAB_URL`,
-    /// `AGENTSCM_GITLAB_TOKEN[_FILE]`, `AGENTSCM_GITLAB_WEBHOOK_SECRET[_FILE]` through `lookup`.
+    /// `AGENTSCM_GITLAB_TOKEN[_FILE]`, `AGENTSCM_GITLAB_WEBHOOK_SECRET[_FILE]` and
+    /// `AGENTSCM_GITHUB_EXTERNAL_RUNS` (comma-separated `owner/name`) through `lookup`.
     pub fn from_lookup(
         public_url: &str,
         secrets: PathBuf,
@@ -149,6 +152,23 @@ impl SyncConfig {
         if !(1..=365).contains(&activity_days) {
             return Err(HubError::Invalid("--activity-days must be 1 to 365".into()));
         }
+        let external_runs = lookup("AGENTSCM_GITHUB_EXTERNAL_RUNS")
+            .map(|list| {
+                list.split(',')
+                    .map(|name| {
+                        let name = name.trim();
+                        if name.split('/').count() != 2 || validate_repository(name).is_err() {
+                            return Err(HubError::Invalid(
+                                "AGENTSCM_GITHUB_EXTERNAL_RUNS must list owner/name repositories"
+                                    .into(),
+                            ));
+                        }
+                        Ok(name.to_ascii_lowercase())
+                    })
+                    .collect::<Result<BTreeSet<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
         Ok(Self {
             web: urls.web,
             api: urls.api,
@@ -156,6 +176,7 @@ impl SyncConfig {
             public_url: public_url.to_owned(),
             secrets,
             activity_days,
+            external_runs,
             pat: token.map(|token| Pat {
                 token,
                 webhook_secret: hook,
@@ -234,6 +255,9 @@ pub struct Sync {
     /// Per repository id, the last pull request number the forge check pass finished with.
     #[cfg(unix)]
     forge_cursors: Mutex<HashMap<String, i64>>,
+    /// Per repository id, where the external run pass left off: the last pull request number
+    /// checked for a merge and the last merged publication id read.
+    external_cursors: Mutex<HashMap<String, (i64, String)>>,
     /// Files already noticed per (intent, repository, pull request number).
     noticed: Mutex<HashMap<(String, String, i64), BTreeSet<String>>>,
 }
@@ -260,6 +284,24 @@ impl Sync {
     #[cfg(unix)]
     pub(super) fn set_forge_cursor(&self, repository: &str, number: i64) {
         lock(&self.forge_cursors).insert(repository.to_owned(), number);
+    }
+
+    /// Whether external runs are read for this GitHub repository (never, unless listed).
+    pub(super) fn external_runs_enabled(&self, full_name: &str) -> bool {
+        self.config
+            .as_ref()
+            .is_some_and(|c| c.external_runs.contains(&full_name.to_ascii_lowercase()))
+    }
+
+    pub(super) fn external_cursor(&self, repository: &str) -> (i64, String) {
+        lock(&self.external_cursors)
+            .get(repository)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(super) fn set_external_cursor(&self, repository: &str, cursor: (i64, String)) {
+        lock(&self.external_cursors).insert(repository.to_owned(), cursor);
     }
 
     pub fn unconfigured() -> Self {
@@ -291,6 +333,7 @@ impl Sync {
             round: AtomicUsize::new(0),
             #[cfg(unix)]
             forge_cursors: Mutex::default(),
+            external_cursors: Mutex::default(),
             noticed: Mutex::default(),
         }
     }
@@ -407,7 +450,7 @@ impl Sync {
             .ok_or_else(|| GhError::Failed("sync is not configured".into()))
     }
 
-    fn config(&self) -> Gh<&SyncConfig> {
+    pub(super) fn config(&self) -> Gh<&SyncConfig> {
         self.config
             .as_ref()
             .ok_or_else(|| GhError::Failed("sync is not configured".into()))
@@ -895,6 +938,7 @@ async fn read_repo(
     }
     #[cfg(unix)]
     super::forge_check::reconcile_repo(state, conn, repo, token, None).await?;
+    super::external_runs::reconcile_repo(state, conn, repo, token).await?;
     Ok(report)
 }
 

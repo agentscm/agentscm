@@ -99,6 +99,25 @@ and `note` says branch protection, raw pushes and administrator bypass are not
 enforced or verified by AgentSCM. A GitLab status on the MR head is not a verified merged-result
 pipeline. See [workflow status](hub.md#workflow-status-for-candidate-pull-requests).
 
+## Hub publication external outcomes
+
+This is the Hub, not `serve`. When the repository is listed in `AGENTSCM_GITHUB_EXTERNAL_RUNS`
+and the publication has a merge commit, `GET /v1/hub/repos/{repo}/publications/{id}` adds a
+read-only `external` object; otherwise the reply has no such field. It reads the Hub's store
+and calls no forge. Fields: `provider` (`github`), `note` (observed after landing, not
+evidence for the landing decision), `merge_commit`, `state`, `reconciled_at` (unix seconds of
+the last read, or null), `ci` (`run_id`, `attempt`, `branch`, `name`, `outcome`,
+`provider_updated_at`, `html_url`) and `deployments` (`run_id`, `environment`, `name`,
+`outcome`, `provider_updated_at`, `html_url`). `outcome` is `pending`, `running`,
+`succeeded`, `failed`, `cancelled`, `superseded` or `unknown`. `state` is `unobserved` (no
+read yet), `incomplete` (the read was cut short, or more than 200 rows of a kind exist) or
+`observed`. Under `incomplete` the lists may be non-empty but are partial, and under
+`unobserved` they are empty; an empty list is not success unless `state` is `observed`.
+`reconciled_at` is the staleness signal; a later failed read leaves the previous value.
+`html_url` may be null. At most 200 rows of each kind are shown. Names and links come from the provider and are untrusted.
+These outcomes are separate from source approval and from `forge_check`. See
+[external CI and deployment outcomes](hub.md#external-ci-and-deployment-outcomes).
+
 ## HTTP boundaries
 
 Workflow and collision responses carry `nosniff`, no referrer, `no-store` and a
