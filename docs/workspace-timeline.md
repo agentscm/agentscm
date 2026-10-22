@@ -4,6 +4,7 @@
 > It is not an attached-Git history, backup system, approval record or automatic agent audit.
 
 The workspace timeline records selected observations of an existing native AgentSCM workspace.
+Like native workspaces, the timeline and its local client adapters require Unix (including macOS).
 Each changed observation creates an immutable source revision and adds an entry to that
 workspace's local journal without checkpointing, advancing or otherwise changing the workspace.
 Unchanged observations reuse the matching revision and add no entry.

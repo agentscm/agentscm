@@ -1332,6 +1332,7 @@ fn ignored_paths(
         && let Some(lease) = lease_root(root, destination)?
     {
         ignored.insert(lease.join(LOCK));
+        #[cfg(unix)]
         if destination.starts_with("workspaces/") {
             ignored.insert(lease.join(crate::workspace::TIMELINE_LEASE_FILE));
             ignored.insert(lease.join(crate::workspace::TIMELINE_PROBES_DIRECTORY));
