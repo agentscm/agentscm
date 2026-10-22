@@ -988,7 +988,7 @@ fn field(values: &Value, id: &str) -> Option<String> {
         .map(str::to_owned)
 }
 fn input(id: &str, label: &str, optional: bool, multiline: bool) -> Value {
-    json!({"type":"input","block_id":id,"optional":optional,"label":plain_text(label,100),"element":{"type":"plain_text_input","action_id":"value","multiline":multiline,"max_length":if multiline{4000}else{500}}})
+    json!({"type":"input","block_id":id,"optional":optional,"label":plain_text(label,100),"element":{"type":"plain_text_input","action_id":"value","multiline":multiline,"max_length":if multiline{3000}else{500}}})
 }
 
 pub fn routes() -> Router<HubState> {
@@ -1527,6 +1527,18 @@ mod tests {
         }
     }
 
+    fn assert_plain_text_input_lengths(view: &Value) {
+        let mut inputs = 0;
+        for block in view["blocks"].as_array().unwrap() {
+            let element = &block["element"];
+            if element["type"] == "plain_text_input" {
+                inputs += 1;
+                assert!(element["max_length"].as_u64().unwrap() <= 3000, "{element}");
+            }
+        }
+        assert!(inputs > 0, "{view}");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ingress_checks_signature_workspace_app_user_and_request_shape() {
         let f = Fixture::new(true, false).await;
@@ -1623,10 +1635,17 @@ mod tests {
         let item = f.start().await;
         assert_eq!(item.lead_session, SESSION);
         assert_eq!(item.scope, ["src/widget.rs"]);
-        let nonce = f.last_modal()["private_metadata"]
-            .as_str()
+        let start_modal = f.last_modal();
+        assert_plain_text_input_lengths(&start_modal);
+        let scope = start_modal["blocks"]
+            .as_array()
             .unwrap()
-            .to_owned();
+            .iter()
+            .find(|block| block["block_id"] == "scope")
+            .unwrap();
+        assert_eq!(scope["element"]["max_length"], 3000);
+        assert_eq!(scope["element"]["multiline"], true);
+        let nonce = start_modal["private_metadata"].as_str().unwrap().to_owned();
         let values = json!({"title":{"value":{"value":"Synthetic scoped task"}},"scope":{"value":{"value":"src/widget.rs"}},"next":{"value":{"value":"Inspect source"}}});
         let payload = f.submission(&nonce, values.clone());
         assert_eq!(f.interaction(payload).await.1["response_action"], "clear");
@@ -1640,7 +1659,9 @@ mod tests {
             f.command(&format!("checkpoint {}", item.id)).await.0,
             StatusCode::OK
         );
-        let stale = f.last_modal()["private_metadata"]
+        let checkpoint_modal = f.last_modal();
+        assert_plain_text_input_lengths(&checkpoint_modal);
+        let stale = checkpoint_modal["private_metadata"]
             .as_str()
             .unwrap()
             .to_owned();
