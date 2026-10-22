@@ -30,6 +30,7 @@ struct Env {
     store: Arc<dyn Store>,
     repo: String,
     token: String,
+    secret: String,
     _root: TempDir,
 }
 
@@ -76,7 +77,7 @@ impl Env {
         sync::start(&state).await.unwrap();
         let host = fake.base.trim_start_matches("http://").to_owned();
         let setup = store.clone();
-        let (repo, token) = tokio::task::spawn_blocking(move || {
+        let (repo, token, secret) = tokio::task::spawn_blocking(move || {
             let connection = setup.pat_connection(&host).unwrap().unwrap().id;
             setup
                 .upsert_repository(&connection, &host, REPO_ID, REPO, None, None)
@@ -91,9 +92,10 @@ impl Env {
                     "alice",
                 )
                 .unwrap();
-            let (token, _) = mint_agent_token(&*setup, &owner.id, "agent-a", REPO, 3600).unwrap();
+            let (token, secret) =
+                mint_agent_token(&*setup, &owner.id, "agent-a", REPO, 3600).unwrap();
             let repo = setup.repository_named(&host, REPO).unwrap().unwrap().id;
-            (repo, token)
+            (repo, token, secret.expose().to_owned())
         })
         .await
         .unwrap();
@@ -103,6 +105,7 @@ impl Env {
             store,
             repo,
             token,
+            secret,
             _root: root,
         }
     }
@@ -157,6 +160,24 @@ impl Env {
             .unwrap()
             .id;
         sync::refresh(&self.state, &connection).await.unwrap();
+    }
+
+    /// The publication as the Hub API shows it.
+    async fn show(&self, id: &str) -> Value {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = agentscm::hub::router(self.state.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let response = reqwest::Client::new()
+            .get(format!(
+                "{url}/v1/hub/repos/acme%2Fwidgets/publications/{id}"
+            ))
+            .bearer_auth(&self.secret)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        serde_json::from_str(&response.text().await.unwrap()).unwrap()
     }
 
     fn runs(&self, sha: &str) -> Vec<ExternalRun> {
@@ -498,6 +519,126 @@ async fn external_outcomes_change_no_check_or_publication_state() {
             .collect()
     });
     assert_eq!(writes, Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn the_publication_shows_nothing_external_unless_opted_in() {
+    let env = Env::start(false).await;
+    let id = env.publish(1, OTHER, Some(MERGED)).await;
+    env.seed(|r| {
+        r.runs.push(run_json(
+            REPO_ID,
+            1,
+            MERGED,
+            "main",
+            "completed",
+            Some("success"),
+        ));
+    });
+    env.pass().await;
+    assert!(env.show(&id).await.get("external").is_none());
+}
+
+#[tokio::test]
+async fn the_publication_separates_ci_from_each_deployed_environment() {
+    let env = Env::start(true).await;
+    let id = env.publish(1, OTHER, Some(MERGED)).await;
+    let unmerged = env.publish(2, "3".repeat(40).as_str(), None).await;
+    // Nothing is inferred before a pass has read the provider.
+    let before = env.show(&id).await["external"].clone();
+    assert_eq!(before["state"], "unobserved");
+    assert_eq!(before["reconciled_at"], Value::Null);
+    assert_eq!(before["ci"], json!([]));
+    assert_eq!(before["deployments"], json!([]));
+    assert!(env.show(&unmerged).await.get("external").is_none());
+
+    env.seed(|r| {
+        r.runs.push(run_json(
+            REPO_ID,
+            1,
+            MERGED,
+            "main",
+            "completed",
+            Some("success"),
+        ));
+        r.deployments.push((
+            deployment_json(10, MERGED, "production"),
+            vec![status_json(1, "success")],
+        ));
+        r.deployments.push((
+            deployment_json(11, MERGED, "staging"),
+            vec![status_json(2, "failure")],
+        ));
+    });
+    env.pass().await;
+    let shown = env.show(&id).await;
+    let external = &shown["external"];
+    assert_eq!(external["provider"], "github");
+    assert_eq!(external["merge_commit"], MERGED);
+    assert_eq!(external["state"], "observed");
+    assert!(external["reconciled_at"].is_i64());
+    assert_eq!(external["ci"].as_array().unwrap().len(), 1);
+    assert_eq!(external["ci"][0]["run_id"], 1);
+    assert_eq!(external["ci"][0]["branch"], "main");
+    assert_eq!(external["ci"][0]["outcome"], "succeeded");
+    let deployed: Vec<_> = external["deployments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| (d["environment"].clone(), d["outcome"].clone()))
+        .collect();
+    assert_eq!(
+        deployed,
+        [
+            (json!("production"), json!("succeeded")),
+            (json!("staging"), json!("failed"))
+        ]
+    );
+    // The forge check view is a separate field and is unaffected.
+    assert!(shown.get("forge_check").is_none());
+}
+
+#[tokio::test]
+async fn a_cut_short_read_or_list_is_shown_as_incomplete() {
+    let env = Env::start(true).await;
+    let id = env.publish(1, OTHER, Some(MERGED)).await;
+    env.seed(|r| {
+        for id in 1..=305 {
+            r.runs.push(run_json(
+                REPO_ID,
+                id,
+                MERGED,
+                "main",
+                "completed",
+                Some("success"),
+            ));
+        }
+    });
+    env.pass().await;
+    let external = env.show(&id).await["external"].clone();
+    assert_eq!(external["state"], "incomplete");
+    assert_eq!(external["ci"].as_array().unwrap().len(), 200);
+
+    // A complete read whose rows exceed what one reply shows is still incomplete.
+    let env = Env::start(true).await;
+    let id = env.publish(1, OTHER, Some(MERGED)).await;
+    env.seed(|r| {
+        for id in 1..=250 {
+            r.runs.push(run_json(
+                REPO_ID,
+                id,
+                MERGED,
+                "main",
+                "completed",
+                Some("success"),
+            ));
+        }
+    });
+    env.pass().await;
+    assert!(env.marker(MERGED).is_some_and(|(_, complete)| complete));
+    let external = env.show(&id).await["external"].clone();
+    assert_eq!(external["state"], "incomplete");
+    assert_eq!(external["ci"].as_array().unwrap().len(), 200);
 }
 
 #[test]

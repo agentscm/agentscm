@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::connection::{ConnectedRepository, Connection};
+use super::external_runs::ExternalKind;
 use super::github::{Gh, GhError, parse_rfc3339, valid_ref_name};
 use super::http::{ApiError, Authenticated, JsonBody, blocking};
 use super::intent::scope;
@@ -964,7 +965,79 @@ async fn show(
     if let Some(view) = forge_check_view(&state, &principal, &publication).await? {
         reply["forge_check"] = view;
     }
+    if let Some(view) = external_view(&state, &principal, &publication).await? {
+        reply["external"] = view;
+    }
     Ok(Json(reply))
+}
+
+/// External runs shown per publication; one more is read to tell a full list from a cut one.
+const EXTERNAL_SHOWN: usize = 200;
+
+/// External CI and deployment outcomes stored for a merged publication's merge commit, only
+/// where the repository is opted in. Read-only: it reads the store and calls no forge.
+async fn external_view(
+    state: &HubState,
+    principal: &Principal,
+    publication: &Publication,
+) -> std::result::Result<Option<Value>, ApiError> {
+    let Some(sha) = publication.merge_commit.clone() else {
+        return Ok(None);
+    };
+    let (host, name, repository_id) = (
+        principal.owner.identity.host.clone(),
+        principal.repository.clone(),
+        principal.repository_id,
+    );
+    let store = state.store.clone();
+    let found = blocking(state, move || {
+        let Some(repo) = find_repository(&*store, &host, &name, repository_id)? else {
+            return Ok(None);
+        };
+        Ok(store.connection(&repo.connection)?.map(|conn| (conn, repo)))
+    })
+    .await?;
+    let Some((conn, repo)) = found else {
+        return Ok(None);
+    };
+    if conn.provider != "github"
+        || !state.sync.external_runs_enabled(&repo.full_name)
+        || !publication_on_forge(state, publication, &repo).await
+    {
+        return Ok(None);
+    }
+    let (store, id, commit) = (state.store.clone(), repo.id.clone(), sha.clone());
+    let (mut runs, marker) = blocking(state, move || {
+        Ok((
+            store.external_runs(&id, &commit, EXTERNAL_SHOWN + 1)?,
+            store.external_reconciled(&id, &commit)?,
+        ))
+    })
+    .await?;
+    let cut = runs.len() > EXTERNAL_SHOWN;
+    runs.truncate(EXTERNAL_SHOWN);
+    let status = match marker {
+        None => "unobserved",
+        Some((_, true)) if !cut => "observed",
+        Some(_) => "incomplete",
+    };
+    let (mut ci, mut deployments) = (vec![], vec![]);
+    for run in runs {
+        match run.kind {
+            ExternalKind::Ci => ci.push(json!({"run_id": run.run_id, "attempt": run.attempt,
+                "branch": run.branch, "name": run.name, "outcome": run.outcome.as_str(),
+                "provider_updated_at": run.provider_updated_at, "html_url": run.html_url})),
+            ExternalKind::Deployment => deployments.push(json!({"run_id": run.run_id,
+                "environment": run.environment, "name": run.name,
+                "outcome": run.outcome.as_str(),
+                "provider_updated_at": run.provider_updated_at, "html_url": run.html_url})),
+        }
+    }
+    Ok(Some(json!({"provider": "github",
+        "note": "Observed after landing; not evidence for the landing decision.",
+        "merge_commit": sha, "state": status,
+        "reconciled_at": marker.map(|(at, _)| at),
+        "ci": ci, "deployments": deployments})))
 }
 
 /// What the Hub does about a forge check for this publication's pull request. Read-only:
