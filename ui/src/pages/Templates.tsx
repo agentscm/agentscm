@@ -1,0 +1,227 @@
+import { useState } from 'react'
+import { fetchHandoff, inspectTemplate, type Handoff, type RunState, type TemplateAction, type TemplateInspect } from '../localApi.ts'
+import { Box, Empty, Explain, Icon, Notice, Pill, PreviewBanner, Skeleton, type Tone } from '../ui.tsx'
+import { usePoll } from '../usePoll.ts'
+
+/** One plain sentence per step, so the recipe reads like instructions rather than configuration. */
+export function describeAction(a: TemplateAction): { icon: string; text: string } {
+  switch (a.kind) {
+    case 'source_paths':
+      return { icon: 'folder-check', text: `Check ${a.expectations.length === 1 ? 'this path is' : `these ${a.expectations.length} paths are`} in the change: ${a.expectations.map((e) => e.path).join(', ')}` }
+    case 'require_capability':
+      return { icon: 'plug', text: `Needs the “${a.capability}” capability on the machine that runs it` }
+    case 'command':
+      return { icon: 'terminal', text: `Run the “${a.runner}” command` }
+    case 'claude_code_review':
+      return { icon: 'chat-square-text', text: `Ask Claude (${a.model}) to review ${a.paths.length} file${a.paths.length === 1 ? '' : 's'}` }
+    default:
+      return { icon: 'question-circle', text: 'A step this page does not know how to describe yet' }
+  }
+}
+
+const RUN: Record<RunState, { tone: Tone; icon: string; word: string }> = {
+  pending: { tone: 'brand', icon: 'hourglass-split', word: 'Waiting to start' },
+  running: { tone: 'brand', icon: 'arrow-repeat', word: 'Running' },
+  succeeded: { tone: 'ok', icon: 'check-circle', word: 'Passed' },
+  completed_with_omissions: { tone: 'warn', icon: 'exclamation-circle', word: 'Passed, with gaps' },
+  failed: { tone: 'bad', icon: 'x-octagon', word: 'Failed' },
+  blocked: { tone: 'bad', icon: 'slash-circle', word: 'Blocked' },
+  cancelled: { tone: 'warn', icon: 'stop-circle', word: 'Cancelled' },
+  unknown: { tone: 'muted', icon: 'question-circle', word: 'Unclear' },
+}
+const STEP_TONE = (state: string): { tone: Tone; word: string } =>
+  state === 'succeeded' ? { tone: 'ok', word: 'Passed' } : state === 'failed' ? { tone: 'bad', word: 'Failed' } : state === 'blocked' ? { tone: 'bad', word: 'Blocked' } : state === 'running' ? { tone: 'brand', word: 'Running' } : state === 'pending' ? { tone: 'muted', word: 'Not started' } : state === 'cancelled' ? { tone: 'warn', word: 'Skipped' } : { tone: 'muted', word: 'Unclear' }
+
+function Recipe({ value }: { value: TemplateInspect }) {
+  const t = value.template
+  return (
+    <>
+      <div className="recipe-head">
+        <strong>{t.name}</strong>
+        <Pill tone="muted" icon="tag">version {t.version}</Pill>
+        <span className="small muted">from <code>{value.reference.path}</code> at <code>{value.reference.revision.slice(0, 10)}</code></span>
+      </div>
+      <ol className="recipe" aria-label="Steps in this template">
+        {t.steps.map((s) => {
+          const d = describeAction(s.action)
+          return (
+            <li key={s.id} className="recipe-step">
+              <span className="recipe-icon"><Icon name={d.icon} /></span>
+              <span className="recipe-main">
+                <span>{d.text}</span>
+                <span className="small muted">
+                  Step <code>{s.id}</code>
+                  {s.needs.length > 0 && <> · after {s.needs.map((n) => <code key={n} className="me-1">{n}</code>)}</>}
+                </span>
+              </span>
+              <Pill tone={s.required ? 'brand' : 'muted'} tip={s.required ? 'The run fails if this step fails.' : 'The run can pass even if this step does not.'}>{s.required ? 'Required' : 'Optional'}</Pill>
+            </li>
+          )
+        })}
+      </ol>
+      <p className="small muted mb-0"><Icon name="info-circle" /> Skill: <code>{t.skill.entrypoint}</code>. Looking at a template does not approve, start or run anything.</p>
+    </>
+  )
+}
+
+function HandoffView({ value }: { value: Handoff }) {
+  const st = RUN[value.run.state]
+  return (
+    <>
+      <div className="recipe-head">
+        <code>{value.run.run_id}</code>
+        <Pill tone={st.tone} icon={st.icon}>{st.word}</Pill>
+      </div>
+      <ul className="run-list">
+        {value.run.steps.map((s) => {
+          const t = STEP_TONE(s.state)
+          return (
+            <li key={s.id} className="run-row">
+              <span className="run-main">
+                <strong><code>{s.id}</code>{!s.required && <span className="small muted"> · optional</span>}</strong>
+                {s.detail && <span className="small muted">{s.detail}</span>}
+              </span>
+              <Pill tone={t.tone}>{t.word}</Pill>
+            </li>
+          )
+        })}
+      </ul>
+      <Notice tone="brand" icon="signpost" title="What to do next">{value.next_action}</Notice>
+      <p className="small muted mb-0">
+        {value.subject_scope === 'source_revision_and_command_contexts'
+          ? <>Covers the source revision <strong>and</strong> the change versions its commands ran against ({value.command_context_bindings.map((b) => `${b.change} v${b.change_version}`).join(', ')}).</>
+          : 'Covers the source revision only.'}{' '}
+        <Explain text="A run is evidence about exact bytes. If the change moves on, run the check again before relying on this." />
+      </p>
+    </>
+  )
+}
+
+const RECENT = { recipe: 'agentscm.hub.recentRecipes', run: 'agentscm.hub.recentRuns' } as const
+/** A remembered recipe lookup is the pair, stored as one string. */
+const PAIR = '\u0000'
+function loadIds(key: string): string[] {
+  try {
+    const v: unknown = JSON.parse(window.localStorage.getItem(key) ?? '[]')
+    return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && x.length <= 8200).slice(0, 6) : []
+  } catch {
+    return []
+  }
+}
+function rememberId(key: string, id: string): string[] {
+  const next = [id, ...loadIds(key).filter((x) => x !== id)].slice(0, 6)
+  try {
+    window.localStorage.setItem(key, JSON.stringify(next))
+  } catch {
+    /* not remembered in this browser */
+  }
+  return next
+}
+
+/** A friendly single-field lookup: what to paste, where to find it, and the IDs opened before. */
+function Lookup({ id, label, placeholder, where, recent, onOpen }: { id: string; label: string; placeholder: string; where: string; recent: string[]; onOpen: (v: string) => void }) {
+  const [value, setValue] = useState('')
+  return (
+    <>
+      <form className="lookup" onSubmit={(e) => { e.preventDefault(); if (value.trim()) onOpen(value.trim()) }}>
+        <label className="visually-hidden" htmlFor={id}>{label}</label>
+        <input id={id} className="form-control" placeholder={placeholder} value={value} onChange={(e) => setValue(e.target.value)} spellCheck={false} autoComplete="off" aria-describedby={`${id}-help`} />
+        <button type="submit" className="btn btn-primary" disabled={!value.trim()}><Icon name="arrow-right" /> Open</button>
+      </form>
+      <div id={`${id}-help`} className="form-text">{where}</div>
+      {recent.length > 0 && (
+        <div className="recent">
+          <span className="small muted">Opened recently:</span>
+          {recent.map((r) => (
+            <button key={r} type="button" className="recent-chip btn btn-link btn-sm" onClick={() => onOpen(r)}><code>{r}</code></button>
+          ))}
+        </div>
+      )}
+    </>
+  )
+}
+
+/** The recipe lookup needs two things: the change, and where the template file sits inside it. */
+function RecipeLookup({ recent, onOpen }: { recent: string[]; onOpen: (change: string, library: string) => void }) {
+  const [change, setChange] = useState('')
+  const [library, setLibrary] = useState('')
+  const ok = change.trim() !== '' && library.trim() !== ''
+  return (
+    <>
+      <form className="lookup-2" onSubmit={(e) => { e.preventDefault(); if (ok) onOpen(change.trim(), library.trim()) }}>
+        <div>
+          <label className="form-label small" htmlFor="tpl-change">Change ID</label>
+          <input id="tpl-change" className="form-control" placeholder="Change ID" value={change} onChange={(e) => setChange(e.target.value)} spellCheck={false} autoComplete="off" aria-describedby="tpl-change-help" />
+          <div id="tpl-change-help" className="form-text">Your agent shows it when it starts work; agentscm status lists it.</div>
+        </div>
+        <div>
+          <label className="form-label small" htmlFor="tpl-path">Template file</label>
+          <input id="tpl-path" className="form-control" placeholder="skills/checks/v1/workflow.json" value={library} onChange={(e) => setLibrary(e.target.value)} spellCheck={false} autoComplete="off" aria-describedby="tpl-path-help" />
+          <div id="tpl-path-help" className="form-text">The workflow template file inside the skill folder of that change.</div>
+        </div>
+        <button type="submit" className="btn btn-primary align-self-start mt-4" disabled={!ok}><Icon name="arrow-right" /> Open</button>
+      </form>
+      {recent.length > 0 && (
+        <div className="recent">
+          <span className="small muted">Opened recently:</span>
+          {recent.map((r) => {
+            const [c, l] = r.split(PAIR) as [string, string]
+            return (
+              <button key={r} type="button" className="recent-chip btn btn-link btn-sm" onClick={() => onOpen(c, l)}>
+                <code>{c}</code> · <code>{l}</code>
+              </button>
+            )
+          })}
+        </div>
+      )}
+    </>
+  )
+}
+
+export function TemplatesPage() {
+  const [recipe, setRecipe] = useState<{ change: string; library: string } | null>(null)
+  const [runId, setRunId] = useState<string | null>(null)
+  const [recentRecipes, setRecentRecipes] = useState(() => loadIds(RECENT.recipe))
+  const [recentRuns, setRecentRuns] = useState(() => loadIds(RECENT.run))
+  const inspect = usePoll((signal) => (recipe ? inspectTemplate(recipe.change, recipe.library, signal) : Promise.resolve(null)), 0, recipe ? `${recipe.change}${PAIR}${recipe.library}` : '')
+  const handoff = usePoll((signal) => (runId ? fetchHandoff(runId, signal) : Promise.resolve(null)), 0, runId ?? '')
+  const preview = [inspect, handoff].find((p) => p.kind === 'ready' && p.value?.source === 'preview')
+  return (
+    <div className="page">
+      <div className="answer">
+        <h1 className="page-question">Which workflow recipes can agents reuse?</h1>
+        <p className="answer-text">A <strong>template</strong> is a saved recipe of checks (like “check these files, run the tests, then ask Claude to review”) that any change can reuse instead of writing its own.</p>
+      </div>
+      {preview && preview.kind === 'ready' && <PreviewBanner reason={preview.value?.reason} />}
+      <div className="grid-2 align-start">
+        <Box icon="journal-code" title="See a change’s recipe" explain="Shows the template this computer uses, as it applies to one change: its steps, what each waits for, and which must pass. Same as skill-workflow library inspect.">
+          <RecipeLookup recent={recentRecipes} onOpen={(change, library) => { setRecipe({ change, library }); setRecentRecipes(rememberId(RECENT.recipe, `${change}${PAIR}${library}`)) }} />
+        </Box>
+        <Box icon="flag" title="Where did a run get to?" explain="A run is one go at a recipe's checks. This shows each step's result and what to do next. Same as skill-workflow handoff.">
+          <Lookup
+            id="tpl-run"
+            label="Run ID"
+            placeholder="Run ID"
+            where="Your agent prints the run ID when a check starts; Timeline also shows it next to the snapshot it tested."
+            recent={recentRuns}
+            onOpen={(v) => { setRunId(v); setRecentRuns(rememberId(RECENT.run, v)) }}
+          />
+        </Box>
+      </div>
+      {recipe !== null && (
+        <Box icon="list-check" title={`Recipe for ${recipe.change}`} explain="Each step runs after the ones it waits for. Required steps must pass for the run to pass.">
+          {inspect.kind === 'loading' ? <Skeleton rows={4} /> : inspect.kind === 'error' ? <Notice tone="bad" title="Could not read this recipe">{inspect.message}</Notice> : inspect.value && <Recipe value={inspect.value.value} />}
+        </Box>
+      )}
+      {runId !== null && (
+        <Box icon="flag" title={`Run ${runId}`} explain="Step results as this computer recorded them.">
+          {handoff.kind === 'loading' ? <Skeleton rows={4} /> : handoff.kind === 'error' ? <Notice tone="bad" title="Could not read this run">{handoff.message}</Notice> : handoff.value && <HandoffView value={handoff.value.value} />}
+        </Box>
+      )}
+      {recipe === null && runId === null && (
+        <Empty icon="journal-code" title="Open a change or a run to begin">Paste an ID above. This page reads from this computer only and never starts or approves anything.</Empty>
+      )}
+      <p className="small muted"><Icon name="laptop" /> Read from <code>agentscm serve</code> on this computer, not from the hub.</p>
+    </div>
+  )
+}

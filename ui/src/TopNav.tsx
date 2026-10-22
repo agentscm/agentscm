@@ -7,6 +7,8 @@ import type { Section } from './App.tsx'
 import { workTabFromHash, workTabHref } from './pages/Work.tsx'
 import { routeFromHash as workflowRouteFromHash, runHref as workflowRunHref } from './pages/Workflows.tsx'
 import { workspaceRoute, workspaceRunHref } from './pages/Workspace.tsx'
+import { landedIdFromHash, landedHref } from './pages/Landed.tsx'
+import { compareHref, entryHref, timelineRoute } from './pages/Timeline.tsx'
 import { Icon, Tip, relative } from './ui.tsx'
 
 export interface SectionDef {
@@ -14,14 +16,15 @@ export interface SectionDef {
   icon: string
   label: string
   question: string
-  group: 'Coordinate' | 'Verify' | 'Manage'
+  group: 'Coordinate' | 'Verify' | 'This computer' | 'Manage'
 }
 
 export type Badges = Partial<Record<Section, { n: number; tone: string; tip: string }>>
 
 const GROUPS: { name: SectionDef['group']; tip: string }[] = [
   { name: 'Coordinate', tip: 'Who holds which files, who owns which task, and what just happened.' },
-  { name: 'Verify', tip: 'Recorded workflow checks. Results here never decide landing.' },
+  { name: 'Verify', tip: 'Recorded workflow checks, and what CI and deploys did after a change landed. Results here never decide landing.' },
+  { name: 'This computer', tip: 'Read from agentscm serve on this machine, not from the hub: workflow templates and this workspace’s saved moments.' },
   { name: 'Manage', tip: 'Connect agents, workspace access, hub health and your own settings.' },
 ]
 
@@ -385,6 +388,13 @@ export function crumbsFor(hash: string, section: SectionDef, overview: WorkOverv
       out.push({ label: `Run ${run.length > 14 ? `${run.slice(0, 14)}…` : run}`, href: workflowRunHref(run), mono: true })
       if (route.stepId) out.push({ label: `Step ${route.stepId}`, mono: true })
     }
+  } else if (section.key === 'landed') {
+    const id = landedIdFromHash(hash)
+    if (id) out.push({ label: `Change ${id.slice(0, 12)}…`, href: landedHref(id), mono: true })
+  } else if (section.key === 'timeline') {
+    const route = timelineRoute(hash)
+    if (route.kind === 'entry') out.push({ label: `Saved moment #${route.id}`, href: entryHref(route.id) })
+    else if (route.kind === 'compare') out.push({ label: `Compare #${route.left} and #${route.right}`, href: compareHref(route.left, route.right) })
   }
   return out
 }

@@ -50,7 +50,14 @@ export default defineConfig({
     host: '127.0.0.1',
     port: 5184,
     strictPort: true,
-    proxy: mock ? undefined : { '/v1': { target: process.env['AGENTSCM_HUB'] ?? 'http://127.0.0.1:7332', changeOrigin: true } },
+    // `agentscm serve` on this machine answers /v1/local (Templates, Timeline); it must come before /v1 (the hub).
+    proxy: mock
+      ? undefined
+      : {
+          // No changeOrigin: serve checks for a loopback Host, which the proxy passes through unchanged.
+          '/v1/local': { target: process.env['AGENTSCM_SERVE'] ?? 'http://127.0.0.1:7331' },
+          '/v1': { target: process.env['AGENTSCM_HUB'] ?? 'http://127.0.0.1:7332', changeOrigin: true },
+        },
   },
   // The hub embeds exactly dist/index.html, app.js and app.css. Fonts and images inline as data: URIs
   // because the hub's CSP is font-src 'self' data:.

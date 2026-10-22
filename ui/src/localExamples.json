@@ -1,0 +1,298 @@
+{
+  "timeline": {
+    "request": "/v1/local/workspace/timeline?limit=2",
+    "response": {
+      "timeline": {
+        "coverage": {
+          "earliest_recorded_id": 1,
+          "includes_pre_feature_history": false
+        },
+        "entries": [
+          {
+            "base_revision": "7f15adf851036723c29facae90fc583f434074a64c85e6206b454572ca340259",
+            "change": {
+              "id": "demo-change",
+              "repository": "fd0d382080b8a6d3c253ce5e390051c0"
+            },
+            "change_version": 4,
+            "context_digest": "8ac3371a0f18684eaa7a7b0c05e719b1cac468d214141bfb6ecbc1ed864db50b",
+            "evidence_coverage": "reference_only",
+            "generation": 1,
+            "id": 3,
+            "kind": "check_link",
+            "policy_epoch": 1,
+            "recorded_at": 1792686748,
+            "requirement_digest": "efbbbb6f7568f15630ff63bdd2d267ea812cfc08d6d5388e7c1e3651d47478ef",
+            "run_id": "loop-b863061f8d326fb0e01a1e0d17054548d5e6ec726b9f2c58251c8172c2f",
+            "source_revision": "7f15adf851036723c29facae90fc583f434074a64c85e6206b454572ca340259",
+            "target": "main",
+            "tested_revision": "7f15adf851036723c29facae90fc583f434074a64c85e6206b454572ca340259"
+          },
+          {
+            "admitted_bytes": 54,
+            "base_revision": "e839396188b3a3a93eb2fd79e6591ef99de2a829801cd29fcb80c44cbc20e4d8",
+            "changed_paths": 2,
+            "generation": 0,
+            "id": 2,
+            "kind": "snapshot",
+            "recorded_at": 1792686748,
+            "revision": "7f15adf851036723c29facae90fc583f434074a64c85e6206b454572ca340259",
+            "trigger": "manual"
+          }
+        ],
+        "next_before": 2
+      },
+      "version": 1
+    }
+  },
+  "timelineOlder": {
+    "request": "/v1/local/workspace/timeline?limit=2&before=2",
+    "response": {
+      "timeline": {
+        "coverage": {
+          "earliest_recorded_id": 1,
+          "includes_pre_feature_history": false
+        },
+        "entries": [
+          {
+            "admitted_bytes": 37,
+            "base_revision": "e839396188b3a3a93eb2fd79e6591ef99de2a829801cd29fcb80c44cbc20e4d8",
+            "changed_paths": 1,
+            "generation": 0,
+            "id": 1,
+            "kind": "snapshot",
+            "recorded_at": 1792686748,
+            "revision": "1945eb915e28d35b1d108873960c5934b075680b89ddea1634eac523dd5cd46c",
+            "trigger": "manual"
+          }
+        ]
+      },
+      "version": 1
+    }
+  },
+  "entry3": {
+    "request": "/v1/local/workspace/timeline/3",
+    "response": {
+      "entry": {
+        "base_revision": "7f15adf851036723c29facae90fc583f434074a64c85e6206b454572ca340259",
+        "change": {
+          "id": "demo-change",
+          "repository": "fd0d382080b8a6d3c253ce5e390051c0"
+        },
+        "change_version": 4,
+        "context_digest": "8ac3371a0f18684eaa7a7b0c05e719b1cac468d214141bfb6ecbc1ed864db50b",
+        "evidence_coverage": "reference_only",
+        "generation": 1,
+        "id": 3,
+        "kind": "check_link",
+        "policy_epoch": 1,
+        "recorded_at": 1792686748,
+        "requirement_digest": "efbbbb6f7568f15630ff63bdd2d267ea812cfc08d6d5388e7c1e3651d47478ef",
+        "run_id": "loop-b863061f8d326fb0e01a1e0d17054548d5e6ec726b9f2c58251c8172c2f",
+        "source_revision": "7f15adf851036723c29facae90fc583f434074a64c85e6206b454572ca340259",
+        "target": "main",
+        "tested_revision": "7f15adf851036723c29facae90fc583f434074a64c85e6206b454572ca340259"
+      },
+      "evidence": {
+        "state": "available",
+        "workflow": {
+          "present_applicability": {
+            "basis": "current_authority_repository_policy_epoch_and_immutable_revision",
+            "reason": null,
+            "state": "current"
+          },
+          "present_landing_binding": null,
+          "run": {
+            "admission": "not_assessed",
+            "plan_digest": "sha256:43558c5d5431f2a7472a4436197de0feef2fdaeb84d7b2e0abf312bd2a115bcc",
+            "run_id": "loop-b863061f8d326fb0e01a1e0d17054548d5e6ec726b9f2c58251c8172c2f",
+            "skill_digest": "sha256:60f8bc2a030af369c7de4b974d33fc73b52f507e452cc1e1eea69d0b2e9092d3",
+            "source": {
+              "policy_epoch": 1,
+              "repository": "fd0d382080b8a6d3c253ce5e390051c0",
+              "revision": "7f15adf851036723c29facae90fc583f434074a64c85e6206b454572ca340259"
+            },
+            "state": "failed",
+            "steps": [
+              {
+                "detail": "content digest does not match for src/lib.rs",
+                "id": "source",
+                "needs": [],
+                "observations": [
+                  {
+                    "bytes": 37,
+                    "path": "src/lib.rs",
+                    "sha256": "395a6b7a3ac5abf3b3e4959f0314a122bb3a8e79f849bb56e14dd5eb0a6502a9"
+                  }
+                ],
+                "required": true,
+                "state": "failed"
+              }
+            ],
+            "version": 1
+          },
+          "version": 1
+        }
+      },
+      "version": 1
+    }
+  },
+  "diff": {
+    "request": "/v1/local/workspace/diff?left=1&right=2&limit=100",
+    "response": {
+      "diff": {
+        "entries": [
+          {
+            "after": "5793d0d60811fb49f9b56ec0e2304d782d84f00ef2a3031516f02de5ca29f9d2",
+            "before": null,
+            "path": "src/more.rs"
+          }
+        ],
+        "needed_objects": [],
+        "next": null
+      },
+      "left": 1,
+      "right": 2,
+      "version": 1
+    }
+  },
+  "inspect": {
+    "request": "/v1/local/skill-workflow-library?change=other-change&library=skills/checks/v2/workflow.json",
+    "response": {
+      "admission": "not_assessed",
+      "definition": {
+        "name": "verify:v2",
+        "skill": {
+          "entrypoint": "skills/checks/v2/SKILL.md",
+          "resources": [
+            "skills/checks/v2/workflow.json"
+          ]
+        },
+        "source": {
+          "policy_epoch": 0,
+          "repository": "fd0d382080b8a6d3c253ce5e390051c0",
+          "revision": "e839396188b3a3a93eb2fd79e6591ef99de2a829801cd29fcb80c44cbc20e4d8"
+        },
+        "steps": [
+          {
+            "action": {
+              "expectations": [
+                {
+                  "path": "src/lib.rs",
+                  "sha256": "ee54963dd71aa0a4288ecbad2cf17d9aad5fb5401dc75dbba9ca2338a3c778a7"
+                }
+              ],
+              "kind": "source_paths"
+            },
+            "id": "source",
+            "needs": [],
+            "required": true
+          }
+        ],
+        "version": 1
+      },
+      "reference": {
+        "name": "verify",
+        "path": "skills/checks/v2/workflow.json",
+        "repository": "fd0d382080b8a6d3c253ce5e390051c0",
+        "revision": "e839396188b3a3a93eb2fd79e6591ef99de2a829801cd29fcb80c44cbc20e4d8",
+        "sha256": "a86b12aa905007d4277213961a79c5d0ee2111a02ad525d5982fcddee3c40dc6",
+        "workflow_version": 2
+      },
+      "template": {
+        "name": "verify",
+        "skill": {
+          "entrypoint": "skills/checks/v2/SKILL.md",
+          "resources": []
+        },
+        "steps": [
+          {
+            "action": {
+              "expectations": [
+                {
+                  "path": "src/lib.rs",
+                  "sha256": "ee54963dd71aa0a4288ecbad2cf17d9aad5fb5401dc75dbba9ca2338a3c778a7"
+                }
+              ],
+              "kind": "source_paths"
+            },
+            "id": "source",
+            "needs": [],
+            "required": true
+          }
+        ],
+        "version": 1,
+        "workflow_version": 2
+      }
+    }
+  },
+  "handoff": {
+    "request": "/v1/local/skill-workflows/loop-b863061f8d326fb0e01a1e0d17054548d5e6ec726b9f2c58251c8172c2f/handoff",
+    "response": {
+      "admission": "not_assessed",
+      "command_context_bindings": [],
+      "definition": {
+        "name": "verify:v1",
+        "skill": {
+          "entrypoint": "skills/checks/v1/SKILL.md",
+          "resources": [
+            "skills/checks/v1/workflow.json"
+          ]
+        },
+        "source": {
+          "policy_epoch": 1,
+          "repository": "fd0d382080b8a6d3c253ce5e390051c0",
+          "revision": "7f15adf851036723c29facae90fc583f434074a64c85e6206b454572ca340259"
+        },
+        "steps": [
+          {
+            "action": {
+              "expectations": [
+                {
+                  "path": "src/lib.rs",
+                  "sha256": "ee54963dd71aa0a4288ecbad2cf17d9aad5fb5401dc75dbba9ca2338a3c778a7"
+                }
+              ],
+              "kind": "source_paths"
+            },
+            "id": "source",
+            "needs": [],
+            "required": true
+          }
+        ],
+        "version": 1
+      },
+      "next_action": "Inspect failed or blocked steps and omissions. Fix source or missing capabilities, checkpoint fresh bytes, and check the current Change again; this terminal run cannot resume.",
+      "run": {
+        "admission": "not_assessed",
+        "plan_digest": "sha256:43558c5d5431f2a7472a4436197de0feef2fdaeb84d7b2e0abf312bd2a115bcc",
+        "run_id": "loop-b863061f8d326fb0e01a1e0d17054548d5e6ec726b9f2c58251c8172c2f",
+        "skill_digest": "sha256:60f8bc2a030af369c7de4b974d33fc73b52f507e452cc1e1eea69d0b2e9092d3",
+        "source": {
+          "policy_epoch": 1,
+          "repository": "fd0d382080b8a6d3c253ce5e390051c0",
+          "revision": "7f15adf851036723c29facae90fc583f434074a64c85e6206b454572ca340259"
+        },
+        "state": "failed",
+        "steps": [
+          {
+            "detail": "content digest does not match for src/lib.rs",
+            "id": "source",
+            "needs": [],
+            "observations": [
+              {
+                "bytes": 37,
+                "path": "src/lib.rs",
+                "sha256": "395a6b7a3ac5abf3b3e4959f0314a122bb3a8e79f849bb56e14dd5eb0a6502a9"
+              }
+            ],
+            "required": true,
+            "state": "failed"
+          }
+        ],
+        "version": 1
+      },
+      "subject_scope": "source_revision_only"
+    }
+  }
+}

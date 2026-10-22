@@ -864,31 +864,41 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
 /* Tones */
 .tone-brand.box-badge,
 .tone-brand.event-icon,
-.tone-brand.run-icon {
+.tone-brand.run-icon,
+.tone-brand > .track-dot,
+.honesty.tone-brand > .bi {
   background: var(--hub-brand-soft);
   color: var(--hub-brand-ink);
 }
 .tone-ok.box-badge,
 .tone-ok.event-icon,
-.tone-ok.run-icon {
+.tone-ok.run-icon,
+.tone-ok > .track-dot,
+.honesty.tone-ok > .bi {
   background: var(--hub-ok-soft);
   color: var(--hub-ok);
 }
 .tone-warn.box-badge,
 .tone-warn.event-icon,
-.tone-warn.run-icon {
+.tone-warn.run-icon,
+.tone-warn > .track-dot,
+.honesty.tone-warn > .bi {
   background: var(--hub-warn-soft);
   color: var(--hub-warn);
 }
 .tone-bad.box-badge,
 .tone-bad.event-icon,
-.tone-bad.run-icon {
+.tone-bad.run-icon,
+.tone-bad > .track-dot,
+.honesty.tone-bad > .bi {
   background: var(--hub-bad-soft);
   color: var(--hub-bad);
 }
 .tone-muted.box-badge,
 .tone-muted.event-icon,
-.tone-muted.run-icon {
+.tone-muted.run-icon,
+.tone-muted > .track-dot,
+.honesty.tone-muted > .bi {
   background: var(--hub-muted-soft);
   color: var(--hub-text-2);
 }
@@ -2158,4 +2168,171 @@ a.run-row:hover {
   .box-actions { margin-left: 0; flex: 1 1 100%; min-width: 0; }
   .box-actions > .btn-group { width: 100%; flex-wrap: wrap; }
   .box-actions > .btn-group > .btn { flex: 1 1 auto; padding-inline: 6px; white-space: nowrap; }
+}
+
+/* Landed changes: the five-step track */
+.track {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 0;
+  counter-reset: none;
+}
+.track-step {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  text-align: center;
+  padding: 0 6px;
+}
+/* The rail between steps: drawn from each dot to the next, behind the dots. */
+.track-step + .track-step::before {
+  content: '';
+  position: absolute;
+  top: 19px;
+  right: calc(50% + 22px);
+  width: calc(100% - 44px);
+  height: 2px;
+  border-radius: 2px;
+  background: var(--hub-rule-strong);
+}
+.track-step.tone-ok + .track-step::before { background: color-mix(in srgb, var(--hub-ok) 45%, transparent); }
+.track-dot {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-size: 1.05rem;
+  box-shadow: 0 0 0 4px var(--hub-surface);
+}
+.track-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.track-label { font-size: 0.75rem; font-weight: 650; color: var(--hub-text-3); letter-spacing: 0.02em; }
+.track-word { font-weight: 650; font-size: 0.9rem; overflow-wrap: anywhere; }
+.tone-bad .track-word { color: var(--hub-bad); }
+.tone-warn .track-word { color: var(--hub-warn); }
+.tone-ok .track-word { color: var(--hub-ok); }
+.tone-muted .track-word { color: var(--hub-text-2); font-weight: 550; }
+.track.is-compact { grid-template-columns: repeat(5, 30px); gap: 6px; flex: none; }
+.track.is-compact .track-step { padding: 0; gap: 0; }
+.track.is-compact .track-step + .track-step::before { display: none; }
+.track.is-compact .track-dot { width: 30px; height: 30px; font-size: 0.85rem; box-shadow: none; }
+.track.is-compact .track-text { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.landed-row .run-main { min-width: 0; }
+.branch-name { font-size: 0.95em; overflow-wrap: anywhere; }
+.honesty {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-radius: 12px;
+  border: 1px solid var(--hub-rule);
+  background: var(--hub-surface);
+}
+.honesty > .bi {
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+  display: grid;
+  place-items: center;
+  flex: none;
+}
+.honesty > span { flex: 1; }
+
+/* Lookups and local pages */
+.lookup { display: flex; gap: 8px; align-items: center; }
+.lookup .form-control { max-width: 460px; }
+.lookup-2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; gap: 12px; margin-bottom: 16px; }
+.lookup-2 .form-control { max-width: none; }
+.recent { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 12px; }
+.recent-chip {
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--hub-rule-strong);
+  text-decoration: none;
+}
+.recent-chip:hover { border-color: var(--hub-brand); }
+.recipe-head { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; margin-bottom: 12px; }
+.recipe { list-style: none; margin: 0 0 12px; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.recipe-step {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: var(--hub-sunken);
+  border: 1px solid var(--hub-rule);
+}
+.recipe-icon {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  display: grid;
+  place-items: center;
+  flex: none;
+  background: var(--hub-brand-soft);
+  color: var(--hub-brand-ink);
+}
+.recipe-main { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.snaps { list-style: none; margin: 0; padding: 0; position: relative; }
+.snaps::before {
+  content: '';
+  position: absolute;
+  left: 17px;
+  top: 18px;
+  bottom: 18px;
+  width: 2px;
+  background: var(--hub-rule-strong);
+}
+.snap { position: relative; display: flex; gap: 14px; align-items: center; padding: 10px 0; }
+.snap-dot {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  flex: none;
+  background: var(--hub-brand-soft);
+  color: var(--hub-brand-ink);
+  box-shadow: 0 0 0 4px var(--hub-surface);
+  z-index: 1;
+}
+.snap.kind-check_link .snap-dot { background: var(--hub-ok-soft); color: var(--hub-ok); }
+.snap-main { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; text-decoration: none; color: var(--hub-text); padding: 6px 10px; border-radius: 10px; }
+.snap-main:hover { background: var(--hub-sunken); }
+.snap.is-picked .snap-main { background: var(--hub-brand-soft); }
+.snap-pick { display: flex; gap: 6px; align-items: center; font-size: 0.85rem; color: var(--hub-text-2); flex: none; }
+.cmd {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--hub-sunken);
+  border: 1px solid var(--hub-rule);
+}
+.cmd code { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.more-row { display: flex; gap: 12px; align-items: center; justify-content: space-between; margin-top: 12px; flex-wrap: wrap; }
+
+@container main (max-width: 720px) {
+  .track { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+  .track-step { flex-direction: row; text-align: left; gap: 12px; padding: 4px 0; }
+  .track-step + .track-step::before { top: auto; bottom: calc(100% - 4px); right: auto; left: 19px; width: 2px; height: 12px; }
+  .lookup-2 { grid-template-columns: minmax(0, 1fr); }
+  .landed-row { flex-wrap: wrap; }
+  .landed-row .track.is-compact { order: 3; }
+}
+
+/* Run ids, change ids and paths are long unbroken strings: let them wrap instead of widening the page. */
+.snap-main,
+.recipe-head,
+.recent-chip,
+.box-title,
+.run-main code {
+  overflow-wrap: anywhere;
+  min-width: 0;
 }

@@ -1,5 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
-import { AGENT_TOKEN, READ_TOKEN, checkpoint, freshHandoff, hubReachable, marker, readWork, startWork } from '../hub.ts'
+import { AGENT_TOKEN, READ_TOKEN, checkpoint, freshHandoff, hubReachable, marker, readWork, seededPublication, startWork } from '../hub.ts'
 
 test.beforeAll(async () => {
   test.skip(!(await hubReachable()), 'Start the dev hub first: ui/dev-seed/start.sh (127.0.0.1:7332).')
@@ -269,4 +269,69 @@ test('a malformed workflow address shows the run list instead of a blank page, e
   await expect(crumbs(page).locator('[aria-current="page"]')).toHaveText(/Workflows/)
   await expect(page.getByRole('alert').filter({ hasText: 'This page hit a problem' })).toHaveCount(0)
   expect(errors).toEqual([])
+})
+
+// ---------- New features: Landed changes (#62), Templates (#64), Timeline (#67)
+
+test('the rail groups the local pages under "This computer", each with its question and breadcrumb', async ({ page }) => {
+  await signIn(page)
+  await expect(rail(page).getByText('This computer', { exact: true })).toBeVisible()
+  for (const [label, question] of [
+    ['Landed changes', 'Did our changes land, and did checks pass after?'],
+    ['Templates', 'Which workflow recipes can agents reuse?'],
+    ['Timeline', 'What did this workspace look like earlier?'],
+  ] as const) {
+    await rail(page).getByRole('link', { name: new RegExp(`^${label}(?= )`) }).click()
+    await expect(crumbs(page).locator('[aria-current="page"]')).toContainText(label)
+    await expect(main(page).getByRole('heading', { level: 1 })).toHaveText(question)
+  }
+})
+
+test('Landed changes shows live changes to a read-only token, or says plainly the hub won’t', async ({ page }) => {
+  // Hubs before the read-only publication routes refuse the status page's token; newer ones list
+  // changes. The page must handle both, and must never ask for an agent token.
+  const probe = await page.request.get(`/v1/hub/repos/${encodeURIComponent('counterbranch/agentscm')}/publications?limit=1`, { headers: { Authorization: `Bearer ${READ_TOKEN}` } })
+  const readable = probe.ok()
+  const failedCi = seededPublication('agent/rune/schema-migration-lock')
+  test.skip(!failedCi, 'No seeded publications in ui/dev-seed/.data/publications.txt')
+  await signIn(page, '#landed')
+  if (readable) {
+    await expect(main(page).getByRole('heading', { level: 1 })).toHaveText('Did our changes land, and did checks pass after?')
+    await expect(main(page)).toContainText('3 of 7 recent changes landed')
+    await expect(main(page)).toContainText('agent/rune/schema-migration-lock')
+    await page.evaluate((h) => (window.location.hash = h), `#landed/${failedCi}`)
+    const track = main(page).locator('.box').filter({ hasText: 'How far it got' })
+    await expect(track).toContainText('Opened #483')
+    await expect(track).toContainText('Failed')
+    await expect(main(page).getByText('Partly checked', { exact: false }).first()).toBeVisible()
+  } else {
+    expect(probe.status()).toBe(403)
+    await expect(main(page)).toContainText(/needs a newer hub/)
+    await page.evaluate((h) => (window.location.hash = h), `#landed/${failedCi}`)
+    await expect(main(page).getByText('Landed changes aren’t readable here yet')).toBeVisible()
+  }
+  await expect(page.getByLabel(/token/i)).toHaveCount(0)
+})
+
+test('Templates and Timeline read this computer through the dev proxy: live when serve answers, labelled preview when not', async ({ page }) => {
+  // The local read API may or may not be running; the page must say which, and work either way.
+  const probe = await page.request.get('/v1/local/workspace/timeline?limit=1').catch(() => null)
+  const live = probe !== null && probe.ok() && (probe.headers()['content-type'] ?? '').includes('json')
+  const banner = (scope: ReturnType<typeof main>) => scope.getByText(/Preview data/)
+  await signIn(page, '#timeline')
+  await expect(main(page).getByRole('heading', { name: 'Saved moments' })).toBeVisible()
+  if (live) await expect(banner(main(page))).toHaveCount(0)
+  else await expect(banner(main(page))).toBeVisible()
+  await page.getByLabel('Pick #3 to compare').check()
+  await page.getByLabel('Pick #2 to compare').check()
+  await page.getByRole('link', { name: /Compare these two/ }).click()
+  await expect(crumbs(page).locator('[aria-current="page"]')).toContainText('Compare #2 and #3')
+  await expect(main(page).getByText(/What changed from #2 to #3/)).toBeVisible()
+  await page.evaluate(() => (window.location.hash = '#templates'))
+  await page.getByLabel('Change ID').fill('other-change')
+  await page.getByLabel('Template file').fill('skills/checks/v2/workflow.json')
+  await page.getByRole('button', { name: /Open/ }).first().click()
+  await expect(main(page).getByText('Check this path is in the change: src/lib.rs')).toBeVisible()
+  if (live) await expect(banner(main(page))).toHaveCount(0)
+  else await expect(banner(main(page))).toBeVisible()
 })

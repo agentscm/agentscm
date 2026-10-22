@@ -181,3 +181,12 @@ export function Avatar({ name, size = 32 }: { name: string; size?: number }) {
     </span>
   )
 }
+
+/** Shown whenever a local-feature page is rendering fixtures instead of a live local read API. */
+export function PreviewBanner({ reason }: { reason?: string }) {
+  return (
+    <Notice tone="brand" icon="easel" title="Preview data — the local read API isn’t connected yet">
+      {reason ? `${reason} ` : ''}Everything below is sample data so you can see how this page works. Set the local server address in Settings once <code>agentscm serve</code> offers these reads.
+    </Notice>
+  )
+}
