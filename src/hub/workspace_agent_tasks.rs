@@ -21,7 +21,7 @@ const AGENT_TASK_ENVELOPE_HEADROOM_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_AGENT_TASK_REQUEST_BYTES: usize =
     crate::skill_workflow::task_contracts::MAX_WIRE_BYTES + AGENT_TASK_ENVELOPE_HEADROOM_BYTES;
 
-struct Clock;
+pub(super) struct Clock;
 
 impl TaskClock for Clock {
     fn now_ms(&self) -> crate::Result<u64> {
@@ -35,7 +35,7 @@ impl TaskClock for Clock {
     }
 }
 
-struct WorkspaceGuard<'a> {
+pub(super) struct WorkspaceGuard<'a> {
     service: &'a ExecutionService,
     actor: &'a WorkspaceActor,
     repository: &'a str,
@@ -415,14 +415,18 @@ fn task<T>(result: crate::Result<T>) -> Result<T> {
 }
 
 impl ExecutionService {
-    fn agent_task_profile(&self, repository: &str, profile: &str) -> Result<AgentTaskProfile> {
+    pub(super) fn agent_task_profile(
+        &self,
+        repository: &str,
+        profile: &str,
+    ) -> Result<AgentTaskProfile> {
         self.agent_task_profiles
             .get(&(repository.into(), profile.into()))
             .cloned()
             .ok_or(HubError::Unauthorized)
     }
 
-    fn task_parts<'a>(
+    pub(super) fn task_parts<'a>(
         &'a self,
         actor: &'a WorkspaceActor,
         repository: &'a str,

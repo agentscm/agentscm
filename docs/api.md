@@ -86,6 +86,12 @@ user. Only configure a repository whose writers you trust that far. See
 [collisions](collisions.md) for the profile and its limits. The result is a
 warning, never a lock or a native record.
 
+## Workspace attached-candidate preparation
+
+With an operator-pinned `attached_publication_profiles` entry, the authenticated workspace Hub exposes `POST /v1/hub/workspace/repositories/{repository}/profiles/{profile}/attachments/{attachment}/publication` and read-only `POST .../publication/status`. Prepare accepts only `request_id`, `expected_generation`, an exact `RunSubject`, and `CommitMetadata`; status accepts only `request_id`. The sibling `/publication/mcp` endpoint exposes the same two operations. The Hub freshly checks the configured owner, repository-scoped Contributor agent credential, attachment identity, live imported-origin grants, exact native subject, attached Git source and owned Mirror before retaining a candidate through the existing Mirror prepare journal.
+
+This phase prepares an unlanded local candidate only. It does not push a branch, create a pull request, post forge status, change the native target, or expose configured paths, endpoints, refs, or credential material through request fields.
+
 ## Hub publication forge check
 
 This is the Hub, not `serve`. `GET /v1/hub/repos/{repo}/publications/{id}` adds a

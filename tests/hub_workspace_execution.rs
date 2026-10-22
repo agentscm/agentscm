@@ -19,8 +19,11 @@ use agentscm::execution::{
     COMMAND_CAPABILITY, COMMAND_EVIDENCE, CommandRecipe, ExecutionLimits, OciBackend,
     SyscallPolicy, environment_digest,
 };
+use agentscm::git_export::{CommitMetadata, Mirror};
 use agentscm::hub::store::{mint_agent_token, mint_bound_agent_token};
-use agentscm::hub::workspace_execution::{AgentTaskProfile, ExecutionConfig, ExecutionService};
+use agentscm::hub::workspace_execution::{
+    AgentTaskProfile, AttachedPublicationProfile, ExecutionConfig, ExecutionService,
+};
 use agentscm::model::FileChange;
 use agentscm::skill_workflow::{
     self, CollectorPayload, CollectorProfile, CollectorProfileAction, CriterionOutcome,
@@ -66,6 +69,12 @@ fn git(dir: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap().trim().into()
+}
+
+fn json_request(builder: reqwest::RequestBuilder, value: &Value) -> reqwest::RequestBuilder {
+    builder
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(serde_json::to_vec(value).unwrap())
 }
 
 fn isolated_git(repo: &Path) -> PathBuf {
@@ -204,6 +213,7 @@ async fn execution_env(
         let service = ExecutionService::open(
             &queue,
             ExecutionConfig {
+                attached_publication_profiles: vec![],
                 version: 1,
                 source_profiles: vec![],
                 agent_task_profiles: vec![],
@@ -241,6 +251,7 @@ async fn agent_only_env(
             ExecutionService::open(
                 &queue,
                 ExecutionConfig {
+                    attached_publication_profiles: vec![],
                     version: 1,
                     profiles: vec![],
                     source_profiles: vec![],
@@ -3128,6 +3139,279 @@ async fn agent_owned_transport_lifecycle(attached: bool) {
         .await;
     assert_eq!(agent_integration.0, 403, "{agent_integration:?}");
     if let Some((state, _, concurrent_context)) = &attached_current {
+        let mirror_path = root.path().join("hub-candidate.git");
+        Mirror::initialize_with_seed(
+            Path::new(&state.git),
+            &mirror_path,
+            &native.profile.native_repository,
+            &state.target,
+            Path::new(&state.worktree),
+            &state.target_commit,
+        )
+        .unwrap();
+        let owner_user = env
+            .store
+            .list_users()
+            .unwrap()
+            .into_iter()
+            .find(|user| user.identity.user_id == 202)
+            .unwrap();
+        let publication_profile = AttachedPublicationProfile {
+            repository_id: native.profile.repository_id.clone(),
+            profile_id: native.profile.profile_id.clone(),
+            attachment_id: state.id.clone(),
+            owner_id: owner_user.id.clone(),
+            git: PathBuf::from(&state.git),
+            worktree: PathBuf::from(&state.worktree),
+            git_common_dir: PathBuf::from(&state.git_common_dir),
+            git_dir: PathBuf::from(&state.git_dir),
+            index: PathBuf::from(&state.index),
+            mirror: mirror_path,
+            endpoint: state.remote_url.clone(),
+            target: state.target.clone(),
+            output: state.output.clone(),
+            credential_file: None,
+            ca_file: None,
+        };
+        let publication_service = Arc::new(
+            ExecutionService::open(
+                &root.path().join("publication.sqlite"),
+                ExecutionConfig {
+                    version: 1,
+                    profiles: vec![],
+                    source_profiles: vec![],
+                    agent_task_profiles: vec![AgentTaskProfile {
+                        repository_id: native.profile.repository_id.clone(),
+                        profile_id: native.profile.profile_id.clone(),
+                        native_repository: native.profile.native_repository.clone(),
+                        data_dir: native.profile.data_dir.clone(),
+                        target: native.profile.target.clone(),
+                        requirement_digest: native.profile.requirement_digest.clone(),
+                        publish_forge_status: false,
+                    }],
+                    attached_publication_profiles: vec![publication_profile],
+                },
+                env.workspace.clone(),
+            )
+            .unwrap(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let publication_base = format!("http://{}", listener.local_addr().unwrap());
+        let publication_app = agentscm::hub::router(
+            agentscm::hub::HubState::new(
+                env.store.clone(),
+                Arc::new(
+                    agentscm::backend::LocalBackend::open(root.path().join("publication-objects"))
+                        .unwrap(),
+                ),
+            )
+            .with_workspace(env.workspace.clone())
+            .with_workspace_execution(publication_service),
+        );
+        let publication_server = tokio::spawn(async move {
+            axum::serve(listener, publication_app).await.unwrap();
+        });
+        let path = format!(
+            "{publication_base}{REPO}/profiles/checks/attachments/{}/publication",
+            state.id
+        );
+        let prepare = json!({
+            "request_id":"prepare-imported-receipt",
+            "expected_generation":state.generation,
+            "subject":native.subject,
+            "metadata":CommitMetadata { name:"Synthetic".into(), email:"synthetic@example.invalid".into(), timestamp:1780000001, message:"Prepare imported receipt".into() }
+        });
+        let first = json_request(env.client.post(&path).bearer_auth(&token), &prepare)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            first.status().as_u16(),
+            200,
+            "{}",
+            first.text().await.unwrap()
+        );
+        let first: Value = serde_json::from_slice(&first.bytes().await.unwrap()).unwrap();
+        assert_eq!(first["currentness"], "current_at_prepare");
+        let encoded = first.to_string();
+        for private in ["endpoint", "worktree", "credential", "ca_file"] {
+            assert!(!encoded.contains(private), "{encoded}");
+        }
+        for private in [
+            &state.worktree,
+            &state.git_dir,
+            &state.git_common_dir,
+            &state.index,
+        ] {
+            assert!(!encoded.contains(private), "{encoded}");
+        }
+        let exact = json_request(env.client.post(&path).bearer_auth(&token), &prepare)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(exact.status().as_u16(), 200);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&exact.bytes().await.unwrap()).unwrap(),
+            first
+        );
+        let mut changed = prepare.clone();
+        changed["expected_generation"] = json!(state.generation + 1);
+        assert_eq!(
+            json_request(env.client.post(&path).bearer_auth(&token), &changed)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            409
+        );
+        let status_path = format!("{path}/status");
+        let status_request = json!({"request_id":"prepare-imported-receipt"});
+        let status = json_request(
+            env.client.post(&status_path).bearer_auth(&token),
+            &status_request,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(status.status().as_u16(), 200);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&status.bytes().await.unwrap()).unwrap()["candidate"],
+            first["candidate"]
+        );
+        let (_, read_only, _) = mint_bound_agent_token(
+            &*env.store,
+            &owner_user.id,
+            "publication-read-only",
+            "synthetic/project",
+            1,
+            3600,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            json_request(
+                env.client.post(&path).bearer_auth(read_only.expose()),
+                &prepare
+            )
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+            403
+        );
+        let hub_owner = env
+            .store
+            .list_users()
+            .unwrap()
+            .into_iter()
+            .find(|user| user.identity.user_id == 101)
+            .unwrap();
+        let (_, wrong_owner) = mint_agent_token(
+            &*env.store,
+            &hub_owner.id,
+            "publication-wrong-owner",
+            "synthetic/project",
+            3600,
+        )
+        .unwrap();
+        assert_eq!(
+            json_request(
+                env.client.post(&path).bearer_auth(wrong_owner.expose()),
+                &prepare
+            )
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+            401
+        );
+        let reader_only = env.member(
+            202,
+            &[Role::Reader],
+            true,
+            env.workspace.settings().unwrap().generation,
+            "publication-remove-contributor",
+        );
+        assert_eq!(
+            env.request(
+                Method::PUT,
+                "/v1/hub/workspace/members",
+                Some(&owner),
+                Some(owner_csrf),
+                None,
+                Some(reader_only)
+            )
+            .await
+            .0,
+            200
+        );
+        let mut new_request = prepare.clone();
+        new_request["request_id"] = json!("prepare-without-contributor");
+        let (_, reader_token) = mint_agent_token(
+            &*env.store,
+            &owner_user.id,
+            "publication-reader-role",
+            "synthetic/project",
+            3600,
+        )
+        .unwrap();
+        assert_eq!(
+            json_request(
+                env.client.post(&path).bearer_auth(reader_token.expose()),
+                &new_request,
+            )
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+            409
+        );
+        let regrant = env.member(
+            202,
+            &[Role::Reader, Role::Contributor],
+            true,
+            env.workspace.settings().unwrap().generation,
+            "publication-regrant-contributor",
+        );
+        assert_eq!(
+            env.request(
+                Method::PUT,
+                "/v1/hub/workspace/members",
+                Some(&owner),
+                Some(owner_csrf),
+                None,
+                Some(regrant)
+            )
+            .await
+            .0,
+            200
+        );
+        let (_, fresh_token) = mint_agent_token(
+            &*env.store,
+            &owner_user.id,
+            "publication-fresh-actor",
+            "synthetic/project",
+            3600,
+        )
+        .unwrap();
+        new_request["request_id"] = json!("prepare-with-revoked-origin");
+        assert_eq!(
+            json_request(
+                env.client.post(&path).bearer_auth(fresh_token.expose()),
+                &new_request
+            )
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+            409
+        );
+        publication_server.abort();
         assert_attached_publication_boundary(&native, state);
         let (_, _, contributor_b, _, attachments, _, attached_b) = git_fixture.as_ref().unwrap();
         assert_eq!(

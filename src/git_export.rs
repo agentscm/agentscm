@@ -1079,6 +1079,33 @@ impl Mirror {
         Ok(Some(request))
     }
 
+    /// Read a retained fixed prepare request without accepting new caller-controlled inputs.
+    pub fn retained_candidate_operation(
+        &self,
+        operation: &str,
+    ) -> Result<Option<CandidateExportRequest>> {
+        remote::validate_id(operation)?;
+        self.validate()?;
+        let present: bool = self.journal.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='candidate_operations' AND type='table')", [], |r| r.get(0))?;
+        if !present {
+            return Ok(None);
+        }
+        let row: Option<Vec<u8>> = self.journal.query_row(
+            "SELECT CASE WHEN typeof(record)='blob' AND octet_length(record)<=65536 THEN record END FROM candidate_operations WHERE id=?1",
+            [operation], |r| r.get(0),
+        ).optional()?;
+        let Some(bytes) = row else {
+            return Ok(None);
+        };
+        let (stored, _, request): (String, serde_json::Value, CandidateExportRequest) =
+            serde_json::from_slice(&bytes)?;
+        if stored != operation {
+            return Err(Error::Invalid("prepare row key mismatch".into()));
+        }
+        validate_candidate_request(&request, &self.owner)?;
+        Ok(Some(request))
+    }
+
     pub fn reserve_candidate_operation(
         &self,
         operation: &str,

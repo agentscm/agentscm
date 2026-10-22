@@ -43,9 +43,11 @@ pub struct ExecutionConfig {
     pub source_profiles: Vec<source::SourceProfile>,
     #[serde(default)]
     pub agent_task_profiles: Vec<AgentTaskProfile>,
+    #[serde(default)]
+    pub attached_publication_profiles: Vec<AttachedPublicationProfile>,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentTaskProfile {
     pub repository_id: String,
@@ -57,6 +59,26 @@ pub struct AgentTaskProfile {
     /// Off by default: the Hub publishes a forge commit status for this profile only when set.
     #[serde(default)]
     pub publish_forge_status: bool,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttachedPublicationProfile {
+    pub repository_id: String,
+    pub profile_id: String,
+    pub attachment_id: String,
+    pub owner_id: String,
+    pub git: PathBuf,
+    pub worktree: PathBuf,
+    pub git_common_dir: PathBuf,
+    pub git_dir: PathBuf,
+    pub index: PathBuf,
+    pub mirror: PathBuf,
+    pub endpoint: String,
+    pub target: String,
+    pub output: String,
+    pub credential_file: Option<PathBuf>,
+    pub ca_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -87,6 +109,89 @@ impl ExecutionConfig {
         serde_json::from_slice(&bytes)
             .map_err(|_| HubError::Invalid("invalid execution configuration".into()))
     }
+}
+
+fn validate_attached_publication_profile(
+    profile: &AttachedPublicationProfile,
+    task: &AgentTaskProfile,
+) -> Result<()> {
+    use crate::git_export::remote::{Endpoint, HttpsTrust};
+    if profile.target != task.target
+        || profile.output == profile.target
+        || !crate::hub::github::valid_ref_name(&profile.output)
+        || [
+            &profile.git,
+            &profile.worktree,
+            &profile.git_common_dir,
+            &profile.git_dir,
+            &profile.index,
+            &profile.mirror,
+        ]
+        .iter()
+        .any(|path| !path.is_absolute())
+    {
+        return Err(HubError::Invalid(
+            "invalid attached publication identity".into(),
+        ));
+    }
+    if profile.endpoint.starts_with("https://") {
+        Endpoint::Https {
+            url: profile.endpoint.clone(),
+            trust: HttpsTrust::System,
+        }
+        .validate()?;
+    } else if !Path::new(&profile.endpoint).is_absolute() {
+        return Err(HubError::Invalid(
+            "attached publication endpoint must be canonical HTTPS or absolute local".into(),
+        ));
+    }
+    if profile.endpoint.len() > 4096 || profile.endpoint.chars().any(char::is_control) {
+        return Err(HubError::Invalid(
+            "invalid attached publication endpoint".into(),
+        ));
+    }
+    if let Some(path) = &profile.credential_file {
+        if !path.is_absolute() {
+            return Err(HubError::Invalid("credential path must be absolute".into()));
+        }
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(HubError::Invalid(
+                "credential must be an owner-private regular file".into(),
+            ));
+        }
+    }
+    if let Some(path) = &profile.ca_file {
+        if !path.is_absolute() || !fs::symlink_metadata(path)?.is_file() {
+            return Err(HubError::Invalid(
+                "CA file must be an absolute regular file".into(),
+            ));
+        }
+        crate::git_export::remote::network::trust_digest(path)?;
+    }
+    let state = crate::attached_worktree::AttachmentJournal::open_existing(
+        &task.data_dir,
+        &task.native_repository,
+    )?
+    .state(&profile.attachment_id)?;
+    if state.git != profile.git.to_string_lossy()
+        || state.worktree != profile.worktree.to_string_lossy()
+        || state.git_common_dir != profile.git_common_dir.to_string_lossy()
+        || state.git_dir != profile.git_dir.to_string_lossy()
+        || state.index != profile.index.to_string_lossy()
+        || state.remote_url != profile.endpoint
+        || state.target != profile.target
+        || state.output != profile.output
+    {
+        return Err(HubError::Invalid(
+            "attached publication configuration differs from retained attachment".into(),
+        ));
+    }
+    crate::git_export::Mirror::open(&profile.git, &profile.mirror, &task.native_repository)?;
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -177,6 +282,8 @@ pub struct ExecutionService {
     queue: Mutex<Queue>,
     profiles: BTreeMap<(String, String), ExecutionProfile>,
     pub(crate) agent_task_profiles: BTreeMap<(String, String), AgentTaskProfile>,
+    pub(crate) attached_publication_profiles:
+        BTreeMap<(String, String, String), AttachedPublicationProfile>,
     source_profiles: BTreeMap<(String, String), source::SourceProfile>,
     source_worker: Mutex<()>,
     pub(crate) workspace: Arc<Workspace>,
@@ -195,6 +302,7 @@ impl ExecutionService {
             || config.profiles.len() > MAX_PROFILES
             || config.source_profiles.len() > MAX_PROFILES
             || config.agent_task_profiles.len() > MAX_PROFILES
+            || config.attached_publication_profiles.len() > MAX_PROFILES
         {
             return Err(HubError::Invalid(
                 "unsupported execution configuration".into(),
@@ -270,6 +378,29 @@ impl ExecutionService {
                 ));
             }
         }
+        let mut attached_publication_profiles = BTreeMap::new();
+        for profile in config.attached_publication_profiles {
+            super::store::validate_repository(&profile.repository_id)?;
+            validate_id(&profile.profile_id)?;
+            validate_id(&profile.attachment_id)?;
+            validate_id(&profile.owner_id)?;
+            let task = agent_task_profiles
+                .get(&(profile.repository_id.clone(), profile.profile_id.clone()))
+                .ok_or_else(|| {
+                    HubError::Invalid("attached publication has no agent task profile".into())
+                })?;
+            validate_attached_publication_profile(&profile, task)?;
+            let key = (
+                profile.repository_id.clone(),
+                profile.profile_id.clone(),
+                profile.attachment_id.clone(),
+            );
+            if attached_publication_profiles.insert(key, profile).is_some() {
+                return Err(HubError::Invalid(
+                    "duplicate attached publication profile".into(),
+                ));
+            }
+        }
         let mut source_profiles = BTreeMap::new();
         for source in config.source_profiles {
             let key = (source.repository_id.clone(), source.profile_id.clone());
@@ -331,6 +462,7 @@ impl ExecutionService {
             queue: Mutex::new(queue),
             profiles,
             agent_task_profiles,
+            attached_publication_profiles,
             source_profiles,
             source_worker: Mutex::new(()),
             workspace,
