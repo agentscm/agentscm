@@ -59,5 +59,3 @@ states are tested with fixture data instead, through a stubbed fetch that answer
 
 No end-to-end browser test covers the signed-in workspace, because the dev hub has no forge
 sign-in; those flows are covered by the fixture tests above.
-
-See `docs/mcp-ui-integration.md` for the proposed MCP Apps / WebMCP integration.
