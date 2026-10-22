@@ -5,9 +5,11 @@
 mod workspace_hub;
 
 use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fs, process::Command};
 
+use agentscm::attached_worktree::{AttachRequest, AttachmentJournal, SourceMode};
 use agentscm::authority::Authority;
 use agentscm::checks::SourcePathExpectation;
 use agentscm::context::{
@@ -35,6 +37,153 @@ use serde_json::{Value, json};
 use workspace_hub::{Env, NativeSourceProfile, native_source_profile};
 
 const REPO: &str = "/v1/hub/workspace/repositories/synthetic%2Fproject";
+
+fn git_path() -> PathBuf {
+    PathBuf::from(std::env::var("AGENTSCM_TEST_GIT").unwrap_or_else(|_| "/usr/bin/git".into()))
+}
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new(git_path())
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .current_dir(dir)
+        .args([
+            "-c",
+            "user.name=synthetic contributor",
+            "-c",
+            "user.email=contributor@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().into()
+}
+
+fn isolated_git(repo: &Path) -> PathBuf {
+    let common = PathBuf::from(git(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    ));
+    let wrapper = common.join("synthetic-git");
+    let executable = git_path().to_string_lossy().replace('\'', "'\\''");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexport GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1\nexec '{executable}' \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+    wrapper
+}
+
+fn attachment_request(worktree: &Path, actor: &str, output: &str, paths: &[&str]) -> AttachRequest {
+    AttachRequest {
+        git: isolated_git(worktree),
+        worktree: worktree.into(),
+        actor: actor.into(),
+        remote: "origin".into(),
+        target: "main".into(),
+        output: output.into(),
+        source: SourceMode::Worktree,
+        paths: paths.iter().map(|path| (*path).into()).collect(),
+    }
+}
+
+/// Probe the existing publication boundaries without inventing a published candidate or
+/// replacing the imported receipt with a controller-native workflow run.
+fn assert_attached_publication_boundary(
+    native: &NativeSourceProfile,
+    state: &agentscm::attached_worktree::AttachmentState,
+) {
+    use agentscm::candidate::CandidateSubject;
+    use agentscm::hub::forge_check::{NativeState, native_state};
+
+    let authority = Authority::open_read_only(&native.profile.data_dir).unwrap();
+    let expected =
+        "requires a successful workflow for the exact current revision and review context";
+    let error = authority
+        .qualify_draft_candidate(&native.context.change)
+        .unwrap_err();
+    assert!(error.to_string().contains(expected), "{error}");
+    let mirror = native.profile.data_dir.join("candidate.git");
+    let output = Command::new(env!("CARGO_BIN_EXE_agentscm"))
+        .arg("--data-dir")
+        .arg(&native.profile.data_dir)
+        .args([
+            "attached-worktree",
+            "prepare",
+            "--id",
+            &state.id,
+            "--expected-generation",
+            &state.generation.to_string(),
+            "--mirror",
+        ])
+        .arg(&mirror)
+        .args([
+            "--operation-id",
+            "prepare-imported-current",
+            "--name",
+            "Synthetic",
+            "--email",
+            "synthetic@example.invalid",
+            "--timestamp",
+            "1780000000",
+            "--message",
+            "Current imported check",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(expected), "{stderr}");
+
+    let engine = Engine::open(&native.profile.data_dir).unwrap();
+    let journal =
+        AttachmentJournal::open_existing(&native.profile.data_dir, &state.repository).unwrap();
+    let comparison = journal
+        .validate_current(&engine, &state.id, state.generation)
+        .unwrap();
+    let mut subject = CandidateSubject {
+        id: String::new(),
+        attachment: state.id.clone(),
+        endpoint: state.remote_url.clone(),
+        output: state.output.clone(),
+        change: native.context.change.clone(),
+        change_version: native.subject.change_version,
+        context_digest: native.subject.context_digest.clone(),
+        policy_epoch: native.context.policy_epoch,
+        revision: native.subject.revision.clone(),
+        target: state.target.clone(),
+        baseline_commit: state.target_commit.clone(),
+        parent_commit: state.target_commit.clone(),
+        source_commit: state.head_commit.clone(),
+        source_fingerprint: state.source_fingerprint.clone(),
+        comparison_fingerprint: comparison,
+    };
+    subject.id = subject.canonical_id().unwrap();
+    let profile = AgentTaskProfile {
+        repository_id: native.profile.repository_id.clone(),
+        profile_id: native.profile.profile_id.clone(),
+        native_repository: native.profile.native_repository.clone(),
+        data_dir: native.profile.data_dir.clone(),
+        target: native.profile.target.clone(),
+        requirement_digest: native.profile.requirement_digest.clone(),
+        publish_forge_status: true,
+    };
+    assert_eq!(native_state(&profile, &subject), NativeState::NotQualified);
+    assert_eq!(journal.state(&state.id).unwrap(), *state);
+    assert!(authority.target("main").unwrap().is_none());
+}
 
 mod fake_docker {
     include!(concat!(
@@ -1087,6 +1236,15 @@ async fn public_cli_uses_the_real_authenticated_task_route_without_server_execut
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_owned_transport_failure_revision_success_and_native_landing_are_end_to_end() {
+    agent_owned_transport_lifecycle(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_git_worktrees_qualify_but_imported_receipts_cannot_publish_candidates() {
+    agent_owned_transport_lifecycle(true).await;
+}
+
+async fn agent_owned_transport_lifecycle(attached: bool) {
     let root = tempfile::tempdir().unwrap();
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let docker_home = root.path().join("fake-docker-home");
@@ -1110,6 +1268,137 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
     let _socket = std::os::unix::net::UnixListener::bind(&docker_socket).unwrap();
     let (mut native, collector_profile) =
         source_command_profile(root.path(), &docker, &docker_socket, &docker_config);
+    let engine = Engine::open(&native.profile.data_dir).unwrap();
+    let git_fixture = if attached {
+        let git_repository = root.path().join("git-repository");
+        let contributor_a = root.path().join("contributor-a");
+        let contributor_b = root.path().join("contributor-b");
+        let target_writer = root.path().join("target-writer");
+        fs::create_dir(&git_repository).unwrap();
+        git(&git_repository, &["init", "-q"]);
+        git(&git_repository, &["config", "core.excludesFile", ""]);
+        for (path, contents) in [
+            (
+                "skills/check/SKILL.md",
+                b"# Run the pinned local check\n".as_slice(),
+            ),
+            (
+                "src/example.rs",
+                b"fn example() -> bool { false }\n".as_slice(),
+            ),
+        ] {
+            let full = git_repository.join(path);
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(full, contents).unwrap();
+        }
+        let recipe = match &collector_profile.action {
+            CollectorProfileAction::Command { recipe, .. } => recipe,
+            _ => unreachable!(),
+        };
+        fs::write(
+            git_repository.join("skills/check/runner.json"),
+            serde_json::to_vec(recipe).unwrap(),
+        )
+        .unwrap();
+        git(&git_repository, &["add", "."]);
+        git(&git_repository, &["commit", "-q", "-m", "synthetic base"]);
+        git(
+            &git_repository,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/synthetic/project.git",
+            ],
+        );
+        git(
+            &git_repository,
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        git(
+            &git_repository,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "contributor-a",
+                contributor_a.to_str().unwrap(),
+            ],
+        );
+        git(
+            &git_repository,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "contributor-b",
+                contributor_b.to_str().unwrap(),
+            ],
+        );
+        git(
+            &git_repository,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "target-writer",
+                target_writer.to_str().unwrap(),
+            ],
+        );
+        let engine = Engine::open(&native.profile.data_dir).unwrap();
+        let attachments =
+            AttachmentJournal::open(&native.profile.data_dir, &native.context.change.repository)
+                .unwrap();
+        let attached_a = attachments
+            .attach(
+                &engine,
+                "attach-contributor-a",
+                &attachment_request(
+                    &contributor_a,
+                    "forge-user-202",
+                    "agents/contributor-a",
+                    &["src/example.rs"],
+                ),
+            )
+            .unwrap();
+        let attached_b = attachments
+            .attach(
+                &engine,
+                "attach-contributor-b",
+                &attachment_request(
+                    &contributor_b,
+                    "forge-user-303",
+                    "agents/contributor-b",
+                    &["notes/contributor-b.txt"],
+                ),
+            )
+            .unwrap();
+        assert_eq!(attached_a.candidate_revision, native.subject.revision);
+        assert_eq!(attached_b.candidate_revision, native.subject.revision);
+        let attached_a = attachments
+            .bind_context(
+                &Authority::open(&native.profile.data_dir).unwrap(),
+                "bind-contributor-a-initial",
+                &attached_a.id,
+                attached_a.generation,
+                &native.context.change,
+            )
+            .unwrap();
+        Some((
+            git_repository,
+            contributor_a,
+            contributor_b,
+            target_writer,
+            attachments,
+            attached_a,
+            attached_b,
+        ))
+    } else {
+        None
+    };
     let (env, service) = agent_only_env(root.path(), &native).await;
     assert!(
         !service.server_execution_enabled(),
@@ -1119,12 +1408,16 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
     let (_, owner) = env.signin(101).await;
     let owner_session = env.session(&owner).await;
     let owner_csrf = owner_session["csrf_token"].as_str().unwrap();
-    let roles = [
-        Role::Reader,
-        Role::Contributor,
-        Role::Reviewer,
-        Role::Integrator,
-    ];
+    let roles = if attached {
+        vec![Role::Reader, Role::Contributor]
+    } else {
+        vec![
+            Role::Reader,
+            Role::Contributor,
+            Role::Reviewer,
+            Role::Integrator,
+        ]
+    };
     let grant = env.member(
         202,
         &roles,
@@ -1145,6 +1438,79 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
         .0,
         200
     );
+    let reviewer_grant = env.member(
+        404,
+        &[Role::Reader, Role::Reviewer],
+        true,
+        env.workspace.settings().unwrap().generation,
+        "grant-independent-native-reviewer",
+    );
+    assert_eq!(
+        env.request(
+            Method::PUT,
+            "/v1/hub/workspace/members",
+            Some(&owner),
+            Some(owner_csrf),
+            None,
+            Some(reviewer_grant),
+        )
+        .await
+        .0,
+        200
+    );
+    let integrator_grant = env.member(
+        505,
+        &[Role::Reader, Role::Integrator],
+        true,
+        env.workspace.settings().unwrap().generation,
+        "grant-independent-native-integrator",
+    );
+    assert_eq!(
+        env.request(
+            Method::PUT,
+            "/v1/hub/workspace/members",
+            Some(&owner),
+            Some(owner_csrf),
+            None,
+            Some(integrator_grant),
+        )
+        .await
+        .0,
+        200
+    );
+    let (_, reviewer) = env.signin(404).await;
+    let reviewer_session = env.session(&reviewer).await;
+    let (_, integrator) = env.signin(505).await;
+    let integrator_session = env.session(&integrator).await;
+    let integrate_path = format!("{REPO}/profiles/checks/integrate");
+
+    if attached {
+        let grant = env.member(
+            303,
+            &[Role::Reader, Role::Contributor],
+            true,
+            env.workspace.settings().unwrap().generation,
+            "second-contributor",
+        );
+        assert_eq!(
+            env.request(
+                Method::PUT,
+                "/v1/hub/workspace/members",
+                Some(&owner),
+                Some(owner_csrf),
+                None,
+                Some(grant)
+            )
+            .await
+            .0,
+            200
+        );
+        let (_, second) = env.signin(303).await;
+        assert_ne!(
+            env.session(&second).await["actor"],
+            reviewer_session["actor"]
+        );
+    }
     let (_, member) = env.signin(202).await;
     let mut member_session = env.session(&member).await;
     let user = env
@@ -1754,7 +2120,7 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
             })),
         )
         .await;
-    assert_eq!(blocked.0, 409, "{blocked:?}");
+    assert_eq!(blocked.0, if attached { 403 } else { 409 }, "{blocked:?}");
 
     let retried = cli(
         "retry-upload",
@@ -1837,40 +2203,200 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
     fs::write(&token_file, &token).unwrap();
     fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600)).unwrap();
 
-    let engine = Engine::open(&native.profile.data_dir).unwrap();
-    let CollectorProfileAction::Command { recipe, .. } = &collector_profile.action else {
-        unreachable!()
-    };
-    let next_revision = engine
-        .checkpoint(
-            None,
-            &[
-                FileChange {
-                    path: "skills/check/SKILL.md".into(),
-                    content: Some(b"# Run the pinned local check\n".to_vec()),
-                },
-                FileChange {
-                    path: "skills/check/runner.json".into(),
-                    content: Some(serde_json::to_vec(recipe).unwrap()),
-                },
-                FileChange {
-                    path: "src/example.rs".into(),
-                    content: Some(b"fn example() -> bool { true }\n".to_vec()),
-                },
-            ],
+    let old_subject = native.subject.clone();
+    let attached_current = if let Some((
+        git_repository,
+        contributor_a,
+        contributor_b,
+        target_writer,
+        attachments,
+        attached_a,
+        attached_b,
+    )) = &git_fixture
+    {
+        fs::write(
+            contributor_a.join("src/example.rs"),
+            b"fn example() -> bool { true }\n",
         )
         .unwrap();
-    let old_subject = native.subject.clone();
-    let previous_version = native.context.change_version;
-    native.context.change_version += 1;
-    native.context.revision = next_revision.clone();
-    let changed = Authority::open(&native.profile.data_dir)
-        .unwrap()
-        .update_change_context(previous_version, &native.context)
+        let fixed = attachments
+            .capture(
+                &engine,
+                "capture-contributor-a-fix",
+                &attached_a.id,
+                attached_a.generation,
+            )
+            .unwrap();
+        assert_eq!(fixed.changed_paths, ["src/example.rs"]);
+
+        fs::create_dir_all(contributor_b.join("notes")).unwrap();
+        fs::write(
+            contributor_b.join("notes/contributor-b.txt"),
+            b"independent concurrent edit\n",
+        )
         .unwrap();
-    native.subject.change_version = changed.version;
-    native.subject.context_digest = changed.context_digest;
-    native.subject.revision = next_revision;
+        let concurrent = attachments
+            .capture(
+                &engine,
+                "capture-contributor-b-concurrent-edit",
+                &attached_b.id,
+                attached_b.generation,
+            )
+            .unwrap();
+        assert_eq!(concurrent.changed_paths, ["notes/contributor-b.txt"]);
+        assert_eq!(
+            engine
+                .read_file(&concurrent.revision, "notes/contributor-b.txt")
+                .unwrap(),
+            b"independent concurrent edit\n"
+        );
+        let mut concurrent_context = native.context.clone();
+        concurrent_context.change = ChangeId {
+            repository: native.context.change.repository.clone(),
+            id: "contributor-b-concurrent-work".into(),
+        };
+        concurrent_context.change_version = 1;
+        concurrent_context.revision = concurrent.revision.clone();
+        concurrent_context.intent = "preserve the second contributor's concurrent work".into();
+        concurrent_context.acceptance_criteria =
+            vec!["the independent note remains attached to its exact source".into()];
+        concurrent_context.scope = vec!["notes/contributor-b.txt".into()];
+        let mut authority = Authority::open(&native.profile.data_dir).unwrap();
+        authority.start_change(&concurrent_context).unwrap();
+        attachments
+            .bind_context(
+                &authority,
+                "bind-contributor-b-concurrent-change",
+                &concurrent.attachment.id,
+                concurrent.attachment.generation,
+                &concurrent_context.change,
+            )
+            .unwrap();
+
+        let previous_version = native.context.change_version;
+        native.context.change_version += 1;
+        native.context.revision = fixed.revision.clone();
+        let changed = Authority::open(&native.profile.data_dir)
+            .unwrap()
+            .update_change_context(previous_version, &native.context)
+            .unwrap();
+        native.subject.change_version = changed.version;
+        native.subject.context_digest = changed.context_digest;
+        native.subject.revision = fixed.revision;
+        let fixed_subject = native.subject.clone();
+        let fixed = attachments
+            .bind_context(
+                &Authority::open(&native.profile.data_dir).unwrap(),
+                "bind-contributor-a-fix",
+                &fixed.attachment.id,
+                fixed.attachment.generation,
+                &native.context.change,
+            )
+            .unwrap();
+
+        fs::write(
+            target_writer.join("target-advance.txt"),
+            b"independent target advancement\n",
+        )
+        .unwrap();
+        git(&target_writer, &["add", "target-advance.txt"]);
+        git(
+            &target_writer,
+            &["commit", "-q", "-m", "advance synthetic target"],
+        );
+        let advanced_target = git(&target_writer, &["rev-parse", "HEAD"]);
+        git(
+            &git_repository,
+            &["update-ref", "refs/remotes/origin/main", &advanced_target],
+        );
+        let target_error = attachments
+            .validate_current(&engine, &fixed.id, fixed.generation)
+            .unwrap_err()
+            .to_string();
+        assert!(target_error.contains("target advanced"), "{target_error}");
+        let refreshed = attachments
+            .refresh(
+                &engine,
+                "refresh-contributor-a-target",
+                &fixed.id,
+                fixed.generation,
+            )
+            .unwrap();
+        assert_eq!(refreshed.target_commit, advanced_target);
+        assert_eq!(
+            engine
+                .read_file(&refreshed.candidate_revision, "src/example.rs")
+                .unwrap(),
+            b"fn example() -> bool { true }\n"
+        );
+        assert_eq!(
+            engine
+                .read_file(&refreshed.candidate_revision, "target-advance.txt")
+                .unwrap(),
+            b"independent target advancement\n"
+        );
+        assert_eq!(
+            fs::read(contributor_b.join("notes/contributor-b.txt")).unwrap(),
+            b"independent concurrent edit\n",
+            "target refresh must not overwrite the other contributor's worktree"
+        );
+        let previous_version = native.context.change_version;
+        native.context.change_version += 1;
+        native.context.revision = refreshed.candidate_revision.clone();
+        let changed = Authority::open(&native.profile.data_dir)
+            .unwrap()
+            .update_change_context(previous_version, &native.context)
+            .unwrap();
+        native.subject.change_version = changed.version;
+        native.subject.context_digest = changed.context_digest;
+        native.subject.revision = refreshed.candidate_revision.clone();
+        let refreshed = attachments
+            .bind_context(
+                &Authority::open(&native.profile.data_dir).unwrap(),
+                "bind-contributor-a-refreshed-target",
+                &refreshed.id,
+                refreshed.generation,
+                &native.context.change,
+            )
+            .unwrap();
+
+        Some((refreshed, fixed_subject, concurrent_context))
+    } else {
+        let CollectorProfileAction::Command { recipe, .. } = &collector_profile.action else {
+            unreachable!()
+        };
+        let next_revision = engine
+            .checkpoint(
+                None,
+                &[
+                    FileChange {
+                        path: "skills/check/SKILL.md".into(),
+                        content: Some(b"# Run the pinned local check\n".to_vec()),
+                    },
+                    FileChange {
+                        path: "skills/check/runner.json".into(),
+                        content: Some(serde_json::to_vec(recipe).unwrap()),
+                    },
+                    FileChange {
+                        path: "src/example.rs".into(),
+                        content: Some(b"fn example() -> bool { true }\n".to_vec()),
+                    },
+                ],
+            )
+            .unwrap();
+        let previous_version = native.context.change_version;
+        native.context.change_version += 1;
+        native.context.revision = next_revision.clone();
+        let changed = Authority::open(&native.profile.data_dir)
+            .unwrap()
+            .update_change_context(previous_version, &native.context)
+            .unwrap();
+        native.subject.change_version = changed.version;
+        native.subject.context_digest = changed.context_digest;
+        native.subject.revision = next_revision;
+
+        None
+    };
 
     let stale_retry = cli(
         "retry-upload",
@@ -1893,7 +2419,19 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
             })),
         )
         .await;
-    assert_eq!(stale_blocked.0, 409, "{stale_blocked:?}");
+    assert_eq!(
+        stale_blocked.0,
+        if attached { 403 } else { 409 },
+        "{stale_blocked:?}"
+    );
+
+    if let Some((_, fixed_subject, _)) = &attached_current {
+        let stale_fixed =
+            qualification(&env, &token, &native.profile.data_dir, fixed_subject).await;
+        assert_eq!(stale_fixed["qualified"], false);
+        assert_eq!(stale_fixed["subject_current"], false);
+        assert_eq!(stale_fixed["receipt_digest"], Value::Null);
+    }
 
     let fresh_requirements = env
         .request(
@@ -2165,69 +2703,135 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
     assert_eq!(superseded["revision"], old_subject.revision);
     assert_eq!(superseded["next"], json!({"operation":"checkpoint"}));
 
-    let approval = env
+    let agent_approval = env
         .request(
             Method::POST,
             &approve_path,
-            Some(&current_member),
-            Some(member_session["csrf_token"].as_str().unwrap()),
             None,
+            None,
+            Some(&token),
             Some(json!({
-                "request_id":"approve-agent-owned-success",
+                "request_id":"agent-token-cannot-approve",
                 "expected_generation":member_session["actor"]["generation"],
                 "subject":native.subject
             })),
         )
         .await;
-    assert_eq!(approval.0, 200, "{approval:?}");
-    let integration = env
+    assert_eq!(agent_approval.0, 403, "{agent_approval:?}");
+    let integrator_approval = env
         .request(
             Method::POST,
-            &format!("{REPO}/profiles/checks/integrate"),
-            Some(&current_member),
-            Some(member_session["csrf_token"].as_str().unwrap()),
+            &approve_path,
+            Some(&integrator),
+            Some(integrator_session["csrf_token"].as_str().unwrap()),
             None,
             Some(json!({
-                "request_id":"integrate-agent-owned-success",
+                "request_id":"integrator-cannot-approve",
+                "expected_generation":integrator_session["actor"]["generation"],
+                "subject":native.subject
+            })),
+        )
+        .await;
+    assert_eq!(integrator_approval.0, 403, "{integrator_approval:?}");
+
+    let approval = env
+        .request(
+            Method::POST,
+            &approve_path,
+            Some(&reviewer),
+            Some(reviewer_session["csrf_token"].as_str().unwrap()),
+            None,
+            Some(json!({
+                "request_id":"approve-agent-owned-success",
+                "expected_generation":reviewer_session["actor"]["generation"],
+                "subject":native.subject
+            })),
+        )
+        .await;
+    assert_eq!(approval.0, 200, "{approval:?}");
+    let reviewer_integration = env
+        .request(
+            Method::POST,
+            &integrate_path,
+            Some(&reviewer),
+            Some(reviewer_session["csrf_token"].as_str().unwrap()),
+            None,
+            Some(json!({
+                "request_id":"reviewer-cannot-integrate",
+                "expected_generation":reviewer_session["actor"]["generation"],
+                "subject":native.subject,
+                "approval_id":approval.1["approval_id"]
+            })),
+        )
+        .await;
+    assert_eq!(reviewer_integration.0, 403, "{reviewer_integration:?}");
+    let agent_integration = env
+        .request(
+            Method::POST,
+            &integrate_path,
+            None,
+            None,
+            Some(&token),
+            Some(json!({
+                "request_id":"agent-token-cannot-integrate",
                 "expected_generation":member_session["actor"]["generation"],
                 "subject":native.subject,
                 "approval_id":approval.1["approval_id"]
             })),
         )
         .await;
-    assert_eq!(integration.0, 200, "{integration:?}");
-    assert_eq!(
-        Authority::open(&native.profile.data_dir)
-            .unwrap()
-            .target("main")
-            .unwrap()
-            .unwrap()
-            .revision,
-        native.context.revision
-    );
+    assert_eq!(agent_integration.0, 403, "{agent_integration:?}");
+    if let Some((state, _, concurrent_context)) = &attached_current {
+        assert_attached_publication_boundary(&native, state);
+        let (_, _, contributor_b, _, attachments, _, attached_b) = git_fixture.as_ref().unwrap();
+        assert_eq!(
+            fs::read(contributor_b.join("notes/contributor-b.txt")).unwrap(),
+            b"independent concurrent edit\n"
+        );
+        let second = attachments.state(&attached_b.id).unwrap();
+        assert_eq!(second.change_id.as_ref(), Some(&concurrent_context.change));
+        assert_eq!(second.candidate_revision, concurrent_context.revision);
+        assert_eq!(
+            engine
+                .read_file(&second.candidate_revision, "notes/contributor-b.txt")
+                .unwrap(),
+            b"independent concurrent edit\n"
+        );
+        assert!(
+            Authority::open_read_only(&native.profile.data_dir)
+                .unwrap()
+                .target("main")
+                .unwrap()
+                .is_none()
+        );
+    } else {
+        let integration = env
+            .request(
+                Method::POST,
+                &integrate_path,
+                Some(&integrator),
+                Some(integrator_session["csrf_token"].as_str().unwrap()),
+                None,
+                Some(json!({
+                    "request_id":"integrate-agent-owned-success",
+                    "expected_generation":integrator_session["actor"]["generation"],
+                    "subject":native.subject,
+                    "approval_id":approval.1["approval_id"]
+                })),
+            )
+            .await;
+        assert_eq!(integration.0, 200, "{integration:?}");
+        assert_eq!(
+            Authority::open(&native.profile.data_dir)
+                .unwrap()
+                .target("main")
+                .unwrap()
+                .unwrap()
+                .revision,
+            native.context.revision
+        );
+    }
 
-    let independent_human = env.member(
-        303,
-        &[Role::Reader, Role::Reviewer, Role::Integrator],
-        true,
-        env.workspace.settings().unwrap().generation,
-        "grant-independent-native-reviewer",
-    );
-    assert_eq!(
-        env.request(
-            Method::PUT,
-            "/v1/hub/workspace/members",
-            Some(&owner),
-            Some(owner_csrf),
-            None,
-            Some(independent_human),
-        )
-        .await
-        .0,
-        200
-    );
-    let (_, independent_human) = env.signin(303).await;
-    let independent_session = env.session(&independent_human).await;
     let revoke_success_origin = env.member(
         202,
         &roles,
@@ -2252,12 +2856,12 @@ async fn agent_owned_transport_failure_revision_success_and_native_landing_are_e
         .request(
             Method::POST,
             &approve_path,
-            Some(&independent_human),
-            Some(independent_session["csrf_token"].as_str().unwrap()),
+            Some(&reviewer),
+            Some(reviewer_session["csrf_token"].as_str().unwrap()),
             None,
             Some(json!({
                 "request_id":"successful-receipt-revoked-origin",
-                "expected_generation":independent_session["actor"]["generation"],
+                "expected_generation":reviewer_session["actor"]["generation"],
                 "subject":native.subject
             })),
         )
