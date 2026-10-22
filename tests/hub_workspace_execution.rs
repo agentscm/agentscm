@@ -1576,6 +1576,127 @@ async fn agent_owned_transport_lifecycle(attached: bool) {
             .clone(),
     )
     .unwrap();
+    let reads_before = task_state_snapshot(&native.profile.data_dir);
+    let instructions = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_instructions",
+                json!({
+                    "subject":native.subject,
+                    "task_id":first_task.task_id,
+                    "task_digest":first_task.digest().unwrap(),
+                    "supported_schema_versions":[1]
+                }),
+            )),
+        )
+        .await;
+    assert_eq!(instructions.0, 200, "{instructions:?}");
+    assert_eq!(
+        mcp_envelope(&instructions.1)["result"]["status"],
+        "available"
+    );
+    let entrypoint = &first_task.entrypoint.references[0];
+    let reference = json!({
+        "subject":native.subject,
+        "task_id":first_task.task_id,
+        "task_digest":first_task.digest().unwrap(),
+        "reference_name":entrypoint.name,
+        "expected_sha256":entrypoint.sha256,
+        "expected_schema_version":1
+    });
+    let fetched = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call("agentscm_task_reference", reference.clone())),
+        )
+        .await;
+    assert_eq!(fetched.0, 200, "{fetched:?}");
+    let fetched = mcp_envelope(&fetched.1)["result"].clone();
+    assert_eq!(fetched["status"], "available");
+    assert_eq!(fetched["task_id"], first_task.task_id);
+    assert_eq!(fetched["task_digest"], first_task.digest().unwrap());
+    assert_eq!(fetched["sha256"], entrypoint.sha256);
+    assert!(fetched["content"].as_str().unwrap().len() <= 128 * 1024);
+
+    let mut stale_digest = reference.clone();
+    stale_digest["task_digest"] = json!("0".repeat(64));
+    let rejected = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call("agentscm_task_reference", stale_digest)),
+        )
+        .await;
+    assert_eq!(rejected.0, 200, "{rejected:?}");
+    assert_eq!(rejected.1["result"]["isError"], true, "{rejected:?}");
+    let mut stale_subject = reference.clone();
+    stale_subject["subject"]["context_digest"] = json!("0".repeat(64));
+    let rejected = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call("agentscm_task_reference", stale_subject)),
+        )
+        .await;
+    assert_eq!(rejected.0, 200, "{rejected:?}");
+    assert_eq!(rejected.1["error"]["code"], -32603, "{rejected:?}");
+    let mut stale_schema = reference.clone();
+    stale_schema["expected_schema_version"] = json!(2);
+    let rejected = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call("agentscm_task_reference", stale_schema)),
+        )
+        .await;
+    assert_eq!(rejected.0, 200, "{rejected:?}");
+    assert_eq!(
+        mcp_envelope(&rejected.1)["result"]["status"],
+        "schema_mismatch"
+    );
+    let (_, cross_repository_token) = mint_agent_token(
+        &*env.store,
+        &user.id,
+        "cross-repository-reference",
+        "synthetic/other",
+        3_600,
+    )
+    .unwrap();
+    let rejected = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(cross_repository_token.expose()),
+            Some(mcp_call("agentscm_task_reference", reference)),
+        )
+        .await;
+    assert_eq!(rejected.0, 200, "{rejected:?}");
+    assert_eq!(rejected.1["result"]["isError"], true, "{rejected:?}");
+    assert_eq!(
+        task_state_snapshot(&native.profile.data_dir),
+        reads_before,
+        "instruction/reference reads and refusals must not mutate native state"
+    );
     let next = env
         .request(
             Method::POST,
@@ -1830,8 +1951,8 @@ async fn agent_owned_transport_lifecycle(attached: bool) {
         .await;
     assert_eq!(reconciled.0, 200, "{reconciled:?}");
 
-    let mut expiry_claim = claim_input(&first_task, &executor, "expiry-refusal");
-    expiry_claim["requested_lease_ms"] = json!(1);
+    let mut expiry_claim_request = claim_input(&first_task, &executor, "expiry-refusal");
+    expiry_claim_request["requested_lease_ms"] = json!(1);
     let expiry_claim = env
         .request(
             Method::POST,
@@ -1841,7 +1962,7 @@ async fn agent_owned_transport_lifecycle(attached: bool) {
             Some(&token),
             Some(mcp_call(
                 "agentscm_task_collector_claim",
-                json!({"subject":native.subject,"claim":expiry_claim,"collector_profile_id":"command-profile"}),
+                json!({"subject":native.subject,"claim":expiry_claim_request,"collector_profile_id":"command-profile"}),
             )),
         )
         .await;
@@ -1915,6 +2036,54 @@ async fn agent_owned_transport_lifecycle(attached: bool) {
     );
     assert_eq!(expired_report["failures"][0]["code"], "attempt_expired");
     assert_eq!(expired_report["next"]["operation"], "reconcile");
+    let exact_transport_retry = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_collector_claim",
+                json!({"subject":native.subject,"claim":expiry_claim_request,"collector_profile_id":"command-profile"}),
+            )),
+        )
+        .await;
+    assert_eq!(exact_transport_retry.0, 200, "{exact_transport_retry:?}");
+    assert_eq!(
+        exact_transport_retry.1["result"]["isError"], false,
+        "{exact_transport_retry:?}"
+    );
+    let exact_transport_retry: TaskAttemptView =
+        serde_json::from_value(mcp_envelope(&exact_transport_retry.1)["result"].clone()).unwrap();
+    assert_eq!(exact_transport_retry.attempt, expired_attempt.attempt);
+    assert_eq!(exact_transport_retry.state, expired_attempt.state);
+    assert!(!exact_transport_retry.currently_applicable);
+    let unauthorized_new_attempt = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_collector_claim",
+                json!({
+                    "subject":native.subject,
+                    "claim":claim_input(&first_task,&executor,"expiry-is-not-replacement"),
+                    "collector_profile_id":"command-profile"
+                }),
+            )),
+        )
+        .await;
+    assert_eq!(
+        unauthorized_new_attempt.0, 200,
+        "{unauthorized_new_attempt:?}"
+    );
+    assert_eq!(
+        unauthorized_new_attempt.1["result"]["isError"], true,
+        "{unauthorized_new_attempt:?}"
+    );
     let expired_collect = cli(
         "collect",
         &expired_descriptor_file,
@@ -1940,6 +2109,183 @@ async fn agent_owned_transport_lifecycle(attached: bool) {
         )
         .await;
     assert_eq!(reconciled_expiry.0, 200, "{reconciled_expiry:?}");
+    let state_after_reconcile = task_state_snapshot(&native.profile.data_dir);
+    let reconcile_mutation = mutation_input(&expired_attempt, "reconcile-expired-cli", "reconcile");
+    let recovery_http = env
+        .request(
+            Method::POST,
+            &task_path,
+            None,
+            None,
+            Some(&token),
+            Some(json!({
+                "operation":"recovery",
+                "subject":native.subject,
+                "mutation":reconcile_mutation
+            })),
+        )
+        .await;
+    assert_eq!(recovery_http.0, 200, "{recovery_http:?}");
+    let recovery_mcp = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_recovery",
+                json!({"subject":native.subject,"mutation":reconcile_mutation}),
+            )),
+        )
+        .await;
+    assert_eq!(recovery_mcp.0, 200, "{recovery_mcp:?}");
+    assert_eq!(
+        recovery_mcp.1["result"]["isError"], false,
+        "{recovery_mcp:?}"
+    );
+    let recovered = recovery_http.1["result"].clone();
+    assert_eq!(mcp_envelope(&recovery_mcp.1)["result"], recovered);
+    assert_eq!(recovered["disposition"], "uncertain_effect");
+    assert_eq!(recovered["observed_state"], "replaced");
+    assert_eq!(recovered["next_action"], "prepare_fresh_attempt");
+    assert_eq!(
+        recovered["unresolved_effects"],
+        json!([{"effect":"execution_may_still_run"}])
+    );
+    for (field, expected) in [
+        ("request_id", json!("reconcile-expired-cli")),
+        (
+            "execution_operation_id",
+            json!(expired_attempt.attempt.execution_operation_id),
+        ),
+        ("task_id", json!(expired_attempt.attempt.task_id)),
+        ("task_digest", json!(expired_attempt.attempt.task_digest)),
+        ("attempt_id", json!(expired_attempt.attempt.attempt_id)),
+        (
+            "attempt_digest",
+            json!(expired_attempt.attempt.digest().unwrap()),
+        ),
+        ("fence", json!(expired_attempt.attempt.lease.fence)),
+    ] {
+        assert_eq!(recovered[field], expected, "recovery field {field}");
+    }
+    let replaced_before_late = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_status",
+                json!({"subject":native.subject,"status":{
+                    "version":1,
+                    "task_id":expired_attempt.attempt.task_id,
+                    "task_digest":expired_attempt.attempt.task_digest,
+                    "attempt_id":expired_attempt.attempt.attempt_id,
+                    "attempt_digest":expired_attempt.attempt.digest().unwrap(),
+                    "fence":expired_attempt.attempt.lease.fence,
+                    "executor":expired_attempt.attempt.executor
+                }}),
+            )),
+        )
+        .await;
+    assert_eq!(replaced_before_late.0, 200, "{replaced_before_late:?}");
+    assert_eq!(
+        replaced_before_late.1["result"]["isError"], false,
+        "{replaced_before_late:?}"
+    );
+    let replaced_before_late = mcp_envelope(&replaced_before_late.1)["result"].clone();
+    let receipt_before_late = qualification(
+        &env,
+        &token,
+        &native.profile.data_dir,
+        &native.subject,
+    )
+    .await["receipt_digest"]
+        .clone();
+    let late_heartbeat = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_heartbeat",
+                json!({
+                    "subject":native.subject,
+                    "mutation":mutation_input(&expired_attempt,"late-heartbeat-after-replacement","heartbeat")
+                }),
+            )),
+        )
+        .await;
+    assert_eq!(late_heartbeat.0, 200, "{late_heartbeat:?}");
+    assert_eq!(
+        late_heartbeat.1["result"]["isError"], true,
+        "{late_heartbeat:?}"
+    );
+    let late_result = env
+        .request(
+            Method::POST,
+            &task_path,
+            None,
+            None,
+            Some(&token),
+            Some(json!({
+                "operation":"result",
+                "subject":native.subject,
+                "assertion":large_assertion_input(&first_task,&expired_attempt,"late-result-after-replacement")
+            })),
+        )
+        .await;
+    assert_eq!(late_result.0, 409, "{late_result:?}");
+    let replaced_after_late = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_status",
+                json!({"subject":native.subject,"status":{
+                    "version":1,
+                    "task_id":expired_attempt.attempt.task_id,
+                    "task_digest":expired_attempt.attempt.task_digest,
+                    "attempt_id":expired_attempt.attempt.attempt_id,
+                    "attempt_digest":expired_attempt.attempt.digest().unwrap(),
+                    "fence":expired_attempt.attempt.lease.fence,
+                    "executor":expired_attempt.attempt.executor
+                }}),
+            )),
+        )
+        .await;
+    assert_eq!(replaced_after_late.0, 200, "{replaced_after_late:?}");
+    assert_eq!(
+        replaced_after_late.1["result"]["isError"], false,
+        "{replaced_after_late:?}"
+    );
+    assert_eq!(
+        mcp_envelope(&replaced_after_late.1)["result"],
+        replaced_before_late
+    );
+    assert_eq!(replaced_before_late["state"], "replaced");
+    assert_eq!(
+        qualification(&env, &token, &native.profile.data_dir, &native.subject).await["receipt_digest"],
+        receipt_before_late
+    );
+    assert_eq!(
+        task_state_snapshot(&native.profile.data_dir),
+        state_after_reconcile,
+        "recovery reads and fenced late traffic must not mutate native state"
+    );
+    assert_eq!(
+        fake_docker_effect_counts(&docker_home.join("calls.jsonl")),
+        effects_before_refusals,
+        "expiry, recovery reads and fenced late traffic must not execute externally"
+    );
 
     let replacement_claim = env
         .request(
@@ -2851,6 +3197,37 @@ async fn agent_owned_transport_lifecycle(attached: bool) {
         .await
         .0,
         200
+    );
+    let fresh_entrypoint = &fresh_task.entrypoint.references[0];
+    let before_revoked_read = task_state_snapshot(&native.profile.data_dir);
+    let revoked_reference = env
+        .request(
+            Method::POST,
+            mcp_path,
+            None,
+            None,
+            Some(&token),
+            Some(mcp_call(
+                "agentscm_task_reference",
+                json!({
+                    "subject":native.subject,
+                    "task_id":fresh_task.task_id,
+                    "task_digest":fresh_task.digest().unwrap(),
+                    "reference_name":fresh_entrypoint.name,
+                    "expected_sha256":fresh_entrypoint.sha256,
+                    "expected_schema_version":1
+                }),
+            )),
+        )
+        .await;
+    assert!(
+        matches!(revoked_reference.0, 401 | 403),
+        "{revoked_reference:?}"
+    );
+    assert_eq!(
+        task_state_snapshot(&native.profile.data_dir),
+        before_revoked_read,
+        "revoked reference read must not mutate native state"
     );
     let revoked_origin_approval = env
         .request(
