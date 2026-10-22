@@ -18,6 +18,9 @@ const MAX_DEFINITION_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Subcommand)]
 pub enum SkillWorkflowCommand {
+    /// Serve local workflow tools to any stdio MCP client using fixed operator settings.
+    #[cfg(unix)]
+    Mcp(crate::skill_workflow_mcp::McpArgs),
     /// Inspect or configure a reusable template from exact native source.
     Library {
         #[command(subcommand)]
@@ -172,6 +175,8 @@ pub(crate) fn telemetry_action(command: &SkillWorkflowCommand) -> bool {
             command: LibraryCommand::Inspect { .. },
         } => false,
         #[cfg(unix)]
+        SkillWorkflowCommand::Mcp(_) => false,
+        #[cfg(unix)]
         SkillWorkflowCommand::ClaudeStop(_)
         | SkillWorkflowCommand::CodexStop(_)
         | SkillWorkflowCommand::RemoteStop(_)
@@ -184,6 +189,8 @@ pub(crate) fn telemetry_action(command: &SkillWorkflowCommand) -> bool {
 
 pub async fn run(data_dir: &Path, command: SkillWorkflowCommand) -> Result<()> {
     match command {
+        #[cfg(unix)]
+        SkillWorkflowCommand::Mcp(args) => crate::skill_workflow_mcp::run(data_dir, args),
         SkillWorkflowCommand::Library { command } => run_library(data_dir, command),
         SkillWorkflowCommand::Handoff { run_id } => handoff(data_dir, &run_id),
         #[cfg(unix)]
@@ -361,6 +368,11 @@ fn current_context(data_dir: &Path, change: &str) -> Result<agentscm::context::R
 }
 
 fn run_library(data_dir: &Path, command: LibraryCommand) -> Result<()> {
+    crate::print_json(&library_value(data_dir, command)?);
+    Ok(())
+}
+
+pub(crate) fn library_value(data_dir: &Path, command: LibraryCommand) -> Result<serde_json::Value> {
     let (change, path) = match &command {
         LibraryCommand::Inspect { change, library } => (change, library),
         #[cfg(unix)]
@@ -371,24 +383,25 @@ fn run_library(data_dir: &Path, command: LibraryCommand) -> Result<()> {
     let definition = snapshot.instantiate(&context)?;
     skill_workflow::compiler::validate_sources(data_dir, &definition)?;
     match command {
-        LibraryCommand::Inspect { .. } => {
-            crate::print_json(&serde_json::json!({
-                "reference": snapshot.reference(), "template": snapshot.template(),
-                "definition": definition, "admission": "not_assessed",
-            }));
-            Ok(())
-        }
+        LibraryCommand::Inspect { .. } => Ok(serde_json::json!({
+            "reference": snapshot.reference(), "template": snapshot.template(),
+            "definition": definition, "admission": "not_assessed",
+        })),
         #[cfg(unix)]
         LibraryCommand::Configure { .. } => {
             let mut value = configure_definition(data_dir, definition, &context)?;
             value["reference"] = serde_json::to_value(snapshot.reference())?;
-            crate::print_json(&value);
-            Ok(())
+            Ok(value)
         }
     }
 }
 
 fn handoff(data_dir: &Path, run_id: &str) -> Result<()> {
+    crate::print_json(&handoff_value(data_dir, run_id)?);
+    Ok(())
+}
+
+pub(crate) fn handoff_value(data_dir: &Path, run_id: &str) -> Result<serde_json::Value> {
     let run = skill_workflow::status(data_dir, run_id)?;
     let definition = skill_workflow::runtime::retained_definition(data_dir, run_id)?;
     let mut command_context_bindings = Vec::new();
@@ -438,13 +451,12 @@ fn handoff(data_dir: &Path, run_id: &str) -> Result<()> {
             "Cancellation is terminal. Reconcile retained command custody if needed and explicitly start a new run for the current subject."
         }
     };
-    crate::print_json(&serde_json::json!({
+    Ok(serde_json::json!({
         "run": run, "definition": definition, "next_action": next_action,
         "subject_scope": subject_scope,
         "command_context_bindings": command_context_bindings,
         "admission": "not_assessed",
-    }));
-    Ok(())
+    }))
 }
 
 #[cfg(unix)]

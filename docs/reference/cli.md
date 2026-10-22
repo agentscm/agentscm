@@ -230,6 +230,11 @@ agentscm --data-dir ./agentscm-data skill-workflow library inspect CHANGE \
 agentscm --data-dir ./agentscm-data skill-workflow library configure CHANGE \
   --library skills/checks/v1/workflow.json
 agentscm --data-dir ./agentscm-data skill-workflow handoff RUN_ID
+agentscm --data-dir /absolute/native-data skill-workflow mcp \
+  [--allow-configure] [--allow-execution] \
+  [--workspace /absolute/native-workspace] \
+  [--docker /absolute/docker --docker-socket /absolute/docker.sock] \
+  [--claude /absolute/claude]
 ```
 
 Manifest and package bytes come from the Change's exact native revision. Review the inspected
@@ -248,6 +253,14 @@ It reports only bindings retained by the definition: command actions carry a his
 Change/context binding that may no longer be current, while a source-only handoff carries source
 and run identity without inventing Change attribution. The configured `check` output carries its
 current context and receipt.
+
+`skill-workflow mcp` is a local Unix stdio server for any MCP-capable client. Read-only startup
+advertises library inspect and workflow handoff. The two explicit allow flags separately advertise
+library configure and check. The operator fixes the native data directory, workspace and execution
+backends in the server command; requests cannot override them. This is distinct from the remote Hub
+MCP, which exposes retained workflow status only. Client identity does not choose the reviewer: a
+`claude_code_review` step still requires the fixed `--claude` backend, whichever MCP client made the
+call. No native Grok integration or live-client qualification is implied.
 
 Further `skill-workflow` commands support the Stop triggers. `codex-stop` takes the arguments of `check` and `claude-stop` and is a Codex CLI Stop hook with the same pass/block behavior. `remote-codex-stop` takes the arguments of `remote-check` and `remote-stop` for hosted workspaces. `task-stop` and `task-codex-stop CHANGE --endpoint URL --repository OWNER/NAME --profile ID --token-file ABS_PATH --workspace PATH` are read-only Stop hooks for agent-owned tasks: they pass only when the facade `qualification` is current and qualified and the clean workspace base is the qualified revision, and never run, upload, finalize or checkpoint (see [agent workflow tasks](../advanced/agent-workflow-tasks.md#stop-hook-agent-owned-mode)). `install-stop --settings FILE [--apply] [--remove [--workspace PATH]] -- <claude-stop|remote-stop|codex-stop|remote-codex-stop|task-stop|task-codex-stop> ARGS...` previews by default and writes the hook entry into an operator-local Claude Code or Codex hook file only with `--apply`; it replaces only the same workspace's entry, whatever the stop subcommand or change, and `--remove` removes all its entries or only those for `--workspace`. The Stop handlers require `stop_hook_active` and allow at most 8 consecutive automatic continuations per agent, session, workspace and change; a parse error in a Stop subcommand exits 1, a non-blocking error. See the [Stop hook guide](../advanced/claude-code-workflows.md#opt-in-claude-code-stop-hook) and the [hosted variant](../advanced/hosted-laptop-workflows.md#optional-stop-hooks).
 

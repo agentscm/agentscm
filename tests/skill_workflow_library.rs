@@ -5,9 +5,13 @@ use std::process::{Command, Output};
 #[cfg(unix)]
 use std::fs;
 #[cfg(unix)]
+use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::net::UnixListener;
+#[cfg(unix)]
+use std::process::Stdio;
 
 use agentscm::authority::Authority;
 use agentscm::context::{ChangeId, InputIdentity, RequiredEvidence, ReviewContext};
@@ -157,6 +161,469 @@ fn invoke(data: &Path, args: &[&str]) -> Output {
 
 fn output_json(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[cfg(unix)]
+fn invoke_mcp_raw(data: &Path, startup: &[&str], input: &str) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentscm"))
+        .arg("--data-dir")
+        .arg(data)
+        .args(["skill-workflow", "mcp"])
+        .args(startup)
+        .env("PATH", "")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let written = child.stdin.take().unwrap().write_all(input.as_bytes());
+    let output = child.wait_with_output().unwrap();
+    if output.status.success() {
+        written.unwrap();
+    }
+    output
+}
+
+#[cfg(unix)]
+fn invoke_mcp(data: &Path, startup: &[&str], requests: &[Value]) -> Output {
+    let input = requests
+        .iter()
+        .map(|request| serde_json::to_string(request).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    invoke_mcp_raw(data, startup, &input)
+}
+
+#[cfg(unix)]
+fn mcp_responses(output: &Output) -> Vec<Value> {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout.clone())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[cfg(unix)]
+fn mcp_response(responses: &[Value], id: u64) -> &Value {
+    responses
+        .iter()
+        .find(|response| response["id"] == id)
+        .unwrap()
+}
+
+#[cfg(unix)]
+fn initialize(id: u64, client: &str) -> Value {
+    json!({
+        "jsonrpc":"2.0",
+        "id":id,
+        "method":"initialize",
+        "params":{
+            "protocolVersion":"2025-06-18",
+            "capabilities":{},
+            "clientInfo":{"name":client,"version":"synthetic"}
+        }
+    })
+}
+
+#[cfg(unix)]
+fn mcp_call(id: u64, name: &str, arguments: Value) -> Value {
+    json!({
+        "jsonrpc":"2.0",
+        "id":id,
+        "method":"tools/call",
+        "params":{"name":name,"arguments":arguments}
+    })
+}
+
+#[cfg(unix)]
+#[test]
+fn local_mcp_is_client_neutral_read_only_by_default_and_rejects_injected_settings() {
+    let root = TempDir::new().unwrap();
+    Engine::open(root.path()).unwrap();
+    Authority::open(root.path()).unwrap();
+
+    for client in [
+        "claude", "codex", "cursor", "copilot", "gemini", "grok", "generic",
+    ] {
+        let output = invoke_mcp(
+            root.path(),
+            &[],
+            &[
+                initialize(1, client),
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+            ],
+        );
+        let responses = mcp_responses(&output);
+        assert_eq!(
+            mcp_response(&responses, 1)["result"]["serverInfo"]["name"],
+            "agentscm-local-workflows"
+        );
+        let names = mcp_response(&responses, 2)["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "agentscm_workflow_library_inspect",
+                "agentscm_workflow_handoff"
+            ]
+        );
+    }
+
+    for (startup, expected) in [
+        (
+            &["--allow-configure"][..],
+            vec![
+                "agentscm_workflow_library_inspect",
+                "agentscm_workflow_handoff",
+                "agentscm_workflow_library_configure",
+            ],
+        ),
+        (
+            &["--allow-execution"][..],
+            vec![
+                "agentscm_workflow_library_inspect",
+                "agentscm_workflow_handoff",
+                "agentscm_workflow_check",
+            ],
+        ),
+    ] {
+        let output = invoke_mcp(
+            root.path(),
+            startup,
+            &[
+                initialize(1, "generic"),
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+            ],
+        );
+        let responses = mcp_responses(&output);
+        let names = mcp_response(&responses, 2)["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(names, expected);
+    }
+
+    let requests = [
+        initialize(1, "generic"),
+        mcp_call(
+            2,
+            "agentscm_workflow_library_configure",
+            json!({"change":"missing","library":LIBRARY_V1}),
+        ),
+        mcp_call(3, "agentscm_workflow_check", json!({"change":"missing"})),
+        mcp_call(
+            4,
+            "agentscm_workflow_library_inspect",
+            json!({"change":"missing","library":LIBRARY_V1,"data_dir":"/injected"}),
+        ),
+    ];
+    let input = format!(
+        "{{not-json\n{}\n",
+        requests
+            .iter()
+            .map(|request| serde_json::to_string(request).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let output = invoke_mcp_raw(root.path(), &[], &input);
+    let responses = mcp_responses(&output);
+    assert_eq!(responses[0]["id"], Value::Null);
+    assert_eq!(responses[0]["error"]["code"], -32700);
+    for id in 2..=4 {
+        assert_eq!(mcp_response(&responses, id)["error"]["code"], -32602);
+    }
+    assert!(
+        Authority::open(root.path())
+            .unwrap()
+            .workflow_requirement("main")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn workflow_inspection_does_not_recreate_a_missing_native_object_store() {
+    let root = TempDir::new().unwrap();
+    let manifest = template(
+        "missing-store",
+        1,
+        SKILL,
+        vec![step(
+            "source",
+            &[],
+            true,
+            source_action(&digest(SOURCE_BYTES)),
+        )],
+    );
+    let engine = Engine::open(root.path()).unwrap();
+    let revision = engine
+        .checkpoint(
+            None,
+            &[
+                put(SKILL, b"# Missing store fixture\n".to_vec()),
+                put(SOURCE, SOURCE_BYTES.to_vec()),
+                put(LIBRARY_V1, serde_json::to_vec(&manifest).unwrap()),
+            ],
+        )
+        .unwrap();
+    let mut authority = Authority::open(root.path()).unwrap();
+    let repository = authority.repository_id().unwrap();
+    authority
+        .start_change(&context(&repository, "missing-store", &revision))
+        .unwrap();
+    drop(authority);
+    drop(engine);
+    let objects = root.path().join("objects");
+    fs::remove_dir_all(&objects).unwrap();
+
+    let mcp = invoke_mcp(
+        root.path(),
+        &[],
+        &[
+            initialize(1, "generic"),
+            mcp_call(
+                2,
+                "agentscm_workflow_library_inspect",
+                json!({"change":"missing-store","library":LIBRARY_V1}),
+            ),
+        ],
+    );
+    assert!(!mcp.status.success());
+    assert!(!objects.exists());
+
+    let cli = invoke(
+        root.path(),
+        &[
+            "skill-workflow",
+            "library",
+            "inspect",
+            "missing-store",
+            "--library",
+            LIBRARY_V1,
+        ],
+    );
+    assert!(!cli.status.success());
+    assert!(!objects.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn local_mcp_runs_the_source_only_library_lifecycle_without_a_backend() {
+    let root = TempDir::new().unwrap();
+    let manifest = template(
+        "mcp-source-only",
+        1,
+        SKILL,
+        vec![step(
+            "source",
+            &[],
+            true,
+            source_action(&digest(SOURCE_BYTES)),
+        )],
+    );
+    let engine = Engine::open(root.path()).unwrap();
+    let revision = engine
+        .checkpoint(
+            None,
+            &[
+                put(SKILL, b"# MCP source check\n".to_vec()),
+                put(SOURCE, SOURCE_BYTES.to_vec()),
+                put(LIBRARY_V1, serde_json::to_vec(&manifest).unwrap()),
+            ],
+        )
+        .unwrap();
+    let mut authority = Authority::open(root.path()).unwrap();
+    let repository = authority.repository_id().unwrap();
+    let original_context = context(&repository, "mcp-change", &revision);
+    let original_state = authority.start_change(&original_context).unwrap();
+    drop(authority);
+    let snapshot = library::load(root.path(), &revision, LIBRARY_V1).unwrap();
+    let expected_definition = snapshot.instantiate(&original_context).unwrap();
+
+    let configure = json!({
+        "jsonrpc":"2.0",
+        "method":"tools/call",
+        "params":{
+            "name":"agentscm_workflow_library_configure",
+            "arguments":{"change":"mcp-change","library":LIBRARY_V1}
+        }
+    });
+    let check = json!({
+        "jsonrpc":"2.0",
+        "method":"tools/call",
+        "params":{
+            "name":"agentscm_workflow_check",
+            "arguments":{"change":"mcp-change"}
+        }
+    });
+    let mut null_configure = configure.clone();
+    null_configure["id"] = Value::Null;
+    let mut null_check = check.clone();
+    null_check["id"] = Value::Null;
+    let notification_output = invoke_mcp(
+        root.path(),
+        &["--allow-configure", "--allow-execution"],
+        &[
+            initialize(1, "generic"),
+            configure,
+            check,
+            null_configure,
+            null_check,
+            mcp_call(
+                2,
+                "agentscm_workflow_library_inspect",
+                json!({"change":"mcp-change","library":LIBRARY_V1}),
+            ),
+        ],
+    );
+    let notification_responses = mcp_responses(&notification_output);
+    assert_eq!(notification_responses.len(), 4);
+    for response in &notification_responses[1..3] {
+        assert_eq!(response["id"], Value::Null);
+        assert!(response["error"].is_object());
+    }
+    assert_eq!(
+        mcp_response(&notification_responses, 2)["result"]["structuredContent"]["definition"],
+        serde_json::to_value(&expected_definition).unwrap()
+    );
+    let authority = Authority::open(root.path()).unwrap();
+    assert_eq!(
+        authority.change(&original_state.id).unwrap(),
+        original_state
+    );
+    assert!(authority.workflow_requirement("main").unwrap().is_none());
+    drop(authority);
+
+    let output = invoke_mcp(
+        root.path(),
+        &["--allow-configure", "--allow-execution"],
+        &[
+            initialize(1, "grok"),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+            mcp_call(
+                3,
+                "agentscm_workflow_library_inspect",
+                json!({"change":"mcp-change","library":LIBRARY_V1}),
+            ),
+            mcp_call(
+                4,
+                "agentscm_workflow_library_configure",
+                json!({"change":"mcp-change","library":LIBRARY_V1}),
+            ),
+            mcp_call(
+                5,
+                "agentscm_workflow_check",
+                json!({"change":"mcp-change","docker":"/injected"}),
+            ),
+            mcp_call(6, "agentscm_workflow_check", json!({"change":"mcp-change"})),
+            mcp_call(7, "agentscm_workflow_check", json!({"change":"mcp-change"})),
+        ],
+    );
+    let responses = mcp_responses(&output);
+    let names = mcp_response(&responses, 2)["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        [
+            "agentscm_workflow_library_inspect",
+            "agentscm_workflow_handoff",
+            "agentscm_workflow_library_configure",
+            "agentscm_workflow_check",
+        ]
+    );
+
+    let inspected = &mcp_response(&responses, 3)["result"];
+    assert_eq!(inspected["isError"], false);
+    assert_eq!(
+        inspected["structuredContent"]["reference"],
+        serde_json::to_value(snapshot.reference()).unwrap()
+    );
+    assert_eq!(
+        inspected["structuredContent"]["definition"],
+        serde_json::to_value(expected_definition).unwrap()
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(inspected["content"][0]["text"].as_str().unwrap()).unwrap(),
+        inspected["structuredContent"]
+    );
+
+    let configured = &mcp_response(&responses, 4)["result"];
+    assert_eq!(configured["isError"], false);
+    assert!(configured["structuredContent"]["requirement_digest"].is_string());
+    assert_eq!(mcp_response(&responses, 5)["error"]["code"], -32602);
+
+    let checked = &mcp_response(&responses, 6)["result"];
+    let checked_again = &mcp_response(&responses, 7)["result"];
+    for result in [checked, checked_again] {
+        assert_eq!(result["isError"], false);
+        assert_eq!(result["structuredContent"]["run"]["state"], "succeeded");
+        assert!(result["structuredContent"]["receipt"].is_string());
+    }
+    assert_eq!(
+        checked["structuredContent"]["run"]["run_id"],
+        checked_again["structuredContent"]["run"]["run_id"]
+    );
+    assert_eq!(
+        checked["structuredContent"]["receipt"],
+        checked_again["structuredContent"]["receipt"]
+    );
+    assert!(!root.path().join("execution").exists());
+
+    let run_id = checked["structuredContent"]["run"]["run_id"]
+        .as_str()
+        .unwrap();
+    let retained = status(root.path(), run_id).unwrap();
+    assert_eq!(
+        serde_json::to_value(&retained).unwrap(),
+        checked["structuredContent"]["run"]
+    );
+    let authority = Authority::open(root.path()).unwrap();
+    let requirement = authority.workflow_requirement("main").unwrap().unwrap();
+    assert_eq!(
+        requirement.digest().unwrap(),
+        configured["structuredContent"]["requirement_digest"]
+            .as_str()
+            .unwrap()
+    );
+    drop(authority);
+
+    let handoff_output = invoke_mcp(
+        root.path(),
+        &[],
+        &[
+            initialize(1, "generic"),
+            mcp_call(2, "agentscm_workflow_handoff", json!({"run_id":run_id})),
+        ],
+    );
+    let handoff_responses = mcp_responses(&handoff_output);
+    let handoff = &mcp_response(&handoff_responses, 2)["result"];
+    assert_eq!(handoff["isError"], false);
+    assert_eq!(
+        handoff["structuredContent"]["run"],
+        serde_json::to_value(retained).unwrap()
+    );
+    assert_eq!(handoff["structuredContent"]["admission"], "not_assessed");
+    assert_eq!(
+        handoff["structuredContent"]["subject_scope"],
+        "source_revision_only"
+    );
 }
 
 #[test]

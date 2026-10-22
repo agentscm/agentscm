@@ -153,6 +153,50 @@ strict `CommandRecipe`; template prose is never converted into a shell command. 
 the existing bounded adapter. See [skill workflows](skill-workflows.md) and
 [isolated command execution](execution.md) for runtime, cancellation and isolation limits.
 
+## Local MCP front door
+
+On Unix, an operator can expose the same library operations to the current MCP-capable agent as a
+local newline-delimited JSON-RPC stdio server. The MCP client launches this command and keeps the
+process open; running it in an ordinary terminal does not itself inspect or execute a workflow:
+
+```sh
+agentscm --data-dir /absolute/path/to/native-data skill-workflow mcp
+```
+
+The default server advertises only the read-only `agentscm_workflow_library_inspect` and
+`agentscm_workflow_handoff` tools. Mutation and execution require separate startup grants:
+
+```sh
+agentscm --data-dir /absolute/path/to/native-data skill-workflow mcp \
+  --allow-configure --allow-execution \
+  --workspace /absolute/path/to/native-workspace \
+  --docker /absolute/path/to/docker \
+  --docker-socket /absolute/path/to/docker.sock \
+  --claude /absolute/path/to/claude
+```
+
+`--allow-configure` advertises `agentscm_workflow_library_configure`;
+`--allow-execution` advertises `agentscm_workflow_check`. The data directory, optional native
+workspace and optional backends are fixed when the operator starts the server. Tool arguments can
+select only a Change, a native manifest path or a retained run ID; they cannot select host paths,
+executables, credentials or sockets. Omit every backend the selected graphs do not need. Prefer a
+separate server configuration for the current agent and repository so its fixed authority and
+runtime choices are easy to review. Sharing the tools between clients on the same trusted local
+account does not add isolation or multi-writer semantics.
+
+This stdio surface is client-neutral. Claude Code, Codex, Cursor, Copilot, Gemini, Grok or another
+MCP client can call it when the operator configures that client to launch the command. That is MCP
+protocol compatibility, not a native AgentSCM adapter or live qualification for every client;
+AgentSCM has no native Grok setup. It is also separate from the remote Coordination Hub MCP, whose
+workflow tool remains read-only retained-run status.
+
+The orchestrating client does not select or become the workflow reviewer. A manifest containing
+`claude_code_review` still uses the optional fixed Claude executable and the existing bounded
+Claude review adapter, even when another client called `agentscm_workflow_check`. The caller's
+brand or model assertions do not become independent review, evidence, approval or admission.
+Successful `check` records the same exact-current receipt as the CLI; native authority still
+performs its normal checks.
+
 ## Read-only handoff
 
 Inspect a retained run as a handoff without advancing it:

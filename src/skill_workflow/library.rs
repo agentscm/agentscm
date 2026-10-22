@@ -147,7 +147,7 @@ pub fn load(data_dir: &Path, revision: &str, path: &str) -> Result<WorkflowTempl
     validate_path(path)?;
     let authority = Authority::open_read_only(data_dir)?;
     let repository = authority.repository_id()?;
-    let engine = Engine::open(data_dir)?;
+    let engine = Engine::open_existing(data_dir)?;
     let (source, budget) = engine.with_read_budget(2 * 1024 * 1024);
     let bytes = budget
         .finish(source.read_regular_file_bounded(revision, path, MAX_TEMPLATE_BYTES))?
