@@ -133,4 +133,4 @@ export async function freshHandoff(m: string): Promise<{ file: string; release: 
   }
 }
 
-export const marker = () => `m${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
+export const marker = () => `m${crypto.randomUUID().replaceAll('-', '').slice(0, 12)}`

@@ -13,8 +13,7 @@ rm -rf "$data"
 mkdir -p "$data/objects" "$data/secrets"
 chmod 700 "$data" "$data/secrets"
 export AGENTSCM_DATABASE_URL="sqlite://$data/hub.sqlite"
-"$root/target/debug/agentscm-dev-seed-mint" > "$data/tokens.env"
-chmod 600 "$data/tokens.env"
+"$root/target/debug/agentscm-dev-seed-mint" "$data/tokens.env"
 printf 'AGENTSCM_HUB=http://127.0.0.1:7332\nREAD_TOKEN=%s\n' "$(sed -n 's/^READ=//p' "$data/tokens.env")" > "$here/.hub.env"
 
 "$bin" hub --no-telemetry serve --objects "$data/objects" --secrets "$data/secrets" &
