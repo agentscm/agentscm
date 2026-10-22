@@ -2,7 +2,7 @@
 // every string in them is teammate-supplied.
 import { decodeSkillWorkflowEnvelope, decodeSkillWorkflowListEnvelope } from './skillWorkflow.ts'
 import { decodeSetup } from './onboarding.ts'
-import type { Activity, Health, HubEvent, Intent, Session, SkillWorkflowEnvelope, SkillWorkflowListEnvelope, Whoami, Work } from './types.ts'
+import type { ViewOverride, ViewSettings, ViewSettingsReport, Activity, Health, HubEvent, Intent, Session, SkillWorkflowEnvelope, SkillWorkflowListEnvelope, Whoami, Work } from './types.ts'
 
 export const AGENT_TOKEN_MESSAGE = 'This is an agent token, which can change coordination. The status page needs a read-only token.'
 
@@ -199,4 +199,16 @@ export async function fetchSkillWorkflows(token: string, signal: AbortSignal, be
   const query = before === undefined ? '' : `?before=${encodeURIComponent(before)}`
   const value = await getBoundedJson(`/v1/hub/skill-workflows${query}`, signal, token)
   return decodeSkillWorkflowListEnvelope(value)
+}
+
+const viewSettings = (v: unknown): ViewSettings => {
+  const j = rec(v)
+  return { enabled: j['enabled'] === true, work_overview: j['work_overview'] === true, coordination_inbox: j['coordination_inbox'] === true }
+}
+
+export async function fetchViewSettings(token: string, signal: AbortSignal): Promise<ViewSettingsReport> {
+  const j = rec(await getJson('/v1/hub/view-settings', signal, token))
+  const raw = j['override']
+  const override: ViewOverride | null = raw && typeof raw === 'object' ? Object.fromEntries(Object.entries(raw).filter(([, v]) => typeof v === 'boolean')) : null
+  return { effective: viewSettings(j['effective']), hub_default: viewSettings(j['hub_default']), override }
 }

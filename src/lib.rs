@@ -39,6 +39,8 @@ pub mod sync;
 pub mod team;
 #[cfg(unix)]
 pub mod workspace;
+#[cfg(unix)]
+pub mod workspace_timeline_service;
 pub use error::{Error, Result};
 
 pub mod forge;

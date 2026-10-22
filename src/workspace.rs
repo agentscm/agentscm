@@ -22,16 +22,23 @@ mod git_config;
 mod glob;
 mod scope;
 mod selection;
+mod snapshots;
 
 use scope::Scope;
 pub use selection::Rule;
 use selection::{Classified, Selection, Selector, Settings, Tracked};
+pub use snapshots::{
+    CapturePause, CaptureResult, CaptureSkip, CheckEvidenceCoverage, CheckLinkEntry,
+    CheckLinkRequest, CheckLinkResult, SnapshotEntry, SnapshotTrigger, TimelineCoverage,
+    TimelineEntry, TimelinePage,
+};
+pub(crate) use snapshots::{TIMELINE_LEASE_FILE, TIMELINE_PROBES_DIRECTORY};
 
 pub const METADATA_DIRECTORY: &str = crate::local_recovery::WORKSPACE_METADATA_DIRECTORY;
 
 const DATABASE_FILE: &str = "state.sqlite";
 const APPLICATION_ID: i64 = 0x4153_574b;
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const LIST_PAGE_SIZE: usize = 4_096;
 const MAX_ENTRIES: usize = 100_000;
@@ -418,8 +425,8 @@ impl Workspace {
         })
     }
 
-    /// Inspect an existing current-schema workspace without migrating it, creating files or
-    /// changing the journal mode. `state` and `status` work; mutating calls fail.
+    /// Inspect an existing v4 or current-schema workspace without migrating it, creating files
+    /// or changing the journal mode. `state` and `status` work; mutating calls fail.
     pub fn open_read_only(root: impl AsRef<Path>) -> Result<Self> {
         let root = absolute_path(root.as_ref())?;
         require_directory(&root, "workspace root")?;
@@ -1345,7 +1352,7 @@ impl Workspace {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct StoredState {
     change: ChangeId,
     base_revision: String,
@@ -1557,7 +1564,48 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
             after_kind TEXT NOT NULL CHECK (after_kind IN ('regular', 'executable', 'symlink')),
             PRIMARY KEY(operation_id, path),
             FOREIGN KEY(operation_id) REFERENCES scope_expansions(operation_id)
-         ) STRICT;",
+         ) STRICT;
+         CREATE TABLE timeline_entries (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT CHECK (sequence > 0),
+            kind TEXT NOT NULL CHECK (kind IN ('snapshot', 'check_link')),
+            trigger TEXT NOT NULL CHECK (trigger IN ('manual', 'turn_end', 'check_start', 'mcp_explicit')),
+            recorded_at INTEGER NOT NULL CHECK (recorded_at >= 0),
+            source_revision TEXT NOT NULL CHECK (length(source_revision) = 64),
+            base_revision TEXT NOT NULL CHECK (length(base_revision) = 64),
+            generation INTEGER NOT NULL CHECK (generation >= 0),
+            scope_json BLOB NOT NULL,
+            changed_paths INTEGER CHECK (changed_paths IS NULL OR changed_paths >= 0),
+            admitted_bytes INTEGER CHECK (admitted_bytes IS NULL OR admitted_bytes >= 0),
+            tested_revision TEXT CHECK (tested_revision IS NULL OR length(tested_revision) = 64),
+            change_repository TEXT,
+            change_id TEXT,
+            change_version INTEGER CHECK (change_version IS NULL OR change_version >= 0),
+            context_digest TEXT CHECK (context_digest IS NULL OR length(context_digest) = 64),
+            policy_epoch INTEGER CHECK (policy_epoch IS NULL OR policy_epoch >= 0),
+            target TEXT,
+            target_revision TEXT CHECK (target_revision IS NULL OR length(target_revision) = 64),
+            target_version INTEGER CHECK (target_version IS NULL OR target_version >= 0),
+            requirement_digest TEXT CHECK (requirement_digest IS NULL OR length(requirement_digest) = 64),
+            run_id TEXT CHECK (run_id IS NULL OR length(run_id) BETWEEN 1 AND 64),
+            CHECK (
+                (kind = 'snapshot' AND changed_paths IS NOT NULL AND admitted_bytes IS NOT NULL
+                    AND tested_revision IS NULL AND change_repository IS NULL AND change_id IS NULL
+                    AND change_version IS NULL AND context_digest IS NULL AND policy_epoch IS NULL
+                    AND target IS NULL AND target_revision IS NULL AND target_version IS NULL
+                    AND requirement_digest IS NULL AND run_id IS NULL)
+                OR
+                (kind = 'check_link' AND trigger = 'check_start' AND changed_paths IS NULL
+                    AND admitted_bytes IS NULL AND tested_revision IS NOT NULL
+                    AND change_repository IS NOT NULL AND change_id IS NOT NULL
+                    AND change_version IS NOT NULL AND context_digest IS NOT NULL
+                    AND policy_epoch IS NOT NULL AND target IS NOT NULL
+                    AND ((target_revision IS NULL) = (target_version IS NULL))
+                    AND requirement_digest IS NOT NULL AND run_id IS NOT NULL)
+            )
+         ) STRICT;
+         CREATE UNIQUE INDEX timeline_check_link_identity
+            ON timeline_entries(run_id, context_digest, requirement_digest)
+            WHERE kind = 'check_link';",
     )?;
     tx.pragma_update(None, "application_id", APPLICATION_ID)?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1570,7 +1618,7 @@ fn migrate_schema(connection: &mut Connection) -> Result<()> {
         connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
     let schema_version: i64 =
         connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if application_id != APPLICATION_ID || !matches!(schema_version, 1..=3) {
+    if application_id != APPLICATION_ID || !matches!(schema_version, 1..=4) {
         return Ok(());
     }
 
@@ -1583,7 +1631,7 @@ fn migrate_schema(connection: &mut Connection) -> Result<()> {
         tx.commit()?;
         return Ok(());
     }
-    if locked_application_id != APPLICATION_ID || !matches!(locked_schema_version, 1..=3) {
+    if locked_application_id != APPLICATION_ID || !matches!(locked_schema_version, 1..=4) {
         return Err(Error::Invalid(format!(
             "workspace schema changed during migration ({locked_application_id}/{locked_schema_version})"
         )));
@@ -1600,9 +1648,10 @@ fn migrate_schema(connection: &mut Connection) -> Result<()> {
                 CHECK (after_kind IN ('regular', 'executable', 'symlink'));",
         )?;
     }
-    // v4 adds optional sparse scope and a separate durable expansion journal.
-    tx.execute_batch(
-        "CREATE TABLE workspace_scope (
+    if locked_schema_version <= 3 {
+        // v4 adds optional sparse scope and a separate durable expansion journal.
+        tx.execute_batch(
+            "CREATE TABLE workspace_scope (
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             roots_json BLOB NOT NULL
          ) STRICT;
@@ -1626,6 +1675,51 @@ fn migrate_schema(connection: &mut Connection) -> Result<()> {
             PRIMARY KEY(operation_id, path),
             FOREIGN KEY(operation_id) REFERENCES scope_expansions(operation_id)
          ) STRICT;",
+        )?;
+    }
+    // v5 adds a bounded observational timeline separate from the workspace operation journal.
+    tx.execute_batch(
+        "CREATE TABLE timeline_entries (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT CHECK (sequence > 0),
+            kind TEXT NOT NULL CHECK (kind IN ('snapshot', 'check_link')),
+            trigger TEXT NOT NULL CHECK (trigger IN ('manual', 'turn_end', 'check_start', 'mcp_explicit')),
+            recorded_at INTEGER NOT NULL CHECK (recorded_at >= 0),
+            source_revision TEXT NOT NULL CHECK (length(source_revision) = 64),
+            base_revision TEXT NOT NULL CHECK (length(base_revision) = 64),
+            generation INTEGER NOT NULL CHECK (generation >= 0),
+            scope_json BLOB NOT NULL,
+            changed_paths INTEGER CHECK (changed_paths IS NULL OR changed_paths >= 0),
+            admitted_bytes INTEGER CHECK (admitted_bytes IS NULL OR admitted_bytes >= 0),
+            tested_revision TEXT CHECK (tested_revision IS NULL OR length(tested_revision) = 64),
+            change_repository TEXT,
+            change_id TEXT,
+            change_version INTEGER CHECK (change_version IS NULL OR change_version >= 0),
+            context_digest TEXT CHECK (context_digest IS NULL OR length(context_digest) = 64),
+            policy_epoch INTEGER CHECK (policy_epoch IS NULL OR policy_epoch >= 0),
+            target TEXT,
+            target_revision TEXT CHECK (target_revision IS NULL OR length(target_revision) = 64),
+            target_version INTEGER CHECK (target_version IS NULL OR target_version >= 0),
+            requirement_digest TEXT CHECK (requirement_digest IS NULL OR length(requirement_digest) = 64),
+            run_id TEXT CHECK (run_id IS NULL OR length(run_id) BETWEEN 1 AND 64),
+            CHECK (
+                (kind = 'snapshot' AND changed_paths IS NOT NULL AND admitted_bytes IS NOT NULL
+                    AND tested_revision IS NULL AND change_repository IS NULL AND change_id IS NULL
+                    AND change_version IS NULL AND context_digest IS NULL AND policy_epoch IS NULL
+                    AND target IS NULL AND target_revision IS NULL AND target_version IS NULL
+                    AND requirement_digest IS NULL AND run_id IS NULL)
+                OR
+                (kind = 'check_link' AND trigger = 'check_start' AND changed_paths IS NULL
+                    AND admitted_bytes IS NULL AND tested_revision IS NOT NULL
+                    AND change_repository IS NOT NULL AND change_id IS NOT NULL
+                    AND change_version IS NOT NULL AND context_digest IS NOT NULL
+                    AND policy_epoch IS NOT NULL AND target IS NOT NULL
+                    AND ((target_revision IS NULL) = (target_version IS NULL))
+                    AND requirement_digest IS NOT NULL AND run_id IS NOT NULL)
+            )
+         ) STRICT;
+         CREATE UNIQUE INDEX timeline_check_link_identity
+            ON timeline_entries(run_id, context_digest, requirement_digest)
+            WHERE kind = 'check_link';",
     )?;
     let foreign_key_violation = {
         let mut statement = tx.prepare("PRAGMA foreign_key_check")?;
@@ -1721,7 +1815,7 @@ fn validate_schema(connection: &Connection) -> Result<()> {
             "workspace metadata belongs to a different application ({application_id})"
         )));
     }
-    if schema_version != SCHEMA_VERSION {
+    if !matches!(schema_version, 4 | SCHEMA_VERSION) {
         return Err(Error::Invalid(format!(
             "unsupported workspace schema version {schema_version}"
         )));
@@ -1808,9 +1902,11 @@ fn decode_required_scope(bytes: &[u8]) -> Result<Scope> {
     Scope::from_effective(serde_json::from_slice(bytes)?)
 }
 
-/// Validate the workspace-specific portion of a schema-v4 recovery database
+/// Validate the workspace-specific portion of a current-schema recovery database
 /// without migrating it or touching the working tree.
 pub(crate) fn validate_recovery_schema(connection: &Connection) -> Result<()> {
+    let schema_version: i64 =
+        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     connection.prepare("SELECT singleton, roots_json FROM workspace_scope LIMIT 0")?;
     connection.prepare(
         "SELECT operation_id, request_digest, status, expected_generation,
@@ -1821,6 +1917,9 @@ pub(crate) fn validate_recovery_schema(connection: &Connection) -> Result<()> {
         "SELECT operation_id, path, after_content, after_kind
          FROM scope_expansion_paths LIMIT 0",
     )?;
+    if schema_version == SCHEMA_VERSION {
+        snapshots::validate_recovery_schema(connection)?;
+    }
     let state = read_state(connection)?;
     let scope = read_scope(connection)?;
     let pending = pending_operation(connection)?;
@@ -3916,11 +4015,11 @@ fn executable_bit_preserved(clear_mode: u32, set_mode: u32) -> bool {
 
 const PROBE_PREFIX: &str = ".agentscm-probe-";
 
-/// Remove probe leftovers from a process killed mid-probe. Probes run under
-/// the workspace's immediate transaction (and creation owns the new metadata
-/// directory), so no live probe shares the directory. Only direct entries with
-/// the probe prefix that are files or symbolic links are removed; links are
-/// never followed and nothing is recursed into.
+/// Remove probe leftovers from a process killed mid-probe. Callers must serialize
+/// probes sharing a directory. Capture uses its own directory under the timeline
+/// lease; creation owns a new metadata directory. Only direct entries with the
+/// probe prefix that are files or symbolic links are removed; links are never
+/// followed and nothing is recursed into.
 fn sweep_stale_probes(directory: &Path) -> Result<()> {
     for entry in fs::read_dir(directory)? {
         let entry = entry?;

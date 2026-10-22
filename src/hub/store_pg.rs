@@ -3894,6 +3894,26 @@ impl Store for PgStore {
         })
     }
 
+    fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        self.run(true, |client| {
+            Ok(client
+                .query_opt("SELECT value FROM hub_settings WHERE key = $1", &[&key])?
+                .map(|row| row.get(0)))
+        })
+    }
+
+    fn set_setting(&self, key: &str, value: &str, actor: &str) -> Result<()> {
+        let now = unix_now();
+        self.run(false, |client| {
+            client.execute(
+                "INSERT INTO hub_settings (key, value, updated_at, updated_by) VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = $3, updated_by = $4",
+                &[&key, &value, &now, &actor],
+            )?;
+            Ok(())
+        })
+    }
+
     fn set_next_poll(&self, id: &str, at: i64) -> Result<()> {
         self.run(false, |client| {
             client.execute(

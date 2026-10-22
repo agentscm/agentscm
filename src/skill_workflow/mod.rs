@@ -2,6 +2,7 @@
 pub mod collector_transfer;
 pub mod compiler;
 pub mod contracts;
+pub mod library;
 pub mod runtime;
 pub mod task_contracts;
 pub use collector_transfer::*;

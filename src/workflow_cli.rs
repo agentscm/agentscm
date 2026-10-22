@@ -11,6 +11,42 @@ use serde_json::{Value, json};
 
 #[derive(Debug, Subcommand)]
 pub enum WorkspaceCommand {
+    /// Capture observed working bytes without advancing the workspace base or Change.
+    Capture {
+        root: PathBuf,
+    },
+    /// List retained snapshots and exact workflow run links, newest first.
+    Timeline {
+        root: PathBuf,
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+        #[arg(long)]
+        before: Option<u64>,
+    },
+    /// Inspect one retained entry and its exact workflow evidence, if present.
+    Entry {
+        root: PathBuf,
+        id: u64,
+    },
+    /// Compare paths inside both entries' recorded scopes.
+    Diff {
+        root: PathBuf,
+        left: u64,
+        right: u64,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long)]
+        after: Option<String>,
+    },
+    /// Materialize an entry for a different existing Change in a fresh directory.
+    Fork {
+        root: PathBuf,
+        id: u64,
+        child: String,
+        change: String,
+        #[arg(long)]
+        fork_root: PathBuf,
+    },
     /// Create a new directory for an existing local Change and revision.
     Create {
         root: PathBuf,
@@ -140,8 +176,54 @@ pub fn sync(data_dir: &Path, command: SyncCommand) -> Result<Value> {
 }
 
 pub fn workspace(data_dir: &Path, command: WorkspaceCommand) -> Result<Value> {
+    use agentscm::workspace::SnapshotTrigger;
+    use agentscm::workspace_timeline_service::WorkspaceTimelineService;
+    match &command {
+        WorkspaceCommand::Capture { root } => {
+            return WorkspaceTimelineService::new(data_dir, root, None)?
+                .capture(SnapshotTrigger::Manual);
+        }
+        WorkspaceCommand::Timeline {
+            root,
+            limit,
+            before,
+        } => return WorkspaceTimelineService::new(data_dir, root, None)?.timeline(*limit, *before),
+        WorkspaceCommand::Entry { root, id } => {
+            return WorkspaceTimelineService::new(data_dir, root, None)?.entry(*id);
+        }
+        WorkspaceCommand::Diff {
+            root,
+            left,
+            right,
+            limit,
+            after,
+        } => {
+            return WorkspaceTimelineService::new(data_dir, root, None)?.diff(
+                *left,
+                *right,
+                *limit,
+                after.clone(),
+            );
+        }
+        WorkspaceCommand::Fork {
+            root,
+            id,
+            child,
+            change,
+            fork_root,
+        } => {
+            return WorkspaceTimelineService::new(data_dir, root, Some(fork_root))?
+                .fork(*id, child, change);
+        }
+        _ => {}
+    }
     let root = match &command {
-        WorkspaceCommand::Create { root, .. }
+        WorkspaceCommand::Capture { root }
+        | WorkspaceCommand::Timeline { root, .. }
+        | WorkspaceCommand::Entry { root, .. }
+        | WorkspaceCommand::Diff { root, .. }
+        | WorkspaceCommand::Fork { root, .. }
+        | WorkspaceCommand::Create { root, .. }
         | WorkspaceCommand::Expand { root, .. }
         | WorkspaceCommand::PathState { root, .. }
         | WorkspaceCommand::State { root }
@@ -247,6 +329,6 @@ pub fn workspace(data_dir: &Path, command: WorkspaceCommand) -> Result<Value> {
         WorkspaceCommand::Recover { choice, .. } => Ok(
             json!({"ok":true,"outcome":workspace.recover(&engine, match choice { Choice::Complete=>RecoveryChoice::Complete, Choice::RollBack=>RecoveryChoice::RollBack })?}),
         ),
-        WorkspaceCommand::Create { .. } => unreachable!("create handled before open"),
+        _ => unreachable!("creation and timeline commands handled before open"),
     }
 }

@@ -79,7 +79,7 @@ const JOURNAL_BYTES = 64 * 1024
 const BODY_BYTES = 16 * 1024
 const pendingMutationEvent = 'agentscm:workspace-pending-mutations'
 const sensitiveField = /(^|_)(authorization|bearer|csrf|password|secret|session|token)($|_)/i
-const validMutationPath = (path: string): boolean => path === '/members' || path === '/settings' || /^\/repositories\/[^/?#]+\/runs(?:\/[^/?#]+\/cancel)?$/.test(path) || /^\/repositories\/[^/?#]+\/profiles\/[^/?#]+\/(approve|integrate)$/.test(path)
+const validMutationPath = (path: string): boolean => path === '/members' || path === '/settings' || path === '/view-settings' || path === '/view-settings/me' || /^\/repositories\/[^/?#]+\/runs(?:\/[^/?#]+\/cancel)?$/.test(path) || /^\/repositories\/[^/?#]+\/profiles\/[^/?#]+\/(approve|integrate)$/.test(path)
 
 const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value)
 const canonicalJson = (value: unknown): string => JSON.stringify(value, (_key, nested: unknown) => {

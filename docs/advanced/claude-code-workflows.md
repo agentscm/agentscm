@@ -47,7 +47,11 @@ It updates the Change's command context, installs a target requirement and advan
 The requirement pins the graph, model selection, skill and recipe bytes. The alpha profile
 allows only the first immutable requirement per target; it has no update/remove operation.
 Configuration requires a context without a separate source-path recipe. Skill, source and model
-preflight rejects invalid setup before mutation; configuration never approves or lands work.
+preflight rejects invalid setup before mutation. Explicit configuration refreshes an otherwise
+valid stale policy epoch to the current global epoch; it rejects a Change whose recorded base no
+longer matches the target. Inspect and publish any reviewed replacement context as described in
+[reusable workflow configuration](reusable-workflows.md#inspect-configure-and-check).
+Configuration never approves or lands work.
 For a custom graph, `skill-workflow require TARGET DEFINITION.json` installs a compiled profile.
 
 Run the complete loop explicitly:
@@ -92,9 +96,11 @@ earlier `install-stop` entry for the same workspace (compared canonically when b
 resolve), regardless of stop subcommand or change, so each settings file keeps one AgentSCM
 Stop entry per workspace, and keeps other hooks, events, keys and other workspaces' entries. Re-installing an
 identical entry is `unchanged` and does not move it. It refuses a settings file inside the
-workspace or a symbolic link, requires absolute `--workspace`, `--docker`, `--docker-socket`
-and `--claude` paths, reads only plain JSON and stores the resolved path of the running
-`agentscm` executable, so re-run `install-stop` after upgrading or moving the binary.
+workspace or a symbolic link and requires an absolute `--workspace`. Docker flags are required
+only when the selected graph contains a command step, and `--claude` only when it contains a
+Claude review step; every backend path supplied to the installer must be absolute. The installer
+reads only plain JSON and stores the resolved path of the running `agentscm` executable, so re-run
+`install-stop` after upgrading or moving the binary.
 `install-stop --settings FILE --remove [--workspace PATH] [--apply]` removes only its own
 entries, only those for `PATH` when given. Rewriting normalizes JSON key order and does not
 preserve file locking, hardlinks or ACLs, so edit settings serially. Hosted workspaces use `remote-stop` ([hosted laptop workflows](hosted-laptop-workflows.md#optional-stop-hooks)).

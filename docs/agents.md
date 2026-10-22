@@ -9,6 +9,12 @@ AgentSCM warns an agent when another agent already holds a file it is about to e
 
 The read-only `agentscm_workflow_status` MCP tool inspects a retained native skill workflow when the operator has configured a repository mapping. It preserves recorded outcomes, current source applicability and unavailable capabilities as separate facts. See [skill workflows in the hub](advanced/skill-workflow-hub.md).
 
+The separate local `agentscm --data-dir PATH skill-workflow mcp` stdio server lets an operator give
+an MCP-capable client read-only reusable-workflow inspect and handoff tools, with configure and check
+available only through explicit startup flags. Its native store, workspace and execution backends
+are fixed at startup and cannot be supplied by a tool call. See
+[reusable workflow templates](advanced/reusable-workflows.md#local-mcp-front-door).
+
 The [asynchronous stand-up](standup.md) adds durable engineering work and checkpoint handovers alongside file intents. Its agent-authenticated CLI and MCP surfaces can retrieve current unfinished work and a bounded catch-up before a task, then create or reuse an explicit work item and report meaningful changes. `agentscm_work_briefing` reads the briefing; `agentscm_start` resolves and claims explicit work; `agentscm_work_checkpoint` records a meaningful change; and `agentscm_work_ack` deliberately advances a completely delivered writer briefing. A supported session-start hook can render the bounded briefing, and a safely linked end hook can record pause or handover. Hooks do not create a goal, acknowledge delivery, infer decisions or meaningful progress, or claim completion as accepted or landed. The durable workflow also provides a session-specific catch-up cursor and a directed coordination inbox with explicit receipts, replies and validated resolution. Requests appear in later MCP calls and supported hooks; disconnected clients catch up through the inbox. A model can also skip an MCP call. A reported checkpoint is coordination context, not trusted execution or landing evidence.
 
 Nothing is locked: a refusal happens once per session and file, a repeat always passes, and any failure lets the edit through. Cursor's hook cannot refuse, so Cursor gets a note just after the edit, and an agent that only has MCP gets advice only. Details: [warn once](hub.md#warn-once).
@@ -114,9 +120,13 @@ These are not generated and not tested here. The shape is always the same:
 2. Make sure the agent reads `AGENTS.md` (or paste the snippet from it into the agent's own instructions file).
 3. If the agent can run a command before edits and wants a JSON answer, `agentscm hook generic` accepts `{"agent", "session", "event", "tool", "paths", "task"}` on standard input.
 
+Grok has no native AgentSCM setup, hook or workflow adapter in this repository. A Grok host with an
+MCP client can use the generic remote Hub recipe above, or an operator can separately configure the
+local reusable-workflow stdio server. Neither route is a live-tested Grok integration.
+
 ## Workflow lifecycle capability matrix
 
-Matrix version 2, verified 2026-10-20 (see [Verified against](#verified-against)). It records, per client surface, what this repository's code and tests cover for the workflow lifecycle. Only the two CLI rows' Stop cells rest on a run in the real client product; every other cell is fixture-tested, unverified or unsupported.
+Matrix version 3, updated 2026-10-22 (see [Verified against](#verified-against)). It records, per client surface, what this repository's code and tests cover for the workflow lifecycle. Only the two CLI rows' Stop cells rest on a run in the real client product; every other cell is fixture-tested, unverified or unsupported.
 
 Cell values:
 
@@ -134,7 +144,7 @@ Cell values:
 | Codex IDE/desktop | Not verified | Not verified: hook support is not checked | Not verified | Not verified |
 | Cursor | Not verified: `init-repo` writes `.cursor/mcp.json` from vendor docs; no client session was run | Fixture-tested: post-edit note only; the hook cannot refuse | Not verified: no Stop adapter | Unsupported: no adapter, the edit hook cannot refuse, and per vendor documentation its `stop` hook can only return `followup_message` to continue (default `loop_limit` 5), not block |
 | Copilot | Not verified: `init-repo` writes `.vscode/mcp.json` from vendor docs; no client session was run | Fixture-tested: pre-edit hook, refuses once; the CLI gets the refusal but no notes | Not verified: no Stop adapter | Documented, not verified: Copilot CLI and cloud agent document `agentStop` with `decision: block` and `stop_hook_active`, capped at 8 consecutive blocks in the CLI. VS Code agent hooks (preview) document a `Stop` event; not verified. AgentSCM installs no adapter for either |
-| Any MCP client | Fixture-tested: the hub's `POST /mcp` coordination tools ([hub](hub.md#agent-sessions-mcp-and-hook-endpoints)) and the workspace [agent-task MCP](advanced/agent-workflow-tasks.md) are implemented and tested server-side, including with a synthetic MCP protocol client (initialize, tools/list, capabilities, reference, qualification, revocation) and no vendor hook; that is not a live editor test. Advice only, and a model can skip calls | Unsupported: MCP alone has no hook, so no edit is intercepted | Unsupported: MCP has no completion event | Unsupported |
+| Any MCP client | Fixture-tested: the hub's `POST /mcp` coordination tools ([hub](hub.md#agent-sessions-mcp-and-hook-endpoints)), the workspace [agent-task MCP](advanced/agent-workflow-tasks.md) and the local [reusable-workflow stdio server](advanced/reusable-workflows.md#local-mcp-front-door) are exercised with synthetic protocol clients, not live vendor sessions. Hub coordination tools are advice only. The local server's configure and check tools require explicit startup grants; its paths and backends are fixed by the operator. A model can still skip calls | Unsupported: MCP alone has no hook, so no edit is intercepted | Unsupported: MCP has no completion event | Unsupported |
 
 Live qualification, 2026-10-20: one macOS machine, a synthetic fixture, a local native store, a Docker command check and a Claude review step. Claude Code print mode used `claude -p` with `--settings` pointing at a file written by `install-stop`. Codex used `codex exec` with hooks in an isolated `CODEX_HOME` `hooks.json` written by `install-stop`; hooks fired only with `--dangerously-bypass-hook-trust`, and a native workspace also needs `--skip-git-repo-check`. In both, an independent `skill-workflow check` confirmed a receipt for the current revision after the fix. Not live-tested: interactive Claude Code, Claude desktop/IDE, Codex interactive (`/hooks` trust), Codex IDE/desktop, the hosted `remote-*` stops and the agent-owned `task-stop` and `task-codex-stop`. The hosted and agent-owned stops are fixture-tested against a synthetic local HTTP hub harness, including token revocation, an unreachable endpoint, uncheckpointed edits and a stale subject.
 

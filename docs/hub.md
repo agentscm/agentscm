@@ -537,7 +537,8 @@ agentscm hub token create --read-only --name status-page --repo owner/name
 
 Every `/ui/` response carries a `Content-Security-Policy` that allows scripts only from the hub
 itself, plus `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and `Cache-Control:
-no-cache`. Styles may be inline, because the component library injects style tags at runtime.
+no-cache`. Styles may be inline, because the page sets inline `style` attributes; fonts and images are
+inlined into the stylesheet as `data:` URIs.
 
 ### Try it locally: `agentscm demo`
 

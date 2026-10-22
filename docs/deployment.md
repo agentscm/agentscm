@@ -91,7 +91,7 @@ cargo build --release --locked
 ./target/release/agentscm --data-dir /srv/agentscm serve --bind 127.0.0.1:7331
 ```
 
-The `serve` command serves a read-only JSON API under `/v1/*` plus `/health`, and has no web interface. The coordination hub (`agentscm hub serve`) serves a separate read-only status page at `/ui/`; it is built into the container image and the release binaries (see [the status page](hub.md#status-page)).
+The `serve` command serves a read-only JSON API under `/v1/*` plus `/health`, and has no web interface. The coordination hub (`agentscm hub serve`) serves a separate web UI at `/ui/`; it is built into the container image and the release binaries (see [the status page](hub.md#status-page)).
 
 The loopback default keeps the unauthenticated API local. `serve` refuses a non-loopback `--bind` unless you also pass `--public`, as `hub serve` does. With `--public`, source reads are exposed to that network, so the service needs an operator-managed authenticated proxy and transport security. The CLI remains available while the service runs. SQLite serializes authority writes; run administrative CLI commands against local durable storage.
 

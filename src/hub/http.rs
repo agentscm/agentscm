@@ -37,6 +37,7 @@ pub fn routes() -> Router<HubState> {
     Router::new()
         .route("/v1/hub/health", get(health))
         .route("/v1/hub/whoami", get(whoami))
+        .route("/v1/hub/view-settings", get(view_settings))
         .route("/v1/hub/skill-workflows", get(skill_workflows))
         .route("/v1/hub/skill-workflows/{run_id}", get(skill_workflow))
 }
@@ -169,10 +170,13 @@ pub async fn serve(config: HubConfig) -> Result<()> {
         .as_ref()
         .filter(|execution| execution.server_execution_enabled())
         .map(|execution| execution.clone().spawn_worker());
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(crate::Error::Io)?;
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .map_err(crate::Error::Io)?;
     #[cfg(unix)]
     if let Some(worker) = execution_worker {
         worker.abort();
@@ -360,6 +364,18 @@ async fn health(State(state): State<HubState>) -> Response {
                 .into_response()
         }
     }
+}
+
+async fn view_settings(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    let store = state.store.clone();
+    let report = blocking(&state, move || {
+        super::view_settings::ViewSettings::report(&*store, &principal.owner.id)
+    })
+    .await?;
+    Ok(Json(report))
 }
 
 async fn whoami(Reader(principal): Reader) -> Json<serde_json::Value> {

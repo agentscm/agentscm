@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Coordination inbox</title>
+<style>
+:root{--bg:#fff;--card:#fff;--fg:#1c1b22;--mut:#5d5b6b;--bd:#e3e1ec;--acc:#6d4aff;--accbg:#efeaff;--ok:#1b7a43;--okbg:#e5f5ec;--warn:#8a5a00;--warnbg:#fff3d6;--bad:#b3261e;--badbg:#fde8e6;color-scheme:light}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#15141a;--card:#1d1b25;--fg:#ececf3;--mut:#a9a6b8;--bd:#34314a;--acc:#a28cff;--accbg:#2c2550;--ok:#6fd49a;--okbg:#17301f;--warn:#f1c36a;--warnbg:#38290a;--bad:#ff8f87;--badbg:#3d1916;color-scheme:dark}}
+:root[data-theme=dark]{--bg:#15141a;--card:#1d1b25;--fg:#ececf3;--mut:#a9a6b8;--bd:#34314a;--acc:#a28cff;--accbg:#2c2550;--ok:#6fd49a;--okbg:#17301f;--warn:#f1c36a;--warnbg:#38290a;--bad:#ff8f87;--badbg:#3d1916;color-scheme:dark}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+.card{margin:8px;padding:14px;background:var(--card);border:.5px solid var(--bd);border-radius:12px}
+header{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+h1{font-size:15px;margin:0;font-weight:650}h2{font-size:13px;margin:16px 0 6px;color:var(--mut);font-weight:650;text-transform:uppercase;letter-spacing:.04em}
+.sp{flex:1}.mut{color:var(--mut)}button{font:inherit;color:var(--acc);background:var(--accbg);border:.5px solid var(--acc);border-radius:8px;padding:4px 12px;cursor:pointer}
+button:focus-visible,summary:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+.tiles{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.tile{border:.5px solid var(--bd);border-radius:10px;padding:8px 10px}
+.num{font-size:28px;font-weight:650;line-height:1.1}.warn{background:var(--warnbg);color:var(--warn);border-radius:8px;padding:6px 10px;margin:8px 0}
+.note{color:var(--mut);margin:4px 0}ul{margin:0;padding:0;list-style:none}li.att{padding:5px 0;border-bottom:.5px solid var(--bd)}
+.row{display:flex;gap:10px;align-items:center;padding:8px 0;border-bottom:.5px solid var(--bd)}.row:last-child{border:0}
+.av{flex:none;width:30px;height:30px;border-radius:50%;background:var(--accbg);color:var(--acc);display:grid;place-items:center;font-weight:650;font-size:13px}
+.main{flex:1;min-width:0}.t{font-size:15px;font-weight:600;overflow-wrap:anywhere}.s{color:var(--mut);overflow-wrap:anywhere}
+.right{flex:none;text-align:right}.pill{display:inline-block;border-radius:999px;padding:1px 9px;font-size:13px;background:var(--accbg);color:var(--acc);white-space:nowrap}
+.pill.ok{background:var(--okbg);color:var(--ok)}.pill.warn{background:var(--warnbg);color:var(--warn)}.pill.bad{background:var(--badbg);color:var(--bad)}
+.dots{display:inline-flex;gap:4px;vertical-align:middle;margin-right:6px}.dot{width:9px;height:9px;border-radius:50%;border:1px solid var(--acc)}.dot.on{background:var(--acc)}
+details{margin-top:6px}summary{cursor:pointer;color:var(--acc)}footer{margin-top:14px;color:var(--mut)}.quiet{margin-top:8px;font-size:13px;color:var(--mut)}
+@media (max-width:420px){.tiles{grid-template-columns:1fr}.row{flex-wrap:wrap}.right{text-align:left}}
+</style></head><body><div class="card" id="app"></div>
+<script>
+"use strict";
+var TOOL='agentscm_coordination_inbox',paged=false;
+var STAGES=['Awaiting receipt','Awaiting reply','Replied','Resolved'];
+var KIND={propose_split:'Proposed a split',join:'Offered to join',handover:'Offered a handover',decline:'Declined'};
+function stage(q){if(q.status==='withdrawn')return -1;if(q.status==='resolved')return 3;if(q.status==='responded')return 2;
+return (q.acknowledgements||[]).some(function(a){return a.target_work_id!=null})?1:0}
+function names(a){var u=[];a.forEach(function(x){if(u.indexOf(x)<0)u.push(x)});return u.length>3?u.slice(0,3).join(', ')+' and '+(u.length-3)+' more':u.join(' and ')}
+function render(root,d,at){
+var rs=Array.isArray(d.requests)?d.requests:[];
+var open=rs.filter(function(q){return q.status==='pending'||q.status==='responded'}).length;
+var hd=h('header');add(hd,h('h1',null,'Coordination inbox'),h('span','pill',open+(d.complete===false?'+':'')+' open'),h('span','sp'),h('span','mut','Updated '+pad(at.getHours())+':'+pad(at.getMinutes())),refreshBtn());add(root,hd,failNote());
+if(d.complete===false)add(root,h('div','warn','⚠ More requests are on the next page.'));
+if(d.retention_gap)add(root,h('div','warn','⚠ Some history is no longer retained.'));
+if(!rs.length)add(root,h('p','note','No coordination requests on this page.'));
+rs.forEach(function(q){var s=stage(q),r=h('div','row'),m=h('div','main'),x=h('div','right'),tg=(q.targets||[]).map(function(t){return t.lead&&t.lead.agent||'unknown agent'});
+var ps=[];(q.targets||[]).forEach(function(t){(t.reasons||[]).forEach(function(o){if(ps.indexOf(o.your_path)<0)ps.push(o.your_path)})});
+var tp=(q.targets||[]).some(function(t){return t.reasons_complete===false});
+add(m,h('div','t',clip(q.proposal&&q.proposal.title)),h('div','s',clip(q.requester&&q.requester.agent||'unknown agent')+' asked '+clip(names(tg))),
+h('div','s','Paths: '+(ps.slice(0,3).map(clip).join(', ')||'none listed')+(ps.length>3?' and '+(ps.length-3)+' more':'')+(tp?' (more paths omitted by the hub)':'')));
+var pr=h('div','s'),dots=h('span','dots');for(var i=0;i<4;i++)dots.appendChild(h('span','dot'+(i<=s?' on':'')));
+add(pr,dots,document.createTextNode(s<0?'Withdrawn':'Step '+(s+1)+' of 4: '+STAGES[s]));m.appendChild(pr);
+var nr=(q.acknowledgements||[]).length,nq=(q.responses||[]).length,dt=h('details');add(dt,h('summary',null,'Receipts ('+nr+') and replies ('+nq+')'));
+(q.acknowledgements||[]).forEach(function(a){dt.appendChild(h('div','s','✓ Receipt: '+clip(a.agent&&a.agent.agent)+(a.target_work_id==null?' (requester)':'')+' · '+ago(a.acknowledged_at)))});
+if(q.acknowledgements_complete===false)dt.appendChild(h('div','s','⚠ Receipt history omitted by the hub. A missing receipt here is unknown, not absent.'));
+(q.responses||[]).forEach(function(a){dt.appendChild(h('div','s','↩ '+clip(a.responder&&a.responder.agent)+': '+(KIND[a.kind]||a.kind)+(a.note?' — '+clip(a.note):'')+' · '+ago(a.created_at)))});
+if(q.responses_complete===false)dt.appendChild(h('div','s','⚠ Reply history omitted by the hub.'));
+m.appendChild(dt);
+add(x,s<0?pill('bad','⊘','Withdrawn'):pill(s===3?'ok':s===2?'':'warn',s===3?'✓':s===2?'↩':'⏳',STAGES[s]),h('div','s',ago(q.updated_at)));add(r,m,x);root.appendChild(r)});
+var f=h('footer',null,'Read-only. Reading never acknowledges. ');
+if(paged)f.appendChild(document.createTextNode('Showing a later page; Refresh returns to the first page. '));
+if(d.complete===false&&d.next_after!=null){var b=h('button',null,'Next page');b.type='button';b.addEventListener('click',function(){paged=true;call({after:d.next_after,through:d.through})});f.appendChild(b)}
+add(root,f,h('div','quiet',manage))}
+function h(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=String(text);return e}
+function add(p){for(var i=1;i<arguments.length;i++)if(arguments[i])p.appendChild(arguments[i]);return p}
+function clip(s){s=String(s==null?'':s);return s.length>300?s.slice(0,300)+'…':s}
+function pad(n){return n<10?'0'+n:''+n}
+function hms(d){return pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds())}
+function ago(at){var s=Math.max(0,Math.floor(Date.now()/1000-at));if(s<60)return 'just now';var m=Math.floor(s/60);if(m<60)return m+' min ago';var x=Math.floor(m/60);return x<24?x+' h ago':Math.floor(x/24)+' d ago'}
+function pill(cls,icon,label){return h('span','pill '+cls,icon+' '+label)}
+var nextId=1,pending={},last=null,lastAt=null,lastH=0;
+function send(m){window.parent.postMessage(m,'*')}
+function rpc(method,params){return new Promise(function(ok,no){var id=nextId++;pending[id]={ok:ok,no:no};send({jsonrpc:'2.0',id:id,method:method,params:params})})}
+function parse(r){if(!r||r.isError)return null;var s=r.structuredContent;if(s&&typeof s==='object')return s;var c=r.content;if(c&&c[0]&&typeof c[0].text==='string'){try{var v=JSON.parse(c[0].text);if(v&&typeof v==='object')return v}catch(e){}}return null}
+function theme(c){if(c&&(c.theme==='dark'||c.theme==='light'))document.documentElement.setAttribute('data-theme',c.theme)}
+function size(){var v=Math.ceil(document.body.scrollHeight);if(v!==lastH){lastH=v;send({jsonrpc:'2.0',method:'ui/notifications/size-changed',params:{height:v}})}}
+function paint(){var root=document.getElementById('app');root.textContent='';if(!last){add(root,h('p','note','No data returned.'))}else render(root,last,lastAt);size()}
+function take(r,silent){var d=parse(r);if(d){last=d;lastAt=new Date();failedAt=null;paint();return}if(silent){if(!last)paint();return}fail()}
+var failedAt=null;
+function fail(){failedAt=lastAt;paint()}
+function call(args,keep){return rpc('tools/call',{name:TOOL,arguments:args}).then(function(r){var d=parse(r);if(d){last=d;lastAt=new Date();failedAt=null;paint()}else fail()},fail)}
+function refreshBtn(){var b=h('button',null,'Refresh');b.type='button';b.addEventListener('click',function(){call({})});return b}
+function failNote(){return failedAt?h('div','warn','Could not refresh. Showing data from '+hms(failedAt)):null}
+window.addEventListener('message',function(e){if(e.source!==window.parent)return;var m=e.data;if(!m||m.jsonrpc!=='2.0')return;
+if(m.id!=null&&pending[m.id]&&!m.method){var p=pending[m.id];delete pending[m.id];if(m.error)p.no(m.error);else p.ok(m.result);return}
+if(m.method==='ui/notifications/tool-result')take(m.params,true);
+else if(m.method==='ui/notifications/host-context-changed')theme(m.params&&(m.params.theme?m.params:m.params.hostContext))});
+var manage='Manage these views: ask your agent to run agentscm_view_settings, or open Settings in the hub.';
+function start(){if(typeof ResizeObserver==='function')new ResizeObserver(size).observe(document.body);
+rpc('ui/initialize',{appInfo:{name:TOOL+'-view',version:'1.0.0'},appCapabilities:{},protocolVersion:'2026-01-26'}).then(function(r){theme(r&&r.hostContext);send({jsonrpc:'2.0',method:'ui/notifications/initialized',params:{}})},function(){});
+paint()}
+start();
+</script></body></html>
