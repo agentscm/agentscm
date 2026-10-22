@@ -1,0 +1,11 @@
+[package]
+name = "agentscm-dev-seed-mint"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone: not part of the agentscm build.
+[workspace]
+
+[dependencies]
+agentscm = { path = "../../.." }
