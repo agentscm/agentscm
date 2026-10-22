@@ -81,7 +81,17 @@ function describe(e: HubEvent, d: Derived): Row | null {
     case 'pr_notice': {
       const n = typeof data['number'] === 'number' ? data['number'] : null
       const title = typeof data['title'] === 'string' ? data['title'] : null
-      return { icon: 'git', tone: 'warn', text: <>was told {n !== null ? `PR #${n}` : 'a pull request'} touches its files</>, sub: title }
+      const pr = n !== null ? `PR #${n}` : 'a pull request'
+      if (data['merged'] === true) {
+        const base = typeof data['base_ref'] === 'string' ? data['base_ref'] : 'the base'
+        return { icon: 'git', tone: 'warn', text: <>was told {pr} merged into {base} under its files, so it should sync first</>, sub: title }
+      }
+      return { icon: 'git', tone: 'warn', text: <>was told {pr} touches its files</>, sub: title }
+    }
+    case 'task_overlap': {
+      const task = typeof data['task'] === 'string' ? data['task'] : null
+      const matches = strs(data['work']).length + (Array.isArray(data['pulls']) ? data['pulls'].length : 0)
+      return { icon: 'people', tone: 'warn', text: <>started a task that reads like {matches === 1 ? 'work' : `${matches} pieces of work`} already under way</>, sub: task }
     }
     default:
       return null
@@ -91,7 +101,7 @@ function describe(e: HubEvent, d: Derived): Row | null {
 const KINDS: { key: string; label: string; match: (k: string) => boolean }[] = [
   { key: 'all', label: 'Everything', match: () => true },
   { key: 'conflict', label: 'Refusals & handoffs', match: (k) => k.startsWith('edit_') || k.startsWith('handoff_') },
-  { key: 'work', label: 'Announcements', match: (k) => k.startsWith('intent_') || k === 'pr_notice' || k === 'hold_expired' },
+  { key: 'work', label: 'Announcements', match: (k) => k.startsWith('intent_') || k === 'pr_notice' || k === 'task_overlap' || k === 'hold_expired' },
   { key: 'session', label: 'Sessions', match: (k) => k.startsWith('session_') },
 ]
 

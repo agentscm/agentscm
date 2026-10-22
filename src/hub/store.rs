@@ -159,7 +159,7 @@ pub struct ActivityEvent {
 /// The event kinds the status page shows, as an SQL list.
 pub(super) const ACTIVITY_KINDS: &str = "'session_started', 'session_connected', 'session_ended',
     'edit_denied', 'edit_repeated', 'hold_expired', 'intent_announced', 'intent_released',
-    'intent_notice', 'pr_notice', 'handoff_request', 'handoff_grant', 'handoff_decline'";
+    'intent_notice', 'pr_notice', 'handoff_request', 'handoff_grant', 'handoff_decline', 'task_overlap'";
 
 /// Methods block; async callers use `spawn_blocking`. Every mutation appends
 /// its event in the same transaction as the state change; a no-op appends nothing.
@@ -388,8 +388,8 @@ pub trait Store: Send + Sync {
         oldest: i64,
         limit: usize,
     ) -> Result<Vec<Publication>>;
-    /// `pr_notice` events as `(intent id, data JSON)`, in one transaction.
-    fn append_pr_notices(&self, notices: &[(String, String)]) -> Result<()>;
+    /// `kind` events (`pr_notice`, `task_overlap`) as `(subject, data JSON)`, in one transaction.
+    fn append_notices(&self, kind: &'static str, notices: &[(String, String)]) -> Result<()>;
     /// Idempotent by `new.id`: the first call records the publication for the active token's
     /// repository and its `publication_requested` event; a repeat with the same manifest returns the
     /// row. A token may have at most `MAX_UNFINISHED` open publications.

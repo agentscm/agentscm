@@ -312,12 +312,12 @@ impl Event {
         Self::new("pr_status_written", &repo.id, data)
     }
 
-    pub(super) fn pr_notice(intent: &str, data: &str) -> Result<Self> {
+    pub(super) fn notice(kind: &'static str, subject: &str, data: &str) -> Result<Self> {
         Ok(Self {
             id: super::store::new_id("evt")?,
             at: super::store::unix_now(),
-            kind: "pr_notice",
-            subject: intent.to_owned(),
+            kind,
+            subject: subject.to_owned(),
             data: data.to_owned(),
         })
     }

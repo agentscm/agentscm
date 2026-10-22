@@ -2297,3 +2297,55 @@ async fn the_cli_sets_up_and_manages_connections() {
     let (ok, _, stderr) = cli(&other, &["connections", "list"]);
     assert!(!ok && stderr.contains("not signed in"), "{stderr}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_tells_overlapping_intents_to_sync_but_not_the_merged_branch() {
+    let env = Env::start().await;
+    let connection = env.connect_app().await;
+    env.install_widgets();
+    env.refresh(&connection).await;
+    let other = env.agent(1, "alice", "other");
+    let own = env.agent(2, "bob", "own");
+    env.announce(&other, 1, &["src/billing.rs"], None).await;
+    env.announce(&own, 2, &["src/billing.rs"], Some("feat/5"))
+        .await;
+    add_pull(&env, 5, &["src/billing.rs"]);
+    env.poll().await;
+    let merged = |agent: &str| {
+        let agent = agent.to_owned();
+        let env = &env;
+        async move {
+            notices(env, &agent, 0).await["notices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|n| n["notice"]["merged"] == true)
+                .map(|n| n["notice"].clone())
+                .collect::<Vec<_>>()
+        }
+    };
+    assert!(merged(&other).await.is_empty(), "open is not merged");
+
+    // Closed without merging tells nobody to sync.
+    env.pull(5, |p| p.state = "closed".into());
+    env.poll().await;
+    assert!(merged(&other).await.is_empty());
+
+    env.pull(5, |p| p.state = "open".into());
+    env.poll().await;
+    env.pull(5, |p| {
+        p.state = "closed".into();
+        p.merged = true;
+        p.merge_commit_sha = Some("c".repeat(40));
+    });
+    env.poll().await;
+    let told = merged(&other).await;
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert_eq!(told[0]["number"], 5);
+    assert_eq!(told[0]["their_paths"], json!(["src/billing.rs"]));
+    assert_eq!(told[0]["merge_commit_sha"], "c".repeat(40));
+    assert!(
+        merged(&own).await.is_empty(),
+        "the merged branch's own intent"
+    );
+}
