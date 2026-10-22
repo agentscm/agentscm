@@ -3,10 +3,12 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io::Read;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use axum::Extension;
 use axum::Router;
-use axum::extract::{FromRequestParts, Path, RawQuery, State};
+use axum::extract::{ConnectInfo, FromRequestParts, Path, RawQuery, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
@@ -34,6 +36,8 @@ const BROWSER_LOGIN_SECONDS: i64 = 600;
 const HANDOFF_SECONDS: i64 = 60;
 const MAX_DEVICE_SECONDS: i64 = 900;
 const MAX_ENTRIES: usize = 1024;
+/// Unauthenticated starts one client may have pending, so one client cannot fill the table.
+const MAX_PENDING_PER_CLIENT: usize = 8;
 const MAX_SESSIONS_PER_USER: usize = 8;
 const MAX_SECRET_FILE_BYTES: u64 = 4096;
 /// Connected repositories a sign-in tries before it gives up.
@@ -319,6 +323,13 @@ impl<T> Table<T> {
         self.0.insert(key, (expires_at, value));
     }
 
+    pub(super) fn count(&self, now: i64, mine: impl Fn(&T) -> bool) -> usize {
+        self.0
+            .values()
+            .filter(|(expires_at, value)| *expires_at > now && mine(value))
+            .count()
+    }
+
     pub(super) fn get(&self, key: &str, now: i64) -> Option<&T> {
         self.0
             .get(key)
@@ -358,9 +369,11 @@ struct BrowserLogin {
     cli_port: u16,
     cli_challenge: String,
     workspace: bool,
+    client: IpAddr,
 }
 
 struct DeviceLogin {
+    client: IpAddr,
     provider: String,
     device_code: String,
     interval: i64,
@@ -596,12 +609,39 @@ fn cookie_matches(headers: &HeaderMap, state: &str) -> bool {
     matches!((found.next(), found.next()), (Some(value), None) if value == state)
 }
 
+/// The caller's address. Behind a reverse proxy on a loopback or private peer the last
+/// `X-Forwarded-For` entry (the one the proxy appended) is used; anyone else cannot choose
+/// their own key.
+fn client_ip(peer: Option<Extension<ConnectInfo<SocketAddr>>>, headers: &HeaderMap) -> IpAddr {
+    let peer = peer.map_or(
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        |Extension(ConnectInfo(a))| a.ip(),
+    );
+    let trusted = match peer {
+        IpAddr::V4(ip) => ip.is_loopback() || ip.is_private(),
+        IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local(),
+    };
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next_back()?.trim().parse().ok())
+        .filter(|_| trusted)
+        .unwrap_or(peer)
+}
+
+fn too_many() -> ApiError {
+    ApiError::new(StatusCode::TOO_MANY_REQUESTS, "too_many_logins")
+}
+
 async fn browser_start(
     State(state): State<HubState>,
     Path(name): Path<String>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> ApiResult<Response> {
     let (provider, _) = state.login.provider(&name).ok_or_else(not_found)?;
+    let client = client_ip(peer, &headers);
     let params = query(raw);
     let workspace = params.get("workspace").is_some_and(|value| value == "1");
     if workspace && state.workspace.is_none() {
@@ -659,12 +699,16 @@ async fn browser_start(
         cli_port,
         cli_challenge,
         workspace,
+        client,
     };
-    state
-        .login
-        .pending()
+    let mut pending = state.login.pending();
+    if pending.browser.count(now, |l| l.client == client) >= MAX_PENDING_PER_CLIENT {
+        return Err(too_many());
+    }
+    pending
         .browser
         .insert(csrf.clone(), now + BROWSER_LOGIN_SECONDS, login, now);
+    drop(pending);
     found(
         url.as_str(),
         cookie_attributes(&csrf, BROWSER_LOGIN_SECONDS as u32),
@@ -949,8 +993,20 @@ async fn exchange(
 async fn device_start(
     State(state): State<HubState>,
     Path(name): Path<String>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     let (provider, forge) = state.login.provider(&name).ok_or_else(not_found)?;
+    let client = client_ip(peer, &headers);
+    if state
+        .login
+        .pending()
+        .device
+        .count(unix_now(), |l| l.client == client)
+        >= MAX_PENDING_PER_CLIENT
+    {
+        return Err(too_many());
+    }
     let unavailable = || ApiError::new(StatusCode::CONFLICT, "device_flow_unavailable");
     let (url, scope) = if provider.is_gitlab() {
         (
@@ -985,6 +1041,7 @@ async fn device_start(
         .unwrap_or(5);
     let (handle, now) = (random_hex()?, unix_now());
     let login = DeviceLogin {
+        client,
         provider: name,
         device_code: device_code.to_owned(),
         interval,

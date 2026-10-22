@@ -169,10 +169,13 @@ pub async fn serve(config: HubConfig) -> Result<()> {
         .as_ref()
         .filter(|execution| execution.server_execution_enabled())
         .map(|execution| execution.clone().spawn_worker());
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(crate::Error::Io)?;
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .map_err(crate::Error::Io)?;
     #[cfg(unix)]
     if let Some(worker) = execution_worker {
         worker.abort();
