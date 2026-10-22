@@ -486,6 +486,14 @@ enum Command {
         /// Serve collision warnings for this trusted Git checkout. Off when omitted.
         #[arg(long)]
         collisions_repo: Option<PathBuf>,
+        /// Serve this native workspace's snapshot timeline read-only under /v1/local. Off when
+        /// omitted.
+        #[arg(long)]
+        timeline_workspace: Option<PathBuf>,
+        /// Allow this exact browser origin to read /v1/local cross-origin (repeatable). Requires
+        /// AGENTSCM_SERVE_READ_TOKEN.
+        #[arg(long)]
+        browser_origin: Vec<String>,
         /// Allow a non-loopback bind address.
         #[arg(long)]
         public: bool,
@@ -1119,9 +1127,20 @@ async fn run(cli: Cli) -> Result<RunExit> {
             bind,
             max_concurrency,
             collisions_repo,
+            timeline_workspace,
+            browser_origin,
             public,
         } => {
-            server::serve(cli.data_dir, bind, public, max_concurrency, collisions_repo).await?;
+            server::serve(
+                cli.data_dir,
+                bind,
+                public,
+                max_concurrency,
+                collisions_repo,
+                timeline_workspace,
+                browser_origin,
+            )
+            .await?;
         }
     }
     Ok(RunExit::Completed)

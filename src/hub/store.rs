@@ -405,6 +405,14 @@ pub trait Store: Send + Sync {
         now: i64,
     ) -> Result<Create>;
     fn publication(&self, repository: &str, id: &str) -> Result<Option<Publication>>;
+    /// Publications of `repository` (matched exactly, as [`Store::publication`]), newest first by
+    /// `created_at`, then `id`, strictly older than the `before` publication, at most `limit`.
+    fn publications(
+        &self,
+        repository: &str,
+        before: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Publication>>;
     /// The newest publication of each pull request number above `after` in `repository`
     /// (matched case-insensitively), omitting pull requests whose newest publication is merged,
     /// by number, at most `limit`. "Newest" is by `created_at`, then `id`, descending.
