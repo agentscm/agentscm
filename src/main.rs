@@ -87,6 +87,8 @@ mod telemetry_cli;
 mod work_cli;
 #[cfg(unix)]
 mod workflow_cli;
+#[cfg(unix)]
+mod workspace_client;
 
 const MAX_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
@@ -263,6 +265,12 @@ enum Command {
     Workspace {
         #[command(subcommand)]
         command: workflow_cli::WorkspaceCommand,
+    },
+    /// [experimental] Connect local agents to a pinned workspace timeline.
+    #[cfg(unix)]
+    WorkspaceClient {
+        #[command(subcommand)]
+        command: workspace_client::WorkspaceClientCommand,
     },
     /// [experimental] Exchange source objects through offline files.
     #[cfg(unix)]
@@ -516,6 +524,19 @@ fn is_stop_hook_invocation() -> bool {
     )
 }
 
+/// Recognize capture hooks structurally even when one of their options is invalid.
+fn is_capture_hook_invocation() -> bool {
+    let Ok(root) = <Cli as clap::CommandFactory>::command()
+        .ignore_errors(true)
+        .try_get_matches_from(std::env::args_os())
+    else {
+        return false;
+    };
+    root.subcommand().is_some_and(|(name, sub)| {
+        name == "workspace-client" && sub.subcommand_name() == Some("hook")
+    })
+}
+
 #[tokio::main]
 async fn main() {
     // Before clap: a bad flag must not exit non-zero (agents read that as "block").
@@ -526,6 +547,11 @@ async fn main() {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) if error.use_stderr() => {
+            if is_capture_hook_invocation() {
+                eprintln!("AgentSCM capture skipped: invalid hook command options");
+                println!("{{}}");
+                return;
+            }
             print_error(&Error::Invalid(error.to_string()));
             // Exit 2 blocks a Stop hook, so a parse error there is a non-blocking error.
             std::process::exit(if is_stop_hook_invocation() { 1 } else { 2 });
@@ -713,6 +739,10 @@ async fn run(cli: Cli) -> Result<RunExit> {
             let context = authority.review_context(&digest)?;
             print_json(&json!({"ok": true, "digest": digest, "context": context,
                 "readiness": context.readiness(SUPPORTED_CAPABILITIES)}));
+        }
+        #[cfg(unix)]
+        Command::WorkspaceClient { command } => {
+            workspace_client::run(&cli.data_dir, command)?;
         }
         #[cfg(unix)]
         Command::Workspace { command } => {

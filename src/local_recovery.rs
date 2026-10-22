@@ -932,6 +932,19 @@ fn validate_journal(
             source.load_revision(&revision?)?;
         }
     }
+    if kind == DbKind::Workspace {
+        let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version == 5 {
+            let mut statement = db.prepare(
+                "SELECT source_revision FROM timeline_entries
+                 UNION SELECT tested_revision FROM timeline_entries WHERE tested_revision IS NOT NULL
+                 UNION SELECT target_revision FROM timeline_entries WHERE target_revision IS NOT NULL",
+            )?;
+            for revision in statement.query_map([], |row| row.get::<_, String>(0))? {
+                source.load_revision(&revision?)?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -960,7 +973,7 @@ fn validate_database(db: &Connection, kind: DbKind) -> Result<()> {
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
     let supported = match kind {
         DbKind::Authority => app == 0x4153_434d && matches!(version, 8 | 9),
-        DbKind::Workspace => app == 0x4153_574b && matches!(version, 2..=4),
+        DbKind::Workspace => app == 0x4153_574b && matches!(version, 2..=5),
         DbKind::Merge => (app, version) == (0x4147_4d47, 1),
         DbKind::Workflow => (app, version) == (0x4153_4746, 1),
         DbKind::SkillWorkflow => app == 0x4153_5746 && matches!(version, 1..=4),
@@ -988,7 +1001,7 @@ fn validate_database(db: &Connection, kind: DbKind) -> Result<()> {
         crate::skill_workflow::runtime::validate_recovery_schema(db)?;
     }
     #[cfg(unix)]
-    if kind == DbKind::Workspace && version == 4 {
+    if kind == DbKind::Workspace && matches!(version, 4 | 5) {
         crate::workspace::validate_recovery_schema(db)?;
     }
     if kind == DbKind::Export {
@@ -1319,6 +1332,11 @@ fn ignored_paths(
         && let Some(lease) = lease_root(root, destination)?
     {
         ignored.insert(lease.join(LOCK));
+        #[cfg(unix)]
+        if destination.starts_with("workspaces/") {
+            ignored.insert(lease.join(crate::workspace::TIMELINE_LEASE_FILE));
+            ignored.insert(lease.join(crate::workspace::TIMELINE_PROBES_DIRECTORY));
+        }
     }
     for (database, _) in database_paths(root, destination, issue_config)? {
         let mut wal = database.as_os_str().to_os_string();
