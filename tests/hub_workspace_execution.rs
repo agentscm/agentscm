@@ -3450,7 +3450,12 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
             "candidate_id":first["candidate"]["candidate_id"],
             "expected_generation":state.generation
         });
+        // First publication performs repeated source/authorization checks and eight Git
+        // transport commands, each with a production bound of 60 seconds. Give this
+        // multi-command fixture operation a finite 120-second HTTP budget under suite
+        // contention; the shared client's 15 seconds can expire before it completes.
         let published = json_request(env.client.post(&branch_path).bearer_auth(&token), &branch)
+            .timeout(std::time::Duration::from_secs(120))
             .send()
             .await
             .unwrap();
