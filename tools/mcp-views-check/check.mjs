@@ -17,7 +17,7 @@ function mk(tag) {
   return e;
 }
 function load(html) {
-  const js = html.match(/<script>([\s\S]*)<\/script>/)[1];
+  const js = html.slice(html.indexOf('<script>') + 8, html.lastIndexOf('</script>'));
   const app = mk('div'), body = mk('body'), sent = [], made = [], handlers = {};
   const doc = { body, documentElement: mk('html'), getElementById: () => app, createTextNode: (t) => { const n = mk('#text'); n._t = t; return n; },
     createElement: (t) => { made.push(t); return mk(t); } };
