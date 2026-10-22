@@ -1682,20 +1682,22 @@ fn external_run_journal(db: &Db) {
     other.commit_sha = "b".repeat(40);
     assert_eq!(observe(&other), ExternalObserved::Changed);
 
-    // Kind, then environment, then run id, then attempt.
+    // Each kind is listed apart: environment, then run id, then attempt.
+    let of = |kind, limit| store.external_runs(&repo.id, &sha, kind, limit).unwrap();
+    assert_eq!(of(ExternalKind::Ci, 50), [done, retry]);
     assert_eq!(
-        store.external_runs(&repo.id, &sha, 50).unwrap(),
+        of(ExternalKind::Deployment, 50),
         [
-            done,
-            retry,
             deploy(10, "dev"),
             deploy(8, "production"),
             deploy(9, "production")
         ]
     );
-    assert_eq!(store.external_runs(&repo.id, &sha, 2).unwrap().len(), 2);
+    assert_eq!(of(ExternalKind::Deployment, 2).len(), 2);
     assert_eq!(
-        store.external_runs(&repo.id, &"c".repeat(40), 50).unwrap(),
+        store
+            .external_runs(&repo.id, &"c".repeat(40), ExternalKind::Ci, 50)
+            .unwrap(),
         []
     );
 
@@ -1745,12 +1747,14 @@ fn merged_publications_skip_unmerged_ones(db: &Db) {
         ("m1", "Acme/Widgets", "'d'"),
         ("open", "Acme/Widgets", "NULL"),
         ("other", "acme/other", "'e'"),
+        ("stale", "Acme/Widgets", "'f'"),
     ] {
+        let updated = if id == "stale" { 0 } else { 5 };
         sql.push_str(&format!(
             "INSERT INTO hub_publications (id,repository,token,revision,event_seq,commit_sha,
                 branch,base,manifest,branch_state,pr_number,merge_commit,created_at,updated_at)
              VALUES ('{id}','{repository}','tok_mp','{}',1,'{}','b-{id}','main','{{}}','created',
-                1,{merged},1,1);",
+                1,{merged},1,{updated});",
             "a".repeat(64),
             "b".repeat(40)
         ));
@@ -1758,13 +1762,21 @@ fn merged_publications_skip_unmerged_ones(db: &Db) {
     db.exec(&sql).unwrap();
     let ids = |after: &str, limit: usize| {
         store
-            .merged_publications("acme/widgets", after, limit)
+            .merged_publications("acme/widgets", after, 1, limit)
             .unwrap()
             .into_iter()
             .map(|p| p.id)
             .collect::<Vec<_>>()
     };
+    // The stale one is outside the window, so it cannot fill a page.
     assert_eq!(ids("", 50), ["m1", "m2"]);
+    assert_eq!(
+        store
+            .merged_publications("acme/widgets", "", 0, 50)
+            .unwrap()
+            .len(),
+        3
+    );
     assert_eq!(ids("m1", 50), ["m2"]);
     assert_eq!(ids("", 1), ["m1"]);
     assert_eq!(ids("m2", 50), Vec::<String>::new());

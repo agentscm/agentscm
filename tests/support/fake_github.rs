@@ -327,6 +327,8 @@ pub struct FakeState {
     pub users: HashMap<String, (String, i64, BTreeSet<i64>)>,
     /// The first entry whose `path_contains` matches a request is consumed and answered.
     pub fail: VecDeque<Failure>,
+    /// Answer the actions and deployments lists with 200 and an empty object, no array.
+    pub arrayless_external_lists: bool,
     /// Store the next created comment, then answer 502 with no body.
     pub lose_next_comment_reply: bool,
     pub requests: Vec<Request>,
@@ -1102,6 +1104,11 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                     let (page, mut link) = paginate(ctx, uri, &query, open);
                     link.push(("etag".into(), etag));
                     reply(200, &link, Some(Value::Array(page)))
+                }
+                (&Method::GET, ["actions", "runs"] | ["deployments"])
+                    if state.arrayless_external_lists =>
+                {
+                    json_reply(200, json!({}))
                 }
                 (&Method::GET, ["actions", "runs"]) => {
                     let wanted = query.iter().find(|(k, _)| k == "head_sha").map(|(_, v)| v);

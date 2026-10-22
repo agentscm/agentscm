@@ -17,6 +17,11 @@ const MAX_URL_BYTES: usize = 2048;
 const MAX_PER_PASS: usize = 20;
 /// Deployment statuses read per commit; the rest are dropped and the read is incomplete.
 const MAX_STATUSES: usize = 50;
+/// A commit whose last read was complete and whose stored runs are all terminal is read again
+/// only after this many seconds; a deployment can still arrive later.
+const SETTLED_SECONDS: i64 = 3600;
+/// Stored runs of one kind loaded to judge whether a commit has settled.
+const SETTLED_ROWS: usize = 1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExternalKind {
@@ -123,9 +128,11 @@ pub enum ExternalObserved {
 
 /// Whether `incoming` should replace `stored` for the same key. An identical run, one the
 /// provider updated earlier, or a non-terminal state after a terminal one never replaces it.
+/// At the same provider time only a terminal state replaces, so open states cannot flip-flop.
 pub fn supersedes(stored: &ExternalRun, incoming: &ExternalRun) -> bool {
+    let (then, now) = (stored.provider_updated_at, incoming.provider_updated_at);
     incoming != stored
-        && incoming.provider_updated_at >= stored.provider_updated_at
+        && (now > then || (now == then && incoming.outcome.is_terminal()))
         && (!stored.outcome.is_terminal() || incoming.outcome.is_terminal())
 }
 
@@ -220,22 +227,28 @@ fn clipped(text: &str) -> String {
     text.chars().take(MAX_TEXT_CHARS).collect()
 }
 
-/// A push-event workflow run for exactly `sha` on `branch` in repository `repo_id`, or `None`
-/// when it is some other run, malformed, or out of bounds. `web` is the connection's web base.
-pub fn ci_run(
-    value: &Value,
-    repo_id: i64,
-    sha: &str,
-    branch: &str,
-    web: &str,
-) -> Option<ExternalRun> {
-    let run = WireRun::deserialize(value).ok()?;
+/// What one listed workflow run is to the commit being read.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Ci {
+    /// Another repository, commit, branch or event: not this commit's outcome.
+    Other,
+    /// It could not be decoded, or is out of bounds: the read is incomplete.
+    Invalid,
+    Run(ExternalRun),
+}
+
+/// A push-event workflow run for exactly `sha` on `branch` in repository `repo_id`. `web` is
+/// the connection's web base.
+pub fn ci_run(value: &Value, repo_id: i64, sha: &str, branch: &str, web: &str) -> Ci {
+    let Ok(run) = WireRun::deserialize(value) else {
+        return Ci::Invalid;
+    };
     if run.repository.id != repo_id
         || run.head_sha != sha
         || run.head_branch.as_deref() != Some(branch)
         || run.event != "push"
     {
-        return None;
+        return Ci::Other;
     }
     let outcome = match (run.status.as_str(), run.conclusion.as_deref()) {
         ("queued" | "waiting" | "requested" | "pending", _) => ExternalOutcome::Pending,
@@ -244,6 +257,9 @@ pub fn ci_run(
         ("completed", Some("failure" | "timed_out" | "startup_failure")) => ExternalOutcome::Failed,
         ("completed", Some("cancelled")) => ExternalOutcome::Cancelled,
         _ => ExternalOutcome::Unknown,
+    };
+    let Some(provider_updated_at) = parse_rfc3339(&run.updated_at) else {
+        return Ci::Invalid;
     };
     let run = ExternalRun {
         provider: "github".into(),
@@ -255,14 +271,17 @@ pub fn ci_run(
         environment: None,
         name: clipped(&run.path),
         outcome,
-        provider_updated_at: parse_rfc3339(&run.updated_at)?,
+        provider_updated_at,
         html_url: on_host(run.html_url.as_deref(), web),
     };
-    run.validate().ok()?;
-    Some(run)
+    match run.validate() {
+        Ok(()) => Ci::Run(run),
+        Err(_) => Ci::Invalid,
+    }
 }
 
-/// A deployment of exactly `sha` with its newest status (`None` reads as pending).
+/// A deployment of exactly `sha` with its newest status (`None` reads as pending); `None` when
+/// it is for another commit, malformed or out of bounds.
 pub fn deployment(
     value: &Value,
     status: Option<&Value>,
@@ -319,6 +338,8 @@ pub(super) async fn reconcile_repo(
     if conn.provider != "github" || !state.sync.external_runs_enabled(&repo.full_name) {
         return Ok(());
     }
+    // The external reads turn a 403 into `Auth("403 ...")`, whether or not it carried rate-limit
+    // headers; a 401 stays a failed credential.
     match pass(state, conn, repo, token).await {
         Err(GhError::Auth(detail)) if detail.starts_with("403") => {
             eprintln!("hub: external runs for {}: {detail}", repo.full_name);
@@ -375,25 +396,21 @@ async fn pass(
 
     let (store, name) = (state.store.clone(), repo.full_name.clone());
     let merged = blocking(state, move || {
-        store.merged_publications(&name, &after_id, MAX_PER_PASS)
+        store.merged_publications(&name, &after_id, oldest, MAX_PER_PASS)
     })
     .await?;
     let next = match merged.last() {
         Some(p) if merged.len() >= MAX_PER_PASS => p.id.clone(),
         _ => String::new(),
     };
-    state
-        .sync
-        .set_external_cursor(&repo.id, (if full { last } else { 0 }, next));
     for publication in merged {
-        let Some(sha) = publication
-            .merge_commit
-            .as_deref()
-            .filter(|_| publication.updated_at >= oldest)
-        else {
+        let Some(sha) = publication.merge_commit.as_deref() else {
             continue;
         };
         if !publication_on_forge(state, &publication, repo).await {
+            continue;
+        }
+        if settled(state, &repo.id, sha).await? {
             continue;
         }
         match commit_runs(state, repo, token, sha, &publication.base).await {
@@ -410,7 +427,32 @@ async fn pass(
             }
         }
     }
+    // Only after the page was read: a stop part-way reads the same page again next pass.
+    state
+        .sync
+        .set_external_cursor(&repo.id, (if full { last } else { 0 }, next));
     Ok(())
+}
+
+/// Whether `sha` was read in full within [`SETTLED_SECONDS`] and every run stored for it is
+/// terminal, so reading it again now would only spend requests. A commit with no stored run
+/// is never settled.
+async fn settled(state: &HubState, repo: &str, sha: &str) -> Result<bool> {
+    let (store, repo, sha) = (state.store.clone(), repo.to_owned(), sha.to_owned());
+    blocking(state, move || {
+        let Some((at, true)) = store.external_reconciled(&repo, &sha)? else {
+            return Ok(false);
+        };
+        if unix_now() - at >= SETTLED_SECONDS {
+            return Ok(false);
+        }
+        let mut runs = Vec::new();
+        for kind in [ExternalKind::Ci, ExternalKind::Deployment] {
+            runs.extend(store.external_runs(&repo, &sha, kind, SETTLED_ROWS)?);
+        }
+        Ok(!runs.is_empty() && runs.iter().all(|run| run.outcome.is_terminal()))
+    })
+    .await
 }
 
 /// Reads and stores the runs and deployments of exactly `sha`. True when every list and every
@@ -426,23 +468,31 @@ async fn commit_runs(
     let name = repo.full_name.as_str();
     let (runs, runs_done) = api.workflow_runs(token, name, sha).await?;
     let (deployments, deployments_done) = api.deployments(token, name, sha).await?;
-    let mut found: Vec<ExternalRun> = runs
-        .iter()
-        .filter_map(|run| ci_run(run, repo.repository_id, sha, base, web))
-        .collect();
+    let mut found = Vec::new();
     let mut complete = runs_done && deployments_done;
+    for run in &runs {
+        match ci_run(run, repo.repository_id, sha, base, web) {
+            Ci::Run(run) => found.push(run),
+            Ci::Invalid => complete = false,
+            Ci::Other => {}
+        }
+    }
     for (index, item) in deployments.iter().enumerate() {
         let Some(id) = item["id"].as_i64().filter(|_| index < MAX_STATUSES) else {
             complete = false;
             continue;
         };
         match api.deployment_status(token, name, id).await {
-            Ok(status) => found.extend(deployment(item, status.as_ref(), sha, web)),
+            Ok(status) => match deployment(item, status.as_ref(), sha, web) {
+                Some(run) => found.push(run),
+                None => complete = false,
+            },
             Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
             Err(GhError::Failed(_)) => complete = false,
         }
     }
-    // Runs of other branches, events or repositories are not this commit's outcome.
+    // Runs of other branches, events or repositories are not this commit's outcome; anything
+    // else dropped has already made the read incomplete.
     let dropped = runs.len() + deployments.len() - found.len();
     if dropped > 0 {
         eprintln!("hub: external runs for {name} {sha}: {dropped} items not matched");
@@ -508,7 +558,10 @@ mod tests {
     fn newer_state_replaces_and_older_is_ignored() {
         let stored = run(ExternalOutcome::Running, 10);
         assert!(supersedes(&stored, &run(ExternalOutcome::Succeeded, 11)));
-        assert!(supersedes(&stored, &run(ExternalOutcome::Pending, 10)));
+        assert!(supersedes(&stored, &run(ExternalOutcome::Pending, 11)));
+        // Equal times: an open state does not replace another, a terminal one does.
+        assert!(!supersedes(&stored, &run(ExternalOutcome::Pending, 10)));
+        assert!(supersedes(&stored, &run(ExternalOutcome::Failed, 10)));
         assert!(!supersedes(&stored, &run(ExternalOutcome::Succeeded, 9)));
     }
 
@@ -584,8 +637,15 @@ mod tests {
             "repository": {"id": 5}})
     }
 
-    fn ci(value: &Value) -> Option<ExternalRun> {
+    fn classify(value: &Value) -> Ci {
         ci_run(value, 5, &"a".repeat(40), "main", WEB)
+    }
+
+    fn ci(value: &Value) -> Option<ExternalRun> {
+        match classify(value) {
+            Ci::Run(run) => Some(run),
+            _ => None,
+        }
     }
 
     #[test]
@@ -637,13 +697,20 @@ mod tests {
     }
 
     #[test]
-    fn ci_run_drops_other_runs_and_bad_data() {
+    fn ci_run_ignores_other_runs_but_flags_bad_data() {
         let edits: &[fn(&mut Value)] = &[
             |v| v["repository"]["id"] = 6.into(),
             |v| v["head_sha"] = "b".repeat(40).into(),
             |v| v["head_branch"] = "dev".into(),
             |v| v["head_branch"] = Value::Null,
             |v| v["event"] = "pull_request".into(),
+        ];
+        for edit in edits {
+            let mut value = wire_run();
+            edit(&mut value);
+            assert_eq!(classify(&value), Ci::Other, "{value}");
+        }
+        let edits: &[fn(&mut Value)] = &[
             |v| v["id"] = "9".into(),
             |v| v["updated_at"] = "yesterday".into(),
             |v| v["path"] = "ci\u{1b}[31m".into(),
@@ -655,7 +722,7 @@ mod tests {
         for edit in edits {
             let mut value = wire_run();
             edit(&mut value);
-            assert_eq!(ci(&value), None, "{value}");
+            assert_eq!(classify(&value), Ci::Invalid, "{value}");
         }
     }
 
@@ -679,7 +746,7 @@ mod tests {
         assert_eq!(ci(&value).unwrap().html_url, None);
         // A plain-http web host never yields a link.
         let got = ci_run(&wire_run(), 5, &"a".repeat(40), "main", "http://github.com");
-        assert_eq!(got.unwrap().html_url, None);
+        assert!(matches!(got, Ci::Run(run) if run.html_url.is_none()));
     }
 
     fn wire_deployment() -> Value {

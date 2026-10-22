@@ -1052,37 +1052,56 @@ _Experimental, off by default, fake-tested only: the implementation has run agai
 in-process fake GitHub, never a live GitHub. The REST response shapes are not live-verified._
 
 Set `AGENTSCM_GITHUB_EXTERNAL_RUNS` to a comma-separated list of `owner/name` GitHub
-repositories (case-insensitive; anything else refuses to start). For those repositories each
+repositories (case-insensitive; anything else refuses to start, including an empty entry such as a trailing
+comma). For those repositories each
 poll records a merge the forge reports for a publication's pull request (at most 20 per pass),
 then reads what GitHub shows for the exact recorded merge commit of up to 20 merged
-publications per pass, taken in turn and only within `--activity-days`:
+publications per pass, taken in turn. Only publications updated within `--activity-days` are
+paged, so old merges never occupy a page:
 
 - Actions workflow runs (`actions/runs?head_sha=`) kept only if the run is a `push` event on the
   publication's base branch in this repository, for exactly that commit. Runs for pull
   requests, other branches or other repositories are dropped.
 - Deployments for that commit (`deployments?sha=`), each with its newest deployment status.
+  Deployments carry no repository id, so they are matched by the repository name in the
+  request and the exact sha, the same exposure as the `pulls/{n}` merge read.
 
 Outcomes are `pending`, `running`, `succeeded`, `failed`, `cancelled`, `superseded` (a
 deployment that went `inactive`) or `unknown`; anything the Hub does not recognise is
 `unknown`, never success. A run is keyed by provider, kind, run id and attempt, so a rerun
 is a separate row. A stored row is replaced only by a different state the provider updated
-no earlier, and a terminal state is never replaced by a non-terminal one. A repeat pass that
+no earlier (at the same time only a terminal state replaces), and a terminal state is never
+replaced by a non-terminal one. A repeat pass that
 changes nothing appends nothing. Links are kept only if they are `https` on the connection's
 own web host. Provider text is untrusted display data (control characters are refused and
 text is cut to 200 characters).
 
 `GET .../publications/{id}` adds an `external` object beside the landed revision (see the
 [API notes](api.md#hub-publication-external-outcomes)). It separates `ci` from
-`deployments`, one entry per environment, and is distinct from source approval and from
-`forge_check`. Its `state` is `unobserved` (no pass has read this commit), `incomplete`
-(the last read was cut short, or more rows exist than one reply shows) or `observed`.
-Missing CI or deployment is never read as success: an empty list under `observed` means
-the provider showed none, and `unobserved` or `incomplete` means the Hub does not know.
+`deployments`, one entry per deployment (an environment can have several), and is distinct
+from source approval and from `forge_check`. Its `state` is `unobserved` (no pass has read
+this commit), `incomplete` (the last read was cut short, or more rows exist than one reply
+shows) or `observed`. Missing CI or deployment is never read as success: an empty list under
+`observed` means the provider showed none, and under `unobserved` or `incomplete` it means
+the Hub does not know. `reconciled_at` is the staleness signal: the time of the last
+completed read of the commit. A later read that fails (a rate limit, 401, 403 or an error)
+changes nothing, so the previous marker and rows stay.
 
-Bounds: 3 pages of 100 for each list, 50 deployment statuses read per commit, 200 rows shown
-per publication. Anything dropped or unread marks the commit's read `incomplete`. A 401 or
-a 429 stops the pass and leaves the markers alone; a 403 skips the repository without
-blaming the connection. The token needs `actions: read` and `deployments: read` (a fine-grained
+Bounds: 3 pages of 100 for each list, 50 deployment statuses read per commit, 200 rows of each
+kind shown per publication. Anything dropped or unread marks the commit's read `incomplete`:
+a run or deployment of the commit that cannot be decoded or is out of bounds, a deployment
+past the status cap, and a list reply without its array all count. Runs of other branches,
+events or repositories are ignored and do not.
+
+Request budget: a commit read in full whose stored rows are all terminal is read again only
+after an hour (a deployment can still arrive later); a commit with no stored row, an open
+row or an incomplete read is read every pass. Per repository, one pass makes at most 20
+pull request reads plus, for each of 20 commits, 3 + 3 list pages and 50 status reads, so at
+most 1140 requests; typically a handful per commit. A rate limit (429, or 403 with
+`retry-after` or no quota left) or a 401 hit by this pass backs off the whole connection like
+any other sync read, and the cursor does not advance past the page being read. Any other 403
+(including one that carries rate-limit headers) skips the repository for this pass without
+blaming the connection or marking anything read. The token needs `actions: read` and `deployments: read` (a fine-grained
 PAT, or an App installation); the GitHub App manifest does not request them yet, so an App
 installation gets 403 and the repository is skipped.
 

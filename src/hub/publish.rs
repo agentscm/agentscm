@@ -984,6 +984,9 @@ async fn external_view(
     let Some(sha) = publication.merge_commit.clone() else {
         return Ok(None);
     };
+    if !state.sync.external_runs_enabled(&principal.repository) {
+        return Ok(None);
+    }
     let (host, name, repository_id) = (
         principal.owner.identity.host.clone(),
         principal.repository.clone(),
@@ -1007,32 +1010,39 @@ async fn external_view(
         return Ok(None);
     }
     let (store, id, commit) = (state.store.clone(), repo.id.clone(), sha.clone());
-    let (mut runs, marker) = blocking(state, move || {
+    // Each kind has its own cap, so many CI runs cannot hide the deployments.
+    let (mut ci_runs, mut deployed, marker) = blocking(state, move || {
         Ok((
-            store.external_runs(&id, &commit, EXTERNAL_SHOWN + 1)?,
+            store.external_runs(&id, &commit, ExternalKind::Ci, EXTERNAL_SHOWN + 1)?,
+            store.external_runs(&id, &commit, ExternalKind::Deployment, EXTERNAL_SHOWN + 1)?,
             store.external_reconciled(&id, &commit)?,
         ))
     })
     .await?;
-    let cut = runs.len() > EXTERNAL_SHOWN;
-    runs.truncate(EXTERNAL_SHOWN);
+    let cut = ci_runs.len() > EXTERNAL_SHOWN || deployed.len() > EXTERNAL_SHOWN;
+    ci_runs.truncate(EXTERNAL_SHOWN);
+    deployed.truncate(EXTERNAL_SHOWN);
     let status = match marker {
         None => "unobserved",
         Some((_, true)) if !cut => "observed",
         Some(_) => "incomplete",
     };
-    let (mut ci, mut deployments) = (vec![], vec![]);
-    for run in runs {
-        match run.kind {
-            ExternalKind::Ci => ci.push(json!({"run_id": run.run_id, "attempt": run.attempt,
+    let ci: Vec<Value> = ci_runs
+        .into_iter()
+        .map(|run| {
+            json!({"run_id": run.run_id, "attempt": run.attempt,
                 "branch": run.branch, "name": run.name, "outcome": run.outcome.as_str(),
-                "provider_updated_at": run.provider_updated_at, "html_url": run.html_url})),
-            ExternalKind::Deployment => deployments.push(json!({"run_id": run.run_id,
-                "environment": run.environment, "name": run.name,
+                "provider_updated_at": run.provider_updated_at, "html_url": run.html_url})
+        })
+        .collect();
+    let deployments: Vec<Value> = deployed
+        .into_iter()
+        .map(|run| {
+            json!({"run_id": run.run_id, "environment": run.environment, "name": run.name,
                 "outcome": run.outcome.as_str(),
-                "provider_updated_at": run.provider_updated_at, "html_url": run.html_url})),
-        }
-    }
+                "provider_updated_at": run.provider_updated_at, "html_url": run.html_url})
+        })
+        .collect();
     Ok(Some(json!({"provider": "github",
         "note": "Observed after landing; not evidence for the landing decision.",
         "merge_commit": sha, "state": status,

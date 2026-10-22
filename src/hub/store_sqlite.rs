@@ -4302,16 +4302,20 @@ impl Store for SqliteStore {
         &self,
         repo: &str,
         commit_sha: &str,
+        kind: ExternalKind,
         limit: usize,
     ) -> Result<Vec<ExternalRun>> {
         let conn = self.conn();
         let mut statement = conn.prepare(&format!(
             "SELECT {EXTERNAL_RUN_COLUMNS} FROM hub_external_runs
-             WHERE repository = ?1 AND commit_sha = ?2
-             ORDER BY kind, COALESCE(environment, ''), run_id, attempt LIMIT ?3"
+             WHERE repository = ?1 AND commit_sha = ?2 AND kind = ?3
+             ORDER BY COALESCE(environment, ''), run_id, attempt LIMIT ?4"
         ))?;
         statement
-            .query_map(params![repo, commit_sha, limit as i64], external_run_row)?
+            .query_map(
+                params![repo, commit_sha, kind.as_str(), limit as i64],
+                external_run_row,
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?
             .into_iter()
             .collect()
@@ -4350,15 +4354,19 @@ impl Store for SqliteStore {
         &self,
         repository: &str,
         after: &str,
+        oldest: i64,
         limit: usize,
     ) -> Result<Vec<Publication>> {
         let conn = self.conn();
         let mut statement = conn.prepare(&format!(
             "{PUBLICATION_SELECT} WHERE lower(p.repository) = lower(?1) AND p.id > ?2
-             AND p.merge_commit IS NOT NULL ORDER BY p.id LIMIT ?3"
+             AND p.merge_commit IS NOT NULL AND p.updated_at >= ?3 ORDER BY p.id LIMIT ?4"
         ))?;
         let rows = statement
-            .query_map(params![repository, after, limit as i64], publication_row)?
+            .query_map(
+                params![repository, after, oldest, limit as i64],
+                publication_row,
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }

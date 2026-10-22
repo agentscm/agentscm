@@ -4429,18 +4429,21 @@ impl Store for PgStore {
         &self,
         repo: &str,
         commit_sha: &str,
+        kind: ExternalKind,
         limit: usize,
     ) -> Result<Vec<ExternalRun>> {
         self.run(true, |client| {
             let limit = limit as i64;
+            let kind = kind.as_str();
             client
                 .query(
                     &format!(
                         "SELECT {EXTERNAL_RUN_COLUMNS} FROM hub_external_runs
-                         WHERE repository = $1 AND commit_sha = $2
-                         ORDER BY kind, COALESCE(environment, ''), run_id, attempt LIMIT $3"
+                         WHERE repository = $1 AND commit_sha = $2 AND kind = $3
+                         ORDER BY COALESCE(environment, '') COLLATE \"C\", run_id, attempt
+                         LIMIT $4"
                     ),
-                    &[&repo, &commit_sha, &limit],
+                    &[&repo, &commit_sha, &kind, &limit],
                 )?
                 .iter()
                 .map(external_run_row)
@@ -4484,6 +4487,7 @@ impl Store for PgStore {
         &self,
         repository: &str,
         after: &str,
+        oldest: i64,
         limit: usize,
     ) -> Result<Vec<Publication>> {
         self.run(true, |client| {
@@ -4492,9 +4496,10 @@ impl Store for PgStore {
                 .query(
                     &format!(
                         "{PUBLICATION_SELECT} WHERE lower(p.repository) = lower($1) AND p.id > $2
-                         AND p.merge_commit IS NOT NULL ORDER BY p.id LIMIT $3"
+                         AND p.merge_commit IS NOT NULL AND p.updated_at >= $3
+                         ORDER BY p.id LIMIT $4"
                     ),
-                    &[&repository, &after, &limit],
+                    &[&repository, &after, &oldest, &limit],
                 )?
                 .iter()
                 .map(publication_row)

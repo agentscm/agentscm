@@ -181,7 +181,22 @@ impl Env {
     }
 
     fn runs(&self, sha: &str) -> Vec<ExternalRun> {
-        self.store.external_runs(&self.repo, sha, 1000).unwrap()
+        [ExternalKind::Ci, ExternalKind::Deployment]
+            .into_iter()
+            .flat_map(|kind| {
+                self.store
+                    .external_runs(&self.repo, sha, kind, 1000)
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    /// Makes the last read of `sha` look old enough to be read again.
+    fn age(&self, sha: &str) {
+        let (_, complete) = self.marker(sha).unwrap();
+        self.store
+            .mark_external_reconciled(&self.repo, sha, 0, complete)
+            .unwrap();
     }
 
     fn marker(&self, sha: &str) -> Option<(i64, bool)> {
@@ -211,11 +226,15 @@ impl Env {
     }
 
     fn fail(&self, path: &str, status: u16) {
+        self.fail_with(path, status, vec![]);
+    }
+
+    fn fail_with(&self, path: &str, status: u16, headers: Vec<(String, String)>) {
         self.fake.with(|s| {
             s.fail.push_back(Failure {
                 path_contains: path.into(),
                 status,
-                headers: vec![],
+                headers,
             })
         });
     }
@@ -376,7 +395,34 @@ async fn a_repeat_pass_appends_no_events() {
     assert_eq!(events, 2);
     env.pass().await;
     assert_eq!(env.observed_events(), events);
+    assert_eq!(
+        env.requests("/actions/runs"),
+        1,
+        "a settled commit is not read again within the hour"
+    );
+    env.age(MERGED);
+    env.pass().await;
     assert_eq!(env.requests("/actions/runs"), 2, "read again, stored once");
+    assert_eq!(env.observed_events(), events);
+}
+
+#[tokio::test]
+async fn open_or_incomplete_commits_are_read_every_pass() {
+    let env = Env::start(true).await;
+    env.publish(1, OTHER, Some(MERGED)).await;
+    env.seed(|r| {
+        r.runs
+            .push(run_json(REPO_ID, 1, MERGED, "main", "in_progress", None));
+    });
+    env.pass().await;
+    env.pass().await;
+    assert_eq!(env.requests("/actions/runs"), 2, "a running run is open");
+    // A commit with nothing stored is not settled either.
+    let env = Env::start(true).await;
+    env.publish(1, OTHER, Some(MERGED)).await;
+    env.pass().await;
+    env.pass().await;
+    assert_eq!(env.requests("/actions/runs"), 2);
 }
 
 #[tokio::test]
@@ -404,6 +450,7 @@ async fn run_state_advances_but_never_regresses_and_attempts_stay_separate() {
     assert_eq!(outcomes(&env), [(1, ExternalOutcome::Succeeded)]);
     // A stale in-progress read after completion does not regress it.
     set(&env, vec![run("in_progress", None, EARLY, 1)]);
+    env.age(MERGED);
     env.pass().await;
     assert_eq!(outcomes(&env), [(1, ExternalOutcome::Succeeded)]);
     // A rerun is a new attempt of the same run, not an overwrite.
@@ -414,6 +461,7 @@ async fn run_state_advances_but_never_regresses_and_attempts_stay_separate() {
             run("in_progress", None, LATE, 2),
         ],
     );
+    env.age(MERGED);
     env.pass().await;
     assert_eq!(
         outcomes(&env),
@@ -459,6 +507,120 @@ async fn auth_and_rate_limit_failures_leave_rows_and_markers_alone() {
     env.pass().await;
     assert_eq!(env.runs(MERGED).len(), 2);
     assert!(env.marker(MERGED).is_some_and(|(_, complete)| complete));
+}
+
+#[tokio::test]
+async fn a_permission_403_with_rate_limit_headers_skips_the_repository_for_the_pass() {
+    let env = Env::start(true).await;
+    env.publish(1, OTHER, Some(MERGED)).await;
+    env.publish(2, "3".repeat(40).as_str(), Some(&"4".repeat(40)))
+        .await;
+    env.seed(|r| {
+        r.runs.push(run_json(
+            REPO_ID,
+            1,
+            MERGED,
+            "main",
+            "completed",
+            Some("success"),
+        ));
+    });
+    // Real GitHub sends the rate-limit headers with a permission refusal.
+    let headers = vec![("x-ratelimit-remaining".to_owned(), "4999".to_owned())];
+    env.fail_with("/actions/runs", 403, headers.clone());
+    env.pass().await;
+    assert_eq!(env.requests("/actions/runs"), 1, "the second commit waits");
+    assert_eq!(env.requests("/deployments"), 0);
+    assert_eq!(env.marker(MERGED), None);
+    assert_eq!(env.marker(&"4".repeat(40)), None);
+    // The same refusal on a deployment's statuses skips the rest of that pass too.
+    env.seed(|r| {
+        for id in [10, 11] {
+            r.deployments.push((
+                deployment_json(id, MERGED, "production"),
+                vec![status_json(1, "success")],
+            ));
+        }
+    });
+    env.fail_with("/statuses", 403, headers);
+    env.pass().await;
+    assert_eq!(env.requests("/statuses"), 1);
+    assert_eq!(env.marker(MERGED), None);
+    // The connection was not blamed for either refusal: the next pass reads everything.
+    env.pass().await;
+    assert!(env.marker(MERGED).is_some_and(|(_, complete)| complete));
+    assert!(env.marker(&"4".repeat(40)).is_some());
+    assert_eq!(env.runs(MERGED).len(), 3);
+}
+
+#[tokio::test]
+async fn dropped_items_leave_the_commit_incomplete() {
+    // A deployment of the commit that does not decode.
+    let env = Env::start(true).await;
+    let id = env.publish(1, OTHER, Some(MERGED)).await;
+    env.seed(|r| {
+        r.deployments.push((
+            with(
+                deployment_json(10, MERGED, "production"),
+                "environment",
+                Value::Null,
+            ),
+            vec![],
+        ));
+        r.deployments.push((
+            deployment_json(11, MERGED, "staging"),
+            vec![status_json(1, "success")],
+        ));
+    });
+    env.pass().await;
+    assert_eq!(env.runs(MERGED).len(), 1);
+    assert!(env.marker(MERGED).is_some_and(|(_, complete)| !complete));
+    assert_eq!(env.show(&id).await["external"]["state"], "incomplete");
+
+    // A run of the commit and branch that does not decode; other branches are ignored.
+    let env = Env::start(true).await;
+    env.publish(1, OTHER, Some(MERGED)).await;
+    env.seed(|r| {
+        let ok = run_json(REPO_ID, 1, MERGED, "main", "completed", Some("success"));
+        r.runs.push(with(ok.clone(), "id", json!("two")));
+        r.runs.push(ok);
+        r.runs.push(run_json(
+            REPO_ID,
+            3,
+            MERGED,
+            "feature",
+            "completed",
+            Some("success"),
+        ));
+    });
+    env.pass().await;
+    assert_eq!(env.runs(MERGED).len(), 1);
+    assert!(env.marker(MERGED).is_some_and(|(_, complete)| !complete));
+    // Only other branches: complete.
+    let env = Env::start(true).await;
+    env.publish(1, OTHER, Some(MERGED)).await;
+    env.seed(|r| {
+        r.runs.push(run_json(
+            REPO_ID,
+            3,
+            MERGED,
+            "feature",
+            "completed",
+            Some("success"),
+        ));
+    });
+    env.pass().await;
+    assert!(env.marker(MERGED).is_some_and(|(_, complete)| complete));
+}
+
+#[tokio::test]
+async fn a_list_reply_without_its_array_is_a_failed_read_not_an_empty_one() {
+    let env = Env::start(true).await;
+    env.publish(1, OTHER, Some(MERGED)).await;
+    env.fake.with(|s| s.arrayless_external_lists = true);
+    env.pass().await;
+    assert_eq!(env.marker(MERGED), None);
+    assert!(env.runs(MERGED).is_empty());
 }
 
 #[tokio::test]
@@ -655,4 +817,31 @@ fn malformed_repository_lists_are_refused() {
         });
         assert!(result.is_err(), "{bad}");
     }
+}
+
+#[tokio::test]
+async fn many_ci_runs_do_not_hide_deployments_in_the_view() {
+    let env = Env::start(true).await;
+    let id = env.publish(1, OTHER, Some(MERGED)).await;
+    env.seed(|r| {
+        for id in 1..=250 {
+            r.runs.push(run_json(
+                REPO_ID,
+                id,
+                MERGED,
+                "main",
+                "completed",
+                Some("success"),
+            ));
+        }
+        r.deployments.push((
+            deployment_json(10, MERGED, "production"),
+            vec![status_json(1, "success")],
+        ));
+    });
+    env.pass().await;
+    let external = env.show(&id).await["external"].clone();
+    assert_eq!(external["state"], "incomplete");
+    assert_eq!(external["ci"].as_array().unwrap().len(), 200);
+    assert_eq!(external["deployments"].as_array().unwrap().len(), 1);
 }

@@ -276,6 +276,21 @@ impl Api {
         max_pages: u32,
         etag: Option<&str>,
     ) -> Gh<Option<Paged>> {
+        self.paged_with(token, path, key, max_pages, etag, false)
+            .await
+    }
+
+    /// [`paged`](Self::paged); with `require_array` a 2xx body without the array fails the read
+    /// instead of reading as an empty page.
+    async fn paged_with(
+        &self,
+        token: &str,
+        path: &str,
+        key: Option<&str>,
+        max_pages: u32,
+        etag: Option<&str>,
+        require_array: bool,
+    ) -> Gh<Option<Paged>> {
         let sep = if path.contains('?') { '&' } else { '?' };
         let mut items = Vec::new();
         let mut first_etag = None;
@@ -289,7 +304,16 @@ impl Api {
             let (next, last, tag) = (reply.next, reply.last_page, reply.etag.clone());
             let body = reply.ok(endpoint_kind(&url, &self.base))?;
             let list = key.map_or(&body, |key| &body[key]);
-            items.extend(list.as_array().cloned().unwrap_or_default());
+            match list.as_array() {
+                Some(list) => items.extend(list.iter().cloned()),
+                None if require_array => {
+                    return Err(GhError::Failed(format!(
+                        "unreadable reply from {}",
+                        endpoint_kind(&url, &self.base)
+                    )));
+                }
+                None => {}
+            }
             if page == 1 {
                 first_etag = tag;
             }
@@ -497,12 +521,13 @@ impl Api {
         id: i64,
     ) -> Gh<Option<Value>> {
         let path = format!("/repos/{full_name}/deployments/{id}/statuses?per_page=1");
-        let reply = self.get(token, &path).await?;
+        let reply = self.get(token, &path).await.map_err(forbidden)?;
         if reply.status == 404 {
             return Ok(None);
         }
         Ok(reply
-            .ok("repos")?
+            .ok("repos")
+            .map_err(forbidden)?
             .as_array()
             .and_then(|list| list.first().cloned()))
     }
@@ -514,8 +539,9 @@ impl Api {
         token: &str,
     ) -> Gh<(Vec<Value>, bool)> {
         let paged = self
-            .paged(token, path, key, MAX_EXTERNAL_PAGES, None)
-            .await?;
+            .paged_with(token, path, key, MAX_EXTERNAL_PAGES, None, true)
+            .await
+            .map_err(forbidden)?;
         let paged = paged.ok_or_else(|| GhError::Failed("unexpected 304 from repos".into()))?;
         Ok((paged.items, paged.unread == 0))
     }
@@ -1053,6 +1079,16 @@ pub(super) fn endpoint_kind<'a>(url: &'a str, base: &str) -> &'a str {
         .split(['/', '?'])
         .next()
         .unwrap_or_default()
+}
+
+/// A 403 that was not a rate limit, as `Auth("403 ...")`. A permission refusal carries
+/// `x-ratelimit-remaining` on real GitHub, which `classify_with` reads as an ordinary reply,
+/// so the external reads normalise both forms for the caller to skip the repository.
+fn forbidden(error: GhError) -> GhError {
+    match error {
+        GhError::Failed(detail) if detail.starts_with("403") => GhError::Auth(detail),
+        other => other,
+    }
 }
 
 fn classify_with(kind: &str, full: Full, strict: bool) -> Gh<Reply> {

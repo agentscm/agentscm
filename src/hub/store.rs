@@ -13,7 +13,7 @@ use super::coordination::{
     CoordinationAck, CoordinationInbox, CoordinationInboxQuery, CoordinationListQuery,
     CoordinationReply, CoordinationRequest, CoordinationResolve, CoordinationWithdraw,
 };
-use super::external_runs::{ExternalObserved, ExternalRun};
+use super::external_runs::{ExternalKind, ExternalObserved, ExternalRun};
 use super::handoff::{Answered, Asked};
 use super::intent::{Announced, Intent, NewIntent};
 use super::publish::{Create, NewPublication, Publication, Update};
@@ -355,9 +355,14 @@ pub trait Store: Send + Sync {
     /// Records one external CI or deployment run of `repo` (a repository id) unless
     /// [`supersedes`](super::external_runs::supersedes) rejects it; an event only on `Changed`.
     fn observe_external_run(&self, repo: &str, run: &ExternalRun) -> Result<ExternalObserved>;
-    /// Runs seen for `commit_sha`, by kind, environment, run id, then attempt, at most `limit`.
-    fn external_runs(&self, repo: &str, commit_sha: &str, limit: usize)
-    -> Result<Vec<ExternalRun>>;
+    /// Runs of `kind` seen for `commit_sha`, by environment, run id, then attempt, at most `limit`.
+    fn external_runs(
+        &self,
+        repo: &str,
+        commit_sha: &str,
+        kind: ExternalKind,
+        limit: usize,
+    ) -> Result<Vec<ExternalRun>>;
     /// Notes that the provider was read for `commit_sha` at `at` (unix seconds); `complete` is
     /// false when the read was cut short.
     fn mark_external_reconciled(
@@ -369,11 +374,13 @@ pub trait Store: Send + Sync {
     ) -> Result<()>;
     fn external_reconciled(&self, repo: &str, commit_sha: &str) -> Result<Option<(i64, bool)>>;
     /// Publications of `repository` (a full name, matched case-insensitively) with a merge
-    /// commit, by id, ids above `after`, at most `limit`.
+    /// commit, last updated at or after `oldest` (unix seconds), by id, ids above `after`, at
+    /// most `limit`.
     fn merged_publications(
         &self,
         repository: &str,
         after: &str,
+        oldest: i64,
         limit: usize,
     ) -> Result<Vec<Publication>>;
     /// `pr_notice` events as `(intent id, data JSON)`, in one transaction.
