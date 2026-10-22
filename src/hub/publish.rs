@@ -1038,7 +1038,7 @@ async fn forge_check_view(
     Ok(Some(view))
 }
 
-async fn merged_commit(
+pub(super) async fn merged_commit(
     state: &HubState,
     conn: &Connection,
     repository: &ConnectedRepository,

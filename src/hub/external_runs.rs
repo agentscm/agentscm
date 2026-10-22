@@ -3,13 +3,20 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::connection::is_lower_hex;
-use super::github::parse_rfc3339;
-use super::store::Event;
+use super::HubState;
+use super::connection::{ConnectedRepository, Connection, is_lower_hex};
+use super::github::{Gh, GhError, parse_rfc3339};
+use super::http::blocking;
+use super::publish::{Update, merged_commit, publication_on_forge};
+use super::store::{Event, unix_now};
 use super::{HubError, Result};
 
 const MAX_TEXT_CHARS: usize = 200;
 const MAX_URL_BYTES: usize = 2048;
+/// Publications read (and pull requests checked for a merge) per repository per pass.
+const MAX_PER_PASS: usize = 20;
+/// Deployment statuses read per commit; the rest are dropped and the read is incomplete.
+const MAX_STATUSES: usize = 50;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExternalKind {
@@ -296,6 +303,155 @@ pub fn deployment(
     };
     run.validate().ok()?;
     Some(run)
+}
+
+/// Reads the merges and the external runs of one opted-in GitHub repository. Observations only:
+/// the one publication change is recording a merge the forge reports, as a publication read
+/// does. The caller holds the repository lock. `Auth` (a 401) and `Limited` stop the pass; a
+/// 403 means the token may not read actions or deployments, so the repository is skipped
+/// without blaming the connection. Any other failure skips one item and leaves its marker.
+pub(super) async fn reconcile_repo(
+    state: &HubState,
+    conn: &Connection,
+    repo: &ConnectedRepository,
+    token: &str,
+) -> Gh<()> {
+    if conn.provider != "github" || !state.sync.external_runs_enabled(&repo.full_name) {
+        return Ok(());
+    }
+    match pass(state, conn, repo, token).await {
+        Err(GhError::Auth(detail)) if detail.starts_with("403") => {
+            eprintln!("hub: external runs for {}: {detail}", repo.full_name);
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+async fn pass(
+    state: &HubState,
+    conn: &Connection,
+    repo: &ConnectedRepository,
+    token: &str,
+) -> Gh<()> {
+    let oldest = unix_now() - state.sync.config()?.activity_days * 86_400;
+    let (after_number, after_id) = state.sync.external_cursor(&repo.id);
+    let (store, name) = (state.store.clone(), repo.full_name.clone());
+    let unmerged = blocking(state, move || {
+        store.pull_publications(&name, after_number, MAX_PER_PASS)
+    })
+    .await?;
+    let full = unmerged.len() >= MAX_PER_PASS;
+    let last = unmerged.last().and_then(|p| p.pr_number).unwrap_or(0);
+    for publication in unmerged {
+        let Some(number) = publication
+            .pr_number
+            .filter(|_| publication.updated_at >= oldest)
+        else {
+            continue;
+        };
+        if !publication_on_forge(state, &publication, repo).await {
+            continue;
+        }
+        match merged_commit(state, conn, repo, number, &publication.commit).await {
+            Ok(Some(merge_commit)) => {
+                let (store, id) = (state.store.clone(), publication.id);
+                blocking(state, move || {
+                    store.update_publication(&id, &Update::Merged { merge_commit }, unix_now())?;
+                    Ok(())
+                })
+                .await?;
+            }
+            Ok(None) => {}
+            Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
+            Err(GhError::Failed(detail)) => {
+                eprintln!(
+                    "hub: external runs for {}#{number}: {detail}",
+                    repo.full_name
+                );
+            }
+        }
+    }
+
+    let (store, name) = (state.store.clone(), repo.full_name.clone());
+    let merged = blocking(state, move || {
+        store.merged_publications(&name, &after_id, MAX_PER_PASS)
+    })
+    .await?;
+    let next = match merged.last() {
+        Some(p) if merged.len() >= MAX_PER_PASS => p.id.clone(),
+        _ => String::new(),
+    };
+    state
+        .sync
+        .set_external_cursor(&repo.id, (if full { last } else { 0 }, next));
+    for publication in merged {
+        let Some(sha) = publication
+            .merge_commit
+            .as_deref()
+            .filter(|_| publication.updated_at >= oldest)
+        else {
+            continue;
+        };
+        if !publication_on_forge(state, &publication, repo).await {
+            continue;
+        }
+        match commit_runs(state, repo, token, sha, &publication.base).await {
+            Ok(complete) => {
+                let (store, id, sha) = (state.store.clone(), repo.id.clone(), sha.to_owned());
+                blocking(state, move || {
+                    store.mark_external_reconciled(&id, &sha, unix_now(), complete)
+                })
+                .await?;
+            }
+            Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
+            Err(GhError::Failed(detail)) => {
+                eprintln!("hub: external runs for {} {sha}: {detail}", repo.full_name);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reads and stores the runs and deployments of exactly `sha`. True when every list and every
+/// item was read in full; dropped or unread items make it false rather than being guessed.
+async fn commit_runs(
+    state: &HubState,
+    repo: &ConnectedRepository,
+    token: &str,
+    sha: &str,
+    base: &str,
+) -> Gh<bool> {
+    let (api, web) = (state.sync.api()?, state.sync.config()?.web.as_str());
+    let name = repo.full_name.as_str();
+    let (runs, runs_done) = api.workflow_runs(token, name, sha).await?;
+    let (deployments, deployments_done) = api.deployments(token, name, sha).await?;
+    let mut found: Vec<ExternalRun> = runs
+        .iter()
+        .filter_map(|run| ci_run(run, repo.repository_id, sha, base, web))
+        .collect();
+    let mut complete = runs_done && deployments_done;
+    for (index, item) in deployments.iter().enumerate() {
+        let Some(id) = item["id"].as_i64().filter(|_| index < MAX_STATUSES) else {
+            complete = false;
+            continue;
+        };
+        match api.deployment_status(token, name, id).await {
+            Ok(status) => found.extend(deployment(item, status.as_ref(), sha, web)),
+            Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
+            Err(GhError::Failed(_)) => complete = false,
+        }
+    }
+    // Runs of other branches, events or repositories are not this commit's outcome.
+    let dropped = runs.len() + deployments.len() - found.len();
+    if dropped > 0 {
+        eprintln!("hub: external runs for {name} {sha}: {dropped} items not matched");
+    }
+    for run in found {
+        let (store, id) = (state.store.clone(), repo.id.clone());
+        blocking(state, move || store.observe_external_run(&id, &run)).await?;
+    }
+    Ok(complete)
 }
 
 impl Event {
