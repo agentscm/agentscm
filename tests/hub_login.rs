@@ -365,7 +365,7 @@ impl Env {
             Arc::new(LocalBackend::open(dir.path().join("objects")).unwrap()),
         )
         .with_login(Login::new(config).unwrap());
-        let app = router(state);
+        let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
         tokio::spawn(async move { axum::serve(listener, app).await });
         let env = Self {
             hub,
@@ -682,6 +682,28 @@ async fn browser_start_validates_input_and_provider() {
             .0,
         404
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_client_cannot_fill_the_pending_login_table() {
+    let env = Env::start("").await;
+    let start = |client: &str| {
+        let url = format!(
+            "{}/v1/hub/login/github?cli_port=40000&cli_challenge={}",
+            env.url(),
+            challenge("x")
+        );
+        let request = env
+            .http
+            .get(url)
+            .header("x-forwarded-for", client.to_owned());
+        async move { request.send().await.unwrap().status().as_u16() }
+    };
+    for _ in 0..8 {
+        assert_eq!(start("203.0.113.1").await, 302);
+    }
+    assert_eq!(start("203.0.113.1").await, 429);
+    assert_eq!(start("203.0.113.2").await, 302);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
