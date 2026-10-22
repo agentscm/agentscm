@@ -249,6 +249,35 @@ fn quick<'a>(url: &'a str, token: &'a Path, extra: &[&'a str]) -> Vec<&'a str> {
     args
 }
 
+#[test]
+fn invalid_slack_config_is_rejected_before_quickstart_runtime_writes() {
+    let machine = Machine::new();
+    let repo = machine.repo();
+    let config = machine.home.path().join("invalid-slack.json");
+    std::fs::write(&config, "{}\n").unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let output = machine.run(
+        repo.path(),
+        &[
+            "quickstart",
+            "--yes",
+            "--hub",
+            "local",
+            "--slack-config-file",
+            config.to_str().unwrap(),
+            "--no-collisions",
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("the prepared Slack configuration is invalid")
+    );
+    assert!(!machine.home.path().join(".agentscm").exists());
+    assert!(!machine.config().join("quickstart.lock").exists());
+    assert!(!machine.config().join("quickstart.json").exists());
+}
+
 const SETTINGS: &str = ".claude/settings.local.json";
 
 fn last_line(output: &Output) -> String {
@@ -1249,6 +1278,9 @@ fn fake_docker(machine: &Machine) {
         r#"#!/bin/sh
 printf '%s\n' "$*" >> "$HOME/docker.log"
 case "$1 $2" in
+  'ps -aq') exit 0 ;;
+  'inspect --format'|'inspect '* ) exit 1 ;;
+  'rm -f') exit 0 ;;
   'version '*|'compose version') exit 0 ;;
   'info --format') echo "${FAKE_DOCKER_PLATFORM:-linux/amd64}"; exit 0 ;;
   'context inspect') echo "${FAKE_DOCKER_ENDPOINT:-unix:///var/run/docker.sock}"; exit 0 ;;
@@ -1259,6 +1291,7 @@ case "$1 $2" in
   'pull '*) echo 'fixture: registry denied pull' >&2; exit 17 ;;
   'compose -p')
     case "$*" in
+      *'agentscm-slack-pending'*) echo agentscm-slack-clean ;;
       *' exec -T hub cat /data/secrets/bootstrap-setup-url') echo "$FAKE_HUB_URL/setup" ;;
     esac
     exit 0
@@ -1269,6 +1302,726 @@ exit 1
     )
     .unwrap();
     std::fs::set_permissions(docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn slack_install_fixture(machine: &Machine) -> PathBuf {
+    let dir = machine.home.path().join("slack-install-fixture");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for (name, bytes) in [
+        ("signing", b"synthetic-signing".as_slice()),
+        ("bot", b"xoxb-synthetic".as_slice()),
+        ("agent", &[b'a'; 64]),
+    ] {
+        std::fs::write(dir.join(name), bytes).unwrap();
+        std::fs::set_permissions(dir.join(name), std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let config = dir.join("config.json");
+    std::fs::write(
+        &config,
+        serde_json::to_vec_pretty(&json!({
+            "version": 1, "app_id": "A123", "bot_id": "B123", "team_id": "T123",
+            "hub_url": "https://hub.example.test/", "signing_secret_file": dir.join("signing"),
+            "bot_token_file": dir.join("bot"), "database": dir.join("install.sqlite"),
+            "bindings": [{"slack_user":"U123","provider":"github","host":"github.com",
+                "forge_user_id":42,"repository":"acme/widgets","repository_id":101,
+                "agent_token_file":dir.join("agent"),"allow_coordination_writes":false}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    config
+}
+
+fn recovery_fake_docker(machine: &Machine) {
+    let docker = machine.bin.path().join("docker");
+    std::fs::write(
+        &docker,
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$HOME/docker.log"
+case "$1 $2" in
+  'ps -aq')
+    if [ "${FAKE_FAIL_HELPER_CONFIRM:-}" = 1 ] && [ -e "$FAKE_HELPER_CONFIRM_ATTEMPT" ]; then exit 17; fi
+    exit 0 ;;
+  'inspect --format')
+    if [ "${FAKE_FAIL_HELPER_CONFIRM:-}" = 1 ]; then /usr/bin/touch "$FAKE_HELPER_CONFIRM_ATTEMPT"; fi
+    exit 1 ;;
+  'inspect '* ) exit 1 ;;
+  'rm -f') exit 0 ;;
+  'version '*|'compose version') exit 0 ;;
+  'info --format') echo linux/amd64; exit 0 ;;
+  'context inspect') echo unix:///var/run/docker.sock; exit 0 ;;
+  'image inspect')
+    if [ "${FAKE_FAIL_AFTER_CLEAN:-}" = 1 ] && [ -e "$FAKE_RECOVERED_CLEAN" ]; then exit 17; fi
+    echo linux/amd64; exit 0 ;;
+  'compose -p')
+    all="$*"
+    case "$all" in
+      *' exec -T hub sh -c ls /data/secrets/con_'*) exit 0 ;;
+      *' exec -T hub cat /data/secrets/bootstrap-setup-url') echo "$FAKE_HUB_URL/setup"; exit 0 ;;
+      *' up -d '*'--force-recreate'*) /usr/bin/touch "$FAKE_RESTARTED" "$FAKE_RUNNING"; exit 0 ;;
+      *' down'*)
+        /bin/rm -f "$FAKE_RUNNING"; /usr/bin/touch "$FAKE_STOPPED"
+        if [ -n "${FAKE_STOPPED_AFTER_FINALIZE:-}" ] && [ -e "$FAKE_FINALIZE_FAILED" ]; then
+          /usr/bin/touch "$FAKE_STOPPED_AFTER_FINALIZE"
+        fi
+        exit 0 ;;
+      *'agentscm-slack-pending'*)
+        if [ -e "$FAKE_PENDING" ]; then echo agentscm-slack-pending; else echo agentscm-slack-clean; fi
+        exit 0 ;;
+      *'agentscm-slack-rollback:%s'*)
+        [ ! -e "$FAKE_RUNNING" ] || { /usr/bin/touch "$FAKE_LIVE_MUTATION"; exit 17; }
+        if [ "${FAKE_RECOVER_CLEAN:-}" = 1 ]; then
+          /usr/bin/touch "$FAKE_RECOVERED_CLEAN"
+          echo agentscm-slack-clean
+          exit 0
+        fi
+        /bin/chmod 700 "$FAKE_CONFIG_DIR"
+        if [ "${FAKE_FIRST_GENERATION:-}" = 1 ]; then
+          /bin/rm -f "$FAKE_VOLUME_CONFIG"
+          echo agentscm-slack-rollback:
+        else
+          /bin/cp "$FAKE_OLD_CONFIG" "$FAKE_VOLUME_CONFIG"
+          echo agentscm-slack-rollback:config.json,signing-secret,bot-token,agent-0.token
+        fi
+        exit 0 ;;
+      *'agentscm-slack-commit-clean'*)
+        [ ! -e "$FAKE_RUNNING" ] || { /usr/bin/touch "$FAKE_LIVE_MUTATION"; exit 17; }
+        if [ -e "$FAKE_PENDING" ]; then /bin/rm -f "$FAKE_PENDING"; echo agentscm-slack-commit; else echo agentscm-slack-commit-clean; fi
+        exit 0 ;;
+      *'rm -rf "$backup" /data/secrets/.slack-next'*)
+        if [ "${FAKE_FAIL_FINALIZE:-}" = 1 ] && [ ! -e "$FAKE_FINALIZE_FAILED" ]; then
+          /usr/bin/touch "$FAKE_FINALIZE_FAILED"; exit 17
+        fi
+        /bin/rm -f "$FAKE_PENDING"; exit 0 ;;
+      *'mv "$backup/commit-marker" "$backup/commit"'*)
+        [ "${FAKE_FAIL_MARK:-}" != 1 ] || exit 17
+        /usr/bin/touch "$FAKE_COMMIT_MARKED"; exit 0 ;;
+      *'trap rollback EXIT HUP INT TERM'*)
+        stage=
+        for argument in "$@"; do case "$argument" in *:/run/agentscm-slack:ro) stage="${argument%:/run/agentscm-slack:ro}" ;; esac; done
+        [ -n "$stage" ] && /bin/cp "$stage/config.json" "$FAKE_VOLUME_CONFIG"
+        /usr/bin/touch "$FAKE_PENDING"
+        if [ "${FAKE_LOCK_MANIFEST:-}" = 1 ]; then /bin/chmod 500 "$FAKE_CONFIG_DIR"; fi
+        echo agentscm-slack-changed; exit 0 ;;
+      *'/run/agentscm-slack:ro'*)
+        stage=
+        for argument in "$@"; do case "$argument" in *:/run/agentscm-slack:ro) stage="${argument%:/run/agentscm-slack:ro}" ;; esac; done
+        case "$all" in
+         *'source=/run/agentscm-slack'*)
+          if [ -n "$stage" ] && /usr/bin/cmp -s "$stage/config.json" "$FAKE_VOLUME_CONFIG"; then
+            echo agentscm-slack-unchanged
+          else
+            echo agentscm-slack-changed
+          fi ;;
+         *'rm -rf "$backup"'*)
+          /bin/rm -f "$FAKE_PENDING"
+          [ "${FAKE_FAIL_FINAL_COMMIT:-}" != 1 ] || exit 17 ;;
+         *)
+          if [ "${FAKE_FAIL_POST_VERIFY:-}" = 1 ] && [ -e "$FAKE_PENDING" ] && [ ! -e "$FAKE_POST_VERIFY_FAILED" ]; then
+            /usr/bin/touch "$FAKE_POST_VERIFY_FAILED"; exit 17
+          fi ;;
+        esac
+        exit 0 ;;
+      *'rm -rf "$backup"'*)
+        /bin/rm -f "$FAKE_PENDING"
+        [ "${FAKE_FAIL_FINAL_COMMIT:-}" != 1 ] || exit 17
+        exit 0 ;;
+      *'rm -rf /data/secrets/.slack-next'*)
+        [ ! -e "$FAKE_RUNNING" ] || { /usr/bin/touch "$FAKE_LIVE_MUTATION"; exit 17; }
+        [ "${FAKE_FAIL_ROLLBACK:-}" != 1 ] || exit 17
+        /bin/chmod 700 "$FAKE_CONFIG_DIR"
+        /bin/cp "$FAKE_OLD_CONFIG" "$FAKE_VOLUME_CONFIG"
+        echo agentscm-slack-rollback; exit 0 ;;
+    esac
+    if [ "${FAKE_FAIL_POST_VERIFY:-}" = 1 ] && [ -e "$FAKE_PENDING" ] && [ ! -e "$FAKE_POST_VERIFY_FAILED" ]; then
+      /usr/bin/touch "$FAKE_POST_VERIFY_FAILED"; exit 17
+    fi
+    exit 0 ;;
+esac
+exit 1
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn seed_docker_slack_receipt(setup: &Path) {
+    let digest = "0".repeat(64);
+    let receipt = [
+        "config.json",
+        "signing-secret",
+        "bot-token",
+        "agent-0.token",
+    ]
+    .into_iter()
+    .map(|name| format!("{digest}  {name}\n"))
+    .collect::<String>();
+    let path = setup.join(".slack-bundle-receipt");
+    std::fs::write(&path, receipt).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[test]
+fn docker_slack_recovery_gates_restart_and_retains_retry_evidence() {
+    for (failure, expected_restart, expected_pending) in [
+        ("post-verify-rollback", false, true),
+        ("manifest-save", true, false),
+        ("commit-marker", true, false),
+        ("helper-confirm", false, true),
+    ] {
+        let (hub, machine) = (Hub::start(), Machine::new());
+        let repo = machine.repo();
+        recovery_fake_docker(&machine);
+        let config = slack_install_fixture(&machine);
+        let port = hub.url.rsplit(':').next().unwrap();
+        let setup = machine.home.path().join(".agentscm/hub");
+        std::fs::create_dir_all(&setup).unwrap();
+        let old_env = "AGENTSCM_SLACK_FILE=/data/secrets/slack/config.json\nAGENTSCM_SLACK_BUNDLE_FILES=config.json,signing-secret,bot-token,agent-0.token\n";
+        let old_compose = "previous compose\n";
+        std::fs::write(setup.join(".env"), old_env).unwrap();
+        std::fs::write(setup.join("compose.yaml"), old_compose).unwrap();
+        seed_docker_slack_receipt(&setup);
+        std::fs::create_dir_all(machine.config()).unwrap();
+        let old_manifest = json!({
+            "local_hub": {"dir":setup,"project":"fixture-hub","port":port.parse::<u16>().unwrap()}
+        })
+        .to_string();
+        std::fs::write(machine.config().join("quickstart.json"), &old_manifest).unwrap();
+        let pending = machine.home.path().join("pending-slack-transaction");
+        let restarted = machine.home.path().join("previous-hub-restarted");
+        let running = machine.home.path().join("hub-running");
+        let stopped = machine.home.path().join("hub-stopped");
+        let live_mutation = machine.home.path().join("live-volume-mutation");
+        let old_volume_config = machine.home.path().join("old-volume-config");
+        let volume_config = machine.home.path().join("volume-config");
+        std::fs::write(&old_volume_config, b"synthetic-old-credential-generation").unwrap();
+        std::fs::write(&volume_config, b"synthetic-old-credential-generation").unwrap();
+        let mut command = machine.command(
+            repo.path(),
+            &[
+                "quickstart",
+                "--yes",
+                "--hub",
+                "local",
+                "--hub-runtime",
+                "docker",
+                "--hub-port",
+                port,
+                "--hub-project",
+                "fixture-hub",
+                "--github-login",
+                "octo",
+                "--slack-config-file",
+                config.to_str().unwrap(),
+                "--hook",
+                "none",
+                "--no-collisions",
+            ],
+        );
+        command
+            .env("FAKE_CONFIG_DIR", machine.config())
+            .env("FAKE_PENDING", &pending)
+            .env("FAKE_RESTARTED", &restarted)
+            .env("FAKE_RUNNING", &running)
+            .env("FAKE_STOPPED", &stopped)
+            .env("FAKE_LIVE_MUTATION", &live_mutation)
+            .env("FAKE_OLD_CONFIG", &old_volume_config)
+            .env("FAKE_VOLUME_CONFIG", &volume_config)
+            .env(
+                "FAKE_FINALIZE_FAILED",
+                machine.home.path().join("finalizer-failed"),
+            )
+            .env(
+                "FAKE_COMMIT_MARKED",
+                machine.home.path().join("commit-marked"),
+            )
+            .env(
+                "FAKE_POST_VERIFY_FAILED",
+                machine.home.path().join("post-verify-failed"),
+            )
+            .env(
+                "FAKE_HELPER_CONFIRM_ATTEMPT",
+                machine.home.path().join("helper-confirm-attempt"),
+            )
+            .env("FAKE_HUB_URL", &hub.url);
+        match failure {
+            "post-verify-rollback" => {
+                command
+                    .env("FAKE_FAIL_POST_VERIFY", "1")
+                    .env("FAKE_FAIL_ROLLBACK", "1");
+            }
+            "manifest-save" => {
+                command.env("FAKE_LOCK_MANIFEST", "1");
+            }
+            "commit-marker" => {
+                command.env("FAKE_FAIL_MARK", "1");
+            }
+            "helper-confirm" => {
+                command
+                    .env("FAKE_FAIL_MARK", "1")
+                    .env("FAKE_FAIL_HELPER_CONFIRM", "1");
+            }
+            _ => unreachable!(),
+        }
+        let output = command.output().unwrap();
+        let docker_log = std::fs::read_to_string(machine.home.path().join("docker.log")).unwrap();
+        assert!(docker_log.contains("com.counterbranch.agentscm.slack-helper=1"));
+        assert!(docker_log.contains("com.counterbranch.agentscm.slack-project=fixture-hub"));
+        if failure != "manifest-save" {
+            assert!(
+                docker_log.contains("inspect --format"),
+                "{failure}: {docker_log}"
+            );
+            assert!(
+                docker_log.contains("ps -aq --no-trunc"),
+                "{failure}: {docker_log}"
+            );
+        }
+        assert!(!docker_log.contains("xoxb-synthetic"));
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{failure}: {output:?}\n{docker_log}"
+        );
+        let installed_env = std::fs::read_to_string(setup.join(".env")).unwrap();
+        if expected_pending {
+            assert!(
+                installed_env.ends_with(old_env),
+                "{failure}: {output:?}\n{docker_log}"
+            );
+            assert!(setup.join(".slack-bundle-receipt").exists());
+        } else {
+            assert_eq!(
+                installed_env, old_env,
+                "{failure}: {output:?}\n{docker_log}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(setup.join("compose.yaml")).unwrap(),
+                old_compose
+            );
+        }
+        assert_eq!(
+            restarted.exists(),
+            expected_restart,
+            "{failure}: {output:?}\n{docker_log}"
+        );
+        assert_eq!(
+            pending.exists(),
+            expected_pending,
+            "{failure}: {output:?}\n{docker_log}"
+        );
+        assert!(!live_mutation.exists(), "{failure}: {docker_log}");
+        let restored: Value = json_file(&machine.config().join("quickstart.json"));
+        assert_eq!(restored["local_hub"]["project"], "fixture-hub");
+    }
+}
+
+#[test]
+fn docker_ambiguous_final_commit_keeps_the_exact_new_generation() {
+    let (hub, machine) = (Hub::start(), Machine::new());
+    let repo = machine.repo();
+    recovery_fake_docker(&machine);
+    let config = slack_install_fixture(&machine);
+    let port = hub.url.rsplit(':').next().unwrap();
+    let setup = machine.home.path().join(".agentscm/hub");
+    std::fs::create_dir_all(&setup).unwrap();
+    let old_env = "AGENTSCM_SLACK_FILE=/data/secrets/slack/config.json\nAGENTSCM_SLACK_BUNDLE_FILES=config.json,signing-secret,bot-token,agent-0.token\n";
+    std::fs::write(setup.join(".env"), old_env).unwrap();
+    std::fs::write(setup.join("compose.yaml"), "previous compose\n").unwrap();
+    seed_docker_slack_receipt(&setup);
+    std::fs::create_dir_all(machine.config()).unwrap();
+    std::fs::write(
+        machine.config().join("quickstart.json"),
+        json!({
+            "local_hub": {"dir":setup,"project":"fixture-hub","port":port.parse::<u16>().unwrap()}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let pending = machine.home.path().join("pending-slack-transaction");
+    let restarted = machine.home.path().join("hub-restarted");
+    let running = machine.home.path().join("hub-running");
+    let stopped = machine.home.path().join("hub-stopped");
+    let live_mutation = machine.home.path().join("live-volume-mutation");
+    let old_volume_config = machine.home.path().join("old-volume-config");
+    let volume_config = machine.home.path().join("volume-config");
+    std::fs::write(&old_volume_config, b"synthetic-old-credential-generation").unwrap();
+    std::fs::write(&volume_config, b"synthetic-old-credential-generation").unwrap();
+    let output = machine
+        .command(
+            repo.path(),
+            &[
+                "quickstart",
+                "--yes",
+                "--hub",
+                "local",
+                "--hub-runtime",
+                "docker",
+                "--hub-port",
+                port,
+                "--hub-project",
+                "fixture-hub",
+                "--github-login",
+                "octo",
+                "--slack-config-file",
+                config.to_str().unwrap(),
+                "--hook",
+                "none",
+                "--no-collisions",
+            ],
+        )
+        .env("FAKE_CONFIG_DIR", machine.config())
+        .env("FAKE_PENDING", &pending)
+        .env("FAKE_RESTARTED", &restarted)
+        .env("FAKE_RUNNING", &running)
+        .env("FAKE_STOPPED", &stopped)
+        .env("FAKE_LIVE_MUTATION", &live_mutation)
+        .env("FAKE_OLD_CONFIG", &old_volume_config)
+        .env("FAKE_VOLUME_CONFIG", &volume_config)
+        .env(
+            "FAKE_FINALIZE_FAILED",
+            machine.home.path().join("finalizer-failed"),
+        )
+        .env(
+            "FAKE_COMMIT_MARKED",
+            machine.home.path().join("commit-marked"),
+        )
+        .env(
+            "FAKE_POST_VERIFY_FAILED",
+            machine.home.path().join("post-verify-failed"),
+        )
+        .env("FAKE_HUB_URL", &hub.url)
+        .env("FAKE_FAIL_FINAL_COMMIT", "1")
+        .output()
+        .unwrap();
+    let docker_log = std::fs::read_to_string(machine.home.path().join("docker.log")).unwrap();
+    assert_eq!(output.status.code(), Some(3), "{output:?}\n{docker_log}");
+    assert!(!pending.exists(), "{output:?}\n{docker_log}");
+    assert!(stopped.exists() && restarted.exists() && running.exists());
+    assert!(!live_mutation.exists());
+    assert_ne!(
+        std::fs::read(&volume_config).unwrap(),
+        std::fs::read(&old_volume_config).unwrap(),
+        "identical filenames must not let the old credential digest pass"
+    );
+    assert_ne!(
+        std::fs::read_to_string(setup.join("compose.yaml")).unwrap(),
+        "previous compose\n"
+    );
+}
+
+#[test]
+fn docker_finalizer_failure_stops_before_retrying_pending_recovery() {
+    let (hub, machine) = (Hub::start(), Machine::new());
+    let repo = machine.repo();
+    recovery_fake_docker(&machine);
+    let config = slack_install_fixture(&machine);
+    let port = hub.url.rsplit(':').next().unwrap();
+    let setup = machine.home.path().join(".agentscm/hub");
+    std::fs::create_dir_all(&setup).unwrap();
+    let old_env = "AGENTSCM_SLACK_FILE=/data/secrets/slack/config.json\nAGENTSCM_SLACK_BUNDLE_FILES=config.json,signing-secret,bot-token,agent-0.token\n";
+    std::fs::write(setup.join(".env"), old_env).unwrap();
+    std::fs::write(setup.join("compose.yaml"), "previous compose\n").unwrap();
+    seed_docker_slack_receipt(&setup);
+    std::fs::create_dir_all(machine.config()).unwrap();
+    std::fs::write(
+        machine.config().join("quickstart.json"),
+        json!({
+            "local_hub": {"dir":setup,"project":"fixture-hub","port":port.parse::<u16>().unwrap()}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let pending = machine.home.path().join("pending-slack-transaction");
+    let restarted = machine.home.path().join("hub-restarted");
+    let running = machine.home.path().join("hub-running");
+    let stopped = machine.home.path().join("hub-stopped");
+    let stopped_after_finalize = machine.home.path().join("stopped-after-finalizer");
+    let live_mutation = machine.home.path().join("live-volume-mutation");
+    let old_volume_config = machine.home.path().join("old-volume-config");
+    let volume_config = machine.home.path().join("volume-config");
+    let finalizer_failed = machine.home.path().join("finalizer-failed");
+    std::fs::write(&old_volume_config, b"synthetic-old-credential-generation").unwrap();
+    std::fs::write(&volume_config, b"synthetic-old-credential-generation").unwrap();
+    let run = |fail_finalizer: bool| {
+        let mut command = machine.command(
+            repo.path(),
+            &[
+                "quickstart",
+                "--yes",
+                "--hub",
+                "local",
+                "--hub-runtime",
+                "docker",
+                "--hub-port",
+                port,
+                "--hub-project",
+                "fixture-hub",
+                "--github-login",
+                "octo",
+                "--slack-config-file",
+                config.to_str().unwrap(),
+                "--hook",
+                "none",
+                "--no-collisions",
+            ],
+        );
+        command
+            .env("FAKE_CONFIG_DIR", machine.config())
+            .env("FAKE_PENDING", &pending)
+            .env("FAKE_RESTARTED", &restarted)
+            .env("FAKE_RUNNING", &running)
+            .env("FAKE_STOPPED", &stopped)
+            .env("FAKE_STOPPED_AFTER_FINALIZE", &stopped_after_finalize)
+            .env("FAKE_LIVE_MUTATION", &live_mutation)
+            .env("FAKE_OLD_CONFIG", &old_volume_config)
+            .env("FAKE_VOLUME_CONFIG", &volume_config)
+            .env("FAKE_FINALIZE_FAILED", &finalizer_failed)
+            .env(
+                "FAKE_COMMIT_MARKED",
+                machine.home.path().join("commit-marked"),
+            )
+            .env(
+                "FAKE_POST_VERIFY_FAILED",
+                machine.home.path().join("post-verify-failed"),
+            )
+            .env("FAKE_HUB_URL", &hub.url);
+        if fail_finalizer {
+            command
+                .env("FAKE_LOCK_MANIFEST", "1")
+                .env("FAKE_FAIL_FINALIZE", "1");
+        }
+        command.output().unwrap()
+    };
+
+    let first = run(true);
+    let first_log = std::fs::read_to_string(machine.home.path().join("docker.log")).unwrap();
+    assert_eq!(first.status.code(), Some(1), "{first:?}\n{first_log}");
+    assert!(finalizer_failed.exists(), "{first:?}\n{first_log}");
+    assert!(pending.exists(), "{first:?}\n{first_log}");
+    assert!(!running.exists(), "{first:?}\n{first_log}");
+    assert!(!live_mutation.exists(), "{first_log}");
+
+    let second = run(false);
+    let second_log = std::fs::read_to_string(machine.home.path().join("docker.log")).unwrap();
+    assert_eq!(second.status.code(), Some(3), "{second:?}\n{second_log}");
+    assert!(stopped_after_finalize.exists(), "{second:?}\n{second_log}");
+    assert!(!pending.exists(), "{second:?}\n{second_log}");
+    assert!(running.exists() && restarted.exists());
+    assert!(!live_mutation.exists(), "{second_log}");
+}
+
+#[test]
+fn fresh_docker_slack_failure_retains_an_empty_anchor_and_retries() {
+    let (hub, machine) = (Hub::start(), Machine::new());
+    let repo = machine.repo();
+    recovery_fake_docker(&machine);
+    let config = slack_install_fixture(&machine);
+    let port = hub.url.rsplit(':').next().unwrap();
+    let setup = machine.home.path().join(".agentscm/hub");
+    std::fs::create_dir_all(machine.config()).unwrap();
+    std::fs::write(
+        machine.config().join("quickstart.json"),
+        json!({
+            "local_hub": {"dir":setup,"project":"fixture-hub","port":port.parse::<u16>().unwrap()}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let pending = machine.home.path().join("pending-slack-transaction");
+    let running = machine.home.path().join("hub-running");
+    let old_volume = machine.home.path().join("unused-old-volume-config");
+    let volume = machine.home.path().join("volume-config");
+    std::fs::write(&old_volume, b"unused synthetic generation").unwrap();
+    let run = |fail: bool| {
+        let mut command = machine.command(
+            repo.path(),
+            &[
+                "quickstart",
+                "--yes",
+                "--hub",
+                "local",
+                "--hub-runtime",
+                "docker",
+                "--hub-port",
+                port,
+                "--hub-project",
+                "fixture-hub",
+                "--github-login",
+                "octo",
+                "--slack-config-file",
+                config.to_str().unwrap(),
+                "--hook",
+                "none",
+                "--no-collisions",
+            ],
+        );
+        command
+            .env("FAKE_CONFIG_DIR", machine.config())
+            .env("FAKE_PENDING", &pending)
+            .env("FAKE_RESTARTED", machine.home.path().join("hub-restarted"))
+            .env("FAKE_RUNNING", &running)
+            .env("FAKE_STOPPED", machine.home.path().join("hub-stopped"))
+            .env(
+                "FAKE_LIVE_MUTATION",
+                machine.home.path().join("live-mutation"),
+            )
+            .env("FAKE_OLD_CONFIG", &old_volume)
+            .env("FAKE_VOLUME_CONFIG", &volume)
+            .env(
+                "FAKE_FINALIZE_FAILED",
+                machine.home.path().join("finalize-failed"),
+            )
+            .env(
+                "FAKE_COMMIT_MARKED",
+                machine.home.path().join("commit-marked"),
+            )
+            .env(
+                "FAKE_POST_VERIFY_FAILED",
+                machine.home.path().join("verify-failed"),
+            )
+            .env("FAKE_FIRST_GENERATION", "1")
+            .env("FAKE_HUB_URL", &hub.url);
+        if fail {
+            command
+                .env("FAKE_FAIL_POST_VERIFY", "1")
+                .env("FAKE_FAIL_ROLLBACK", "1");
+        }
+        command.output().unwrap()
+    };
+
+    let first = run(true);
+    let first_log = std::fs::read_to_string(machine.home.path().join("docker.log")).unwrap();
+    assert_eq!(first.status.code(), Some(1), "{first:?}\n{first_log}");
+    assert!(pending.exists(), "{first:?}\n{first_log}");
+    assert_eq!(
+        std::fs::read(setup.join(".slack-bundle-receipt.rollback")).unwrap(),
+        b""
+    );
+    assert!(!running.exists());
+
+    let second = run(false);
+    let log = std::fs::read_to_string(machine.home.path().join("docker.log")).unwrap();
+    assert_eq!(second.status.code(), Some(3), "{second:?}\n{log}");
+    assert!(!pending.exists());
+    assert!(!setup.join(".slack-bundle-receipt.rollback").exists());
+    assert!(setup.join(".slack-bundle-receipt").exists());
+    assert!(running.exists());
+}
+
+#[test]
+fn fresh_docker_finalized_rollback_crash_recovers_empty_generation() {
+    let (hub, machine) = (Hub::start(), Machine::new());
+    let repo = machine.repo();
+    recovery_fake_docker(&machine);
+    let config = slack_install_fixture(&machine);
+    let port = hub.url.rsplit(':').next().unwrap();
+    let setup = machine.home.path().join(".agentscm/hub");
+    std::fs::create_dir_all(&setup).unwrap();
+    std::fs::write(setup.join("compose.yaml"), "stale fresh compose\n").unwrap();
+    std::fs::write(
+        setup.join(".env"),
+        "UNRELATED=kept\nAGENTSCM_SLACK_FILE=/data/secrets/slack/config.json\nAGENTSCM_SLACK_BUNDLE_FILES=config.json,signing-secret,bot-token,agent-0.token\n",
+    )
+    .unwrap();
+    let rollback_receipt = setup.join(".slack-bundle-receipt.rollback");
+    std::fs::write(&rollback_receipt, b"").unwrap();
+    std::fs::set_permissions(&rollback_receipt, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::create_dir_all(machine.config()).unwrap();
+    std::fs::write(
+        machine.config().join("quickstart.json"),
+        json!({
+            "local_hub": {"dir":setup,"project":"fixture-hub","port":port.parse::<u16>().unwrap()}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let pending = machine.home.path().join("pending-slack-transaction");
+    let recovered_clean = machine.home.path().join("recovered-clean-generation");
+    let running = machine.home.path().join("hub-running");
+    let volume = machine.home.path().join("volume-config");
+    let old_volume = machine.home.path().join("unused-old-volume-config");
+    let run = |fail_after_clean: bool| {
+        let mut command = machine.command(
+            repo.path(),
+            &[
+                "quickstart",
+                "--yes",
+                "--hub",
+                "local",
+                "--hub-runtime",
+                "docker",
+                "--hub-port",
+                port,
+                "--hub-project",
+                "fixture-hub",
+                "--github-login",
+                "octo",
+                "--slack-config-file",
+                config.to_str().unwrap(),
+                "--hook",
+                "none",
+                "--no-collisions",
+            ],
+        );
+        command
+            .env("FAKE_CONFIG_DIR", machine.config())
+            .env("FAKE_PENDING", &pending)
+            .env("FAKE_RESTARTED", machine.home.path().join("hub-restarted"))
+            .env("FAKE_RUNNING", &running)
+            .env("FAKE_STOPPED", machine.home.path().join("hub-stopped"))
+            .env(
+                "FAKE_LIVE_MUTATION",
+                machine.home.path().join("live-mutation"),
+            )
+            .env("FAKE_OLD_CONFIG", &old_volume)
+            .env("FAKE_VOLUME_CONFIG", &volume)
+            .env(
+                "FAKE_FINALIZE_FAILED",
+                machine.home.path().join("finalize-failed"),
+            )
+            .env(
+                "FAKE_COMMIT_MARKED",
+                machine.home.path().join("commit-marked"),
+            )
+            .env(
+                "FAKE_POST_VERIFY_FAILED",
+                machine.home.path().join("verify-failed"),
+            )
+            .env("FAKE_FIRST_GENERATION", "1")
+            .env("FAKE_RECOVER_CLEAN", "1")
+            .env("FAKE_RECOVERED_CLEAN", &recovered_clean)
+            .env("FAKE_HUB_URL", &hub.url);
+        if fail_after_clean {
+            command.env("FAKE_FAIL_AFTER_CLEAN", "1");
+        }
+        command.output().unwrap()
+    };
+
+    let first = run(true);
+    let first_log = std::fs::read_to_string(machine.home.path().join("docker.log")).unwrap();
+    assert_eq!(first.status.code(), Some(1), "{first:?}\n{first_log}");
+    assert!(recovered_clean.exists(), "{first:?}\n{first_log}");
+    let recovered_env = std::fs::read_to_string(setup.join(".env")).unwrap();
+    assert!(recovered_env.contains("UNRELATED=kept"));
+    assert!(!recovered_env.contains("AGENTSCM_SLACK_"));
+    assert!(!rollback_receipt.exists());
+    assert!(!setup.join(".slack-bundle-receipt").exists());
+    assert!(!pending.exists() && !running.exists());
+    assert!(first_log.contains("install.sqlite|install.sqlite-wal|install.sqlite-shm"));
+
+    let second = run(false);
+    let second_log = std::fs::read_to_string(machine.home.path().join("docker.log")).unwrap();
+    assert_eq!(second.status.code(), Some(3), "{second:?}\n{second_log}");
+    let installed_env = std::fs::read_to_string(setup.join(".env")).unwrap();
+    assert!(installed_env.contains("AGENTSCM_SLACK_FILE=/data/secrets/slack/config.json"));
+    assert!(!rollback_receipt.exists() && !pending.exists());
+    assert!(
+        setup.join(".slack-bundle-receipt").exists() && running.exists(),
+        "the retried first generation must be recorded and running"
+    );
 }
 
 #[test]
@@ -1621,6 +2374,9 @@ fn native_fixture(machine: &Machine, hub: &Hub) -> (PathBuf, PathBuf) {
     let config = home.join(".agentscm/hub-native").join(project);
     let data = config.join("data");
     std::fs::create_dir_all(data.join("secrets")).unwrap();
+    for private in [&config, &data, &data.join("secrets")] {
+        std::fs::set_permissions(private, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     std::fs::create_dir_all(machine.bin_dir()).unwrap();
     let executable = machine
         .bin_dir()
@@ -1651,6 +2407,18 @@ fn native_fixture(machine: &Machine, hub: &Hub) -> (PathBuf, PathBuf) {
         json!({"native_hub":record,"bin_dir":machine.bin_dir()}).to_string(),
     )
     .unwrap();
+    let retained = config.join("retained.json");
+    std::fs::write(
+        &retained,
+        json!({
+            "project": project,
+            "environment": {"AGENTSCM_DATABASE_URL": format!("sqlite://{}",data.join("hub.sqlite").display())},
+            "slack_files": {}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::set_permissions(retained, std::fs::Permissions::from_mode(0o600)).unwrap();
     std::fs::write(
         data.join("secrets/con_fixture.json"),
         json!({"client_id":"fixture-client","slug":"fixture-app"}).to_string(),
@@ -1669,21 +2437,105 @@ case "$1" in
  print)
   case "$FAKE_PRINT_MODE" in
    unavailable) echo "fixture: GUI domain unavailable" >&2; exit 5 ;;
+   wrong-label) echo 'Could not find service "com.counterbranch.agentscm.other" in domain for user gui' >&2; exit 113 ;;
+   timeout) exec /bin/sleep 30 ;;
    absent) printf 'Could not find service "%s" in domain for user gui\n' "${2##*/}" >&2; exit 113 ;;
   esac
+  if [ -e "$HOME/launchctl-stopped" ]; then
+   printf 'Could not find service "%s" in domain for user gui\n' "${2##*/}" >&2
+   exit 113
+  fi
   printf 'program = %s\n' "$FAKE_EXECUTABLE" ;;
  bootstrap|bootout)
+  if [ "$FAKE_FAILURE" = bootout ] && [ "$1" = bootout ]; then echo "fixture bootout failed" >&2; exit 17; fi
   if /usr/bin/grep -q AGENTSCM_ADMINS "$FAKE_PLIST"; then
+   if [ "$FAKE_FAILURE" = health-stop ] && [ "$1" = bootout ]; then echo "fixture recovery bootout failed" >&2; exit 17; fi
    [ "$FAKE_FAILURE" != "$1" ] || { echo "fixture $1 failed" >&2; exit 17; }
-   if [ "$FAKE_FAILURE" = health ] && [ "$1" = bootstrap ]; then printf broken > "$FAKE_HEALTH_MARKER"; fi
+   if { [ "$FAKE_FAILURE" = health ] || [ "$FAKE_FAILURE" = health-stop ]; } && [ "$1" = bootstrap ]; then printf broken > "$FAKE_HEALTH_MARKER"; fi
   else
    if [ -n "$FAKE_HEALTH_MARKER" ]; then printf ok > "$FAKE_HEALTH_MARKER"; fi
   fi ;;
+esac
+case "$1" in
+ bootout) /usr/bin/touch "$HOME/launchctl-stopped" ;;
+ bootstrap) /bin/rm -f "$HOME/launchctl-stopped" ;;
 esac
 exit 0
 "#).unwrap();
     std::fs::set_permissions(launchctl, std::fs::Permissions::from_mode(0o755)).unwrap();
     (plist, executable)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn native_pending_recovery_requires_a_known_service_state() {
+    for mode in ["unavailable", "wrong-label", "timeout"] {
+        let (machine, hub) = (Machine::new(), Hub::start());
+        let repo = machine.repo();
+        let (plist, executable) = native_fixture(&machine, &hub);
+        let config = machine
+            .home
+            .path()
+            .join(".agentscm/hub-native/fixture-native");
+        let pending = config.join("data/secrets/.slack-rollback");
+        std::fs::create_dir(&pending).unwrap();
+        std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let marker = pending.join("pending.json");
+        std::fs::write(&marker, b"synthetic pending evidence").unwrap();
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let watched = [
+            plist.clone(),
+            config.join("retained.json"),
+            config.join("data/secrets/con_fixture.json"),
+            config.join("data/secrets/con_fixture.client_secret"),
+            marker,
+        ];
+        let manifest_path = machine.config().join("quickstart.json");
+        let mut before_record = json_file(&manifest_path)["native_hub"].clone();
+        before_record["slack_files"] = json!({});
+        let before: Vec<_> = watched
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect();
+
+        let output = machine
+            .command(
+                repo.path(),
+                &[
+                    "quickstart",
+                    "--yes",
+                    "--hub",
+                    "local",
+                    "--hub-runtime",
+                    "native",
+                    "--github-login",
+                    "octo",
+                    "--hook",
+                    "none",
+                    "--no-collisions",
+                ],
+            )
+            .env("FAKE_PRINT_MODE", mode)
+            .env("FAKE_EXECUTABLE", &executable)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{mode}: {output:?}");
+        for (path, expected) in watched.iter().zip(&before) {
+            assert_eq!(&std::fs::read(path).unwrap(), expected, "{mode}: {path:?}");
+        }
+        assert_eq!(
+            json_file(&manifest_path)["native_hub"],
+            before_record,
+            "{mode}: the owned native Hub record changed"
+        );
+        let calls = std::fs::read_to_string(machine.home.path().join("launchctl.log")).unwrap();
+        assert_eq!(
+            calls.lines().count(),
+            1,
+            "{mode}: recovery must not mutate or stop with unknown service state: {calls}"
+        );
+        assert!(calls.starts_with("print "), "{mode}: {calls}");
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1752,6 +2604,254 @@ fn native_configuration_failure_restores_plist_record_and_previous_service() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn native_uninstall_settles_unhealthy_recovery_without_restarting_the_hub() {
+    for wipe in [false, true] {
+        let machine = Machine::new();
+        let marker = machine.home.path().join("health-marker");
+        let hub = Hub::start_with_health_guard(Some(marker.clone()));
+        let repo = machine.repo();
+        let (plist, _) = native_fixture(&machine, &hub);
+        let config = machine
+            .home
+            .path()
+            .join(".agentscm/hub-native/fixture-native");
+        let journal = config.join(".github-update.json");
+        let output = machine
+            .command(
+                repo.path(),
+                &[
+                    "quickstart",
+                    "--yes",
+                    "--hub",
+                    "local",
+                    "--hub-runtime",
+                    "native",
+                    "--github-login",
+                    "octo",
+                    "--hook",
+                    "none",
+                    "--no-collisions",
+                ],
+            )
+            .env("FAKE_FAILURE", "health-stop")
+            .env("FAKE_PLIST", &plist)
+            .env("FAKE_HEALTH_MARKER", &marker)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{wipe}: {output:?}");
+        let said = out(&output);
+        assert!(
+            said.contains("configured native Hub did not become healthy"),
+            "{said}"
+        );
+        assert!(said.contains("fixture recovery bootout failed"), "{said}");
+        assert!(
+            said.contains("launchctl still reports the native Hub loaded"),
+            "{said}"
+        );
+        assert!(said.contains("Hub service state is unconfirmed"), "{said}");
+        assert!(journal.exists(), "{wipe}: recovery evidence must remain");
+
+        let launchctl_log = machine.home.path().join("launchctl.log");
+        if !wipe {
+            let manifest = machine.config().join("quickstart.json");
+            let mut manifest_text = std::fs::read_to_string(&manifest).unwrap();
+            let updated =
+                manifest_text.find("\"updated_at\": ").unwrap() + "\"updated_at\": ".len();
+            let comma = manifest_text[updated..].find(',').unwrap() + updated;
+            manifest_text.replace_range(updated..comma, "0");
+            std::fs::write(&manifest, manifest_text).unwrap();
+            let receipt = config.join("retained.json");
+            let watched = [&journal, &plist, &manifest, &receipt];
+            let before: Vec<_> = watched
+                .iter()
+                .map(|path| std::fs::read(path).unwrap())
+                .collect();
+            let library = machine.home.path().join("Library");
+            let real_library = machine.home.path().join("Library-real");
+            std::fs::rename(&library, &real_library).unwrap();
+            symlink(&real_library, &library).unwrap();
+            std::fs::write(&launchctl_log, "").unwrap();
+
+            let refused = machine.run(repo.path(), &["uninstall", "--yes", "--remove-hub-data"]);
+            assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+            assert!(
+                out(&refused).contains("Library directory is a symbolic link"),
+                "{refused:?}"
+            );
+            for (path, expected) in watched.iter().zip(before) {
+                assert_eq!(std::fs::read(path).unwrap(), expected, "{path:?}");
+            }
+            assert_eq!(
+                std::fs::read_to_string(&launchctl_log).unwrap(),
+                "",
+                "the symlink guard must run before pending recovery calls launchctl"
+            );
+            std::fs::remove_file(&library).unwrap();
+            std::fs::rename(&real_library, &library).unwrap();
+            assert!(journal.exists());
+        }
+        std::fs::write(&launchctl_log, "").unwrap();
+        let mut uninstall = vec!["uninstall", "--yes"];
+        if wipe {
+            uninstall.push("--remove-hub-data");
+        }
+        ok(&machine.run(repo.path(), &uninstall));
+        let calls = std::fs::read_to_string(&launchctl_log).unwrap();
+        assert!(!calls.contains("bootstrap "), "{wipe}: {calls}");
+        assert!(!calls.contains("kickstart "), "{wipe}: {calls}");
+        assert!(!plist.exists(), "{wipe}");
+        assert!(!machine.config().join("quickstart.json").exists(), "{wipe}");
+        assert_eq!(config.exists(), !wipe, "{wipe}");
+        assert!(!journal.exists(), "{wipe}");
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn native_github_update_crash_recovery_chooses_only_a_valid_generation() {
+    for phase in ["rollback", "commit", "drift"] {
+        let (machine, hub) = (Machine::new(), Hub::start());
+        let repo = machine.repo();
+        let (plist, _) = native_fixture(&machine, &hub);
+        let token = hub.token_file(machine.home.path());
+        let config = machine
+            .home
+            .path()
+            .join(".agentscm/hub-native/fixture-native");
+        let receipt = config.join("retained.json");
+        let manifest_path = machine.config().join("quickstart.json");
+        let args = [
+            "quickstart",
+            "--yes",
+            "--hub",
+            "local",
+            "--hub-runtime",
+            "native",
+            "--github-login",
+            "octo",
+            "--agent-token-file",
+            token.to_str().unwrap(),
+            "--hook",
+            "none",
+            "--no-collisions",
+        ];
+        let connection = config.join("data/secrets/con_fixture.json");
+        let connection_secret = config.join("data/secrets/con_fixture.client_secret");
+        let connection_bytes = std::fs::read(&connection).unwrap();
+        let connection_secret_bytes = std::fs::read(&connection_secret).unwrap();
+        std::fs::remove_file(&connection).unwrap();
+        std::fs::remove_file(&connection_secret).unwrap();
+        ok(&machine
+            .command(repo.path(), &args)
+            .env("FAKE_PLIST", &plist)
+            .output()
+            .unwrap());
+        std::fs::write(&connection, connection_bytes).unwrap();
+        std::fs::write(&connection_secret, connection_secret_bytes).unwrap();
+        let prior_manifest = json_file(&manifest_path);
+        let prior_plist = std::fs::read_to_string(&plist).unwrap();
+        let prior_receipt = std::fs::read_to_string(&receipt).unwrap();
+        ok(&machine
+            .command(repo.path(), &args)
+            .env("FAKE_PLIST", &plist)
+            .output()
+            .unwrap());
+        let next_manifest = json_file(&manifest_path);
+        let next_plist = std::fs::read_to_string(&plist).unwrap();
+        let next_receipt = std::fs::read_to_string(&receipt).unwrap();
+        let pending = config.join(".github-update.json");
+        std::fs::write(
+            &pending,
+            json!({
+                "phase": if phase == "commit" { "commit" } else { "rollback" },
+                "prior_record": prior_manifest["native_hub"],
+                "next_record": next_manifest["native_hub"],
+                "prior_plist": prior_plist.clone(),
+                "prior_receipt": prior_receipt.clone(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::remove_file(&connection).unwrap();
+        std::fs::remove_file(&connection_secret).unwrap();
+        std::fs::write(machine.home.path().join("launchctl.log"), "").unwrap();
+
+        match phase {
+            "rollback" => {
+                std::fs::write(&manifest_path, next_manifest.to_string()).unwrap();
+                std::fs::write(&plist, &next_plist).unwrap();
+                std::fs::write(&receipt, &prior_receipt).unwrap();
+            }
+            "commit" => {}
+            "drift" => std::fs::write(&plist, "unrelated plist edit").unwrap(),
+            _ => unreachable!(),
+        }
+        let before = [
+            std::fs::read(&manifest_path).unwrap(),
+            std::fs::read(&plist).unwrap(),
+            std::fs::read(&receipt).unwrap(),
+            std::fs::read(&pending).unwrap(),
+        ];
+        let output = machine
+            .command(repo.path(), &args)
+            .env("FAKE_PLIST", &plist)
+            .output()
+            .unwrap();
+        if phase == "drift" {
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            assert!(out(&output).contains("no service or file was changed"));
+            for (path, expected) in [&manifest_path, &plist, &receipt, &pending]
+                .iter()
+                .zip(before)
+            {
+                assert_eq!(std::fs::read(path).unwrap(), expected, "{path:?}");
+            }
+            let calls = std::fs::read_to_string(machine.home.path().join("launchctl.log")).unwrap();
+            assert_eq!(calls.lines().count(), 1, "{calls}");
+            assert!(calls.starts_with("print "), "{calls}");
+            continue;
+        }
+        ok(&output);
+        assert!(!pending.exists(), "{phase}");
+        if phase == "commit" {
+            let calls = std::fs::read_to_string(machine.home.path().join("launchctl.log")).unwrap();
+            assert!(calls.starts_with("print "), "{calls}");
+            assert!(!calls.contains("bootout "), "{calls}");
+            assert!(!calls.contains("bootstrap "), "{calls}");
+        }
+        let expected = if phase == "commit" {
+            &next_manifest["native_hub"]
+        } else {
+            &prior_manifest["native_hub"]
+        };
+        assert_eq!(
+            &json_file(&manifest_path)["native_hub"],
+            expected,
+            "{phase}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&plist).unwrap(),
+            if phase == "commit" {
+                next_plist.as_str()
+            } else {
+                prior_plist.as_str()
+            },
+            "{phase}"
+        );
+        let expected_receipt: serde_json::Value = serde_json::from_str(if phase == "commit" {
+            &next_receipt
+        } else {
+            &prior_receipt
+        })
+        .unwrap();
+        assert_eq!(json_file(&receipt), expected_receipt, "{phase}");
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn native_uninstall_rejects_another_home_and_stops_when_the_executable_is_missing() {
     let (machine, other, hub) = (Machine::new(), Machine::new(), Hub::start());
     let repo = machine.repo();
@@ -1796,6 +2896,76 @@ fn native_uninstall_rejects_another_home_and_stops_when_the_executable_is_missin
     let record = json_file(&machine.config().join("quickstart.json"));
     assert!(record["native_hub"].is_null());
     assert!(record["bin_dir"].is_string());
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn native_uninstall_journal_inspection_failure_changes_nothing() {
+    let (machine, hub) = (Machine::new(), Hub::start());
+    let repo = machine.repo();
+    let (plist, _) = native_fixture(&machine, &hub);
+    let config = machine
+        .home
+        .path()
+        .join(".agentscm/hub-native/fixture-native");
+    std::fs::remove_file(config.join("data/secrets/con_fixture.json")).unwrap();
+    std::fs::remove_file(config.join("data/secrets/con_fixture.client_secret")).unwrap();
+    let normalized = machine
+        .command(
+            repo.path(),
+            &[
+                "quickstart",
+                "--yes",
+                "--hub",
+                "local",
+                "--hub-runtime",
+                "native",
+                "--github-login",
+                "octo",
+                "--hook",
+                "none",
+                "--no-collisions",
+            ],
+        )
+        .env("FAKE_PLIST", &plist)
+        .output()
+        .unwrap();
+    assert_eq!(normalized.status.code(), Some(1), "{normalized:?}");
+    let journal = config.join(".github-update.json");
+    std::fs::write(&journal, "synthetic private recovery evidence").unwrap();
+    std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let data = config.join("data/install.sqlite");
+    std::fs::write(&data, "synthetic retained journal").unwrap();
+    let manifest = machine.config().join("quickstart.json");
+    let mut manifest_text = std::fs::read_to_string(&manifest).unwrap();
+    let updated = manifest_text.find("\"updated_at\": ").unwrap() + "\"updated_at\": ".len();
+    let comma = manifest_text[updated..].find(',').unwrap() + updated;
+    manifest_text.replace_range(updated..comma, "0");
+    std::fs::write(&manifest, manifest_text).unwrap();
+    let paths = [&journal, &plist, &manifest, &data];
+    let before: Vec<_> = paths
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect();
+    let launchctl_log = machine.home.path().join("launchctl.log");
+    std::fs::write(&launchctl_log, "").unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let output = machine.run(repo.path(), &["uninstall", "--yes", "--remove-hub-data"]);
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        out(&output).contains("Could not inspect the native GitHub configuration recovery record"),
+        "{output:?}"
+    );
+    for (path, expected) in paths.iter().zip(before) {
+        assert_eq!(std::fs::read(path).unwrap(), expected, "{path:?}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(launchctl_log).unwrap(),
+        "",
+        "uninstall must not call launchctl when journal inspection fails"
+    );
 }
 
 #[test]

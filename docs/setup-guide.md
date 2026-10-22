@@ -47,6 +47,7 @@ Without a terminal quickstart refuses unless you pass `--yes`, which takes the r
 | `--hub-port PORT`, `--hub-project NAME` | Isolated local instance; defaults to port 7332 and a home-specific name. Resume reuses the record. |
 | `--hub-url URL` | The hub for `--hub existing`. |
 | `--agent-token-file PATH` | Use this agent token instead of signing in; it is checked against the hub and used where it is. |
+| `--slack-config-file ABSOLUTE_PATH` | Install a prepared private Slack bundle into a managed local Hub. See [Slack setup](slack.md). Requires `--hub local`; `--yes` alone never enables it. |
 | `--agent-name NAME`, `--ttl 30d` | Name and lifetime of the token quickstart creates. |
 | `--provider github\|gitlab` | Forge to sign in with (default: from `origin`). |
 | `--github-login LOGIN` | Your GitHub login for the local hub's administrator. With `--yes` it is required unless `gh api user` works; an unverified `git config github.user` is only offered in the interactive prompt. |

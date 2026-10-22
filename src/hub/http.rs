@@ -384,6 +384,7 @@ async fn whoami(Reader(principal): Reader) -> Json<serde_json::Value> {
             "id": principal.token_id,
             "name": principal.name,
             "repository": principal.repository,
+            "repository_id": principal.repository_id,
             "expires_at": principal.expires_at,
             "read_only": principal.read_only,
         },

@@ -14,7 +14,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -28,32 +28,34 @@ pub const CONFIG_ENV: &str = "AGENTSCM_SLACK_FILE";
 const SESSION: &str = "slack-human";
 const CAPACITY: i64 = 4096;
 
-#[derive(Deserialize)]
+pub mod setup;
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SlackConfig {
-    version: u32,
-    app_id: String,
-    bot_id: String,
-    team_id: String,
-    hub_url: String,
-    signing_secret_file: PathBuf,
-    bot_token_file: PathBuf,
-    database: PathBuf,
-    bindings: Vec<BindingConfig>,
+    pub version: u32,
+    pub app_id: String,
+    pub bot_id: String,
+    pub team_id: String,
+    pub hub_url: String,
+    pub signing_secret_file: PathBuf,
+    pub bot_token_file: PathBuf,
+    pub database: PathBuf,
+    pub bindings: Vec<BindingConfig>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct BindingConfig {
-    slack_user: String,
-    provider: String,
-    host: String,
-    forge_user_id: i64,
-    repository: String,
-    repository_id: i64,
-    agent_token_file: PathBuf,
+pub struct BindingConfig {
+    pub slack_user: String,
+    pub provider: String,
+    pub host: String,
+    pub forge_user_id: i64,
+    pub repository: String,
+    pub repository_id: i64,
+    pub agent_token_file: PathBuf,
     #[serde(default)]
-    allow_coordination_writes: bool,
+    pub allow_coordination_writes: bool,
 }
 
 struct Binding {
@@ -224,6 +226,96 @@ fn secret(path: &Path) -> Result<String> {
     Ok(value.to_owned())
 }
 
+struct ValidatedConfig {
+    hub_url: String,
+    callback_url: String,
+    signing: String,
+    bot: String,
+    digests: Vec<TokenDigest>,
+}
+
+fn origin(value: &str) -> Result<reqwest::Url> {
+    let url = reqwest::Url::parse(value).map_err(|_| invalid())?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/"
+    {
+        return Err(invalid());
+    }
+    Ok(url)
+}
+
+fn validate_config(config: &SlackConfig) -> Result<ValidatedConfig> {
+    if cfg!(not(unix)) {
+        return Err(HubError::Invalid(
+            "Slack adapter requires Unix private-file permissions".into(),
+        ));
+    }
+    if config.version != 1
+        || !slack_id(&config.app_id, 'A')
+        || !slack_id(&config.bot_id, 'B')
+        || !slack_id(&config.team_id, 'T')
+        || config.bindings.is_empty()
+        || config.bindings.len() > 32
+        || !config.database.is_absolute()
+    {
+        return Err(invalid());
+    }
+    let url = origin(&config.hub_url)?;
+    let hub_url = url.join("ui/").map_err(|_| invalid())?.to_string();
+    let callback_url = url.join("v1/hub/slack").map_err(|_| invalid())?.to_string();
+    let signing = secret(&config.signing_secret_file)?;
+    let bot = secret(&config.bot_token_file)?;
+    let mut users = BTreeSet::new();
+    let mut digests = BTreeSet::new();
+    let mut binding_digests = Vec::with_capacity(config.bindings.len());
+    for binding in &config.bindings {
+        if !slack_id(&binding.slack_user, 'U')
+            || !users.insert(binding.slack_user.clone())
+            || binding.forge_user_id <= 0
+            || binding.repository_id <= 0
+        {
+            return Err(invalid());
+        }
+        super::store::validate_repository(&binding.repository)?;
+        let digest = agent_token_digest(&secret(&binding.agent_token_file)?)?;
+        if !digests.insert(digest.as_str().to_owned()) {
+            return Err(invalid());
+        }
+        binding_digests.push(digest);
+    }
+    let parent = config.database.parent().ok_or_else(invalid)?;
+    let meta = fs::symlink_metadata(parent)?;
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return Err(invalid());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.mode() & 0o077 != 0 || meta.uid() != effective_uid() {
+            return Err(invalid());
+        }
+    }
+    if config.database.exists() {
+        let metadata = fs::symlink_metadata(&config.database)?;
+        if metadata.file_type().is_symlink() {
+            return Err(invalid());
+        }
+        validate_private_metadata(&metadata, 128 * 1024 * 1024)?;
+    }
+    Ok(ValidatedConfig {
+        hub_url,
+        callback_url,
+        signing,
+        bot,
+        digests: binding_digests,
+    })
+}
+
 impl Slack {
     pub fn from_file(path: &Path) -> Result<Self> {
         let config: SlackConfig =
@@ -232,49 +324,9 @@ impl Slack {
     }
 
     fn open(config: SlackConfig) -> Result<Self> {
-        if cfg!(not(unix)) {
-            return Err(HubError::Invalid(
-                "Slack adapter requires Unix private-file permissions".into(),
-            ));
-        }
-        if config.version != 1
-            || !slack_id(&config.app_id, 'A')
-            || !slack_id(&config.bot_id, 'B')
-            || !slack_id(&config.team_id, 'T')
-            || config.bindings.is_empty()
-            || config.bindings.len() > 32
-            || !config.database.is_absolute()
-        {
-            return Err(invalid());
-        }
-        let url = reqwest::Url::parse(&config.hub_url).map_err(|_| invalid())?;
-        if url.scheme() != "https"
-            || url.host_str().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-            || url.path() != "/"
-        {
-            return Err(invalid());
-        }
-        let hub_url = url.join("ui/").map_err(|_| invalid())?.to_string();
-        let mut users = BTreeSet::new();
-        let mut digests = BTreeSet::new();
+        let validated = validate_config(&config)?;
         let mut bindings = Vec::new();
-        for binding in config.bindings {
-            if !slack_id(&binding.slack_user, 'U')
-                || !users.insert(binding.slack_user.clone())
-                || binding.forge_user_id <= 0
-                || binding.repository_id <= 0
-            {
-                return Err(invalid());
-            }
-            super::store::validate_repository(&binding.repository)?;
-            let digest = agent_token_digest(&secret(&binding.agent_token_file)?)?;
-            if !digests.insert(digest.as_str().to_owned()) {
-                return Err(invalid());
-            }
+        for (binding, digest) in config.bindings.into_iter().zip(validated.digests) {
             bindings.push(Binding {
                 config: binding,
                 digest,
@@ -283,17 +335,9 @@ impl Slack {
         }
         // A separate private journal is intentionally independent of the Hub database backend.
         // The operator owns its parent directory and backups; no multiwriter deployment.
-        let parent = config.database.parent().ok_or_else(invalid)?;
-        let meta = fs::symlink_metadata(parent)?;
-        if !meta.is_dir() || meta.file_type().is_symlink() {
-            return Err(invalid());
-        }
         #[cfg(unix)]
         {
-            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-            if meta.mode() & 0o077 != 0 || meta.uid() != effective_uid() {
-                return Err(invalid());
-            }
+            use std::os::unix::fs::OpenOptionsExt;
             if !config.database.exists() {
                 fs::OpenOptions::new()
                     .write(true)
@@ -302,13 +346,6 @@ impl Slack {
                     .custom_flags(libc::O_NOFOLLOW)
                     .open(&config.database)?;
             }
-        }
-        if config.database.exists() {
-            let metadata = fs::symlink_metadata(&config.database)?;
-            if metadata.file_type().is_symlink() {
-                return Err(invalid());
-            }
-            validate_private_metadata(&metadata, 128 * 1024 * 1024)?;
         }
         let db = Connection::open(&config.database)?;
         db.busy_timeout(Duration::from_millis(250))?;
@@ -340,9 +377,9 @@ impl Slack {
             app: config.app_id,
             expected_bot: config.bot_id,
             team: config.team_id,
-            hub_url,
-            signing: secret(&config.signing_secret_file)?,
-            bot: secret(&config.bot_token_file)?,
+            hub_url: validated.hub_url,
+            signing: validated.signing,
+            bot: validated.bot,
             bindings,
             db: Mutex::new(db),
             client: reqwest::Client::builder()

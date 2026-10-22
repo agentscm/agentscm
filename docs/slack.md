@@ -1,12 +1,64 @@
 # Slack adapter
 
-The Slack adapter is an optional, single-server Unix Hub integration. It renders bounded, repository-scoped AgentSCM views in a private App Home and accepts only signed Slack events, slash commands, and typed modal submissions at `POST /v1/hub/slack` (`src/hub/slack.rs`). Slack installation, token access, and live dogfood status are unverified until an operator completes the pilot setup.
+The Slack adapter is an optional Core Edition integration for a single-server Unix Hub. It renders bounded, repository-scoped AgentSCM views in a private App Home and accepts only signed Slack events, slash commands, and typed modal submissions at `POST /v1/hub/slack` (`src/hub/slack.rs`). A successful installation is separate from verified Slack delivery and rendering.
 
 The adapter is designed for private status and coordination. It does not read channel history, copy raw Slack messages, disclose work in shared channels, control a remote coding agent, or perform browser administration, approval, landing, source transfer, forge administration, or merge. Use the existing Hub browser UI for those human actions. The Open Hub button uses an operator-configured HTTPS Hub origin and carries no credential.
 
 ## Installation
 
-Use manual pilot bindings, one repository per Slack user (up to 32 users). Before starting the Hub, an administrator should verify the exact values in the Slack and forge admin consoles:
+Use a matching CLI and Hub build containing these commands. Install the [official Slack CLI](https://docs.slack.dev/tools/slack-cli/) version 4.8.0 or newer and sign in to the intended workspace. AgentSCM does not download or silently authorize another CLI. Workspace approval remains with Slack administrators. The CLI’s operator authorization is separate from the app’s `commands` bot scope; review Slack’s displayed management permissions during login.
+
+### Automated preparation and runtime installation
+
+Installation agents and setup surfaces can use the same `hub slack` commands and `hub::slack::setup` service. Preparation validates identity and private files; it does not open a runtime journal. Secret values never belong in command arguments or repository files.
+
+1. Start or select the Hub and connect the repository. Create a dedicated read-only token as described below; do not reuse a coding-agent credential.
+2. Create and install a workspace-local app. A bootstrap installation needs no public callback yet:
+
+   ```sh
+   agentscm hub slack install --directory "$HOME/.agentscm/slack/app" --team-id T0123456789
+   ```
+
+   The generated project contains the minimal manifest, empty SDK hooks and the bundled AgentSCM icon. The official Slack CLI uploads the icon during installation. AgentSCM requires its upload acknowledgement and this workspace's local app record before returning a result, and returns the app ID without copying provider output. The result keeps `installation_verified` false: cached app metadata and an icon acknowledgement do not prove installation approval. `doctor --verify` checks the intended bot token; live delivery and rendering need the checklist below. It does not deploy a Slack-hosted runtime. Reuse the same project when resuming.
+3. Obtain the app signing secret and installed bot token from Slack's app settings. Store each in an absolute, private `0600` file outside the repository. Independently verify the intended bot ID and your Slack user ID. Approval and credential collection are not completed by generating a manifest.
+4. Prepare a binding using the dedicated read-only credential. The command derives the numeric forge user and repository identity from the authenticated Hub:
+
+   ```sh
+   agentscm hub slack setup \
+     --directory "$HOME/.agentscm/slack/config" \
+     --hub-url https://hub.example.com --repo org/repository \
+     --app-id A0123456789 --team-id T0123456789 \
+     --bot-id B0123456789 --slack-user U0123456789 \
+     --signing-secret-file "$HOME/.agentscm/slack/signing-secret" \
+     --bot-token-file "$HOME/.agentscm/slack/bot-token" \
+     --agent-token-file "$HOME/.agentscm/slack/read-only-agent.token"
+   ```
+
+   Add `--allow-coordination-writes` only when enabling the two structured forms. `--api-url http://127.0.0.1:7332` can select a local control endpoint; the public callback must still be HTTPS. An existing config must match exactly; a different binding requires deliberate operator configuration.
+5. Install the prepared bundle into a managed local Hub:
+
+   ```sh
+   agentscm quickstart --hub local --slack-config-file "$HOME/.agentscm/slack/config/config.json"
+   ```
+
+   Quickstart copies credentials into private runtime-owned files, rewrites their paths, and supplies `AGENTSCM_SLACK_FILE`. Native and Docker runtimes retain the bundle across resume and retained-data reinstall. Receipts detect altered files; unsafe paths or ownership fail before replacement. Omitting the flag preserves an existing managed bundle. `--yes` alone never enables Slack. Existing remote Hubs require operator installation of the private config and a restart; quickstart does not modify them.
+6. Route a public HTTPS origin to that configured Hub, then activate callbacks in the same app project:
+
+   ```sh
+   agentscm hub slack install --directory "$HOME/.agentscm/slack/app" \
+     --team-id T0123456789 --hub-url https://hub.example.com
+   agentscm hub slack doctor --config-file "$HOME/.agentscm/slack/config/config.json" --verify
+   ```
+
+   An exact generated bootstrap project can advance to a live manifest. Arbitrary edits, a different live callback origin or a downgrade are refused. Update an intentional custom installation through Slack's settings instead.
+
+Without `--verify`, doctor performs local validation only. With it, doctor checks current Hub binding identity and Slack bot identity, and sends a signed public callback challenge. An echoed challenge establishes reachability only; it does not prove HMAC enforcement or intended-server identity. These checks do not establish Slack-origin delivery, App Home rendering, form outcomes or human approval. Complete the checklist below in the real workspace. No tunnel, cloud resource or public endpoint is provisioned automatically.
+
+### Manual installation and additional bindings
+
+Customer-operated installations can import [examples/slack-manifest.json](../examples/slack-manifest.json) through Slack's app settings, replace its placeholder URLs and upload [the app icon](assets/agentscm-icon.png). Alternatively, `agentscm hub slack manifest --hub-url https://hub.example.com` prints the configured manifest. Marketplace listing is not required to create a workspace-local app; Slack's distribution and workspace policies still apply.
+
+Use explicit bindings, one repository per Slack user (up to 32 users). Before starting the Hub, an administrator should verify the exact values in the Slack and forge admin consoles:
 
 - Slack app ID (`A...`), workspace/team ID (`T...`), bot ID (`B...`) from the intended app installation, and user ID (`U...`). Use IDs, not display names.
 - Forge provider and host, forge user ID, repository name, and stable repository ID.

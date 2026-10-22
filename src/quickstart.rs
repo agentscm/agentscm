@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use agentscm::git_collisions::{self, Request};
 use agentscm::hub::forge_http::{self, check_base_url};
+use agentscm::hub::slack::setup as slack_setup;
 use agentscm::hub::store::{unix_now, validate_agent_name};
 use agentscm::{Error, Result};
 use clap::{Args, ValueEnum};
@@ -28,7 +29,7 @@ mod hub_local;
 mod hub_native;
 mod hub_setup;
 mod manifest;
-mod process;
+pub(crate) mod process;
 
 use crate::prompt::Ui;
 use detect::{Detected, Forge};
@@ -96,6 +97,9 @@ pub struct QuickstartArgs {
     /// Lifetime of the agent token, such as 8h or 30d (at most 30d).
     #[arg(long, default_value = "30d")]
     ttl: String,
+    /// Prepared private Slack adapter configuration for a managed local Hub.
+    #[arg(long)]
+    slack_config_file: Option<PathBuf>,
     /// Which forge to sign in with (default: the one in origin's URL).
     #[arg(long, value_enum)]
     provider: Option<Provider>,
@@ -135,7 +139,7 @@ const NEEDS_TERMINAL: &str = "agentscm quickstart asks questions, and there is n
 To run it without one, pass --yes and choose with flags: --hub local|existing|skip, --hub-url URL, \
 --agent-token-file PATH, --agent-name NAME, --ttl 30d, --provider github|gitlab, --github-login LOGIN, \
 --hub-runtime native|docker, --hub-port PORT, --hub-project NAME, \
---hook user|project|none, --no-collisions, --init";
+--slack-config-file ABSOLUTE_PATH, --hook user|project|none, --no-collisions, --init";
 
 const HUB_EXPLAINED: &str =
     "A hub is a small shared server that lets agents on different machines see each other's work.";
@@ -162,6 +166,46 @@ fn home_dir() -> Result<PathBuf> {
 fn short(error: &Error) -> String {
     let text = error.to_string();
     text.strip_prefix("invalid: ").unwrap_or(&text).to_owned()
+}
+
+pub(crate) struct SlackBundle {
+    pub(crate) config: PathBuf,
+    pub(crate) files: Vec<(String, Vec<u8>)>,
+}
+
+fn slack_bundle(
+    source: Option<&Path>,
+    target: &Path,
+) -> std::result::Result<Option<SlackBundle>, String> {
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    let bundle = slack_setup::bundle(source, target)
+        .map_err(|_| "The prepared Slack configuration is invalid.".to_owned())?;
+    let files = bundle.files().to_vec();
+    if !files.iter().any(|(name, _)| name == "config.json") {
+        return Err("The prepared Slack bundle has no config.json.".into());
+    }
+    Ok(Some(SlackBundle {
+        config: target.join("config.json"),
+        files,
+    }))
+}
+
+fn preflight_slack(args: &QuickstartArgs) -> Result<()> {
+    let Some(path) = args.slack_config_file.as_deref() else {
+        return Ok(());
+    };
+    if !path.is_absolute() {
+        return Err(invalid("--slack-config-file must be an absolute path"));
+    }
+    if args.hub_url.is_some() || matches!(args.hub, Some(HubChoice::Existing | HubChoice::Skip)) {
+        return Err(invalid(
+            "--slack-config-file requires a managed local Hub (--hub local)",
+        ));
+    }
+    slack_setup::check(path).map_err(|_| invalid("the prepared Slack configuration is invalid"))?;
+    Ok(())
 }
 
 // ---- files ----
@@ -386,6 +430,9 @@ pub async fn run(args: QuickstartArgs) -> Result<u8> {
     if !args.yes && !tty {
         return Err(invalid(NEEDS_TERMINAL));
     }
+    // Validate the complete private input before acquiring the lease or performing any install
+    // write. Supplying this flag is the only way quickstart enables the optional Slack adapter.
+    preflight_slack(&args)?;
     let ui = Ui { yes: args.yes };
     let home = home_dir()?;
     let _quickstart_lease = manifest::acquire_lease()?;
@@ -687,6 +734,9 @@ async fn choose_hub(cx: &mut Cx<'_>) -> Option<String> {
     if choice.is_none() && cx.args.hub_url.is_some() {
         choice = Some(HubChoice::Existing);
     }
+    if choice.is_none() && cx.args.slack_config_file.is_some() {
+        choice = Some(HubChoice::Local);
+    }
     if choice.is_none() {
         if let Some(config) = &current
             && (cx.ui.yes
@@ -861,6 +911,10 @@ async fn local_hub(cx: &mut Cx<'_>) -> std::result::Result<Option<String>, Strin
             println!(
                 "Local hub runtime: Docker (explicit container fallback). No automatic emulation or runtime switching."
             );
+            let slack = slack_bundle(
+                cx.args.slack_config_file.as_deref(),
+                Path::new("/data/secrets/slack"),
+            )?;
             hub_local::start(
                 cx.ui,
                 cx.args.github_login.as_deref(),
@@ -872,6 +926,7 @@ async fn local_hub(cx: &mut Cx<'_>) -> std::result::Result<Option<String>, Strin
                     runtime,
                     port,
                     project: project.clone(),
+                    slack,
                 },
             )
             .await?
@@ -888,6 +943,16 @@ async fn local_hub(cx: &mut Cx<'_>) -> std::result::Result<Option<String>, Strin
                 .canonicalize()
                 .map_err(|e| e.to_string())?;
             let dir = binary::bin_dir(&cx.home);
+            let slack = slack_bundle(
+                cx.args.slack_config_file.as_deref(),
+                &cx.home
+                    .join(".agentscm")
+                    .join("hub-native")
+                    .join(&project)
+                    .join("data")
+                    .join("secrets")
+                    .join("slack"),
+            )?;
             println!(
                 "Local hub runtime: native macOS ARM64, managed by launchd. Will retain the verified executable in {}.",
                 shown(&dir, &cx.home)
@@ -915,6 +980,7 @@ async fn local_hub(cx: &mut Cx<'_>) -> std::result::Result<Option<String>, Strin
                     executable: stable,
                     port,
                     project: project.clone(),
+                    slack,
                 },
             )
             .await?
@@ -1948,7 +2014,7 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
     }
     let ui = Ui { yes: args.yes };
     let _quickstart_lease = manifest::acquire_lease()?;
-    let Some(m) = Manifest::load()? else {
+    let Some(mut m) = Manifest::load()? else {
         println!("Nothing to undo: quickstart hasn't installed anything here.");
         return Ok(());
     };
@@ -2107,8 +2173,8 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
     let native_executable_drift = m.native_hub.as_ref().is_some_and(|native| {
         file_hash(&native.executable).as_deref() != Some(native.executable_sha256.as_str())
     });
-    if let Some(native) = &m.native_hub {
-        match hub_native::uninstall(native, &home, remove_hub_data) {
+    if m.native_hub.is_some() {
+        match hub_native::uninstall(&mut m, &home, remove_hub_data) {
             Ok(()) => println!(
                 "Stopped the native hub and removed its managed LaunchAgent. Hub data {}.",
                 if remove_hub_data {
@@ -2120,7 +2186,7 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
             Err(message) => {
                 println!("Couldn't uninstall the native hub: {message}.");
                 manual.push(message);
-                left.native_hub = Some(native.clone());
+                left.native_hub = m.native_hub.clone();
             }
         }
     }
@@ -2308,12 +2374,36 @@ mod tests {
             "--hub",
             "--hub-url",
             "--agent-token-file",
+            "--slack-config-file",
             "--hook",
             "--no-collisions",
             "--init",
         ] {
             assert!(NEEDS_TERMINAL.contains(flag), "{flag}");
         }
+    }
+
+    #[test]
+    fn slack_input_rejects_nonlocal_hubs_before_reading_the_file() {
+        let args = QuickstartArgs {
+            yes: true,
+            hub: Some(HubChoice::Existing),
+            hub_url: None,
+            hub_runtime: None,
+            hub_port: None,
+            hub_project: None,
+            github_login: None,
+            agent_token_file: None,
+            agent_name: None,
+            ttl: "30d".into(),
+            slack_config_file: Some(PathBuf::from("/does/not/exist")),
+            provider: None,
+            hook: None,
+            no_collisions: false,
+            init: false,
+        };
+        let error = preflight_slack(&args).unwrap_err().to_string();
+        assert!(error.contains("requires a managed local Hub"));
     }
 
     #[test]

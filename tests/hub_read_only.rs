@@ -265,4 +265,5 @@ async fn a_read_only_token_reaches_only_the_read_routes_and_writes_nothing() {
         .unwrap();
     let body: Value = serde_json::from_str(&whoami.text().await.unwrap()).unwrap();
     assert_eq!(body["token"]["read_only"], true);
+    assert_eq!(body["token"]["repository_id"], 1);
 }
