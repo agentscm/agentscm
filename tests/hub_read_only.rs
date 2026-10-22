@@ -68,7 +68,8 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     // Notices are per token and long-poll: agent-only.
     row(&get, format!("{REPO}/notices"), "".into(), AgentOnly);
     row(&post, format!("{REPO}/publications"), "{}".into(), AgentOnly);
-    row(&get, format!("{REPO}/publications/{id}"), "".into(), AgentOnly);
+    row(&get, format!("{REPO}/publications"), "".into(), Allowed);
+    row(&get, format!("{REPO}/publications/{id}"), "".into(), Status(404));
     row(&put, format!("{REPO}/publications/{id}/blobs/{hash}"), "x".into(), AgentOnly);
     row(&post, format!("{REPO}/publications/{id}/run"), "{}".into(), AgentOnly);
     // /mcp: negotiation and the repository-scoped workflow read are side-effect-free.

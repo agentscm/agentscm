@@ -4484,6 +4484,25 @@ impl Store for SqliteStore {
         Ok(publication_by_id(&self.conn(), id)?.filter(|p| p.repository == repository))
     }
 
+    fn publications(
+        &self,
+        repository: &str,
+        before: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Publication>> {
+        let conn = self.conn();
+        let mut statement = conn.prepare(&format!(
+            "{PUBLICATION_SELECT} WHERE p.repository = ?1
+             AND (?2 IS NULL OR (p.created_at, p.id) < (SELECT q.created_at, q.id
+                 FROM hub_publications q WHERE q.repository = ?1 AND q.id = ?2))
+             ORDER BY p.created_at DESC, p.id DESC LIMIT ?3"
+        ))?;
+        let rows = statement
+            .query_map(params![repository, before, limit as i64], publication_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     fn pull_publications(
         &self,
         repository: &str,

@@ -227,6 +227,31 @@ fn suite(store: Arc<dyn Store>) {
         .unwrap();
     done(store.create_publication(&capped, &over, now).unwrap());
 
+    // Listing is newest first by created time, then id, and pages strictly before a cursor.
+    let all = store.publications(REPO, None, 100).unwrap();
+    assert!(all.len() > 2);
+    assert!(
+        all.windows(2)
+            .all(|w| (w[0].created_at, &w[0].id) > (w[1].created_at, &w[1].id))
+    );
+    assert_eq!(store.publications(REPO, None, 1).unwrap(), all[..1]);
+    assert_eq!(
+        store.publications(REPO, Some(&all[1].id), 100).unwrap(),
+        all[2..]
+    );
+    assert!(
+        store
+            .publications(REPO, Some("pub_missing"), 100)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .publications("acme/other", None, 100)
+            .unwrap()
+            .is_empty()
+    );
+
     // A revoked token cannot create.
     assert!(store.revoke_agent_token(&token).unwrap());
     let mut again = new("t");

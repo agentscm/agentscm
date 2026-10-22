@@ -200,10 +200,12 @@ on no others:
 - `GET /v1/hub/skill-workflows` for recent runs in an operator-mapped native repository
 - `GET /v1/hub/skill-workflows/{run_id}` for an operator-mapped native repository
 - `GET /v1/hub/standup/briefing` and `GET /v1/hub/standup/work/{id}` for the token's repository
+- `GET /v1/hub/repos/{repo}/publications` and `GET /v1/hub/repos/{repo}/publications/{id}`
+  (stored state only; see [publications](#publishing-a-revision))
 - MCP `initialize`, `ping`, `tools/list`, `agentscm_workflow_status`, and `agentscm_work_briefing`
 
 Every other route that takes an agent token (announcing, renewing and releasing intents, `notices`,
-publications, and coordination MCP mutation tools, including `agentscm_status`, which also renews a hold)
+creating, uploading to and running publications, and coordination MCP mutation tools, including `agentscm_status`, which also renews a hold)
 answers 403 `{"error":"read_only"}` and writes nothing. `POST /v1/hub/hook/{agent}` treats a
 read-only token as an unknown one: the same "token not accepted" reply, and no session or event.
 Routes for human sessions still answer 401 to any agent token. `tests/hub_read_only.rs` walks every
@@ -790,7 +792,16 @@ from it. The command authenticates with the agent token, configured as for
    connection has [outbound](#github-and-gitlab-connections-and-sync) turned on. The GitHub App or
    PAT needs contents and pull requests write.
 4. `GET .../publications/{id}` shows the publication; while its pull request is open
-   it re-reads it, and records the merge once when GitHub reports it merged.
+   it re-reads it, and records the merge once when GitHub reports it merged. Only an agent
+   token's read does this. A read-only token gets the stored row with no forge call and no write.
+   Its view of `pull_request` can lag until an agent read or the sync records the merge.
+5. `GET /v1/hub/repos/{repo}/publications?limit=25&before=ID` lists the repository's
+   publications, newest first by creation time, then id. `limit` is 1 through 100. `before` is the
+   previous page's `next_cursor`, which is a publication id; an unknown id is a 400. The reply is
+   `{"publications": [...], "next_cursor": ID|null, "complete": bool}`, and `complete` is true
+   exactly when `next_cursor` is null. Each item is the show reply plus `created_at` and
+   `updated_at` (unix seconds), without `forge_check` or `external`; fetch the publication for
+   those. The list reads the store only and calls no forge.
 
 The publication reports four states: `native_landed` (always true: the revision is
 already integrated natively), `branch` (`pending`, `created` or `rejected`, with the

@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{DefaultBodyLimit, Path, Query};
 use axum::extract::{Json, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post, put};
@@ -23,7 +24,7 @@ use sha2::{Digest, Sha256};
 use super::connection::{ConnectedRepository, Connection};
 use super::external_runs::ExternalKind;
 use super::github::{Gh, GhError, parse_rfc3339, valid_ref_name};
-use super::http::{ApiError, Authenticated, JsonBody, blocking};
+use super::http::{ApiError, Authenticated, JsonBody, Reader, blocking};
 use super::intent::scope;
 use super::store::{Event, Principal, lower_hex_of, unix_now};
 use super::sync::{failed, find_repository};
@@ -662,7 +663,9 @@ pub fn routes() -> Router<HubState> {
     Router::new()
         .route(
             "/v1/hub/repos/{repo}/publications",
-            post(create).layer(DefaultBodyLimit::max(MANIFEST_BODY_BYTES)),
+            post(create)
+                .layer(DefaultBodyLimit::max(MANIFEST_BODY_BYTES))
+                .get(list),
         )
         .route("/v1/hub/repos/{repo}/publications/{id}", get(show))
         .route(
@@ -929,14 +932,75 @@ pub(super) async fn publication_on_forge(
     }
 }
 
+/// Publications listed per page by default and at most.
+const DEFAULT_LISTED: usize = 25;
+const MAX_LISTED: usize = 100;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListQuery {
+    limit: Option<usize>,
+    before: Option<String>,
+}
+
+/// The repository's publications, newest first, for the status page. Store rows only: no forge
+/// call, and none of the per-publication `forge_check` or `external` views that `show` adds.
+async fn list(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+    Path(repo): Path<String>,
+    query: std::result::Result<Query<ListQuery>, QueryRejection>,
+) -> ApiResult {
+    scope(&principal, &repo)?;
+    let Query(query) = query.map_err(|_| ApiError::invalid())?;
+    let limit = query.limit.unwrap_or(DEFAULT_LISTED);
+    if !(1..=MAX_LISTED).contains(&limit) {
+        return Err(ApiError::invalid());
+    }
+    let store = state.store.clone();
+    let mut rows = blocking(&state, move || {
+        // An unknown cursor is a bad request, not an empty page.
+        if let Some(before) = &query.before
+            && store.publication(&repo, before)?.is_none()
+        {
+            return Ok(None);
+        }
+        store
+            .publications(&repo, query.before.as_deref(), limit + 1)
+            .map(Some)
+    })
+    .await?
+    .ok_or_else(ApiError::invalid)?;
+    let next_cursor = if rows.len() > limit {
+        rows.truncate(limit);
+        rows.last().map(|p| p.id.clone())
+    } else {
+        None
+    };
+    let publications: Vec<Value> = rows
+        .iter()
+        .map(|p| {
+            let mut item = p.to_json();
+            item["created_at"] = json!(p.created_at);
+            item["updated_at"] = json!(p.updated_at);
+            item
+        })
+        .collect();
+    Ok(Json(json!({"publications": publications,
+        "complete": next_cursor.is_none(), "next_cursor": next_cursor})))
+}
+
 async fn show(
     State(state): State<HubState>,
-    Authenticated(principal): Authenticated,
+    Reader(principal): Reader,
     Path((repo, id)): Path<(String, String)>,
 ) -> ApiResult {
     scope(&principal, &repo)?;
     let mut publication = load(&state, &repo, &id).await?;
-    if let (Some(number), None) = (publication.pr_number, &publication.merge_commit)
+    // Reading the merge from the forge records it and can mark the connection failed, so a
+    // read-only caller gets the stored row; agent reads and the sync still record merges.
+    if !principal.read_only
+        && let (Some(number), None) = (publication.pr_number, &publication.merge_commit)
         && read_due(&id)
         && let Some(candidate) = publication.manifest().ok().map(|m| m.candidate.is_some())
         && let Ok((conn, repository)) = target(&state, &principal, false, candidate).await

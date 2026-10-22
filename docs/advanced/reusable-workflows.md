@@ -214,6 +214,14 @@ receipt. Failed, unknown and omitted work stays failed, unknown or omitted. The 
 execute or retry steps, checkpoint source, modify the Change, grant approval or claim admission;
 its output retains `"admission":"not_assessed"`.
 
+## Read over HTTP
+
+`agentscm serve` returns the same inspect and handoff JSON from
+`GET /v1/local/skill-workflow-library?change=CHANGE&library=PATH` and
+`GET /v1/local/skill-workflows/RUN_ID/handoff`, so a local status page can show them. Configure,
+check and the other mutations are not available over HTTP. See
+[local template and timeline reads](../api.md#local-template-and-timeline-reads).
+
 ## Trust boundary and limits
 
 The local native data directory, its operator and configured runtimes remain trusted. This feature
