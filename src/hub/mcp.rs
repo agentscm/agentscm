@@ -21,7 +21,7 @@ use super::coordination::{
 };
 use super::http::{ApiError, Reader, blocking};
 use super::insights::{InsightQuery, UsageRecord};
-use super::session::{SessionCall, announce_for, done_for, others_for, status_for};
+use super::session::{SessionCall, announce_for, done_for, duplicates_for, others_for, status_for};
 use super::skill_workflow::ReadError as SkillWorkflowReadError;
 use super::store::{Principal, unix_now};
 use super::view_settings::{ViewOverride, ViewSettings};
@@ -490,7 +490,7 @@ fn tools(read_only: bool, settings: &ViewSettings) -> Value {
              "blocker": {"type":"string", "enum":["login","trust","quota","unsupported","unknown"]}
          }), &["agent", "session"])},
         {"name": "agentscm_start",
-         "description": "Call before editing. Reads ongoing work and recent outcomes, then atomically checks declared scope and claims or joins the task. Conflicting new lead scopes are refused with existing assignments and paths. Inspect work.context, completeness flags and overlap alternatives before proceeding.",
+         "description": "Call before editing. Reads ongoing work and recent outcomes, then atomically checks declared scope and claims or joins the task. Conflicting new lead scopes are refused with existing assignments and paths. Inspect work.context, completeness flags and overlap alternatives before proceeding. When a new task reads like another agent's ongoing work or an open pull request, the reply says so: ask the user whether it is the same work before continuing.",
          "inputSchema": schema(json!({
              "task": {"type": "string", "description": "What you are about to do, in one line."},
              "paths": paths("Repo-relative files you expect to edit."),
@@ -1184,20 +1184,19 @@ async fn run(
                 reason,
                 session,
             } = args(arguments)?;
-            let store = state.store.clone();
+            let (store, wanted) = (state.store.clone(), path.clone());
             blocking(state, move || {
-                store
-                    .answer_handoff(
-                        &token,
-                        session.as_deref(),
-                        &path,
-                        accept,
-                        reason.as_deref(),
-                        unix_now(),
-                    )
-                    .map(|outcome| answered(&outcome, &path))
+                store.answer_handoff(
+                    &token,
+                    session.as_deref(),
+                    &wanted,
+                    accept,
+                    reason.as_deref(),
+                    unix_now(),
+                )
             })
             .await
+            .map(|outcome| answered(&outcome, &path))
         }
         "agentscm_done" => {
             let SessionArgs { session } = args(arguments)?;
@@ -1396,7 +1395,7 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
     let advice = announce_for(
         state,
         principal,
-        session_call(Some(resolved), Some(task), paths),
+        session_call(Some(resolved), Some(task.clone()), paths),
     )
     .await?;
     let own = advice
@@ -1408,7 +1407,19 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
     if !advice.text.is_empty() {
         parts.push(advice.text.clone());
     }
-    // The touch is committed; a failed listing must not turn the start into an error.
+    // The touch is committed; a failed comparison or listing must not turn the start into an error.
+    // Only new work is compared: a join, takeover or resumed start already knows what it continues.
+    if work.created {
+        let current = work
+            .context
+            .as_ref()
+            .map_or(&[][..], |c| c.current.as_slice());
+        match duplicates_for(state, principal, &task, current).await {
+            Ok(text) if !text.is_empty() => parts.push(text),
+            Ok(_) => {}
+            Err(error) => eprintln!("hub: similar work for a start: {error}"),
+        }
+    }
     parts.push(match others_for(state, principal, own).await {
         Ok(others) => others,
         Err(error) => {

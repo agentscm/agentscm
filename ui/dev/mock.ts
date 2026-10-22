@@ -62,6 +62,8 @@ function events() {
     e('pr_notice', 330, A.mariaClaude, 'maria', { number: 42, title: 'Round invoice totals per currency', author: 'sam', html_url: 'https://example.invalid/acme/widgets/pull/42' }),
     e('edit_denied', 360, A.mariaClaude, 'maria', { paths: ['src/billing.rs'], holders: ['int_dev_codex'] }),
     e('edit_repeated', 300, A.mariaClaude, 'maria', { paths: ['src/billing.rs'] }),
+    e('pr_notice', 240, A.mariaClaude, 'maria', { number: 41, title: 'Split tax rounding', author: { login: 'sam' }, merged: true, base_ref: 'main', their_paths: ['src/tax.rs'] }),
+    e('task_overlap', 200, A.devCursor, 'dev', { task: 'Round invoice totals per currency', work: ['wrk_synth_1'], pulls: [42] }),
     // settled: dev's codex asked maria's claude-code for src/tax.rs, which was handed over
     e('handoff_request', 140, A.devCodex, 'dev', { request: 'hof_synth_1', paths: ['src/tax.rs'], note: 'Rounding fix needs a one-line change here <b>please</b>', to: { agent: 'claude-code', login: 'maria' } }),
     e('handoff_grant', 110, A.mariaClaude, 'maria', { request: 'hof_synth_1', paths: ['src/tax.rs'], from: { agent: 'codex', login: 'dev' } }),

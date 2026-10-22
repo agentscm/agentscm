@@ -1263,12 +1263,15 @@ fn deliveries_outbound_and_notices(db: &Db) {
         ttl_seconds: 600,
     };
     store.announce_intent(&token, &intent, unix_now()).unwrap();
-    store.append_pr_notices(&[]).unwrap();
+    store.append_notices("pr_notice", &[]).unwrap();
     store
-        .append_pr_notices(&[(
-            intent.id.clone(),
-            json!({"about": "pull_request"}).to_string(),
-        )])
+        .append_notices(
+            "pr_notice",
+            &[(
+                intent.id.clone(),
+                json!({"about": "pull_request"}).to_string(),
+            )],
+        )
         .unwrap();
     let notices = store.notices_after(&token, 0, 10).unwrap();
     assert_eq!(

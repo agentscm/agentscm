@@ -1033,6 +1033,11 @@ async fn reread_pull(
     .await?;
     if forgotten {
         lock(&state.sync.noticed).retain(|k, _| !(k.1 == repo.id && k.2 == number));
+        if let (Some(pull), Some(old)) = (&pull, stored.get(&number))
+            && pull["merged"] == true
+        {
+            notify_merged(state, conn, repo, pull, old).await?;
+        }
     }
     Ok(forgotten)
 }
@@ -1196,18 +1201,64 @@ async fn notify_overlaps(
             let fresh = theirs.iter().any(|file| !told.contains(file));
             told.extend(theirs.iter().cloned());
             fresh.then(|| {
-                let notice = json!({"about": "pull_request", "repository": repo.full_name,
-                    "repository_id": repo.repository_id, "number": data["number"],
-                    "node_id": data["node_id"], "title": data["title"],
-                    "html_url": data["html_url"], "head_ref": data["head_ref"],
-                    "head_sha": data["head_sha"], "author": data["author"],
-                    "their_paths": theirs, "your_paths": yours});
+                let notice = pr_notice(repo, data, &theirs, &yours);
                 (intent.id.clone(), notice.to_string())
             })
         })
         .collect();
+    append_pr_notices(state, notices).await
+}
+
+/// One `pr_notice` with `merged: true` per live intent overlapping a just-merged PR's files, so
+/// agents still editing them sync with the base before going on. Not the PR's own branch.
+async fn notify_merged(
+    state: &HubState,
+    conn: &Connection,
+    repo: &ConnectedRepository,
+    pull: &Value,
+    observed: &Value,
+) -> Gh<()> {
+    let files = files_of(observed);
+    let head = observed["head_ref"].as_str();
+    let notices: Vec<(String, String)> = repo_intents(state, conn, repo)
+        .await?
+        .iter()
+        .filter(|intent| head.is_none() || intent.branch.as_deref() != head)
+        .filter_map(|intent| {
+            let (theirs, yours) = pull_overlap(&files, &intent.paths);
+            (!theirs.is_empty()).then(|| {
+                let mut notice = pr_notice(repo, observed, &theirs, &yours);
+                notice["merged"] = json!(true);
+                notice["base_ref"] = observed["base_ref"].clone();
+                notice["merge_commit_sha"] = pull["merge_commit_sha"].clone();
+                (intent.id.clone(), notice.to_string())
+            })
+        })
+        .collect();
+    append_pr_notices(state, notices).await
+}
+
+/// A `pr_notice` body for the observed pull request `data`.
+fn pr_notice(
+    repo: &ConnectedRepository,
+    data: &Value,
+    theirs: &[String],
+    yours: &[String],
+) -> Value {
+    json!({"about": "pull_request", "repository": repo.full_name,
+        "repository_id": repo.repository_id, "number": data["number"],
+        "node_id": data["node_id"], "title": data["title"],
+        "html_url": data["html_url"], "head_ref": data["head_ref"],
+        "head_sha": data["head_sha"], "author": data["author"],
+        "their_paths": theirs, "your_paths": yours})
+}
+
+async fn append_pr_notices(state: &HubState, notices: Vec<(String, String)>) -> Gh<()> {
     if !notices.is_empty() {
-        db(state, move |store| store.append_pr_notices(&notices)).await?;
+        db(state, move |store| {
+            store.append_notices("pr_notice", &notices)
+        })
+        .await?;
         NOTICES.notify_waiters();
     }
     Ok(())

@@ -4729,10 +4729,10 @@ impl Store for PgStore {
         })
     }
 
-    fn append_pr_notices(&self, notices: &[(String, String)]) -> Result<()> {
+    fn append_notices(&self, kind: &'static str, notices: &[(String, String)]) -> Result<()> {
         let events = notices
             .iter()
-            .map(|(intent, data)| Event::pr_notice(intent, data))
+            .map(|(subject, data)| Event::notice(kind, subject, data))
             .collect::<Result<Vec<_>>>()?;
         self.run(false, |client| {
             let mut tx = client.transaction()?;

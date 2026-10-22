@@ -17,6 +17,7 @@ use super::intent::{
 };
 use super::store::{Event, HubEvent, Principal, new_id, unix_now};
 use super::sync::{open_pulls, overlapping_pulls};
+use super::work::WorkItem;
 use super::{HubError, HubState, Result};
 
 pub const SESSION_TTL_SECONDS: i64 = 1200;
@@ -746,6 +747,44 @@ pub async fn others_for(
         &principal.repository,
         unix_now(),
     ))
+}
+
+/// Other agents' ongoing work (`current`) and open PR titles that read like `task`: one
+/// `task_overlap` event and the rendered warning. Empty when nothing matches.
+pub async fn duplicates_for(
+    state: &HubState,
+    principal: &Principal,
+    task: &str,
+    current: &[WorkItem],
+) -> Result<String> {
+    let host = &principal.owner.identity.host;
+    // A failed look at pull requests leaves only the agents to compare.
+    let pulls = open_pulls(state, host, &principal.repository, principal.repository_id)
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("hub: open pull requests for a start: {error}");
+            Vec::new()
+        });
+    let same: Vec<&WorkItem> = current
+        .iter()
+        .filter(|item| item.lead_token != principal.token_id && advice::similar(task, &item.title))
+        .collect();
+    let prs: Vec<&Value> = pulls
+        .iter()
+        .filter(|pr| advice::similar(task, pr["title"].as_str().unwrap_or_default()))
+        .collect();
+    if same.is_empty() && prs.is_empty() {
+        return Ok(String::new());
+    }
+    let work_ids: Vec<&str> = same.iter().map(|item| item.id.as_str()).collect();
+    let numbers: Vec<&Value> = prs.iter().map(|pr| &pr["number"]).collect();
+    let data = json!({"task": task, "work": work_ids, "pulls": numbers}).to_string();
+    let (store, token) = (state.store.clone(), principal.token_id.clone());
+    blocking(state, move || {
+        store.append_notices("task_overlap", &[(token, data)])
+    })
+    .await?;
+    Ok(advice::duplicates(task, &same, &prs, unix_now()))
 }
 
 /// Touch (a heartbeat when `call` has no paths), then the others, open PRs and notices, rendered.
