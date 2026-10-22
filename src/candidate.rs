@@ -1,12 +1,18 @@
 //! Platform-neutral candidate identity shared by export and Hub protocols.
+#[cfg(unix)]
 use std::path::Path;
 
-use crate::attached_worktree::AttachmentJournal;
-use crate::attached_worktree::AttachmentState;
+#[cfg(unix)]
+use crate::Error;
+use crate::Result;
+#[cfg(unix)]
+use crate::attached_worktree::{AttachmentJournal, AttachmentState};
+#[cfg(unix)]
 use crate::authority::Authority;
+#[cfg(unix)]
 use crate::skill_workflow::LiveImportedOrigins;
+#[cfg(unix)]
 use crate::store::Engine;
-use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 
 /// An unlanded, exact native subject prepared for an ordinary Git branch/PR.
@@ -49,6 +55,7 @@ impl CandidateSubject {
 /// Compare an attached Git source with its exact retained native candidate and build the
 /// unlanded subject. The live proof is required even for native-only workflows so callers
 /// cannot accidentally bypass the shared authorization boundary.
+#[cfg(unix)]
 pub fn qualify_attached_candidate(
     data_dir: &Path,
     engine: &Engine,
@@ -64,6 +71,7 @@ pub fn qualify_attached_candidate(
 
 /// Legacy trusted-local CLI boundary. Imported receipts remain fail-closed because no live
 /// origin proof is supplied.
+#[cfg(unix)]
 pub fn qualify_attached_candidate_native(
     data_dir: &Path,
     engine: &Engine,
@@ -76,12 +84,14 @@ pub fn qualify_attached_candidate_native(
     qualify_attached_candidate_from_comparison(data_dir, repository, &compared, None)
 }
 
+#[cfg(unix)]
 #[derive(Clone)]
 pub struct AttachedCandidateComparison {
     state: AttachmentState,
     comparison_fingerprint: String,
 }
 
+#[cfg(unix)]
 pub fn compare_attached_candidate(
     data_dir: &Path,
     engine: &Engine,
@@ -101,6 +111,7 @@ pub fn compare_attached_candidate(
     })
 }
 
+#[cfg(unix)]
 pub fn qualify_attached_candidate_from_comparison(
     data_dir: &Path,
     repository: &str,

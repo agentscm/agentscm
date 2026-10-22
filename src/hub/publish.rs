@@ -1816,7 +1816,11 @@ async fn candidate_pull(
 }
 
 /// Fresh dispatch authorization; no workspace mutex spans provider I/O.
-async fn bound_effect(state: &HubState, publication: &Publication) -> Result<()> {
+async fn bound_effect(
+    #[cfg(unix)] state: &HubState,
+    #[cfg(not(unix))] _state: &HubState,
+    publication: &Publication,
+) -> Result<()> {
     #[cfg(unix)]
     if let Some(binding) = &publication.authorization_binding {
         let binding: super::workspace_publication::ForgeBinding = serde_json::from_str(binding)
