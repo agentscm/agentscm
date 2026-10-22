@@ -222,6 +222,7 @@ async fn hook(
             repo.clone(),
             super::onboarding::client(&parts.headers),
             onboarding_epoch,
+            super::insights::completion_enabled(&parts.headers),
         ),
     )
     .await
@@ -452,6 +453,7 @@ impl Call {
         repo: Option<String>,
         client: Option<&str>,
         onboarding_epoch: u64,
+        completion_reporting: bool,
     ) -> Result<Outcome, &'static str> {
         let call = |paths: Vec<String>| SessionCall {
             session: self.session.clone(),
@@ -577,7 +579,8 @@ impl Call {
                     .await
                     .map_err(reason)?;
                 if let Some(session) = self.session.clone() {
-                    pause_known_work(state, &principal, session, &self.via).await;
+                    pause_known_work(state, &principal, session, &self.via, completion_reporting)
+                        .await;
                 }
                 Ok(Outcome::clean())
             }
@@ -724,14 +727,28 @@ fn bounded_hook_text(text: &str, max: usize) -> String {
     super::advice::sanitize(text, max)
 }
 
-async fn pause_known_work(state: &HubState, principal: &Principal, session: String, via: &str) {
+async fn pause_known_work(
+    state: &HubState,
+    principal: &Principal,
+    session: String,
+    via: &str,
+    completion_reporting: bool,
+) {
     let store = state.store.clone();
     let token = principal.token_id.clone();
     let lookup_session = session.clone();
     let (item, session) = match blocking(state, move || {
         let now = unix_now();
         let canonical = store.session_name_for(&token, Some(&lookup_session), now)?;
-        Ok((store.work_for_session(&token, &canonical, now)?, canonical))
+        let item = store.work_for_session(&token, &canonical, now)?;
+        if completion_reporting
+            && let Some(item) = item.as_ref()
+            && super::insights::record_completion(store.as_ref(), &token, item, &canonical, now)
+                .is_err()
+        {
+            eprintln!("hub: completion report failed");
+        }
+        Ok((item, canonical))
     })
     .await
     {

@@ -469,6 +469,9 @@ is 64 KiB. Tools:
 | `agentscm_ask` | `path`, `note?` (at most 200 characters), `session?` | Asks the agent that holds a file to hand it over to this session (see [Handoff](#handoff)). |
 | `agentscm_handoff` | `path`, `accept`, `reason?` (at most 200 characters, with `accept` false), `session?` | Answers a request for a file this session holds: `true` hands it over, `false` keeps it. |
 | `agentscm_workflow_status` | `run_id` | Reads a retained skill workflow from the operator-mapped native repository, with historical state and present applicability separate. |
+| `agentscm_work_insights` | bounded window and continuation | Reads one page of repository work insights. A continuation repeats the exact returned window and watermark. |
+| `agentscm_work_insight` | `work_id` | Reads one bounded work insight projection. |
+| `agentscm_work_usage` | strict usage record | Idempotently reports partial token, attempt and optional cost evidence for the caller's current repository work. It does not prove complete capture or a verified bill. |
 
 The six coordination tools use repo-relative path specs and carry the session's new notices.
 The workflow reads use no session and write no coordination events. `GET /v1/hub/skill-workflows`
@@ -1275,6 +1278,12 @@ workflow text, and it is inactive until an endpoint and data-handling profile
 are configured.
 
 What the hub keeps, in its database and object store:
+
+- Work usage observations: at most 500 immutable reports per work item, containing bounded
+  agent/provider/model labels, attempt phase and outcome, optional token counts, optional
+  caller-supplied cost evidence and an optional source commit. The stored record also retains
+  its native session label and an author token ID reference for authorization and retry handling
+  (not the token secret). Insight responses omit those session labels and token references. The Hub does not capture prompts, responses or transcript contents for this feature.
 
 - People: forge provider and host, numeric forge user id, login name, whether
   the account is disabled, and when it was created. No name, email address,

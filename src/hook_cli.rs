@@ -136,42 +136,44 @@ async fn call_hub(
         return Err("client connection mode does not support this agent".into());
     }
     let plugin_route = client_connection;
-    let (url, token, repo, root, endpoint_agent, outbound, client_root) = if plugin_route {
-        let routed = route_client(&agent, &payload)?;
-        (
-            routed.connection.hub.clone(),
-            Token::PrivateFile(routed.connection.token_file.clone()),
-            Some(routed.connection.repo.clone()),
-            None,
-            routed.endpoint_agent,
-            routed.payload,
-            Some(routed.connection.root.clone()),
-        )
-    } else {
-        let env = |name| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
-        let settings = Settings {
-            url: env("AGENTSCM_HUB_URL"),
-            token: env("AGENTSCM_HUB_TOKEN"),
-            token_file: env("AGENTSCM_HUB_TOKEN_FILE"),
-        };
-        let file = config_dir()
-            .ok()
-            .and_then(|dir| std::fs::read_to_string(dir.join("agentscm").join("hub.json")).ok())
-            .and_then(|text| parse_hub_file(&text).ok());
-        let (url, token) = resolve(
-            &settings,
-            flag_url.as_deref(),
-            &cwd_of(&payload),
-            file.as_ref(),
-        )?;
-        let root = repo_root(&cwd_of(&payload));
-        let outbound = if agent == "codex" {
-            sanitized_codex(&payload, None)?
+    let (url, token, repo, root, endpoint_agent, outbound, client_root, report_completion) =
+        if plugin_route {
+            let routed = route_client(&agent, &payload)?;
+            (
+                routed.connection.hub.clone(),
+                Token::PrivateFile(routed.connection.token_file.clone()),
+                Some(routed.connection.repo.clone()),
+                None,
+                routed.endpoint_agent,
+                routed.payload,
+                Some(routed.connection.root.clone()),
+                routed.connection.report_completion,
+            )
         } else {
-            payload.clone()
+            let env = |name| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
+            let settings = Settings {
+                url: env("AGENTSCM_HUB_URL"),
+                token: env("AGENTSCM_HUB_TOKEN"),
+                token_file: env("AGENTSCM_HUB_TOKEN_FILE"),
+            };
+            let file = config_dir()
+                .ok()
+                .and_then(|dir| std::fs::read_to_string(dir.join("agentscm").join("hub.json")).ok())
+                .and_then(|text| parse_hub_file(&text).ok());
+            let (url, token) = resolve(
+                &settings,
+                flag_url.as_deref(),
+                &cwd_of(&payload),
+                file.as_ref(),
+            )?;
+            let root = repo_root(&cwd_of(&payload));
+            let outbound = if agent == "codex" {
+                sanitized_codex(&payload, None)?
+            } else {
+                payload.clone()
+            };
+            (url, token, repo, root, agent.clone(), outbound, None, false)
         };
-        (url, token, repo, root, agent.clone(), outbound, None)
-    };
     let token = match token {
         Token::Value(token) => token,
         Token::File(path) => std::fs::read_to_string(path)
@@ -205,6 +207,7 @@ async fn call_hub(
             client_config::onboarding_client(&root, &token),
         );
     }
+    request = client_config::with_completion_reporting(request, report_completion);
     // `send` errors carry no URL or credentials.
     let (status, reply) = send(request, REPLY_BYTES)
         .await
@@ -1242,6 +1245,7 @@ mod tests {
             hub: "https://hub.example.test".into(),
             repo: repo.into(),
             token_file: std::env::temp_dir().join(format!("{}-token", repo.replace('/', "-"))),
+            report_completion: false,
             owned_token_id: None,
             owned_token_expires_at: None,
         }
@@ -1371,7 +1375,9 @@ mod tests {
     fn client_routes_each_native_agent_without_a_root_header() {
         let parent = tempfile::tempdir().unwrap();
         let root = git_repo(parent.path(), "repo");
-        let connections = [connection(&root, "acme/widgets")];
+        let mut reporting = connection(&root, "acme/widgets");
+        reporting.report_completion = true;
+        let connections = [reporting];
         let payloads = [
             (
                 "claude",
@@ -1402,6 +1408,7 @@ mod tests {
         for (agent, payload) in payloads {
             let routed = route_client_with(agent, &payload, &connections).unwrap();
             assert_eq!(routed.connection.repo, "acme/widgets");
+            assert!(routed.connection.report_completion);
             assert_eq!(
                 routed.endpoint_agent,
                 if agent == "gemini" { "generic" } else { agent }

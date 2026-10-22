@@ -7,6 +7,7 @@ use std::time::Duration;
 use agentscm::hub::coordination::{
     CoordinationAck, CoordinationReply, CoordinationResolve, CoordinationWithdraw,
 };
+use agentscm::hub::insights::UsageRecord;
 use agentscm::hub::store::{self, unix_now};
 use agentscm::hub::work::{
     BriefingAck, WorkCheckpoint, WorkRepositoryScope, WorkStart, WorkStartResult,
@@ -25,6 +26,27 @@ const REQUEST_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Subcommand)]
 pub enum WorkCommand {
+    /// Submit one caller-reported usage observation for durable work.
+    Usage {
+        /// Strict UsageRecord JSON file, or - for standard input.
+        #[arg(long, default_value = "-")]
+        request: PathBuf,
+    },
+    /// Read the conservative insight projection for one work item.
+    Insight { id: String },
+    /// List conservative work insight projections in a bounded time window.
+    Insights {
+        #[arg(long)]
+        since: Option<i64>,
+        #[arg(long)]
+        until: Option<i64>,
+        #[arg(long)]
+        after: Option<String>,
+        #[arg(long)]
+        through: Option<i64>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// Read durable requests addressed to an agent session; does not acknowledge receipt.
     Inbox {
         #[arg(long)]
@@ -142,15 +164,18 @@ pub enum WorkCommand {
 
 pub(crate) fn telemetry_action(command: &WorkCommand) -> bool {
     match command {
-        WorkCommand::Inbox { .. } | WorkCommand::Overview { .. } | WorkCommand::Briefing { .. } => {
-            false
-        }
+        WorkCommand::Inbox { .. }
+        | WorkCommand::Overview { .. }
+        | WorkCommand::Briefing { .. }
+        | WorkCommand::Insight { .. }
+        | WorkCommand::Insights { .. } => false,
         WorkCommand::Compact { apply, .. } => *apply,
         WorkCommand::CoordinationAck { .. }
         | WorkCommand::CoordinationReply { .. }
         | WorkCommand::CoordinationResolve { .. }
         | WorkCommand::CoordinationWithdraw { .. }
         | WorkCommand::Start { .. }
+        | WorkCommand::Usage { .. }
         | WorkCommand::Checkpoint { .. }
         | WorkCommand::Ack { .. } => true,
     }
@@ -193,6 +218,64 @@ pub async fn run(command: WorkCommand) -> Result<()> {
     };
     let hub = Hub::connect(timeout)?;
     let (reply, claim_conflict) = match command {
+        WorkCommand::Usage { request } => {
+            let request: UsageRecord = read_request(&request)?;
+            (
+                hub.call(
+                    Method::POST,
+                    "/v1/hub/standup/usage",
+                    Some(serde_json::to_value(request)?),
+                )
+                .await?,
+                false,
+            )
+        }
+        WorkCommand::Insight { id } => {
+            let mut url = reqwest::Url::parse("http://hub/v1/hub/standup/work")
+                .map_err(|_| invalid("cannot construct insight URL"))?;
+            url.path_segments_mut()
+                .map_err(|_| invalid("cannot construct insight URL"))?
+                .push(&id)
+                .push("insights");
+            let path = url
+                .as_str()
+                .strip_prefix("http://hub")
+                .ok_or_else(|| invalid("cannot construct insight URL"))?
+                .to_owned();
+            (hub.call(Method::GET, &path, None).await?, false)
+        }
+        WorkCommand::Insights {
+            since,
+            until,
+            after,
+            through,
+            limit,
+        } => {
+            let mut url = reqwest::Url::parse("http://hub/v1/hub/standup/insights")
+                .map_err(|_| invalid("cannot construct insights URL"))?;
+            {
+                let mut query = url.query_pairs_mut();
+                query.append_pair("limit", &limit.to_string());
+                if let Some(value) = since {
+                    query.append_pair("since", &value.to_string());
+                }
+                if let Some(value) = until {
+                    query.append_pair("until", &value.to_string());
+                }
+                if let Some(value) = after {
+                    query.append_pair("after", &value);
+                }
+                if let Some(value) = through {
+                    query.append_pair("through", &value.to_string());
+                }
+            }
+            let path = url
+                .as_str()
+                .strip_prefix("http://hub")
+                .ok_or_else(|| invalid("cannot construct insights URL"))?
+                .to_owned();
+            (hub.call(Method::GET, &path, None).await?, false)
+        }
         WorkCommand::Inbox {
             session,
             after,
