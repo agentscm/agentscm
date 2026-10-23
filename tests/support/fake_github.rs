@@ -257,6 +257,8 @@ pub struct Repo {
     pub comments: BTreeMap<u64, Vec<Comment>>,
     /// (sha, {state, context, description}) in creation order.
     pub statuses: Vec<(String, Value)>,
+    /// The login that posted each of `statuses`, index for index.
+    pub status_creators: Vec<String>,
     /// A bare Git repository behind the git-data API (blobs, trees, commits, refs), if any.
     pub git: Option<std::path::PathBuf>,
     /// Without `git`: commit sha to (tree sha, parent shas) for `GET git/commits/{sha}`.
@@ -270,6 +272,12 @@ pub struct Repo {
 }
 
 impl Repo {
+    /// Records a status and the login that posted it, keeping the two lists aligned.
+    pub fn record_status(&mut self, sha: &str, status: Value, creator: &str) {
+        self.statuses.push((sha.to_string(), status));
+        self.status_creators.push(creator.to_string());
+    }
+
     /// A private repository; set `private = false` for a publicly readable one.
     pub fn new(id: i64, full_name: &str) -> Self {
         Repo {
@@ -282,6 +290,7 @@ impl Repo {
             branches: Vec::new(),
             comments: BTreeMap::new(),
             statuses: Vec::new(),
+            status_creators: Vec::new(),
             git: None,
             commits: BTreeMap::new(),
             runs: Vec::new(),
@@ -368,13 +377,11 @@ pub struct FakeState {
 impl FakeState {
     /// Records a status as another account posted it (newest last, as the API would).
     pub fn push_status(&mut self, repo: i64, sha: &str, state: &str, context: &str, login: &str) {
-        let status = json!({"state": state, "context": context, "description": "other",
-            "creator": {"login": login}});
+        let status = json!({"state": state, "context": context, "description": "other"});
         self.repos
             .get_mut(&repo)
             .unwrap()
-            .statuses
-            .push((sha.to_string(), status));
+            .record_status(sha, status, login);
     }
 }
 
@@ -1370,12 +1377,18 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                     }
                 }
                 (&Method::GET, ["commits", sha, "statuses"]) => {
-                    let list: Vec<Value> = state.repos[&id]
+                    let repo = &state.repos[&id];
+                    let list: Vec<Value> = repo
                         .statuses
                         .iter()
+                        .zip(&repo.status_creators)
                         .rev()
-                        .filter(|(at, _)| at == sha)
-                        .map(|(_, v)| v.clone())
+                        .filter(|((at, _), _)| at == sha)
+                        .map(|((_, v), login)| {
+                            let mut listed = v.clone();
+                            listed["creator"] = json!({"login": login});
+                            listed
+                        })
                         .collect();
                     json_reply(200, Value::Array(list))
                 }
@@ -1400,14 +1413,11 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                         Who::Reader(login, ..) => login.clone(),
                         Who::Installation(_) => format!("{APP_SLUG}[bot]"),
                     });
-                    let mut stored = status.clone();
-                    stored["creator"] = json!({"login": creator});
                     state
                         .repos
                         .get_mut(&id)
                         .unwrap()
-                        .statuses
-                        .push((sha.to_string(), stored));
+                        .record_status(sha, status.clone(), &creator);
                     if let Some(tip) = state.advance_base_after_status.take() {
                         state.repos.get_mut(&id).unwrap().branches[0].sha = tip;
                     }
