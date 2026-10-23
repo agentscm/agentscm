@@ -2231,6 +2231,7 @@ mod tests {
         assert!(load_receipt(&config, "work").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn native_slack_bundle_is_private_and_drift_checked() {
         let temp = tempfile::tempdir().unwrap();
