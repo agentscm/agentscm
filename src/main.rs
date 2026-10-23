@@ -205,7 +205,8 @@ enum Command {
     /// Always exits 0 and fails open. Usage: `agentscm hook <claude|codex|cursor|copilot|generic>
     /// [--hub-url URL]`; the token comes from AGENTSCM_HUB_TOKEN(_FILE) or hub.json.
     Hook(hook_cli::HookArgs),
-    /// Wire this Git repository's agents to a hub: write hooks, MCP config and instructions.
+    /// Write this Git repository's shared agent instructions (AGENTS.md and the files that point
+    /// each agent at it). Hooks and MCP come from `agentscm client setup` on each machine.
     InitRepo(init_cli::InitArgs),
     /// Bind or diagnose a checkout's connection to an existing coordination Hub.
     Client {

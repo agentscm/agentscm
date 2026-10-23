@@ -220,17 +220,7 @@ page uses) are separate paths with separate token and configuration stores. `age
 quickstart; `agentscm client remove` undoes client setup. Only agents set up with `client setup` report
 on the Connect agents page.
 
-In a repository that ran `agentscm init-repo`, `client setup` still refuses Codex, Cursor and Copilot
-because of the committed AgentSCM entries. Claude Code is the exception. `client setup --agent claude`
-leaves the committed `.mcp.json` and `.claude/settings.json` unchanged. It adds the checkout-bound MCP
-server in Claude Code's local scope (`claude mcp add-json --scope local agentscm ...`), which takes
-precedence over the project entry of the same name. It also writes `"allowedHttpHookUrls": []` to the
-Git-excluded `.claude/settings.local.json`, so on that machine only the plugin's command hooks run and
-the committed HTTP hooks do not. That setting blocks every HTTP hook in the checkout, so setup refuses
-when other HTTP hooks or another `allowedHttpHookUrls` list are present in user, project or local
-settings. Managed settings are not inspected. An `allowedHttpHookUrls` list there would merge with
-the local one, so check it yourself. If the `claude` CLI is missing, setup prints the exact
-`claude mcp add-json` command and stops.
+`agentscm init-repo` commits only shared agent instruction files (no MCP config, hooks or token). Each developer still runs `agentscm client setup --agent <agent> --hub <hub>` once per checkout, and the Connect agents page verifies the result.
 
 Then run `agentscm client list` and `agentscm client check` for the local binding. Start a real agent
 task and confirm that its session appears for the expected repository in the hosted Hub. A local
