@@ -1295,6 +1295,47 @@ fn hub_port_retry_reaches_docker_failure_after_an_occupied_first_port() {
     assert!(!machine.config().join("quickstart.json").exists());
 }
 
+#[test]
+fn a_busy_hub_port_prints_a_rerun_command_with_a_free_port() {
+    let machine = Machine::new();
+    let repo = machine.repo();
+    fake_docker(&machine);
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = held.local_addr().unwrap().port().to_string();
+    let output = machine.run(
+        repo.path(),
+        &[
+            "quickstart",
+            "--yes",
+            "--local",
+            "--hub-runtime",
+            "docker",
+            "--hub-port",
+            &port,
+            "--github-login",
+            "octo",
+            "--hook",
+            "none",
+            "--no-collisions",
+        ],
+    );
+    drop(held);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let said = out(&output);
+    let hint = said
+        .lines()
+        .find_map(|line| line.strip_prefix("To use a free port, run: "))
+        .unwrap_or_else(|| panic!("{said}"));
+    let free: u16 = hint
+        .rsplit_once(" quickstart --local --hub-port ")
+        .unwrap_or_else(|| panic!("{hint}"))
+        .1
+        .parse()
+        .unwrap();
+    assert_ne!(free.to_string(), port);
+    assert!(!machine.home.path().join(".agentscm/hub").exists());
+}
+
 fn fake_docker(machine: &Machine) {
     let docker = machine.bin.path().join("docker");
     std::fs::write(
