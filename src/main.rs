@@ -67,6 +67,8 @@ mod init_cli;
 mod intent_cli;
 mod local_recovery_cli;
 #[cfg(unix)]
+mod local_validation_cli;
+#[cfg(unix)]
 mod merge_cli;
 mod prompt;
 #[cfg(unix)]
@@ -126,6 +128,12 @@ enum Command {
     AgentTask {
         #[command(subcommand)]
         command: agent_task_cli::AgentTaskCommand,
+    },
+    /// [experimental] Produce, show and verify Git-bound local validation attestations.
+    #[cfg(unix)]
+    LocalValidation {
+        #[command(subcommand)]
+        command: local_validation_cli::LocalValidationCommand,
     },
     /// [experimental] Run bounded repository skill workflows on immutable local source.
     SkillWorkflow {
@@ -660,6 +668,13 @@ async fn run(cli: Cli) -> Result<RunExit> {
         #[cfg(unix)]
         Command::AgentTask { command } => {
             print_json(&agent_task_cli::run(&cli.data_dir, command).await?);
+        }
+        #[cfg(unix)]
+        Command::LocalValidation { command } => {
+            let code = local_validation_cli::run(command)?;
+            if code != 0 {
+                return Ok(RunExit::SpecializedFailure(code));
+            }
         }
         Command::SkillWorkflow { command } => {
             skill_workflow_cli::run(&cli.data_dir, command).await?;

@@ -190,6 +190,28 @@ fn fails(case: Case, reason: &str) {
 }
 
 #[test]
+fn issue_time_in_the_future_fails_without_underflow() {
+    let mut case = Case::new();
+    case.clock = EvaluationClock::Known {
+        unix_ms: ISSUED - 1,
+    };
+    assert_eq!(case.run().state, VerdictState::Failure);
+}
+
+#[test]
+fn recipe_and_policy_decode_strictly() {
+    let recipe = br#"{"recipe_id":"r","commands":[{"id":"a","argv":["x"],"timeout_secs":1}]}"#;
+    assert!(ValidationRecipe::from_slice(recipe).is_ok());
+    assert!(ValidationRecipe::from_slice(br#"{"recipe_id":"r","commands":[],"x":1}"#).is_err());
+    assert!(ValidationRecipe::from_slice(br#"{"recipe_id":"r","commands":[]}"#).is_err());
+    let mut value = serde_json::to_value(policy()).unwrap();
+    assert!(ValidationPolicy::from_slice(&serde_json::to_vec(&value).unwrap()).is_ok());
+    value["extra"] = true.into();
+    assert!(ValidationPolicy::from_slice(&serde_json::to_vec(&value).unwrap()).is_err());
+    assert!(ValidationPolicy::from_slice(&vec![b' '; MAX_RECORD_BYTES + 1]).is_err());
+}
+
+#[test]
 fn valid_attestation_succeeds() {
     expect(Case::new().run(), VerdictState::Success, "validated");
 }

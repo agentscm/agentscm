@@ -8,6 +8,10 @@
 
 use std::collections::HashSet;
 
+pub mod comment;
+#[cfg(unix)]
+pub mod run;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -184,6 +188,12 @@ impl ValidationRecipe {
         Ok(())
     }
 
+    pub fn from_slice(input: &[u8]) -> Result<Self> {
+        let recipe: Self = from_bounded_json(input)?;
+        recipe.validate()?;
+        Ok(recipe)
+    }
+
     /// SHA-256 of the recipe's canonical (struct-ordered JSON) bytes.
     pub fn sha256(&self) -> Result<String> {
         self.validate()?;
@@ -191,14 +201,19 @@ impl ValidationRecipe {
     }
 }
 
+/// Strict (unknown fields are denied by the types) and size-bounded decoding.
+fn from_bounded_json<T: serde::de::DeserializeOwned>(input: &[u8]) -> Result<T> {
+    if input.len() > MAX_RECORD_BYTES {
+        return Err(Error::Limit(format!(
+            "validation input exceeds {MAX_RECORD_BYTES} bytes"
+        )));
+    }
+    Ok(serde_json::from_slice(input)?)
+}
+
 impl ValidationRecord {
     pub fn from_slice(input: &[u8]) -> Result<Self> {
-        if input.len() > MAX_RECORD_BYTES {
-            return Err(Error::Limit(format!(
-                "validation record exceeds {MAX_RECORD_BYTES} bytes"
-            )));
-        }
-        let record: Self = serde_json::from_slice(input)?;
+        let record: Self = from_bounded_json(input)?;
         record.validate()?;
         Ok(record)
     }
@@ -277,6 +292,12 @@ impl ValidationRecord {
 }
 
 impl ValidationPolicy {
+    pub fn from_slice(input: &[u8]) -> Result<Self> {
+        let policy: Self = from_bounded_json(input)?;
+        policy.validate()?;
+        Ok(policy)
+    }
+
     pub fn validate(&self) -> Result<()> {
         validate_identifier("repository", &self.repository)?;
         validate_lower_hex("recipe digest", &self.recipe_sha256, 32)?;
@@ -543,7 +564,10 @@ pub fn assess(
     let EvaluationClock::Known { unix_ms } = clock else {
         return Verdict::new(Err_, "clock uncertain", "cannot judge age");
     };
-    if unix_ms - payload.issued_at_ms > policy.max_age_seconds.saturating_mul(1000) {
+    let Some(age_ms) = unix_ms.checked_sub(payload.issued_at_ms) else {
+        return Verdict::failure("attestation from the future", "issued after the clock");
+    };
+    if age_ms > policy.max_age_seconds.saturating_mul(1000) {
         return Verdict::failure("attestation too old", "older than policy max age");
     }
     if report.execution_claim() != ExecutionClaimStatus::WorkerAssertion
