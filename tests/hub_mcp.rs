@@ -1227,10 +1227,7 @@ async fn errors_are_tool_results_with_fixed_text() {
     ] {
         let (text, error) = hub.tool(&key, "/mcp", name, arguments).await;
         assert!(error, "{name}");
-        assert!(
-            text.contains("coordination unknown (invalid arguments)"),
-            "{text}"
-        );
+        assert!(text.contains("invalid arguments"), "{text}");
     }
     let (text, error) = hub
         .tool(

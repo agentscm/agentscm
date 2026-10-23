@@ -271,7 +271,7 @@ fn hub_problems_are_coordination_unknown_and_exit_zero() {
     bare.url = String::new();
     let text = context(&bare.edit("s", "Edit", work.path(), file), "PreToolUse");
     assert!(
-        text.contains("no hub configured (see docs/intents.md)"),
+        text.contains("no hub configured (run `agentscm quickstart` to connect one)"),
         "{text}"
     );
 

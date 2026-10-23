@@ -262,7 +262,10 @@ async fn mcp(
                         },
                     )
                 } else {
-                    Ok(refused("invalid setup arguments"))
+                    Ok(invalid_args(
+                        "agentscm_setup_status",
+                        "unexpected setup arguments",
+                    ))
                 }
             } else {
                 call(
@@ -563,12 +566,25 @@ fn tools(read_only: bool, settings: &ViewSettings) -> Value {
 }
 
 /// Parsed arguments; `None` for anything the tool does not accept.
-fn args<T: DeserializeOwned>(arguments: Option<&Value>) -> Option<T> {
+fn try_args<T: DeserializeOwned>(arguments: Option<&Value>) -> std::result::Result<T, String> {
     let arguments = match arguments {
         None | Some(Value::Null) => json!({}),
         Some(other) => other.clone(),
     };
-    serde_json::from_value(arguments).ok()
+    serde_json::from_value(arguments).map_err(|error| error.to_string())
+}
+
+fn args<T: DeserializeOwned>(arguments: Option<&Value>) -> Option<T> {
+    try_args(arguments).ok()
+}
+
+/// A malformed call is the caller's mistake, not a coordination outage.
+fn invalid_args(tool: &str, detail: &str) -> Value {
+    let detail: String = detail.chars().take(200).collect();
+    result(
+        &format!("AgentSCM: invalid arguments for {tool}: {detail}"),
+        true,
+    )
 }
 
 fn session_call(session: Option<String>, task: Option<String>, paths: Vec<String>) -> SessionCall {
@@ -745,8 +761,9 @@ async fn call_inner(
     }
     let arguments = params.and_then(|params| params.get("arguments"));
     if name == "agentscm_coordination_inbox" {
-        let Some(args) = args::<InboxArgs>(arguments) else {
-            return Ok(refused("invalid arguments"));
+        let args = match try_args::<InboxArgs>(arguments) {
+            Ok(value) => value,
+            Err(error) => return Ok(invalid_args(name, &error)),
         };
         let store = state.store.clone();
         let token = principal.token_id.clone();
@@ -788,8 +805,9 @@ async fn call_inner(
         let token = principal.token_id.clone();
         let outcome = match name {
             "agentscm_coordination_ack" => {
-                let Some(request) = args::<CoordinationAck>(arguments) else {
-                    return Ok(refused("invalid arguments"));
+                let request = match try_args::<CoordinationAck>(arguments) {
+                    Ok(value) => value,
+                    Err(error) => return Ok(invalid_args(name, &error)),
                 };
                 blocking(state, move || {
                     store.coordination_ack(&token, &request, unix_now())
@@ -797,8 +815,9 @@ async fn call_inner(
                 .await
             }
             "agentscm_coordination_reply" => {
-                let Some(request) = args::<CoordinationReply>(arguments) else {
-                    return Ok(refused("invalid arguments"));
+                let request = match try_args::<CoordinationReply>(arguments) {
+                    Ok(value) => value,
+                    Err(error) => return Ok(invalid_args(name, &error)),
                 };
                 blocking(state, move || {
                     store.coordination_reply(&token, &request, unix_now())
@@ -806,8 +825,9 @@ async fn call_inner(
                 .await
             }
             "agentscm_coordination_resolve" => {
-                let Some(request) = args::<CoordinationResolve>(arguments) else {
-                    return Ok(refused("invalid arguments"));
+                let request = match try_args::<CoordinationResolve>(arguments) {
+                    Ok(value) => value,
+                    Err(error) => return Ok(invalid_args(name, &error)),
                 };
                 blocking(state, move || {
                     store.coordination_resolve(&token, &request, unix_now())
@@ -815,8 +835,9 @@ async fn call_inner(
                 .await
             }
             _ => {
-                let Some(request) = args::<CoordinationWithdraw>(arguments) else {
-                    return Ok(refused("invalid arguments"));
+                let request = match try_args::<CoordinationWithdraw>(arguments) {
+                    Ok(value) => value,
+                    Err(error) => return Ok(invalid_args(name, &error)),
                 };
                 blocking(state, move || {
                     store.coordination_withdraw(&token, &request, unix_now())
@@ -830,8 +851,9 @@ async fn call_inner(
         });
     }
     if name == "agentscm_view_settings" {
-        let Some(change) = args::<ViewSettingsArgs>(arguments) else {
-            return Ok(refused("invalid arguments"));
+        let change = match try_args::<ViewSettingsArgs>(arguments) {
+            Ok(value) => value,
+            Err(error) => return Ok(invalid_args(name, &error)),
         };
         let store = state.store.clone();
         let owner = principal.owner.id.clone();
@@ -861,8 +883,9 @@ async fn call_inner(
         );
     }
     if name == "agentscm_work_overview" {
-        let Some(query) = args::<WorkOverviewQuery>(arguments) else {
-            return Ok(refused("invalid arguments"));
+        let query = match try_args::<WorkOverviewQuery>(arguments) {
+            Ok(value) => value,
+            Err(error) => return Ok(invalid_args(name, &error)),
         };
         let store = state.store.clone();
         let token = principal.token_id.clone();
@@ -878,8 +901,9 @@ async fn call_inner(
         );
     }
     if name == "agentscm_work_insight" {
-        let Some(WorkInsightArgs { work_id }) = args(arguments) else {
-            return Ok(refused("invalid arguments"));
+        let WorkInsightArgs { work_id } = match try_args(arguments) {
+            Ok(value) => value,
+            Err(error) => return Ok(invalid_args(name, &error)),
         };
         let store = state.store.clone();
         let token = principal.token_id.clone();
@@ -896,8 +920,9 @@ async fn call_inner(
         );
     }
     if name == "agentscm_work_insights" {
-        let Some(query) = args::<InsightQuery>(arguments) else {
-            return Ok(refused("invalid arguments"));
+        let query = match try_args::<InsightQuery>(arguments) {
+            Ok(value) => value,
+            Err(error) => return Ok(invalid_args(name, &error)),
         };
         let store = state.store.clone();
         let token = principal.token_id.clone();
@@ -913,8 +938,9 @@ async fn call_inner(
         );
     }
     if name == "agentscm_work_usage" {
-        let Some(usage) = args::<UsageRecord>(arguments) else {
-            return Ok(refused("invalid arguments"));
+        let usage = match try_args::<UsageRecord>(arguments) {
+            Ok(value) => value,
+            Err(error) => return Ok(invalid_args(name, &error)),
         };
         let store = state.store.clone();
         let token = principal.token_id.clone();
@@ -926,32 +952,37 @@ async fn call_inner(
         );
     }
     if name == "agentscm_workflow_status" {
-        let Some(WorkflowStatusArgs { run_id }) = args(arguments) else {
-            return Ok(refused("invalid arguments"));
+        let WorkflowStatusArgs { run_id } = match try_args(arguments) {
+            Ok(value) => value,
+            Err(error) => return Ok(invalid_args(name, &error)),
         };
         return Ok(workflow_status(state, principal, &run_id).await);
     }
     if name == "agentscm_work_briefing" {
-        let Some(arguments) = args::<BriefingArgs>(arguments) else {
-            return Ok(refused("invalid arguments"));
+        let arguments = match try_args::<BriefingArgs>(arguments) {
+            Ok(value) => value,
+            Err(error) => return Ok(invalid_args(name, &error)),
         };
         return Ok(work_briefing(state, principal, arguments).await);
     }
     if name == "agentscm_work_checkpoint" {
-        let Some(checkpoint) = args::<WorkCheckpoint>(arguments) else {
-            return Ok(refused("invalid arguments"));
+        let checkpoint = match try_args::<WorkCheckpoint>(arguments) {
+            Ok(value) => value,
+            Err(error) => return Ok(invalid_args(name, &error)),
         };
         return Ok(work_checkpoint(state, principal, checkpoint, completion_reporting).await);
     }
     if name == "agentscm_work_ack" {
-        let Some(ack) = args::<BriefingAck>(arguments) else {
-            return Ok(refused("invalid arguments"));
+        let ack = match try_args::<BriefingAck>(arguments) {
+            Ok(value) => value,
+            Err(error) => return Ok(invalid_args(name, &error)),
         };
         return Ok(work_ack(state, principal, ack).await);
     }
     if name == "agentscm_start" {
-        let Some(arguments) = args::<StartArgs>(arguments) else {
-            return Ok(refused("invalid arguments"));
+        let arguments = match try_args::<StartArgs>(arguments) {
+            Ok(value) => value,
+            Err(error) => return Ok(invalid_args(name, &error)),
         };
         return Ok(match start(state, principal, arguments).await {
             Ok(value) => value,
@@ -977,7 +1008,9 @@ async fn workflow_status(state: &HubState, principal: &Principal, run_id: &str) 
             Ok(text) => result(&text, false),
             Err(_) => refused("hub unavailable"),
         },
-        Ok(Err(SkillWorkflowReadError::InvalidRunId)) => refused("invalid arguments"),
+        Ok(Err(SkillWorkflowReadError::InvalidRunId)) => {
+            invalid_args("agentscm_workflow_status", "run_id is not a valid run id")
+        }
         Ok(Err(SkillWorkflowReadError::NotFound)) => refused("workflow run not found"),
         Ok(Err(SkillWorkflowReadError::Internal(detail))) => {
             eprintln!("hub workflow error: {detail}");

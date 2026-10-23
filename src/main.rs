@@ -145,7 +145,7 @@ enum Command {
         #[command(subcommand)]
         command: telemetry_cli::TelemetryCommand,
     },
-    /// [experimental] Initialize or inspect an explicitly owned local native installation.
+    /// [experimental] Contributor helper: initialize or inspect an explicitly owned local native installation. New users run `agentscm quickstart`.
     #[cfg(unix)]
     Setup {
         #[command(subcommand)]
@@ -569,6 +569,11 @@ fn parse_cli(argv: Vec<OsString>) -> ParsedCli {
                 println!("{{}}");
                 return ParsedCli::Return;
             }
+            if io::IsTerminal::is_terminal(&io::stderr()) {
+                // A person at a terminal gets clap's normal usage text, not a JSON blob.
+                let _ = error.print();
+                return ParsedCli::Exit(error.exit_code());
+            }
             print_error(&Error::Invalid(error.to_string()));
             // Exit 2 blocks a Stop hook, so a parse error there is a non-blocking error.
             ParsedCli::Exit(if is_stop_hook_invocation(&argv) { 1 } else { 2 })
@@ -598,7 +603,9 @@ fn parse_cli_on_bounded_stack() -> Result<ParsedCli> {
 #[tokio::main]
 async fn main() {
     // Before clap: a bad flag must not exit non-zero (agents read that as "block").
-    if std::env::args_os().nth(1).is_some_and(|a| a == "hook") {
+    if std::env::args_os().nth(1).is_some_and(|a| a == "hook")
+        && !std::env::args_os().any(|a| a == "--help" || a == "-h")
+    {
         let args = std::env::args_os().skip(2);
         hook_cli::run_unparsed(args.map(|a| a.to_string_lossy().into_owned()).collect()).await;
     }
