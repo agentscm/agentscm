@@ -1,6 +1,6 @@
 # Local validation attestations
 
-> **Experimental (alpha).** Unix only, GitHub only, trusted-local. The verifier workflow has not been qualified against live GitHub, and no key is enrolled yet, so no attestation verifies today (until one is, same-repository pull requests need `ci-extended` for hosted test coverage).
+> **Experimental (alpha).** Unix only, GitHub only, trusted-local. One maintainer key is enrolled. The verifier workflow was qualified before merge by running it under `act` against live GitHub on pull request #86: a signed failure (`failure` on that head), then a fix and a signed pass (`success` on the new head), with tampered, wrong-repository and other-head attestations giving `pending`. Its first run on GitHub-hosted Actions happens after merge. Contributors without an enrolled key or local PostgreSQL and S3 request `ci-extended` for hosted test coverage.
 
 A maintainer can run the repository's gate on their own machine and attach a signed, Git-bound record of the result to a pull request. A separate verifier workflow checks that record and publishes the `agentscm/local-validation` commit status. For pull requests from branches in this repository, this attestation is the expected evidence for the test gate: the expensive hosted suites no longer run on ordinary updates. See [Hosted CI and required checks](#hosted-ci-and-required-checks).
 
@@ -21,7 +21,7 @@ A maintainer can run the repository's gate on their own machine and attach a sig
 ## Maintainer workflow
 
 1. Create a key with `agentscm agent-task key-generate` (owner-private file).
-2. Enroll the public key in `.github/local-validation/registry.json` by a reviewed pull request. The shipped registry has no issuers, so nothing verifies until this happens.
+2. Enroll the public key in `.github/local-validation/registry.json` by a reviewed pull request. Only enrolled, unrevoked and unexpired keys verify; revoke by setting `revoked_at_ms` in a reviewed change.
 3. On a clean checkout of the PR head, run `git fetch origin main` (the merge-base is computed against the local `origin/main`), start the PostgreSQL and S3 test services, then run `agentscm local-validation run --recipe .github/local-validation/recipe.json --policy .github/local-validation/policy.json --registry .github/local-validation/registry.json --key-file KEY --issuer-id ID --state-dir DIR`. `run` has no defaults for the recipe, policy or registry; pass all three. Note the printed envelope digest. Ctrl-C cancels the running command and signs a failure; that path is implemented but untested interactively.
 4. `local-validation post` the attestation to the PR (it refuses if the PR head differs from the attested commit). Do not post statuses by hand.
 5. The verifier workflow reports the status. If the verifier errors for a PR it posts `error` on that head and the job fails; re-run it. Report `pending` or `failure` as it is.
