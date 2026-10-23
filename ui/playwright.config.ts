@@ -1,5 +1,6 @@
 import { defineConfig, devices } from '@playwright/test'
 
+const uiPort = process.env['AGENTSCM_UI_PORT'] ?? '5184'
 const desktop = { viewport: { width: 1360, height: 900 } }
 const mobileSpec = /mobile\.spec\.ts/
 
@@ -11,7 +12,7 @@ export default defineConfig({
   timeout: 60_000,
   expect: { timeout: 10_000 },
   reporter: [['list']],
-  use: { baseURL: 'http://127.0.0.1:5184', trace: 'retain-on-failure' },
+  use: { baseURL: `http://127.0.0.1:${uiPort}`, trace: 'retain-on-failure' },
   projects: [
     // Desktop: the whole suite in all three engines.
     { name: 'chromium', use: { ...devices['Desktop Chrome'], ...desktop }, testIgnore: mobileSpec },
@@ -21,5 +22,5 @@ export default defineConfig({
     { name: 'mobile-chrome', use: { ...devices['Pixel 7'] }, testMatch: mobileSpec },
     { name: 'mobile-safari', use: { ...devices['iPhone 14'] }, testMatch: mobileSpec },
   ],
-  webServer: { command: 'npx vite --port 5184 --strictPort', url: 'http://127.0.0.1:5184', reuseExistingServer: true, timeout: 60_000 },
+  webServer: { command: `npx vite --port ${uiPort} --strictPort`, url: `http://127.0.0.1:${uiPort}`, reuseExistingServer: true, timeout: 60_000 },
 })
