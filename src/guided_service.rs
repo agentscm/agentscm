@@ -541,6 +541,20 @@ pub fn source_diff(engine: &Engine, left: &str, right: &str, limit: usize) -> Re
     inspection_diff(engine, left, right, limit, MAX_SCAN_PAGES)
 }
 
+/// Readable file bytes for JSON: `<prefix>text` when valid UTF-8, otherwise
+/// `<prefix>base64` (standard alphabet). Nothing is added for an absent side.
+pub fn content_fields(target: &mut Value, prefix: &str, bytes: Option<&[u8]>) {
+    use base64::Engine as _;
+    let Some(bytes) = bytes else { return };
+    match std::str::from_utf8(bytes) {
+        Ok(text) => target[format!("{prefix}text")] = json!(text),
+        Err(_) => {
+            target[format!("{prefix}base64")] =
+                json!(base64::engine::general_purpose::STANDARD.encode(bytes));
+        }
+    }
+}
+
 // The Engine bounds traversal work separately from changed-entry count. Empty
 // pages can still advance over unchanged source and must not end inspection.
 fn inspection_diff(
@@ -601,7 +615,10 @@ fn inspection_diff(
                 },
                 None => None,
             };
-            let mut item = json!({"path":entry.path,"before_sha256":entry.before,"after_sha256":entry.after,"before_bytes":before,"after_bytes":after});
+            let mut item =
+                json!({"path":entry.path,"before_sha256":entry.before,"after_sha256":entry.after,});
+            content_fields(&mut item, "before_", before.as_deref());
+            content_fields(&mut item, "after_", after.as_deref());
             // Kinds appear only for non-regular sides, as in `DiffEntry`.
             for (name, kind) in [
                 ("before_kind", entry.before_kind),
@@ -680,6 +697,14 @@ mod tests {
         assert!(full["continuation"].is_null());
     }
     #[test]
+    fn content_fields_use_text_for_utf8_and_base64_otherwise() {
+        let mut v = json!({});
+        content_fields(&mut v, "x_", Some("hi \u{e9}".as_bytes()));
+        content_fields(&mut v, "y_", Some(&[0, 255, 16]));
+        content_fields(&mut v, "z_", None);
+        assert_eq!(v, json!({"x_text":"hi \u{e9}","y_base64":"AP8Q"}));
+    }
+    #[test]
     fn inspection_caps_each_side_before_allocation_and_the_combined_payload() {
         for (before_len, after_len, complete) in [
             (256 * 1024 + 1, 1, false),
@@ -712,11 +737,11 @@ mod tests {
             assert_eq!(diff["complete"], complete);
             if complete {
                 assert_eq!(
-                    diff["entries"][0]["before_bytes"].as_array().unwrap().len(),
+                    diff["entries"][0]["before_text"].as_str().unwrap().len(),
                     before_len
                 );
                 assert_eq!(
-                    diff["entries"][0]["after_bytes"].as_array().unwrap().len(),
+                    diff["entries"][0]["after_text"].as_str().unwrap().len(),
                     after_len
                 );
             } else {
@@ -766,6 +791,6 @@ mod tests {
         let link = find("link");
         assert_eq!(link["before_kind"], "symlink");
         assert_eq!(link["after_kind"], "symlink");
-        assert_eq!(link["after_bytes"], json!(b"new".to_vec()));
+        assert_eq!(link["after_text"], "new");
     }
 }

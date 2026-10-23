@@ -394,6 +394,16 @@ fn exact_context(view: &Value, id: &str, criterion: &str, source_check: bool) {
         assert_eq!(context["required_evidence"], json!([]));
     }
 }
+/// Decode `read` output: `text` (UTF-8) or `base64`.
+fn read_bytes(v: &Value) -> Vec<u8> {
+    use base64::Engine as _;
+    match v["text"].as_str() {
+        Some(t) => t.as_bytes().to_vec(),
+        None => base64::engine::general_purpose::STANDARD
+            .decode(text(&v["base64"]))
+            .unwrap(),
+    }
+}
 fn exact_diff(view: &Value, before: &Files, after: &Files) {
     assert_eq!(view["diff"]["complete"], true);
     let expected: BTreeSet<_> = before
@@ -408,12 +418,17 @@ fn exact_diff(view: &Value, before: &Files, after: &Files) {
     for entry in entries {
         let path = text(&entry["path"]);
         assert!(actual.insert(path.to_owned()));
-        assert_eq!(
-            entry["before_bytes"],
-            json!(before.get(path)),
-            "before {path}"
-        );
-        assert_eq!(entry["after_bytes"], json!(after.get(path)), "after {path}");
+        for (side, files) in [("before_", before), ("after_", after)] {
+            let mut want = json!({});
+            agentscm::guided_service::content_fields(
+                &mut want,
+                side,
+                files.get(path).map(|b| b.as_slice()),
+            );
+            for key in [format!("{side}text"), format!("{side}base64")] {
+                assert_eq!(entry.get(&key), want.get(&key), "{key} {path}");
+            }
+        }
         assert_eq!(
             entry["before_sha256"],
             json!(before.get(path).map(|b| native_blob_id(b)))
@@ -439,7 +454,7 @@ fn exact_tree(cli: &Cli, mirror: &Path, oid: &str, revision: &str, expected: &Fi
         let path = std::str::from_utf8(&entry[tab + 1..]).unwrap().to_owned();
         let bytes = git(&cli.root, mirror, &["cat-file", "blob", fields[2]]);
         assert!(actual.insert(path.clone(), bytes.clone()).is_none());
-        assert_eq!(cli.ok(&["read", revision, &path])["content"], json!(bytes));
+        assert_eq!(read_bytes(&cli.ok(&["read", revision, &path])), bytes);
     }
     assert_eq!(&actual, expected, "full path/mode/byte/deletion equality");
 }
@@ -1110,8 +1125,8 @@ fn independent_cli_roundtrip_and_quiesced_recovery() {
     for (path, bytes) in &after_two {
         assert_eq!(fs::read(restored_workspace.join(path)).unwrap(), *bytes);
         assert_eq!(
-            restored.ok(&["read", text(&two["context"]["revision"]), path])["content"],
-            json!(bytes)
+            read_bytes(&restored.ok(&["read", text(&two["context"]["revision"]), path])),
+            *bytes
         );
     }
     assert!(!restored_workspace.join("docs/obsolete.txt").exists());

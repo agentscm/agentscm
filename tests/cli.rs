@@ -88,7 +88,7 @@ fn init_checkpoint_and_read_are_machine_readable() {
     let request = data_dir.path().join("checkpoint.json");
     fs::write(
         &request,
-        r#"{"parent":null,"changes":[{"path":"hello.txt","content":[104,105]}]}"#,
+        r#"{"parent":null,"changes":[{"path":"hello.txt","content":[104,105]},{"path":"bin.dat","content":[0,255,16]}]}"#,
     )
     .unwrap();
     let checkpoint = agentscm(
@@ -114,7 +114,10 @@ fn init_checkpoint_and_read_are_machine_readable() {
         "{}",
         String::from_utf8_lossy(&read.stderr)
     );
-    assert_eq!(json_output(&read)["content"], serde_json::json!([104, 105]));
+    assert_eq!(json_output(&read)["text"], "hi");
+    let bin = json_output(&agentscm(&data_dir, &["read", &revision, "bin.dat"]));
+    assert_eq!(bin["base64"], "AP8Q");
+    assert!(bin.get("text").is_none() && bin.get("content").is_none());
 }
 
 #[test]

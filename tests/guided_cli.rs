@@ -153,7 +153,7 @@ fn guided_multiple_checkpoints_exact_diff_explicit_approval_and_two_serial_chang
             .as_array()
             .unwrap()
             .iter()
-            .any(|e| e["after_bytes"] == json!([111, 110, 101]))
+            .any(|e| e["after_text"] == "one")
     );
     fail(
         &data,
@@ -1303,8 +1303,8 @@ fn guided_inspection_follows_unchanged_scan_pages_before_exact_approval_and_land
     let entries = view["diff"]["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["path"], path);
-    assert_eq!(entries[0]["before_bytes"], json!(b"before".to_vec()));
-    assert_eq!(entries[0]["after_bytes"], json!(b"after".to_vec()));
+    assert_eq!(entries[0]["before_text"], "before");
+    assert_eq!(entries[0]["after_text"], "after");
     let t = view["inspection"].as_str().unwrap();
     ok(
         &data,
