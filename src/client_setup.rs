@@ -142,7 +142,7 @@ fn object<'a>(parent: &'a mut Map<String, Value>, key: &str) -> Result<&'a mut M
 fn check_mcp_entry(existing: &Value, root: &Path) -> Result<()> {
     if existing["args"] != mcp_args(root)? || existing["url"].is_string() {
         return Err(invalid(
-            "this file already has an AgentSCM MCP entry (a repository set up with `agentscm init-repo` gives its agents MCP through AGENTSCM_HUB_TOKEN); the hub's Connect agents page cannot verify this checkout through it, and `client setup` left it unchanged. To let `client setup` manage it instead, remove only the `agentscm` entry from this file and rerun",
+            "this file already has an `agentscm` MCP entry that `client setup` did not write, so it was left unchanged; remove only that entry and rerun to let `client setup` manage it",
         ));
     }
     Ok(())
@@ -390,17 +390,9 @@ fn codex_mcp(root: &Path, program: &Path) -> Result<Edit> {
 fn plan(agent: Agent, root: &Path, program: &Path) -> Result<Vec<Edit>> {
     program_text(program)?;
     let mut edits = match agent {
-        Agent::Claude => {
-            let mut edits = Vec::new();
-            if !committed_claude_mcp(root)? {
-                edits.push(json_edit(root, ".mcp.json", |v| {
-                    add_typed_mcp(v, "mcpServers", root, program, "stdio")
-                })?);
-            }
-            let user = crate::client_plugin::claude_config_dir(root)?.join("settings.json");
-            edits.extend(block_committed_hooks(root, &user)?);
-            edits
-        }
+        Agent::Claude => vec![json_edit(root, ".mcp.json", |v| {
+            add_typed_mcp(v, "mcpServers", root, program, "stdio")
+        })?],
         Agent::Codex => vec![codex_mcp(root, program)?],
         Agent::Cursor => vec![
             json_edit(root, ".cursor/mcp.json", |v| {
@@ -468,193 +460,6 @@ fn plan(agent: Agent, root: &Path, program: &Path) -> Result<Vec<Edit>> {
         }
     }
     Ok(edits)
-}
-
-fn strict_json(path: &Path) -> Result<Value> {
-    read(path)?.map_or(Ok(Value::Null), |text| {
-        serde_json::from_str(&text).map_err(|_| {
-            invalid(&format!(
-                "{} is not strict JSON; review it before setup",
-                path.display()
-            ))
-        })
-    })
-}
-
-/// `init-repo`'s committed entry, which Claude Code's local MCP scope outranks by name.
-fn committed_claude_mcp(root: &Path) -> Result<bool> {
-    let value = strict_json(&local_path(root, ".mcp.json")?)?;
-    Ok(crate::init_cli::is_claude_mcp(
-        &value["mcpServers"]["agentscm"],
-    ))
-}
-
-fn http_hooks(settings: &Value) -> impl Iterator<Item = &Value> {
-    settings["hooks"]
-        .as_object()
-        .into_iter()
-        .flat_map(|events| events.values())
-        .filter_map(Value::as_array)
-        .flatten()
-        .filter_map(|group| group["hooks"].as_array())
-        .flatten()
-        .filter(|hook| hook["type"] == "http")
-}
-
-/// Claude Code merges hooks across settings files and cannot drop one, so `init-repo`'s
-/// committed HTTP hooks are blocked for this machine instead; the plugin's command hooks
-/// replace them. `allowedHttpHookUrls` arrays merge, so another allowlist would reopen them.
-fn block_committed_hooks(root: &Path, user: &Path) -> Result<Option<Edit>> {
-    let project = strict_json(&local_path(root, ".claude/settings.json")?)?;
-    if !http_hooks(&project).any(crate::init_cli::is_claude_hook) {
-        return Ok(None);
-    }
-    let user = strict_json(user)?;
-    for settings in [&project, &user] {
-        if settings.get("allowedHttpHookUrls").is_some() {
-            return Err(invalid(
-                "Claude Code settings already set allowedHttpHookUrls, so client setup cannot keep the committed AgentSCM HTTP hooks from running beside its plugin hooks; review that setting before setup",
-            ));
-        }
-        if http_hooks(settings).any(|hook| !crate::init_cli::is_claude_hook(hook)) {
-            return Err(invalid(
-                "Claude Code settings have HTTP hooks that AgentSCM did not write; client setup would block them together with the committed AgentSCM HTTP hooks, so review them before setup",
-            ));
-        }
-    }
-    json_edit(root, ".claude/settings.local.json", |value| {
-        if http_hooks(value).next().is_some()
-            || value
-                .get("allowedHttpHookUrls")
-                .is_some_and(|urls| *urls != json!([]))
-        {
-            return Err(invalid(
-                "local HTTP hook settings need review before client setup blocks the committed AgentSCM HTTP hooks",
-            ));
-        }
-        value
-            .as_object_mut()
-            .ok_or_else(|| invalid("native configuration must be an object"))?
-            .insert("allowedHttpHookUrls".into(), json!([]));
-        Ok(())
-    })
-    .map(Some)
-}
-
-fn local_mcp_server(root: &Path, program: &Path) -> Result<Value> {
-    let mut server = mcp(root, program)?;
-    server["type"] = json!("stdio");
-    Ok(server)
-}
-
-/// This checkout's `agentscm` entry in Claude Code's local scope (`~/.claude.json`).
-fn local_claude_mcp(root: &Path) -> Result<Option<Value>> {
-    local_entry(&claude_global_config()?, root)
-}
-
-fn claude_global_config() -> Result<PathBuf> {
-    std::env::var_os("CLAUDE_CONFIG_DIR")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(|dir| PathBuf::from(dir).join(".claude.json"))
-        .ok_or_else(|| invalid("HOME and CLAUDE_CONFIG_DIR are not set"))
-}
-
-fn local_entry(path: &Path, root: &Path) -> Result<Option<Value>> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let value: Value = serde_json::from_str(&text).map_err(|_| {
-        invalid(&format!(
-            "{} is not strict JSON; review it before setup",
-            path.display()
-        ))
-    })?;
-    let root = root
-        .to_str()
-        .ok_or_else(|| invalid("checkout path is not UTF-8"))?;
-    Ok(value["projects"][root]["mcpServers"]
-        .get("agentscm")
-        .cloned())
-}
-
-/// Whether the local entry is already current; one AgentSCM did not write is refused.
-fn check_local_mcp(root: &Path, server: &Value) -> Result<bool> {
-    current_entry(local_claude_mcp(root)?, root, server)
-}
-
-fn current_entry(existing: Option<Value>, root: &Path, server: &Value) -> Result<bool> {
-    match existing {
-        None => Ok(false),
-        Some(existing) if existing == *server => Ok(true),
-        Some(existing) if existing["args"] == mcp_args(root)? => Ok(false),
-        Some(_) => Err(invalid(
-            "Claude Code's local MCP scope for this checkout already has an `agentscm` server that AgentSCM did not write; review it with `claude mcp get agentscm`, remove it with `claude mcp remove --scope local agentscm` if it is stale, and rerun",
-        )),
-    }
-}
-
-fn claude_mcp(root: &Path, args: &[&str], server: &Value) -> Result<()> {
-    let manual = || {
-        format!(
-            "run this from {}, then rerun client setup:\n  claude mcp add-json --scope local agentscm {}",
-            root.display(),
-            shell_quote(&server.to_string())
-        )
-    };
-    let status = std::process::Command::new("claude")
-        .args(args)
-        .current_dir(root)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .status()
-        .map_err(|_| {
-            invalid(&format!(
-                "could not run `claude`; install Claude Code, or {}",
-                manual()
-            ))
-        })?;
-    if !status.success() {
-        return Err(invalid(&format!(
-            "Claude Code could not update its local MCP server; resolve the CLI error, or {}",
-            manual()
-        )));
-    }
-    Ok(())
-}
-
-fn install_local_mcp(root: &Path, program: &Path) -> Result<()> {
-    let server = local_mcp_server(root, program)?;
-    if check_local_mcp(root, &server)? {
-        return Ok(());
-    }
-    if local_claude_mcp(root)?.is_some() {
-        claude_mcp(
-            root,
-            &["mcp", "remove", "--scope", "local", "agentscm"],
-            &server,
-        )?;
-    }
-    claude_mcp(
-        root,
-        &[
-            "mcp",
-            "add-json",
-            "--scope",
-            "local",
-            "agentscm",
-            &server.to_string(),
-        ],
-        &server,
-    )?;
-    if local_claude_mcp(root)?.as_ref() != Some(&server) {
-        return Err(invalid(
-            "Claude Code did not record the expected local MCP server; check `claude mcp get agentscm` and rerun client setup",
-        ));
-    }
-    println!("Configured Claude Code local MCP server agentscm");
-    Ok(())
 }
 
 fn tracked(root: &Path, relative: &str) -> Result<bool> {
@@ -753,7 +558,7 @@ fn check_other_hooks(agent: Agent, root: &Path) -> Result<()> {
                 })
             {
                 return Err(invalid(&format!(
-                    "{}: another AgentSCM native hook or plugin is enabled (for example one written by `agentscm init-repo`); review its migration, or remove that file's AgentSCM entries, before setup",
+                    "{}: another AgentSCM native hook or plugin is enabled; review its migration, or remove that file's AgentSCM entries, before setup",
                     path.display()
                 )));
             }
@@ -771,13 +576,7 @@ fn installation_lock() -> Result<std::fs::File> {
 pub(crate) fn preflight(agent: Agent, root: &Path) -> Result<()> {
     let _lock = installation_lock()?;
     check_other_hooks(agent, root)?;
-    let program = std::env::current_exe()?;
-    plan(agent, root, &program)?;
-    if agent == Agent::Claude && committed_claude_mcp(root)? {
-        let server = local_mcp_server(root, &program)?;
-        check_local_mcp(root, &server)?;
-        claude_mcp(root, &["--version"], &server)?;
-    }
+    plan(agent, root, &std::env::current_exe()?)?;
     if agent == Agent::Codex {
         crate::client_plugin::preflight_for_root(root)?;
     }
@@ -839,22 +638,14 @@ fn write_plan(root: &Path, edits: Vec<Edit>) -> Result<()> {
 pub(crate) fn install(agent: Agent, root: &Path) -> Result<()> {
     let _lock = installation_lock()?;
     check_other_hooks(agent, root)?;
-    let program = std::env::current_exe()?;
-    let edits = plan(agent, root, &program)?;
+    let edits = plan(agent, root, &std::env::current_exe()?)?;
     if agent == Agent::Codex {
         crate::client_plugin::install_for_root(root)?;
     }
     if agent == Agent::Claude {
         crate::client_plugin::install_claude_for_root(root)?;
     }
-    let blocked = edits
-        .iter()
-        .any(|edit| edit.relative == ".claude/settings.local.json");
     write_plan(root, edits)?;
-    let committed = agent == Agent::Claude && committed_claude_mcp(root)?;
-    if committed {
-        install_local_mcp(root, &program)?;
-    }
     println!(
         "Native {} hooks, coordination skill and checkout-scoped MCP are configured.",
         agent.name()
@@ -862,16 +653,6 @@ pub(crate) fn install(agent: Agent, root: &Path) -> Result<()> {
     println!(
         "Review the client's own project, hook and MCP approvals, then start a fresh session and verify it reaches the expected repository. Setup does not grant trust."
     );
-    if committed {
-        println!(
-            "Committed AgentSCM files are unchanged. On this machine Claude Code uses the local-scope `agentscm` MCP server instead of the one in .mcp.json."
-        );
-    }
-    if blocked {
-        println!(
-            "All HTTP hooks are now blocked in this checkout on this machine (\"allowedHttpHookUrls\": [] in .claude/settings.local.json), so the committed AgentSCM hooks do not run beside the plugin's. To undo, delete that line; then disable the plugin with `claude plugin disable agentscm@agentscm-claude-client` so the two hook sets do not both run."
-        );
-    }
     println!(
         "New local settings are Git-excluded. Review changes to any settings your repository already tracks; do not commit machine-specific configuration."
     );
@@ -1126,154 +907,28 @@ mod tests {
         )));
     }
 
-    /// The `.mcp.json` entry and hooks `init-repo` commits for Claude Code.
-    fn commit_init_repo_claude(root: &Path) -> (String, String) {
-        let hub = "https://hub.example.test";
-        let mcp = json!({"mcpServers":{"agentscm":{"type":"http","url":format!("{hub}/mcp"),
-            "headers":{"Authorization":"Bearer ${AGENTSCM_HUB_TOKEN}"}}}});
-        let hooks: Map<String, Value> = crate::init_cli::claude_hook_groups(hub, None)
-            .into_iter()
-            .map(|(event, group)| (event.to_owned(), json!([group])))
-            .collect();
-        let mcp = serde_json::to_string_pretty(&mcp).unwrap();
-        let settings = serde_json::to_string_pretty(&json!({ "hooks": hooks })).unwrap();
-        std::fs::create_dir(root.join(".claude")).unwrap();
-        std::fs::write(root.join(".mcp.json"), &mcp).unwrap();
-        std::fs::write(root.join(".claude/settings.json"), &settings).unwrap();
-        assert!(
-            std::process::Command::new("git")
-                .args(["add", ".mcp.json", ".claude/settings.json"])
-                .current_dir(root)
-                .status()
-                .unwrap()
-                .success()
-        );
-        (mcp, settings)
-    }
-
     #[test]
-    fn init_repo_claude_files_stay_committed_and_only_their_http_hooks_are_blocked_locally() {
+    fn init_repo_output_never_conflicts_with_client_setup() {
         let (_dir, root) = repo();
-        let (mcp, settings) = commit_init_repo_claude(&root);
-        let user = root.join("no-user-settings.json");
-        assert!(committed_claude_mcp(&root).unwrap());
-        for _ in 0..2 {
-            let edit = block_committed_hooks(&root, &user).unwrap().unwrap();
-            write_plan(&root, vec![edit]).unwrap();
-        }
-        assert_eq!(
-            std::fs::read_to_string(root.join(".mcp.json")).unwrap(),
-            mcp
-        );
-        assert_eq!(
-            std::fs::read_to_string(root.join(".claude/settings.json")).unwrap(),
-            settings
-        );
-        let local: Value = serde_json::from_str(
-            &std::fs::read_to_string(root.join(".claude/settings.local.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(local, json!({"allowedHttpHookUrls": []}));
-        assert!(
-            std::process::Command::new("git")
-                .args(["check-ignore", "-q", ".claude/settings.local.json"])
-                .current_dir(&root)
-                .status()
-                .unwrap()
-                .success()
-        );
-        // Without init-repo's hooks nothing is blocked.
-        let (_dir, plain) = repo();
-        assert!(block_committed_hooks(&plain, &user).unwrap().is_none());
-        assert!(!committed_claude_mcp(&plain).unwrap());
-    }
-
-    #[test]
-    fn hooks_and_allowlists_agentscm_did_not_write_still_refuse_the_local_block() {
-        let foreign = json!({"type":"http","url":"https://other.example.test/hook"});
-        let cases = [
-            (
-                ".claude/settings.json",
-                None,
-                Some(json!({"allowedHttpHookUrls":["https://*"]})),
-            ),
-            ("user", Some(json!({"allowedHttpHookUrls":[]})), None),
-            (
-                "user",
-                Some(json!({"hooks":{"Stop":[{"hooks":[foreign.clone()]}]}})),
-                None,
-            ),
-            (
-                ".claude/settings.local.json",
-                None,
-                Some(json!({"allowedHttpHookUrls":["https://*"]})),
-            ),
-            (
-                ".claude/settings.local.json",
-                None,
-                Some(json!({"hooks":{"Stop":[{"hooks":[foreign.clone()]}]}})),
-            ),
-        ];
-        for (file, user_settings, repo_settings) in cases {
-            let (_dir, root) = repo();
-            let (_, settings) = commit_init_repo_claude(&root);
-            let user = root.join("user-settings.json");
-            if let Some(value) = user_settings {
-                std::fs::write(&user, value.to_string()).unwrap();
-            }
-            if let Some(mut value) = repo_settings {
-                if file == ".claude/settings.json" {
-                    value["hooks"] =
-                        serde_json::from_str::<Value>(&settings).unwrap()["hooks"].clone();
-                }
-                std::fs::write(root.join(file), value.to_string()).unwrap();
-            }
-            assert!(block_committed_hooks(&root, &user).is_err(), "{file}");
-        }
-        // A committed hook set that is not exactly init-repo's is left to the plugin preflight.
-        let (_dir, root) = repo();
-        commit_init_repo_claude(&root);
-        let mut value: Value = serde_json::from_str(
-            &std::fs::read_to_string(root.join(".claude/settings.json")).unwrap(),
-        )
-        .unwrap();
-        value["hooks"]["PreToolUse"][0]["hooks"]
-            .as_array_mut()
+        let written = crate::init_cli::run_in(&root, None, &crate::prompt::Ui { yes: true })
             .unwrap()
-            .push(foreign);
-        std::fs::write(root.join(".claude/settings.json"), value.to_string()).unwrap();
-        assert!(block_committed_hooks(&root, &root.join("none.json")).is_err());
-    }
-
-    #[test]
-    fn local_mcp_entry_is_ours_or_refused() {
-        let root = Path::new("/work/repo");
-        let server = local_mcp_server(root, Path::new("/new/agentscm")).unwrap();
-        assert_eq!(server["type"], "stdio");
-        assert_eq!(server["args"], mcp_args(root).unwrap());
-        assert!(!current_entry(None, root, &server).unwrap());
-        assert!(current_entry(Some(server.clone()), root, &server).unwrap());
-        let old = local_mcp_server(root, Path::new("/old/agentscm")).unwrap();
-        assert!(!current_entry(Some(old), root, &server).unwrap());
-        let foreign = json!({"type":"stdio","command":"other","args":[]});
-        assert!(current_entry(Some(foreign), root, &server).is_err());
-
-        let dir = tempfile::tempdir().unwrap();
-        let config = dir.path().join(".claude.json");
-        assert_eq!(local_entry(&config, root).unwrap(), None);
-        std::fs::write(
-            &config,
-            json!({"projects":{"/work/repo":{"mcpServers":{"agentscm":server}},
-                "/work/other":{"mcpServers":{"agentscm":{"command":"x"}}}}})
-            .to_string(),
-        )
-        .unwrap();
-        assert_eq!(local_entry(&config, root).unwrap(), Some(server));
-        std::fs::write(&config, "{not json").unwrap();
-        assert!(local_entry(&config, root).is_err());
-        // Someone else's `.mcp.json` entry is not init-repo's and keeps the old refusal.
-        let entry = json!({"type":"http","url":"https://hub.example.test/mcp","headers":{"Authorization":"Bearer secret"}});
-        assert!(!crate::init_cli::is_claude_mcp(&entry));
+            .written;
+        assert!(!written.is_empty());
+        for agent in [
+            Agent::Claude,
+            Agent::Codex,
+            Agent::Cursor,
+            Agent::Copilot,
+            Agent::Gemini,
+        ] {
+            let edits = plan(agent, &root, Path::new("/opt/agentscm")).unwrap();
+            assert!(
+                edits
+                    .iter()
+                    .all(|edit| written.iter().all(|path| path != Path::new(edit.relative))),
+                "{agent:?}"
+            );
+        }
     }
 
     #[test]

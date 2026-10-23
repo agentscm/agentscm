@@ -467,8 +467,7 @@ fn another_agentscm_plugin(listed: &Value) -> Result<bool> {
     }))
 }
 
-/// `committed` skips `init-repo`'s Claude HTTP hooks, which `client setup` blocks locally.
-fn has_agentscm_hooks(path: &Path, committed: bool) -> Result<bool> {
+fn has_agentscm_hooks(path: &Path) -> Result<bool> {
     use std::io::Read;
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
@@ -494,15 +493,14 @@ fn has_agentscm_hooks(path: &Path, committed: bool) -> Result<bool> {
         .filter_map(|group| group["hooks"].as_array())
         .flatten()
         .any(|hook| {
-            !(committed && crate::init_cli::is_claude_hook(hook))
-                && (hook["url"]
-                    .as_str()
-                    .is_some_and(|url| url.contains("/v1/hub/hook/"))
-                    || ["command", "command_windows"].iter().any(|key| {
-                        hook[*key].as_str().is_some_and(|command| {
-                            command.to_ascii_lowercase().contains("agentscm")
-                        })
-                    }))
+            hook["url"]
+                .as_str()
+                .is_some_and(|url| url.contains("/v1/hub/hook/"))
+                || ["command", "command_windows"].iter().any(|key| {
+                    hook[*key]
+                        .as_str()
+                        .is_some_and(|command| command.to_ascii_lowercase().contains("agentscm"))
+                })
         }))
 }
 
@@ -515,7 +513,7 @@ fn check_existing_hooks(root: &Path) -> Result<()> {
         root.join(".codex/hooks.json"),
         codex_home.join("hooks.json"),
     ] {
-        if has_agentscm_hooks(&path, false)? {
+        if has_agentscm_hooks(&path)? {
             return Err(invalid(
                 "existing AgentSCM Codex command hooks were found; review and remove only their old entries before rerunning client setup, or keep using them instead of the plugin",
             ));
@@ -524,7 +522,7 @@ fn check_existing_hooks(root: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn claude_config_dir(root: &Path) -> Result<PathBuf> {
+fn claude_config_dir(root: &Path) -> Result<PathBuf> {
     let path = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude")))
@@ -538,12 +536,12 @@ pub(crate) fn claude_config_dir(root: &Path) -> Result<PathBuf> {
 
 fn check_existing_claude_hooks(root: &Path) -> Result<()> {
     let config = claude_config_dir(root)?;
-    for (path, committed) in [
-        (config.join("settings.json"), false),
-        (root.join(".claude/settings.json"), true),
-        (root.join(".claude/settings.local.json"), false),
+    for path in [
+        config.join("settings.json"),
+        root.join(".claude/settings.json"),
+        root.join(".claude/settings.local.json"),
     ] {
-        if has_agentscm_hooks(&path, committed)? {
+        if has_agentscm_hooks(&path)? {
             return Err(invalid(
                 "existing AgentSCM Claude command hooks were found; review and remove only their old entries before installing the plugin to avoid duplicate hooks",
             ));
@@ -1035,32 +1033,23 @@ mod tests {
     fn legacy_hook_guard_preserves_existing_files_and_detects_our_commands() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("hooks.json");
-        assert!(!has_agentscm_hooks(&path, false).unwrap());
+        assert!(!has_agentscm_hooks(&path).unwrap());
         let unrelated = br#"{"hooks":{"PreToolUse":[{"hooks":[{"command":"other-check"}]}]}}"#;
         std::fs::write(&path, unrelated).unwrap();
-        assert!(!has_agentscm_hooks(&path, false).unwrap());
+        assert!(!has_agentscm_hooks(&path).unwrap());
         assert_eq!(std::fs::read(&path).unwrap(), unrelated);
         let legacy = br#"{"hooks":{"PreToolUse":[{"hooks":[{"command":"agentscm hook codex --hub-url https://hub.example.test"}]}]}}"#;
         std::fs::write(&path, legacy).unwrap();
-        assert!(has_agentscm_hooks(&path, false).unwrap());
+        assert!(has_agentscm_hooks(&path).unwrap());
         assert_eq!(std::fs::read(&path).unwrap(), legacy);
         let claude = br#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"/opt/agentscm","args":["--no-telemetry","hook","claude","--client-connection"]}]}]}}"#;
         std::fs::write(&path, claude).unwrap();
-        assert!(has_agentscm_hooks(&path, false).unwrap());
+        assert!(has_agentscm_hooks(&path).unwrap());
         assert_eq!(std::fs::read(&path).unwrap(), claude);
         let http = br#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"http","url":"https://hub.example.test/v1/hub/hook/claude","headers":{"authorization":"Bearer ${AGENTSCM_HOOK_TOKEN}"}}]}]}}"#;
         std::fs::write(&path, http).unwrap();
-        assert!(has_agentscm_hooks(&path, false).unwrap());
+        assert!(has_agentscm_hooks(&path).unwrap());
         assert_eq!(std::fs::read(&path).unwrap(), http);
-        // Only init-repo's exact committed hook is left for client setup to block locally.
-        assert!(has_agentscm_hooks(&path, true).unwrap());
-        let committed = serde_json::to_vec(&json!({"hooks":{"PreToolUse":[{"hooks":[
-            crate::init_cli::claude_hook_groups("https://hub.example.test", None)[0].1["hooks"][0].clone()
-        ]}]}}))
-        .unwrap();
-        std::fs::write(&path, &committed).unwrap();
-        assert!(has_agentscm_hooks(&path, false).unwrap());
-        assert!(!has_agentscm_hooks(&path, true).unwrap());
     }
 
     #[test]
