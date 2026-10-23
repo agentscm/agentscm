@@ -78,7 +78,7 @@ export function ConnectAgent() {
         )}
         {command && <p className="muted small mt-2 mb-0">Then run <code>npx agentscm client check</code> in the checkout (Hub binding only). Verify hooks and MCP from your agent.</p>}
       </details>
-      <p className="muted small mb-0">macOS and Linux. Your agent guides setup; you approve sign-in and trust. Configuration alone is not verification. If this checkout already has hooks from <code>agentscm quickstart</code>, <code>client setup</code> can stop on them; run <code>agentscm uninstall</code> first. A repository set up with <code>agentscm init-repo</code> gets MCP through <code>AGENTSCM_HUB_TOKEN</code>, and this page cannot verify it.</p>
+      <p className="muted small mb-0">macOS and Linux. Your agent guides setup; you approve sign-in and trust. Configuration alone is not verification. If this checkout already has hooks from <code>agentscm quickstart</code>, <code>client setup</code> can stop on them; run <code>agentscm uninstall</code> first. A repository set up with <code>agentscm init-repo</code> gets MCP through <code>AGENTSCM_HUB_TOKEN</code>, and this page cannot verify it, except for Claude Code: there <code>client setup</code> leaves the committed files unchanged, adds its MCP server in Claude Code's local scope and blocks the committed HTTP hooks on this machine so only its plugin hooks run.</p>
     </div>
   )
 }

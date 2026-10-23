@@ -127,41 +127,92 @@ fn yes_without_a_hub_url_or_a_repository_is_an_error() {
 }
 
 #[cfg(unix)]
+fn client_setup(repo: &Path, home: &Path, agent: &str, hub: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_agentscm"))
+        .args(["client", "setup", "--agent", agent, "--hub", hub])
+        .current_dir(repo)
+        .env_clear()
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        // Git but no `claude`, so setup stops before it contacts the hub or Claude Code.
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
+#[cfg(unix)]
+fn git_init() -> (TempDir, TempDir) {
+    let repo = TempDir::new().unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    (repo, TempDir::new().unwrap())
+}
+
+#[cfg(unix)]
 #[test]
 fn client_setup_after_init_repo_names_the_file_and_leaves_it_unchanged() {
-    for (agent, file) in [("claude", ".mcp.json"), ("cursor", ".cursor/mcp.json")] {
-        let (repo, home) = checkout();
-        let hub = "https://hub.example.test";
-        let out = init_repo(
-            repo.path(),
-            home.path(),
-            &["--yes", "--hub-url", hub, "--agents", agent],
-        );
-        assert!(out.status.success(), "{}", stderr(&out));
-        let before = std::fs::read_to_string(repo.path().join(file)).unwrap();
-        let out = Command::new(env!("CARGO_BIN_EXE_agentscm"))
-            .args(["client", "setup", "--agent", agent, "--hub", hub])
-            .current_dir(repo.path())
-            .env_clear()
-            .env("HOME", home.path())
-            .env("XDG_CONFIG_HOME", home.path().join("config"))
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
-        let message = stderr(&out);
-        assert!(!out.status.success());
-        assert!(
-            message.contains(file)
-                && message.contains("AGENTSCM_HUB_TOKEN")
-                && message.contains("Connect agents page cannot verify")
-                && message.contains("remove only the `agentscm` entry"),
-            "{message}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(repo.path().join(file)).unwrap(),
-            before
-        );
-    }
+    let (repo, home) = checkout();
+    let hub = "https://hub.example.test";
+    let out = init_repo(
+        repo.path(),
+        home.path(),
+        &["--yes", "--hub-url", hub, "--agents", "cursor"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let before = std::fs::read_to_string(repo.path().join(".cursor/mcp.json")).unwrap();
+    let out = client_setup(repo.path(), home.path(), "cursor", hub);
+    let message = stderr(&out);
+    assert!(!out.status.success());
+    assert!(
+        message.contains(".cursor/mcp.json")
+            && message.contains("AGENTSCM_HUB_TOKEN")
+            && message.contains("Connect agents page cannot verify")
+            && message.contains("remove only the `agentscm` entry"),
+        "{message}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join(".cursor/mcp.json")).unwrap(),
+        before
+    );
+}
+
+/// Claude Code is no longer refused: its committed files are accepted, and setup needs only
+/// the `claude` CLI to add the local-scope MCP server. Without it, setup prints the command.
+#[cfg(unix)]
+#[test]
+fn claude_client_setup_after_init_repo_accepts_the_committed_files() {
+    let (repo, home) = git_init();
+    let hub = "https://hub.example.test";
+    let out = init_repo(
+        repo.path(),
+        home.path(),
+        &["--yes", "--hub-url", hub, "--agents", "claude"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let files = [".mcp.json", ".claude/settings.json"];
+    let before = files.map(|file| std::fs::read(repo.path().join(file)).unwrap());
+    let out = client_setup(repo.path(), home.path(), "claude", hub);
+    let message = stderr(&out);
+    assert!(!out.status.success());
+    assert!(
+        message.contains("could not run `claude`")
+            && message.contains("claude mcp add-json --scope local agentscm '{")
+            && message.contains("--root")
+            && !message.contains("Connect agents page cannot verify"),
+        "{message}"
+    );
+    assert_eq!(
+        files.map(|file| std::fs::read(repo.path().join(file)).unwrap()),
+        before
+    );
+    assert!(!repo.path().join(".claude/settings.local.json").exists());
 }
 
 #[test]

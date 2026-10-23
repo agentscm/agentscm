@@ -16,7 +16,7 @@ use crate::prompt::Ui;
 mod merge;
 mod targets;
 
-pub(crate) use targets::{TOKEN_VAR, claude_hook_groups};
+pub(crate) use targets::{TOKEN_VAR, claude_hook_groups, is_claude_hook, is_claude_mcp};
 
 const NEEDS_TERMINAL: &str = "agentscm init-repo asks before it writes, and there is no terminal here. \
 To run it without one, pass --yes and choose with flags: --hub-url URL, --agents claude,codex,cursor,copilot,gemini";
@@ -346,7 +346,7 @@ pub(crate) fn print_next_steps(agents: &[Agent], hub: Option<&str>, repo: Option
     );
     println!();
     println!(
-        "In a repository set up with `agentscm init-repo`, MCP works through AGENTSCM_HUB_TOKEN. The hub's Connect agents page cannot verify these checkouts."
+        "In a repository set up with `agentscm init-repo`, MCP works through AGENTSCM_HUB_TOKEN. The hub's Connect agents page cannot verify these checkouts, except for Claude Code: `agentscm client setup --agent claude` adds a local-scope MCP server and plugin hooks on that machine and blocks the committed HTTP hooks there, leaving these files unchanged."
     );
     println!();
     let has = |agent| agents.contains(&agent);

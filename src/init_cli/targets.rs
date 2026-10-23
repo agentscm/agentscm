@@ -129,6 +129,23 @@ pub(crate) fn claude_hook_groups(hub: &str, repo: Option<&str>) -> Vec<(&'static
     ]
 }
 
+/// Whether `hook` is one of `claude_hook_groups`' HTTP hooks, for any hub or repository.
+pub(crate) fn is_claude_hook(hook: &Value) -> bool {
+    hook["type"] == "http"
+        && hook["url"]
+            .as_str()
+            .is_some_and(|url| url.contains("/v1/hub/hook/claude"))
+        && hook["headers"] == json!({"Authorization": format!("Bearer ${TOKEN_VAR}")})
+        && hook["allowedEnvVars"] == json!([TOKEN_VAR])
+}
+
+/// Whether `server` is the Claude Code `.mcp.json` entry written here, for any hub or repository.
+pub(crate) fn is_claude_mcp(server: &Value) -> bool {
+    server["type"] == "http"
+        && server["url"].is_string()
+        && server["headers"] == json!({"Authorization": format!("Bearer ${{{TOKEN_VAR}}}")})
+}
+
 fn claude(hub: &str, repo: Option<&str>) -> Vec<Target> {
     let hooks = claude_hook_groups(hub, repo)
         .into_iter()
@@ -333,6 +350,12 @@ mod tests {
                 "SessionEnd": [{"hooks": [hook]}]
             }})
         );
+        assert!(
+            is_claude_hook(&hook) && is_claude_mcp(&parsed(".mcp.json")["mcpServers"]["agentscm"])
+        );
+        let mut other = hook.clone();
+        other["allowedEnvVars"] = json!(["OTHER_TOKEN"]);
+        assert!(!is_claude_hook(&other));
         assert_eq!(render("CLAUDE.md"), "@AGENTS.md\n");
     }
 
