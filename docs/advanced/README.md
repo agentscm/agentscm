@@ -27,6 +27,7 @@ Capture a Git commit, work and land natively, reconcile with Git and export to a
 
 ## Isolated command checks
 
+- [GitHub merge queues](github-merge-queue.md): experimental workflow status on merge queue groups, with exact-tree rules, lifecycle recovery and read-only ruleset observations.
 - [Local validation attestations](local-validation.md): experimental signed, Git-bound records of a maintainer's local gate, verified by a separate workflow.
 - [Isolated command checks](execution.md): run a declared command against an exact revision in a locked-down container. Not a sandbox for arbitrary hostile code.
 

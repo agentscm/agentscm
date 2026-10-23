@@ -940,8 +940,9 @@ AgentSCM never creates or changes branch protection or rulesets. To make the sta
 binding, the operator must require the `agentscm/workflow/<target>` context in GitHub
 branch protection or rulesets. Where possible pin the required check to the posting
 App or source: anyone with `statuses:write` on the repository can post the same context.
-Merge queue (`merge_group`) is not supported; a required context will block queued
-merges. Verification that a protected branch actually requires the check, and that
+Merge queue groups get the same context on the group commit under stricter
+exact-source rules, for GitHub App connections only; see
+[GitHub merge queues](advanced/github-merge-queue.md). Verification that a protected branch actually requires the check, and that
 raw pushes and administrator bypass are closed, is pending: the Hub reports
 `protection: "unverified"` and does not enforce it. For GitLab see the next subsection. A native
 store that exists only on a laptop cannot be pinned here; signed local attestations
