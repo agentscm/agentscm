@@ -147,6 +147,7 @@ enum Command {
     },
     /// [experimental] Contributor helper: initialize or inspect an explicitly owned local native installation. New users run `agentscm quickstart`.
     #[cfg(unix)]
+    #[command(hide = true)]
     Setup {
         #[command(subcommand)]
         command: setup_cli::SetupCommand,
