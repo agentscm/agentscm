@@ -626,6 +626,8 @@ rollback() {
   fi
   if [ -e "$backup/.agentscm-receipt" ]; then rm -f "$target/.agentscm-receipt"; cp "$backup/.agentscm-receipt" "$target/.agentscm-receipt"; chmod 600 "$target/.agentscm-receipt"; chown 10001:10001 "$target/.agentscm-receipt"; elif [ ! -e "$backup/had-receipt" ]; then rm -f "$target/.agentscm-receipt"; fi
   rm -rf "$next"
+  # A first install's rollback also drops the journal its Hub wrote, so a retry finds no target.
+  if [ ! -s "$backup/old-files" ]; then rm -f "$target/install.sqlite" "$target/install.sqlite-wal" "$target/install.sqlite-shm"; fi
   if [ -d "$target" ] && [ -z "$(find "$target" -mindepth 1 -maxdepth 1 -print -quit)" ]; then rmdir "$target"; fi
   sync -f /data/secrets
   [ ! -d "$target" ] || sync -f "$target"
@@ -711,6 +713,7 @@ if [ -f "$backup/new-files" ]; then while read -r file; do rm -f "$target/$file"
 if [ -f "$backup/old-files" ]; then while read -r file; do rm -f "$target/$file"; cp "$backup/$file" "$target/$file"; chmod 600 "$target/$file"; chown 10001:10001 "$target/$file"; done < "$backup/old-files"; fi
 if [ -e "$backup/.agentscm-receipt" ]; then rm -f "$target/.agentscm-receipt"; cp "$backup/.agentscm-receipt" "$target/.agentscm-receipt"; chmod 600 "$target/.agentscm-receipt"; chown 10001:10001 "$target/.agentscm-receipt"; elif [ ! -e "$backup/had-receipt" ]; then rm -f "$target/.agentscm-receipt"; fi
 rm -rf /data/secrets/.slack-next
+if [ ! -s "$backup/old-files" ]; then rm -f "$target/install.sqlite" "$target/install.sqlite-wal" "$target/install.sqlite-shm"; fi
 if [ -d "$target" ] && [ -z "$(find "$target" -mindepth 1 -maxdepth 1 -print -quit)" ]; then rmdir "$target"; fi
 [ ! -d "$target" ] || sync -f "$target"
 sync -f /data/secrets
@@ -814,6 +817,7 @@ if [ -f "$backup/new-files" ]; then while read -r file; do rm -f "$target/$file"
 if [ -f "$backup/old-files" ]; then while read -r file; do rm -f "$target/$file"; cp "$backup/$file" "$target/$file"; chmod 600 "$target/$file"; chown 10001:10001 "$target/$file"; done < "$backup/old-files"; fi
 if [ -e "$backup/.agentscm-receipt" ]; then rm -f "$target/.agentscm-receipt"; cp "$backup/.agentscm-receipt" "$target/.agentscm-receipt"; chmod 600 "$target/.agentscm-receipt"; chown 10001:10001 "$target/.agentscm-receipt"; elif [ ! -e "$backup/had-receipt" ]; then rm -f "$target/.agentscm-receipt"; fi
 rm -rf "$next" "$backup_stage"
+if [ ! -s "$backup/old-files" ]; then rm -f "$target/install.sqlite" "$target/install.sqlite-wal" "$target/install.sqlite-shm"; fi
 if [ -d "$target" ] && [ -z "$(find "$target" -mindepth 1 -maxdepth 1 -print -quit)" ]; then rmdir "$target"; fi
 [ ! -d "$target" ] || sync -f "$target"
 sync -f /data/secrets
@@ -2612,6 +2616,13 @@ mod tests {
                     .unwrap()
         );
         assert!(ROLLBACK_SLACK.contains("cp \"$backup/$file\" \"$target/$file\""));
+        // A first install's rollback drops the Hub's journal before removing the empty target.
+        for script in [INSTALL_SLACK, ROLLBACK_SLACK, RECOVER_SLACK] {
+            let drop = script
+                .find("then rm -f \"$target/install.sqlite\"")
+                .unwrap();
+            assert!(drop < script.rfind("rmdir \"$target\"").unwrap());
+        }
         assert!(RECOVER_SLACK.contains("agentscm-slack-rollback:%s"));
         assert!(MARK_SLACK_COMMIT.contains("$backup/commit"));
         assert!(COMMIT_SLACK.contains("rm -rf \"$backup\""));

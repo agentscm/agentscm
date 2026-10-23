@@ -556,6 +556,15 @@ impl SlackSwap {
         restore_private_file(&self.receipt, &self.prior_receipt)?;
         std::fs::remove_dir_all(&self.next).ok();
         if self.old_files.is_empty() {
+            // A first install's rollback also drops the journal its Hub wrote, so a retry
+            // finds no Slack directory without an ownership record.
+            for journal in ["install.sqlite", "install.sqlite-wal", "install.sqlite-shm"] {
+                match std::fs::remove_file(self.target.join(journal)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
             match self.target.read_dir() {
                 Ok(entries) => {
                     if entries.count() == 0 {
@@ -2314,6 +2323,9 @@ mod tests {
             },
         )
         .unwrap();
+        // The Hub wrote its journal before the first install was rolled back.
+        atomic_private(&target.join("install.sqlite"), "synthetic-journal").unwrap();
+        atomic_private(&target.join("install.sqlite-wal"), "synthetic-journal").unwrap();
         first_swap.as_mut().unwrap().rollback().unwrap();
         assert!(!target.exists());
         std::fs::remove_dir_all(data.join("secrets/.slack-rollback")).unwrap();
