@@ -19,7 +19,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ github.event.action == 'labeled' && 'label' || 'code' }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ github.event.action == 'labeled' && format('label-{0}', github.event.label.name) || 'code' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:

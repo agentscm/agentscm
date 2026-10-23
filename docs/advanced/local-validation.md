@@ -1,6 +1,6 @@
 # Local validation attestations
 
-> **Experimental (alpha).** Unix only, GitHub only, trusted-local. One maintainer key is enrolled. The verifier workflow was qualified before merge by running it under `act` against live GitHub on pull request #86: a signed failure (`failure` on that head), then a fix and a signed pass (`success` on the new head), with tampered, wrong-repository and other-head attestations giving `pending`. Its first run on GitHub-hosted Actions happens after merge. Contributors without an enrolled key or local PostgreSQL and S3 request `ci-extended` for hosted test coverage.
+> **Experimental (alpha).** Unix only, GitHub only, trusted-local. One maintainer key is enrolled. The verifier workflow was qualified before merge by running it under `act` against live GitHub on pull request #86: a signed failure (`failure` on that head), then a fix and a signed pass (`success` on the new head). Tampered, wrong-repository and other-head attestations were checked with `local-validation verify` against the same live comment bodies and gave `pending`. Its first run on GitHub-hosted Actions happens after merge. Contributors without an enrolled key or local PostgreSQL and S3 request `ci-extended` for hosted test coverage.
 
 A maintainer can run the repository's gate on their own machine and attach a signed, Git-bound record of the result to a pull request. A separate verifier workflow checks that record and publishes the `agentscm/local-validation` commit status. For pull requests from branches in this repository, this attestation is the expected evidence for the test gate: the expensive hosted suites no longer run on ordinary updates. See [Hosted CI and required checks](#hosted-ci-and-required-checks).
 
@@ -34,7 +34,7 @@ Automatic on every pull request update: `CI / static` (formatting and clippy), d
 
 - Same-repository pull requests: the `CI / tests` job (hosted PostgreSQL and S3), Windows, container, hub end-to-end and live execution run only while the pull request has the `ci-extended` label, on labeling and on each later update. The attestation replaces them otherwise. If you have no enrolled key or services, say so in the pull request and request `ci-extended` instead of claiming coverage.
 - Fork pull requests cannot carry an attestation. `CI / tests` stays automatic; a maintainer adds `ci-extended` after reading the change to run the extended jobs once against that head.
-- Pushes to `main` still run every suite, so release provenance is unchanged: `release.yml` relies on main CI and rebuilds and smoke-tests itself.
+- Pushes to `main` still run every suite, and `release.yml` independently rebuilds and smoke-tests the tagged commit, so release provenance is unchanged.
 - To request hosted coverage on demand, add `ci-extended` or run the workflow with `workflow_dispatch` on the branch.
 
 The `main` ruleset has no required status checks today (it requires no deletion, no non-fast-forward, signed commits and a pull request). Skipped jobs report as skipped and path-filtered workflows may not report at all. If a requirement is added, require only `CI / static` and `agentscm/local-validation`; never require a label-gated job.
@@ -60,4 +60,4 @@ Every attestation records these as not covered: ignored tests, Windows, containe
 
 ## Not done
 
-Hosted jobs are gated on the `ci-extended` label, not on the presence of an attestation, so a pull request with neither runs no hosted test suite. The verifier status is not a required check, and live GitHub qualification is pending.
+Hosted jobs are gated on the `ci-extended` label, not on the presence of an attestation, so a pull request with neither runs no hosted test suite. The verifier status is not a required check, and qualification on GitHub-hosted Actions is pending until the verifier runs from `main`.
