@@ -2,6 +2,7 @@ name: CI
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
   push:
     branches: [main]
   workflow_dispatch:
@@ -10,14 +11,33 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ github.event.action == 'labeled' && format('label-{0}', github.event.label.name) || 'code' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  linux:
+  # Formatting and lint: on every trigger, including `labeled`, so a label event never records a
+  # skipped `static` run that a required check would count as passing.
+  static:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install # reads rust-toolchain.toml
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  # Hosted tests with PostgreSQL and S3. Always on push to main and manual runs. For a pull request:
+  # fork PRs run on opened, synchronize and reopened (they cannot carry a local validation
+  # attestation); same-repository PRs rely on a signed local validation attestation and run here only
+  # with the `ci-extended` label (on labeling, then on every later update while it stays).
+  tests:
+    if: ${{ github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'ci-extended' && github.event.pull_request.head.repo.full_name == github.repository) || (github.event.action != 'labeled' && (github.event.pull_request.head.repo.full_name != github.repository || contains(github.event.pull_request.labels.*.name, 'ci-extended'))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -43,8 +63,6 @@ jobs:
         with:
           tool: nextest@0.9.148
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets --locked -- -D warnings
       - name: Generate throwaway S3 credentials
         run: |
           access=$(openssl rand -hex 10)

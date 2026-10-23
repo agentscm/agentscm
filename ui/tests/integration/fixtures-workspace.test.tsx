@@ -136,6 +136,36 @@ describe('signed-in overview', () => {
 })
 
 describe('capability gating', () => {
+  it('task-only profiles inspect empty server history and keep native admission without start controls', async () => {
+    const sent = stubHub(
+      withCaps({ approve_revisions: true, integrate_revisions: true }),
+      (url, init) => path(url) === '/repositories' && !isWrite(init) ? fromMock(url, init, (body) => ({
+        ...body,
+        repositories: [{
+          repository_id: 'acme/widgets',
+          profiles: [{
+            profile_id: 'quality-gate',
+            target: 'main',
+            requirement_digest: SUBJECT.requirement_digest,
+            server_execution: false,
+            readiness: 'configured',
+            limitations: 'Agent-owned tasks only.',
+          }],
+        }],
+      })) : undefined,
+      (url, init) => path(url) === `/repositories/${REPO}/runs` && !isWrite(init) ? json(200, { runs: [], next_cursor: null }) : undefined,
+    )
+    const subject = await openComposerWithSubject()
+    expect(screen.getByText('No server-executed runs yet')).toBeTruthy()
+    expect(screen.getByText(/Task qualification is recorded through agent-owned tasks/)).toBeTruthy()
+    expect(within(subject).queryByRole('button', { name: /Start workflow/ })).toBeNull()
+    expect(within(subject).getByText(/agent-owned task qualification only/)).toBeTruthy()
+    expect(within(subject).getByRole('button', { name: /Approve revision/ })).toBeTruthy()
+    expect(within(subject).getByRole('button', { name: /Land revision/ })).toBeTruthy()
+    expect(sent.some((request) => request.url === `/v1/hub/workspace/repositories/${REPO}/runs?limit=20`)).toBe(true)
+    expect(writes(sent)).toEqual([])
+  })
+
   it('without execute_workflows: no Start or Cancel buttons, and a note why', async () => {
     stubHub(withCaps({ execute_workflows: false }), (url, init) => (path(url) === `/repositories/${REPO}/runs` && !isWrite(init) ? json(200, { runs: [startRun(SUBJECT, 'running')], next_cursor: null }) : undefined))
     const subject = await openComposerWithSubject()

@@ -258,6 +258,7 @@ function Execution({ session }: { session: WorkspaceSession }) {
   const [chosenRepo, setChosenRepo] = useState<string | null>(null)
   const repositoryId = chosenRepo ?? repositories?.[0]?.repository_id ?? null
   const repository = repositories?.find((r) => r.repository_id === repositoryId)
+  const repositoryCanExecute = repository?.profiles.some((profile) => profile.server_execution) === true
   const [runCursors, setRunCursors] = useState<string[]>([''])
   const runCursor = runCursors.at(-1) ?? ''
   const [refresh, setRefresh] = useState(0)
@@ -326,7 +327,7 @@ function Execution({ session }: { session: WorkspaceSession }) {
         {runs.kind === 'loading' && <Skeleton rows={3} />}
         {runs.kind === 'error' && <Notice title={pollError(runs)} />}
         {runs.kind === 'ready' && (runs.value.runs.length === 0 ? (
-          <Empty icon="inbox" title="No workspace runs yet">Open New run below to load a Change and start its configured workflow.</Empty>
+          <Empty icon="inbox" title="No server-executed runs yet">{repositoryCanExecute ? 'Open New run below to load a Change and start its configured workflow.' : 'This repository has agent-owned task profiles but no server executor. Task qualification is recorded through agent-owned tasks, not workspace run history.'}</Empty>
         ) : (
           <ul className="run-list">
             {runs.value.runs.map((r) => (
@@ -531,10 +532,12 @@ function Composer({ session, repository, onStarted }: { session: WorkspaceSessio
               <dt>Review context <Explain text="Digest of the review context the approval and landing are bound to." /></dt><dd><code>{subject.context_digest}</code></dd>
               <dt>Requirement <Explain text="Digest of the profile requirement this run must satisfy." /></dt><dd><code>{subject.requirement_digest}</code></dd>
             </dl>
-            {canExecute ? (
+            {canExecute && profile.server_execution ? (
               <button type="button" className="btn btn-primary" disabled={busy !== null || profile.readiness !== 'configured'} onClick={() => void start()}>
                 {busy === 'start' ? <span className="spinner-border spinner-border-sm" aria-hidden="true" /> : <Icon name="play-fill" />} {pendingStart ? 'Retry same start request' : 'Start workflow'}
               </button>
+            ) : canExecute ? (
+              <p className="small muted">This profile supports agent-owned task qualification only; no server workflow executor is configured.</p>
             ) : (
               <p className="small muted">Starting runs requires the contributor role.</p>
             )}

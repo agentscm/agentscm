@@ -2,7 +2,13 @@
 use super::*;
 use agentscm::attached_worktree::AttachmentState;
 use agentscm::hub::workspace::{MemberChange, Workspace, WorkspaceActor, WorkspaceConfig};
+use agentscm::hub::workspace_execution::source::{
+    ContextDeclaration, SOURCE_TRANSFER_VERSION, SourceProfile, SourceTransfer,
+    SourceTransferRequest, SourceTransferState,
+};
+use agentscm::hub::workspace_execution::{ExecutionState, StartRequest, WorkspaceRun};
 use agentscm::skill_workflow::CollectorTransfer;
+use agentscm::sync;
 use std::collections::BTreeMap;
 use std::time::Duration;
 use workspace_hub::EnvStorage;
@@ -15,6 +21,136 @@ struct Entry {
     sha256: String,
 }
 type Manifest = BTreeMap<PathBuf, Entry>;
+
+pub(super) struct RecoveryQueueState {
+    run: WorkspaceRun,
+    transfer: SourceTransfer,
+}
+
+pub(super) fn stage_optional_server_recovery(
+    root: &Path,
+    native: &NativeSourceProfile,
+    workspace: Arc<Workspace>,
+    actor: &WorkspaceActor,
+) -> (Arc<ExecutionService>, RecoveryQueueState) {
+    let template_context_digest = native.context.digest().unwrap();
+    let source = SourceProfile {
+        repository_id: native.profile.repository_id.clone(),
+        profile_id: native.profile.profile_id.clone(),
+        template_context_digest: template_context_digest.clone(),
+    };
+    let config_path = root.join("recovery-config.json");
+    fs::write(
+        &config_path,
+        serde_json::to_vec(&json!({
+            "version":1,
+            "profiles":[{
+                "repository_id":native.profile.repository_id,
+                "profile_id":native.profile.profile_id,
+                "native_repository":native.profile.native_repository,
+                "data_dir":native.profile.data_dir,
+                "target":native.profile.target,
+                "requirement_digest":native.profile.requirement_digest,
+                "docker":native.profile.docker,
+                "docker_socket":native.profile.docker_socket,
+                "claude":native.profile.claude
+            }],
+            "source_profiles":[{
+                "repository_id":source.repository_id,
+                "profile_id":source.profile_id,
+                "template_context_digest":template_context_digest
+            }],
+            "agent_task_profiles":[],
+            "attached_publication_profiles":[]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let queue_path = root.join("recovery-execution.sqlite");
+    let service = Arc::new(
+        ExecutionService::open(
+            &queue_path,
+            ExecutionConfig::from_file(&config_path).unwrap(),
+            workspace,
+        )
+        .unwrap(),
+    );
+    let run = service
+        .start(
+            actor,
+            &native.profile.repository_id,
+            StartRequest {
+                request_id: "cold-queued-server-run".into(),
+                expected_generation: actor.generation(),
+                profile_id: native.profile.profile_id.clone(),
+                subject: native.subject.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(run.state, ExecutionState::Queued);
+    assert!(run.receipt.is_none());
+
+    let engine = Engine::open(&native.profile.data_dir).unwrap();
+    let offer = sync::source_offer(
+        &engine,
+        &native.profile.native_repository,
+        std::slice::from_ref(&native.subject.revision),
+    )
+    .unwrap();
+    let transfer = service
+        .source_offer(
+            actor,
+            &native.profile.repository_id,
+            &native.profile.profile_id,
+            SourceTransferRequest {
+                version: SOURCE_TRANSFER_VERSION,
+                request_id: "cold-interrupted-source-admission".into(),
+                expected_generation: actor.generation(),
+                source_repository: native.profile.native_repository.clone(),
+                source_change: "cold-recovery-source".into(),
+                source_revision: native.subject.revision.clone(),
+                expected_change_version: 0,
+                context: ContextDeclaration {
+                    intent: native.context.intent.clone(),
+                    acceptance_criteria: native.context.acceptance_criteria.clone(),
+                    scope: native.context.scope.clone(),
+                    exclusions: native.context.exclusions.clone(),
+                    omissions: native.context.omissions.clone(),
+                },
+                offer,
+            },
+        )
+        .unwrap();
+    assert_eq!(transfer.state, SourceTransferState::AwaitingUpload);
+
+    // Inject the durable state immediately after bundle acceptance and before native
+    // admission. This qualifies reopen classification, not an actual SIGKILL boundary.
+    let mut interrupted = transfer.clone();
+    interrupted.state = SourceTransferState::Importing;
+    interrupted.detail = "Injected durable recovery state at the source-admission boundary".into();
+    let connection = rusqlite::Connection::open(&queue_path).unwrap();
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE workspace_source_transfers SET state='importing',transfer_json=?1,bundle_sha256=?2,body_bytes=1,reserved_bytes=1 WHERE transfer_id=?3 AND state='awaiting_upload'",
+                rusqlite::params![
+                    serde_json::to_vec(&interrupted).unwrap(),
+                    "0".repeat(64),
+                    interrupted.transfer_id
+                ],
+            )
+            .unwrap(),
+        1
+    );
+    drop(connection);
+    (
+        service,
+        RecoveryQueueState {
+            run,
+            transfer: interrupted,
+        },
+    )
+}
 
 fn inventory(root: &Path) -> Result<Manifest, &'static str> {
     fn visit(root: &Path, path: &Path, result: &mut Manifest) -> Result<(), &'static str> {
@@ -203,6 +339,7 @@ pub(super) fn sync_config(root: &Path) -> agentscm::hub::sync::SyncConfig {
 struct Restored {
     env: Env,
     publication: agentscm::hub::HubState,
+    recovery: Arc<ExecutionService>,
     task: tokio::task::JoinHandle<()>,
     base: String,
 }
@@ -214,6 +351,7 @@ impl Restored {
             .unwrap();
         assert!(result.is_ok() || result.unwrap_err().is_cancelled());
         drop(self.publication);
+        drop(self.recovery);
         self.env.stop().await
     }
 }
@@ -237,6 +375,14 @@ async fn reopen(storage: EnvStorage, root: &Path) -> Restored {
         )
         .unwrap(),
     );
+    let recovery = Arc::new(
+        ExecutionService::open(
+            &root.join("recovery-execution.sqlite"),
+            ExecutionConfig::from_file(&root.join("recovery-config.json")).unwrap(),
+            env.workspace.clone(),
+        )
+        .unwrap(),
+    );
     let publication = agentscm::hub::HubState::new(
         env.store.clone(),
         Arc::new(agentscm::backend::LocalBackend::open(root.join("publication-objects")).unwrap()),
@@ -254,6 +400,7 @@ async fn reopen(storage: EnvStorage, root: &Path) -> Restored {
     Restored {
         env,
         publication,
+        recovery,
         task,
         base: format!("http://{address}"),
     }
@@ -297,6 +444,7 @@ pub(super) async fn qualify(
     publication_id: &str,
     forge_request: &Value,
     recovery: &Value,
+    recovery_queue: &RecoveryQueueState,
     docker_home: &Path,
 ) {
     let external = tempfile::tempdir().unwrap();
@@ -362,6 +510,8 @@ pub(super) async fn qualify(
         PathBuf::from("collector.key"),
         PathBuf::from("agent.token"),
         PathBuf::from("publication-config.json"),
+        PathBuf::from("recovery-config.json"),
+        PathBuf::from("recovery-execution.sqlite"),
         PathBuf::from("sync-config.json"),
         PathBuf::from("publication.pat"),
         PathBuf::from("synthetic-git-credential.json"),
@@ -450,6 +600,63 @@ pub(super) async fn qualify(
     for restart in 0..2 {
         let restored = reopen(storage, root.path()).await;
         let env = &restored.env;
+        let recovered_run = restored
+            .recovery
+            .get(
+                &actor,
+                &recovery_queue.run.repository_id,
+                &recovery_queue.run.run_id,
+            )
+            .unwrap();
+        assert_eq!(recovered_run.state, ExecutionState::Unknown);
+        assert_eq!(recovered_run.receipt, None);
+        assert_eq!(recovered_run.run_id, recovery_queue.run.run_id);
+        assert_eq!(
+            recovered_run.generation,
+            recovery_queue.run.generation + 1,
+            "only the first reopen may record the Unknown transition"
+        );
+        assert_eq!(recovered_run.subject, recovery_queue.run.subject);
+        assert!(recovered_run.detail.contains("will not be replayed"));
+        let recovered_transfer = restored
+            .recovery
+            .source_transfer(
+                &actor,
+                &recovery_queue.transfer.repository_id,
+                &recovery_queue.transfer.profile_id,
+                &recovery_queue.transfer.transfer_id,
+            )
+            .unwrap();
+        assert_eq!(recovered_transfer.state, SourceTransferState::Unknown);
+        assert_eq!(recovered_transfer.subject, None);
+        assert_eq!(
+            recovered_transfer.transfer_id,
+            recovery_queue.transfer.transfer_id
+        );
+        assert_eq!(
+            recovered_transfer.request_id,
+            recovery_queue.transfer.request_id
+        );
+        assert_eq!(
+            recovered_transfer.input_revision,
+            recovery_queue.transfer.input_revision
+        );
+        assert!(recovered_transfer.detail.contains("will not be replayed"));
+        assert!(!restored.recovery.process_next().unwrap());
+        let recovery_db =
+            rusqlite::Connection::open(root.path().join("recovery-execution.sqlite")).unwrap();
+        assert_eq!(
+            recovery_db
+                .query_row(
+                    "SELECT count(*) FROM workspace_run_events WHERE run_id=?1 AND event='unknown'",
+                    [&recovery_queue.run.run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "a second restart must not append another recovery transition"
+        );
+        drop(recovery_db);
         let path = format!(
             "{REPO}/profiles/checks/attachments/{}/publication",
             attachments[0].id

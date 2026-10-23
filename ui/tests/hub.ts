@@ -2,8 +2,8 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
-// Both runners start in this package directory (jsdom's import.meta.url is not a file URL).
-const seed = `${resolve(process.cwd(), '../dev-seed')}/`
+// Both runners start in ui/, the package directory (jsdom’s import.meta.url is not a file URL).
+const seed = `${resolve(process.cwd(), 'dev-seed')}/`
 
 function envFile(path: string): Record<string, string> {
   try {
@@ -134,3 +134,14 @@ export async function freshHandoff(m: string): Promise<{ file: string; release: 
 }
 
 export const marker = () => `m${crypto.randomUUID().replaceAll('-', '').slice(0, 12)}`
+
+/** A publication the seeder recorded (`publication <id> <branch>` lines): the first one, or the one on `branch`; '' when none. */
+export function seededPublication(branch?: string): string {
+  try {
+    const rows = readFileSync(`${seed}.data/publications.txt`, 'utf8').split('\n').map((line) => line.split(' '))
+    const row = branch ? rows.find((r) => r[2] === branch) : rows[0]
+    return row?.[1] ?? ''
+  } catch {
+    return ''
+  }
+}

@@ -38,7 +38,7 @@ test('tapping the dimmed page closes the drawer', async ({ page }) => {
 
 test('every page fits the phone width', async ({ page }) => {
   await signIn(page)
-  for (const hash of ['#now', '#work', '#work/coordination', '#activity', '#workflows', '#workspace', '#setup', '#health', '#settings']) {
+  for (const hash of ['#now', '#work', '#work/coordination', '#activity', '#workflows', '#landed', '#templates', '#timeline', '#workspace', '#setup', '#health', '#settings']) {
     await page.evaluate((h) => (window.location.hash = h), hash)
     await expect(page.locator('#main')).not.toBeEmpty()
     expect(await noSideScroll(page), hash).toBe(true)

@@ -11,17 +11,18 @@ permissions:
   contents: read
 
 concurrency:
-  group: container-${{ github.ref }}-${{ github.event.action == 'labeled' && 'label' || 'code' }}
+  group: container-${{ github.ref }}-${{ github.event.action == 'labeled' && format('label-{0}', github.event.label.name) || 'code' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   docker:
     # Gate for cost and abuse control, not isolation: fork code can run on any hosted runner, which is
-    # ephemeral and has a read-only token and no secrets. Same-repository pull requests, pushes and
-    # manual runs always pass. A fork pull request runs this job only when a maintainer adds the
-    # `ci-extended` label, once per labelling and against the head at that moment; pushing again
-    # does not re-run it. Remove and re-add the label to run it again.
-    if: ${{ github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'ci-extended') || (github.event.action != 'labeled' && github.event.pull_request.head.repo.full_name == github.repository) }}
+    # ephemeral and has a read-only token and no secrets. Pushes to main and manual runs always pass.
+    # A pull request runs this job only when a maintainer adds the `ci-extended` label (same-repository
+    # PRs rely on a local validation attestation otherwise). A fork PR runs once per labelling, against
+    # the head at that moment; pushing again does not re-run it. A same-repository PR also re-runs on
+    # each update while the label stays. Remove and re-add the label to run a fork PR again.
+    if: ${{ github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'ci-extended') || (github.event.action != 'labeled' && github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'ci-extended')) }}
     strategy:
       fail-fast: false
       matrix:

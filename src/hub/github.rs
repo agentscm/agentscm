@@ -667,11 +667,24 @@ impl Api {
         full_name: &str,
         number: i64,
     ) -> Gh<Vec<(i64, String, String)>> {
+        Ok(self
+            .comments_pages(token, full_name, number, MAX_COMMENT_PAGES)
+            .await?
+            .0)
+    }
+
+    /// Like [`comments`](Self::comments) over up to `max_pages` pages; true when pages were left unread.
+    pub async fn comments_pages(
+        &self,
+        token: &str,
+        full_name: &str,
+        number: i64,
+        max_pages: u32,
+    ) -> Gh<(Vec<(i64, String, String)>, bool)> {
         let path = format!("/repos/{full_name}/issues/{number}/comments");
-        let paged = self
-            .paged(token, &path, None, MAX_COMMENT_PAGES, None)
-            .await?;
-        Ok(paged
+        let paged = self.paged(token, &path, None, max_pages, None).await?;
+        let truncated = paged.as_ref().is_some_and(|p| p.unread > 0);
+        let comments = paged
             .map(|p| p.items)
             .unwrap_or_default()
             .iter()
@@ -683,7 +696,8 @@ impl Api {
                     c["body"].as_str()?.to_owned(),
                 ))
             })
-            .collect())
+            .collect();
+        Ok((comments, truncated))
     }
 
     pub async fn create_comment(

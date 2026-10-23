@@ -20,6 +20,7 @@ work=$(mktemp -d)
 run_id=${requested_run_id:-${work##*/}}
 name=agentscm-smoke-$run_id
 vol=$name-data
+repo_vol=$name-repo
 for container in "$name" "$name-hub"; do
   if docker container inspect "$container" >/dev/null 2>&1; then
     rm -rf "$work"
@@ -27,7 +28,7 @@ for container in "$name" "$name-hub"; do
     exit 2
   fi
 done
-for volume in "$vol" "$vol-hub"; do
+for volume in "$vol" "$vol-hub" "$repo_vol"; do
   if docker volume inspect "$volume" >/dev/null 2>&1; then
     rm -rf "$work"
     echo "refusing to reuse existing smoke-test volume $volume" >&2
@@ -36,7 +37,7 @@ for volume in "$vol" "$vol-hub"; do
 done
 cleanup() {
   docker rm -f "$name" "$name-hub" >/dev/null 2>&1 || true
-  docker volume rm "$vol" "$vol-hub" >/dev/null 2>&1 || true
+  docker volume rm "$vol" "$vol-hub" "$repo_vol" >/dev/null 2>&1 || true
   rm -rf "$work"
 }
 trap cleanup EXIT
@@ -49,22 +50,32 @@ ldd_out=$(docker run --rm --network none --entrypoint /usr/bin/ldd "$image" /usr
 grep -q 'libc\.so' <<<"$ldd_out"
 
 # Two branches editing the same file must be reported by collisions.
-git init -q -b main "$work/repo"
-git -C "$work/repo" config user.email smoke@example.com
-git -C "$work/repo" config user.name smoke
-echo base >"$work/repo/f"
-git -C "$work/repo" add f
-git -C "$work/repo" commit -q -m base
-for b in a b; do
-  git -C "$work/repo" checkout -q -b "$b" main
-  echo "$b" >>"$work/repo/f"
-  git -C "$work/repo" commit -q -am "$b"
-done
-# Same user as the host so Git's ownership check passes; read-write because merge-tree writes objects.
-out=$(docker run --rm --network none --user "$(id -u):$(id -g)" -v "$work/repo:/repo" "$image" collisions --git-dir /repo --base main)
+# Named volumes start as root-owned, so provision this synthetic fixture for the image's fixed identity.
+docker run --rm --network none --user 0:0 --entrypoint chown -v "$repo_vol:/repo" "$image" 10001:10001 /repo
+docker run --rm --network none --entrypoint /bin/sh -v "$repo_vol:/repo" "$image" -c '
+  set -eu
+  git init -q -b main /repo
+  git -C /repo config user.email smoke@example.com
+  git -C /repo config user.name smoke
+  echo base >/repo/f
+  git -C /repo add f
+  git -C /repo commit -q -m base
+  for b in a b; do
+    git -C /repo checkout -q -b "$b" main
+    echo "$b" >>/repo/f
+    git -C /repo commit -q -am "$b"
+  done
+'
+# The writable volume lets merge-tree create temporary objects and report a content conflict.
+out=$(docker run --rm --network none -v "$repo_vol:/repo" "$image" collisions --git-dir /repo --base main)
 grep -q '"level":"conflict"' <<<"$out"
 # A read-only mount still works but degrades to path-level warnings (merge-tree cannot write).
-out=$(docker run --rm --network none --user "$(id -u):$(id -g)" -v "$work/repo:/repo:ro" "$image" collisions --git-dir /repo --base main)
+if docker run --rm --network none --entrypoint /bin/sh -v "$repo_vol:/repo:ro" "$image" -c \
+  'printf object | git -C /repo hash-object -w --stdin >/dev/null 2>&1'; then
+  echo "read-only Git fixture unexpectedly accepted an object write" >&2
+  exit 1
+fi
+out=$(docker run --rm --network none -v "$repo_vol:/repo:ro" "$image" collisions --git-dir /repo --base main)
 grep -q '"level":"same-file"' <<<"$out"
 
 docker run --rm -v "$vol:/data" "$image" --data-dir /data init

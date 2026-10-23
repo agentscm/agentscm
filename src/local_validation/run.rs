@@ -1,0 +1,290 @@
+//! Unix producer and Git observation. Git is only ever asked read-only questions;
+//! recipe commands run as the signing user with a cleared, allowlisted environment (HOME is passed).
+
+use std::os::unix::process::CommandExt;
+use std::path::Path;
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+use sha2::{Digest, Sha256};
+
+use super::{
+    CommandResult, GitValidationContext, GitValidationSubject, Services, StopReason,
+    ValidationPolicy, ValidationRecipe, ValidationRecord,
+};
+use crate::execution::Cancellation;
+use crate::execution::process::{Stop, capture_with_input};
+use crate::{Error, Result};
+
+const GIT_TIMEOUT: Duration = Duration::from_secs(60);
+const GIT_OUTPUT: u64 = 16 * 1024 * 1024;
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const PROBE_OUTPUT: u64 = 64 * 1024;
+/// Retained bytes per recipe command, stdout and stderr together.
+pub const COMMAND_OUTPUT_LIMIT: u64 = 16 * 1024 * 1024;
+const ENV_ALLOWLIST: [&str; 8] = [
+    "PATH",
+    "HOME",
+    "USER",
+    "TMPDIR",
+    "LANG",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "CARGO_TARGET_DIR",
+];
+const S3_VARS: [&str; 4] = [
+    "AGENTSCM_TEST_S3_ENDPOINT",
+    "AGENTSCM_TEST_S3_BUCKET",
+    "AGENTSCM_TEST_S3_ACCESS_KEY_ID",
+    "AGENTSCM_TEST_S3_SECRET_ACCESS_KEY",
+];
+
+fn sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn allowlisted(command: &mut Command) {
+    command.env_clear();
+    for (key, value) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if ENV_ALLOWLIST.contains(&&*name) || name.starts_with("AGENTSCM_TEST_") {
+            command.env(key, value);
+        }
+    }
+}
+
+fn git(repo: &Path, args: &[&str], limit: u64) -> Result<Vec<u8>> {
+    let mut command = Command::new("git");
+    command
+        .env_clear()
+        .env("LC_ALL", "C")
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .arg("-C")
+        .arg(repo)
+        .args(["--no-optional-locks", "-c", "core.fsmonitor=false"])
+        .args(args)
+        .process_group(0);
+    let out = capture_with_input(
+        &mut command,
+        None,
+        GIT_TIMEOUT,
+        limit,
+        &Cancellation::default(),
+    )?;
+    if out.stop.is_some() || out.code != Some(0) {
+        return Err(Error::Invalid(format!(
+            "git {} failed",
+            args.first().copied().unwrap_or("")
+        )));
+    }
+    Ok(out.stdout)
+}
+
+fn git_line(repo: &Path, args: &[&str]) -> Result<String> {
+    let out = git(repo, args, 4096)?;
+    Ok(String::from_utf8_lossy(&out).trim().to_owned())
+}
+
+fn rev(repo: &Path, name: &str, suffix: &str) -> Result<String> {
+    if name.starts_with('-') || name.contains('\0') {
+        return Err(Error::Invalid("revision must not start with '-'".into()));
+    }
+    git_line(repo, &["rev-parse", "--verify", &format!("{name}{suffix}")])
+}
+
+/// What Git says about a head and its base, read-only.
+pub struct GitState {
+    pub commit: String,
+    pub tree: String,
+    pub base_tip: String,
+    pub merge_base: String,
+}
+
+pub fn observe(repo: &Path, head: &str, base_rev: &str) -> Result<GitState> {
+    let commit = rev(repo, head, "^{commit}")?;
+    let base_tip = rev(repo, base_rev, "^{commit}")?;
+    Ok(GitState {
+        tree: rev(repo, &commit, "^{tree}")?,
+        merge_base: git_line(repo, &["merge-base", &commit, &base_tip])?,
+        commit,
+        base_tip,
+    })
+}
+
+fn is_clean(repo: &Path) -> Result<bool> {
+    Ok(git(
+        repo,
+        &["status", "--porcelain", "--untracked-files=normal"],
+        GIT_OUTPUT,
+    )?
+    .is_empty())
+}
+
+/// Digest of `path` at `commit`; a file the commit does not contain is an error.
+fn file_digest(repo: &Path, commit: &str, path: &str) -> Result<String> {
+    git(repo, &["show", &format!("{commit}:{path}")], GIT_OUTPUT)
+        .map(|bytes| sha256(&bytes))
+        .map_err(|_| Error::Invalid(format!("{path} cannot be read at the commit")))
+}
+
+/// Captured bytes of one command, exactly those the record's digests cover.
+pub struct CommandOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+pub struct Produced {
+    pub record: ValidationRecord,
+    /// One entry per `record.results`, in order.
+    pub outputs: Vec<CommandOutput>,
+    pub cargo_lock_sha256: String,
+    pub toolchain_file_sha256: String,
+}
+
+fn probe(repo: &Path, argv: &[&str]) -> String {
+    let mut command = Command::new(argv[0]);
+    allowlisted(&mut command);
+    command.args(&argv[1..]).current_dir(repo).process_group(0);
+    let line = capture_with_input(
+        &mut command,
+        None,
+        PROBE_TIMEOUT,
+        PROBE_OUTPUT,
+        &Cancellation::default(),
+    )
+    .ok()
+    .filter(|c| c.stop.is_none() && c.code == Some(0))
+    .and_then(|c| {
+        String::from_utf8_lossy(&c.stdout)
+            .lines()
+            .next()
+            .map(|l| l.chars().take(512).collect::<String>())
+    })
+    .filter(|l| !l.is_empty());
+    line.unwrap_or_else(|| format!("{}: unavailable", argv.join(" ")))
+}
+
+fn run_command(
+    repo: &Path,
+    id: &str,
+    argv: &[String],
+    timeout_secs: u64,
+    cancel: &Cancellation,
+) -> (CommandResult, CommandOutput) {
+    let mut command = Command::new(&argv[0]);
+    allowlisted(&mut command);
+    command.args(&argv[1..]).current_dir(repo).process_group(0);
+    let started = Instant::now();
+    let captured = capture_with_input(
+        &mut command,
+        None,
+        Duration::from_secs(timeout_secs),
+        COMMAND_OUTPUT_LIMIT,
+        cancel,
+    );
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let spawn_failed = captured.is_err();
+    let (code, stdout, stderr, stop) = match captured {
+        Ok(c) => (c.code, c.stdout, c.stderr, c.stop),
+        Err(_) => (None, vec![], vec![], None),
+    };
+    let reason = match stop {
+        Some(Stop::Timeout) => StopReason::TimedOut,
+        Some(Stop::Output) => StopReason::OutputLimit,
+        Some(Stop::Cancelled) => StopReason::Cancelled,
+        Some(Stop::Io) => StopReason::IoError,
+        None if spawn_failed => StopReason::SpawnFailed,
+        // No exit code without a stop: the child died to a signal.
+        None if code.is_none() => StopReason::IoError,
+        None => StopReason::Exited,
+    };
+    let result = CommandResult {
+        id: id.into(),
+        argv: argv.to_vec(),
+        exit_code: if reason == StopReason::Exited {
+            code
+        } else {
+            None
+        },
+        stop: reason,
+        duration_ms,
+        stdout_sha256: sha256(&stdout),
+        stderr_sha256: sha256(&stderr),
+        truncated: reason == StopReason::OutputLimit,
+    };
+    (result, CommandOutput { stdout, stderr })
+}
+
+/// Runs the recipe in `repo` (which must be clean) until the first failure.
+/// Only commands that actually ran are recorded. `cancel` stops the running command and the run.
+pub fn produce(
+    repo: &Path,
+    recipe: &ValidationRecipe,
+    policy: &ValidationPolicy,
+    base_ref: &str,
+    base_rev: &str,
+    cancel: &Cancellation,
+) -> Result<Produced> {
+    let recipe_sha256 = recipe.sha256()?;
+    if recipe_sha256 != policy.recipe_sha256 {
+        return Err(Error::Invalid("recipe differs from the policy".into()));
+    }
+    if !is_clean(repo)? {
+        return Err(Error::Invalid("working tree is not clean".into()));
+    }
+    let state = observe(repo, "HEAD", base_rev)?;
+    let cargo_lock_sha256 = file_digest(repo, &state.commit, "Cargo.lock")?;
+    let toolchain_file_sha256 = file_digest(repo, &state.commit, "rust-toolchain.toml")?;
+    let (mut results, mut outputs) = (Vec::new(), Vec::new());
+    for c in &recipe.commands {
+        let (result, output) = run_command(repo, &c.id, &c.argv, c.timeout_secs, cancel);
+        let ok = result.stop == StopReason::Exited && result.exit_code == Some(0);
+        results.push(result);
+        outputs.push(output);
+        if !ok {
+            break;
+        }
+    }
+    let toolchain = [
+        &["rustc", "-V"][..],
+        &["cargo", "-V"],
+        &["cargo", "nextest", "--version"],
+        &["git", "--version"],
+    ]
+    .iter()
+    .map(|argv| probe(repo, argv))
+    .collect();
+    // A failed re-check must not drop the run: it is recorded as a changed tree.
+    let after = observe(repo, "HEAD", base_rev).ok();
+    let unchanged = after
+        .as_ref()
+        .is_some_and(|a| a.commit == state.commit && a.tree == state.tree)
+        && is_clean(repo).unwrap_or(false);
+    let var_set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
+    Ok(Produced {
+        outputs,
+        cargo_lock_sha256,
+        toolchain_file_sha256,
+        record: ValidationRecord {
+            subject: GitValidationSubject {
+                repository: policy.repository.clone(),
+                commit: state.commit.clone(),
+                tree: state.tree.clone(),
+            },
+            context: GitValidationContext {
+                base_ref: base_ref.into(),
+                merge_base: state.merge_base,
+            },
+            base_tip: state.base_tip,
+            recipe_sha256,
+            results,
+            services: Services {
+                postgres: var_set("AGENTSCM_TEST_DATABASE_URL"),
+                s3: S3_VARS.iter().all(|v| var_set(v)),
+            },
+            platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            toolchain,
+            tree_unchanged_after: unchanged,
+        },
+    })
+}

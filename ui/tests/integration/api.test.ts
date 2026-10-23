@@ -38,7 +38,8 @@ describe.skipIf(!live)('data layer against the live hub', () => {
       expect(i.agent.name).toBeTruthy()
       expect(Array.isArray(i.paths)).toBe(true)
     }
-    expect(work.connected).toBe(false) // no forge in the dev hub
+    // The seeder records a synthetic GitHub connection (for #62's CI/deploy view); nothing reaches GitHub.
+    expect(work.connected).toBe(true)
     const activity = await fetchActivity(repo, READ_TOKEN, signal())
     expect(activity.sessions.length).toBeGreaterThan(0)
     const kinds = new Set(activity.events.map((e) => e.kind))

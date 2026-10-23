@@ -916,6 +916,11 @@ const MIGRATIONS: &[Migration] = &[
         sqlite: include_str!("migrations/0019_work_insights.sqlite.sql"),
         postgres: include_str!("migrations/0019_work_insights.pg.sql"),
     },
+    Migration {
+        version: 20,
+        sqlite: include_str!("migrations/0020_unchecked_holds.sqlite.sql"),
+        postgres: include_str!("migrations/0020_unchecked_holds.pg.sql"),
+    },
 ];
 
 #[derive(Debug)]
@@ -1038,7 +1043,7 @@ mod tests {
             count - 14
         );
         let after_hub_settings = pending(&(1..=18).collect::<Vec<_>>()).unwrap();
-        assert_eq!(after_hub_settings.len(), 1);
+        assert_eq!(after_hub_settings.len(), 2);
         assert_eq!(after_hub_settings[0].version, 19);
         assert!(
             after_hub_settings[0]
@@ -1050,6 +1055,11 @@ mod tests {
                 .postgres
                 .contains("hub_work_model_usage")
         );
+        let after_work_insights = pending(&(1..=19).collect::<Vec<_>>()).unwrap();
+        assert_eq!(after_work_insights.len(), 1);
+        assert_eq!(after_work_insights[0].version, 20);
+        assert!(after_work_insights[0].sqlite.contains("unchecked"));
+        assert!(after_work_insights[0].postgres.contains("unchecked"));
         assert!(
             pending(&(1..=i64::try_from(count).unwrap()).collect::<Vec<_>>())
                 .unwrap()
