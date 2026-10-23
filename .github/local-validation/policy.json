@@ -1,0 +1,1 @@
+{"repository":"github.com/counterbranch/agentscm","recipe_sha256":"861a8d7f5eccc82b89bd4e06a6460cef6c7b7dcbeb67af39e2248d1a5f705504","required_services":{"postgres":true,"s3":true},"max_age_seconds":2592000,"epoch":1}

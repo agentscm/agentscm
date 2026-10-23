@@ -945,7 +945,8 @@ merges. Verification that a protected branch actually requires the check, and th
 raw pushes and administrator bypass are closed, is pending: the Hub reports
 `protection: "unverified"` and does not enforce it. For GitLab see the next subsection. A native
 store that exists only on a laptop cannot be pinned here; signed local attestations
-for that case are tracked separately and are not implemented.
+for that case are not implemented in the Hub. The experimental, Hub-independent
+[local validation attestations](advanced/local-validation.md) are a separate verifier-posted status and do not use this path.
 
 `GET .../publications/{id}` adds a read-only `forge_check` object for a candidate
 publication with a pull request (see the [API notes](api.md#hub-publication-forge-check)).

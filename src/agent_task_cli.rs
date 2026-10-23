@@ -810,7 +810,7 @@ fn key_value(key: &SigningKey) -> Result<Value> {
     }))
 }
 
-fn read_signing_key(path: &Path) -> Result<SigningKey> {
+pub(crate) fn read_signing_key(path: &Path) -> Result<SigningKey> {
     let bytes = read_private_file(path, 32)?;
     let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
         Error::Invalid("collector private key must contain exactly 32 raw bytes".into())
@@ -818,7 +818,7 @@ fn read_signing_key(path: &Path) -> Result<SigningKey> {
     Ok(SigningKey::from_bytes(&bytes))
 }
 
-fn public_hex(key: &SigningKey) -> String {
+pub(crate) fn public_hex(key: &SigningKey) -> String {
     key.verifying_key()
         .to_bytes()
         .iter()
@@ -998,7 +998,7 @@ impl VerifiedPrivateParent {
     }
 }
 
-fn validate_private_directory_metadata(metadata: &fs::Metadata) -> Result<()> {
+pub(crate) fn validate_private_directory_metadata(metadata: &fs::Metadata) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     // SAFETY: geteuid only reads the effective process identity and has no preconditions.
     let owner = unsafe { libc::geteuid() };

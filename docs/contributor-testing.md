@@ -58,6 +58,10 @@ Measure on an otherwise idle host and record the exact revision, operating syste
 
 Report build time separately from each warm execution time, along with test counts, failures, ignored tests, early returns and service availability. Do not claim an improvement from unmatched revisions or environments.
 
+## Local validation attestations
+
+A maintainer may attach a signed record of a local run of this gate to a pull request; see [local validation](advanced/local-validation.md). It is experimental and does not replace the evidence rules above. For same-repository pull requests it is the expected evidence for the test gate: the hosted test suites, Windows, container, hub end-to-end and live execution jobs run only with the `ci-extended` label or a manual `workflow_dispatch`, while `CI / static` and the security checks stay automatic and `main` still runs everything.
+
 ## Resource audit boundaries
 
 At the revision where nextest was introduced, the audit found temporary-directory isolation, ephemeral ports, random PostgreSQL schemas and process-local telemetry state. Those patterns support concurrent execution but do not prove every timing interaction is safe. A source and inventory audit found 109 PostgreSQL fixture tests across ten integration binaries. Every fixture test uses one of four full-name forms selected by the `hub-postgres` group: `on_postgres::*`, `*::postgres`, `postgres_*` or `*_on_postgres`. Future tests that create a `PgSchema` must retain one of those forms. The similarly named SQLite test `on_sqlite::postgres_read_briefings_share_the_repository_maintenance_lock` is deliberately outside the group.
