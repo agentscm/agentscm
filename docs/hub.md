@@ -374,7 +374,10 @@ or a request limit is reached), the reason instead lists the option to ask
 the holder with `agentscm_ask` (path, session and a one-line note) before
 "ask the user".
 
-The refused file is not added to the session's intent. Repeating the edit
+The refused file is not added to the session's intent. A file the session already holds because
+an MCP call (`agentscm_start`, `agentscm_check`) or a hook that runs after the edit named it is
+checked the same way on the session's first refusing edit of it, so an agent that announces its
+files before editing is still refused once. Repeating the edit
 passes and is recorded (`edit_repeated`); the hub never refuses the same file
 twice in a session. A call with several contested files is refused once and
 lists them. At most 3 refusals per session in 10 minutes: past that, edits pass
