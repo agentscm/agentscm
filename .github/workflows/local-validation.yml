@@ -1,0 +1,131 @@
+name: Local validation verifier
+
+# Verifies maintainer-signed local validation attestations posted as PR comments and
+# publishes the verdict as the `agentscm/local-validation` commit status on the exact
+# verified head. It builds only the default branch and treats the PR head purely as Git
+# data (`git fetch`, then `verify`); it never checks out, builds or runs pull request code.
+# Policy, recipe and registry come from the default branch.
+
+on:
+  issue_comment: # zizmor: ignore[dangerous-triggers] default-branch build only; the PR head is fetched as Git data, never built or run
+    types: [created, edited]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number to verify
+        required: true
+        type: number
+  push:
+    branches: [main]
+    paths:
+      - ".agentscm/validation/**"
+
+permissions: {}
+
+concurrency:
+  group: local-validation-${{ github.event.issue.number || inputs.pr || github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    # For comments: only pull request comments that start with the attestation marker.
+    if: ${{ github.event_name != 'issue_comment' || (github.event.issue.pull_request && startsWith(github.event.comment.body, '<!-- agentscm-local-validation:v1 ')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+      - run: rustup toolchain install # reads rust-toolchain.toml
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo build --locked --bin agentscm
+      - name: Verify and publish status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          COMMENT_PR: ${{ github.event.issue.number }}
+          DISPATCH_PR: ${{ inputs.pr }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          marker='<!-- agentscm-local-validation:v1 '
+          cfg=.agentscm/validation
+          repository=$(jq -r .repository "$cfg/policy.json")
+          work=$(mktemp -d)
+
+          post_status() { # sha state description
+            gh api -X POST "repos/$REPO/statuses/$1" \
+              -f state="$2" -f context=agentscm/local-validation \
+              -f description="${3:0:140}" -f target_url="$RUN_URL" > /dev/null
+          }
+
+          verify_pr() {
+            local pr=$1 dir="$work/$1" head base page n=0 args=() out code state
+            mkdir -p "$dir"
+            gh api "repos/$REPO/pulls/$pr" > "$dir/pull.json"
+            head=$(jq -r .head.sha "$dir/pull.json")
+            base=$(jq -r .base.ref "$dir/pull.json")
+            if [[ ! $head =~ ^[0-9a-f]{40}$ || ! $base =~ ^[A-Za-z0-9._/-]+$ ]]; then
+              echo "PR $pr: unexpected head or base; skipped"; return 0
+            fi
+            git fetch --no-tags origin "+refs/heads/$base:refs/remotes/origin/$base"
+            git fetch --no-tags origin "refs/pull/$pr/head"
+            if ! git cat-file -e "$head^{commit}" 2>/dev/null; then
+              post_status "$head" error "head moved while fetching; re-run"; return 0
+            fi
+            for page in $(seq 10); do
+              gh api "repos/$REPO/issues/$pr/comments?per_page=100&page=$page" > "$dir/page.json"
+              while IFS= read -r body; do
+                n=$((n + 1))
+                printf '%s' "$body" | jq -r . > "$dir/comment-$n.txt"
+                args+=(--comment-body "$dir/comment-$n.txt")
+              done < <(jq -c --arg m "$marker" '.[] | select(.body | startswith($m)) | .body' "$dir/page.json")
+              [[ $(jq length "$dir/page.json") -lt 100 ]] && break
+              if [[ $page -eq 10 ]]; then
+                post_status "$head" error "too many comments to read the newest attestation"; return 0
+              fi
+            done
+            if [[ $n -eq 0 ]]; then
+              post_status "$head" pending "no local validation attestation for this head"; return 0
+            fi
+            code=0
+            out=$(target/debug/agentscm local-validation verify "${args[@]}" \
+              --policy "$cfg/policy.json" --registry "$cfg/registry.json" --repo . \
+              --head "$head" --base-ref "$base" --base-rev "origin/$base" \
+              --repository "$repository") || code=$?
+            echo "PR $pr head $head exit $code: $out"
+            # Trust the exit code only when stdout is a verdict that agrees with it.
+            state=error
+            case $code in
+              0) want=success ;; 1) want=failure ;; 2) want=error ;; 3) want=pending ;; *) want= ;;
+            esac
+            if [[ -n $want && $(printf '%s' "$out" | jq -r .state 2>/dev/null) == "$want" ]]; then
+              state=$want
+            fi
+            desc=$(printf '%s' "$out" | jq -r '.reason // empty' 2>/dev/null || true)
+            post_status "$head" "$state" "${desc:-verifier error (exit $code)}"
+            if [[ $(gh api "repos/$REPO/pulls/$pr" --jq .head.sha) != "$head" ]]; then
+              echo "PR $pr head moved during verification; the status is bound to $head and the new head has none"
+            fi
+          }
+
+          case $EVENT_NAME in
+            issue_comment) prs=$COMMENT_PR ;;
+            workflow_dispatch) prs=$DISPATCH_PR ;;
+            push) prs=$(gh pr list --repo "$REPO" --state open --limit 50 --json number --jq '.[].number') ;;
+            *) echo "unexpected event"; exit 1 ;;
+          esac
+          for pr in $prs; do
+            [[ $pr =~ ^[0-9]+$ ]] || { echo "bad PR number"; exit 1; }
+            verify_pr "$pr"
+          done

@@ -21,7 +21,7 @@ Install the pinned nextest version and read the focused-validation, coverage-aud
 - Say what changed, why, how you tested it, and what is not covered. State unsupported behavior instead of hiding it.
 - Keep commit messages factual: the behavior, the reason and any limit. Do not include session links, transcripts, secrets or personal data anywhere in a commit or pull request.
 - Signing your commits is welcome but not required. Maintainers sign theirs, and squash merges are signed by GitHub.
-- CI must pass: formatting, clippy with warnings denied, the nextest suite, separate doctests, and a container build and smoke test. For pull requests from forks the formatting, clippy and test job runs automatically; a maintainer starts the container and end-to-end jobs by adding the `ci-extended` label after reading the change. Do not weaken CI, signing or branch protections in a change that is not about them.
+- CI must pass: formatting, clippy with warnings denied, the nextest suite, separate doctests, and a container build and smoke test. For pull requests from forks the formatting, clippy and test job runs automatically; a maintainer starts the container and end-to-end jobs by adding the `ci-extended` label after reading the change. Do not weaken CI, signing or branch protections in a change that is not about them. Maintainers may additionally attach an optional, experimental [local validation attestation](docs/advanced/local-validation.md); it does not replace any of these checks.
 
 ## AI and agent assistance
 

@@ -1,5 +1,6 @@
 /target/
-/.agentscm/
+/.agentscm/*
+!/.agentscm/validation/
 /agentscm-data/
 .DS_Store
 *.sqlite-wal

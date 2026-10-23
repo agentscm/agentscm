@@ -1,0 +1,6 @@
+{"recipe_id":"agentscm-gate-v1","commands":[
+{"id":"fmt","argv":["cargo","fmt","--check"],"timeout_secs":600},
+{"id":"clippy","argv":["cargo","clippy","--all-targets","--locked","--","-D","warnings"],"timeout_secs":3600},
+{"id":"nextest","argv":["cargo","nextest","run","--locked"],"timeout_secs":3600},
+{"id":"doctest","argv":["cargo","test","--locked","--doc"],"timeout_secs":3600}
+]}

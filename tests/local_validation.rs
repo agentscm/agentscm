@@ -492,3 +492,16 @@ fn uncertain_clock_surfaces_as_error() {
         "clock uncertain",
     );
 }
+
+/// The repository's own configuration must decode and agree, so drift fails CI.
+#[test]
+fn repository_configuration_is_consistent() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".agentscm/validation");
+    let read = |name: &str| std::fs::read(dir.join(name)).unwrap();
+    let recipe = ValidationRecipe::from_slice(&read("recipe.json")).unwrap();
+    let policy = ValidationPolicy::from_slice(&read("policy.json")).unwrap();
+    let registry = IssuerRegistrySnapshot::from_slice(&read("registry.json")).unwrap();
+    assert_eq!(policy.recipe_sha256, recipe.sha256().unwrap());
+    assert_eq!(policy.repository, registry.repository);
+    assert_eq!(policy.epoch, registry.epoch);
+}

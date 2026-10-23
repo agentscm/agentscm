@@ -6,6 +6,8 @@
 
 <!-- Commands run and results. State anything you did not run. -->
 
+<!-- Optional: local validation attestation envelope SHA-256 and the agentscm/local-validation status, if one was attached. -->
+
 ## Limits
 
 <!-- Known gaps, unsupported cases, follow-ups. -->

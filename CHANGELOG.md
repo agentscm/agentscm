@@ -4,6 +4,8 @@ All notable changes are listed here, newest first. AgentSCM is alpha: any releas
 
 ## Unreleased
 
+- Experimental, Unix and GitHub only: the repository now carries `.agentscm/validation/` (recipe, policy and an issuer registry with no enrolled keys) and a `local-validation` workflow that verifies signed local validation attestations posted as PR comments and publishes an `agentscm/local-validation` commit status on the exact head, without building PR code. The workflow is not yet live-qualified, no key is enrolled so nothing verifies, hosted CI is unchanged and the status is not required. See [local validation](docs/advanced/local-validation.md).
+
 - When a pull request is merged, every live intent overlapping its files (other than the pull request's own branch) gets a `pr_notice` with `"merged": true`, so an agent still editing them is told mid-task to merge or rebase onto the base first. An `agentscm_start` that creates new work now warns when its task reads like another agent's ongoing work or an open pull request and tells the agent to ask the user, recording a `task_overlap` event. The status page's activity shows merged notices and similar work. The store method `append_pr_notices` is now `append_notices(kind, ...)`.
 
 - Read-only tokens (the status page's) can now read publications. `GET /v1/hub/repos/{repo}/publications/{id}` accepts them and returns the stored row: for those tokens it never reads the forge or records a merge. A new `GET /v1/hub/repos/{repo}/publications?limit=&before=` lists a repository's publications newest first, with `next_cursor` and `complete`. It reads the store only and omits `forge_check` and `external`. See [publishing a revision](docs/hub.md#publishing-a-revision).
