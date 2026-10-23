@@ -862,9 +862,14 @@ pub(crate) fn install(agent: Agent, root: &Path) -> Result<()> {
     println!(
         "Review the client's own project, hook and MCP approvals, then start a fresh session and verify it reaches the expected repository. Setup does not grant trust."
     );
-    if committed || blocked {
+    if committed {
         println!(
-            "Committed AgentSCM files are unchanged. On this machine Claude Code uses the local-scope `agentscm` MCP server, and .claude/settings.local.json sets allowedHttpHookUrls to [] so only the plugin's hooks run; that blocks every HTTP hook in this checkout."
+            "Committed AgentSCM files are unchanged. On this machine Claude Code uses the local-scope `agentscm` MCP server instead of the one in .mcp.json."
+        );
+    }
+    if blocked {
+        println!(
+            "All HTTP hooks are now blocked in this checkout on this machine (\"allowedHttpHookUrls\": [] in .claude/settings.local.json), so the committed AgentSCM hooks do not run beside the plugin's. To undo, delete that line; then disable the plugin with `claude plugin disable agentscm@agentscm-claude-client` so the two hook sets do not both run."
         );
     }
     println!(
