@@ -19,6 +19,9 @@ on:
     branches: [main]
     paths:
       - ".github/local-validation/**"
+      - ".github/workflows/local-validation.yml"
+      - "src/local_validation/**"
+      - "src/local_validation_cli.rs"
   schedule:
     - cron: '17 6 * * *' # replaces the success of an aged-out attestation on the head
 
@@ -65,6 +68,9 @@ jobs:
           marker='<!-- agentscm-local-validation:v1 '
           cfg=.github/local-validation
           repository=$(jq -r .repository "$cfg/policy.json")
+          if [[ $repository != "github.com/$REPO" ]]; then
+            echo "policy repository $repository does not match github.com/$REPO; not verifying"; exit 1
+          fi
           work=$(mktemp -d)
           CHECKOUT_SHA=$(git rev-parse HEAD)
           trusted='["OWNER","MEMBER","COLLABORATOR"]'
@@ -82,8 +88,23 @@ jobs:
               -f description="${3:0:140}" -f target_url="$RUN_URL" > /dev/null
           }
 
+          # Select the trusted attestation comments; shared by reading and re-checking.
+          # shellcheck disable=SC2016 # jq variables, not shell expansions
+          sel='.[] | select((.body | startswith($m)) and (.author_association as $a | $t | index($a)))'
+          fp_filter="$sel | \"\(.id):\(.updated_at)\""
+
+          fingerprint() { # pr: sorted id:updated_at of the trusted marker comments
+            local pr=$1 page len
+            for page in $(seq 10); do
+              gh api "repos/$REPO/issues/$pr/comments?per_page=100&page=$page" > "$work/fp-page.json"
+              jq -r --arg m "$marker" --argjson t "$trusted" "$fp_filter" "$work/fp-page.json"
+              len=$(jq length "$work/fp-page.json")
+              [[ $len -lt 100 ]] && break
+            done | sort
+          }
+
           verify_pr() {
-            local pr=$1 dir="$work/$1" head base page len n=0 args=() out code state want desc
+            local pr=$1 dir="$work/$1" head base page len n=0 args=() out code state want desc fp_before fp_after
             mkdir -p "$dir"
             gh api "repos/$REPO/pulls/$pr" > "$dir/pull.json"
             head=$(jq -r .head.sha "$dir/pull.json")
@@ -97,12 +118,12 @@ jobs:
             if ! git cat-file -e "$head^{commit}" 2>/dev/null; then
               post_status "$head" error "head moved while fetching; re-run"; return 0
             fi
+            : > "$dir/fp.txt"
             for page in $(seq 10); do
               gh api "repos/$REPO/issues/$pr/comments?per_page=100&page=$page" > "$dir/page.json"
               len=$(jq length "$dir/page.json")
-              jq -c --arg m "$marker" --argjson t "$trusted" \
-                '.[] | select((.body | startswith($m)) and (.author_association as $a | $t | index($a))) | .body' \
-                "$dir/page.json" > "$dir/bodies.txt"
+              jq -c --arg m "$marker" --argjson t "$trusted" "$sel | .body" "$dir/page.json" > "$dir/bodies.txt"
+              jq -r --arg m "$marker" --argjson t "$trusted" "$fp_filter" "$dir/page.json" >> "$dir/fp.txt"
               while IFS= read -r body; do
                 n=$((n + 1))
                 printf '%s' "$body" | jq -r . > "$dir/comment-$n.txt"
@@ -113,6 +134,10 @@ jobs:
                 post_status "$head" error "too many comments to read the newest attestation"; return 0
               fi
             done
+            fp_before=$(sort "$dir/fp.txt")
+            if [[ $n -eq 0 && ( $EVENT_NAME == push || $EVENT_NAME == schedule ) ]]; then
+              echo "PR $pr: no trusted attestation comment; not opted in, no status written"; return 0
+            fi
             if [[ $n -eq 0 ]]; then
               post_status "$head" pending "no local validation attestation for this head"; return 0
             fi
@@ -131,6 +156,13 @@ jobs:
               state=$want
             fi
             desc=$(printf '%s' "$out" | jq -r '.reason // empty' 2>/dev/null || true)
+            # A comment run and a push/schedule run can overlap; if a trusted attestation
+            # comment changed since it was read, the run that saw the change owns the verdict.
+            fp_after=$(fingerprint "$pr")
+            if [[ $fp_after != "$fp_before" ]]; then
+              echo "PR $pr: attestation comments changed during verification; not posting $state on $head; a newer run owns the verdict"
+              return 0
+            fi
             post_status "$head" "$state" "${desc:-verifier error (exit $code)}"
             if [[ $(gh api "repos/$REPO/pulls/$pr" --jq .head.sha || true) != "$head" ]]; then
               echo "PR $pr head moved during verification; the status is bound to $head and the new head has none"

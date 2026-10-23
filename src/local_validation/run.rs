@@ -254,7 +254,12 @@ pub fn produce(
     .iter()
     .map(|argv| probe(repo, argv))
     .collect();
-    let after = observe(repo, "HEAD", base_rev)?;
+    // A failed re-check must not drop the run: it is recorded as a changed tree.
+    let after = observe(repo, "HEAD", base_rev).ok();
+    let unchanged = after
+        .as_ref()
+        .is_some_and(|a| a.commit == state.commit && a.tree == state.tree)
+        && is_clean(repo).unwrap_or(false);
     let var_set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
     Ok(Produced {
         outputs,
@@ -279,9 +284,7 @@ pub fn produce(
             },
             platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
             toolchain,
-            tree_unchanged_after: after.commit == state.commit
-                && after.tree == state.tree
-                && is_clean(repo)?,
+            tree_unchanged_after: unchanged,
         },
     })
 }

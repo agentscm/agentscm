@@ -5,7 +5,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use sha2::{Digest, Sha256};
 
-use super::{FIXED_OMISSIONS, MAX_RECORD_BYTES, ValidationRecord};
+use super::{MAX_RECORD_BYTES, ValidationRecord};
 use crate::evidence::validate_lower_hex;
 use crate::{Error, Result};
 
@@ -35,13 +35,10 @@ pub fn render(envelope: &[u8], record: &[u8]) -> Result<String> {
     let outcome = envelope_json["payload"]["outcome"]
         .as_str()
         .unwrap_or("unknown");
-    let mut omissions: Vec<&str> = FIXED_OMISSIONS.to_vec();
-    if !parsed.services.postgres {
-        omissions.push("postgres tests");
-    }
-    if !parsed.services.s3 {
-        omissions.push("s3 tests");
-    }
+    let omissions: Vec<&str> = envelope_json["payload"]["coverage"]["omissions"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
     let mut body = format!(
         "{MARKER_PREFIX}{} -->\n\n**Local validation: {outcome}**\n\n- commit: `{}`\n- tree: `{}`\n- base: `{}` at `{}` (merge-base `{}`)\n- services: postgres={}, s3={}\n- omissions: {}\n",
         envelope_sha256(envelope),

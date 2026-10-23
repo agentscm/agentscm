@@ -397,6 +397,12 @@ fn failures_are_signed_retained_and_never_verify() {
         "stops at first failure"
     );
     let body = f.show_to_file(&sha, "body.md");
+    assert!(
+        std::fs::read_to_string(&body)
+            .unwrap()
+            .contains("skipped: never"),
+        "the summary lists signed omissions"
+    );
     assert_eq!(f.verify(&body, "repo-1").0, 1);
 }
 

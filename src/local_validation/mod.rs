@@ -622,7 +622,7 @@ pub fn select(
             "no attestation for this head",
             ignored.map_or_else(
                 || "no attestation found".into(),
-                |i| format!("newest ignored: {i}"),
+                |i| format!("last ignored: {i}"),
             ),
         )
     })
@@ -786,9 +786,11 @@ mod tests {
             .current_dir(env!("CARGO_MANIFEST_DIR"))
             .output()
         else {
+            eprintln!("skipped: git is unavailable");
             return;
         };
         if !out.status.success() {
+            eprintln!("skipped: not a git checkout");
             return;
         }
         let paths = String::from_utf8_lossy(&out.stdout);

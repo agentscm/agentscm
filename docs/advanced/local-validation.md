@@ -22,11 +22,11 @@ A maintainer can run the repository's gate on their own machine and attach a sig
 
 1. Create a key with `agentscm agent-task key-generate` (owner-private file).
 2. Enroll the public key in `.github/local-validation/registry.json` by a reviewed pull request. The shipped registry has no issuers, so nothing verifies until this happens.
-3. On a clean checkout of the PR head, run `git fetch origin main` (the merge-base is computed against the local `origin/main`), start the PostgreSQL and S3 test services, then run `agentscm local-validation run`. Note the printed envelope digest. Ctrl-C cancels the running command and signs a failure; that path is implemented but untested interactively.
+3. On a clean checkout of the PR head, run `git fetch origin main` (the merge-base is computed against the local `origin/main`), start the PostgreSQL and S3 test services, then run `agentscm local-validation run --recipe .github/local-validation/recipe.json --policy .github/local-validation/policy.json --registry .github/local-validation/registry.json --key-file KEY --issuer-id ID --state-dir DIR`. `run` has no defaults for the recipe, policy or registry; pass all three. Note the printed envelope digest. Ctrl-C cancels the running command and signs a failure; that path is implemented but untested interactively.
 4. `local-validation post` the attestation to the PR (it refuses if the PR head differs from the attested commit). Do not post statuses by hand.
 5. The verifier workflow reports the status. If the verifier errors for a PR it posts `error` on that head and the job fails; re-run it. Report `pending` or `failure` as it is.
 
-`verify` is forge-neutral and also runs standalone against a local Git checkout. The standalone `evidence-verifier` tool has not been exercised on these envelopes.
+`verify` is forge-neutral and also runs standalone against a local Git checkout; its `--recipe` default, `.github/local-validation/recipe.json`, is relative to the current directory. The verifier workflow fetches the PR head without credentials, so as written it supports public repositories only. The standalone `evidence-verifier` tool has not been exercised on these envelopes.
 
 ## What invalidates an attestation
 

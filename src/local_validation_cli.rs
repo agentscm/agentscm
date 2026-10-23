@@ -136,6 +136,10 @@ pub async fn run(command: LocalValidationCommand) -> Result<i32> {
             tokio::spawn(async move {
                 if interrupt.recv().await.is_some() {
                     on_interrupt.cancel();
+                    // A second Ctrl-C abandons the wait for the cancelled command.
+                    if interrupt.recv().await.is_some() {
+                        std::process::exit(130);
+                    }
                 }
             });
             tokio::task::spawn_blocking(move || run_recipe(args, &cancel))
