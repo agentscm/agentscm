@@ -142,7 +142,7 @@ fn object<'a>(parent: &'a mut Map<String, Value>, key: &str) -> Result<&'a mut M
 fn check_mcp_entry(existing: &Value, root: &Path) -> Result<()> {
     if existing["args"] != mcp_args(root)? || existing["url"].is_string() {
         return Err(invalid(
-            "an existing AgentSCM MCP server entry (for example the one `agentscm init-repo` writes, which already covers MCP through AGENTSCM_HUB_TOKEN) needs reviewed migration and was left unchanged; to let `client setup` manage it instead, delete only the `agentscm` entry from this file and rerun",
+            "this file already has an AgentSCM MCP entry (a repository set up with `agentscm init-repo` gives its agents MCP through AGENTSCM_HUB_TOKEN); the hub's Connect agents page cannot verify this checkout through it, and `client setup` left it unchanged. To let `client setup` manage it instead, remove only the `agentscm` entry from this file and rerun",
         ));
     }
     Ok(())

@@ -345,6 +345,10 @@ pub(crate) fn print_next_steps(agents: &[Agent], hub: Option<&str>, repo: Option
         "  PowerShell: $env:AGENTSCM_HUB_TOKEN = \"<agent token>\"   (persist with: setx AGENTSCM_HUB_TOKEN \"<agent token>\")"
     );
     println!();
+    println!(
+        "In a repository set up with `agentscm init-repo`, MCP works through AGENTSCM_HUB_TOKEN. The hub's Connect agents page cannot verify these checkouts."
+    );
+    println!();
     let has = |agent| agents.contains(&agent);
     if has(Agent::Codex) || has(Agent::Cursor) || has(Agent::Copilot) {
         println!(

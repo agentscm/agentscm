@@ -129,30 +129,39 @@ fn yes_without_a_hub_url_or_a_repository_is_an_error() {
 #[cfg(unix)]
 #[test]
 fn client_setup_after_init_repo_names_the_file_and_leaves_it_unchanged() {
-    let (repo, home) = checkout();
-    let hub = "https://hub.example.test";
-    let out = init_repo(repo.path(), home.path(), &["--yes", "--hub-url", hub]);
-    assert!(out.status.success(), "{}", stderr(&out));
-    let before = std::fs::read_to_string(repo.path().join(".mcp.json")).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_agentscm"))
-        .args(["client", "setup", "--agent", "claude", "--hub", hub])
-        .current_dir(repo.path())
-        .env_clear()
-        .env("HOME", home.path())
-        .env("XDG_CONFIG_HOME", home.path().join("config"))
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    let message = stderr(&out);
-    assert!(!out.status.success());
-    assert!(
-        message.contains(".mcp.json") && message.contains("init-repo"),
-        "{message}"
-    );
-    assert_eq!(
-        std::fs::read_to_string(repo.path().join(".mcp.json")).unwrap(),
-        before
-    );
+    for (agent, file) in [("claude", ".mcp.json"), ("cursor", ".cursor/mcp.json")] {
+        let (repo, home) = checkout();
+        let hub = "https://hub.example.test";
+        let out = init_repo(
+            repo.path(),
+            home.path(),
+            &["--yes", "--hub-url", hub, "--agents", agent],
+        );
+        assert!(out.status.success(), "{}", stderr(&out));
+        let before = std::fs::read_to_string(repo.path().join(file)).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_agentscm"))
+            .args(["client", "setup", "--agent", agent, "--hub", hub])
+            .current_dir(repo.path())
+            .env_clear()
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join("config"))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let message = stderr(&out);
+        assert!(!out.status.success());
+        assert!(
+            message.contains(file)
+                && message.contains("AGENTSCM_HUB_TOKEN")
+                && message.contains("Connect agents page cannot verify")
+                && message.contains("remove only the `agentscm` entry"),
+            "{message}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join(file)).unwrap(),
+            before
+        );
+    }
 }
 
 #[test]
