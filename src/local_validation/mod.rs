@@ -288,7 +288,10 @@ impl ValidationRecord {
             if r.exit_code != Some(0) {
                 return Some((
                     "command failed",
-                    format!("{} exited with {:?}", r.id, r.exit_code),
+                    match r.exit_code {
+                        Some(code) => format!("{} exited with {code}", r.id),
+                        None => format!("{} exited without a code", r.id),
+                    },
                 ));
             }
             if r.truncated {
