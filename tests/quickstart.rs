@@ -917,9 +917,10 @@ fn running_from_the_install_directory_is_undoable_without_any_hook() {
         .command_as(&link, repo.path(), &args)
         .output()
         .unwrap());
+    // No hooks were written, so the summary must not claim hooks call the program.
     assert!(
         said.contains(&format!(
-            "{}: the agentscm program the hooks call",
+            "{}: the agentscm program\n",
             bin.display()
                 .to_string()
                 .replace(machine.home.path().to_str().unwrap(), "~")
