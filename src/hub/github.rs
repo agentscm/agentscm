@@ -489,6 +489,55 @@ impl Api {
         reply.ok("repos").map(Some)
     }
 
+    /// The ruleset rules that apply to `branch` (read-only). None when GitHub refuses or does not
+    /// know the read (403, 404): the requirement is then unknown, not absent.
+    pub async fn branch_rules(
+        &self,
+        token: &str,
+        full_name: &str,
+        branch: &str,
+    ) -> Gh<Option<Value>> {
+        if !valid_ref_name(branch) {
+            return Err(GhError::Failed("bad branch name".into()));
+        }
+        let url = format!(
+            "{}/repos/{full_name}/rules/branches/{}?per_page=100",
+            self.base,
+            encode_path(branch)
+        );
+        let reply = self
+            .send(token, Method::GET, &url, None, None, false)
+            .await?;
+        if matches!(reply.status, 403 | 404) {
+            return Ok(None);
+        }
+        let complete = !reply.next;
+        let body = reply.ok("repos")?;
+        Ok(complete.then_some(body))
+    }
+
+    /// The newest page (up to 100) of commit statuses on `sha`, newest first, and whether it is
+    /// the whole list. None when GitHub refuses the read.
+    pub async fn status_page(
+        &self,
+        token: &str,
+        full_name: &str,
+        sha: &str,
+    ) -> Gh<Option<(Value, bool)>> {
+        let url = format!(
+            "{}/repos/{full_name}/commits/{sha}/statuses?per_page=100",
+            self.base
+        );
+        let reply = self
+            .send(token, Method::GET, &url, None, None, false)
+            .await?;
+        if matches!(reply.status, 403 | 404) {
+            return Ok(None);
+        }
+        let complete = !reply.next;
+        Ok(Some((reply.ok("repos")?, complete)))
+    }
+
     /// Workflow runs for exactly `sha`, at most [`MAX_EXTERNAL_PAGES`] pages, and whether the
     /// list is complete. Read-only: no logs, no reruns.
     pub async fn workflow_runs(
@@ -779,7 +828,7 @@ impl Api {
     }
 
     /// The tree and parents of a commit; None when the commit is not on the forge.
-    async fn commit_parts(
+    pub(super) async fn commit_parts(
         &self,
         token: &str,
         full_name: &str,
