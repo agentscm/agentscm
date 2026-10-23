@@ -371,6 +371,14 @@ pub trait Store: Send + Sync {
     fn merge_group(&self, repo: &str, head_sha: &str) -> Result<Option<MergeGroup>>;
     /// Current (not ended) groups of `repo`, oldest observation first, at most `limit`.
     fn active_merge_groups(&self, repo: &str, limit: usize) -> Result<Vec<MergeGroup>>;
+    /// Groups of `repo` that queued pull request `pr_number`, current or ended, newest
+    /// observation first, at most `limit`.
+    fn merge_groups_for_pull(
+        &self,
+        repo: &str,
+        pr_number: i64,
+        limit: usize,
+    ) -> Result<Vec<MergeGroup>>;
     /// Ends a current group; false when it was already ended or is unknown.
     fn end_merge_group(&self, repo: &str, head_sha: &str, reason: &str, now: i64) -> Result<bool>;
     /// Compare-and-set on `expected` generation of a current group: records the desired post as

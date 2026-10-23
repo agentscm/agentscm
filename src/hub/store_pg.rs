@@ -4725,6 +4725,29 @@ impl Store for PgStore {
         })
     }
 
+    fn merge_groups_for_pull(
+        &self,
+        repo: &str,
+        pr_number: i64,
+        limit: usize,
+    ) -> Result<Vec<MergeGroup>> {
+        self.run(true, |client| {
+            let limit = limit as i64;
+            Ok(client
+                .query(
+                    &format!(
+                        "SELECT {MERGE_GROUP_COLUMNS} FROM hub_merge_groups
+                         WHERE repository = $1 AND pr_number = $2
+                         ORDER BY observed_at DESC, head_sha COLLATE \"C\" LIMIT $3"
+                    ),
+                    &[&repo, &pr_number, &limit],
+                )?
+                .iter()
+                .map(merge_group_row)
+                .collect())
+        })
+    }
+
     fn end_merge_group(&self, repo: &str, head_sha: &str, reason: &str, now: i64) -> Result<bool> {
         if !is_lower_hex(head_sha, 40) {
             return Err(HubError::Invalid("merge group is out of bounds".into()));

@@ -22,3 +22,4 @@ CREATE TABLE hub_merge_groups (
 );
 CREATE INDEX hub_merge_groups_active ON hub_merge_groups (repository, observed_at)
     WHERE ended_reason IS NULL;
+CREATE INDEX hub_merge_groups_pull ON hub_merge_groups (repository, pr_number, observed_at);
