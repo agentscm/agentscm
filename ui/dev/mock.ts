@@ -289,6 +289,13 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
         }
         if (down) return send(503, { error: 'unavailable' })
         const empty = scenario === 'empty'
+        if (url.pathname === '/onboarding') {
+          const base = { owner: 'maria', expires_at: ago(-600), mcp_verified: true, native_verified: true, blocker: null, next_action: 'Setup is verified for this session.' }
+          return send(200, empty ? [] : [
+            { ...base, agent: 'claude', key: 'a1b2c3d4e5f6', name: 'Claude Code' },
+            { ...base, agent: 'codex', key: '9f8e7d6c5b4a', name: 'Codex', native_verified: false, blocker: 'trust', next_action: 'Call agentscm_setup_status after approving the project hooks in Codex.' },
+          ])
+        }
         if (url.pathname === '/skill-workflows') {
           if (empty || scenario === 'demo') return send(200, { version: 1, availability: 'available', runs: [], next_cursor: null })
           const before = url.searchParams.get('before')

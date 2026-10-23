@@ -28,12 +28,12 @@ export function SetupPage({ token }: { token: string }) {
         <p className="answer-text">An agent is ready when it has proved, in one session, that it can reach the hub over MCP and that its edit hook fires on a real edit.</p>
       </div>
       <div className="grid-2 align-start">
-        <Box icon="patch-check" title="Verified sessions" count={rows.length} explain="Setup proof expires after 15 minutes. Ready does not guarantee future quota or that every edit tool is covered.">
+        <Box icon="patch-check" title="Verified sessions" count={rows.length} explain="Proof lasts up to 15 minutes after the agent’s last check, and never outlasts the agent’s own token (8 hours for client setup). Ready does not guarantee future quota or that every edit tool is covered.">
           {load.kind === 'loading' && <Skeleton rows={3} />}
           {!available && load.kind !== 'loading' && <Notice tone="muted" icon="info-circle" title="Setup verification unavailable">No agent is marked ready until the hub answers again.</Notice>}
           {load.kind === 'ready' && rows.length === 0 && (
             <Empty icon="plug" title="No verified setup yet">
-              Copy the instructions to your agent, resolve any sign-in or approval blockers, then verify a native edit.
+              Copy the instructions to your agent, resolve any sign-in or approval blockers, then verify a native edit. Only agents set up with <code>agentscm client setup</code> report here; agents set up with <code>agentscm quickstart</code> do not appear.
             </Empty>
           )}
           <ul className="plain-list">
@@ -62,7 +62,7 @@ export function SetupPage({ token }: { token: string }) {
                     </span>
                   </div>
                   <p className="small mt-2 mb-0">
-                    <Icon name="arrow-right-circle" /> {!available ? 'Verification unavailable. Reconnect to the hub before relying on setup status.' : row.expires_at <= now / 1000 ? 'Evidence expired. Ask your agent to verify MCP and a native edit again.' : row.blocker ? `${blockerLabel(row.blocker)}. ${row.next_action}` : row.next_action}
+                    <Icon name="arrow-right-circle" /> {!available ? 'Verification unavailable. Reconnect to the hub before relying on setup status.' : row.expires_at <= now / 1000 ? 'Evidence expired. Ask your agent to verify MCP and a native edit again.' : row.blocker ? `${blockerLabel(row.blocker)}. Ask your agent to: ${row.next_action}` : `Ask your agent to: ${row.next_action}`}
                   </p>
                 </li>
               )
