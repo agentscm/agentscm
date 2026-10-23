@@ -125,3 +125,63 @@ fn yes_without_a_hub_url_or_a_repository_is_an_error() {
     assert!(!out.status.success());
     assert!(stderr(&out).contains("Git repository"), "{}", stderr(&out));
 }
+
+#[cfg(unix)]
+#[test]
+fn client_setup_after_init_repo_names_the_file_and_leaves_it_unchanged() {
+    let (repo, home) = checkout();
+    let hub = "https://hub.example.test";
+    let out = init_repo(repo.path(), home.path(), &["--yes", "--hub-url", hub]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let before = std::fs::read_to_string(repo.path().join(".mcp.json")).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_agentscm"))
+        .args(["client", "setup", "--agent", "claude", "--hub", hub])
+        .current_dir(repo.path())
+        .env_clear()
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join("config"))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let message = stderr(&out);
+    assert!(!out.status.success());
+    assert!(
+        message.contains(".mcp.json") && message.contains("init-repo"),
+        "{message}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join(".mcp.json")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn next_steps_give_a_token_command_that_parses_and_one_line_per_agent() {
+    let (repo, home) = checkout();
+    let out = init_repo(
+        repo.path(),
+        home.path(),
+        &[
+            "--yes",
+            "--hub-url",
+            "https://hub.example.test",
+            "--repo",
+            "o/n",
+            "--agents",
+            "gemini,cursor",
+        ],
+    );
+    let text = stdout(&out);
+    assert!(
+        text.contains("hub login --hub https://hub.example.test"),
+        "{text}"
+    );
+    assert!(
+        text.contains("hub token create --name <token name> --repo o/n --ttl 30d"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Gemini: only GEMINI.md") && text.contains("Cursor:"),
+        "{text}"
+    );
+}

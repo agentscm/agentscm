@@ -142,7 +142,7 @@ fn object<'a>(parent: &'a mut Map<String, Value>, key: &str) -> Result<&'a mut M
 fn check_mcp_entry(existing: &Value, root: &Path) -> Result<()> {
     if existing["args"] != mcp_args(root)? || existing["url"].is_string() {
         return Err(invalid(
-            "an existing AgentSCM MCP server needs reviewed migration; it was left unchanged",
+            "an existing AgentSCM MCP server entry (for example the one `agentscm init-repo` writes, which already covers MCP through AGENTSCM_HUB_TOKEN) needs reviewed migration and was left unchanged; to let `client setup` manage it instead, delete only the `agentscm` entry from this file and rerun",
         ));
     }
     Ok(())
@@ -340,7 +340,7 @@ fn json_edit(
         Some(text) => serde_json::from_str(text).map_err(|_| invalid("native configuration is not strict JSON; use the client's editor to migrate it first"))?,
         None => json!({}),
     };
-    edit(&mut value)?;
+    edit(&mut value).map_err(|error| invalid(&format!("{relative}: {error}")))?;
     let after = serde_json::to_string_pretty(&value)? + "\n";
     Ok(Edit {
         relative,
@@ -485,7 +485,8 @@ fn check_other_hooks(agent: Agent, root: &Path) -> Result<()> {
         })?;
         if let Some(existing) = value["mcpServers"].get("agentscm") {
             // Copilot loads both this Claude-compatible file and .github/mcp.json.
-            check_mcp_entry(existing, root)?;
+            check_mcp_entry(existing, root)
+                .map_err(|error| invalid(&format!(".mcp.json: {error}")))?;
         }
     }
     let home = std::env::var_os("HOME")
@@ -556,9 +557,10 @@ fn check_other_hooks(agent: Agent, root: &Path) -> Result<()> {
                     })
                 })
             {
-                return Err(invalid(
-                    "another AgentSCM native hook or plugin is enabled; review its migration before setup",
-                ));
+                return Err(invalid(&format!(
+                    "{}: another AgentSCM native hook or plugin is enabled (for example one written by `agentscm init-repo`); review its migration, or remove that file's AgentSCM entries, before setup",
+                    path.display()
+                )));
             }
         }
     }
