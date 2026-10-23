@@ -772,7 +772,7 @@ fn existing_hub(cx: &Cx<'_>, configured: Option<String>) -> Option<String> {
         Ok(url) => Some(url),
         Err(_) => {
             println!(
-                "That hub URL isn't usable: it must be https://host, or http:// for a loopback address, with no credentials."
+                "That hub URL isn't usable: it must be https://host, or http://127.0.0.1:PORT for a hub on this machine (not localhost), with no credentials."
             );
             None
         }
@@ -1467,6 +1467,12 @@ fn hook_stage(cx: &mut Cx<'_>) {
                 return;
             }
         }
+        None if cx.live.hub.is_none() => {
+            println!(
+                "Not adding the Claude Code hooks: they need a hub to report to. Use --hook project to add them anyway."
+            );
+            return;
+        }
         None => {
             let options = [
                 "This project only (.claude/settings.local.json)",
@@ -1773,7 +1779,7 @@ fn init_stage(cx: &mut Cx<'_>) {
         cx.args.init
     } else {
         cx.ui.confirm(
-            "Also add AgentSCM to this repository's agent config (MCP, hooks and instructions for Claude Code, Codex, Cursor and Copilot)? It writes files you can commit.",
+            "Also add AgentSCM to this repository's agent config (MCP, hooks and instructions for Claude Code, Codex, Cursor, Copilot and Gemini)? It writes files you can commit.",
             true,
         )
     };
@@ -1851,8 +1857,13 @@ fn summary(cx: &Cx<'_>, changed: bool) {
     }
     if let Some(dir) = &m.bin_dir {
         line(format!(
-            "{}: the agentscm program the hooks call",
-            shown(dir, home)
+            "{}: the agentscm program{}",
+            shown(dir, home),
+            if m.hooks.is_empty() {
+                ""
+            } else {
+                " the hooks call"
+            }
         ));
     }
     for record in &m.hooks {
