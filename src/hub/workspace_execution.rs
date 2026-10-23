@@ -271,6 +271,7 @@ pub struct ProfileView {
     pub profile_id: String,
     pub target: String,
     pub requirement_digest: String,
+    pub server_execution: bool,
     pub readiness: &'static str,
     pub limitations: &'static str,
 }
@@ -511,11 +512,15 @@ impl ExecutionService {
             {
                 continue;
             }
+            let server_execution = self
+                .profiles
+                .contains_key(&(profile.repository_id.clone(), profile.profile_id.clone()));
             repositories.entry(profile.repository_id.clone()).or_default().push(ProfileView {
                 profile_id: profile.profile_id.clone(), target: profile.target.clone(),
                 requirement_digest: profile.requirement_digest.clone(),
+                server_execution,
                 readiness: if profile.current_requirement().is_ok() { "configured" } else { "unavailable" },
-                limitations: if self.profiles.contains_key(&(profile.repository_id.clone(), profile.profile_id.clone())) {
+                limitations: if server_execution {
                     if self.source_profiles.contains_key(&(profile.repository_id.clone(), profile.profile_id.clone())) { "Server execution and opt-in laptop source/context sync are enabled. Agent-owned tasks remain separately claimed and never trigger server model dispatch." } else { "Server execution and agent-owned tasks are enabled. Source and Change context must already exist in the server native store." }
                 } else { "Agent-owned tasks only. No server command or model executor is configured; source and Change context must already exist in the native store." },
             });
@@ -749,7 +754,11 @@ impl ExecutionService {
     }
 
     fn profile_for_repository(&self, repository: &str) -> Result<()> {
-        if self.profiles.keys().any(|(repo, _)| repo == repository) {
+        if self
+            .agent_task_profiles
+            .keys()
+            .any(|(repo, _)| repo == repository)
+        {
             Ok(())
         } else {
             Err(HubError::Unauthorized)

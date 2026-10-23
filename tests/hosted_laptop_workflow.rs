@@ -8,7 +8,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
 
 use agentscm::authority::Authority;
@@ -128,6 +128,33 @@ struct Laptop {
     change: String,
     poll_attempts: u16,
     poll_interval_ms: u64,
+}
+
+struct CliChild(Option<Child>);
+
+impl CliChild {
+    fn get_mut(&mut self) -> &mut Child {
+        self.0.as_mut().unwrap()
+    }
+
+    fn wait_with_output(mut self) -> Output {
+        self.0.take().unwrap().wait_with_output().unwrap()
+    }
+
+    fn kill_with_output(mut self) -> Output {
+        let mut child = self.0.take().unwrap();
+        let _ = child.kill();
+        child.wait_with_output().unwrap()
+    }
+}
+
+impl Drop for CliChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 fn run_cli(data: &Path, laptop: &Laptop, command: &str) -> Value {
@@ -594,23 +621,25 @@ async fn stop_blocks_when_workspace_changes_while_the_exact_hosted_run_succeeds(
     laptop.poll_interval_ms = 50;
     run_cli(&data, &laptop, "remote-init");
 
-    let mut child = cli_command(&data, &laptop, "remote-stop")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
+    let mut waiting = CliChild(Some(
+        cli_command(&data, &laptop, "remote-stop")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ));
+    waiting
+        .get_mut()
         .stdin
         .take()
         .unwrap()
         .write_all(br#"{"hook_event_name":"Stop","stop_hook_active":false}"#)
         .unwrap();
-    let waiting = tokio::task::spawn_blocking(move || child.wait_with_output().unwrap());
 
     let queue = root.path().join("execution.sqlite");
-    let mut queued = false;
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
         let count: i64 = Connection::open(&queue)
             .unwrap()
             .query_row(
@@ -620,16 +649,31 @@ async fn stop_blocks_when_workspace_changes_while_the_exact_hosted_run_succeeds(
             )
             .unwrap();
         if count == 1 {
-            queued = true;
             break;
+        }
+        if waiting.get_mut().try_wait().unwrap().is_some() {
+            let output = waiting.wait_with_output();
+            panic!(
+                "Stop exited before durably queueing its hosted run\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            let output = waiting.kill_with_output();
+            panic!(
+                "Stop did not durably queue its hosted run before the deadline\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    assert!(queued, "Stop did not durably queue its hosted run");
 
     let changed = laptop.workspace.join("during-run.txt");
     fs::write(&changed, b"newer local bytes\n").unwrap();
     let worker = service.spawn_worker();
+    let waiting = tokio::task::spawn_blocking(move || waiting.wait_with_output());
     let output = waiting.await.unwrap();
     assert!(
         output.status.success(),

@@ -11,7 +11,7 @@ export interface WorkspaceSession {
   synthetic_fixture?: boolean
 }
 export interface WorkspaceRepository { repository_id: string; profiles: WorkspaceProfile[] }
-export interface WorkspaceProfile { profile_id: string; target: string; requirement_digest: string; readiness: string; limitations?: string }
+export interface WorkspaceProfile { profile_id: string; target: string; requirement_digest: string; server_execution: boolean; readiness: string; limitations?: string }
 export interface WorkspaceSubject { change_id: string; change_version: number; context_digest: string; revision: string; requirement_digest: string }
 export interface WorkspaceRun { run_id: string; repository_id: string; profile_id: string; actor_id: string; generation: number; state: string; subject: WorkspaceSubject; native_run_id: string | null; receipt: string | null; detail: string | null }
 
