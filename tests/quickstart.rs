@@ -305,6 +305,16 @@ fn end_to_end_with_a_given_token_then_the_hook_works() {
         "{said}"
     );
     assert!(said.contains(" uninstall`"), "{said}");
+    assert!(
+        said.contains(&format!("Hub status page: {}/ui/", hub.url)),
+        "{said}"
+    );
+    assert!(
+        said.contains(
+            " hub token create --read-only --name status-page --repo acme/widgets --ttl 30d"
+        ),
+        "{said}"
+    );
     assert_eq!(
         last_line(&output),
         format!("Live warnings: on (hub {}, repo acme/widgets)", hub.url)
@@ -827,17 +837,18 @@ fn a_requested_hub_that_is_down_fails_but_keeps_the_planned_hook() {
     let said = out(&output);
     assert!(
         said.contains(&format!(
-            "The hub at {url} isn't answering; live warnings will start working once it is."
+            "The hub at {url} isn't answering, so nothing was saved for it."
         )),
         "{said}"
     );
     assert!(repo.path().join(SETTINGS).exists());
     assert!(!machine.config().join("hub.json").exists());
-    assert_eq!(
-        last_line(&output),
-        format!(
-            "Live warnings: off — the hub at {url} isn't answering (start it, then run `agentscm quickstart` again)"
-        )
+    let last = last_line(&output);
+    assert!(
+        last.starts_with(&format!(
+            "Live warnings: off — the hub at {url} isn't answering (start it, then run `/"
+        )) && last.ends_with(" quickstart` again)"),
+        "{last}"
     );
 
     // With a token the user supplies, the settings are written even though it cannot be checked.
@@ -850,6 +861,7 @@ fn a_requested_hub_that_is_down_fails_but_keeps_the_planned_hook() {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     let said = out(&output);
     assert!(said.contains("hub isn't answering"), "{said}");
+    assert!(said.contains("its settings are saved"), "{said}");
     assert_eq!(
         json_file(&machine.config().join("hub.json"))["url"],
         url.as_str()
@@ -894,6 +906,22 @@ fn hosted_prints_the_guide_and_sets_up_no_hub() {
     assert!(!machine.home.path().join(".agentscm/hub").exists());
     let output = machine.run(repo.path(), &["quickstart", "--yes", "--local", "--hosted"]);
     assert!(!output.status.success());
+}
+
+#[test]
+fn a_first_local_hub_with_yes_needs_its_administrator_before_any_write() {
+    let machine = Machine::new();
+    let repo = machine.repo();
+    for hub in [&["--local"][..], &["--hub", "local"]] {
+        let mut args = vec!["quickstart", "--yes", "--no-collisions"];
+        args.extend_from_slice(hub);
+        let output = machine.run(repo.path(), &args);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let said = String::from_utf8_lossy(&output.stderr);
+        assert!(said.contains("--github-login"), "{said}");
+        assert!(!machine.config().exists());
+        assert!(!machine.home.path().join(".agentscm").exists());
+    }
 }
 
 #[test]
