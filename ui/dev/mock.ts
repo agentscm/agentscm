@@ -290,10 +290,10 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
         if (down) return send(503, { error: 'unavailable' })
         const empty = scenario === 'empty'
         if (url.pathname === '/onboarding') {
-          const base = { owner: 'maria', expires_at: ago(-600), mcp_verified: true, native_verified: true, blocker: null, next_action: 'Setup is verified for this session.' }
+          const base = { owner: 'maria', expires_at: ago(-600), mcp_verified: true, native_verified: true, blocker: null, next_action: 'MCP and a native edit-hook check were observed for this connection and session. Continue work; this is coordination evidence, not a guarantee of future quota or complete tool coverage.' }
           return send(200, empty ? [] : [
             { ...base, agent: 'claude', key: 'a1b2c3d4e5f6', name: 'Claude Code' },
-            { ...base, agent: 'codex', key: '9f8e7d6c5b4a', name: 'Codex', native_verified: false, blocker: 'trust', next_action: 'Call agentscm_setup_status after approving the project hooks in Codex.' },
+            { ...base, agent: 'codex', key: '9f8e7d6c5b4a', name: 'Codex', native_verified: false, blocker: 'trust', next_action: 'Review the generated AgentSCM plugin/hooks and MCP server in your host, approve them yourself, then start a fresh session. Never bypass trust.' },
           ])
         }
         if (url.pathname === '/skill-workflows') {
