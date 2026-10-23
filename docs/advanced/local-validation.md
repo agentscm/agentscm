@@ -8,7 +8,7 @@ A maintainer can run the repository's gate on their own machine and attach a sig
 
 - `agentscm local-validation run|show|post|verify`: see the [CLI reference](../reference/cli.md#local-validation-attestations). `run` refuses a dirty tree, runs `.github/local-validation/recipe.json` with an allowlisted environment (see the trust boundary), retains each command's output as `<sha>.cmd<N>.stdout|stderr` in the state directory, and signs a portable-evidence-v1 envelope plus a `record` artifact bound to the repository, commit, tree, base ref and merge-base. Failed runs are signed too.
 - Repository configuration in `.github/local-validation/`: `recipe.json` (the commands from `AGENTS.md`), `policy.json` (repository ID, recipe digest, required PostgreSQL and S3 services, 30-day maximum age, epoch) and `registry.json` (issuer keys). A test fails when `policy.json` drifts from `recipe.json`.
-- `.github/workflows/local-validation.yml`: runs on a PR comment that starts with the attestation marker from an `OWNER`, `MEMBER` or `COLLABORATOR` (created, edited or deleted; other commenters are ignored and the signature still decides), on manual dispatch, on pushes to `main` that touch the verifier inputs (`src/evidence/**`, `src/policy/**`, `src/local_validation/**`, `src/local_validation_cli.rs`, `src/main.rs`, `Cargo.lock`, `rust-toolchain.toml`, `.github/local-validation/**` and the workflow itself) and daily. The push and daily runs re-verify every open PR (and fail the job if 1000 or more are open); they skip a PR that has no trusted attestation comment and no existing `agentscm/local-validation` status on its head, and post `pending` where a status exists but the comment is gone. The workflow builds `agentscm` from the default branch, fetches the PR head only as Git data, runs `verify` and posts `success`, `failure`, `error` or `pending` on exactly the verified head SHA. It never checks out, builds or runs PR code.
+- `.github/workflows/local-validation.yml`: runs on a PR comment that starts with the attestation marker from an `OWNER`, `MEMBER` or `COLLABORATOR` (created, edited or deleted; an edit that removes the marker re-verifies; other commenters are ignored and the signature still decides), on manual dispatch, on pushes to `main` that touch the verifier inputs (`src/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.github/local-validation/**` and the workflow itself) and daily. The push and daily runs re-verify every open PR (and fail the job if 1000 or more are open); they skip a PR that has no trusted attestation comment and no existing `agentscm/local-validation` status on its head, and post `pending` where a status exists but the comment is gone. The workflow builds `agentscm` from the default branch, fetches the PR head only as Git data, runs `verify` and posts `success`, `failure`, `error` or `pending` on exactly the verified head SHA. It never checks out, builds or runs PR code.
 
 ## Trust boundary
 
@@ -33,6 +33,13 @@ A maintainer can run the repository's gate on their own machine and attach a sig
 - A new head commit or tree, or a different merge-base.
 - A change to the policy, recipe or registry. The verifier re-runs on pushes to `main` that touch the verifier inputs, and daily, so an aged-out attestation's `success` is replaced. A run posts nothing if the verifier inputs listed above changed on the default branch since it checked out, or if the PR's trusted attestation comments changed while it ran; the newer run owns the verdict.
 - Age beyond the policy maximum.
+
+## Limits
+
+- The status is attached to the commit, so PRs that share a head commit share it. Stacked PRs and one branch opened against two bases are unsupported.
+- Retargeting a PR to a new base fires no event. The next daily run re-verifies it; re-run the workflow with `workflow_dispatch` to refresh sooner.
+- Batch runs (push and daily) process PRs serially within the 30-minute job and the token rate limit. That is practical for tens of open PRs, not hundreds.
+- An aged-out (expired) `success` is replaced by the daily run, so within about a day of expiry.
 
 Advancing the base branch tip does not invalidate it; only the merge-base is bound. The base tip is deliberately not bound, and the tests ran on the PR head, not on the merge result. The maintainers accept this limit.
 
