@@ -2933,7 +2933,7 @@ fn session_row(
 ) -> Result<Option<Row>> {
     Ok(tx
         .query_opt(
-            "SELECT intent, task, via, notice_cursor, denied, deny_times FROM hub_sessions
+            "SELECT intent, task, via, notice_cursor, denied, deny_times, unchecked FROM hub_sessions
              WHERE token = $1 AND session = $2",
             &[&token, &session],
         )?
@@ -2944,6 +2944,7 @@ fn session_row(
             cursor: row.get(3),
             denied: row.get(4),
             deny_times: row.get(5),
+            unchecked: row.get(6),
         }))
 }
 
@@ -3129,12 +3130,13 @@ fn touch_in(
     let cursor = notices.last().map_or(cursor, |event| event.seq);
     tx.execute(
         "INSERT INTO hub_sessions (token, session, intent, task, via, notice_cursor,
-             created_at, updated_at, denied, deny_times)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9)
+             created_at, updated_at, denied, deny_times, unchecked)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, $10)
          ON CONFLICT (token, session) DO UPDATE SET intent = excluded.intent,
              task = excluded.task, via = excluded.via,
              notice_cursor = excluded.notice_cursor, updated_at = excluded.updated_at,
-             denied = excluded.denied, deny_times = excluded.deny_times",
+             denied = excluded.denied, deny_times = excluded.deny_times,
+             unchecked = excluded.unchecked",
         &[
             &token,
             &name,
@@ -3145,6 +3147,7 @@ fn touch_in(
             &now,
             &guarded.denied_json,
             &guarded.times_json,
+            &guarded.unchecked_json,
         ],
     )?;
     if row.is_none() {
