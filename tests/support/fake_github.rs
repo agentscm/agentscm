@@ -265,6 +265,8 @@ pub struct Repo {
     pub runs: Vec<Value>,
     /// Raw deployments with their statuses, newest first; `sha` selects them.
     pub deployments: Vec<(Value, Vec<Value>)>,
+    /// Rulesets applying to every branch, as `GET rules/branches/{branch}` lists them. None: `[]`.
+    pub rules: Option<Value>,
 }
 
 impl Repo {
@@ -284,6 +286,7 @@ impl Repo {
             commits: BTreeMap::new(),
             runs: Vec::new(),
             deployments: Vec::new(),
+            rules: None,
         }
     }
 }
@@ -352,6 +355,22 @@ pub struct FakeState {
     pub omit_pull_repos: bool,
     /// Build every created commit with a different message, so its SHA differs from the client's.
     pub alter_commit_messages: bool,
+    /// The login recorded as `creator` of statuses posted through the API. Default: the
+    /// caller's own login (`<slug>[bot]` for an installation token).
+    pub status_creator: Option<String>,
+}
+
+impl FakeState {
+    /// Records a status as another account posted it (newest last, as the API would).
+    pub fn push_status(&mut self, repo: i64, sha: &str, state: &str, context: &str, login: &str) {
+        let status = json!({"state": state, "context": context, "description": "other",
+            "creator": {"login": login}});
+        self.repos
+            .get_mut(&repo)
+            .unwrap()
+            .statuses
+            .push((sha.to_string(), status));
+    }
 }
 
 fn fake_sha(seed: &str) -> String {
@@ -1305,6 +1324,20 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                         None => not_found(),
                     }
                 }
+                (&Method::GET, ["commits", sha, "statuses"]) => {
+                    let list: Vec<Value> = state.repos[&id]
+                        .statuses
+                        .iter()
+                        .rev()
+                        .filter(|(at, _)| at == sha)
+                        .map(|(_, v)| v.clone())
+                        .collect();
+                    json_reply(200, Value::Array(list))
+                }
+                (&Method::GET, ["rules", "branches", _name @ ..]) => json_reply(
+                    200,
+                    state.repos[&id].rules.clone().unwrap_or_else(|| json!([])),
+                ),
                 (&Method::POST, ["statuses", sha]) => {
                     let b = json_body();
                     let valid_state = matches!(
@@ -1318,12 +1351,18 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                         return json_reply(422, json!({"message": "Validation Failed"}));
                     }
                     let status = json!({"state": b["state"], "context": b["context"], "description": b["description"]});
+                    let creator = state.status_creator.clone().unwrap_or_else(|| match &who {
+                        Who::Reader(login, ..) => login.clone(),
+                        Who::Installation(_) => format!("{APP_SLUG}[bot]"),
+                    });
+                    let mut stored = status.clone();
+                    stored["creator"] = json!({"login": creator});
                     state
                         .repos
                         .get_mut(&id)
                         .unwrap()
                         .statuses
-                        .push((sha.to_string(), status.clone()));
+                        .push((sha.to_string(), stored));
                     if let Some(tip) = state.advance_base_after_status.take() {
                         state.repos.get_mut(&id).unwrap().branches[0].sha = tip;
                     }
