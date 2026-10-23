@@ -133,6 +133,9 @@ struct NativeRollback<'a> {
     prior_plist: &'a Option<Vec<u8>>,
     manifest: &'a mut Manifest,
     prior_record: &'a Option<Record>,
+    /// A first install's receipt to keep, so a rerun adopts its data directory as after an
+    /// uninstall that keeps data, instead of refusing a directory nothing owns.
+    retain: &'a Option<Receipt>,
     restart_previous: bool,
 }
 
@@ -158,7 +161,12 @@ fn validate_native_restoration(recovery: &NativeRollback<'_>) -> Result<(), Stri
             Some(actual)
         }
         None => {
-            if recovery.receipt.symlink_metadata().is_ok() {
+            if let Some(retained) = recovery.retain {
+                let config = recovery.receipt.parent().ok_or("receipt has no parent")?;
+                if &load_receipt(config, &retained.project)? != retained {
+                    return Err("The first install's receipt was not kept.".into());
+                }
+            } else if recovery.receipt.symlink_metadata().is_ok() {
                 return Err("The new native Hub receipt remains after rollback.".into());
             }
             None
@@ -234,6 +242,16 @@ where
         errors.push(format!(
             "restoring the previous LaunchAgent failed: {error}"
         ));
+    }
+    if let Some(retained) = recovery.retain {
+        let kept = serde_json::to_string_pretty(retained)
+            .map_err(|_| "cannot encode native Hub ownership receipt".to_owned())
+            .and_then(|text| atomic_private(recovery.receipt, &format!("{text}\n")));
+        if let Err(error) = kept {
+            errors.push(format!(
+                "keeping the first install's receipt failed: {error}"
+            ));
+        }
     }
     recovery.manifest.native_hub = recovery.prior_record.clone();
     if let Err(error) = save_manifest(recovery.manifest) {
@@ -747,6 +765,7 @@ where
         prior_plist: &prior_plist,
         manifest,
         prior_record: &old_record,
+        retain: &None,
         restart_previous: false,
     };
     validate_native_restoration(&recovery)?;
@@ -1702,14 +1721,10 @@ pub(crate) async fn start(
         record.environment = existing.environment.clone();
         record.slack_files = existing.slack_files.clone();
         validate_slack_state(&record.data_dir, &record.environment, &record.slack_files)?;
+        // Older releases never copied GitHub settings into the receipt, so its environment may
+        // lag the record; it is rewritten from the record below. The Slack files must match.
         let retained = load_receipt(&record.config_dir, &options.project)?;
-        if retained
-            != (Receipt {
-                project: existing.project.clone(),
-                environment: existing.environment.clone(),
-                slack_files: existing.slack_files.clone(),
-            })
-        {
+        if retained.slack_files != existing.slack_files {
             return Err("The native Hub ownership receipt has drifted.".into());
         }
     } else if record.plist.exists() {
@@ -1751,6 +1766,11 @@ pub(crate) async fn start(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.to_string()),
     };
+    let retain = (existing.is_none() && prior_receipt.is_none()).then(|| Receipt {
+        project: record.project.clone(),
+        environment: base_environment(&record),
+        slack_files: BTreeMap::new(),
+    });
     let slack_will_change = options.slack.as_ref().is_some_and(|bundle| {
         let files: BTreeMap<_, _> = bundle
             .files
@@ -1795,6 +1815,7 @@ pub(crate) async fn start(
                         prior_plist: &prior_plist,
                         manifest,
                         prior_record: &existing,
+                        retain: &retain,
                         restart_previous: service_was_loaded && !service_loaded,
                     },
                     error.message,
@@ -1830,6 +1851,7 @@ pub(crate) async fn start(
                     prior_plist: &prior_plist,
                     manifest,
                     prior_record: &existing,
+                    retain: &retain,
                     restart_previous: service_was_loaded && !service_loaded,
                 },
                 error,
@@ -1847,6 +1869,7 @@ pub(crate) async fn start(
                 prior_plist: &prior_plist,
                 manifest,
                 prior_record: &existing,
+                retain: &retain,
                 restart_previous: service_was_loaded && !service_loaded,
             },
             error,
@@ -1877,6 +1900,7 @@ pub(crate) async fn start(
                     prior_plist: &prior_plist,
                     manifest,
                     prior_record: &existing,
+                    retain: &retain,
                     restart_previous: service_was_loaded && !service_loaded,
                 },
                 error,
@@ -1894,6 +1918,7 @@ pub(crate) async fn start(
                     prior_plist: &prior_plist,
                     manifest,
                     prior_record: &existing,
+                    retain: &retain,
                     restart_previous: service_was_loaded && !service_loaded,
                 },
                 error,
@@ -1915,6 +1940,7 @@ pub(crate) async fn start(
                 prior_plist: &prior_plist,
                 manifest,
                 prior_record: &existing,
+                retain: &retain,
                 restart_previous: service_was_loaded,
             },
             error,
@@ -1966,6 +1992,7 @@ pub(crate) async fn start(
                 prior_plist: &prior_plist,
                 manifest: runtime.manifest,
                 prior_record: &existing,
+                retain: &retain,
                 restart_previous: service_was_loaded,
             },
             cause,
@@ -2493,6 +2520,7 @@ mod tests {
                 prior_plist: &Some(old_plist),
                 manifest: &mut rollback_manifest,
                 prior_record: &Some(current_record),
+                retain: &None,
                 restart_previous: true,
             },
             failure.message,

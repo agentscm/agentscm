@@ -3246,6 +3246,124 @@ fn overlapping_install_and_uninstall_preserve_ownership_and_release_after_exit()
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn a_first_native_install_that_fails_its_health_check_can_be_run_again() {
+    let (machine, hub) = (Machine::new(), Hub::start());
+    let repo = machine.repo();
+    let (plist, _) = native_fixture(&machine, &hub);
+    // Nothing installed yet: only the fake launchctl and the program remain from the fixture.
+    let config = machine
+        .home
+        .path()
+        .join(".agentscm/hub-native/fixture-native");
+    std::fs::remove_dir_all(&config).unwrap();
+    std::fs::remove_file(&plist).unwrap();
+    std::fs::remove_file(machine.config().join("quickstart.json")).unwrap();
+    // Nothing answers on this port, so the new Hub never becomes healthy.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+        .to_string();
+    let token = hub.token_file(machine.home.path());
+    let run = || {
+        machine
+            .command(
+                repo.path(),
+                &[
+                    "quickstart",
+                    "--yes",
+                    "--hub",
+                    "local",
+                    "--hub-runtime",
+                    "native",
+                    "--hub-project",
+                    "fixture-native",
+                    "--hub-port",
+                    &port,
+                    "--github-login",
+                    "octo",
+                    "--agent-token-file",
+                    token.to_str().unwrap(),
+                    "--hook",
+                    "none",
+                    "--no-collisions",
+                ],
+            )
+            .env("FAKE_PLIST", &plist)
+            .output()
+            .unwrap()
+    };
+    for attempt in ["first", "rerun"] {
+        let failed = run();
+        assert_eq!(failed.status.code(), Some(1), "{attempt}: {failed:?}");
+        // The rerun adopts the kept data directory instead of refusing it as unowned.
+        assert!(
+            out(&failed).contains("didn't become healthy"),
+            "{attempt}: {failed:?}"
+        );
+        assert!(!plist.exists(), "{attempt}");
+        // Kept with a receipt, as an uninstall that keeps data leaves it.
+        assert!(config.join("retained.json").is_file(), "{attempt}");
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn native_resume_accepts_a_receipt_written_before_github_settings_were_kept_in_it() {
+    let (machine, hub) = (Machine::new(), Hub::start());
+    let repo = machine.repo();
+    let (plist, _) = native_fixture(&machine, &hub);
+    // Earlier releases kept GitHub settings in the record only, and wrote no `slack_files`.
+    let manifest = machine.config().join("quickstart.json");
+    let mut state = json_file(&manifest);
+    let native = &mut state["native_hub"];
+    let data = native["data_dir"].as_str().unwrap().to_owned();
+    let config = PathBuf::from(native["config_dir"].as_str().unwrap());
+    let environment = &mut native["environment"];
+    environment["AGENTSCM_GITHUB_CLIENT_ID"] = json!("fixture-client");
+    environment["AGENTSCM_GITHUB_CLIENT_SECRET_FILE"] =
+        json!(format!("{data}/secrets/con_fixture.client_secret"));
+    environment["AGENTSCM_ADMINS"] = json!("github:octo");
+    std::fs::write(&manifest, state.to_string()).unwrap();
+    let retained = config.join("retained.json");
+    std::fs::write(
+        &retained,
+        json!({"project": "fixture-native",
+            "environment": {"AGENTSCM_DATABASE_URL": format!("sqlite://{data}/hub.sqlite")}})
+        .to_string(),
+    )
+    .unwrap();
+    let token = hub.token_file(machine.home.path());
+    let output = machine
+        .command(
+            repo.path(),
+            &[
+                "quickstart",
+                "--yes",
+                "--hub",
+                "local",
+                "--hub-runtime",
+                "native",
+                "--github-login",
+                "octo",
+                "--agent-token-file",
+                token.to_str().unwrap(),
+                "--hook",
+                "none",
+                "--no-collisions",
+            ],
+        )
+        .env("FAKE_PLIST", &plist)
+        .output()
+        .unwrap();
+    ok(&output);
+    let receipt = json_file(&retained);
+    assert_eq!(receipt["environment"]["AGENTSCM_ADMINS"], "github:octo");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn native_program_repairs_are_reported_but_true_noop_preserves_record() {
     for missing in ["link", "versioned"] {
         let (machine, hub) = (Machine::new(), Hub::start());
