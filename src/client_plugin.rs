@@ -789,13 +789,14 @@ fn install_claude(root: &Path, path: &Path, files: &[(&'static str, Vec<u8>)]) -
     verify_claude_install(plugin, files)
 }
 
-pub(crate) fn install_for_root(root: &Path) -> Result<()> {
+pub(crate) fn install_for_root(root: &Path, program: &Path) -> Result<()> {
     run_for_root(
         PluginArgs {
             output: None,
             install: true,
         },
         root,
+        program,
     )
 }
 
@@ -809,31 +810,130 @@ pub(crate) fn preflight_claude_for_root(root: &Path) -> Result<()> {
     check_installed_claude_plugins(root)
 }
 
-pub(crate) fn install_claude_for_root(root: &Path) -> Result<()> {
+pub(crate) fn install_claude_for_root(root: &Path, program: &Path) -> Result<()> {
     // Preflight precedes package generation so a duplicate hook cannot mint a token first.
     preflight_claude_for_root(root)?;
-    let program = std::env::current_exe()?;
     let output = default_output(Engine::Claude)?;
-    prepare_for(Engine::Claude, &output, &program)?;
+    prepare_for(Engine::Claude, &output, program)?;
     let path = std::fs::canonicalize(&output)?;
-    let files = package_files(Engine::Claude, program_text(&program)?);
+    let files = package_files(Engine::Claude, program_text(program)?);
     install_claude(root, &path, &files)
 }
 
-pub fn run(args: PluginArgs) -> Result<()> {
-    run_for_root(args, &std::env::current_dir()?)
+/// Runs a plugin CLI for removal from a directory that always exists; `None` when the CLI is
+/// gone, since it then has no plugin left to remove.
+fn removal_output(program: &str, args: &[&str]) -> Result<Option<std::process::Output>> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| invalid("HOME is not set"))?;
+    match std::process::Command::new(program)
+        .args(args)
+        .current_dir(home)
+        .stdin(std::process::Stdio::null())
+        .output()
+    {
+        Ok(output) => Ok(Some(output)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
-fn run_for_root(args: PluginArgs, root: &Path) -> Result<()> {
+fn removed(program: &str, args: &[&str], failure: &str) -> Result<()> {
+    match removal_output(program, args)? {
+        Some(output) if !output.status.success() => Err(invalid(failure)),
+        _ => Ok(()),
+    }
+}
+
+/// Takes out the user-scope plugin, its marketplace and the generated package once no
+/// connected checkout uses them.
+pub(crate) fn remove(claude: bool) -> Result<()> {
+    let engine = if claude {
+        Engine::Claude
+    } else {
+        Engine::Codex
+    };
+    let (program, plugin) = if claude {
+        ("claude", "agentscm@agentscm-claude-client")
+    } else {
+        ("codex", "agentscm@agentscm-client")
+    };
+    let Some(listed) = removal_output(program, &["plugin", "list", "--json"])? else {
+        println!("{program} is not installed, so there is no AgentSCM plugin to remove from it.");
+        return Ok(());
+    };
+    let listed: Value = serde_json::from_slice(&listed.stdout).unwrap_or(Value::Null);
+    let plugins = if claude {
+        &listed
+    } else {
+        &listed["installed"]
+    };
+    let installed = plugins
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|entry| entry["id"] == plugin || entry["pluginId"] == plugin);
+    if installed {
+        let args: &[&str] = if claude {
+            &["plugin", "uninstall", "--scope", "user", plugin]
+        } else {
+            &["plugin", "remove", plugin]
+        };
+        removed(
+            program,
+            args,
+            &format!("{program} could not uninstall {plugin}; remove it through {program}"),
+        )?;
+        println!("Uninstalled the {plugin} plugin.");
+    }
+    let marketplaces = if claude {
+        removal_output(program, &["plugin", "marketplace", "list", "--json"])?
+    } else {
+        None
+    };
+    let registered = !claude
+        || marketplaces
+            .and_then(|output| serde_json::from_slice::<Value>(&output.stdout).ok())
+            .and_then(|value| value.as_array().cloned())
+            .is_some_and(|list| {
+                list.iter()
+                    .any(|entry| entry["name"] == engine.marketplace())
+            });
+    if registered {
+        // Codex has no machine-readable marketplace list; its remove fails only when absent.
+        let result = removed(
+            program,
+            &["plugin", "marketplace", "remove", engine.marketplace()],
+            &format!(
+                "{program} could not remove the {} marketplace; remove it through {program}",
+                engine.marketplace()
+            ),
+        );
+        if claude {
+            result?;
+        }
+    }
+    let output = default_output(engine)?;
+    match std::fs::remove_dir_all(&output) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+        _ => {}
+    }
+    Ok(())
+}
+
+pub fn run(args: PluginArgs) -> Result<()> {
+    run_for_root(args, &std::env::current_dir()?, &std::env::current_exe()?)
+}
+
+fn run_for_root(args: PluginArgs, root: &Path, program: &Path) -> Result<()> {
     if args.install {
         check_existing_hooks(root)?;
     }
-    let program = std::env::current_exe()?;
     let output = match args.output {
         Some(output) => output,
         None => default_output(Engine::Codex)?,
     };
-    prepare(&output, &program)?;
+    prepare(&output, program)?;
     let path = std::fs::canonicalize(&output)?;
     println!("Prepared local Codex marketplace at {}", path.display());
     if args.install {

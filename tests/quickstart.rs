@@ -84,6 +84,7 @@ impl Hub {
         let (_, secret) = mint_agent_token(&*self.store, &owner.id, "t", repo, 3600).unwrap();
         let file = dir.join(name);
         std::fs::write(&file, format!("{}\n", secret.expose())).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
         file
     }
 
@@ -111,6 +112,8 @@ fn find_git() -> PathBuf {
 struct Machine {
     home: TempDir,
     bin: TempDir,
+    /// Whether `/usr/bin:/bin` is on PATH, which the fake `claude` script needs.
+    system_path: bool,
 }
 
 impl Machine {
@@ -133,7 +136,16 @@ impl Machine {
         Self {
             home: TempDir::new().unwrap(),
             bin,
+            system_path: false,
         }
+    }
+
+    fn path(&self) -> std::ffi::OsString {
+        let mut path = self.bin.path().as_os_str().to_owned();
+        if self.system_path {
+            path.push(":/usr/bin:/bin");
+        }
+        path
     }
 
     fn config(&self) -> PathBuf {
@@ -152,7 +164,7 @@ impl Machine {
             .env_clear()
             .env("HOME", self.home.path())
             .env("XDG_CONFIG_HOME", self.home.path().join(".config"))
-            .env("PATH", self.bin.path())
+            .env("PATH", self.path())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -218,25 +230,6 @@ fn mode(path: &Path) -> u32 {
     path.metadata().unwrap().permissions().mode() & 0o777
 }
 
-fn backups(settings: &Path) -> Vec<PathBuf> {
-    let prefix = format!(
-        "{}.agentscm-backup-",
-        settings.file_name().unwrap().to_string_lossy()
-    );
-    let mut found: Vec<_> = std::fs::read_dir(settings.parent().unwrap())
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .filter(|p| {
-            p.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with(&prefix)
-        })
-        .collect();
-    found.sort();
-    found
-}
-
 fn closed_port_url() -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     format!("http://{}", listener.local_addr().unwrap())
@@ -248,8 +241,6 @@ fn quick<'a>(url: &'a str, token: &'a Path, extra: &[&'a str]) -> Vec<&'a str> {
     args.extend(extra);
     args
 }
-
-const SETTINGS: &str = ".claude/settings.local.json";
 
 fn last_line(output: &Output) -> String {
     out(output).lines().last().unwrap_or_default().to_owned()
@@ -275,7 +266,7 @@ fn hook_json(session: &str, cwd: &Path, file: &str) -> String {
     .to_string()
 }
 
-/// An Edit hook call from `cwd`, through the hub.json quickstart wrote.
+/// An Edit hook call from `cwd`, through the checkout's client connection.
 fn edit(machine: &Machine, cwd: &Path, session: &str, file: &str) -> Output {
     let mut check = machine.command(cwd, &["intent", "check", "--hook", "claude"]);
     check.stdin(Stdio::piped());
@@ -288,121 +279,6 @@ fn edit(machine: &Machine, cwd: &Path, session: &str, file: &str) -> Output {
 fn live_paths(hub: &Hub, repo: &str) -> Vec<Vec<String>> {
     let live = hub.store.live_intents(repo, unix_now(), 100).unwrap();
     live.into_iter().map(|i| i.paths).collect()
-}
-
-#[test]
-fn end_to_end_with_a_given_token_then_the_hook_works() {
-    let (hub, machine) = (Hub::start(), Machine::transient());
-    let repo = machine.repo();
-    let token = hub.token_file(machine.home.path());
-    // User scope keeps the command form: one env var cannot serve several repositories.
-    let args = quick(&hub.url, &token, &["--hook", "user", "--no-collisions"]);
-    let output = machine.run(repo.path(), &args);
-    let said = ok(&output);
-    assert!(
-        said.lines()
-            .any(|l| l == "The agent token is valid for acme/widgets."),
-        "{said}"
-    );
-    assert!(said.contains(" uninstall`"), "{said}");
-    assert!(
-        said.contains(&format!("Hub status page: {}/ui/", hub.url)),
-        "{said}"
-    );
-    assert!(
-        said.contains(
-            " hub token create --read-only --name status-page --repo acme/widgets --ttl 30d"
-        ),
-        "{said}"
-    );
-    assert_eq!(
-        last_line(&output),
-        format!("Live warnings: on (hub {}, repo acme/widgets)", hub.url)
-    );
-
-    let hub_json = machine.config().join("hub.json");
-    assert_eq!(mode(&hub_json), 0o600);
-    let config = json_file(&hub_json);
-    let token_path = token.canonicalize().unwrap();
-    assert_eq!(config["url"], hub.url.as_str());
-    assert_eq!(
-        Path::new(config["token_file"].as_str().unwrap()),
-        token_path
-    );
-    assert_eq!(
-        Path::new(config["tokens"][REPO].as_str().unwrap()),
-        token_path
-    );
-    assert_eq!(config.as_object().unwrap().len(), 3);
-
-    // This test program is not installed anywhere stable, so it is copied in the
-    // installer's layout and the hooks call the symlink.
-    let (bin, version) = (machine.bin_dir(), env!("CARGO_PKG_VERSION"));
-    let link = bin.join("agentscm");
-    let versioned = bin.join(format!("agentscm-{version}"));
-    assert_eq!(
-        std::fs::read_link(&link).unwrap(),
-        Path::new(&format!("agentscm-{version}"))
-    );
-    assert_eq!(
-        versioned.metadata().unwrap().len(),
-        Path::new(env!("CARGO_BIN_EXE_agentscm"))
-            .metadata()
-            .unwrap()
-            .len()
-    );
-    assert_eq!(mode(&versioned), 0o755);
-    assert_eq!(mode(&bin), 0o700);
-    assert_eq!(names_in(&bin).len(), 2);
-    assert!(
-        said.contains(&format!("Run AgentSCM commands with: {}", link.display())),
-        "{said}"
-    );
-    assert!(
-        said.contains(&format!("export PATH={}:\"$PATH\"", bin.display())),
-        "{said}"
-    );
-    let command_help = Command::new(&link).arg("--help").output().unwrap();
-    assert!(command_help.status.success());
-
-    let settings = machine.home.path().join(".claude/settings.json");
-    assert_eq!(mode(&settings), 0o600);
-    assert!(json_file(&settings).get("env").is_none());
-    let exe = link.display().to_string();
-    let hooks = &json_file(&settings)["hooks"];
-    assert_eq!(
-        hooks["SessionStart"][0]["hooks"][0]["command"],
-        format!("{exe} intent start --hook claude")
-    );
-    assert_eq!(hooks["PreToolUse"][0]["matcher"], "Edit|Write|MultiEdit");
-    assert_eq!(
-        hooks["PreToolUse"][0]["hooks"][0]["command"],
-        format!("{exe} intent check --hook claude")
-    );
-    assert_eq!(
-        hooks["SessionEnd"][0]["hooks"][0]["command"],
-        format!("{exe} intent done --hook claude")
-    );
-
-    let record = machine.config().join("quickstart.json");
-    assert_eq!(mode(&record), 0o600);
-    let record = json_file(&record);
-    assert_eq!(record["hooks"][0]["added"].as_array().unwrap().len(), 3);
-    assert_eq!(record["hooks"][0]["created"], true);
-    assert_eq!(record["hub_json"]["path"], hub_json.to_str().unwrap());
-    assert_eq!(record["hub_json"]["hash"].as_str().unwrap().len(), 64);
-    assert_eq!(record["tokens"][0]["repo"], REPO);
-    assert_eq!(record["tokens"][0]["owned"], false);
-    assert_eq!(record["bin_dir"], bin.to_str().unwrap());
-
-    // The configuration it wrote is enough for the hook: no AGENTSCM_* variables are set.
-    let reply = ok(&edit(&machine, repo.path(), "s1", "src/main.rs"));
-    assert!(!reply.contains("unknown"), "{reply}");
-    assert!(live_paths(&hub, REPO).contains(&vec!["src/main.rs".to_owned()]));
-
-    // Uninstall removes the copy and the symlink it made.
-    ok(&machine.run(repo.path(), &["uninstall", "--yes"]));
-    assert!(!bin.exists());
 }
 
 #[test]
@@ -421,8 +297,7 @@ fn a_program_already_in_the_install_directory_is_used_through_its_symlink() {
         "--yes",
         "--hub",
         "skip",
-        "--hook",
-        "project",
+        "--no-agents",
         "--no-collisions",
     ];
     ok(&machine
@@ -443,11 +318,7 @@ fn a_program_already_in_the_install_directory_is_used_through_its_symlink() {
         std::fs::read_link(&link).unwrap(),
         Path::new("agentscm-0.0.0")
     );
-    let hooks = json_file(&repo.path().join(SETTINGS));
-    assert_eq!(
-        hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"],
-        format!("{} intent start --hook claude", link.display())
-    );
+    assert!(!repo.path().join(".claude").exists());
     // Uninstall removes the installer's files, even ones quickstart did not make, and
     // only those named agentscm or agentscm-*: not a directory.
     let said = ok(&machine
@@ -478,7 +349,7 @@ fn collisions_are_summarised() {
     let version = Command::new(find_git()).arg("--version").output().unwrap();
     let said = ok(&machine.run(
         dir,
-        &["quickstart", "--yes", "--hub", "skip", "--hook", "none"],
+        &["quickstart", "--yes", "--hub", "skip", "--no-agents"],
     ));
     if String::from_utf8_lossy(&version.stdout).contains("git version 2.")
         && !said.contains("Couldn't check")
@@ -499,390 +370,6 @@ fn collisions_are_summarised() {
     assert!(!dir.join(".claude").exists());
 }
 
-const OTHER_HOOKS: &str = r#"{"model":"x","hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"other"}]}]}}"#;
-
-fn project_args() -> [&'static str; 7] {
-    [
-        "quickstart",
-        "--yes",
-        "--hub",
-        "skip",
-        "--hook",
-        "project",
-        "--no-collisions",
-    ]
-}
-
-#[test]
-fn hook_merge_keeps_everything_else_and_is_idempotent() {
-    let machine = Machine::new();
-    let repo = machine.repo();
-    let settings = repo.path().join(SETTINGS);
-    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
-    std::fs::write(&settings, OTHER_HOOKS).unwrap();
-    std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o640)).unwrap();
-    ok(&machine.run(repo.path(), &project_args()));
-
-    let merged = json_file(&settings);
-    assert_eq!(merged["model"], "x");
-    let pre = merged["hooks"]["PreToolUse"].as_array().unwrap();
-    assert_eq!(pre.len(), 2);
-    assert_eq!(pre[0]["hooks"][0]["command"], "other");
-    assert!(merged["hooks"]["SessionStart"].is_array() && merged["hooks"]["SessionEnd"].is_array());
-    assert_eq!(mode(&settings), 0o640);
-    let saved = backups(&settings);
-    assert_eq!(saved.len(), 1);
-    assert_eq!(std::fs::read(&saved[0]).unwrap(), OTHER_HOOKS.as_bytes());
-
-    let before = std::fs::read(&settings).unwrap();
-    let output = machine.run(repo.path(), &project_args());
-    let said = ok(&output);
-    assert!(
-        said.contains("already has the AgentSCM hooks; nothing to change."),
-        "{said}"
-    );
-    assert!(last_line(&output).starts_with("Live warnings: off — no hub chosen"));
-    assert_eq!(std::fs::read(&settings).unwrap(), before);
-    assert_eq!(backups(&settings).len(), 1);
-}
-
-#[test]
-fn an_unparsable_or_unreadable_settings_file_is_left_alone() {
-    let machine = Machine::new();
-    let repo = machine.repo();
-    let settings = repo.path().join(SETTINGS);
-    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
-    std::fs::write(&settings, "{ not json").unwrap();
-    let said = ok(&machine.run(repo.path(), &project_args()));
-    assert!(
-        said.contains("isn't valid JSON, so I left it alone"),
-        "{said}"
-    );
-    assert_eq!(std::fs::read(&settings).unwrap(), b"{ not json");
-    assert!(backups(&settings).is_empty());
-    assert!(!machine.config().join("quickstart.json").exists());
-
-    // Not UTF-8, or not readable: that is an error, not an absent file.
-    std::fs::write(&settings, [0xff, 0xfe, 0x00]).unwrap();
-    let said = ok(&machine.run(repo.path(), &project_args()));
-    assert!(said.contains("I couldn't read"), "{said}");
-    assert_eq!(std::fs::read(&settings).unwrap(), [0xff, 0xfe, 0x00]);
-    std::fs::write(&settings, "{}").unwrap();
-    std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o000)).unwrap();
-    let said = ok(&machine.run(repo.path(), &project_args()));
-    std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o600)).unwrap();
-    assert!(said.contains("I couldn't read"), "{said}");
-    assert_eq!(std::fs::read(&settings).unwrap(), b"{}");
-    assert!(backups(&settings).is_empty());
-    assert!(!machine.config().join("quickstart.json").exists());
-}
-
-#[test]
-fn a_symlinked_settings_file_stays_a_symlink() {
-    let machine = Machine::new();
-    let repo = machine.repo();
-    let real = machine.home.path().join("dotfiles/settings.local.json");
-    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
-    std::fs::write(&real, OTHER_HOOKS).unwrap();
-    let link = repo.path().join(SETTINGS);
-    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
-    symlink(&real, &link).unwrap();
-    ok(&machine.run(repo.path(), &project_args()));
-    assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
-    assert_eq!(
-        json_file(&real)["hooks"]["PreToolUse"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
-    );
-    assert_eq!(backups(&real).len(), 1);
-    ok(&machine.run(repo.path(), &["uninstall", "--yes"]));
-    assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
-    assert_eq!(std::fs::read(&real).unwrap(), OTHER_HOOKS.as_bytes());
-}
-
-#[test]
-fn uninstall_restores_the_original_files() {
-    let (hub, machine) = (Hub::start(), Machine::new());
-    let repo = machine.repo();
-    let token = hub.token_file(machine.home.path());
-    let settings = repo.path().join(SETTINGS);
-    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
-    let original = "{\n  \"model\": \"x\"\n}\n";
-    std::fs::write(&settings, original).unwrap();
-    // A second file quickstart creates, in the user-level settings.
-    let user = machine.home.path().join(".claude/settings.json");
-
-    ok(&machine.run(
-        repo.path(),
-        &quick(&hub.url, &token, &["--hook", "project", "--no-collisions"]),
-    ));
-    ok(&machine.run(
-        repo.path(),
-        &quick(&hub.url, &token, &["--hook", "user", "--no-collisions"]),
-    ));
-    assert!(user.exists() && machine.config().join("hub.json").exists());
-
-    let said = ok(&machine.run(repo.path(), &["uninstall", "--yes"]));
-    assert!(said.contains("Removed quickstart's record"), "{said}");
-    assert_eq!(std::fs::read_to_string(&settings).unwrap(), original);
-    assert!(!user.exists());
-    assert!(!machine.config().join("hub.json").exists());
-    assert!(!machine.config().join("quickstart.json").exists());
-    assert!(!machine.bin_dir().exists());
-    // The token file was the user's own, so it stays.
-    assert!(token.exists());
-    // Nothing left to undo.
-    assert!(out(&machine.run(repo.path(), &["uninstall", "--yes"])).contains("Nothing to undo"));
-}
-
-#[test]
-fn uninstall_after_the_user_edited_the_file_removes_only_our_hooks() {
-    let machine = Machine::new();
-    let repo = machine.repo();
-    let settings = repo.path().join(SETTINGS);
-    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
-    std::fs::write(&settings, OTHER_HOOKS).unwrap();
-    ok(&machine.run(repo.path(), &project_args()));
-    let mut edited = json_file(&settings);
-    edited["extra"] = json!(1);
-    std::fs::write(&settings, serde_json::to_string_pretty(&edited).unwrap()).unwrap();
-
-    let said = ok(&machine.run(repo.path(), &["uninstall", "--yes"]));
-    assert!(said.contains("removed 3 hook entries"), "{said}");
-    let after = json_file(&settings);
-    assert_eq!(after["extra"], 1);
-    assert_eq!(after["model"], "x");
-    assert_eq!(after["hooks"].as_object().unwrap().len(), 1);
-    assert_eq!(
-        after["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
-        "other"
-    );
-    assert!(!machine.config().join("quickstart.json").exists());
-}
-
-#[test]
-fn uninstall_keeps_what_it_could_not_undo() {
-    let (hub, machine) = (Hub::start(), Machine::new());
-    let repo = machine.repo();
-    let token = hub.token_file(machine.home.path());
-    ok(&machine.run(
-        repo.path(),
-        &quick(&hub.url, &token, &["--hook", "none", "--no-collisions"]),
-    ));
-    let record_path = machine.config().join("quickstart.json");
-    let mut record = json_file(&record_path);
-    record["tokens"][0]["owned"] = json!(true);
-    std::fs::write(&record_path, record.to_string()).unwrap();
-    let hub_json = machine.config().join("hub.json");
-    let written = std::fs::read_to_string(&hub_json).unwrap();
-    let changed = format!("{written}\n\n");
-    std::fs::write(&hub_json, &changed).unwrap();
-
-    let output = machine.run(repo.path(), &["uninstall", "--yes"]);
-    assert!(!output.status.success());
-    let said = out(&output);
-    assert!(
-        said.contains("you changed it after quickstart wrote it"),
-        "{said}"
-    );
-    assert!(said.contains("To finish by hand"), "{said}");
-    assert!(
-        said.contains(&format!("review {}", hub_json.display())),
-        "{said}"
-    );
-    assert_eq!(std::fs::read_to_string(&hub_json).unwrap(), changed);
-    assert!(!token.exists());
-    // Only what is left stays in the record.
-    let left = json_file(&record_path);
-    assert!(left["hub_json"].is_object());
-    assert!(left["tokens"].as_array().unwrap().is_empty());
-    assert!(left["hooks"].as_array().unwrap().is_empty());
-
-    // Once it is as quickstart wrote it again, uninstall finishes.
-    std::fs::write(&hub_json, &written).unwrap();
-    ok(&machine.run(repo.path(), &["uninstall", "--yes"]));
-    assert!(!hub_json.exists() && !record_path.exists());
-}
-
-#[test]
-fn uninstall_ends_the_sign_in_quickstart_created() {
-    let (hub, machine) = (Hub::start(), Machine::new());
-    let repo = machine.repo();
-    let token = hub.token_file(machine.home.path());
-    ok(&machine.run(
-        repo.path(),
-        &quick(&hub.url, &token, &["--hook", "none", "--no-collisions"]),
-    ));
-    let session = machine.config().join("hub-session.json");
-    std::fs::write(
-        &session,
-        json!({"hub": hub.url, "session": "x", "expires_at": 0}).to_string(),
-    )
-    .unwrap();
-    let record_path = machine.config().join("quickstart.json");
-    let mut record = json_file(&record_path);
-    record["session"] = json!({"hub": hub.url});
-    std::fs::write(&record_path, record.to_string()).unwrap();
-
-    let said = ok(&machine.run(repo.path(), &["uninstall", "--yes"]));
-    assert!(said.contains("Signed out of"), "{said}");
-    assert!(!session.exists() && !record_path.exists());
-}
-
-#[test]
-fn a_hub_json_for_another_hub_is_replaced_with_a_backup_and_restored_by_uninstall() {
-    let (hub, machine) = (Hub::start(), Machine::new());
-    let repo = machine.repo();
-    let token = hub.token_file(machine.home.path());
-    let hub_json = machine.config().join("hub.json");
-    std::fs::create_dir_all(hub_json.parent().unwrap()).unwrap();
-    let original = r#"{"url":"http://127.0.0.1:9","token_file":"/old/token","tokens":{"acme/other":"/old/other"}}"#;
-    std::fs::write(&hub_json, original).unwrap();
-    let said = ok(&machine.run(
-        repo.path(),
-        &quick(&hub.url, &token, &["--hook", "none", "--no-collisions"]),
-    ));
-    assert!(
-        said.contains("switching moves your other repositories"),
-        "{said}"
-    );
-    let now = json_file(&hub_json);
-    assert_eq!(now["url"], hub.url.as_str());
-    assert_eq!(now["tokens"].as_object().unwrap().len(), 1);
-    let saved = backups(&hub_json);
-    assert_eq!(saved.len(), 1);
-    assert_eq!(std::fs::read(&saved[0]).unwrap(), original.as_bytes());
-
-    ok(&machine.run(repo.path(), &["uninstall", "--yes"]));
-    assert_eq!(std::fs::read(&hub_json).unwrap(), original.as_bytes());
-}
-
-#[test]
-fn several_repositories_share_one_hub_with_their_own_tokens() {
-    let (hub, machine) = (Hub::start(), Machine::new());
-    let (one, two) = (
-        machine.repo(),
-        machine.repo_at("https://github.com/acme/gadgets.git"),
-    );
-    let token_one = hub.token_file_for(machine.home.path(), "acme/widgets", "one.token");
-    let token_two = hub.token_file_for(machine.home.path(), "acme/gadgets", "two.token");
-    let go = |dir: &Path, token: &Path| {
-        let output = machine.run(
-            dir,
-            &quick(&hub.url, token, &["--hook", "none", "--no-collisions"]),
-        );
-        ok(&output);
-    };
-    go(one.path(), &token_one);
-    go(two.path(), &token_two);
-
-    let config = json_file(&machine.config().join("hub.json"));
-    let tokens = config["tokens"].as_object().unwrap();
-    assert_eq!(tokens.len(), 2);
-    assert_eq!(
-        Path::new(tokens["acme/widgets"].as_str().unwrap()),
-        token_one.canonicalize().unwrap()
-    );
-    assert_eq!(
-        Path::new(tokens["acme/gadgets"].as_str().unwrap()),
-        token_two.canonicalize().unwrap()
-    );
-    assert_eq!(
-        json_file(&machine.config().join("quickstart.json"))["tokens"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
-    );
-
-    // Each checkout announces with its own token.
-    ok(&edit(&machine, one.path(), "a", "src/one.rs"));
-    ok(&edit(&machine, two.path(), "b", "src/two.rs"));
-    assert_eq!(
-        live_paths(&hub, "acme/widgets"),
-        [vec!["src/one.rs".to_owned()]]
-    );
-    assert_eq!(
-        live_paths(&hub, "acme/gadgets"),
-        [vec!["src/two.rs".to_owned()]]
-    );
-
-    ok(&machine.run(one.path(), &["uninstall", "--yes"]));
-    assert!(!machine.config().join("hub.json").exists());
-    assert!(token_one.exists() && token_two.exists());
-}
-
-#[test]
-fn a_requested_hub_that_is_down_fails_but_keeps_the_planned_hook() {
-    let machine = Machine::new();
-    let repo = machine.repo();
-    let url = closed_port_url();
-    let output = machine.run(
-        repo.path(),
-        &[
-            "quickstart",
-            "--yes",
-            "--hub",
-            "existing",
-            "--hub-url",
-            &url,
-            "--hook",
-            "project",
-            "--no-collisions",
-        ],
-    );
-    assert_eq!(output.status.code(), Some(1), "{output:?}");
-    let said = out(&output);
-    assert!(
-        said.contains(&format!(
-            "The hub at {url} isn't answering, so nothing was saved for it."
-        )),
-        "{said}"
-    );
-    assert!(repo.path().join(SETTINGS).exists());
-    assert!(!machine.config().join("hub.json").exists());
-    let last = last_line(&output);
-    assert!(
-        last.starts_with(&format!(
-            "Live warnings: off — the hub at {url} isn't answering (start it, then run `/"
-        )) && last.ends_with(" quickstart` again)"),
-        "{last}"
-    );
-
-    // With a token the user supplies, the settings are written even though it cannot be checked.
-    let token = machine.home.path().join("t.token");
-    std::fs::write(&token, "tok\n").unwrap();
-    let output = machine.run(
-        repo.path(),
-        &quick(&url, &token, &["--hook", "none", "--no-collisions"]),
-    );
-    assert_eq!(output.status.code(), Some(1), "{output:?}");
-    let said = out(&output);
-    assert!(said.contains("hub isn't answering"), "{said}");
-    assert!(said.contains("its settings are saved"), "{said}");
-    assert_eq!(
-        json_file(&machine.config().join("hub.json"))["url"],
-        url.as_str()
-    );
-}
-
-#[test]
-fn with_yes_the_hooks_wait_for_a_hub() {
-    let machine = Machine::new();
-    let repo = machine.repo();
-    std::fs::create_dir_all(machine.home.path().join(".claude")).unwrap();
-    let output = machine.run(
-        repo.path(),
-        &["quickstart", "--yes", "--hub", "skip", "--no-collisions"],
-    );
-    let said = ok(&output);
-    assert!(said.contains("Not adding the Claude Code hooks"), "{said}");
-    assert!(!repo.path().join(".claude").exists());
-    assert!(!machine.config().join("quickstart.json").exists());
-}
-
 #[test]
 fn hosted_prints_the_guide_and_sets_up_no_hub() {
     let machine = Machine::new();
@@ -893,8 +380,7 @@ fn hosted_prints_the_guide_and_sets_up_no_hub() {
             "quickstart",
             "--yes",
             "--hosted",
-            "--hook",
-            "none",
+            "--no-agents",
             "--no-collisions",
         ],
     );
@@ -925,32 +411,6 @@ fn a_first_local_hub_with_yes_needs_its_administrator_before_any_write() {
 }
 
 #[test]
-fn without_a_terminal_it_refuses_and_writes_nothing() {
-    let machine = Machine::new();
-    let repo = machine.repo();
-    let output = machine.run(repo.path(), &["quickstart", "--hook", "project"]);
-    assert!(!output.status.success());
-    let said = String::from_utf8_lossy(&output.stderr);
-    for flag in [
-        "--yes",
-        "--hub local|existing|skip",
-        "--hub-url",
-        "--agent-token-file",
-        "--hook user|project|none",
-        "--no-collisions",
-    ] {
-        assert!(said.contains(flag), "{flag}: {said}");
-    }
-    assert!(!repo.path().join(".claude").exists());
-    assert!(!machine.config().exists());
-    assert!(!machine.home.path().join(".agentscm").exists());
-    // With nothing recorded there is nothing to refuse.
-    let output = machine.run(repo.path(), &["uninstall"]);
-    assert!(output.status.success());
-    assert!(out(&output).contains("nothing was installed by quickstart"));
-}
-
-#[test]
 fn running_from_the_install_directory_is_undoable_without_any_hook() {
     let machine = Machine::transient();
     let repo = machine.repo();
@@ -964,8 +424,7 @@ fn running_from_the_install_directory_is_undoable_without_any_hook() {
         "--yes",
         "--hub",
         "skip",
-        "--hook",
-        "none",
+        "--no-agents",
         "--no-collisions",
     ];
     let said = ok(&machine
@@ -995,198 +454,18 @@ fn running_from_the_install_directory_is_undoable_without_any_hook() {
 }
 
 #[test]
-fn uninstall_after_two_writes_keeps_edits_made_in_between() {
-    let machine = Machine::new();
+fn init_writes_only_instruction_files_even_for_a_local_hub() {
+    let (hub, machine) = (Hub::start(), Machine::new().with_claude());
     let repo = machine.repo();
-    let settings = repo.path().join(SETTINGS);
-    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
-    std::fs::write(&settings, OTHER_HOOKS).unwrap();
-    ok(&machine.run(repo.path(), &project_args()));
-    // The user adds a setting and drops one of our hooks; quickstart puts it back.
-    let mut edited = json_file(&settings);
-    edited["extra"] = json!(1);
-    edited["hooks"]
-        .as_object_mut()
-        .unwrap()
-        .remove("SessionEnd");
-    std::fs::write(&settings, serde_json::to_string_pretty(&edited).unwrap()).unwrap();
-    ok(&machine.run(repo.path(), &project_args()));
-    assert_eq!(backups(&settings).len(), 2);
-    assert!(json_file(&settings)["hooks"]["SessionEnd"].is_array());
-
-    let said = ok(&machine.run(repo.path(), &["uninstall", "--yes"]));
-    assert!(said.contains("hook entries"), "{said}");
-    let after = json_file(&settings);
-    assert_eq!(after["extra"], 1);
-    assert_eq!(after["model"], "x");
-    assert_eq!(after["hooks"].as_object().unwrap().len(), 1);
-    assert_eq!(
-        after["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
-        "other"
-    );
-}
-
-fn bytes_of(path: &Path) -> Vec<u8> {
-    std::fs::read(path).unwrap()
-}
-
-#[test]
-fn project_hooks_with_a_hub_are_http_and_keep_the_token_in_env() {
-    let (hub, machine) = (Hub::start(), Machine::transient());
-    let repo = machine.repo();
-    let token = hub.token_file(machine.home.path());
-    let secret = std::fs::read_to_string(&token).unwrap().trim().to_owned();
-    let settings = repo.path().join(SETTINGS);
-    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
-    std::fs::write(&settings, OTHER_HOOKS).unwrap();
-    // An older run left the command form (and a copied program) behind.
-    ok(&machine.run(repo.path(), &project_args()));
-    assert!(machine.bin_dir().exists());
-    assert!(json_file(&settings)["hooks"]["SessionStart"].is_array());
-
-    let args = quick(&hub.url, &token, &["--hook", "project", "--no-collisions"]);
-    let output = machine.run(repo.path(), &args);
-    let said = ok(&output);
-    assert!(!said.contains(&secret), "the token was printed");
-    assert!(said.contains("<your agent token>"), "{said}");
-    assert!(said.contains("older command-form"), "{said}");
-    assert!(
-        said.contains("holds your agent token and isn't ignored by Git"),
-        "{said}"
-    );
-    let after = json_file(&settings);
-    assert_eq!(after["model"], "x");
-    assert_eq!(after["env"]["AGENTSCM_HUB_TOKEN"], secret.as_str());
-    let hooks = after["hooks"].as_object().unwrap();
-    assert_eq!(hooks.len(), 2, "{hooks:?}");
-    // The repository comes from the checkout's origin remote.
-    let url = format!("{}/v1/hub/hook/claude?repo=acme/widgets", hub.url);
-    let pre = hooks["PreToolUse"].as_array().unwrap();
-    assert_eq!(pre.len(), 2);
-    assert_eq!(pre[0]["hooks"][0]["command"], "other");
-    assert_eq!(pre[1]["hooks"][0]["type"], "http");
-    assert_eq!(pre[1]["hooks"][0]["url"], url.as_str());
-    assert_eq!(
-        pre[1]["hooks"][0]["headers"]["Authorization"],
-        "Bearer $AGENTSCM_HUB_TOKEN"
-    );
-    assert_eq!(hooks["SessionEnd"][0]["hooks"][0]["url"], url.as_str());
-    assert!(
-        !std::fs::read_to_string(machine.config().join("quickstart.json"))
-            .unwrap()
-            .contains(&secret)
-    );
-
-    // A second run changes nothing.
-    let before = bytes_of(&settings);
-    let said = ok(&machine.run(repo.path(), &args));
-    assert!(said.contains("nothing to change"), "{said}");
-    assert_eq!(bytes_of(&settings), before);
-
-    // Uninstall gives back the file as it was before quickstart first touched it.
-    ok(&machine.run(repo.path(), &["uninstall", "--yes"]));
-    assert_eq!(
-        json_file(&settings),
-        serde_json::from_str::<Value>(OTHER_HOOKS).unwrap()
-    );
-    assert!(!machine.bin_dir().exists());
-}
-
-#[test]
-fn a_new_project_settings_file_with_a_token_is_private_and_a_foreign_token_is_kept() {
-    let (hub, machine) = (Hub::start(), Machine::new());
-    let (fresh, other) = (machine.repo(), machine.repo());
-    let token = hub.token_file(machine.home.path());
-    let args = quick(&hub.url, &token, &["--hook", "project", "--no-collisions"]);
-    ok(&machine.run(fresh.path(), &args));
-    let settings = fresh.path().join(SETTINGS);
-    assert_eq!(mode(&settings), 0o600);
-    ok(&machine.run(fresh.path(), &["uninstall", "--yes"]));
-    assert!(!settings.exists());
-
-    let settings = other.path().join(SETTINGS);
-    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
-    std::fs::write(&settings, r#"{"env":{"AGENTSCM_HUB_TOKEN":"mine"}}"#).unwrap();
-    let said = ok(&machine.run(other.path(), &args));
-    assert!(said.contains("a value I didn't write"), "{said}");
-    assert!(!said.contains("<your agent token>"), "{said}");
-    let kept = json_file(&settings);
-    assert_eq!(kept["env"]["AGENTSCM_HUB_TOKEN"], "mine");
-    assert_eq!(kept["hooks"]["SessionEnd"][0]["hooks"][0]["type"], "http");
-    ok(&machine.run(other.path(), &["uninstall", "--yes"]));
-    assert_eq!(
-        json_file(&settings),
-        json!({"env": {"AGENTSCM_HUB_TOKEN": "mine"}})
-    );
-}
-
-#[test]
-fn an_existing_world_readable_settings_file_becomes_private_with_its_backup() {
-    use std::os::unix::fs::PermissionsExt;
-    let (hub, machine) = (Hub::start(), Machine::new());
-    let repo = machine.repo();
-    let token = hub.token_file(machine.home.path());
-    let settings = repo.path().join(SETTINGS);
-    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
-    std::fs::write(&settings, r#"{"model":"x"}"#).unwrap();
-    std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let args = quick(&hub.url, &token, &["--hook", "project", "--no-collisions"]);
-    ok(&machine.run(repo.path(), &args));
-    assert_eq!(mode(&settings), 0o600);
-    for backup in backups(&settings) {
-        assert_eq!(mode(&backup), 0o600);
-    }
-}
-
-#[test]
-fn local_hub_never_generates_team_repository_config_even_with_init() {
-    let (hub, machine) = (Hub::start(), Machine::new());
-    let repo = machine.repo();
-    let instructions = "@AGENTS.md\nKeep the project's instructions.\n";
-    std::fs::write(repo.path().join("CLAUDE.md"), instructions).unwrap();
     let token = hub.token_file(machine.home.path());
     let said = ok(&machine.run(
         repo.path(),
-        &quick(
-            &hub.url,
-            &token,
-            &["--hook", "none", "--no-collisions", "--init"],
-        ),
+        &quick(&hub.url, &token, &["--no-collisions", "--init"]),
     ));
-    for file in [".mcp.json", ".claude/settings.json", "AGENTS.md"] {
-        assert!(!repo.path().join(file).exists(), "{file}");
-    }
-    assert_eq!(
-        std::fs::read_to_string(repo.path().join("CLAUDE.md")).unwrap(),
-        instructions
-    );
-    assert!(said.contains("Skipping repository agent config"), "{said}");
-    assert!(
-        !said.contains("Repository files to review and commit"),
-        "{said}"
-    );
-}
-
-#[test]
-fn worktree_sessions_default_to_user_hooks_and_resolve_repository_token() {
-    let (hub, machine) = (Hub::start(), Machine::new());
-    let repo = machine.repo();
-    machine.git(repo.path(), &["commit", "--allow-empty", "-qm", "fixture"]);
-    let tree = repo.path().join(".claude/worktrees/agent");
-    machine.git(
-        repo.path(),
-        &["worktree", "add", "-qb", "agent", tree.to_str().unwrap()],
-    );
-    std::fs::create_dir_all(machine.home.path().join(".claude")).unwrap();
-    let token = hub.token_file(machine.home.path());
-    let said = ok(&machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"])));
-    let settings = machine.home.path().join(".claude/settings.json");
-    assert!(settings.exists(), "{said}");
-    assert!(!repo.path().join(SETTINGS).exists());
-    assert!(!tree.join(SETTINGS).exists());
-    assert!(json_file(&settings)["hooks"]["PreToolUse"].is_array());
-    ok(&edit(&machine, &tree, "worktree-session", "src/lib.rs"));
-    assert_eq!(live_paths(&hub, REPO), vec![vec!["src/lib.rs".to_owned()]]);
+    // Instructions name no hub, so a hub on this machine no longer skips them.
+    assert!(repo.path().join("AGENTS.md").exists(), "{said}");
+    assert!(!repo.path().join(".claude/settings.json").exists());
+    assert!(said.contains("Repository files to review and commit"), "{said}");
 }
 
 #[test]
@@ -1200,8 +479,7 @@ fn no_op_run_explicitly_reports_no_changes_and_writes_no_record() {
             "--yes",
             "--hub",
             "skip",
-            "--hook",
-            "none",
+            "--no-agents",
             "--no-collisions",
         ],
     ));
@@ -1280,8 +558,7 @@ fn hub_port_retry_reaches_docker_failure_after_an_occupied_first_port() {
                         port,
                         "--github-login",
                         "octo",
-                        "--hook",
-                        "none",
+                        "--no-agents",
                         "--no-collisions",
                     ],
                 )
@@ -1359,8 +636,7 @@ fn noninteractive_docker_bootstrap_uses_the_recorded_dynamic_port_and_exits_pend
                 "fixture-hub",
                 "--github-login",
                 "octo",
-                "--hook",
-                "none",
+                "--no-agents",
                 "--no-collisions",
             ],
         )
@@ -1384,13 +660,7 @@ fn noninteractive_docker_bootstrap_uses_the_recorded_dynamic_port_and_exits_pend
         "{said}"
     );
     assert!(last_line(&output).contains("the local hub is waiting for GitHub App setup"));
-    assert!(!machine.config().join("hub.json").exists());
-    assert!(
-        json_file(&machine.config().join("quickstart.json"))["tokens"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
+    assert!(machine.connections().is_empty());
 }
 
 #[test]
@@ -1419,8 +689,7 @@ fn invalid_local_runtime_project_and_port_fail_without_setup_files() {
             "local",
             "--github-login",
             "octo",
-            "--hook",
-            "none",
+            "--no-agents",
             "--no-collisions",
         ];
         args.extend(*extra);
@@ -1460,8 +729,7 @@ fn failed_hub_pull_leaves_no_setup_files_or_record_and_honors_platform() {
                     port,
                     "--github-login",
                     "octo",
-                    "--hook",
-                    "none",
+                    "--no-agents",
                     "--no-collisions",
                 ],
             );
@@ -1528,23 +796,35 @@ fn uninstall_explains_app_retention_and_keeps_hub_data_by_default() {
     assert!(!commands.contains("down -v"));
 }
 
+/// The test binary placed in the installer's directory, so a run from it is recorded and undoable.
+fn install_dir_program(machine: &Machine) -> PathBuf {
+    let bin = machine.bin_dir();
+    std::fs::create_dir_all(&bin).unwrap();
+    place_binary(&bin.join("agentscm-0.0.0"));
+    symlink("agentscm-0.0.0", bin.join("agentscm")).unwrap();
+    bin.join("agentscm")
+}
+
+fn run_as(machine: &Machine, link: &Path, cwd: &Path, args: &[&str]) -> Output {
+    machine.command_as(link, cwd, args).output().unwrap()
+}
+
 #[test]
 fn no_op_rerun_keeps_manifest_bytes_and_reports_no_changes() {
-    let machine = Machine::new();
-    let repo = machine.repo();
+    let machine = Machine::transient();
+    let (repo, link) = (machine.repo(), install_dir_program(&machine));
     let args = [
         "quickstart",
         "--yes",
         "--hub",
         "skip",
-        "--hook",
-        "user",
+        "--no-agents",
         "--no-collisions",
     ];
-    ok(&machine.run(repo.path(), &args));
+    ok(&run_as(&machine, &link, repo.path(), &args));
     let record = machine.config().join("quickstart.json");
     let before = std::fs::read(&record).unwrap();
-    let said = ok(&machine.run(repo.path(), &args));
+    let said = ok(&run_as(&machine, &link, repo.path(), &args));
     assert!(said.contains("No changes made."), "{said}");
     assert!(said.contains("Quickstart's recorded setup:"), "{said}");
     assert_eq!(std::fs::read(record).unwrap(), before);
@@ -1552,21 +832,20 @@ fn no_op_rerun_keeps_manifest_bytes_and_reports_no_changes() {
 
 #[test]
 fn no_op_rerun_repairs_a_world_readable_manifest_mode() {
-    let machine = Machine::new();
-    let repo = machine.repo();
+    let machine = Machine::transient();
+    let (repo, link) = (machine.repo(), install_dir_program(&machine));
     let args = [
         "quickstart",
         "--yes",
         "--hub",
         "skip",
-        "--hook",
-        "user",
+        "--no-agents",
         "--no-collisions",
     ];
-    ok(&machine.run(repo.path(), &args));
+    ok(&run_as(&machine, &link, repo.path(), &args));
     let record = machine.config().join("quickstart.json");
     std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let said = ok(&machine.run(repo.path(), &args));
+    let said = ok(&run_as(&machine, &link, repo.path(), &args));
     assert_eq!(mode(&record), 0o600);
     assert!(!said.contains("No changes made."), "{said}");
 }
@@ -1592,8 +871,7 @@ fn malformed_custom_image_never_reaches_image_inspect_or_pull() {
                         port,
                         "--github-login",
                         "octo",
-                        "--hook",
-                        "none",
+                        "--no-agents",
                         "--no-collisions",
                     ],
                 )
@@ -1643,8 +921,7 @@ fn custom_image_drops_previous_platform_choice_and_failed_pull_preserves_existin
                     port,
                     "--github-login",
                     "octo",
-                    "--hook",
-                    "none",
+                    "--no-agents",
                     "--no-collisions",
                 ],
             )
@@ -1763,8 +1040,7 @@ fn native_configuration_failure_restores_plist_record_and_previous_service() {
                     "native",
                     "--github-login",
                     "octo",
-                    "--hook",
-                    "none",
+                    "--no-agents",
                     "--no-collisions",
                 ],
             )
@@ -1912,8 +1188,7 @@ fn docker_platform_and_context_selection_use_the_effective_local_daemon() {
                         port,
                         "--github-login",
                         "octo",
-                        "--hook",
-                        "none",
+                        "--no-agents",
                         "--no-collisions",
                     ],
                 )
@@ -2042,7 +1317,12 @@ fn overlapping_install_and_uninstall_preserve_ownership_and_release_after_exit()
     use std::sync::mpsc;
     use std::time::Duration;
 
-    let machine = Machine::new();
+    let machine = Machine::transient();
+    let bin = machine.bin_dir();
+    std::fs::create_dir_all(&bin).unwrap();
+    place_binary(&bin.join("agentscm-0.0.0"));
+    symlink("agentscm-0.0.0", bin.join("agentscm")).unwrap();
+    let link = bin.join("agentscm");
     let first_repo = machine.repo();
     let second_repo = machine.repo_at("git@github.com:acme/other.git");
     let args = [
@@ -2050,8 +1330,7 @@ fn overlapping_install_and_uninstall_preserve_ownership_and_release_after_exit()
         "--yes",
         "--hub",
         "skip",
-        "--hook",
-        "project",
+        "--no-agents",
         "--no-collisions",
     ];
     // The first child pauses in status after loading its ownership record. A second
@@ -2073,13 +1352,18 @@ fn overlapping_install_and_uninstall_preserve_ownership_and_release_after_exit()
                 b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}",
             );
         });
+        // Status asks the hub of the checkout's saved connection, so that is where it pauses.
+        let connection = json!({"version": 1, "connections": [{"root": first_repo.path().canonicalize().unwrap(),
+            "origin_host": "github.com", "hub": url, "repo": REPO,
+            "token_file": machine.home.path().join("absent.token")}]});
+        std::fs::create_dir_all(machine.config()).unwrap();
+        std::fs::write(
+            machine.config().join("connections.json"),
+            connection.to_string(),
+        )
+        .unwrap();
         let child = machine
-            .command(first_repo.path(), &args)
-            .env("AGENTSCM_HUB_URL", url)
-            .env(
-                "AGENTSCM_HUB_TOKEN_FILE",
-                machine.home.path().join("absent.token"),
-            )
+            .command_as(&link, first_repo.path(), &args)
             .spawn()
             .unwrap();
         entered_rx.recv_timeout(Duration::from_secs(30)).unwrap();
@@ -2091,7 +1375,6 @@ fn overlapping_install_and_uninstall_preserve_ownership_and_release_after_exit()
     let second = machine.run(second_repo.path(), &args);
     let uninstall = machine.run(first_repo.path(), &["uninstall", "--yes"]);
     let record_while_paused = std::fs::read(&record).ok();
-    let hooks_while_paused = second_repo.path().join(SETTINGS).exists();
     resume.send(()).unwrap();
     let first_output = first.wait_with_output().unwrap();
     server.join().unwrap();
@@ -2104,11 +1387,12 @@ fn overlapping_install_and_uninstall_preserve_ownership_and_release_after_exit()
         );
     }
     assert_eq!(record_before, record_while_paused);
-    assert!(!hooks_while_paused);
     ok(&first_output);
-    assert_eq!(json_file(&record)["hooks"].as_array().unwrap().len(), 1);
-    ok(&machine.run(second_repo.path(), &args));
-    assert_eq!(json_file(&record)["hooks"].as_array().unwrap().len(), 2);
+    assert!(record.exists());
+    ok(&machine
+        .command_as(&link, second_repo.path(), &args)
+        .output()
+        .unwrap());
 
     // A killed owner releases the operating-system lock; the stable lock file is
     // reused, rather than removed and recreated while another process may hold it.
@@ -2122,10 +1406,10 @@ fn overlapping_install_and_uninstall_preserve_ownership_and_release_after_exit()
     killed.wait().unwrap();
     let _ = resume.send(());
     server.join().unwrap();
+    // The scaffolding connection would keep the program files, so drop it first.
+    std::fs::remove_file(machine.config().join("connections.json")).unwrap();
     ok(&machine.run(first_repo.path(), &["uninstall", "--yes"]));
     assert!(!record.exists());
-    assert!(!first_repo.path().join(SETTINGS).exists());
-    assert!(!second_repo.path().join(SETTINGS).exists());
     use std::os::unix::fs::MetadataExt;
     assert_eq!(lock_path.metadata().unwrap().ino(), lock_inode);
 }
@@ -2134,7 +1418,7 @@ fn overlapping_install_and_uninstall_preserve_ownership_and_release_after_exit()
 #[test]
 fn native_program_repairs_are_reported_but_true_noop_preserves_record() {
     for missing in ["link", "versioned"] {
-        let (machine, hub) = (Machine::new(), Hub::start());
+        let (machine, hub) = (Machine::new().with_claude(), Hub::start());
         let repo = machine.repo();
         let (plist, executable) = native_fixture(&machine, &hub);
         let token = hub.token_file(machine.home.path());
@@ -2149,8 +1433,6 @@ fn native_program_repairs_are_reported_but_true_noop_preserves_record() {
             "octo",
             "--agent-token-file",
             token.to_str().unwrap(),
-            "--hook",
-            "none",
             "--no-collisions",
         ];
         let run = || {
@@ -2183,13 +1465,477 @@ fn native_program_repairs_are_reported_but_true_noop_preserves_record() {
     }
 }
 
+/// A stand-in for the `claude` CLI: it keeps the plugin and marketplace state in files next
+/// to its log and answers the calls `client setup` and `client remove` make.
+const FAKE_CLAUDE: &str = r#"#!/bin/sh
+S="__STATE__"
+printf '%s\n' "$*" >> "$S/log"
+touch "$S/plugins" "$S/markets"
+for last in "$@"; do :; done
+ok() { printf '{"outcome":"ok"}\n'; }
+list() {
+  printf '['
+  first=1
+  while IFS='|' read -r a b c; do
+    [ -n "$a" ] || continue
+    [ "$first" = 1 ] || printf ','
+    first=0
+    if [ "$1" = plugins ]; then
+      printf '{"id":"%s","scope":"user","enabled":true,"version":"%s","installPath":"%s"}' "$a" "$b" "$c"
+    else
+      printf '{"name":"%s","path":"%s"}' "$a" "$b"
+    fi
+  done < "$S/$1"
+  printf ']\n'
+}
+install() {
+  path=$(cut -d'|' -f2 "$S/markets")
+  src=$(sed -n 's/.*"source": *"\([^"]*\)".*/\1/p' "$path/.claude-plugin/marketplace.json" | head -1)
+  plugin="$path/$src"
+  version=$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$plugin/.claude-plugin/plugin.json" | head -1)
+  rm -rf "$S/cache"
+  mkdir -p "$S/cache"
+  cp -Rp "$plugin/." "$S/cache/"
+  printf '%s|%s|%s\n' "$last" "$version" "$S/cache" > "$S/plugins"
+  ok
+}
+case "$2" in
+  list) list plugins ;;
+  install|update) install ;;
+  enable) ok ;;
+  uninstall) : > "$S/plugins" ;;
+  marketplace)
+    case "$3" in
+      list) list markets ;;
+      add) printf 'agentscm-claude-client|%s\n' "$last" > "$S/markets"; ok ;;
+      update) ok ;;
+      remove) : > "$S/markets" ;;
+    esac ;;
+esac
+"#;
+
+impl Machine {
+    /// Puts a fake `claude` first on PATH.
+    fn with_claude(mut self) -> Self {
+        let state = self.home.path().join("fake-claude");
+        std::fs::create_dir_all(&state).unwrap();
+        let script = self.bin.path().join("claude");
+        std::fs::write(
+            &script,
+            FAKE_CLAUDE.replace("__STATE__", state.to_str().unwrap()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        self.system_path = true;
+        self
+    }
+
+    /// Every call made to the fake `claude`, one line each.
+    fn claude_log(&self) -> String {
+        std::fs::read_to_string(self.home.path().join("fake-claude/log")).unwrap_or_default()
+    }
+
+    fn connections(&self) -> Vec<Value> {
+        std::fs::read_to_string(self.config().join("connections.json"))
+            .map(|text| {
+                serde_json::from_str::<Value>(&text).unwrap()["connections"]
+                    .as_array()
+                    .unwrap()
+                    .clone()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// The agents the hub's Connect agents page lists for the repository, as `(agent, state)`.
+fn onboarding(hub: &Hub, token: &Path) -> Vec<(String, String)> {
+    let secret = std::fs::read_to_string(token).unwrap();
+    let reply = hub._runtime.block_on(async {
+        reqwest::Client::new()
+            .get(format!("{}/v1/hub/onboarding", hub.url))
+            .bearer_auth(secret.trim())
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .map(|text| serde_json::from_str::<Value>(&text).unwrap())
+            .unwrap()
+    });
+    reply
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row["agent"].as_str().unwrap().to_owned(),
+                row["state"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// Runs `agentscm` with `input` on stdin and returns what it printed.
+fn feed(machine: &Machine, cwd: &Path, args: &[&str], input: &str) -> Output {
+    let mut child = machine
+        .command(cwd, args)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), input.as_bytes()).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn fresh_quickstart_connects_claude_code_through_client_setup_and_the_connect_page_sees_it() {
+    let (hub, machine) = (Hub::start(), Machine::new().with_claude());
+    let repo = machine.repo();
+    let token = hub.token_file(machine.home.path());
+    let output = machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"]));
+    let said = ok(&output);
+    assert_eq!(
+        last_line(&output),
+        format!("Live warnings: on (hub {}, repo acme/widgets)", hub.url)
+    );
+    assert!(said.contains("agents set up: claude"), "{said}");
+
+    let root = repo.path().canonicalize().unwrap();
+    let connections = machine.connections();
+    assert_eq!(connections.len(), 1, "{connections:?}");
+    assert_eq!(connections[0]["root"], root.to_str().unwrap());
+    assert_eq!(connections[0]["repo"], REPO);
+    assert_eq!(connections[0]["hub"], hub.url.as_str());
+    assert_eq!(connections[0]["agents"], json!(["claude"]));
+    let mcp = json_file(&repo.path().join(".mcp.json"));
+    let server = &mcp["mcpServers"]["agentscm"];
+    assert_eq!(server["type"], "stdio");
+    assert!(
+        server["args"].to_string().contains(root.to_str().unwrap()),
+        "{server}"
+    );
+    let log = machine.claude_log();
+    assert!(
+        log.contains("plugin install --scope user --json agentscm@agentscm-claude-client"),
+        "{log}"
+    );
+    // Quickstart no longer writes its own hooks, hub.json or per-repository token files.
+    assert!(!machine.config().join("hub.json").exists());
+    assert!(!machine.home.path().join(".claude").exists());
+    assert!(!repo.path().join(".claude").exists());
+    let record = json_file(&machine.config().join("quickstart.json"));
+    assert_eq!(record["clients"], json!([root.to_str().unwrap()]));
+    assert!(record.get("hooks").is_none() && record.get("tokens").is_none());
+
+    // Nothing is proven until a native session and the MCP server have both spoken.
+    assert!(onboarding(&hub, &token).is_empty());
+    let session = "quickstart-session";
+    let hook = |event: &str, tool: bool| {
+        let mut payload = json!({"session_id": session, "cwd": root, "hook_event_name": event});
+        if tool {
+            payload["tool_name"] = json!("Write");
+            payload["tool_input"] = json!({"file_path": root.join("src/new.rs")});
+        }
+        ok(&feed(
+            &machine,
+            &root,
+            &["--no-telemetry", "hook", "claude", "--client-connection"],
+            &payload.to_string(),
+        ))
+    };
+    hook("SessionStart", false);
+    let call = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+        "name":"agentscm_setup_status","arguments":{"agent":"claude","session":session}}});
+    let mcp = ok(&feed(
+        &machine,
+        &root,
+        &["client", "mcp", "--root", root.to_str().unwrap()],
+        &format!("{call}\n"),
+    ));
+    let reply: Value = serde_json::from_str(mcp.lines().next().unwrap()).unwrap();
+    let status: Value =
+        serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(status["mcp_verified"], true, "{reply}");
+    assert_eq!(
+        onboarding(&hub, &token),
+        [("claude".to_owned(), "unverified".to_owned())]
+    );
+    hook("PreToolUse", true);
+    assert_eq!(
+        onboarding(&hub, &token),
+        [("claude".to_owned(), "ready".to_owned())]
+    );
+}
+
+#[test]
+fn uninstall_removes_everything_quickstart_set_up() {
+    let (hub, machine) = (Hub::start(), Machine::new().with_claude());
+    let repo = machine.repo();
+    let token = hub.token_file(machine.home.path());
+    ok(&machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"])));
+    assert_eq!(machine.connections().len(), 1);
+    assert!(repo.path().join(".mcp.json").exists());
+
+    let said = ok(&machine.run(repo.path(), &["uninstall", "--yes"]));
+    assert!(said.contains("Removed the client connection"), "{said}");
+    assert!(machine.connections().is_empty());
+    // The token file was the user's own, so it stays; nothing managed is left behind.
+    assert!(token.exists());
+    assert!(names_in(&machine.config().join("tokens")).is_empty());
+    assert!(!repo.path().join(".mcp.json").exists());
+    let log = machine.claude_log();
+    assert!(
+        log.contains("plugin uninstall --scope user agentscm@agentscm-claude-client"),
+        "{log}"
+    );
+    assert!(
+        log.contains("plugin marketplace remove agentscm-claude-client"),
+        "{log}"
+    );
+    assert!(!machine.config().join("quickstart.json").exists());
+    assert!(out(&machine.run(repo.path(), &["uninstall", "--yes"])).contains("Nothing to undo"));
+}
+
+#[test]
+fn uninstall_keeps_what_the_user_added_to_mcp_json_and_ends_the_sign_in() {
+    let (hub, machine) = (Hub::start(), Machine::new().with_claude());
+    let repo = machine.repo();
+    let token = hub.token_file(machine.home.path());
+    std::fs::write(
+        repo.path().join(".mcp.json"),
+        r#"{"mcpServers":{"other":{"command":"x"}}}"#,
+    )
+    .unwrap();
+    ok(&machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"])));
+    assert!(json_file(&repo.path().join(".mcp.json"))["mcpServers"]["agentscm"].is_object());
+    let session = machine.config().join("hub-session.json");
+    std::fs::write(
+        &session,
+        json!({"hub": hub.url, "session": "x", "expires_at": 0}).to_string(),
+    )
+    .unwrap();
+    let record_path = machine.config().join("quickstart.json");
+    let mut record = json_file(&record_path);
+    record["session"] = json!({"hub": hub.url});
+    std::fs::write(&record_path, record.to_string()).unwrap();
+
+    let said = ok(&machine.run(repo.path(), &["uninstall", "--yes"]));
+    assert!(said.contains("Signed out of"), "{said}");
+    assert!(!session.exists() && !record_path.exists());
+    assert_eq!(
+        json_file(&repo.path().join(".mcp.json")),
+        json!({"mcpServers":{"other":{"command":"x"}}})
+    );
+}
+
+#[test]
+fn several_repositories_share_one_hub_with_their_own_connections() {
+    let (hub, machine) = (Hub::start(), Machine::new().with_claude());
+    let (one, two) = (
+        machine.repo(),
+        machine.repo_at("https://github.com/acme/gadgets.git"),
+    );
+    let token_one = hub.token_file_for(machine.home.path(), "acme/widgets", "one.token");
+    let token_two = hub.token_file_for(machine.home.path(), "acme/gadgets", "two.token");
+    for (dir, token) in [(&one, &token_one), (&two, &token_two)] {
+        ok(&machine.run(dir.path(), &quick(&hub.url, token, &["--no-collisions"])));
+    }
+    let connections = machine.connections();
+    assert_eq!(connections.len(), 2, "{connections:?}");
+    let repos: Vec<_> = connections
+        .iter()
+        .map(|c| c["repo"].as_str().unwrap())
+        .collect();
+    assert!(repos.contains(&"acme/widgets") && repos.contains(&"acme/gadgets"));
+    assert_eq!(
+        json_file(&machine.config().join("quickstart.json"))["clients"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // Each checkout announces with its own connection's token.
+    ok(&edit(&machine, one.path(), "a", "src/one.rs"));
+    ok(&edit(&machine, two.path(), "b", "src/two.rs"));
+    assert_eq!(
+        live_paths(&hub, "acme/widgets"),
+        [vec!["src/one.rs".to_owned()]]
+    );
+    assert_eq!(
+        live_paths(&hub, "acme/gadgets"),
+        [vec!["src/two.rs".to_owned()]]
+    );
+
+    ok(&machine.run(one.path(), &["uninstall", "--yes"]));
+    assert!(machine.connections().is_empty());
+    assert!(token_one.exists() && token_two.exists());
+    assert!(!one.path().join(".mcp.json").exists() && !two.path().join(".mcp.json").exists());
+}
+
+#[test]
+fn a_requested_hub_that_is_down_connects_no_agent() {
+    let machine = Machine::new().with_claude();
+    let repo = machine.repo();
+    let url = closed_port_url();
+    let token = machine.home.path().join("t.token");
+    std::fs::write(&token, "tok\n").unwrap();
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let output = machine.run(repo.path(), &quick(&url, &token, &["--no-collisions"]));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let said = out(&output);
+    assert!(
+        said.contains(&format!(
+            "The hub at {url} isn't answering, so no agent was connected to it."
+        )),
+        "{said}"
+    );
+    assert!(machine.connections().is_empty());
+    assert!(!repo.path().join(".mcp.json").exists());
+    assert!(machine.claude_log().is_empty());
+    let last = last_line(&output);
+    assert!(
+        last.starts_with(&format!(
+            "Live warnings: off — the hub at {url} isn't answering (start it, then run `"
+        )) && last.ends_with(" quickstart` again)"),
+        "{last}"
+    );
+}
+
+#[test]
+fn with_yes_and_no_hub_no_agent_is_set_up() {
+    let machine = Machine::new().with_claude();
+    let repo = machine.repo();
+    let output = machine.run(
+        repo.path(),
+        &["quickstart", "--yes", "--hub", "skip", "--no-collisions"],
+    );
+    let said = ok(&output);
+    assert!(
+        said.contains("Not setting up claude: agents need a hub that answers."),
+        "{said}"
+    );
+    assert!(machine.connections().is_empty() && machine.claude_log().is_empty());
+    assert!(!repo.path().join(".claude").exists());
+    assert!(!machine.config().join("quickstart.json").exists());
+}
+
+#[test]
+fn yes_without_claude_sets_up_no_agent() {
+    let (hub, machine) = (Hub::start(), Machine::new());
+    let repo = machine.repo();
+    let token = hub.token_file(machine.home.path());
+    let output = machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"]));
+    // The requested hub is up but this checkout is not connected, so the run is incomplete.
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let said = out(&output);
+    assert!(
+        said.contains("Claude Code wasn't found, so I'm not setting up a coding agent"),
+        "{said}"
+    );
+    assert!(machine.connections().is_empty());
+    assert!(!repo.path().join(".mcp.json").exists());
+    assert!(last_line(&output).contains("this checkout isn't connected to the hub"));
+}
+
+#[test]
+fn no_agents_skips_setup_even_with_claude_installed() {
+    let (hub, machine) = (Hub::start(), Machine::new().with_claude());
+    let repo = machine.repo();
+    let token = hub.token_file(machine.home.path());
+    let output = machine.run(
+        repo.path(),
+        &quick(&hub.url, &token, &["--no-collisions", "--no-agents"]),
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(machine.connections().is_empty() && machine.claude_log().is_empty());
+    assert!(!repo.path().join(".mcp.json").exists());
+    assert!(last_line(&output).contains("this checkout isn't connected to the hub"));
+}
+
+#[test]
+fn without_a_terminal_it_refuses_and_writes_nothing() {
+    let machine = Machine::new().with_claude();
+    let repo = machine.repo();
+    let output = machine.run(repo.path(), &["quickstart"]);
+    assert!(!output.status.success());
+    let said = String::from_utf8_lossy(&output.stderr);
+    for flag in [
+        "--yes",
+        "--hub local|existing|skip",
+        "--hub-url",
+        "--agent-token-file",
+        "--agent claude|codex|cursor|copilot|gemini",
+        "--no-agents",
+        "--no-collisions",
+    ] {
+        assert!(said.contains(flag), "{flag}: {said}");
+    }
+    assert!(!repo.path().join(".claude").exists() && !repo.path().join(".mcp.json").exists());
+    assert!(!machine.config().exists());
+    assert!(!machine.home.path().join(".agentscm").exists());
+    assert!(machine.claude_log().is_empty());
+    // With nothing recorded there is nothing to refuse.
+    let output = machine.run(repo.path(), &["uninstall"]);
+    assert!(output.status.success());
+    assert!(out(&output).contains("nothing was installed by quickstart"));
+}
+
+#[test]
+fn yes_without_a_token_or_saved_sign_in_does_not_try_to_sign_in() {
+    let (hub, machine) = (Hub::start(), Machine::new().with_claude());
+    let repo = machine.repo();
+    let output = machine.run(
+        repo.path(),
+        &[
+            "quickstart",
+            "--yes",
+            "--hub",
+            "existing",
+            "--hub-url",
+            &hub.url,
+            "--no-collisions",
+        ],
+    );
+    let said = out(&output);
+    assert!(said.contains("pass --agent-token-file"), "{said}");
+    assert!(machine.connections().is_empty() && machine.claude_log().is_empty());
+    assert!(!repo.path().join(".mcp.json").exists());
+    assert!(!machine.config().join("hub-session.json").exists());
+}
+
+#[test]
+fn a_foreign_agentscm_hook_makes_setup_refuse_before_anything_is_written() {
+    let (hub, machine) = (Hub::start(), Machine::new().with_claude());
+    let repo = machine.repo();
+    let token = hub.token_file(machine.home.path());
+    let settings = repo.path().join(".claude/settings.local.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    let foreign = r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"/opt/agentscm intent check --hook claude"}]}]}}"#;
+    std::fs::write(&settings, foreign).unwrap();
+    let output = machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"]));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let said = out(&output);
+    assert!(
+        said.contains("Couldn't finish setting up claude: ")
+            && said.contains("existing AgentSCM Claude command hooks were found"),
+        "{said}"
+    );
+    assert!(machine.connections().is_empty());
+    assert!(!repo.path().join(".mcp.json").exists());
+    assert_eq!(std::fs::read_to_string(&settings).unwrap(), foreign);
+    // Preflight runs first, so the plugin was never touched and nothing was minted.
+    assert!(!machine.claude_log().contains("install"));
+    assert!(!machine.config().join("tokens").exists());
+    assert!(!said.contains("agents set up: claude"), "{said}");
+}
+
 #[test]
 fn a_fresh_repository_says_there_is_nothing_to_compare() {
     let machine = Machine::new();
     let repo = machine.repo();
     let said = ok(&machine.run(
         repo.path(),
-        &["quickstart", "--yes", "--hub", "skip", "--hook", "none"],
+        &["quickstart", "--yes", "--hub", "skip", "--no-agents"],
     ));
     if !said.contains("Couldn't check") {
         assert!(
@@ -2201,34 +1947,24 @@ fn a_fresh_repository_says_there_is_nothing_to_compare() {
 }
 
 #[test]
-fn uninstall_removes_only_the_empty_directories_quickstart_created() {
-    let machine = Machine::transient();
+fn uninstall_removes_the_program_directory_quickstart_created() {
+    let (hub, machine) = (Hub::start(), Machine::transient().with_claude());
     let repo = machine.repo();
-    let args = ["quickstart", "--yes", "--hub", "skip", "--hook", "project"];
-    ok(&machine.run(repo.path(), &args));
-    assert!(repo.path().join(".claude").is_dir() && machine.bin_dir().is_dir());
+    let token = hub.token_file(machine.home.path());
+    ok(&machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"])));
+    assert!(machine.bin_dir().is_dir());
     ok(&machine.run(repo.path(), &["uninstall", "--yes"]));
-    assert!(!repo.path().join(".claude").exists());
     assert!(!machine.home.path().join(".agentscm").exists());
-
-    // A `.claude` that was already there, or holds anything else, stays.
-    let keep = machine.repo();
-    std::fs::create_dir_all(keep.path().join(".claude")).unwrap();
-    ok(&machine.run(keep.path(), &args));
-    ok(&machine.run(keep.path(), &["uninstall", "--yes"]));
-    assert!(keep.path().join(".claude").is_dir());
-    ok(&machine.run(repo.path(), &args));
-    std::fs::write(repo.path().join(".claude/notes"), "mine").unwrap();
-    ok(&machine.run(repo.path(), &["uninstall", "--yes"]));
-    assert!(repo.path().join(".claude/notes").exists());
 }
 
 #[test]
 fn uninstall_without_a_terminal_still_needs_yes_when_something_is_recorded() {
-    let machine = Machine::new();
+    let (hub, machine) = (Hub::start(), Machine::new().with_claude());
     let repo = machine.repo();
-    ok(&machine.run(repo.path(), &project_args()));
+    let token = hub.token_file(machine.home.path());
+    ok(&machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"])));
     let output = machine.run(repo.path(), &["uninstall"]);
     assert!(!output.status.success());
-    assert!(repo.path().join(SETTINGS).exists());
+    assert!(repo.path().join(".mcp.json").exists());
+    assert_eq!(machine.connections().len(), 1);
 }

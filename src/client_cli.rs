@@ -16,8 +16,12 @@ use crate::client_config::{
 };
 use crate::hub_cli::{Provider, call, has_session, load_session, map_hub_error, sign_in};
 use crate::intent_cli::valid_repo;
+use crate::prompt::Ui;
 
 const TOKEN_BYTES: u64 = 16 * 1024;
+/// Hub maximum. Nothing renews agent tokens, so a shorter life stops every agent each day
+/// until someone signs in again; the token stays per repository and revocable.
+const AGENT_TOKEN_TTL: i64 = 30 * 24 * 60 * 60;
 const REPLY_BYTES: usize = 64 * 1024;
 
 fn invalid(message: &str) -> Error {
@@ -58,23 +62,23 @@ pub(crate) enum ReportingCommand {
     Status(RootArgs),
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Default, Args)]
 pub(crate) struct ConnectArgs {
     #[arg(long)]
-    hub: String,
+    pub(crate) hub: String,
     #[arg(long)]
-    repo: Option<String>,
+    pub(crate) repo: Option<String>,
     #[arg(long)]
-    token_file: Option<PathBuf>,
+    pub(crate) token_file: Option<PathBuf>,
     /// Forge sign-in provider (inferred for github.com and gitlab.com).
     #[arg(long, value_enum)]
-    provider: Option<Provider>,
+    pub(crate) provider: Option<Provider>,
     /// Checkout root, or any existing path inside it (default: current directory).
     #[arg(long)]
-    root: Option<PathBuf>,
+    pub(crate) root: Option<PathBuf>,
     /// Replace a different connection already bound to this checkout.
     #[arg(long)]
-    replace: bool,
+    pub(crate) replace: bool,
 }
 
 #[cfg(unix)]
@@ -120,23 +124,77 @@ pub(crate) async fn run(command: ClientCommand) -> Result<()> {
     match command {
         ClientCommand::Connect(args) => {
             let root = selected_root(args.root.as_deref())?;
-            connect(args, root).await
+            let ui = Ui { yes: false };
+            connect(args, root, terminal_wait(&ui).as_ref()).await
         }
         #[cfg(unix)]
         ClientCommand::Setup(args) => {
             let root = selected_root(args.connect.root.as_deref())?;
-            crate::client_setup::preflight(args.agent, &root)?;
-            connect(args.connect, root.clone()).await?;
-            crate::client_setup::install(args.agent, &root)?;
-            Ok(())
+            let ui = Ui { yes: false };
+            let program = std::env::current_exe()?;
+            setup(
+                &[args.agent],
+                args.connect,
+                root,
+                &program,
+                terminal_wait(&ui).as_ref(),
+            )
+            .await
         }
         ClientCommand::List => list(),
-        ClientCommand::Remove(args) => remove(args),
+        ClientCommand::Remove(args) => remove(args).await,
         ClientCommand::Check(args) => check(args).await,
         ClientCommand::Doctor(args) => doctor(args).await,
         ClientCommand::Mcp(args) => crate::client_mcp::run(args.root.as_deref()).await,
         ClientCommand::Reporting { command } => reporting(command),
     }
+}
+
+/// Waiting for the GitHub App install needs someone at a terminal to press Enter.
+fn terminal_wait(ui: &Ui) -> Option<AppWait<'_>> {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal().then_some(AppWait {
+        ui,
+        install_url: None,
+    })
+}
+
+/// The one setup path, for `client setup` and quickstart: check every agent's files first so
+/// nothing is minted for a setup that would be refused, connect the checkout, then install.
+/// `program` is the stable executable the hooks and MCP entries run.
+#[cfg(unix)]
+pub(crate) async fn setup(
+    agents: &[crate::client_setup::Agent],
+    args: ConnectArgs,
+    root: PathBuf,
+    program: &Path,
+    wait: Option<&AppWait<'_>>,
+) -> Result<()> {
+    for agent in agents {
+        crate::client_setup::preflight(*agent, &root, program)?;
+    }
+    connect(args, root.clone(), wait).await?;
+    for agent in agents {
+        crate::client_setup::install(*agent, &root, program)?;
+        record_agent(&root, *agent)?;
+    }
+    Ok(())
+}
+
+/// Remembers which agents were set up in a checkout, so `client remove` can take them out.
+#[cfg(unix)]
+fn record_agent(root: &Path, agent: crate::client_setup::Agent) -> Result<()> {
+    let saved = load()?
+        .into_iter()
+        .find(|connection| connection.root == root)
+        .ok_or_else(|| invalid("the client connection disappeared during setup; retry"))?;
+    let name = agent.name().to_owned();
+    if saved.agents.contains(&name) {
+        return Ok(());
+    }
+    let mut replacement = saved.clone();
+    replacement.agents.push(name);
+    update(root, Some(&saved), Some(replacement))
 }
 
 fn selected_root(given: Option<&Path>) -> Result<PathBuf> {
@@ -365,7 +423,7 @@ async fn mint_request(hub: &str, session: &str, repo: &str) -> Result<(u16, Valu
         Some(json!({
             "name": token_name()?,
             "repository": repo,
-            "ttl_seconds": 8 * 60 * 60,
+            "ttl_seconds": AGENT_TOKEN_TTL,
         })),
     )
     .await
@@ -423,7 +481,52 @@ struct Minted {
     session: String,
 }
 
-async fn mint_agent_token(connection: &Connection, provider: Provider) -> Result<Minted> {
+/// How `connect` reports, and at a terminal waits out, a repository the hub's GitHub App is not
+/// installed on.
+pub(crate) struct AppWait<'a> {
+    pub(crate) ui: &'a Ui,
+    /// The app's install page, when the caller knows it.
+    pub(crate) install_url: Option<String>,
+}
+
+fn install_help(install_url: Option<&str>, repo: &str) -> String {
+    let repo = crate::hub_cli::clean(repo);
+    match install_url {
+        Some(link) => format!(
+            "The hub's GitHub App isn't installed on {repo}. Open {link}, choose {repo}, and install."
+        ),
+        None => format!(
+            "The hub's GitHub App isn't installed on {repo}. Open GitHub, then Settings, Applications, the hub's app, Configure, and add {repo}."
+        ),
+    }
+}
+
+fn not_connected(status: u16, reply: &Value) -> bool {
+    status == 403 && reply["error"] == "not_connected"
+}
+
+/// Best effort, as the signed-in user: ask every connection to look at its repositories again.
+async fn refresh_connections(hub: &str, session: &str) {
+    let Ok(client) = forge_http::client() else {
+        return;
+    };
+    let list = format!("{hub}/v1/hub/connections");
+    let Ok((200, reply)) = call(&client, Method::GET, &list, Some(session), None).await else {
+        return;
+    };
+    for id in reply["connections"].as_array().into_iter().flatten() {
+        if let Some(id) = id["id"].as_str().filter(|id| id.starts_with("con_")) {
+            let target = format!("{hub}/v1/hub/connections/{id}/refresh");
+            let _ = call(&client, Method::POST, &target, Some(session), None).await;
+        }
+    }
+}
+
+async fn mint_agent_token(
+    connection: &Connection,
+    provider: Provider,
+    wait: Option<&AppWait<'_>>,
+) -> Result<Minted> {
     let mut session = session_for(&connection.hub, provider, &connection.origin_host).await?;
     let (mut status, mut reply) = mint_request(&connection.hub, &session, &connection.repo).await?;
     if status == 401 {
@@ -435,6 +538,31 @@ async fn mint_agent_token(connection: &Connection, provider: Provider) -> Result
         .await?;
         session = session_for(&connection.hub, provider, &connection.origin_host).await?;
         (status, reply) = mint_request(&connection.hub, &session, &connection.repo).await?;
+    }
+    if not_connected(status, &reply) {
+        refresh_connections(&connection.hub, &session).await;
+        (status, reply) = mint_request(&connection.hub, &session, &connection.repo).await?;
+        if let Some(wait) = wait
+            && not_connected(status, &reply)
+        {
+            println!(
+                "{}",
+                install_help(wait.install_url.as_deref(), &connection.repo)
+            );
+            // With --yes nobody is there to press Enter.
+            while !wait.ui.yes
+                && wait
+                    .ui
+                    .retry("Press Enter after installing, or type skip to stop.")
+            {
+                refresh_connections(&connection.hub, &session).await;
+                (status, reply) = mint_request(&connection.hub, &session, &connection.repo).await?;
+                if !not_connected(status, &reply) {
+                    break;
+                }
+                println!("Still not connected.");
+            }
+        }
     }
     match (status, reply["error"].as_str()) {
         (403, Some("not_connected")) => Err(invalid(
@@ -484,7 +612,7 @@ async fn revoke_minted(connection: &Connection, minted: &Minted) {
 
 fn warn_unrevoked(connection: &Connection, id: &str, expiry: i64) {
     eprintln!(
-        "warning: the replaced managed token {id} on {} could not be revoked; it remains valid until unix {expiry}. Revoke that token manually; no retry was queued.",
+        "warning: the managed token {id} on {} could not be revoked; it remains valid until unix {expiry}. Revoke that token manually; no retry was queued.",
         connection.hub
     );
 }
@@ -499,14 +627,14 @@ async fn retire_owned(connection: &Connection) {
     match remove_unreferenced_owned_file(connection) {
         Ok(RetiredFile::Referenced) => {
             eprintln!(
-                "warning: the replaced managed token {id} was preserved because another client connection references its token file; it remains valid until unix {expiry}"
+                "warning: the managed token {id} was preserved because another client connection references its token file; it remains valid until unix {expiry}"
             );
             return;
         }
         Ok(RetiredFile::Removed) => {}
         Err(error) => {
             eprintln!(
-                "warning: the replaced managed token {id} and its file were preserved because AgentSCM could not verify that the file is unreferenced ({error}); the token remains valid until unix {expiry}. No retry was queued."
+                "warning: the managed token {id} and its file were preserved because AgentSCM could not verify that the file is unreferenced ({error}); the token remains valid until unix {expiry}. No retry was queued."
             );
             return;
         }
@@ -532,12 +660,21 @@ async fn retire_owned(connection: &Connection) {
     } else {
         false
     };
-    if !revoked {
+    if revoked {
+        println!(
+            "Deleted its token file and revoked token {id} on {}.",
+            connection.hub
+        );
+    } else {
         warn_unrevoked(connection, id, expiry);
     }
 }
 
-async fn connect(args: ConnectArgs, root: PathBuf) -> Result<()> {
+pub(crate) async fn connect(
+    args: ConnectArgs,
+    root: PathBuf,
+    wait: Option<&AppWait<'_>>,
+) -> Result<()> {
     let (origin_host, inferred_repo) = origin_identity(&root)?;
     let repo = match args.repo {
         Some(repo) if !valid_repo(&repo) => {
@@ -623,6 +760,11 @@ async fn connect(args: ConnectArgs, root: PathBuf) -> Result<()> {
             .is_some_and(|saved| !changed && saved.report_completion),
         owned_token_id: None,
         owned_token_expires_at: None,
+        // The agents' files stay in the checkout whichever hub it connects to.
+        agents: existing
+            .as_ref()
+            .map(|saved| saved.agents.clone())
+            .unwrap_or_default(),
     };
     let mut owned_minted = None;
     let verified = if supplied_token.is_some() {
@@ -641,7 +783,7 @@ async fn connect(args: ConnectArgs, root: PathBuf) -> Result<()> {
         let provider = args.provider.or(inferred).ok_or_else(|| {
             invalid("cannot infer the forge sign-in provider for this origin; pass --provider github or --provider gitlab")
         })?;
-        let minted = mint_agent_token(&connection, provider).await?;
+        let minted = mint_agent_token(&connection, provider, wait).await?;
         let verified = match verify_token(&connection, &minted.token).await {
             Ok(verified) => verified,
             Err(error) => {
@@ -781,24 +923,38 @@ fn list() -> Result<()> {
     Ok(())
 }
 
-fn remove(args: RemoveArgs) -> Result<()> {
-    let root = removal_root(args.root.as_deref())?;
-    let connection = load()?
-        .into_iter()
+async fn remove(args: RemoveArgs) -> Result<()> {
+    remove_checkout(&removal_root(args.root.as_deref())?).await
+}
+
+/// Undoes `client setup` for one checkout: its agents' files (and a plugin no other checkout
+/// uses), the connection, and its managed token, which is revoked. `agentscm uninstall` runs
+/// this for every checkout quickstart connected.
+pub(crate) async fn remove_checkout(root: &Path) -> Result<()> {
+    let connections = load()?;
+    let connection = connections
+        .iter()
         .find(|connection| connection.root == root)
+        .cloned()
         .ok_or_else(|| invalid("no client connection for this exact registered root"))?;
-    update(&root, Some(&connection), None)?;
-    println!(
-        "Removed the local client connection for {}. The token file and remote token were left unchanged.",
-        root.display()
-    );
-    if let (Some(id), Some(expiry)) = (
-        connection.owned_token_id.as_deref(),
-        connection.owned_token_expires_at,
-    ) {
+    // Agents first: if one cannot be taken out, the connection stays so removal can be retried.
+    #[cfg(unix)]
+    for name in &connection.agents {
+        let agent = <crate::client_setup::Agent as clap::ValueEnum>::from_str(name, false)
+            .map_err(|_| invalid("connections.json names an unknown agent"))?;
+        let last = !connections
+            .iter()
+            .any(|other| other.root != root && other.agents.contains(name));
+        crate::client_setup::remove(agent, root, last)?;
+    }
+    update(root, Some(&connection), None)?;
+    println!("Removed the client connection for {}.", root.display());
+    if connection.owned_token_id.is_some() {
+        retire_owned(&connection).await;
+    } else {
         println!(
-            "Managed token {id} on {} remains active until unix {expiry}; revoke it manually if it is no longer needed.",
-            connection.hub
+            "The token file {} was given to setup, so it and its token were left unchanged.",
+            connection.token_file.display()
         );
     }
     Ok(())
@@ -985,6 +1141,7 @@ mod tests {
             report_completion: false,
             owned_token_id: None,
             owned_token_expires_at: None,
+            agents: Vec::new(),
         };
         let verified = verify_token(&connection, "agent-synthetic").await.unwrap();
         assert_eq!(verified.login, "member");
@@ -995,7 +1152,7 @@ mod tests {
         assert!(headers.contains("authorization: Bearer session-synthetic"));
         assert!(!body.contains("session-synthetic"));
         assert!(body.contains("\"repository\":\"acme/widgets\""));
-        assert!(body.contains("\"ttl_seconds\":28800"));
+        assert!(body.contains("\"ttl_seconds\":2592000"));
         let whoami = requests.recv().unwrap();
         assert!(whoami.starts_with("GET /v1/hub/whoami HTTP/1.1"));
         assert!(whoami.contains("authorization: Bearer agent-synthetic"));

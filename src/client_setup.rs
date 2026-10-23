@@ -24,7 +24,7 @@ pub(crate) enum Agent {
 }
 
 impl Agent {
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
@@ -573,10 +573,10 @@ fn installation_lock() -> Result<std::fs::File> {
     )
 }
 
-pub(crate) fn preflight(agent: Agent, root: &Path) -> Result<()> {
+pub(crate) fn preflight(agent: Agent, root: &Path, program: &Path) -> Result<()> {
     let _lock = installation_lock()?;
     check_other_hooks(agent, root)?;
-    plan(agent, root, &std::env::current_exe()?)?;
+    plan(agent, root, program)?;
     if agent == Agent::Codex {
         crate::client_plugin::preflight_for_root(root)?;
     }
@@ -635,15 +635,15 @@ fn write_plan(root: &Path, edits: Vec<Edit>) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn install(agent: Agent, root: &Path) -> Result<()> {
+pub(crate) fn install(agent: Agent, root: &Path, program: &Path) -> Result<()> {
     let _lock = installation_lock()?;
     check_other_hooks(agent, root)?;
-    let edits = plan(agent, root, &std::env::current_exe()?)?;
+    let edits = plan(agent, root, program)?;
     if agent == Agent::Codex {
-        crate::client_plugin::install_for_root(root)?;
+        crate::client_plugin::install_for_root(root, program)?;
     }
     if agent == Agent::Claude {
-        crate::client_plugin::install_claude_for_root(root)?;
+        crate::client_plugin::install_claude_for_root(root, program)?;
     }
     write_plan(root, edits)?;
     println!(
@@ -656,6 +656,142 @@ pub(crate) fn install(agent: Agent, root: &Path) -> Result<()> {
     println!(
         "New local settings are Git-excluded. Review changes to any settings your repository already tracks; do not commit machine-specific configuration."
     );
+    Ok(())
+}
+
+/// The checkout files `install` writes for `agent`.
+fn written_files(agent: Agent) -> &'static [&'static str] {
+    match agent {
+        Agent::Claude => &[".mcp.json"],
+        Agent::Codex => &[".codex/config.toml"],
+        Agent::Cursor => &[
+            ".cursor/mcp.json",
+            ".cursor/hooks.json",
+            ".cursor/skills/coordinate-edits/SKILL.md",
+        ],
+        Agent::Copilot => &[
+            ".github/mcp.json",
+            ".vscode/mcp.json",
+            ".github/hooks/agentscm-client.json",
+            ".github/skills/coordinate-edits/SKILL.md",
+            ".mcp.json",
+        ],
+        Agent::Gemini => &[
+            ".gemini/settings.json",
+            ".gemini/skills/coordinate-edits/SKILL.md",
+        ],
+    }
+}
+
+/// `text` without the `agentscm` MCP entries and hooks `install` writes; anything else stays.
+fn without_ours(text: &str, root: &Path) -> Result<Value> {
+    let mut value: Value = serde_json::from_str(text)
+        .map_err(|_| invalid("native configuration is not strict JSON"))?;
+    let args = mcp_args(root)?;
+    for key in ["mcpServers", "servers"] {
+        if let Some(servers) = value.get_mut(key).and_then(Value::as_object_mut) {
+            if servers
+                .get("agentscm")
+                .is_some_and(|entry| entry["args"] == args)
+            {
+                servers.remove("agentscm");
+            }
+            if servers.is_empty() {
+                value.as_object_mut().map(|top| top.remove(key));
+            }
+        }
+    }
+    if let Some(hooks) = value.get_mut("hooks").and_then(Value::as_object_mut) {
+        for list in hooks.values_mut() {
+            if let Some(list) = list.as_array_mut() {
+                list.retain_mut(|group| {
+                    if own_command(group) {
+                        return false;
+                    }
+                    match group.get_mut("hooks").and_then(Value::as_array_mut) {
+                        Some(inner) if !inner.is_empty() => {
+                            inner.retain(|hook| !own_command(hook));
+                            !inner.is_empty()
+                        }
+                        _ => true,
+                    }
+                });
+            }
+        }
+        hooks.retain(|_, list| list.as_array().is_none_or(|list| !list.is_empty()));
+        if hooks.is_empty() {
+            value.as_object_mut().map(|top| top.remove("hooks"));
+            // `install` adds the version key only for the hooks it writes.
+            if value.as_object().is_some_and(|top| top.len() == 1) && value["version"] == json!(1) {
+                value = json!({});
+            }
+        }
+    }
+    Ok(value)
+}
+
+/// Takes out what `install` wrote for `agent` in the checkout at `root`, keeping everything
+/// else; with `last`, also the user-scope plugin no other checkout uses. A checkout that is
+/// gone has nothing left to take out.
+pub(crate) fn remove(agent: Agent, root: &Path, last: bool) -> Result<()> {
+    let _lock = installation_lock()?;
+    if root.is_dir() {
+        remove_files(agent, root)?;
+    }
+    if last && matches!(agent, Agent::Claude | Agent::Codex) {
+        crate::client_plugin::remove(agent == Agent::Claude)?;
+    }
+    Ok(())
+}
+
+fn remove_files(agent: Agent, root: &Path) -> Result<()> {
+    {
+        for relative in written_files(agent) {
+            let path = local_path(root, relative)?;
+            let Some(text) = read(&path)? else {
+                continue;
+            };
+            if relative.ends_with("SKILL.md") {
+                if text == SKILL || text == PREVIOUS_SKILL {
+                    std::fs::remove_file(&path)?;
+                    // Only directories left empty go.
+                    let _ = path.parent().map(std::fs::remove_dir);
+                    println!("Removed {relative}");
+                }
+                continue;
+            }
+            let after = if relative.ends_with(".toml") {
+                match (text.find(BEGIN), text.find(END)) {
+                    (Some(start), Some(end)) if start < end => format!(
+                        "{}{}",
+                        text[..start].trim_end_matches('\n'),
+                        &text[end + END.len()..]
+                    )
+                    .trim_start_matches('\n')
+                    .to_owned(),
+                    _ => continue,
+                }
+            } else {
+                let value = without_ours(&text, root)
+                    .map_err(|error| invalid(&format!("{relative}: {error}")))?;
+                if value == json!({}) {
+                    String::new()
+                } else {
+                    serde_json::to_string_pretty(&value)? + "\n"
+                }
+            };
+            if after == text {
+                continue;
+            }
+            if after.trim().is_empty() {
+                std::fs::remove_file(&path)?;
+                println!("Removed {relative}");
+            } else {
+                crate::hub_cli::write_private(&path, &after)?;
+                println!("Took AgentSCM out of {relative}");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -675,6 +811,58 @@ mod tests {
                 .success()
         );
         (dir, root)
+    }
+
+    #[test]
+    fn removal_takes_out_only_what_setup_wrote() {
+        let program = Path::new("/opt/agentscm");
+        for agent in [Agent::Codex, Agent::Cursor, Agent::Copilot, Agent::Gemini] {
+            let (_dir, root) = repo();
+            // A file the user had first keeps everything but AgentSCM's entries.
+            let kept = match agent {
+                Agent::Codex => (".codex/config.toml", "model = \"x\"\n"),
+                Agent::Cursor => (".cursor/mcp.json", "{\"mcpServers\":{\"other\":{}}}"),
+                Agent::Copilot => (".vscode/mcp.json", "{\"servers\":{\"other\":{}}}"),
+                _ => (".gemini/settings.json", "{\"theme\":\"dark\"}"),
+            };
+            let path = root.join(kept.0);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, kept.1).unwrap();
+            write_plan(&root, plan(agent, &root, program).unwrap()).unwrap();
+            remove_files(agent, &root).unwrap();
+            for relative in written_files(agent) {
+                if *relative != kept.0 {
+                    assert!(!root.join(relative).exists(), "{relative}");
+                }
+            }
+            let left = std::fs::read_to_string(&path).unwrap();
+            assert!(!left.contains("agentscm"), "{left}");
+            if agent == Agent::Codex {
+                assert_eq!(left, kept.1);
+            } else {
+                assert_eq!(
+                    serde_json::from_str::<Value>(&left).unwrap(),
+                    serde_json::from_str::<Value>(kept.1).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn removal_keeps_hooks_and_skills_it_did_not_write() {
+        let (_dir, root) = repo();
+        let hooks = root.join(".cursor/hooks.json");
+        let skill = root.join(".cursor/skills/coordinate-edits/SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        let theirs = json!({"version":1,"hooks":{"preToolUse":[{"command":"my-check"}]}});
+        std::fs::write(&hooks, theirs.to_string()).unwrap();
+        std::fs::write(&skill, "my own skill\n").unwrap();
+        remove_files(Agent::Cursor, &root).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&std::fs::read_to_string(&hooks).unwrap()).unwrap(),
+            theirs
+        );
+        assert_eq!(std::fs::read_to_string(&skill).unwrap(), "my own skill\n");
     }
 
     #[test]

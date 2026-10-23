@@ -917,12 +917,6 @@ pub(crate) fn forget_session(hub: &str) -> Result<bool> {
     remove_saved_session_if(&hub, None)
 }
 
-/// Remove one local human sign-in only if it is still the selected generation.
-pub(crate) fn forget_session_if_current(hub: &str, expected_secret: &str) -> Result<bool> {
-    let hub = check_base_url(hub).map_err(map_hub_error)?;
-    remove_saved_session_if(&hub, Some(expected_secret))
-}
-
 fn remove_from_store(store: &mut SavedSessions, hub: &str) -> bool {
     let before = store.sessions.len();
     store.sessions.retain(|saved| saved.hub != hub);

@@ -81,7 +81,7 @@ If the binary or the hub is missing, the hooks do nothing visible (see below).
 
 `agentscm hook <claude|codex|cursor|copilot|generic> [--hub-url URL]` reads the agent's hook JSON on standard input, sends it unchanged to `POST /v1/hub/hook/<agent>` with the token as a bearer header (for an edit, the JSON includes the edit's contents; the hub keeps only [the few fields it needs](hub.md#data-the-hub-stores)), and prints the hub's reply, which is already in the agent's own hook output format.
 
-- The token comes from `AGENTSCM_HUB_TOKEN`, else the file named by `AGENTSCM_HUB_TOKEN_FILE`, else `hub.json` as for `agentscm intent`. It is never a command-line argument.
+- The token comes from `AGENTSCM_HUB_TOKEN`, else the file named by `AGENTSCM_HUB_TOKEN_FILE`, else the checkout's client connection, else `hub.json`, as for `agentscm intent`. It is never a command-line argument.
 - The hub URL comes from `AGENTSCM_HUB_URL`, else `--hub-url`, else `hub.json`. A token stored in `hub.json` is only ever sent to the hub that file names, so a `--hub-url` in a hook command cannot redirect it; to use a different hub, set `AGENTSCM_HUB_TOKEN`.
 - `--repo OWNER/NAME` adds `?repo=` to the hook URL. If the token belongs to another repository the hub answers "coordination unknown" and records nothing, which catches one `AGENTSCM_HUB_TOKEN` reused across repositories.
 - It sends the Git root of the agent's working directory as `X-Agentscm-Root` so the hub can make edited paths repository-relative.

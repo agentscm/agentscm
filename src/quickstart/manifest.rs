@@ -7,57 +7,9 @@ use agentscm::hub::store::unix_now;
 use agentscm::lease::Lease;
 use agentscm::{Error, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::hub_cli::{config_dir, write_private};
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct Added {
-    pub(crate) event: String,
-    pub(crate) entry: Value,
-}
-
-/// A Claude Code settings file quickstart created or changed.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct HookRecord {
-    pub(crate) path: PathBuf,
-    /// Quickstart created the file (it did not exist).
-    pub(crate) created: bool,
-    /// Copies of the file before each change, oldest first.
-    pub(crate) backups: Vec<PathBuf>,
-    pub(crate) added: Vec<Added>,
-    /// Hash of the file as quickstart last wrote it.
-    pub(crate) written_hash: String,
-    /// SHA-256 of the `env.AGENTSCM_HUB_TOKEN` value quickstart put in the file (never the
-    /// token itself); uninstall removes the variable only while it still has this hash.
-    #[serde(default)]
-    pub(crate) env_token_sha: Option<String>,
-    /// The directory holding the file, when quickstart had to create it; uninstall removes
-    /// it again only if it is empty.
-    #[serde(default)]
-    pub(crate) created_dir: Option<PathBuf>,
-}
-
-/// An agent token file for one repository.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct TokenRecord {
-    pub(crate) repo: String,
-    pub(crate) file: PathBuf,
-    /// Quickstart created the file (or already owned it); a file that was there before is
-    /// never deleted.
-    pub(crate) owned: bool,
-    pub(crate) id: Option<String>,
-    pub(crate) hub: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct HubJsonRecord {
-    pub(crate) path: PathBuf,
-    pub(crate) hash: String,
-    /// The hub.json this one replaced.
-    pub(crate) backup: Option<PathBuf>,
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct LocalHubRecord {
@@ -82,13 +34,13 @@ pub(crate) struct SessionRecord {
 pub(crate) struct Manifest {
     pub(crate) created_at: i64,
     pub(crate) updated_at: i64,
-    pub(crate) hooks: Vec<HookRecord>,
-    pub(crate) tokens: Vec<TokenRecord>,
-    pub(crate) hub_json: Option<HubJsonRecord>,
+    /// Checkout roots quickstart connected with `client setup`; `uninstall` runs
+    /// `client remove` for each.
+    pub(crate) clients: Vec<PathBuf>,
     pub(crate) session: Option<SessionRecord>,
     pub(crate) local_hub: Option<LocalHubRecord>,
     pub(crate) native_hub: Option<super::hub_native::Record>,
-    /// `~/.agentscm/bin` holds the program the hooks call.
+    /// `~/.agentscm/bin` holds the program the agents' hooks call.
     pub(crate) bin_dir: Option<PathBuf>,
     /// Quickstart created `~/.agentscm` itself, not only `bin` inside it.
     pub(crate) bin_parent_created: bool,
@@ -219,9 +171,7 @@ impl Manifest {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.hooks.is_empty()
-            && self.tokens.is_empty()
-            && self.hub_json.is_none()
+        self.clients.is_empty()
             && self.session.is_none()
             && self.local_hub.is_none()
             && self.native_hub.is_none()
