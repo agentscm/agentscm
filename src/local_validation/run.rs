@@ -1,5 +1,5 @@
 //! Unix producer and Git observation. Git is only ever asked read-only questions;
-//! recipe commands run with a cleared, allowlisted environment (no forge tokens).
+//! recipe commands run as the signing user with a cleared, allowlisted environment (HOME is passed).
 
 use std::os::unix::process::CommandExt;
 use std::path::Path;

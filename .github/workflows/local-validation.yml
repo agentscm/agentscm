@@ -19,6 +19,8 @@ on:
     branches: [main]
     paths:
       - ".github/local-validation/**"
+  schedule:
+    - cron: '17 6 * * *' # replaces the success of an aged-out attestation on the head
 
 permissions: {}
 
@@ -31,8 +33,9 @@ env:
 
 jobs:
   verify:
-    # For comments: only pull request comments that start with the attestation marker.
-    if: ${{ github.event_name != 'issue_comment' || (github.event.issue.pull_request && startsWith(github.event.comment.body, '<!-- agentscm-local-validation:v1 ')) }}
+    # For comments: only pull request comments from trusted associations that start with the
+    # attestation marker (the signature still decides; this limits compute abuse and replay).
+    if: ${{ github.event_name != 'issue_comment' || (github.event.issue.pull_request && startsWith(github.event.comment.body, '<!-- agentscm-local-validation:v1 ') && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -42,7 +45,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ github.event.repository.default_branch || github.ref_name }}
           fetch-depth: 0
           persist-credentials: false
       - run: rustup toolchain install # reads rust-toolchain.toml
@@ -52,6 +55,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch || github.ref_name }}
           EVENT_NAME: ${{ github.event_name }}
           COMMENT_PR: ${{ github.event.issue.number }}
           DISPATCH_PR: ${{ inputs.pr }}
@@ -62,15 +66,24 @@ jobs:
           cfg=.github/local-validation
           repository=$(jq -r .repository "$cfg/policy.json")
           work=$(mktemp -d)
+          CHECKOUT_SHA=$(git rev-parse HEAD)
+          trusted='["OWNER","MEMBER","COLLABORATOR"]'
 
           post_status() { # sha state description
+            # A run that checked out an older default-branch policy must not overwrite the
+            # verdict of the run that re-verifies after the policy changed.
+            git fetch --no-tags origin "$DEFAULT_BRANCH"
+            if ! git diff --quiet "$CHECKOUT_SHA" FETCH_HEAD -- .github/local-validation .github/workflows/local-validation.yml; then
+              echo "not posting $2 on $1: default-branch validation config changed since checkout; a newer run owns the verdict"
+              return 0
+            fi
             gh api -X POST "repos/$REPO/statuses/$1" \
               -f state="$2" -f context=agentscm/local-validation \
               -f description="${3:0:140}" -f target_url="$RUN_URL" > /dev/null
           }
 
           verify_pr() {
-            local pr=$1 dir="$work/$1" head base page n=0 args=() out code state
+            local pr=$1 dir="$work/$1" head base page len n=0 args=() out code state want desc
             mkdir -p "$dir"
             gh api "repos/$REPO/pulls/$pr" > "$dir/pull.json"
             head=$(jq -r .head.sha "$dir/pull.json")
@@ -78,6 +91,7 @@ jobs:
             if [[ ! $head =~ ^[0-9a-f]{40}$ || ! $base =~ ^[A-Za-z0-9._/-]+$ ]]; then
               echo "PR $pr: unexpected head or base; skipped"; return 0
             fi
+            echo "$head" > "$work/$pr.head"
             git fetch --no-tags origin "+refs/heads/$base:refs/remotes/origin/$base"
             git fetch --no-tags origin "refs/pull/$pr/head"
             if ! git cat-file -e "$head^{commit}" 2>/dev/null; then
@@ -85,12 +99,16 @@ jobs:
             fi
             for page in $(seq 10); do
               gh api "repos/$REPO/issues/$pr/comments?per_page=100&page=$page" > "$dir/page.json"
+              len=$(jq length "$dir/page.json")
+              jq -c --arg m "$marker" --argjson t "$trusted" \
+                '.[] | select((.body | startswith($m)) and (.author_association as $a | $t | index($a))) | .body' \
+                "$dir/page.json" > "$dir/bodies.txt"
               while IFS= read -r body; do
                 n=$((n + 1))
                 printf '%s' "$body" | jq -r . > "$dir/comment-$n.txt"
                 args+=(--comment-body "$dir/comment-$n.txt")
-              done < <(jq -c --arg m "$marker" '.[] | select(.body | startswith($m)) | .body' "$dir/page.json")
-              [[ $(jq length "$dir/page.json") -lt 100 ]] && break
+              done < "$dir/bodies.txt"
+              [[ $len -lt 100 ]] && break
               if [[ $page -eq 10 ]]; then
                 post_status "$head" error "too many comments to read the newest attestation"; return 0
               fi
@@ -100,7 +118,7 @@ jobs:
             fi
             code=0
             out=$(target/debug/agentscm local-validation verify "${args[@]}" \
-              --policy "$cfg/policy.json" --registry "$cfg/registry.json" --repo . \
+              --policy "$cfg/policy.json" --recipe "$cfg/recipe.json" --registry "$cfg/registry.json" --repo . \
               --head "$head" --base-ref "$base" --base-rev "origin/$base" \
               --repository "$repository") || code=$?
             echo "PR $pr head $head exit $code: $out"
@@ -114,7 +132,7 @@ jobs:
             fi
             desc=$(printf '%s' "$out" | jq -r '.reason // empty' 2>/dev/null || true)
             post_status "$head" "$state" "${desc:-verifier error (exit $code)}"
-            if [[ $(gh api "repos/$REPO/pulls/$pr" --jq .head.sha) != "$head" ]]; then
+            if [[ $(gh api "repos/$REPO/pulls/$pr" --jq .head.sha || true) != "$head" ]]; then
               echo "PR $pr head moved during verification; the status is bound to $head and the new head has none"
             fi
           }
@@ -122,10 +140,28 @@ jobs:
           case $EVENT_NAME in
             issue_comment) prs=$COMMENT_PR ;;
             workflow_dispatch) prs=$DISPATCH_PR ;;
-            push) prs=$(gh pr list --repo "$REPO" --state open --limit 50 --json number --jq '.[].number') ;;
+            push | schedule)
+              gh pr list --repo "$REPO" --state open --limit 1000 --json number > "$work/open.json"
+              if [[ $(jq length "$work/open.json") -ge 1000 ]]; then
+                echo "1000 or more open PRs; the list may be truncated"; exit 1
+              fi
+              prs=$(jq -r '.[].number' "$work/open.json") ;;
             *) echo "unexpected event"; exit 1 ;;
           esac
+          errored=0
           for pr in $prs; do
             [[ $pr =~ ^[0-9]+$ ]] || { echo "bad PR number"; exit 1; }
-            verify_pr "$pr"
+            # set -e is ignored inside an `if` or `||` context, so run the subshell bare.
+            set +e
+            (set -euo pipefail; verify_pr "$pr")
+            rc=$?
+            set -e
+            if [[ $rc -ne 0 ]]; then
+              errored=1
+              echo "PR $pr: verifier failed with exit $rc"
+              if [[ -s $work/$pr.head ]]; then
+                post_status "$(cat "$work/$pr.head")" error "verifier error; re-run" || true
+              fi
+            fi
           done
+          exit $errored
