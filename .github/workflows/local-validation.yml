@@ -8,7 +8,7 @@ name: Local validation verifier
 
 on:
   issue_comment: # zizmor: ignore[dangerous-triggers] default-branch build only; the PR head is fetched as Git data, never built or run
-    types: [created, edited]
+    types: [created, edited, deleted]
   workflow_dispatch:
     inputs:
       pr:
@@ -17,11 +17,17 @@ on:
         type: number
   push:
     branches: [main]
+    # Keep this list identical to `verifier_inputs` in the verify step below.
     paths:
-      - ".github/local-validation/**"
-      - ".github/workflows/local-validation.yml"
+      - "src/evidence/**"
+      - "src/policy/**"
       - "src/local_validation/**"
       - "src/local_validation_cli.rs"
+      - "src/main.rs"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/local-validation/**"
+      - ".github/workflows/local-validation.yml"
   schedule:
     - cron: '17 6 * * *' # replaces the success of an aged-out attestation on the head
 
@@ -65,6 +71,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
+          shopt -s inherit_errexit # a failing $(...) helper must fail the PR, not be skipped
           marker='<!-- agentscm-local-validation:v1 '
           cfg=.github/local-validation
           repository=$(jq -r .repository "$cfg/policy.json")
@@ -75,12 +82,19 @@ jobs:
           CHECKOUT_SHA=$(git rev-parse HEAD)
           trusted='["OWNER","MEMBER","COLLABORATOR"]'
 
+          # Inputs that decide a verdict. Must match the push `paths:` list above.
+          verifier_inputs=(
+            'src/evidence/**' 'src/policy/**' 'src/local_validation/**' src/local_validation_cli.rs
+            src/main.rs Cargo.lock rust-toolchain.toml '.github/local-validation/**'
+            .github/workflows/local-validation.yml
+          )
+
           post_status() { # sha state description
-            # A run that checked out an older default-branch policy must not overwrite the
-            # verdict of the run that re-verifies after the policy changed.
+            # A run that checked out older verifier inputs must not overwrite the verdict
+            # of the run that re-verifies after they changed.
             git fetch --no-tags origin "$DEFAULT_BRANCH"
-            if ! git diff --quiet "$CHECKOUT_SHA" FETCH_HEAD -- .github/local-validation .github/workflows/local-validation.yml; then
-              echo "not posting $2 on $1: default-branch validation config changed since checkout; a newer run owns the verdict"
+            if ! git diff --quiet "$CHECKOUT_SHA" FETCH_HEAD -- "${verifier_inputs[@]}"; then
+              echo "not posting $2 on $1: default-branch verifier inputs changed since checkout; a newer run owns the verdict"
               return 0
             fi
             gh api -X POST "repos/$REPO/statuses/$1" \
@@ -95,12 +109,14 @@ jobs:
 
           fingerprint() { # pr: sorted id:updated_at of the trusted marker comments
             local pr=$1 page len
+            : > "$work/fp-out.txt"
             for page in $(seq 10); do
-              gh api "repos/$REPO/issues/$pr/comments?per_page=100&page=$page" > "$work/fp-page.json"
-              jq -r --arg m "$marker" --argjson t "$trusted" "$fp_filter" "$work/fp-page.json"
-              len=$(jq length "$work/fp-page.json")
-              [[ $len -lt 100 ]] && break
-            done | sort
+              gh api "repos/$REPO/issues/$pr/comments?per_page=100&page=$page" > "$work/fp-page.json" || return 1
+              jq -r --arg m "$marker" --argjson t "$trusted" "$fp_filter" "$work/fp-page.json" >> "$work/fp-out.txt" || return 1
+              len=$(jq length "$work/fp-page.json") || return 1
+              if [[ $len -lt 100 ]]; then break; fi
+            done
+            sort "$work/fp-out.txt"
           }
 
           verify_pr() {
@@ -136,7 +152,13 @@ jobs:
             done
             fp_before=$(sort "$dir/fp.txt")
             if [[ $n -eq 0 && ( $EVENT_NAME == push || $EVENT_NAME == schedule ) ]]; then
-              echo "PR $pr: no trusted attestation comment; not opted in, no status written"; return 0
+              # Skip PRs that never opted in; but if this head already has our status (for
+              # example the attestation comment was deleted), replace it with pending.
+              gh api --paginate "repos/$REPO/commits/$head/statuses?per_page=100" \
+                --jq '.[] | select(.context == "agentscm/local-validation") | .id' > "$dir/statuses.txt"
+              if [[ ! -s $dir/statuses.txt ]]; then
+                echo "PR $pr: no trusted attestation comment and no existing status; not opted in, no status written"; return 0
+              fi
             fi
             if [[ $n -eq 0 ]]; then
               post_status "$head" pending "no local validation attestation for this head"; return 0
