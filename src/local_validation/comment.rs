@@ -9,7 +9,7 @@ use super::{MAX_RECORD_BYTES, ValidationRecord};
 use crate::evidence::validate_lower_hex;
 use crate::{Error, Result};
 
-pub const MAX_COMMENT_BYTES: usize = 60 * 1024;
+pub const MAX_COMMENT_BYTES: usize = 60*1024;
 const MARKER_PREFIX: &str = "<!-- agentscm-local-validation:v1 ";
 const ENVELOPE_FENCE: &str = "```agentscm-envelope-v1";
 const RECORD_FENCE: &str = "```agentscm-record-v1";
