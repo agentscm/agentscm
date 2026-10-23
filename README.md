@@ -46,6 +46,13 @@ AgentSCM connects three parts of that process:
 | Native workflow pilot | Revision-bound tests/review, explicit approval and native landing | [Claude Code workflow loop](docs/advanced/claude-code-workflows.md) |
 
 For packaged binaries or containers, see [install options](docs/install.md).
+
+**Install: local or hosted?** For the alpha, run it on your own machine: `npx agentscm --local`.
+A hosted hub for a team is unsupported in the alpha and will likely break; `npx agentscm --hosted`
+prints the [hosted guide](docs/hosted.md) to work through with your coding agent. Asked to
+install AgentSCM for someone? Ask them "local or hosted?" first, then follow
+[choose local or hosted](docs/install.md#choose-local-or-hosted).
+
 Joining an existing Hub? Use **Connect an agent** in its status page. Your agent guides sign-in,
 native approvals and verification; readiness requires recent MCP and native edit-hook observations.
 See [member onboarding](docs/team-member-onboarding.md#verify-trust-and-behavior).

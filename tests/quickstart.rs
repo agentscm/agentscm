@@ -872,6 +872,31 @@ fn with_yes_the_hooks_wait_for_a_hub() {
 }
 
 #[test]
+fn hosted_prints_the_guide_and_sets_up_no_hub() {
+    let machine = Machine::new();
+    let repo = machine.repo();
+    let output = machine.run(
+        repo.path(),
+        &[
+            "quickstart",
+            "--yes",
+            "--hosted",
+            "--hook",
+            "none",
+            "--no-collisions",
+        ],
+    );
+    let said = ok(&output);
+    assert!(said.contains("not supported in the alpha"), "{said}");
+    assert!(said.contains("docs/hosted.md"), "{said}");
+    assert!(last_line(&output).starts_with("Live warnings: off — no hub chosen"));
+    assert!(!machine.config().join("quickstart.json").exists());
+    assert!(!machine.home.path().join(".agentscm/hub").exists());
+    let output = machine.run(repo.path(), &["quickstart", "--yes", "--local", "--hosted"]);
+    assert!(!output.status.success());
+}
+
+#[test]
 fn without_a_terminal_it_refuses_and_writes_nothing() {
     let machine = Machine::new();
     let repo = machine.repo();
