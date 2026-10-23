@@ -31,7 +31,7 @@ export AGENTSCM_GITHUB_API_URL=http://127.0.0.1:9
 "$bin" hub --no-telemetry serve --bind "127.0.0.1:$port" --objects "$data/objects" --secrets "$data/secrets" &
 hub=$!
 trap 'kill $hub 2>/dev/null' EXIT
-for _ in $(seq 50); do curl -sf "$health" >/dev/null && break; sleep 0.2; done
+for _ in $(seq 300); do curl -sf "$health" >/dev/null && break; sleep 0.2; done
 kill -0 "$hub" 2>/dev/null && curl -sf "$health" >/dev/null || { echo "start.sh: the hub did not start on 127.0.0.1:$port" >&2; exit 1; }
 
 python3 -I "$here/seed.py" "$data/tokens.env" "$root" --live
