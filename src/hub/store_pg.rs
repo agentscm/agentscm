@@ -2592,6 +2592,7 @@ fn intent_row(row: &postgres::Row) -> (Intent, String, Option<String>) {
                 disabled: false,
             },
             via: Vec::new(),
+            session: row.get(18),
         },
         row.get(16),
         row.get(17),

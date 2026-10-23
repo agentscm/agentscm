@@ -387,6 +387,121 @@ async fn a_repeated_edit_messages_both_people_and_the_holder_hands_over_with_a_b
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_journal_holds_events_until_queued_messages_are_sent() {
+    let f = Fixture::new().await;
+    {
+        let slack = f.slack();
+        let mut db = slack.database().unwrap();
+        let tx = db.transaction().unwrap();
+        for n in 0..CAPACITY {
+            tx.execute(
+                "INSERT INTO messages(id,user,body,state,created,due) VALUES(?1,'U9','{}','queued',?2,?3)",
+                params![format!("waiting{n}"), unix_now(), unix_now() + 86400],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    f.contest();
+    // Events before the repeat need no message and pass; the repeat waits at the cursor.
+    let (slack, state) = (f.slack(), f.state.clone());
+    let _ = tokio::task::block_in_place(|| slack.collect(&state));
+    let queued: i64 = f
+        .slack()
+        .database()
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM messages WHERE id NOT LIKE 'waiting%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(queued, 0);
+    assert!(f.slack().full.load(std::sync::atomic::Ordering::Relaxed));
+    // Sent rows no longer count: the held event is collected, not lost.
+    f.slack()
+        .database()
+        .unwrap()
+        .execute(
+            "UPDATE messages SET state='done' WHERE id LIKE 'waiting%'",
+            [],
+        )
+        .unwrap();
+    f.run().await;
+    assert_eq!(f.sent().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_holder_button_answers_for_the_session_that_holds_the_file() {
+    let f = Fixture::new().await;
+    f.edit(&f.alice, "a");
+    // A second hook session of alice's token: the token's default session is no longer "a".
+    let other = SessionCall {
+        session: Some("c".into()),
+        via: "hook:claude".into(),
+        task: None,
+        paths: Vec::new(),
+        deny: true,
+        report: false,
+    };
+    tokio::task::block_in_place(|| f.store().touch_session(&f.alice, &other, unix_now())).unwrap();
+    assert!(!f.edit(&f.bob, "b").denied.is_empty());
+    assert!(!f.edit(&f.bob, "b").repeated.is_empty());
+    f.run().await;
+    assert_eq!(f.click("U1", YES).await, StatusCode::OK);
+    let update = f
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(path, _)| path == "/api/chat.update")
+        .unwrap()
+        .1
+        .clone();
+    assert_eq!(
+        update["blocks"][1]["elements"][0]["text"],
+        "You handed src/widget.rs to bob's agent codex; their agent is told on its next call."
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repeated_edit_of_several_held_files_is_one_message_without_buttons() {
+    let f = Fixture::new().await;
+    let edit = |token: &str, session: &str| {
+        let call = SessionCall {
+            session: Some(session.into()),
+            via: "hook:claude".into(),
+            task: None,
+            paths: vec![PATH.into(), "src/gadget.rs".into()],
+            deny: true,
+            report: false,
+        };
+        tokio::task::block_in_place(|| f.store().touch_session(token, &call, unix_now()).unwrap())
+    };
+    edit(&f.alice, "a");
+    assert!(!edit(&f.bob, "b").denied.is_empty());
+    assert!(!edit(&f.bob, "b").repeated.is_empty());
+    f.run().await;
+    let holder: Vec<_> = f
+        .sent()
+        .into_iter()
+        .filter(|(user, _)| user == "U1")
+        .collect();
+    assert_eq!(holder.len(), 1, "{holder:?}");
+    assert_eq!(
+        holder[0].1,
+        "bob's agent codex edited src/gadget.rs, src/widget.rs in acme/widgets after AgentSCM said your agent claude is working on them. Hand the files over, or keep them and agree with them who goes first."
+    );
+    let buttons: Vec<_> = f.sent_body("U1")["blocks"][1]["elements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["action_id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(buttons, ["agentscm_open_hub"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_declined_handoff_messages_both_people_with_the_reason() {
     let f = Fixture::new().await;
     f.edit(&f.alice, "a");

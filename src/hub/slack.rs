@@ -37,6 +37,7 @@ const CAPACITY: i64 = 4096;
 const BATCH: usize = 200;
 /// A message is tried at most this many times.
 const MAX_ATTEMPTS: i64 = 8;
+const SENDS_PER_PASS: usize = 20;
 /// The Hub events that become direct messages.
 const KINDS: [&str; 3] = ["edit_repeated", "handoff_decline", "task_overlap"];
 const NAME_CHARS: usize = 64;
@@ -89,6 +90,8 @@ pub struct Slack {
     client: reqwest::Client,
     requests: Arc<Semaphore>,
     verified_until: tokio::sync::Mutex<i64>,
+    /// Whether the last collection found the journal full, so the log says it once.
+    full: std::sync::atomic::AtomicBool,
     // Fixed in production. Tests use a private loopback fake only.
     api: String,
 }
@@ -323,11 +326,14 @@ fn escape(text: &str) -> String {
 }
 
 /// A direct message: the text as plain text (never mrkdwn), handoff buttons for `handoff`
-/// (holder token, path), and a link to the Hub.
-fn message(text: &str, handoff: Option<(&str, &str)>, hub_url: &str) -> Value {
+/// (holder token, holder session, path), and a link to the Hub.
+fn message(text: &str, handoff: Option<(&str, Option<&str>, &str)>, hub_url: &str) -> Value {
     let mut elements = Vec::new();
-    if let Some((token, path)) = handoff {
-        let value = json!({"t": token, "p": path}).to_string();
+    // Slack refuses a whole message whose button value passes 2000 characters; send it without buttons.
+    let value = handoff
+        .map(|(token, session, path)| json!({"t": token, "s": session, "p": path}).to_string())
+        .filter(|value| value.chars().count() <= 2000);
+    if let Some(value) = value {
         elements.push(json!({"type":"button","action_id":YES,"style":"primary",
             "text":plain_text("Hand it over",30),"value":value}));
         elements.push(json!({"type":"button","action_id":NO,
@@ -412,6 +418,7 @@ impl Slack {
                 .map_err(|_| unavailable())?,
             requests: Arc::new(Semaphore::new(8)),
             verified_until: tokio::sync::Mutex::new(0),
+            full: std::sync::atomic::AtomicBool::new(false),
             api: "https://slack.com/api/".into(),
         })
     }
@@ -567,19 +574,22 @@ impl Slack {
             return Ok(());
         };
         let events = state.store.events_after(cursor, BATCH)?;
-        let Some(last) = events.last().map(|event| event.seq) else {
+        if events.is_empty() {
             return Ok(());
+        }
+        let people = if events.iter().any(|e| KINDS.contains(&e.kind.as_str())) {
+            self.people(state)?
+        } else {
+            Vec::new()
         };
-        let relevant: Vec<&HubEvent> = events
-            .iter()
-            .filter(|event| KINDS.contains(&event.kind.as_str()))
-            .collect();
-        let mut messages = Vec::new();
-        if !relevant.is_empty() {
-            let people = self.people(state)?;
-            for event in relevant {
-                messages.extend(self.messages_for(state, &people, event)?);
-            }
+        let mut batches = Vec::new();
+        for event in &events {
+            let messages = if KINDS.contains(&event.kind.as_str()) {
+                self.messages_for(state, &people, event)?
+            } else {
+                Vec::new()
+            };
+            batches.push((event.seq, messages));
         }
         let now = unix_now();
         let mut db = self.database()?;
@@ -588,17 +598,42 @@ impl Slack {
             "DELETE FROM messages WHERE state IN ('done','failed') AND created < ?1",
             [now - 86400],
         )?;
-        let held: i64 = tx.query_row("SELECT count(*) FROM messages", [], |r| r.get(0))?;
-        if held + messages.len() as i64 > CAPACITY {
+        // Sent rows only remember what was sent; the cap bounds what is still waiting.
+        let mut waiting: i64 = tx.query_row(
+            "SELECT count(*) FROM messages WHERE state IN ('queued','sending')",
+            [],
+            |r| r.get(0),
+        )?;
+        let mut reached = None;
+        for (seq, messages) in batches {
+            if waiting + messages.len() as i64 > CAPACITY {
+                break;
+            }
+            waiting += messages.len() as i64;
+            for (id, user, body) in messages {
+                tx.execute(
+                    "INSERT OR IGNORE INTO messages(id,user,body,state,created,due) VALUES(?1,?2,?3,'queued',?4,?4)",
+                    params![id, user, body.to_string(), now],
+                )?;
+            }
+            reached = Some(seq);
+        }
+        // Events that do not fit wait at the cursor until sends make room.
+        let full = reached != events.last().map(|event| event.seq);
+        if full != self.full.swap(full, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "{}",
+                if full {
+                    "Slack message journal is full; new coordination messages wait until queued ones are sent"
+                } else {
+                    "Slack message journal has room again"
+                }
+            );
+        }
+        let Some(reached) = reached else {
             return Err(HubError::Busy);
-        }
-        for (id, user, body) in messages {
-            tx.execute(
-                "INSERT OR IGNORE INTO messages(id,user,body,state,created,due) VALUES(?1,?2,?3,'queued',?4,?4)",
-                params![id, user, body.to_string(), now],
-            )?;
-        }
-        tx.execute("UPDATE cursor SET seq=?1 WHERE id=1", [last])?;
+        };
+        tx.execute("UPDATE cursor SET seq=?1 WHERE id=1", [reached])?;
         tx.commit()?;
         Ok(())
     }
@@ -694,18 +729,32 @@ impl Slack {
                 if let Some(person) = Self::bound(people, &repository, &intent.token)
                     && repeater.is_none_or(|r| r.slack_user != person.slack_user)
                 {
-                    for path in &held {
-                        let text = format!(
-                            "{who} edited {} in {repository} after AgentSCM said your agent {} is working on it. Hand the file over, or keep it and agree with them who goes first.",
-                            sanitize(path, TEXT_CHARS),
-                            sanitize(&intent.agent, NAME_CHARS),
-                        );
-                        out.push((
-                            person.slack_user.clone(),
-                            format!("holder\n{}\n{path}", intent.token),
-                            message(&text, Some((&intent.token, path)), &self.hub_url),
-                        ));
-                    }
+                    // One message per holder and event; buttons answer one file only.
+                    let text = format!(
+                        "{who} edited {} in {repository} after AgentSCM said your agent {} is working on {}. Hand {} over, or keep {} and agree with them who goes first.",
+                        paths_text(&held),
+                        sanitize(&intent.agent, NAME_CHARS),
+                        if held.len() == 1 { "it" } else { "them" },
+                        if held.len() == 1 {
+                            "the file"
+                        } else {
+                            "the files"
+                        },
+                        if held.len() == 1 { "it" } else { "them" },
+                    );
+                    let handoff = match held.as_slice() {
+                        [path] => Some((
+                            intent.token.as_str(),
+                            intent.session.as_deref(),
+                            path.as_str(),
+                        )),
+                        _ => None,
+                    };
+                    out.push((
+                        person.slack_user.clone(),
+                        format!("holder\n{}", intent.token),
+                        message(&text, handoff, &self.hub_url),
+                    ));
                 }
                 holders.push(holder);
             }
@@ -936,13 +985,14 @@ impl Slack {
         Ok(Some((id, user, body, attempts)))
     }
 
-    async fn deliver(self: &Arc<Self>, state: &HubState) -> Result<()> {
+    /// Sends the next due message; `false` when none was due.
+    async fn deliver(self: &Arc<Self>, state: &HubState) -> Result<bool> {
         let service = self.clone();
         let context = state.clone();
         let Some((id, user, mut body, attempts)) =
             offload(move || service.next_message(&context)).await?
         else {
-            return Ok(());
+            return Ok(false);
         };
         // A user id as the channel is the app's direct message with that user.
         body["channel"] = json!(user);
@@ -957,7 +1007,7 @@ impl Slack {
                 "UPDATE messages SET state=?1,due=?2 WHERE id=?3 AND state='sending'",
                 params![status, unix_now() + delay, id],
             )?;
-            Ok(())
+            Ok(true)
         })
         .await
     }
@@ -971,9 +1021,16 @@ impl Slack {
                     Ok(()) | Err(HubError::Unauthorized | HubError::Busy) => {}
                     Err(_) => eprintln!("Slack event collection unavailable"),
                 }
-                match self.deliver(&state).await {
-                    Ok(()) | Err(HubError::Unauthorized | HubError::Busy) => {}
-                    Err(_) => eprintln!("Slack delivery journal unavailable"),
+                // Several sends per pass, so a burst is not paced at one message per sleep.
+                for _ in 0..SENDS_PER_PASS {
+                    match self.deliver(&state).await {
+                        Ok(true) => {}
+                        Ok(false) | Err(HubError::Unauthorized | HubError::Busy) => break,
+                        Err(_) => {
+                            eprintln!("Slack delivery journal unavailable");
+                            break;
+                        }
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
@@ -987,6 +1044,8 @@ impl Slack {
         let (Some(token), Some(path)) = (button["t"].as_str(), button["p"].as_str()) else {
             return Err(invalid());
         };
+        // The session holding the file: the request was filed to it, not to the token's default.
+        let session = button["s"].as_str();
         let _store_slot = state.permits.try_acquire().map_err(|_| HubError::Busy)?;
         let binding = self
             .bindings
@@ -1001,7 +1060,7 @@ impl Slack {
         Ok(
             match state
                 .store
-                .answer_handoff(token, None, path, accept, None, unix_now())?
+                .answer_handoff(token, session, path, accept, None, unix_now())?
             {
                 Answered::Granted { requester } => format!(
                     "You handed {path_text} to {}; their agent is told on its next call.",

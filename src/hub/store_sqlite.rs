@@ -2690,6 +2690,7 @@ fn intent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Intent, String, Opti
                 disabled: false,
             },
             via: Vec::new(),
+            session: row.get(18)?,
         },
         row.get(16)?,
         row.get(17)?,
