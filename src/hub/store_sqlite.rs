@@ -8,8 +8,9 @@ use serde_json::json;
 
 use super::connection::{
     CONNECTION_SELECT, ConnectedRepository, Connection as ForgeConnection, DELIVERY_KEEP_SECONDS,
-    ForgeCheck, ForgeCheckReserve, NewConnection, NewForgeCheck, Observation, Observed, Outbound,
-    REPOSITORY_SELECT, gone_event, observation_kinds, validate_check_key, validate_check_phase,
+    ForgeCheck, ForgeCheckReserve, MergeGroup, NewConnection, NewForgeCheck, NewMergeGroup,
+    Observation, Observed, Outbound, REPOSITORY_SELECT, gone_event, is_lower_hex,
+    observation_kinds, validate_check_key, validate_check_phase, validate_group_note,
     validate_observation, validate_repository_row, validate_status,
 };
 use super::coordination::{
@@ -2639,6 +2640,45 @@ fn repository_by_rep(tx: &Connection, id: &str) -> Result<ConnectedRepository> {
     .ok_or_else(|| HubError::Invalid("unknown repository".into()))
 }
 
+/// Ended merge groups are kept this long (30 days) before an observation of the repository drops them.
+const MERGE_GROUP_KEEP_SECONDS: i64 = 2_592_000;
+
+const MERGE_GROUP_COLUMNS: &str = "head_sha, head_ref, base_ref, base_sha, pr_number, pr_head_sha,
+    context, ended_reason, observed_at, ended_at, state, binding_digest, description, phase,
+    generation, updated_at, ruleset_requirement, status_source";
+
+fn merge_group_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MergeGroup> {
+    let head_sha: String = row.get(0)?;
+    let phase: Option<String> = row.get(13)?;
+    Ok(MergeGroup {
+        check: match phase {
+            Some(phase) => Some(ForgeCheck {
+                head_sha: head_sha.clone(),
+                state: row.get(10)?,
+                binding_digest: row.get(11)?,
+                description: row.get(12)?,
+                phase,
+                generation: row.get(14)?,
+                updated_at: row.get(15)?,
+            }),
+            None => None,
+        },
+        head_sha,
+        head_ref: row.get(1)?,
+        base_ref: row.get(2)?,
+        base_sha: row.get(3)?,
+        pr_number: row.get(4)?,
+        pr_head_sha: row.get(5)?,
+        context: row.get(6)?,
+        ended_reason: row.get(7)?,
+        observed_at: row.get(8)?,
+        ended_at: row.get(9)?,
+        generation: row.get(14)?,
+        ruleset_requirement: row.get(16)?,
+        status_source: row.get(17)?,
+    })
+}
+
 fn external_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<ExternalRun>> {
     let kind: String = row.get(1)?;
     let outcome: String = row.get(8)?;
@@ -4605,6 +4645,180 @@ impl Store for SqliteStore {
              WHERE repository = ?1 AND number = ?2 AND context = ?3 AND generation = ?4",
             params![repo, number, context, generation, now, phase],
         )? == 1)
+    }
+
+    fn observe_merge_group(
+        &self,
+        repo: &str,
+        group: &NewMergeGroup,
+        ended: Option<&str>,
+        now: i64,
+    ) -> Result<MergeGroup> {
+        group.validate()?;
+        ended.map(validate_group_note).transpose()?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        repository_by_rep(&tx, repo)?;
+        tx.execute(
+            "DELETE FROM hub_merge_groups
+             WHERE repository = ?1 AND ended_reason IS NOT NULL AND ended_at < ?2",
+            params![repo, now.saturating_sub(MERGE_GROUP_KEEP_SECONDS)],
+        )?;
+        tx.execute(
+            "INSERT INTO hub_merge_groups (repository, head_sha, head_ref, base_ref, base_sha,
+                 pr_number, pr_head_sha, context, ended_reason, observed_at, ended_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, CASE WHEN ?9 IS NULL THEN NULL ELSE ?10 END, ?10)
+             ON CONFLICT (repository, head_sha) DO NOTHING",
+            params![
+                repo,
+                group.head_sha,
+                group.head_ref,
+                group.base_ref,
+                group.base_sha,
+                group.pr_number,
+                group.pr_head_sha,
+                group.context,
+                ended,
+                now
+            ],
+        )?;
+        if let Some(reason) = ended {
+            tx.execute(
+                "UPDATE hub_merge_groups SET ended_reason = ?3, ended_at = ?4, updated_at = ?4
+                 WHERE repository = ?1 AND head_sha = ?2 AND ended_reason IS NULL",
+                params![repo, group.head_sha, reason, now],
+            )?;
+        }
+        let stored = tx.query_row(
+            &format!(
+                "SELECT {MERGE_GROUP_COLUMNS} FROM hub_merge_groups
+                 WHERE repository = ?1 AND head_sha = ?2"
+            ),
+            params![repo, group.head_sha],
+            merge_group_row,
+        )?;
+        tx.commit()?;
+        Ok(stored)
+    }
+
+    fn merge_group(&self, repo: &str, head_sha: &str) -> Result<Option<MergeGroup>> {
+        if !is_lower_hex(head_sha, 40) {
+            return Err(HubError::Invalid("merge group is out of bounds".into()));
+        }
+        Ok(self
+            .conn()
+            .query_row(
+                &format!(
+                    "SELECT {MERGE_GROUP_COLUMNS} FROM hub_merge_groups
+                     WHERE repository = ?1 AND head_sha = ?2"
+                ),
+                params![repo, head_sha],
+                merge_group_row,
+            )
+            .optional()?)
+    }
+
+    fn active_merge_groups(&self, repo: &str, limit: usize) -> Result<Vec<MergeGroup>> {
+        let conn = self.conn();
+        let mut statement = conn.prepare(&format!(
+            "SELECT {MERGE_GROUP_COLUMNS} FROM hub_merge_groups
+             WHERE repository = ?1 AND ended_reason IS NULL
+             ORDER BY observed_at, head_sha LIMIT ?2"
+        ))?;
+        let rows = statement
+            .query_map(params![repo, limit as i64], merge_group_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    fn end_merge_group(&self, repo: &str, head_sha: &str, reason: &str, now: i64) -> Result<bool> {
+        if !is_lower_hex(head_sha, 40) {
+            return Err(HubError::Invalid("merge group is out of bounds".into()));
+        }
+        validate_group_note(reason)?;
+        Ok(self.conn().execute(
+            "UPDATE hub_merge_groups SET ended_reason = ?3, ended_at = ?4, updated_at = ?4
+             WHERE repository = ?1 AND head_sha = ?2 AND ended_reason IS NULL",
+            params![repo, head_sha, reason, now],
+        )? == 1)
+    }
+
+    fn reserve_merge_group_check(
+        &self,
+        repo: &str,
+        head_sha: &str,
+        expected: i64,
+        new: &NewForgeCheck,
+        now: i64,
+    ) -> Result<ForgeCheckReserve> {
+        new.validate()?;
+        if new.head_sha != head_sha {
+            return Err(HubError::Invalid(
+                "forge check is not for this merge group".into(),
+            ));
+        }
+        Ok(
+            if self.conn().execute(
+                "UPDATE hub_merge_groups SET state = ?4, binding_digest = ?5, description = ?6,
+                     phase = 'attempting', generation = generation + 1, updated_at = ?7
+                 WHERE repository = ?1 AND head_sha = ?2 AND generation = ?3
+                     AND ended_reason IS NULL",
+                params![
+                    repo,
+                    head_sha,
+                    expected,
+                    new.state,
+                    new.binding_digest,
+                    new.description,
+                    now
+                ],
+            )? == 1
+            {
+                ForgeCheckReserve::Reserved(expected.saturating_add(1))
+            } else {
+                ForgeCheckReserve::Conflict
+            },
+        )
+    }
+
+    fn complete_merge_group_check(
+        &self,
+        repo: &str,
+        head_sha: &str,
+        generation: i64,
+        phase: &str,
+        now: i64,
+    ) -> Result<bool> {
+        if !is_lower_hex(head_sha, 40) {
+            return Err(HubError::Invalid("merge group is out of bounds".into()));
+        }
+        validate_check_phase(phase)?;
+        // No lifecycle guard: a post that happened after the group ended is still recorded.
+        Ok(self.conn().execute(
+            "UPDATE hub_merge_groups SET phase = ?4, generation = generation + 1, updated_at = ?5
+             WHERE repository = ?1 AND head_sha = ?2 AND generation = ?3",
+            params![repo, head_sha, generation, phase, now],
+        )? == 1)
+    }
+
+    fn note_merge_group_source(
+        &self,
+        repo: &str,
+        head_sha: &str,
+        ruleset_requirement: &str,
+        status_source: &str,
+    ) -> Result<()> {
+        if !is_lower_hex(head_sha, 40) {
+            return Err(HubError::Invalid("merge group is out of bounds".into()));
+        }
+        validate_group_note(ruleset_requirement)?;
+        validate_group_note(status_source)?;
+        self.conn().execute(
+            "UPDATE hub_merge_groups SET ruleset_requirement = ?3, status_source = ?4
+             WHERE repository = ?1 AND head_sha = ?2",
+            params![repo, head_sha, ruleset_requirement, status_source],
+        )?;
+        Ok(())
     }
 
     fn observe_external_run(&self, repo: &str, run: &ExternalRun) -> Result<ExternalObserved> {
@@ -6897,5 +7111,316 @@ impl Store for SqliteStore {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(events)
+    }
+}
+
+#[cfg(test)]
+mod merge_group_tests {
+    use super::*;
+    use crate::hub::store::{Store, new_connection_id};
+
+    const DAY: i64 = 86_400;
+
+    fn store() -> (tempfile::TempDir, SqliteStore, String) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SqliteStore::open(&dir.path().join("hub.sqlite")).unwrap();
+        let con = store
+            .insert_connection(
+                &NewConnection {
+                    id: new_connection_id().unwrap(),
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    kind: "app".into(),
+                    app_id: Some(42),
+                    app_slug: Some("agentscm-test".into()),
+                    acts_as: None,
+                },
+                "usr_admin",
+            )
+            .unwrap();
+        let repo = store
+            .upsert_repository(&con.id, "github.com", 4242, "acme/widgets", None, None)
+            .unwrap();
+        (dir, store, repo.id)
+    }
+
+    fn sha(c: char) -> String {
+        c.to_string().repeat(40)
+    }
+
+    fn group(c: char) -> NewMergeGroup {
+        NewMergeGroup {
+            head_sha: sha(c),
+            head_ref: format!("gh-readonly-queue/main/pr-7-{c}"),
+            base_ref: "main".into(),
+            base_sha: sha('b'),
+            pr_number: 7,
+            pr_head_sha: sha('e'),
+            context: "agentscm/workflow/main".into(),
+        }
+    }
+
+    fn check(c: char, state: &str) -> NewForgeCheck {
+        NewForgeCheck {
+            head_sha: sha(c),
+            state: state.into(),
+            binding_digest: (state == "success").then(|| "d".repeat(64)),
+            description: "qualified".into(),
+        }
+    }
+
+    #[test]
+    fn merge_group_observe_is_idempotent_and_never_revives() {
+        let (_dir, store, repo) = store();
+        let first = store
+            .observe_merge_group(&repo, &group('a'), None, 10)
+            .unwrap();
+        assert_eq!(first.head_sha, sha('a'));
+        assert_eq!(
+            (
+                first.observed_at,
+                first.ended_reason.clone(),
+                first.generation
+            ),
+            (10, None, 0)
+        );
+        assert_eq!(first.check, None);
+        assert_eq!(
+            store.merge_group(&repo, &sha('a')).unwrap(),
+            Some(first.clone())
+        );
+        assert_eq!(store.merge_group(&repo, &sha('f')).unwrap(), None);
+        assert!(store.merge_group(&repo, "short").is_err());
+
+        // Identity fields never change on a repeat.
+        let other = NewMergeGroup {
+            pr_number: 9,
+            base_ref: "dev".into(),
+            ..group('a')
+        };
+        assert_eq!(
+            store.observe_merge_group(&repo, &other, None, 99).unwrap(),
+            first
+        );
+
+        let ended = store
+            .observe_merge_group(&repo, &group('a'), Some("destroyed"), 20)
+            .unwrap();
+        assert_eq!(ended.ended_reason.as_deref(), Some("destroyed"));
+        assert_eq!(
+            (ended.ended_at, ended.pr_number, ended.observed_at),
+            (Some(20), 7, 10)
+        );
+
+        // A later observation neither revives it nor rewrites the reason.
+        let later = store
+            .observe_merge_group(&repo, &group('a'), None, 30)
+            .unwrap();
+        assert_eq!(later, ended);
+        let again = store
+            .observe_merge_group(&repo, &group('a'), Some("merged"), 40)
+            .unwrap();
+        assert_eq!(again, ended);
+
+        // Unseen and already destroyed.
+        let unseen = store
+            .observe_merge_group(&repo, &group('c'), Some("destroyed"), 50)
+            .unwrap();
+        assert_eq!(
+            (
+                unseen.ended_reason.as_deref(),
+                unseen.ended_at,
+                unseen.observed_at
+            ),
+            (Some("destroyed"), Some(50), 50)
+        );
+        assert!(
+            store
+                .observe_merge_group(&repo, &group('d'), Some(""), 1)
+                .is_err()
+        );
+        assert!(
+            store
+                .observe_merge_group("rep_unknown", &group('d'), None, 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn merge_group_end_returns_true_once() {
+        let (_dir, store, repo) = store();
+        store
+            .observe_merge_group(&repo, &group('a'), None, 10)
+            .unwrap();
+        assert!(
+            store
+                .end_merge_group(&repo, &sha('a'), "merged", 11)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .end_merge_group(&repo, &sha('a'), "destroyed", 12)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .end_merge_group(&repo, &sha('f'), "merged", 12)
+                .unwrap()
+        );
+        assert!(store.end_merge_group(&repo, &sha('a'), "", 12).is_err());
+        let stored = store.merge_group(&repo, &sha('a')).unwrap().unwrap();
+        assert_eq!(
+            (stored.ended_reason.as_deref(), stored.ended_at),
+            (Some("merged"), Some(11))
+        );
+    }
+
+    #[test]
+    fn merge_group_check_journal() {
+        let (_dir, store, repo) = store();
+        store
+            .observe_merge_group(&repo, &group('a'), None, 10)
+            .unwrap();
+        let (a, pending) = (sha('a'), check('a', "pending"));
+        assert_eq!(
+            store
+                .reserve_merge_group_check(&repo, &a, 1, &pending, 11)
+                .unwrap(),
+            ForgeCheckReserve::Conflict
+        );
+        assert!(
+            store
+                .reserve_merge_group_check(&repo, &a, 0, &check('b', "pending"), 11)
+                .is_err()
+        );
+        assert_eq!(store.merge_group(&repo, &a).unwrap().unwrap().check, None);
+        assert_eq!(
+            store
+                .reserve_merge_group_check(&repo, &a, 0, &pending, 11)
+                .unwrap(),
+            ForgeCheckReserve::Reserved(1)
+        );
+        let reserved = store.merge_group(&repo, &a).unwrap().unwrap();
+        assert_eq!(reserved.generation, 1);
+        assert_eq!(
+            reserved.check,
+            Some(ForgeCheck {
+                head_sha: a.clone(),
+                state: "pending".into(),
+                binding_digest: None,
+                description: "qualified".into(),
+                phase: "attempting".into(),
+                generation: 1,
+                updated_at: 11,
+            })
+        );
+        assert!(
+            !store
+                .complete_merge_group_check(&repo, &a, 0, "posted", 12)
+                .unwrap()
+        );
+        assert!(
+            store
+                .complete_merge_group_check(&repo, &a, 1, "bogus", 12)
+                .is_err()
+        );
+        assert!(
+            store
+                .complete_merge_group_check(&repo, &a, 1, "posted", 12)
+                .unwrap()
+        );
+        let posted = store.merge_group(&repo, &a).unwrap().unwrap();
+        let check_now = posted.check.unwrap();
+        assert_eq!(
+            (
+                check_now.phase.as_str(),
+                check_now.generation,
+                check_now.updated_at
+            ),
+            ("posted", 2, 12)
+        );
+        assert_eq!(posted.generation, 2);
+
+        // An ended group refuses a reservation but still records a completed post.
+        assert_eq!(
+            store
+                .reserve_merge_group_check(&repo, &a, 2, &check('a', "success"), 13)
+                .unwrap(),
+            ForgeCheckReserve::Reserved(3)
+        );
+        assert!(store.end_merge_group(&repo, &a, "merged", 14).unwrap());
+        assert!(
+            store
+                .complete_merge_group_check(&repo, &a, 3, "posted", 15)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .reserve_merge_group_check(&repo, &a, 4, &pending, 16)
+                .unwrap(),
+            ForgeCheckReserve::Conflict
+        );
+        assert_eq!(store.merge_group(&repo, &a).unwrap().unwrap().generation, 4);
+    }
+
+    #[test]
+    fn merge_group_active_listing_and_source() {
+        let (_dir, store, repo) = store();
+        for (c, at) in [('c', 30), ('a', 10), ('b', 20), ('d', 40)] {
+            store
+                .observe_merge_group(&repo, &group(c), None, at)
+                .unwrap();
+        }
+        store
+            .end_merge_group(&repo, &sha('b'), "merged", 41)
+            .unwrap();
+        let heads = |limit| {
+            store
+                .active_merge_groups(&repo, limit)
+                .unwrap()
+                .into_iter()
+                .map(|g| g.head_sha)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(heads(10), [sha('a'), sha('c'), sha('d')]);
+        assert_eq!(heads(2), [sha('a'), sha('c')]);
+
+        assert!(
+            store
+                .note_merge_group_source(&repo, &sha('a'), "x\ny", "app")
+                .is_err()
+        );
+        store
+            .note_merge_group_source(&repo, &sha('a'), "required", "app")
+            .unwrap();
+        let noted = store.merge_group(&repo, &sha('a')).unwrap().unwrap();
+        assert_eq!(
+            (
+                noted.ruleset_requirement.as_deref(),
+                noted.status_source.as_deref()
+            ),
+            (Some("required"), Some("app"))
+        );
+    }
+
+    #[test]
+    fn merge_group_prunes_old_ended_groups_of_the_repository() {
+        let (_dir, store, repo) = store();
+        let now = 100 * DAY;
+        store
+            .observe_merge_group(&repo, &group('a'), Some("merged"), now - 31 * DAY)
+            .unwrap();
+        store
+            .observe_merge_group(&repo, &group('b'), Some("merged"), now - 29 * DAY)
+            .unwrap();
+        store
+            .observe_merge_group(&repo, &group('c'), None, now - 40 * DAY)
+            .unwrap();
+        store
+            .observe_merge_group(&repo, &group('d'), None, now)
+            .unwrap();
+        assert_eq!(store.merge_group(&repo, &sha('a')).unwrap(), None);
+        assert!(store.merge_group(&repo, &sha('b')).unwrap().is_some());
+        assert!(store.merge_group(&repo, &sha('c')).unwrap().is_some());
     }
 }

@@ -5,7 +5,9 @@ mod hub_pg;
 use std::sync::Arc;
 use std::thread;
 
-use agentscm::hub::connection::{ForgeCheckReserve, NewConnection, NewForgeCheck, Observed};
+use agentscm::hub::connection::{
+    ForgeCheckReserve, NewConnection, NewForgeCheck, NewMergeGroup, Observed,
+};
 use agentscm::hub::external_runs::{ExternalKind, ExternalObserved, ExternalOutcome, ExternalRun};
 use agentscm::hub::intent::NewIntent;
 use agentscm::hub::store::{
@@ -1283,6 +1285,135 @@ fn deliveries_outbound_and_notices(db: &Db) {
     );
 }
 
+/// The merge queue group journal: identities stick, an ended group never revives or reserves,
+/// and the check compare-and-set matches the pull request journal.
+fn merge_group_journal(db: &Db) {
+    let store = db.open();
+    let con = store
+        .insert_connection(&app("github.com"), "usr_admin")
+        .unwrap();
+    let repo = store
+        .upsert_repository(&con.id, "github.com", 4242, "acme/widgets", None, None)
+        .unwrap();
+    let group = |head: char, pr: i64| NewMergeGroup {
+        head_sha: head.to_string().repeat(40),
+        head_ref: format!("gh-readonly-queue/main/pr-{pr}-{}", "e".repeat(40)),
+        base_ref: "main".into(),
+        base_sha: "b".repeat(40),
+        pr_number: pr,
+        pr_head_sha: "e".repeat(40),
+        context: "agentscm/workflow/main".into(),
+    };
+    let check = |head: char, state: &str| NewForgeCheck {
+        head_sha: head.to_string().repeat(40),
+        state: state.into(),
+        binding_digest: (state == "success").then(|| "d".repeat(64)),
+        description: "qualified".into(),
+    };
+    let a = "a".repeat(40);
+    let row = store
+        .observe_merge_group(&repo.id, &group('a', 1), None, 10)
+        .unwrap();
+    assert_eq!(
+        (
+            row.generation,
+            row.check.is_none(),
+            row.ended_reason.is_none()
+        ),
+        (0, true, true)
+    );
+    // A repeat with other identities changes nothing.
+    let again = store
+        .observe_merge_group(&repo.id, &group('a', 9), None, 11)
+        .unwrap();
+    assert_eq!((again.pr_number, again.observed_at), (1, 10));
+
+    assert_eq!(
+        store
+            .reserve_merge_group_check(&repo.id, &a, 1, &check('a', "pending"), 12)
+            .unwrap(),
+        ForgeCheckReserve::Conflict
+    );
+    assert!(
+        store
+            .reserve_merge_group_check(&repo.id, &a, 0, &check('c', "pending"), 12)
+            .is_err()
+    );
+    let ForgeCheckReserve::Reserved(generation) = store
+        .reserve_merge_group_check(&repo.id, &a, 0, &check('a', "success"), 12)
+        .unwrap()
+    else {
+        panic!("reserve");
+    };
+    assert!(
+        !store
+            .complete_merge_group_check(&repo.id, &a, generation - 1, "posted", 13)
+            .unwrap()
+    );
+    assert!(
+        store
+            .complete_merge_group_check(&repo.id, &a, generation, "posted", 13)
+            .unwrap()
+    );
+    let posted = store.merge_group(&repo.id, &a).unwrap().unwrap();
+    let shown = posted.check.clone().unwrap();
+    assert_eq!(
+        (shown.state.as_str(), shown.phase.as_str()),
+        ("success", "posted")
+    );
+    assert_eq!(posted.generation, generation + 1);
+
+    store
+        .note_merge_group_source(&repo.id, &a, "required_from_this_app", "hub")
+        .unwrap();
+    assert_eq!(store.active_merge_groups(&repo.id, 10).unwrap().len(), 1);
+    assert!(
+        store
+            .end_merge_group(&repo.id, &a, "merge group was rebuilt", 14)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .end_merge_group(&repo.id, &a, "merge group was rebuilt", 15)
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .reserve_merge_group_check(&repo.id, &a, posted.generation, &check('a', "failure"), 16)
+            .unwrap(),
+        ForgeCheckReserve::Conflict
+    );
+    let ended = store
+        .observe_merge_group(&repo.id, &group('a', 1), None, 17)
+        .unwrap();
+    assert_eq!(
+        ended.ended_reason.as_deref(),
+        Some("merge group was rebuilt")
+    );
+    assert_eq!(
+        ended.ruleset_requirement.as_deref(),
+        Some("required_from_this_app")
+    );
+
+    // A destroy seen first is recorded ended and stays ended.
+    let first = store
+        .observe_merge_group(&repo.id, &group('f', 2), Some("dequeued"), 20)
+        .unwrap();
+    assert_eq!(first.ended_reason.as_deref(), Some("dequeued"));
+    assert!(store.active_merge_groups(&repo.id, 10).unwrap().is_empty());
+    // Ended groups go 30 days after they end, on a later observation of the repository.
+    store
+        .observe_merge_group(&repo.id, &group('c', 3), None, 20 + 2_592_001)
+        .unwrap();
+    assert!(store.merge_group(&repo.id, &a).unwrap().is_none());
+    assert!(
+        store
+            .merge_group(&repo.id, &"c".repeat(40))
+            .unwrap()
+            .is_some()
+    );
+}
+
 fn forge_check_journal(db: &Db) {
     let store = db.open();
     let con = store
@@ -1996,6 +2127,7 @@ conformance!(
     observations,
     deliveries_outbound_and_notices,
     forge_check_journal,
+    merge_group_journal,
     external_run_journal,
     merged_publications_skip_unmerged_ones,
     pull_publications_are_newest_per_pull_request,

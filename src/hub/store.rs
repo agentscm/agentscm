@@ -6,8 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 use super::connection::{
-    ConnectedRepository, Connection, ForgeCheck, ForgeCheckReserve, NewConnection, NewForgeCheck,
-    Observation, Observed, Outbound,
+    ConnectedRepository, Connection, ForgeCheck, ForgeCheckReserve, MergeGroup, NewConnection,
+    NewForgeCheck, NewMergeGroup, Observation, Observed, Outbound,
 };
 use super::coordination::{
     CoordinationAck, CoordinationInbox, CoordinationInboxQuery, CoordinationListQuery,
@@ -357,6 +357,50 @@ pub trait Store: Send + Sync {
         phase: &str,
         now: i64,
     ) -> Result<bool>;
+    /// Records merge group `group` of `repo` once; identities of an existing row never change.
+    /// `ended` ends a current row, or records an unseen group as already ended (a destroy
+    /// delivered first). A later observation never revives an ended group. Also deletes ended
+    /// groups of `repo` that ended over 30 days before `now`. Returns the stored row.
+    fn observe_merge_group(
+        &self,
+        repo: &str,
+        group: &NewMergeGroup,
+        ended: Option<&str>,
+        now: i64,
+    ) -> Result<MergeGroup>;
+    fn merge_group(&self, repo: &str, head_sha: &str) -> Result<Option<MergeGroup>>;
+    /// Current (not ended) groups of `repo`, oldest observation first, at most `limit`.
+    fn active_merge_groups(&self, repo: &str, limit: usize) -> Result<Vec<MergeGroup>>;
+    /// Ends a current group; false when it was already ended or is unknown.
+    fn end_merge_group(&self, repo: &str, head_sha: &str, reason: &str, now: i64) -> Result<bool>;
+    /// Compare-and-set on `expected` generation of a current group: records the desired post as
+    /// `attempting` and returns the new generation, or `Conflict` when another writer won or the
+    /// group has ended. `new.head_sha` must be the group's.
+    fn reserve_merge_group_check(
+        &self,
+        repo: &str,
+        head_sha: &str,
+        expected: i64,
+        new: &NewForgeCheck,
+        now: i64,
+    ) -> Result<ForgeCheckReserve>;
+    /// Marks the post `phase` (`posted` or `refused`) only if `generation` is still current.
+    fn complete_merge_group_check(
+        &self,
+        repo: &str,
+        head_sha: &str,
+        generation: i64,
+        phase: &str,
+        now: i64,
+    ) -> Result<bool>;
+    /// Records what the Hub last observed about the required context and the posting account.
+    fn note_merge_group_source(
+        &self,
+        repo: &str,
+        head_sha: &str,
+        ruleset_requirement: &str,
+        status_source: &str,
+    ) -> Result<()>;
     /// Records one external CI or deployment run of `repo` (a repository id) unless
     /// [`supersedes`](super::external_runs::supersedes) rejects it; an event only on `Changed`.
     fn observe_external_run(&self, repo: &str, run: &ExternalRun) -> Result<ExternalObserved>;
