@@ -120,9 +120,11 @@ fn is_clean(repo: &Path) -> Result<bool> {
     .is_empty())
 }
 
-fn file_digest(repo: &Path, commit: &str, path: &str) -> String {
-    // A file absent from the commit digests as empty.
-    sha256(&git(repo, &["show", &format!("{commit}:{path}")], GIT_OUTPUT).unwrap_or_default())
+/// Digest of `path` at `commit`; a file the commit does not contain is an error.
+fn file_digest(repo: &Path, commit: &str, path: &str) -> Result<String> {
+    git(repo, &["show", &format!("{commit}:{path}")], GIT_OUTPUT)
+        .map(|bytes| sha256(&bytes))
+        .map_err(|_| Error::Invalid(format!("{path} cannot be read at the commit")))
 }
 
 pub struct Produced {
@@ -215,6 +217,8 @@ pub fn produce(
         return Err(Error::Invalid("working tree is not clean".into()));
     }
     let state = observe(repo, "HEAD", base_rev)?;
+    let cargo_lock_sha256 = file_digest(repo, &state.commit, "Cargo.lock")?;
+    let toolchain_file_sha256 = file_digest(repo, &state.commit, "rust-toolchain.toml")?;
     let mut results = Vec::new();
     for c in &recipe.commands {
         let result = run_command(repo, &c.id, &c.argv, c.timeout_secs);
@@ -236,8 +240,8 @@ pub fn produce(
     let after = observe(repo, "HEAD", base_rev)?;
     let var_set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
     Ok(Produced {
-        cargo_lock_sha256: file_digest(repo, &state.commit, "Cargo.lock"),
-        toolchain_file_sha256: file_digest(repo, &state.commit, "rust-toolchain.toml"),
+        cargo_lock_sha256,
+        toolchain_file_sha256,
         record: ValidationRecord {
             subject: GitValidationSubject {
                 repository: policy.repository.clone(),

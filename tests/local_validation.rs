@@ -1,6 +1,7 @@
 //! Synthetic keys, hashes and Git object ids only.
 
 use agentscm::evidence::{EvaluationClock, EvidencePayload, sign_evidence};
+use agentscm::local_validation::comment;
 use agentscm::local_validation::*;
 use agentscm::policy::issuers::{
     CommonControl, IssuerKeyRecord, IssuerRecord, IssuerRegistrySnapshot, issuer_key_id,
@@ -125,6 +126,15 @@ impl Case {
     }
 
     fn run(self) -> Verdict {
+        self.execute().0
+    }
+
+    /// The comment body this case would be posted as (empty when it cannot render).
+    fn body(self) -> String {
+        self.execute().1
+    }
+
+    fn execute(self) -> (Verdict, String) {
         let reg = registry();
         let key_id = reg.issuers[0].keys[0].key_id.clone();
         let issuance = Issuance {
@@ -159,8 +169,9 @@ impl Case {
         if self.tamper_record {
             record_bytes.push(b' ');
         }
+        let body = comment::render(&envelope_bytes, &record_bytes).unwrap_or_default();
         let [repository, commit, tree, base_ref, merge_base] = &self.observed;
-        assess(
+        let verdict = assess(
             &envelope_bytes,
             &record_bytes,
             &self.registry,
@@ -173,7 +184,8 @@ impl Case {
                 merge_base,
             },
             self.clock,
-        )
+        );
+        (verdict, body)
     }
 }
 
@@ -357,4 +369,126 @@ fn producer_marks_missing_service_run_as_not_pass() {
     // The producer marks the run failed without all services, so the signed
     // outcome is not pass even though the policy tolerates the absence.
     fails(c, "outcome not pass");
+}
+
+const OLD: &str = "5555555555555555555555555555555555555555";
+
+fn pass() -> Case {
+    Case::new()
+}
+
+fn fail() -> Case {
+    let mut c = Case::new();
+    c.record.results[0].exit_code = Some(1);
+    c
+}
+
+fn old_head(mut c: Case) -> Case {
+    c.record.subject.commit = OLD.into();
+    c
+}
+
+fn select_all(bodies: &[&str], clock: EvaluationClock) -> Verdict {
+    select(
+        bodies,
+        &registry(),
+        &policy(),
+        Observed {
+            repository: "repo-1",
+            commit: COMMIT,
+            tree: TREE,
+            base_ref: "refs/heads/main",
+            merge_base: BASE,
+        },
+        clock,
+    )
+}
+
+fn known(bodies: &[&str]) -> Verdict {
+    select_all(bodies, EvaluationClock::Known { unix_ms: NOW })
+}
+
+#[test]
+fn applies_to_head_only_for_the_observed_commit() {
+    assert!(pass().run().applies_to_head);
+    assert!(fail().run().applies_to_head);
+    assert!(!old_head(pass()).run().applies_to_head);
+    let mut c = Case::new();
+    c.observed[0] = "repo-2".into();
+    assert!(!c.run().applies_to_head);
+    let mut c = Case::new();
+    c.tamper_envelope = true;
+    assert!(!c.run().applies_to_head);
+}
+
+#[test]
+fn newest_applicable_attestation_decides() {
+    let (old_pass, current_fail, current_pass) =
+        (old_head(pass()).body(), fail().body(), pass().body());
+    expect(
+        known(&[&old_pass, &current_fail]),
+        VerdictState::Failure,
+        "command failed",
+    );
+    expect(
+        known(&[&current_fail, &current_pass]),
+        VerdictState::Success,
+        "validated",
+    );
+    expect(
+        known(&[&current_pass, &current_fail]),
+        VerdictState::Failure,
+        "command failed",
+    );
+}
+
+#[test]
+fn junk_stale_and_forged_bodies_never_override_an_applicable_one() {
+    let current_pass = pass().body();
+    let mut tampered = Case::new();
+    tampered.tamper_record = true;
+    let mut forged = fail();
+    forged.registry.issuers[0].keys.clear();
+    let mut wrong_key = fail();
+    wrong_key.registry.issuers[0].issuer_id = "someone-else".into();
+    let later = [
+        "not an attestation".to_owned(),
+        old_head(fail()).body(),
+        tampered.body(),
+        forged.body(),
+        wrong_key.body(),
+        current_pass.replace("Local validation", "Local validation: edited"),
+    ];
+    let mut bodies = vec![current_pass.as_str()];
+    bodies.extend(later.iter().map(String::as_str));
+    expect(known(&bodies), VerdictState::Success, "validated");
+}
+
+#[test]
+fn nothing_applicable_is_pending_never_success() {
+    for bodies in [vec![], vec!["junk"]] {
+        expect(
+            known(&bodies),
+            VerdictState::Pending,
+            "no attestation for this head",
+        );
+    }
+    let (old, junk) = (old_head(pass()).body(), "junk");
+    let verdict = known(&[&old, junk]);
+    expect(
+        verdict.clone(),
+        VerdictState::Pending,
+        "no attestation for this head",
+    );
+    assert!(!verdict.applies_to_head && verdict.detail.contains("stale attestation"));
+}
+
+#[test]
+fn uncertain_clock_surfaces_as_error() {
+    let body = pass().body();
+    expect(
+        select_all(&[&body, "junk"], EvaluationClock::Uncertain),
+        VerdictState::Error,
+        "clock uncertain",
+    );
 }

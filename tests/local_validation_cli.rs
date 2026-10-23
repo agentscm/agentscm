@@ -52,6 +52,8 @@ impl Fixture {
         fs::create_dir(&repo).unwrap();
         git(&repo, &["init", "-q", "-b", "main"]);
         fs::write(repo.join("a.txt"), "a").unwrap();
+        fs::write(repo.join("Cargo.lock"), "# synthetic lock\n").unwrap();
+        fs::write(repo.join("rust-toolchain.toml"), "[toolchain]\n").unwrap();
         git(&repo, &["add", "."]);
         git(&repo, &["commit", "-q", "-m", "base"]);
         git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
@@ -198,20 +200,32 @@ impl Fixture {
     }
 
     fn verify(&self, body: &Path, repository: &str) -> (i32, Value) {
+        self.verify_all(&[body], repository)
+    }
+
+    /// Bodies oldest first.
+    fn verify_all(&self, bodies: &[&Path], repository: &str) -> (i32, Value) {
         let root = self.root();
-        let out = self.cli(&[
-            "verify",
-            "--comment-body",
-            body.to_str().unwrap(),
-            "--policy",
-            root.join("policy.json").to_str().unwrap(),
-            "--registry",
-            root.join("registry.json").to_str().unwrap(),
-            "--repo",
-            self.repo().to_str().unwrap(),
-            "--repository",
-            repository,
-        ]);
+        let mut args = vec!["verify"];
+        for body in bodies {
+            args.extend(["--comment-body", body.to_str().unwrap()]);
+        }
+        let out = self.cli(
+            &[
+                &args[..],
+                &[
+                    "--policy",
+                    root.join("policy.json").to_str().unwrap(),
+                    "--registry",
+                    root.join("registry.json").to_str().unwrap(),
+                    "--repo",
+                    self.repo().to_str().unwrap(),
+                    "--repository",
+                    repository,
+                ][..],
+            ]
+            .concat(),
+        );
         let json = serde_json::from_slice(&out.stdout)
             .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&out.stderr)));
         (out.status.code().unwrap(), json)
@@ -255,7 +269,7 @@ fn success_flow_then_stale_after_new_commit() {
     let (code, verdict) = f.verify(&body, "repo-1");
     assert_eq!(
         (code, verdict["reason"].as_str()),
-        (1, Some("stale attestation")),
+        (3, Some("no attestation for this head")),
         "{verdict}"
     );
 }
@@ -265,7 +279,7 @@ fn wrong_repository_tampering_and_marker_mismatch_fail() {
     let f = ok_fixture();
     let (sha, _) = f.attest();
     let body = f.show_to_file(&sha, "body.md");
-    assert_eq!(f.verify(&body, "repo-2").0, 1);
+    assert_eq!(f.verify(&body, "repo-2").0, 3);
 
     let text = fs::read_to_string(&body).unwrap();
     let at = text.find("```agentscm-record-v1\n").unwrap() + "```agentscm-record-v1\n".len();
@@ -273,20 +287,49 @@ fn wrong_repository_tampering_and_marker_mismatch_fail() {
     tampered[at + 4] = if tampered[at + 4] == b'A' { b'B' } else { b'A' };
     let path = f.root().join("tampered.md");
     fs::write(&path, tampered).unwrap();
-    assert_eq!(f.verify(&path, "repo-1").0, 1);
+    assert_eq!(f.verify(&path, "repo-1").0, 3);
 
     let path = f.root().join("marker.md");
     fs::write(&path, text.replace(&sha, &"0".repeat(64))).unwrap();
     let (code, verdict) = f.verify(&path, "repo-1");
     assert_eq!(
         (code, verdict["reason"].as_str()),
-        (1, Some("comment body invalid"))
+        (3, Some("no attestation for this head"))
     );
 
     let path = f.root().join("dup.md");
     let record_block = &text[text.find("```agentscm-record-v1").unwrap()..];
     fs::write(&path, format!("{text}\n{record_block}")).unwrap();
-    assert_eq!(f.verify(&path, "repo-1").0, 1);
+    assert_eq!(f.verify(&path, "repo-1").0, 3);
+}
+
+#[test]
+fn missing_lockfile_is_an_error_not_an_empty_digest() {
+    let f = ok_fixture();
+    git(&f.repo(), &["rm", "-q", "Cargo.lock"]);
+    git(&f.repo(), &["commit", "-q", "-m", "drop lock"]);
+    let out = f.run();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Cargo.lock"));
+    assert!(!f.state().exists() || fs::read_dir(f.state()).unwrap().next().is_none());
+}
+
+#[test]
+fn verify_selects_the_newest_attestation_for_the_head() {
+    let f = Fixture::new(vec![command("gate", "test -f marker", 30)]);
+    let (bad, code) = f.attest();
+    assert_eq!(code, 1);
+    let bad = f.show_to_file(&bad, "bad.md");
+    // Not an attestation at all.
+    let junk = f.root().join("junk.md");
+    fs::write(&junk, "hello").unwrap();
+    let (code, verdict) = f.verify_all(&[&junk], "repo-1");
+    assert_eq!((code, verdict["state"].as_str()), (3, Some("pending")));
+    let (code, _) = f.verify_all(&[&junk, &bad], "repo-1");
+    assert_eq!(code, 1);
+    // A later junk body does not override the failure.
+    let (code, _) = f.verify_all(&[&bad, &junk], "repo-1");
+    assert_eq!(code, 1);
 }
 
 #[test]
@@ -345,4 +388,168 @@ fn command_that_dirties_the_tree_is_incomplete() {
         (1, Some("tree changed")),
         "{verdict}"
     );
+}
+
+#[path = "support/fake_github.rs"]
+mod fake_github;
+
+use fake_github::{Comment, FakeGithub, Pull, Repo};
+
+const TOKEN: &str = "synthetic-token";
+
+impl Fixture {
+    fn head(&self) -> String {
+        let out = Command::new("git")
+            .current_dir(self.repo())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    fn post(&self, api: &str, sha: &str) -> Output {
+        let token = self.root().join("token");
+        fs::write(&token, TOKEN).unwrap();
+        fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+        tokio::task::block_in_place(|| {
+            self.cli(&[
+                "post",
+                "--state-dir",
+                self.state().to_str().unwrap(),
+                "--attestation",
+                sha,
+                "--github-repo",
+                "o/r",
+                "--pr",
+                "7",
+                "--token-file",
+                token.to_str().unwrap(),
+                "--api-url",
+                api,
+            ])
+        })
+    }
+}
+
+async fn fake(head: &str) -> FakeGithub {
+    let fake = FakeGithub::start().await;
+    fake.with(|s| {
+        let mut repo = Repo::new(1, "o/r");
+        repo.pulls.insert(
+            7,
+            Pull {
+                head_sha: head.into(),
+                ..Pull::new(7, "feature", &[])
+            },
+        );
+        s.repos.insert(1, repo);
+        s.pats.insert(
+            TOKEN.into(),
+            ("maintainer-login".into(), 9, [1].into_iter().collect()),
+        );
+    });
+    fake
+}
+
+fn comments(fake: &FakeGithub) -> Vec<Comment> {
+    fake.with(|s| s.repos[&1].comments.get(&7).cloned().unwrap_or_default())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn post_creates_once_and_rerun_adopts_the_comment() {
+    let f = ok_fixture();
+    let fake = fake(&f.head()).await;
+    let (sha, _) = tokio::task::block_in_place(|| f.attest());
+    let out = f.post(&fake.base, &sha);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let first = comments(&fake);
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].author, "maintainer-login");
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(f.state().join(format!("{sha}.posted.json"))).unwrap())
+            .unwrap();
+    assert_eq!(receipt["comment_id"], first[0].id);
+    assert_eq!(receipt["pr"], 7);
+    assert!(
+        receipt["html_url"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("#issuecomment-{}", first[0].id))
+    );
+
+    assert!(f.post(&fake.base, &sha).status.success());
+    assert_eq!(comments(&fake).len(), 1);
+    // The producer side never posts a commit status.
+    assert!(fake.with(|s| s.repos[&1].statuses.is_empty()));
+
+    // A different attestation is a new comment; the earlier one stays.
+    let (second, _) = tokio::task::block_in_place(|| f.attest());
+    assert_ne!(second, sha);
+    assert!(f.post(&fake.base, &second).status.success());
+    assert_eq!(comments(&fake).len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lost_create_reply_is_adopted_not_duplicated() {
+    let f = ok_fixture();
+    let fake = fake(&f.head()).await;
+    let (sha, _) = tokio::task::block_in_place(|| f.attest());
+    fake.with(|s| s.lose_next_comment_reply = true);
+    assert!(!f.post(&fake.base, &sha).status.success());
+    assert_eq!(comments(&fake).len(), 1);
+    assert!(!f.state().join(format!("{sha}.posted.json")).exists());
+    assert!(f.post(&fake.base, &sha).status.success());
+    assert_eq!(comments(&fake).len(), 1);
+    assert!(f.state().join(format!("{sha}.posted.json")).exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn another_authors_marker_comment_is_not_adopted() {
+    let f = ok_fixture();
+    let fake = fake(&f.head()).await;
+    let (sha, _) = tokio::task::block_in_place(|| f.attest());
+    let body = String::from_utf8(
+        tokio::task::block_in_place(|| {
+            f.cli(&[
+                "show",
+                "--state-dir",
+                f.state().to_str().unwrap(),
+                "--attestation",
+                &sha,
+            ])
+        })
+        .stdout,
+    )
+    .unwrap();
+    fake.with(|s| {
+        s.repos.get_mut(&1).unwrap().comments.insert(
+            7,
+            vec![Comment {
+                id: 50,
+                body,
+                author: "mallory".into(),
+            }],
+        );
+    });
+    assert!(f.post(&fake.base, &sha).status.success());
+    let all = comments(&fake);
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].author, "mallory");
+    assert_eq!(all[1].author, "maintainer-login");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn moved_pr_head_is_refused_and_nothing_is_posted() {
+    let f = ok_fixture();
+    let fake = fake(&"9".repeat(40)).await;
+    let (sha, _) = tokio::task::block_in_place(|| f.attest());
+    let out = f.post(&fake.base, &sha);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("head differs"));
+    assert!(comments(&fake).is_empty());
+    assert!(!f.state().join(format!("{sha}.posted.json")).exists());
 }

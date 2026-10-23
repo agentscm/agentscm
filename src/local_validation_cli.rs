@@ -8,11 +8,11 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentscm::evidence::{EvaluationClock, EvidenceOutcome, sign_evidence};
-use agentscm::local_validation::comment::{self, MAX_COMMENT_BYTES, envelope_sha256};
+use agentscm::local_validation::comment::{self, envelope_sha256};
 use agentscm::local_validation::run::{observe, produce};
 use agentscm::local_validation::{
-    Issuance, MAX_RECORD_BYTES, Observed, ValidationPolicy, ValidationRecipe, Verdict,
-    VerdictState, assess, evidence_payload,
+    Issuance, MAX_RECORD_BYTES, Observed, ValidationPolicy, ValidationRecipe, ValidationRecord,
+    Verdict, VerdictState, assess, evidence_payload, select,
 };
 use agentscm::policy::issuers::{IssuerRegistrySnapshot, issuer_key_id};
 use agentscm::{Error, Result};
@@ -20,8 +20,11 @@ use clap::{Args, Subcommand};
 use serde_json::json;
 
 use crate::agent_task_cli::{public_hex, read_signing_key, validate_private_directory_metadata};
+use crate::client_cli::read_token;
 
 const MAX_INPUT_BYTES: u64 = 2 * 1024 * 1024;
+/// Comment pages (of 100) read when looking for an earlier post.
+const MAX_COMMENT_PAGES: u32 = 10;
 const MAX_EXPIRES_SECONDS: u64 = 366 * 24 * 3600;
 
 #[derive(Debug, Subcommand)]
@@ -36,8 +39,29 @@ pub enum LocalValidationCommand {
         #[arg(long)]
         attestation: String,
     },
-    /// Decide whether an attestation satisfies the exact head. Exit 0 success, 1 failure, 2 error.
+    /// Decide whether an attestation satisfies the exact head. Exit 0 success, 1 failure, 2 error, 3 no attestation for the head.
     Verify(VerifyArgs),
+    /// Post a retained attestation as a PR comment (GitHub). Posts no status.
+    Post(PostArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PostArgs {
+    #[arg(long)]
+    state_dir: PathBuf,
+    /// Envelope SHA-256 printed by `run`.
+    #[arg(long)]
+    attestation: String,
+    /// OWNER/NAME.
+    #[arg(long)]
+    github_repo: String,
+    #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
+    pr: i64,
+    /// Absolute owner-private file holding the token.
+    #[arg(long)]
+    token_file: PathBuf,
+    #[arg(long, default_value = "https://api.github.com")]
+    api_url: String,
 }
 
 #[derive(Debug, Args)]
@@ -72,9 +96,9 @@ pub struct RunArgs {
 
 #[derive(Debug, Args)]
 pub struct VerifyArgs {
-    /// Comment body produced by `show`.
+    /// Comment body produced by `show`; repeat oldest first to judge a whole PR thread.
     #[arg(long, conflicts_with_all = ["envelope", "record"])]
-    comment_body: Option<PathBuf>,
+    comment_body: Vec<PathBuf>,
     #[arg(long, requires = "record")]
     envelope: Option<PathBuf>,
     #[arg(long, requires = "envelope")]
@@ -96,7 +120,7 @@ pub struct VerifyArgs {
 }
 
 /// Returns the process exit code.
-pub fn run(command: LocalValidationCommand) -> Result<i32> {
+pub async fn run(command: LocalValidationCommand) -> Result<i32> {
     match command {
         LocalValidationCommand::Run(args) => run_recipe(args),
         LocalValidationCommand::Show {
@@ -107,6 +131,7 @@ pub fn run(command: LocalValidationCommand) -> Result<i32> {
             Ok(0)
         }
         LocalValidationCommand::Verify(args) => verify(args),
+        LocalValidationCommand::Post(args) => post(args).await,
     }
 }
 
@@ -217,11 +242,14 @@ fn run_recipe(args: RunArgs) -> Result<i32> {
 }
 
 fn show(state_dir: &Path, sha: &str) -> Result<()> {
-    if sha.len() != 64 || !sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-        return Err(Error::Invalid(
-            "attestation must be a lowercase SHA-256".into(),
-        ));
-    }
+    let (envelope, record) = read_retained(state_dir, sha)?;
+    print!("{}", comment::render(&envelope, &record)?);
+    Ok(())
+}
+
+/// The retained `(envelope, record)` bytes, checked against the envelope digest in the name.
+fn read_retained(state_dir: &Path, sha: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+    check_sha(sha)?;
     let envelope = read_bounded(
         &state_dir.join(format!("{sha}.envelope.json")),
         MAX_RECORD_BYTES as u64,
@@ -235,26 +263,20 @@ fn show(state_dir: &Path, sha: &str) -> Result<()> {
             "retained envelope does not match its name".into(),
         ));
     }
-    print!("{}", comment::render(&envelope, &record)?);
-    Ok(())
+    Ok((envelope, record))
 }
 
-fn verdict_exit(
-    state: VerdictState,
-    reason: &str,
-    detail: &str,
-    envelope_sha256: &str,
-    commit: &str,
-) -> i32 {
-    let (name, code) = match state {
+fn verdict_exit(verdict: &Verdict, commit: &str) -> i32 {
+    let (name, code) = match verdict.state {
         VerdictState::Success => ("success", 0),
         VerdictState::Failure => ("failure", 1),
         VerdictState::Error => ("error", 2),
+        VerdictState::Pending => ("pending", 3),
     };
     println!(
         "{}",
-        json!({"state": name, "reason": reason, "detail": detail,
-               "envelope_sha256": envelope_sha256, "commit": commit})
+        json!({"state": name, "reason": verdict.reason, "detail": verdict.detail,
+               "envelope_sha256": verdict.envelope_sha256, "commit": commit})
     );
     code
 }
@@ -262,68 +284,147 @@ fn verdict_exit(
 fn verify(args: VerifyArgs) -> Result<i32> {
     let policy = ValidationPolicy::from_slice(&read_bounded(&args.policy, MAX_INPUT_BYTES)?)?;
     let registry = read_registry(&args.registry)?;
-    let inputs = match (&args.comment_body, &args.envelope, &args.record) {
-        (Some(body), _, _) => {
-            let raw = read_bounded(body, MAX_COMMENT_BYTES as u64)?;
-            String::from_utf8(raw)
-                .map_err(|_| Error::Invalid("comment body is not UTF-8".into()))
-                .and_then(|text| comment::parse(&text))
-        }
-        (None, Some(envelope), Some(record)) => Ok((
+    // Oversized or non-UTF-8 bodies read like any other junk: `select` ignores what does not parse.
+    let bodies = args
+        .comment_body
+        .iter()
+        .map(|path| {
+            read_bounded(path, MAX_INPUT_BYTES).map(|b| String::from_utf8_lossy(&b).into_owned())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let pair = match (&args.envelope, &args.record) {
+        (Some(envelope), Some(record)) => Some((
             read_bounded(envelope, MAX_RECORD_BYTES as u64)?,
             read_bounded(record, MAX_RECORD_BYTES as u64)?,
         )),
-        _ => {
+        _ if bodies.is_empty() => {
             return Err(Error::Invalid(
                 "pass --comment-body or --envelope with --record".into(),
             ));
         }
+        _ => None,
     };
-    let (envelope, record) = match inputs {
-        Ok(pair) => pair,
-        Err(error) => {
-            return Ok(verdict_exit(
-                VerdictState::Failure,
-                "comment body invalid",
-                &error.to_string(),
-                "",
-                "",
-            ));
-        }
-    };
-    let sha = envelope_sha256(&envelope);
     let git = match observe(&args.repo, &args.head, &args.base_rev) {
         Ok(git) => git,
         Err(error) => {
-            return Ok(verdict_exit(
-                VerdictState::Error,
-                "git unavailable",
-                &error.to_string(),
-                &sha,
-                "",
-            ));
+            let verdict = Verdict {
+                state: VerdictState::Error,
+                reason: "git unavailable",
+                detail: error.to_string(),
+                applies_to_head: false,
+                envelope_sha256: String::new(),
+            };
+            return Ok(verdict_exit(&verdict, ""));
         }
     };
     let clock = now_ms().map_or(EvaluationClock::Uncertain, |unix_ms| {
         EvaluationClock::Known { unix_ms }
     });
-    let Verdict {
-        state,
-        reason,
-        detail,
-    } = assess(
-        &envelope,
-        &record,
-        &registry,
-        &policy,
-        Observed {
-            repository: &args.repository,
-            commit: &git.commit,
-            tree: &git.tree,
-            base_ref: &args.base_ref,
-            merge_base: &git.merge_base,
-        },
-        clock,
-    );
-    Ok(verdict_exit(state, reason, &detail, &sha, &git.commit))
+    let observed = Observed {
+        repository: &args.repository,
+        commit: &git.commit,
+        tree: &git.tree,
+        base_ref: &args.base_ref,
+        merge_base: &git.merge_base,
+    };
+    let verdict = match pair {
+        Some((envelope, record)) => assess(&envelope, &record, &registry, &policy, observed, clock),
+        None => {
+            let refs: Vec<&str> = bodies.iter().map(String::as_str).collect();
+            select(&refs, &registry, &policy, observed, clock)
+        }
+    };
+    Ok(verdict_exit(&verdict, &git.commit))
+}
+
+fn check_sha(sha: &str) -> Result<()> {
+    if sha.len() != 64 || !sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(Error::Invalid(
+            "attestation must be a lowercase SHA-256".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Posts the retained attestation as one PR comment, adopting this login's earlier comment for
+/// the same envelope so a lost create reply cannot duplicate it. The local producer never posts
+/// a status; the separate verifier does.
+async fn post(args: PostArgs) -> Result<i32> {
+    use agentscm::hub::forge_http::check_base_url;
+    use agentscm::hub::github::Api;
+    check_sha(&args.attestation)?;
+    let valid_name = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    };
+    if !args.github_repo.split('/').all(valid_name) || args.github_repo.matches('/').count() != 1 {
+        return Err(Error::Invalid("--github-repo must be OWNER/NAME".into()));
+    }
+    if !args.token_file.is_absolute() {
+        return Err(Error::Invalid("--token-file must be absolute".into()));
+    }
+    let token = read_token(&args.token_file)?;
+    let (envelope, record) = read_retained(&args.state_dir, &args.attestation)?;
+    let body = comment::render(&envelope, &record)?;
+    let marker = body.lines().next().unwrap_or_default();
+    let commit = ValidationRecord::from_slice(&record)?.subject.commit;
+    let base = check_base_url(&args.api_url).map_err(|e| Error::Invalid(e.to_string()))?;
+    let api = Api::new(&base, &base).map_err(|e| Error::Invalid(e.to_string()))?;
+    let (repo, pr) = (args.github_repo.as_str(), args.pr);
+    let gh = |e: agentscm::hub::github::GhError| Error::Invalid(format!("GitHub: {e:?}"));
+    let pull = api
+        .pull(&token, repo, pr)
+        .await
+        .map_err(gh)?
+        .ok_or_else(|| Error::Invalid("pull request not found".into()))?;
+    if pull["head"]["sha"].as_str() != Some(commit.as_str()) {
+        return Err(Error::Conflict(
+            "pull request head differs from the attestation commit; nothing posted".into(),
+        ));
+    }
+    let (_, login) = api.user(&token).await.map_err(gh)?;
+    let (comments, truncated) = api
+        .comments_pages(&token, repo, pr, MAX_COMMENT_PAGES)
+        .await
+        .map_err(gh)?;
+    let own = comments.into_iter().find(|(_, author, text)| {
+        author.eq_ignore_ascii_case(&login)
+            && text.lines().next().map(str::trim_end) == Some(marker)
+    });
+    if own.is_none() && truncated {
+        return Err(Error::Limit(
+            "too many comments to rule out an earlier post; nothing posted".into(),
+        ));
+    }
+    let adopted = match own {
+        Some((id, _, text)) if text == body => Some(id),
+        Some((id, _, _)) => api
+            .edit_comment(&token, repo, id, &body)
+            .await
+            .map_err(gh)?
+            .then_some(id),
+        None => None,
+    };
+    let id = match adopted {
+        Some(id) => id,
+        None => api
+            .create_comment(&token, repo, pr, &body)
+            .await
+            .map_err(gh)?,
+    };
+    let receipt = json!({
+        "github_repo": repo,
+        "pr": pr,
+        "comment_id": id,
+        "html_url": format!("{}#issuecomment-{id}", pull["html_url"].as_str().unwrap_or_default()),
+    });
+    retain(
+        &args.state_dir,
+        &format!("{}.posted.json", args.attestation),
+        &serde_json::to_vec(&receipt)?,
+    )?;
+    println!("{receipt}");
+    Ok(0)
 }

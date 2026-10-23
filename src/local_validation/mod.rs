@@ -479,6 +479,8 @@ pub enum VerdictState {
     Success,
     Failure,
     Error,
+    /// No attestation for the head was found (see [`select`]).
+    Pending,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -486,6 +488,11 @@ pub struct Verdict {
     pub state: VerdictState,
     pub reason: &'static str,
     pub detail: String,
+    /// True only once the signature verified against the registry and the signed record names
+    /// the observed repository and commit. Anything else is about some other head or is junk.
+    pub applies_to_head: bool,
+    /// Digest of the assessed envelope; empty when none was assessed.
+    pub envelope_sha256: String,
 }
 
 impl Verdict {
@@ -494,7 +501,14 @@ impl Verdict {
             state,
             reason,
             detail: detail.into(),
+            applies_to_head: false,
+            envelope_sha256: String::new(),
         }
+    }
+
+    fn applied(mut self) -> Self {
+        self.applies_to_head = true;
+        self
     }
 
     fn failure(reason: &'static str, detail: impl Into<String>) -> Self {
@@ -515,6 +529,64 @@ pub struct Observed<'a> {
 /// Decides whether an attestation satisfies the observed head. Anything other
 /// than every check holding is a `Failure` or `Error`, never `Success`.
 pub fn assess(
+    envelope_bytes: &[u8],
+    record_bytes: &[u8],
+    registry: &IssuerRegistrySnapshot,
+    policy: &ValidationPolicy,
+    observed: Observed<'_>,
+    clock: EvaluationClock,
+) -> Verdict {
+    let mut verdict = assess_envelope(
+        envelope_bytes,
+        record_bytes,
+        registry,
+        policy,
+        observed,
+        clock,
+    );
+    verdict.envelope_sha256 = comment::envelope_sha256(envelope_bytes);
+    verdict
+}
+
+/// Assesses every comment body (oldest first) and returns the newest verdict that applies to
+/// the observed head. Bodies that do not parse, or that are stale, tampered or signed by an
+/// unregistered key, never decide. Without an applicable one, an environmental `Error`
+/// (uncertain clock, invalid policy) surfaces; otherwise the result is `Pending`.
+pub fn select(
+    bodies_oldest_first: &[&str],
+    registry: &IssuerRegistrySnapshot,
+    policy: &ValidationPolicy,
+    observed: Observed<'_>,
+    clock: EvaluationClock,
+) -> Verdict {
+    let (mut decided, mut error, mut ignored) = (None, None, None);
+    for body in bodies_oldest_first {
+        let Ok((envelope, record)) = comment::parse(body) else {
+            continue;
+        };
+        let verdict = assess(&envelope, &record, registry, policy, observed, clock);
+        if verdict.applies_to_head {
+            decided = Some(verdict);
+        } else {
+            ignored = Some(format!("{}: {}", verdict.reason, verdict.detail));
+            if verdict.state == VerdictState::Error {
+                error = Some(verdict);
+            }
+        }
+    }
+    decided.or(error).unwrap_or_else(|| {
+        Verdict::new(
+            VerdictState::Pending,
+            "no attestation for this head",
+            ignored.map_or_else(
+                || "no attestation found".into(),
+                |i| format!("newest ignored: {i}"),
+            ),
+        )
+    })
+}
+
+fn assess_envelope(
     envelope_bytes: &[u8],
     record_bytes: &[u8],
     registry: &IssuerRegistrySnapshot,
@@ -624,20 +696,21 @@ pub fn assess(
         );
     }
     if record.recipe_sha256 != policy.recipe_sha256 {
-        return Verdict::failure("recipe mismatch", "recipe differs from policy");
+        return Verdict::failure("recipe mismatch", "recipe differs from policy").applied();
     }
     if let Some((reason, detail)) = record.shortfall(policy.required_services) {
-        return Verdict::failure(reason, detail);
+        return Verdict::failure(reason, detail).applied();
     }
     if payload.outcome != EvidenceOutcome::Pass || payload.terminal_state != TerminalState::Success
     {
-        return Verdict::failure("outcome not pass", format!("{:?}", payload.outcome));
+        return Verdict::failure("outcome not pass", format!("{:?}", payload.outcome)).applied();
     }
     Verdict::new(
         VerdictState::Success,
         "validated",
         "attestation satisfies the exact head",
     )
+    .applied()
 }
 
 #[cfg(test)]

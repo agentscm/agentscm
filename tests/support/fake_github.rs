@@ -1247,7 +1247,10 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                     let comment = Comment {
                         id: next,
                         body: json_body()["body"].as_str().unwrap_or_default().to_string(),
-                        author: format!("{APP_SLUG}[bot]"),
+                        author: match &who {
+                            Who::Reader(login, ..) => login.clone(),
+                            Who::Installation(_) => format!("{APP_SLUG}[bot]"),
+                        },
                     };
                     let created = json!({"id": comment.id, "body": comment.body});
                     state

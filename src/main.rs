@@ -671,7 +671,7 @@ async fn run(cli: Cli) -> Result<RunExit> {
         }
         #[cfg(unix)]
         Command::LocalValidation { command } => {
-            let code = local_validation_cli::run(command)?;
+            let code = local_validation_cli::run(command).await?;
             if code != 0 {
                 return Ok(RunExit::SpecializedFailure(code));
             }
