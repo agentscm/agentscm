@@ -24,6 +24,7 @@ Nothing is locked: a refusal happens once per session and file, a repeat always 
 | Tier | Agents | How |
 | --- | --- | --- |
 | **Wired by `agentscm init-repo`** | Claude Code, Codex CLI, Cursor, GitHub Copilot in VS Code | MCP config, hooks and instructions committed to the repository. |
+| **Wired by `agentscm client setup --agent claude\|codex\|cursor\|copilot\|gemini`** | Claude Code, Codex CLI, Cursor, GitHub Copilot in VS Code, Gemini CLI | Binds one checkout to an existing hub and installs that agent's native hooks and MCP config locally, without committing files. Candidate behavior: not yet qualified end to end across all five clients or against a hosted hub ([onboarding](team-member-onboarding.md)). |
 | **Recipe** (hand configuration; not tested here) | Copilot coding agent and Copilot CLI, Gemini CLI and Antigravity, Windsurf, Devin, Amp, OpenCode, Cline | Point the agent's MCP client at the hub and give it the `AGENTS.md` snippet. |
 | **Advisory MCP only** | Roo | No hook; relies on the model following the instructions. |
 | **Not supported** | Aider | No hook or MCP client to attach to. |

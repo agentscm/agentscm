@@ -548,8 +548,9 @@ from source without the feature answers `/ui/` with a short notice page and noth
 The page signs in with a [read-only token](#read-only-tokens) for the repository, sent as
 `Authorization: Bearer`, and refuses an agent token, so the browser never holds a token that can
 write. The token is kept in the browser's session storage, or in its local storage if "keep me
-signed in" is ticked. There are no cookies and no sign-in route of its own. It polls every few
-seconds and reads `whoami`, `work`, `activity` and `health`; the workflow panel also reads the
+signed in" is ticked. The token path uses no cookies. The workspace section is separate: it signs in through the hub's
+browser login and keeps a cookie session. The page polls every few seconds and reads `whoami`,
+`work`, `activity`, `health` and `/v1/hub/onboarding` (the Connect agents page); the workflow panel also reads the
 bounded recent-run list once and an individual run when selected. Mint a token only for this, so it
 can be revoked on its own:
 

@@ -4,6 +4,8 @@
 
 This walkthrough runs a coordination [hub](hub.md) on one machine, connects it to a GitHub repository, and shows one agent being warned that another is already editing the same file. It takes about fifteen minutes and needs Docker, a web browser signed in to GitHub, and a repository you can install a GitHub App on. Everything runs on one host over loopback, which is why plain `http://` is fine here; agents on other machines need the hub behind an `https://` proxy (see [hub](hub.md)).
 
+> Contributors with a repository checkout can skip Docker and the GitHub App: [ui/dev-seed/README.md](../ui/dev-seed/README.md) starts a throwaway, credential-free dev hub. It is not an install route for users.
+
 ## 1. Start the hub
 
 ```sh

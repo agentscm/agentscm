@@ -153,7 +153,7 @@ workspace membership or enable native source control.
 
 ## Verify trust and behavior
 
-The Hub's **Agent setup** card separates live activity from setup readiness. Copy its instructions
+The Hub's **Connect agents** page separates live activity from setup readiness. Copy its instructions
 to your agent; it guides setup and leaves account sign-in and trust decisions with you. Coding-agent
 login is separate from forge login. Installed configuration, cached login, MCP discovery and a
 session-start event alone do not mark an agent ready.
@@ -214,6 +214,11 @@ Before approving hooks or MCP configuration:
    binding and that no token appears in tracked files or command arguments.
 3. Accept the coding client's own project, MCP and hook trust prompts. Generating or installing a
    plugin does not supply that approval.
+
+`agentscm quickstart` (Claude Code hooks only) and `agentscm client setup` (the path the Connect agents
+page uses) are separate paths with separate token and configuration stores. `agentscm uninstall` undoes
+quickstart; `agentscm client remove` undoes client setup. Only agents set up with `client setup` report
+on the Connect agents page.
 
 Then run `agentscm client list` and `agentscm client check` for the local binding. Start a real agent
 task and confirm that its session appears for the expected repository in the hosted Hub. A local
