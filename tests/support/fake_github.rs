@@ -358,6 +358,11 @@ pub struct FakeState {
     /// The login recorded as `creator` of statuses posted through the API. Default: the
     /// caller's own login (`<slug>[bot]` for an installation token).
     pub status_creator: Option<String>,
+    /// `permissions` of `GET /app/installations/{id}`. Default: the Hub's own request set,
+    /// including `merge_queues: read`.
+    pub installation_permissions: Option<Value>,
+    /// `events` of `GET /app/installations/{id}`. Default: `merge_group` among the others.
+    pub installation_events: Option<Vec<String>>,
 }
 
 impl FakeState {
@@ -1012,6 +1017,29 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                     .collect::<Vec<_>>()
                     .into(),
             ),
+            (&Method::GET, ["installations", id]) => {
+                let Some(installation) = id
+                    .parse::<i64>()
+                    .ok()
+                    .and_then(|id| state.installations.iter().find(|i| i.id == id))
+                else {
+                    return not_found();
+                };
+                let permissions = state.installation_permissions.clone().unwrap_or_else(|| {
+                    json!({"merge_queues": "read", "statuses": "write", "pull_requests": "read",
+                        "contents": "read", "metadata": "read"})
+                });
+                let events = state.installation_events.clone().unwrap_or_else(|| {
+                    ["merge_group", "pull_request", "push"]
+                        .map(String::from)
+                        .into()
+                });
+                json_reply(
+                    200,
+                    json!({"id": installation.id, "account": {"login": installation.account},
+                        "permissions": permissions, "events": events}),
+                )
+            }
             (&Method::POST, ["installations", id, "access_tokens"]) => {
                 let Some(id) = id
                     .parse::<i64>()
@@ -1303,6 +1331,23 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                         }
                         None => not_found(),
                     }
+                }
+                // Every branch whose name starts with the prefix, as GitHub's matching-refs does
+                // (a trailing slash is part of the prefix), paginated.
+                (&Method::GET, ["git", "matching-refs", "heads", prefix @ ..]) => {
+                    let slash = if uri.path().ends_with('/') { "/" } else { "" };
+                    let prefix = format!("{}{slash}", prefix.join("/"));
+                    let refs: Vec<Value> = state.repos[&id]
+                        .branches
+                        .iter()
+                        .filter(|b| b.name.starts_with(&prefix))
+                        .map(|b| {
+                            json!({"ref": format!("refs/heads/{}", b.name),
+                                "object": {"type": "commit", "sha": b.sha}})
+                        })
+                        .collect();
+                    let (page, link) = paginate(ctx, uri, &query, refs);
+                    reply(200, &link, Some(Value::Array(page)))
                 }
                 (&Method::GET, ["git", "commits", sha]) => {
                     match state.repos[&id].commits.get(*sha) {
