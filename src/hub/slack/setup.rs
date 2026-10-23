@@ -386,7 +386,10 @@ fn ensure_install_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_directory_component(metadata: &fs::Metadata, destination: bool) -> Result<()> {
+fn validate_directory_component(
+    metadata: &fs::Metadata,
+    #[cfg_attr(not(unix), allow(unused_variables))] destination: bool,
+) -> Result<()> {
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(invalid());
     }
@@ -408,6 +411,7 @@ fn validate_directory_component(metadata: &fs::Metadata, destination: bool) -> R
 }
 
 fn create_private_directory(path: &Path) -> Result<()> {
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {

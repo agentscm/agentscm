@@ -16,7 +16,7 @@ The adapter does not read channel history, post to channels, copy raw Slack mess
 
 ## Installation
 
-Use a matching CLI and Hub build containing these commands. Install the [official Slack CLI](https://docs.slack.dev/tools/slack-cli/) version 4.8.0 or newer and sign in to the intended workspace. AgentSCM does not download or silently authorize another CLI. Workspace approval remains with Slack administrators. The CLI’s operator authorization is separate from the app’s `commands` bot scope; review Slack’s displayed management permissions during login.
+Use a matching CLI and Hub build containing these commands. Install the [official Slack CLI](https://docs.slack.dev/tools/slack-cli/) version 4.8.0 or newer and sign in to the intended workspace. AgentSCM does not download or silently authorize another CLI. Workspace approval remains with Slack administrators. The CLI’s operator authorization is separate from the app’s `chat:write` bot scope; review Slack’s displayed management permissions during login.
 
 ### Automated preparation and runtime installation
 
