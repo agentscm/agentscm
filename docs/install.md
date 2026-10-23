@@ -11,6 +11,21 @@ These docs describe the branch or tag you are viewing. A command present on `mai
 a published binary yet. Use the documentation at the matching release tag, or
 [build from source](../CONTRIBUTING.md#set-up) to try unreleased features.
 
+## Choose local or hosted
+
+The first question the setup guide asks is where AgentSCM should run:
+
+- **Local, on this machine (recommended for the alpha).** The hub runs on your computer and your agents use it. Run `npx agentscm --local` to skip the question. Without a terminal (CI, or an agent's shell), add `--yes --github-login YOUR_LOGIN`.
+- **Hosted, a shared hub on a server for a team.** Not supported in the alpha: it will likely break and is not for production. Quickstart does not set up a server. `npx agentscm --hosted` prints the [hosted guide](hosted.md) for you to work through with your coding agent; once the team's hub runs, `npx agentscm --hosted --hub-url https://hub.example.com` connects this machine to it.
+
+`install.sh` passes the same flags: `curl -fsSL .../install.sh | sh -s -- --local`.
+
+### If you are an agent installing AgentSCM for someone
+
+1. Ask the person: "Do you want to run AgentSCM locally on this machine (recommended for the alpha), or set up a hosted hub for a team (unsupported in the alpha)?"
+2. Local: run `npx agentscm --local` in their terminal so they can answer its prompts. If you have no terminal, ask for their GitHub login and run `npx agentscm --local --yes --github-login LOGIN`.
+3. Hosted: follow [hosted.md](hosted.md) step by step with them. If their team's hub already runs, ask for its URL and run `npx agentscm --hosted --hub-url URL`.
+
 Three ways to get AgentSCM. The first two download the release binary, check it, keep it in `~/.agentscm/bin` (`%USERPROFILE%\.agentscm\bin` on Windows) and start the setup guide (`agentscm quickstart`).
 
 The download and verification steps do not send product telemetry. After verification, the installers invoke the binary to record one installation indicator only when telemetry was already configured and permitted for this user. Pass `--no-telemetry`, set `AGENTSCM_TELEMETRY=off`, or set `DO_NOT_TRACK=1` before installing to suppress it. On first use, a build containing the staged capability follows the [setup choice and telemetry controls](telemetry.md). No event can be sent until an HTTPS endpoint and data-handling profile are configured.

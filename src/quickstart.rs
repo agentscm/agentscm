@@ -44,6 +44,9 @@ pub enum HubChoice {
     Existing,
     /// Only the collision check and hooks; no live warnings yet.
     Skip,
+    /// Print the hosted guide, then connect only if --hub-url is given (chosen with --hosted).
+    #[value(skip)]
+    Hosted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -69,6 +72,13 @@ pub struct QuickstartArgs {
     /// The local hub's administrator must then be given with --github-login.
     #[arg(long)]
     yes: bool,
+    /// Run everything on this machine (recommended for the alpha); same as --hub local.
+    #[arg(long, conflicts_with_all = ["hub", "hosted"])]
+    local: bool,
+    /// Use a shared hub on a server: prints the agent-guided hosted guide (unsupported in
+    /// the alpha), then connects only when --hub-url is given.
+    #[arg(long, conflicts_with = "hub")]
+    hosted: bool,
     /// How to get live warnings.
     #[arg(long, value_enum)]
     hub: Option<HubChoice>,
@@ -132,13 +142,21 @@ pub struct UninstallArgs {
 }
 
 const NEEDS_TERMINAL: &str = "agentscm quickstart asks questions, and there is no terminal here. \
-To run it without one, pass --yes and choose with flags: --hub local|existing|skip, --hub-url URL, \
+To run it without one, pass --yes and choose with flags: --local (recommended) or --hosted, \
+--hub local|existing|skip, --hub-url URL, \
 --agent-token-file PATH, --agent-name NAME, --ttl 30d, --provider github|gitlab, --github-login LOGIN, \
 --hub-runtime native|docker, --hub-port PORT, --hub-project NAME, \
 --hook user|project|none, --no-collisions, --init";
 
 const HUB_EXPLAINED: &str =
     "A hub is a small shared server that lets agents on different machines see each other's work.";
+
+const HOSTED_GUIDE: &str = "\
+Hosted (a shared hub on a server) is not supported in the alpha: it will likely break and is not \
+for production. Quickstart does not set up a server. Hand this guide to your coding agent and work \
+through it together:
+  https://github.com/counterbranch/agentscm/blob/main/docs/hosted.md
+If your team's hub already runs, give its URL to connect this machine to it.";
 
 fn invalid(message: &str) -> Error {
     Error::Invalid(message.to_owned())
@@ -347,7 +365,7 @@ impl Live {
         match (&self.hub, &self.repo) {
             (None, _) => off(
                 "no hub chosen",
-                "run `agentscm quickstart --hub existing --hub-url URL`, or `--hub local` for a managed local hub",
+                "run `agentscm quickstart --local` for a hub on this machine, or `--hosted --hub-url URL` for your team's hub",
             ),
             (Some(url), _) if !self.hub_up => off(
                 &format!("the hub at {url} isn't answering"),
@@ -417,7 +435,7 @@ pub async fn run(args: QuickstartArgs) -> Result<u8> {
         cx.manifest.bin_dir = Some(binary::bin_dir(&cx.home));
     }
     status(&cx).await;
-    collisions_step(&cx);
+    // Local or hosted is the first question; the collision check does not depend on it.
     if let Some(url) = choose_hub(&mut cx).await {
         cx.live.hub_up = healthy(&cx.client, &url).await;
         cx.live.hub = Some(url.clone());
@@ -430,6 +448,7 @@ pub async fn run(args: QuickstartArgs) -> Result<u8> {
             hub_json_stage(&mut cx, &url, &staged);
         }
     }
+    collisions_step(&cx);
     hook_stage(&mut cx);
     init_stage(&mut cx);
     if !cx.manifest.is_empty() {
@@ -455,7 +474,9 @@ pub async fn run(args: QuickstartArgs) -> Result<u8> {
     if cx.live.pending_local.is_some() {
         return Ok(3);
     }
-    if (matches!(args.hub, Some(HubChoice::Local | HubChoice::Existing)) || args.hub_url.is_some())
+    if (args.local
+        || matches!(args.hub, Some(HubChoice::Local | HubChoice::Existing))
+        || args.hub_url.is_some())
         && (!cx.live.hub_up || cx.live.repo.is_none())
     {
         return Err(invalid(
@@ -687,7 +708,11 @@ fn collisions_step(cx: &Cx<'_>) {
 async fn choose_hub(cx: &mut Cx<'_>) -> Option<String> {
     let current = current_hub();
     let mut choice = cx.args.hub;
-    if choice.is_none() && cx.args.hub_url.is_some() {
+    if cx.args.local {
+        choice = Some(HubChoice::Local);
+    } else if cx.args.hosted {
+        choice = Some(HubChoice::Hosted);
+    } else if choice.is_none() && cx.args.hub_url.is_some() {
         choice = Some(HubChoice::Existing);
     }
     if choice.is_none() {
@@ -716,6 +741,20 @@ async fn choose_hub(cx: &mut Cx<'_>) -> Option<String> {
                 return None;
             }
             HubChoice::Existing => return existing_hub(cx, current.map(|c| c.url)),
+            HubChoice::Hosted => {
+                println!("{HOSTED_GUIDE}\n");
+                let url = match &cx.args.hub_url {
+                    Some(url) => url.clone(),
+                    None => cx.ui.ask("Hub URL (leave empty to skip for now)", ""),
+                };
+                if url.is_empty() {
+                    println!(
+                        "Skipping live warnings. Run quickstart again with --hosted --hub-url URL once the hub runs.\n"
+                    );
+                    return None;
+                }
+                return checked_hub_url(&url);
+            }
             HubChoice::Local => match local_hub(cx).await {
                 Ok(url) => return url,
                 Err(message) => {
@@ -739,15 +778,15 @@ fn menu(cx: &Cx<'_>, with_local: bool) -> HubChoice {
         .as_ref()
         .is_none_or(|r| r.forge == Forge::Github);
     let mut options = vec![
-        "Connect to a hub that already runs (your team's; you need its URL)",
+        "Hosted: a shared hub on a server for a team (unsupported in the alpha; your agent follows a guide)",
         "Skip live warnings for now",
     ];
-    let mut choices = vec![HubChoice::Existing, HubChoice::Skip];
+    let mut choices = vec![HubChoice::Hosted, HubChoice::Skip];
     let mut default = 1;
     if with_local {
         options.insert(
             0,
-            "Start a hub on this machine (native when supported; Docker fallback; GitHub only)",
+            "Run it on this machine (recommended for the alpha; GitHub only)",
         );
         choices.insert(0, HubChoice::Local);
         default = if (native_hub_supported() || cx.found.docker) && github {
@@ -758,7 +797,7 @@ fn menu(cx: &Cx<'_>, with_local: bool) -> HubChoice {
     }
     choices[cx
         .ui
-        .choose("How should live warnings work?", &options, default)]
+        .choose("Where should AgentSCM run?", &options, default)]
 }
 
 fn existing_hub(cx: &Cx<'_>, configured: Option<String>) -> Option<String> {
@@ -771,7 +810,11 @@ fn existing_hub(cx: &Cx<'_>, configured: Option<String>) -> Option<String> {
         }
         (None, configured) => cx.ui.ask("Hub URL", &configured.unwrap_or_default()),
     };
-    match check_base_url(&url) {
+    checked_hub_url(&url)
+}
+
+fn checked_hub_url(url: &str) -> Option<String> {
+    match check_base_url(url) {
         Ok(url) => Some(url),
         Err(_) => {
             println!(
@@ -2330,6 +2373,8 @@ mod tests {
     fn terminal_refusal_lists_the_flags() {
         for flag in [
             "--yes",
+            "--local",
+            "--hosted",
             "--hub",
             "--hub-url",
             "--agent-token-file",
