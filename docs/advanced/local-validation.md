@@ -36,7 +36,7 @@ A maintainer can run the repository's gate on their own machine and attach a sig
 
 ## Limits
 
-- The status is attached to the commit, so PRs that share a head commit share it. Stacked PRs and one branch opened against two bases are unsupported.
+- The status is attached to the commit, so PRs that share a head commit (for example one branch opened against two bases) share it; that case is unsupported.
 - Retargeting a PR to a new base fires no event. The next daily run re-verifies it; re-run the workflow with `workflow_dispatch` to refresh sooner.
 - Batch runs (push and daily) process PRs serially within the 30-minute job and the token rate limit. That is practical for tens of open PRs, not hundreds.
 - An aged-out (expired) `success` is replaced by the daily run, so within about a day of expiry.
