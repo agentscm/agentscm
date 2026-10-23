@@ -1224,10 +1224,17 @@ async fn errors_are_tool_results_with_fixed_text() {
         ("agentscm_check", json!({"paths": []})),
         ("agentscm_check", json!({"paths": "src/a.rs"})),
         ("agentscm_status", json!({"unknown": true})),
+        ("agentscm_check", json!({"paths": secret_looking})),
+        ("agentscm_start", json!({"task": "t", "sekrit-key": 1})),
+        ("agentscm_ask", json!({"path": 5, "note": secret_looking})),
     ] {
         let (text, error) = hub.tool(&key, "/mcp", name, arguments).await;
         assert!(error, "{name}");
-        assert!(text.contains("invalid arguments"), "{text}");
+        assert!(
+            text.starts_with(&format!("AgentSCM: invalid arguments for {name}: ")),
+            "{text}"
+        );
+        assert!(!text.contains("sekrit"), "{text}");
     }
     let (text, error) = hub
         .tool(

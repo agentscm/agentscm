@@ -38,7 +38,7 @@ const AGENT_INSTRUCTIONS: &str = "AgentSCM coordinates durable shared work and t
     Use agentscm_work_usage only when a client or provider result supplies usage; use literal unknown labels when identities are unavailable and null for unknown counts. AgentSCM does not discover token billing or transcripts. Read agentscm_work_insight or agentscm_work_insights for conservative, report-only projections and inspect completeness fields. \
     Reuse work_id, a canonical forge source, or a stable request_key across sessions; a legacy task-only start is retry-safe only in its resolved session. \
     Claim work before taking a coordinated file path. Call agentscm_check before editing a file you have not \
-    edited yet in this session, and agentscm_done when finished. If a reply says another agent is \
+    edited yet in this session (hooks already check edits where installed), and agentscm_done when finished. If a reply says another agent is \
     already working on a file, do other work first or ask the user. When an edit is refused \
     because another agent holds the file, agentscm_ask asks that agent to hand it over, and \
     agentscm_handoff answers such a request. agentscm_workflow_status reads a retained native \
@@ -571,7 +571,25 @@ fn try_args<T: DeserializeOwned>(arguments: Option<&Value>) -> std::result::Resu
         None | Some(Value::Null) => json!({}),
         Some(other) => other.clone(),
     };
-    serde_json::from_value(arguments).map_err(|error| error.to_string())
+    serde_json::from_value(arguments).map_err(|error| safe_detail(&error.to_string()))
+}
+
+/// Keeps only the schema side of a serde error: input values and unknown keys are never echoed.
+fn safe_detail(error: &str) -> String {
+    let error = error.split(" at line ").next().unwrap_or(error);
+    if error.starts_with("missing field `") {
+        return error.to_owned();
+    }
+    if error.starts_with("unknown field `") {
+        return match error.split_once(", expected ") {
+            Some((_, expected)) => format!("unknown field, expected {expected}"),
+            None => "unknown field".into(),
+        };
+    }
+    match error.split_once(", expected ") {
+        Some((_, expected)) => format!("wrong type or value, expected {expected}"),
+        None => "malformed arguments".into(),
+    }
 }
 
 fn args<T: DeserializeOwned>(arguments: Option<&Value>) -> Option<T> {
@@ -989,8 +1007,9 @@ async fn call_inner(
             Err(error) => hub_failure(&error),
         });
     }
-    let Some(outcome) = run(state, principal, name, arguments, completion_reporting).await else {
-        return Ok(refused("invalid arguments"));
+    let outcome = match run(state, principal, name, arguments, completion_reporting).await {
+        Ok(outcome) => outcome,
+        Err(detail) => return Ok(invalid_args(name, &detail)),
     };
     Ok(match outcome {
         Ok(text) => result(&text, false),
@@ -1169,25 +1188,25 @@ fn work_failure(error: &HubError) -> Value {
     })
 }
 
-/// `None`: the arguments do not fit the tool.
+/// `Err(detail)`: the arguments do not fit the tool.
 async fn run(
     state: &HubState,
     principal: &Principal,
     name: &str,
     arguments: Option<&Value>,
     completion_reporting: bool,
-) -> Option<Result<String>> {
+) -> std::result::Result<Result<String>, String> {
     let token = principal.token_id.clone();
-    Some(match name {
+    Ok(match name {
         "agentscm_check" => {
-            let CheckArgs { paths, session } = args(arguments)?;
+            let CheckArgs { paths, session } = try_args(arguments)?;
             if !(1..=MAX_CHECK_PATHS).contains(&paths.len()) {
-                return None;
+                return Err(format!("paths must hold 1 to {MAX_CHECK_PATHS} entries"));
             }
             check(state, principal, session_call(session, None, paths)).await
         }
         "agentscm_status" => {
-            let SessionArgs { session } = args(arguments)?;
+            let SessionArgs { session } = try_args(arguments)?;
             status_for(state, principal, session_call(session, None, Vec::new())).await
         }
         "agentscm_ask" => {
@@ -1195,7 +1214,7 @@ async fn run(
                 path,
                 note,
                 session,
-            } = args(arguments)?;
+            } = try_args(arguments)?;
             let store = state.store.clone();
             blocking(state, move || {
                 store
@@ -1216,7 +1235,7 @@ async fn run(
                 accept,
                 reason,
                 session,
-            } = args(arguments)?;
+            } = try_args(arguments)?;
             let (store, wanted) = (state.store.clone(), path.clone());
             blocking(state, move || {
                 store.answer_handoff(
@@ -1232,10 +1251,10 @@ async fn run(
             .map(|outcome| answered(&outcome, &path))
         }
         "agentscm_done" => {
-            let SessionArgs { session } = args(arguments)?;
+            let SessionArgs { session } = try_args(arguments)?;
             done(state, principal, session, completion_reporting).await
         }
-        _ => return None,
+        _ => return Err("unknown tool".into()),
     })
 }
 
@@ -1605,4 +1624,26 @@ async fn check(state: &HubState, principal: &Principal, call: SessionCall) -> Re
     } else {
         advice.text
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_detail;
+
+    #[test]
+    fn invalid_argument_details_never_echo_input() {
+        assert_eq!(
+            safe_detail("missing field `task` at line 1 column 2"),
+            "missing field `task`"
+        );
+        assert_eq!(
+            safe_detail("unknown field `sekrit`, expected `task` or `paths`"),
+            "unknown field, expected `task` or `paths`"
+        );
+        assert_eq!(
+            safe_detail("invalid type: string \"../sekrit\", expected a sequence"),
+            "wrong type or value, expected a sequence"
+        );
+        assert_eq!(safe_detail("sekrit"), "malformed arguments");
+    }
 }
