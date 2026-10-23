@@ -24,6 +24,10 @@ the name of the coding agent you are connecting:
 npx agentscm client setup --agent claude --hub 'https://hub.example.com'
 ```
 
+For a self-hosted forge (GitLab self-managed, GitHub Enterprise) add `--provider github` or
+`--provider gitlab`: it is inferred only for github.com and gitlab.com, and the Hub UI's copied
+command does not include it.
+
 The five agent names are `claude` for Claude Code, `codex`, `cursor`, `copilot` and `gemini`. There
 is no default: the copied Hub instructions tell the running agent to identify its own host and pass
 the matching name. The member does not choose between hooks, MCP or APIs.

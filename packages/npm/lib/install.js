@@ -143,8 +143,18 @@ function checkProvenance(file, version, gap = provenanceGap(), run = spawnSync) 
   return true;
 }
 
+// The one-line report of what was actually checked.
+const provenanceLine = (gap) => gap
+  ? `Checked the SHA-256 checksum (provenance not checked: ${gap}).`
+  : 'Verified provenance with GitHub attestations. Set AGENTSCM_INSTALL_VERBOSE=1 for details.';
+
 async function main(args) {
   const version = require('../package.json').version;
+  // The package installs exactly its own version, so this matches the binary without a download.
+  if (args[0] === '--version' || args[0] === '-V') {
+    console.log(`agentscm ${version}`);
+    return 0;
+  }
   console.log(`${NOTICE_TEXT}\n`);
   const target = targetFor(process.platform, process.arch);
   if (!target) {
@@ -217,11 +227,7 @@ async function main(args) {
     }
   }
 
-  if (gap) {
-    console.log(`Verified checksum; provenance was not checked (${gap}).`);
-  } else {
-    console.log('Verified checksum and build provenance. Set AGENTSCM_INSTALL_VERBOSE=1 for details.');
-  }
+  console.log(provenanceLine(gap));
 
   // This process-only assertion comes from the verified installer. The binary records an
   // installation only after its disclosure/choice gates are effective; HTTP stays detached.
@@ -231,4 +237,4 @@ async function main(args) {
   return r.status ?? 128 + (os.constants.signals[r.signal] ?? 0);
 }
 
-module.exports = { NOTICE_TEXT, targetFor, assetNameFor, installNames, urlFor, launchArgs, verifiedInstallEnv, parseSums, sha256File, matches, localSums, ghVerifyArgs, provenanceGap, checkProvenance, main };
+module.exports = { NOTICE_TEXT, targetFor, assetNameFor, installNames, urlFor, launchArgs, verifiedInstallEnv, parseSums, sha256File, matches, localSums, ghVerifyArgs, provenanceGap, checkProvenance, provenanceLine, main };

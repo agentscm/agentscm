@@ -168,7 +168,7 @@ fn workspace_checkpoint_and_offline_exchange_preserve_source_without_git() {
         ],
     );
     let read = success(&receiver, &["read", next, "a.txt"]);
-    assert_eq!(read["content"], json!(b"changed".to_vec()));
+    assert_eq!(read["text"], "changed");
     assert_eq!(success(&receiver, &["init"])["repository"], receiver_id);
     assert!(success(&receiver, &["target", "main"])["target"].is_null());
     failure(
@@ -307,10 +307,7 @@ fn target_initialization_and_landing_preparation_work_without_git() {
     assert_eq!(landing["outcome"], "prepared");
     let revision = landing["revision"].as_str().unwrap().to_owned();
     assert_ne!(revision, b);
-    assert_eq!(
-        success(&data, &["read", &revision, "b.txt"])["content"],
-        json!([66])
-    );
+    assert_eq!(success(&data, &["read", &revision, "b.txt"])["text"], "B");
     assert_eq!(
         success(&data, &["target", "main"])["target"],
         event["after"]

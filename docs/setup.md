@@ -1,5 +1,8 @@
-# Local source install helper
+# `agentscm setup`: contributor install helper
 
+> **Looking to set AgentSCM up for yourself or your team?** This is not that page: see the
+> [setup guide](setup-guide.md).
+>
 > **For contributors.** This page documents `agentscm setup`, a local install
 > helper for source builds. Users run AgentSCM as a container (see the README
 > quickstart) and do not need it. The helper checks the host and fails with

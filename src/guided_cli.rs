@@ -86,7 +86,9 @@ pub enum WorkflowCommand {
     },
     /// Explicitly rebind source, target and policy after drift. Does not merge source.
     Refresh,
+    /// Record the clean workspace tip as the source to land (queues a landing preparation when a target is set).
     Prepare {
+        /// Caller-chosen ID that makes retrying this operation safe.
         operation_id: String,
     },
     /// Complete bounded diff with file bytes; incomplete output cannot authorize approval.
@@ -107,13 +109,19 @@ pub enum WorkflowCommand {
         #[arg(long)]
         result: String,
     },
+    /// Approve the exact inspected revision and context for integration.
     Approve {
+        /// Caller-chosen ID for this approval.
         approval_id: String,
+        /// The `inspection` field of the `workflow inspect` JSON for the current revision.
         #[arg(long)]
         inspection: String,
     },
+    /// Land the approved revision on its target; needs a prior `workflow approve`.
     Integrate {
+        /// Caller-chosen ID that makes retrying this operation safe.
         operation_id: String,
+        /// The `inspection` field of the `workflow inspect` JSON for the current revision.
         #[arg(long)]
         inspection: String,
     },

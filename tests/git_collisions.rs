@@ -491,3 +491,19 @@ fn text_flag_prints_a_report_and_json_keeps_its_shape() {
     let both = run(&repo, &["--json", "--text"]);
     assert!(!both.status.success());
 }
+
+#[test]
+fn text_mode_reports_a_bad_base_as_one_plain_line() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "base"]);
+    let out = run(&repo, &["--text", "--base", "no-such-ref"]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        !err.trim_start().starts_with('{') && err.trim().lines().count() == 1,
+        "{err}"
+    );
+}

@@ -891,8 +891,10 @@ fn without_a_terminal_it_refuses_and_writes_nothing() {
     assert!(!repo.path().join(".claude").exists());
     assert!(!machine.config().exists());
     assert!(!machine.home.path().join(".agentscm").exists());
+    // With nothing recorded there is nothing to refuse.
     let output = machine.run(repo.path(), &["uninstall"]);
-    assert!(!output.status.success());
+    assert!(output.status.success());
+    assert!(out(&output).contains("nothing was installed by quickstart"));
 }
 
 #[test]
@@ -2126,4 +2128,54 @@ fn native_program_repairs_are_reported_but_true_noop_preserves_record() {
         assert!(noop.contains("No changes made."), "{missing}: {noop}");
         assert_eq!(std::fs::read(&record).unwrap(), before, "{missing}");
     }
+}
+
+#[test]
+fn a_fresh_repository_says_there_is_nothing_to_compare() {
+    let machine = Machine::new();
+    let repo = machine.repo();
+    let said = ok(&machine.run(
+        repo.path(),
+        &["quickstart", "--yes", "--hub", "skip", "--hook", "none"],
+    ));
+    if !said.contains("Couldn't check") {
+        assert!(
+            said.contains("No other branches or worktrees to compare yet."),
+            "{said}"
+        );
+    }
+    assert!(!said.contains("0 branches/worktrees checked"), "{said}");
+}
+
+#[test]
+fn uninstall_removes_only_the_empty_directories_quickstart_created() {
+    let machine = Machine::transient();
+    let repo = machine.repo();
+    let args = ["quickstart", "--yes", "--hub", "skip", "--hook", "project"];
+    ok(&machine.run(repo.path(), &args));
+    assert!(repo.path().join(".claude").is_dir() && machine.bin_dir().is_dir());
+    ok(&machine.run(repo.path(), &["uninstall", "--yes"]));
+    assert!(!repo.path().join(".claude").exists());
+    assert!(!machine.home.path().join(".agentscm").exists());
+
+    // A `.claude` that was already there, or holds anything else, stays.
+    let keep = machine.repo();
+    std::fs::create_dir_all(keep.path().join(".claude")).unwrap();
+    ok(&machine.run(keep.path(), &args));
+    ok(&machine.run(keep.path(), &["uninstall", "--yes"]));
+    assert!(keep.path().join(".claude").is_dir());
+    ok(&machine.run(repo.path(), &args));
+    std::fs::write(repo.path().join(".claude/notes"), "mine").unwrap();
+    ok(&machine.run(repo.path(), &["uninstall", "--yes"]));
+    assert!(repo.path().join(".claude/notes").exists());
+}
+
+#[test]
+fn uninstall_without_a_terminal_still_needs_yes_when_something_is_recorded() {
+    let machine = Machine::new();
+    let repo = machine.repo();
+    ok(&machine.run(repo.path(), &project_args()));
+    let output = machine.run(repo.path(), &["uninstall"]);
+    assert!(!output.status.success());
+    assert!(repo.path().join(SETTINGS).exists());
 }

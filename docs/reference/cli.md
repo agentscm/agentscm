@@ -52,7 +52,7 @@ agentscm --data-dir ./agentscm-data events --after 0 --limit 100
 
 Use `-` or omit the input filename for JSON on standard input. A checkpoint request contains an optional parent and changes. File content is an array of byte values; `null` deletes a path.
 
-`files` scans one immutable manifest page and returns entry metadata, `scanned`, `next` and `complete`. `--prefix PATH` and the literal, case-sensitive `--contains TEXT` filter that page after scanning it; search text must contain 1 to 1024 bytes. A filtered page can have no entries and still return `next`; save that JSON cursor string in a file and pass `--cursor FILE` until `next` is null. `stat` checks exact manifest membership without reading the file blob: `present` does not prove the blob is locally available, while `nonexistent` means the complete manifest has no such path. Missing source objects, denied/indeterminate reads and limits remain distinct failures with a typed top-level `error_kind`. `read` retrieves entry kind and bytes.
+`files` scans one immutable manifest page and returns entry metadata, `scanned`, `next` and `complete`. `--prefix PATH` and the literal, case-sensitive `--contains TEXT` filter that page after scanning it; search text must contain 1 to 1024 bytes. A filtered page can have no entries and still return `next`; save that JSON cursor string in a file and pass `--cursor FILE` until `next` is null. `stat` checks exact manifest membership without reading the file blob: `present` does not prove the blob is locally available, while `nonexistent` means the complete manifest has no such path. Missing source objects, denied/indeterminate reads and limits remain distinct failures with a typed top-level `error_kind`. `read` retrieves the entry kind and content as `text` (a string, when the bytes are valid UTF-8) or `base64` (standard alphabet, otherwise); exactly one is present. `workflow inspect` diff entries use the same rule per side as `before_text`/`before_base64` and `after_text`/`after_base64`, omitted for an absent side.
 
 ```json
 {
@@ -190,6 +190,8 @@ agentscm --data-dir ./agentscm-data workspace expand ./work expand-1 0 \
   --path crates/shared
 agentscm --data-dir ./agentscm-data workflow checkpoint checkpoint-1 1
 ```
+
+Later steps: `workflow prepare OPERATION_ID` records the clean workspace tip as the source to land; `workflow inspect` prints the bounded diff and an `inspection` token; `workflow approve APPROVAL_ID --inspection TOKEN` approves that exact revision; `workflow integrate OPERATION_ID --inspection TOKEN` lands it. `TOKEN` is the `inspection` field of the `workflow inspect` JSON.
 
 Repeated `--path` values select the ordinary files materialized into the workspace. They are independent from repeated `--scope` values, which declare the review-context boundary. Expansion advances only the workspace generation; `workflow checkpoint` at that new generation advances the workspace base and updates the guided Change context. Omit `--path` for a full workspace, or use a sole `--path .` as an explicit full-tree selection. See [task-scoped source and workspaces](../advanced/task-workspaces.md) for the full flow and boundaries.
 

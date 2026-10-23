@@ -10,7 +10,9 @@ import time
 import urllib.error
 import urllib.request
 
-HUB = "http://127.0.0.1:7332"
+import os
+
+HUB = f"http://127.0.0.1:{os.environ.get('AGENTSCM_DEV_HUB_PORT', '7332')}"
 tokens = dict(line.strip().split("=", 1) for line in open(sys.argv[1]) if "=" in line)
 ROOT = sys.argv[2]
 HOOK = {"IVY": "claude", "ORION": "codex", "JUNO": "claude", "PAX": "claude", "RUNE": "claude"}

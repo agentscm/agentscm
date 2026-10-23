@@ -1179,17 +1179,11 @@ fn capture_then_native_workflow_without_git() {
     let second = success(&f.data, &["workspace", "checkpoint", ws_arg, "op-2", "1"]);
     let second = second["outcome"]["revision"].as_str().unwrap().to_owned();
     assert_ne!(first, second);
-    let read = |rev: &str, path: &str| success(&f.data, &["read", rev, path])["content"].clone();
-    assert_eq!(read(&first, "new.txt"), json!(b"new\n".to_vec()));
-    assert_eq!(read(&second, "new.txt"), json!(b"newer\n".to_vec()));
-    assert_eq!(
-        read(&second, "src/lib.rs"),
-        json!(b"fn lib() { 1 }\n".to_vec())
-    );
-    assert_eq!(
-        read(&revision, "src/lib.rs"),
-        json!(b"fn lib() {}\n".to_vec())
-    );
+    let read = |rev: &str, path: &str| success(&f.data, &["read", rev, path])["text"].clone();
+    assert_eq!(read(&first, "new.txt"), json!("new\n"));
+    assert_eq!(read(&second, "new.txt"), json!("newer\n"));
+    assert_eq!(read(&second, "src/lib.rs"), json!("fn lib() { 1 }\n"));
+    assert_eq!(read(&revision, "src/lib.rs"), json!("fn lib() {}\n"));
 
     assert!(success(&f.data, &["target", "main"])["target"].is_null());
     assert_eq!(git(&f.repo, &["rev-parse", "HEAD"]), head_before);

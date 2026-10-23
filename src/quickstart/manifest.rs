@@ -33,6 +33,10 @@ pub(crate) struct HookRecord {
     /// token itself); uninstall removes the variable only while it still has this hash.
     #[serde(default)]
     pub(crate) env_token_sha: Option<String>,
+    /// The directory holding the file, when quickstart had to create it; uninstall removes
+    /// it again only if it is empty.
+    #[serde(default)]
+    pub(crate) created_dir: Option<PathBuf>,
 }
 
 /// An agent token file for one repository.
@@ -86,6 +90,8 @@ pub(crate) struct Manifest {
     pub(crate) native_hub: Option<super::hub_native::Record>,
     /// `~/.agentscm/bin` holds the program the hooks call.
     pub(crate) bin_dir: Option<PathBuf>,
+    /// Quickstart created `~/.agentscm` itself, not only `bin` inside it.
+    pub(crate) bin_parent_created: bool,
 }
 
 pub(crate) fn path() -> Result<PathBuf> {

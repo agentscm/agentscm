@@ -1051,9 +1051,9 @@ async fn run(cli: Cli) -> Result<RunExit> {
                     "CLI source response exceeds {MAX_OUTPUT_BYTES} bytes"
                 )));
             }
-            print_json(
-                &json!({"ok": true, "revision": revision, "path": path, "kind": kind, "content": content}),
-            );
+            let mut out = json!({"ok": true, "revision": revision, "path": path, "kind": kind});
+            agentscm::guided_service::content_fields(&mut out, "", Some(&content));
+            print_json(&out);
         }
         Command::Diff { left, right, limit } => {
             require_limit(limit, MAX_DIFF_LIMIT, "diff")?;
