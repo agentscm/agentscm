@@ -2365,6 +2365,46 @@ fn custom_image_drops_previous_platform_choice_and_failed_pull_preserves_existin
     assert!(!machine.config().join("quickstart.json").exists());
 }
 
+#[test]
+fn a_docker_resume_without_slack_does_not_run_the_previous_image() {
+    let machine = Machine::new();
+    let repo = machine.repo();
+    fake_docker(&machine);
+    let dir = machine.home.path().join(".agentscm/hub");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(".env"), "AGENTSCM_ADMINS=github:octo\n").unwrap();
+    std::fs::write(dir.join("compose.yaml"), "previous compose\n").unwrap();
+    let output = run_with_hub_port_retry(|port| {
+        machine
+            .command(
+                repo.path(),
+                &[
+                    "quickstart",
+                    "--yes",
+                    "--hub",
+                    "local",
+                    "--hub-runtime",
+                    "docker",
+                    "--hub-port",
+                    port,
+                    "--github-login",
+                    "octo",
+                    "--hook",
+                    "none",
+                    "--no-collisions",
+                ],
+            )
+            .output()
+            .unwrap()
+    });
+    // The fake registry refuses the pull; what matters is what ran before it.
+    assert!(out(&output).contains("Docker could not pull"), "{output:?}");
+    let commands = std::fs::read_to_string(machine.home.path().join("docker.log")).unwrap();
+    // No Slack receipt on the host: the previous compose image is never run to look for a
+    // pending Slack transaction, which needs that old image present.
+    assert!(!commands.contains("agentscm-slack-pending"), "{commands}");
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn native_fixture(machine: &Machine, hub: &Hub) -> (PathBuf, PathBuf) {
     use sha2::{Digest, Sha256};

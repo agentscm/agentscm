@@ -2031,7 +2031,11 @@ pub(crate) async fn start(
     let had_complete_setup = compose.exists() && env.exists();
     let existing_env = std::fs::read_to_string(&env).unwrap_or_default();
     let (existing_env, mut recovered_slack_restart) = if had_complete_setup {
-        let pending = slack_volume_pending(&dir, &options.project)?;
+        // A Slack install writes a host receipt before it touches the volume. Without one there
+        // is no transaction to find, and a resume must not need the previous compose image.
+        let slack_used = slack_receipt_path(&dir).symlink_metadata().is_ok()
+            || slack_rollback_receipt_path(&dir).symlink_metadata().is_ok();
+        let pending = slack_used && slack_volume_pending(&dir, &options.project)?;
         if pending || read_private_receipt(&slack_rollback_receipt_path(&dir))?.is_some() {
             if !down(&dir, &options.project, false) {
                 return Err(
