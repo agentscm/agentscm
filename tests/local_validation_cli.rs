@@ -218,6 +218,8 @@ impl Fixture {
                     root.join("policy.json").to_str().unwrap(),
                     "--registry",
                     root.join("registry.json").to_str().unwrap(),
+                    "--recipe",
+                    root.join("recipe.json").to_str().unwrap(),
                     "--repo",
                     self.repo().to_str().unwrap(),
                     "--repository",
@@ -330,6 +332,46 @@ fn verify_selects_the_newest_attestation_for_the_head() {
     // A later junk body does not override the failure.
     let (code, _) = f.verify_all(&[&bad, &junk], "repo-1");
     assert_eq!(code, 1);
+}
+
+#[test]
+fn verify_input_errors_are_error_verdicts_not_failures() {
+    let f = ok_fixture();
+    let missing = f.root().join("missing.md");
+    let (code, verdict) = f.verify_all(&[&missing], "repo-1");
+    assert_eq!((code, verdict["state"].as_str()), (2, Some("error")));
+    fs::remove_file(f.root().join("policy.json")).unwrap();
+    let (code, verdict) = f.verify_all(&[&missing], "repo-1");
+    assert_eq!((code, verdict["state"].as_str()), (2, Some("error")));
+}
+
+#[test]
+fn command_output_is_retained_privately_and_matches_the_record_digests() {
+    use sha2::{Digest, Sha256};
+    let f = Fixture::new(vec![command("noisy", "echo out; echo err >&2; exit 1", 30)]);
+    let (sha, code) = f.attest();
+    assert_eq!(code, 1);
+    let record = f.record(&sha);
+    for (stream, key) in [("stdout", "stdout_sha256"), ("stderr", "stderr_sha256")] {
+        let path = f.state().join(format!("{sha}.cmd1.{stream}"));
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(
+            bytes,
+            if stream == "stdout" {
+                b"out\n"
+            } else {
+                b"err\n"
+            }
+        );
+        assert_eq!(
+            record["results"][0][key].as_str().unwrap(),
+            format!("{:x}", Sha256::digest(&bytes))
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 }
 
 #[test]

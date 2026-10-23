@@ -49,6 +49,21 @@ fn registry() -> IssuerRegistrySnapshot {
     }
 }
 
+fn recipe() -> ValidationRecipe {
+    ValidationRecipe {
+        recipe_id: "gate".into(),
+        commands: vec![RecipeCommand {
+            id: "test".into(),
+            argv: vec!["cargo".into(), "test".into()],
+            timeout_secs: 60,
+        }],
+    }
+}
+
+fn recipe_hash() -> String {
+    recipe().sha256().unwrap()
+}
+
 fn record() -> ValidationRecord {
     ValidationRecord {
         subject: GitValidationSubject {
@@ -61,7 +76,7 @@ fn record() -> ValidationRecord {
             merge_base: BASE.into(),
         },
         base_tip: BASE.into(),
-        recipe_sha256: hex(1),
+        recipe_sha256: recipe_hash(),
         results: vec![CommandResult {
             id: "test".into(),
             argv: vec!["cargo".into(), "test".into()],
@@ -85,7 +100,7 @@ fn record() -> ValidationRecord {
 fn policy() -> ValidationPolicy {
     ValidationPolicy {
         repository: "repo-1".into(),
-        recipe_sha256: hex(1),
+        recipe_sha256: recipe_hash(),
         required_services: Services {
             postgres: true,
             s3: true,
@@ -99,6 +114,8 @@ type Tamper = Box<dyn FnOnce(&mut EvidencePayload)>;
 
 struct Case {
     record: ValidationRecord,
+    recipe: ValidationRecipe,
+    issued_at_ms: u64,
     registry: IssuerRegistrySnapshot,
     policy: ValidationPolicy,
     /// Policy used at verification time when it differs from the signed one.
@@ -114,6 +131,8 @@ impl Case {
     fn new() -> Self {
         Self {
             record: record(),
+            recipe: recipe(),
+            issued_at_ms: ISSUED,
             registry: registry(),
             policy: policy(),
             assess_policy: None,
@@ -142,14 +161,14 @@ impl Case {
             key_id: &key_id,
             attempt_id: "attempt-1",
             run_generation: 1,
-            issued_at_ms: ISSUED,
+            issued_at_ms: self.issued_at_ms,
             expires_at_ms: ISSUED + 86_400_000,
             issuer_registry_sha256: &self.registry.digest().unwrap(),
             cargo_lock_sha256: &hex(8),
             toolchain_file_sha256: &hex(9),
         };
         let (mut payload, mut record_bytes) =
-            evidence_payload(&self.record, &self.policy, &issuance).unwrap();
+            evidence_payload(&self.record, &self.recipe, &self.policy, &issuance).unwrap();
         if let Some(tamper) = self.tamper_payload {
             tamper(&mut payload);
         }
@@ -174,6 +193,7 @@ impl Case {
         let verdict = assess(
             &envelope_bytes,
             &record_bytes,
+            &self.recipe,
             &self.registry,
             self.assess_policy.as_ref().unwrap_or(&self.policy),
             Observed {
@@ -391,6 +411,7 @@ fn old_head(mut c: Case) -> Case {
 fn select_all(bodies: &[&str], clock: EvaluationClock) -> Verdict {
     select(
         bodies,
+        &recipe(),
         &registry(),
         &policy(),
         Observed {
@@ -421,25 +442,73 @@ fn applies_to_head_only_for_the_observed_commit() {
     assert!(!c.run().applies_to_head);
 }
 
+fn at(mut c: Case, offset: u64) -> Case {
+    c.issued_at_ms = ISSUED + offset;
+    c
+}
+
 #[test]
-fn newest_applicable_attestation_decides() {
-    let (old_pass, current_fail, current_pass) =
-        (old_head(pass()).body(), fail().body(), pass().body());
+fn latest_signed_issue_time_decides_regardless_of_order() {
+    let (old_pass, current_fail) = (old_head(pass()).body(), fail().body());
     expect(
         known(&[&old_pass, &current_fail]),
         VerdictState::Failure,
         "command failed",
     );
-    expect(
-        known(&[&current_fail, &current_pass]),
-        VerdictState::Success,
-        "validated",
+    let (fail2, pass1, pass2) = (
+        at(fail(), 2).body(),
+        at(pass(), 1).body(),
+        at(pass(), 2).body(),
     );
+    for bodies in [
+        [fail2.as_str(), pass1.as_str()],
+        [pass1.as_str(), fail2.as_str()],
+    ] {
+        expect(known(&bodies), VerdictState::Failure, "command failed");
+    }
     expect(
-        known(&[&current_pass, &current_fail]),
+        known(&[&pass1, &fail2, &pass1]),
         VerdictState::Failure,
         "command failed",
     );
+    let fail1 = at(fail(), 1).body();
+    for bodies in [
+        [fail1.as_str(), pass2.as_str()],
+        [pass2.as_str(), fail1.as_str()],
+    ] {
+        expect(known(&bodies), VerdictState::Success, "validated");
+    }
+}
+
+#[test]
+fn skipped_commands_are_never_a_pass() {
+    let mut c = Case::new();
+    c.recipe.commands.push(RecipeCommand {
+        id: "lint".into(),
+        argv: vec!["cargo".into(), "clippy".into()],
+        timeout_secs: 60,
+    });
+    c.policy.recipe_sha256 = c.recipe.sha256().unwrap();
+    c.record.recipe_sha256 = c.policy.recipe_sha256.clone();
+    c.tamper_payload = Some(Box::new(|p| {
+        assert!(p.coverage.omissions.contains(&"skipped: lint".to_owned()));
+        assert_eq!(p.coverage.expected_count, 2);
+        p.outcome = agentscm::evidence::EvidenceOutcome::Pass;
+        p.terminal_state = agentscm::evidence::TerminalState::Success;
+    }));
+    let verdict = c.run();
+    expect(verdict.clone(), VerdictState::Failure, "incomplete run");
+    assert!(verdict.detail.contains("lint"));
+}
+
+#[test]
+fn recipe_must_match_policy_and_argv_must_match_recipe() {
+    let mut c = Case::new();
+    c.recipe.commands[0].timeout_secs = 61;
+    expect(c.run(), VerdictState::Error, "recipe does not match policy");
+    let mut c = Case::new();
+    c.record.results[0].argv = vec!["true".into()];
+    fails(c, "incomplete run");
 }
 
 #[test]
@@ -496,7 +565,7 @@ fn uncertain_clock_surfaces_as_error() {
 /// The repository's own configuration must decode and agree, so drift fails CI.
 #[test]
 fn repository_configuration_is_consistent() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".agentscm/validation");
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/local-validation");
     let read = |name: &str| std::fs::read(dir.join(name)).unwrap();
     let recipe = ValidationRecipe::from_slice(&read("recipe.json")).unwrap();
     let policy = ValidationPolicy::from_slice(&read("policy.json")).unwrap();

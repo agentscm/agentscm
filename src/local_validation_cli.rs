@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentscm::evidence::{EvaluationClock, EvidenceOutcome, sign_evidence};
+use agentscm::execution::Cancellation;
 use agentscm::local_validation::comment::{self, envelope_sha256};
 use agentscm::local_validation::run::{observe, produce};
 use agentscm::local_validation::{
@@ -39,7 +40,7 @@ pub enum LocalValidationCommand {
         #[arg(long)]
         attestation: String,
     },
-    /// Decide whether an attestation satisfies the exact head. Exit 0 success, 1 failure, 2 error, 3 no attestation for the head.
+    /// Decide whether an attestation satisfies the exact head. Exit 0 success, 1 failure, 2 error (including unreadable inputs), 3 no attestation for the head.
     Verify(VerifyArgs),
     /// Post a retained attestation as a PR comment (GitHub). Posts no status.
     Post(PostArgs),
@@ -96,7 +97,7 @@ pub struct RunArgs {
 
 #[derive(Debug, Args)]
 pub struct VerifyArgs {
-    /// Comment body produced by `show`; repeat oldest first to judge a whole PR thread.
+    /// Comment body produced by `show`; repeat to judge a whole PR thread (order does not matter).
     #[arg(long, conflicts_with_all = ["envelope", "record"])]
     comment_body: Vec<PathBuf>,
     #[arg(long, requires = "record")]
@@ -105,6 +106,9 @@ pub struct VerifyArgs {
     record: Option<PathBuf>,
     #[arg(long)]
     policy: PathBuf,
+    /// Trusted (default-branch) recipe; its digest must equal the policy's.
+    #[arg(long, default_value = ".github/local-validation/recipe.json")]
+    recipe: PathBuf,
     #[arg(long)]
     registry: PathBuf,
     #[arg(long, default_value = ".")]
@@ -122,7 +126,22 @@ pub struct VerifyArgs {
 /// Returns the process exit code.
 pub async fn run(command: LocalValidationCommand) -> Result<i32> {
     match command {
-        LocalValidationCommand::Run(args) => run_recipe(args),
+        LocalValidationCommand::Run(args) => {
+            // Registered before any command starts; children run in their own process groups
+            // and would otherwise be orphaned by Ctrl-C.
+            let mut interrupt =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+            let cancel = Cancellation::default();
+            let on_interrupt = cancel.clone();
+            tokio::spawn(async move {
+                if interrupt.recv().await.is_some() {
+                    on_interrupt.cancel();
+                }
+            });
+            tokio::task::spawn_blocking(move || run_recipe(args, &cancel))
+                .await
+                .map_err(|e| Error::Invalid(format!("run task failed: {e}")))?
+        }
         LocalValidationCommand::Show {
             state_dir,
             attestation,
@@ -158,6 +177,11 @@ fn now_ms() -> Option<u64> {
 
 fn retain(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     let temporary = dir.join(format!(".{name}.tmp"));
+    // A crash can leave a stale temporary; it holds nothing retained yet.
+    match fs::remove_file(&temporary) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -181,7 +205,7 @@ fn private_state_dir(path: &Path) -> Result<()> {
     validate_private_directory_metadata(&fs::symlink_metadata(path)?)
 }
 
-fn run_recipe(args: RunArgs) -> Result<i32> {
+fn run_recipe(args: RunArgs, cancel: &Cancellation) -> Result<i32> {
     let recipe: ValidationRecipe =
         ValidationRecipe::from_slice(&read_bounded(&args.recipe, MAX_INPUT_BYTES)?)?;
     let policy = ValidationPolicy::from_slice(&read_bounded(&args.policy, MAX_INPUT_BYTES)?)?;
@@ -193,7 +217,14 @@ fn run_recipe(args: RunArgs) -> Result<i32> {
     }
     let key = read_signing_key(&args.key_file)?;
     private_state_dir(&args.state_dir)?;
-    let produced = produce(&args.repo, &recipe, &policy, &args.base_ref, &args.base_rev)?;
+    let produced = produce(
+        &args.repo,
+        &recipe,
+        &policy,
+        &args.base_ref,
+        &args.base_rev,
+        cancel,
+    )?;
     let mut attempt = [0_u8; 16];
     getrandom::fill(&mut attempt)
         .map_err(|_| Error::Invalid("random source unavailable".into()))?;
@@ -203,6 +234,7 @@ fn run_recipe(args: RunArgs) -> Result<i32> {
     let key_id = issuer_key_id(&public_hex(&key))?;
     let (payload, record_bytes) = evidence_payload(
         &produced.record,
+        &recipe,
         &policy,
         &Issuance {
             issuer_id: &args.issuer_id,
@@ -219,7 +251,16 @@ fn run_recipe(args: RunArgs) -> Result<i32> {
     let pass = payload.outcome == EvidenceOutcome::Pass;
     let envelope_bytes = serde_json::to_vec(&sign_evidence(payload, &key)?)?;
     let sha = envelope_sha256(&envelope_bytes);
-    // The record first: an envelope on disk always has its record.
+    // Command output first (diagnosis for failures), then the record: an envelope on disk
+    // always has its record. File names use the command position, never the recipe's ID.
+    let mut output_files = Vec::new();
+    for (index, output) in produced.outputs.iter().enumerate() {
+        for (stream, bytes) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
+            let name = format!("{sha}.cmd{}.{stream}", index + 1);
+            retain(&args.state_dir, &name, bytes)?;
+            output_files.push(args.state_dir.join(name).display().to_string());
+        }
+    }
     retain(
         &args.state_dir,
         &format!("{sha}.record.json"),
@@ -236,6 +277,7 @@ fn run_recipe(args: RunArgs) -> Result<i32> {
             "envelope_sha256": sha,
             "outcome": if pass { "pass" } else { "fail" },
             "commit": produced.record.subject.commit,
+            "output_files": output_files,
         })
     );
     Ok(i32::from(!pass))
@@ -281,9 +323,24 @@ fn verdict_exit(verdict: &Verdict, commit: &str) -> i32 {
     code
 }
 
+/// Input errors are an `error` verdict (exit 2), never a failure verdict (exit 1).
 fn verify(args: VerifyArgs) -> Result<i32> {
+    verify_inputs(args).or_else(|error| {
+        let verdict = Verdict {
+            state: VerdictState::Error,
+            reason: "input error",
+            detail: error.to_string(),
+            applies_to_head: false,
+            envelope_sha256: String::new(),
+        };
+        Ok(verdict_exit(&verdict, ""))
+    })
+}
+
+fn verify_inputs(args: VerifyArgs) -> Result<i32> {
     let policy = ValidationPolicy::from_slice(&read_bounded(&args.policy, MAX_INPUT_BYTES)?)?;
     let registry = read_registry(&args.registry)?;
+    let recipe = ValidationRecipe::from_slice(&read_bounded(&args.recipe, MAX_INPUT_BYTES)?)?;
     // Oversized or non-UTF-8 bodies read like any other junk: `select` ignores what does not parse.
     let bodies = args
         .comment_body
@@ -328,10 +385,12 @@ fn verify(args: VerifyArgs) -> Result<i32> {
         merge_base: &git.merge_base,
     };
     let verdict = match pair {
-        Some((envelope, record)) => assess(&envelope, &record, &registry, &policy, observed, clock),
+        Some((envelope, record)) => assess(
+            &envelope, &record, &recipe, &registry, &policy, observed, clock,
+        ),
         None => {
             let refs: Vec<&str> = bodies.iter().map(String::as_str).collect();
-            select(&refs, &registry, &policy, observed, clock)
+            select(&refs, &recipe, &registry, &policy, observed, clock)
         }
     };
     Ok(verdict_exit(&verdict, &git.commit))

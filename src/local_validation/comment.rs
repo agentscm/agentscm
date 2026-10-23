@@ -43,20 +43,22 @@ pub fn render(envelope: &[u8], record: &[u8]) -> Result<String> {
         omissions.push("s3 tests");
     }
     let mut body = format!(
-        "{MARKER_PREFIX}{} -->\n\n**Local validation: {outcome}**\n\n- commit: `{}`\n- tree: `{}`\n- base: `{}` (merge-base `{}`)\n- services: postgres={}, s3={}\n- omissions: {}\n",
+        "{MARKER_PREFIX}{} -->\n\n**Local validation: {outcome}**\n\n- commit: `{}`\n- tree: `{}`\n- base: `{}` at `{}` (merge-base `{}`)\n- services: postgres={}, s3={}\n- omissions: {}\n",
         envelope_sha256(envelope),
         parsed.subject.commit,
         parsed.subject.tree,
         parsed.context.base_ref,
+        parsed.base_tip,
         parsed.context.merge_base,
         parsed.services.postgres,
         parsed.services.s3,
         omissions.join(", "),
     );
     for r in &parsed.results {
+        let exit = r.exit_code.map_or("none".to_owned(), |c| c.to_string());
         body.push_str(&format!(
-            "- `{}`: {:?}, exit {:?}, {} ms\n",
-            r.id, r.stop, r.exit_code, r.duration_ms
+            "- `{}`: {:?}, exit {exit}, {} ms\n",
+            r.id, r.stop, r.duration_ms
         ));
     }
     body.push_str("\nThis summary is display only; the signed blocks below decide.\n\n");

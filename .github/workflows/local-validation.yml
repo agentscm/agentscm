@@ -18,7 +18,7 @@ on:
   push:
     branches: [main]
     paths:
-      - ".agentscm/validation/**"
+      - ".github/local-validation/**"
 
 permissions: {}
 
@@ -59,7 +59,7 @@ jobs:
         run: |
           set -euo pipefail
           marker='<!-- agentscm-local-validation:v1 '
-          cfg=.agentscm/validation
+          cfg=.github/local-validation
           repository=$(jq -r .repository "$cfg/policy.json")
           work=$(mktemp -d)
 

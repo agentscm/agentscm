@@ -127,8 +127,16 @@ fn file_digest(repo: &Path, commit: &str, path: &str) -> Result<String> {
         .map_err(|_| Error::Invalid(format!("{path} cannot be read at the commit")))
 }
 
+/// Captured bytes of one command, exactly those the record's digests cover.
+pub struct CommandOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
 pub struct Produced {
     pub record: ValidationRecord,
+    /// One entry per `record.results`, in order.
+    pub outputs: Vec<CommandOutput>,
     pub cargo_lock_sha256: String,
     pub toolchain_file_sha256: String,
 }
@@ -156,7 +164,13 @@ fn probe(repo: &Path, argv: &[&str]) -> String {
     line.unwrap_or_else(|| format!("{}: unavailable", argv.join(" ")))
 }
 
-fn run_command(repo: &Path, id: &str, argv: &[String], timeout_secs: u64) -> CommandResult {
+fn run_command(
+    repo: &Path,
+    id: &str,
+    argv: &[String],
+    timeout_secs: u64,
+    cancel: &Cancellation,
+) -> (CommandResult, CommandOutput) {
     let mut command = Command::new(&argv[0]);
     allowlisted(&mut command);
     command.args(&argv[1..]).current_dir(repo).process_group(0);
@@ -166,7 +180,7 @@ fn run_command(repo: &Path, id: &str, argv: &[String], timeout_secs: u64) -> Com
         None,
         Duration::from_secs(timeout_secs),
         COMMAND_OUTPUT_LIMIT,
-        &Cancellation::default(),
+        cancel,
     );
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let spawn_failed = captured.is_err();
@@ -184,7 +198,7 @@ fn run_command(repo: &Path, id: &str, argv: &[String], timeout_secs: u64) -> Com
         None if code.is_none() => StopReason::IoError,
         None => StopReason::Exited,
     };
-    CommandResult {
+    let result = CommandResult {
         id: id.into(),
         argv: argv.to_vec(),
         exit_code: if reason == StopReason::Exited {
@@ -197,17 +211,19 @@ fn run_command(repo: &Path, id: &str, argv: &[String], timeout_secs: u64) -> Com
         stdout_sha256: sha256(&stdout),
         stderr_sha256: sha256(&stderr),
         truncated: reason == StopReason::OutputLimit,
-    }
+    };
+    (result, CommandOutput { stdout, stderr })
 }
 
 /// Runs the recipe in `repo` (which must be clean) until the first failure.
-/// Only commands that actually ran are recorded.
+/// Only commands that actually ran are recorded. `cancel` stops the running command and the run.
 pub fn produce(
     repo: &Path,
     recipe: &ValidationRecipe,
     policy: &ValidationPolicy,
     base_ref: &str,
     base_rev: &str,
+    cancel: &Cancellation,
 ) -> Result<Produced> {
     let recipe_sha256 = recipe.sha256()?;
     if recipe_sha256 != policy.recipe_sha256 {
@@ -219,11 +235,12 @@ pub fn produce(
     let state = observe(repo, "HEAD", base_rev)?;
     let cargo_lock_sha256 = file_digest(repo, &state.commit, "Cargo.lock")?;
     let toolchain_file_sha256 = file_digest(repo, &state.commit, "rust-toolchain.toml")?;
-    let mut results = Vec::new();
+    let (mut results, mut outputs) = (Vec::new(), Vec::new());
     for c in &recipe.commands {
-        let result = run_command(repo, &c.id, &c.argv, c.timeout_secs);
+        let (result, output) = run_command(repo, &c.id, &c.argv, c.timeout_secs, cancel);
         let ok = result.stop == StopReason::Exited && result.exit_code == Some(0);
         results.push(result);
+        outputs.push(output);
         if !ok {
             break;
         }
@@ -240,6 +257,7 @@ pub fn produce(
     let after = observe(repo, "HEAD", base_rev)?;
     let var_set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
     Ok(Produced {
+        outputs,
         cargo_lock_sha256,
         toolchain_file_sha256,
         record: ValidationRecord {

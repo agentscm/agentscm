@@ -6,9 +6,9 @@ A maintainer can run the repository's gate on their own machine and attach a sig
 
 ## What exists
 
-- `agentscm local-validation run|show|post|verify`: see the [CLI reference](../reference/cli.md#local-validation). `run` refuses a dirty tree, runs `.agentscm/validation/recipe.json` with an allowlisted environment, and signs a portable-evidence-v1 envelope plus a `record` artifact bound to the repository, commit, tree, base ref and merge-base. Failed runs are signed too.
-- Repository configuration in `.agentscm/validation/`: `recipe.json` (the commands from `AGENTS.md`), `policy.json` (repository ID, recipe digest, required PostgreSQL and S3 services, 30-day maximum age, epoch) and `registry.json` (issuer keys). A test fails when `policy.json` drifts from `recipe.json`.
-- `.github/workflows/local-validation.yml`: on a PR comment that starts with the attestation marker, on manual dispatch, and on pushes to `main` that touch `.agentscm/validation/**` (re-verifying up to 50 open PRs), it builds `agentscm` from the default branch, fetches the PR head only as Git data, runs `verify` and posts `success`, `failure`, `error` or `pending` on exactly the verified head SHA. It never checks out, builds or runs PR code.
+- `agentscm local-validation run|show|post|verify`: see the [CLI reference](../reference/cli.md#local-validation). `run` refuses a dirty tree, runs `.github/local-validation/recipe.json` with an allowlisted environment, and signs a portable-evidence-v1 envelope plus a `record` artifact bound to the repository, commit, tree, base ref and merge-base. Failed runs are signed too.
+- Repository configuration in `.github/local-validation/`: `recipe.json` (the commands from `AGENTS.md`), `policy.json` (repository ID, recipe digest, required PostgreSQL and S3 services, 30-day maximum age, epoch) and `registry.json` (issuer keys). A test fails when `policy.json` drifts from `recipe.json`.
+- `.github/workflows/local-validation.yml`: on a PR comment that starts with the attestation marker, on manual dispatch, and on pushes to `main` that touch `.github/local-validation/**` (re-verifying up to 50 open PRs), it builds `agentscm` from the default branch, fetches the PR head only as Git data, runs `verify` and posts `success`, `failure`, `error` or `pending` on exactly the verified head SHA. It never checks out, builds or runs PR code.
 
 ## Trust boundary
 
@@ -21,7 +21,7 @@ A maintainer can run the repository's gate on their own machine and attach a sig
 ## Maintainer workflow
 
 1. Create a key with `agentscm agent-task key-generate` (owner-private file).
-2. Enroll the public key in `.agentscm/validation/registry.json` by a reviewed pull request. The shipped registry has no issuers, so nothing verifies until this happens.
+2. Enroll the public key in `.github/local-validation/registry.json` by a reviewed pull request. The shipped registry has no issuers, so nothing verifies until this happens.
 3. On a clean checkout of the PR head, with the PostgreSQL and S3 test services running, run `agentscm local-validation run`. Note the printed envelope digest.
 4. `local-validation post` the attestation to the PR (it refuses if the PR head differs from the attested commit). Do not post statuses by hand.
 5. The verifier workflow reports the status. Report `pending` or `failure` as it is.

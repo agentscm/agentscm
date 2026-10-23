@@ -194,6 +194,23 @@ impl ValidationRecipe {
         Ok(recipe)
     }
 
+    /// The first position where `results` departs from this recipe's commands (ids and argv, in
+    /// order), as `(reason, detail)`. A missing command is reported by id.
+    fn first_departure(&self, results: &[CommandResult]) -> Option<String> {
+        for (index, command) in self.commands.iter().enumerate() {
+            match results.get(index) {
+                None => return Some(format!("{} did not run", command.id)),
+                Some(r) if r.id != command.id || r.argv != command.argv => {
+                    return Some(format!("{} differs from the recipe", r.id));
+                }
+                Some(_) => {}
+            }
+        }
+        results
+            .get(self.commands.len())
+            .map(|r| format!("{} is not in the recipe", r.id))
+    }
+
     /// SHA-256 of the recipe's canonical (struct-ordered JSON) bytes.
     pub fn sha256(&self) -> Result<String> {
         self.validate()?;
@@ -375,6 +392,7 @@ pub struct Issuance<'a> {
 /// Builds the payload to sign and the exact `record` artifact bytes it commits to.
 pub fn evidence_payload(
     record: &ValidationRecord,
+    recipe: &ValidationRecipe,
     policy: &ValidationPolicy,
     issuance: &Issuance<'_>,
 ) -> Result<(EvidencePayload, Vec<u8>)> {
@@ -384,8 +402,16 @@ pub fn evidence_payload(
         postgres: true,
         s3: true,
     };
-    let pass = record.shortfall(all_services).is_none();
+    let pass = record.shortfall(all_services).is_none()
+        && recipe.first_departure(&record.results).is_none();
     let mut omissions: Vec<String> = FIXED_OMISSIONS.iter().map(|s| (*s).to_owned()).collect();
+    omissions.extend(
+        recipe
+            .commands
+            .iter()
+            .filter(|c| !record.results.iter().any(|r| r.id == c.id))
+            .map(|c| format!("skipped: {}", c.id)),
+    );
     if !record.services.postgres {
         omissions.push("postgres tests".into());
     }
@@ -445,7 +471,7 @@ pub fn evidence_payload(
         qualification_claim: None,
         coverage: CoverageClaim {
             scope: record.results.iter().map(|r| r.id.clone()).collect(),
-            expected_count: record.results.len() as u32,
+            expected_count: recipe.commands.len() as u32,
             observed_count: record.results.len() as u32,
             inventory_complete: false,
             omissions,
@@ -531,6 +557,7 @@ pub struct Observed<'a> {
 pub fn assess(
     envelope_bytes: &[u8],
     record_bytes: &[u8],
+    recipe: &ValidationRecipe,
     registry: &IssuerRegistrySnapshot,
     policy: &ValidationPolicy,
     observed: Observed<'_>,
@@ -539,6 +566,7 @@ pub fn assess(
     let mut verdict = assess_envelope(
         envelope_bytes,
         record_bytes,
+        recipe,
         registry,
         policy,
         observed,
@@ -548,25 +576,39 @@ pub fn assess(
     verdict
 }
 
-/// Assesses every comment body (oldest first) and returns the newest verdict that applies to
-/// the observed head. Bodies that do not parse, or that are stale, tampered or signed by an
-/// unregistered key, never decide. Without an applicable one, an environmental `Error`
-/// (uncertain clock, invalid policy) surfaces; otherwise the result is `Pending`.
+/// Assesses every comment body and returns the verdict that applies to the observed head with
+/// the greatest signed `issued_at_ms` (ties: greatest envelope digest), so neither comment order
+/// nor reposting an older attestation changes the result. Bodies that do not parse, or that are
+/// stale, tampered or signed by an unregistered key, never decide. Without an applicable one, an
+/// environmental `Error` (uncertain clock, invalid policy) surfaces; otherwise `Pending`.
 pub fn select(
-    bodies_oldest_first: &[&str],
+    bodies: &[&str],
+    recipe: &ValidationRecipe,
     registry: &IssuerRegistrySnapshot,
     policy: &ValidationPolicy,
     observed: Observed<'_>,
     clock: EvaluationClock,
 ) -> Verdict {
     let (mut decided, mut error, mut ignored) = (None, None, None);
-    for body in bodies_oldest_first {
+    let mut decided_key = (0_u64, String::new());
+    for body in bodies {
         let Ok((envelope, record)) = comment::parse(body) else {
             continue;
         };
-        let verdict = assess(&envelope, &record, registry, policy, observed, clock);
+        let verdict = assess(
+            &envelope, &record, recipe, registry, policy, observed, clock,
+        );
         if verdict.applies_to_head {
-            decided = Some(verdict);
+            // Only a verified envelope applies to the head, so its issue time is the signed one.
+            let issued = serde_json::from_slice::<serde_json::Value>(&envelope)
+                .ok()
+                .and_then(|v| v["payload"]["issued_at_ms"].as_u64())
+                .unwrap_or(0);
+            let key = (issued, verdict.envelope_sha256.clone());
+            if decided.is_none() || key > decided_key {
+                decided_key = key;
+                decided = Some(verdict);
+            }
         } else {
             ignored = Some(format!("{}: {}", verdict.reason, verdict.detail));
             if verdict.state == VerdictState::Error {
@@ -589,6 +631,7 @@ pub fn select(
 fn assess_envelope(
     envelope_bytes: &[u8],
     record_bytes: &[u8],
+    recipe: &ValidationRecipe,
     registry: &IssuerRegistrySnapshot,
     policy: &ValidationPolicy,
     observed: Observed<'_>,
@@ -597,6 +640,13 @@ fn assess_envelope(
     use VerdictState::Error as Err_;
     if let Err(error) = policy.validate() {
         return Verdict::new(Err_, "policy invalid", error.to_string());
+    }
+    if recipe.sha256().ok().as_ref() != Some(&policy.recipe_sha256) {
+        return Verdict::new(
+            Err_,
+            "recipe does not match policy",
+            "the trusted recipe differs from the policy digest",
+        );
     }
     let inputs = [ArtifactInput {
         artifact_id: "record",
@@ -698,8 +748,19 @@ fn assess_envelope(
     if record.recipe_sha256 != policy.recipe_sha256 {
         return Verdict::failure("recipe mismatch", "recipe differs from policy").applied();
     }
+    // Departures inside the recipe order come first; a stopped run is a prefix, reported below.
+    let departure = recipe.first_departure(&record.results);
+    if let Some(detail) = departure
+        .as_ref()
+        .filter(|_| record.results.len() >= recipe.commands.len())
+    {
+        return Verdict::failure("incomplete run", detail.clone()).applied();
+    }
     if let Some((reason, detail)) = record.shortfall(policy.required_services) {
         return Verdict::failure(reason, detail).applied();
+    }
+    if let Some(detail) = departure {
+        return Verdict::failure("incomplete run", detail).applied();
     }
     if payload.outcome != EvidenceOutcome::Pass || payload.terminal_state != TerminalState::Success
     {
@@ -716,6 +777,27 @@ fn assess_envelope(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tracked files must stay eligible for native capture, so none may use a reserved name.
+    #[test]
+    fn tracked_paths_avoid_reserved_namespaces() {
+        let Ok(out) = std::process::Command::new("git")
+            .args(["ls-files", "-z"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+        else {
+            return;
+        };
+        if !out.status.success() {
+            return;
+        }
+        let paths = String::from_utf8_lossy(&out.stdout);
+        let reserved: Vec<&str> = paths
+            .split('\0')
+            .filter(|p| crate::git_path_profile::uses_reserved_namespace(p))
+            .collect();
+        assert!(reserved.is_empty(), "reserved tracked paths: {reserved:?}");
+    }
 
     const SHA1: &str = "0123456789abcdef0123456789abcdef01234567";
 
