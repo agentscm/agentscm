@@ -353,8 +353,8 @@ struct Live {
 }
 
 impl Live {
-    /// The last line of every run.
-    fn line(&self) -> String {
+    /// The last line of every run; `cli` is the program to run again (see `cli_command`).
+    fn line(&self, cli: &str) -> String {
         let off = |reason: &str, todo: &str| format!("Live warnings: off — {reason} ({todo})");
         if let Some(command) = &self.pending_local {
             return off(
@@ -365,19 +365,21 @@ impl Live {
         match (&self.hub, &self.repo) {
             (None, _) => off(
                 "no hub chosen",
-                "run `agentscm quickstart --local` for a hub on this machine, or `--hosted --hub-url URL` for your team's hub",
+                &format!(
+                    "run `{cli} quickstart --local` for a hub on this machine, or `--hosted --hub-url URL` for your team's hub"
+                ),
             ),
             (Some(url), _) if !self.hub_up => off(
                 &format!("the hub at {url} isn't answering"),
-                "start it, then run `agentscm quickstart` again",
+                &format!("start it, then run `{cli} quickstart` again"),
             ),
             (Some(_), None) => off(
                 "no agent token or hub settings were saved",
-                "run `agentscm quickstart` again, or pass `--agent-token-file`",
+                &format!("run `{cli} quickstart` again, or pass `--agent-token-file`"),
             ),
             (Some(_), Some(_)) if !self.hooks => off(
                 "no Claude Code hooks were added",
-                "run `agentscm quickstart --hook project`",
+                &format!("run `{cli} quickstart --hook project`"),
             ),
             (Some(url), Some(repo)) => format!("Live warnings: on (hub {url}, repo {repo})"),
         }
@@ -405,6 +407,13 @@ pub async fn run(args: QuickstartArgs) -> Result<u8> {
         return Err(invalid(NEEDS_TERMINAL));
     }
     let ui = Ui { yes: args.yes };
+    if args.yes
+        && (args.local || matches!(args.hub, Some(HubChoice::Local)))
+        && args.github_login.is_none()
+        && Manifest::load()?.is_none_or(|m| m.local_hub.is_none() && m.native_hub.is_none())
+    {
+        hub_setup::github_login(None, &ui).map_err(|message| invalid(&message))?;
+    }
     let home = home_dir()?;
     let _quickstart_lease = manifest::acquire_lease()?;
     let cwd = std::env::current_dir()?;
@@ -439,13 +448,19 @@ pub async fn run(args: QuickstartArgs) -> Result<u8> {
     if let Some(url) = choose_hub(&mut cx).await {
         cx.live.hub_up = healthy(&cx.client, &url).await;
         cx.live.hub = Some(url.clone());
-        if !cx.live.hub_up {
-            println!(
-                "The hub at {url} isn't answering; live warnings will start working once it is."
-            );
-        }
         if let Some(staged) = token_stage(&mut cx, &url).await {
             hub_json_stage(&mut cx, &url, &staged);
+        }
+        if !cx.live.hub_up {
+            if cx.live.repo.is_some() {
+                println!(
+                    "The hub at {url} isn't answering; its settings are saved, so live warnings start once it answers."
+                );
+            } else {
+                println!(
+                    "The hub at {url} isn't answering, so nothing was saved for it. Start it, then run quickstart again."
+                );
+            }
         }
     }
     collisions_step(&cx);
@@ -467,7 +482,13 @@ pub async fn run(args: QuickstartArgs) -> Result<u8> {
             binary::quote(dir)
         );
     }
-    println!("{}", cx.live.line());
+    if let (Some(url), Some(repo), true) = (&cx.live.hub, &cx.live.repo, cx.live.hub_up) {
+        println!("Hub status page: {url}/ui/");
+        println!(
+            "Sign in there with a read-only token: {command} hub token create --read-only --name status-page --repo {repo} --ttl 30d"
+        );
+    }
+    println!("{}", cx.live.line(&command));
     if let Some(failure) = cx.failure {
         return Err(invalid(&failure));
     }
@@ -759,6 +780,15 @@ async fn choose_hub(cx: &mut Cx<'_>) -> Option<String> {
                 Ok(url) => return url,
                 Err(message) => {
                     println!("{message}");
+                    // Both runtimes' busy-port errors say "already in use".
+                    if message.contains("already in use")
+                        && let Some(port) = free_port()
+                    {
+                        println!(
+                            "To use a free port, run: {} quickstart --local --hub-port {port}",
+                            cli_command(cx)
+                        );
+                    }
                     if cx.ui.yes {
                         cx.failure = Some(message);
                         return None;
@@ -832,6 +862,13 @@ fn valid_hub_project(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn free_port() -> Option<u16> {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|listener| listener.local_addr())
+        .map(|addr| addr.port())
+        .ok()
 }
 
 fn native_hub_supported() -> bool {
@@ -1825,7 +1862,8 @@ fn init_stage(cx: &mut Cx<'_>) {
     };
     if is_loopback(&hub) {
         println!(
-            "Skipping repository agent config: this hub runs on this machine. When you have a shared hub, run `agentscm init-repo --hub-url URL`."
+            "Skipping repository agent config: this hub runs on this machine. When you have a shared hub, run `{} init-repo --hub-url URL`.",
+            cli_command(cx)
         );
         return;
     }
@@ -2322,7 +2360,7 @@ mod tests {
             pending_local: Some("/opt/agentscm quickstart --hub local".into()),
             ..Live::default()
         };
-        let line = live.line();
+        let line = live.line("agentscm");
         assert!(line.contains("finish creating and installing the app"));
         assert!(line.contains("`/opt/agentscm quickstart --hub local`"));
         assert!(!line.contains("agent-token-file"));
@@ -2390,24 +2428,24 @@ mod tests {
     fn the_last_line_says_why_warnings_are_off() {
         let mut live = Live::default();
         assert!(
-            live.line()
+            live.line("agentscm")
                 .starts_with("Live warnings: off — no hub chosen (")
         );
         live.hub = Some("http://h".into());
         assert_eq!(
-            live.line(),
+            live.line("agentscm"),
             "Live warnings: off — the hub at http://h isn't answering (start it, then run `agentscm quickstart` again)"
         );
         live.hub_up = true;
         assert!(
-            live.line()
+            live.line("agentscm")
                 .contains("no agent token or hub settings were saved")
         );
         live.repo = Some("acme/widgets".into());
-        assert!(live.line().contains("no Claude Code hooks"));
+        assert!(live.line("agentscm").contains("no Claude Code hooks"));
         live.hooks = true;
         assert_eq!(
-            live.line(),
+            live.line("agentscm"),
             "Live warnings: on (hub http://h, repo acme/widgets)"
         );
     }
