@@ -274,6 +274,11 @@ fn now_ms() -> i64 {
 
 impl Sync {
     #[cfg(unix)]
+    /// Accepted webhook deliveries whose job has not finished.
+    pub(super) fn pending_webhooks(&self) -> usize {
+        self.pending.load(Ordering::Relaxed)
+    }
+
     pub(super) fn forge_cursor(&self, repository: &str) -> i64 {
         lock(&self.forge_cursors)
             .get(repository)
@@ -385,7 +390,7 @@ impl Sync {
             .ok_or_else(|| GhError::Failed("no app credentials loaded for the connection".into()))
     }
 
-    async fn jwt(&self, conn: &Connection) -> Gh<String> {
+    pub(super) async fn jwt(&self, conn: &Connection) -> Gh<String> {
         let app = self.app(conn)?;
         Ok(app.key.jwt(app.app_id, unix_now())?)
     }

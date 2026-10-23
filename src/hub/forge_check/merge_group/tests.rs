@@ -296,3 +296,39 @@ fn status_source_names_who_posted_the_newest_status_of_the_context() {
     assert_eq!(status_source(&json!([]), false, ctx, Some("x")), "unknown");
     assert_eq!(status_source(&list, true, ctx, None), "unknown");
 }
+
+#[test]
+fn delivery_access_needs_an_app_with_the_permission_and_the_event() {
+    let installation = |permission: Option<&str>, events: Value| json!({"permissions": {"merge_queues": permission}, "events": events});
+    let full = installation(Some("read"), json!(["pull_request", "merge_group"]));
+    assert_eq!(delivery_access("app", Some(&full)), "subscribed");
+    let no_event = installation(Some("write"), json!(["pull_request"]));
+    assert_eq!(
+        delivery_access("app", Some(&no_event)),
+        "event_not_subscribed"
+    );
+    let no_permission = installation(None, json!(["merge_group"]));
+    assert_eq!(
+        delivery_access("app", Some(&no_permission)),
+        "permission_missing"
+    );
+    assert_eq!(delivery_access("app", None), "unknown");
+    // GitHub delivers merge_group only to Apps, never to repository webhooks.
+    assert_eq!(
+        delivery_access("pat", Some(&full)),
+        "personal_token_unsupported"
+    );
+}
+
+#[test]
+fn only_a_verified_merge_commit_is_a_landed_outcome() {
+    assert_eq!(outcome(None), "pending");
+    assert_eq!(outcome(Some(LANDED)), "landed");
+    assert_eq!(outcome(Some("merged")), "merged_reported");
+    for reason in ["invalidated", "dequeued", "merge group was rebuilt"] {
+        assert_eq!(outcome(Some(reason)), "not_landed");
+    }
+    for reason in [MERGED_ELSEWHERE, "merge group branch is gone", "destroyed"] {
+        assert_eq!(outcome(Some(reason)), "unknown");
+    }
+}

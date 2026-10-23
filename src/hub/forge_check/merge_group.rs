@@ -8,6 +8,7 @@
 //! for its combined source and stays pending. The webhook payload only names the group; its
 //! existence, tree and base are read again from GitHub.
 use std::collections::HashMap;
+use std::sync::{Mutex, PoisonError};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -20,7 +21,7 @@ use super::super::forge_api::ForgeApi;
 use super::super::github::{self, CommitStatus, Gh, GhError, StatusState};
 use super::super::http::blocking;
 use super::super::publish::Publication;
-use super::super::store::unix_now;
+use super::super::store::{Store, unix_now};
 use super::super::workspace_execution::AgentTaskProfile;
 use super::super::{HubState, Result};
 use super::{
@@ -282,6 +283,12 @@ pub fn status_source(
     }
 }
 
+/// Ended reason when the queued pull request merged with the group commit as its merge commit.
+const LANDED: &str = "landed";
+/// Ended reason when the queued pull request merged as some other commit (for example a group
+/// stacked above this one): this group's own outcome is unknown.
+const MERGED_ELSEWHERE: &str = "pull request merged as another commit";
+
 /// Current groups rechecked per poll, oldest observation first.
 const MAX_GROUPS_PER_PASS: usize = 20;
 /// How many queue groups beneath one the projection follows.
@@ -366,6 +373,19 @@ pub(super) async fn reconcile_active(
         store.active_merge_groups(&id, MAX_GROUPS_PER_PASS)
     })
     .await?;
+    let ForgeApi::Github(api) = state.sync.forge(conn)? else {
+        return Ok(());
+    };
+    let targets: Vec<String> = state
+        .workspace_execution
+        .iter()
+        .flat_map(|service| service.agent_task_profiles.values())
+        .filter(|p| p.publish_forge_status && p.repository_id.eq_ignore_ascii_case(&repo.full_name))
+        .map(|p| p.target.clone())
+        .collect();
+    for target in &targets {
+        observe_readiness(state, api, conn, repo, token, target).await?;
+    }
     for row in rows {
         match reconcile_group(state, conn, repo, token, &row).await {
             Ok(()) => {}
@@ -407,6 +427,52 @@ async fn end(
     .await
 }
 
+/// Reads the queue branch; when the group is no longer its tip, ends the group and says false.
+async fn still_current(
+    state: &HubState,
+    api: &github::Api,
+    repo: &ConnectedRepository,
+    token: &str,
+    row: &MergeGroup,
+) -> Gh<bool> {
+    let tip = api.ref_sha(token, &repo.full_name, &row.head_ref).await?;
+    let Some(reason) = lifecycle(&row.head_sha, tip.as_deref()) else {
+        return Ok(true);
+    };
+    let reason = if tip.is_none() {
+        gone_reason(api, repo, token, row).await?
+    } else {
+        reason
+    };
+    end(state, repo, &row.head_sha, reason).await?;
+    Ok(false)
+}
+
+/// Why a group whose queue branch is gone ended. `landed` only when the queued pull request is
+/// merged with the group commit itself as its merge commit; anything else stays uncertain.
+async fn gone_reason(
+    api: &github::Api,
+    repo: &ConnectedRepository,
+    token: &str,
+    row: &MergeGroup,
+) -> Gh<&'static str> {
+    let pull = match api.pull_soft(token, &repo.full_name, row.pr_number).await {
+        Ok(pull) => pull,
+        Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
+        Err(GhError::Failed(_)) => None,
+    };
+    Ok(match pull {
+        Some(pull) if pull["merged"] == true => {
+            if pull["merge_commit_sha"].as_str() == Some(row.head_sha.as_str()) {
+                LANDED
+            } else {
+                MERGED_ELSEWHERE
+            }
+        }
+        _ => "merge group branch is gone",
+    })
+}
+
 /// One read-decide-post round for one current group.
 async fn reconcile_group(
     state: &HubState,
@@ -418,9 +484,8 @@ async fn reconcile_group(
     let ForgeApi::Github(api) = state.sync.forge(conn)? else {
         return Ok(());
     };
-    let tip = api.ref_sha(token, &repo.full_name, &row.head_ref).await?;
-    if let Some(reason) = lifecycle(&row.head_sha, tip.as_deref()) {
-        return Ok(end(state, repo, &row.head_sha, reason).await?);
+    if !still_current(state, api, repo, token, row).await? {
+        return Ok(());
     }
     let profile = profile_for(state, repo, &row.base_ref);
     let judged = match &profile {
@@ -598,9 +663,8 @@ async fn post_group(
         if !status_authorized(state, authorization.as_ref()).await? {
             return Ok(());
         }
-        let tip = api.ref_sha(token, &repo.full_name, &row.head_ref).await?;
-        if let Some(reason) = lifecycle(&row.head_sha, tip.as_deref()) {
-            return Ok(end(state, repo, &row.head_sha, reason).await?);
+        if !still_current(state, api, repo, token, row).await? {
+            return Ok(());
         }
     }
     let phase = match api
@@ -682,18 +746,42 @@ pub async fn group_projection(
         let Some(row) = store.merge_group(&id, &head)? else {
             return Ok(None);
         };
-        let mut stacked_on = Vec::new();
-        let mut base = row.base_sha.clone();
-        while stacked_on.len() < MAX_STACK_DEPTH {
-            let Some(below) = store.merge_group(&id, &base)? else {
-                break;
-            };
-            stacked_on.push(below.pr_number);
-            base = below.base_sha;
-        }
+        let stacked_on = stacked_on(&*store, &id, &row)?;
         Ok(Some(projection(&row, stacked_on)))
     })
     .await
+}
+
+/// Projections of the groups that queued pull request `pr_number`, newest first.
+pub async fn pull_projections(
+    state: &HubState,
+    repo_id: &str,
+    pr_number: i64,
+    limit: usize,
+) -> Result<Vec<Projection>> {
+    let (store, id) = (state.store.clone(), repo_id.to_owned());
+    blocking(state, move || {
+        store
+            .merge_groups_for_pull(&id, pr_number, limit)?
+            .iter()
+            .map(|row| Ok(projection(row, stacked_on(&*store, &id, row)?)))
+            .collect()
+    })
+    .await
+}
+
+/// Pull request numbers of the queue groups the Hub saw beneath `row`, nearest first.
+fn stacked_on(store: &dyn Store, repo_id: &str, row: &MergeGroup) -> Result<Vec<i64>> {
+    let mut stacked = Vec::new();
+    let mut base = row.base_sha.clone();
+    while stacked.len() < MAX_STACK_DEPTH {
+        let Some(below) = store.merge_group(repo_id, &base)? else {
+            break;
+        };
+        stacked.push(below.pr_number);
+        base = below.base_sha;
+    }
+    Ok(stacked)
 }
 
 pub fn projection(row: &MergeGroup, stacked_on: Vec<i64>) -> Projection {
@@ -713,6 +801,7 @@ pub fn projection(row: &MergeGroup, stacked_on: Vec<i64>) -> Projection {
             "current"
         },
         ended_reason: row.ended_reason.clone(),
+        outcome: outcome(row.ended_reason.as_deref()),
         state: check.map(|c| c.state.clone()),
         description: check.map(|c| c.description.clone()),
         binding_digest: check.and_then(|c| c.binding_digest.clone()),
@@ -735,6 +824,123 @@ pub fn projection(row: &MergeGroup, stacked_on: Vec<i64>) -> Projection {
     }
 }
 
+/// What the outcome of an ended group is known to be, from its ended reason.
+pub fn outcome(ended_reason: Option<&str>) -> &'static str {
+    match ended_reason {
+        None => "pending",
+        Some(LANDED) => "landed",
+        // GitHub's signed delivery says so; the Hub did not see the merge commit itself.
+        Some("merged") => "merged_reported",
+        Some("invalidated" | "dequeued" | "merge group was rebuilt") => "not_landed",
+        Some(_) => "unknown",
+    }
+}
+
+/// Whether merge queue groups of `target` can reach the Hub at all, and which current queue
+/// branches it has no delivery for. Re-read on every poll; held in memory only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct QueueReadiness {
+    pub target: String,
+    /// `subscribed`, `permission_missing`, `event_not_subscribed`,
+    /// `personal_token_unsupported` (GitHub delivers `merge_group` only to Apps) or `unknown`.
+    pub delivery: &'static str,
+    /// Pull request numbers of current queue branches no delivery named. None when the branch
+    /// listing was refused or truncated, so it is unknown.
+    pub undelivered: Option<Vec<i64>>,
+    pub checked_at: i64,
+}
+
+type Readiness = HashMap<(String, String), QueueReadiness>;
+static READINESS: Mutex<Option<Readiness>> = Mutex::new(None);
+
+/// The last readiness observed for `repo_id` and `target` in this process.
+pub fn queue_readiness(repo_id: &str, target: &str) -> Option<QueueReadiness> {
+    READINESS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()?
+        .get(&(repo_id.to_owned(), target.to_owned()))
+        .cloned()
+}
+
+/// Delivery access from the connection kind and the App installation GitHub returned.
+pub fn delivery_access(kind: &str, installation: Option<&Value>) -> &'static str {
+    if kind != "app" {
+        return "personal_token_unsupported";
+    }
+    let Some(installation) = installation else {
+        return "unknown";
+    };
+    let permitted = matches!(
+        installation["permissions"]["merge_queues"].as_str(),
+        Some("read" | "write")
+    );
+    let subscribed = installation["events"]
+        .as_array()
+        .is_some_and(|events| events.iter().any(|e| e == "merge_group"));
+    match (permitted, subscribed) {
+        (false, _) => "permission_missing",
+        (true, false) => "event_not_subscribed",
+        (true, true) => "subscribed",
+    }
+}
+
+async fn observe_readiness(
+    state: &HubState,
+    api: &github::Api,
+    conn: &Connection,
+    repo: &ConnectedRepository,
+    token: &str,
+    target: &str,
+) -> Gh<()> {
+    let installation = match (conn.kind.as_str(), repo.installation_id) {
+        ("app", Some(id)) => {
+            let jwt = state.sync.jwt(conn).await?;
+            match api.installation(&jwt, id).await {
+                Ok(found) => found,
+                Err(error @ GhError::Limited(_)) => return Err(error),
+                Err(GhError::Auth(_) | GhError::Failed(_)) => None,
+            }
+        }
+        _ => None,
+    };
+    let delivery = delivery_access(&conn.kind, installation.as_ref());
+    let undelivered = match api.queue_branches(token, &repo.full_name, target).await? {
+        Some((branches, true)) => {
+            let queued: Vec<(i64, String)> = branches
+                .into_iter()
+                .filter_map(|(name, sha)| Some((queue_branch(&name)?.pr_number, sha)))
+                .collect();
+            let (store, id) = (state.store.clone(), repo.id.clone());
+            Some(
+                blocking(state, move || {
+                    let mut missing = Vec::new();
+                    for (number, sha) in queued {
+                        if store.merge_group(&id, &sha)?.is_none() {
+                            missing.push(number);
+                        }
+                    }
+                    Ok(missing)
+                })
+                .await?,
+            )
+        }
+        _ => None,
+    };
+    let readiness = QueueReadiness {
+        target: target.to_owned(),
+        delivery,
+        undelivered,
+        checked_at: unix_now(),
+    };
+    READINESS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get_or_insert_with(HashMap::new)
+        .insert((repo.id.clone(), target.to_owned()), readiness);
+    Ok(())
+}
+
 /// The compact, read-only view consumers use instead of scraping a status description.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Projection {
@@ -749,6 +955,9 @@ pub struct Projection {
     pub stacked_on: Vec<i64>,
     pub lifecycle: &'static str,
     pub ended_reason: Option<String>,
+    /// `pending`, `landed` (the queued pull request merged as this group commit),
+    /// `merged_reported` (GitHub's delivery said merged), `not_landed` or `unknown`.
+    pub outcome: &'static str,
     pub state: Option<String>,
     pub description: Option<String>,
     pub binding_digest: Option<String>,

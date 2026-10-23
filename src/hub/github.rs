@@ -489,6 +489,59 @@ impl Api {
         reply.ok("repos").map(Some)
     }
 
+    /// One installation of the App, read with the App's JWT: its granted permissions and the
+    /// events it is subscribed to. None when GitHub does not know it (404).
+    pub async fn installation(&self, jwt: &str, installation: i64) -> Gh<Option<Value>> {
+        let reply = self
+            .get(jwt, &format!("/app/installations/{installation}"))
+            .await?;
+        if reply.status == 404 {
+            return Ok(None);
+        }
+        reply.ok("app").map(Some)
+    }
+
+    /// The current merge queue branches of `base` as (branch name, commit), at most one page of
+    /// 100, and whether that is all of them. None when GitHub refuses the read.
+    pub async fn queue_branches(
+        &self,
+        token: &str,
+        full_name: &str,
+        base: &str,
+    ) -> Gh<Option<(Vec<(String, String)>, bool)>> {
+        if !valid_ref_name(base) {
+            return Err(GhError::Failed("bad branch name".into()));
+        }
+        let url = format!(
+            "{}/repos/{full_name}/git/matching-refs/heads/gh-readonly-queue/{}/?per_page=100",
+            self.base,
+            encode_path(base)
+        );
+        let reply = self
+            .send(token, Method::GET, &url, None, None, false)
+            .await?;
+        if matches!(reply.status, 403 | 404) {
+            return Ok(None);
+        }
+        let complete = !reply.next;
+        let body = reply.ok("git")?;
+        let refs = body
+            .as_array()
+            .ok_or_else(|| GhError::Failed("unreadable reply from git".into()))?
+            .iter()
+            .map(|item| {
+                let name = item["ref"]
+                    .as_str()
+                    .and_then(|r| r.strip_prefix("refs/heads/"));
+                match (name, item["object"]["sha"].as_str()) {
+                    (Some(name), Some(sha)) => Ok((name.to_owned(), sha.to_owned())),
+                    _ => Err(GhError::Failed("unreadable reply from git".into())),
+                }
+            })
+            .collect::<Gh<Vec<_>>>()?;
+        Ok(Some((refs, complete)))
+    }
+
     /// The ruleset rules that apply to `branch` (read-only). None when GitHub refuses or does not
     /// know the read (403, 404): the requirement is then unknown, not absent.
     pub async fn branch_rules(
