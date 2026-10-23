@@ -106,7 +106,7 @@ fn restore_private_file(path: &Path, prior: &Option<Vec<u8>>) -> Result<(), Stri
             atomic_private(path, text)
         }
         None => match std::fs::remove_file(path) {
-            Ok(()) => sync_dir(path.parent().ok_or("private file has no parent")?),
+            Ok(()) => super::sync_dir(path.parent().ok_or("private file has no parent")?),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.to_string()),
         },
@@ -548,13 +548,13 @@ impl SlackSwap {
                 Err(error) => return Err(error.to_string()),
             }
         }
-        sync_dir(
+        super::sync_dir(
             self.target
                 .parent()
                 .ok_or("native Slack target has no parent")?,
         )?;
         if self.target.exists() {
-            sync_dir(&self.target)?;
+            super::sync_dir(&self.target)?;
         }
         self.active = false;
         Ok(())
@@ -567,7 +567,7 @@ impl SlackSwap {
         self.active = false;
         std::fs::remove_dir_all(&self.next).ok();
         std::fs::remove_dir_all(&self.backup).map_err(|error| error.to_string())?;
-        sync_dir(
+        super::sync_dir(
             self.backup
                 .parent()
                 .ok_or("native Slack backup has no parent")?,
@@ -709,7 +709,7 @@ where
         if next.exists() {
             std::fs::remove_dir_all(next).map_err(|error| error.to_string())?;
         }
-        sync_dir(&parent)?;
+        super::sync_dir(&parent)?;
         return Ok(true);
     }
     let prior_receipt = if pending.receipt_present {
@@ -751,7 +751,7 @@ where
     };
     validate_native_restoration(&recovery)?;
     std::fs::remove_dir_all(&backup).map_err(|error| error.to_string())?;
-    sync_dir(&parent)?;
+    super::sync_dir(&parent)?;
     Ok(false)
 }
 
@@ -879,7 +879,7 @@ where
             return Err("Could not preserve the previous native Hub Slack bundle.".into());
         }
     }
-    sync_dir(parent)?;
+    super::sync_dir(parent)?;
     atomic_private(&backup.join("ready"), "")?;
     let swap = SlackSwap {
         target: dir.clone(),
@@ -899,7 +899,7 @@ where
         for name in prior.files.keys().filter(|name| !files.contains_key(*name)) {
             std::fs::remove_file(dir.join(name)).map_err(|error| error.to_string())?;
         }
-        sync_dir(&dir)?;
+        super::sync_dir(&dir)?;
         Ok::<(), String>(())
     })();
     if let Err(error) = replaced {
@@ -1063,11 +1063,9 @@ fn atomic_private(path: &Path, contents: &str) -> Result<(), String> {
     let temp = parent.join(format!(".agentscm-service-{}.tmp", std::process::id()));
     let _ = std::fs::remove_file(&temp);
     crate::hub_cli::write_private(&temp, contents).map_err(|error| error.to_string())?;
-    std::fs::File::open(&temp)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| error.to_string())?;
+    super::sync_file(&temp)?;
     std::fs::rename(&temp, path).map_err(|error| error.to_string())?;
-    sync_dir(parent)
+    super::sync_dir(parent)
 }
 
 fn github_environment_transition(prior: &Record, next: &Record) -> bool {
@@ -1225,7 +1223,7 @@ fn validate_github_transaction_state(
 fn clear_github_update(config_dir: &Path) -> Result<(), String> {
     let path = github_update_path(config_dir);
     std::fs::remove_file(&path).map_err(|error| error.to_string())?;
-    sync_dir(
+    super::sync_dir(
         path.parent()
             .ok_or("native GitHub recovery record has no parent")?,
     )
@@ -1390,19 +1388,11 @@ async fn reconcile_github_error(
     }
 }
 
-fn sync_dir(path: &Path) -> Result<(), String> {
-    std::fs::File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| error.to_string())
-}
-
 fn save_manifest_durable(manifest: &mut Manifest) -> Result<(), String> {
     manifest.save().map_err(|error| error.to_string())?;
     let path = super::manifest::path().map_err(|error| error.to_string())?;
-    std::fs::File::open(&path)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| error.to_string())?;
-    sync_dir(path.parent().ok_or("quickstart manifest has no parent")?)
+    super::sync_file(&path)?;
+    super::sync_dir(path.parent().ok_or("quickstart manifest has no parent")?)
 }
 
 fn reject_symlink(path: &Path, description: &str) -> Result<(), String> {

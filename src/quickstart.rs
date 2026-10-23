@@ -210,6 +210,28 @@ fn preflight_slack(args: &QuickstartArgs) -> Result<()> {
 
 // ---- files ----
 
+/// Flushes a written file to disk. Windows flushes only through a writable handle.
+fn sync_file(path: &Path) -> std::result::Result<(), String> {
+    #[cfg(unix)]
+    let file = std::fs::File::open(path);
+    #[cfg(not(unix))]
+    let file = std::fs::OpenOptions::new().write(true).open(path);
+    file.and_then(|file| file.sync_all())
+        .map_err(|error| error.to_string())
+}
+
+/// Makes a rename or removal in `path` durable. Windows cannot open a directory as a file and has
+/// no such step.
+fn sync_dir(path: &Path) -> std::result::Result<(), String> {
+    #[cfg(unix)]
+    std::fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| error.to_string())?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 /// `Ok(None)` only when the file is absent; any other failure to read it (permissions,
 /// not UTF-8) is an error, so a file we cannot read is never overwritten.
 fn read_existing(path: &Path) -> std::result::Result<Option<String>, String> {
@@ -2396,7 +2418,7 @@ mod tests {
             agent_token_file: None,
             agent_name: None,
             ttl: "30d".into(),
-            slack_config_file: Some(PathBuf::from("/does/not/exist")),
+            slack_config_file: Some(std::env::temp_dir().join("does-not-exist")),
             provider: None,
             hook: None,
             no_collisions: false,

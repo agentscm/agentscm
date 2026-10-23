@@ -313,13 +313,9 @@ fn write(path: &Path, text: &str) -> Result<(), String> {
         let temp = dir.join(format!(".agentscm-quickstart-{}.tmp", std::process::id()));
         let _ = std::fs::remove_file(&temp);
         write_private(&temp, text).map_err(|e| e.to_string())?;
-        std::fs::File::open(&temp)
-            .and_then(|file| file.sync_all())
-            .map_err(|error| error.to_string())?;
+        super::sync_file(&temp)?;
         std::fs::rename(&temp, path).map_err(|error| error.to_string())?;
-        return std::fs::File::open(dir)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| error.to_string());
+        return super::sync_dir(dir);
     }
     Err("quickstart setup file has no parent".into())
 }
@@ -363,9 +359,7 @@ fn restore_file(path: &Path, prior: Option<&Vec<u8>>) -> Result<(), String> {
                 .map_err(|_| "The previous Docker setup file is not UTF-8.".to_owned())?,
         ),
         None => match std::fs::remove_file(path) {
-            Ok(()) => std::fs::File::open(path.parent().ok_or("Docker setup file has no parent")?)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|error| error.to_string()),
+            Ok(()) => super::sync_dir(path.parent().ok_or("Docker setup file has no parent")?),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.to_string()),
         },
@@ -1105,9 +1099,7 @@ fn cleanup_slack_stages(dir: &Path) -> Result<(), String> {
         }
         std::fs::remove_dir_all(entry.path()).map_err(|error| error.to_string())?;
     }
-    std::fs::File::open(dir)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| error.to_string())
+    super::sync_dir(dir)
 }
 
 fn slack_receipt_path(dir: &Path) -> PathBuf {
@@ -1184,9 +1176,7 @@ fn write_slack_receipt(path: &Path, receipt: &[u8]) -> Result<(), String> {
 
 fn remove_slack_receipt(path: &Path) -> Result<(), String> {
     match std::fs::remove_file(path) {
-        Ok(()) => std::fs::File::open(path.parent().ok_or("Slack receipt has no parent")?)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| error.to_string()),
+        Ok(()) => super::sync_dir(path.parent().ok_or("Slack receipt has no parent")?),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.to_string()),
     }
@@ -1233,9 +1223,7 @@ fn with_staged_slack_receipt<T>(
     })();
     if result.is_ok() {
         std::fs::remove_dir_all(&stage).map_err(|error| error.to_string())?;
-        std::fs::File::open(dir)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| error.to_string())?;
+        super::sync_dir(dir)?;
     }
     result
 }
@@ -1560,9 +1548,7 @@ fn with_staged_slack_bundle<T>(
     match result {
         Ok(value) => {
             std::fs::remove_dir_all(&stage).map_err(|error| error.to_string())?;
-            std::fs::File::open(dir)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|error| error.to_string())?;
+            super::sync_dir(dir)?;
             Ok(value)
         }
         Err(error) => Err(format!(
