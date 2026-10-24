@@ -3415,7 +3415,11 @@ fn a_failed_agent_step_ends_non_zero_and_the_last_line_says_so() {
     // Fails when it cannot be asked about installed plugins, as a half-working install does.
     let shim = machine.bin.path().join("claude");
     let body = std::fs::read_to_string(&shim).unwrap();
-    std::fs::write(&shim, body.replacen("\n", "\ncase \"$*\" in *install*) exit 1;; esac\n", 1)).unwrap();
+    std::fs::write(
+        &shim,
+        body.replacen("\n", "\ncase \"$*\" in *install*) exit 1;; esac\n", 1),
+    )
+    .unwrap();
     let output = machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"]));
     let line = last_line(&output);
     assert!(!output.status.success(), "{output:?}");
