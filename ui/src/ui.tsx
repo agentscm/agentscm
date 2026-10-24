@@ -34,7 +34,7 @@ export function Explain({ text }: { text: string }) {
 /** An evidence box: icon-badged header strip, optional count and explainer, then content. */
 export function Box({ id, tour, icon, title, explain, count, tone = 'brand', actions, children, className = '', flush = false }: { id?: string; /** Stable walkthrough anchor (`data-tour`). */ tour?: string; icon: string; title: string; explain?: string; count?: number | string; tone?: Tone; actions?: ReactNode; children: ReactNode; className?: string; flush?: boolean }) {
   return (
-    <section id={id} data-tour={tour} className={`box ${className}`} aria-labelledby={id ? `${id}-title` : undefined}>
+    <section id={id} data-tour={tour} className={`box box-tone-${tone} ${className}`} aria-labelledby={id ? `${id}-title` : undefined}>
       <header className="box-head">
         <span className={`box-badge tone-${tone}`}>
           <Icon name={icon} />
@@ -139,16 +139,19 @@ export function Ago({ at }: { at: number }) {
 
 export function CopyButton({ text, label = 'Copy', className = 'btn btn-sm btn-outline-secondary' }: { text: string; label?: string; className?: string }) {
   const [state, setState] = useState<'idle' | 'ok' | 'fail'>('idle')
+  const timer = useRef<number>()
+  useEffect(() => () => window.clearTimeout(timer.current), [])
   return (
     <button
       type="button"
       className={className}
       onClick={() => {
-        void navigator.clipboard.writeText(text).then(
-          () => setState('ok'),
-          () => setState('fail'),
-        )
-        window.setTimeout(() => setState('idle'), 2000)
+        // `navigator.clipboard` is missing on plain-http pages (a LAN hub), so a throw is a failed copy too.
+        void Promise.resolve()
+          .then(() => navigator.clipboard.writeText(text))
+          .then(() => setState('ok'), () => setState('fail'))
+        window.clearTimeout(timer.current)
+        timer.current = window.setTimeout(() => setState('idle'), 2000)
       }}
     >
       <Icon name={state === 'ok' ? 'check2' : state === 'fail' ? 'x-lg' : 'clipboard'} /> {state === 'ok' ? 'Copied' : state === 'fail' ? 'Copy failed' : label}

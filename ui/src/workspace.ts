@@ -1,4 +1,6 @@
 /** Browser workspace requests use the HttpOnly session and CSRF, never agent tokens. */
+import { withTimeout } from './timeout.ts'
+
 export interface WorkspaceIdentity { provider: string; host: string; user_id: number }
 export interface WorkspaceMember { identity: WorkspaceIdentity; roles: string[]; repository_ids: string[]; enabled: boolean; generation: number }
 export interface WorkspaceSettings { id: string; name: string; generation: number; max_concurrent_runs: number }
@@ -59,7 +61,7 @@ export const workspaceError = (error: unknown): string => {
 export async function workspaceRequest<T>(path: string, options: { signal?: AbortSignal; method?: string; body?: unknown; csrf?: string } = {}): Promise<T> {
   const method = options.method ?? 'GET'
   const response = await fetch(`/v1/hub/workspace${path}`, {
-    method, credentials: 'same-origin', cache: 'no-store', signal: options.signal,
+    method, credentials: 'same-origin', cache: 'no-store', signal: method === 'GET' ? withTimeout(options.signal) : options.signal,
     headers: { ...(options.body !== undefined ? { 'Content-Type': 'application/json' } : {}), ...(options.csrf ? { 'x-csrf-token': options.csrf } : {}) },
     ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
   })

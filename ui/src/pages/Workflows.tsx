@@ -259,6 +259,7 @@ function List({ token }: { token: string }) {
       </div>
       <Box
         tour="workflows-runs"
+        tone={load.kind === 'ready' && load.value.availability === 'available' && load.value.runs.some((r) => r.state === 'failed' || r.state === 'blocked') ? 'bad' : 'brand'}
         icon="diagram-3"
         title="Workflow runs"
         explain="Skill workflows are multi-step checks (tests, reviews) run by a local controller and recorded on the hub."

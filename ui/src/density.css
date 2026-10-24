@@ -1,0 +1,40 @@
+/* Density. styles.css and tour.css hold the compact values as the fallbacks of these tokens; Spacious is the
+   default and overrides them here, in one place. Compact (data-density='compact') sets nothing. */
+:root[data-density='spacious'] {
+  --bs-body-font-size: 0.9375rem;
+  --hub-gap: 32px;
+  --hub-top-h: 62px;
+  --hub-main-top: 36px;
+  --hub-answer-pad: 36px;
+  --hub-answer-gap: 12px;
+  --hub-head-h: 58px;
+  --hub-head-x: 22px;
+  --hub-pad-box: 20px 22px 22px;
+  --hub-row-y: 16px;
+  --hub-event-y: 11px;
+  --hub-lane-head: 14px 16px 12px;
+  --hub-lane-body: 6px 12px 12px;
+  --hub-card-pad: 16px 18px;
+  --hub-card-gap: 10px;
+  --hub-nav-h: 44px;
+  --hub-nav-group: 24px;
+}
+/* Phones get a lighter increase: the screen is the scarce thing there. */
+@media (max-width: 640px) {
+  :root[data-density='spacious'] {
+    --hub-gap: 26px;
+    --hub-top-h: 56px;
+    --hub-main-top: 26px;
+    --hub-answer-pad: 28px;
+    --hub-answer-gap: 10px;
+    --hub-head-h: 54px;
+    --hub-head-x: 18px;
+    --hub-pad-box: 18px 18px 20px;
+    --hub-row-y: 14px;
+    --hub-event-y: 10px;
+    --hub-lane-head: 12px 14px 11px;
+    --hub-lane-body: 5px 10px 10px;
+    --hub-card-pad: 14px 16px;
+    --hub-card-gap: 9px;
+  }
+}

@@ -96,6 +96,21 @@ describe('useHashCursor and Pager', () => {
     expect(window.location.hash).toBe('#landed')
   })
 
+  it('a click refocuses only its own Pager when its buttons vanish', () => {
+    const Two = ({ gone }: { gone: boolean }) => (
+      <>
+        <Pager onOlder={() => {}} />
+        <Pager onOlder={gone ? undefined : () => {}} complete={gone} />
+      </>
+    )
+    const { rerender } = render(<Two gone={false} />)
+    const navs = screen.getAllByRole('navigation', { name: 'Pages' })
+    fireEvent.click(screen.getAllByRole('button', { name: /Older/ })[1]!)
+    ;(document.activeElement as HTMLElement).blur()
+    rerender(<Two gone />)
+    expect(document.activeElement).toBe(navs[1])
+  })
+
   it('Pager shows the end state only when there is nothing older', () => {
     const { rerender } = render(<Pager onNewer={() => {}} complete />)
     expect(screen.getByText('That’s everything.')).toBeTruthy()

@@ -92,7 +92,7 @@ export function Combobox({ id, label, placeholder, onSelect, options, search, pa
 
   const pasted = parseId?.(text) ?? null
   const current = remote?.key === key ? remote : null
-  const shown: ComboOption[] = search ? (current?.result?.options ?? []) : (options ?? []).filter((o) => !typed || !text || o.text.toLowerCase().includes(text.toLowerCase()))
+  const shown: ComboOption[] = search ? ((current ?? remote)?.result?.options ?? []) : (options ?? []).filter((o) => !typed || !text || o.text.toLowerCase().includes(text.toLowerCase()))
   const result = current?.result ?? null
   const canMore = !!result?.more && !!result.loadMore
   const moreOption: ComboOption[] = canMore ? [{ value: MORE, text: '', label: loadingMore ? 'Searching…' : (result.moreLabel ?? 'Show more results') }] : []
@@ -102,6 +102,9 @@ export function Combobox({ id, label, placeholder, onSelect, options, search, pa
   const items: ComboOption[] = [...(pastedOption && !looseId ? [pastedOption] : []), ...rest2, ...(pastedOption && looseId ? [pastedOption] : []), ...moreOption]
   const strictPasted = !!pastedOption && !looseId
   const loading = !!search && !current
+  // Keep the last results visible (full contrast, but inert) until the new ones land, so typing doesn't flash the list away.
+  const stale = loading && shown.length > 0
+  const live = stale ? [] : items
   const failed = !!search && !!current && current.result === null
 
   const loadMore = () => {
@@ -120,9 +123,13 @@ export function Combobox({ id, label, placeholder, onSelect, options, search, pa
     setQuery(keepText ? o.text : '')
     onSelect(o.value, o)
   }
+  const activeId = open && active >= 0 && live[active] ? `${uid}-opt-${active}` : undefined
+  useEffect(() => {
+    document.getElementById(activeId ?? '')?.scrollIntoView?.({ block: 'nearest' })
+  }, [activeId])
   const move = (to: number) => {
     setOpen(true)
-    setActive(items.length === 0 ? -1 : ((to % items.length) + items.length) % items.length)
+    setActive(live.length === 0 ? -1 : ((to % live.length) + live.length) % live.length)
   }
   const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     const go = (to: number) => {
@@ -130,11 +137,11 @@ export function Combobox({ id, label, placeholder, onSelect, options, search, pa
       move(to)
     }
     if (e.key === 'ArrowDown') go(open ? active + 1 : 0)
-    else if (e.key === 'ArrowUp') go(open ? (active < 0 ? items.length - 1 : active - 1) : items.length - 1)
+    else if (e.key === 'ArrowUp') go(open ? (active < 0 ? live.length - 1 : active - 1) : live.length - 1)
     else if (e.key === 'Home' && open) go(0)
-    else if (e.key === 'End' && open) go(items.length - 1)
+    else if (e.key === 'End' && open) go(live.length - 1)
     else if (e.key === 'Enter' && open) {
-      const o = items[active] ?? (pastedOption && (!looseId || rest2.length === 0) ? pastedOption : undefined)
+      const o = live[active] ?? (pastedOption && (!looseId || rest2.length === 0) ? pastedOption : undefined)
       if (o) {
         e.preventDefault()
         pick(o)
@@ -168,7 +175,7 @@ export function Combobox({ id, label, placeholder, onSelect, options, search, pa
         aria-expanded={open}
         aria-controls={open ? listId : undefined}
         aria-autocomplete="list"
-        aria-activedescendant={open && active >= 0 && items[active] ? `${uid}-opt-${active}` : undefined}
+        aria-activedescendant={activeId}
         aria-describedby={describedBy}
         placeholder={placeholder}
         value={query}
@@ -193,9 +200,9 @@ export function Combobox({ id, label, placeholder, onSelect, options, search, pa
       {open && (
         <div className="combo-pop" onMouseDown={(e) => e.preventDefault()}>
           {items.length > 0 && (
-            <ul id={listId} role="listbox" aria-label={label} className="combo-list">
+            <ul id={listId} role="listbox" aria-label={label} aria-busy={stale} className="combo-list">
               {items.map((o, i) => (
-                <li key={o.value} id={`${uid}-opt-${i}`} role="option" aria-selected={i === active} className="combo-opt" onMouseEnter={() => setActive(i)} onClick={() => pick(o)}>
+                <li key={o.value} id={`${uid}-opt-${i}`} role="option" aria-selected={!stale && i === active} className="combo-opt" onMouseEnter={() => !stale && setActive(i)} onClick={() => !stale && pick(o)}>
                   <span className="combo-main">
                     <span className="combo-label">{o.label}</span>
                     {o.meta}

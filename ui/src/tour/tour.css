@@ -1,0 +1,206 @@
+/* Feature walkthrough. The card, the spotlight and the "register trail": all colour comes from the --hub-* tokens. */
+.tour-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  padding: 2px 10px;
+  border: 1px solid var(--hub-rule);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--hub-text-3);
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+.tour-trigger:hover { color: var(--hub-brand-ink); border-color: var(--hub-rule-strong); background: var(--hub-brand-soft); }
+.tour-trigger:focus-visible { outline: 2px solid var(--hub-brand); outline-offset: 3px; }
+@media (max-width: 640px) {
+  .tour-trigger { padding: 2px; width: 44px; min-height: 44px; justify-content: center; border-color: transparent; font-size: 1rem; }
+  .tour-trigger-text { display: none; }
+}
+.tour-list { list-style: none; margin: 0; padding: 0; }
+.tour-list li { display: grid; grid-template-columns: 22px 1fr auto auto; gap: 12px; align-items: center; padding: 10px 0; }
+.tour-list li + li { border-top: 1px solid var(--hub-rule); }
+.tour-list .bi { color: var(--hub-brand); }
+
+.tour-layer {
+  --tour-scrim: rgba(10, 12, 25, 0.56);
+  --tour-shadow: 0 1px 2px rgba(0, 0, 0, 0.2), 0 22px 48px -20px rgba(0, 0, 0, 0.55);
+  --tour-ease: cubic-bezier(0.25, 1, 0.5, 1);
+  position: fixed;
+  inset: 0;
+  z-index: 1090;
+}
+.tour-block { position: absolute; inset: 0; }
+
+/* Scrim with a rounded cut-out, crop marks at its corners, one ping on arrival. */
+.tour-scrim { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.tour-scrim .scrim { fill: var(--tour-scrim); }
+.tour-hole { fill: none; stroke: var(--hub-brand); stroke-width: 1.5; stroke-opacity: 0.85; }
+.tour-ping { fill: none; stroke: var(--hub-brand); stroke-width: 2; opacity: 0; transform-box: fill-box; transform-origin: center; }
+.tour-marks { transform-box: fill-box; transform-origin: center; }
+.tour-marks use { fill: none; stroke-linecap: square; stroke-linejoin: miter; }
+.tour-marks .halo { stroke: var(--hub-surface); stroke-width: 5.5; }
+.tour-marks .ink { stroke: var(--hub-brand-ink); stroke-width: 2.5; }
+:root[data-bs-theme='dark'] .tour-marks .ink { stroke: var(--hub-brand); }
+
+.tour-card {
+  position: fixed;
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100dvh - 24px);
+  overflow: hidden;
+  border-radius: 16px;
+  border: 1px solid var(--hub-rule-strong);
+  background: var(--hub-surface);
+  color: var(--hub-text);
+  box-shadow: var(--tour-shadow);
+  animation: tour-in 180ms var(--tour-ease) backwards;
+}
+.tour-card :focus-visible { outline: 2px solid var(--hub-brand); outline-offset: 2px; }
+.tour-card.is-sheet { max-height: 45dvh; }
+@keyframes tour-in { from { opacity: 0; } }
+
+/* Only this part scrolls. The foot is a flex sibling, not position: sticky: WebKit mis-places a sticky child of a card that is mid-glide (transform), which left Back partly off screen. */
+.tour-scroll { flex: 1 1 auto; min-height: 0; overflow-x: hidden; overflow-y: auto; }
+
+/* The band: a drawing for the section being toured. */
+.tour-band { display: grid; place-items: center; height: 84px; flex: none; background: var(--hub-brand-soft); color: var(--hub-text-2); border-bottom: 1px solid var(--hub-rule); }
+.tour-band.is-hero { height: 140px; }
+.tour-art { height: 100%; max-width: 100%; padding: 6px 0; }
+.tour-art .ln { fill: none; stroke: var(--hub-text-2); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.tour-art .ln.soft { stroke: var(--hub-text-3); stroke-opacity: 0.7; }
+.tour-art .ln.brand { stroke: var(--hub-brand); }
+.tour-art .ln.bad { stroke: var(--hub-bad); }
+.tour-art .ln.ok { stroke: var(--hub-ok); }
+.tour-art .ln.dot { fill: var(--hub-surface); }
+.tour-art .ln.dot.brand { fill: var(--hub-brand); }
+.tour-art .ln.dot.ok { fill: var(--hub-ok); }
+.tour-art .ln.dot.bad { fill: var(--hub-bad); }
+.tour-hero .agent rect { fill: var(--hub-surface); stroke: var(--hub-brand); stroke-width: 1.5; }
+.tour-hero .agent path { fill: none; stroke: var(--hub-text-2); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.tour-hero .hub circle { fill: var(--hub-brand); }
+.tour-hero .hub path { fill: none; stroke: var(--hub-surface); stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.tour-hero .halo { fill: var(--hub-brand); fill-opacity: 0.16; }
+.tour-hero .agent, .tour-hero .hub, .tour-hero .halo { transform-box: fill-box; transform-origin: center; }
+
+@media (prefers-reduced-motion: no-preference) {
+  .tour-art .ln:not(.dot) { stroke-dasharray: 1; animation: tour-draw 600ms var(--tour-ease) backwards; animation-delay: calc(var(--i, 0) * 70ms); }
+  .tour-art .ln.dot { animation: tour-pop 320ms var(--tour-ease) backwards; animation-delay: calc(var(--i, 0) * 70ms + 200ms); transform-box: fill-box; transform-origin: center; }
+  .tour-hero .ln { animation-duration: 640ms; animation-delay: calc(var(--i, 0) * 140ms + 180ms); }
+  .tour-hero:not(.is-still) .agent { animation: tour-pop 300ms var(--tour-ease) backwards; animation-delay: calc(var(--i, 0) * 140ms); }
+  .tour-hero:not(.is-still) .hub { animation: tour-pop 360ms var(--tour-ease) backwards 800ms; }
+  .tour-hero:not(.is-still) .halo { animation: tour-halo 500ms var(--tour-ease) backwards 900ms; }
+  .tour-hero.is-still .ln, .tour-hero.is-still .ln.dot { animation: none; stroke-dasharray: none; }
+  .tour-live-dot::after { animation: tour-ripple 900ms var(--tour-ease) 1 backwards 250ms; }
+}
+@keyframes tour-draw { from { stroke-dashoffset: 1; opacity: 0; } 12% { opacity: 1; } to { stroke-dashoffset: 0; opacity: 1; } }
+@keyframes tour-pop { from { opacity: 0; transform: scale(0.6); } }
+@keyframes tour-halo { from { opacity: 0; transform: scale(0.55); } }
+@keyframes tour-ripple { from { opacity: 0.6; transform: scale(0.8); } to { opacity: 0; transform: scale(2.6); } }
+
+.tour-main { display: flex; flex-direction: column; gap: var(--tour-gap, 12px); padding: var(--tour-main-pad, 14px 18px 4px); }
+.tour-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 28px; }
+.tour-kicker { font-size: 0.8rem; font-weight: 600; color: var(--hub-brand-ink); }
+.tour-x { display: inline-flex; align-items: center; justify-content: center; flex: none; width: 32px; height: 32px; margin-right: -6px; border: 0; border-radius: 8px; background: transparent; color: var(--hub-text-3); }
+.tour-x:hover { background: var(--hub-muted-soft); color: var(--hub-text); }
+
+/* The trail: a tiny commit graph. Filled nodes are behind you, the ring is where you are. */
+.tour-trail { --r: 8px; position: relative; height: 16px; flex: none; }
+.tour-trail-line, .tour-trail-fill { position: absolute; left: var(--r); right: var(--r); top: 7px; height: 2px; border-radius: 1px; }
+.tour-trail-line { background: var(--hub-rule-strong); }
+.tour-trail-fill { background: var(--hub-brand); transform-origin: left; transition: transform 300ms var(--tour-ease); }
+.tour-node { position: absolute; top: 8px; width: 8px; height: 8px; box-sizing: border-box; border: 1.5px solid var(--hub-text-3); border-radius: 50%; background: var(--hub-surface); transform: translate(-50%, -50%); transition: background-color 200ms, border-color 200ms; }
+.tour-node.is-done { border-color: var(--hub-brand); background: var(--hub-brand); }
+.tour-trail-ring { position: absolute; left: var(--r); width: calc(100% - 2 * var(--r)); top: 0; height: 100%; transition: transform 300ms var(--tour-ease); }
+.tour-trail-ring::before { content: ''; position: absolute; left: 0; top: 8px; width: 16px; height: 16px; box-sizing: border-box; border: 2px solid var(--hub-brand); border-radius: 50%; background: var(--hub-surface); transform: translate(-50%, -50%); }
+.tour-trail-ring::after { content: ''; position: absolute; left: 0; top: 8px; width: 6px; height: 6px; border-radius: 50%; background: var(--hub-brand); transform: translate(-50%, -50%); }
+
+.tour-swap { display: flex; flex-direction: column; gap: var(--tour-gap, 12px); }
+.tour-title { margin: 0; font-size: 1.125rem; font-weight: 700; line-height: 1.25; letter-spacing: -0.01em; text-wrap: balance; }
+.tour-what { margin: 0; font-size: 0.906rem; line-height: var(--tour-lh, 1.5); color: var(--hub-text); }
+.tour-body { display: grid; gap: var(--tour-rows, 10px); margin: 0; }
+.tour-row { display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 10px; }
+.tour-glyph { width: 16px; height: 16px; margin-top: 2px; fill: none; stroke: var(--hub-brand); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.tour-row dt { font-size: 0.78rem; font-weight: 600; color: var(--hub-text-3); }
+.tour-row dd { margin: 1px 0 0; font-size: 0.844rem; line-height: var(--tour-lh, 1.45); color: var(--hub-text-2); }
+.tour-more { display: inline-flex; align-items: center; gap: 6px; align-self: flex-start; min-height: 32px; padding: 2px 8px 2px 0; border: 0; background: transparent; color: var(--hub-brand-ink); font-size: 0.82rem; font-weight: 600; }
+.tour-more::after { content: ''; width: 6px; height: 6px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: translateY(-2px) rotate(45deg); transition: transform 160ms var(--tour-ease); }
+.tour-more[aria-expanded='true']::after { transform: translateY(1px) rotate(-135deg); }
+
+/* A readout of what is on screen now. */
+.tour-tip { display: flex; align-items: flex-start; gap: 10px; margin: 0; padding: 9px 12px; border: 1px solid var(--hub-rule); border-radius: 10px; background: var(--hub-muted-soft); color: var(--hub-text-2); font-size: 0.82rem; line-height: 1.45; font-variant-numeric: tabular-nums; }
+.tour-tip.is-live { border-color: color-mix(in srgb, var(--hub-brand) 28%, transparent); background: var(--hub-brand-soft); color: var(--hub-text); }
+.tour-tip .tour-glyph { stroke: var(--hub-text-3); margin-top: 1px; }
+.tour-live-dot { position: relative; flex: none; width: 8px; height: 8px; margin: 6px 4px 0 4px; border-radius: 50%; background: var(--hub-brand); }
+.tour-live-dot::after { content: ''; position: absolute; inset: 0; border-radius: 50%; border: 1.5px solid var(--hub-brand); opacity: 0; }
+
+.tour-foot { flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; margin-top: 8px; padding: var(--tour-foot-pad, 10px 18px 12px); border-top: 1px solid var(--hub-rule); background: var(--hub-surface); }
+.tour-check { display: inline-flex; align-items: center; gap: 6px; min-height: 32px; font-size: 0.82rem; color: var(--hub-text-2); }
+.tour-count { font-size: 0.78rem; color: var(--hub-text-3); font-variant-numeric: tabular-nums; }
+.tour-buttons { display: flex; gap: 8px; margin-left: auto; }
+.tour-primary .bi { display: inline-block; transition: transform 150ms var(--tour-ease); }
+.tour-primary:hover .bi { transform: translateX(2px); }
+.tour-keys { margin: 0; padding: 0 var(--tour-x, 18px) 12px; font-size: 0.72rem; color: var(--hub-text-3); }
+.tour-keys kbd { margin-right: 2px; }
+@media (max-width: 640px) {
+  .tour-buttons .btn, .tour-x, .tour-more, .tour-check { min-height: 44px; }
+  .tour-x { width: 44px; margin-block: -8px; }
+  .tour-main { gap: 8px; padding-top: 10px; }
+  .tour-keys { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tour-trail-fill, .tour-trail-ring, .tour-node, .tour-primary .bi, .tour-more::after { transition: none; }
+  .tour-card { animation: none; }
+}
+
+/* Density: Spacious (the default) gives the card more air; the width comes from place.ts. */
+:root[data-density='spacious'] .tour-layer {
+  --tour-main-pad: 24px 30px 8px;
+  --tour-gap: 18px;
+  --tour-rows: 18px;
+  --tour-lh: 1.6;
+  --tour-foot-pad: 16px 30px 18px;
+  --tour-x: 30px;
+}
+/* Larger, not only airier: type, band, trail and buttons all step up. */
+:root[data-density='spacious'] .tour-card { border-radius: 20px; }
+:root[data-density='spacious'] .tour-band { height: 116px; }
+:root[data-density='spacious'] .tour-band.is-hero { height: 188px; }
+:root[data-density='spacious'] .tour-art { padding: 10px 0; }
+:root[data-density='spacious'] .tour-head { min-height: 32px; }
+:root[data-density='spacious'] .tour-kicker { font-size: 0.9rem; }
+:root[data-density='spacious'] .tour-x { width: 36px; height: 36px; font-size: 1.05rem; }
+:root[data-density='spacious'] .tour-title { font-size: 1.45rem; letter-spacing: -0.015em; }
+:root[data-density='spacious'] .tour-what { font-size: 1.0625rem; }
+:root[data-density='spacious'] .tour-row { grid-template-columns: 22px minmax(0, 1fr); gap: 12px; }
+:root[data-density='spacious'] .tour-glyph { width: 20px; height: 20px; }
+:root[data-density='spacious'] .tour-row dt { font-size: 0.875rem; }
+:root[data-density='spacious'] .tour-row dd { margin-top: 3px; font-size: 0.97rem; }
+:root[data-density='spacious'] .tour-more { min-height: 36px; font-size: 0.92rem; }
+:root[data-density='spacious'] .tour-tip { gap: 12px; padding: 14px 16px; border-radius: 12px; font-size: 0.94rem; }
+:root[data-density='spacious'] .tour-live-dot { width: 10px; height: 10px; margin-top: 7px; }
+:root[data-density='spacious'] .tour-check, :root[data-density='spacious'] .tour-count { font-size: 0.9rem; }
+:root[data-density='spacious'] .tour-buttons { gap: 10px; }
+:root[data-density='spacious'] .tour-buttons .btn { --bs-btn-padding-y: 0.5rem; --bs-btn-padding-x: 1.1rem; --bs-btn-font-size: 0.97rem; min-height: 44px; }
+:root[data-density='spacious'] .tour-keys { padding-bottom: 16px; font-size: 0.8rem; }
+:root[data-density='spacious'] .tour-trail { --r: 10px; height: 20px; }
+:root[data-density='spacious'] .tour-trail-line, :root[data-density='spacious'] .tour-trail-fill { top: 9px; }
+:root[data-density='spacious'] .tour-node { top: 10px; width: 10px; height: 10px; }
+:root[data-density='spacious'] .tour-trail-ring::before { top: 10px; width: 20px; height: 20px; }
+:root[data-density='spacious'] .tour-trail-ring::after { top: 10px; width: 8px; height: 8px; }
+@media (max-width: 640px) {
+  :root[data-density='spacious'] .tour-layer {
+    --tour-main-pad: 14px 20px 4px;
+    --tour-gap: 12px;
+    --tour-rows: 13px;
+    --tour-lh: 1.55;
+    --tour-foot-pad: 12px 20px 14px;
+    --tour-x: 20px;
+  }
+  :root[data-density='spacious'] .tour-title { font-size: 1.25rem; }
+  :root[data-density='spacious'] .tour-what { font-size: 1rem; }
+  :root[data-density='spacious'] .tour-row dd { font-size: 0.94rem; }
+  :root[data-density='spacious'] .tour-band { height: 96px; }
+  :root[data-density='spacious'] .tour-band.is-hero { height: 140px; }
+}

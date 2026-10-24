@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useState, useSyncExternalStore } from 'react'
 import { derive } from './derive.ts'
 import { fetchOverview } from './standup.ts'
-import { clearToken, loadTheme, loadToken, saveTheme, saveToken, type ThemePref } from './storage.ts'
+import { clearToken, loadDensity, loadTheme, loadToken, saveDensity, saveTheme, saveToken, type Density, type ThemePref } from './storage.ts'
 import { useHub } from './useHub.ts'
 import logoDark from './logo-dark.png'
 import logoLight from './logo-light.png'
@@ -90,7 +90,7 @@ export function Logo({ dark, height = 32 }: { dark: boolean; height?: number }) 
   return <img src={dark ? logoDark : logoLight} alt="AgentSCM" height={height} className="logo" />
 }
 
-function Shell({ token, dark, pref, onPref, onUnauthorized, onForget }: { token: string; dark: boolean; pref: ThemePref; onPref: (p: ThemePref) => void; onUnauthorized: (m?: string) => void; onForget: () => void }) {
+function Shell({ token, dark, pref, onPref, density, onDensity, onUnauthorized, onForget }: { token: string; dark: boolean; pref: ThemePref; onPref: (p: ThemePref) => void; density: Density; onDensity: (d: Density) => void; onUnauthorized: (m?: string) => void; onForget: () => void }) {
   const data = useHub(token, onUnauthorized)
   const section = useSection()
   const d = useMemo(() => (data.work && data.activity ? derive(data.work, data.activity) : null), [data.work, data.activity])
@@ -140,7 +140,7 @@ function Shell({ token, dark, pref, onPref, onUnauthorized, onForget }: { token:
         {section === 'setup' && <SetupPage token={token} />}
         {section === 'workspace' && <WorkspacePage />}
         {section === 'health' && <HealthPage health={data.health} />}
-        {section === 'settings' && <SettingsPage token={token} whoami={data.whoami} pref={pref} onPref={onPref} railCollapsed={rail} onRail={changeRail} onForget={onForget} />}
+        {section === 'settings' && <SettingsPage token={token} whoami={data.whoami} pref={pref} onPref={onPref} density={density} onDensity={onDensity} railCollapsed={rail} onRail={changeRail} onForget={onForget} />}
       </AppChrome>
     </TourProvider>
   )
@@ -150,6 +150,7 @@ export default function App() {
   const [token, setToken] = useState<string | null>(loadToken)
   const [notice, setNotice] = useState<string | null>(null)
   const [pref, setPref] = useState<ThemePref>(loadTheme)
+  const [density, setDensity] = useState<Density>(loadDensity)
   const prefersDark = useSyncExternalStore(subscribeDark, systemDark)
   const dark = pref === 'dark' || (pref === 'system' && prefersDark)
   const section = useSection()
@@ -158,6 +159,14 @@ export default function App() {
     document.documentElement.dataset['bsTheme'] = dark ? 'dark' : 'light'
   }, [dark])
 
+  useLayoutEffect(() => {
+    document.documentElement.dataset['density'] = density
+  }, [density])
+
+  const changeDensity = useCallback((d: Density) => {
+    setDensity(d)
+    saveDensity(d)
+  }, [])
   const changePref = useCallback((p: ThemePref) => {
     setPref(p)
     saveTheme(p)
@@ -170,7 +179,7 @@ export default function App() {
   const onUnauthorized = useCallback((m?: string) => signedOut(m ?? 'Your token was rejected or has expired. Paste a current one to continue.'), [signedOut])
   const onForget = useCallback(() => signedOut('Token forgotten on this browser. The hub still accepts it until it expires or is revoked.'), [signedOut])
 
-  if (token) return <Shell key={token} token={token} dark={dark} pref={pref} onPref={changePref} onUnauthorized={onUnauthorized} onForget={onForget} />
+  if (token) return <Shell key={token} token={token} dark={dark} pref={pref} onPref={changePref} density={density} onDensity={changeDensity} onUnauthorized={onUnauthorized} onForget={onForget} />
   if (section === 'workspace')
     return (
       <div className="signed-out-workspace">

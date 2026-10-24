@@ -868,7 +868,7 @@ export function WorkspacePage() {
   const route = useWorkspaceRoute()
   const [nonce, setNonce] = useState(0)
   const [signOutError, setSignOutError] = useState<string | null>(null)
-  const session = usePoll((signal) => workspaceRequest<WorkspaceSession>('/session', { signal }), 15_000, String(nonce))
+  const session = usePoll((signal) => workspaceRequest<WorkspaceSession>('/session', { signal }), 15_000, 'session', nonce)
   const s = session.kind === 'ready' ? session.value : null
   const reload = () => setNonce((n) => n + 1)
   const signedOut = session.kind === 'error' && session.status === 401

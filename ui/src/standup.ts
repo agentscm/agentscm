@@ -1,4 +1,5 @@
 import { ApiError } from './api.ts'
+import { withTimeout } from './timeout.ts'
 
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 const MAX_PAGE = 100
@@ -767,7 +768,7 @@ export function safeCommitHref(source: WorkSource, oid: string): string | null {
 
 async function getBoundedJson(path: string, token: string, signal: AbortSignal): Promise<unknown> {
   const response = await fetch(path, {
-    signal,
+    signal: withTimeout(signal),
     cache: 'no-store',
     credentials: 'omit',
     headers: { Authorization: `Bearer ${token}` },

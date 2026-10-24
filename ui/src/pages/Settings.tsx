@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { loadLocalBase, loadLocalToken, localStatus, saveLocalBase, saveLocalToken, validLocalBase } from '../localApi.ts'
 import { usePoll } from '../usePoll.ts'
-import type { ThemePref } from '../storage.ts'
+import { loadSingleKeys, saveSingleKeys, type Density, type ThemePref } from '../storage.ts'
 import type { Whoami } from '../types.ts'
 import { ViewSettingsBox } from '../ViewSettings.tsx'
 import { Box, Icon, Pill, Skeleton, localDate } from '../ui.tsx'
@@ -16,12 +16,43 @@ const CADENCE = [
   ['heart-pulse', 'Hub health', 'Every 15 seconds'],
 ] as const
 
-export function SettingsPage({ token, whoami, pref, onPref, railCollapsed, onRail, onForget }: { token: string; whoami: Whoami | null; pref: ThemePref; onPref: (p: ThemePref) => void; railCollapsed: boolean; onRail: (collapsed: boolean) => void; onForget: () => void }) {
+/** A WAI-ARIA radio group of cards: one tab stop, arrows/Home/End move the choice and the focus together. */
+function RadioCards<V extends string>({ label, tour, options, value, onChange }: { label: string; tour: string; options: { v: V; icon: string; label: string; hint: string }[]; value: V; onChange: (v: V) => void }) {
+  const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    const i = options.findIndex((o) => o.v === value)
+    const to = { ArrowRight: i + 1, ArrowDown: i + 1, ArrowLeft: i - 1, ArrowUp: i - 1, Home: 0, End: options.length - 1 }[e.key]
+    if (to === undefined) return
+    e.preventDefault()
+    const next = options[(to + options.length) % options.length]!
+    onChange(next.v)
+    e.currentTarget.querySelectorAll<HTMLElement>('[role="radio"]')[options.indexOf(next)]?.focus()
+  }
+  return (
+    <div className="choice-cards" data-tour={tour} role="radiogroup" aria-label={label} onKeyDown={onKeyDown}>
+      {options.map((t) => (
+        <button key={t.v} type="button" role="radio" aria-checked={value === t.v} tabIndex={value === t.v ? 0 : -1} className={`choice${value === t.v ? ' on' : ''}`} onClick={() => onChange(t.v)}>
+          <Icon name={t.icon} />
+          <span>
+            <strong>{t.label}</strong>
+            <span className="muted small">{t.hint}</span>
+          </span>
+        </button>
+      ))}
+    </div>
+  )
+}
+
+export function SettingsPage({ token, whoami, pref, onPref, density, onDensity, railCollapsed, onRail, onForget }: { token: string; whoami: Whoami | null; pref: ThemePref; onPref: (p: ThemePref) => void; density: Density; onDensity: (d: Density) => void; railCollapsed: boolean; onRail: (collapsed: boolean) => void; onForget: () => void }) {
   const themes: { v: ThemePref; icon: string; label: string; hint: string }[] = [
     { v: 'light', icon: 'sun', label: 'Light', hint: 'Always light' },
     { v: 'system', icon: 'circle-half', label: 'System', hint: 'Follows your device' },
     { v: 'dark', icon: 'moon-stars', label: 'Dark', hint: 'Always dark' },
   ]
+  const densities: { v: Density; icon: string; label: string; hint: string }[] = [
+    { v: 'spacious', icon: 'arrows-expand', label: 'Spacious', hint: 'More room between rows and sections.' },
+    { v: 'compact', icon: 'arrows-collapse', label: 'Compact', hint: 'Fits more on screen.' },
+  ]
+  const [singleKeys, setSingleKeys] = useState(loadSingleKeys)
   return (
     <div className="page">
       <div className="answer" data-tour="answer">
@@ -35,17 +66,14 @@ export function SettingsPage({ token, whoami, pref, onPref, railCollapsed, onRai
               <div className="settings-label">Theme</div>
               <div className="muted small">Pick a fixed theme or follow your device’s setting.</div>
             </div>
-            <div className="choice-cards" data-tour="settings-theme" role="radiogroup" aria-label="Theme">
-              {themes.map((t) => (
-                <button key={t.v} type="button" role="radio" aria-checked={pref === t.v} className={`choice${pref === t.v ? ' on' : ''}`} onClick={() => onPref(t.v)}>
-                  <Icon name={t.icon} />
-                  <span>
-                    <strong>{t.label}</strong>
-                    <span className="muted small">{t.hint}</span>
-                  </span>
-                </button>
-              ))}
+            <RadioCards label="Theme" tour="settings-theme" options={themes} value={pref} onChange={onPref} />
+          </div>
+          <div className="settings-row">
+            <div>
+              <div className="settings-label">Density</div>
+              <div className="muted small">How much room rows, boxes and sections get.</div>
             </div>
+            <RadioCards label="Density" tour="settings-density" options={densities} value={density} onChange={onDensity} />
           </div>
           <div className="settings-row">
             <div>
@@ -55,6 +83,16 @@ export function SettingsPage({ token, whoami, pref, onPref, railCollapsed, onRai
             <div className="form-check form-switch m-0">
               <input id="rail-compact" className="form-check-input" type="checkbox" role="switch" checked={railCollapsed} onChange={(e) => onRail(e.target.checked)} />
               <label className="visually-hidden" htmlFor="rail-compact">Compact sidebar</label>
+            </div>
+          </div>
+          <div className="settings-row">
+            <div>
+              <div className="settings-label">Single-key shortcuts</div>
+              <div className="muted small">Let <kbd>/</kbd> open search and <kbd>[</kbd> collapse the sidebar. Switch off if they trigger by accident; <kbd>Ctrl</kbd> <kbd>K</kbd> or <kbd>⌘</kbd> <kbd>K</kbd> still opens search.</div>
+            </div>
+            <div className="form-check form-switch m-0">
+              <input id="single-keys" className="form-check-input" type="checkbox" role="switch" checked={singleKeys} onChange={(e) => { setSingleKeys(e.target.checked); saveSingleKeys(e.target.checked) }} />
+              <label className="visually-hidden" htmlFor="single-keys">Single-key shortcuts</label>
             </div>
           </div>
         </Box>

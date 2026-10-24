@@ -9,10 +9,12 @@ const message = (e: unknown) => (e instanceof Error ? e.message : 'Unknown error
 
 /**
  * Loads `load` now and every `everyMs` (0 = once) while the tab is visible. A failed refresh keeps
- * and labels the last good value instead of replacing it. `key` restarts from scratch.
+ * and labels the last good value instead of replacing it. `key` restarts from scratch (loading);
+ * `refresh` re-fetches now but keeps the shown value (stale-while-revalidate).
  */
-export function usePoll<T>(load: (signal: AbortSignal) => Promise<T>, everyMs: number, key: string): Poll<T> {
-  const [state, setState] = useState<Poll<T>>({ kind: 'loading' })
+export function usePoll<T>(load: (signal: AbortSignal) => Promise<T>, everyMs: number, key: string, refresh = 0): Poll<T> {
+  // The state is tagged with the key it was loaded for; a result for another key reads as loading.
+  const [tagged, setTagged] = useState<{ key: string; poll: Poll<T> }>({ key, poll: { kind: 'loading' } })
   const [attempt, setAttempt] = useState(0)
   const latest = useRef(load)
   useEffect(() => {
@@ -23,7 +25,7 @@ export function usePoll<T>(load: (signal: AbortSignal) => Promise<T>, everyMs: n
     let running = false
     let timer: number | undefined
     let controller: AbortController | undefined
-    let had = false
+    const setState = (next: Poll<T> | ((s: Poll<T>) => Poll<T>)) => setTagged((t) => ({ key, poll: typeof next === 'function' ? next(t.key === key ? t.poll : { kind: 'loading' }) : next }))
     const retry = () => {
       setState({ kind: 'loading' })
       setAttempt((n) => n + 1)
@@ -38,13 +40,12 @@ export function usePoll<T>(load: (signal: AbortSignal) => Promise<T>, everyMs: n
       try {
         const value = await latest.current(controller.signal)
         if (disposed) return
-        had = true
         setState({ kind: 'ready', value, fetchedAt: Date.now(), refreshError: null, retry })
       } catch (e) {
         if (disposed || controller.signal.aborted) return
         const status = typeof (e as { status?: unknown }).status === 'number' ? (e as { status: number }).status : undefined
-        if (had) setState((s) => (s.kind === 'ready' ? { ...s, refreshError: message(e) } : s))
-        else setState({ kind: 'error', message: message(e), ...(status !== undefined ? { status } : {}), retry })
+        // A 401 on a refresh means the session is gone: show that, not a stale value.
+        setState((s) => (s.kind === 'ready' && status !== 401 ? { ...s, refreshError: message(e) } : { kind: 'error', message: message(e), ...(status !== undefined ? { status } : {}), retry }))
       } finally {
         running = false
         schedule()
@@ -62,6 +63,6 @@ export function usePoll<T>(load: (signal: AbortSignal) => Promise<T>, everyMs: n
       controller?.abort()
       document.removeEventListener('visibilitychange', onVisibility)
     }
-  }, [everyMs, key, attempt])
-  return state
+  }, [everyMs, key, attempt, refresh])
+  return tagged.key === key ? tagged.poll : { kind: 'loading' }
 }

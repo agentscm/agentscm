@@ -1,5 +1,6 @@
 import { ApiError } from './api.ts'
 import { validWorkId } from './standup.ts'
+import { withTimeout } from './timeout.ts'
 
 const MAX_RESPONSE_BYTES = 48 * 1024
 const MAX_IDENTIFIER_BYTES = 255
@@ -395,7 +396,7 @@ export function decodeChangeRecordResponse(value: unknown, expectedWorkId?: stri
 
 async function boundedJson(path: string, token: string, signal: AbortSignal): Promise<unknown> {
   const response = await fetch(path, {
-    signal,
+    signal: withTimeout(signal),
     cache: 'no-store',
     credentials: 'omit',
     headers: { Authorization: `Bearer ${token}` },
