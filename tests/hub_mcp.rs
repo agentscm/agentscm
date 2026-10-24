@@ -1227,6 +1227,11 @@ async fn errors_are_tool_results_with_fixed_text() {
         ("agentscm_check", json!({"paths": secret_looking})),
         ("agentscm_start", json!({"task": "t", "sekrit-key": 1})),
         ("agentscm_ask", json!({"path": 5, "note": secret_looking})),
+        ("agentscm_check", json!({"paths": "x\", expected sekrit"})),
+        (
+            "agentscm_start",
+            json!({"task": "t", "a\", expected sekrit": 1}),
+        ),
     ] {
         let (text, error) = hub.tool(&key, "/mcp", name, arguments).await;
         assert!(error, "{name}");
