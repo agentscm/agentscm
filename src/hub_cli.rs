@@ -781,6 +781,9 @@ pub(crate) fn write_private(path: &std::path::Path, contents: &str) -> Result<()
         file.write_all(contents.as_bytes())?;
         file.sync_all()?;
         std::fs::rename(&temp, path)?;
+        // Ordinary directory handles support syncing on Unix, but not on Windows.
+        // The file contents are synced before publication on every platform.
+        #[cfg(unix)]
         std::fs::File::open(dir)?.sync_all()?;
         Ok(())
     })();
@@ -1205,6 +1208,20 @@ async fn connections(command: ConnectionCommand) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_write_creates_and_replaces_a_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("nested/session.json");
+        write_private(&path, "first").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
+        write_private(&path, "replacement").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "replacement");
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
 
     fn temporary_session_files(label: &str) -> (PathBuf, SessionFiles) {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

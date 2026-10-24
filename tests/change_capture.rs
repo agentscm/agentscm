@@ -2791,7 +2791,7 @@ fn configured_recipe_allows_replacement_inode_after_completed_attempt() {
     let moved = repo.path().with_extension("replaced");
     fs::rename(repo.path(), &moved).unwrap();
     fs::create_dir(repo.path()).unwrap();
-    run_git(repo.path(), &["init"]);
+    run_git(repo.path(), &["init", "-b", "main"]);
     run_git(
         repo.path(),
         &["config", "user.email", "fixture@example.invalid"],
@@ -2953,9 +2953,15 @@ fn configured_recipe_rejects_replaced_permanent_lock_inode() {
                 .is_some_and(|extension| extension == "lock")
         })
         .unwrap();
-    fs::remove_file(&lock).unwrap();
+    // Keep the old inode allocated so filesystems cannot reuse its number for the replacement.
+    let retired_lock = spool_dir.path().join("retired-recipe.lock");
+    fs::rename(&lock, &retired_lock).unwrap();
     fs::write(&lock, []).unwrap();
     fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_ne!(
+        fs::metadata(&lock).unwrap().ino(),
+        fs::metadata(&retired_lock).unwrap().ino()
+    );
 
     let retry = configured_recipe_request(
         repo.path(),
