@@ -515,7 +515,6 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
 }
 .side-link:hover { background: color-mix(in srgb, var(--hub-text) 6%, transparent); color: var(--hub-text); }
 .side-link.active { background: var(--hub-nav-active); color: var(--hub-text); align-items: flex-start; padding-top: 8px; padding-bottom: 8px; position: relative; }
-.side-link.active::before { content: ''; position: absolute; left: 0; top: 8px; bottom: 8px; width: 3px; border-radius: 0 3px 3px 0; background: var(--hub-brand); }
 .side-link.active .side-badge { margin-top: 0; }
 .side-icon {
   width: 20px;

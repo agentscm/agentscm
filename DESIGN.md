@@ -184,7 +184,7 @@ The Hub uses gently rounded controls and surfaces: 12px is the primary control a
 
 ### Navigation rail
 - **Shape:** A 248px rail (68px compact) on the chrome surface with no dividing rule. Group heads are sentence-case 12px 650 `--hub-text-3` labels; on desktop their explainers appear on hover or focus, and in the mobile drawer they are always visible. Rows are 40px, with a plain 20px icon in `--hub-text-3` and a 550-weight label.
-- **Behavior:** The active row takes the `--hub-nav-active` tint, a 3px brand bar at its left edge, a violet icon and a 650 label, and shows the page's question beneath it, wrapped rather than truncated. Other rows keep their question in the accessible name only, since each page opens with its question as its heading. The mobile drawer has room for the questions and no hover, so it shows every one. Badges stay compact counts beside the label, or a corner dot in the compact rail.
+- **Behavior:** The active row takes the `--hub-nav-active` tint, a violet icon and a 650 label, and shows the page's question beneath it, wrapped rather than truncated. Other rows keep their question in the accessible name only, since each page opens with its question as its heading. The mobile drawer has room for the questions and no hover, so it shows every one. Badges stay compact counts beside the label, or a corner dot in the compact rail.
 
 ### Top bar
 - **Shape:** It sits on the chrome surface, with the search field and the header "Connect agent" action as white controls with hairline borders. The header action is deliberately secondary (an outline button with violet text) so each page's filled primary action stays the only filled violet on screen.
