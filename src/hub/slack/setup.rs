@@ -93,16 +93,20 @@ pub fn prepare(directory: &Path, mut config: SlackConfig) -> Result<Report> {
     let bytes = serialized_config(&config)?;
     let pending = config_file.with_extension("json.prepare");
     if path_present(&config_file)? {
-        let existing: SlackConfig = serde_json::from_slice(&private_file(&config_file, 64 * 1024)?)
-            .map_err(|_| invalid())?;
+        let existing_bytes = private_file(&config_file, 64 * 1024)?;
+        let mut existing: SlackConfig =
+            serde_json::from_slice(&existing_bytes).map_err(|_| invalid())?;
+        // Earlier releases stored the origin as typed; compare it canonically too.
+        existing.hub_url = origin(&existing.hub_url)?.to_string();
         if existing != config {
             return Err(HubError::Invalid(format!(
                 "{} already holds a different Slack configuration; remove it to replace it, or rerun with the same values",
                 config_file.display()
             )));
         }
+        // A leftover pending file is the published config's hard link, in whatever form it was written.
         if path_present(&pending)? {
-            exact_private_file(&pending, &bytes)?;
+            exact_private_file(&pending, &existing_bytes)?;
             fs::remove_file(&pending)?;
         }
     } else {
@@ -627,10 +631,26 @@ mod tests {
         );
         let mut changed = config;
         changed.team_id = "T999".into();
-        let error = prepare(directory.path(), changed).unwrap_err().to_string();
+        let error = prepare(directory.path(), changed.clone())
+            .unwrap_err()
+            .to_string();
         assert!(
             error.contains("already holds a different Slack configuration"),
             "{error}"
+        );
+
+        // A config an earlier release stored with the origin as typed still matches a rerun.
+        let (legacy, mut config) = fixture();
+        config.hub_url = "https://hub.example.test".into();
+        let legacy_bytes = serialized_config(&config).unwrap();
+        private(&legacy.path().join(CONFIG_FILE), &legacy_bytes);
+        for typed in ["https://hub.example.test", "https://hub.example.test/"] {
+            config.hub_url = typed.into();
+            prepare(legacy.path(), config.clone()).unwrap();
+        }
+        assert_eq!(
+            fs::read(legacy.path().join(CONFIG_FILE)).unwrap(),
+            legacy_bytes
         );
         assert_eq!(
             fs::read(directory.path().join(CONFIG_FILE)).unwrap(),

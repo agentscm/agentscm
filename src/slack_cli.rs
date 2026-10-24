@@ -283,6 +283,11 @@ async fn doctor(path: &Path, verify: bool, api_url: Option<&str>) -> Result<Valu
     )
 }
 
+/// `path` as one POSIX shell word.
+fn shell_quoted(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
+}
+
 async fn install(
     directory: PathBuf,
     team_id: String,
@@ -330,10 +335,10 @@ async fn install(
             .unwrap_or_else(|| PathBuf::from("slack")),
     };
     let rerun = format!(
-        "cd '{}' && SLACK_CLI_APP_ICON_PATH='{}' '{}' app install --environment deployed --app deployed --team {team_id} --skip-update",
-        directory.display(),
-        icon.display(),
-        program.display()
+        "cd {} && SLACK_CLI_APP_ICON_PATH={} {} app install --environment deployed --app deployed --team {team_id} --skip-update",
+        shell_quoted(&directory),
+        shell_quoted(&icon),
+        shell_quoted(&program)
     );
     let status = tokio::task::spawn_blocking(move || {
         crate::quickstart::process::run(
@@ -429,6 +434,15 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn shell_quoted_paths_survive_single_quotes() {
+        assert_eq!(shell_quoted(Path::new("/tmp/slack")), "'/tmp/slack'");
+        assert_eq!(
+            shell_quoted(Path::new("/Users/a/Jonny's projects")),
+            r"'/Users/a/Jonny'\''s projects'"
+        );
     }
 
     #[test]
