@@ -42,13 +42,17 @@ const DELIVERY_DEADLINE: Duration = Duration::from_secs(5);
 const HOOK_TIMEOUT_SECONDS: u8 = 20;
 const MAX_SESSION_CONTEXT_BYTES: usize = 16 * 1024;
 const HOOK_MARKER: &str = "AGENTSCM_CAPTURE_HOOK_V1=1 ";
-const CLAUDE_EVENTS: [&str; 7] = [
+const CLAUDE_EVENTS: [&str; 11] = [
     "SessionStart",
     "UserPromptSubmit",
     "PreToolUse",
     "PostToolUse",
     "PostToolUseFailure",
     "MessageDisplay",
+    "Stop",
+    "PreCompact",
+    "SubagentStart",
+    "SubagentStop",
     "SessionEnd",
 ];
 

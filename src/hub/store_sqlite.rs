@@ -5848,7 +5848,12 @@ impl Store for SqliteStore {
         for (sequence, encoded) in &retained_lifecycle {
             let event: CapturedEventV1 = json_value(encoded)?;
             match event.kind {
-                CapturedEventKindV1::SessionStarted => start_sequences.push(*sequence),
+                // A compaction restart continues the same session, not a second origin.
+                CapturedEventKindV1::SessionStarted
+                    if event.boundary.as_deref() != Some("compact") =>
+                {
+                    start_sequences.push(*sequence)
+                }
                 CapturedEventKindV1::SessionEnded => end_sequences.push(*sequence),
                 _ => {}
             }

@@ -378,17 +378,33 @@ async fn hook_claude() -> Result<i32> {
             return Ok(0);
         }
     };
+    let live_parent = payload
+        .get("parent_session_id")
+        .and_then(serde_json::Value::as_str);
+    let (parent_session_id, capture_mode) = spool
+        .pin_session_identity(
+            &session_id,
+            &target.session_id,
+            &target.work_id,
+            target.generation,
+            live_parent,
+            binding.capture_mode,
+        )
+        .unwrap_or_else(|_| {
+            eprintln!(
+                "AgentSCM local capture warning: pinned session identity is unavailable; using the live binding"
+            );
+            (live_parent.map(str::to_owned), binding.capture_mode)
+        });
     let request = CaptureRequest {
         operation_prefix: "hook".into(),
         work_id: target.work_id,
         generation: target.generation,
         observed_session_id: session_id,
         canonical_session_id: target.session_id,
-        parent_session_id: payload
-            .get("parent_session_id")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned),
-        capture_mode: binding.capture_mode,
+        parent_session_id,
+        capture_mode,
+        live_capture_mode: binding.capture_mode,
     };
     match claude_code::capture_native_hook(&input, &request, &actions, &spool) {
         Ok(report) => {
@@ -663,6 +679,7 @@ fn import_claude(args: ImportClaudeArgs) -> Result<i32> {
         canonical_session_id: args.session_id,
         parent_session_id: args.parent_session_id,
         capture_mode: args.capture_mode.into(),
+        live_capture_mode: args.capture_mode.into(),
     };
     let report =
         claude_code::import_jsonl(BufReader::new(File::open(args.input)?), &request, &spool)

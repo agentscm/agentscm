@@ -1449,25 +1449,18 @@ What the hub keeps, in its database and object store:
   200) and the times of its recent refusals (`deny_times`, for the limit of 3
   per 10 minutes). A session row is deleted when the session ends, and rows
   untouched for 7 days are deleted the next time the same token is used.
-- The task from a hook payload. Sessions started by a hook can take their
-  task from the agent's own start event, where the agent includes its first
-  prompt there: `initial_prompt` in a `SessionStart` payload, or
-  `initialPrompt` in a Copilot CLI one. Control
-  characters are replaced with spaces and the text is cut to 500 bytes
-  (otherwise it is stored as sent). It is stored as the session's task at
-  once and becomes its intent's task, so a prompt can reach teammates: their
-  agents' warnings show it cut to 120 characters (80 printable ASCII
-  characters in a refusal), the intents API and the status page return it in
-  full to any token for the repository, and the `intent_announced` and
-  `intent_notice` events keep it in the append-only log. Claude Code
-  does not support HTTP hooks for `SessionStart`, so with the HTTP hooks
-  of a manual setup no prompt reaches the hub. The task can also come from
-  `agentscm_start` or `agentscm intent`. An agent's hook sends the hub its
-  whole hook JSON, which for an edit includes the edit's contents; the hub
-  reads only the event and tool names, the session id, the edited file paths,
-  the working directory, workspace roots and root header (to make paths
-  repository-relative), and the start task (or a generic hook's `task`), and
-  neither stores nor logs the rest.
+- The task from a hook payload. A prompt in a `SessionStart` payload
+  (`initial_prompt`, or `initialPrompt` in a Copilot CLI one) is not stored:
+  a prompt would otherwise become the session's task and its intent's task,
+  which teammates' warnings, the intents API and the status page show. A
+  generic hook's `task` field is still stored (control characters replaced
+  with spaces, cut to 500 bytes), and the task can come from `agentscm_start`
+  or `agentscm intent`. An agent's hook sends the hub its whole hook JSON,
+  which for an edit includes the edit's contents; the hub reads only the
+  event and tool names, the session id, the edited file paths, the working
+  directory, workspace roots and root header (to make paths
+  repository-relative), and a generic hook's `task`, and neither stores nor
+  logs the rest.
 - Handoff requests (`hub_handoffs`, experimental): the file path, the
   requesting and holding tokens and sessions, the holder's intent, a note (the
   requester's task or note, filtered, at most 200 characters), the holder's

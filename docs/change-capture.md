@@ -71,13 +71,25 @@ one priority `capture_interrupted` pause marker, and remains fail-open.
 
 The native adapter accepts Claude Code command-hook JSON on stdin. Its supported input events are:
 
-- `SessionStart`: observed startup, resume, clear, compact, or fork boundary.
+- `SessionStart`: observed startup, resume, clear, compact, or fork boundary. An allowlisted
+  `source` (startup, resume, clear, compact) is kept as the event boundary; a compact restart
+  continues the same session and is not counted as a second original start.
 - `UserPromptSubmit`: visible prompt, if local-conversation capture is enabled.
 - `PreToolUse`: typed tool start and optional local tool input.
 - `PostToolUse` and `PostToolUseFailure`: typed tool finish and optional local result or error.
 - `MessageDisplay`: assistant-message fragments. When Claude Code supplies a message identity,
   fragment index, final flag, or timestamp, the adapter uses those correlation fields.
-- `SessionEnd`: session termination.
+- `Stop`, `PreCompact`, `SubagentStart` and `SubagentStop`: turn-ended, compaction and subagent
+  lifecycle markers. A subagent marker carries the subagent's `agent_id` and optional
+  `agent_type`; one without a valid `agent_id` is ignored. These markers are informational: they
+  never raise coverage, and they do not record an `identity_uncertain` gap when the host supplies no
+  identity.
+- `SessionEnd`: session termination. An allowlisted `reason` (clear, logout, prompt_input_exit) is
+  kept as the event boundary and any other reason is recorded as `other`.
+
+Tool facts also carry the bounded host tool name (for example `mcp__server__tool`) and, on finish
+events, whether the host reported the call as `returned` or `failed`. `returned` means the host
+hook fired for a finished call; it is not evidence that the call achieved anything.
 
 `Stop` is a turn boundary and is not recorded as session termination. Only a `SessionStart` whose
 documented source is `startup` establishes an original session boundary. A resume, clear, compact,
@@ -190,7 +202,7 @@ read-only, but they cannot be enabled for configured execution or rebound to the
 This conservative refusal avoids splitting a possibly live legacy lock or granting replay authority
 to copied history.
 
-Configuration adds marked `agentscm change-capture hook-claude` entries for the seven lifecycle
+Configuration adds marked `agentscm change-capture hook-claude` entries for the eleven lifecycle
 groups and preserves unrelated hooks. Each hook has a 20-second host timeout. The hook resolves the
 exact current Work and generation for the native session on every invocation, appends locally
 before delivery, then replays at most ten pending envelopes in causal order through the existing

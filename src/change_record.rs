@@ -53,6 +53,10 @@ pub enum CapturedEventKindV1 {
     CheckFinished,
     SessionEnded,
     Gap,
+    TurnEnded,
+    Compaction,
+    SubagentStarted,
+    SubagentStopped,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -74,6 +78,28 @@ pub struct ToolFactV1 {
     pub kind: ToolKindV1,
     /// Opaque provider request identity, restricted to identifier characters.
     pub request_id: Option<String>,
+    /// Raw host tool name (for example `mcp__server__tool`), bounded to 128 identifier bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// What the host reported when the tool finished. Absent on start events and when unobserved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<ToolCompletionV1>,
+}
+
+/// A host completion hook proves the call ended, not that it achieved anything.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCompletionV1 {
+    Returned,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentFactV1 {
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -174,6 +200,11 @@ pub struct CapturedEventV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup: Option<SetupObservationV1>,
     pub gap: Option<GapFactV1>,
+    /// Allowlisted session boundary: SessionStart `source` or SessionEnd `reason`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<SubagentFactV1>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -683,6 +714,51 @@ impl CapturedEventV1 {
         {
             identifier("tool request_id", request_id, 255)?;
         }
+        if let Some(tool) = &self.tool
+            && let Some(name) = &tool.name
+        {
+            identifier("tool name", name, 128)?;
+        }
+        if let Some(subagent) = &self.subagent {
+            identifier("subagent agent_id", &subagent.agent_id, 255)?;
+            if let Some(agent_type) = &subagent.agent_type {
+                identifier("subagent agent_type", agent_type, 128)?;
+            }
+        }
+        if let Some(boundary) = &self.boundary
+            && !matches!(
+                (self.kind, boundary.as_str()),
+                (
+                    CapturedEventKindV1::SessionStarted,
+                    "startup" | "resume" | "clear" | "compact"
+                ) | (
+                    CapturedEventKindV1::SessionEnded,
+                    "clear" | "logout" | "prompt_input_exit" | "other"
+                )
+            )
+        {
+            return Err(invalid("event boundary is not allowlisted for its kind"));
+        }
+        if matches!(
+            self.kind,
+            CapturedEventKindV1::SubagentStarted | CapturedEventKindV1::SubagentStopped
+        ) != self.subagent.is_some()
+        {
+            return Err(invalid(
+                "subagent facts must appear exactly on subagent events",
+            ));
+        }
+        if self
+            .tool
+            .as_ref()
+            .is_some_and(|tool| tool.completion.is_some())
+            && !matches!(
+                self.kind,
+                CapturedEventKindV1::ToolFinished | CapturedEventKindV1::CheckFinished
+            )
+        {
+            return Err(invalid("tool completion must appear on finish events"));
+        }
         let tool_event = matches!(
             self.kind,
             CapturedEventKindV1::ToolStarted
@@ -1092,12 +1168,118 @@ mod tests {
                 }),
                 setup: None,
                 gap: None,
+                boundary: None,
+                subagent: None,
             }],
         };
         assert!(batch.validate().is_err());
         batch.events[0].artifact = None;
         batch.events[0].event_id = "/private/tmp/transcript.jsonl".into();
         assert!(batch.validate().is_err());
+    }
+
+    fn batch_of(event: serde_json::Value) -> CaptureBatchV1 {
+        serde_json::from_value(json!({
+            "schema_version": 1,
+            "operation_id": "upload-1",
+            "work_id": "wrk_0123456789abcdef0123456789abcdef",
+            "generation": 1,
+            "session": serde_json::to_value(session()).unwrap(),
+            "events": [event],
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn old_event_shapes_deserialize_and_new_fields_stay_off_the_wire() {
+        let batch = batch_of(json!({
+            "event_id": "event-1", "sequence": 1, "observed_at": 1,
+            "kind": "tool_finished",
+            "tool": {"kind": "read", "request_id": "toolu-1"},
+            "artifact": null, "gap": null,
+        }));
+        batch.validate().unwrap();
+        let event = &batch.events[0];
+        assert!(event.boundary.is_none() && event.subagent.is_none());
+        let tool = event.tool.as_ref().unwrap();
+        assert!(tool.name.is_none() && tool.completion.is_none());
+        let encoded = serde_json::to_string(&batch).unwrap();
+        for field in ["boundary", "subagent", "completion", "\"name\""] {
+            assert!(!encoded.contains(field), "{field} leaked: {encoded}");
+        }
+    }
+
+    #[test]
+    fn new_event_shapes_round_trip_and_are_bounded() {
+        let tool = batch_of(json!({
+            "event_id": "event-1", "sequence": 1, "observed_at": 1,
+            "kind": "tool_finished",
+            "tool": {"kind": "other", "request_id": null,
+                     "name": "mcp__server__tool", "completion": "returned"},
+            "artifact": null, "gap": null,
+        }));
+        tool.validate().unwrap();
+        let tool_again: CaptureBatchV1 =
+            serde_json::from_slice(&serde_json::to_vec(&tool).unwrap()).unwrap();
+        assert_eq!(tool, tool_again);
+        assert_eq!(
+            tool.events[0].tool.as_ref().unwrap().completion,
+            Some(ToolCompletionV1::Returned)
+        );
+
+        let mut overlong = tool.clone();
+        overlong.events[0].tool.as_mut().unwrap().name = Some("n".repeat(129));
+        assert!(overlong.validate().is_err());
+        let mut started = tool.clone();
+        started.events[0].kind = CapturedEventKindV1::ToolStarted;
+        assert!(
+            started.validate().is_err(),
+            "completion needs a finish event"
+        );
+
+        let subagent = batch_of(json!({
+            "event_id": "event-2", "sequence": 1, "observed_at": 1,
+            "kind": "subagent_started", "tool": null, "artifact": null, "gap": null,
+            "subagent": {"agent_id": "agent-1", "agent_type": "Explore"},
+        }));
+        subagent.validate().unwrap();
+        let mut bad = subagent.clone();
+        bad.events[0].subagent.as_mut().unwrap().agent_id = "a b".into();
+        assert!(bad.validate().is_err());
+        let mut missing = subagent;
+        missing.events[0].subagent = None;
+        assert!(missing.validate().is_err());
+
+        let turn_ended = |kind: &str, boundary: Option<&str>| {
+            batch_of(json!({
+                "event_id": "event-3", "sequence": 1, "observed_at": 1,
+                "kind": kind, "tool": null, "artifact": null, "gap": null,
+                "boundary": boundary,
+            }))
+        };
+        turn_ended("turn_ended", None).validate().unwrap();
+        turn_ended("compaction", None).validate().unwrap();
+        turn_ended("session_started", Some("compact"))
+            .validate()
+            .unwrap();
+        turn_ended("session_ended", Some("other"))
+            .validate()
+            .unwrap();
+        assert!(
+            turn_ended("session_started", Some("logout"))
+                .validate()
+                .is_err()
+        );
+        assert!(
+            turn_ended("session_ended", Some("/tmp/x"))
+                .validate()
+                .is_err()
+        );
+        assert!(
+            turn_ended("turn_ended", Some("startup"))
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]
@@ -1110,10 +1292,14 @@ mod tests {
             tool: Some(ToolFactV1 {
                 kind: ToolKindV1::Test,
                 request_id: Some(format!("request-{sequence}")),
+                name: None,
+                completion: None,
             }),
             artifact: None,
             setup: None,
             gap: None,
+            boundary: None,
+            subagent: None,
         };
         let batch = CaptureBatchV1 {
             schema_version: 1,

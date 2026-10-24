@@ -2088,6 +2088,43 @@ impl LocalSpool {
         atomic_replace(&path, &bytes)
     }
 
+    /// Returns the parent session and capture mode that identify this canonical session to the Hub,
+    /// pinning the supplied live values the first time the (Work, generation, session) is seen.
+    /// The Hub compares both as part of session identity, so a later mode change or a parent id
+    /// that appears mid-session must not alter what later batches carry.
+    pub fn pin_session_identity(
+        &self,
+        observed_session_id: &str,
+        canonical_session_id: &str,
+        work_id: &str,
+        generation: i64,
+        parent_session_id: Option<&str>,
+        capture_mode: CaptureModeV1,
+    ) -> Result<(Option<String>, CaptureModeV1)> {
+        let live = SessionAssociationV1 {
+            observed_session_id: observed_session_id.to_owned(),
+            canonical_session_id: canonical_session_id.to_owned(),
+            work_id: work_id.to_owned(),
+            generation,
+            parent_session_id: parent_session_id.map(str::to_owned),
+            capture_mode,
+        };
+        validate_association(&live)?;
+        let _lock = self.lock()?;
+        if let Some(pinned) = load_association(&self.root, observed_session_id)?
+            && pinned.canonical_session_id == canonical_session_id
+            && pinned.work_id == work_id
+            && pinned.generation == generation
+        {
+            return Ok((pinned.parent_session_id, pinned.capture_mode));
+        }
+        let bytes = serde_json::to_vec(&live)?;
+        let path = association_path(&self.root, observed_session_id);
+        self.reserve_replace(&path, bytes.len() as u64)?;
+        atomic_replace(&path, &bytes)?;
+        Ok((live.parent_session_id, live.capture_mode))
+    }
+
     /// Returns deferred occurrences that were bound to the exact target current when capture was
     /// interrupted. The sanitized deferred facts stay local; callers emit only explicit gaps.
     pub(crate) fn deferred_gaps(&self, observed_session_id: &str) -> Result<Vec<DeferredGapV1>> {

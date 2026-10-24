@@ -10,6 +10,7 @@ use agentscm::change_record::{
     ArtifactMediaV1, ArtifactRefV1, AssuranceBasisV1, CaptureBatchV1, CaptureModeV1,
     CapturedEventKindV1, CapturedEventV1, CheckResultV1, ContentAvailabilityV1, CoverageV1,
     DriftV1, RecipeProvenanceV1, RetentionClassV1, SessionIdentityV1, SourceBindingV1,
+    SubagentFactV1, ToolCompletionV1, ToolFactV1, ToolKindV1,
 };
 use agentscm::hub::store::{self, ForgeIdentity, Store, mint_agent_token, unix_now};
 use agentscm::hub::work::{CheckpointKind, SourceRef, WorkCheckpoint, WorkRole, WorkStart};
@@ -119,6 +120,8 @@ fn event_batch(work_id: &str, generation: i64, operation: &str, sequence: u64) -
             artifact: None,
             setup: None,
             gap: None,
+            boundary: None,
+            subagent: None,
         }],
     }
 }
@@ -647,11 +650,86 @@ fn lifecycle_resume_and_replay(db: &Db) {
     );
 }
 
+fn informational_events_do_not_change_lifecycle_coverage(fresh: &dyn Fn() -> Db) {
+    // Each case gets its own database: a session participates in one Work at a time.
+    let ingest = |kinds: &[(CapturedEventKindV1, Option<&str>)]| {
+        let db = fresh();
+        let (store, token, work_id, generation) = setup(&db);
+        let mut batch = event_batch(&work_id, generation, "informational", 1);
+        batch.events = kinds
+            .iter()
+            .enumerate()
+            .map(|(index, (kind, boundary))| {
+                let sequence = index as u64 + 1;
+                let mut event = event_batch_kind(&work_id, generation, "x", sequence, *kind)
+                    .events
+                    .remove(0);
+                event.boundary = boundary.map(str::to_owned);
+                match kind {
+                    CapturedEventKindV1::SubagentStarted | CapturedEventKindV1::SubagentStopped => {
+                        event.subagent = Some(SubagentFactV1 {
+                            agent_id: "agent-1".into(),
+                            agent_type: Some("Explore".into()),
+                        });
+                    }
+                    CapturedEventKindV1::ToolFinished => {
+                        event.tool = Some(ToolFactV1 {
+                            kind: ToolKindV1::Other,
+                            request_id: Some("toolu-1".into()),
+                            name: Some("mcp__server__tool".into()),
+                            completion: Some(ToolCompletionV1::Returned),
+                        });
+                    }
+                    _ => {}
+                }
+                event
+            })
+            .collect();
+        store.change_ingest(&token, &batch, 400).unwrap();
+        store
+            .change_record(&token, &work_id, 401)
+            .unwrap()
+            .unwrap()
+            .sessions
+            .coverage
+    };
+    use CapturedEventKindV1::*;
+    // Informational kinds and a compaction restart sit inside one valid lifecycle.
+    assert_eq!(
+        ingest(&[
+            (SessionStarted, Some("startup")),
+            (SubagentStarted, None),
+            (ToolFinished, None),
+            (SubagentStopped, None),
+            (TurnEnded, None),
+            (Compaction, None),
+            (SessionStarted, Some("compact")),
+            (TurnEnded, None),
+            (SessionEnded, Some("other")),
+        ]),
+        CoverageV1::Complete
+    );
+    // They never complete a session that was not observed ending, or one with a second origin.
+    assert_ne!(
+        ingest(&[(SessionStarted, Some("startup")), (TurnEnded, None)]),
+        CoverageV1::Complete
+    );
+    assert_ne!(
+        ingest(&[
+            (SessionStarted, Some("startup")),
+            (SessionStarted, Some("resume")),
+            (SessionEnded, None),
+        ]),
+        CoverageV1::Complete
+    );
+}
+
 #[test]
 fn sqlite_action_capture_receipt() {
     let db = Db::sqlite();
     action_capture_receipt(&db);
     lifecycle_resume_and_replay(&db);
+    informational_events_do_not_change_lifecycle_coverage(&Db::sqlite);
 }
 
 #[test]
@@ -659,5 +737,6 @@ fn postgres_action_capture_receipt() {
     if let Some(db) = Db::postgres() {
         action_capture_receipt(&db);
         lifecycle_resume_and_replay(&db);
+        informational_events_do_not_change_lifecycle_coverage(&|| Db::postgres().unwrap());
     }
 }

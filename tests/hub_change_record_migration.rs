@@ -241,6 +241,8 @@ fn write_change_record(store: &dyn Store, fixture: &Fixture) -> Value {
                     artifact: None,
                     setup: None,
                     gap: None,
+                    boundary: None,
+                    subagent: None,
                 }],
             },
             now,

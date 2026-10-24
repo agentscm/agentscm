@@ -32,10 +32,8 @@ def call(who, method, path, body=None, ok=(200,)):
     return status, (json.loads(text) if text else None)
 
 
-def hook(who, session, event, file=None, prompt=None):
+def hook(who, session, event, file=None):
     body = {"session_id": session, "cwd": ROOT, "hook_event_name": event}
-    if prompt:
-        body["initial_prompt"] = prompt
     if file:
         if HOOK[who] == "codex":
             body["tool_name"] = "apply_patch"
@@ -91,17 +89,17 @@ def refresh(key):
 
 def seed():
     # Live file activity: sessions, held files, a refusal, a granted and a declined handoff.
-    hook("IVY", "ivy-1", "SessionStart", prompt="Rebuild the hub status page shell")
+    hook("IVY", "ivy-1", "SessionStart")
     for f in ["ui/src/App.tsx", "ui/src/components/Header.tsx", "ui/src/styles.css"]:
         hook("IVY", "ivy-1", "PreToolUse", f)
-    hook("ORION", "orion-1", "SessionStart", prompt="Bound coordination request history")
+    hook("ORION", "orion-1", "SessionStart")
     for f in ["src/hub/coordination.rs", "src/hub/coordination_http.rs"]:
         hook("ORION", "orion-1", "PreToolUse", f)
-    hook("JUNO", "juno-1", "SessionStart", prompt="Document the skill workflow hub")
+    hook("JUNO", "juno-1", "SessionStart")
     hook("JUNO", "juno-1", "PreToolUse", "docs/hub.md")
-    hook("PAX", "pax-1", "SessionStart", prompt="Retention migration for PostgreSQL")
+    hook("PAX", "pax-1", "SessionStart")
     hook("PAX", "pax-1", "PreToolUse", "src/hub/store_pg.rs")
-    hook("RUNE", "rune-1", "SessionStart", prompt="Fix intent renewal race")
+    hook("RUNE", "rune-1", "SessionStart")
     hook("RUNE", "rune-1", "PreToolUse", "src/hub/intent.rs")
     # Juno touches Ivy's stylesheet: refused, then Ivy hands it over.
     assert denied(hook("JUNO", "juno-1", "PreToolUse", "ui/src/styles.css")), "expected a refusal"

@@ -29,6 +29,7 @@ use agentscm::change_record::{
     AssuranceBasisV1, CaptureBatchV1, CaptureEnvelopeV1, CaptureModeV1, CapturedEventKindV1,
     CapturedEventV1, CheckResultV1, ContentAvailabilityV1, CoverageV1, DriftV1, GapReasonV1,
     RecipeProvenanceV1, RetentionClassV1, SCHEMA_VERSION_V1, SessionIdentityV1, SourceBindingV1,
+    ToolCompletionV1,
 };
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -47,6 +48,7 @@ fn capture_request(mode: CaptureModeV1) -> CaptureRequest {
         canonical_session_id: "session_fixture".into(),
         parent_session_id: None,
         capture_mode: mode,
+        live_capture_mode: mode,
     }
 }
 
@@ -389,6 +391,8 @@ fn sample_batch(operation_id: &str, event_id: &str) -> CaptureEnvelopeV1 {
             artifact: None,
             setup: None,
             gap: None,
+            boundary: None,
+            subagent: None,
         }],
     })
 }
@@ -2843,6 +2847,7 @@ fn completed_works_compact_without_growing_checkout_lock_records() {
         canonical_session_id: "session_repeated".into(),
         parent_session_id: None,
         capture_mode: CaptureModeV1::MetadataOnly,
+        live_capture_mode: CaptureModeV1::MetadataOnly,
     };
     capture_hook(
         br#"{"hook_event_name":"SessionStart","session_id":"session_repeated","source":"startup"}"#,
@@ -2866,6 +2871,7 @@ fn completed_works_compact_without_growing_checkout_lock_records() {
             canonical_session_id: "session_repeated".into(),
             parent_session_id: None,
             capture_mode: CaptureModeV1::MetadataOnly,
+            live_capture_mode: CaptureModeV1::MetadataOnly,
         };
         let pre = serde_json::to_vec(&serde_json::json!({
             "hook_event_name": "PreToolUse",
@@ -4071,6 +4077,7 @@ fn legacy_managed_marker_without_capture_binding_stays_unassociated() {
         canonical_session_id: "legacy_canonical".into(),
         parent_session_id: None,
         capture_mode: CaptureModeV1::MetadataOnly,
+        live_capture_mode: CaptureModeV1::MetadataOnly,
     };
     let actions = ActionCaptureConfig {
         source: git_request(&canonical),
@@ -4699,4 +4706,164 @@ fn contains_bytes(values: &[Vec<u8>], needle: &[u8]) -> bool {
     values
         .iter()
         .any(|value| value.windows(needle.len()).any(|window| window == needle))
+}
+
+fn captured_events(spool: &LocalSpool) -> Vec<(SessionIdentityV1, CapturedEventV1)> {
+    spool
+        .pending(100)
+        .unwrap()
+        .into_iter()
+        .flat_map(|envelope| match envelope {
+            CaptureEnvelopeV1::EventBatch(batch) => batch
+                .events
+                .into_iter()
+                .map(|event| (batch.session.clone(), event))
+                .collect(),
+            _ => Vec::new(),
+        })
+        .collect()
+}
+
+#[test]
+fn lifecycle_hooks_record_boundaries_subagents_tool_names_and_completion() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let request = capture_request(CaptureModeV1::MetadataOnly);
+    let capture = |payload: &str| capture_hook(payload.as_bytes(), &request, &spool).unwrap();
+    let base = r#""session_id":"session_fixture""#;
+    for payload in [
+        format!(
+            r#"{{"hook_event_name":"SessionStart",{base},"source":"startup","timestamp":"2026-10-24T10:00:00Z"}}"#
+        ),
+        format!(
+            r#"{{"hook_event_name":"PostToolUse",{base},"tool_name":"mcp__server__tool","tool_use_id":"tool_a"}}"#
+        ),
+        format!(
+            r#"{{"hook_event_name":"PostToolUseFailure",{base},"tool_name":"Bash","tool_use_id":"tool_b"}}"#
+        ),
+        format!(r#"{{"hook_event_name":"Stop",{base}}}"#),
+        format!(r#"{{"hook_event_name":"Stop",{base}}}"#),
+        format!(r#"{{"hook_event_name":"PreCompact",{base}}}"#),
+        format!(
+            r#"{{"hook_event_name":"SubagentStart",{base},"agent_id":"agent_1","agent_type":"Explore"}}"#
+        ),
+        format!(r#"{{"hook_event_name":"SubagentStop",{base},"agent_id":"agent_1"}}"#),
+        format!(
+            r#"{{"hook_event_name":"SessionStart",{base},"source":"compact","timestamp":"2026-10-24T10:00:01Z"}}"#
+        ),
+        format!(
+            r#"{{"hook_event_name":"SessionEnd",{base},"reason":"unlisted reason","timestamp":"2026-10-24T10:00:02Z"}}"#
+        ),
+    ] {
+        assert_eq!(capture(&payload), HookCaptureOutcome::Stored, "{payload}");
+    }
+    // A subagent marker without a usable agent id would be invalid on the Hub, so it is dropped.
+    assert_eq!(
+        capture(&format!(
+            r#"{{"hook_event_name":"SubagentStart",{base},"agent_type":"Explore"}}"#
+        )),
+        HookCaptureOutcome::Ignored
+    );
+
+    let events: Vec<_> = captured_events(&spool)
+        .into_iter()
+        .map(|(_, event)| event)
+        .collect();
+    let of = |kind| events.iter().filter(move |event| event.kind == kind);
+    assert_eq!(of(CapturedEventKindV1::TurnEnded).count(), 2);
+    assert_eq!(of(CapturedEventKindV1::Compaction).count(), 1);
+    // Informational markers without a host identity record no identity-uncertainty gap.
+    assert_eq!(of(CapturedEventKindV1::Gap).count(), 0);
+    let subagents: Vec<_> = events
+        .iter()
+        .filter_map(|event| event.subagent.as_ref())
+        .collect();
+    assert_eq!(subagents.len(), 2);
+    assert_eq!(subagents[0].agent_id, "agent_1");
+    assert_eq!(subagents[0].agent_type.as_deref(), Some("Explore"));
+    assert_eq!(subagents[1].agent_type, None);
+    let boundaries: Vec<_> = of(CapturedEventKindV1::SessionStarted)
+        .chain(of(CapturedEventKindV1::SessionEnded))
+        .map(|event| event.boundary.as_deref())
+        .collect();
+    assert_eq!(
+        boundaries,
+        [Some("startup"), Some("compact"), Some("other")]
+    );
+    let finishes: Vec<_> = of(CapturedEventKindV1::ToolFinished)
+        .map(|event| event.tool.as_ref().unwrap())
+        .collect();
+    assert_eq!(finishes.len(), 2);
+    assert_eq!(finishes[0].name.as_deref(), Some("mcp__server__tool"));
+    assert_eq!(finishes[0].completion, Some(ToolCompletionV1::Returned));
+    assert_eq!(finishes[1].name.as_deref(), Some("Bash"));
+    assert_eq!(finishes[1].completion, Some(ToolCompletionV1::Failed));
+}
+
+#[test]
+fn session_identity_is_pinned_while_the_live_mode_gates_retention() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let pin = |parent: Option<&str>, mode, generation| {
+        spool
+            .pin_session_identity(
+                "session_fixture",
+                "session_fixture",
+                "wrk_fixture",
+                generation,
+                parent,
+                mode,
+            )
+            .unwrap()
+    };
+    assert_eq!(
+        pin(None, CaptureModeV1::MetadataOnly, 1),
+        (None, CaptureModeV1::MetadataOnly)
+    );
+    // A later toggle or a parent id that appears mid-session does not change the identity...
+    assert_eq!(
+        pin(Some("parent_fixture"), CaptureModeV1::LocalConversation, 1),
+        (None, CaptureModeV1::MetadataOnly)
+    );
+    // ...but a new Work generation is a new identity.
+    assert_eq!(
+        pin(Some("parent_fixture"), CaptureModeV1::LocalConversation, 2),
+        (
+            Some("parent_fixture".to_owned()),
+            CaptureModeV1::LocalConversation
+        )
+    );
+    pin(None, CaptureModeV1::MetadataOnly, 1);
+
+    let mut request = capture_request(CaptureModeV1::MetadataOnly);
+    request.live_capture_mode = CaptureModeV1::LocalConversation;
+    let prompt = |id: &str, body: &str| {
+        format!(
+            r#"{{"hook_event_name":"UserPromptSubmit","session_id":"session_fixture","prompt_id":"{id}","prompt":"{body}"}}"#
+        )
+    };
+    capture_hook(prompt("p1", "LIVE_BODY_ONE").as_bytes(), &request, &spool).unwrap();
+    request.live_capture_mode = CaptureModeV1::MetadataOnly;
+    capture_hook(prompt("p2", "LIVE_BODY_TWO").as_bytes(), &request, &spool).unwrap();
+
+    let captured = captured_events(&spool);
+    assert!(!captured.is_empty());
+    assert!(captured.iter().all(|(session, _)| session.capture_mode
+        == CaptureModeV1::MetadataOnly
+        && session.parent_session_id.is_none()));
+    let artifact_for = |sequence_kind: usize| {
+        captured
+            .iter()
+            .filter(|(_, event)| event.kind == CapturedEventKindV1::UserPrompt)
+            .nth(sequence_kind)
+            .unwrap()
+            .1
+            .artifact
+            .is_some()
+    };
+    assert!(
+        artifact_for(0),
+        "live local-conversation mode retains the body"
+    );
+    assert!(!artifact_for(1), "live metadata-only mode retains nothing");
 }
