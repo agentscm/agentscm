@@ -760,9 +760,13 @@ fn menu(cx: &Cx<'_>, with_local: bool) -> HubChoice {
             2
         };
     }
-    choices[cx
-        .ui
-        .choose("Where should AgentSCM run?", &options, default)]
+    let skip = choices.iter().position(|c| matches!(c, HubChoice::Skip));
+    choices[cx.ui.choose(
+        "Where should AgentSCM run?",
+        &options,
+        default,
+        skip.unwrap_or(default),
+    )]
 }
 
 fn existing_hub(cx: &Cx<'_>, configured: Option<String>) -> Option<String> {
@@ -1038,6 +1042,7 @@ fn chosen_agents(cx: &Cx<'_>) -> Vec<crate::client_setup::Agent> {
         let pick = cx.ui.choose(
             "Claude Code wasn't found. Which coding agent should I set up?",
             &options,
+            none,
             none,
         );
         agents
