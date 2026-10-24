@@ -25,6 +25,10 @@ pub(crate) enum Stop {
 }
 
 const INPUT_CHUNK: usize = 16 * 1024;
+// After the leader exits, a concurrent spawn elsewhere in this process can hold
+// inherited copies of our pipe ends until its exec completes, which takes
+// hundreds of milliseconds on a loaded host. Only a retained pipe pays this wait.
+const POST_EXIT_DRAIN: Duration = Duration::from_secs(2);
 
 struct CaptureSettings {
     input_chunk: usize,
@@ -323,10 +327,10 @@ fn kill_group(child: &std::process::Child) {
     unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
 }
 
+// The reader bounds itself with its read timeout and drain deadline, so this waits
+// for its verdict rather than racing it with a scheduler-dependent timeout.
 fn receive(receiver: std::sync::mpsc::Receiver<(Vec<u8>, bool)>) -> (Vec<u8>, bool) {
-    receiver
-        .recv_timeout(Duration::from_millis(250))
-        .unwrap_or_default()
+    receiver.recv().unwrap_or_default()
 }
 
 fn reader(
@@ -352,30 +356,22 @@ fn reader(
             let mut buffer = [0u8; 4096];
             let mut drain_started = None;
             loop {
-                if done.load(Ordering::Acquire) {
-                    let started = drain_started.get_or_insert_with(Instant::now);
-                    if started.elapsed() >= Duration::from_millis(100) {
-                        return (retained, false);
-                    }
-                }
                 let count = match stream.read(&mut buffer) {
+                    Ok(0) => return (retained, true),
                     Ok(count) => count,
+                    // A transient read timeout is not EOF or completion.
                     Err(error)
                         if matches!(
                             error.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
                         ) =>
                     {
-                        // Only the loop's absolute drain deadline ends capture;
-                        // a transient read timeout is not EOF or completion.
-                        continue;
+                        0
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => return (retained, false),
                 };
-                if count == 0 {
-                    return (retained, true);
-                }
                 let previous = seen.fetch_add(count as u64, Ordering::AcqRel);
                 let keep = limit.saturating_sub(previous).min(count as u64) as usize;
                 retained.extend_from_slice(&buffer[..keep]);
@@ -384,6 +380,14 @@ fn reader(
                     // Stop reading to close the pipe. The supervisor kills the CLI
                     // and removes the container; output is never an unbounded log.
                     return (retained, true);
+                }
+                // Only this absolute drain deadline ends capture. It is checked after
+                // a read, so a reader descheduled past it still observes an EOF that
+                // is already available instead of failing.
+                if done.load(Ordering::Acquire)
+                    && drain_started.get_or_insert_with(Instant::now).elapsed() >= POST_EXIT_DRAIN
+                {
+                    return (retained, false);
                 }
             }
         })();
@@ -592,7 +596,7 @@ os._exit(0)
     #[test]
     fn inherited_output_writer_cannot_claim_complete_capture() {
         let result = capture(
-            Command::new("/bin/sh").args(["-c", "(/bin/sleep 0.3; printf late) & exit 0"]),
+            Command::new("/bin/sh").args(["-c", "(/bin/sleep 4; printf late) & exit 0"]),
             Duration::from_secs(1),
             256,
             &Cancellation::default(),
@@ -602,12 +606,28 @@ os._exit(0)
     }
 
     #[test]
+    fn a_write_end_released_shortly_after_exit_still_completes_capture() {
+        // Stands in for a concurrent spawn that briefly holds an inherited copy of
+        // the pipe on a loaded host; the old 100 ms bound reported this as Io.
+        let result = capture(
+            Command::new("/bin/sh").args(["-c", "printf ok; (/bin/sleep 0.3) & exit 0"]),
+            Duration::from_secs(2),
+            256,
+            &Cancellation::default(),
+        )
+        .unwrap();
+        assert_eq!(result.stop, None);
+        assert_eq!(result.code, Some(0));
+        assert_eq!(result.stdout, b"ok");
+    }
+
+    #[test]
     fn continuous_trickle_has_an_absolute_drain_deadline_and_retains_partial_bytes() {
         let started = Instant::now();
-        let result = capture(Command::new("/usr/bin/python3").args(["-c", "import os,time; child=os.fork();\nif child: os._exit(0)\nfor _ in range(100):\n os.write(1,b'x'); time.sleep(0.01)\n"]), Duration::from_secs(2), 1024, &Cancellation::default()).unwrap();
+        let result = capture(Command::new("/usr/bin/python3").args(["-c", "import os,time; child=os.fork();\nif child: os._exit(0)\nfor _ in range(400):\n os.write(1,b'x'); time.sleep(0.01)\n"]), Duration::from_secs(2), 1024, &Cancellation::default()).unwrap();
         assert_eq!(result.stop, Some(Stop::Io));
         assert!(!result.stdout.is_empty());
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < POST_EXIT_DRAIN + Duration::from_secs(1));
     }
 
     #[test]

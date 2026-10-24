@@ -101,19 +101,26 @@ fn isolated_git(repo: &Path) -> PathBuf {
             endpoint = mapping["endpoint"],
             exe = serde_json::to_string(&git_path()).unwrap()
         );
-        fs::write(&wrapper, script).unwrap();
-        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+        write_wrapper(&wrapper, &script);
         return wrapper;
     }
-    fs::write(
+    write_wrapper(
         &wrapper,
-        format!(
+        &format!(
             "#!/bin/sh\nexport GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1\nexec '{executable}' \"$@\"\n"
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+    );
     wrapper
+}
+
+// Worktrees of one repository share this wrapper. Rewriting identical bytes would
+// truncate it under a concurrent exec and make every later exec a slow first exec.
+fn write_wrapper(wrapper: &Path, script: &str) {
+    if fs::read(wrapper).is_ok_and(|current| current == script.as_bytes()) {
+        return;
+    }
+    fs::write(wrapper, script).unwrap();
+    fs::set_permissions(wrapper, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 fn attachment_request(worktree: &Path, actor: &str, output: &str, paths: &[&str]) -> AttachRequest {
@@ -3375,6 +3382,16 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
         let publication_server = tokio::spawn(async move {
             axum::serve(listener, publication_app).await.unwrap();
         });
+        // Publication requests run repeated source/authorization checks and several Git
+        // commands, each with a production bound of 60 seconds. Give them a finite
+        // 120-second HTTP budget under suite contention; the shared client's 15 seconds
+        // can expire before a multi-command operation completes on a loaded host.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
         let path = format!(
             "{publication_base}{REPO}/profiles/checks/attachments/{}/publication",
             state.id
@@ -3385,7 +3402,7 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
             "subject":native.subject,
             "metadata":CommitMetadata { name:"Synthetic".into(), email:"synthetic@example.invalid".into(), timestamp:1780000001, message:"Prepare imported receipt".into() }
         });
-        let first = json_request(env.client.post(&path).bearer_auth(&token), &prepare)
+        let first = json_request(client.post(&path).bearer_auth(&token), &prepare)
             .send()
             .await
             .unwrap();
@@ -3409,7 +3426,7 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
         ] {
             assert!(!encoded.contains(private), "{encoded}");
         }
-        let exact = json_request(env.client.post(&path).bearer_auth(&token), &prepare)
+        let exact = json_request(client.post(&path).bearer_auth(&token), &prepare)
             .send()
             .await
             .unwrap();
@@ -3421,7 +3438,7 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
         let mut changed = prepare.clone();
         changed["expected_generation"] = json!(state.generation + 1);
         assert_eq!(
-            json_request(env.client.post(&path).bearer_auth(&token), &changed)
+            json_request(client.post(&path).bearer_auth(&token), &changed)
                 .send()
                 .await
                 .unwrap()
@@ -3432,7 +3449,7 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
         let status_path = format!("{path}/status");
         let status_request = json!({"request_id":"prepare-imported-receipt"});
         let status = json_request(
-            env.client.post(&status_path).bearer_auth(&token),
+            client.post(&status_path).bearer_auth(&token),
             &status_request,
         )
         .send()
@@ -3450,12 +3467,7 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
             "candidate_id":first["candidate"]["candidate_id"],
             "expected_generation":state.generation
         });
-        // First publication performs repeated source/authorization checks and eight Git
-        // transport commands, each with a production bound of 60 seconds. Give this
-        // multi-command fixture operation a finite 120-second HTTP budget under suite
-        // contention; the shared client's 15 seconds can expire before it completes.
-        let published = json_request(env.client.post(&branch_path).bearer_auth(&token), &branch)
-            .timeout(std::time::Duration::from_secs(120))
+        let published = json_request(client.post(&branch_path).bearer_auth(&token), &branch)
             .send()
             .await
             .unwrap();
@@ -3477,7 +3489,7 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
             ),
             first["candidate"]["commit"].as_str().unwrap()
         );
-        let repeated = json_request(env.client.post(&branch_path).bearer_auth(&token), &branch)
+        let repeated = json_request(client.post(&branch_path).bearer_auth(&token), &branch)
             .send()
             .await
             .unwrap();
@@ -3511,13 +3523,11 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
                 &provider,
                 &["update-ref", &reference, replacement, original],
             );
-            let response = json_request(
-                env.client.post(&forge_path).bearer_auth(&token),
-                &forge_request,
-            )
-            .send()
-            .await
-            .unwrap();
+            let response =
+                json_request(client.post(&forge_path).bearer_auth(&token), &forge_request)
+                    .send()
+                    .await
+                    .unwrap();
             assert_eq!(response.status().as_u16(), 200);
             let refused: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
             assert!(refused["error"].is_string(), "{refused}");
@@ -3528,13 +3538,10 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
             );
         }
         fake.with(|s| s.lose_next_pull_reply = true);
-        let result = json_request(
-            env.client.post(&forge_path).bearer_auth(&token),
-            &forge_request,
-        )
-        .send()
-        .await
-        .unwrap();
+        let result = json_request(client.post(&forge_path).bearer_auth(&token), &forge_request)
+            .send()
+            .await
+            .unwrap();
         let code = result.status();
         let result: Value = serde_json::from_slice(&result.bytes().await.unwrap()).unwrap();
         assert_eq!(code.as_u16(), 200, "{result}");
@@ -3553,7 +3560,7 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
             (forge_path.clone(), &forge_request),
             (format!("{forge_path}/recover"), &recovery),
         ] {
-            let response = json_request(env.client.post(url).bearer_auth(&token), request)
+            let response = json_request(client.post(url).bearer_auth(&token), request)
                 .send()
                 .await
                 .unwrap();
@@ -3566,17 +3573,13 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
         // Concurrent retries adopt the one exact PR; durable attempting forbids another create.
         let (a, b) = tokio::join!(
             json_request(
-                env.client
+                client
                     .post(format!("{forge_path}/recover"))
                     .bearer_auth(&token),
                 &recovery
             )
             .send(),
-            json_request(
-                env.client.post(&forge_path).bearer_auth(&token),
-                &forge_request
-            )
-            .send()
+            json_request(client.post(&forge_path).bearer_auth(&token), &forge_request).send()
         );
         for response in [a.unwrap(), b.unwrap()] {
             let code = response.status();
