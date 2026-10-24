@@ -167,6 +167,9 @@ sign-in there.
 - `GET /v1/hub/whoami`: needs `Authorization: Bearer <token>`. Returns the
   token's id, name, repository and expiry, and its owner. Every authentication
   failure returns the same 401 body.
+- `DELETE /v1/hub/token`: needs `Authorization: Bearer <token>` (read-only tokens too) and revokes
+  that token only (204). `agentscm client remove` and `uninstall` use it, so undoing a setup needs no
+  sign-in. A revoked or unknown token gets 401.
 - Sign-in (unauthenticated): `GET /v1/hub/login/{provider}?cli_port&cli_challenge`
   (302 to the forge), `GET /v1/hub/login/{provider}/callback`,
   `POST /v1/hub/login/exchange` (`code`, `verifier`),
@@ -193,6 +196,7 @@ A read-only token (see [Identity model](#identity-model)) is accepted on exactly
 on no others:
 
 - `GET /v1/hub/whoami` (its `token` has `"read_only": true`)
+- `DELETE /v1/hub/token`, which revokes the read-only token itself
 - `GET /v1/hub/repos/{repo}/intents`
 - `GET /v1/hub/repos/{repo}/work`
 - `GET /v1/hub/repos/{repo}/activity`

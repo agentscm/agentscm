@@ -89,16 +89,6 @@ pub(crate) struct Remote {
     pub(crate) repo: String,
 }
 
-impl Remote {
-    pub(crate) fn provider(&self) -> Option<&'static str> {
-        match self.forge {
-            Forge::Github => Some("github"),
-            Forge::Gitlab => Some("gitlab"),
-            Forge::Other => None,
-        }
-    }
-}
-
 /// Understands `git@host:owner/name.git`, `https://host/owner/name(.git)` and
 /// `ssh://git@host[:port]/owner/name(.git)`.
 pub(crate) fn parse_remote(url: &str) -> Option<Remote> {
@@ -193,7 +183,7 @@ pub(crate) struct Detected {
     pub(crate) claude: bool,
 }
 
-pub(crate) fn detect(cwd: &Path, home: &Path) -> Detected {
+pub(crate) fn detect(cwd: &Path) -> Detected {
     let git = which("git").and_then(|path| {
         let version = capture(&path, &["--version"], None, QUICK)?;
         Some((path, version))
@@ -225,7 +215,8 @@ pub(crate) fn detect(cwd: &Path, home: &Path) -> Detected {
         capture(&docker, &["version"], None, QUICK).is_some()
             && capture(&docker, &["compose", "version"], None, QUICK).is_some()
     });
-    let claude = home.join(".claude").is_dir() || which("claude").is_some();
+    // Setup installs Claude Code's plugin through its CLI, so the app alone does not count.
+    let claude = which("claude").is_some();
     Detected {
         git,
         repo_root,

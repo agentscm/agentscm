@@ -1,5 +1,5 @@
 //! `agentscm quickstart` and `agentscm uninstall`: guided setup of early collision
-//! warnings (and, optionally, live warnings through a hub and Claude Code hooks).
+//! warnings (and, optionally, live warnings through a hub and coding agents set up by `client setup`).
 //! Every write is announced first and recorded in `quickstart.json`, which `uninstall`
 //! reads to take back exactly what was done. Nothing here is telemetry.
 use std::io::IsTerminal;
@@ -12,19 +12,15 @@ use std::time::{Duration, Instant};
 use agentscm::git_collisions::{self, Request};
 use agentscm::hub::forge_http::{self, check_base_url};
 use agentscm::hub::slack::setup as slack_setup;
-use agentscm::hub::store::{unix_now, validate_agent_name};
 use agentscm::{Error, Result};
 use clap::{Args, ValueEnum};
 use reqwest::Method;
-use serde_json::{Value, json};
+use serde_json::Value;
 
-use crate::hub_cli::{
-    self, Provider, call, clean, config_dir, load_session, parse_ttl, write_private,
-};
+use crate::hub_cli::{self, Provider, call, clean};
 
 mod binary;
 pub(crate) mod detect;
-mod hook;
 mod hub_local;
 mod hub_native;
 mod hub_setup;
@@ -33,9 +29,9 @@ pub(crate) mod process;
 
 use crate::prompt::Ui;
 use detect::{Detected, Forge};
-use manifest::{
-    Added, HookRecord, HubJsonRecord, Manifest, SessionRecord, TokenRecord, file_hash, sha_hex,
-};
+#[cfg(unix)]
+use manifest::SessionRecord;
+use manifest::{Manifest, file_hash, sha_hex};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum HubChoice {
@@ -56,15 +52,6 @@ pub enum HubRuntime {
     Native,
     /// Run the matching Linux container image with Docker Compose.
     Docker,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum HookScope {
-    /// Every project: ~/.claude/settings.json.
-    User,
-    /// This repository only: .claude/settings.local.json.
-    Project,
-    None,
 }
 
 #[derive(Debug, Args)]
@@ -101,26 +88,25 @@ pub struct QuickstartArgs {
     /// An agent token you already have; it is checked and used instead of signing in.
     #[arg(long)]
     agent_token_file: Option<PathBuf>,
-    /// Name for the agent token (default claude-<hostname>).
-    #[arg(long)]
-    agent_name: Option<String>,
-    /// Lifetime of the agent token, such as 8h or 30d (at most 30d).
-    #[arg(long, default_value = "30d")]
-    ttl: String,
     /// Prepared private Slack adapter configuration for a managed local Hub.
     #[arg(long)]
     slack_config_file: Option<PathBuf>,
     /// Which forge to sign in with (default: the one in origin's URL).
     #[arg(long, value_enum)]
     provider: Option<Provider>,
-    /// Where to add the Claude Code hooks.
-    #[arg(long, value_enum)]
-    hook: Option<HookScope>,
+    /// Coding agent to set up through `agentscm client setup` (repeatable; default: Claude
+    /// Code when it is installed).
+    #[cfg(unix)]
+    #[arg(long, value_enum, conflicts_with = "no_agents")]
+    agent: Vec<crate::client_setup::Agent>,
+    /// Set up no coding agent.
+    #[arg(long)]
+    no_agents: bool,
     /// Skip the check for colliding branches.
     #[arg(long)]
     no_collisions: bool,
-    /// Also write the repository's agent config (agentscm init-repo); with --yes it is
-    /// skipped unless this is passed. Loopback hubs never generate repository config.
+    /// Also write the repository's agent instructions (agentscm init-repo); with --yes it is
+    /// skipped unless this is passed.
     #[arg(long)]
     init: bool,
 }
@@ -148,9 +134,9 @@ pub struct UninstallArgs {
 const NEEDS_TERMINAL: &str = "agentscm quickstart asks questions, and there is no terminal here. \
 To run it without one, pass --yes and choose with flags: --local (recommended) or --hosted, \
 --hub local|existing|skip, --hub-url URL, \
---agent-token-file PATH, --agent-name NAME, --ttl 30d, --provider github|gitlab, --github-login LOGIN, \
+--agent-token-file PATH, --provider github|gitlab, --github-login LOGIN, \
 --hub-runtime native|docker, --hub-port PORT, --hub-project NAME, \
---slack-config-file ABSOLUTE_PATH, --hook user|project|none, --no-collisions, --init";
+--slack-config-file ABSOLUTE_PATH, --agent claude|codex|cursor|copilot|gemini (repeatable) or --no-agents, --no-collisions, --init";
 
 const HUB_EXPLAINED: &str =
     "A hub is a small shared server that lets agents on different machines see each other's work.";
@@ -249,58 +235,6 @@ fn sync_dir(path: &Path) -> std::result::Result<(), String> {
     Ok(())
 }
 
-/// `Ok(None)` only when the file is absent; any other failure to read it (permissions,
-/// not UTF-8) is an error, so a file we cannot read is never overwritten.
-fn read_existing(path: &Path) -> std::result::Result<Option<String>, String> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => Ok(Some(text)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("I couldn't read {}: {error}", path.display())),
-    }
-}
-
-/// Where a write really lands: a symlink (a dotfiles setup) is followed, so it stays a link.
-fn resolve(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_owned())
-}
-
-/// Atomic replace of the file `path` resolves to. An existing file keeps its permissions;
-/// a new one is 0600.
-fn write_keeping_mode(path: &Path, text: &str) -> std::result::Result<(), String> {
-    let real = resolve(path);
-    #[cfg(unix)]
-    let mode = real
-        .metadata()
-        .ok()
-        .map(|m| m.permissions().mode() & 0o7777);
-    write_private(&real, text).map_err(|e| short(&e))?;
-    #[cfg(unix)]
-    if let Some(mode) = mode {
-        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(mode))
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
-fn backup_path(path: &Path) -> PathBuf {
-    let base = format!("{}.agentscm-backup-{}", resolve(path).display(), unix_now());
-    let mut candidate = PathBuf::from(&base);
-    let mut n = 1;
-    while candidate.exists() {
-        candidate = PathBuf::from(format!("{base}-{n}"));
-        n += 1;
-    }
-    candidate
-}
-
-/// A copy of `path` before it is replaced. Failing to make one stops the change.
-fn make_backup(path: &Path) -> std::result::Result<PathBuf, String> {
-    let backup = backup_path(path);
-    std::fs::copy(path, &backup)
-        .map_err(|e| format!("I couldn't back up {} first ({e})", path.display()))?;
-    Ok(backup)
-}
-
 #[cfg(unix)]
 fn private_dir(dir: &Path) -> std::io::Result<()> {
     std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o700)
@@ -339,71 +273,6 @@ async fn wait_healthy(url: &str, limit: Duration) -> bool {
     false
 }
 
-/// `Ok(Some(reply))` for a valid token, `Ok(None)` when the hub rejects it, `Err` when
-/// the hub does not answer.
-async fn whoami(client: &reqwest::Client, url: &str, token: &str) -> Result<Option<Value>> {
-    let url = format!("{url}/v1/hub/whoami");
-    match call(client, Method::GET, &url, Some(token), None).await? {
-        (200, reply) => Ok(Some(reply)),
-        _ => Ok(None),
-    }
-}
-
-fn hub_json_path() -> Result<PathBuf> {
-    Ok(config_dir()?.join("agentscm").join("hub.json"))
-}
-
-/// The hub the other commands would use: the environment, else hub.json.
-struct HubConfig {
-    url: String,
-    token_file: PathBuf,
-    tokens: Vec<(String, PathBuf)>,
-}
-
-impl HubConfig {
-    /// The token file the hooks would use in a checkout of `repo`.
-    fn file_for(&self, repo: Option<&str>) -> &Path {
-        repo.and_then(|repo| {
-            self.tokens
-                .iter()
-                .find(|(r, _)| r.eq_ignore_ascii_case(repo))
-        })
-        .map_or(&self.token_file, |(_, file)| file)
-    }
-}
-
-fn current_hub() -> Option<HubConfig> {
-    let var = |name| std::env::var(name).ok().filter(|v| !v.is_empty());
-    let (url, file, tokens) = match (var("AGENTSCM_HUB_URL"), var("AGENTSCM_HUB_TOKEN_FILE")) {
-        (Some(url), Some(file)) => (url, file, Vec::new()),
-        _ => {
-            let text = std::fs::read_to_string(hub_json_path().ok()?).ok()?;
-            let value: Value = serde_json::from_str(&text).ok()?;
-            let tokens = value["tokens"]
-                .as_object()
-                .into_iter()
-                .flatten()
-                .filter_map(|(repo, file)| Some((repo.clone(), PathBuf::from(file.as_str()?))))
-                .collect();
-            (
-                value["url"].as_str()?.to_owned(),
-                value["token_file"].as_str()?.to_owned(),
-                tokens,
-            )
-        }
-    };
-    Some(HubConfig {
-        url: check_base_url(&url).ok()?,
-        token_file: PathBuf::from(file),
-        tokens,
-    })
-}
-
-fn read_token(file: &Path) -> Option<String> {
-    let token = std::fs::read_to_string(file).ok()?.trim().to_owned();
-    (!token.is_empty()).then_some(token)
-}
-
 // ---- the flow ----
 
 /// What is true about live warnings when the run ends.
@@ -411,9 +280,18 @@ fn read_token(file: &Path) -> Option<String> {
 struct Live {
     hub: Option<String>,
     hub_up: bool,
-    /// The repository whose token and hub settings were saved.
+    /// The repository this checkout is connected to.
     repo: Option<String>,
-    hooks: bool,
+    /// Agents set up in this checkout.
+    agents: Vec<String>,
+    /// This run tried to set up at least one agent.
+    wanted_agents: bool,
+    /// The user answered no to "Go ahead?" for the agent setup.
+    declined: bool,
+    /// Why setting up the coding agents failed.
+    agent_error: Option<String>,
+    /// Why a requested local hub isn't running.
+    hub_error: Option<String>,
     pending_local: Option<String>,
 }
 
@@ -427,7 +305,26 @@ impl Live {
                 &format!("finish creating and installing the app, then run `{command}`"),
             );
         }
+        if let Some(error) = &self.agent_error {
+            return off(
+                &format!("coding agent setup failed: {error}"),
+                &format!("fix that, then run `{cli} quickstart` again"),
+            );
+        }
+        if self.declined {
+            return off(
+                "you chose not to set up a coding agent; nothing was changed for it",
+                &format!("run `{cli} quickstart` again when you want it"),
+            );
+        }
         match (&self.hub, &self.repo) {
+            (None, _) if self.hub_error.is_some() => off(
+                &format!(
+                    "local hub not started: {}",
+                    self.hub_error.as_deref().unwrap_or_default()
+                ),
+                &format!("fix that, then run `{cli} quickstart --local` again"),
+            ),
             (None, _) => off(
                 "no hub chosen",
                 &format!(
@@ -438,13 +335,17 @@ impl Live {
                 &format!("the hub at {url} isn't answering"),
                 &format!("start it, then run `{cli} quickstart` again"),
             ),
+            (Some(_), None) if !self.wanted_agents => off(
+                "no coding agent was set up",
+                &format!("run `{cli} quickstart --agent claude|codex|cursor|copilot|gemini`"),
+            ),
             (Some(_), None) => off(
-                "no agent token or hub settings were saved",
+                "this checkout isn't connected to the hub",
                 &format!("run `{cli} quickstart` again, or pass `--agent-token-file`"),
             ),
-            (Some(_), Some(_)) if !self.hooks => off(
-                "no Claude Code hooks were added",
-                &format!("run `{cli} quickstart --hook project`"),
+            (Some(_), Some(_)) if self.agents.is_empty() => off(
+                "no coding agent was set up",
+                &format!("run `{cli} quickstart --agent claude`"),
             ),
             (Some(url), Some(repo)) => format!("Live warnings: on (hub {url}, repo {repo})"),
         }
@@ -485,7 +386,7 @@ pub async fn run(args: QuickstartArgs) -> Result<u8> {
     let home = home_dir()?;
     let _quickstart_lease = manifest::acquire_lease()?;
     let cwd = std::env::current_dir()?;
-    let found = detect::detect(&cwd, &home);
+    let found = detect::detect(&cwd);
     let mut cx = Cx {
         ui: &ui,
         args: &args,
@@ -516,23 +417,14 @@ pub async fn run(args: QuickstartArgs) -> Result<u8> {
     if let Some(url) = choose_hub(&mut cx).await {
         cx.live.hub_up = healthy(&cx.client, &url).await;
         cx.live.hub = Some(url.clone());
-        if let Some(staged) = token_stage(&mut cx, &url).await {
-            hub_json_stage(&mut cx, &url, &staged);
-        }
         if !cx.live.hub_up {
-            if cx.live.repo.is_some() {
-                println!(
-                    "The hub at {url} isn't answering; its settings are saved, so live warnings start once it answers."
-                );
-            } else {
-                println!(
-                    "The hub at {url} isn't answering, so nothing was saved for it. Start it, then run quickstart again."
-                );
-            }
+            println!(
+                "The hub at {url} isn't answering, so no agent was connected to it. Start it, then run quickstart again."
+            );
         }
     }
     collisions_step(&cx);
-    hook_stage(&mut cx);
+    agents_stage(&mut cx).await;
     init_stage(&mut cx);
     if !cx.manifest.is_empty() {
         cx.manifest.save()?;
@@ -563,10 +455,17 @@ pub async fn run(args: QuickstartArgs) -> Result<u8> {
     if cx.live.pending_local.is_some() {
         return Ok(3);
     }
+    if cx.live.agent_error.is_some() {
+        return Err(invalid(
+            "setting up the coding agent failed; see the status and recovery instructions above",
+        ));
+    }
     if (args.local
         || matches!(args.hub, Some(HubChoice::Local | HubChoice::Existing))
         || args.hub_url.is_some())
-        && (!cx.live.hub_up || cx.live.repo.is_none())
+        // Without an agent to set up (--no-agents, or none found) nothing is connected on purpose.
+        && !cx.live.declined
+        && (!cx.live.hub_up || (cx.live.repo.is_none() && cx.live.wanted_agents))
     {
         return Err(invalid(
             "the requested hub setup is incomplete; see the status and recovery instructions above",
@@ -675,26 +574,25 @@ async fn status(cx: &Cx<'_>) {
             "not available"
         }
     );
-    match current_hub() {
-        Some(config) => {
-            let repo = found.remote.as_ref().map(|r| r.repo.as_str());
-            let reach = if !healthy(&cx.client, &config.url).await {
-                "not answering".to_owned()
+    match checkout_connection(found) {
+        Some(connection) => {
+            let reach = if healthy(&cx.client, &connection.hub).await {
+                "answering"
             } else {
-                match read_token(config.file_for(repo)) {
-                    None => "answering; no readable token yet".to_owned(),
-                    Some(token) => match whoami(&cx.client, &config.url, &token).await {
-                        Ok(Some(reply)) => format!(
-                            "answering; token valid for {}",
-                            clean(reply["token"]["repository"].as_str().unwrap_or("?"))
-                        ),
-                        _ => "answering; its token is not accepted".to_owned(),
-                    },
-                }
+                "not answering"
             };
-            println!("  Hub: {} ({reach})", config.url);
+            println!(
+                "  Hub: {} ({reach}); this checkout is connected for {}{}",
+                connection.hub,
+                clean(&connection.repo),
+                if connection.agents.is_empty() {
+                    String::new()
+                } else {
+                    format!(" with {}", connection.agents.join(", "))
+                }
+            );
         }
-        None => println!("  Hub: not configured"),
+        None => println!("  Hub: this checkout isn't connected to one"),
     }
     println!(
         "  Claude Code: {}\n",
@@ -706,10 +604,10 @@ async fn status(cx: &Cx<'_>) {
 fn summarize(report: &Value) -> String {
     let checked = report["items"].as_array().map_or(0, Vec::len);
     let list = report["collisions"].as_array().cloned().unwrap_or_default();
-    let conflicts = list.iter().filter(|c| c["level"] == "conflict").count();
     if checked < 2 && !report["truncated"].is_string() {
         return "No other branches or worktrees to compare yet.".into();
     }
+    let conflicts = list.iter().filter(|c| c["level"] == "conflict").count();
     let noun = if checked == 1 {
         "branch/worktree"
     } else {
@@ -795,7 +693,7 @@ fn collisions_step(cx: &Cx<'_>) {
 /// Which hub to use, or `None` to go without. Starting a local hub that fails falls
 /// back to the other two choices.
 async fn choose_hub(cx: &mut Cx<'_>) -> Option<String> {
-    let current = current_hub();
+    let current = checkout_connection(&cx.found).map(|connection| connection.hub);
     let mut choice = cx.args.hub;
     if cx.args.local {
         choice = Some(HubChoice::Local);
@@ -808,17 +706,14 @@ async fn choose_hub(cx: &mut Cx<'_>) -> Option<String> {
         choice = Some(HubChoice::Local);
     }
     if choice.is_none() {
-        if let Some(config) = &current
+        if let Some(url) = &current
             && (cx.ui.yes
                 || cx.ui.confirm(
-                    &format!(
-                        "A hub is already configured ({}). Keep using it?",
-                        config.url
-                    ),
+                    &format!("This checkout is already connected to a hub ({url}). Keep using it?"),
                     true,
                 ))
         {
-            return Some(config.url.clone());
+            return Some(url.clone());
         }
         choice = Some(if cx.ui.yes {
             HubChoice::Skip
@@ -832,7 +727,7 @@ async fn choose_hub(cx: &mut Cx<'_>) -> Option<String> {
                 println!("Skipping live warnings. Run quickstart again any time to add them.\n");
                 return None;
             }
-            HubChoice::Existing => return existing_hub(cx, current.map(|c| c.url)),
+            HubChoice::Existing => return existing_hub(cx, current),
             HubChoice::Hosted => {
                 println!("{HOSTED_GUIDE}\n");
                 let url = match &cx.args.hub_url {
@@ -860,6 +755,7 @@ async fn choose_hub(cx: &mut Cx<'_>) -> Option<String> {
                             cli_command(cx)
                         );
                     }
+                    cx.live.hub_error = Some(message.clone());
                     if cx.ui.yes {
                         cx.failure = Some(message);
                         return None;
@@ -896,9 +792,13 @@ fn menu(cx: &Cx<'_>, with_local: bool) -> HubChoice {
             2
         };
     }
-    choices[cx
-        .ui
-        .choose("Where should AgentSCM run?", &options, default)]
+    let skip = choices.iter().position(|c| matches!(c, HubChoice::Skip));
+    choices[cx.ui.choose(
+        "Where should AgentSCM run?",
+        &options,
+        default,
+        skip.unwrap_or(default),
+    )]
 }
 
 fn existing_hub(cx: &Cx<'_>, configured: Option<String>) -> Option<String> {
@@ -1019,6 +919,7 @@ async fn local_hub(cx: &mut Cx<'_>) -> std::result::Result<Option<String>, Strin
                 cx.args.slack_config_file.as_deref(),
                 Path::new("/data/secrets/slack"),
             )?;
+            cx.manifest.bin_parent_created |= !cx.home.join(".agentscm").exists();
             hub_local::start(
                 cx.ui,
                 cx.args.github_login.as_deref(),
@@ -1106,497 +1007,7 @@ async fn local_hub(cx: &mut Cx<'_>) -> std::result::Result<Option<String>, Strin
     Ok(Some(started.url))
 }
 
-// ---- sign-in and token ----
-
-enum Mint {
-    Minted { id: String, token: String },
-    NotConnected,
-    Forbidden,
-    Unauthorized,
-    Failed(String),
-}
-
-fn classify(status: u16, body: &Value) -> Mint {
-    match (status, body["error"].as_str()) {
-        (201, _) => match (body["id"].as_str(), body["token"].as_str()) {
-            (Some(id), Some(token)) => Mint::Minted {
-                id: id.into(),
-                token: token.into(),
-            },
-            _ => Mint::Failed("the hub's reply had no token".into()),
-        },
-        (403, Some("not_connected")) => Mint::NotConnected,
-        (403, _) => Mint::Forbidden,
-        (401, _) => Mint::Unauthorized,
-        _ => Mint::Failed(format!("the hub replied {status}")),
-    }
-}
-
-async fn mint(cx: &Cx<'_>, url: &str, session: &str, body: &Value) -> Mint {
-    let target = format!("{url}/v1/hub/tokens");
-    match call(
-        &cx.client,
-        Method::POST,
-        &target,
-        Some(session),
-        Some(body.clone()),
-    )
-    .await
-    {
-        Ok((status, reply)) => classify(status, &reply),
-        Err(error) => Mint::Failed(short(&error)),
-    }
-}
-
-/// Best effort, as the signed-in user: ask every connection to look at its repositories again.
-async fn refresh_connections(cx: &Cx<'_>, url: &str, session: &str) {
-    let list = format!("{url}/v1/hub/connections");
-    let Ok((200, reply)) = call(&cx.client, Method::GET, &list, Some(session), None).await else {
-        return;
-    };
-    for id in reply["connections"].as_array().into_iter().flatten() {
-        if let Some(id) = id["id"].as_str().filter(|id| id.starts_with("con_")) {
-            let target = format!("{url}/v1/hub/connections/{id}/refresh");
-            let _ = call(&cx.client, Method::POST, &target, Some(session), None).await;
-        }
-    }
-}
-
-fn agent_name(cx: &Cx<'_>) -> String {
-    cx.args.agent_name.clone().unwrap_or_else(|| {
-        let host = crate::intent_cli::hostname().unwrap_or_default();
-        let host: String = host
-            .split('.')
-            .next()
-            .unwrap_or_default()
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || "-_".contains(*c))
-            .take(40)
-            .collect();
-        if host.is_empty() {
-            "claude".into()
-        } else {
-            format!("claude-{host}")
-        }
-    })
-}
-
-/// A token file ready for hub.json.
-struct Staged {
-    file: PathBuf,
-    repo: String,
-}
-
-/// Writes the token file. A file that was already there and isn't ours is backed up first
-/// (and stays the user's: it is never deleted later). Returns whether the file is ours.
-fn write_token_file(
-    file: &Path,
-    token: &str,
-    ours_before: bool,
-) -> std::result::Result<bool, String> {
-    let existed = match file.symlink_metadata() {
-        Ok(_) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => return Err(format!("I couldn't look at {}: {e}", file.display())),
-    };
-    if existed && !ours_before {
-        make_backup(file)?;
-    }
-    let real = resolve(file);
-    real.parent()
-        .map_or(Ok(()), private_dir)
-        .map_err(|e| e.to_string())?;
-    write_private(&real, &format!("{token}\n")).map_err(|e| short(&e))?;
-    Ok(!existed || ours_before)
-}
-
-/// The token file to hand to hub.json, or `None` when this step could not finish.
-async fn token_stage(cx: &mut Cx<'_>, url: &str) -> Option<Staged> {
-    let remote_repo = cx.found.remote.as_ref().map(|r| r.repo.clone());
-    // A token the user already has.
-    if let Some(file) = cx.args.agent_token_file.clone() {
-        let Ok(file) = file.canonicalize() else {
-            println!("I can't find the token file {}.", file.display());
-            return None;
-        };
-        let token = match read_existing(&file) {
-            Ok(text) => text.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty()),
-            Err(message) => {
-                println!("{message}.");
-                return None;
-            }
-        };
-        let Some(token) = token else {
-            println!("The token file {} is empty.", file.display());
-            return None;
-        };
-        let mut repo = remote_repo;
-        match whoami(&cx.client, url, &token).await {
-            Ok(Some(reply)) => {
-                let named = reply["token"]["repository"].as_str().unwrap_or("?");
-                println!("The agent token is valid for {}.", clean(named));
-                repo = repo.or_else(|| Some(named.to_owned()));
-            }
-            Ok(None) => {
-                println!("The hub rejected that agent token (expired or revoked?).");
-                return None;
-            }
-            Err(_) => println!(
-                "Couldn't check the agent token because the hub isn't answering; using it as given."
-            ),
-        }
-        let Some(repo) = repo else {
-            println!(
-                "I can't tell which repository that token is for; run quickstart inside the repository."
-            );
-            return None;
-        };
-        keep_record(cx, &repo, &file, false, None, url);
-        return Some(Staged { file, repo });
-    }
-    // A working setup from an earlier run.
-    if let Some(config) = current_hub()
-        && config.url == url
-        && let file = config.file_for(remote_repo.as_deref()).to_owned()
-        && let Some(token) = read_token(&file)
-        && let Ok(Some(reply)) = whoami(&cx.client, url, &token).await
-        && let Some(named) = reply["token"]["repository"].as_str()
-        && remote_repo
-            .as_deref()
-            .is_none_or(|r| named.eq_ignore_ascii_case(r))
-        && cx.ui.confirm(
-            "You already have a working agent token for this hub and repository. Keep it?",
-            true,
-        )
-    {
-        return Some(Staged {
-            file,
-            repo: named.to_owned(),
-        });
-    }
-    let Some(remote) = cx.found.remote.clone() else {
-        println!(
-            "To get an agent token I need to run inside a Git repository with an origin on GitHub or GitLab, or you can pass --agent-token-file."
-        );
-        return None;
-    };
-    let provider = match cx.args.provider {
-        Some(p) => p.to_possible_value().map(|v| v.get_name().to_owned()),
-        None => remote.provider().map(str::to_owned),
-    };
-    let Some(provider) = provider else {
-        println!(
-            "This hub can sign you in with GitHub or GitLab, but origin is on another forge; pass --provider, or --agent-token-file."
-        );
-        return None;
-    };
-    if !cx.live.hub_up {
-        return None;
-    }
-    let name = agent_name(cx);
-    if validate_agent_name(&name).is_err() {
-        println!("The agent name must be 1-64 characters of letters, digits, '.', '_' or '-'.");
-        return None;
-    }
-    let Ok(ttl) = parse_ttl(&cx.args.ttl) else {
-        println!("--ttl must look like 8h or 30d.");
-        return None;
-    };
-    let slug = remote.repo.replace('/', "__");
-    let file = config_dir()
-        .ok()?
-        .join("agentscm")
-        .join("tokens")
-        .join(format!("{slug}.token"));
-    println!(
-        "Will sign you in to {url} with {provider}, create an agent token (a key that lets agents on this machine use the hub for this one repository) named {name} for {} (valid {}), and write {} (0600).",
-        clean(&remote.repo),
-        cx.args.ttl,
-        shown(&file, &cx.home)
-    );
-    if !cx.ui.confirm("Go ahead?", true) {
-        return None;
-    }
-    let body = json!({"name": name, "repository": remote.repo, "ttl_seconds": ttl});
-    let host = if provider == "github" {
-        "github.com".to_owned()
-    } else {
-        remote.host.clone()
-    };
-    let Some(Mint::Minted { id, token }) =
-        obtain(cx, url, &provider, &host, &body, &remote.repo).await
-    else {
-        return None;
-    };
-    let ours_before = cx.manifest.tokens.iter().any(|t| t.file == file && t.owned);
-    let owned = match write_token_file(&file, &token, ours_before) {
-        Ok(owned) => owned,
-        Err(message) => {
-            println!("Couldn't write the token file: {message}.");
-            return None;
-        }
-    };
-    keep_record(cx, &remote.repo, &file, owned, Some(id), url);
-    Some(Staged {
-        file,
-        repo: remote.repo,
-    })
-}
-
-/// Remembers a token file in the manifest (replacing any record of the same file).
-fn keep_record(
-    cx: &mut Cx<'_>,
-    repo: &str,
-    file: &Path,
-    owned: bool,
-    id: Option<String>,
-    hub: &str,
-) {
-    cx.manifest.tokens.retain(|t| t.file != file);
-    cx.manifest.tokens.push(TokenRecord {
-        repo: repo.to_owned(),
-        file: file.to_owned(),
-        owned,
-        id,
-        hub: hub.to_owned(),
-    });
-    let _ = cx.manifest.save();
-}
-
-/// Signs in when needed and mints, repairing "app not installed on this repository".
-async fn obtain(
-    cx: &mut Cx<'_>,
-    url: &str,
-    provider: &str,
-    forge_host: &str,
-    body: &Value,
-    repo: &str,
-) -> Option<Mint> {
-    let mut signed_in = false;
-    loop {
-        let session = load_session(Some(url)).ok().map(|(_, s)| s);
-        let Some(session) = session else {
-            if signed_in {
-                println!("Sign-in didn't produce a usable session.");
-                return None;
-            }
-            if !cx.tty {
-                println!(
-                    "I can't sign in without a terminal: pass --agent-token-file for non-interactive setup."
-                );
-                return None;
-            }
-            println!("Signing in ...");
-            let existed = match hub_cli::has_session(Some(url)) {
-                Ok(existed) => existed,
-                Err(error) => {
-                    println!("Couldn't inspect saved sign-ins: {}.", short(&error));
-                    return None;
-                }
-            };
-            match hub_cli::sign_in(url, provider, Some(forge_host)).await {
-                Ok(who) => println!("Signed in as {who}."),
-                Err(error) => {
-                    println!("Couldn't sign in: {}.", short(&error));
-                    return None;
-                }
-            }
-            if !existed {
-                cx.manifest.session = Some(SessionRecord {
-                    hub: url.to_owned(),
-                });
-                let _ = cx.manifest.save();
-            }
-            signed_in = true;
-            continue;
-        };
-        match mint(cx, url, &session, body).await {
-            Mint::Unauthorized if !signed_in => {
-                let _ = hub_cli::forget_session_if_current(url, &session);
-            }
-            Mint::Unauthorized => {
-                println!("The hub didn't accept the new sign-in.");
-                return None;
-            }
-            Mint::NotConnected => {
-                refresh_connections(cx, url, &session).await;
-                if let done @ Mint::Minted { .. } = mint(cx, url, &session, body).await {
-                    return Some(done);
-                }
-                println!("{}", install_help(cx.install_url.as_deref(), repo));
-                if cx.ui.yes {
-                    println!("The agent token wasn't created.");
-                    return None;
-                }
-                while cx
-                    .ui
-                    .retry("Press Enter after installing, or type skip to stop.")
-                {
-                    refresh_connections(cx, url, &session).await;
-                    match mint(cx, url, &session, body).await {
-                        done @ Mint::Minted { .. } => return Some(done),
-                        Mint::NotConnected => println!("Still not connected."),
-                        _ => {
-                            println!("Couldn't create the agent token.");
-                            return None;
-                        }
-                    }
-                }
-                println!("Skipped. Install the app, then run quickstart again.");
-                return None;
-            }
-            Mint::Forbidden => {
-                println!(
-                    "You can't read {} on the forge, so the hub won't give you a token for it.",
-                    clean(repo)
-                );
-                return None;
-            }
-            Mint::Failed(why) => {
-                println!("Couldn't create the agent token: {}.", clean(&why));
-                return None;
-            }
-            minted @ Mint::Minted { .. } => return Some(minted),
-        }
-    }
-}
-
-fn install_help(install_url: Option<&str>, repo: &str) -> String {
-    match install_url {
-        Some(link) => format!(
-            "The hub's GitHub App isn't installed on {}. Open {link}, choose {}, and install.",
-            clean(repo),
-            clean(repo)
-        ),
-        None => format!(
-            "The hub's GitHub App isn't installed on {}. Open GitHub, then Settings, Applications, the hub's app, Configure, and add {}.",
-            clean(repo),
-            clean(repo)
-        ),
-    }
-}
-
-/// Adds this repository's token to hub.json (keeping other repositories' entries).
-fn hub_json_stage(cx: &mut Cx<'_>, url: &str, staged: &Staged) {
-    let Ok(path) = hub_json_path() else { return };
-    let name = shown(&path, &cx.home);
-    let existing = match read_existing(&path) {
-        Ok(existing) => existing,
-        Err(message) => {
-            println!("{message}. I left it alone.");
-            return;
-        }
-    };
-    let old = match &existing {
-        None => None,
-        Some(text) => match serde_json::from_str::<Value>(text) {
-            Ok(value) if value.is_object() => Some(value),
-            _ => {
-                println!(
-                    "{name} isn't valid JSON, so I left it alone. Fix or remove it, then run quickstart again."
-                );
-                return;
-            }
-        },
-    };
-    let Some(file) = staged.file.to_str() else {
-        println!("The token file's path isn't plain text, so I can't put it in hub.json.");
-        return;
-    };
-    let old_url = old
-        .as_ref()
-        .and_then(|o| o["url"].as_str())
-        .and_then(|u| check_base_url(u).ok());
-    let same_hub = old_url.as_deref() == Some(url);
-    if old.is_some() && !same_hub && cx.ui.yes && cx.args.hub.is_none() && cx.args.hub_url.is_none()
-    {
-        println!(
-            "{name} points at another hub ({}); with --yes I don't switch it unless you pass --hub or --hub-url, so I kept it.",
-            clean(old_url.as_deref().unwrap_or("?"))
-        );
-        return;
-    }
-    let mut new = match (&old, same_hub) {
-        (Some(old), true) => old.clone(),
-        _ => json!({"url": url, "token_file": file}),
-    };
-    let tokens = new["tokens"].take();
-    let mut tokens = if tokens.is_object() {
-        tokens
-    } else {
-        json!({})
-    };
-    tokens[&staged.repo] = json!(file);
-    new["tokens"] = tokens;
-    let text = serde_json::to_string_pretty(&new).unwrap_or_default() + "\n";
-    if old.as_ref() == Some(&new) {
-        // Unchanged: whoever wrote it keeps it, so the manifest is not touched.
-        println!("{name} already has this repository's token for this hub; keeping it.");
-    } else {
-        if let Some(existing) = &existing {
-            println!("{name} already exists:\n{}", existing.trim_end());
-            if !same_hub {
-                println!(
-                    "It points at another hub ({}); switching moves your other repositories to {url} too.",
-                    clean(old_url.as_deref().unwrap_or("?"))
-                );
-            }
-        }
-        println!("Will write {name} (0600 if new): {}", new);
-        let question = if existing.is_some() {
-            "Replace it? A backup is kept."
-        } else {
-            "Write it?"
-        };
-        if !cx.ui.confirm(question, true) {
-            println!("Left {name} as it was.");
-            return;
-        }
-        let ours = cx
-            .manifest
-            .hub_json
-            .as_ref()
-            .filter(|r| file_hash(&r.path).as_deref() == Some(r.hash.as_str()));
-        let backup = match (&existing, ours) {
-            (Some(_), Some(record)) => record.backup.clone(),
-            (Some(_), None) => match make_backup(&path) {
-                Ok(backup) => Some(backup),
-                Err(message) => {
-                    println!("{message}. I left {name} alone.");
-                    return;
-                }
-            },
-            _ => None,
-        };
-        if let Err(message) = write_keeping_mode(&path, &text) {
-            println!("Couldn't write {name}: {message}.");
-            return;
-        }
-        cx.manifest.hub_json = Some(HubJsonRecord {
-            path,
-            hash: sha_hex(text.as_bytes()),
-            backup,
-        });
-    }
-    // Only now is an older token of the same repository unused.
-    let stale: Vec<PathBuf> = cx
-        .manifest
-        .tokens
-        .iter()
-        .filter(|t| t.repo == staged.repo && t.file != staged.file && t.owned)
-        .map(|t| t.file.clone())
-        .collect();
-    for old in &stale {
-        let _ = std::fs::remove_file(old);
-    }
-    cx.manifest
-        .tokens
-        .retain(|t| !(t.repo == staged.repo && stale.contains(&t.file)));
-    let _ = cx.manifest.save();
-    cx.live.repo = Some(staged.repo.clone());
-}
-
-// ---- Claude Code hooks ----
+// ---- coding agents ----
 
 /// Which `agentscm` the hooks would call, and the running program's canonical path.
 fn program_plan(home: &Path) -> Option<(binary::Program, PathBuf)> {
@@ -1609,351 +1020,229 @@ fn program_plan(home: &Path) -> Option<(binary::Program, PathBuf)> {
     Some((binary::plan(home, &exe, on_path.as_deref(), &temp), exe))
 }
 
-fn recommended_hook_scope(found: &Detected) -> HookScope {
-    if found.repo_root.is_some() && !found.worktrees {
-        HookScope::Project
-    } else {
-        HookScope::User
+/// This checkout's `client setup` connection, if it has one.
+fn checkout_connection(found: &Detected) -> Option<crate::client_config::Connection> {
+    let root = found.repo_root.as_ref()?;
+    let root = crate::client_config::canonical_root(root).ok()?;
+    crate::client_config::load()
+        .ok()?
+        .into_iter()
+        .find(|connection| connection.root == root)
+}
+
+/// The program the agents' hooks and MCP entries run. They must keep working after quickstart
+/// exits, so a program in a cache or temp directory is first copied to `~/.agentscm/bin`.
+#[cfg(unix)]
+fn stable_program(
+    cx: &mut Cx<'_>,
+    plan: binary::Program,
+    exe: PathBuf,
+) -> std::result::Result<PathBuf, String> {
+    let dir = binary::bin_dir(&cx.home);
+    match plan {
+        binary::Program::Bare => Ok(exe),
+        binary::Program::InstallDir(link) => {
+            cx.manifest.bin_dir = Some(dir);
+            Ok(link)
+        }
+        binary::Program::Copy => {
+            let parent_new = dir.parent().is_some_and(|parent| !parent.exists());
+            binary::install(&dir, &exe, env!("CARGO_PKG_VERSION"))?;
+            cx.manifest.bin_parent_created |= parent_new;
+            cx.manifest.bin_dir = Some(dir.clone());
+            Ok(dir.join(binary::LINK))
+        }
     }
 }
 
-fn hook_stage(cx: &mut Cx<'_>) {
-    let root = cx.found.repo_root.clone();
-    let scope = match cx.args.hook {
-        Some(scope) => scope,
-        None if !cx.found.claude => {
-            println!(
-                "Claude Code wasn't found, so I'm not adding its hooks (use --hook user or --hook project to add them anyway)."
-            );
-            return;
-        }
-        None if cx.ui.yes => {
-            if cx.live.repo.is_some() && root.is_some() {
-                recommended_hook_scope(&cx.found)
-            } else {
-                println!(
-                    "Not adding the Claude Code hooks: live warnings are off, so they would have nothing to report. Use --hook project to add them anyway."
-                );
-                return;
-            }
-        }
-        None if cx.live.hub.is_none() => {
-            println!(
-                "Not adding the Claude Code hooks: they need a hub to report to. Use --hook project to add them anyway."
-            );
-            return;
-        }
-        None => {
-            let options = [
-                "This project only (.claude/settings.local.json)",
-                "Every project (~/.claude/settings.json)",
-                "Skip the hooks",
-            ];
-            if cx.found.worktrees {
-                println!(
-                    "Git worktrees detected. Every project is recommended so sessions in worktrees receive the hooks too."
-                );
-            }
-            let default = if recommended_hook_scope(&cx.found) == HookScope::Project {
-                0
-            } else {
-                1
-            };
-            [HookScope::Project, HookScope::User, HookScope::None][cx.ui.choose(
-                "Where should Claude Code's hooks go?",
-                &options,
-                default,
-            )]
-        }
-    };
-    let path = match (scope, &root) {
-        (HookScope::None, _) => return,
-        (HookScope::User, _) => cx.home.join(".claude").join("settings.json"),
-        (HookScope::Project, Some(root)) => root.join(".claude").join("settings.local.json"),
-        (HookScope::Project, None) => {
-            println!(
-                "--hook project needs to run inside a Git repository, so I didn't add the hooks."
-            );
-            return;
-        }
-    };
-    let name = shown(&path, &cx.home);
-    let existing = match read_existing(&path) {
-        Ok(existing) => existing,
-        Err(message) => {
-            println!("{message}. I left it alone.");
-            return;
-        }
-    };
-    let mut settings = match &existing {
-        None => json!({}),
-        Some(text) => match serde_json::from_str::<Value>(text) {
-            Ok(value) => value,
-            Err(_) => {
-                println!(
-                    "{name} isn't valid JSON, so I left it alone. Fix or remove it, then run quickstart again."
-                );
-                return;
-            }
-        },
-    };
-    // Project scope with a known hub and token: Claude Code calls the hub directly (HTTP
-    // hooks, no program on this machine) and the token goes in this file's `env`.
-    let token = (scope == HookScope::Project)
-        .then(|| project_token(cx))
-        .flatten();
-    let http = cx.live.hub.clone().zip(token);
-    let (wanted, program) = match &http {
-        Some((hub, _)) => (hook::http_entries(hub, guard_repo(cx).as_deref()), None),
-        None => {
-            let Some((plan, exe)) = program_plan(&cx.home) else {
-                println!("I can't tell where this program is, so I didn't add the hooks.");
-                return;
-            };
-            let prefix = match &plan {
-                binary::Program::Bare => "agentscm".to_owned(),
-                binary::Program::InstallDir(link) => binary::quote(link),
-                binary::Program::Copy => {
-                    binary::quote(&binary::bin_dir(&cx.home).join(binary::LINK))
-                }
-            };
-            (hook::entries(&prefix), Some((plan, exe)))
-        }
-    };
-    let dir = binary::bin_dir(&cx.home);
-    let recorded = cx
-        .manifest
-        .hooks
-        .iter()
-        .find(|r| r.path == path)
-        .and_then(|r| r.env_token_sha.clone());
-    let mut env = None;
-    let mut replaced = 0;
-    if let Some((_, token)) = &http {
-        match hook::set_env(&mut settings, token, recorded.as_deref()) {
-            Ok(done) => env = Some(done),
-            Err(why) => {
-                println!("I left {name} alone: {why}.");
-                return;
-            }
-        }
-        replaced = hook::remove_command_form(&mut settings);
+#[cfg(unix)]
+fn chosen_agents(cx: &Cx<'_>) -> Vec<crate::client_setup::Agent> {
+    if cx.args.no_agents {
+        Vec::new()
+    } else if !cx.args.agent.is_empty() {
+        cx.args.agent.clone()
+    } else if cx.found.claude {
+        vec![crate::client_setup::Agent::Claude]
+    } else if cx.ui.yes {
+        println!("Claude Code wasn't found, so I'm not setting up a coding agent.");
+        Vec::new()
+    } else {
+        use clap::ValueEnum;
+        let agents = crate::client_setup::Agent::value_variants();
+        let mut options: Vec<&str> = agents.iter().map(|agent| agent.name()).collect();
+        options.push("none for now");
+        let none = options.len() - 1;
+        let pick = cx.ui.choose(
+            "Claude Code wasn't found. Which coding agent should I set up?",
+            &options,
+            none,
+            none,
+        );
+        agents
+            .get(pick)
+            .map(|agent| vec![*agent])
+            .unwrap_or_default()
     }
-    let added = match hook::merge(&mut settings, &wanted) {
-        Ok(added) => added,
-        Err(why) => {
-            println!("I left {name} alone: {why}.");
-            return;
-        }
-    };
-    if env == Some(hook::Env::Foreign) {
+}
+
+/// The `client setup` line for every supported agent, for setting one up later.
+#[cfg(unix)]
+fn print_agent_setup_hints(cx: &Cx<'_>, hub: &str) {
+    use clap::ValueEnum;
+    println!("To set up a coding agent later, run one of these in this checkout:");
+    for agent in crate::client_setup::Agent::value_variants() {
         println!(
-            "{name} already sets {} to a value I didn't write, so I left it alone; the hooks use it, so make sure it is this repository's agent token.",
-            hook::TOKEN_VAR
+            "  {} client setup --agent {} --hub {hub}",
+            cli_command(cx),
+            agent.name()
         );
     }
-    let sets_token = matches!(env, Some(hook::Env::Set));
-    if added.is_empty() && replaced == 0 && !sets_token {
-        println!("{name} already has the AgentSCM hooks; nothing to change.");
-        cx.live.hooks = true;
+}
+
+#[cfg(not(unix))]
+async fn agents_stage(_cx: &mut Cx<'_>) {
+    println!("Setting up coding agents isn't available on Windows yet.");
+}
+
+/// Connects this checkout and sets up its coding agents with `client setup`, the one path that
+/// writes agent hooks and MCP configuration and gives the hub's Connect agents page its proof.
+#[cfg(unix)]
+async fn agents_stage(cx: &mut Cx<'_>) {
+    let agents = chosen_agents(cx);
+    if agents.is_empty() {
+        if let (false, Some(hub), true) = (cx.args.no_agents, &cx.live.hub, cx.live.hub_up) {
+            print_agent_setup_hints(cx, hub);
+        }
         return;
     }
+    cx.live.wanted_agents = true;
+    let names = agents
+        .iter()
+        .map(|agent| agent.name())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (Some(hub), true) = (cx.live.hub.clone(), cx.live.hub_up) else {
+        println!("Not setting up {names}: agents need a hub that answers.");
+        return;
+    };
+    let Some(root) = cx
+        .found
+        .repo_root
+        .as_deref()
+        .and_then(|root| crate::client_config::canonical_root(root).ok())
+    else {
+        println!(
+            "Not setting up {names}: run quickstart inside the Git repository the agents work in."
+        );
+        return;
+    };
+    let signed_in = hub_cli::has_session(Some(&hub)).unwrap_or(false);
+    // With --yes or no terminal nobody can finish a browser or device sign-in.
+    let no_sign_in = cx.ui.yes || !cx.tty;
+    if cx.args.agent_token_file.is_none() && no_sign_in && !signed_in {
+        println!(
+            "Not setting up {names}: this run can't sign in to the hub (no terminal, or --yes). Run quickstart at a terminal, or pass --agent-token-file."
+        );
+        return;
+    }
+    let Some((plan, exe)) = program_plan(&cx.home) else {
+        println!("I can't tell where this program is, so I didn't set up {names}.");
+        return;
+    };
+    // Quickstart owns this checkout's connection: an unchanged, valid one is kept as it is,
+    // and anything else (another hub, another token file) is replaced after this notice.
+    let existing = checkout_connection(&cx.found);
+    let replace = existing.is_some();
+    if let Some(saved) = existing.as_ref().filter(|saved| saved.hub != hub) {
+        println!(
+            "This checkout is connected to another hub ({}); setting it up for {hub} replaces that connection.",
+            saved.hub
+        );
+    }
     println!(
-        "Will add this to {name}{}:\n{}",
-        if existing.is_some() {
-            " (a backup is kept)"
+        "Will connect {} to {hub} with {}, then set up {names}: hooks, MCP and the coordination skill. This is `{} client setup`; undo it with `uninstall`.",
+        root.display(),
+        if cx.args.agent_token_file.is_some() {
+            "your agent token"
         } else {
-            " (0600, new file)"
+            "a new agent token (a 30-day key that lets agents on this machine use the hub for this one repository)"
         },
-        hook::preview(&added, sets_token)
+        cli_command(cx)
     );
-    if replaced > 0 {
-        println!(
-            "Will also take the {replaced} older command-form AgentSCM hook entries out of {name}, so edits aren't announced twice."
-        );
-    }
-    if sets_token {
-        println!(
-            "The real agent token is written in place of <your agent token>, so {name} will hold a secret."
-        );
-    }
-    if let Some((binary::Program::Copy, _)) = &program {
+    if matches!(plan, binary::Program::Copy) {
         println!(
             "Will also copy this program to {0}/agentscm-{1} and point {0}/agentscm at it (0755), so the hooks keep working after this copy goes away.",
-            shown(&dir, &cx.home),
+            shown(&binary::bin_dir(&cx.home), &cx.home),
             env!("CARGO_PKG_VERSION")
         );
     }
     if !cx.ui.confirm("Go ahead?", true) {
+        cx.live.declined = true;
         return;
     }
-    if let Some((plan, exe)) = &program {
-        let parent_new = dir.parent().is_some_and(|p| !p.exists());
-        if matches!(plan, binary::Program::Copy)
-            && let Err(why) = binary::install(&dir, exe, env!("CARGO_PKG_VERSION"))
-        {
-            println!("Couldn't copy the program: {why}. I didn't add the hooks.");
+    let program = match stable_program(cx, plan, exe) {
+        Ok(program) => program,
+        Err(why) => {
+            println!("Couldn't copy the program: {why}. I didn't set up {names}.");
             return;
         }
-        if !matches!(plan, binary::Program::Bare) {
-            cx.manifest.bin_dir = Some(dir);
-            cx.manifest.bin_parent_created |= parent_new;
-        }
-    }
-    let env_sha = http
-        .as_ref()
-        .filter(|_| env.is_some() && env != Some(hook::Env::Foreign))
-        .map(|(_, token)| sha_hex(token.as_bytes()));
-    let form = Written {
-        env_sha,
-        http: http.is_some(),
     };
-    if let Err(why) = write_settings(cx, &path, existing.is_some(), &settings, added, form) {
-        println!("Couldn't update {name}: {why}. The file is unchanged.");
-        return;
-    }
-    cx.live.hooks = true;
-    if scope != HookScope::Project {
-        return;
-    }
-    // The command contains this machine's path, or the file holds the agent token: either
-    // way it should not be committed.
-    if let (Some((git, _)), Some(root)) = (&cx.found.git, &root) {
-        let arg = path.display().to_string();
-        let args = ["check-ignore", "-q", arg.as_str()];
-        let ignored = detect::capture(git, &args, Some(root), Duration::from_secs(10)).is_some();
-        match (sets_token, ignored) {
-            (true, true) => {
-                println!("Note: {name} now holds your agent token; never commit it.");
-            }
-            (true, false) => println!(
-                "Warning: {name} now holds your agent token and isn't ignored by Git; add it to .gitignore before you commit anything (I haven't touched that file)."
-            ),
-            (false, false) => println!(
-                "Note: {name} isn't ignored by Git and now holds a path on this machine; consider adding it to .gitignore (I haven't touched that file)."
-            ),
-            (false, true) => {}
-        }
-    }
-}
-
-/// The repository from the `origin` remote when it is a plain `owner/name`, for the `?repo=`
-/// guard in the hook and MCP URLs.
-fn guard_repo(cx: &Cx<'_>) -> Option<String> {
-    let repo = &cx.found.remote.as_ref()?.repo;
-    crate::intent_cli::valid_repo(repo).then(|| repo.clone())
-}
-
-/// The token of the hub quickstart just configured, as the hooks would find it in this
-/// checkout.
-fn project_token(cx: &Cx<'_>) -> Option<String> {
-    let config = current_hub().filter(|c| Some(&c.url) == cx.live.hub.as_ref())?;
-    let remote = cx.found.remote.as_ref().map(|r| r.repo.as_str());
-    read_token(config.file_for(cx.live.repo.as_deref().or(remote)))
-}
-
-/// What a settings write adds to the manifest besides the hook entries.
-struct Written {
-    /// SHA-256 of the token quickstart put in `env`.
-    env_sha: Option<String>,
-    /// The HTTP form was written, so recorded command-form entries are gone from the file.
-    http: bool,
-}
-
-fn write_settings(
-    cx: &mut Cx<'_>,
-    path: &Path,
-    existed: bool,
-    settings: &Value,
-    added: Vec<Added>,
-    form: Written,
-) -> std::result::Result<(), String> {
-    let mut created_dir = None;
-    let backup = if existed {
-        Some(make_backup(path)?)
-    } else {
-        if let Some(dir) = path.parent() {
-            let real = resolve(dir);
-            if !real.exists() {
-                created_dir = Some(dir.to_owned());
-            }
-            std::fs::create_dir_all(real).map_err(|e| e.to_string())?;
-        }
-        None
+    let args = crate::client_cli::ConnectArgs {
+        hub: hub.clone(),
+        token_file: cx.args.agent_token_file.clone(),
+        provider: cx.args.provider,
+        root: Some(root.clone()),
+        replace,
+        no_sign_in,
+        ..Default::default()
     };
-    let text = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())? + "\n";
-    write_keeping_mode(path, &text)?;
-    #[cfg(unix)]
-    let holds_token = form.env_sha.is_some()
-        || cx
-            .manifest
-            .hooks
-            .iter()
-            .any(|r| r.path == path && r.env_token_sha.is_some());
-    // Windows has no mode bits; files under the user's profile are already private to them.
-    #[cfg(unix)]
-    if holds_token {
-        // The file (and any copy of it) holds the agent token: owner only, whatever it was.
-        for secret in std::iter::once(resolve(path)).chain(backup.iter().cloned()) {
-            std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| e.to_string())?;
-        }
+    let wait = crate::client_cli::AppWait {
+        ui: cx.ui,
+        install_url: cx.install_url.clone(),
+    };
+    let result = crate::client_cli::setup(&agents, args, root.clone(), &program, Some(&wait)).await;
+    if !signed_in && hub_cli::has_session(Some(&hub)).unwrap_or(false) {
+        cx.manifest.session = Some(SessionRecord { hub: hub.clone() });
     }
-    let hash = sha_hex(text.as_bytes());
-    match cx.manifest.hooks.iter_mut().find(|r| r.path == path) {
-        Some(record) => {
-            record.backups.extend(backup);
-            if form.http {
-                record
-                    .added
-                    .retain(|a| a.entry["hooks"][0]["type"] != "command");
-            }
-            record.added.extend(added);
-            record.written_hash = hash;
-            record.env_token_sha = form.env_sha.or(record.env_token_sha.take());
+    // Uninstall undoes only a connection this run made (also when a later step failed), not one
+    // it found and kept, such as a manual `client setup`.
+    if let Some(connection) = checkout_connection(&cx.found) {
+        let created = existing.as_ref().is_none_or(|before| {
+            before.hub != connection.hub || before.token_file != connection.token_file
+        });
+        if created && !cx.manifest.clients.contains(&connection.root) {
+            cx.manifest.clients.push(connection.root.clone());
+        } else if !cx.manifest.clients.contains(&connection.root) {
+            println!(
+                "This checkout's connection existed before quickstart, so `uninstall` leaves it; `{} client remove` takes it out.",
+                cli_command(cx)
+            );
         }
-        None => cx.manifest.hooks.push(HookRecord {
-            path: path.to_owned(),
-            created: !existed,
-            backups: backup.into_iter().collect(),
-            added,
-            written_hash: hash,
-            env_token_sha: form.env_sha,
-            created_dir,
-        }),
+        cx.live.repo = Some(connection.repo.clone());
+        cx.live.agents = connection.agents.clone();
     }
-    cx.manifest.save().map_err(|e| e.to_string())
+    let _ = cx.manifest.save();
+    if let Err(error) = result {
+        println!("Couldn't finish setting up {names}: {}.", short(&error));
+        cx.live.agent_error = Some(short(&error));
+    } else if cx.found.worktrees {
+        println!(
+            "Each Git worktree is its own checkout: in every worktree you start agents in, run `{} client setup --agent AGENT --hub {hub}`.",
+            cli_command(cx)
+        );
+    }
 }
 
-/// Whether `url` names this machine, where teammates cannot reach a hub.
-fn is_loopback(url: &str) -> bool {
-    reqwest::Url::parse(url)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_owned))
-        .is_some_and(|host| {
-            host == "localhost"
-                || host
-                    .trim_matches(['[', ']'])
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback())
-        })
-}
-
-/// Offers `agentscm init-repo` for the hub just configured. Failure is reported, not fatal.
+/// Offers `agentscm init-repo`'s instruction files once a hub is chosen. Failure is reported, not fatal.
 fn init_stage(cx: &mut Cx<'_>) {
     let (Some(root), Some(hub)) = (cx.found.repo_root.clone(), cx.live.hub.clone()) else {
         if cx.args.init {
-            println!("--init needs a Git repository and a hub, so I didn't add the agent config.");
+            println!(
+                "--init needs a Git repository and a hub, so I didn't add the agent instructions."
+            );
         }
         return;
     };
-    if is_loopback(&hub) {
-        println!(
-            "Skipping repository agent config: this hub runs on this machine. When you have a shared hub, run `{} init-repo --hub-url URL`.",
-            cli_command(cx)
-        );
-        return;
-    }
     if cx.ui.yes && !cx.args.init {
         return;
     }
@@ -1963,7 +1252,10 @@ fn init_stage(cx: &mut Cx<'_>) {
     );
     match crate::init_cli::run_in(&root, None, Some(&hub), cx.ui) {
         Ok(outcome) => cx.init_written = outcome.written,
-        Err(error) => println!("Couldn't add the agent config: {}.", short(&error)),
+        Err(error) => println!("Couldn't add the agent instructions: {}.", short(&error)),
+    }
+    if !cx.init_written.is_empty() {
+        crate::init_cli::print_next_steps(&crate::init_cli::ALL, Some(&hub), &cx.init_written);
     }
 }
 
@@ -2003,53 +1295,41 @@ fn summary(cx: &Cx<'_>, changed: bool) {
             native.port
         ));
     }
-    for token in &m.tokens {
-        line(format!(
-            "{}: agent token for {}{}",
-            shown(&token.file, home),
-            clean(&token.repo),
-            if token.owned {
-                ""
-            } else {
-                " (yours; used as given)"
-            }
-        ));
-    }
-    if let Some(hub) = &m.hub_json {
-        line(format!(
-            "{}: which hub to use, and which token for which repository{}",
-            shown(&hub.path, home),
-            hub.backup.as_ref().map_or(String::new(), |b| format!(
-                " (previous copy: {})",
-                shown(b, home)
-            ))
-        ));
-    }
     if m.session.is_some()
         && let Ok(path) = hub_cli::sessions_path()
     {
         line(format!("{}: your hub sign-in", shown(&path, home)));
     }
+    let connections = crate::client_config::load().unwrap_or_default();
+    for root in &m.clients {
+        match connections
+            .iter()
+            .find(|connection| &connection.root == root)
+        {
+            Some(connection) => line(format!(
+                "{}: connected to {} for {}{}; token {}",
+                root.display(),
+                connection.hub,
+                clean(&connection.repo),
+                if connection.agents.is_empty() {
+                    String::new()
+                } else {
+                    format!(", agents set up: {}", connection.agents.join(", "))
+                },
+                shown(&connection.token_file, home)
+            )),
+            None => line(format!("{}: no longer connected", root.display())),
+        }
+    }
     if let Some(dir) = &m.bin_dir {
         line(format!(
             "{}: the agentscm program{}",
             shown(dir, home),
-            if m.hooks.is_empty() {
+            if m.clients.is_empty() {
                 ""
             } else {
-                " the hooks call"
+                " the agents' hooks call"
             }
-        ));
-    }
-    for record in &m.hooks {
-        line(format!(
-            "{}: {} Claude Code hook entries{}",
-            shown(&record.path, home),
-            record.added.len(),
-            record.backups.first().map_or(String::new(), |b| format!(
-                " (original: {})",
-                shown(b, home)
-            ))
         ));
     }
     if !any && cx.init_written.is_empty() {
@@ -2075,57 +1355,6 @@ fn summary(cx: &Cx<'_>, changed: bool) {
 
 // ---- uninstall ----
 
-/// Puts `backup`'s text back, atomically, through any symlink.
-fn restore(path: &Path, backup: &Path) -> std::result::Result<String, String> {
-    let text = std::fs::read_to_string(backup).map_err(|e| e.to_string())?;
-    write_keeping_mode(path, &text)?;
-    Ok(format!("restored {} from its backup", path.display()))
-}
-
-/// `(finished, what happened)`; unfinished means the file was left as it is.
-fn undo_hooks(record: &HookRecord) -> (bool, String) {
-    let path = &record.path;
-    let text = match read_existing(path) {
-        Ok(Some(text)) => text,
-        Ok(None) => return (true, format!("{} is already gone", path.display())),
-        Err(message) => return (false, format!("left {} alone: {message}", path.display())),
-    };
-    // Only a file exactly as quickstart last wrote it, written once, is put back wholesale:
-    // after a second write the backups hold edits made in between.
-    let unchanged = sha_hex(text.as_bytes()) == record.written_hash;
-    let result = match record.backups.as_slice() {
-        [] if unchanged && record.created => std::fs::remove_file(path)
-            .map(|()| format!("removed {}", path.display()))
-            .map_err(|e| e.to_string()),
-        [backup] if unchanged && !record.created && backup.exists() => restore(path, backup),
-        _ => surgical_undo(record, &text),
-    };
-    match result {
-        Ok(message) => (true, message),
-        Err(why) => (false, format!("left {} alone: {why}", path.display())),
-    }
-}
-
-/// The file changed since quickstart wrote it: remove just our entries.
-fn surgical_undo(record: &HookRecord, text: &str) -> std::result::Result<String, String> {
-    let mut settings: Value =
-        serde_json::from_str(text).map_err(|_| "it is no longer valid JSON".to_owned())?;
-    let removed = hook::remove(&mut settings, &record.added);
-    if let Some(sha) = &record.env_token_sha {
-        hook::remove_env(&mut settings, sha);
-    }
-    if record.created && settings == json!({}) {
-        std::fs::remove_file(&record.path).map_err(|e| e.to_string())?;
-        return Ok(format!("removed {}", record.path.display()));
-    }
-    let text = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())? + "\n";
-    write_keeping_mode(&record.path, &text)?;
-    Ok(format!(
-        "removed {removed} hook entries from {}, leaving the rest",
-        record.path.display()
-    ))
-}
-
 pub async fn uninstall(args: UninstallArgs) -> Result<()> {
     let ui = Ui { yes: args.yes };
     let _quickstart_lease = manifest::acquire_lease()?;
@@ -2144,26 +1373,14 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
         .as_ref()
         .map(|d| (d.clone(), binary::installed(d)));
     println!("Will undo what quickstart did:");
-    for r in &m.hooks {
+    for root in &m.clients {
         println!(
-            "  - take the AgentSCM hooks out of {}",
-            shown(&r.path, &home)
-        );
-    }
-    for t in m.tokens.iter().filter(|t| t.owned) {
-        println!(
-            "  - delete the agent token file {} and revoke the token on the hub if it answers",
-            shown(&t.file, &home)
+            "  - disconnect {} with `client remove`: take out its agents' hooks, MCP entries and skills, and delete and revoke the agent token setup created",
+            root.display()
         );
     }
     if m.session.is_some() {
         println!("  - sign out of the hub (end the sign-in quickstart created)");
-    }
-    if let Some(h) = &m.hub_json {
-        println!(
-            "  - remove {} unless you changed it since",
-            shown(&h.path, &home)
-        );
     }
     if let Some((dir, files)) = &programs {
         let names: Vec<String> = files
@@ -2219,22 +1436,17 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
         ..Manifest::default()
     };
     let mut manual: Vec<String> = Vec::new();
-    for token in &m.tokens {
-        if token.owned {
-            revoke(token).await;
-            match std::fs::remove_file(&token.file) {
-                Ok(()) => println!("Deleted {}.", shown(&token.file, &home)),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    println!("{} was already gone.", shown(&token.file, &home));
-                }
-                Err(e) => {
-                    println!("Couldn't delete {}: {e}.", shown(&token.file, &home));
-                    manual.push(format!("rm {}", token.file.display()));
-                    left.tokens.push(token.clone());
-                }
-            }
+    for root in &m.clients {
+        if let Err(error) = crate::client_cli::remove_checkout(root).await {
+            println!("Couldn't disconnect {}: {}.", root.display(), short(&error));
+            manual.push(format!(
+                "agentscm client remove --root {}",
+                binary::quote(root)
+            ));
+            left.clients.push(root.clone());
         }
     }
+    // Ending the sign-in comes after `client remove`, which revokes tokens with it.
     if let Some(session) = &m.session {
         match hub_cli::end_session(&session.hub).await {
             Ok(true) => println!("Signed out of {}.", clean(&session.hub)),
@@ -2246,51 +1458,6 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
                 println!("Couldn't sign out: {}.", short(&e));
                 manual.push("agentscm hub logout".into());
                 left.session = Some(session.clone());
-            }
-        }
-    }
-    for record in &m.hooks {
-        let (done, message) = undo_hooks(record);
-        println!("{message}.");
-        if done && let Some(dir) = &record.created_dir {
-            // Only an empty directory goes.
-            let _ = std::fs::remove_dir(dir);
-        }
-        if !done {
-            manual.push(format!(
-                "edit {} and remove the hooks whose commands end in `intent start|check|done --hook claude`",
-                record.path.display()
-            ));
-            left.hooks.push(record.clone());
-        }
-    }
-    if let Some(hub) = &m.hub_json {
-        let name = shown(&hub.path, &home);
-        match file_hash(&hub.path) {
-            None => println!("{name} was already gone."),
-            Some(hash) if hash == hub.hash => {
-                let result = match hub.backup.as_ref().filter(|b| b.exists()) {
-                    Some(backup) => restore(&hub.path, backup),
-                    None => std::fs::remove_file(&hub.path)
-                        .map(|()| format!("removed {}", hub.path.display()))
-                        .map_err(|e| e.to_string()),
-                };
-                match result {
-                    Ok(message) => println!("{message}."),
-                    Err(why) => {
-                        println!("Left {name} alone: {why}.");
-                        manual.push(format!("remove {}", hub.path.display()));
-                        left.hub_json = Some(hub.clone());
-                    }
-                }
-            }
-            Some(_) => {
-                println!("Left {name} alone: you changed it after quickstart wrote it.");
-                manual.push(format!(
-                    "review {} and remove what you no longer need",
-                    hub.path.display()
-                ));
-                left.hub_json = Some(hub.clone());
             }
         }
     }
@@ -2314,16 +1481,18 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
             }
         }
     }
-    if let Some((dir, _)) = programs
-        .as_ref()
-        .filter(|_| !left.hooks.is_empty() || left.native_hub.is_some() || native_executable_drift)
-    {
+    if let Some((dir, _)) = programs.as_ref().filter(|_| {
+        // Connections quickstart didn't make may run this program too.
+        !crate::client_config::load().is_ok_and(|connections| connections.is_empty())
+            || left.native_hub.is_some()
+            || native_executable_drift
+    }) {
         println!(
-            "Left the program files in {}: recorded hooks or a managed hub still need them, or the native executable changed.",
+            "Left the program files in {}: client connections or a managed hub still need them, or the native executable changed.",
             shown(dir, &home)
         );
         manual.push(
-            "after resolving the retained hooks or hub, run `agentscm uninstall` again".into(),
+            "after removing the remaining client connections or hub, run `agentscm uninstall` again".into(),
         );
         left.bin_dir = Some(dir.clone());
     } else if let Some((dir, files)) = programs {
@@ -2356,11 +1525,12 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
         manual.push(command);
         left.local_hub = Some(local.clone());
     }
+    if m.bin_parent_created && left.bin_dir.is_none() && left.local_hub.is_none() {
+        remove_created_root(&home);
+    }
     if left.is_empty() {
         let _ = std::fs::remove_file(manifest::path()?);
-        println!(
-            "Removed quickstart's record. Backups of changed files stay next to them (*.agentscm-backup-*)."
-        );
+        println!("Removed quickstart's record.");
         return Ok(());
     }
     left.save()?;
@@ -2375,27 +1545,11 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
     ))
 }
 
-async fn revoke(token: &TokenRecord) {
-    let Some(id) = token
-        .id
-        .as_deref()
-        .filter(|id| id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
-    else {
-        return;
-    };
-    let (Ok(client), Ok((hub, session))) = (client(), load_session(Some(&token.hub))) else {
-        println!(
-            "Couldn't revoke the agent token on the hub (no saved sign-in); it expires on its own."
-        );
-        return;
-    };
-    let url = format!("{hub}/v1/hub/tokens/{id}");
-    match call(&client, Method::DELETE, &url, Some(&session), None).await {
-        Ok((204, _)) => println!("Revoked the agent token on the hub."),
-        _ => println!(
-            "Couldn't revoke the agent token on the hub (it isn't answering, or your sign-in expired); it expires on its own."
-        ),
-    }
+/// Drops `~/.agentscm` (and an emptied `hubs`) that quickstart created, only if nothing is left.
+fn remove_created_root(home: &Path) {
+    let root = home.join(".agentscm");
+    let _ = std::fs::remove_dir(root.join("hubs"));
+    let _ = std::fs::remove_dir(root);
 }
 
 /// `Err` carries the command to finish by hand.
@@ -2440,6 +1594,21 @@ fn safe_hub_data_dir(dir: &Path, home: &Path, project: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn created_root_goes_only_when_empty() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".agentscm");
+        std::fs::create_dir_all(root.join("hubs")).unwrap();
+        std::fs::write(root.join("keep"), "x").unwrap();
+        remove_created_root(home.path());
+        assert!(root.join("keep").exists() && !root.join("hubs").exists());
+        std::fs::remove_file(root.join("keep")).unwrap();
+        std::fs::create_dir_all(root.join("hubs")).unwrap();
+        remove_created_root(home.path());
+        assert!(!root.exists());
+    }
 
     #[test]
     fn pending_local_setup_names_the_resume_command_instead_of_token_setup() {
@@ -2451,27 +1620,6 @@ mod tests {
         assert!(line.contains("finish creating and installing the app"));
         assert!(line.contains("`/opt/agentscm quickstart --hub local`"));
         assert!(!line.contains("agent-token-file"));
-    }
-
-    #[test]
-    fn not_connected_is_told_apart_from_other_refusals() {
-        let mint = |status, body: Value| classify(status, &body);
-        assert!(matches!(
-            mint(403, json!({"error": "not_connected"})),
-            Mint::NotConnected
-        ));
-        assert!(matches!(
-            mint(403, json!({"error": "forbidden"})),
-            Mint::Forbidden
-        ));
-        assert!(matches!(mint(403, Value::Null), Mint::Forbidden));
-        assert!(matches!(mint(401, Value::Null), Mint::Unauthorized));
-        assert!(matches!(
-            mint(201, json!({"id": "tok_1", "token": "s"})),
-            Mint::Minted { .. }
-        ));
-        assert!(matches!(mint(201, json!({})), Mint::Failed(_)));
-        assert!(matches!(mint(500, Value::Null), Mint::Failed(_)));
     }
 
     #[test]
@@ -2503,8 +1651,9 @@ mod tests {
             "--hub",
             "--hub-url",
             "--agent-token-file",
+            "--agent",
+            "--no-agents",
             "--slack-config-file",
-            "--hook",
             "--no-collisions",
             "--init",
         ] {
@@ -2523,18 +1672,46 @@ mod tests {
             hub_project: None,
             github_login: None,
             agent_token_file: None,
-            agent_name: None,
-            ttl: "30d".into(),
             slack_config_file: Some(std::env::temp_dir().join("does-not-exist")),
             local: false,
             hosted: false,
             provider: None,
-            hook: None,
+            #[cfg(unix)]
+            agent: Vec::new(),
+            no_agents: true,
             no_collisions: false,
             init: false,
         };
         let error = preflight_slack(&args).unwrap_err().to_string();
         assert!(error.contains("requires a managed local Hub"));
+    }
+
+    #[test]
+    fn the_last_line_names_why_a_requested_local_hub_is_not_running() {
+        let live = Live {
+            hub_error: Some("Docker is not running.".into()),
+            ..Live::default()
+        };
+        let line = live.line("agentscm");
+        assert!(
+            line.starts_with("Live warnings: off — local hub not started: Docker is not running."),
+            "{line}"
+        );
+        assert!(!line.contains("no hub chosen"), "{line}");
+    }
+
+    #[test]
+    fn declining_the_agent_setup_says_nothing_was_changed_and_suggests_no_flag() {
+        let live = Live {
+            hub: Some("http://h".into()),
+            hub_up: true,
+            wanted_agents: true,
+            declined: true,
+            ..Live::default()
+        };
+        let line = live.line("agentscm");
+        assert!(line.contains("nothing was changed"), "{line}");
+        assert!(!line.contains("--agent-token-file"), "{line}");
     }
 
     #[test]
@@ -2552,128 +1729,22 @@ mod tests {
         live.hub_up = true;
         assert!(
             live.line("agentscm")
-                .contains("no agent token or hub settings were saved")
+                .contains("no coding agent was set up (run `agentscm quickstart --agent claude|codex|cursor|copilot|gemini`)")
+        );
+        live.wanted_agents = true;
+        assert!(
+            live.line("agentscm")
+                .contains("this checkout isn't connected to the hub")
         );
         live.repo = Some("acme/widgets".into());
-        assert!(live.line("agentscm").contains("no Claude Code hooks"));
-        live.hooks = true;
+        assert!(
+            live.line("agentscm")
+                .contains("no coding agent was set up (run `agentscm quickstart --agent claude`)")
+        );
+        live.agents = vec!["claude".into()];
         assert_eq!(
             live.line("agentscm"),
             "Live warnings: on (hub http://h, repo acme/widgets)"
         );
-    }
-
-    #[test]
-    fn a_token_file_that_was_there_is_backed_up_and_never_ours() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("tokens").join("a__b.token");
-        // New file: ours, private directory and file.
-        assert!(write_token_file(&file, "one", false).unwrap());
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\n");
-        #[cfg(unix)]
-        assert_eq!(mode_of(&file), 0o600);
-        #[cfg(unix)]
-        assert_eq!(mode_of(file.parent().unwrap()), 0o700);
-        // Ours already (the manifest says so): replaced without a backup, still ours.
-        assert!(write_token_file(&file, "two", true).unwrap());
-        assert_eq!(
-            std::fs::read_dir(file.parent().unwrap()).unwrap().count(),
-            1
-        );
-        // Not ours: backed up, replaced, not ours.
-        assert!(!write_token_file(&file, "three", false).unwrap());
-        let names: Vec<String> = std::fs::read_dir(file.parent().unwrap())
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        let backup = names
-            .iter()
-            .find(|n| n.contains("agentscm-backup"))
-            .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(file.parent().unwrap().join(backup)).unwrap(),
-            "two\n"
-        );
-    }
-
-    #[test]
-    fn only_this_machine_counts_as_a_local_hub() {
-        for url in [
-            "http://127.0.0.1:8080",
-            "http://[::1]:8080",
-            "https://localhost",
-        ] {
-            assert!(is_loopback(url), "{url}");
-        }
-        for url in ["https://hub.example.com", "http://192.168.1.5:8080", "nope"] {
-            assert!(!is_loopback(url), "{url}");
-        }
-    }
-
-    #[test]
-    fn undo_takes_back_the_http_hooks_and_only_our_token() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("settings.local.json");
-        let mut settings = json!({"model": "x"});
-        let added = hook::merge(
-            &mut settings,
-            &hook::http_entries("https://h.example.com", None),
-        )
-        .unwrap();
-        hook::set_env(&mut settings, "tok", None).unwrap();
-        let record = HookRecord {
-            path: path.clone(),
-            created: true,
-            backups: Vec::new(),
-            added,
-            written_hash: String::new(),
-            env_token_sha: Some(sha_hex(b"tok")),
-            created_dir: None,
-        };
-        let text = serde_json::to_string(&settings).unwrap();
-        std::fs::write(&path, &text).unwrap();
-        surgical_undo(&record, &text).unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(&std::fs::read_to_string(&path).unwrap()).unwrap(),
-            json!({"model": "x"})
-        );
-        // A token the user has since replaced stays.
-        let mut changed: Value = serde_json::from_str(&text).unwrap();
-        changed["env"][hook_env()] = json!("theirs");
-        surgical_undo(&record, &changed.to_string()).unwrap();
-        let after: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(after["env"][hook_env()], "theirs");
-        assert!(after.get("hooks").is_none());
-    }
-
-    fn hook_env() -> &'static str {
-        hook::TOKEN_VAR
-    }
-
-    #[cfg(unix)]
-    fn mode_of(path: &Path) -> u32 {
-        path.metadata().unwrap().permissions().mode() & 0o777
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn writes_go_through_symlinks_and_unreadable_files_are_not_absent() {
-        let dir = tempfile::tempdir().unwrap();
-        let real = dir.path().join("dotfiles").join("settings.json");
-        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
-        std::fs::write(&real, "old").unwrap();
-        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).unwrap();
-        let link = dir.path().join("settings.json");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-        write_keeping_mode(&link, "new").unwrap();
-        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
-        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
-        assert_eq!(mode_of(&real), 0o640);
-        let backup = make_backup(&link).unwrap();
-        assert_eq!(backup.parent(), real.canonicalize().unwrap().parent());
-        assert_eq!(read_existing(&dir.path().join("missing")), Ok(None));
-        std::fs::write(dir.path().join("binary"), [0xff, 0xfe]).unwrap();
-        assert!(read_existing(&dir.path().join("binary")).is_err());
-        assert!(read_existing(dir.path()).is_err());
     }
 }

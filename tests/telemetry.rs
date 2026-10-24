@@ -81,8 +81,7 @@ fn consent_profile_needs_explicit_on_and_environment_still_wins() {
             "--yes",
             "--hub",
             "skip",
-            "--hook",
-            "none",
+            "--no-agents",
             "--no-collisions",
         ],
     );
@@ -350,8 +349,7 @@ fn headless_quickstart_never_acknowledges_the_telemetry_notice() {
             "--yes",
             "--hub",
             "skip",
-            "--hook",
-            "none",
+            "--no-agents",
             "--no-collisions",
         ],
     );

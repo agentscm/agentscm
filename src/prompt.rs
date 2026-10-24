@@ -23,6 +23,29 @@ fn ask(mut read: impl FnMut() -> Option<String>, default_yes: bool) -> Option<bo
     None
 }
 
+fn pick(
+    mut read: impl FnMut() -> Option<String>,
+    len: usize,
+    default: usize,
+    fallback: usize,
+) -> usize {
+    for _ in 0..MAX_TRIES {
+        let Some(answer) = read() else {
+            return fallback;
+        };
+        if answer.is_empty() {
+            return default;
+        }
+        if let Ok(n) = answer.parse::<usize>()
+            && (1..=len).contains(&n)
+        {
+            return n - 1;
+        }
+        println!("Enter a number from 1 to {len}.");
+    }
+    fallback
+}
+
 pub(crate) struct Ui {
     pub(crate) yes: bool,
 }
@@ -52,9 +75,15 @@ impl Ui {
         ask(|| self.read(&format!("{question} {hint} ")), default_yes)
     }
 
-    /// The 0-based index of the chosen option; `default` on Enter, end of input, or after
-    /// three unusable answers.
-    pub(crate) fn choose(&self, question: &str, options: &[&str], default: usize) -> usize {
+    /// The 0-based index of the chosen option: `default` on Enter, and `fallback` (the
+    /// caller's non-writing option) at end of input or after three unusable answers.
+    pub(crate) fn choose(
+        &self,
+        question: &str,
+        options: &[&str],
+        default: usize,
+        fallback: usize,
+    ) -> usize {
         if self.yes {
             return default;
         }
@@ -62,23 +91,8 @@ impl Ui {
         for (i, option) in options.iter().enumerate() {
             println!("  {}) {option}", i + 1);
         }
-        for _ in 0..MAX_TRIES {
-            let Some(answer) =
-                self.read(&format!("Choose 1-{} [{}]: ", options.len(), default + 1))
-            else {
-                return default;
-            };
-            if answer.is_empty() {
-                return default;
-            }
-            if let Ok(n) = answer.parse::<usize>()
-                && (1..=options.len()).contains(&n)
-            {
-                return n - 1;
-            }
-            println!("Enter a number from 1 to {}.", options.len());
-        }
-        default
+        let hint = format!("Choose 1-{} [{}]: ", options.len(), default + 1);
+        pick(|| self.read(&hint), options.len(), default, fallback)
     }
 
     /// A free-text answer, prefilled with `default`.
@@ -141,5 +155,18 @@ mod tests {
         assert_eq!(super::ask(answers(&["yse", "x", "?"]), true), None);
         assert_eq!(super::ask(answers(&["yse", "n"]), true), Some(false));
         assert_eq!(super::ask(answers(&[""]), true), Some(true));
+    }
+
+    #[test]
+    fn no_answer_at_a_menu_takes_the_fallback_not_the_default() {
+        let answers = |list: &[&str]| {
+            let mut list: Vec<String> = list.iter().map(|a| a.to_string()).collect();
+            list.reverse();
+            move || list.pop()
+        };
+        assert_eq!(super::pick(answers(&[]), 3, 0, 1), 1);
+        assert_eq!(super::pick(answers(&["x", "9", "0"]), 3, 0, 1), 1);
+        assert_eq!(super::pick(answers(&[""]), 3, 0, 1), 0);
+        assert_eq!(super::pick(answers(&["x", "3"]), 3, 0, 1), 2);
     }
 }

@@ -1382,6 +1382,41 @@ async fn tokens_are_listed_and_revoked_by_their_owner_only() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_token_revokes_only_itself() {
+    let env = Env::start("").await;
+    env.grant_repo(7, "acme/widgets", 1);
+    let alice = secret(&env.device_login("github", 7).await);
+    let (_, first) = env.create_token(&alice, "acme/widgets").await;
+    let (_, second) = env.create_token(&alice, "acme/widgets").await;
+    let (first, second) = (
+        first["token"].as_str().unwrap(),
+        second["token"].as_str().unwrap(),
+    );
+    let url = format!("{}/v1/hub/token", env.url());
+    for refused in [None, Some(alice.as_str())] {
+        assert_eq!(
+            env.send(Method::DELETE, &url, refused, None, None).await.0,
+            401
+        );
+    }
+    assert_eq!(
+        env.send(Method::DELETE, &url, Some(first), None, None)
+            .await
+            .0,
+        204
+    );
+    assert_eq!(env.get("/v1/hub/whoami", Some(first)).await.0, 401);
+    assert_eq!(env.get("/v1/hub/whoami", Some(second)).await.0, 200);
+    // A revoked token is just an unknown one.
+    assert_eq!(
+        env.send(Method::DELETE, &url, Some(first), None, None)
+            .await
+            .0,
+        401
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sessions_and_agent_tokens_are_not_interchangeable() {
     let env = Env::start("").await;
     env.grant_repo(7, "acme/widgets", 1);

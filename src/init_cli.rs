@@ -40,7 +40,7 @@ impl Agent {
     }
 }
 
-const ALL: [Agent; 5] = [
+pub(crate) const ALL: [Agent; 5] = [
     Agent::Claude,
     Agent::Codex,
     Agent::Cursor,
