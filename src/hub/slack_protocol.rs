@@ -76,16 +76,29 @@ pub fn verify_request(
     }
 
     let signature = decode_signature(signature_header)?;
-    let mut signed = Vec::with_capacity(
-        SIGNED_VERSION_PREFIX.len() + timestamp_header.len() + 1 + raw_body.len(),
-    );
+    let key = hmac::Key::new(hmac::HMAC_SHA256, signing_secret.as_bytes());
+    hmac::verify(&key, &signed(timestamp_header, raw_body), &signature)
+        .map_err(|_| ProtocolError::InvalidSignature)
+}
+
+/// Signs a request as Slack does: the `x-slack-signature` value `verify_request` accepts.
+pub fn sign_request(signing_secret: &str, timestamp: &str, raw_body: &[u8]) -> String {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, signing_secret.as_bytes());
+    let tag = hmac::sign(&key, &signed(timestamp, raw_body));
+    format!(
+        "{SIGNATURE_HEADER_PREFIX}{}",
+        crate::team::auth::lower_hex(tag.as_ref())
+    )
+}
+
+fn signed(timestamp: &str, raw_body: &[u8]) -> Vec<u8> {
+    let mut signed =
+        Vec::with_capacity(SIGNED_VERSION_PREFIX.len() + timestamp.len() + 1 + raw_body.len());
     signed.extend_from_slice(SIGNED_VERSION_PREFIX.as_bytes());
-    signed.extend_from_slice(timestamp_header.as_bytes());
+    signed.extend_from_slice(timestamp.as_bytes());
     signed.push(b':');
     signed.extend_from_slice(raw_body);
-
-    let key = hmac::Key::new(hmac::HMAC_SHA256, signing_secret.as_bytes());
-    hmac::verify(&key, &signed, &signature).map_err(|_| ProtocolError::InvalidSignature)
+    signed
 }
 
 fn parse_timestamp(timestamp: &str) -> Result<i64, ProtocolError> {
@@ -203,7 +216,6 @@ fn form_hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-/// Parses a bounded JSON request body.
 /// Returns a Block Kit `plain_text` object with bounded, control-free text.
 ///
 /// The object type is fixed rather than caller-controlled so Slack does not
@@ -259,6 +271,22 @@ mod tests {
             write!(&mut result, "{byte:02x}").unwrap();
         }
         result
+    }
+
+    #[test]
+    fn signs_requests_as_slack_does() {
+        let timestamp = NOW.to_string();
+        let body = br#"{"type":"url_verification","challenge":"c"}"#;
+        let signed = sign_request(SECRET, &timestamp, body);
+        assert_eq!(signed, signature(&timestamp, body));
+        assert_eq!(
+            verify_request(SECRET, &timestamp, &signed, body, NOW),
+            Ok(())
+        );
+        assert_eq!(
+            verify_request("other-secret", &timestamp, &signed, body, NOW),
+            Err(ProtocolError::InvalidSignature)
+        );
     }
 
     #[test]

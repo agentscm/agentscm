@@ -116,7 +116,7 @@ fn setup_derives_identity_is_idempotent_and_doctor_does_not_create_a_journal() {
     ]);
     assert!(output.status.success());
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["configuration"]["local_valid"], true);
+    assert_eq!(report["configuration"]["binding_ids"], json!(["U123"]));
     assert_eq!(report["live_verified"], false);
     assert!(!destination.join("install.sqlite").exists());
 }
@@ -223,4 +223,41 @@ exit 0
     assert!(String::from_utf8_lossy(&denied.stderr).contains("did not confirm"));
     assert!(!String::from_utf8_lossy(&denied.stdout).contains("xoxb-"));
     assert!(!String::from_utf8_lossy(&denied.stderr).contains("xoxb-"));
+}
+
+#[test]
+fn provider_install_resolves_a_relative_cli_and_withholds_failed_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let program = root.join("slack");
+    private(
+        &program,
+        "#!/bin/sh\nprintf 'xoxb-synthetic-provider-output\\n'\nexit 1\n",
+    );
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let project = root.join("project");
+    // `./slack` names the caller's file, not one in the project the CLI runs in.
+    let output = Command::new(env!("CARGO_BIN_EXE_agentscm"))
+        .current_dir(&root)
+        .args(["hub", "slack", "install", "--directory"])
+        .arg(&project)
+        .args(["--team-id", "T123", "--slack-cli", "./slack"])
+        .env("AGENTSCM_TELEMETRY", "off")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("output was withheld"), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "cd '{}' && SLACK_CLI_APP_ICON_PATH='{}' '{}' app install",
+            project.display(),
+            project.join("icon.png").display(),
+            program.display()
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("xoxb-"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("xoxb-"));
 }

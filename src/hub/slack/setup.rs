@@ -12,6 +12,10 @@ use crate::hub::{HubError, Result};
 
 const CONFIG_FILE: &str = "config.json";
 const DATABASE_FILE: &str = "install.sqlite";
+/// The Slack journal and the SQLite side files that can sit beside it.
+pub const JOURNAL_FILES: [&str; 3] = [DATABASE_FILE, "install.sqlite-wal", "install.sqlite-shm"];
+const SIGNING_FILE: &str = "signing-secret";
+const BOT_FILE: &str = "bot-token";
 const MANIFEST_FILE: &str = "manifest.json";
 const HOOKS_FILE: &str = "hooks.json";
 const ICON_FILE: &str = "icon.png";
@@ -21,14 +25,15 @@ const ICON: &[u8] = include_bytes!("../../../docs/assets/agentscm-icon.png");
 pub struct Report {
     pub config_file: PathBuf,
     pub callback_url: String,
-    pub binding_count: usize,
     pub binding_ids: Vec<String>,
-    pub local_valid: bool,
-    pub live_verified: bool,
 }
 
-pub struct Bundle {
-    files: Vec<(String, Vec<u8>)>,
+/// A validated configuration with the Slack secrets it names.
+pub struct Loaded {
+    pub report: Report,
+    pub config: SlackConfig,
+    pub signing_secret: String,
+    pub bot_token: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -46,18 +51,17 @@ pub struct AppRecord {
     pub team_domain: Option<String>,
 }
 
-impl Bundle {
-    pub fn files(&self) -> &[(String, Vec<u8>)] {
-        &self.files
-    }
-}
-
 /// Read and fully validate a private Slack configuration without opening its journal.
-pub fn read_config(path: &Path) -> Result<SlackConfig> {
+pub fn load(path: &Path) -> Result<Loaded> {
     let config: SlackConfig =
         serde_json::from_slice(&private_file(path, 64 * 1024)?).map_err(|_| invalid())?;
-    validate_config(&config)?;
-    Ok(config)
+    let validated = validate_config(&config)?;
+    Ok(Loaded {
+        report: report(path.to_path_buf(), &config, validated.callback_url),
+        config,
+        signing_secret: validated.signing,
+        bot_token: validated.bot,
+    })
 }
 
 /// Read a private agent token and validate its local credential shape.
@@ -69,12 +73,13 @@ pub fn read_agent_token(path: &Path) -> Result<String> {
 
 /// Validate a local Slack configuration without network or journal side effects.
 pub fn check(config_path: &Path) -> Result<Report> {
-    let config = read_config(config_path)?;
-    report(config_path.to_path_buf(), &config)
+    load(config_path).map(|loaded| loaded.report)
 }
 
 /// Create the private configuration file for an installation directory.
-pub fn prepare(directory: &Path, config: SlackConfig) -> Result<Report> {
+pub fn prepare(directory: &Path, mut config: SlackConfig) -> Result<Report> {
+    // Store the canonical origin so `https://hub` and `https://hub/` name the same config.
+    config.hub_url = origin(&config.hub_url)?.to_string();
     ensure_install_directory(directory)?;
     let _lease = project_lease(directory)?;
     if config.database != directory.join(DATABASE_FILE) {
@@ -91,7 +96,10 @@ pub fn prepare(directory: &Path, config: SlackConfig) -> Result<Report> {
         let existing: SlackConfig = serde_json::from_slice(&private_file(&config_file, 64 * 1024)?)
             .map_err(|_| invalid())?;
         if existing != config {
-            return Err(invalid());
+            return Err(HubError::Invalid(format!(
+                "{} already holds a different Slack configuration; remove it to replace it, or rerun with the same values",
+                config_file.display()
+            )));
         }
         if path_present(&pending)? {
             exact_private_file(&pending, &bytes)?;
@@ -104,17 +112,13 @@ pub fn prepare(directory: &Path, config: SlackConfig) -> Result<Report> {
         fs::remove_file(&pending)?;
     }
     fs::File::open(directory)?.sync_all()?;
-    Ok(report_from_validated(
-        config_file,
-        &config,
-        validated.callback_url,
-    ))
+    Ok(report(config_file, &config, validated.callback_url))
 }
 
 /// Build a secret-bearing in-memory bundle for an already validated installation.
-pub fn bundle(config_path: &Path, target_directory: &Path) -> Result<Bundle> {
+pub fn bundle(config_path: &Path, target_directory: &Path) -> Result<Vec<(String, Vec<u8>)>> {
     validate_lexical_absolute(target_directory)?;
-    let mut config = read_config(config_path)?;
+    let mut config = load(config_path)?.config;
     let signing = private_file(&config.signing_secret_file, 4096)?;
     let bot = private_file(&config.bot_token_file, 4096)?;
     let mut agents = Vec::with_capacity(config.bindings.len());
@@ -123,24 +127,40 @@ pub fn bundle(config_path: &Path, target_directory: &Path) -> Result<Bundle> {
     }
 
     config.database = target_directory.join(DATABASE_FILE);
-    config.signing_secret_file = target_directory.join("signing-secret");
-    config.bot_token_file = target_directory.join("bot-token");
+    config.signing_secret_file = target_directory.join(SIGNING_FILE);
+    config.bot_token_file = target_directory.join(BOT_FILE);
     for (index, binding) in config.bindings.iter_mut().enumerate() {
-        binding.agent_token_file = target_directory.join(format!("agent-{index}.token"));
+        binding.agent_token_file = target_directory.join(agent_file(index));
     }
 
-    let mut files = vec![
-        (CONFIG_FILE.to_owned(), serialized_config(&config)?),
-        ("signing-secret".to_owned(), signing),
-        ("bot-token".to_owned(), bot),
-    ];
-    files.extend(
-        agents
-            .into_iter()
-            .enumerate()
-            .map(|(index, bytes)| (format!("agent-{index}.token"), bytes)),
-    );
-    Ok(Bundle { files })
+    let contents = [serialized_config(&config)?, signing, bot]
+        .into_iter()
+        .chain(agents);
+    Ok(bundle_file_names(config.bindings.len())
+        .zip(contents)
+        .collect())
+}
+
+fn agent_file(index: usize) -> String {
+    format!("agent-{index}.token")
+}
+
+/// The file names `bundle` gives a configuration with `bindings` bindings, in order.
+pub fn bundle_file_names(bindings: usize) -> impl Iterator<Item = String> {
+    [CONFIG_FILE, SIGNING_FILE, BOT_FILE]
+        .into_iter()
+        .map(str::to_owned)
+        .chain((0..bindings).map(agent_file))
+}
+
+/// Whether `bundle` can name a file `name`.
+pub fn bundle_file_name(name: &str) -> bool {
+    matches!(name, CONFIG_FILE | SIGNING_FILE | BOT_FILE)
+        || name
+            .strip_prefix("agent-")
+            .and_then(|rest| rest.strip_suffix(".token"))
+            .and_then(|index| index.parse::<usize>().ok())
+            .is_some_and(|index| name == agent_file(index))
 }
 
 /// Return a Slack app manifest for bootstrap or for a live HTTPS Hub origin.
@@ -238,10 +258,10 @@ pub fn app_record(directory: &Path, team_id: &str) -> Result<Option<AppRecord>> 
         .get("apps")
         .and_then(Value::as_object)
         .ok_or_else(invalid)?;
-    let selected = apps
-        .get(team_id)
-        .and_then(Value::as_object)
-        .ok_or_else(invalid)?;
+    let Some(selected) = apps.get(team_id) else {
+        return Ok(None);
+    };
+    let selected = selected.as_object().ok_or_else(invalid)?;
     let stored_team = selected
         .get("team_id")
         .and_then(Value::as_str)
@@ -301,30 +321,15 @@ fn valid_team_domain(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
-fn report(config_file: PathBuf, config: &SlackConfig) -> Result<Report> {
-    let callback_url = origin(&config.hub_url)?
-        .join("v1/hub/slack")
-        .map_err(|_| invalid())?
-        .to_string();
-    Ok(report_from_validated(config_file, config, callback_url))
-}
-
-fn report_from_validated(
-    config_file: PathBuf,
-    config: &SlackConfig,
-    callback_url: String,
-) -> Report {
+fn report(config_file: PathBuf, config: &SlackConfig, callback_url: String) -> Report {
     Report {
         config_file,
         callback_url,
-        binding_count: config.bindings.len(),
         binding_ids: config
             .bindings
             .iter()
             .map(|binding| binding.slack_user.clone())
             .collect(),
-        local_valid: true,
-        live_verified: false,
     }
 }
 
@@ -345,20 +350,24 @@ fn serialized_json(value: &Value) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn rejected(path: &Path, reason: &str) -> HubError {
+    HubError::Invalid(format!("Slack directory {}: {reason}", path.display()))
+}
+
 fn validate_lexical_absolute(path: &Path) -> Result<()> {
     if !path.is_absolute() {
-        return Err(invalid());
+        return Err(rejected(path, "use an absolute path"));
     }
     let mut saw_normal = false;
     for component in path.components() {
         match component {
             Component::RootDir => {}
             Component::Normal(_) => saw_normal = true,
-            _ => return Err(invalid()),
+            _ => return Err(rejected(path, "remove `.` and `..` components")),
         }
     }
     if !saw_normal {
-        return Err(invalid());
+        return Err(rejected(path, "use a directory below the filesystem root"));
     }
     Ok(())
 }
@@ -381,17 +390,24 @@ fn ensure_install_directory(path: &Path) -> Result<()> {
             }
             Err(error) => return Err(error.into()),
         };
-        validate_directory_component(&metadata, current == path)?;
+        validate_directory_component(&current, &metadata, current == path)?;
     }
     Ok(())
 }
 
 fn validate_directory_component(
+    path: &Path,
     metadata: &fs::Metadata,
     #[cfg_attr(not(unix), allow(unused_variables))] destination: bool,
 ) -> Result<()> {
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(invalid());
+    if metadata.file_type().is_symlink() {
+        return Err(rejected(
+            path,
+            "is a symbolic link; pass the resolved path (on macOS, /private/tmp rather than /tmp)",
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(rejected(path, "is not a directory"));
     }
     #[cfg(unix)]
     {
@@ -399,12 +415,18 @@ fn validate_directory_component(
         let owner = metadata.uid();
         let mode = metadata.mode();
         if destination && (owner != super::effective_uid() || mode & 0o077 != 0) {
-            return Err(invalid());
+            return Err(rejected(
+                path,
+                "must be owned by you with no group or other access (mode 0700)",
+            ));
         }
         let writable = mode & 0o022 != 0;
         let protected_temporary = owner == 0 && mode & 0o1000 != 0;
         if (owner != super::effective_uid() && owner != 0) || (writable && !protected_temporary) {
-            return Err(invalid());
+            return Err(rejected(
+                path,
+                "must be owned by you or root and not writable by other users",
+            ));
         }
     }
     Ok(())
@@ -574,10 +596,11 @@ mod tests {
 
     #[test]
     fn prepare_is_create_only_idempotent_and_does_not_create_journal() {
-        let (directory, config) = fixture();
+        let (directory, mut config) = fixture();
+        // The origin is stored canonically, so a rerun with or without the slash matches.
+        config.hub_url = "https://hub.example.test".into();
         let first = prepare(directory.path(), config.clone()).unwrap();
-        assert!(first.local_valid);
-        assert!(!first.live_verified);
+        assert_eq!(first.binding_ids, ["U123"]);
         assert!(!config.database.exists());
         #[cfg(unix)]
         assert_eq!(
@@ -589,6 +612,14 @@ mod tests {
             0o600
         );
         let original = fs::read(directory.path().join(CONFIG_FILE)).unwrap();
+        assert_eq!(
+            load(&directory.path().join(CONFIG_FILE))
+                .unwrap()
+                .config
+                .hub_url,
+            "https://hub.example.test/"
+        );
+        config.hub_url = "https://hub.example.test/".into();
         prepare(directory.path(), config.clone()).unwrap();
         assert_eq!(
             fs::read(directory.path().join(CONFIG_FILE)).unwrap(),
@@ -596,7 +627,11 @@ mod tests {
         );
         let mut changed = config;
         changed.team_id = "T999".into();
-        assert!(prepare(directory.path(), changed).is_err());
+        let error = prepare(directory.path(), changed).unwrap_err().to_string();
+        assert!(
+            error.contains("already holds a different Slack configuration"),
+            "{error}"
+        );
         assert_eq!(
             fs::read(directory.path().join(CONFIG_FILE)).unwrap(),
             original
@@ -610,7 +645,10 @@ mod tests {
         let bytes = serialized_config(&config).unwrap();
         private(&pending, &bytes[..17]);
         prepare(directory.path(), config.clone()).unwrap();
-        assert!(read_config(&directory.path().join(CONFIG_FILE)).unwrap() == config);
+        let loaded = load(&directory.path().join(CONFIG_FILE)).unwrap();
+        assert!(loaded.config == config);
+        assert_eq!(loaded.signing_secret, "synthetic-signing");
+        assert_eq!(loaded.bot_token, "xoxb-synthetic");
         assert!(!pending.exists());
         // A stop between link publication and pending-file cleanup is also resumable.
         fs::hard_link(directory.path().join(CONFIG_FILE), &pending).unwrap();
@@ -675,13 +713,27 @@ mod tests {
         let public = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         fs::set_permissions(public.path(), fs::Permissions::from_mode(0o755)).unwrap();
         config.database = public.path().join(DATABASE_FILE);
-        assert!(prepare(public.path(), config.clone()).is_err());
+        let error = prepare(public.path(), config.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("mode 0700"), "{error}");
 
         let link = directory.path().with_extension("link");
         std::os::unix::fs::symlink(directory.path(), &link).unwrap();
         config.database = link.join(DATABASE_FILE);
-        assert!(prepare(&link, config).is_err());
+        let error = prepare(&link, config.clone()).unwrap_err().to_string();
+        assert!(error.contains("is a symbolic link"), "{error}");
+        assert!(error.contains(&link.display().to_string()), "{error}");
         fs::remove_file(link).unwrap();
+
+        let error = prepare(Path::new("relative/slack"), config.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("use an absolute path"), "{error}");
+        let error = prepare(&directory.path().join("../slack"), config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("`..`"), "{error}");
     }
 
     #[test]
@@ -691,11 +743,7 @@ mod tests {
         private(&path, &serialized_config(&config).unwrap());
         let target = Path::new("/runtime/slack");
         let bundle = bundle(&path, target).unwrap();
-        let names: Vec<_> = bundle
-            .files()
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect();
+        let names: Vec<_> = bundle.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(
             names,
             [
@@ -705,7 +753,9 @@ mod tests {
                 "agent-0.token"
             ]
         );
-        let bundled: SlackConfig = serde_json::from_slice(&bundle.files()[0].1).unwrap();
+        assert!(names.iter().all(|name| bundle_file_name(name)));
+        assert!(!bundle_file_name("agent-01.token") && !bundle_file_name("install.sqlite"));
+        let bundled: SlackConfig = serde_json::from_slice(&bundle[0].1).unwrap();
         assert_eq!(bundled.database, target.join(DATABASE_FILE));
         assert_eq!(bundled.signing_secret_file, target.join("signing-secret"));
         assert_eq!(
@@ -932,6 +982,8 @@ mod tests {
             })
         );
         assert!(app_record(&directory, "T999").is_err());
+        // No entry for the workspace is the CLI's "not recorded" case, not malformed state.
+        assert_eq!(app_record(&directory, "T555").unwrap(), None);
         assert!(app_record(&directory, "invalid").is_err());
 
         private(

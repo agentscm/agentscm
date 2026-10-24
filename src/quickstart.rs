@@ -198,9 +198,8 @@ fn slack_bundle(
     let Some(source) = source else {
         return Ok(None);
     };
-    let bundle = slack_setup::bundle(source, target)
+    let files = slack_setup::bundle(source, target)
         .map_err(|_| "The prepared Slack configuration is invalid.".to_owned())?;
-    let files = bundle.files().to_vec();
     if !files.iter().any(|(name, _)| name == "config.json") {
         return Err("The prepared Slack bundle has no config.json.".into());
     }

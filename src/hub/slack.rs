@@ -139,7 +139,8 @@ fn hash(bytes: &[u8]) -> String {
     crate::team::auth::lower_hex(&Sha256::digest(bytes))
 }
 
-fn slack_id(value: &str, prefix: char) -> bool {
+/// Whether `value` is a Slack ID of the kind `prefix` names (`T` workspace, `U` user...).
+pub fn slack_id(value: &str, prefix: char) -> bool {
     value.starts_with(prefix)
         && (2..=32).contains(&value.len())
         && value
@@ -575,6 +576,13 @@ impl Slack {
         };
         let events = state.store.events_after(cursor, BATCH)?;
         if events.is_empty() {
+            // A restored Hub database can end below the cursor; restart from its newest
+            // event, or every event until it passes the old cursor would be skipped.
+            let latest = state.store.latest_event_seq()?;
+            if latest < cursor {
+                self.database()?
+                    .execute("UPDATE cursor SET seq=?1 WHERE id=1", [latest])?;
+            }
             return Ok(());
         }
         let people = if events.iter().any(|e| KINDS.contains(&e.kind.as_str())) {
@@ -1125,7 +1133,6 @@ async fn ingress(State(state): State<HubState>, headers: HeaderMap, body: Bytes)
     };
     let context = state.clone();
     let work = async move {
-        let _permit = permit;
         let service = slack.clone();
         let prepared = offload(move || prepare(&context, &service, &headers, &body)).await?;
         match prepared {
@@ -1138,8 +1145,13 @@ async fn ingress(State(state): State<HubState>, headers: HeaderMap, body: Bytes)
             } => {
                 let update = json!({"channel":channel,"ts":ts,"text":escape(&outcome),
                     "blocks":[original,{"type":"context","elements":[plain_text(&outcome,500)]}]});
-                // The answer is committed; a failed update only leaves the buttons showing.
-                let _ = slack.api("chat.update", update).await;
+                // The answer is committed, so acknowledge now rather than spend Slack's
+                // acknowledgement window on the update; a failed update only leaves the buttons.
+                tokio::spawn(async move {
+                    // The update keeps the request's admission slot until it ends.
+                    let _permit = permit;
+                    let _ = slack.api("chat.update", update).await;
+                });
                 Ok(json!({}))
             }
         }
