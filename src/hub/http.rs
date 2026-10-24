@@ -159,6 +159,14 @@ pub async fn serve(config: HubConfig) -> Result<()> {
             "workspace execution is unsupported on this platform".into(),
         ));
     }
+    if let Some(path) = std::env::var_os(super::slack::CONFIG_ENV) {
+        let slack = tokio::task::spawn_blocking(move || {
+            super::slack::Slack::from_file(std::path::Path::new(&path))
+        })
+        .await
+        .map_err(|_| HubError::Unavailable("Slack startup task failed".into()))??;
+        state = state.with_slack(slack);
+    }
     sync::start(&state).await?;
     if let Err(error) = sync::bootstrap(&state, signin, |name| std::env::var(name).ok()).await {
         eprintln!("hub: first-run setup link not created: {error}");
@@ -170,7 +178,14 @@ pub async fn serve(config: HubConfig) -> Result<()> {
         .as_ref()
         .filter(|execution| execution.server_execution_enabled())
         .map(|execution| execution.clone().spawn_worker());
+    let slack_worker = state
+        .slack
+        .as_ref()
+        .map(|slack| slack.clone().spawn_worker(state.clone()));
     crate::http_listener::serve(listener, router(state), shutdown_signal()).await;
+    if let Some(worker) = slack_worker {
+        worker.abort();
+    }
     #[cfg(unix)]
     if let Some(worker) = execution_worker {
         worker.abort();
@@ -379,6 +394,7 @@ async fn whoami(Reader(principal): Reader) -> Json<serde_json::Value> {
             "id": principal.token_id,
             "name": principal.name,
             "repository": principal.repository,
+            "repository_id": principal.repository_id,
             "expires_at": principal.expires_at,
             "read_only": principal.read_only,
         },

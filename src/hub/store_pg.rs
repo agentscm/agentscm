@@ -2629,6 +2629,7 @@ fn intent_row(row: &postgres::Row) -> (Intent, String, Option<String>) {
                 disabled: false,
             },
             via: Vec::new(),
+            session: row.get(18),
         },
         row.get(16),
         row.get(17),
@@ -7087,6 +7088,14 @@ impl Store for PgStore {
                     })?;
             tx.commit()?;
             Ok(updated)
+        })
+    }
+
+    fn latest_event_seq(&self) -> Result<i64> {
+        self.run(true, |client| {
+            Ok(client
+                .query_one("SELECT COALESCE(MAX(seq), 0) FROM hub_events", &[])?
+                .get(0))
         })
     }
 

@@ -32,6 +32,11 @@ pub enum Provider {
 
 #[derive(Debug, Subcommand)]
 pub enum HubCommand {
+    /// Configure and verify the optional private Slack integration.
+    Slack {
+        #[command(subcommand)]
+        command: crate::slack_cli::SlackCommand,
+    },
     /// Serve the hub API. The database comes from AGENTSCM_DATABASE_URL
     /// (default sqlite:///data/hub.sqlite), never from a flag. Sign-in is
     /// enabled by AGENTSCM_GITHUB_* and AGENTSCM_GITLAB_* variables.
@@ -186,7 +191,7 @@ pub enum SessionCommand {
 
 pub(crate) fn telemetry_action(command: &HubCommand) -> bool {
     match command {
-        HubCommand::Serve { .. } => false,
+        HubCommand::Serve { .. } | HubCommand::Slack { .. } => false,
         HubCommand::Token {
             command: TokenCommand::List { .. },
         }
@@ -210,6 +215,7 @@ pub(crate) fn telemetry_action(command: &HubCommand) -> bool {
 #[cfg_attr(not(unix), allow(unused_variables))]
 pub async fn run(command: HubCommand, data_dir: &std::path::Path) -> Result<()> {
     match command {
+        HubCommand::Slack { command } => crate::slack_cli::run(command).await,
         HubCommand::Serve {
             bind,
             public,

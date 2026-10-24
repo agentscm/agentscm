@@ -84,6 +84,7 @@ mod skill_workflow_cli;
 mod skill_workflow_loop;
 #[cfg(unix)]
 mod skill_workflow_mcp;
+mod slack_cli;
 mod team_cli;
 mod telemetry;
 mod telemetry_cli;

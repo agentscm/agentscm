@@ -23,6 +23,7 @@
 - [Asynchronous agent stand-up](standup.md): durable work claims, checkpoint handovers and bounded catch-up
 - [Work insights](work-insights.md): bounded timing, coordination, usage reports and stored publication observations
 - [Supported coding agents](agents.md): Claude Code, Codex, Cursor, Copilot and others; `agentscm init-repo` and `agentscm hook`
+- [Slack adapter](slack.md) and [capability map](slack-capabilities.md): optional direct messages for coordination moments that need a person, with handoff buttons.
 - [Multi-user coordination hub](hub.md), including [what the hub stores](hub.md#data-the-hub-stores)
 - [Deployment](deployment.md)
 - [Hosted hub setup (agent-guided, unsupported in the alpha)](hosted.md)

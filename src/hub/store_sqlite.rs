@@ -2730,6 +2730,7 @@ fn intent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Intent, String, Opti
                 disabled: false,
             },
             via: Vec::new(),
+            session: row.get(18)?,
         },
         row.get(16)?,
         row.get(17)?,
@@ -7108,6 +7109,14 @@ impl Store for SqliteStore {
             .ok_or_else(|| HubError::Unavailable("coordination request disappeared".into()))?;
         tx.commit()?;
         Ok(updated)
+    }
+
+    fn latest_event_seq(&self) -> Result<i64> {
+        Ok(self
+            .conn()
+            .query_row("SELECT COALESCE(MAX(seq), 0) FROM hub_events", [], |row| {
+                row.get(0)
+            })?)
     }
 
     fn events_after(&self, seq: i64, limit: usize) -> Result<Vec<HubEvent>> {
