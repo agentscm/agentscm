@@ -25,6 +25,7 @@
 - [Supported coding agents](agents.md): Claude Code, Codex, Cursor, Copilot and others; `agentscm init-repo` and `agentscm hook`
 - [Multi-user coordination hub](hub.md), including [what the hub stores](hub.md#data-the-hub-stores)
 - [Deployment](deployment.md)
+- [Hosted hub setup (agent-guided, unsupported in the alpha)](hosted.md)
 
 ## Reference
 
