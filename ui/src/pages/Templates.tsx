@@ -130,6 +130,7 @@ function RunLookup({ recent, onOpen }: { recent: string[]; onOpen: (v: string) =
           label="Run ID"
           placeholder="Find a run by name, state or ID"
           describedBy="tpl-run-help"
+          looseId
           parseId={(t) => (/^[A-Za-z0-9._-]{1,64}$/.test(t) ? t : null)}
           onSelect={onOpen}
           search={async (q, signal) => {
@@ -202,7 +203,9 @@ function RecipeLookup({ recent, onOpen }: { recent: string[]; onOpen: (change: s
             placeholder={changes.loading ? 'Loading changes…' : 'Search changes or paste an ID'}
             describedBy="tpl-change-help"
             keepText
-            parseId={(t) => (/^[\w.:-]{3,200}$/.test(t) ? t : null)}
+            looseId
+            onTextChange={() => setChange('')}
+            parseId={(t) => (/^[A-Za-z0-9._:/-]{1,200}$/.test(t) ? t : null)}
             emptyText={changes.failed ? 'Could not list changes. Paste an ID.' : 'No change matches. Paste an ID.'}
             options={changes.ids.map((c) => ({ value: c.id, text: c.id, label: c.id, meta: <Pill tone="muted">version {c.version}</Pill> }))}
             onSelect={setChange}

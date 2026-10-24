@@ -1984,6 +1984,7 @@ async fn search_tools_page_filter_and_stay_in_the_tokens_repository() {
         )
         .await;
     assert_eq!(ids(&filtered, "publications").len(), 1);
+    assert!(filtered["structuredContent"]["searched_to"].is_string());
     let by_title = hub
         .tool_result(
             &reader,

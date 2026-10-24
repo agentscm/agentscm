@@ -175,15 +175,21 @@ endpoint's range, otherwise 400. `q` is trimmed; empty means no filter; more tha
 control character is a 400. Matching is case-insensitive substring, and `%`, `_` and `\` in `q` are
 literal. Case-insensitivity is ASCII-only on SQLite (a non-ASCII letter matches at its own case); PostgreSQL
 folds by its database locale. Where a record has a number, `q` of `123` or `#123` also matches it exactly. A cursor is the
-opaque value the previous page returned (`next_cursor`, or `next_before` on activity); an unknown
-or malformed cursor is a 400, never an empty page. `q` applies on every page.
+value the previous page returned (`next_cursor`, `next_before` on activity, `next_after` on local
+changes) and `q` applies on every page. Cursors that name a record are checked: publications
+`before` must be a publication of the repository, and work search `cursor` must name a work item of
+the token's repository with exactly its creation time; otherwise, and for any malformed cursor, the
+reply is a 400, never an empty page. Cursors that are plain positions are not checked against a row:
+activity `before` (an event `seq`), skill-workflow `before` (a run sequence) and local changes
+`after` (a Change id) return the rows after that position, which may be none. Cursors are not
+signed.
 
 Its repository-authenticated stand-up routes also include `GET /v1/hub/standup/work?q=…&limit=20&cursor=…`,
-which finds work by text, finished work included, newest `updated_at` first (limit 1 through 50;
-`cursor` is the previous `next_cursor`, an opaque string that carries the position, so an update between
-pages cannot repeat or skip an item; a malformed one is a 400). It matches title, branch, lead agent, owner login,
+which finds work by text, finished work included, in creation order, newest first (limit 1 through 50;
+`cursor` is the previous `next_cursor`, `<created_at>:<id>`, built from the immutable creation time,
+so an update between pages cannot repeat or skip an item; treat it as opaque). It matches title, branch, lead agent, owner login,
 work id, scope paths and the source issue number. The reply is `{"items": [{id, title, state,
-lead_agent, owner, branch, source_issue, updated_at}], "next_cursor": id|null, "complete": bool}`.
+lead_agent, owner, branch, source_issue, updated_at, created_at}], "next_cursor": id|null, "complete": bool}`.
 Read-only tokens may call it. Items of `GET /v1/hub/repos/{repo}/publications` also carry the manifest `title`. It also includes `POST /v1/hub/standup/usage`,
 `GET /v1/hub/standup/insights` and `GET /v1/hub/standup/work/{work_id}/insights`.
 The first stores one idempotent partial usage report; the GET routes return bounded

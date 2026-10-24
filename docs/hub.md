@@ -890,9 +890,13 @@ from it. The command authenticates with the agent token, configured as for
    those. The list reads the store only and calls no forge. `q` keeps publications whose branch,
    base, title, id, owner login or agent name contains it (case-insensitive), or whose pull request
    number it names (`123` or `#123`); it is at most 200 bytes with no control characters, and
-   `before` keeps paging inside the same `q`. A `q` reads the title of every stored manifest of the
-   repository on each request (manifests over 2 MiB or not valid JSON are skipped), so it costs more
-   than an unfiltered page.
+   `before` keeps paging inside the same `q`. With `q` the list examines at most the 256 newest
+   publications below `before` (reading each one's manifest title; manifests over 2 MiB or not
+   valid JSON are skipped) and keeps the matches. A full page of matches returns the last match's id
+   as `next_cursor`. If the page is short because the 256 rows ran out, `next_cursor` is the id of
+   the last row examined and `complete` is false, since older publications may still match; keep
+   following it. The reply then also has `searched_to`, the id of the oldest publication examined
+   (null when nothing lay below the cursor); it is absent without `q`.
 
 The publication reports four states: `native_landed` (always true: the revision is
 already integrated natively), `branch` (`pending`, `created` or `rejected`, with the

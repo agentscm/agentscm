@@ -120,4 +120,22 @@ describe('Searching older pages from a picker', () => {
     await waitFor(() => expect(screen.getAllByRole('option').length).toBeGreaterThan(first), LOAD)
     expect(sent.some((r) => r.url.startsWith('/v1/hub/standup/work?') && r.url.includes('cursor=wrk_'))).toBe(true)
   })
+
+  it('Landed: a capped scan with a cursor says so and offers "Show more results"', async () => {
+    const sent = stubHub((url) => {
+      if (!url.pathname.endsWith('/publications') || !url.searchParams.has('q')) return undefined
+      return url.searchParams.has('before')
+        ? json(200, { publications: [], next_cursor: null, complete: true })
+        : json(200, { publications: [], next_cursor: `pub_${'a'.repeat(32)}`, complete: false, searched_to: 5 })
+    })
+    at('#landed')
+    render(<LandedPage repo={REPO} token="fixture-token" />)
+    const picker = await screen.findByRole('combobox', { name: 'Find a change' }, LOAD)
+    fireEvent.focus(picker)
+    fireEvent.change(picker, { target: { value: 'nothing here' } })
+    await screen.findByText('No matches in the results searched so far', {}, LOAD)
+    fireEvent.keyDown(picker, { key: 'ArrowDown' })
+    fireEvent.keyDown(picker, { key: 'Enter' })
+    await waitFor(() => expect(sent.some((r) => r.url.includes('before=pub_') && r.url.includes('q=nothing+here'))).toBe(true), LOAD)
+  })
 })

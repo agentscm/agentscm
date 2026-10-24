@@ -50,7 +50,8 @@ use super::intent::{
     finish, notice_events, plan, probe_set, validate_ttl,
 };
 use super::publish::{
-    Create, MAX_UNFINISHED, NewPublication, PUBLICATION_SELECT, Publication, Update,
+    Create, MAX_UNFINISHED, NewPublication, PUBLICATION_SELECT, Publication, PublicationSearch,
+    SEARCH_SCAN_ROWS, Update,
 };
 use super::session::{
     Checked, DEFAULT_SESSION, NOTICES_PER_TOUCH, Row, SESSION_TTL_SECONDS, STALE_SESSION_SECONDS,
@@ -5156,20 +5157,64 @@ impl Store for PgStore {
         &self,
         repository: &str,
         before: Option<&str>,
-        search: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Publication>> {
         self.run(true, |client| {
             let limit = limit as i64;
-            let pattern = search.map(like_pattern);
-            let number = search.and_then(search_number);
             client
                 .query(
                     &format!(
                         "{PUBLICATION_SELECT} WHERE p.repository = $1
                          AND ($2::text IS NULL OR (p.created_at, p.id) < (SELECT q.created_at, q.id
                              FROM hub_publications q WHERE q.repository = $1 AND q.id = $2))
-                         AND ($4::text IS NULL OR p.pr_number = $5::bigint
+                         ORDER BY p.created_at DESC, p.id DESC LIMIT $3"
+                    ),
+                    &[&repository, &before, &limit],
+                )?
+                .iter()
+                .map(publication_row)
+                .collect()
+        })
+    }
+
+    fn publication_search(
+        &self,
+        repository: &str,
+        before: Option<&str>,
+        search: &str,
+        limit: usize,
+    ) -> Result<PublicationSearch> {
+        self.run(true, |client| {
+            let scan = SEARCH_SCAN_ROWS as i64;
+            let window: Vec<(i64, String)> = client
+                .query(
+                    "SELECT p.created_at, p.id FROM hub_publications p WHERE p.repository = $1
+                     AND ($2::text IS NULL OR (p.created_at, p.id) < (SELECT q.created_at, q.id
+                         FROM hub_publications q WHERE q.repository = $1 AND q.id = $2))
+                     ORDER BY p.created_at DESC, p.id DESC LIMIT $3",
+                    &[&repository, &before, &scan],
+                )?
+                .iter()
+                .map(|row| (row.get(0), row.get(1)))
+                .collect();
+            let Some((oldest_at, oldest_id)) = window.last().cloned() else {
+                return Ok(PublicationSearch {
+                    rows: vec![],
+                    searched_to: None,
+                    window_full: false,
+                });
+            };
+            let limit = limit as i64;
+            let pattern = like_pattern(search);
+            let number = search_number(search);
+            let rows = client
+                .query(
+                    &format!(
+                        "{PUBLICATION_SELECT} WHERE p.repository = $1
+                         AND ($2::text IS NULL OR (p.created_at, p.id) < (SELECT q.created_at, q.id
+                             FROM hub_publications q WHERE q.repository = $1 AND q.id = $2))
+                         AND (p.created_at, p.id) >= ($6::bigint, $7::text)
+                         AND (p.pr_number = $5::bigint
                              OR p.branch ILIKE $4 ESCAPE '\\' OR p.base ILIKE $4 ESCAPE '\\'
                              OR p.id ILIKE $4 ESCAPE '\\' OR u.login ILIKE $4 ESCAPE '\\'
                              OR t.name ILIKE $4 ESCAPE '\\'
@@ -5178,11 +5223,24 @@ impl Store for PgStore {
                                  THEN p.manifest::jsonb ->> 'title' END) ILIKE $4 ESCAPE '\\')
                          ORDER BY p.created_at DESC, p.id DESC LIMIT $3"
                     ),
-                    &[&repository, &before, &limit, &pattern, &number],
+                    &[
+                        &repository,
+                        &before,
+                        &limit,
+                        &pattern,
+                        &number,
+                        &oldest_at,
+                        &oldest_id,
+                    ],
                 )?
                 .iter()
                 .map(publication_row)
-                .collect()
+                .collect::<Result<Vec<_>>>()?;
+            Ok(PublicationSearch {
+                rows,
+                searched_to: Some(oldest_id),
+                window_full: window.len() == SEARCH_SCAN_ROWS,
+            })
         })
     }
 
@@ -5578,21 +5636,40 @@ impl Store for PgStore {
             let mut tx = client.transaction()?;
             let who = work_who(&mut tx, token, now)?;
             let after = cursor.map(super::work::parse_search_cursor).transpose()?;
+            // A cursor must name a work item of this scope at exactly that creation time.
+            if let Some((created_at, id)) = &after {
+                let known = tx.query_opt(
+                    "SELECT 1 FROM hub_work_items WHERE id = $5 AND created_at = $6
+                       AND provider = $1 AND host = $2 AND repository = $3
+                       AND repository_id IS NOT DISTINCT FROM $4",
+                    &[
+                        &who.owner.identity.provider,
+                        &who.owner.identity.host,
+                        &who.repository,
+                        &who.repository_id,
+                        id,
+                        created_at,
+                    ],
+                )?;
+                if known.is_none() {
+                    return Err(HubError::Invalid("unknown cursor".into()));
+                }
+            }
             let pattern = search.map(like_pattern);
             let number = search.and_then(search_number).map(|n| n.to_string());
             let after_at = after.as_ref().map(|a| a.0);
             let after_id = after.as_ref().map(|a| a.1.clone());
             let rows = tx.query(
-                "SELECT w.id, w.title, w.state, w.lead_agent, u.login, w.branch, w.source_issue, w.updated_at
+                "SELECT w.id, w.title, w.state, w.lead_agent, u.login, w.branch, w.source_issue, w.updated_at, w.created_at
                  FROM hub_work_items w JOIN hub_users u ON u.id = w.owner
                  WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
                    AND w.repository_id IS NOT DISTINCT FROM $4
-                   AND ($5::bigint IS NULL OR (w.updated_at, w.id) < ($5::bigint, $6::text))
+                   AND ($5::bigint IS NULL OR (w.created_at, w.id) < ($5::bigint, $6::text))
                    AND ($7::text IS NULL OR w.source_issue = $8::text
                      OR w.title ILIKE $7 ESCAPE '\\' OR w.branch ILIKE $7 ESCAPE '\\'
                      OR w.lead_agent ILIKE $7 ESCAPE '\\' OR u.login ILIKE $7 ESCAPE '\\'
                      OR w.id ILIKE $7 ESCAPE '\\' OR w.scope ILIKE $7 ESCAPE '\\')
-                 ORDER BY w.updated_at DESC, w.id DESC LIMIT $9",
+                 ORDER BY w.created_at DESC, w.id DESC LIMIT $9",
                 &[
                     &who.owner.identity.provider,
                     &who.owner.identity.host,
@@ -5616,6 +5693,7 @@ impl Store for PgStore {
                     branch: row.get(5),
                     source_issue: row.get(6),
                     updated_at: row.get(7),
+                    created_at: row.get(8),
                 })
                 .collect();
             tx.commit()?;

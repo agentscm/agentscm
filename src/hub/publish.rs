@@ -654,6 +654,20 @@ impl Publication {
 }
 
 /// Column order read by both backends' row mappers.
+/// Publications examined by one searched listing, newest first below the cursor.
+pub const SEARCH_SCAN_ROWS: usize = 256;
+
+/// One searched window of the listing; see [`Store::publication_search`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicationSearch {
+    /// Matches inside the window, newest first, at most the requested count.
+    pub rows: Vec<Publication>,
+    /// Id of the oldest publication examined; `None` when nothing lay below the cursor.
+    pub searched_to: Option<String>,
+    /// The window hit [`SEARCH_SCAN_ROWS`], so older publications may still match.
+    pub window_full: bool,
+}
+
 pub(super) const PUBLICATION_SELECT: &str = "SELECT p.id, p.repository, p.token, t.name, u.login,
         p.revision, p.event_seq, p.commit_sha, p.branch, p.base, CASE WHEN octet_length(p.manifest)<=2097152 THEN p.manifest END, p.branch_state,
         p.branch_message, p.pr_number, p.pr_node_id, p.pr_url, p.merge_commit, p.error,
@@ -990,12 +1004,20 @@ pub(super) fn publication_page(
     {
         return Ok(None);
     }
-    let mut rows = store.publications(repo, before, search, limit + 1)?;
-    let next_cursor = if rows.len() > limit {
-        rows.truncate(limit);
-        rows.last().map(|p| p.id.clone())
-    } else {
-        None
+    let (mut rows, search_info) = match search {
+        None => (store.publications(repo, before, limit + 1)?, None),
+        Some(search) => {
+            let found = store.publication_search(repo, before, search, limit + 1)?;
+            (found.rows, Some((found.searched_to, found.window_full)))
+        }
+    };
+    let more = rows.len() > limit;
+    rows.truncate(limit);
+    let next_cursor = match &search_info {
+        _ if more => rows.last().map(|p| p.id.clone()),
+        // The window ended before the page filled: older publications may still match.
+        Some((searched_to, true)) => searched_to.clone(),
+        _ => None,
     };
     let publications: Vec<Value> = rows
         .iter()
@@ -1010,8 +1032,12 @@ pub(super) fn publication_page(
             item
         })
         .collect();
-    Ok(Some(json!({"publications": publications,
-        "complete": next_cursor.is_none(), "next_cursor": next_cursor})))
+    let mut page = json!({"publications": publications,
+        "complete": next_cursor.is_none(), "next_cursor": next_cursor});
+    if let Some((searched_to, _)) = search_info {
+        page["searched_to"] = json!(searched_to);
+    }
+    Ok(Some(page))
 }
 
 async fn show(

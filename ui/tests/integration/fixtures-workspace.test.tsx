@@ -135,6 +135,16 @@ describe('signed-in overview', () => {
   })
 })
 
+describe('stale selection', () => {
+  it('editing the Change text drops the loaded revision', async () => {
+    stubHub()
+    at('#workspace')
+    await openComposerWithSubject()
+    fireEvent.change(screen.getByRole('combobox', { name: 'Native Change' }), { target: { value: `${SUBJECT.change_id}-other` } })
+    expect(screen.queryByRole('region', { name: 'Revision to execute' })).toBeNull()
+  })
+})
+
 describe('capability gating', () => {
   it('task-only profiles inspect empty server history and keep native admission without start controls', async () => {
     const sent = stubHub(

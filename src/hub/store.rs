@@ -22,7 +22,7 @@ use super::external_runs::{ExternalKind, ExternalObserved, ExternalRun};
 use super::handoff::{Answered, Asked};
 use super::insights::{InsightPage, InsightQuery, UsageReceipt, UsageRecord, WorkInsight};
 use super::intent::{Announced, Intent, NewIntent};
-use super::publish::{Create, NewPublication, Publication, Update};
+use super::publish::{Create, NewPublication, Publication, PublicationSearch, Update};
 use super::session::{SessionCall, Touched};
 use super::skills::{EvidenceRow, RunHead, SkillAdoption};
 use super::store_pg::PgStore;
@@ -471,15 +471,23 @@ pub trait Store: Send + Sync {
     fn publication(&self, repository: &str, id: &str) -> Result<Option<Publication>>;
     /// Publications of `repository` (matched exactly, as [`Store::publication`]), newest first by
     /// `created_at`, then `id`, strictly older than the `before` publication, at most `limit`.
-    /// `search` (already [`search_text`]-cleaned) keeps publications whose branch, base, title,
-    /// id, owner login or token name contains it, or whose pull request number it names.
     fn publications(
         &self,
         repository: &str,
         before: Option<&str>,
-        search: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Publication>>;
+    /// Like [`Store::publications`] but only matches of `search` (already [`search_text`]-cleaned)
+    /// among the newest `SEARCH_SCAN_ROWS` publications below `before`: branch, base, title,
+    /// id, owner login or token name containing it, or the pull request number it names. Never
+    /// reads more than that window; the result says where it stopped.
+    fn publication_search(
+        &self,
+        repository: &str,
+        before: Option<&str>,
+        search: &str,
+        limit: usize,
+    ) -> Result<PublicationSearch>;
     /// The newest publication of each pull request number above `after` in `repository`
     /// (matched case-insensitively), omitting pull requests whose newest publication is merged,
     /// by number, at most `limit`. "Newest" is by `created_at`, then `id`, descending.
@@ -506,8 +514,8 @@ pub trait Store: Send + Sync {
         now: i64,
     ) -> Result<WorkCheckpointResult>;
     fn work_get(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkItem>>;
-    /// Work of the token's repository, finished work included, newest `updated_at` then `id`
-    /// first, strictly after the `cursor` position (`<updated_at>:<id>` from a previous page), at most `limit` (see `MAX_WORK_SEARCH`).
+    /// Work of the token's repository, finished work included, newest `created_at` then `id`
+    /// first, strictly after the `cursor` position (`<created_at>:<id>` from a previous page; it must name a work item of the token's repository with exactly that creation time), at most `limit` (see `MAX_WORK_SEARCH`).
     /// `search` (already [`search_text`]-cleaned) keeps items whose title, branch, lead agent,
     /// owner login, id or scope contains it, or whose source issue number it names. An unknown
     /// cursor is `Invalid`.

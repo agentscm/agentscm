@@ -48,7 +48,8 @@ use super::intent::{
     finish, notice_events, plan, probe_set, validate_ttl,
 };
 use super::publish::{
-    Create, MAX_UNFINISHED, NewPublication, PUBLICATION_SELECT, Publication, Update,
+    Create, MAX_UNFINISHED, NewPublication, PUBLICATION_SELECT, Publication, PublicationSearch,
+    SEARCH_SCAN_ROWS, Update,
 };
 use super::session::{
     Checked, DEFAULT_SESSION, NOTICES_PER_TOUCH, Row, SESSION_TTL_SECONDS, STALE_SESSION_SECONDS,
@@ -5166,17 +5167,56 @@ impl Store for SqliteStore {
         &self,
         repository: &str,
         before: Option<&str>,
-        search: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Publication>> {
         let conn = self.conn();
-        let pattern = search.map(like_pattern);
-        let number = search.and_then(search_number);
         let mut statement = conn.prepare(&format!(
             "{PUBLICATION_SELECT} WHERE p.repository = ?1
              AND (?2 IS NULL OR (p.created_at, p.id) < (SELECT q.created_at, q.id
                  FROM hub_publications q WHERE q.repository = ?1 AND q.id = ?2))
-             AND (?4 IS NULL OR p.pr_number = ?5
+             ORDER BY p.created_at DESC, p.id DESC LIMIT ?3"
+        ))?;
+        let rows = statement
+            .query_map(params![repository, before, limit as i64], publication_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    fn publication_search(
+        &self,
+        repository: &str,
+        before: Option<&str>,
+        search: &str,
+        limit: usize,
+    ) -> Result<PublicationSearch> {
+        let conn = self.conn();
+        let window = conn
+            .prepare(
+                "SELECT p.created_at, p.id FROM hub_publications p WHERE p.repository = ?1
+                 AND (?2 IS NULL OR (p.created_at, p.id) < (SELECT q.created_at, q.id
+                     FROM hub_publications q WHERE q.repository = ?1 AND q.id = ?2))
+                 ORDER BY p.created_at DESC, p.id DESC LIMIT ?3",
+            )?
+            .query_map(
+                params![repository, before, SEARCH_SCAN_ROWS as i64],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let Some((oldest_at, oldest_id)) = window.last().cloned() else {
+            return Ok(PublicationSearch {
+                rows: vec![],
+                searched_to: None,
+                window_full: false,
+            });
+        };
+        let pattern = like_pattern(search);
+        let number = search_number(search);
+        let mut statement = conn.prepare(&format!(
+            "{PUBLICATION_SELECT} WHERE p.repository = ?1
+             AND (?2 IS NULL OR (p.created_at, p.id) < (SELECT q.created_at, q.id
+                 FROM hub_publications q WHERE q.repository = ?1 AND q.id = ?2))
+             AND (p.created_at, p.id) >= (?6, ?7)
+             AND (p.pr_number = ?5
                  OR lower(p.branch) LIKE ?4 ESCAPE '\\' OR lower(p.base) LIKE ?4 ESCAPE '\\'
                  OR lower(p.id) LIKE ?4 ESCAPE '\\' OR lower(u.login) LIKE ?4 ESCAPE '\\'
                  OR lower(t.name) LIKE ?4 ESCAPE '\\'
@@ -5187,11 +5227,23 @@ impl Store for SqliteStore {
         ))?;
         let rows = statement
             .query_map(
-                params![repository, before, limit as i64, pattern, number],
+                params![
+                    repository,
+                    before,
+                    limit as i64,
+                    pattern,
+                    number,
+                    oldest_at,
+                    oldest_id
+                ],
                 publication_row,
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
+        Ok(PublicationSearch {
+            rows,
+            searched_to: Some(oldest_id),
+            window_full: window.len() == SEARCH_SCAN_ROWS,
+        })
     }
 
     fn pull_publications(
@@ -5542,18 +5594,39 @@ impl Store for SqliteStore {
         let tx = conn.transaction()?;
         let who = work_who(&tx, token, now)?;
         let after = cursor.map(super::work::parse_search_cursor).transpose()?;
+        // A cursor must name a work item of this scope at exactly that creation time.
+        if let Some((created_at, id)) = &after {
+            let known: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM hub_work_items WHERE id = ?5 AND created_at = ?6
+                       AND provider = ?1 AND host = ?2 AND repository = ?3 AND repository_id IS ?4",
+                    params![
+                        who.owner.identity.provider,
+                        who.owner.identity.host,
+                        who.repository,
+                        who.repository_id,
+                        id,
+                        created_at
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if known.is_none() {
+                return Err(HubError::Invalid("unknown cursor".into()));
+            }
+        }
         let pattern = search.map(like_pattern);
         let number = search.and_then(search_number).map(|n| n.to_string());
         let mut statement = tx.prepare(
-            "SELECT w.id, w.title, w.state, w.lead_agent, u.login, w.branch, w.source_issue, w.updated_at
+            "SELECT w.id, w.title, w.state, w.lead_agent, u.login, w.branch, w.source_issue, w.updated_at, w.created_at
              FROM hub_work_items w JOIN hub_users u ON u.id = w.owner
              WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3 AND w.repository_id IS ?4
-               AND (?5 IS NULL OR (w.updated_at, w.id) < (?5, ?6))
+               AND (?5 IS NULL OR (w.created_at, w.id) < (?5, ?6))
                AND (?7 IS NULL OR w.source_issue = ?8
                  OR lower(w.title) LIKE ?7 ESCAPE '\\' OR lower(w.branch) LIKE ?7 ESCAPE '\\'
                  OR lower(w.lead_agent) LIKE ?7 ESCAPE '\\' OR lower(u.login) LIKE ?7 ESCAPE '\\'
                  OR lower(w.id) LIKE ?7 ESCAPE '\\' OR lower(w.scope) LIKE ?7 ESCAPE '\\')
-             ORDER BY w.updated_at DESC, w.id DESC LIMIT ?9",
+             ORDER BY w.created_at DESC, w.id DESC LIMIT ?9",
         )?;
         let items = statement
             .query_map(
@@ -5578,6 +5651,7 @@ impl Store for SqliteStore {
                         branch: row.get(5)?,
                         source_issue: row.get(6)?,
                         updated_at: row.get(7)?,
+                        created_at: row.get(8)?,
                     })
                 },
             )?

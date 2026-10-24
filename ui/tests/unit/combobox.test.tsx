@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import { Combobox, type ComboOption, type ComboResult } from '../../src/Combobox.tsx'
 
@@ -183,5 +184,75 @@ describe('Combobox (older pages)', () => {
     expect(screen.getAllByRole('option').map((o) => o.textContent)).toEqual(expect.arrayContaining([expect.stringContaining('Older run 1'), expect.stringContaining('Older run 2')]))
     expect(screen.queryByRole('option', { name: 'Search older runs' })).toBeNull()
     expect(onSelect).not.toHaveBeenCalled()
+  })
+})
+
+describe('Combobox (focus, edits and loose IDs)', () => {
+  it('keeps the popup open while Tab moves to the footer action, which Enter activates, and closes when focus leaves', async () => {
+    const user = userEvent.setup()
+    const onMore = vi.fn()
+    render(
+      <>
+        <Combobox id="p" label="Pick" options={OPTIONS} footer={<button type="button" onClick={onMore}>Load more Changes</button>} onSelect={() => {}} />
+        <button type="button">after</button>
+      </>,
+    )
+    await user.click(input())
+    await user.tab()
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Load more Changes' }))
+    expect(input().getAttribute('aria-expanded')).toBe('true')
+    await user.keyboard('{Enter}')
+    expect(onMore).toHaveBeenCalledTimes(1)
+    await user.keyboard('{Escape}')
+    expect(input().getAttribute('aria-expanded')).toBe('false')
+    expect(document.activeElement).toBe(input())
+    await user.tab()
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'after' }))
+    expect(input().getAttribute('aria-expanded')).toBe('false')
+  })
+
+  it('makes the retry button reachable with Tab', async () => {
+    const user = userEvent.setup()
+    render(<Combobox id="p" label="Pick" search={async () => { throw new Error('x') }} onSelect={() => {}} />)
+    await user.click(input())
+    await screen.findByRole('alert')
+    await user.tab()
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Try again' }))
+    expect(input().getAttribute('aria-expanded')).toBe('true')
+  })
+
+  it('calls onTextChange for edits but not for picks', () => {
+    const onTextChange = vi.fn()
+    render(<Combobox id="p" label="Pick" options={OPTIONS} keepText onTextChange={onTextChange} onSelect={() => {}} />)
+    fireEvent.focus(input())
+    fireEvent.click(screen.getByRole('option', { name: /Gamma/ }))
+    expect(onTextChange).not.toHaveBeenCalled()
+    fireEvent.change(input(), { target: { value: 'Gamm' } })
+    expect(onTextChange).toHaveBeenCalledWith('Gamm')
+  })
+
+  it('looseId: "Open <text>" goes last and Enter does not pick it while results exist', () => {
+    const onSelect = vi.fn()
+    render(<Combobox id="p" label="Pick" options={[opt('review-1', 'review gate')]} looseId parseId={(t) => (/^[a-z-]+$/.test(t) ? t : null)} onSelect={onSelect} />)
+    fireEvent.focus(input())
+    fireEvent.change(input(), { target: { value: 'review' } })
+    const opts = screen.getAllByRole('option')
+    expect(opts[0]!.textContent).toContain('review gate')
+    expect(opts.at(-1)!.textContent).toBe('Open review')
+    expect(opts.every((o) => o.getAttribute('aria-selected') === 'false')).toBe(true)
+    fireEvent.keyDown(input(), { key: 'Enter' })
+    expect(onSelect).not.toHaveBeenCalled()
+    fireEvent.keyDown(input(), { key: 'ArrowDown' })
+    fireEvent.keyDown(input(), { key: 'Enter' })
+    expect(onSelect).toHaveBeenCalledWith('review-1', expect.anything())
+  })
+
+  it('looseId: with no results Enter opens the typed ID', () => {
+    const onSelect = vi.fn()
+    render(<Combobox id="p" label="Pick" options={OPTIONS} looseId parseId={(t) => t} onSelect={onSelect} />)
+    fireEvent.focus(input())
+    fireEvent.change(input(), { target: { value: 'zzz-9' } })
+    fireEvent.keyDown(input(), { key: 'Enter' })
+    expect(onSelect).toHaveBeenCalledWith('zzz-9', expect.anything())
   })
 })

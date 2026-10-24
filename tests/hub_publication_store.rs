@@ -228,28 +228,26 @@ fn suite(store: Arc<dyn Store>) {
     done(store.create_publication(&capped, &over, now).unwrap());
 
     // Listing is newest first by created time, then id, and pages strictly before a cursor.
-    let all = store.publications(REPO, None, None, 100).unwrap();
+    let all = store.publications(REPO, None, 100).unwrap();
     assert!(all.len() > 2);
     assert!(
         all.windows(2)
             .all(|w| (w[0].created_at, &w[0].id) > (w[1].created_at, &w[1].id))
     );
-    assert_eq!(store.publications(REPO, None, None, 1).unwrap(), all[..1]);
+    assert_eq!(store.publications(REPO, None, 1).unwrap(), all[..1]);
     assert_eq!(
-        store
-            .publications(REPO, Some(&all[1].id), None, 100)
-            .unwrap(),
+        store.publications(REPO, Some(&all[1].id), 100).unwrap(),
         all[2..]
     );
     assert!(
         store
-            .publications(REPO, Some("pub_missing"), None, 100)
+            .publications(REPO, Some("pub_missing"), 100)
             .unwrap()
             .is_empty()
     );
     assert!(
         store
-            .publications("acme/other", None, None, 100)
+            .publications("acme/other", None, 100)
             .unwrap()
             .is_empty()
     );
@@ -263,8 +261,9 @@ fn suite(store: Arc<dyn Store>) {
     );
     let found = |q: &str| -> Vec<String> {
         store
-            .publications(REPO, None, Some(q), 100)
+            .publication_search(REPO, None, q, 100)
             .unwrap()
+            .rows
             .into_iter()
             .map(|p| p.id)
             .collect()
@@ -287,18 +286,23 @@ fn suite(store: Arc<dyn Store>) {
     assert!(found("100%").is_empty() && found("p_b").is_empty() && found("\\").is_empty());
     assert_eq!(
         found("alice").len(),
-        store.publications(REPO, None, None, 100).unwrap().len()
+        store.publications(REPO, None, 100).unwrap().len()
     );
-    let page = store.publications(REPO, None, Some("feat/n"), 2).unwrap();
+    let page = store
+        .publication_search(REPO, None, "feat/n", 2)
+        .unwrap()
+        .rows;
     let rest = store
-        .publications(REPO, Some(&page[1].id), Some("feat/n"), 100)
-        .unwrap();
+        .publication_search(REPO, Some(&page[1].id), "feat/n", 100)
+        .unwrap()
+        .rows;
     assert_eq!(page.len() + rest.len(), found("feat/n").len());
     assert!(rest.iter().all(|p| p.branch.starts_with("feat/n")));
     assert!(
         store
-            .publications("acme/other", None, Some("alice"), 100)
+            .publication_search("acme/other", None, "alice", 100)
             .unwrap()
+            .rows
             .is_empty()
     );
 
@@ -623,14 +627,80 @@ fn a_corrupt_manifest_row_still_lists_and_does_not_break_search() {
         )
         .unwrap();
     let ids = |q: Option<&str>| -> Vec<String> {
-        store
-            .publications(REPO, None, q, 100)
-            .unwrap()
-            .into_iter()
-            .map(|p| p.id)
-            .collect()
+        match q {
+            None => store.publications(REPO, None, 100).unwrap(),
+            Some(q) => store.publication_search(REPO, None, q, 100).unwrap().rows,
+        }
+        .into_iter()
+        .map(|p| p.id)
+        .collect()
     };
     assert_eq!(ids(None).len(), 2);
     assert_eq!(ids(Some("findable")), std::slice::from_ref(&good.id));
     assert_eq!(ids(Some("feat/bad")), std::slice::from_ref(&bad.id));
+}
+
+/// A search reads at most 256 publications below the cursor and says where it stopped, so a
+/// match further back is reached by following the cursor.
+fn window_suite(store: Arc<dyn Store>) {
+    let identity = ForgeIdentity {
+        provider: "github".into(),
+        host: "github.com".into(),
+        user_id: 7,
+    };
+    let owner = store.upsert_user(&identity, "alice").unwrap();
+    let base = unix_now();
+    let mut tokens = Vec::new();
+    for n in 0..15 {
+        tokens.push(
+            mint_agent_token(&*store, &owner.id, &format!("t{n}"), REPO, 3600)
+                .unwrap()
+                .0,
+        );
+    }
+    let mut oldest = String::new();
+    for i in 0..300usize {
+        let branch = if i == 0 {
+            "feat/needle".to_owned()
+        } else {
+            format!("feat/bulk{i}")
+        };
+        let made = done(
+            store
+                .create_publication(&tokens[i / 20], &new_on("t", &branch), base + i as i64)
+                .unwrap(),
+        );
+        if i == 0 {
+            oldest = made.id;
+        }
+    }
+    let first = store.publication_search(REPO, None, "needle", 5).unwrap();
+    assert!(first.rows.is_empty() && first.window_full);
+    let stopped = first.searched_to.unwrap();
+    // The window is the 256 newest: the 256th row from the top is the oldest examined.
+    let newest = store.publications(REPO, None, 256).unwrap();
+    assert_eq!(stopped, newest[255].id);
+    let second = store
+        .publication_search(REPO, Some(&stopped), "needle", 5)
+        .unwrap();
+    assert_eq!(second.rows.len(), 1);
+    assert_eq!(second.rows[0].id, oldest);
+    assert!(!second.window_full);
+    // More matches than the page: the extra row is returned for the caller to cut.
+    let many = store.publication_search(REPO, None, "bulk", 5).unwrap();
+    assert_eq!(many.rows.len(), 5);
+    assert!(many.window_full);
+}
+
+#[test]
+fn publication_search_window_on_sqlite() {
+    let dir = TempDir::new().unwrap();
+    let url = format!("sqlite://{}", dir.path().join("hub.sqlite").display());
+    window_suite(store::open(&url).unwrap());
+}
+
+#[test]
+fn publication_search_window_on_postgres() {
+    let Some(pg) = PgSchema::create() else { return };
+    window_suite(store::open(&pg.url).unwrap());
 }

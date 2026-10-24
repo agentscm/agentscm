@@ -2173,6 +2173,11 @@ async fn publications_list_newest_first_and_read_only_reads_call_no_forge() {
         .api(Method::GET, &format!("{BASE}?q=FEAT%2FL1"), &reader, None)
         .await;
     assert_eq!(ids_of(&one), [created[2].clone()]);
+    assert!(
+        one["searched_to"].is_string() && one["complete"] == true,
+        "{one}"
+    );
+    assert!(whole.get("searched_to").is_none());
     let (_, none) = env
         .api(Method::GET, &format!("{BASE}?q=%25"), &reader, None)
         .await;

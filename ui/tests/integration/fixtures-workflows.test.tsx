@@ -69,8 +69,13 @@ describe('workflow run list', () => {
     expect(screen.queryByText(/^Open/)).toBeNull()
     fireEvent.change(box, { target: { value: 'claude-review-stale' } })
     await waitFor(() => expect(sent.some((r) => r.url === '/v1/hub/skill-workflows?q=claude-review-stale')).toBe(true), LOAD)
-    const options = await screen.findAllByRole('option', {}, LOAD)
-    expect(options[0]!.textContent).toContain('Open claude-review-stale')
+    const listbox = () => within(screen.getByRole('listbox', { name: 'Find a run' }))
+    await waitFor(() => expect(listbox().getAllByRole('option').map((o) => o.textContent)).toEqual([expect.stringContaining('Billing change verification')]), LOAD)
+    // Run IDs are free-form, so a result for the same ID stands in for "Open <text>" and Enter never guesses.
+    const before = window.location.hash
+    fireEvent.keyDown(box, { key: 'Enter' })
+    expect(window.location.hash).toBe(before)
+    fireEvent.keyDown(box, { key: 'ArrowDown' })
     fireEvent.keyDown(box, { key: 'Enter' })
     expect(window.location.hash).toBe('#workflows/runs/claude-review-stale')
   })

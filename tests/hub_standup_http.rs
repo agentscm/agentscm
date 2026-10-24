@@ -425,7 +425,7 @@ async fn work_search(hub: Hub) {
     assert_eq!(pages, 3);
     let unique: std::collections::BTreeSet<_> = seen.iter().collect();
     assert_eq!((seen.len(), unique.len()), (5, 5));
-    // The cursor carries its position: a checkpoint between pages cannot repeat or loop an item.
+    // Paging follows creation order, so updates between pages cannot repeat or skip an item.
     let (_, first) = get("/v1/hub/standup/work?limit=2&q=alpha".into(), alice.clone()).await;
     let first_ids: Vec<String> = first["items"]
         .as_array()
@@ -434,14 +434,15 @@ async fn work_search(hub: Hub) {
         .map(|i| i["id"].as_str().unwrap().to_owned())
         .collect();
     let cursor = first["next_cursor"].as_str().unwrap().to_owned();
+    let real_cursor = cursor.clone();
     assert!(cursor.contains(':') && cursor.ends_with(first_ids.last().unwrap().as_str()));
     let database = hub._dir.path().join("hub.sqlite");
     if database.exists() {
         rusqlite::Connection::open(&database)
             .unwrap()
             .execute(
-                "UPDATE hub_work_items SET updated_at = updated_at + 1000 WHERE id = ?1",
-                [first_ids.last().unwrap()],
+                "UPDATE hub_work_items SET updated_at = updated_at + 1000 * (rowid % 5 + 1)",
+                [],
             )
             .unwrap();
     }
@@ -500,6 +501,8 @@ async fn work_search(hub: Hub) {
         "/v1/hub/standup/work?cursor=1:wrk_missing".to_owned(),
         format!("/v1/hub/standup/work?cursor=x:{}", seen[0]),
         format!("/v1/hub/standup/work?cursor=-1:{}", seen[0]),
+        // Well-formed but forged: right id, wrong creation time.
+        format!("/v1/hub/standup/work?cursor=1:{}", seen[0]),
         format!("/v1/hub/standup/work?cursor={}", seen[0]),
         "/v1/hub/standup/work?x=1".to_owned(),
     ] {
@@ -508,12 +511,12 @@ async fn work_search(hub: Hub) {
     // Another repository sees none of it, and cannot use this repository's cursor.
     let (status, page) = get("/v1/hub/standup/work".into(), other_repo.clone()).await;
     assert_eq!((status, page["items"].as_array().unwrap().len()), (200, 0));
-    let (status, page) = get(
-        format!("/v1/hub/standup/work?cursor=99999999999:{id}"),
+    let (status, _) = get(
+        format!("/v1/hub/standup/work?cursor={real_cursor}"),
         other_repo,
     )
     .await;
-    assert_eq!((status, page["items"].as_array().unwrap().len()), (200, 0));
+    assert_eq!(status, 400);
     assert_eq!(
         get("/v1/hub/standup/work".into(), "nope".into()).await.0,
         401

@@ -384,3 +384,27 @@ test('pickers: change records, workflow runs and activity paging', async ({ page
   await older.getByRole('button', { name: /Load older/ }).click()
   await expect(older.getByRole('button', { name: /Load older/ }).or(older.getByText('That’s everything.'))).toBeVisible()
 })
+
+test('keyboard: the Landed picker reaches "Show more results" and Enter loads the next page', async ({ page }) => {
+  const pubs = `/v1/hub/repos/${encodeURIComponent('counterbranch/agentscm')}/publications`
+  const seen: string[] = []
+  // A scan that hit its cap: no matches yet, but a cursor to keep looking.
+  await page.route(`**${pubs}?*`, async (route) => {
+    const url = new URL(route.request().url())
+    if (!url.searchParams.has('q')) return route.continue()
+    seen.push(url.search)
+    const body = url.searchParams.has('before')
+      ? { publications: [], next_cursor: null, complete: true }
+      : { publications: [], next_cursor: `pub_${'a'.repeat(32)}`, complete: false, searched_to: 1 }
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify(body) })
+  })
+  await signIn(page, '#landed')
+  const picker = page.getByRole('combobox', { name: 'Find a change' })
+  await picker.fill('no such branch')
+  await expect(page.getByText('No matches in the results searched so far')).toBeVisible()
+  // The action is an option of the listbox: arrow to it and press Enter.
+  await picker.press('ArrowDown')
+  await expect(page.getByRole('option', { name: 'Show more results' })).toHaveAttribute('aria-selected', 'true')
+  await picker.press('Enter')
+  await expect.poll(() => seen.some((q) => q.includes('before=pub_'))).toBe(true)
+})

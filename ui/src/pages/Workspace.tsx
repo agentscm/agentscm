@@ -485,8 +485,10 @@ function Composer({ session, repository, onStarted }: { session: WorkspaceSessio
                 label="Native Change"
                 placeholder={firstSubjects.kind === 'loading' ? 'Loading Changes…' : 'Search current Changes or paste a Change ID'}
                 keepText
+                looseId
+                onTextChange={clearSubject}
                 disabled={locked}
-                parseId={(t) => (/^[\w.:-]{3,200}$/.test(t) ? t : null)}
+                parseId={(t) => (/^[A-Za-z0-9._:/-]{1,200}$/.test(t) ? t : null)}
                 emptyText={subjects.length ? 'No loaded Change matches. Load more, or paste the ID.' : 'No current Changes found on this page. Paste a Change ID.'}
                 options={subjects.map((s) => ({ value: s.change_id, text: s.change_id, label: s.change_id, secondary: `${s.revision.slice(0, 12)}`, meta: <Pill tone="muted">version {s.change_version}</Pill> }))}
                 footer={subjectCursor ? <button type="button" className="btn btn-sm btn-outline-secondary" disabled={busy !== null} onClick={() => void loadMore()}>Load more Changes</button> : undefined}

@@ -37,6 +37,10 @@ interface Props {
   parseId?: (text: string) => string | null
   /** Keep the picked option's text in the input instead of clearing it. */
   keepText?: boolean
+  /** The ID kind has no distinctive shape (any word could be one): "Open <text>" goes last and is never chosen by Enter while results exist. */
+  looseId?: boolean
+  /** Fired on every edit of the text (not on a pick), so callers can drop a selection the text no longer names. */
+  onTextChange?: (text: string) => void
   footer?: ReactNode
   describedBy?: string
   invalid?: boolean
@@ -48,7 +52,7 @@ interface Props {
 const DEBOUNCE_MS = 200
 type Remote = { key: string; result: ComboResult | null }
 
-export function Combobox({ id, label, placeholder, onSelect, options, search, parseId, keepText = false, footer, describedBy, invalid, disabled, emptyText = 'No matches', ...rest }: Props) {
+export function Combobox({ id, label, placeholder, onSelect, options, search, parseId, keepText = false, looseId = false, onTextChange, footer, describedBy, invalid, disabled, emptyText = 'No matches', ...rest }: Props) {
   const uid = useId()
   const listId = `${id}-listbox`
   const [query, setQuery] = useState('')
@@ -92,7 +96,11 @@ export function Combobox({ id, label, placeholder, onSelect, options, search, pa
   const result = current?.result ?? null
   const canMore = !!result?.more && !!result.loadMore
   const moreOption: ComboOption[] = canMore ? [{ value: MORE, text: '', label: loadingMore ? 'Searching…' : (result.moreLabel ?? 'Show more results') }] : []
-  const items: ComboOption[] = [...(pasted ? [{ value: pasted, label: <>Open <code>{pasted}</code></>, text: pasted }, ...shown.filter((o) => o.value !== pasted)] : shown), ...moreOption]
+  // A result that already is the pasted ID stands in for the "Open" option.
+  const pastedOption: ComboOption | null = pasted && (!looseId || !shown.some((o) => o.value === pasted)) ? { value: pasted, label: <>Open <code>{pasted}</code></>, text: pasted } : null
+  const rest2 = pasted && !looseId ? shown.filter((o) => o.value !== pasted) : shown
+  const items: ComboOption[] = [...(pastedOption && !looseId ? [pastedOption] : []), ...rest2, ...(pastedOption && looseId ? [pastedOption] : []), ...moreOption]
+  const strictPasted = !!pastedOption && !looseId
   const loading = !!search && !current
   const failed = !!search && !!current && current.result === null
 
@@ -126,7 +134,7 @@ export function Combobox({ id, label, placeholder, onSelect, options, search, pa
     else if (e.key === 'Home' && open) go(0)
     else if (e.key === 'End' && open) go(items.length - 1)
     else if (e.key === 'Enter' && open) {
-      const o = items[active] ?? (pasted ? items[0] : undefined)
+      const o = items[active] ?? (pastedOption && (!looseId || rest2.length === 0) ? pastedOption : undefined)
       if (o) {
         e.preventDefault()
         pick(o)
@@ -138,7 +146,20 @@ export function Combobox({ id, label, placeholder, onSelect, options, search, pa
   }
 
   return (
-    <div className="combo" data-tour={rest['data-tour']}>
+    <div
+      className="combo"
+      data-tour={rest['data-tour']}
+      onBlur={(e) => {
+        // Focus may move from the input to the popup's buttons (Tab); close only when it leaves both.
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setOpen(false)
+      }}
+      onKeyDown={(e) => {
+        if (e.key === 'Escape' && e.target !== e.currentTarget.querySelector('input')) {
+          setOpen(false)
+          e.currentTarget.querySelector('input')?.focus()
+        }
+      }}
+    >
       <label className="visually-hidden" htmlFor={id}>{label}</label>
       <input
         id={id}
@@ -156,16 +177,17 @@ export function Combobox({ id, label, placeholder, onSelect, options, search, pa
         autoComplete="off"
         onChange={(e) => {
           setQuery(e.target.value)
+          onTextChange?.(e.target.value)
           setTyped(true)
           setOpen(true)
           setActive(-1)
         }}
         onFocus={(e) => {
-          setOpen(true)
+          // Returning from the popup (Escape on a footer button) must not reopen it.
+          if (!e.currentTarget.parentElement?.contains(e.relatedTarget as Node | null)) setOpen(true)
           e.target.select()
         }}
         onClick={() => setOpen(true)}
-        onBlur={() => setOpen(false)}
         onKeyDown={onKeyDown}
       />
       {open && (
@@ -190,7 +212,7 @@ export function Combobox({ id, label, placeholder, onSelect, options, search, pa
               Could not search. <button type="button" className="btn btn-link btn-sm p-0" onClick={() => setAttempt((n) => n + 1)}>Try again</button>
             </div>
           )}
-          {!loading && !failed && shown.length === 0 && !pasted && <div className="combo-note small muted" role="status">{canMore ? (result.emptyMoreText ?? 'No matches in the results searched so far') : emptyText}</div>}
+          {!loading && !failed && shown.length === 0 && !strictPasted && <div className="combo-note small muted" role="status">{canMore ? (result.emptyMoreText ?? 'No matches in the results searched so far') : emptyText}</div>}
           {!loading && !failed && items.length > 0 && (
             <div className="visually-hidden" role="status">{items.length} result{items.length === 1 ? '' : 's'}</div>
           )}

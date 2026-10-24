@@ -426,7 +426,7 @@ fn tools(read_only: bool, settings: &ViewSettings) -> Value {
             "limit":{"type":"integer","minimum":1,"maximum":20,"default":20}
         }), &[])});
     let work_search = json!({"name": "agentscm_work_search",
-        "description": "Finds work in this repository by text, finished work included, newest first. q matches title, branch, lead agent, owner, work id, scope paths or a source issue number (123 or #123). Pass next_cursor as cursor for the next page. Pure read.",
+        "description": "Finds work in this repository by text, finished work included, in creation order, newest first. q matches title, branch, lead agent, owner, work id, scope paths or a source issue number (123 or #123). Pass next_cursor as cursor for the next page. Pure read.",
         "annotations": {"readOnlyHint": true},
         "inputSchema": schema(json!({
             "q":{"type":"string","maxLength":200},
@@ -434,7 +434,7 @@ fn tools(read_only: bool, settings: &ViewSettings) -> Value {
             "cursor":{"type":"string","maxLength":255,"description":"next_cursor from the previous page."}
         }), &[])});
     let publications = json!({"name": "agentscm_publications_list",
-        "description": "Lists this repository's publications (published branches and pull requests), newest first, from stored rows only. q matches branch, title, base, publication id, owner, agent name or a pull request number (123 or #123). Pass next_cursor as cursor for the next page. Pure read.",
+        "description": "Lists this repository's publications (published branches and pull requests), newest first, from stored rows only. A search examines at most the 256 newest publications below the cursor, so a page can be short while next_cursor is set (complete is false); searched_to names the oldest one examined. q matches branch, title, base, publication id, owner, agent name or a pull request number (123 or #123). Pass next_cursor as cursor for the next page. Pure read.",
         "annotations": {"readOnlyHint": true},
         "inputSchema": schema(json!({
             "q":{"type":"string","maxLength":200},

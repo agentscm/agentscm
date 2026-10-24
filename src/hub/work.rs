@@ -365,6 +365,8 @@ pub struct WorkSearchItem {
     pub branch: Option<String>,
     pub source_issue: Option<String>,
     pub updated_at: i64,
+    /// Creation time: the immutable position the paging cursor is built from.
+    pub created_at: i64,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -374,7 +376,7 @@ pub struct WorkSearchPage {
     pub complete: bool,
 }
 
-/// Reads a [`WorkSearchPage`] cursor, `<updated_at>:<id>`, as the position to continue after.
+/// Reads a [`WorkSearchPage`] cursor, `<created_at>:<id>`, as the position to continue after.
 pub(super) fn parse_search_cursor(cursor: &str) -> Result<(i64, String)> {
     let (at, id) = cursor
         .split_once(':')
@@ -395,7 +397,7 @@ impl WorkSearchPage {
         let more = items.len() > limit;
         items.truncate(limit);
         let next_cursor = more
-            .then(|| items.last().map(|i| format!("{}:{}", i.updated_at, i.id)))
+            .then(|| items.last().map(|i| format!("{}:{}", i.created_at, i.id)))
             .flatten();
         Self {
             items,

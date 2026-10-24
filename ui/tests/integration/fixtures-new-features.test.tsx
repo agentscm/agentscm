@@ -188,6 +188,35 @@ describe('Templates', () => {
     expect(screen.getByRole('button', { name: 'loop-b863' })).toBeTruthy()
   })
 
+  it('editing the picked change clears it, so Open stays disabled until another is chosen', async () => {
+    stub(() => {
+      throw new TypeError('connection refused')
+    })
+    render(<TemplatesPage />)
+    const picker = screen.getByRole('combobox', { name: 'Change ID' })
+    fireEvent.focus(picker)
+    fireEvent.change(picker, { target: { value: 'change-a' } })
+    fireEvent.keyDown(picker, { key: 'Enter' })
+    fireEvent.change(screen.getByLabelText('Template file'), { target: { value: 'skills/x/workflow.json' } })
+    const open = screen.getAllByRole('button', { name: /Open/ })[0] as HTMLButtonElement
+    expect(open.disabled).toBe(false)
+    fireEvent.change(picker, { target: { value: 'change-b' } })
+    expect(open.disabled).toBe(true)
+  })
+
+  it('a plain word does not hijack Enter for the run picker', async () => {
+    stub(() => {
+      throw new TypeError('connection refused')
+    })
+    render(<TemplatesPage />)
+    const run = screen.getByRole('combobox', { name: 'Run ID' })
+    fireEvent.focus(run)
+    fireEvent.change(run, { target: { value: 'preview' } })
+    await screen.findAllByRole('option', { name: /preview-run/ }, LOAD)
+    fireEvent.keyDown(run, { key: 'Enter' })
+    expect(screen.queryByText(/^Run preview$/)).toBeNull()
+  })
+
   it('asks the live server with both values and shows its own error as advice instead of sample data', async () => {
     const sent = stub(() => json(404, { error: 'manifest not found' }))
     render(<TemplatesPage />)
