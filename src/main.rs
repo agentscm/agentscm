@@ -42,6 +42,7 @@ mod autopsy_cli;
 mod change_capture_cli;
 #[cfg(unix)]
 mod change_capture_client;
+mod client_activity;
 mod client_cli;
 mod client_config;
 mod client_mcp;
@@ -49,6 +50,7 @@ mod client_mcp;
 mod client_plugin;
 #[cfg(unix)]
 mod client_setup;
+mod client_status;
 mod demo_cli;
 mod distribution;
 #[cfg(unix)]
@@ -94,6 +96,7 @@ mod slack_cli;
 mod team_cli;
 mod telemetry;
 mod telemetry_cli;
+mod tray;
 mod work_cli;
 #[cfg(unix)]
 mod workflow_cli;
@@ -124,6 +127,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Open the optional native status-bar companion (macOS).
+    Tray(tray::TrayArgs),
     /// [experimental] Capture local agent events and observed command receipts.
     #[cfg(unix)]
     ChangeCapture {
@@ -696,6 +701,7 @@ enum RunExit {
 
 async fn run(cli: Cli) -> Result<RunExit> {
     match cli.command {
+        Command::Tray(args) => tray::run(args).await?,
         #[cfg(unix)]
         Command::ChangeCapture { command } => {
             let code = change_capture_cli::run(command).await?;

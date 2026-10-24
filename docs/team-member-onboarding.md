@@ -44,6 +44,11 @@ checkout-scoped local MCP server. The MCP command uses the private root binding 
 existing Hub. Generated client configuration contains the installed AgentSCM binary and checkout
 paths, but no Hub token. Different checkouts can therefore remain connected to different Hubs.
 
+On macOS, `npx agentscm tray` can show these connections in the optional status-bar companion;
+there is no separate app install. Start at Login is off until the member enables it in the menu.
+On every platform, `agentscm client status --check` provides the CLI view. Activity is based on
+recent observed MCP and native hook participation, so missing or idle activity remains unknown.
+
 | Coding agent | Native components written or installed | Review and refresh in the host |
 | --- | --- | --- |
 | Claude Code | AgentSCM plugin (session and pre-edit hooks plus skill); `.mcp.json` | Review the plugin and project MCP approval, then start a fresh session and confirm it with `/mcp`. See Anthropic's [plugin overview](https://claude.com/blog/claude-code-plugins) and [MCP guidance](https://support.claude.com/en/articles/14554922-claude-code-user-faq). |

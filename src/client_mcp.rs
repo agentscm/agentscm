@@ -152,6 +152,7 @@ async fn serve(
 ) -> Result<()> {
     let client = forge_http::client().map_err(map_hub_error)?;
     let url = endpoint(connection)?;
+    let activity_binding = crate::client_activity::activity_binding(connection, token);
     loop {
         let line = match read_line(reader) {
             Ok(Some(line)) => line,
@@ -178,6 +179,10 @@ async fn serve(
         let id = response_id(&message);
         drop(message);
         if check_connection().is_err() {
+            report_activity(
+                &activity_binding,
+                crate::client_activity::ActivityOutcome::BindingChanged,
+            );
             if let Some(id) = id {
                 write_json(
                     writer,
@@ -199,12 +204,65 @@ async fn serve(
         )
         .await;
         match (id, forwarded) {
-            (None, Ok((202 | 204, _, _))) => {}
-            (None, _) => eprintln!("AgentSCM MCP: Hub notification failed"),
+            (None, Ok((202 | 204, _, _))) => report_activity(
+                &activity_binding,
+                crate::client_activity::ActivityOutcome::Acknowledged,
+            ),
+            (None, Ok((401 | 403, _, _))) => {
+                report_activity(
+                    &activity_binding,
+                    crate::client_activity::ActivityOutcome::TokenRejected,
+                );
+                eprintln!("AgentSCM MCP: Hub notification failed");
+            }
+            (None, Ok(_)) => {
+                report_activity(
+                    &activity_binding,
+                    crate::client_activity::ActivityOutcome::InvalidResponse,
+                );
+                eprintln!("AgentSCM MCP: Hub notification failed");
+            }
+            (None, Err(_)) => {
+                report_activity(
+                    &activity_binding,
+                    crate::client_activity::ActivityOutcome::Unavailable,
+                );
+                eprintln!("AgentSCM MCP: Hub notification failed");
+            }
             (Some(id), Ok((200, true, reply))) if valid_reply(&reply, &id) => {
+                report_activity(
+                    &activity_binding,
+                    crate::client_activity::ActivityOutcome::Acknowledged,
+                );
                 write_json(writer, &reply)?;
             }
-            (Some(id), _) => {
+            (Some(id), Ok((401 | 403, _, _))) => {
+                report_activity(
+                    &activity_binding,
+                    crate::client_activity::ActivityOutcome::TokenRejected,
+                );
+                eprintln!("AgentSCM MCP: Hub request failed");
+                write_json(
+                    writer,
+                    &rpc_error(&id, -32000, "AgentSCM Hub request failed"),
+                )?;
+            }
+            (Some(id), Ok(_)) => {
+                report_activity(
+                    &activity_binding,
+                    crate::client_activity::ActivityOutcome::InvalidResponse,
+                );
+                eprintln!("AgentSCM MCP: Hub request failed");
+                write_json(
+                    writer,
+                    &rpc_error(&id, -32000, "AgentSCM Hub request failed"),
+                )?;
+            }
+            (Some(id), Err(_)) => {
+                report_activity(
+                    &activity_binding,
+                    crate::client_activity::ActivityOutcome::Unavailable,
+                );
                 eprintln!("AgentSCM MCP: Hub request failed");
                 write_json(
                     writer,
@@ -213,6 +271,15 @@ async fn serve(
             }
         }
     }
+}
+
+fn report_activity(binding: &str, outcome: crate::client_activity::ActivityOutcome) {
+    crate::client_activity::observe(
+        binding,
+        None,
+        crate::client_activity::ActivityPath::Mcp,
+        outcome,
+    );
 }
 
 pub(crate) async fn run(root: Option<&Path>) -> Result<()> {

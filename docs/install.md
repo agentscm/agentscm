@@ -35,6 +35,7 @@ The download and verification steps do not send product telemetry. After verific
 ```sh
 npx agentscm            # setup guide; flags go to `agentscm quickstart`
 npx agentscm uninstall  # any other subcommand is passed through as given
+npx agentscm tray       # optional macOS status-bar companion
 ```
 
 Needs Node 18 or later. The package has no dependencies and no install scripts. On Windows, run the same command in PowerShell:
@@ -85,6 +86,37 @@ current shell, or add that line to your shell's startup file for future terminal
 You can also keep using `npx agentscm <subcommand>`.
 
 Remove them with `agentscm uninstall`.
+
+The optional macOS tray is part of this same binary; no separate app install is needed. Run
+`npx agentscm tray`, or add `--tray` to quickstart to open it after successful setup. Start at
+Login is off until enabled in the tray menu. The alpha binary is not signed or notarized, and the
+tray does not update independently; install a newer AgentSCM release through the same installer.
+Each checkout menu groups its status, opening actions, **Agent Integrations**, **Connection Details**,
+**Recent Activity** and **Troubleshooting**. Connection Details shows the full checkout path and
+connection values.
+
+The Start at Login switch shows **On** or **Off**, and **Updating…** while a change is saved.
+**Open Hub** uses the saved sign-in for that exact Hub to create a read-only browser token valid
+for 30 minutes. It opens the Hub UI with that token in the URL fragment; the UI removes the
+fragment immediately. An existing browser sign-in is preserved, so sign out there first when
+switching repositories. If the saved sign-in is missing or expired, the tray shows an error
+with a sign-in instruction. Under **Troubleshooting → Hub Sign-in**, copy the GitHub or GitLab
+login command for that exact Hub and run it in Terminal; then retry Open Hub.
+
+For a connected checkout, choose **Agent Integrations** in its menu to configure Claude
+Code, Codex, Cursor, Copilot or Gemini. This installs AgentSCM's existing hooks, MCP connection
+and coordination skill; the native client's own trust prompts still apply. **Reapply** reruns
+that setup without signing in again. Connect a new checkout or Hub through quickstart.
+Setup opens a status window with progress, the result and the client's next steps. It does not
+install the coding client itself. Open the configured checkout in that client, review its own
+approvals, and start a fresh session before checking activity in the tray.
+If macOS starts the tray with a minimal `PATH`, an installed Claude Code or Codex CLI may be
+unavailable there. Use **Copy Terminal Setup** for that agent. The tray only copies this
+command: it runs normal `client setup` only after you paste and run it in Terminal. That guided
+command may contact the Hub, request forge sign-in, and create or replace a managed coordination
+token; the native client's own trust prompts still apply.
+Uninstall removes the owned tray login setting before removing its program. A running tray can
+be closed with **Quit AgentSCM Tray**.
 
 For an optional customer-operated Slack app, follow [Slack setup](slack.md). The same preparation commands support an installation agent, the official Slack CLI and manual app settings. A prepared private bundle can be supplied to `quickstart --hub local --slack-config-file ABSOLUTE_PATH`; installing the AgentSCM binary alone does not connect Slack.
 

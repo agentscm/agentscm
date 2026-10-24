@@ -91,20 +91,28 @@ async fn hook(
     };
     let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let remaining = deadline.saturating_duration_since(Instant::now());
-    let call = tokio::spawn(call_hub(
+    let activity = std::sync::Arc::new(ActivityTracker::new(agent));
+    let mut call = tokio::spawn(call_hub(
         agent.to_owned(),
         flag_url,
         repo,
         client_connection,
         destination_args,
         payload.clone(),
-        body,
+        HubCallContext {
+            original_body: body,
+            activity_tracker: activity.clone(),
+        },
     ));
-    match tokio::time::timeout(remaining, call).await {
+    match tokio::time::timeout(remaining, &mut call).await {
         Ok(Ok(Ok(reply))) => reply,
         Ok(Ok(Err(reason))) => unknown_output(agent, &payload, &reason),
         Ok(Err(_)) => unknown_output(agent, &payload, "bad reply"),
-        Err(_) => unknown_output(agent, &payload, "hub unreachable"),
+        Err(_) => {
+            activity.finish(crate::client_activity::ActivityOutcome::Unavailable);
+            call.abort();
+            unknown_output(agent, &payload, "hub unreachable")
+        }
     }
 }
 
@@ -116,6 +124,11 @@ fn read_stdin() -> Option<Vec<u8>> {
     (body.len() <= STDIN_BYTES).then_some(body)
 }
 
+struct HubCallContext {
+    original_body: Vec<u8>,
+    activity_tracker: std::sync::Arc<ActivityTracker>,
+}
+
 async fn call_hub(
     agent: String,
     flag_url: Option<String>,
@@ -123,8 +136,12 @@ async fn call_hub(
     client_connection: bool,
     destination_args: bool,
     payload: Value,
-    original_body: Vec<u8>,
+    context: HubCallContext,
 ) -> Result<Value, String> {
+    let HubCallContext {
+        original_body,
+        activity_tracker,
+    } = context;
     let supported_client = matches!(
         agent.as_str(),
         "claude" | "codex" | "cursor" | "copilot" | "gemini"
@@ -136,7 +153,7 @@ async fn call_hub(
         return Err("client connection mode does not support this agent".into());
     }
     let plugin_route = client_connection;
-    let (url, token, repo, root, endpoint_agent, outbound, client_root, report_completion) =
+    let (url, token, repo, root, endpoint_agent, outbound, client_connection, report_completion) =
         if plugin_route {
             let routed = route_client(&agent, &payload)?;
             (
@@ -146,7 +163,7 @@ async fn call_hub(
                 None,
                 routed.endpoint_agent,
                 routed.payload,
-                Some(routed.connection.root.clone()),
+                Some(routed.connection.clone()),
                 routed.connection.report_completion,
             )
         } else {
@@ -185,6 +202,10 @@ async fn call_hub(
     if token.is_empty() {
         return Err("no token".into());
     }
+    let activity_binding = client_connection
+        .as_ref()
+        .map(|connection| crate::client_activity::activity_binding(connection, &token));
+    let mut activity = ActivityAttempt::new(activity_tracker, activity_binding);
     let client = forge_http::client().map_err(|_| "hub unreachable")?;
     let outbound_body = if plugin_route || agent == "codex" {
         serde_json::to_vec(&outbound).map_err(|_| "payload unreadable")?
@@ -201,10 +222,10 @@ async fn call_hub(
         &outbound_body,
         root.as_deref(),
     )?;
-    if let Some(root) = client_root {
+    if let Some(connection) = client_connection.as_ref() {
         request = request.header(
             agentscm::hub::onboarding::CLIENT_HEADER,
-            client_config::onboarding_client(&root, &token),
+            client_config::onboarding_client(&connection.root, &token),
         );
     }
     request = client_config::with_completion_reporting(request, report_completion);
@@ -214,17 +235,136 @@ async fn call_hub(
         .map_err(|_| "hub unreachable")?;
     match status {
         200 if reply.is_object() && agent == "gemini" && plugin_route => {
+            activity.finish(successful_hook_outcome(&outbound));
             Ok(gemini_reply(reply, &payload, config_dir().ok().as_deref()))
         }
-        200 if reply.is_object() => Ok(defanged(
-            reply,
-            &agent,
-            &payload,
-            config_dir().ok().as_deref(),
-        )),
-        200 => Err("bad reply".into()),
-        401 | 403 => Err("token rejected".into()),
-        _ => Err(format!("hub error {status}")),
+        200 if reply.is_object() => {
+            activity.finish(successful_hook_outcome(&outbound));
+            Ok(defanged(
+                reply,
+                &agent,
+                &payload,
+                config_dir().ok().as_deref(),
+            ))
+        }
+        200 => {
+            activity.finish(crate::client_activity::ActivityOutcome::InvalidResponse);
+            Err("bad reply".into())
+        }
+        401 | 403 => {
+            activity.finish(crate::client_activity::ActivityOutcome::TokenRejected);
+            Err("token rejected".into())
+        }
+        _ => {
+            activity.finish(crate::client_activity::ActivityOutcome::Unavailable);
+            Err(format!("hub error {status}"))
+        }
+    }
+}
+
+struct ActivityTracker {
+    agent: String,
+    binding: std::sync::OnceLock<String>,
+    finished: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    recorded:
+        Option<std::sync::Arc<std::sync::Mutex<Vec<crate::client_activity::ActivityOutcome>>>>,
+}
+
+impl ActivityTracker {
+    fn new(agent: &str) -> Self {
+        Self {
+            agent: agent.to_owned(),
+            binding: std::sync::OnceLock::new(),
+            finished: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            recorded: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn recording(
+        recorded: std::sync::Arc<std::sync::Mutex<Vec<crate::client_activity::ActivityOutcome>>>,
+    ) -> Self {
+        Self {
+            agent: "codex".into(),
+            binding: std::sync::OnceLock::from("0".repeat(64)),
+            finished: std::sync::atomic::AtomicBool::new(false),
+            recorded: Some(recorded),
+        }
+    }
+
+    fn set_binding(&self, binding: Option<String>) {
+        if let Some(binding) = binding {
+            let _ = self.binding.set(binding);
+        }
+    }
+
+    fn binding(&self) -> Option<&str> {
+        self.binding.get().map(String::as_str)
+    }
+
+    fn finish(&self, outcome: crate::client_activity::ActivityOutcome) {
+        use std::sync::atomic::Ordering;
+        if self.finished.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Some(binding) = self.binding() else {
+            return;
+        };
+        #[cfg(test)]
+        if let Some(recorded) = &self.recorded {
+            recorded.lock().unwrap().push(outcome);
+        } else {
+            crate::client_activity::observe(
+                binding,
+                Some(&self.agent),
+                crate::client_activity::ActivityPath::Hook,
+                outcome,
+            );
+        }
+        #[cfg(not(test))]
+        crate::client_activity::observe(
+            binding,
+            Some(&self.agent),
+            crate::client_activity::ActivityPath::Hook,
+            outcome,
+        );
+    }
+}
+
+struct ActivityAttempt {
+    tracker: std::sync::Arc<ActivityTracker>,
+}
+
+impl ActivityAttempt {
+    fn new(tracker: std::sync::Arc<ActivityTracker>, binding: Option<String>) -> Self {
+        tracker.set_binding(binding);
+        Self { tracker }
+    }
+
+    fn finish(&mut self, outcome: crate::client_activity::ActivityOutcome) {
+        self.tracker.finish(outcome);
+    }
+}
+
+impl Drop for ActivityAttempt {
+    fn drop(&mut self) {
+        self.tracker
+            .finish(crate::client_activity::ActivityOutcome::Unavailable);
+    }
+}
+
+fn successful_hook_outcome(payload: &Value) -> crate::client_activity::ActivityOutcome {
+    let ended = matches!(
+        payload["hook_event_name"].as_str(),
+        Some("SessionEnd" | "sessionEnd")
+    ) || payload["event"].as_str() == Some("done")
+        || payload["reason"].as_str() == Some("client-session-end");
+    if ended {
+        crate::client_activity::ActivityOutcome::SessionEnded
+    } else {
+        crate::client_activity::ActivityOutcome::Acknowledged
     }
 }
 
@@ -924,6 +1064,62 @@ fn fail_open(agent: &str, payload: &Value, note: Option<&str>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalized_lifecycle_alone_marks_session_end() {
+        use crate::client_activity::ActivityOutcome::{Acknowledged, SessionEnded};
+        assert_eq!(
+            successful_hook_outcome(&json!({"hook_event_name":"SessionEnd"})),
+            SessionEnded
+        );
+        assert_eq!(
+            successful_hook_outcome(&json!({"event":"done"})),
+            SessionEnded
+        );
+        assert_eq!(
+            successful_hook_outcome(&json!({"reason":"client-session-end"})),
+            SessionEnded
+        );
+        assert_eq!(
+            successful_hook_outcome(&json!({"reason":"transport-error"})),
+            Acknowledged
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_and_cancelled_attempts_report_exact_outcomes() {
+        use crate::client_activity::ActivityOutcome::{Acknowledged, TokenRejected, Unavailable};
+        let completed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let tracker = std::sync::Arc::new(ActivityTracker::recording(completed.clone()));
+            let mut attempt = ActivityAttempt::new(tracker, None);
+            attempt.finish(Acknowledged);
+        }
+        {
+            let tracker = std::sync::Arc::new(ActivityTracker::recording(completed.clone()));
+            let mut attempt = ActivityAttempt::new(tracker, None);
+            attempt.finish(TokenRejected);
+        }
+        assert_eq!(*completed.lock().unwrap(), [Acknowledged, TokenRejected]);
+
+        let cancelled = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = cancelled.clone();
+        let tracker = std::sync::Arc::new(ActivityTracker::recording(recorded));
+        let timed = tracker.clone();
+        let mut task = tokio::spawn(async move {
+            let _attempt = ActivityAttempt::new(tracker, None);
+            std::future::pending::<()>().await;
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), &mut task)
+                .await
+                .is_err()
+        );
+        timed.finish(Unavailable);
+        task.abort();
+        timed.finish(Acknowledged);
+        assert_eq!(*cancelled.lock().unwrap(), [Unavailable]);
+    }
 
     #[test]
     fn gemini_native_start_preserves_session_discovery_context() {

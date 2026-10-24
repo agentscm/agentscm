@@ -81,6 +81,8 @@ test('launch arguments', () => {
   assert.deepEqual(launchArgs(['-h']), ['-h']);
   assert.deepEqual(launchArgs(['uninstall']), ['uninstall']);
   assert.deepEqual(launchArgs(['hub', 'serve', '--x']), ['hub', 'serve', '--x']);
+  assert.deepEqual(launchArgs(['tray']), ['tray']);
+  assert.deepEqual(launchArgs(['tray', '--foreground']), ['tray', '--foreground']);
 });
 
 test('verified installer marks only the launched product process', () => {
