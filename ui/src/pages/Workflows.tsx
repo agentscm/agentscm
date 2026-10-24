@@ -222,7 +222,7 @@ function RunPicker({ token }: { token: string }) {
       id="workflow-run-picker"
       data-tour="workflow-run-picker"
       label="Find a run"
-      placeholder="Find a run by name, state or ID"
+      placeholder="Find a run"
       looseId
       parseId={(t) => (validSkillWorkflowRunId(t) ? t : null)}
       onSelect={(id) => { window.location.hash = runHref(id).slice(1) }}
