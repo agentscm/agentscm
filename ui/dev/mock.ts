@@ -245,7 +245,7 @@ const PR_GATES = [
 ]
 // Written by hand from the manifest walkthrough rules; the real lines come from the hub.
 const SELF = 'self-reported or stronger'
-const STOP = "Blocks: the Stop hook keeps the author's session from finishing until this is recorded."
+const STOP = "Blocks if the opt-in Stop hook is installed: the author's session cannot finish until this is recorded."
 const FORGE = 'Warns only for now: a merge check (forge status) is planned but not built.'
 const walk = (merge: string): string[] => [
   `1. Branch: The author works on a branch made for this task, never on the default branch. Done by the author agent. Needs: the task branch (${SELF}). Warns only.`,
@@ -255,13 +255,14 @@ const walk = (merge: string): string[] => [
   `5. CI: The hosted checks run on the current commit and must pass. Done by the author agent. Needs: green CI on the current head (${SELF}). ${FORGE}`,
   `6. Approval: A maintainer looks at the current commit and approves it. Done by a maintainer (a person). Needs: maintainer approval of the current head (${SELF}). ${FORGE}`,
   `7. Merge: A maintainer merges the pull request. Done by a maintainer (a person). Needs: the merge${merge} (${SELF}). Warns only.`,
-  `8. Post merge: After the merge, the author checks the default branch still passes. Done by the author agent. Needs: a regression pass on the default branch after the merge (${SELF}). Recorded only; the planned main-red alert is not built yet.`,
+  `8. Post merge: After the merge, the author checks the default branch still passes. Done by the author agent. Needs: a regression pass on the default branch after the merge (${SELF}). Recorded only; the planned alert for a red default branch is not built yet.`,
 ]
 const SKILL_CATALOG = [
   {
     name: 'pr-gate', workflow_version: 1, sha256: SHA_PR_GATE, first_party: true, summary: 'Every pull request passes tests, an independent review, CI and approval before it merges.',
     gates: PR_GATES.map(({ id, enforce }) => ({ id, enforce })),
     walkthrough: walk(''),
+    procedure: '---\nname: pr-gate\n---\n\n# pr-gate v1\n\n3. **review**: the hub refuses a review recorded with the same agent token and session as an author.',
     applicability: { triggers: ['opening a pull request', 'before merging a pull request'], prerequisites: ['a GitHub or GitLab repository', 'a test command agents can run'], not_for: ['direct pushes to the default branch by a person'] },
     parameters: [
       { name: 'ci_label', description: 'Label that requests the extended CI run.', type: 'string', default: null },
@@ -272,6 +273,7 @@ const SKILL_CATALOG = [
     name: 'post-merge-check', workflow_version: 1, sha256: SHA_POST_MERGE, first_party: true, summary: 'Run a regression pass on the target branch after each merge.',
     gates: [{ id: 'merge', enforce: ['advise'] }, { id: 'post_merge', enforce: ['signal'] }],
     walkthrough: walk('').slice(6).map((l, i) => l.replace(/^\d+/, String(i + 1))),
+    procedure: '# post-merge-check v1\n\nRun the regression pass on the default branch.',
     applicability: { triggers: ['after a pull request merges'], prerequisites: ['a command that checks the target branch'], not_for: ['repositories without a stable default branch'] },
     parameters: [],
   },

@@ -4,7 +4,8 @@
 //! A run is one (repository, branch, skill). Evidence is what an agent says it did; the hub
 //! labels it `self_reported` and only checks the ordering rules in
 //! `skill_workflow::supported::admit`. Adoption comes from the lock file on the forge's default
-//! branch when the repository is connected, else from what a checkout reported.
+//! branch when the repository is connected, else from what a checkout reported (a connected
+//! repository refuses checkout reports).
 
 use std::collections::BTreeMap;
 
@@ -69,6 +70,8 @@ pub struct EvidenceRow {
     pub url: Option<String>,
     pub pull_request: Option<i64>,
     pub detail: Option<String>,
+    /// The recording token's id; with the session it decides review independence.
+    pub token_id: String,
     pub session: String,
     pub agent: String,
     pub recorded_at: i64,
@@ -122,6 +125,7 @@ impl EvidenceRow {
                 .detail
                 .as_ref()
                 .and_then(|d| serde_json::to_string(d).ok()),
+            token_id: s.token_id.clone(),
             session: s.session.clone(),
             agent: s.agent.clone(),
             recorded_at: s.recorded_at as i64,
@@ -131,6 +135,7 @@ impl EvidenceRow {
     fn to_stored(&self) -> Option<StoredEvidence> {
         Some(StoredEvidence {
             id: self.id.clone(),
+            token_id: self.token_id.clone(),
             session: self.session.clone(),
             agent: self.agent.clone(),
             recorded_at: u64::try_from(self.recorded_at).ok()?,
@@ -386,7 +391,16 @@ fn record(store: &dyn Store, who: Recorder<'_>, mut evidence: Evidence) -> Out<R
             format!("a run keeps at most {MAX_RUN_EVIDENCE} evidence records"),
         ));
     }
-    supported::admit(&entry.manifest, &existing, &evidence, &session).map_err(|r| {
+    supported::admit(
+        &entry.manifest,
+        &existing,
+        &evidence,
+        &supported::Who {
+            token: who.token,
+            session: &session,
+        },
+    )
+    .map_err(|r| {
         if r.code == "invalid" {
             bad_request(r.message)
         } else {
@@ -396,6 +410,7 @@ fn record(store: &dyn Store, who: Recorder<'_>, mut evidence: Evidence) -> Out<R
     evidence.skill = Some(skill.clone());
     let stored = StoredEvidence {
         id: new_id("evd")?,
+        token_id: who.token.to_owned(),
         session,
         agent: who.agent.to_owned(),
         recorded_at: now as u64,
@@ -521,7 +536,19 @@ async fn adoption_route(
     scope(&principal, &repo)?;
     let store = state.store.clone();
     let token = principal.token_id;
+    let (host, repository_id) = (principal.owner.identity.host, principal.repository_id);
     blocking(&state, move || {
+        // The forge's default-branch lock is the only adoption of a connected repository.
+        if super::sync::find_repository(&*store, &host, &repo, repository_id)?.is_some() {
+            return Ok(Err(Failure::Refused(
+                StatusCode::CONFLICT,
+                "forge_authoritative",
+                format!(
+                    "this repository has a forge connection; adoption comes from {} on the default branch",
+                    supported::LOCK_PATH
+                ),
+            )));
+        }
         Ok(report_adoption(&*store, &repo, &token, &body))
     })
     .await?
@@ -767,6 +794,10 @@ fn render_library(lib: &Value, pins: &[PinStatus]) -> String {
                 .filter_map(Value::as_str)
                 .map(|l| format!("    {l}")),
         );
+        if let (Some(_), Some(procedure)) = (pin, entry["procedure"].as_str()) {
+            lines.push("  Procedure:".into());
+            lines.extend(procedure.lines().map(|l| format!("    {l}")));
+        }
     }
     for p in pins.iter().filter(|p| p.status != AdoptionStatus::Adopted) {
         lines.push(format!(

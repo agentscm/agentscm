@@ -23,6 +23,7 @@ CREATE TABLE hub_skill_evidence (
     url TEXT,
     pull_request BIGINT,
     detail TEXT,
+    token_id TEXT NOT NULL,
     session TEXT NOT NULL,
     agent TEXT NOT NULL,
     recorded_at BIGINT NOT NULL

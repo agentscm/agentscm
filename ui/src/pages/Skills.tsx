@@ -54,6 +54,12 @@ function HowItWorks({ c, pin }: { c: CatalogEntry; pin: Pin | null }) {
     <div className="skill-walkthrough">
       <h4 className="small fw-semibold mb-1">How it works</h4>
       <ol className="small">{lines.map((l, i) => <li key={i}>{stepText(l)}</li>)}</ol>
+      {c.procedure && (
+        <details className="small">
+          <summary>Full procedure</summary>
+          <pre className="small">{c.procedure}</pre>
+        </details>
+      )}
     </div>
   )
 }
@@ -282,7 +288,7 @@ function Run({ run }: { run: RunView }) {
         <div><h2>Next action</h2><p className="mb-0">{run.next_action}</p></div>
         <div>
           <h2>Blocking finish?</h2>
-          <p className="mb-0"><strong>{run.blocks_finish ? 'Yes' : 'No'}</strong>. {run.blocks_finish ? 'The Stop hook blocks the author at tests, review and fix until this gate has evidence for the current head.' : 'The Stop hook blocks the author only at tests, review and fix. This run is not at one of them.'}</p>
+          <p className="mb-0"><strong>{run.blocks_finish ? 'Yes' : 'No'}</strong>. {run.blocks_finish ? 'Where the opt-in Stop hook is installed, it blocks the author at tests, review and fix until this gate has evidence for the current head.' : 'Where the opt-in Stop hook is installed, it blocks the author only at tests, review and fix. This run is not at one of them.'}</p>
         </div>
         <div>
           <h2>Last evidence</h2>

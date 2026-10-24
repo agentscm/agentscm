@@ -260,9 +260,17 @@ fn describe(
         );
     }
     if full {
-        let _ = writeln!(out, "  sha256: {}", entry.sha256);
+        let _ = writeln!(
+            out,
+            "  sha256 (bundle of skill.json and SKILL.md): {}",
+            entry.sha256
+        );
         let _ = writeln!(out, "  How it works:");
         for line in walkthrough {
+            let _ = writeln!(out, "    {line}");
+        }
+        let _ = writeln!(out, "  Procedure:");
+        for line in entry.procedure.lines() {
             let _ = writeln!(out, "    {line}");
         }
     } else {
@@ -470,6 +478,8 @@ fn remove(name: &str) -> Result<()> {
 
 struct Hub {
     base: String,
+    /// `owner/name` as the connection records it.
+    raw_repo: String,
     repo: String,
     token: String,
 }
@@ -486,6 +496,7 @@ impl Hub {
             })?;
         Ok(Self {
             base: connection.hub.clone(),
+            raw_repo: connection.repo.clone(),
             repo: encode_path_segment(&connection.repo),
             token: crate::client_cli::read_token(&connection.token_file)?,
         })
@@ -498,12 +509,35 @@ impl Hub {
         query: &[(&str, &str)],
         body: Option<&Value>,
     ) -> Result<(u16, Value)> {
+        let url = format!("{}/v1/hub/repos/{}/skills/{tail}", self.base, self.repo);
+        self.send(method, url, query, body).await
+    }
+
+    /// Whether the Hub has `name` adopted for this repository.
+    async fn adopted(&self, name: &str) -> Result<bool> {
+        let url = format!("{}/v1/hub/skills", self.base);
+        let (code, body) = self
+            .send(reqwest::Method::GET, url, &[("repo", &self.raw_repo)], None)
+            .await?;
+        if code != 200 {
+            return Err(invalid(format!("the Hub returned status {code}")));
+        }
+        Ok(body["adoption"]["pins"].as_array().is_some_and(|pins| {
+            pins.iter()
+                .any(|p| p["name"] == name && p["status"] == "adopted")
+        }))
+    }
+
+    async fn send(
+        &self,
+        method: reqwest::Method,
+        url: String,
+        query: &[(&str, &str)],
+        body: Option<&Value>,
+    ) -> Result<(u16, Value)> {
         let client = forge_http::client().map_err(|_| invalid("Hub client unavailable"))?;
         let mut request = client
-            .request(
-                method,
-                format!("{}/v1/hub/repos/{}/skills/{tail}", self.base, self.repo),
-            )
+            .request(method, url)
             .query(query)
             .bearer_auth(&self.token)
             .timeout(HUB_TIMEOUT);
@@ -528,6 +562,15 @@ async fn report_adoption() -> Result<()> {
     let (status, reply) = hub
         .call(reqwest::Method::PUT, "adoption", &[], Some(&body))
         .await?;
+    if status == 409 && reply["error"] == "forge_authoritative" {
+        println!(
+            "Nothing reported: {} Commit and merge {LOCK_PATH} to the default branch.",
+            reply["message"]
+                .as_str()
+                .unwrap_or("the Hub reads the lock from the forge.")
+        );
+        return Ok(());
+    }
     if status != 200 {
         return Err(invalid(format!(
             "the Hub refused the adoption report (status {status})"
@@ -713,8 +756,23 @@ fn bound(text: &str) -> String {
     text.chars().take(MAX_REASON).collect()
 }
 
-/// Only gates the agent can act on block; ci, approval, merge and post_merge never do.
-fn verdict_for_run(view: &RunView) -> Verdict {
+/// Only gates the agent can act on block; ci, approval, merge and post_merge never do. A local
+/// HEAD the run has not seen blocks at any gate before the merge: the evidence is for an older
+/// commit, so the tests and the review must be redone.
+fn verdict_for_run(view: &RunView, local_head: Option<&str>) -> Verdict {
+    let before_merge = view
+        .current_gate
+        .as_deref()
+        .is_some_and(|g| !matches!(g, "merge" | "post_merge"));
+    if let Some(local) = local_head.filter(|l| before_merge && *l != view.head_sha) {
+        let short = |s: &str| s.chars().take(7).collect::<String>();
+        return Verdict::Block(bound(&format!(
+            "HEAD is {} but pr-gate last saw {}. Record tests for {} (`agentscm skill evidence --gate tests ...`); the review must be redone for the new commit.",
+            short(local),
+            short(&view.head_sha),
+            short(local)
+        )));
+    }
     let waiting = matches!(
         view.current_gate.as_deref(),
         Some("ci" | "approval" | "merge" | "post_merge")
@@ -734,6 +792,7 @@ async fn decide(
     root: &Path,
     branch: &str,
     ahead: Option<u64>,
+    local_head: Option<&str>,
 ) -> std::result::Result<Verdict, String> {
     let hub = Hub::for_dir(root).map_err(|e| e.to_string())?;
     let (code, body) = hub
@@ -748,7 +807,17 @@ async fn decide(
     match code {
         200 => {
             let view = decode_run(code, body).map_err(|e| e.to_string())?;
-            Ok(verdict_for_run(&view))
+            Ok(verdict_for_run(&view, local_head))
+        }
+        // No run: a lock the Hub has not adopted yet cannot have one, and must not block.
+        404 if !hub
+            .adopted(DEFAULT_SKILL)
+            .await
+            .map_err(|e| e.to_string())? =>
+        {
+            Err(format!(
+                "{DEFAULT_SKILL} is pinned in {LOCK_PATH} here but not adopted on the hub yet: adoption takes effect once the lock is on the default branch (forge connected), or run `agentscm skill report-adoption` when no forge is connected"
+            ))
         }
         404 if ahead.is_some_and(|n| n > 0) => Ok(Verdict::Block(format!(
             "This repository adopted pr-gate and branch {branch} has commits but no run. Start it: agentscm skill evidence --gate branch --kind task_branch --summary \"<what this branch is for>\""
@@ -799,7 +868,8 @@ pub async fn stop(data_dir: &Path, agent: StopAgent, mut stdin: impl Read) -> Va
         Err(e) => return allow(e),
     };
     let ahead = commits_ahead(&root, &default);
-    let result = match decide(&root, &branch, ahead).await {
+    let local_head = git(&root, &["rev-parse", "HEAD"]);
+    let result = match decide(&root, &branch, ahead, local_head.as_deref()).await {
         Ok(Verdict::Block(reason)) => json!({"failures": [], "next_action": reason}),
         Ok(Verdict::Allow) => json!({"receipt": "allow", "workspace_changed_during_run": false}),
         Err(e) => return allow(e),

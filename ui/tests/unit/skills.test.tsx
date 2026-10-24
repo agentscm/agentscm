@@ -47,6 +47,8 @@ describe('labels', () => {
   it('only enforcing values count as enforced', () => {
     expect(enforcement([{ enforce: ['stop'] }, { enforce: ['forge_status', 'advise'] }, { enforce: ['signal'] }])).toEqual({ enforced: ['Stop hook'], planned: ['merge check'] })
     expect(enforcement([{ enforce: ['advise'] }, { enforce: ['signal'] }])).toEqual({ enforced: [], planned: [] })
+    // native is planned, not enforced, for skill gates.
+    expect(enforcement([{ enforce: ['native'] }])).toEqual({ enforced: [], planned: ['native approval and landing'] })
   })
   it('builds the exact CLI commands', () => {
     const defs = [{ name: 'merge_method', description: '', type: 'string', default: 'any', enum: [] }]
@@ -90,6 +92,8 @@ describe('Skills page against the mock hub', () => {
     expect(await screen.findByText('Adoption: read from main on the forge')).toBeTruthy()
     for (const t of ['When to use', 'Prerequisites', 'Not for']) expect(screen.getAllByText(t).length).toBeGreaterThan(0)
     expect(screen.getAllByText('How it works').length).toBe(2)
+    expect(screen.getAllByText('Full procedure').length).toBe(2)
+    expect(document.body.textContent).toContain('same agent token and session')
     // Adopted pr-gate uses the pin's walkthrough (merge method squash); numbers come from <ol>, not the text.
     const steps = screen.getAllByRole('listitem').filter((li) => li.textContent?.startsWith('Tests: The author runs the tests'))
     expect(steps.length).toBeGreaterThan(0)

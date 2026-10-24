@@ -430,7 +430,7 @@ fn tools(read_only: bool, settings: &ViewSettings) -> Value {
                 "description":"Durable work ID whose retained change record should be read."}
         }), &["work_id"])});
     let skill_list = json!({"name": "agentscm_skill_list",
-        "description": "Experimental. Lists the supported skills and which ones this repository adopted, each with when to follow it, its prerequisites, what it is not for, and its effective parameters. Also says where the adoption came from (the default branch on the forge, or reported by a checkout).",
+        "description": "Experimental. Lists the supported skills and which ones this repository adopted, each with when to follow it, its prerequisites, what it is not for, its effective parameters and, for adopted skills, the full procedure to follow. Also says where the adoption came from (the default branch on the forge, or reported by a checkout).",
         "annotations": {"readOnlyHint": true},
         "inputSchema": schema(json!({"repo": {"type": "string", "description": "Repository as owner/name."}}), &["repo"])});
     let skill_status = json!({"name": "agentscm_skill_status",
@@ -438,7 +438,7 @@ fn tools(read_only: bool, settings: &ViewSettings) -> Value {
         "annotations": {"readOnlyHint": true},
         "inputSchema": schema(json!({"repo": {"type": "string"}, "branch": {"type": "string"}}), &["repo", "branch"])});
     let skill_evidence = json!({"name": "agentscm_skill_evidence",
-        "description": "Experimental. Records evidence for a gate of an adopted skill. It is stored as self-reported: the hub checks ordering (current head, independent reviewer) but not that the work happened. Refusals say why (stale_head, not_independent, not_adopted, unknown_gate).",
+        "description": "Experimental. Records evidence for a gate of an adopted skill. It is stored as self-reported: the hub checks ordering (evidence for an older head than the run head is refused; a review recorded with the same agent token and session as an author is refused, and it cannot tell two sessions apart beyond that) but not that the work happened. Refusals say why (stale_head, not_independent, not_adopted, unknown_gate).",
         "inputSchema": schema(json!({
             "repo": {"type": "string"}, "skill": {"type": "string"}, "gate": {"type": "string"},
             "kind": {"type": "string", "enum": ["task_branch", "revision_tests", "independent_review", "findings_resolved", "hosted_ci", "human_approval", "merged", "post_merge_check", "workflow_receipt"]},

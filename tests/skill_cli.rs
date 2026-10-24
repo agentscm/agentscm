@@ -31,6 +31,17 @@ type Routes = Vec<(&'static str, u16, String)>;
 
 /// Answers every request from the first route whose text occurs in the request line, else 404.
 fn serve(routes: Routes) -> (String, Arc<Mutex<Vec<String>>>) {
+    let (url, seen, _) = serve_with_head(routes);
+    (url, seen)
+}
+
+/// Like `serve`, and replaces `@HEAD@` in a body with the cell's text, so a stub can name a
+/// commit made after the stub started.
+type Requests = Arc<Mutex<Vec<String>>>;
+
+fn serve_with_head(routes: Routes) -> (String, Requests, Arc<Mutex<String>>) {
+    let head = Arc::new(Mutex::new(String::new()));
+    let named = head.clone();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -72,7 +83,7 @@ fn serve(routes: Routes) -> (String, Arc<Mutex<Vec<String>>>) {
                 .iter()
                 .find(|(needle, _, _)| line.contains(needle))
                 .map_or((404, r#"{"error":"not_found"}"#.to_owned()), |(_, s, b)| {
-                    (*s, b.clone())
+                    (*s, b.replace("@HEAD@", &named.lock().unwrap()))
                 });
             let _ = write!(
                 stream,
@@ -81,7 +92,7 @@ fn serve(routes: Routes) -> (String, Arc<Mutex<Vec<String>>>) {
             );
         }
     });
-    (url, seen)
+    (url, seen, head)
 }
 
 struct Fixture {
@@ -186,26 +197,44 @@ impl Fixture {
         serde_json::from_slice(&out.stdout).unwrap()
     }
 
-    fn feature_branch(&self) {
+    /// Makes the `feat/x` branch with one commit and returns its HEAD.
+    fn feature_branch(&self) -> String {
         git(&self.root, &["checkout", "--quiet", "-b", "feat/x"]);
         std::fs::write(self.root.join("b.txt"), "b").unwrap();
         git(&self.root, &["add", "."]);
         git(&self.root, &["commit", "--quiet", "-m", "work"]);
+        let head = Command::new("git")
+            .current_dir(&self.root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&head.stdout).trim().to_owned()
     }
 }
 
+/// A run whose head is the commit `feature_branch` makes (see `serve_with_head`).
 fn run_json(current: &str, blocks: bool) -> String {
+    run_json_at("@HEAD@", current, blocks)
+}
+
+fn run_json_at(head: &str, current: &str, blocks: bool) -> String {
     let gate = |id: &str, state: &str, assurance: Value| {
         json!({"id": id, "state": state, "by": "author", "enforce": ["stop"],
             "min_assurance": "self_reported", "assurance": assurance, "evidence": []})
     };
     json!({"run_id": "r1", "repo": "acme/widgets", "branch": "feat/x", "pull_request": 41,
-        "head_sha": "a".repeat(40), "state": "open",
+        "head_sha": head, "state": "open",
         "skill": {"name": "pr-gate", "workflow_version": 1, "sha256": "0".repeat(64)},
         "params": {"ci_label": "ci-extended"}, "current_gate": current,
         "next_action": format!("Do the {current} step."), "blocks_finish": blocks,
         "gates": [gate("branch", "done", json!("self_reported")), gate(current, "current", Value::Null)],
         "stale_evidence": [], "updated_at": 1})
+    .to_string()
+}
+
+fn adopted_library() -> String {
+    json!({"adoption": {"source": "default_branch",
+        "pins": [{"name": "pr-gate", "status": "adopted"}]}})
     .to_string()
 }
 
@@ -260,6 +289,8 @@ fn list_show_add_remove_round_trip() {
     assert!(
         shown.contains("[adopted]")
             && shown.contains("How it works:")
+            && shown.contains("Procedure:")
+            && shown.contains("same agent token and session")
             && shown.contains("2. Tests: The author runs the tests on the exact head commit. Done by the author agent.")
             && shown.contains("green CI on the current head after adding the ci-extended label"),
         "{shown}"
@@ -412,24 +443,24 @@ fn stop_fails_open() {
 
 #[test]
 fn stop_blocks_on_blocks_finish_and_allows_waiting_gates() {
-    let (hub, _) = serve(vec![("by-branch", 200, run_json("review", true))]);
+    let (hub, _, head) = serve_with_head(vec![("by-branch", 200, run_json("review", true))]);
     let fx = fixture(&hub);
-    fx.feature_branch();
+    *head.lock().unwrap() = fx.feature_branch();
     fx.ok(&["add", "pr-gate"]);
     let out = fx.stop(false);
     assert_eq!(out["decision"], "block");
     assert_eq!(out["reason"], "Do the review step.");
 
-    let (hub, _) = serve(vec![("by-branch", 200, run_json("ci", false))]);
+    let (hub, _, head) = serve_with_head(vec![("by-branch", 200, run_json("ci", false))]);
     let fx = fixture(&hub);
-    fx.feature_branch();
+    *head.lock().unwrap() = fx.feature_branch();
     fx.ok(&["add", "pr-gate"]);
     assert_eq!(fx.stop(false), json!({}));
 }
 
 #[test]
 fn stop_blocks_when_commits_exist_without_a_run_but_not_on_the_default_branch() {
-    let (hub, _) = serve(vec![]);
+    let (hub, _) = serve(vec![("/v1/hub/skills?repo", 200, adopted_library())]);
     let fx = fixture(&hub);
     fx.ok(&["add", "pr-gate"]);
     assert_eq!(fx.stop(false), json!({}), "default branch");
@@ -448,9 +479,9 @@ fn stop_blocks_when_commits_exist_without_a_run_but_not_on_the_default_branch() 
 
 #[test]
 fn stop_gives_up_after_eight_consecutive_blocks() {
-    let (hub, _) = serve(vec![("by-branch", 200, run_json("tests", true))]);
+    let (hub, _, head) = serve_with_head(vec![("by-branch", 200, run_json("tests", true))]);
     let fx = fixture(&hub);
-    fx.feature_branch();
+    *head.lock().unwrap() = fx.feature_branch();
     fx.ok(&["add", "pr-gate"]);
     assert_eq!(fx.stop(false)["decision"], "block");
     for _ in 1..8 {
@@ -459,4 +490,73 @@ fn stop_gives_up_after_eight_consecutive_blocks() {
     let out = fx.stop(true);
     assert_eq!(out["continue"], false);
     assert!(out.get("decision").is_none());
+}
+
+#[test]
+fn stop_blocks_when_head_moved_past_the_run_before_the_merge() {
+    let other = "b".repeat(40);
+    for (gate, blocks) in [("ci", false), ("tests", true)] {
+        let (hub, _) = serve(vec![("by-branch", 200, run_json_at(&other, gate, blocks))]);
+        let fx = fixture(&hub);
+        let local = fx.feature_branch();
+        fx.ok(&["add", "pr-gate"]);
+        let out = fx.stop(false);
+        assert_eq!(out["decision"], "block", "{gate}: {out}");
+        let reason = out["reason"].as_str().unwrap();
+        assert!(
+            reason.contains(&format!(
+                "HEAD is {} but pr-gate last saw bbbbbbb",
+                &local[..7]
+            )) && reason.contains("review must be redone"),
+            "{reason}"
+        );
+    }
+    // A run at the merge gate no longer cares which commit the branch is on.
+    let (hub, _) = serve(vec![(
+        "by-branch",
+        200,
+        run_json_at(&other, "merge", false),
+    )]);
+    let fx = fixture(&hub);
+    fx.feature_branch();
+    fx.ok(&["add", "pr-gate"]);
+    assert_eq!(fx.stop(false), json!({}));
+}
+
+#[test]
+fn stop_allows_with_a_note_when_the_hub_has_not_adopted_the_skill() {
+    let library = json!({"adoption": {"source": "none", "pins": []}}).to_string();
+    let (hub, _) = serve(vec![("/v1/hub/skills?repo", 200, library)]);
+    let fx = fixture(&hub);
+    fx.feature_branch();
+    fx.ok(&["add", "pr-gate"]);
+    let payload = json!({"hook_event_name": "Stop", "session_id": "s1", "cwd": fx.root,
+        "stop_hook_active": false})
+    .to_string();
+    let out = fx.run(&["stop", "--agent", "claude"], &payload);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+        json!({})
+    );
+    let note = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        note.contains("pinned in agentscm-skills.lock.json here but not adopted on the hub yet")
+            && note.contains("agentscm skill report-adoption"),
+        "{note}"
+    );
+}
+
+#[test]
+fn report_adoption_explains_a_connected_repository_refusal() {
+    let body = json!({"error": "forge_authoritative",
+        "message": "this repository has a forge connection; adoption comes from agentscm-skills.lock.json on the default branch"})
+    .to_string();
+    let (hub, _) = serve(vec![("PUT", 409, body)]);
+    let fx = fixture(&hub);
+    fx.ok(&["add", "pr-gate"]);
+    let out = fx.ok(&["report-adoption"]);
+    assert!(
+        out.contains("Nothing reported") && out.contains("forge connection"),
+        "{out}"
+    );
 }

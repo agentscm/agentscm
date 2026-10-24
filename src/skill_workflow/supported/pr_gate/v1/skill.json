@@ -45,7 +45,7 @@
     }
   ],
   "skill": {
-    "entrypoint": "skills/supported/pr-gate/v1/SKILL.md",
+    "entrypoint": "src/skill_workflow/supported/pr_gate/v1/SKILL.md",
     "resources": []
   },
   "steps": [],

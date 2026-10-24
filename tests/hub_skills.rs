@@ -20,6 +20,8 @@ struct Hub {
     store: Arc<dyn Store>,
     client: reqwest::Client,
     writer: String,
+    /// A second writer: a different token for the same repository.
+    other_writer: String,
     reader: String,
     _directory: TempDir,
 }
@@ -52,11 +54,13 @@ impl Hub {
                 .to_owned()
         };
         let (writer, reader) = (mint("writer", false), mint("reader", true));
+        let other_writer = mint("other-writer", false);
         Self {
             base,
             store,
             client: reqwest::Client::new(),
             writer,
+            other_writer,
             reader,
             _directory: directory,
         }
@@ -111,12 +115,24 @@ impl Hub {
         kind: &str,
         head: &str,
     ) -> (StatusCode, Value) {
+        self.record_with(&self.writer, session, gate, kind, head)
+            .await
+    }
+
+    async fn record_with(
+        &self,
+        token: &str,
+        session: &str,
+        gate: &str,
+        kind: &str,
+        head: &str,
+    ) -> (StatusCode, Value) {
         let body = json!({"skill": "pr-gate", "gate": gate, "kind": kind, "head_sha": head,
             "assurance": "self_reported", "summary": "done", "branch": "feat/x", "session": session});
         self.send(
             Method::POST,
             &format!("{REPO_PATH}/evidence"),
-            &self.writer,
+            token,
             Some(body),
         )
         .await
@@ -151,6 +167,8 @@ async fn library_shows_the_catalog_with_and_without_adoption_and_flags_an_unknow
             .starts_with("2. Tests: The author runs the tests on the exact head commit."),
         "{steps:?}"
     );
+    let procedure = bare["catalog"][0]["procedure"].as_str().unwrap();
+    assert!(procedure.starts_with("---\nname: pr-gate"), "{procedure}");
     assert_eq!(bare["adoption"]["source"], "none");
     let (_, none) = hub
         .send(
@@ -416,6 +434,10 @@ async fn mcp_tools_list_status_and_record_with_labels_and_named_errors() {
         text.contains("pr-gate v1 (adopted)") && text.contains("merge_method"),
         "{text}"
     );
+    assert!(
+        text.contains("Procedure:") && text.contains("same agent token and session"),
+        "{text}"
+    );
     assert_eq!(
         listed["structuredContent"]["adoption"]["source"],
         "default_branch"
@@ -477,4 +499,149 @@ async fn mcp_tools_list_status_and_record_with_labels_and_named_errors() {
             .unwrap()
             .contains("not_independent")
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evidence_for_an_older_head_is_refused_and_cannot_move_the_head_back() {
+    let hub = Hub::start().await;
+    hub.adopt();
+    hub.record("author", "branch", "task_branch", H1).await;
+    hub.record("author", "tests", "revision_tests", H1).await;
+    let (_, moved) = hub.record("author", "tests", "revision_tests", H2).await;
+    assert_eq!(moved["head_sha"], H2);
+
+    for (session, gate, kind) in [
+        ("author", "tests", "revision_tests"),
+        ("reviewer", "review", "independent_review"),
+    ] {
+        let (status, refused) = hub.record(session, gate, kind, H1).await;
+        assert_eq!(
+            (status, refused["error"].clone()),
+            (StatusCode::CONFLICT, json!("stale_head")),
+            "{refused}"
+        );
+        assert!(
+            refused["message"]
+                .as_str()
+                .unwrap()
+                .contains("older than the run head"),
+            "{refused}"
+        );
+    }
+    let (_, run) = hub
+        .send(
+            Method::GET,
+            &format!("{REPO_PATH}/runs/by-branch?branch=feat%2Fx"),
+            &hub.reader,
+            None,
+        )
+        .await;
+    assert_eq!(run["head_sha"], H2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_independence_needs_a_different_token_or_session_than_the_author() {
+    let hub = Hub::start().await;
+    hub.adopt();
+    hub.record("author", "branch", "task_branch", H1).await;
+    hub.record("author", "tests", "revision_tests", H1).await;
+    let (status, same) = hub
+        .record("author", "review", "independent_review", H1)
+        .await;
+    assert_eq!(
+        (status, same["error"].clone()),
+        (StatusCode::CONFLICT, json!("not_independent")),
+        "{same}"
+    );
+    // Another token that picked the same session name is a different recorder.
+    let (status, other_token) = hub
+        .record_with(
+            &hub.other_writer,
+            "author",
+            "review",
+            "independent_review",
+            H1,
+        )
+        .await;
+    assert_eq!(status, 200, "{other_token}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_same_token_with_another_session_may_review_but_is_self_reported() {
+    let hub = Hub::start().await;
+    hub.adopt();
+    hub.record("author", "branch", "task_branch", H1).await;
+    hub.record("author", "tests", "revision_tests", H1).await;
+    let (status, view) = hub
+        .record("reviewer", "review", "independent_review", H1)
+        .await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["gates"][2]["assurance"], "self_reported");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forge_connected_repository_refuses_checkout_adoption_reports() {
+    use agentscm::hub::connection::NewConnection;
+    let hub = Hub::start().await;
+    let lock = serde_json::to_value(SkillLock {
+        version: 1,
+        skills: vec![SkillPin::first_party(
+            catalog_entry("pr-gate", 1).unwrap(),
+            None,
+        )],
+    })
+    .unwrap();
+    let adoption = format!("{REPO_PATH}/adoption");
+
+    // Without a forge connection the checkout's report is the adoption.
+    let (status, put) = hub
+        .send(Method::PUT, &adoption, &hub.writer, Some(lock.clone()))
+        .await;
+    assert_eq!(
+        (status, put["applied"].clone()),
+        (StatusCode::OK, json!(true)),
+        "{put}"
+    );
+    let before = hub.store.skill_adoption(REPO).unwrap();
+
+    let connection = hub
+        .store
+        .insert_connection(
+            &NewConnection {
+                id: store::new_connection_id().unwrap(),
+                provider: "github".into(),
+                host: "github.com".into(),
+                kind: "pat".into(),
+                app_id: None,
+                app_slug: None,
+                acts_as: Some("bot".into()),
+            },
+            "test",
+        )
+        .unwrap();
+    hub.store
+        .upsert_repository(&connection.id, "github.com", 1, REPO, None, None)
+        .unwrap();
+
+    let (status, refused) = hub
+        .send(
+            Method::PUT,
+            &adoption,
+            &hub.writer,
+            Some(json!({"version": 1, "skills": []})),
+        )
+        .await;
+    assert_eq!(
+        (status, refused["error"].clone()),
+        (StatusCode::CONFLICT, json!("forge_authoritative")),
+        "{refused}"
+    );
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap()
+            .contains("agentscm-skills.lock.json on the default branch"),
+        "{refused}"
+    );
+    assert_eq!(hub.store.skill_adoption(REPO).unwrap(), before);
 }

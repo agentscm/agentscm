@@ -20,6 +20,8 @@ export interface CatalogEntry {
   applicability: { triggers: string[]; prerequisites: string[]; not_for: string[] }; parameters: Param[]
   /** One plain-English line per gate, numbered by the hub ("1. Branch: ..."). */
   walkthrough: string[]
+  /** The agent-facing procedure (SKILL.md); empty when an older hub does not send it. */
+  procedure: string
 }
 export type PinStatus = 'adopted' | 'unknown_version' | 'unsupported_source' | 'invalid_params'
 export interface Pin { name: string; workflow_version: number; path: string | null; sha256: string; status: PinStatus; params: Record<string, unknown>; source: string; walkthrough: string[] }
@@ -100,11 +102,12 @@ export function adoptionLabel(source: AdoptionSource, defaultBranch: string | nu
   if (source === 'reported_by_checkout') return 'Adoption: reported by checkout'
   return 'Not adopted'
 }
-const ENFORCED: Record<string, string> = { stop: 'Stop hook', native: 'native' }
-/** Only built enforcement points count as enforced; forge_status (merge check) is planned; advise and signal are neither. */
+const ENFORCED: Record<string, string> = { stop: 'Stop hook' }
+const PLANNED: Record<string, string> = { forge_status: 'merge check', native: 'native approval and landing' }
+/** Only the Stop hook is built (and it is opt-in); forge_status and native are planned; advise and signal are neither. */
 export function enforcement(gates: { enforce: string[] }[]): { enforced: string[]; planned: string[] } {
   const all = new Set(gates.flatMap((g) => g.enforce))
-  return { enforced: Object.keys(ENFORCED).filter((k) => all.has(k)).map((k) => ENFORCED[k]!), planned: all.has('forge_status') ? ['merge check'] : [] }
+  return { enforced: Object.keys(ENFORCED).filter((k) => all.has(k)).map((k) => ENFORCED[k]!), planned: Object.keys(PLANNED).filter((k) => all.has(k)).map((k) => PLANNED[k]!) }
 }
 export const gateChain = (gates: { id: string }[]) => gates.map((g) => gateLabel(g.id).toLowerCase()).join(' → ')
 /** The hub numbers its lines; the page numbers them with <ol>. */
@@ -188,7 +191,7 @@ export function decodeLibrary(v: unknown): Library {
         const q = rec(x, 'skills')
         return { name: str(q['name'], 'skills'), description: typeof q['description'] === 'string' ? q['description'] : '', type: str(q['type'], 'skills'), default: q['default'] ?? null, enum: strs(q['enum']) }
       })
-      return { name: str(r['name'], 'skills'), workflow_version: num(r['workflow_version'], 'skills'), sha256: str(r['sha256'], 'skills'), summary: str(r['summary'], 'skills'), gates, first_party: r['first_party'] === true, applicability: { triggers: strs(ap['triggers']), prerequisites: strs(ap['prerequisites']), not_for: strs(ap['not_for']) }, parameters, walkthrough: strs(r['walkthrough']) }
+      return { name: str(r['name'], 'skills'), workflow_version: num(r['workflow_version'], 'skills'), sha256: str(r['sha256'], 'skills'), summary: str(r['summary'], 'skills'), gates, first_party: r['first_party'] === true, applicability: { triggers: strs(ap['triggers']), prerequisites: strs(ap['prerequisites']), not_for: strs(ap['not_for']) }, parameters, walkthrough: strs(r['walkthrough']), procedure: typeof r['procedure'] === 'string' ? r['procedure'] : '' }
     }),
     adoption: {
       repo: str(a['repo'], 'skills'), source: source as AdoptionSource, observed_at: nullable(a['observed_at'], (x) => num(x, 'skills')), default_branch: nullable(a['default_branch'], (x) => str(x, 'skills')),

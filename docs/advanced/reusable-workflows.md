@@ -226,8 +226,9 @@ check and the other mutations are not available over HTTP. See
 
 > **Experimental.** Interfaces and gate names may change.
 
-A supported skill is a first-party manifest embedded in the `agentscm` binary under
-`skills/supported/NAME/vN/skill.json`. Manifest `version: 2` keeps the version 1 fields and adds a
+A supported skill is a first-party bundle embedded in the `agentscm` binary from
+`src/skill_workflow/supported/NAME/vN/`: `skill.json` and `SKILL.md`. Agents read the procedure
+with `agentscm skill show NAME` or the MCP `agentscm_skill_list` tool, not from a repository path. Manifest `version: 2` keeps the version 1 fields and adds a
 one-line `summary`, `applicability` (`triggers`, `prerequisites`, `not_for`), `parameters`
 (`string`, `bool` or `integer`, each with a default and an optional `enum`), `subjects`, `roles`
 and `gates`. A gate names the role that records it (`by`), the evidence kinds it needs,
@@ -241,11 +242,13 @@ what happens at that gate. `agentscm skill show`, the Hub Skills library and the
 `agentscm_skill_list` tool print a "How it works" walkthrough generated from the manifest alone:
 one line per gate, in order, with the `plain` text, who does it (the author agent, a different
 session, or a maintainer), the evidence it needs, the minimum assurance and whether the step blocks
-or only warns. Only the Stop hook and native approval block today; the forge merge check is planned
-and the walkthrough says so. Parameters, such as the CI label, change the wording.
+or only warns. Only the Stop hook blocks today, and only where the opt-in Stop hook is installed
+(`agentscm skill stop --agent claude|codex`). The forge merge check (`forge_status`) and native
+approval and landing checks (`native`) are planned, and the walkthrough says so. Parameters, such as the CI label, change the wording.
 
 A repository adopts skills by committing `agentscm-skills.lock.json`: `version: 1` and up to 32
-pins of `name`, `workflow_version`, `sha256` of the exact manifest bytes, `source`
+pins of `name`, `workflow_version`, `sha256` (the bundle digest: SHA-256 over the domain-separated,
+length-prefixed bytes of `skill.json` and `SKILL.md`, so changing the procedure changes the pin), `source`
 (`{"kind":"first_party"}`; other kinds are reserved) and optional `params` overrides. A pin whose
 digest matches no embedded manifest is `unknown_version`, a reserved source is
 `unsupported_source`, and params the manifest does not declare are `invalid_params`; none of these
@@ -253,7 +256,12 @@ resolves to another version. `agentscm init-repo` adds a short "Supported skills
 agent instruction files when this lock file exists.
 
 Evidence recorded by agents is **self-reported**. The hub labels it so wherever it is shown, and
-every version 1 gate accepts it. It is not proof that tests ran or that a review happened.
+every version 1 gate accepts it. It is not proof that tests ran or that a review happened. Head-bound
+evidence names a commit; the hub refuses evidence for a commit older than the run head, and the head
+only moves to a commit the run has not seen. The hub refuses a review recorded with the same agent
+token and session as an author; it cannot tell two sessions apart beyond that. When a repository has
+a forge connection, only the lock file on the default branch sets adoption; a checkout's report is
+refused (`forge_authoritative`).
 
 ## Trust boundary and limits
 

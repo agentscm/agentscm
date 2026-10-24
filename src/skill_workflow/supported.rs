@@ -79,7 +79,7 @@ pub enum EvidenceKind {
 
 impl EvidenceKind {
     /// Evidence that does not belong to one head commit: it never goes stale and does not
-    /// advance the head (a merge commit and the post-merge main are not the branch head).
+    /// advance the head (a merge commit and the post-merge default branch are not the branch head).
     fn head_bound(self) -> bool {
         !matches!(self, Self::TaskBranch | Self::Merged | Self::PostMergeCheck)
     }
@@ -373,12 +373,26 @@ impl SupportedManifest {
 
 // ---- Embedded catalog -------------------------------------------------------------------
 
-const PR_GATE_V1: &[u8] = include_bytes!("../../skills/supported/pr-gate/v1/skill.json");
+// Inside src/ so the Docker build context (which copies src/ only) contains them.
+const PR_GATE_V1: &[u8] = include_bytes!("supported/pr_gate/v1/skill.json");
+const PR_GATE_V1_PROCEDURE: &[u8] = include_bytes!("supported/pr_gate/v1/SKILL.md");
+
+/// The pinned digest: sha256 over a domain-separated, length-prefixed encoding of the manifest
+/// and the procedure, so changing either changes the pin.
+fn bundle_digest(manifest: &[u8], procedure: &[u8]) -> String {
+    let mut bytes = b"agentscm-supported-skill/v1\0".to_vec();
+    for part in [manifest, procedure] {
+        bytes.extend_from_slice(&(part.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(part);
+    }
+    digest(&bytes)
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CatalogEntry {
     pub name: String,
     pub workflow_version: u32,
+    /// Bundle digest of `skill.json` and `SKILL.md`; what a lock pins.
     pub sha256: String,
     pub summary: String,
     pub applicability: Applicability,
@@ -387,6 +401,8 @@ pub struct CatalogEntry {
     /// Plain-English steps with default parameters.
     pub walkthrough: Vec<String>,
     pub first_party: bool,
+    /// The agent-facing procedure (`SKILL.md`).
+    pub procedure: String,
     #[serde(skip)]
     pub manifest: SupportedManifest,
 }
@@ -395,20 +411,21 @@ pub struct CatalogEntry {
 pub fn catalog() -> &'static [CatalogEntry] {
     static CATALOG: OnceLock<Vec<CatalogEntry>> = OnceLock::new();
     CATALOG.get_or_init(|| {
-        [PR_GATE_V1]
+        [(PR_GATE_V1, PR_GATE_V1_PROCEDURE)]
             .into_iter()
-            .map(|bytes| {
+            .map(|(bytes, procedure)| {
                 let manifest = SupportedManifest::parse(bytes).expect("embedded manifest is valid");
                 CatalogEntry {
                     name: manifest.name.clone(),
                     workflow_version: manifest.workflow_version,
-                    sha256: digest(bytes),
+                    sha256: bundle_digest(bytes, procedure),
                     summary: manifest.summary.clone(),
                     applicability: manifest.applicability.clone(),
                     parameters: manifest.parameters.clone(),
                     gates: manifest.gates.clone(),
                     walkthrough: walkthrough(&manifest, None),
                     first_party: true,
+                    procedure: String::from_utf8_lossy(procedure).into_owned(),
                     manifest,
                 }
             })
@@ -468,14 +485,18 @@ fn evidence_words(spec: &EvidenceSpec, params: &Params) -> String {
 fn enforce_words(e: Enforce) -> &'static str {
     match e {
         Enforce::Stop => {
-            "Blocks: the Stop hook keeps the author's session from finishing until this is recorded."
+            "Blocks if the opt-in Stop hook is installed: the author's session cannot finish until this is recorded."
         }
         Enforce::ForgeStatus => {
             "Warns only for now: a merge check (forge status) is planned but not built."
         }
-        Enforce::Native => "Blocks native approval and landing for this target.",
+        Enforce::Native => {
+            "Planned: native approval and landing checks are not built for skill gates yet."
+        }
         Enforce::Advise => "Warns only.",
-        Enforce::Signal => "Recorded only; the planned main-red alert is not built yet.",
+        Enforce::Signal => {
+            "Recorded only; the planned alert for a red default branch is not built yet."
+        }
     }
 }
 
@@ -699,7 +720,10 @@ pub fn instruction_section(lock: &SkillLock) -> String {
                 if !a.not_for.is_empty() {
                     out += &format!("  Not for: {}.\n", a.not_for.join("; "));
                 }
-                out += &format!("  Procedure: `{}`\n", e.manifest.skill.entrypoint);
+                out += &format!(
+                    "  Procedure: run `agentscm skill show {}` (MCP `agentscm_skill_list`).\n",
+                    p.name
+                );
             }
             (status, _) => {
                 let why = match status {
@@ -851,6 +875,9 @@ impl Evidence {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredEvidence {
     pub id: String,
+    /// The recording token's id; kept for the independence check, never serialized.
+    #[serde(skip)]
+    pub token_id: String,
     pub session: String,
     pub agent: String,
     pub recorded_at: u64,
@@ -1069,7 +1096,7 @@ fn next_action(manifest: &SupportedManifest, gate: &str, head: &str, params: &Pa
             }
             s
         }
-        "post_merge" => "Run the post-merge regression pass on the final main and record it.".into(),
+        "post_merge" => "Run the post-merge regression pass on the default branch and record it.".into(),
         other => manifest.gate(other).map_or_else(
             || format!("Record evidence for gate {other}."),
             |g| g.plain.clone(),
@@ -1167,12 +1194,18 @@ fn refuse(code: &'static str, message: impl Into<String>) -> Refusal {
     }
 }
 
-/// Whether `session` may record `new` given the run's `existing` evidence. Pure.
+/// Who records: the authenticated token and the hub's canonical session name.
+pub struct Who<'a> {
+    pub token: &'a str,
+    pub session: &'a str,
+}
+
+/// Whether `who` may record `new` given the run's `existing` evidence. Pure.
 pub fn admit(
     manifest: &SupportedManifest,
     existing: &[StoredEvidence],
     new: &Evidence,
-    session: &str,
+    who: &Who<'_>,
 ) -> std::result::Result<(), Refusal> {
     new.validate()
         .map_err(|e| refuse("invalid", e.to_string()))?;
@@ -1185,18 +1218,31 @@ pub fn admit(
                 format!("gate {} does not accept {:?}", new.gate, new.kind),
             )
         })?;
-    if gate.by != Role::Author && new.kind.head_bound() && !existing.is_empty() {
+    if new.kind.head_bound() && !existing.is_empty() {
         let head = head_of(manifest, existing);
         if head != new.head_sha {
-            return Err(refuse(
-                "stale_head",
-                format!("the run head is {}, not {}", head, new.head_sha),
-            ));
+            let seen = existing
+                .iter()
+                .any(|e| e.evidence.kind.head_bound() && e.evidence.head_sha == new.head_sha);
+            if seen {
+                // The head only moves to a commit the run has not seen.
+                return Err(refuse(
+                    "stale_head",
+                    format!("head {} is older than the run head {head}", new.head_sha),
+                ));
+            }
+            if gate.by != Role::Author {
+                return Err(refuse(
+                    "stale_head",
+                    format!("the run head is {head}, not {}", new.head_sha),
+                ));
+            }
         }
     }
     if new.kind == EvidenceKind::IndependentReview {
         let author = existing.iter().any(|e| {
-            e.session == session
+            e.token_id == who.token
+                && e.session == who.session
                 && manifest
                     .gate(&e.evidence.gate)
                     .is_some_and(|g| g.by == Role::Author)
@@ -1204,7 +1250,7 @@ pub fn admit(
         if author {
             return Err(refuse(
                 "not_independent",
-                "an author session cannot review its own work",
+                "an author recorded with this same agent token and session; the hub cannot tell two sessions apart beyond that",
             ));
         }
     }
@@ -1243,6 +1289,7 @@ mod tests {
     ) -> StoredEvidence {
         StoredEvidence {
             id: "e".into(),
+            token_id: "t1".into(),
             session: session.into(),
             agent: "claude".into(),
             recorded_at: 10,
@@ -1304,6 +1351,17 @@ mod tests {
     }
 
     #[test]
+    fn the_pin_covers_the_procedure_as_well_as_the_manifest() {
+        let c = &catalog()[0];
+        assert_eq!(c.sha256, bundle_digest(PR_GATE_V1, PR_GATE_V1_PROCEDURE));
+        assert_ne!(c.sha256, bundle_digest(PR_GATE_V1, b"changed"));
+        // Moving a byte between the two parts changes the digest.
+        assert_ne!(bundle_digest(b"ab", b"c"), bundle_digest(b"a", b"bc"));
+        assert!(c.procedure.starts_with("---\nname: pr-gate"));
+        assert!(c.procedure.contains("same agent token and session"));
+    }
+
+    #[test]
     fn parse_refusals() {
         let good = String::from_utf8(PR_GATE_V1.to_vec()).unwrap();
         let bad = |s: String| SupportedManifest::parse(s.as_bytes()).unwrap_err();
@@ -1349,12 +1407,18 @@ mod tests {
         let w = walkthrough(&m, None);
         assert_eq!(w.len(), m.gates.len());
         assert!(w[1].starts_with("2. Tests: The author runs the tests on the exact head commit. Done by the author agent."));
-        assert!(w[1].contains("Blocks: the Stop hook"));
+        assert!(w[1].contains("Blocks if the opt-in Stop hook is installed"));
+        assert!(
+            enforce_words(Enforce::Native)
+                .starts_with("Planned: native approval and landing checks are not built")
+        );
         assert!(w[2].contains("a different session (not the author)"));
         assert!(w[4].starts_with("5. CI: "));
         assert!(w[4].contains("planned but not built"));
         assert!(w[5].contains("a maintainer (a person)"));
-        assert!(w[7].contains("Recorded only; the planned main-red alert is not built yet."));
+        assert!(w[7].contains(
+            "Recorded only; the planned alert for a red default branch is not built yet."
+        ));
         assert!(!w[4].contains("label"));
         let mut p = m.effective_params(None).unwrap();
         p.insert("ci_label".into(), "ci-extended".into());
@@ -1369,7 +1433,7 @@ mod tests {
         let sha = catalog()[0].sha256.clone();
         let lock = |sha: &str, v: u32| {
             format!(
-                r#"{{"version":1,"skills":[{{"name":"pr-gate","workflow_version":{v},"path":"skills/supported/pr-gate/v1/skill.json","sha256":"{sha}"}}]}}"#
+                r#"{{"version":1,"skills":[{{"name":"pr-gate","workflow_version":{v},"path":"src/skill_workflow/supported/pr_gate/v1/skill.json","sha256":"{sha}"}}]}}"#
             )
         };
         let with = |extra: &str| lock(&sha, 1).replace("}]}", &format!(",{extra}}}]}}"));
@@ -1403,7 +1467,12 @@ mod tests {
         let wrong = SkillLock::parse(lock(&sha, 2).as_bytes()).unwrap();
         assert_eq!(resolve(&wrong)[0].status, AdoptionStatus::UnknownVersion);
         assert!(
-            SkillLock::parse(lock(&sha, 1).replace("skills/supported", "../x").as_bytes()).is_err()
+            SkillLock::parse(
+                lock(&sha, 1)
+                    .replace("src/skill_workflow", "../x")
+                    .as_bytes()
+            )
+            .is_err()
         );
         assert!(SkillLock::parse(br#"{"version":2,"skills":[]}"#).is_err());
         assert!(SkillLock::parse(br#"{"version":1,"skills":[],"x":1}"#).is_err());
@@ -1672,49 +1741,70 @@ mod tests {
         ev(gate, kind, head, "x", None).evidence
     }
 
+    fn who<'a>(token: &'a str, session: &'a str) -> Who<'a> {
+        Who { token, session }
+    }
+
     #[test]
     fn admission_rules() {
         let m = manifest();
         let list = vec![branch(), tests(A)];
         let review_new = new_evidence("review", EvidenceKind::IndependentReview, A);
+        // Same token and session as an author: refused. Another token with the same session
+        // name, or the same token with another session, is allowed.
         assert_eq!(
-            admit(&m, &list, &review_new, "auth").unwrap_err().code,
+            admit(&m, &list, &review_new, &who("t1", "auth"))
+                .unwrap_err()
+                .code,
             "not_independent"
         );
-        assert!(admit(&m, &list, &review_new, "other").is_ok());
+        assert!(admit(&m, &list, &review_new, &who("t2", "auth")).is_ok());
+        assert!(admit(&m, &list, &review_new, &who("t1", "other")).is_ok());
         let stale = new_evidence("review", EvidenceKind::IndependentReview, B);
         assert_eq!(
-            admit(&m, &list, &stale, "other").unwrap_err().code,
+            admit(&m, &list, &stale, &who("t2", "other"))
+                .unwrap_err()
+                .code,
             "stale_head"
         );
         let unknown = new_evidence("nope", EvidenceKind::RevisionTests, A);
         assert_eq!(
-            admit(&m, &list, &unknown, "s").unwrap_err().code,
+            admit(&m, &list, &unknown, &who("t1", "s"))
+                .unwrap_err()
+                .code,
             "unknown_gate"
         );
         let wrong_kind = new_evidence("tests", EvidenceKind::HumanApproval, A);
         assert_eq!(
-            admit(&m, &list, &wrong_kind, "s").unwrap_err().code,
+            admit(&m, &list, &wrong_kind, &who("t1", "s"))
+                .unwrap_err()
+                .code,
             "unknown_gate"
         );
-        // Authors may push a new head.
-        assert!(
-            admit(
-                &m,
-                &list,
-                &new_evidence("tests", EvidenceKind::RevisionTests, B),
-                "auth"
-            )
-            .is_ok()
+        // Authors may push a new head, but never move back to one the run has seen.
+        let to_b = new_evidence("tests", EvidenceKind::RevisionTests, B);
+        assert!(admit(&m, &list, &to_b, &who("t1", "auth")).is_ok());
+        let mut moved = list.clone();
+        moved.push(tests(B));
+        let back = new_evidence("tests", EvidenceKind::RevisionTests, A);
+        let refused = admit(&m, &moved, &back, &who("t1", "auth")).unwrap_err();
+        assert_eq!(refused.code, "stale_head");
+        assert!(refused.message.contains("older than the run head"));
+        let old_review = new_evidence("review", EvidenceKind::IndependentReview, A);
+        assert_eq!(
+            admit(&m, &moved, &old_review, &who("t2", "rev"))
+                .unwrap_err()
+                .code,
+            "stale_head"
         );
         // First evidence of a run, and a merge commit, are not stale.
-        assert!(admit(&m, &[], &review_new, "other").is_ok());
+        assert!(admit(&m, &[], &review_new, &who("t2", "other")).is_ok());
         assert!(
             admit(
                 &m,
                 &list,
                 &new_evidence("merge", EvidenceKind::Merged, B),
-                "m"
+                &who("t3", "m")
             )
             .is_ok()
         );
@@ -1725,16 +1815,28 @@ mod tests {
         let m = manifest();
         let mut e = new_evidence("tests", EvidenceKind::RevisionTests, A);
         e.summary = "x".repeat(501);
-        assert_eq!(admit(&m, &[], &e, "s").unwrap_err().code, "invalid");
+        assert_eq!(
+            admit(&m, &[], &e, &who("t1", "s")).unwrap_err().code,
+            "invalid"
+        );
         e.summary = "ok".into();
         e.url = Some("u".repeat(2049));
-        assert_eq!(admit(&m, &[], &e, "s").unwrap_err().code, "invalid");
+        assert_eq!(
+            admit(&m, &[], &e, &who("t1", "s")).unwrap_err().code,
+            "invalid"
+        );
         e.url = None;
         e.head_sha = "abc".into();
-        assert_eq!(admit(&m, &[], &e, "s").unwrap_err().code, "invalid");
+        assert_eq!(
+            admit(&m, &[], &e, &who("t1", "s")).unwrap_err().code,
+            "invalid"
+        );
         e.head_sha = A.into();
         e.assurance = Assurance::Receipt;
-        assert_eq!(admit(&m, &[], &e, "s").unwrap_err().code, "invalid");
+        assert_eq!(
+            admit(&m, &[], &e, &who("t1", "s")).unwrap_err().code,
+            "invalid"
+        );
     }
 
     #[test]
@@ -1743,7 +1845,11 @@ mod tests {
         m.gates[1].min_assurance = Assurance::Observed;
         let v = evaluate(&m, &ident(), &[branch(), tests(A)]);
         assert_eq!(v.current_gate.as_deref(), Some("tests"));
-        let v = run(&[branch(), tests(A)]);
+        let mut v = run(&[branch(), tests(A)]);
+        // The token id is never serialized.
+        for e in v.gates.iter_mut().flat_map(|g| g.evidence.iter_mut()) {
+            e.token_id.clear();
+        }
         let json = serde_json::to_string(&v).unwrap();
         assert!(json.contains("\"self_reported\""));
         assert_eq!(serde_json::from_str::<RunView>(&json).unwrap(), v);

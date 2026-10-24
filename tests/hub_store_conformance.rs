@@ -2309,6 +2309,7 @@ fn skill_adoption_and_evidence(db: &Db) {
         url: None,
         pull_request: Some(4),
         detail: Some("{\"exit_code\":0}".into()),
+        token_id: "tok_a".into(),
         session: "s".into(),
         agent: "claude".into(),
         recorded_at: at,

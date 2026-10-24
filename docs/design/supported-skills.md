@@ -109,9 +109,9 @@ the schema or the lock format.
 A supported skill is a directory with the same layout as a reusable workflow template:
 
 ```text
-skills/supported/pr-gate/v1/SKILL.md      # instructions for the agent (advice)
-skills/supported/pr-gate/v1/skill.json    # the declarative unit (checked)
-skills/supported/pr-gate/v1/runner.json   # optional command recipe for native steps
+src/skill_workflow/supported/pr_gate/v1/SKILL.md      # instructions for the agent (advice)
+src/skill_workflow/supported/pr_gate/v1/skill.json    # the declarative unit (checked)
+src/skill_workflow/supported/pr_gate/v1/runner.json   # optional command recipe for native steps
 ```
 
 `skill.json` is a workflow template manifest with `version: 2`. Version 2 keeps every version 1
@@ -149,7 +149,7 @@ no gates.
   "name": "pr-gate",
   "workflow_version": 1,
   "summary": "Evidence-gated pull requests: tests, independent review, fixes, CI and approval before merge, then a post-merge check.",
-  "skill": { "entrypoint": "skills/supported/pr-gate/v1/SKILL.md", "resources": [] },
+  "skill": { "entrypoint": "src/skill_workflow/supported/pr_gate/v1/SKILL.md", "resources": [] },
   "applicability": {
     "triggers": ["starting a task that will become a pull request", "opening or updating a pull request", "before merging a pull request", "after a pull request merges"],
     "prerequisites": ["a Git repository with pull requests on GitHub or GitLab", "the AgentSCM hub connected for this repository"],
@@ -226,13 +226,17 @@ capture excludes it.
 - **Parameters** are overrides validated against the manifest's declared parameters; unknown names
   or wrong types make the pin `invalid_params`. Effective values (defaults overlaid by the pin) are
   shown wherever a run is shown.
-- **First-party skills ship in the binary.** The AgentSCM release embeds `skills/supported/*`, so
-  the Hub can evaluate a pinned skill without reading the repository. The lock file's SHA must match
-  the embedded bytes; a mismatch is shown as `unknown_version`, never silently resolved to
+- **First-party skills ship in the binary.** The AgentSCM release embeds `skill.json` and `SKILL.md` from
+  `src/skill_workflow/supported/` (inside the crate so the Docker build context has them), so the Hub
+  can evaluate a pinned skill without reading the repository. The lock file's `sha256` is a bundle
+  digest, SHA-256 over `agentscm-supported-skill/v1\0` and the length-prefixed bytes of both files, so
+  it must match the embedded manifest and procedure; a mismatch is shown as `unknown_version`, never silently resolved to
   another version.
 - **Authority for adoption** is the lock file on the default branch (decision 3). When the Hub has a
   forge connection for the repository it reads the lock file from the default branch; otherwise it
-  uses the lock file the checkout reports and labels it `reported by checkout`.
+  uses the lock file the checkout reports and labels it `reported by checkout`. With a forge connection a checkout's
+   report is refused (409 `forge_authoritative`), so a local lock changes nothing until it is on the
+   default branch.
 - **Workspace-level adoption** (one skill required for every repository in a Community workspace)
   is a later step: a workspace setting that lists pins, shown alongside the repository's own.
 
@@ -242,8 +246,9 @@ An agent should not need the orchestrator's prompt to know the rules.
 
 - **Instruction files.** When `agentscm-skills.lock.json` exists, `init-repo` adds a short
   *Supported skills* section inside its existing marked block: each adopted skill and version, its
-  triggers ("Follow when: …"), its `not_for` line, and the commands and MCP tools to call. The block points at the skill's `SKILL.md`
-  for the procedure instead of copying it.
+  triggers ("Follow when: …"), its `not_for` line, and the commands and MCP tools to call. The block points at
+  `agentscm skill show NAME` (and MCP `agentscm_skill_list`) for the procedure instead of copying it
+  or naming a repository path. The hub library entry carries the procedure text.
 - **MCP.** Three Hub tools:
   - `agentscm_skill_list {repo}` → the catalog and this repository's pins with applicability
     (triggers, prerequisites, not_for) and effective parameters, so an agent decides on its own when
@@ -264,9 +269,9 @@ Each gate's `enforce` field names one of four choke points. No new blocking mech
 
 | `enforce` | Choke point (existing) | Behavior |
 |---|---|---|
-| `stop` | The local Stop hook (`src/agent_stop.rs` shape, new `skill-stop` mode) | Blocks the author session from finishing while the run sits at an **agent-actionable** gate (tests, review, fix) without sufficient evidence for the current head. The block reason is the next action from `agentscm_skill_status`. Gates that wait on others (CI, approval) never block; the hook lets the session stop with a handover note. The 8-continuation cap applies unchanged. |
+| `stop` | The opt-in local Stop hook (`src/agent_stop.rs` shape, `agentscm skill stop`; it blocks only where the user installed it) | Blocks the author session from finishing while the run sits at an **agent-actionable** gate (tests, review, fix) without sufficient evidence for the current head. The block reason is the next action from `agentscm_skill_status`. Gates that wait on others (CI, approval) never block; the hook lets the session stop with a handover note. The 8-continuation cap applies unchanged. |
 | `forge_status` | A Hub-posted commit status `agentscm/skill/<name>` on the pull request head, using the forge-check posting journal | `pending` until every pre-merge gate has sufficient evidence for the exact head SHA, then `success`. A new push resets it. It blocks merging only when an operator requires the context in a ruleset; AgentSCM never edits protections. |
-| `native` | Installed target requirement → `approve` / `integrate` | For `native_change` subjects, gates that cite `workflow_receipt` compile to an ordinary template instantiation and requirement. This path already blocks. |
+| `native` | Installed target requirement → `approve` / `integrate` | **Planned.** For `native_change` subjects, gates that cite `workflow_receipt` would compile to an ordinary template instantiation and requirement, which the existing native path already enforces; nothing compiles skill gates to it yet. |
 | `advise`, `signal` | Instruction files, MCP status, Hub UI; `signal` also notifies other sessions (section 4.2) | Shown and recorded, never blocking. |
 
 What stays advice in every version of this design, and the docs will say so: branch per task,
@@ -309,7 +314,7 @@ commits to the default branch or exploratory work that will not be merged.
 |---|---|---|---|---|
 | branch | `task_branch` | self-reported (phase 2); observed later | advise | Flag pushes to the target and branches shared by two work items. |
 | tests | `revision_tests` on head | self-reported (phase 2); receipt when a managed recipe or native step exists | stop | The command and its result for the exact head SHA. A new push invalidates it. |
-| review | `independent_review` on head | self-reported; receipt for `claude_code_review` | stop | Reviewer session must differ from every author session that pushed to the head. Records findings with IDs and `blocking` flags. |
+| review | `independent_review` on head | self-reported; receipt for `claude_code_review` | stop | The hub refuses a review recorded with the same agent token and session as an author; it cannot tell two sessions apart beyond that. Records findings with IDs and `blocking` flags. |
 | fix | `findings_resolved` | self-reported | stop | Each blocking finding is fixed at a later head (and the review is re-run on that head) or dismissed by a maintainer. |
 | ci | `hosted_ci` | self-reported (phase 2); observed later | forge status | Green on the exact head. With `ci_label` set, the next action names the label to add; with the default (null) it waits for whatever checks the repository requires. |
 | approval | `human_approval` on head | self-reported (phase 2); observed later | forge status | Forge approval or native `approve`. |
@@ -474,7 +479,7 @@ AgentSCM's own pull requests use:
 1. **Definition.** `src/skill_workflow/supported.rs`: template manifest version 2 (`subjects`,
    `roles`, `gates`, evidence kinds, assurance), strict parsing and bounds reusing `library.rs`;
    `summary`, `applicability` and `parameters`; a pure `evaluate(manifest, evidence, head_sha) ->
-   RunView` (current gate, per-gate state, stale evidence, next action from effective parameters). `skills/supported/pr-gate/v1/{SKILL.md, skill.json}` embedded in the
+   RunView` (current gate, per-gate state, stale evidence, next action from effective parameters). `src/skill_workflow/supported/pr_gate/v1/{SKILL.md, skill.json}` embedded in the
    binary. Unit tests for parsing, refusal of unknown fields and every gate transition, including a
    new push invalidating head-bound evidence and a reviewer equal to an author being refused.
 2. **Catalog, adoption and discovery.** `agentscm-skills.lock.json` with `source` and `params`;

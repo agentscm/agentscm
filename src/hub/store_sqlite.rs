@@ -6056,9 +6056,9 @@ impl Store for SqliteStore {
     fn skill_evidence_add(&self, r: &EvidenceRow) -> Result<()> {
         self.conn().execute(
             "INSERT INTO hub_skill_evidence (id, repository, branch, run_id, skill, skill_sha256,
-                 gate, kind, head_sha, assurance, summary, url, pull_request, detail, session,
-                 agent, recorded_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                 gate, kind, head_sha, assurance, summary, url, pull_request, detail, token_id,
+                 session, agent, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 r.id,
                 r.repository,
@@ -6074,6 +6074,7 @@ impl Store for SqliteStore {
                 r.url,
                 r.pull_request,
                 r.detail,
+                r.token_id,
                 r.session,
                 r.agent,
                 r.recorded_at
@@ -6086,7 +6087,8 @@ impl Store for SqliteStore {
         let conn = self.conn();
         let mut statement = conn.prepare(
             "SELECT id, repository, branch, run_id, skill, skill_sha256, gate, kind, head_sha,
-                    assurance, summary, url, pull_request, detail, session, agent, recorded_at
+                    assurance, summary, url, pull_request, detail, token_id, session, agent,
+                    recorded_at
              FROM hub_skill_evidence WHERE repository = ?1 AND run_id = ?2 ORDER BY seq",
         )?;
         let rows = statement
@@ -6106,9 +6108,10 @@ impl Store for SqliteStore {
                     url: row.get(11)?,
                     pull_request: row.get(12)?,
                     detail: row.get(13)?,
-                    session: row.get(14)?,
-                    agent: row.get(15)?,
-                    recorded_at: row.get(16)?,
+                    token_id: row.get(14)?,
+                    session: row.get(15)?,
+                    agent: row.get(16)?,
+                    recorded_at: row.get(17)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;

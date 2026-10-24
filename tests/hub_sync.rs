@@ -2370,7 +2370,7 @@ async fn a_lock_file_on_the_default_branch_becomes_the_adoption_and_wins_over_a_
     };
     let adoption = "/v1/hub/repos/acme%2Fwidgets/skills/adoption";
 
-    // Nothing on the forge yet: a checkout's report applies.
+    // Not connected to the forge yet: a checkout's report applies.
     let (status, reply) = env
         .call(Method::PUT, adoption, Some(&agent), Some(lock(vec![])))
         .await;
@@ -2399,13 +2399,18 @@ async fn a_lock_file_on_the_default_branch_becomes_the_adoption_and_wins_over_a_
     assert_eq!(library["adoption"]["pins"][0]["name"], "pr-gate");
     assert_eq!(library["adoption"]["pins"][0]["status"], "adopted");
 
-    // A later checkout report no longer replaces it, and the reply says so.
-    let (_, reply) = env
+    // Once the repository is connected, a checkout report is refused and the forge's lock stays.
+    let (status, reply) = env
         .call(Method::PUT, adoption, Some(&agent), Some(lock(vec![])))
         .await;
     assert_eq!(
-        (reply["source"].clone(), reply["applied"].clone()),
-        (json!("default_branch"), json!(false)),
+        (status, reply["error"].clone()),
+        (409, json!("forge_authoritative")),
         "{reply}"
     );
+    let (_, library) = env
+        .get("/v1/hub/skills?repo=acme%2Fwidgets", Some(&agent))
+        .await;
+    assert_eq!(library["adoption"]["source"], "default_branch");
+    assert_eq!(library["adoption"]["pins"][0]["status"], "adopted");
 }
