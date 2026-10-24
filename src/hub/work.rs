@@ -374,12 +374,29 @@ pub struct WorkSearchPage {
     pub complete: bool,
 }
 
+/// Reads a [`WorkSearchPage`] cursor, `<updated_at>:<id>`, as the position to continue after.
+pub(super) fn parse_search_cursor(cursor: &str) -> Result<(i64, String)> {
+    let (at, id) = cursor
+        .split_once(':')
+        .filter(|(at, _)| {
+            !at.is_empty() && at.len() <= 18 && at.bytes().all(|b| b.is_ascii_digit())
+        })
+        .ok_or_else(|| HubError::Invalid("malformed cursor".into()))?;
+    validate_id("cursor", id, "wrk")?;
+    let at = at
+        .parse()
+        .map_err(|_| HubError::Invalid("malformed cursor".into()))?;
+    Ok((at, id.to_owned()))
+}
+
 impl WorkSearchPage {
     /// `items` read with `limit + 1`: the extra row only says more exist.
     pub(super) fn of(mut items: Vec<WorkSearchItem>, limit: usize) -> Self {
         let more = items.len() > limit;
         items.truncate(limit);
-        let next_cursor = more.then(|| items.last().map(|i| i.id.clone())).flatten();
+        let next_cursor = more
+            .then(|| items.last().map(|i| format!("{}:{}", i.updated_at, i.id)))
+            .flatten();
         Self {
             items,
             next_cursor,

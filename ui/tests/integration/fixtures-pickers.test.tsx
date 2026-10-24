@@ -5,7 +5,8 @@ import App from '../../src/App.tsx'
 import { ChangeRecordPage } from '../../src/pages/ChangeRecord.tsx'
 import { LandedPage } from '../../src/pages/Landed.tsx'
 import { saveToken } from '../../src/storage.ts'
-import { stubHub } from '../fixtures/mockFetch.ts'
+import { WorkflowsPage } from '../../src/pages/Workflows.tsx'
+import { json, stubHub } from '../fixtures/mockFetch.ts'
 
 const LOAD = { timeout: 5_000 }
 const REPO = 'acme/widgets'
@@ -85,5 +86,38 @@ describe('Activity load older', () => {
     await screen.findByText('That’s everything.', {}, LOAD)
     expect(screen.getAllByRole('listitem').length).toBeGreaterThan(before + 100)
     expect(button).toBeTruthy()
+  })
+})
+
+describe('Searching older pages from a picker', () => {
+  it('Workflows: an empty scan with a cursor offers "Search older runs", which requests before=<cursor>', async () => {
+    const run = { run_id: 'old-match', revision: 'a'.repeat(64), state: 'succeeded', name: 'Old gate', sequence: '10' }
+    const sent = stubHub((url) => {
+      if (url.pathname !== '/v1/hub/skill-workflows' || !url.searchParams.has('q')) return undefined
+      return url.searchParams.get('before') === '77'
+        ? json(200, { version: 1, availability: 'available', runs: [run], next_cursor: null })
+        : json(200, { version: 1, availability: 'available', runs: [], next_cursor: '77' })
+    })
+    render(<WorkflowsPage token="fixture-token" repository={REPO} />)
+    const box = await screen.findByRole('combobox', { name: 'Find a run' }, LOAD)
+    fireEvent.focus(box)
+    fireEvent.change(box, { target: { value: 'old gate' } })
+    await screen.findByText('No matches in the newest runs searched', {}, LOAD)
+    fireEvent.click(screen.getByRole('option', { name: 'Search older runs' }))
+    await screen.findByRole('option', { name: /Old gate/ }, LOAD)
+    expect(sent.some((r) => r.url.includes('before=77') && r.url.includes('q=old+gate'))).toBe(true)
+  })
+
+  it('Change records: "Show more results" follows next_cursor', async () => {
+    const sent = stubHub()
+    render(<ChangeRecordPage repo={REPO} token="fixture-token" />)
+    const picker = screen.getByRole('combobox', { name: 'Find a work item' })
+    fireEvent.focus(picker)
+    fireEvent.change(picker, { target: { value: 'Synthetic' } })
+    await screen.findAllByRole('option', {}, LOAD)
+    const first = screen.getAllByRole('option').length
+    fireEvent.click(await screen.findByRole('option', { name: 'Show more results' }, LOAD))
+    await waitFor(() => expect(screen.getAllByRole('option').length).toBeGreaterThan(first), LOAD)
+    expect(sent.some((r) => r.url.startsWith('/v1/hub/standup/work?') && r.url.includes('cursor=wrk_'))).toBe(true)
   })
 })

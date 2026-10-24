@@ -120,6 +120,7 @@ pub fn list_page(
             return Ok(crate::skill_workflow::runtime::RunPage {
                 runs: vec![],
                 next_cursor: None,
+                searched_to: None,
             });
         }
         Err(error) => return Err(error.into()),

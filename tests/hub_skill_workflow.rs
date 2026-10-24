@@ -246,12 +246,16 @@ async fn run_search_scans_a_bounded_window_and_continues_by_cursor() {
     assert_eq!(status, 200, "{first}");
     assert!(first["runs"].as_array().unwrap().is_empty(), "{first}");
     assert_eq!(first["next_cursor"], "45");
+    assert_eq!(first["searched_to"], "45", "the oldest sequence examined");
     let (_, second) = hub
         .get("/v1/hub/skill-workflows?q=run-1&before=45", &token)
         .await;
     assert_eq!(second["runs"][0]["run_id"], "run-1", "{second}");
     assert_eq!(second["runs"].as_array().unwrap().len(), 1);
     assert_eq!(second["next_cursor"], Value::Null);
+    assert_eq!(second["searched_to"], "1");
+    let (_, plain) = hub.get("/v1/hub/skill-workflows", &token).await;
+    assert!(plain.get("searched_to").is_none());
 
     // Few matches inside a full window still carry the continuation cursor.
     let (_, few) = hub.get("/v1/hub/skill-workflows?q=bulk-29", &token).await;

@@ -20,7 +20,7 @@ import {
 import { searchStandupWork, validWorkId, type WorkState } from '../standup.ts'
 import { StatePill } from './Work.tsx'
 import { Ago, Box, Empty, Explain, Icon, Notice, Path, Paths, Pill, Skeleton, relative, type Tone } from '../ui.tsx'
-import { Combobox } from '../Combobox.tsx'
+import { Combobox, type ComboResult } from '../Combobox.tsx'
 import { hashPath } from '../Pager.tsx'
 import { usePoll } from '../usePoll.ts'
 
@@ -171,10 +171,12 @@ function Lookup({ token }: { token: string }) {
             describedBy="change-record-work-id-help"
             parseId={(t) => (validWorkId(t) ? t : null)}
             onSelect={(id) => { window.location.hash = changeRecordHref(id).slice(1) }}
-            search={async (q, signal) => {
-              const r = await searchStandupWork(token, signal, { q, limit: 10 })
+            search={async function page(q, signal, cursor?: string): Promise<ComboResult> {
+              const r = await searchStandupWork(token, signal, { q, limit: 10, ...(cursor ? { cursor } : {}) })
+              const next = r.next_cursor
               return {
-                more: r.next_cursor !== null,
+                more: next !== null,
+                ...(next !== null ? { loadMore: (s: AbortSignal) => page(q, s, next) } : {}),
                 options: r.items.map((w) => ({
                   value: w.id,
                   text: w.title,

@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
-import { Combobox, type ComboOption } from '../../src/Combobox.tsx'
+import { Combobox, type ComboOption, type ComboResult } from '../../src/Combobox.tsx'
 
 const opt = (value: string, text = value): ComboOption => ({ value, text, label: text, secondary: `id-${value}` })
 const OPTIONS = [opt('a', 'Alpha branch'), opt('b', 'Beta branch'), opt('c', 'Gamma')]
@@ -12,12 +12,13 @@ describe('Combobox (client filter)', () => {
     render(<Combobox id="p" label="Pick" options={OPTIONS} onSelect={() => {}} data-tour="x-picker" />)
     expect(input().getAttribute('aria-expanded')).toBe('false')
     expect(input().getAttribute('aria-autocomplete')).toBe('list')
-    expect(input().getAttribute('aria-controls')).toBe('p-listbox')
+    expect(input().getAttribute('aria-controls')).toBeNull()
     expect(document.querySelector('[data-tour="x-picker"]')).toBeTruthy()
     fireEvent.focus(input())
     expect(input().getAttribute('aria-expanded')).toBe('true')
     const list = screen.getByRole('listbox')
     expect(list.id).toBe('p-listbox')
+    expect(input().getAttribute('aria-controls')).toBe('p-listbox')
     expect(screen.getAllByRole('option')).toHaveLength(3)
     expect(screen.getAllByRole('option').every((o) => o.getAttribute('aria-selected') === 'false')).toBe(true)
     // The ID is secondary text, the label is primary.
@@ -152,5 +153,35 @@ describe('Combobox (server search)', () => {
     fireEvent.change(input(), { target: { value: 'id_7' } })
     fireEvent.keyDown(input(), { key: 'Enter' })
     expect(onSelect).toHaveBeenCalledWith('id_7', expect.anything())
+  })
+})
+
+describe('Combobox (older pages)', () => {
+  const page = (n: number): ComboResult => ({
+    options: n === 0 ? [] : [opt(`run-${n}`, `Older run ${n}`)],
+    more: n < 2,
+    moreLabel: 'Search older runs',
+    emptyMoreText: 'No matches in the newest runs searched',
+    ...(n < 2 ? { loadMore: async () => page(n + 1) } : {}),
+  })
+
+  it('says nothing matched yet when a page is empty but more exist, and reaches the next page by keyboard', async () => {
+    const onSelect = vi.fn()
+    render(<Combobox id="p" label="Pick" search={async () => page(0)} onSelect={onSelect} />)
+    fireEvent.focus(input())
+    await screen.findByText('No matches in the newest runs searched')
+    expect(screen.queryByText('No matches')).toBeNull()
+    expect(screen.queryByText(/Keep typing/)).toBeNull()
+    fireEvent.keyDown(input(), { key: 'ArrowDown' })
+    expect(screen.getByRole('option', { name: 'Search older runs' }).getAttribute('aria-selected')).toBe('true')
+    fireEvent.keyDown(input(), { key: 'Enter' })
+    await screen.findByRole('option', { name: /Older run 1/ })
+    // The popup stays open and the action remains while pages remain; the next page appends.
+    expect(input().getAttribute('aria-expanded')).toBe('true')
+    fireEvent.click(screen.getByRole('option', { name: 'Search older runs' }))
+    await screen.findByRole('option', { name: /Older run 2/ })
+    expect(screen.getAllByRole('option').map((o) => o.textContent)).toEqual(expect.arrayContaining([expect.stringContaining('Older run 1'), expect.stringContaining('Older run 2')]))
+    expect(screen.queryByRole('option', { name: 'Search older runs' })).toBeNull()
+    expect(onSelect).not.toHaveBeenCalled()
   })
 })

@@ -18,7 +18,13 @@ export interface ComboResult {
   options: ComboOption[]
   /** More matches exist than were returned. */
   more?: boolean
+  /** Fetches the next page; when set with `more`, a last "show more" option appends it. */
+  loadMore?: (signal: AbortSignal) => Promise<ComboResult>
+  moreLabel?: string
+  /** Shown instead of "No matches" when nothing matched yet but more pages remain. */
+  emptyMoreText?: string
 }
+const MORE = '\u0000more'
 
 interface Props {
   id: string
@@ -51,6 +57,7 @@ export function Combobox({ id, label, placeholder, onSelect, options, search, pa
   const [active, setActive] = useState(-1)
   const [remote, setRemote] = useState<Remote | null>(null)
   const [attempt, setAttempt] = useState(0)
+  const [loadingMore, setLoadingMore] = useState(false)
   const text = query.trim()
   const term = typed ? text : ''
   const key = `${term}|${attempt}`
@@ -82,11 +89,24 @@ export function Combobox({ id, label, placeholder, onSelect, options, search, pa
   const pasted = parseId?.(text) ?? null
   const current = remote?.key === key ? remote : null
   const shown: ComboOption[] = search ? (current?.result?.options ?? []) : (options ?? []).filter((o) => !typed || !text || o.text.toLowerCase().includes(text.toLowerCase()))
-  const items: ComboOption[] = pasted ? [{ value: pasted, label: <>Open <code>{pasted}</code></>, text: pasted }, ...shown.filter((o) => o.value !== pasted)] : shown
+  const result = current?.result ?? null
+  const canMore = !!result?.more && !!result.loadMore
+  const moreOption: ComboOption[] = canMore ? [{ value: MORE, text: '', label: loadingMore ? 'Searching…' : (result.moreLabel ?? 'Show more results') }] : []
+  const items: ComboOption[] = [...(pasted ? [{ value: pasted, label: <>Open <code>{pasted}</code></>, text: pasted }, ...shown.filter((o) => o.value !== pasted)] : shown), ...moreOption]
   const loading = !!search && !current
   const failed = !!search && !!current && current.result === null
 
+  const loadMore = () => {
+    if (!result?.loadMore || loadingMore || !remote) return
+    const base = remote
+    setLoadingMore(true)
+    result.loadMore(new AbortController().signal).then(
+      (next) => setRemote((r) => (r === base ? { key: base.key, result: { ...next, options: [...base.result!.options, ...next.options] } } : r)),
+      () => setRemote((r) => (r === base ? { key: base.key, result: null } : r)),
+    ).finally(() => setLoadingMore(false))
+  }
   const pick = (o: ComboOption) => {
+    if (o.value === MORE) return loadMore()
     setOpen(false)
     setTyped(false)
     setQuery(keepText ? o.text : '')
@@ -125,7 +145,7 @@ export function Combobox({ id, label, placeholder, onSelect, options, search, pa
         role="combobox"
         className={`form-control${invalid ? ' is-invalid' : ''}`}
         aria-expanded={open}
-        aria-controls={listId}
+        aria-controls={open ? listId : undefined}
         aria-autocomplete="list"
         aria-activedescendant={open && active >= 0 && items[active] ? `${uid}-opt-${active}` : undefined}
         aria-describedby={describedBy}
@@ -170,11 +190,11 @@ export function Combobox({ id, label, placeholder, onSelect, options, search, pa
               Could not search. <button type="button" className="btn btn-link btn-sm p-0" onClick={() => setAttempt((n) => n + 1)}>Try again</button>
             </div>
           )}
-          {!loading && !failed && items.length === 0 && <div className="combo-note small muted" role="status">{emptyText}</div>}
+          {!loading && !failed && shown.length === 0 && !pasted && <div className="combo-note small muted" role="status">{canMore ? (result.emptyMoreText ?? 'No matches in the results searched so far') : emptyText}</div>}
           {!loading && !failed && items.length > 0 && (
             <div className="visually-hidden" role="status">{items.length} result{items.length === 1 ? '' : 's'}</div>
           )}
-          {search && current?.result?.more && <div className="combo-note small muted">More matches exist. Keep typing to narrow them.</div>}
+          {search && current?.result?.more && !current.result.loadMore && <div className="combo-note small muted">More matches exist. Keep typing to narrow them.</div>}
           {footer && <div className="combo-note">{footer}</div>}
         </div>
       )}

@@ -4,7 +4,7 @@ import { validSkillWorkflowRunId, validSkillWorkflowStepId } from '../skillWorkf
 import type { SkillWorkflowProjection, SkillWorkflowRunState, SkillWorkflowStep, SkillWorkflowStepState } from '../types.ts'
 import { Box, Empty, Explain, Icon, Notice, Path, Pill, Skeleton, Tip, type Tone } from '../ui.tsx'
 import { usePoll } from '../usePoll.ts'
-import { Combobox } from '../Combobox.tsx'
+import { Combobox, type ComboResult } from '../Combobox.tsx'
 import { hashPath, Pager, useHashCursor } from '../Pager.tsx'
 
 type Route = { kind: 'list' } | { kind: 'run'; runId: string; stepId?: string }
@@ -225,11 +225,15 @@ function RunPicker({ token }: { token: string }) {
       placeholder="Find a run by name, state or ID"
       parseId={(t) => (validSkillWorkflowRunId(t) ? t : null)}
       onSelect={(id) => { window.location.hash = runHref(id).slice(1) }}
-      search={async (q, signal) => {
-        const r = await fetchSkillWorkflows(token, signal, undefined, q)
+      search={async function page(q, signal, before?: string): Promise<ComboResult> {
+        const r = await fetchSkillWorkflows(token, signal, before, q)
         if (r.availability !== 'available') return { options: [] }
+        const next = r.next_cursor
         return {
-          more: r.next_cursor !== null,
+          more: next !== null,
+          moreLabel: 'Search older runs',
+          emptyMoreText: 'No matches in the newest runs searched',
+          ...(next !== null ? { loadMore: (s: AbortSignal) => page(q, s, next) } : {}),
           options: r.runs.map((run) => {
             const st = stateOf(run.state)
             return { value: run.run_id, text: run.name, label: run.name, secondary: run.run_id, meta: <><Pill tone={st.tone}>{st.label}</Pill> <span className="small muted">rev <code>{run.revision.slice(0, 10)}</code></span></> }

@@ -269,6 +269,15 @@ fn suite(store: Arc<dyn Store>) {
             .map(|p| p.id)
             .collect()
     };
+    // Matching is ASCII-case-insensitive; non-ASCII text matches at its own case.
+    let accented = done(
+        store
+            .create_publication(&token, &new_on("Café Ünï report", "feat/uni"), now)
+            .unwrap(),
+    );
+    assert_eq!(found("Café Ünï"), std::slice::from_ref(&accented.id));
+    assert_eq!(found("ünï").len(), 0);
+    assert_eq!(found("CAFé"), std::slice::from_ref(&accented.id));
     assert_eq!(found("QUARTERLY roll"), std::slice::from_ref(&titled.id));
     assert_eq!(found("FEAT/TITLE"), std::slice::from_ref(&titled.id));
     assert_eq!(found(&titled.id[4..12]), std::slice::from_ref(&titled.id));
@@ -579,4 +588,47 @@ fn candidate_lineage_on_sqlite() {
 fn candidate_lineage_on_postgres() {
     let Some(pg) = PgSchema::create() else { return };
     candidate_suite(store::open(&pg.url).unwrap());
+}
+
+#[test]
+fn a_corrupt_manifest_row_still_lists_and_does_not_break_search() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("hub.sqlite");
+    let store = store::open(&format!("sqlite://{}", path.display())).unwrap();
+    let identity = ForgeIdentity {
+        provider: "github".into(),
+        host: "github.com".into(),
+        user_id: 7,
+    };
+    let owner = store.upsert_user(&identity, "alice").unwrap();
+    let (token, _) = mint_agent_token(&*store, &owner.id, "builder", REPO, 3600).unwrap();
+    let now = unix_now();
+    let good = done(
+        store
+            .create_publication(&token, &new_on("Findable title", "feat/good"), now)
+            .unwrap(),
+    );
+    let bad = done(
+        store
+            .create_publication(&token, &new_on("t", "feat/bad"), now)
+            .unwrap(),
+    );
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE hub_publications SET manifest = '{not json' WHERE id = ?1",
+            [&bad.id],
+        )
+        .unwrap();
+    let ids = |q: Option<&str>| -> Vec<String> {
+        store
+            .publications(REPO, None, q, 100)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect()
+    };
+    assert_eq!(ids(None).len(), 2);
+    assert_eq!(ids(Some("findable")), std::slice::from_ref(&good.id));
+    assert_eq!(ids(Some("feat/bad")), std::slice::from_ref(&bad.id));
 }

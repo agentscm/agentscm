@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { fetchPublication, headline, listPublications, listTrack, loadRecent, rememberRecent, track, validPublicationId, type ExternalRun, type ExternalState, type Outcome, type Publication, type Step } from '../publications.ts'
 import { Ago, Box, Empty, Explain, Icon, Notice, Pill, Skeleton, Tip, relative, type Tone } from '../ui.tsx'
-import { Combobox } from '../Combobox.tsx'
+import { Combobox, type ComboResult } from '../Combobox.tsx'
 import { hashPath, Pager, useHashCursor } from '../Pager.tsx'
 import { usePoll } from '../usePoll.ts'
 
@@ -193,11 +193,13 @@ function Lookup({ repo, token, recent, onOpen }: { repo: string; token: string; 
           describedBy="landed-id-help"
           parseId={(t) => (validPublicationId(t) ? t : null)}
           onSelect={(id) => onOpen(id)}
-          search={async (q, signal) => {
-            const r = await listPublications(repo, token, signal, undefined, { q, limit: 10 })
+          search={async function page(q, signal, before?: string): Promise<ComboResult> {
+            const r = await listPublications(repo, token, signal, before, { q, limit: 10 })
             if (!r.supported) return { options: [] }
+            const next = r.nextCursor
             return {
-              more: r.nextCursor !== null,
+              more: next !== null,
+              ...(next !== null ? { loadMore: (s: AbortSignal) => page(q, s, next) } : {}),
               options: r.publications.map((p) => {
                 const h = headline(p)
                 return {

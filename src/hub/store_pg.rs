@@ -5169,11 +5169,12 @@ impl Store for PgStore {
                          AND ($2::text IS NULL OR (p.created_at, p.id) < (SELECT q.created_at, q.id
                              FROM hub_publications q WHERE q.repository = $1 AND q.id = $2))
                          AND ($4::text IS NULL OR p.pr_number = $5::bigint
-                             OR lower(p.branch) LIKE $4 ESCAPE '\\' OR lower(p.base) LIKE $4 ESCAPE '\\'
-                             OR lower(p.id) LIKE $4 ESCAPE '\\' OR lower(u.login) LIKE $4 ESCAPE '\\'
-                             OR lower(t.name) LIKE $4 ESCAPE '\\'
-                             OR lower(CASE WHEN octet_length(p.manifest) <= 2097152
-                                 THEN p.manifest::jsonb ->> 'title' END) LIKE $4 ESCAPE '\\')
+                             OR p.branch ILIKE $4 ESCAPE '\\' OR p.base ILIKE $4 ESCAPE '\\'
+                             OR p.id ILIKE $4 ESCAPE '\\' OR u.login ILIKE $4 ESCAPE '\\'
+                             OR t.name ILIKE $4 ESCAPE '\\'
+                             OR (CASE WHEN octet_length(p.manifest) <= 2097152
+                                 AND p.manifest IS JSON OBJECT
+                                 THEN p.manifest::jsonb ->> 'title' END) ILIKE $4 ESCAPE '\\')
                          ORDER BY p.created_at DESC, p.id DESC LIMIT $3"
                     ),
                     &[&repository, &before, &limit, &pattern, &number],
@@ -5575,25 +5576,7 @@ impl Store for PgStore {
         self.run(true, |client| {
             let mut tx = client.transaction()?;
             let who = work_who(&mut tx, token, now)?;
-            let after: Option<(i64, String)> = match cursor {
-                None => None,
-                Some(id) => Some(
-                    tx.query_opt(
-                        "SELECT updated_at, id FROM hub_work_items
-                         WHERE id = $5 AND provider = $1 AND host = $2 AND repository = $3
-                           AND repository_id IS NOT DISTINCT FROM $4",
-                        &[
-                            &who.owner.identity.provider,
-                            &who.owner.identity.host,
-                            &who.repository,
-                            &who.repository_id,
-                            &id,
-                        ],
-                    )?
-                    .map(|row| (row.get(0), row.get(1)))
-                    .ok_or_else(|| HubError::Invalid("unknown cursor".into()))?,
-                ),
-            };
+            let after = cursor.map(super::work::parse_search_cursor).transpose()?;
             let pattern = search.map(like_pattern);
             let number = search.and_then(search_number).map(|n| n.to_string());
             let after_at = after.as_ref().map(|a| a.0);
@@ -5605,9 +5588,9 @@ impl Store for PgStore {
                    AND w.repository_id IS NOT DISTINCT FROM $4
                    AND ($5::bigint IS NULL OR (w.updated_at, w.id) < ($5::bigint, $6::text))
                    AND ($7::text IS NULL OR w.source_issue = $8::text
-                     OR lower(w.title) LIKE $7 ESCAPE '\\' OR lower(w.branch) LIKE $7 ESCAPE '\\'
-                     OR lower(w.lead_agent) LIKE $7 ESCAPE '\\' OR lower(u.login) LIKE $7 ESCAPE '\\'
-                     OR lower(w.id) LIKE $7 ESCAPE '\\' OR lower(w.scope) LIKE $7 ESCAPE '\\')
+                     OR w.title ILIKE $7 ESCAPE '\\' OR w.branch ILIKE $7 ESCAPE '\\'
+                     OR w.lead_agent ILIKE $7 ESCAPE '\\' OR u.login ILIKE $7 ESCAPE '\\'
+                     OR w.id ILIKE $7 ESCAPE '\\' OR w.scope ILIKE $7 ESCAPE '\\')
                  ORDER BY w.updated_at DESC, w.id DESC LIMIT $9",
                 &[
                     &who.owner.identity.provider,

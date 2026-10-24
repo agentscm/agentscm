@@ -512,7 +512,9 @@ The workflow reads use no session and write no coordination events. `GET /v1/hub
 lists up to 16 newest-created retained runs for selection in the status page. `?before=<next_cursor>`
 pages older runs and `?q=TEXT` (200 bytes, case-insensitive) keeps runs whose id, workflow name, source
 revision or state contains it. A search reads at most 256 runs below the cursor, so a page can hold fewer
-than 16 runs while `next_cursor` is set because older runs may still match; follow it until it is null; the existing
+than 16 runs while `next_cursor` is set because older runs may still match; follow it until it is null. With `q` the reply also has `searched_to`, the oldest run sequence examined, so a
+client can say it searched only part of the history. The scan reads only run id, state, name and
+revision per row; the existing
 `GET /v1/hub/skill-workflows/{run_id}` returns one full retained projection. Read-only tokens discover
 only that tool; operator mapping and availability are described in the
 [workflow hub guide](advanced/skill-workflow-hub.md). Bad arguments and hub errors are tool results with
@@ -888,7 +890,9 @@ from it. The command authenticates with the agent token, configured as for
    those. The list reads the store only and calls no forge. `q` keeps publications whose branch,
    base, title, id, owner login or agent name contains it (case-insensitive), or whose pull request
    number it names (`123` or `#123`); it is at most 200 bytes with no control characters, and
-   `before` keeps paging inside the same `q`.
+   `before` keeps paging inside the same `q`. A `q` reads the title of every stored manifest of the
+   repository on each request (manifests over 2 MiB or not valid JSON are skipped), so it costs more
+   than an unfiltered page.
 
 The publication reports four states: `native_landed` (always true: the revision is
 already integrated natively), `branch` (`pending`, `created` or `rejected`, with the

@@ -5179,7 +5179,8 @@ impl Store for SqliteStore {
                  OR lower(p.branch) LIKE ?4 ESCAPE '\\' OR lower(p.base) LIKE ?4 ESCAPE '\\'
                  OR lower(p.id) LIKE ?4 ESCAPE '\\' OR lower(u.login) LIKE ?4 ESCAPE '\\'
                  OR lower(t.name) LIKE ?4 ESCAPE '\\'
-                 OR lower(json_extract(CASE WHEN length(p.manifest) <= 2097152 THEN p.manifest END,
+                 OR lower(json_extract(CASE WHEN length(p.manifest) <= 2097152 AND json_valid(p.manifest)
+                     THEN p.manifest END,
                      '$.title')) LIKE ?4 ESCAPE '\\')
              ORDER BY p.created_at DESC, p.id DESC LIMIT ?3"
         ))?;
@@ -5539,26 +5540,7 @@ impl Store for SqliteStore {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let who = work_who(&tx, token, now)?;
-        let after: Option<(i64, String)> = match cursor {
-            None => None,
-            Some(id) => Some(
-                tx.query_row(
-                    "SELECT updated_at, id FROM hub_work_items
-                     WHERE id = ?5 AND provider = ?1 AND host = ?2 AND repository = ?3
-                       AND repository_id IS ?4",
-                    params![
-                        who.owner.identity.provider,
-                        who.owner.identity.host,
-                        who.repository,
-                        who.repository_id,
-                        id
-                    ],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?
-                .ok_or_else(|| HubError::Invalid("unknown cursor".into()))?,
-            ),
-        };
+        let after = cursor.map(super::work::parse_search_cursor).transpose()?;
         let pattern = search.map(like_pattern);
         let number = search.and_then(search_number).map(|n| n.to_string());
         let mut statement = tx.prepare(

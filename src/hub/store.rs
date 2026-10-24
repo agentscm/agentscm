@@ -506,7 +506,7 @@ pub trait Store: Send + Sync {
     ) -> Result<WorkCheckpointResult>;
     fn work_get(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkItem>>;
     /// Work of the token's repository, finished work included, newest `updated_at` then `id`
-    /// first, strictly after the `cursor` work item, at most `limit` (see `MAX_WORK_SEARCH`).
+    /// first, strictly after the `cursor` position (`<updated_at>:<id>` from a previous page), at most `limit` (see `MAX_WORK_SEARCH`).
     /// `search` (already [`search_text`]-cleaned) keeps items whose title, branch, lead agent,
     /// owner login, id or scope contains it, or whose source issue number it names. An unknown
     /// cursor is `Invalid`.
@@ -893,11 +893,11 @@ pub fn search_text(q: Option<&str>) -> Result<Option<String>> {
     Ok(Some(q.to_owned()))
 }
 
-/// Case-insensitive substring pattern for `lower(col) LIKE ? ESCAPE '\'`.
+/// ASCII-case-insensitive (as SQLite `lower`) substring pattern for `lower(col) LIKE ? ESCAPE '\'`.
 pub fn like_pattern(q: &str) -> String {
     let mut pattern = String::with_capacity(q.len() + 2);
     pattern.push('%');
-    for c in q.to_lowercase().chars() {
+    for c in q.to_ascii_lowercase().chars() {
         if matches!(c, '%' | '_' | '\\') {
             pattern.push('\\');
         }
