@@ -117,15 +117,52 @@ fn no_hub_url_is_needed_but_a_git_repository_is() {
     let out = init_repo(repo.path(), home.path(), &["--yes", "--agents", "cursor"]);
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(
-        stdout(&out).contains("agentscm client setup --agent cursor --hub <hub url>"),
+        stdout(&out).contains("agentscm client setup --agent cursor --hub <HUB_URL>"),
         "{}",
         stdout(&out)
     );
-    assert!(repo.path().join(".cursor/rules/agentscm.mdc").exists());
+    let rule = std::fs::read_to_string(repo.path().join(".cursor/rules/agentscm.mdc")).unwrap();
+    assert!(
+        rule.contains("`agentscm client setup --agent cursor --hub <HUB_URL>`"),
+        "{rule}"
+    );
     assert!(!repo.path().join(".cursor/mcp.json").exists());
 
     let elsewhere = TempDir::new().unwrap();
     let out = init_repo(elsewhere.path(), home.path(), &["--yes"]);
     assert!(!out.status.success());
     assert!(stderr(&out).contains("Git repository"), "{}", stderr(&out));
+}
+
+#[test]
+fn a_bad_saved_hub_url_warns_and_keeps_the_placeholder() {
+    let (repo, home) = checkout();
+    let out = Command::new(env!("CARGO_BIN_EXE_agentscm"))
+        .args(["init-repo", "--yes", "--agents", "codex"])
+        .current_dir(repo.path())
+        .env_clear()
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join("config"))
+        .env("AGENTSCM_HUB_URL", "not a url")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("Not using the saved hub URL"),
+        "{}",
+        stderr(&out)
+    );
+    let agents = std::fs::read_to_string(repo.path().join("AGENTS.md")).unwrap();
+    assert!(
+        agents.contains("`agentscm client setup --agent codex --hub <HUB_URL>`"),
+        "{agents}"
+    );
+    // An explicit --hub-url goes into committed files, so a bad one is still an error.
+    let out = init_repo(
+        repo.path(),
+        home.path(),
+        &["--yes", "--hub-url", "not a url"],
+    );
+    assert!(!out.status.success());
 }

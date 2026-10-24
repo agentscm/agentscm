@@ -1874,7 +1874,7 @@ fn init_stage(cx: &mut Cx<'_>) {
     println!(
         "AgentSCM can also add this repository's agent instructions (AGENTS.md and the files that point Claude Code, Cursor, Copilot and Gemini at it), as files you can commit:"
     );
-    match crate::init_cli::run_in(&root, None, cx.ui) {
+    match crate::init_cli::run_in(&root, None, Some(&hub), cx.ui) {
         Ok(outcome) => cx.init_written = outcome.written,
         Err(error) => println!("Couldn't add the agent config: {}.", short(&error)),
     }
