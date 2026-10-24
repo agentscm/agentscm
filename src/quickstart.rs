@@ -286,6 +286,8 @@ struct Live {
     agents: Vec<String>,
     /// This run tried to set up at least one agent.
     wanted_agents: bool,
+    /// The user answered no to "Go ahead?" for the agent setup.
+    declined: bool,
     /// Why a requested local hub isn't running.
     hub_error: Option<String>,
     pending_local: Option<String>,
@@ -299,6 +301,12 @@ impl Live {
             return off(
                 "the local hub is waiting for GitHub App setup",
                 &format!("finish creating and installing the app, then run `{command}`"),
+            );
+        }
+        if self.declined {
+            return off(
+                "you chose not to set up a coding agent; nothing was changed for it",
+                &format!("run `{cli} quickstart` again when you want it"),
             );
         }
         match (&self.hub, &self.repo) {
@@ -443,6 +451,7 @@ pub async fn run(args: QuickstartArgs) -> Result<u8> {
         || matches!(args.hub, Some(HubChoice::Local | HubChoice::Existing))
         || args.hub_url.is_some())
         // Without an agent to set up (--no-agents, or none found) nothing is connected on purpose.
+        && !cx.live.declined
         && (!cx.live.hub_up || (cx.live.repo.is_none() && cx.live.wanted_agents))
     {
         return Err(invalid(
@@ -1155,6 +1164,7 @@ async fn agents_stage(cx: &mut Cx<'_>) {
         );
     }
     if !cx.ui.confirm("Go ahead?", true) {
+        cx.live.declined = true;
         return;
     }
     let program = match stable_program(cx, plan, exe) {
@@ -1674,6 +1684,20 @@ mod tests {
             "{line}"
         );
         assert!(!line.contains("no hub chosen"), "{line}");
+    }
+
+    #[test]
+    fn declining_the_agent_setup_says_nothing_was_changed_and_suggests_no_flag() {
+        let live = Live {
+            hub: Some("http://h".into()),
+            hub_up: true,
+            wanted_agents: true,
+            declined: true,
+            ..Live::default()
+        };
+        let line = live.line("agentscm");
+        assert!(line.contains("nothing was changed"), "{line}");
+        assert!(!line.contains("--agent-token-file"), "{line}");
     }
 
     #[test]
