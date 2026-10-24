@@ -701,7 +701,7 @@ fn activity_is_scoped_newest_first_and_limited(db: &Db) {
     hook_touch(&*store, &bob, "s", &["src/a.rs"], T0 + 2);
     touch(&*store, &bob, &["src/a.rs"], T0 + 3);
 
-    let events = store.repository_events(&me, 100).unwrap();
+    let events = store.repository_events(&me, None, 100).unwrap();
     let seqs: Vec<i64> = events.iter().map(|e| e.event.seq).collect();
     assert!(seqs.windows(2).all(|pair| pair[0] > pair[1]), "{seqs:?}");
     assert!(events.iter().all(|e| e.token != carol.token));
@@ -741,10 +741,20 @@ fn activity_is_scoped_newest_first_and_limited(db: &Db) {
             .iter()
             .all(|e| shown.contains(&e.event.kind.as_str()))
     );
-    let two = store.repository_events(&me, 2).unwrap();
+    let two = store.repository_events(&me, None, 2).unwrap();
     assert_eq!(two, events[..2]);
+    // `before` pages strictly below a seq, with no repeats.
+    let older = store
+        .repository_events(&me, Some(two[1].event.seq), 100)
+        .unwrap();
+    assert_eq!(older, events[2..]);
     let theirs = principal(&*store, &carol);
-    assert!(!store.repository_events(&theirs, 100).unwrap().is_empty());
+    assert!(
+        !store
+            .repository_events(&theirs, None, 100)
+            .unwrap()
+            .is_empty()
+    );
 
     // Sessions of this repository only, newest first; the edge of the lifetime is included.
     let live = store.live_sessions(&me, T0 + 3, 10).unwrap();
@@ -809,7 +819,7 @@ fn activity_scope_follows_the_forge_repository_and_host(db: &Db) {
         let sessions = store.live_sessions(&me, T0, 10).unwrap();
         assert_eq!(sessions.len(), 1, "{}", who.token);
         assert_eq!(sessions[0].token, who.token);
-        let events = store.repository_events(&me, 100).unwrap();
+        let events = store.repository_events(&me, None, 100).unwrap();
         assert!(!events.is_empty());
         for other in others {
             assert!(events.iter().all(|e| e.token != other.token));

@@ -23,6 +23,7 @@ import { AppChrome, type Badges, type SectionDef } from './TopNav.tsx'
 import { Icon, Notice } from './ui.tsx'
 import { usePoll } from './usePoll.ts'
 import { TourProvider } from './tour/Tour.tsx'
+import { hashPath } from './Pager.tsx'
 
 const darkQuery = '(prefers-color-scheme: dark)'
 const subscribeDark = (cb: () => void) => {
@@ -67,7 +68,8 @@ export const saveRail = (v: boolean) => {
   }
 }
 
-export function sectionFromHash(h = window.location.hash): Section {
+export function sectionFromHash(raw = window.location.hash): Section {
+  const h = hashPath(raw)
   if (h.startsWith('#coordination/work/')) return 'work'
   const first = h.slice(1).split('/')[0]
   if (first === 'coordination') return 'now'
@@ -128,7 +130,7 @@ function Shell({ token, dark, pref, onPref, onUnauthorized, onForget }: { token:
         )}
         {section === 'now' && <NowPage repo={repo} data={data} d={d} overview={overview} />}
         {section === 'work' && <WorkPage token={token} overview={overview} />}
-        {section === 'activity' && <ActivityPage d={d} events={data.activity?.events ?? null} fresh={data.fresh} />}
+        {section === 'activity' && <ActivityPage d={d} events={data.activity?.events ?? null} fresh={data.fresh} repo={data.whoami?.token.repository ?? null} token={token} />}
         {section === 'workflows' && <WorkflowsPage token={token} repository={data.whoami?.token.repository ?? null} />}
         {section === 'change-record' && <ChangeRecordPage repo={data.whoami?.token.repository ?? null} token={token} />}
         {section === 'landed' && <LandedPage repo={data.whoami?.token.repository ?? null} token={token} />}

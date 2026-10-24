@@ -2,13 +2,14 @@ import { useEffect, useState } from 'react'
 import { fetchDiff, fetchEntry, fetchTimeline, type DiffEntry, type EvidenceState, type TimelineEntry, type Trigger } from '../localApi.ts'
 import { Ago, Box, CopyButton, Empty, Explain, Icon, Notice, Pill, PreviewBanner, Skeleton, type Tone } from '../ui.tsx'
 import { usePoll } from '../usePoll.ts'
+import { hashPath, Pager, useHashCursor } from '../Pager.tsx'
 
 export type TimelineRoute = { kind: 'list' } | { kind: 'entry'; id: number } | { kind: 'compare'; left: number; right: number }
 
 const ID = /^[1-9][0-9]{0,15}$/
 /** `#timeline`, `#timeline/entry/<id>` and `#timeline/compare/<older>/<newer>`; anything else is the list. */
 export function timelineRoute(hash = window.location.hash): TimelineRoute {
-  const parts = hash.slice(1).split('/')
+  const parts = hashPath(hash).slice(1).split('/')
   if (parts[0] !== 'timeline') return { kind: 'list' }
   if (parts[1] === 'entry' && parts.length === 3 && ID.test(parts[2]!)) return { kind: 'entry', id: Number(parts[2]) }
   if (parts[1] === 'compare' && parts.length === 4 && ID.test(parts[2]!) && ID.test(parts[3]!) && parts[2] !== parts[3]) {
@@ -51,8 +52,8 @@ function useRoute(): TimelineRoute {
 }
 
 function List() {
-  const [cursors, setCursors] = useState<(number | undefined)[]>([undefined])
-  const before = cursors.at(-1)
+  const pager = useHashCursor()
+  const before = /^[1-9][0-9]{0,15}$/.test(pager.cursor ?? '') ? Number(pager.cursor) : undefined
   const [picked, setPicked] = useState<number[]>([])
   const load = usePoll((signal) => fetchTimeline(signal, before), before === undefined ? 15_000 : 0, String(before ?? ''))
   if (load.kind === 'loading') return <Skeleton rows={5} />
@@ -101,12 +102,7 @@ function List() {
             })}
           </ol>
         )}
-        {(cursors.length > 1 || value.next_before !== null) && (
-          <nav className="pager">
-            <button type="button" className="btn btn-sm btn-outline-secondary" disabled={cursors.length === 1} onClick={() => setCursors((c) => c.slice(0, -1))}><Icon name="chevron-left" /> Newer</button>
-            <button type="button" className="btn btn-sm btn-outline-secondary" disabled={value.next_before === null} onClick={() => value.next_before !== null && setCursors((c) => [...c, value.next_before!])}>Older <Icon name="chevron-right" /></button>
-          </nav>
-        )}
+        <Pager onNewer={before !== undefined ? pager.newer : undefined} onOlder={value.next_before !== null ? () => pager.older(String(value.next_before)) : undefined} />
       </Box>
       {!value.coverage.includes_pre_feature_history && (
         <p className="small muted"><Icon name="info-circle" /> Saving began when the timeline was turned on{value.coverage.earliest_recorded_id ? ` (with #${value.coverage.earliest_recorded_id})` : ''}. Work from before then isn’t here.</p>

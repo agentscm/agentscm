@@ -354,6 +354,63 @@ pub struct WorkOverlapPair {
     pub reasons_complete: bool,
 }
 
+/// One work item found by [`Store::work_search`]; enough to pick it, not to read it.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct WorkSearchItem {
+    pub id: String,
+    pub title: String,
+    pub state: String,
+    pub lead_agent: String,
+    pub owner: Option<String>,
+    pub branch: Option<String>,
+    pub source_issue: Option<String>,
+    pub updated_at: i64,
+    /// Creation time: the immutable position the paging cursor is built from.
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct WorkSearchPage {
+    pub items: Vec<WorkSearchItem>,
+    pub next_cursor: Option<String>,
+    pub complete: bool,
+}
+
+/// Reads a [`WorkSearchPage`] cursor, `<created_at>:<id>`, as the position to continue after.
+pub(super) fn parse_search_cursor(cursor: &str) -> Result<(i64, String)> {
+    let (at, id) = cursor
+        .split_once(':')
+        .filter(|(at, _)| {
+            !at.is_empty() && at.len() <= 18 && at.bytes().all(|b| b.is_ascii_digit())
+        })
+        .ok_or_else(|| HubError::Invalid("malformed cursor".into()))?;
+    validate_id("cursor", id, "wrk")?;
+    let at = at
+        .parse()
+        .map_err(|_| HubError::Invalid("malformed cursor".into()))?;
+    Ok((at, id.to_owned()))
+}
+
+impl WorkSearchPage {
+    /// `items` read with `limit + 1`: the extra row only says more exist.
+    pub(super) fn of(mut items: Vec<WorkSearchItem>, limit: usize) -> Self {
+        let more = items.len() > limit;
+        items.truncate(limit);
+        let next_cursor = more
+            .then(|| items.last().map(|i| format!("{}:{}", i.created_at, i.id)))
+            .flatten();
+        Self {
+            items,
+            next_cursor,
+            complete: !more,
+        }
+    }
+}
+
+/// Work search page size by default and at most.
+pub const DEFAULT_WORK_SEARCH: usize = 20;
+pub const MAX_WORK_SEARCH: usize = 50;
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkOverview {

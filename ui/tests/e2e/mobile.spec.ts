@@ -143,3 +143,26 @@ test('search opens from the header button and finds a work item', async ({ page 
   await page.getByRole('option', { name: /^Retention migration for PostgreSQL\s*gemini-pax/ }).tap()
   await expect(crumbs(page).locator('[aria-current="page"]')).toHaveText(/Retention migration for PostgreSQL/)
 })
+
+test('pickers open inside the phone viewport without sideways scroll', async ({ page }) => {
+  await signIn(page)
+  const pickers: [string, string][] = [
+    ['#landed', 'Find a change'],
+    ['#change-record', 'Find a work item'],
+    ['#workflows', 'Find a run'],
+  ]
+  for (const [hash, name] of pickers) {
+    await page.evaluate((h) => (window.location.hash = h), hash)
+    const picker = page.getByRole('combobox', { name })
+    await picker.focus()
+    await picker.press('ArrowDown')
+    await expect(picker).toHaveAttribute('aria-expanded', 'true')
+    const box = await page.locator('.combo-pop').first().boundingBox()
+    if (box) expect(box.x + box.width).toBeLessThanOrEqual((page.viewportSize()?.width ?? 0) + 1)
+    expect(await noSideScroll(page)).toBe(true)
+    await picker.press('Escape')
+  }
+  await page.evaluate(() => (window.location.hash = '#activity'))
+  await expect(page.locator('[data-tour="activity-load-older"]')).toBeVisible()
+  expect(await noSideScroll(page)).toBe(true)
+})

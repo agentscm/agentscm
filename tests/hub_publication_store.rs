@@ -252,6 +252,60 @@ fn suite(store: Arc<dyn Store>) {
             .is_empty()
     );
 
+    // Search: case-insensitive substring over branch, base, id, owner, agent and title, plus the
+    // pull request number; LIKE wildcards are literal; paging keeps the filter.
+    let titled = done(
+        store
+            .create_publication(&token, &new_on("Quarterly Rollup", "feat/title"), now)
+            .unwrap(),
+    );
+    let found = |q: &str| -> Vec<String> {
+        store
+            .publication_search(REPO, None, q, 100)
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|p| p.id)
+            .collect()
+    };
+    // Matching folds ASCII case on both backends; PostgreSQL's ILIKE may also fold non-ASCII by locale.
+    let accented = done(
+        store
+            .create_publication(&token, &new_on("Café Ünï report", "feat/uni"), now)
+            .unwrap(),
+    );
+    assert_eq!(found("Café Ünï"), std::slice::from_ref(&accented.id));
+    if store.backend() == "sqlite" {
+        assert_eq!(found("ünï").len(), 0);
+    }
+    assert_eq!(found("CAFé"), std::slice::from_ref(&accented.id));
+    assert_eq!(found("QUARTERLY roll"), std::slice::from_ref(&titled.id));
+    assert_eq!(found("FEAT/TITLE"), std::slice::from_ref(&titled.id));
+    assert_eq!(found(&titled.id[4..12]), std::slice::from_ref(&titled.id));
+    assert_eq!(found("#12"), std::slice::from_ref(&id.to_owned()));
+    assert!(found("100%").is_empty() && found("p_b").is_empty() && found("\\").is_empty());
+    assert_eq!(
+        found("alice").len(),
+        store.publications(REPO, None, 100).unwrap().len()
+    );
+    let page = store
+        .publication_search(REPO, None, "feat/n", 2)
+        .unwrap()
+        .rows;
+    let rest = store
+        .publication_search(REPO, Some(&page[1].id), "feat/n", 100)
+        .unwrap()
+        .rows;
+    assert_eq!(page.len() + rest.len(), found("feat/n").len());
+    assert!(rest.iter().all(|p| p.branch.starts_with("feat/n")));
+    assert!(
+        store
+            .publication_search("acme/other", None, "alice", 100)
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+
     // A revoked token cannot create.
     assert!(store.revoke_agent_token(&token).unwrap());
     let mut again = new("t");
@@ -540,4 +594,113 @@ fn candidate_lineage_on_sqlite() {
 fn candidate_lineage_on_postgres() {
     let Some(pg) = PgSchema::create() else { return };
     candidate_suite(store::open(&pg.url).unwrap());
+}
+
+#[test]
+fn a_corrupt_manifest_row_still_lists_and_does_not_break_search() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("hub.sqlite");
+    let store = store::open(&format!("sqlite://{}", path.display())).unwrap();
+    let identity = ForgeIdentity {
+        provider: "github".into(),
+        host: "github.com".into(),
+        user_id: 7,
+    };
+    let owner = store.upsert_user(&identity, "alice").unwrap();
+    let (token, _) = mint_agent_token(&*store, &owner.id, "builder", REPO, 3600).unwrap();
+    let now = unix_now();
+    let good = done(
+        store
+            .create_publication(&token, &new_on("Findable title", "feat/good"), now)
+            .unwrap(),
+    );
+    let bad = done(
+        store
+            .create_publication(&token, &new_on("t", "feat/bad"), now)
+            .unwrap(),
+    );
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE hub_publications SET manifest = '{not json' WHERE id = ?1",
+            [&bad.id],
+        )
+        .unwrap();
+    let ids = |q: Option<&str>| -> Vec<String> {
+        match q {
+            None => store.publications(REPO, None, 100).unwrap(),
+            Some(q) => store.publication_search(REPO, None, q, 100).unwrap().rows,
+        }
+        .into_iter()
+        .map(|p| p.id)
+        .collect()
+    };
+    assert_eq!(ids(None).len(), 2);
+    assert_eq!(ids(Some("findable")), std::slice::from_ref(&good.id));
+    assert_eq!(ids(Some("feat/bad")), std::slice::from_ref(&bad.id));
+}
+
+/// A search reads at most 256 publications below the cursor and says where it stopped, so a
+/// match further back is reached by following the cursor.
+fn window_suite(store: Arc<dyn Store>) {
+    let identity = ForgeIdentity {
+        provider: "github".into(),
+        host: "github.com".into(),
+        user_id: 7,
+    };
+    let owner = store.upsert_user(&identity, "alice").unwrap();
+    let base = unix_now();
+    let mut tokens = Vec::new();
+    for n in 0..15 {
+        tokens.push(
+            mint_agent_token(&*store, &owner.id, &format!("t{n}"), REPO, 3600)
+                .unwrap()
+                .0,
+        );
+    }
+    let mut oldest = String::new();
+    for i in 0..300usize {
+        let branch = if i == 0 {
+            "feat/needle".to_owned()
+        } else {
+            format!("feat/bulk{i}")
+        };
+        let made = done(
+            store
+                .create_publication(&tokens[i / 20], &new_on("t", &branch), base + i as i64)
+                .unwrap(),
+        );
+        if i == 0 {
+            oldest = made.id;
+        }
+    }
+    let first = store.publication_search(REPO, None, "needle", 5).unwrap();
+    assert!(first.rows.is_empty() && first.window_full);
+    let stopped = first.searched_to.unwrap();
+    // The window is the 256 newest: the 256th row from the top is the oldest examined.
+    let newest = store.publications(REPO, None, 256).unwrap();
+    assert_eq!(stopped, newest[255].id);
+    let second = store
+        .publication_search(REPO, Some(&stopped), "needle", 5)
+        .unwrap();
+    assert_eq!(second.rows.len(), 1);
+    assert_eq!(second.rows[0].id, oldest);
+    assert!(!second.window_full);
+    // More matches than the page: the extra row is returned for the caller to cut.
+    let many = store.publication_search(REPO, None, "bulk", 5).unwrap();
+    assert_eq!(many.rows.len(), 5);
+    assert!(many.window_full);
+}
+
+#[test]
+fn publication_search_window_on_sqlite() {
+    let dir = TempDir::new().unwrap();
+    let url = format!("sqlite://{}", dir.path().join("hub.sqlite").display());
+    window_suite(store::open(&url).unwrap());
+}
+
+#[test]
+fn publication_search_window_on_postgres() {
+    let Some(pg) = PgSchema::create() else { return };
+    window_suite(store::open(&pg.url).unwrap());
 }

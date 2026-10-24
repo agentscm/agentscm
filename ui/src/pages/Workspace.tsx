@@ -17,6 +17,8 @@ import {
   type WorkspaceSettings,
   type WorkspaceSubject,
 } from '../workspace.ts'
+import { Combobox } from '../Combobox.tsx'
+import { Pager, useHashCursor } from '../Pager.tsx'
 import { Box, CopyButton, Empty, Explain, Icon, Notice, Pill, Skeleton, Tip, type Tone } from '../ui.tsx'
 import { usePoll, type Poll } from '../usePoll.ts'
 import { RunView } from './Workflows.tsx'
@@ -61,7 +63,7 @@ const decode = (v: string | undefined) => {
   }
 }
 export function workspaceRoute(hash = window.location.hash): WorkspaceRoute {
-  const parts = hash.slice(1).split('/')
+  const parts = hash.split('?')[0]!.slice(1).split('/')
   if (parts[0] !== 'workspace') return { tab: 'repositories' }
   if (parts[1] === 'members' || parts[1] === 'settings') return { tab: parts[1] }
   if (parts[1] !== 'workflow') return { tab: 'repositories' }
@@ -259,8 +261,8 @@ function Execution({ session }: { session: WorkspaceSession }) {
   const repositoryId = chosenRepo ?? repositories?.[0]?.repository_id ?? null
   const repository = repositories?.find((r) => r.repository_id === repositoryId)
   const repositoryCanExecute = repository?.profiles.some((profile) => profile.server_execution) === true
-  const [runCursors, setRunCursors] = useState<string[]>([''])
-  const runCursor = runCursors.at(-1) ?? ''
+  const runPager = useHashCursor('runs')
+  const runCursor = runPager.cursor ?? ''
   const [refresh, setRefresh] = useState(0)
   const runs = usePoll(
     (signal) => (repositoryId ? workspaceRequest<{ runs: WorkspaceRun[]; next_cursor: string | null }>(`/repositories/${enc(repositoryId)}/runs?limit=20${runCursor ? `&before=${enc(runCursor)}` : ''}`, { signal }) : Promise.resolve({ runs: [], next_cursor: null })),
@@ -314,7 +316,7 @@ function Execution({ session }: { session: WorkspaceSession }) {
               disabled={busy !== null}
               onChange={(e) => {
                 setChosenRepo(e.target.value)
-                setRunCursors([''])
+                runPager.first()
               }}
             >
               {repositories.map((r) => <option key={r.repository_id} value={r.repository_id}>{r.repository_id}</option>)}
@@ -352,13 +354,10 @@ function Execution({ session }: { session: WorkspaceSession }) {
             ))}
           </ul>
         ))}
-        <nav className="pager" aria-label="Run pages">
-          <button type="button" className="btn btn-sm btn-outline-secondary" disabled={runCursors.length <= 1} onClick={() => setRunCursors((c) => c.slice(0, -1))}><Icon name="chevron-left" /> Newer runs</button>
-          <button type="button" className="btn btn-sm btn-outline-secondary" disabled={runs.kind !== 'ready' || !runs.value.next_cursor} onClick={() => runs.kind === 'ready' && runs.value.next_cursor && setRunCursors((c) => [...c, runs.value.next_cursor!])}>Older runs <Icon name="chevron-right" /></button>
-        </nav>
+        <Pager newerLabel="Newer runs" olderLabel="Older runs" onNewer={runPager.canNewer ? runPager.newer : undefined} onOlder={runs.kind === 'ready' && runs.value.next_cursor ? () => runPager.older(runs.value.next_cursor!) : undefined} />
         <p className="small muted mb-0">Configuration readiness does not prove runtime availability or a passing admission receipt.</p>
       </Box>
-      {repository && <Composer key={repository.repository_id} session={session} repository={repository} onStarted={() => { setRunCursors(['']); setRefresh((n) => n + 1) }} />}
+      {repository && <Composer key={repository.repository_id} session={session} repository={repository} onStarted={() => { runPager.first(); setRefresh((n) => n + 1) }} />}
     </div>
   )
 }
@@ -377,7 +376,6 @@ function Composer({ session, repository, onStarted }: { session: WorkspaceSessio
   const extra = more?.key === profileId ? more : null
   const subjects = [...(firstSubjects.kind === 'ready' ? firstSubjects.value.subjects : []), ...(extra?.items ?? [])]
   const subjectCursor = extra ? extra.cursor : firstSubjects.kind === 'ready' ? firstSubjects.value.next_cursor : null
-  const [changeId, setChangeId] = useState('')
   const [subject, setSubject] = useState<WorkspaceSubject | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -404,14 +402,14 @@ function Composer({ session, repository, onStarted }: { session: WorkspaceSessio
       setBusy(null)
     }
   }
-  const loadSubject = async () => {
-    if (!profile || !changeId.trim()) return
+  const loadSubject = async (id: string) => {
+    if (!profile || !id.trim()) return
     const current = selection.current
     setBusy('subject')
     setError(null)
     setSubject(null)
     try {
-      const r = await workspaceRequest<{ subject: WorkspaceSubject }>(`${base}/subject?change_id=${enc(changeId.trim())}`)
+      const r = await workspaceRequest<{ subject: WorkspaceSubject }>(`${base}/subject?change_id=${enc(id.trim())}`)
       if (selection.current === current) setSubject(r.subject)
     } catch (e) {
       if (selection.current === current) setError(workspaceError(e))
@@ -463,7 +461,6 @@ function Composer({ session, repository, onStarted }: { session: WorkspaceSessio
               disabled={locked}
               onChange={(e) => {
                 setProfileId(e.target.value)
-                setChangeId('')
                 clearSubject()
               }}
             >
@@ -481,49 +478,31 @@ function Composer({ session, repository, onStarted }: { session: WorkspaceSessio
         )}
         {profile && (
           <div className="ws-grid">
-            <label className="form-label" htmlFor="ws-known-change">Current native Changes</label>
-            <div className="d-flex gap-2 flex-wrap">
-              <select
-                id="ws-known-change"
-                className="form-select"
-                value={subjects.some((s) => s.change_id === changeId) ? changeId : ''}
+            <span className="form-label">Native Change <Explain text="Pick a current native Change, or paste the ID of any existing one. Loading it shows the exact revision, review context and requirement the run will bind to." /></span>
+            <div className="d-flex gap-2 flex-wrap align-items-start">
+              <Combobox
+                id="ws-change"
+                data-tour="workspace-change-picker"
+                label="Native Change"
+                placeholder={firstSubjects.kind === 'loading' ? 'Loading Changes…' : 'Search current Changes or paste a Change ID'}
+                keepText
+                looseId
+                onTextChange={clearSubject}
                 disabled={locked}
-                onChange={(e) => {
-                  setChangeId(e.target.value)
+                parseId={(t) => (/^[A-Za-z0-9._:/-]{1,200}$/.test(t) ? t : null)}
+                emptyText={subjects.length ? 'No loaded Change matches. Load more, or paste the ID.' : 'No current Changes found on this page. Paste a Change ID.'}
+                options={subjects.map((s) => ({ value: s.change_id, text: s.change_id, label: s.change_id, secondary: `${s.revision.slice(0, 12)}`, meta: <Pill tone="muted">version {s.change_version}</Pill> }))}
+                footer={subjectCursor ? <button type="button" className="btn btn-sm btn-outline-secondary" disabled={busy !== null} onClick={() => void loadMore()}>Load more Changes</button> : undefined}
+                onSelect={(id) => {
                   clearSubject()
+                  void loadSubject(id)
                 }}
-              >
-                <option value="">{firstSubjects.kind === 'loading' ? 'Loading Changes…' : subjects.length ? 'Choose a current Change' : 'No current Changes found on this page'}</option>
-                {subjects.map((s) => <option key={`${s.change_id}:${s.change_version}`} value={s.change_id}>{s.change_id} · version {s.change_version} · {s.revision.slice(0, 12)}</option>)}
-              </select>
-              {subjectCursor && <button type="button" className="btn btn-outline-secondary" disabled={busy !== null} onClick={() => void loadMore()}>Load more Changes</button>}
+              />
+              {busy === 'subject' && <span className="spinner-border spinner-border-sm mt-2" role="status" aria-label="Loading revision" />}
             </div>
             {firstSubjects.kind === 'error' && <Notice title={pollError(firstSubjects)} />}
           </div>
         )}
-        <form
-          className="ws-grid"
-          onSubmit={(e) => {
-            e.preventDefault()
-            void loadSubject()
-          }}
-        >
-          <label className="form-label" htmlFor="ws-change">Native Change ID <Explain text="The ID of an existing native Change. Loading it shows the exact revision, review context and requirement the run will bind to." /></label>
-          <div className="input-group">
-            <input
-              id="ws-change"
-              className="form-control"
-              value={changeId}
-              placeholder="Existing Change ID"
-              disabled={locked}
-              onChange={(e) => {
-                setChangeId(e.target.value)
-                clearSubject()
-              }}
-            />
-            <button type="submit" className="btn btn-outline-secondary" disabled={!profile || !changeId.trim() || locked}>Load revision</button>
-          </div>
-        </form>
         {subject && profile && (
           <section className="ws-subject" aria-label="Revision to execute">
             <h3 className="h6">Revision to execute</h3>

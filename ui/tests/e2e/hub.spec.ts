@@ -311,6 +311,15 @@ test('Landed changes shows live changes to a read-only token, or says plainly th
     await expect(main(page).getByRole('heading', { level: 1 })).toHaveText('Did our changes land, and did checks pass after?')
     await expect(main(page)).toContainText('3 of 7 recent changes landed')
     await expect(main(page)).toContainText('agent/rune/schema-migration-lock')
+    await expect(page.locator('[data-tour="pager"]')).toContainText('That’s everything.')
+    // The picker searches the hub: type part of a branch, pick it, land on that change.
+    const picker = page.getByRole('combobox', { name: 'Find a change' })
+    await picker.fill('schema-migration')
+    await expect(page.getByRole('option', { name: /schema-migration-lock/ })).toBeVisible()
+    await picker.press('ArrowDown')
+    await picker.press('Enter')
+    await expect(page).toHaveURL(new RegExp(`#landed/${failedCi}$`))
+    await page.evaluate((h) => (window.location.hash = h), '#landed')
     await page.evaluate((h) => (window.location.hash = h), `#landed/${failedCi}`)
     const track = main(page).locator('.box').filter({ hasText: 'How far it got' })
     await expect(track).toContainText('Opened #483')
@@ -340,10 +349,62 @@ test('Templates and Timeline read this computer through the dev proxy: live when
   await expect(crumbs(page).locator('[aria-current="page"]')).toContainText('Compare #2 and #3')
   await expect(main(page).getByText(/What changed from #2 to #3/)).toBeVisible()
   await page.evaluate(() => (window.location.hash = '#templates'))
-  await page.getByLabel('Change ID').fill('other-change')
+  const changePicker = page.getByRole('combobox', { name: 'Change ID' })
+  await changePicker.fill('other-change')
+  await changePicker.press('Enter')
   await page.getByLabel('Template file').fill('skills/checks/v2/workflow.json')
   await page.getByRole('button', { name: /Open/ }).first().click()
   await expect(main(page).getByText('Check this path is in the change: src/lib.rs')).toBeVisible()
   if (live) await expect(banner(main(page))).toHaveCount(0)
   else await expect(banner(main(page))).toBeVisible()
+})
+
+test('pickers: change records, workflow runs and activity paging', async ({ page }) => {
+  await signIn(page, '#change-record')
+  const work = page.getByRole('combobox', { name: 'Find a work item' })
+  await expect(page.locator('[data-tour="change-record-picker"]')).toBeVisible()
+  await work.focus()
+  // Seeded work items (and any started by the MCP tests) are listed with human titles; the ID is secondary.
+  await expect(page.getByRole('option').first()).toBeVisible()
+  await work.press('ArrowDown')
+  await work.press('Enter')
+  await expect(page).toHaveURL(/#change-record\/wrk_[0-9a-f]{32}$/)
+
+  await page.evaluate(() => (window.location.hash = '#workflows'))
+  const run = page.getByRole('combobox', { name: 'Find a run' })
+  await expect(page.locator('[data-tour="workflow-run-picker"]')).toBeVisible()
+  await run.fill('retained-run-001')
+  await expect(page.getByRole('option', { name: /Open retained-run-001/ })).toBeVisible()
+  await run.press('Enter')
+  await expect(page).toHaveURL(/#workflows\/runs\/retained-run-001$/)
+
+  await page.evaluate(() => (window.location.hash = '#activity'))
+  const older = page.locator('[data-tour="activity-load-older"]')
+  await expect(older).toBeVisible()
+  await older.getByRole('button', { name: /Load older/ }).click()
+  await expect(older.getByRole('button', { name: /Load older/ }).or(older.getByText('That’s everything.'))).toBeVisible()
+})
+
+test('keyboard: the Landed picker reaches "Show more results" and Enter loads the next page', async ({ page }) => {
+  const pubs = `/v1/hub/repos/${encodeURIComponent('counterbranch/agentscm')}/publications`
+  const seen: string[] = []
+  // A scan that hit its cap: no matches yet, but a cursor to keep looking.
+  await page.route(`**${pubs}?*`, async (route) => {
+    const url = new URL(route.request().url())
+    if (!url.searchParams.has('q')) return route.continue()
+    seen.push(url.search)
+    const body = url.searchParams.has('before')
+      ? { publications: [], next_cursor: null, complete: true }
+      : { publications: [], next_cursor: `pub_${'a'.repeat(32)}`, complete: false, searched_to: 1 }
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify(body) })
+  })
+  await signIn(page, '#landed')
+  const picker = page.getByRole('combobox', { name: 'Find a change' })
+  await picker.fill('no such branch')
+  await expect(page.getByText('No matches in the results searched so far')).toBeVisible()
+  // The action is an option of the listbox: arrow to it and press Enter.
+  await picker.press('ArrowDown')
+  await expect(page.getByRole('option', { name: 'Show more results' })).toHaveAttribute('aria-selected', 'true')
+  await picker.press('Enter')
+  await expect.poll(() => seen.some((q) => q.includes('before=pub_'))).toBe(true)
 })

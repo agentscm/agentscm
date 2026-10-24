@@ -226,6 +226,114 @@ fn registry(data_dir: &Path, native_repository: &str) -> SkillWorkflowRegistry {
     SkillWorkflowRegistry::from_file(&path).unwrap()
 }
 
+/// A search reads at most 256 rows below the cursor and hands back a cursor where it stopped,
+/// so matches further back are reachable; the filter holds on every page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_search_scans_a_bounded_window_and_continues_by_cursor() {
+    let native = Native::initialized();
+    let definition =
+        agentscm::skill_workflow::runtime::retained_definition(native.dir.path(), "run-1").unwrap();
+    let plan = compile(native.dir.path(), &definition).unwrap();
+    for index in 2..=300 {
+        start(native.dir.path(), &format!("bulk-{index}"), &plan).unwrap();
+    }
+    let hub = Hub::start(native.registry()).await;
+    let (token, _) = hub.token(HUB_REPOSITORY, true);
+    let (other, _) = hub.token(OTHER_REPOSITORY, true);
+
+    // Only the oldest run matches; it lies beyond the 256 newest rows.
+    let (status, first) = hub.get("/v1/hub/skill-workflows?q=RUN-1", &token).await;
+    assert_eq!(status, 200, "{first}");
+    assert!(first["runs"].as_array().unwrap().is_empty(), "{first}");
+    assert_eq!(first["next_cursor"], "45");
+    assert_eq!(first["searched_to"], "45", "the oldest sequence examined");
+    let (_, second) = hub
+        .get("/v1/hub/skill-workflows?q=run-1&before=45", &token)
+        .await;
+    assert_eq!(second["runs"][0]["run_id"], "run-1", "{second}");
+    assert_eq!(second["runs"].as_array().unwrap().len(), 1);
+    assert_eq!(second["next_cursor"], Value::Null);
+    assert_eq!(second["searched_to"], "1");
+    let (_, plain) = hub.get("/v1/hub/skill-workflows", &token).await;
+    assert!(plain.get("searched_to").is_none());
+
+    // Few matches inside a full window still carry the continuation cursor.
+    let (_, few) = hub.get("/v1/hub/skill-workflows?q=bulk-29", &token).await;
+    assert_eq!(few["runs"].as_array().unwrap().len(), 10);
+    assert_eq!(few["next_cursor"], "45");
+    // Seventeen matches: a full page and the sixteenth match's sequence.
+    let (_, many) = hub.get("/v1/hub/skill-workflows?q=bulk", &token).await;
+    assert_eq!(many["runs"].as_array().unwrap().len(), 16);
+    assert_eq!(many["next_cursor"], "285");
+    let (_, state) = hub
+        .get("/v1/hub/skill-workflows?q=PENDING&before=3", &token)
+        .await;
+    assert_eq!(
+        state["runs"].as_array().unwrap().len(),
+        1,
+        "state is searched"
+    );
+    let (_, wildcard) = hub.get("/v1/hub/skill-workflows?q=%25", &token).await;
+    assert!(wildcard["runs"].as_array().unwrap().is_empty());
+
+    let long = "a".repeat(201);
+    for path in [
+        format!("/v1/hub/skill-workflows?q={long}"),
+        "/v1/hub/skill-workflows?q=a%01b".to_owned(),
+        "/v1/hub/skill-workflows?before=0".to_owned(),
+        "/v1/hub/skill-workflows?before=1&before=2".to_owned(),
+        "/v1/hub/skill-workflows?x=1".to_owned(),
+    ] {
+        assert_eq!(hub.get(&path, &token).await.0, 400, "{path}");
+    }
+    assert_eq!(
+        hub.get("/v1/hub/skill-workflows?q=run", "nope").await.0,
+        401
+    );
+    // Another repository is not mapped to this store.
+    let (_, unmapped) = hub.get("/v1/hub/skill-workflows?q=run", &other).await;
+    assert_eq!(unmapped["availability"], "unavailable");
+    assert!(unmapped.get("runs").is_none());
+
+    // The MCP tool returns the same page.
+    let (status, reply) = hub
+        .rpc(
+            "/mcp",
+            &token,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "agentscm_workflow_runs_list",
+                    "arguments": {"q": "run-1"}}}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        reply["result"]["structuredContent"]["next_cursor"], "45",
+        "{reply}"
+    );
+    let (_, reply) = hub
+        .rpc(
+            "/mcp",
+            &token,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "agentscm_workflow_runs_list",
+                    "arguments": {"q": "run-1", "before": "45"}}}),
+        )
+        .await;
+    assert_eq!(
+        reply["result"]["structuredContent"]["runs"][0]["run_id"],
+        "run-1"
+    );
+    let (_, reply) = hub
+        .rpc(
+            "/mcp",
+            &token,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "agentscm_workflow_runs_list", "arguments": {"before": "0"}}}),
+        )
+        .await;
+    assert_eq!(reply["result"]["isError"], true, "{reply}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn valid_run_has_the_same_envelope_over_http_and_mcp_for_a_read_only_token() {
     let native = Native::initialized();
@@ -289,12 +397,15 @@ async fn valid_run_has_the_same_envelope_over_http_and_mcp_for_a_read_only_token
         [
             "agentscm_change_record",
             "agentscm_coordination_inbox",
+            "agentscm_publications_list",
             "agentscm_skill_list",
             "agentscm_skill_status",
             "agentscm_work_briefing",
             "agentscm_work_insight",
             "agentscm_work_insights",
             "agentscm_work_overview",
+            "agentscm_work_search",
+            "agentscm_workflow_runs_list",
             "agentscm_workflow_status"
         ]
     );

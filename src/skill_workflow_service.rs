@@ -103,13 +103,14 @@ pub fn read(data_dir: &Path, engine: &Engine, run_id: &str) -> Result<SkillWorkf
 /// Lists a bounded set of newest-created retained runs without projecting their
 /// steps. A configured native store with no workflow journal has no runs.
 pub fn list(data_dir: &Path, limit: usize) -> Result<Vec<RunSummary>> {
-    Ok(list_page(data_dir, limit, None)?.runs)
+    Ok(list_page(data_dir, limit, None, None)?.runs)
 }
 
 pub fn list_page(
     data_dir: &Path,
     limit: usize,
     before: Option<i64>,
+    search: Option<&str>,
 ) -> Result<crate::skill_workflow::runtime::RunPage> {
     if !(1..=MAX_LIST_RUNS).contains(&limit) || before.is_some_and(|value| value <= 0) {
         return Err(Error::Limit("workflow list supports 1..16 runs".into()));
@@ -119,13 +120,14 @@ pub fn list_page(
             return Ok(crate::skill_workflow::runtime::RunPage {
                 runs: vec![],
                 next_cursor: None,
+                searched_to: None,
             });
         }
         Err(error) => return Err(error.into()),
         Ok(_) => {}
     }
     require_existing_journal(data_dir)?;
-    crate::skill_workflow::runtime::list_run_page(data_dir, limit, before)
+    crate::skill_workflow::runtime::list_run_page(data_dir, limit, before, search)
         .map_err(normalize_absence)
 }
 

@@ -50,7 +50,8 @@ use super::intent::{
     finish, notice_events, plan, probe_set, validate_ttl,
 };
 use super::publish::{
-    Create, MAX_UNFINISHED, NewPublication, PUBLICATION_SELECT, Publication, Update,
+    Create, MAX_UNFINISHED, NewPublication, PUBLICATION_SELECT, Publication, PublicationSearch,
+    SEARCH_SCAN_ROWS, Update,
 };
 use super::session::{
     Checked, DEFAULT_SESSION, NOTICES_PER_TOUCH, Row, SESSION_TTL_SECONDS, STALE_SESSION_SECONDS,
@@ -60,7 +61,8 @@ use super::skills::{EvidenceRow, RunHead, SkillAdoption};
 use super::store::{
     ACTIVITY_KINDS, ActivityEvent, AgentToken, Event, ForgeIdentity, HubEvent, LIST_LIMIT,
     NAMED_MIGRATIONS, NewAgentToken, Principal, SessionView, Store, TokenDigest, User, event_limit,
-    lower_hex_of, new_id, pending, plan_named, session_key, unix_now, validate_login,
+    like_pattern, lower_hex_of, new_id, pending, plan_named, search_number, session_key, unix_now,
+    validate_login,
 };
 use super::work::{
     Briefing, BriefingAck, BriefingQuery, CLAIM_STALE_SECONDS, Checkpoint, CheckpointReceipt,
@@ -68,9 +70,10 @@ use super::work::{
     WORK_PAYLOAD_CAPACITY_BYTES, WorkCheckpoint, WorkCheckpointResult, WorkCompaction,
     WorkConflictKind, WorkEvent, WorkItem, WorkOutcome, WorkOutcomeKind, WorkOverview,
     WorkOverviewQuery, WorkParticipant, WorkRepositoryScope, WorkRole, WorkScopeCheck,
-    WorkScopeOverlap, WorkSource, WorkStart, WorkStartConflict, WorkStartResult, WorkState,
-    WorkWho, check_work_delivery_page, check_work_payload_capacity, normalized_scope,
-    scope_overlap_reasons, uncovered_scope, work_overlap_pairs, work_payload_row_bytes,
+    WorkScopeOverlap, WorkSearchItem, WorkSearchPage, WorkSource, WorkStart, WorkStartConflict,
+    WorkStartResult, WorkState, WorkWho, check_work_delivery_page, check_work_payload_capacity,
+    normalized_scope, scope_overlap_reasons, uncovered_scope, work_overlap_pairs,
+    work_payload_row_bytes,
 };
 use super::{HubError, Result};
 
@@ -4054,7 +4057,12 @@ impl Store for PgStore {
         })
     }
 
-    fn repository_events(&self, who: &Principal, limit: usize) -> Result<Vec<ActivityEvent>> {
+    fn repository_events(
+        &self,
+        who: &Principal,
+        before: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<ActivityEvent>> {
         self.run(true, |client| {
             // Driven from the subject index: the scope's token and intent ids, not every event.
             let rows = client.query(
@@ -4069,6 +4077,7 @@ impl Store for PgStore {
                          UNION ALL
                          SELECT i.id FROM hub_intents i JOIN hub_agent_tokens t ON t.id = i.token
                          JOIN hub_users u ON u.id = t.owner WHERE {TOKEN_SCOPE})
+                     AND ($6::bigint IS NULL OR e.seq < $6::bigint)
                      ORDER BY e.seq DESC LIMIT $5"
                 ),
                 &[
@@ -4077,6 +4086,7 @@ impl Store for PgStore {
                     &who.owner.identity.host,
                     &who.owner.identity.provider,
                     &event_limit(limit),
+                    &before,
                 ],
             )?;
             Ok(rows
@@ -5167,6 +5177,73 @@ impl Store for PgStore {
         })
     }
 
+    fn publication_search(
+        &self,
+        repository: &str,
+        before: Option<&str>,
+        search: &str,
+        limit: usize,
+    ) -> Result<PublicationSearch> {
+        self.run(true, |client| {
+            let scan = SEARCH_SCAN_ROWS as i64;
+            let window: Vec<(i64, String)> = client
+                .query(
+                    "SELECT p.created_at, p.id FROM hub_publications p WHERE p.repository = $1
+                     AND ($2::text IS NULL OR (p.created_at, p.id) < (SELECT q.created_at, q.id
+                         FROM hub_publications q WHERE q.repository = $1 AND q.id = $2))
+                     ORDER BY p.created_at DESC, p.id DESC LIMIT $3",
+                    &[&repository, &before, &scan],
+                )?
+                .iter()
+                .map(|row| (row.get(0), row.get(1)))
+                .collect();
+            let Some((oldest_at, oldest_id)) = window.last().cloned() else {
+                return Ok(PublicationSearch {
+                    rows: vec![],
+                    searched_to: None,
+                    window_full: false,
+                });
+            };
+            let limit = limit as i64;
+            let pattern = like_pattern(search);
+            let number = search_number(search);
+            let rows = client
+                .query(
+                    &format!(
+                        "{PUBLICATION_SELECT} WHERE p.repository = $1
+                         AND ($2::text IS NULL OR (p.created_at, p.id) < (SELECT q.created_at, q.id
+                             FROM hub_publications q WHERE q.repository = $1 AND q.id = $2))
+                         AND (p.created_at, p.id) >= ($6::bigint, $7::text)
+                         AND (p.pr_number = $5::bigint
+                             OR p.branch ILIKE $4 ESCAPE '\\' OR p.base ILIKE $4 ESCAPE '\\'
+                             OR p.id ILIKE $4 ESCAPE '\\' OR u.login ILIKE $4 ESCAPE '\\'
+                             OR t.name ILIKE $4 ESCAPE '\\'
+                             OR (CASE WHEN octet_length(p.manifest) <= 2097152
+                                 AND p.manifest IS JSON OBJECT
+                                 THEN p.manifest::jsonb ->> 'title' END) ILIKE $4 ESCAPE '\\')
+                         ORDER BY p.created_at DESC, p.id DESC LIMIT $3"
+                    ),
+                    &[
+                        &repository,
+                        &before,
+                        &limit,
+                        &pattern,
+                        &number,
+                        &oldest_at,
+                        &oldest_id,
+                    ],
+                )?
+                .iter()
+                .map(publication_row)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(PublicationSearch {
+                rows,
+                searched_to: Some(oldest_id),
+                window_full: window.len() == SEARCH_SCAN_ROWS,
+            })
+        })
+    }
+
     fn pull_publications(
         &self,
         repository: &str,
@@ -5544,6 +5621,83 @@ impl Store for PgStore {
             let item = scoped_work(&mut tx, &who, id, now, false)?;
             tx.commit()?;
             Ok(item)
+        })
+    }
+
+    fn work_search(
+        &self,
+        token: &str,
+        search: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+        now: i64,
+    ) -> Result<WorkSearchPage> {
+        self.run(true, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            let after = cursor.map(super::work::parse_search_cursor).transpose()?;
+            // A cursor must name a work item of this scope at exactly that creation time.
+            if let Some((created_at, id)) = &after {
+                let known = tx.query_opt(
+                    "SELECT 1 FROM hub_work_items WHERE id = $5 AND created_at = $6
+                       AND provider = $1 AND host = $2 AND repository = $3
+                       AND repository_id IS NOT DISTINCT FROM $4",
+                    &[
+                        &who.owner.identity.provider,
+                        &who.owner.identity.host,
+                        &who.repository,
+                        &who.repository_id,
+                        id,
+                        created_at,
+                    ],
+                )?;
+                if known.is_none() {
+                    return Err(HubError::Invalid("unknown cursor".into()));
+                }
+            }
+            let pattern = search.map(like_pattern);
+            let number = search.and_then(search_number).map(|n| n.to_string());
+            let after_at = after.as_ref().map(|a| a.0);
+            let after_id = after.as_ref().map(|a| a.1.clone());
+            let rows = tx.query(
+                "SELECT w.id, w.title, w.state, w.lead_agent, u.login, w.branch, w.source_issue, w.updated_at, w.created_at
+                 FROM hub_work_items w JOIN hub_users u ON u.id = w.owner
+                 WHERE w.provider = $1 AND w.host = $2 AND w.repository = $3
+                   AND w.repository_id IS NOT DISTINCT FROM $4
+                   AND ($5::bigint IS NULL OR (w.created_at, w.id) < ($5::bigint, $6::text))
+                   AND ($7::text IS NULL OR w.source_issue = $8::text
+                     OR w.title ILIKE $7 ESCAPE '\\' OR w.branch ILIKE $7 ESCAPE '\\'
+                     OR w.lead_agent ILIKE $7 ESCAPE '\\' OR u.login ILIKE $7 ESCAPE '\\'
+                     OR w.id ILIKE $7 ESCAPE '\\' OR w.scope ILIKE $7 ESCAPE '\\')
+                 ORDER BY w.created_at DESC, w.id DESC LIMIT $9",
+                &[
+                    &who.owner.identity.provider,
+                    &who.owner.identity.host,
+                    &who.repository,
+                    &who.repository_id,
+                    &after_at,
+                    &after_id,
+                    &pattern,
+                    &number,
+                    &(limit as i64 + 1),
+                ],
+            )?;
+            let items = rows
+                .iter()
+                .map(|row| WorkSearchItem {
+                    id: row.get(0),
+                    title: row.get(1),
+                    state: row.get(2),
+                    lead_agent: row.get(3),
+                    owner: row.get(4),
+                    branch: row.get(5),
+                    source_issue: row.get(6),
+                    updated_at: row.get(7),
+                    created_at: row.get(8),
+                })
+                .collect();
+            tx.commit()?;
+            Ok(WorkSearchPage::of(items, limit))
         })
     }
 

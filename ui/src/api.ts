@@ -139,8 +139,15 @@ export async function fetchWork(repo: string, token: string, signal: AbortSignal
 }
 
 export async function fetchActivity(repo: string, token: string, signal: AbortSignal): Promise<Activity> {
-  const j = rec(await getJson(`${repoPath(repo)}/activity?limit=50`, signal, token))
+  const page = await fetchActivityPage(repo, token, signal)
+  return { sessions: page.sessions, events: page.events }
+}
+
+/** One page of events, newest first; `before` is an event `seq` and `next_before` the next page's cursor (null when exhausted). */
+export async function fetchActivityPage(repo: string, token: string, signal: AbortSignal, before?: number): Promise<Activity & { next_before: number | null }> {
+  const j = rec(await getJson(`${repoPath(repo)}/activity?limit=50${before !== undefined ? `&before=${before}` : ''}`, signal, token))
   return {
+    next_before: typeof j['next_before'] === 'number' ? j['next_before'] : null,
     sessions: list(j['sessions']).map(
       (s): Session => ({
         key: str(s['key']),
@@ -195,8 +202,11 @@ export async function fetchSkillWorkflow(runId: string, token: string, signal: A
   return decodeSkillWorkflowEnvelope(value, runId)
 }
 
-export async function fetchSkillWorkflows(token: string, signal: AbortSignal, before?: string): Promise<SkillWorkflowListEnvelope> {
-  const query = before === undefined ? '' : `?before=${encodeURIComponent(before)}`
+export async function fetchSkillWorkflows(token: string, signal: AbortSignal, before?: string, q?: string): Promise<SkillWorkflowListEnvelope> {
+  const params = new URLSearchParams()
+  if (before !== undefined) params.set('before', before)
+  if (q) params.set('q', q)
+  const query = params.size ? `?${params}` : ''
   const value = await getBoundedJson(`/v1/hub/skill-workflows${query}`, signal, token)
   return decodeSkillWorkflowListEnvelope(value)
 }

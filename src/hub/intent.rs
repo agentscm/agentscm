@@ -532,6 +532,7 @@ struct NoticesQuery {
 #[serde(deny_unknown_fields)]
 struct ActivityQuery {
     limit: Option<usize>,
+    before: Option<i64>,
 }
 
 async fn announce(
@@ -611,15 +612,24 @@ async fn activity(
     scope(&principal, &repo)?;
     let Query(query) = query.map_err(|_| ApiError::invalid())?;
     let limit = query.limit.unwrap_or(DEFAULT_ACTIVITY_EVENTS);
-    if !(1..=MAX_ACTIVITY_EVENTS).contains(&limit) {
+    if !(1..=MAX_ACTIVITY_EVENTS).contains(&limit) || query.before.is_some_and(|b| b <= 0) {
         return Err(ApiError::invalid());
     }
+    let before = query.before;
     let store = state.store.clone();
-    let (sessions, events) = blocking(&state, move || {
+    let (sessions, mut events) = blocking(&state, move || {
         let sessions = store.live_sessions(&principal, unix_now(), MAX_ACTIVITY_SESSIONS)?;
-        Ok((sessions, store.repository_events(&principal, limit)?))
+        // One extra row says whether older events exist.
+        Ok((
+            sessions,
+            store.repository_events(&principal, before, limit + 1)?,
+        ))
     })
     .await?;
+    let next_before = (events.len() > limit).then(|| {
+        events.truncate(limit);
+        events.last().map(|e| e.event.seq)
+    });
     let parse = |json: &str| {
         serde_json::from_str::<Value>(json)
             .map_err(|error| HubError::Unavailable(error.to_string()))
@@ -649,7 +659,8 @@ async fn activity(
             )
         })
         .collect::<Result<Vec<Value>>>()?;
-    Ok(Json(json!({"sessions": sessions, "events": events})))
+    Ok(Json(json!({"sessions": sessions, "events": events,
+        "next_before": next_before.flatten()})))
 }
 
 async fn renew(

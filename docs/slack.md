@@ -132,9 +132,21 @@ An app created from an earlier version of this manifest (Home tab, `/agentscm` c
 
 ## Messages and buttons
 
-A background worker reads the Hub event log every half second. On its first run it starts at the newest event, so history from before installation is never sent. Each event becomes at most one message per person; the holder of several contested files gets one message per file. Messages are plain text (Slack never reads them as markup), name the repository, the agents and their owners' logins, and quote teammate text after the same filtering agents get. The notification text has `&`, `<` and `>` escaped, so it cannot mention a channel or add a link.
+A background worker reads the Hub event log every half second. On its first run it starts at the newest event, so history from before installation is never sent. Each event becomes at most one message per person. A message has a short header saying what happened, two columns of fields (the files, up to five then `+N more`; the repository; your agent; their agent with its owner's login), the buttons, and one line of guidance. For example, the holder of a file another agent edited again sees:
 
-**Hand it over** and **Keep it** answer the oldest open handoff request for that file addressed to the holder's agent, exactly as `agentscm_handoff` would: a yes moves the file to the requesting session, and both agents are told on their next call. The button works only for the person bound to the holder agent's owner, rechecked at click time. The message's buttons are then replaced with the outcome. A click after the request lapsed or was answered says so and changes nothing.
+```text
+Another agent edited a file your agent holds
+File                      Repository
+docs/slack-live-check.md  counterbranch/agentscm
+Your agent                Their agent
+slack-live-holder         slack-live-test's slack-live-test-agent
+[Hand it over] [Keep it] [Open Hub]
+Hand it over, or keep it and agree who goes first.
+```
+
+Every header, field and line is plain text (Slack never reads it as markup), and teammate text gets the same filtering agents get. The notification text is the header and the file; it has `&`, `<` and `>` escaped, so it cannot mention a channel or add a link. Several held files come in one message without the handoff buttons.
+
+**Hand it over** and **Keep it** answer the oldest open handoff request for that file addressed to the holder's agent, exactly as `agentscm_handoff` would: a yes moves the file to the requesting session, and both agents are told on their next call. The button works only for the person bound to the holder agent's owner, rechecked at click time. The message's buttons and guidance are then replaced with the outcome, such as `Handed to bob's claude` or `Kept; bob's claude is told on its next call`. A click after the request lapsed or was answered says so and changes nothing.
 
 ## Delivery and recovery behavior
 

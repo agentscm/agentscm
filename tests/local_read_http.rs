@@ -322,6 +322,56 @@ fn local_reads_enforce_bounds_and_not_found() {
 }
 
 #[test]
+fn local_pickers_page_search_and_reject_bad_input() {
+    let (temp, _) = seeded();
+    let data = temp.path().join("data");
+    let server = Server::start(&data, Some(TOKEN), &[]);
+
+    let (status, body) = server.get("/v1/local/changes");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body,
+        json!({"changes": [{"id": "demo", "version": 1}], "next_after": null})
+    );
+    let (_, body) = server.get("/v1/local/changes?limit=1");
+    assert_eq!(
+        body["next_after"],
+        Value::Null,
+        "an exact page is complete: {body}"
+    );
+    let (_, body) = server.get("/v1/local/changes?after=demo");
+    assert_eq!(body["changes"], json!([]));
+
+    let (status, body) = server.get("/v1/local/skill-workflows?q=LOCAL-READ");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["runs"][0]["run_id"], RUN_ID);
+    assert_eq!(body["next_cursor"], Value::Null);
+    let (_, body) = server.get("/v1/local/skill-workflows?q=%25");
+    assert_eq!(
+        body["runs"],
+        json!([]),
+        "LIKE wildcards are literal: {body}"
+    );
+    let (_, body) = server.get("/v1/local/skill-workflows");
+    assert_eq!(body["runs"].as_array().unwrap().len(), 1);
+
+    let long = "a".repeat(201);
+    for path in [
+        "/v1/local/changes?limit=0",
+        "/v1/local/changes?limit=101",
+        "/v1/local/changes?q=x",
+        "/v1/local/skill-workflows?before=0",
+        "/v1/local/skill-workflows?q=a%01b",
+        &format!("/v1/local/skill-workflows?q={long}"),
+        "/v1/local/skill-workflows?x=1",
+    ] {
+        assert_eq!(server.get(path).0, 400, "{path}");
+    }
+    let (status, ..) = server.request("GET", "/v1/local/changes", &[]);
+    assert_eq!(status, 401);
+}
+
+#[test]
 fn local_reads_require_the_token_refuse_writes_and_allow_only_configured_origins() {
     let (temp, _) = seeded();
     let data = temp.path().join("data");

@@ -516,6 +516,9 @@ async fn protocol_basics() {
             "agentscm_change_record",
             "agentscm_work_insight",
             "agentscm_work_insights",
+            "agentscm_work_search",
+            "agentscm_publications_list",
+            "agentscm_workflow_runs_list",
             "agentscm_work_usage",
             "agentscm_work_checkpoint",
             "agentscm_work_ack",
@@ -1822,4 +1825,238 @@ async fn a_start_that_reads_like_live_work_says_to_ask_the_user() {
 
     let unrelated = start(bob, json!({"task": "refactor docs", "session": "d"})).await;
     assert!(!text(&unrelated).contains("reads like work"), "{unrelated}");
+}
+
+fn publication(branch: &str) -> agentscm::hub::publish::NewPublication {
+    let manifest: agentscm::hub::publish::Manifest = serde_json::from_value(json!({
+        "revision": "a".repeat(64), "event_seq": 3, "commit": "b".repeat(40),
+        "tree": "c".repeat(40), "parent": "d".repeat(40), "branch": branch, "base": "main",
+        "title": format!("Title of {branch}"), "body": "", "message": "msg\n",
+        "author": {"name": "A", "email": "a@example.invalid", "date": "2026-05-28T20:26:40Z"},
+        "committer": {"name": "A", "email": "a@example.invalid", "date": "2026-05-28T20:26:40Z"},
+        "changes": [{"path": "a.txt", "mode": "100644", "blob": "e".repeat(40),
+            "sha256": "f".repeat(64), "size": 5}]
+    }))
+    .unwrap();
+    agentscm::hub::publish::NewPublication {
+        id: agentscm::hub::publish::derive_id(REPO, 3, &"b".repeat(40), branch),
+        manifest,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_tools_page_filter_and_stay_in_the_tokens_repository() {
+    let hub = Hub::start().await;
+    let user = |id: i64, login: &str| {
+        hub.store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: id,
+                },
+                login,
+            )
+            .unwrap()
+    };
+    let (writer_id, writer, _) = mint_bound_agent_token(
+        &*hub.store,
+        &user(1, "writer").id,
+        "writer",
+        REPO,
+        2,
+        600,
+        false,
+    )
+    .map(|(id, secret, x)| (id, secret.expose().to_owned(), x))
+    .unwrap();
+    let (_, reader, _) = mint_bound_agent_token(
+        &*hub.store,
+        &user(2, "reader").id,
+        "reader",
+        REPO,
+        2,
+        600,
+        true,
+    )
+    .map(|(id, secret, x)| (id, secret.expose().to_owned(), x))
+    .unwrap();
+    let (_, stranger, _) = mint_bound_agent_token(
+        &*hub.store,
+        &user(3, "stranger").id,
+        "stranger",
+        "acme/private",
+        3,
+        600,
+        true,
+    )
+    .map(|(id, secret, x)| (id, secret.expose().to_owned(), x))
+    .unwrap();
+    for n in 0..3 {
+        let started = hub
+            .tool_result(
+                &writer,
+                "agentscm_start",
+                json!({"task": format!("Picker task {n}"), "request_key": format!("picker-{n}"),
+                    "session": format!("picker-{n}")}),
+            )
+            .await;
+        assert_eq!(started["isError"], false, "{started}");
+        hub.store
+            .create_publication(
+                &writer_id,
+                &publication(&format!("feat/pick{n}")),
+                unix_now(),
+            )
+            .unwrap();
+    }
+    let ids = |page: &Value, key: &str| -> Vec<String> {
+        page["structuredContent"][key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    // Work search: pages of two, the cursor continues, the last page is complete.
+    let first = hub
+        .tool_result(
+            &reader,
+            "agentscm_work_search",
+            json!({"limit": 2, "q": "PICKER"}),
+        )
+        .await;
+    assert_eq!(first["isError"], false, "{first}");
+    let cursor = first["structuredContent"]["next_cursor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(first["structuredContent"]["complete"], false);
+    let last = hub
+        .tool_result(
+            &reader,
+            "agentscm_work_search",
+            json!({"limit": 2, "q": "PICKER", "cursor": cursor}),
+        )
+        .await;
+    assert_eq!(ids(&last, "items").len(), 1);
+    assert_eq!(last["structuredContent"]["complete"], true);
+    assert!(last["structuredContent"]["next_cursor"].is_null());
+    let mut all = ids(&first, "items");
+    all.extend(ids(&last, "items"));
+    all.sort();
+    all.dedup();
+    assert_eq!(all.len(), 3);
+    let narrowed = hub
+        .tool_result(&writer, "agentscm_work_search", json!({"q": "task 1"}))
+        .await;
+    assert_eq!(ids(&narrowed, "items").len(), 1);
+    let none = hub
+        .tool_result(&writer, "agentscm_work_search", json!({"q": "%"}))
+        .await;
+    assert!(ids(&none, "items").is_empty());
+
+    // Publications: same shape as the route, `cursor` being `before`.
+    let page = hub
+        .tool_result(&reader, "agentscm_publications_list", json!({"limit": 2}))
+        .await;
+    assert_eq!(page["isError"], false, "{page}");
+    let before = page["structuredContent"]["next_cursor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(ids(&page, "publications").len(), 2);
+    let rest = hub
+        .tool_result(
+            &reader,
+            "agentscm_publications_list",
+            json!({"limit": 2, "cursor": before}),
+        )
+        .await;
+    assert_eq!(ids(&rest, "publications").len(), 1);
+    assert_eq!(rest["structuredContent"]["complete"], true);
+    let filtered = hub
+        .tool_result(
+            &reader,
+            "agentscm_publications_list",
+            json!({"q": "FEAT/PICK2"}),
+        )
+        .await;
+    assert_eq!(ids(&filtered, "publications").len(), 1);
+    assert!(filtered["structuredContent"]["searched_to"].is_string());
+    let by_title = hub
+        .tool_result(
+            &reader,
+            "agentscm_publications_list",
+            json!({"q": "title of feat/pick0"}),
+        )
+        .await;
+    assert_eq!(ids(&by_title, "publications").len(), 1);
+
+    // Another repository's token sees none of it and cannot use its cursors.
+    for (tool, key) in [
+        ("agentscm_work_search", "items"),
+        ("agentscm_publications_list", "publications"),
+    ] {
+        let theirs = hub.tool_result(&stranger, tool, json!({})).await;
+        assert!(ids(&theirs, key).is_empty(), "{tool}");
+    }
+    let foreign = hub
+        .tool_result(
+            &stranger,
+            "agentscm_publications_list",
+            json!({"cursor": before}),
+        )
+        .await;
+    assert_eq!(foreign["isError"], true);
+
+    // Workflow runs: no operator mapping here, so the same unavailable envelope as the route.
+    let runs = hub
+        .tool_result(&reader, "agentscm_workflow_runs_list", json!({"q": "x"}))
+        .await;
+    assert_eq!(runs["isError"], false, "{runs}");
+    assert_eq!(runs["structuredContent"]["availability"], "unavailable");
+
+    // Bad arguments are tool errors, not empty pages.
+    let long = "a".repeat(201);
+    for (tool, arguments) in [
+        ("agentscm_work_search", json!({"limit": 0})),
+        ("agentscm_work_search", json!({"limit": 51})),
+        ("agentscm_work_search", json!({"cursor": "wrk_missing"})),
+        ("agentscm_work_search", json!({"q": long})),
+        ("agentscm_work_search", json!({"q": "a\u{1}b"})),
+        ("agentscm_work_search", json!({"x": 1})),
+        ("agentscm_work_search", json!({"before": "1"})),
+        ("agentscm_publications_list", json!({"limit": 101})),
+        (
+            "agentscm_publications_list",
+            json!({"cursor": "pub_missing"}),
+        ),
+        ("agentscm_workflow_runs_list", json!({"before": "0"})),
+        ("agentscm_workflow_runs_list", json!({"cursor": "1"})),
+    ] {
+        let result = hub.tool_result(&reader, tool, arguments.clone()).await;
+        assert_eq!(result["isError"], true, "{tool} {arguments}: {result}");
+    }
+    // Writers and read-only tokens are both offered the tools.
+    for secret in [&writer, &reader] {
+        let listed = hub
+            .rpc(secret, &rpc_body("tools/list", json!({})))
+            .await
+            .json();
+        let names: Vec<&str> = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        for tool in [
+            "agentscm_work_search",
+            "agentscm_publications_list",
+            "agentscm_workflow_runs_list",
+        ] {
+            assert!(names.contains(&tool), "{tool}");
+        }
+    }
 }

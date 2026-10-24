@@ -21,8 +21,9 @@ afterEach(() => {
 })
 
 describe('workflow run list', () => {
-  it('pages with the server cursor, newer and older', async () => {
+  it('pages with the server cursor, newer and older, keeping the cursor in the hash', async () => {
     const sent = stubHub()
+    at('#workflows')
     page()
     await screen.findByText('claude-review-failed', {}, LOAD)
     expect(screen.getAllByRole('link', { name: /retained-run|claude-review/ })).toHaveLength(16)
@@ -30,11 +31,17 @@ describe('workflow run list', () => {
     await screen.findByText('retained-run-029', {}, LOAD)
     expect(screen.queryByText('claude-review-failed')).toBeNull()
     expect(sent.at(-1)!.url).toBe('/v1/hub/skill-workflows?before=4985')
+    expect(window.location.hash).toBe('#workflows?before=4985')
     fireEvent.click(screen.getByRole('button', { name: /Older/ }))
     await screen.findByText('retained-run-013', {}, LOAD)
-    // Last page: 45 runs at 16 per page leaves 13, and no further cursor.
-    expect(screen.getAllByRole('link', { name: /retained-run/ })).toHaveLength(13)
-    expect((screen.getByRole('button', { name: /Older/ }) as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: /Older/ }))
+    await screen.findByText('retained-run-001', {}, LOAD)
+    // Last page: 60 runs at 16 per page leaves 12, and no further cursor.
+    expect(screen.getAllByRole('link', { name: /retained-run/ })).toHaveLength(12)
+    expect(screen.queryByRole('button', { name: /Older/ })).toBeNull()
+    expect(screen.getByText('That’s everything.')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /Newer/ }))
+    await screen.findByText('retained-run-013', {}, LOAD)
     fireEvent.click(screen.getByRole('button', { name: /Newer/ }))
     await screen.findByText('retained-run-029', {}, LOAD)
     expect(sent.every((r) => r.method === 'GET')).toBe(true)
@@ -52,17 +59,24 @@ describe('workflow run list', () => {
     expect(screen.getByText('No run on this page matches')).toBeTruthy()
   })
 
-  it('a run ID lookup only accepts valid IDs', async () => {
-    stubHub()
+  it('the run picker searches the server, only opens valid pasted IDs, and opens a picked run', async () => {
+    const sent = stubHub()
     page()
     await screen.findByText('claude-review-failed', {}, LOAD)
-    const box = screen.getByRole('textbox', { name: 'Run ID' })
-    const go = box.closest('form')!.querySelector('button')!
+    const box = screen.getByRole('combobox', { name: 'Find a run' })
+    fireEvent.focus(box)
     fireEvent.change(box, { target: { value: '../../etc' } })
-    expect(go.disabled).toBe(true)
+    expect(screen.queryByText(/^Open/)).toBeNull()
     fireEvent.change(box, { target: { value: 'claude-review-stale' } })
-    expect(go.disabled).toBe(false)
-    fireEvent.submit(box.closest('form')!)
+    await waitFor(() => expect(sent.some((r) => r.url === '/v1/hub/skill-workflows?q=claude-review-stale')).toBe(true), LOAD)
+    const listbox = () => within(screen.getByRole('listbox', { name: 'Find a run' }))
+    await waitFor(() => expect(listbox().getAllByRole('option').map((o) => o.textContent)).toEqual([expect.stringContaining('Billing change verification')]), LOAD)
+    // Run IDs are free-form, so a result for the same ID stands in for "Open <text>" and Enter never guesses.
+    const before = window.location.hash
+    fireEvent.keyDown(box, { key: 'Enter' })
+    expect(window.location.hash).toBe(before)
+    fireEvent.keyDown(box, { key: 'ArrowDown' })
+    fireEvent.keyDown(box, { key: 'Enter' })
     expect(window.location.hash).toBe('#workflows/runs/claude-review-stale')
   })
 })

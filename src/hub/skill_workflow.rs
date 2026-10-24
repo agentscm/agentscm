@@ -79,6 +79,9 @@ pub struct SkillWorkflowListEnvelope {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runs: Option<Vec<RunSummary>>,
     pub next_cursor: Option<String>,
+    /// Search only: the oldest run sequence examined.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub searched_to: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
 }
@@ -117,6 +120,7 @@ impl SkillWorkflowListEnvelope {
             availability: Availability::Available,
             runs: Some(page.runs),
             next_cursor: page.next_cursor,
+            searched_to: page.searched_to,
             reason: None,
         }
     }
@@ -127,6 +131,7 @@ impl SkillWorkflowListEnvelope {
             availability: Availability::Unavailable,
             runs: None,
             next_cursor: None,
+            searched_to: None,
             reason: Some(reason),
         }
     }
@@ -236,20 +241,22 @@ impl SkillWorkflowRegistry {
         &self,
         hub_repository: &str,
     ) -> std::result::Result<SkillWorkflowListEnvelope, ReadError> {
-        self.page(hub_repository, None)
+        self.page(hub_repository, None, None)
     }
 
     pub fn page(
         &self,
         hub_repository: &str,
         before: Option<i64>,
+        search: Option<&str>,
     ) -> std::result::Result<SkillWorkflowListEnvelope, ReadError> {
         let (binding, _authority) = match self.current_binding(hub_repository) {
             Ok(current) => current,
             Err(reason) => return Ok(SkillWorkflowListEnvelope::unavailable(reason)),
         };
-        let page = skill_workflow_service::list_page(&binding.data_dir, MAX_RECENT_RUNS, before)
-            .map_err(read_error)?;
+        let page =
+            skill_workflow_service::list_page(&binding.data_dir, MAX_RECENT_RUNS, before, search)
+                .map_err(read_error)?;
         for run in &page.runs {
             let definition =
                 crate::skill_workflow::runtime::retained_definition(&binding.data_dir, &run.run_id)

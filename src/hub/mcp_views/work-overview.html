@@ -19,9 +19,10 @@ button:focus-visible,summary:focus-visible{outline:2px solid var(--acc);outline-
 .right{flex:none;text-align:right}.pill{display:inline-block;border-radius:999px;padding:1px 9px;font-size:13px;background:var(--accbg);color:var(--acc);white-space:nowrap}
 .pill.ok{background:var(--okbg);color:var(--ok)}.pill.warn{background:var(--warnbg);color:var(--warn)}.pill.bad{background:var(--badbg);color:var(--bad)}
 .dots{display:inline-flex;gap:4px;vertical-align:middle;margin-right:6px}.dot{width:9px;height:9px;border-radius:50%;border:1px solid var(--acc)}.dot.on{background:var(--acc)}
+input[type=search]{font:inherit;color:var(--fg);background:var(--bg);border:.5px solid var(--bd);border-radius:8px;padding:6px 10px;width:100%}input[type=search]:focus-visible{outline:2px solid var(--acc);outline-offset:2px}.id{font-family:ui-monospace,monospace;font-size:12px;color:var(--mut)}
 details{margin-top:6px}summary{cursor:pointer;color:var(--acc)}footer{margin-top:14px;color:var(--mut)}.quiet{margin-top:8px;font-size:13px;color:var(--mut)}
 @media (max-width:420px){.tiles{grid-template-columns:1fr}.row{flex-wrap:wrap}.right{text-align:left}}
-</style></head><body><div class="card" id="app"></div>
+</style></head><body><div class="card" id="app"></div><div class="card" id="find"></div>
 <script>
 "use strict";
 var TOOL='agentscm_work_overview';
@@ -82,5 +83,24 @@ var manage='Manage these views: ask your agent to run agentscm_view_settings, or
 function start(){if(typeof ResizeObserver==='function')new ResizeObserver(size).observe(document.body);
 rpc('ui/initialize',{appInfo:{name:TOOL+'-view',version:'1.0.0'},appCapabilities:{},protocolVersion:'2026-01-26'}).then(function(r){theme(r&&r.hostContext);send({jsonrpc:'2.0',method:'ui/notifications/initialized',params:{}})},function(){});
 paint()}
+var FIND={q:'',items:[],cursor:null,more:false,busy:false,err:false,seq:0,timer:0,box:null,list:null,note:null,btn:null};
+function findBuild(){var root=document.getElementById('find');root.textContent='';
+var i=h('input');i.type='search';i.maxLength=200;i.placeholder='Title, branch, agent, issue number';i.setAttribute('aria-label','Find work');
+i.addEventListener('input',function(){clearTimeout(FIND.timer);FIND.timer=setTimeout(function(){FIND.q=i.value.trim();findRun(false)},250)});
+FIND.box=i;FIND.list=h('div');FIND.note=h('p','note');FIND.note.setAttribute('role','status');
+FIND.btn=h('button',null,'Load more');FIND.btn.type='button';FIND.btn.addEventListener('click',function(){findRun(true)});
+add(root,h('h2',null,'Find work'),i,FIND.note,FIND.list,FIND.btn);findPaint()}
+function findPaint(){FIND.list.textContent='';
+FIND.items.forEach(function(w){var r=h('div','row'),m=h('div','main'),x=h('div','right');
+add(m,h('div','t',clip(w.title)),h('div','s',[w.lead_agent,w.branch,w.state].filter(Boolean).map(clip).join(' · ')),h('div','id',w.id));
+add(x,h('div','s',ago(w.updated_at)));add(r,m,x);FIND.list.appendChild(r)});
+FIND.btn.hidden=!FIND.more||FIND.busy;FIND.btn.disabled=FIND.busy;
+FIND.note.textContent=FIND.err?'Could not search. Try again.':FIND.busy?'Searching…':FIND.items.length?'':FIND.asked?'No matching work.':'Search all work in this repository, finished work included.';size()}
+function findRun(append){var tok=++FIND.seq,a={};FIND.asked=true;FIND.busy=true;FIND.err=false;if(!append){FIND.items=[];FIND.cursor=null;FIND.more=false}findPaint();
+if(FIND.q)a.q=FIND.q;if(append&&FIND.cursor)a.cursor=FIND.cursor;
+rpc('tools/call',{name:'agentscm_work_search',arguments:a}).then(function(r){if(tok!==FIND.seq)return;var d=parse(r);FIND.busy=false;
+if(!d||!Array.isArray(d.items))FIND.err=true;else{FIND.items=append?FIND.items.concat(d.items):d.items;FIND.cursor=d.next_cursor||null;FIND.more=d.complete===false&&!!d.next_cursor}findPaint()},function(){if(tok!==FIND.seq)return;FIND.busy=false;FIND.err=true;findPaint()})}
+FIND.asked=false;
+findBuild();
 start();
 </script></body></html>

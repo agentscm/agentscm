@@ -741,7 +741,7 @@ export const workHref = (id: string): string => validWorkId(id)
   : fail('work.id')
 
 export function workIdFromHash(hash: string): string | null {
-  const match = /^#(?:work|coordination\/work)\/([^/]+)$/.exec(hash)
+  const match = /^#(?:work|coordination\/work)\/([^/]+)$/.exec(hash.split('?')[0]!)
   if (!match) return null
   try {
     const id = decodeURIComponent(match[1]!)
@@ -823,4 +823,44 @@ export async function fetchCoordination(token: string, signal: AbortSignal, quer
 
 export async function fetchStandupWork(id: string, token: string, signal: AbortSignal): Promise<WorkItem> {
   return decodeWorkItem(await getBoundedJson(workPath(id), token, signal), id)
+}
+
+export interface WorkSearchItem {
+  id: string
+  title: string
+  state: string
+  lead_agent: string
+  owner: string | null
+  branch: string | null
+  source_issue: string | null
+  updated_at: number
+}
+export interface WorkSearchPage {
+  items: WorkSearchItem[]
+  next_cursor: string | null
+  complete: boolean
+}
+
+// eslint-disable-next-line no-control-regex
+const plain = (v: unknown, max = 200): string => (typeof v === 'string' ? v.replace(/[\u0000-\u001f\u007f-\u009f]/g, '').slice(0, max) : '')
+const plainOrNull = (v: unknown): string | null => plain(v) || null
+
+/** Search every work item of the token's repository (finished and closed included), newest first. */
+export async function searchStandupWork(token: string, signal: AbortSignal, query: { q?: string; limit?: number; cursor?: string } = {}): Promise<WorkSearchPage> {
+  const params = new URLSearchParams({ limit: String(query.limit ?? 10) })
+  if (query.q) params.set('q', query.q)
+  if (query.cursor) params.set('cursor', query.cursor)
+  const raw = await getBoundedJson(`/v1/hub/standup/work?${params}`, token, signal)
+  const body = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
+  const items = Array.isArray(body['items']) ? body['items'] : []
+  return {
+    items: items.slice(0, 50).flatMap((v): WorkSearchItem[] => {
+      const r = v && typeof v === 'object' ? (v as Record<string, unknown>) : {}
+      const id = plain(r['id'], 64)
+      if (!validWorkId(id)) return []
+      return [{ id, title: plain(r['title']) || 'Untitled work', state: plain(r['state'], 32), lead_agent: plain(r['lead_agent']), owner: plainOrNull(r['owner']), branch: plainOrNull(r['branch']), source_issue: plainOrNull(r['source_issue']), updated_at: typeof r['updated_at'] === 'number' && Number.isFinite(r['updated_at']) ? r['updated_at'] : 0 }]
+    }),
+    next_cursor: plainOrNull(body['next_cursor']),
+    complete: body['complete'] === true,
+  }
 }
