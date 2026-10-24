@@ -52,6 +52,8 @@ A hosted hub for a team is unsupported in the alpha and will likely break; `npx 
 prints the [hosted guide](docs/hosted.md) to work through with your coding agent. Asked to
 install AgentSCM for someone? Ask them "local or hosted?" first, then follow
 [choose local or hosted](docs/install.md#choose-local-or-hosted).
+Building from source? Without the `ui` feature the hub serves only a notice page at `/ui/`; for the
+real status page run `(cd ui && npm ci && npm run build) && cargo build --locked --features ui`.
 
 Joining an existing Hub? Use **Connect an agent** in its status page. Your agent guides sign-in,
 native approvals and verification; readiness requires recent MCP and native edit-hook observations.

@@ -1,11 +1,8 @@
-# `agentscm setup`: contributor install helper
+# Native installation helper (`agentscm setup`)
 
-> **Looking to set AgentSCM up for yourself or your team?** This is not that page: see the
-> [setup guide](setup-guide.md).
->
-> **For contributors.** This page documents `agentscm setup`, a local install
-> helper for source builds. Users run AgentSCM as a container (see the README
-> quickstart) and do not need it. The helper checks the host and fails with
+> **Contributors only.** `agentscm setup` prepares an explicitly owned local native installation
+> from a source build. It is hidden from `agentscm --help`. To set AgentSCM up for yourself or your
+> team, use [`agentscm quickstart`](../setup-guide.md). The helper fails with
 > `unsupported_platform` on anything but macOS.
 
 This source module prepares a new, explicitly owned installation using the

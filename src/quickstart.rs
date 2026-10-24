@@ -1072,20 +1072,12 @@ fn init_stage(cx: &mut Cx<'_>) {
     println!(
         "AgentSCM can also add this repository's agent instructions (AGENTS.md and the files that point Claude Code, Cursor, Copilot and Gemini at it), as files you can commit:"
     );
-    match crate::init_cli::run_in(&root, None, cx.ui) {
+    match crate::init_cli::run_in(&root, None, Some(&hub), cx.ui) {
         Ok(outcome) => cx.init_written = outcome.written,
         Err(error) => println!("Couldn't add the agent instructions: {}.", short(&error)),
     }
     if !cx.init_written.is_empty() {
-        // The committed files carry no hooks or MCP: each machine connects its own agent.
-        println!(
-            "Instructions alone don't connect an agent. {}each developer runs, once per checkout: agentscm client setup --agent claude|codex|cursor|copilot|gemini --hub {hub}",
-            if cx.live.agents.is_empty() {
-                "On this machine and every other, "
-            } else {
-                "This checkout is set up; on every other machine, "
-            }
-        );
+        crate::init_cli::print_next_steps(&crate::init_cli::ALL, Some(&hub), &cx.init_written);
     }
 }
 

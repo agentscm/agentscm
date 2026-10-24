@@ -10,6 +10,7 @@ AgentSCM also contains an immutable ledger for exact revisions, their review con
 - [Checks](checks.md), [evidence](evidence.md), the [portable evidence verifier](evidence-verifier.md) and [installed policy](policy.md)
 - [Workspaces](workspace.md), [task-scoped source and workspaces](task-workspaces.md), [merge sessions](merge.md), [offline sync](sync.md), [source history](source-history.md) and the [source reader](source-reader.md)
 - [Native CLI reference](../reference/cli.md)
+- [Native installation helper](native-installation.md): `agentscm setup`, for contributors working from a source build
 - [Source-bound skill workflows](skill-workflows.md): run exact-file checks and explicit packaged container commands against an immutable revision; inspect, resume, cancel or recover the run.
 - [Reusable workflow templates](reusable-workflows.md): bind one named, versioned manifest from immutable native source to an existing Change, install its first target requirement and retain a read-only handoff.
 - [Agent-owned workflow task contract](agent-workflow-tasks.md): strict task, attempt, instruction, assertion, enrolled-collector and recovery schemas with authenticated HTTP/MCP and Unix CLI routes.
@@ -27,6 +28,7 @@ Capture a Git commit, work and land natively, reconcile with Git and export to a
 
 ## Isolated command checks
 
+- [GitHub merge queues](github-merge-queue.md): experimental workflow status on merge queue groups, with exact-tree rules, lifecycle recovery and read-only ruleset observations.
 - [Local validation attestations](local-validation.md): experimental signed, Git-bound records of a maintainer's local gate, verified by a separate workflow.
 - [Isolated command checks](execution.md): run a declared command against an exact revision in a locked-down container. Not a sandbox for arbitrary hostile code.
 

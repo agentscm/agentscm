@@ -40,7 +40,7 @@ impl Agent {
     }
 }
 
-const ALL: [Agent; 5] = [
+pub(crate) const ALL: [Agent; 5] = [
     Agent::Claude,
     Agent::Codex,
     Agent::Cursor,
@@ -83,8 +83,8 @@ pub fn run(args: InitArgs) -> Result<()> {
     let hub = hub_base(args.hub_url.as_deref())?;
     let ui = Ui { yes: args.yes };
     let agents = args.agents.as_deref();
-    run_in(&root, agents, &ui)?;
-    print_next_steps(agents.unwrap_or(&ALL), hub.as_deref());
+    let outcome = run_in(&root, agents, hub.as_deref(), &ui)?;
+    print_next_steps(agents.unwrap_or(&ALL), hub.as_deref(), &outcome.written);
     Ok(())
 }
 
@@ -101,15 +101,31 @@ fn saved_hub_url() -> Option<String> {
     Some(file.url)
 }
 
-/// The hub URL without a trailing slash, for the printed setup command, so only plain URL
-/// characters are accepted. `None` when no hub is named anywhere.
+/// The hub URL without a trailing slash, for the setup command in the instruction files and
+/// the next steps. A bad `--hub-url` is an error; a bad AGENTSCM_HUB_URL or hub.json only
+/// warns, because the command then just keeps its placeholder.
 fn hub_base(given: Option<&str>) -> Result<Option<String>> {
+    if let Some(url) = given {
+        return checked_hub(url).map(Some);
+    }
     let env = std::env::var("AGENTSCM_HUB_URL")
         .ok()
         .filter(|u| !u.is_empty());
-    let Some(url) = given.map(str::to_owned).or(env).or_else(saved_hub_url) else {
+    let Some(url) = env.or_else(saved_hub_url) else {
         return Ok(None);
     };
+    Ok(checked_hub(&url)
+        .inspect_err(|error| {
+            eprintln!(
+                "Not using the saved hub URL ({error}); the setup command keeps {}.",
+                targets::HUB_PLACEHOLDER
+            )
+        })
+        .ok())
+}
+
+/// Only plain URL characters, since the URL goes into a shell command.
+fn checked_hub(url: &str) -> Result<String> {
     let url = check_base_url(url.trim()).map_err(map_hub_error)?;
     if !url
         .chars()
@@ -119,7 +135,7 @@ fn hub_base(given: Option<&str>) -> Result<Option<String>> {
             "the hub URL has characters that cannot go in a shell command",
         ));
     }
-    Ok(Some(url))
+    Ok(url)
 }
 
 enum Status {
@@ -136,8 +152,8 @@ struct Planned {
     status: Status,
 }
 
-fn plan(root: &Path, agents: &[Agent]) -> Vec<Planned> {
-    targets::targets(agents)
+fn plan(root: &Path, agents: &[Agent], hub: Option<&str>) -> Vec<Planned> {
+    targets::targets(agents, hub)
         .into_iter()
         .map(|target| {
             let path = root.join(target.path);
@@ -237,12 +253,17 @@ fn show_diff(item: &Planned) {
 }
 
 /// Writes the instruction files at `root`; `agents` of `None` means all of them.
-pub(crate) fn run_in(root: &Path, agents: Option<&[Agent]>, ui: &Ui) -> Result<Outcome> {
+pub(crate) fn run_in(
+    root: &Path,
+    agents: Option<&[Agent]>,
+    hub: Option<&str>,
+    ui: &Ui,
+) -> Result<Outcome> {
     let agents = agents.unwrap_or(&ALL);
     if agents.is_empty() {
         return Err(invalid("--agents is empty"));
     }
-    let planned = plan(root, agents);
+    let planned = plan(root, agents, hub);
     let mut outcome = Outcome::default();
     for item in &planned {
         let (label, note) = match &item.status {
@@ -290,16 +311,18 @@ pub(crate) fn run_in(root: &Path, agents: Option<&[Agent]>, ui: &Ui) -> Result<O
     Ok(outcome)
 }
 
-pub(crate) fn print_next_steps(agents: &[Agent], hub: Option<&str>) {
+pub(crate) fn print_next_steps(agents: &[Agent], hub: Option<&str>, written: &[PathBuf]) {
     println!();
-    println!("Commit these files. They hold instructions only: no MCP server, hook or token.");
-    println!("Each developer then connects their own checkout once for each agent they use:");
-    for agent in agents {
+    if !written.is_empty() {
         println!(
-            "  agentscm client setup --agent {} --hub {}",
-            agent.name(),
-            hub.unwrap_or("<hub url>")
+            "Commit the {} file{} written above. They hold instructions only: no MCP server, hook or token.",
+            written.len(),
+            if written.len() == 1 { "" } else { "s" }
         );
+    }
+    println!("Each developer connects their own checkout once for each agent they use:");
+    for agent in agents {
+        println!("  {}", targets::setup_command(*agent, hub));
     }
     println!(
         "It signs in to the hub and adds that machine's MCP server and hooks; the hub's Connect agents page then verifies them."
@@ -317,7 +340,7 @@ mod tests {
     }
 
     fn run_all(root: &Path, agents: Option<&[Agent]>) -> Outcome {
-        run_in(root, agents, &Ui { yes: true }).unwrap()
+        run_in(root, agents, None, &Ui { yes: true }).unwrap()
     }
 
     fn read(root: &Path, path: &str) -> String {

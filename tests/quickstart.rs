@@ -471,10 +471,11 @@ fn init_writes_only_instruction_files_even_for_a_local_hub() {
     );
     // The committed files carry no hooks or MCP, so the per-machine command is printed.
     assert!(
-        said.contains(&format!(
-            "This checkout is set up; on every other machine, each developer runs, once per checkout: agentscm client setup --agent claude|codex|cursor|copilot|gemini --hub {}",
-            hub.url
-        )),
+        said.contains("Each developer connects their own checkout once for each agent they use:")
+            && said.contains(&format!(
+                "agentscm client setup --agent claude --hub {}",
+                hub.url
+            )),
         "{said}"
     );
 }
@@ -500,10 +501,11 @@ fn init_without_an_agent_prints_the_setup_command_for_this_machine_too() {
     assert!(repo.path().join("AGENTS.md").exists(), "{said}");
     assert!(machine.connections().is_empty());
     assert!(
-        said.contains(&format!(
-            "On this machine and every other, each developer runs, once per checkout: agentscm client setup --agent claude|codex|cursor|copilot|gemini --hub {}",
-            hub.url
-        )),
+        said.contains("Each developer connects their own checkout once for each agent they use:")
+            && said.contains(&format!(
+                "agentscm client setup --agent claude --hub {}",
+                hub.url
+            )),
         "{said}"
     );
 }
@@ -613,6 +615,47 @@ fn hub_port_retry_reaches_docker_failure_after_an_occupied_first_port() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("registry denied pull"));
     assert!(!machine.home.path().join(".agentscm/hub").exists());
     assert!(!machine.config().join("quickstart.json").exists());
+}
+
+#[test]
+fn a_busy_hub_port_prints_a_rerun_command_with_a_free_port() {
+    let machine = Machine::new();
+    let repo = machine.repo();
+    fake_docker(&machine);
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = held.local_addr().unwrap().port().to_string();
+    let output = machine.run(
+        repo.path(),
+        &[
+            "quickstart",
+            "--yes",
+            "--local",
+            "--hub-runtime",
+            "docker",
+            "--hub-port",
+            &port,
+            "--github-login",
+            "octo",
+            "--hook",
+            "none",
+            "--no-collisions",
+        ],
+    );
+    drop(held);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let said = out(&output);
+    let hint = said
+        .lines()
+        .find_map(|line| line.strip_prefix("To use a free port, run: "))
+        .unwrap_or_else(|| panic!("{said}"));
+    let free: u16 = hint
+        .rsplit_once(" quickstart --local --hub-port ")
+        .unwrap_or_else(|| panic!("{hint}"))
+        .1
+        .parse()
+        .unwrap();
+    assert_ne!(free.to_string(), port);
+    assert!(!machine.home.path().join(".agentscm/hub").exists());
 }
 
 fn fake_docker(machine: &Machine) {

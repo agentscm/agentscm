@@ -155,6 +155,66 @@ impl NewForgeCheck {
     }
 }
 
+/// One merge queue group the Hub saw, with the journal of the status it posted on it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeGroup {
+    pub head_sha: String,
+    /// The queue branch, without `refs/heads/`.
+    pub head_ref: String,
+    pub base_ref: String,
+    pub base_sha: String,
+    pub pr_number: i64,
+    pub pr_head_sha: String,
+    pub context: String,
+    /// None while the group is current; once set it never clears.
+    pub ended_reason: Option<String>,
+    pub observed_at: i64,
+    pub ended_at: Option<i64>,
+    /// Compare-and-set counter for the status journal; 0 before the first reservation.
+    pub generation: i64,
+    /// The last reserved status, `None` before the first reservation.
+    pub check: Option<ForgeCheck>,
+    pub ruleset_requirement: Option<String>,
+    pub status_source: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewMergeGroup {
+    pub head_sha: String,
+    pub head_ref: String,
+    pub base_ref: String,
+    pub base_sha: String,
+    pub pr_number: i64,
+    pub pr_head_sha: String,
+    pub context: String,
+}
+
+impl NewMergeGroup {
+    pub(super) fn validate(&self) -> Result<()> {
+        validate_check_key(self.pr_number, &self.context)?;
+        let name_ok = |name: &str| {
+            !name.is_empty() && name.len() <= 255 && super::github::valid_ref_name(name)
+        };
+        if !is_lower_hex(&self.head_sha, 40)
+            || !is_lower_hex(&self.base_sha, 40)
+            || !is_lower_hex(&self.pr_head_sha, 40)
+            || !name_ok(&self.head_ref)
+            || !name_ok(&self.base_ref)
+        {
+            return Err(invalid("merge group is out of bounds"));
+        }
+        Ok(())
+    }
+}
+
+/// A short static observation (an ended reason, a requirement or source label).
+pub(super) fn validate_group_note(note: &str) -> Result<()> {
+    if note.is_empty() || note.len() > 120 || note.chars().any(char::is_control) {
+        return Err(invalid("merge group note is out of bounds"));
+    }
+    Ok(())
+}
+
 impl NewConnection {
     pub(super) fn validate(&self) -> Result<()> {
         let id_ok = self.id.strip_prefix("con_").is_some_and(|hex| {

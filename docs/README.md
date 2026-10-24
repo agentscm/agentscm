@@ -50,5 +50,4 @@ token dashboard and MCP inspect retained runs.
 
 - [Contributing](../CONTRIBUTING.md), [security policy](../SECURITY.md) and [code of conduct](../CODE_OF_CONDUCT.md)
 - [Contributor testing](contributor-testing.md): the nextest gate, focused iteration, coverage comparison and reproducible timing
-- [Local source install helper](setup.md)
 - [Releasing](releasing.md)
