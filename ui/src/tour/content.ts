@@ -12,6 +12,8 @@ export interface TourContext {
   overview: WorkOverview | null
   /** How many visible elements match a selector on the page right now. */
   count: (selector: string) => number
+  /** The trimmed text of the first visible match, so a tip can quote what the page already says. */
+  text: (selector: string) => string | null
 }
 
 export interface TourStep {
@@ -89,7 +91,7 @@ export const WELCOME: TourDef = {
     {
       target: NAV('verify'),
       title: 'Verify: did it actually work',
-      what: 'Workflows holds recorded tests and reviews. Change records say what is ready to hand off. Landed changes say whether merges went in and what CI did after.',
+      what: 'Workflows holds recorded tests and reviews. Change records say what is ready to hand off. Landed changes say whether merges went in and what CI did after. Skills says which workflows agents here must follow.',
       why: 'An agent saying “done” is not proof. These pages show the checks that ran on the exact change.',
       how: 'Before you trust a finished task, look for its workflow run or its landed change.',
       tip: (c) => {
@@ -364,6 +366,67 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
     ],
   },
 
+  skills: {
+    title: 'Skills',
+    steps: [
+      {
+        target: T('answer'),
+        title: 'Which workflows agents must follow',
+        what: 'The skills this repository asks agents to follow, such as the pull request gate, and where that choice was read from.',
+        why: 'A skill turns “run the tests and get a review” from a habit into steps the hub can track for each branch.',
+        how: 'Check the adoption line first. A skill only counts once the lock file is committed.',
+        tip: (c) => c.text('[data-tour="answer"] .answer-text'),
+      },
+      {
+        target: T('skills-adopted'),
+        title: 'Adopted skills',
+        what: 'Skills pinned in this repository’s lock file, with how many runs are open, waiting at a stop gate or done.',
+        why: 'These are the workflows agents here are expected to follow on every pull request.',
+        how: 'Open View runs to see where each pull request is in its workflow.',
+        tip: (c) => {
+          const n = c.count('[data-tour="skills-adopted"] [data-tour="skills-item"]')
+          return n > 0 ? `${plural(n, 'skill is', 'skills are')} adopted here.` : null
+        },
+        empty: 'Nothing is adopted yet. Pick a skill under Available and copy its command.',
+      },
+      {
+        target: T('skills-head'),
+        title: 'What is enforced and what is planned',
+        what: 'Each skill says which gates are enforced now and which are only planned. “Enforced: Stop hook” means the opt-in Stop hook can stop an agent from finishing. “Planned: merge check” is not built yet.',
+        why: 'So you know which steps the hub can actually hold an agent to, and which still rely on the agent following along.',
+        how: 'Install the opt-in Stop hook if you want agents blocked at tests, review and fix until there is evidence for the current commit.',
+        tip: (c) => {
+          const t = c.text('[data-tour="skills-head"]')
+          return t ? `The first skill on screen reads: ${t}.` : null
+        },
+        empty: 'Each skill shows its version, its hash and its Enforced and Planned labels here.',
+      },
+      {
+        target: T('skills-how'),
+        title: 'How it works, in plain English',
+        what: 'One line per step of the skill, written by the hub. Full procedure opens the exact text agents follow.',
+        why: 'You can check what an agent is supposed to do before you adopt it, without reading the workflow file.',
+        how: 'Read the steps top to bottom. They match the gates you will see on each run.',
+        tip: (c) => {
+          const t = c.text('[data-tour="skills-how"] li')
+          return t ? `Step 1 says: “${t}”` : null
+        },
+        empty: 'The plain-English steps appear here for each skill the hub ships.',
+      },
+      {
+        target: T('skills-command'),
+        title: 'Adopt or remove with a command',
+        what: 'The exact command to run in the repository, with a copy button.',
+        why: 'This page never writes. Adoption is a change to agentscm-skills.lock.json that you commit and review like any other.',
+        how: 'Copy the command, run it in your checkout, then commit the lock file.',
+        tip: (c) => {
+          const t = c.text('[data-tour="skills-command"] code')
+          return t ? `Copy this: ${t}` : null
+        },
+        empty: 'A command to adopt or remove a skill appears under each one.',
+      },
+    ],
+  },
   templates: {
     title: 'Templates',
     steps: [

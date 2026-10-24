@@ -120,6 +120,23 @@ test('the Tour this page trigger runs the Right now tour', async ({ page }) => {
   await expect(dialog(page)).toHaveCount(0)
 })
 
+test('the Skills tour spotlights the live page and quotes its plain-English steps', async ({ page }) => {
+  await signIn(page)
+  await page.keyboard.press('Escape')
+  await page.evaluate(() => (window.location.hash = 'skills'))
+  await expect(page.locator('[data-tour="skills-how"]').first()).toBeVisible()
+  await trigger(page).click()
+  await expect(title(page)).toHaveText('Which workflows agents must follow')
+  for (const [name, live] of [['Adopted skills', /adopted here/], ['What is enforced and what is planned', /Enforced: Stop hook/], ['How it works, in plain English', /Step 1 says: “.+”/], ['Adopt or remove with a command', /Copy this: agentscm skill (add|remove) /]] as const) {
+    await page.keyboard.press('ArrowRight')
+    await expect(title(page)).toHaveText(name)
+    await expect(page.locator('.tour-hole')).toBeVisible()
+    // The tip quotes the page's own text (from the hub), so the tour never keeps a copy of it.
+    await expect(dialog(page).locator('.tour-tip.is-live')).toContainText(live)
+    await withinViewport(page)
+  }
+})
+
 test('⌘K offers Walk me through this page and Replay the welcome tour', async ({ page }) => {
   await signIn(page)
   await page.keyboard.press('Escape')

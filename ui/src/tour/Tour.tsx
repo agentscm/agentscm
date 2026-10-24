@@ -107,6 +107,16 @@ const visibleCount = (selector: string): number => {
   }
 }
 
+const firstText = (selector: string): string | null => {
+  try {
+    const el = [...document.querySelectorAll<HTMLElement>(selector)].find((e) => !e.closest('.tour-layer') && e.getClientRects().length > 0)
+    const t = el?.textContent?.replace(/\s+/g, ' ').trim()
+    return t ? t.slice(0, 200) : null
+  } catch {
+    return null
+  }
+}
+
 const FOCUSABLE = 'button:not([disabled]), input:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])'
 
 function TourOverlay({ tourKey, data, d, overview, onClose, autoplayOn }: { tourKey: TourKey; data: HubData; d: Derived | null; overview: WorkOverview | null; onClose: (dontShow: boolean) => void; autoplayOn: boolean }) {
@@ -189,7 +199,7 @@ function TourOverlay({ tourKey, data, d, overview, onClose, autoplayOn }: { tour
     return () => document.removeEventListener('keydown', onKey, true)
   }, [next, back, onClose, dontShow])
 
-  const ctx: TourContext = { data, d, overview, count: visibleCount }
+  const ctx: TourContext = { data, d, overview, count: visibleCount, text: firstText }
   let tip: string | null
   try {
     tip = rect || !step.target ? (step.tip?.(ctx) ?? null) : null

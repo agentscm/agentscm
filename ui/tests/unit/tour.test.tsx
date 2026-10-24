@@ -83,7 +83,7 @@ describe('tour preferences', () => {
   })
 })
 
-const nullCtx: TourContext = { data: null, d: null, overview: null, count: () => 0 }
+const nullCtx: TourContext = { data: null, d: null, overview: null, count: () => 0, text: () => null }
 const emptyData: HubData = { whoami: null, work: null, activity: null, health: null, fresh: new Set(), lastOk: null, failing: false }
 let mockCtx: TourContext
 beforeAll(async () => {
@@ -92,7 +92,7 @@ beforeAll(async () => {
   const whoami = await fetchWhoami('mock', sig)
   const [work, activity, health] = await Promise.all([fetchWork(whoami.token.repository, 'mock', sig), fetchActivity(whoami.token.repository, 'mock', sig), fetchHealth(sig)])
   const overview = { recent_since: 0, until: 1, current: [], recent: [{}, {}], overlaps: [], current_complete: true, recent_complete: true, overlaps_complete: true, history_retention_gap: false } as unknown as WorkOverview
-  mockCtx = { data: { ...emptyData, whoami, work, activity, health, lastOk: Date.now() }, d: derive(work, activity), overview, count: () => 2 }
+  mockCtx = { data: { ...emptyData, whoami, work, activity, health, lastOk: Date.now() }, d: derive(work, activity), overview, count: () => 2, text: () => 'sample text' }
   vi.unstubAllGlobals()
 })
 
