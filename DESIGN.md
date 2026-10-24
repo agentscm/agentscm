@@ -167,14 +167,14 @@ The Hub uses gently rounded controls and surfaces: 12px is the primary control a
 ## Components
 
 ### Navigation rail
-- **Shape:** A 248px rail (68px compact) on the chrome surface with no dividing rule. Group heads are 11px uppercase labels; their explainers appear on hover or focus. Rows are 40px, with a plain 20px icon in `--hub-text-3` and a 550-weight label.
+- **Shape:** A 248px rail (68px compact) on the chrome surface with no dividing rule. Group heads are 11px uppercase labels; on desktop their explainers appear on hover or focus, and in the mobile drawer they are always visible. Rows are 40px, with a plain 20px icon in `--hub-text-3` and a 550-weight label.
 - **Behavior:** The active row takes the `--hub-nav-active` tint, a violet icon and a 650 label, and shows the page's question beneath it, wrapped rather than truncated. Other rows keep their question in the accessible name only, since each page opens with its question as its heading. The mobile drawer has room for the questions and no hover, so it shows every one. Badges stay compact counts beside the label, or a corner dot in the compact rail.
 
 ### Top bar
 - **Shape:** It sits on the chrome surface, with the search field and the header "Connect agent" action as white controls with hairline borders. The header action is deliberately secondary (an outline button with violet text) so each page's filled primary action stays the only filled violet on screen.
 
 ### Evidence boxes
-- **Shape:** 12px-corner surfaces with a 52px head of a plain 20px icon (tinted only for ok, warn or bad tones), a 15px 650 title, a plain count and an explainer that sits at rest opacity until the box is hovered or focused, then a hairline rule over the body.
+- **Shape:** 12px-corner surfaces with a 52px head of a plain 20px icon (tinted only for ok, warn or bad tones), a 15px 650 title, a plain count and an explainer at 0.8 rest opacity (at least 3:1 against the surface in both themes) that reaches full opacity when the box is hovered or the explainer focused, then a hairline rule over the body.
 - **Behavior:** The head labels the data; it doesn't compete with it. Rows inside a box are separated by rules or proximity, not nested cards.
 
 ### Info bars
@@ -191,7 +191,7 @@ The Hub uses gently rounded controls and surfaces: 12px is the primary control a
 
 ### Work cards
 - **Shape:** Neutral 10px-corner cards with 14px padding, a one-pixel border, and an 8px internal gap. The reported next action is text under a small label rather than a nested panel; only a blocker keeps a rose field. Check-in time and source share a ruled footer that wraps rather than splitting words.
-- **Behavior:** Source identity is compact and secondary. The title link, lead, state, and reported action form the primary scan path; participant details follow when present. Cards carry the state label but show a claim chip only when the claim needs attention (no recent or unknown check-in, still assigned). A live claim is the normal case for an unfinished lane, and the detail view still states it.
+- **Behavior:** Source identity is compact and secondary. The title link, lead, state, and reported action form the primary scan path; participant details follow when present. Cards carry the state label. In the In progress lane a live claim is the normal case, so the claim chip appears only when it needs attention (no recent or unknown check-in, still assigned). In Blocked, Handover and Paused, the card always shows the claim, Assigned or still assigned, because that is where an idle-looking task could be mistaken for available work.
 
 ### Recently finished
 - **Shape:** A two-column task grid on larger screens and a single queue on narrow screens, preceded by the exact server-provided start and end times.

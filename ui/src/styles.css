@@ -896,8 +896,11 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
   font-weight: 600;
   color: var(--hub-text-3);
 }
-.box-head .explain { opacity: 0.55; transition: opacity 160ms ease-out; }
-.box:hover .box-head .explain, .box-head .explain:focus-visible { opacity: 1; }
+/* 0.8 keeps the (i) at ≥3.4:1 against its surface in both themes (WCAG 1.4.11): quieter, still findable. */
+.box-head .explain,
+.lane-head .explain { opacity: 0.8; transition: opacity 160ms ease-out; }
+.box:hover .box-head .explain, .box-head .explain:focus-visible,
+.lane:hover .lane-head .explain, .lane-head .explain:focus-visible { opacity: 1; }
 
 .box-actions {
   margin-left: auto;
@@ -1352,7 +1355,7 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
   border-top: 2px solid var(--hub-rule-strong);
   border-radius: 12px 12px 0 0;
 }
-.lane-head .explain { opacity: 0.55; }
+
 .lane.tone-brand .lane-head { border-top-color: var(--hub-brand); }
 .lane.tone-brand .lane-head > .bi:first-child { color: var(--hub-brand-ink); }
 .lane.tone-bad .lane-head { border-top-color: var(--hub-bad); color: var(--hub-bad); }
@@ -2082,6 +2085,9 @@ a.run-row:hover {
   }
   .side.is-open { transform: none; }
   .side.is-compact .side-text, .side.is-compact .side-head > span, .side.is-compact .side-head-tip { display: revert; }
+  /* Same reasoning as the questions: no hover on touch, so the drawer's group explainers stay visible. */
+  .side .side-head-tip { opacity: 1; }
+
   .side.is-compact .side-text { display: flex; }
   .side.is-compact .side-head { height: auto; padding: 0 10px 6px; margin: 0; background: none; display: flex; }
   .side.is-compact .side-link { justify-content: flex-start; padding: 7px 8px; }
