@@ -139,10 +139,8 @@ pub async fn serve(
     let app = router(state, access);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     eprintln!("listening on {}", listener.local_addr()?);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(Error::Io)
+    agentscm::http_listener::serve(listener, app, shutdown_signal()).await;
+    Ok(())
 }
 
 fn local_access(token: Option<String>, origins: Vec<String>) -> Result<LocalAccess> {

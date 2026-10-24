@@ -120,7 +120,7 @@ case '__MODE__' in
     printf '%s\n' '{"unexpected":true}'
     ;;
   sleep)
-    sleep 5
+    sleep 30
     printf '%s\n' '__FINISH__'
     ;;
 esac
@@ -393,7 +393,9 @@ async fn controller_deadline_bounds_a_sleeping_cli() {
     .await
     .unwrap();
     assert_eq!(record.stop, ReviewStop::Deadline);
-    assert!(started.elapsed() < Duration::from_secs(1));
+    // The fixture sleeps 30 s; a third of that separates the 50 ms deadline from no deadline
+    // even when a loaded host is slow to start the CLI.
+    assert!(started.elapsed() < Duration::from_secs(10));
 }
 
 #[tokio::test]

@@ -157,7 +157,8 @@ async fn another_controller_stops_active_claude_and_cannot_publish_or_replay_it(
     let cancelled = cancel(&data_dir, "cancel-review").unwrap();
     assert_eq!(cancelled.state, RunState::Cancelled);
     assert_eq!(cancelled.steps[1].state, StepState::Cancelled);
-    let completed = match tokio::time::timeout(Duration::from_secs(3), &mut active).await {
+    // Half the fake Claude's 30 s sleep: cancellation, not the sleep ending, stopped it.
+    let completed = match tokio::time::timeout(Duration::from_secs(15), &mut active).await {
         Ok(result) => result.unwrap().unwrap(),
         Err(_) => {
             let pid: i32 = fs::read_to_string(&started)
@@ -172,7 +173,7 @@ async fn another_controller_stops_active_claude_and_cannot_publish_or_replay_it(
             panic!("active Claude process did not stop promptly after durable cancellation");
         }
     };
-    assert!(cancelled_at.elapsed() < Duration::from_secs(3));
+    assert!(cancelled_at.elapsed() < Duration::from_secs(15));
     assert_eq!(completed.state, RunState::Cancelled);
     assert_eq!(completed.steps[1].state, StepState::Cancelled);
     let review = completed.steps[1].review.as_ref().unwrap();

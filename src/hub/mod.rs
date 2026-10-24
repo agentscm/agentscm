@@ -146,6 +146,8 @@ pub struct HubState {
     workspace: Option<Arc<workspace::Workspace>>,
     #[cfg(unix)]
     workspace_execution: Option<Arc<workspace_execution::ExecutionService>>,
+    #[cfg(unix)]
+    publication_processing_timeout: std::time::Duration,
 }
 
 impl HubState {
@@ -163,6 +165,8 @@ impl HubState {
             workspace: None,
             #[cfg(unix)]
             workspace_execution: None,
+            #[cfg(unix)]
+            publication_processing_timeout: workspace_publication::PROCESSING_TIMEOUT,
         }
     }
 
@@ -208,6 +212,13 @@ impl HubState {
         execution: Arc<workspace_execution::ExecutionService>,
     ) -> Self {
         self.workspace_execution = Some(execution);
+        self
+    }
+
+    /// Replaces the 120-second processing bound on Git-transport publication routes.
+    #[cfg(unix)]
+    pub fn with_publication_processing_timeout(mut self, limit: std::time::Duration) -> Self {
+        self.publication_processing_timeout = limit;
         self
     }
 }
@@ -297,11 +308,11 @@ pub fn router(state: HubState) -> Router {
     let workspace_routes = workspace::routes()
         .merge(workspace_http::routes())
         .merge(workspace_agent_tasks::routes())
-        .merge(workspace_publication::routes())
+        .merge(workspace_publication::status_routes())
         .merge(workspace_source_http::routes());
     #[cfg(not(unix))]
     let workspace_routes = workspace::routes();
-    Router::new()
+    let router = Router::new()
         .merge(http::routes())
         .merge(onboarding::routes())
         .merge(slack::routes())
@@ -314,10 +325,34 @@ pub fn router(state: HubState) -> Router {
         .merge(sync::routes())
         .merge(ui::routes())
         .merge(workspace_routes)
-        .fallback(http::not_found)
+        .fallback(http::not_found);
+    #[cfg(unix)]
+    let publication = workspace_publication::routes();
+    #[cfg(not(unix))]
+    let publication = Router::new();
+    bounded(router, publication, &state).with_state(state)
+}
+
+/// Applies the Hub-wide body and time bounds to `routes`, then merges `publication` behind
+/// its own longer processing bound. Routes merged after a layer are not wrapped by it.
+fn bounded(
+    routes: Router<HubState>,
+    publication: Router<HubState>,
+    state: &HubState,
+) -> Router<HubState> {
+    let routes = routes
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .layer(axum::middleware::from_fn(request_timeout))
-        .with_state(state)
+        .layer(axum::middleware::from_fn(request_timeout));
+    #[cfg(not(unix))]
+    let _ = state;
+    #[cfg(unix)]
+    let publication = publication
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            workspace_publication::processing_timeout,
+        ));
+    routes.merge(publication)
 }
 
 /// Longest any request may run; the notices long-poll caps at 25 seconds and uploads at 8 MiB.
