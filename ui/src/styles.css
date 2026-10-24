@@ -258,7 +258,7 @@ code,
 /* Shell: one frame. Header across the top, grouped question rail on the left,
    breadcrumbs heading the content column. The rail keeps option 1's question subtitles. */
 .app-shell {
-  --top-h: 56px;
+  --top-h: var(--hub-top-h, 56px);
   --side-w: 248px;
   min-height: 100dvh;
   background: var(--hub-chrome);
@@ -486,7 +486,7 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
   overflow-x: hidden;
   z-index: 1020;
 }
-.side-nav { display: flex; flex-direction: column; gap: 18px; }
+.side-nav { display: flex; flex-direction: column; gap: var(--hub-nav-group, 18px); }
 .side-group { display: flex; flex-direction: column; gap: 1px; }
 .side-head {
   display: flex;
@@ -506,7 +506,7 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
   display: flex;
   align-items: center;
   gap: 10px;
-  min-height: 40px;
+  min-height: var(--hub-nav-h, 40px);
   padding: 6px 10px;
   border-radius: 8px;
   color: var(--hub-text-2);
@@ -759,7 +759,7 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
   width: 100%;
   margin: 0 auto;
   min-width: 0;
-  padding: 28px clamp(16px, 3vw, 36px) 72px;
+  padding: var(--hub-main-top, 28px) clamp(16px, 3vw, 36px) 72px;
   display: flex;
   flex-direction: column;
   gap: var(--hub-gap);
@@ -781,8 +781,8 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
 /* The answer: the page's question as a quiet heading, then one readable sentence. Weight, not size,
    carries the facts (the .jump links); the sentence itself stays at reading weight. */
 .answer {
-  padding: 0 2px 28px;
-  margin-bottom: 8px;
+  padding: 0 2px var(--hub-answer-pad, 28px);
+  margin-bottom: var(--hub-answer-gap, 8px);
   border-bottom: 1px solid var(--hub-rule-strong);
 }
 .answer-text, .answer-fact { max-width: 68ch; }
@@ -911,8 +911,8 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
   display: flex;
   align-items: center;
   gap: 8px;
-  min-height: 52px;
-  padding: 10px 18px;
+  min-height: var(--hub-head-h, 52px);
+  padding: 10px var(--hub-head-x, 18px);
   background: var(--hub-surface-head);
   border-bottom: 1px solid var(--hub-rule);
   border-radius: 10px 10px 0 0;
@@ -956,7 +956,7 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
   flex-wrap: wrap;
 }
 .box-body {
-  padding: 16px 18px 18px;
+  padding: var(--hub-pad-box, 16px 18px 18px);
 }
 .box-body.flush {
   padding: 0;
@@ -1181,7 +1181,7 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
 .agent {
   display: flex;
   gap: 12px;
-  padding: 12px 0;
+  padding: var(--hub-row-y, 12px) 0;
 }
 .agent + .agent {
   border-top: 1px solid var(--hub-rule);
@@ -1240,7 +1240,7 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
   color: var(--hub-bad);
 }
 .contested {
-  padding: 12px 0;
+  padding: var(--hub-row-y, 12px) 0;
   border-bottom: 1px solid var(--hub-rule);
   display: flex;
   flex-direction: column;
@@ -1392,7 +1392,7 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 11px 14px 10px;
+  padding: var(--hub-lane-head, 11px 14px 10px);
   font-size: 0.875rem;
   font-weight: 650;
   color: var(--hub-text);
@@ -1414,10 +1414,10 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
   color: var(--hub-text-3);
 }
 .lane-body {
-  padding: 4px 10px 10px;
+  padding: var(--hub-lane-body, 4px 10px 10px);
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--hub-card-gap, 8px);
   max-height: clamp(260px, calc(100dvh - 380px), 620px);
   overflow-y: auto;
 }
@@ -1430,10 +1430,10 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
   background: var(--hub-surface);
   border: 1px solid var(--hub-rule);
   border-radius: 10px;
-  padding: 12px 14px;
+  padding: var(--hub-card-pad, 12px 14px);
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--hub-card-gap, 8px);
   box-shadow: 0 1px 2px rgba(21, 26, 45, 0.04);
   transition: border-color 160ms ease-out;
 }
@@ -1765,7 +1765,7 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
   grid-template-columns: 32px minmax(0, 1fr) auto;
   gap: 12px;
   align-items: start;
-  padding: 8px 0;
+  padding: var(--hub-event-y, 8px) 0;
   position: relative;
 }
 .event-icon {
@@ -1853,7 +1853,7 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
   display: flex;
   gap: 12px;
   align-items: center;
-  padding: 12px;
+  padding: var(--hub-row-y, 12px) 12px;
   border-radius: 12px;
   text-decoration: none;
   color: var(--hub-text);
@@ -2135,7 +2135,7 @@ a.run-row:hover {
 }
 @media (max-width: 640px) {
   .main {
-    padding: 22px 16px 48px;
+    padding: var(--hub-main-top, 22px) 16px 48px;
   }
   .change-record-detail .tech {
     grid-template-columns: minmax(0, 1fr);

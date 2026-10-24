@@ -1,6 +1,7 @@
 // Browser storage can throw (private windows, blocked site data): never rely on it.
 const TOKEN_KEY = 'agentscm.token'
 const THEME_KEY = 'agentscm.theme'
+const DENSITY_KEY = 'agentscm.density'
 
 function stores(): Storage[] {
   const out: Storage[] = []
@@ -72,6 +73,26 @@ export function loadTheme(): ThemePref {
 export function saveTheme(t: ThemePref): void {
   try {
     window.localStorage.setItem(THEME_KEY, t)
+  } catch {
+    /* ignore */
+  }
+}
+
+export type Density = 'spacious' | 'compact'
+
+export function loadDensity(): Density {
+  try {
+    const v = window.localStorage.getItem(DENSITY_KEY)
+    if (v === 'spacious' || v === 'compact') return v
+  } catch {
+    /* ignore */
+  }
+  return 'spacious'
+}
+
+export function saveDensity(d: Density): void {
+  try {
+    window.localStorage.setItem(DENSITY_KEY, d)
   } catch {
     /* ignore */
   }

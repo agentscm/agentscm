@@ -59,6 +59,7 @@ spacing:
   lg: "16px"
   xl: "20px"
   section: "28px"
+  section-spacious: "32px"
 components:
   navigation:
     backgroundColor: "{colors.chrome-light}"
@@ -154,6 +155,26 @@ The Work surface begins with section navigation, a direct heading, read-only loa
 Current work uses four desktop progress lanes: In progress, Blocked, Handover, and Paused. The board is a four-column grid with 14px gaps, 12px lane corners, 14px lane-heading and 10px card insets, and an internally scrolling height of `clamp(240px, calc(100dvh - 570px), 460px)`. Recently finished uses a two-column task grid with the exact overview window above it. Needs coordination starts with a fixed-watermark page of compact directed-request summaries. Each summary exposes the stage, proposal, requester-to-target relationship and first concrete path reason; its native disclosure reveals all returned paths, receipts, responses and notes. Detected overlaps, other attention signals and recent decisions remain separate, count-labelled disclosures that are collapsed by default.
 
 At 860px and below, the board becomes two columns, directed-request targets become a single queue, and detected-overlap rows stack the reason above the involved work. Change history keeps its date column in the stacked record. At 640px and below, the Work surface uses 16px horizontal padding with an 8px side bleed, controls keep 44px targets, lane buttons wrap at a 110px basis, only the selected lane is visible as one scrollable queue, recently finished becomes one column, and each involved work item receives its own separated row. The search input remains visually present while its redundant label is visually hidden and remains available to screen readers.
+
+## Density
+
+**The Two Densities Rule.** The Hub has two density modes, chosen in Settings and stored per browser (`agentscm.density`, set on `<html data-density>` before first paint). **Spacious** is the default; **Compact** is the dense register for big screens and is exactly the layout the sections above describe. Spacious overrides tokens only, all in `ui/src/density.css` (tour card values at the end of `ui/src/tour/tour.css`); the rules in `styles.css` carry the compact value as the `var()` fallback, so Compact sets nothing.
+
+| Token | Compact | Spacious (phone) |
+| --- | --- | --- |
+| Body size (`--bs-body-font-size`) | 14px | 15px |
+| Section and page gap (`--hub-gap`) | 24px | 32px (26px) |
+| Masthead space below (`--hub-answer-pad`) | 28px | 36px (28px) |
+| Top bar (`--hub-top-h`) | 56px | 62px (56px) |
+| Box head (`--hub-head-h`, `--hub-head-x`) | 52px, 18px | 58px, 22px (54px, 18px) |
+| Box body (`--hub-pad-box`) | 16 18 18 | 20 22 22 (18 18 20) |
+| List row (`--hub-row-y`) | 12px | 16px (14px) |
+| Activity row (`--hub-event-y`) | 8px | 11px (10px) |
+| Nav row, group gap (`--hub-nav-h`, `--hub-nav-group`) | 40px, 18px | 44px, 24px |
+| Lane and work-card padding | 11 14 10 / 12 14 | 14 16 12 / 16 18 (12 14 11 / 14 16) |
+| Tour card width, body line height | 400 (480 welcome), 1.5 | 440 (520), 1.6 |
+
+Touch targets stay at 44px in both modes and phones get the lighter increase.
 
 ## Elevation & Depth
 

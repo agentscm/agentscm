@@ -16,6 +16,8 @@ export interface Placement {
 
 export const CARD_W = 400
 export const HERO_W = 480
+// Spacious density: 40px / 40px wider (tour.css sizes the padding to match).
+const WIDE = 40
 const GAP = 12
 const EDGE = 16
 const COMPACT_H = 300
@@ -24,10 +26,11 @@ const COMPACT_H = 300
  * `fullH` is the card's height with its illustration (last measured, or an estimate); `h` its height right now.
  * The compact decision only reads `fullH`, so shrinking the card cannot flip the decision back.
  */
-export function placeCard(rect: Rect | null, card: { fullH: number; h: number; hero?: boolean }, vp: { w: number; h: number }): Placement {
+export function placeCard(rect: Rect | null, card: { fullH: number; h: number; hero?: boolean }, vp: { w: number; h: number }, spacious = false): Placement {
+  const extra = spacious ? WIDE : 0
   const narrow = vp.w <= 640
   if (!rect) {
-    const w = Math.min(card.hero ? HERO_W : CARD_W, vp.w - 32)
+    const w = Math.min((card.hero ? HERO_W : CARD_W) + extra, vp.w - 32)
     return { compact: vp.h < card.fullH + 32, sheet: false, style: { inset: 0, margin: 'auto', height: 'fit-content', width: w } }
   }
   if (narrow) {
@@ -40,7 +43,7 @@ export function placeCard(rect: Rect | null, card: { fullH: number; h: number; h
     const maxHeight = free >= vp.h * 0.45 ? '45dvh' : `${Math.max(190, Math.floor(free))}px`
     return { compact: true, sheet: true, style: sheetAtTop ? { top: 12, left: 12, right: 12, maxHeight } : { bottom: 12, left: 12, right: 12, maxHeight } }
   }
-  const w = Math.min(CARD_W, vp.w - 32)
+  const w = Math.min(CARD_W + extra, vp.w - 32)
   const left = Math.max(EDGE, Math.min(rect.left, vp.w - w - EDGE))
   const near = (h: number) => {
     const below = rect.top + rect.height + GAP

@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { loadLocalBase, loadLocalToken, localStatus, saveLocalBase, saveLocalToken, validLocalBase } from '../localApi.ts'
 import { usePoll } from '../usePoll.ts'
-import { loadSingleKeys, saveSingleKeys, type ThemePref } from '../storage.ts'
+import { loadSingleKeys, saveSingleKeys, type Density, type ThemePref } from '../storage.ts'
 import type { Whoami } from '../types.ts'
 import { ViewSettingsBox } from '../ViewSettings.tsx'
 import { Box, Icon, Pill, Skeleton, localDate } from '../ui.tsx'
@@ -16,11 +16,15 @@ const CADENCE = [
   ['heart-pulse', 'Hub health', 'Every 15 seconds'],
 ] as const
 
-export function SettingsPage({ token, whoami, pref, onPref, railCollapsed, onRail, onForget }: { token: string; whoami: Whoami | null; pref: ThemePref; onPref: (p: ThemePref) => void; railCollapsed: boolean; onRail: (collapsed: boolean) => void; onForget: () => void }) {
+export function SettingsPage({ token, whoami, pref, onPref, density, onDensity, railCollapsed, onRail, onForget }: { token: string; whoami: Whoami | null; pref: ThemePref; onPref: (p: ThemePref) => void; density: Density; onDensity: (d: Density) => void; railCollapsed: boolean; onRail: (collapsed: boolean) => void; onForget: () => void }) {
   const themes: { v: ThemePref; icon: string; label: string; hint: string }[] = [
     { v: 'light', icon: 'sun', label: 'Light', hint: 'Always light' },
     { v: 'system', icon: 'circle-half', label: 'System', hint: 'Follows your device' },
     { v: 'dark', icon: 'moon-stars', label: 'Dark', hint: 'Always dark' },
+  ]
+  const densities: { v: Density; icon: string; label: string; hint: string }[] = [
+    { v: 'spacious', icon: 'arrows-expand', label: 'Spacious', hint: 'More room between rows and sections.' },
+    { v: 'compact', icon: 'arrows-collapse', label: 'Compact', hint: 'Fits more on screen.' },
   ]
   const [singleKeys, setSingleKeys] = useState(loadSingleKeys)
   return (
@@ -39,6 +43,23 @@ export function SettingsPage({ token, whoami, pref, onPref, railCollapsed, onRai
             <div className="choice-cards" data-tour="settings-theme" role="radiogroup" aria-label="Theme">
               {themes.map((t) => (
                 <button key={t.v} type="button" role="radio" aria-checked={pref === t.v} className={`choice${pref === t.v ? ' on' : ''}`} onClick={() => onPref(t.v)}>
+                  <Icon name={t.icon} />
+                  <span>
+                    <strong>{t.label}</strong>
+                    <span className="muted small">{t.hint}</span>
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="settings-row">
+            <div>
+              <div className="settings-label">Density</div>
+              <div className="muted small">How much room rows, boxes and sections get.</div>
+            </div>
+            <div className="choice-cards" data-tour="settings-density" role="radiogroup" aria-label="Density">
+              {densities.map((t) => (
+                <button key={t.v} type="button" role="radio" aria-checked={density === t.v} className={`choice${density === t.v ? ' on' : ''}`} onClick={() => onDensity(t.v)}>
                   <Icon name={t.icon} />
                   <span>
                     <strong>{t.label}</strong>

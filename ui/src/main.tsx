@@ -1,12 +1,16 @@
 import 'bootstrap/dist/css/bootstrap.min.css'
 import 'bootstrap-icons/font/bootstrap-icons.min.css'
 import './styles.css'
+import './density.css'
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { ApiError, fetchHealth, fetchWhoami } from './api.ts'
-import { fragmentTokenAllowed, loadToken, saveToken } from './storage.ts'
+import { fragmentTokenAllowed, loadDensity, loadToken, saveToken } from './storage.ts'
 import App from './App.tsx'
 import { ErrorBoundary } from './ErrorBoundary.tsx'
+
+// Before the first render, so the page never paints at the wrong density.
+document.documentElement.dataset['density'] = loadDensity()
 
 /** `#token=…` (from `agentscm demo`): removed from the address bar before anything else runs. */
 function takeFragmentToken(): string | null {

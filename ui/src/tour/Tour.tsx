@@ -247,7 +247,7 @@ function TourOverlay({ tourKey, data, d, overview, onClose, autoplayOn }: { tour
   const [moreAt, setMoreAt] = useState<number | null>(null) // the step whose "More" is open
   const more = moreAt === i
   const hero = isWelcome && i === 0
-  const place = placeCard(rect, { fullH, h: cardH, hero }, { w: window.innerWidth, h: window.innerHeight })
+  const place = placeCard(rect, { fullH, h: cardH, hero }, { w: window.innerWidth, h: window.innerHeight }, document.documentElement.dataset['density'] !== 'compact')
   const compact = place.compact
   // Measure the card as it renders: its full height (with the illustration) feeds the compact decision.
   useLayoutEffect(() => {
@@ -267,6 +267,7 @@ function TourOverlay({ tourKey, data, d, overview, onClose, autoplayOn }: { tour
       <div className="tour-block" onMouseDown={(e) => e.preventDefault()} />
       <Spotlight rect={rect} step={i} />
       <div ref={card} className={`tour-card${place.sheet ? ' is-sheet' : ''}${compact ? ' is-compact' : ''}`} style={place.style} role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={`${ids}-body`}>
+        <div className="tour-scroll">
         {!compact && <div className={`tour-band${hero ? ' is-hero' : ''}`}>{isWelcome ? <WelcomeHero still={!hero} key={hero ? 'hero' : 'still'} /> : <TourArt tourKey={tourKey} key={i} />}</div>}
         <div className="tour-main">
           <div className="tour-head">
@@ -302,6 +303,7 @@ function TourOverlay({ tourKey, data, d, overview, onClose, autoplayOn }: { tour
               </p>
             )}
           </div>
+        </div>
         </div>
         <div className="tour-foot">
           {(isWelcome || autoplayOn) && (
