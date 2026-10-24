@@ -3163,6 +3163,93 @@ fn client_remove_honors_the_shared_lifecycle_lease() {
 }
 
 #[test]
+fn final_uninstall_cleanup_excludes_setup_and_retains_program_when_busy() {
+    use std::fs::OpenOptions;
+    use std::os::fd::AsRawFd;
+
+    let (hub, machine) = (Hub::start(), Machine::new().with_claude());
+    let repo = machine.repo();
+    let token = hub.token_file(machine.home.path());
+    let installed = install_dir_program(&machine);
+    ok(&run_as(
+        &machine,
+        &installed,
+        repo.path(),
+        &quick(&hub.url, &token, &["--no-collisions"]),
+    ));
+    let manifest = machine.config().join("quickstart.json");
+    let bin = machine.home.path().join(".agentscm/bin");
+    assert!(manifest.exists() && bin.join("agentscm").exists());
+    let registered_root = machine.connections()[0]["root"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    ok(&machine.run(
+        repo.path(),
+        &["client", "remove", "--root", &registered_root],
+    ));
+    let mut record = json_file(&manifest);
+    record["clients"] = serde_json::json!([]);
+    record["session"] = serde_json::json!({"hub": hub.url.clone()});
+    record["local_hub"] = serde_json::json!({
+        "dir": machine.home.path().join(".agentscm/synthetic-hub"),
+        "project": "synthetic-managed-hub",
+        "port": 7332
+    });
+    std::fs::write(&manifest, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+    let lease_path = machine.config().join("client-lifecycle.lock");
+    let lease = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lease_path)
+        .unwrap();
+    // SAFETY: flock only reads the valid descriptor and has no pointer arguments.
+    assert_eq!(unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+    let setup = machine.run(
+        repo.path(),
+        &[
+            "client",
+            "setup",
+            "--agent",
+            "claude",
+            "--hub",
+            &hub.url,
+            "--root",
+            repo.path().to_str().unwrap(),
+        ],
+    );
+    assert!(!setup.status.success(), "{}", out(&setup));
+    assert!(
+        String::from_utf8_lossy(&setup.stderr).contains("client connections are busy"),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+
+    let uninstall = machine.run(repo.path(), &["uninstall", "--yes"]);
+    assert!(!uninstall.status.success(), "{}", out(&uninstall));
+    assert!(bin.join("agentscm").exists());
+    assert!(manifest.exists());
+    let retained = json_file(&manifest);
+    assert_eq!(retained["session"]["hub"], hub.url);
+    assert_eq!(retained["local_hub"]["project"], "synthetic-managed-hub");
+    assert!(!machine.home.path().join("docker.log").exists());
+
+    let mut retry = retained;
+    retry["session"] = serde_json::Value::Null;
+    retry["local_hub"] = serde_json::Value::Null;
+    std::fs::write(&manifest, serde_json::to_vec_pretty(&retry).unwrap()).unwrap();
+
+    drop(lease);
+    ok(&machine.run(repo.path(), &["uninstall", "--yes"]));
+    assert!(!bin.join("agentscm").exists());
+    assert!(!manifest.exists());
+}
+
+#[test]
 fn uninstall_keeps_what_the_user_added_to_mcp_json_and_ends_the_sign_in() {
     let (hub, machine) = (Hub::start(), Machine::new().with_claude());
     let repo = machine.repo();

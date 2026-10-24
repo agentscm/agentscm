@@ -233,6 +233,7 @@ pub(crate) async fn setup(
     wait: Option<&AppWait<'_>>,
 ) -> Result<()> {
     let _lifecycle = lifecycle_lock()?;
+    validate_setup_program(program)?;
     for agent in agents {
         crate::client_setup::preflight(*agent, &root, program)?;
     }
@@ -315,12 +316,22 @@ pub(crate) fn setup_existing_agent(
     crate::client_setup::install_quiet(agent, root, &stable)
 }
 
-fn lifecycle_lock() -> Result<std::fs::File> {
+pub(crate) fn lifecycle_lock() -> Result<std::fs::File> {
     lifecycle_lock_at(&crate::hub_cli::config_dir()?.join("agentscm/client-lifecycle.lock"))
 }
 
 fn lifecycle_lock_at(path: &Path) -> Result<std::fs::File> {
     crate::client_config::acquire_lock(path)
+}
+
+#[cfg(unix)]
+fn validate_setup_program(program: &Path) -> Result<()> {
+    if !program.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        return Err(invalid(
+            "the installed AgentSCM executable disappeared; reinstall it before client setup",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -1395,6 +1406,17 @@ mod tests {
         assert!(lifecycle_lock_at(&path).is_err());
         drop(first);
         assert!(lifecycle_lock_at(&path).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_program_is_rechecked_after_lifecycle_acquisition() {
+        let temp = tempfile::tempdir().unwrap();
+        let program = temp.path().join("agentscm");
+        std::fs::write(&program, b"program").unwrap();
+        assert!(validate_setup_program(&program).is_ok());
+        std::fs::remove_file(&program).unwrap();
+        assert!(validate_setup_program(&program).is_err());
     }
 
     fn fake_hub(responses: Vec<(u16, Value)>) -> (String, mpsc::Receiver<String>) {

@@ -287,12 +287,12 @@ also shows local hook and MCP transport outcomes observed while it is running; t
 stay in memory and expire. Missing or idle activity stays unknown. `--json` emits a versioned
 status contract, including separate onboarding and local-activity binding identifiers.
 
-Each connected checkout has **Set Up Agent Integration** actions for Claude Code, Codex, Cursor,
+Each connected checkout has **Agent Integrations** actions for Claude Code, Codex, Cursor,
 Copilot and Gemini. They reuse the existing owned hooks, MCP and skill installers with the saved
 connection and stable installed binary. **Reapply** repeats setup; it does not certify runtime
 health or accept the native client's trust prompts. A tray started by macOS can have a minimal
 `PATH`, so Claude Code or Codex may be installed but unavailable to the tray. Each agent action has
-a **Copy Guided Terminal Setup** fallback. The copied command is executed only when you paste and
+a **Copy Terminal Setup** fallback. The copied command is executed only when you paste and
 run it in Terminal; it runs normal `client setup`, which may contact the Hub, request forge sign-in,
 and create or replace a managed coordination token. The native client's own trust prompts still
 apply.

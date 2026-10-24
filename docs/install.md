@@ -91,12 +91,16 @@ The optional macOS tray is part of this same binary; no separate app install is 
 `npx agentscm tray`, or add `--tray` to quickstart to open it after successful setup. Start at
 Login is off until enabled in the tray menu. The alpha binary is not signed or notarized, and the
 tray does not update independently; install a newer AgentSCM release through the same installer.
-For a connected checkout, choose **Set Up Agent Integration** in its menu to configure Claude
+Each checkout menu groups its status, opening actions, **Agent Integrations**, **Connection Details**,
+**Recent Activity** and **Troubleshooting**. Connection Details shows the full checkout path and
+connection values.
+
+For a connected checkout, choose **Agent Integrations** in its menu to configure Claude
 Code, Codex, Cursor, Copilot or Gemini. This installs AgentSCM's existing hooks, MCP connection
 and coordination skill; the native client's own trust prompts still apply. **Reapply** reruns
 that setup without signing in again. Connect a new checkout or Hub through quickstart.
 If macOS starts the tray with a minimal `PATH`, an installed Claude Code or Codex CLI may be
-unavailable there. Use **Copy Guided Terminal Setup** for that agent. The tray only copies this
+unavailable there. Use **Copy Terminal Setup** for that agent. The tray only copies this
 command: it runs normal `client setup` only after you paste and run it in Terminal. That guided
 command may contact the Hub, request forge sign-in, and create or replace a managed coordination
 token; the native client's own trust prompts still apply.

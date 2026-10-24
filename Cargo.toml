@@ -39,7 +39,7 @@ toml_edit = "=0.25.17"
 winit = { version = "=0.30.13", default-features = false }
 tray-icon = { version = "=0.26.1", default-features = false }
 objc2 = "=0.6.5"
-objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSAccessibilityProtocols", "NSButton", "NSCell", "NSControl", "NSMenu", "NSMenuItem", "NSResponder", "NSSwitch", "NSTextField", "NSView"] }
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSAccessibilityProtocols", "NSButton", "NSCell", "NSColor", "NSControl", "NSFont", "NSFontDescriptor", "NSImage", "NSImageView", "NSMenu", "NSMenuItem", "NSParagraphStyle", "NSResponder", "NSSwitch", "NSTextField", "NSView"] }
 objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSArray", "NSGeometry", "NSNotification", "NSString"] }
 
 [dev-dependencies]

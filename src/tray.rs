@@ -24,11 +24,27 @@ pub(crate) async fn run(args: TrayArgs) -> Result<()> {
     }
 }
 
-/// Uninstall removes only the exact startup configuration owned by this client.
-pub(crate) fn remove_login_setting() -> Result<()> {
+/// Caller holds the shared client lifecycle lease through program cleanup.
+pub(crate) fn remove_login_setting_locked() -> Result<()> {
     #[cfg(target_os = "macos")]
     login::set_enabled(false, &std::env::current_exe()?)?;
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn set_login_enabled(enable: bool, current: &std::path::Path) -> Result<()> {
+    with_client_lifecycle_using(crate::client_cli::lifecycle_lock, || {
+        login::set_enabled(enable, current)
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn with_client_lifecycle_using<T>(
+    acquire: impl FnOnce() -> Result<std::fs::File>,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let _lifecycle = acquire()?;
+    operation()
 }
 
 #[cfg(target_os = "macos")]
@@ -81,5 +97,39 @@ mod tests {
             foreground_argv(),
             ["--no-telemetry", "tray", "--foreground"]
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_change_waits_for_cleanup_and_rejects_a_deleted_program() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock = temp.path().join("client-lifecycle.lock");
+        let cleanup = crate::client_config::acquire_lock(&lock).unwrap();
+        let mut attempted = false;
+        let blocked = with_client_lifecycle_using(
+            || crate::client_config::acquire_lock(&lock),
+            || {
+                attempted = true;
+                Ok(())
+            },
+        );
+        assert!(blocked.is_err());
+        assert!(!attempted);
+        drop(cleanup);
+
+        let current = temp.path().join("versioned-agentscm");
+        std::fs::write(&current, b"program").unwrap();
+        let stable = temp.path().join("bin/agentscm");
+        std::fs::create_dir_all(stable.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&current, &stable).unwrap();
+        let plist = temp.path().join("LaunchAgents/agentscm.plist");
+        let config = temp.path().join("config");
+        std::fs::remove_file(&current).unwrap();
+        let rejected = with_client_lifecycle_using(
+            || crate::client_config::acquire_lock(&lock),
+            || login::set_enabled_at(true, &current, &plist, &stable, &config),
+        );
+        assert!(rejected.is_err());
+        assert!(!plist.exists());
     }
 }

@@ -13,9 +13,7 @@ use std::time::Duration;
 
 use agentscm::{Error, Result};
 use sha2::{Digest, Sha256};
-use tray_icon::menu::{
-    CheckMenuItem, IconMenuItem, Menu, MenuEvent, MenuItem, NativeIcon, PredefinedMenuItem, Submenu,
-};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIconBuilder};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -37,6 +35,7 @@ const RECENT_HUB_CHECK_SECONDS: i64 = 60;
 enum UserEvent {
     Menu(String),
     LaunchLogin(bool),
+    LoginResult(bool, std::result::Result<(), String>),
     MenuTrackingEnded,
     Snapshot(std::result::Result<Snapshot, String>, ConfigStamp),
     Integration(std::result::Result<String, String>),
@@ -166,6 +165,7 @@ fn run_foreground(initial: Snapshot) -> Result<()> {
         initial_icon: Some(icon()?),
         tray: None,
         native_menu: Some(native_menu),
+        login_changing: false,
         menu_dirty: false,
         notice: None,
     };
@@ -192,6 +192,7 @@ struct TrayApp {
     initial_icon: Option<Icon>,
     tray: Option<tray_icon::TrayIcon>,
     native_menu: Option<native_menu::NativeMenuBridge>,
+    login_changing: bool,
     menu_dirty: bool,
     notice: Option<Notice>,
 }
@@ -345,16 +346,30 @@ impl ApplicationHandler<UserEvent> for TrayApp {
             }
             UserEvent::LaunchLogin(desired) => {
                 self.notice = None;
-                let notice =
-                    if let Err(error) = super::login::set_enabled(desired, &self.executable) {
-                        error.to_string()
-                    } else {
-                        if desired {
-                            "Launch at login enabled for the next login".into()
-                        } else {
-                            "Launch at login disabled".into()
-                        }
-                    };
+                if self.login_changing {
+                    self.notice = Some(Notice::Action(
+                        "A launch-at-login change is still in progress".into(),
+                    ));
+                    if let Some(native_menu) = &self.native_menu {
+                        native_menu.set_enabled(super::login::enabled());
+                    }
+                    self.replace_menu(None);
+                } else {
+                    self.login_changing = true;
+                    spawn_login_change(
+                        self.refresh_proxy.clone(),
+                        desired,
+                        self.executable.clone(),
+                    );
+                }
+            }
+            UserEvent::LoginResult(desired, result) => {
+                self.login_changing = false;
+                let notice = match result {
+                    Err(error) => error,
+                    Ok(()) if desired => "Launch at login enabled for the next login".into(),
+                    Ok(()) => "Launch at login disabled".into(),
+                };
                 if let Some(native_menu) = &self.native_menu {
                     native_menu.set_enabled(super::login::enabled());
                 }
@@ -489,6 +504,18 @@ fn spawn_refresh(proxy: winit::event_loop::EventLoopProxy<UserEvent>, check: boo
     });
 }
 
+fn spawn_login_change(
+    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    desired: bool,
+    executable: std::path::PathBuf,
+) {
+    std::thread::spawn(move || {
+        let result = super::set_login_enabled(desired, &executable)
+            .map_err(|error| bounded_error(&error.to_string()));
+        let _ = proxy.send_event(UserEvent::LoginResult(desired, result));
+    });
+}
+
 struct IntegrationRequest {
     agent: crate::client_setup::Agent,
     label: &'static str,
@@ -583,10 +610,9 @@ fn build_menu(
     menu.append(&PredefinedMenuItem::section_header("AgentSCM"))
         .map_err(menu_error)?;
     if snapshot.connections.is_empty() && notice.is_none() {
-        menu.append(&MenuItem::new(
-            "No connected checkouts — run agentscm quickstart in a checkout",
-            false,
-            None,
+        menu.append(&native_text_item(
+            "empty",
+            "No connected checkouts\nRun agentscm quickstart in a checkout to begin.",
         ))
         .map_err(menu_error)?;
     }
@@ -599,79 +625,37 @@ fn build_menu(
             .unwrap_or(&connection.repository);
         let submenu = Submenu::new(super::clean_label(name), true);
         let indicator = connection_indicator(connection, now);
-        submenu.set_native_icon(Some(indicator.native_icon()));
         submenu
-            .append(&IconMenuItem::with_native_icon(
-                indicator.label(),
-                false,
-                Some(indicator.native_icon()),
-                None,
-            ))
-            .map_err(menu_error)?;
-        submenu
-            .append(&MenuItem::new(
-                format!("Repository: {}", super::clean_label(&connection.repository)),
-                false,
-                None,
-            ))
-            .map_err(menu_error)?;
-        submenu
-            .append(&MenuItem::new(
-                format!(
-                    "Path: {}",
-                    exact_menu_label(&connection.root.to_string_lossy())
+            .append(&native_text_item(
+                "summary",
+                &format!(
+                    "{}\n{}",
+                    full_menu_value(&connection.repository),
+                    indicator.label()
                 ),
-                false,
+            ))
+            .map_err(menu_error)?;
+        submenu
+            .append(&PredefinedMenuItem::separator())
+            .map_err(menu_error)?;
+        submenu
+            .append(&MenuItem::with_id(
+                format!("root:{identity}"),
+                "Open Checkout",
+                true,
                 None,
             ))
             .map_err(menu_error)?;
         submenu
-            .append(&MenuItem::new(
-                format!("URL: {}", super::clean_label(&connection.hub)),
-                false,
+            .append(&MenuItem::with_id(
+                format!("hub:{identity}"),
+                "Open Hub",
+                true,
                 None,
             ))
             .map_err(menu_error)?;
-        submenu
-            .append(&MenuItem::new(
-                format!("Binding: {}", binding_label(&connection.binding.state)),
-                false,
-                None,
-            ))
-            .map_err(menu_error)?;
-        submenu
-            .append(&MenuItem::new(
-                format!(
-                    "Credential: {}",
-                    credential_label(&connection.credential, now)
-                ),
-                false,
-                None,
-            ))
-            .map_err(menu_error)?;
-        submenu
-            .append(&MenuItem::new(
-                format!("Hub: {}", hub_label(&connection.hub_check, now)),
-                false,
-                None,
-            ))
-            .map_err(menu_error)?;
-        let integrations = Submenu::new("Set Up Agent Integration", true);
-        integrations.set_native_icon(Some(NativeIcon::Advanced));
-        integrations
-            .append(&MenuItem::new(
-                "Client CLI unavailable? Use guided Terminal setup.",
-                false,
-                None,
-            ))
-            .map_err(menu_error)?;
-        integrations
-            .append(&MenuItem::new(
-                "Guided setup may sign in or renew the connection.",
-                false,
-                None,
-            ))
-            .map_err(menu_error)?;
+
+        let integrations = Submenu::new("Agent Integrations", true);
         for (agent, label) in agent_choices() {
             let configured = connection.agents.iter().any(|saved| saved == agent.name());
             integrations
@@ -682,33 +666,57 @@ fn build_menu(
                     None,
                 ))
                 .map_err(menu_error)?;
-            integrations
+        }
+        let terminal = Submenu::new("Copy Terminal Setup", true);
+        terminal
+            .append(&native_text_item(
+                "note",
+                "Guided setup may sign in or renew this connection.",
+            ))
+            .map_err(menu_error)?;
+        for (agent, label) in agent_choices() {
+            terminal
                 .append(&MenuItem::with_id(
                     format!("copy-setup:{identity}:{}", agent.name()),
-                    format!("Copy Guided Terminal Setup for {label}"),
+                    label,
                     true,
                     None,
                 ))
                 .map_err(menu_error)?;
         }
+        integrations.append(&terminal).map_err(menu_error)?;
         submenu.append(&integrations).map_err(menu_error)?;
+
+        let details = Submenu::new("Connection Details", true);
+        details
+            .append(&native_text_item(
+                "details",
+                &format!(
+                    "Repository  {}\nPath  {}\nHub  {}\nBinding  {}\nCredential  {}\nAuthentication  {}",
+                    full_menu_value(&connection.repository),
+                    full_menu_value(&connection.root.to_string_lossy()),
+                    full_menu_value(&connection.hub),
+                    binding_label(&connection.binding.state),
+                    credential_label(&connection.credential, now),
+                    hub_label(&connection.hub_check, now),
+                ),
+            ))
+            .map_err(menu_error)?;
+        submenu.append(&details).map_err(menu_error)?;
+
+        let recent = Submenu::new("Recent Activity", true);
+        let mut recent_lines = Vec::new();
         for participation in connection
             .recent_participation
             .iter()
             .filter(|participation| participation_current(participation.expires_at, now))
         {
-            submenu
-                .append(&MenuItem::new(
-                    format!(
-                        "{}: {} — {}",
-                        super::clean_label(&participation.agent),
-                        super::clean_label(&participation.state),
-                        super::clean_label(&participation.next_action)
-                    ),
-                    false,
-                    None,
-                ))
-                .map_err(menu_error)?;
+            recent_lines.push(format!(
+                "{}: {} — {}",
+                full_menu_value(&participation.agent),
+                full_menu_value(&participation.state),
+                full_menu_value(&participation.next_action)
+            ));
         }
         if let Some(binding) = connection.binding.activity_generation.as_deref() {
             for row in activity
@@ -717,73 +725,59 @@ fn build_menu(
                 .rev()
                 .take(5)
             {
-                submenu
-                    .append(&MenuItem::new(activity_label(&row), false, None))
-                    .map_err(menu_error)?;
+                recent_lines.push(activity_label(&row));
             }
         }
-        submenu
-            .append(&PredefinedMenuItem::separator())
-            .map_err(menu_error)?;
-        submenu
-            .append(&IconMenuItem::with_id_and_native_icon(
-                format!("root:{identity}"),
-                "Open Checkout",
-                true,
-                Some(NativeIcon::Folder),
-                None,
-            ))
-            .map_err(menu_error)?;
-        submenu
-            .append(&IconMenuItem::with_id_and_native_icon(
-                format!("hub:{identity}"),
-                "Open Hub",
-                true,
-                Some(NativeIcon::Network),
-                None,
-            ))
-            .map_err(menu_error)?;
-        submenu
-            .append(&IconMenuItem::with_id_and_native_icon(
+        if recent_lines.is_empty() {
+            recent
+                .append(&native_text_item(
+                    "empty",
+                    "No recent AgentSCM activity observed.",
+                ))
+                .map_err(menu_error)?;
+        } else {
+            recent
+                .append(&native_text_item("activity", &recent_lines.join("\n")))
+                .map_err(menu_error)?;
+        }
+        submenu.append(&recent).map_err(menu_error)?;
+
+        let troubleshooting = Submenu::new("Troubleshooting", true);
+        troubleshooting
+            .append(&MenuItem::with_id(
                 format!("diagnostics:{identity}"),
                 "Copy Diagnostics",
                 true,
-                Some(NativeIcon::Info),
                 None,
             ))
             .map_err(menu_error)?;
-        submenu
+        troubleshooting
             .append(&MenuItem::with_id(
                 format!("reconnect:{identity}"),
-                "Copy Reconnect Command",
+                "Copy Reconnect",
                 true,
                 None,
             ))
             .map_err(menu_error)?;
-        submenu
+        troubleshooting
             .append(&MenuItem::with_id(
                 format!("guidance:{identity}"),
-                "Copy Repository Guidance Preview Command",
+                "Copy Guidance Preview",
                 true,
                 None,
             ))
             .map_err(menu_error)?;
+        submenu.append(&troubleshooting).map_err(menu_error)?;
         menu.append(&submenu).map_err(menu_error)?;
     }
     menu.append(&PredefinedMenuItem::separator())
         .map_err(menu_error)?;
     if let Some(notice) = notice {
-        menu.append(&MenuItem::new(super::clean_label(notice), false, None))
+        menu.append(&native_text_item("notice", notice))
             .map_err(menu_error)?;
     }
-    menu.append(&IconMenuItem::with_id_and_native_icon(
-        "refresh",
-        "Check Now",
-        true,
-        Some(NativeIcon::Refresh),
-        None,
-    ))
-    .map_err(menu_error)?;
+    menu.append(&MenuItem::with_id("refresh", "Check Now", true, None))
+        .map_err(menu_error)?;
     menu.append(&CheckMenuItem::with_id(
         "launch-login",
         "Start at Login (configured)",
@@ -795,6 +789,24 @@ fn build_menu(
     menu.append(&MenuItem::with_id("quit", "Quit AgentSCM Tray", true, None))
         .map_err(menu_error)?;
     Ok(menu)
+}
+
+fn native_text_item(role: &str, text: &str) -> MenuItem {
+    MenuItem::new(native_text_title(role, text), false, None)
+}
+
+fn native_text_title(role: &str, text: &str) -> String {
+    format!(
+        "__AGENTSCM_TEXT_{role}__{}",
+        text.replace('\0', "").replace('&', "&&")
+    )
+}
+
+fn full_menu_value(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect()
 }
 
 /// Key only the content users can see. The event loop may evaluate this every few seconds, but
@@ -920,14 +932,6 @@ impl ConnectionIndicator {
             Self::Unknown => "Connection: unknown",
         }
     }
-
-    fn native_icon(self) -> NativeIcon {
-        match self {
-            Self::Connected => NativeIcon::StatusAvailable,
-            Self::Attention => NativeIcon::StatusUnavailable,
-            Self::Unknown => NativeIcon::StatusNone,
-        }
-    }
 }
 
 fn connection_indicator(
@@ -1051,14 +1055,6 @@ fn title_agent(agent: &str) -> &str {
         "gemini" => "Gemini",
         _ => "Agent",
     }
-}
-
-fn exact_menu_label(value: &str) -> String {
-    value
-        .chars()
-        .filter(|character| !character.is_control())
-        .collect::<String>()
-        .replace('&', "&&")
 }
 
 fn handle_action(id: &str, snapshot: &Snapshot, executable: &Path) {
@@ -1469,9 +1465,18 @@ mod tests {
             "Connection: attention needed"
         );
         assert_eq!(ConnectionIndicator::Unknown.label(), "Connection: unknown");
+    }
+
+    #[test]
+    fn connection_detail_values_keep_full_printable_text() {
+        let value = "https://hub.example.test/a/very/long/checkout/value?one=two\nignored";
         assert_eq!(
-            ConnectionIndicator::Unknown.native_icon(),
-            NativeIcon::StatusNone
+            full_menu_value(value),
+            "https://hub.example.test/a/very/long/checkout/value?one=twoignored"
+        );
+        assert_eq!(
+            native_text_title("details", "A&B"),
+            "__AGENTSCM_TEXT_details__A&&B"
         );
     }
 

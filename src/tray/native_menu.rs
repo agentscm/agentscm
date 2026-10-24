@@ -7,7 +7,8 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyClass;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, msg_send, sel};
 use objc2_app_kit::{
-    NSAccessibility, NSControlStateValueOff, NSControlStateValueOn, NSMenu,
+    NSAccessibility, NSColor, NSControlStateValueOff, NSControlStateValueOn, NSFont,
+    NSFontWeightSemibold, NSImage, NSImageView, NSLineBreakMode, NSMenu,
     NSMenuDidBeginTrackingNotification, NSMenuDidEndTrackingNotification, NSMenuItem, NSSwitch,
     NSTextField, NSView,
 };
@@ -77,6 +78,7 @@ pub(super) struct NativeMenuBridge {
     target: Retained<Target>,
     switch: Option<Retained<NSSwitch>>,
     _view: Option<Retained<NSView>>,
+    _text_views: Vec<Retained<NSView>>,
     tracking: Arc<AtomicBool>,
 }
 
@@ -132,6 +134,8 @@ impl NativeMenuBridge {
         } else {
             (None, None)
         };
+        let mut text_views = Vec::new();
+        customize_menu(&menu, mtm, &mut text_views);
 
         let center = NSNotificationCenter::defaultCenter();
         // SAFETY: Target implements both selectors with NSNotification arguments, and observer,
@@ -156,6 +160,7 @@ impl NativeMenuBridge {
             target,
             switch,
             _view: view,
+            _text_views: text_views,
             tracking,
         })
     }
@@ -179,6 +184,210 @@ impl NativeMenuBridge {
     }
 }
 
+const TEXT_MARKER: &str = "__AGENTSCM_TEXT_";
+
+fn customize_menu(menu: &NSMenu, mtm: MainThreadMarker, views: &mut Vec<Retained<NSView>>) {
+    for index in 0..menu.numberOfItems() {
+        let Some(item) = menu.itemAtIndex(index) else {
+            continue;
+        };
+        let title = item.title().to_string();
+        let submenu = item.submenu();
+        if let Some((role, text)) = text_item(&title, item.isEnabled(), submenu.is_some()) {
+            let view = text_view(role, text, mtm);
+            item.setView(Some(&view));
+            item.setAccessibilityLabel(Some(&NSString::from_str(text)));
+            views.push(view);
+        } else if let Some(symbol) = menu_item_symbol(
+            &title,
+            submenu.as_deref().and_then(submenu_status_symbol),
+            submenu.is_some(),
+        ) {
+            set_symbol(&item, symbol);
+        }
+        if let Some(submenu) = submenu {
+            customize_menu(&submenu, mtm, views);
+        }
+    }
+}
+
+fn parse_text_marker(title: &str) -> Option<(&str, &str)> {
+    let rest = title.strip_prefix(TEXT_MARKER)?;
+    rest.split_once("__")
+}
+
+fn text_item(title: &str, enabled: bool, has_submenu: bool) -> Option<(&str, &str)> {
+    (!enabled && !has_submenu)
+        .then(|| parse_text_marker(title))
+        .flatten()
+}
+
+fn text_view(role: &str, text: &str, mtm: MainThreadMarker) -> Retained<NSView> {
+    let width = if role == "details" { 344.0 } else { 328.0 };
+    if role == "summary" {
+        return summary_view(text, width, mtm);
+    }
+    let font = NSFont::systemFontOfSize(12.0);
+    let label_width = width - 28.0;
+    let (label, label_height) = measured_label(text, &font, label_width, mtm);
+    let height = label_height + 14.0;
+    let view = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height)),
+    );
+    label.setFrame(NSRect::new(
+        NSPoint::new(14.0, 7.0),
+        NSSize::new(label_width, label_height),
+    ));
+    label.setSelectable(role == "details");
+    label.setAccessibilityLabel(Some(&NSString::from_str(text)));
+    view.addSubview(&label);
+    view
+}
+
+fn measured_label(
+    text: &str,
+    font: &NSFont,
+    width: f64,
+    mtm: MainThreadMarker,
+) -> (Retained<NSTextField>, f64) {
+    let label = NSTextField::labelWithString(&NSString::from_str(text), mtm);
+    label.setPreferredMaxLayoutWidth(width);
+    label.setMaximumNumberOfLines(0);
+    label.setUsesSingleLineMode(false);
+    label.setLineBreakMode(NSLineBreakMode::ByWordWrapping);
+    label.setTextColor(Some(&NSColor::labelColor()));
+    label.setFont(Some(font));
+    let bounds = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, f64::MAX));
+    let height = label
+        .cell()
+        .map(|cell| cell.cellSizeForBounds(bounds).height.max(17.0))
+        .unwrap_or(17.0);
+    (label, height)
+}
+
+fn summary_view(text: &str, width: f64, mtm: MainThreadMarker) -> Retained<NSView> {
+    let (repository, status) = text
+        .split_once('\n')
+        .unwrap_or((text, "Connection: unknown"));
+    // SAFETY: AppKit exports this immutable process-lifetime font-weight constant.
+    let heading_font = NSFont::systemFontOfSize_weight(13.0, unsafe { NSFontWeightSemibold });
+    let status_font = NSFont::systemFontOfSize(12.0);
+    let label_width = width - 54.0;
+    let (heading, heading_height) = measured_label(repository, &heading_font, label_width, mtm);
+    let (status_label, status_height) = measured_label(status, &status_font, label_width, mtm);
+    let height = heading_height + status_height + 14.0;
+    let view = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height)),
+    );
+    status_label.setFrame(NSRect::new(
+        NSPoint::new(40.0, 7.0),
+        NSSize::new(label_width, status_height),
+    ));
+    heading.setFrame(NSRect::new(
+        NSPoint::new(40.0, 7.0 + status_height),
+        NSSize::new(label_width, heading_height),
+    ));
+    heading.setAccessibilityLabel(Some(&NSString::from_str(repository)));
+    status_label.setAccessibilityLabel(Some(&NSString::from_str(status)));
+    view.addSubview(&heading);
+    view.addSubview(&status_label);
+    if let Some(image) = status_symbol(status) {
+        let image_view = NSImageView::initWithFrame(
+            NSImageView::alloc(mtm),
+            NSRect::new(
+                NSPoint::new(16.0, (height - 16.0) / 2.0),
+                NSSize::new(16.0, 16.0),
+            ),
+        );
+        image_view.setImage(Some(&image));
+        view.addSubview(&image_view);
+    }
+    view.setAccessibilityLabel(Some(&NSString::from_str(text)));
+    view
+}
+
+fn status_symbol(status: &str) -> Option<Retained<NSImage>> {
+    system_symbol(status_symbol_name(status))
+}
+
+fn status_symbol_name(status: &str) -> &'static str {
+    if status == "Hub recently reachable" {
+        "checkmark.circle"
+    } else if status == "Connection: attention needed" {
+        "exclamationmark.triangle"
+    } else {
+        "questionmark.circle"
+    }
+}
+
+fn submenu_status_symbol(menu: &NSMenu) -> Option<&'static str> {
+    let summary = menu.itemAtIndex(0)?;
+    let title = summary.title().to_string();
+    let (role, text) = text_item(&title, summary.isEnabled(), summary.submenu().is_some())?;
+    (role == "summary")
+        .then(|| {
+            text.split_once('\n')
+                .map(|(_, status)| status_symbol_name(status))
+        })
+        .flatten()
+}
+
+fn symbol_for_title(title: &str) -> Option<&'static str> {
+    match title {
+        "Open Checkout" => Some("folder"),
+        "Open Hub" => Some("network"),
+        "Agent Integrations" => Some("puzzlepiece.extension"),
+        "Copy Terminal Setup" => Some("terminal"),
+        "Connection Details" => Some("info.circle"),
+        "Recent Activity" => Some("clock"),
+        "Troubleshooting" => Some("wrench.and.screwdriver"),
+        "Copy Diagnostics" => Some("doc.on.doc"),
+        "Copy Reconnect" => Some("arrow.triangle.2.circlepath"),
+        "Copy Guidance Preview" => Some("text.book.closed"),
+        "Check Now" => Some("arrow.clockwise"),
+        "Quit AgentSCM Tray" => Some("power"),
+        _ if title.starts_with("Set Up ") => Some("plus.app"),
+        _ if title.starts_with("Reapply ") => Some("arrow.clockwise"),
+        _ => None,
+    }
+}
+
+fn menu_item_symbol(
+    title: &str,
+    submenu_status: Option<&'static str>,
+    has_submenu: bool,
+) -> Option<&'static str> {
+    submenu_status
+        .or_else(|| symbol_for_title(title))
+        .or_else(|| has_submenu.then_some("folder"))
+}
+
+fn set_symbol(item: &NSMenuItem, symbol: &str) {
+    if let Some(image) = system_symbol(symbol) {
+        item.setImage(Some(&image));
+    }
+}
+
+fn system_symbol(symbol: &str) -> Option<Retained<NSImage>> {
+    let available = AnyClass::get(c"NSImage").is_some_and(|class| {
+        class
+            .metaclass()
+            .responds_to(sel!(imageWithSystemSymbolName:accessibilityDescription:))
+    });
+    if !available {
+        return None;
+    }
+    let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+        &NSString::from_str(symbol),
+        None,
+    )?;
+    image.setTemplate(true);
+    image.setSize(NSSize::new(16.0, 16.0));
+    Some(image)
+}
+
 impl Drop for NativeMenuBridge {
     fn drop(&mut self) {
         // SAFETY: target was registered with this center and is still retained here.
@@ -198,5 +407,42 @@ mod tests {
         assert!(tracking.load(Ordering::Acquire));
         set_tracking(&tracking, false);
         assert!(!tracking.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn native_text_markers_and_symbols_use_stable_menu_copy() {
+        assert_eq!(
+            parse_text_marker("__AGENTSCM_TEXT_details__Path  /tmp/repo"),
+            Some(("details", "Path  /tmp/repo"))
+        );
+        assert_eq!(symbol_for_title("Open Checkout"), Some("folder"));
+        assert_eq!(symbol_for_title("Connection: unknown"), None);
+        assert_eq!(
+            menu_item_symbol("Open Hub", Some("exclamationmark.triangle"), true),
+            Some("exclamationmark.triangle"),
+            "checkout health wins even when its name collides with an action"
+        );
+        assert_eq!(menu_item_symbol("Open Hub", None, false), Some("network"));
+        assert_eq!(
+            menu_item_symbol("Other Submenu", None, true),
+            Some("folder")
+        );
+        assert_eq!(
+            status_symbol_name("Hub recently reachable"),
+            "checkmark.circle"
+        );
+        assert_eq!(
+            status_symbol_name("Connection: attention needed"),
+            "exclamationmark.triangle"
+        );
+        assert_eq!(
+            status_symbol_name("Connection: unknown"),
+            "questionmark.circle"
+        );
+        assert_eq!(
+            text_item("__AGENTSCM_TEXT_details__Path  /tmp/repo", true, true),
+            None,
+            "an enabled checkout submenu title is never reinterpreted"
+        );
     }
 }

@@ -58,7 +58,7 @@ fn enabled_at(plist: &Path, stable: &Path, config: &Path) -> bool {
         .is_ok_and(|value| value.is_some_and(|(_, text)| text == plist_body(stable, config)))
 }
 
-fn set_enabled_at(
+pub(super) fn set_enabled_at(
     enable: bool,
     current: &Path,
     plist: &Path,

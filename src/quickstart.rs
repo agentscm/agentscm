@@ -1487,6 +1487,31 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
             left.clients.push(root.clone());
         }
     }
+    let _client_lifecycle = match crate::client_cli::lifecycle_lock() {
+        Ok(lease) => lease,
+        Err(error) => {
+            println!(
+                "Couldn't finish client and program cleanup: {}.",
+                short(&error)
+            );
+            manual.push("run `agentscm uninstall` again after client setup finishes".into());
+            left.session = m.session.take();
+            left.local_hub = m.local_hub.take();
+            left.native_hub = m.native_hub.take();
+            left.bin_dir = programs.as_ref().map(|(dir, _)| dir.clone());
+            left.bin_parent_created = m.bin_parent_created;
+            left.save()?;
+            println!(
+                "\nSome things were left in place, and quickstart.json still lists them. To finish by hand:"
+            );
+            for command in &manual {
+                println!("  {command}");
+            }
+            return Err(invalid(
+                "uninstall did not finish; see the list above (quickstart.json keeps what is left)",
+            ));
+        }
+    };
     // Ending the sign-in comes after `client remove`, which revokes tokens with it.
     if let Some(session) = &m.session {
         match hub_cli::end_session(&session.hub).await {
@@ -1527,7 +1552,7 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
         || left.native_hub.is_some()
         || native_executable_drift;
     let tray_cleanup_failed = if programs.is_some() && !retain_program {
-        match crate::tray::remove_login_setting() {
+        match crate::tray::remove_login_setting_locked() {
             Ok(()) => false,
             Err(error) => {
                 println!("Couldn't remove the tray login setting: {}.", short(&error));
@@ -1581,6 +1606,7 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
             );
         }
     }
+    drop(_client_lifecycle);
     if let Some(local) = &m.local_hub
         && let Err(command) = undo_local_hub(remove_hub_data, local, &home)
     {
