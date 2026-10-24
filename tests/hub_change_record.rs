@@ -9,8 +9,9 @@ use agentscm::change_record::{
     ActionFinishV1, ActionKindV1, ActionOutcomeV1, ActionStartV1, AgentHarnessV1, ApplicabilityV1,
     ArtifactMediaV1, ArtifactRefV1, AssuranceBasisV1, CaptureBatchV1, CaptureModeV1,
     CapturedEventKindV1, CapturedEventV1, CheckResultV1, ContentAvailabilityV1, CoverageV1,
-    DriftV1, RecipeProvenanceV1, RetentionClassV1, SessionIdentityV1, SourceBindingV1,
-    SubagentFactV1, ToolCompletionV1, ToolFactV1, ToolKindV1,
+    DriftV1, MAX_PROJECTED_SESSION_SETUPS, RecipeProvenanceV1, RetentionClassV1, SessionIdentityV1,
+    SessionSetupV1, SetupObservationV1, SourceBindingV1, SubagentFactV1, ToolCompletionV1,
+    ToolFactV1, ToolKindV1,
 };
 use agentscm::hub::store::{self, ForgeIdentity, Store, mint_agent_token, unix_now};
 use agentscm::hub::work::{CheckpointKind, SourceRef, WorkCheckpoint, WorkRole, WorkStart};
@@ -722,6 +723,190 @@ fn informational_events_do_not_change_lifecycle_coverage(fresh: &dyn Fn() -> Db)
         ]),
         CoverageV1::Complete
     );
+}
+
+fn setup_observation(
+    model: Option<&str>,
+    permission_mode: Option<&str>,
+    effort: Option<&str>,
+) -> SetupObservationV1 {
+    SetupObservationV1 {
+        provider: Some("anthropic".into()),
+        model: model.map(str::to_owned),
+        permission_mode: permission_mode.map(str::to_owned),
+        effort: effort.map(str::to_owned),
+        artifact: ArtifactRefV1 {
+            digest: "7".repeat(64),
+            size_bytes: 10,
+            media: ArtifactMediaV1::Json,
+            retention: RetentionClassV1::WorkLocal,
+            availability: ContentAvailabilityV1::Local,
+        },
+        unknown_components: vec![],
+    }
+}
+
+fn join_session(store: &dyn Store, token: &str, work_id: &str, session: &str) {
+    let joined = store
+        .work_start(
+            token,
+            &WorkStart {
+                work_id: Some(work_id.into()),
+                source: None,
+                request_key: None,
+                title: "capture a source-bound check".into(),
+                session: session.into(),
+                role: WorkRole::Helper,
+                scope: vec![],
+                branch: None,
+                worktree: None,
+                next_action: None,
+                depends_on: vec![],
+                related_work: vec![],
+                takeover_generation: None,
+            },
+            unix_now(),
+        )
+        .unwrap();
+    assert!(joined.joined);
+}
+
+fn setup_batch(
+    work_id: &str,
+    generation: i64,
+    session_id: &str,
+    parent: Option<&str>,
+    observations: Vec<Option<SetupObservationV1>>,
+) -> CaptureBatchV1 {
+    let mut batch = event_batch(work_id, generation, &format!("setup-{session_id}"), 1);
+    batch.session.session_id = session_id.into();
+    batch.session.parent_session_id = parent.map(str::to_owned);
+    batch.events = observations
+        .into_iter()
+        .enumerate()
+        .map(|(index, setup)| {
+            let mut event = event_batch_kind(
+                work_id,
+                generation,
+                "x",
+                index as u64 + 1,
+                CapturedEventKindV1::TurnEnded,
+            )
+            .events
+            .remove(0);
+            event.event_id = format!("{session_id}-event-{index}");
+            event.setup = setup;
+            event
+        })
+        .collect();
+    batch
+}
+
+fn session_setups_project_latest_per_session(db: &Db) {
+    let (store, token, work_id, generation) = setup(db);
+    assert!(
+        store
+            .change_record(&token, &work_id, 500)
+            .unwrap()
+            .unwrap()
+            .session_setups
+            .is_empty()
+    );
+    // The later setup observation replaces the earlier one; a later event without setup does not.
+    let first = setup_batch(
+        &work_id,
+        generation,
+        "session-1",
+        None,
+        vec![
+            Some(setup_observation(Some("model-a"), Some("default"), None)),
+            Some(setup_observation(
+                Some("model-b"),
+                Some("plan"),
+                Some("high"),
+            )),
+            None,
+        ],
+    );
+    store.change_ingest(&token, &first, 501).unwrap();
+    // A session that never reported setup is absent; absent fields stay None, not guessed.
+    for id in ["session-0", "session-2"] {
+        join_session(&*store, &token, &work_id, id);
+    }
+    let silent = setup_batch(&work_id, generation, "session-0", None, vec![None]);
+    store.change_ingest(&token, &silent, 502).unwrap();
+    let child = setup_batch(
+        &work_id,
+        generation,
+        "session-2",
+        Some("session-1"),
+        vec![Some(setup_observation(None, None, None))],
+    );
+    store.change_ingest(&token, &child, 503).unwrap();
+    let record = store.change_record(&token, &work_id, 504).unwrap().unwrap();
+    assert_eq!(record.session_setups_omitted, 0);
+    assert_eq!(
+        record.session_setups,
+        vec![
+            SessionSetupV1 {
+                session_id: "session-1".into(),
+                parent_session_id: None,
+                model: Some("model-b".into()),
+                permission_mode: Some("plan".into()),
+                effort: Some("high".into()),
+            },
+            SessionSetupV1 {
+                session_id: "session-2".into(),
+                parent_session_id: Some("session-1".into()),
+                model: None,
+                permission_mode: None,
+                effort: None,
+            },
+        ]
+    );
+}
+
+fn session_setups_are_bounded_and_ordered(db: &Db) {
+    let (store, token, work_id, generation) = setup(db);
+    let total = MAX_PROJECTED_SESSION_SETUPS + 3;
+    // Ingest out of id order to prove the ordering comes from the projection.
+    for index in (0..total).rev() {
+        let id = format!("s-{index:02}");
+        join_session(&*store, &token, &work_id, &id);
+        let batch = setup_batch(
+            &work_id,
+            generation,
+            &id,
+            None,
+            vec![Some(setup_observation(Some("model-a"), None, None))],
+        );
+        store.change_ingest(&token, &batch, 600).unwrap();
+    }
+    let record = store.change_record(&token, &work_id, 601).unwrap().unwrap();
+    let ids: Vec<_> = record
+        .session_setups
+        .iter()
+        .map(|setup| setup.session_id.clone())
+        .collect();
+    let expected: Vec<_> = (0..MAX_PROJECTED_SESSION_SETUPS)
+        .map(|index| format!("s-{index:02}"))
+        .collect();
+    assert_eq!(ids, expected);
+    assert_eq!(record.session_setups_omitted, 3);
+}
+
+#[test]
+fn sqlite_session_setups() {
+    session_setups_project_latest_per_session(&Db::sqlite());
+    session_setups_are_bounded_and_ordered(&Db::sqlite());
+}
+
+#[test]
+fn postgres_session_setups() {
+    if Db::postgres().is_some() {
+        session_setups_project_latest_per_session(&Db::postgres().unwrap());
+        session_setups_are_bounded_and_ordered(&Db::postgres().unwrap());
+    }
 }
 
 #[test]

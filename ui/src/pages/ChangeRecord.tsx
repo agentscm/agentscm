@@ -309,6 +309,23 @@ function DecisionFacts({ summary }: { summary: ChangeRecordSummaryV1 }) {
   )
 }
 
+function SessionSetups({ summary }: { summary: ChangeRecordSummaryV1 }) {
+  const { session_setups: setups, session_setups_omitted: omitted } = summary
+  if (setups.length === 0) return <Empty icon="cpu" title="No session setup reported">Model, effort and permission mode are unknown.</Empty>
+  return (
+    <>
+      <dl className="tech mb-0">
+        {setups.map((setup) => (
+          <Fact key={setup.session_id} label={setup.parent_session_id ? `Session ${setup.session_id} (parent ${setup.parent_session_id})` : `Session ${setup.session_id}`}>
+            Model {setup.model ?? 'unknown'} · effort {setup.effort ?? 'unknown'} · permission mode {setup.permission_mode ?? 'unknown'}
+          </Fact>
+        ))}
+      </dl>
+      {omitted > 0 ? <p className="small muted mb-0">{omitted} additional session{omitted === 1 ? '' : 's'} omitted from this bounded projection.</p> : null}
+    </>
+  )
+}
+
 function LatestAction({ summary }: { summary: ChangeRecordSummaryV1 }) {
   const action = summary.latest_action
   if (!action) return <Empty icon="clipboard2-x" title="No action captured">The record does not yet contain a source-bound action receipt.</Empty>
@@ -425,6 +442,10 @@ function Detail({ repo, token, workId }: { repo: string; token: string; workId: 
         explain="Action type, outcome, verification result, freshness, assurance, evidence availability and coverage are independent facts."
       >
         <LatestAction summary={summary} />
+      </Box>
+
+      <Box icon="cpu" title="Sessions" count={summary.sessions.count} explain="The latest model, effort and permission mode each session reported. Fields a session did not report are shown as unknown.">
+        <SessionSetups summary={summary} />
       </Box>
 
       <div className="grid-2 align-start">

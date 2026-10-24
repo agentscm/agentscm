@@ -5,7 +5,7 @@ use crate::change_record::{
     AssuranceBasisV1, ChangeRecordSummaryV1, CheckResultV1, CompletenessV1, ContentAvailabilityV1,
     CoverageV1, DecisionAuthorKindV1, DecisionSourceRefV1, DecisionStatusV1, DecisionSummaryV1,
     DriftV1, IntentSummaryV1, MAX_PROJECTED_DECISION_REFS, MAX_PROJECTED_SCOPE, RecipeProvenanceV1,
-    SessionCoverageV1, SubjectSummaryV1, UnknownFactV1,
+    SessionCoverageV1, SessionSetupV1, SubjectSummaryV1, UnknownFactV1,
 };
 
 use super::work::{Checkpoint, SourceRef, WorkItem};
@@ -17,13 +17,16 @@ pub struct StoredActionV1 {
     pub source_id: String,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct SessionStatsV1 {
     pub count: usize,
     pub gap_count: usize,
     pub complete_count: usize,
     pub setup_observation_count: usize,
     pub usage_observation_count: usize,
+    /// Latest setup per session (at most `MAX_PROJECTED_SESSION_SETUPS`) and the count beyond them.
+    pub setups: Vec<SessionSetupV1>,
+    pub setups_omitted: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -121,6 +124,8 @@ pub fn project(
             coverage: session_coverage,
             gaps: sessions.gap_count,
         },
+        session_setups: sessions.setups,
+        session_setups_omitted: sessions.setups_omitted,
         latest_action,
         decision,
         next_action: item.next_action.clone(),

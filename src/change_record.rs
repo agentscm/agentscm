@@ -16,6 +16,7 @@ pub const MAX_GAPS_PER_SESSION: usize = 32;
 pub const MAX_CHANGE_RECORD_RESPONSE_BYTES: usize = 48 * 1024;
 pub const MAX_PROJECTED_SCOPE: usize = 16;
 pub const MAX_PROJECTED_DECISION_REFS: usize = 16;
+pub const MAX_PROJECTED_SESSION_SETUPS: usize = 16;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -537,12 +538,49 @@ pub struct ChangeRecordSummaryV1 {
     pub intent: IntentSummaryV1,
     pub subject: Option<SubjectSummaryV1>,
     pub sessions: SessionCoverageV1,
+    /// Latest observed model, effort and permission mode per session, ordered by session id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_setups: Vec<SessionSetupV1>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub session_setups_omitted: u64,
     pub latest_action: Option<ActionSummaryV1>,
     pub decision: DecisionSummaryV1,
     /// Existing bounded work checkpoint field, not transcript-derived content.
     pub next_action: Option<String>,
     pub completeness: CompletenessV1,
     pub unknowns: Vec<UnknownFactV1>,
+}
+
+/// Setup facts from the latest setup observation of one session. `None` means not observed.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSetupV1 {
+    pub session_id: String,
+    pub parent_session_id: Option<String>,
+    pub model: Option<String>,
+    pub permission_mode: Option<String>,
+    pub effort: Option<String>,
+}
+
+impl SessionSetupV1 {
+    fn validate(&self) -> Result<()> {
+        identifier("session setup session_id", &self.session_id, 255)?;
+        for (name, value) in [
+            ("session setup parent_session_id", &self.parent_session_id),
+            ("session setup model", &self.model),
+            ("session setup permission_mode", &self.permission_mode),
+            ("session setup effort", &self.effort),
+        ] {
+            if let Some(value) = value {
+                identifier(name, value, 255)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -571,6 +609,11 @@ impl ChangeRecordResponseV1 {
             .len()
             > MAX_CHANGE_RECORD_RESPONSE_BYTES
         {
+            // Session setups are the least essential facts, so they are trimmed first.
+            if response.summary.session_setups.pop().is_some() {
+                response.summary.session_setups_omitted += 1;
+                continue;
+            }
             let scope_bytes = response
                 .summary
                 .intent
@@ -611,6 +654,15 @@ impl ChangeRecordResponseV1 {
     }
 
     pub fn validate_encoded_size(&self) -> Result<()> {
+        let setups = &self.summary.session_setups;
+        if setups.len() > MAX_PROJECTED_SESSION_SETUPS {
+            return Err(HubError::Invalid(
+                "change record has too many session setups".into(),
+            ));
+        }
+        for setup in setups {
+            setup.validate()?;
+        }
         let bytes = serde_json::to_vec(self)
             .map_err(|_| HubError::Invalid("change record response is invalid".into()))?;
         if bytes.len() > MAX_CHANGE_RECORD_RESPONSE_BYTES {
@@ -1356,6 +1408,69 @@ mod tests {
         assert_eq!(response.summary.decision.source_refs.len(), 1);
         assert_eq!(response.summary.decision.source_refs_omitted, 0);
         response.validate_encoded_size().unwrap();
+    }
+
+    fn setup_entry(index: usize) -> SessionSetupV1 {
+        SessionSetupV1 {
+            session_id: format!("session-{index:02}"),
+            parent_session_id: None,
+            model: Some("m".repeat(255)),
+            permission_mode: Some("p".repeat(255)),
+            effort: None,
+        }
+    }
+
+    #[test]
+    fn bounded_response_trims_session_setups_before_anything_else() {
+        let mut summary = summary();
+        summary.intent.scope = vec!["scope".into()];
+        summary.session_setups = (0..MAX_PROJECTED_SESSION_SETUPS).map(setup_entry).collect();
+        summary.next_action = Some("n".repeat(MAX_CHANGE_RECORD_RESPONSE_BYTES - 6_000));
+        let kept = summary.session_setups.clone();
+
+        let response = ChangeRecordResponseV1::bounded(summary).unwrap();
+        let omitted = response.summary.session_setups_omitted as usize;
+        assert!(omitted > 0);
+        // Trimming drops from the tail and never touches scope or decision references.
+        assert_eq!(
+            response.summary.session_setups,
+            kept[..kept.len() - omitted]
+        );
+        assert_eq!(response.summary.intent.scope, ["scope"]);
+        assert_eq!(response.summary.intent.scope_omitted, 0);
+        response.validate_encoded_size().unwrap();
+    }
+
+    #[test]
+    fn session_setups_are_validated_and_additive() {
+        let mut response = ChangeRecordResponseV1::bounded(summary()).unwrap();
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert!(encoded["summary"].get("session_setups").is_none());
+        assert!(encoded["summary"].get("session_setups_omitted").is_none());
+
+        response.summary.session_setups = vec![setup_entry(0)];
+        response.validate_encoded_size().unwrap();
+        for corrupt in [
+            |setup: &mut SessionSetupV1| setup.session_id = "bad id".into(),
+            |setup: &mut SessionSetupV1| setup.model = Some("<b>x</b>".into()),
+            |setup: &mut SessionSetupV1| setup.effort = Some(String::new()),
+            |setup: &mut SessionSetupV1| setup.parent_session_id = Some("p".repeat(256)),
+        ] {
+            let mut bad = response.clone();
+            corrupt(&mut bad.summary.session_setups[0]);
+            assert!(bad.validate_encoded_size().is_err());
+        }
+        response.summary.session_setups = (0..=MAX_PROJECTED_SESSION_SETUPS)
+            .map(|index| SessionSetupV1 {
+                model: None,
+                permission_mode: None,
+                ..setup_entry(index)
+            })
+            .collect();
+        assert!(response.validate_encoded_size().is_err());
+        let unknown = json!({"session_id": "s", "parent_session_id": null, "model": null,
+            "permission_mode": null, "effort": null, "extra": 1});
+        assert!(serde_json::from_value::<SessionSetupV1>(unknown).is_err());
     }
 
     #[test]

@@ -7,9 +7,10 @@ use std::sync::Arc;
 use agentscm::backend::LocalBackend;
 use agentscm::change_capture::MIN_ACTION_CAPTURE_RECORDS;
 use agentscm::change_record::{
-    ActionFinishV1, ActionKindV1, ActionOutcomeV1, ActionStartV1, ArtifactMediaV1, ArtifactRefV1,
-    AssuranceBasisV1, CheckResultV1, ContentAvailabilityV1, CoverageV1, DriftV1,
-    RecipeProvenanceV1, RetentionClassV1, SourceBindingV1,
+    ActionFinishV1, ActionKindV1, ActionOutcomeV1, ActionStartV1, AgentHarnessV1, ArtifactMediaV1,
+    ArtifactRefV1, AssuranceBasisV1, CaptureBatchV1, CaptureModeV1, CapturedEventKindV1,
+    CapturedEventV1, CheckResultV1, ContentAvailabilityV1, CoverageV1, DriftV1, RecipeProvenanceV1,
+    RetentionClassV1, SessionIdentityV1, SetupObservationV1, SourceBindingV1,
 };
 use agentscm::hub::session::SessionCall;
 use agentscm::hub::store::{self, ForgeIdentity, Store, mint_bound_agent_token, unix_now};
@@ -168,6 +169,106 @@ impl Hub {
     }
 }
 
+fn setup_batch(work_id: &str, generation: i64, session_id: &str) -> CaptureBatchV1 {
+    CaptureBatchV1 {
+        schema_version: 1,
+        operation_id: "http-setup".into(),
+        work_id: work_id.into(),
+        generation,
+        session: SessionIdentityV1 {
+            harness: AgentHarnessV1::ClaudeCode,
+            adapter_version: "1.0.0".into(),
+            session_id: session_id.into(),
+            parent_session_id: None,
+            capture_mode: CaptureModeV1::LocalConversation,
+        },
+        events: vec![CapturedEventV1 {
+            event_id: "http-setup-event".into(),
+            sequence: 1,
+            observed_at: 100,
+            kind: CapturedEventKindV1::SessionStarted,
+            tool: None,
+            artifact: None,
+            setup: Some(SetupObservationV1 {
+                provider: None,
+                model: Some("model-a".into()),
+                permission_mode: None,
+                effort: Some("high".into()),
+                artifact: ArtifactRefV1 {
+                    digest: "7".repeat(64),
+                    size_bytes: 10,
+                    media: ArtifactMediaV1::Json,
+                    retention: RetentionClassV1::WorkLocal,
+                    availability: ContentAvailabilityV1::Local,
+                },
+                unknown_components: vec![],
+            }),
+            gap: None,
+            boundary: None,
+            subagent: None,
+        }],
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_setups_reach_the_projection_and_are_trimmed_first() {
+    let hub = Hub::start().await;
+    let owner = hub
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 3,
+            },
+            "writer",
+        )
+        .unwrap();
+    let (token, secret, _) =
+        mint_bound_agent_token(&*hub.store, &owner.id, "writer", REPOSITORY, 78, 600, false)
+            .unwrap();
+    let start = |scope: Vec<String>| WorkStart {
+        work_id: None,
+        source: None,
+        request_key: Some("http-setups".into()),
+        title: "show session setups".into(),
+        session: "http-setups".into(),
+        role: WorkRole::Lead,
+        scope,
+        branch: None,
+        worktree: None,
+        next_action: None,
+        depends_on: vec![],
+        related_work: vec![],
+        takeover_generation: None,
+    };
+    let work = hub
+        .store
+        .work_start(&token, &start(vec!["src/**".into()]), unix_now())
+        .unwrap()
+        .item;
+    let path = format!("/v1/hub/repos/{REPOSITORY_PATH}/change-records/{}", work.id);
+    let secret = secret.expose().to_owned();
+    let (_, before) = hub.get(&path, Some(&secret)).await;
+    assert!(before["summary"].get("session_setups").is_none());
+
+    hub.store
+        .change_ingest(
+            &token,
+            &setup_batch(&work.id, work.generation, "http-setups"),
+            101,
+        )
+        .unwrap();
+    let (status, body) = hub.get(&path, Some(&secret)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["summary"]["session_setups"],
+        json!([{"session_id": "http-setups", "parent_session_id": null,
+            "model": "model-a", "permission_mode": null, "effort": "high"}])
+    );
+    assert!(body["summary"].get("session_setups_omitted").is_none());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_token_gets_exact_projection_and_failures_are_explicit() {
     let hub = Hub::start().await;
@@ -305,6 +406,13 @@ async fn read_token_gets_exact_projection_and_failures_are_explicit() {
         )
         .unwrap();
 
+    hub.store
+        .change_ingest(
+            &writer_token,
+            &setup_batch(&work.id, work.generation, "http-change-record"),
+            122,
+        )
+        .unwrap();
     let reader_owner = hub
         .store
         .upsert_user(
@@ -355,6 +463,9 @@ async fn read_token_gets_exact_projection_and_failures_are_explicit() {
         summary["next_action"],
         "Request review of the retained receipt."
     );
+    // The response is full, so the optional session setup is the first thing dropped.
+    assert!(summary.get("session_setups").is_none());
+    assert_eq!(summary["session_setups_omitted"], 1);
     assert!(!response.to_string().contains("transcript"));
     assert!(serde_json::to_vec(&response).unwrap().len() <= 48 * 1024);
 

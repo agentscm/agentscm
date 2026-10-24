@@ -63,6 +63,11 @@ decision-reference arrays each begin with at most 16 entries in retained order; 
 envelope would exceed that limit, trailing entries are removed deterministically and
 `scope_omitted` or `source_refs_omitted` reports the exact count.
 
+When any session reported setup, `session_setups` lists the latest reported `model`, `effort` and
+`permission_mode` per session (`null` when not reported) with the session's `parent_session_id`,
+ordered by session ID, at most 16 entries; `session_setups_omitted` counts the rest. Both fields
+are absent when empty. They are trimmed before any other field when the envelope is full.
+
 Decision references can include caller-declared captured-event identities and an exact earlier
 version of the same Work. A captured-event reference is metadata only: this API neither fetches nor
 returns its conversation body and does not present it as verified or human-approved. A prior-Work

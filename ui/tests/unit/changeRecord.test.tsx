@@ -240,6 +240,40 @@ describe('change record response', () => {
     expect(() => decodeChangeRecordResponse(excessiveRefs)).toThrow(/summary.decision.source_refs/)
   })
 
+  it('decodes optional session setups strictly and defaults to none observed', () => {
+    const absent = decodeChangeRecordResponse(fixture(), WORK_ID)
+    expect(absent.summary.session_setups).toEqual([])
+    expect(absent.summary.session_setups_omitted).toBe(0)
+
+    const present = fixture() as ReturnType<typeof fixture> & { summary: Record<string, unknown> }
+    present.summary['session_setups'] = [
+      { session_id: 'session-1', parent_session_id: null, model: 'model-a', permission_mode: null, effort: 'high' },
+    ]
+    present.summary['session_setups_omitted'] = 2
+    const decoded = decodeChangeRecordResponse(present, WORK_ID)
+    expect(decoded.summary.session_setups).toEqual([
+      { session_id: 'session-1', parent_session_id: null, model: 'model-a', permission_mode: null, effort: 'high' },
+    ])
+    expect(decoded.summary.session_setups_omitted).toBe(2)
+
+    const setup = (patch: Record<string, unknown>) => {
+      const value = fixture() as ReturnType<typeof fixture> & { summary: Record<string, unknown> }
+      value.summary['session_setups'] = [{ session_id: 'session-1', parent_session_id: null, model: null, permission_mode: null, effort: null, ...patch }]
+      return value
+    }
+    expect(() => decodeChangeRecordResponse(setup({ model: '<img src=x onerror=alert(1)>' }))).toThrow(/session_setups\[0\]\.model/)
+    expect(() => decodeChangeRecordResponse(setup({ effort: '' }))).toThrow(/effort/)
+    expect(() => decodeChangeRecordResponse(setup({ permission_mode: 7 }))).toThrow(/permission_mode/)
+    expect(() => decodeChangeRecordResponse(setup({ session_id: null }))).toThrow(/session_id/)
+    expect(() => decodeChangeRecordResponse(setup({ parent_session_id: undefined }))).toThrow(/parent_session_id/)
+    const tooMany = setup({})
+    tooMany.summary['session_setups'] = Array.from({ length: 17 }, (_, index) => ({ session_id: `s-${index}`, parent_session_id: null, model: null, permission_mode: null, effort: null }))
+    expect(() => decodeChangeRecordResponse(tooMany)).toThrow(/summary.session_setups/)
+    const negative = setup({})
+    negative.summary['session_setups_omitted'] = -1
+    expect(() => decodeChangeRecordResponse(negative)).toThrow(/session_setups_omitted/)
+  })
+
   it('accepts a worst-case escaped projection only after explicit deterministic omissions fit the shared 48 KiB envelope', async () => {
     const value = fixture()
     const escaped = '"'.repeat(1000)
@@ -351,6 +385,32 @@ describe('change record route and page', () => {
     expect(screen.getAllByText('Run the focused UI check against the current source.').length).toBeGreaterThan(0)
     expect(screen.queryByText(/private transcript/)).toBeNull()
     expect(sent).toEqual([{ method: 'GET', url: `/v1/hub/repos/${encodeURIComponent('counterbranch/agentscm')}/change-records/${WORK_ID}` }])
+  })
+
+  it('lists model, effort and permission mode per session with unknown where absent', async () => {
+    const response = fixture() as ReturnType<typeof fixture> & { summary: Record<string, unknown> }
+    response.summary['session_setups'] = [
+      { session_id: 'session-1', parent_session_id: null, model: 'model-a', permission_mode: 'plan', effort: 'high' },
+      { session_id: 'session-2', parent_session_id: 'session-1', model: null, permission_mode: null, effort: null },
+    ]
+    response.summary['session_setups_omitted'] = 3
+    vi.stubGlobal('fetch', async () => json(200, response))
+    window.location.hash = changeRecordHref(WORK_ID)
+    render(<ChangeRecordPage repo="counterbranch/agentscm" token="read-token" />)
+
+    await screen.findByRole('heading', { name: 'Latest verification' })
+    expect(screen.getByText('Session session-1')).toBeTruthy()
+    expect(screen.getByText('Model model-a · effort high · permission mode plan')).toBeTruthy()
+    expect(screen.getByText('Session session-2 (parent session-1)')).toBeTruthy()
+    expect(screen.getByText('Model unknown · effort unknown · permission mode unknown')).toBeTruthy()
+    expect(screen.getByText('3 additional sessions omitted from this bounded projection.')).toBeTruthy()
+  })
+
+  it('says session setup is unknown when none was reported', async () => {
+    vi.stubGlobal('fetch', async () => json(200, fixture()))
+    window.location.hash = changeRecordHref(WORK_ID)
+    render(<ChangeRecordPage repo="counterbranch/agentscm" token="read-token" />)
+    expect(await screen.findByText('No session setup reported')).toBeTruthy()
   })
 
   it('does not turn successful shell execution into a passing verification', async () => {

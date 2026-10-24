@@ -10,7 +10,8 @@ use serde_json::json;
 
 use crate::change_record::{
     ActionFinishV1, ActionMutationReceiptV1, ActionStartV1, CaptureBatchV1, CapturedEventKindV1,
-    CapturedEventV1, ChangeRecordSummaryV1, IngestReceiptV1,
+    CapturedEventV1, ChangeRecordSummaryV1, IngestReceiptV1, MAX_PROJECTED_SESSION_SETUPS,
+    SessionSetupV1,
 };
 
 use super::change_record::{
@@ -5980,6 +5981,24 @@ impl Store for PgStore {
         self.run(true,|client|{let mut tx=client.build_transaction().isolation_level(IsolationLevel::RepeatableRead).start()?;let who=work_who(&mut tx,token,now)?;let Some(item)=scoped_work(&mut tx,&who,work_id,now,false)? else {tx.commit()?;return Ok(None)};
             let row=tx.query_one("SELECT COUNT(*)::bigint,COALESCE(SUM(gap_count + CASE WHEN watermark > event_count THEN watermark-event_count ELSE 0 END),0)::bigint,COALESCE(COUNT(*) FILTER (WHERE lifecycle_valid AND start_sequence=1 AND end_sequence=watermark),0)::bigint FROM hub_change_sessions WHERE work=$1 AND generation=$2",&[&work_id,&item.generation])?;let count:i64=row.get(0);let gaps:i64=row.get(1);let complete:i64=row.get(2);
             let setup_observations:i64=tx.query_one("SELECT COUNT(*)::bigint FROM hub_change_events WHERE work=$1 AND generation=$2 AND event::jsonb ? 'setup'",&[&work_id,&item.generation])?.get(0);
+            let setup_rows=tx.query("WITH latest AS (
+                    SELECT session_id,
+                           event::jsonb->'setup'->>'model' AS model,
+                           event::jsonb->'setup'->>'permission_mode' AS permission_mode,
+                           event::jsonb->'setup'->>'effort' AS effort,
+                           ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY sequence DESC) AS rank
+                    FROM hub_change_events
+                    WHERE work=$1 AND generation=$2 AND event::jsonb ? 'setup'
+                ), picked AS (
+                    SELECT latest.*, COUNT(*) OVER () AS total FROM latest WHERE rank=1
+                )
+                SELECT picked.session_id, s.identity::jsonb->>'parent_session_id',
+                       picked.model, picked.permission_mode, picked.effort, picked.total
+                FROM picked JOIN hub_change_sessions s
+                  ON s.work=$1 AND s.generation=$2 AND s.session_id=picked.session_id
+                ORDER BY picked.session_id COLLATE \"C\" LIMIT $3",&[&work_id,&item.generation,&(MAX_PROJECTED_SESSION_SETUPS as i64)])?;
+            let setups_omitted=setup_rows.first().map_or(0,|r|r.get::<_,i64>(5) as u64).saturating_sub(setup_rows.len() as u64);
+            let setups=setup_rows.iter().map(|r|SessionSetupV1{session_id:r.get(0),parent_session_id:r.get(1),model:r.get(2),permission_mode:r.get(3),effort:r.get(4)}).collect();
             let usage_observations:i64=tx.query_one("SELECT COUNT(*)::bigint FROM hub_work_model_usage WHERE work=$1 AND generation=$2",&[&work_id,&item.generation])?.get(0);
             let action=tx.query_opt("WITH scoped AS (
                     SELECT a.*,
@@ -6002,7 +6021,7 @@ impl Store for PgStore {
                 SELECT start_request,finish_request,source_id FROM ranked
                 WHERE scope_rank=1 ORDER BY received_order DESC LIMIT 1",&[&work_id,&item.generation])?.map(|r| -> Result<StoredActionV1> {let start:String=r.get(0);let finish:Option<String>=r.get(1);Ok(StoredActionV1{start:json_value(&start)?,finish:finish.map(|value|json_value(&value)).transpose()?,source_id:r.get(2)})}).transpose()?;
             let decision=tx.query_opt("SELECT event_seq,snapshot::text FROM hub_work_versions WHERE work=$1 AND snapshot::jsonb #>> '{current,kind}'='decision' ORDER BY event_seq DESC LIMIT 1",&[&work_id])?.map(|r| -> Result<StoredDecisionV1> {let retained:WorkItem=json_value(&r.get::<_,String>(1))?;Ok(StoredDecisionV1{event_seq:r.get(0),checkpoint:retained.current.ok_or_else(||HubError::Unavailable("retained decision checkpoint is missing".into()))?})}).transpose()?;
-            let summary=project_change_record(&item,SessionStatsV1{count:count as usize,gap_count:gaps as usize,complete_count:complete as usize,setup_observation_count:setup_observations as usize,usage_observation_count:usage_observations as usize},action,decision,now);tx.commit()?;Ok(Some(summary))})
+            let summary=project_change_record(&item,SessionStatsV1{count:count as usize,gap_count:gaps as usize,complete_count:complete as usize,setup_observation_count:setup_observations as usize,usage_observation_count:usage_observations as usize,setups,setups_omitted},action,decision,now);tx.commit()?;Ok(Some(summary))})
     }
 
     fn work_usage(&self, token: &str, usage: &UsageRecord, now: i64) -> Result<UsageReceipt> {

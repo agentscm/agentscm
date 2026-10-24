@@ -147,7 +147,9 @@ retained and never pruned automatically. `quarantine` lists bounded invalid cras
 
 `show` returns the same at-most-48-KiB projection as HTTP and MCP. It includes at most 16 retained
 scope entries and 16 retained decision references; exact `scope_omitted` and
-`source_refs_omitted` counts identify any trailing entries removed to fit the envelope.
+`source_refs_omitted` counts identify any trailing entries removed to fit the envelope. When
+sessions reported setup it also carries up to 16 `session_setups` (model, effort and permission
+mode per session) and `session_setups_omitted`.
 
 `pending` shows shareable queued envelopes. `deferred` shows sanitized hooks that could not resolve
 current authorized Work and will never be rewritten into an associated action. `observe` and

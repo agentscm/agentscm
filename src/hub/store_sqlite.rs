@@ -8,7 +8,8 @@ use serde_json::json;
 
 use crate::change_record::{
     ActionFinishV1, ActionMutationReceiptV1, ActionStartV1, CaptureBatchV1, CapturedEventKindV1,
-    CapturedEventV1, ChangeRecordSummaryV1, IngestReceiptV1,
+    CapturedEventV1, ChangeRecordSummaryV1, IngestReceiptV1, MAX_PROJECTED_SESSION_SETUPS,
+    SessionSetupV1,
 };
 
 use super::change_record::{
@@ -6332,6 +6333,48 @@ impl Store for SqliteStore {
             params![work_id, item.generation],
             |row| row.get(0),
         )?;
+        let (setups, setups_omitted) = {
+            let mut statement = tx.prepare(
+                "WITH latest AS (
+                    SELECT session_id,
+                           json_extract(event,'$.setup.model') AS model,
+                           json_extract(event,'$.setup.permission_mode') AS permission_mode,
+                           json_extract(event,'$.setup.effort') AS effort,
+                           ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY sequence DESC) AS rank
+                    FROM hub_change_events
+                    WHERE work=?1 AND generation=?2 AND json_type(event,'$.setup') IS NOT NULL
+                ), picked AS (
+                    SELECT latest.*, COUNT(*) OVER () AS total FROM latest WHERE rank=1
+                )
+                SELECT picked.session_id, json_extract(s.identity,'$.parent_session_id'),
+                       picked.model, picked.permission_mode, picked.effort, picked.total
+                FROM picked JOIN hub_change_sessions s
+                  ON s.work=?1 AND s.generation=?2 AND s.session_id=picked.session_id
+                ORDER BY picked.session_id LIMIT ?3",
+            )?;
+            let mut total = 0_i64;
+            let setups = statement
+                .query_map(
+                    params![
+                        work_id,
+                        item.generation,
+                        MAX_PROJECTED_SESSION_SETUPS as i64
+                    ],
+                    |row| {
+                        total = row.get(5)?;
+                        Ok(SessionSetupV1 {
+                            session_id: row.get(0)?,
+                            parent_session_id: row.get(1)?,
+                            model: row.get(2)?,
+                            permission_mode: row.get(3)?,
+                            effort: row.get(4)?,
+                        })
+                    },
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let omitted = (total as u64).saturating_sub(setups.len() as u64);
+            (setups, omitted)
+        };
         let usage_observations: i64 = tx.query_row(
             "SELECT COUNT(*) FROM hub_work_model_usage WHERE work=?1 AND generation=?2",
             params![work_id, item.generation],
@@ -6384,6 +6427,8 @@ impl Store for SqliteStore {
                 complete_count: complete as usize,
                 setup_observation_count: setup_observations as usize,
                 usage_observation_count: usage_observations as usize,
+                setups,
+                setups_omitted,
             },
             action,
             decision,

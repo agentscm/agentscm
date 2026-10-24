@@ -7,6 +7,7 @@ const MAX_IDENTIFIER_BYTES = 255
 const MAX_PATH_BYTES = 1024
 const MAX_SCOPE = 16
 const MAX_SOURCE_REFS = 16
+const MAX_SESSION_SETUPS = 16
 const MAX_ARTIFACT_BYTES = 1024 * 1024 * 1024
 const textEncoder = new TextEncoder()
 const hiddenText = /[\p{Cc}\u00ad\u061c\u200b-\u200f\u2028-\u202e\u2060-\u2064\u2066-\u206f\ufeff\u{e0000}-\u{e007f}]/u
@@ -65,6 +66,15 @@ export type ChangeRecordDecisionRef =
   | { kind: 'captured_event'; session_id: string; event_id: string }
   | { kind: 'prior_work_version'; work_id: string; event_seq: number }
 
+/** Latest observed setup of one session. `null` means the setup event did not report the field. */
+export interface ChangeRecordSessionSetup {
+  session_id: string
+  parent_session_id: string | null
+  model: string | null
+  permission_mode: string | null
+  effort: string | null
+}
+
 export interface ChangeRecordSummaryV1 {
   schema_version: 1
   work_id: string
@@ -73,6 +83,8 @@ export interface ChangeRecordSummaryV1 {
   intent: { title: string; scope: string[]; scope_omitted: number }
   subject: { source_id: string; source_kind: 'native' | 'git'; source: ChangeRecordSource } | null
   sessions: { count: number; coverage: ChangeRecordCoverage; gaps: number }
+  session_setups: ChangeRecordSessionSetup[]
+  session_setups_omitted: number
   latest_action: {
     action_id: string
     source_id: string
@@ -303,6 +315,22 @@ export function decodeChangeRecordResponse(value: unknown, expectedWorkId?: stri
       })()
 
   const rawSessions = record(raw['sessions'], 'summary.sessions')
+  // The Hub omits both fields when no session reported setup; absent decodes to none observed.
+  const rawSetups = raw['session_setups'] === undefined ? [] : raw['session_setups']
+  const setupsArray: unknown[] = Array.isArray(rawSetups) ? rawSetups : fail('summary.session_setups')
+  if (setupsArray.length > MAX_SESSION_SETUPS) fail('summary.session_setups')
+  const sessionSetups = setupsArray.map((value, index): ChangeRecordSessionSetup => {
+    const field = `summary.session_setups[${index}]`
+    const item = record(value, field)
+    return {
+      session_id: identifier(item['session_id'], `${field}.session_id`),
+      parent_session_id: nullableIdentifier(item['parent_session_id'], `${field}.parent_session_id`),
+      model: nullableIdentifier(item['model'], `${field}.model`),
+      permission_mode: nullableIdentifier(item['permission_mode'], `${field}.permission_mode`),
+      effort: nullableIdentifier(item['effort'], `${field}.effort`),
+    }
+  })
+  const sessionSetupsOmitted = raw['session_setups_omitted'] === undefined ? 0 : integer(raw['session_setups_omitted'], 'summary.session_setups_omitted')
   const rawAction = raw['latest_action']
   const latestAction = rawAction === null
     ? null
@@ -385,6 +413,8 @@ export function decodeChangeRecordResponse(value: unknown, expectedWorkId?: stri
         coverage: enumValue(rawSessions['coverage'], COVERAGE, 'summary.sessions.coverage'),
         gaps: integer(rawSessions['gaps'], 'summary.sessions.gaps'),
       },
+      session_setups: sessionSetups,
+      session_setups_omitted: sessionSetupsOmitted,
       latest_action: latestAction,
       decision,
       next_action: nextAction,
