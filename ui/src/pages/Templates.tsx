@@ -248,7 +248,7 @@ export function TemplatesPage() {
   const preview = [inspect, handoff].find((p) => p.kind === 'ready' && p.value?.source === 'preview')
   return (
     <div className="page">
-      <div className="answer">
+      <div className="answer" data-tour="answer">
         <h1 className="page-question">Which workflow recipes can agents reuse?</h1>
         <p className="answer-text">A <strong>template</strong> is a saved recipe of checks (like “check these files, run the tests, then ask Claude to review”) that any change can reuse instead of writing its own.</p>
       </div>
@@ -277,7 +277,7 @@ export function TemplatesPage() {
       {recipe === null && runId === null && (
         <Empty icon="journal-code" title="Open a change or a run to begin">Paste an ID above. This page reads from this computer only and never starts or approves anything.</Empty>
       )}
-      <p className="small muted"><Icon name="laptop" /> Read from <code>agentscm serve</code> on this computer, not from the hub.</p>
+      <p className="small muted" data-tour="templates-source"><Icon name="laptop" /> Read from <code>agentscm serve</code> on this computer, not from the hub.</p>
     </div>
   )
 }

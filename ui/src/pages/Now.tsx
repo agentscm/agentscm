@@ -80,7 +80,7 @@ function Answer({ repo, d, overview, failing }: { repo: string; d: Derived | nul
   const overlaps = overview.kind === 'ready' ? overview.value.overlaps.length : null
   const c = d.contested.length
   return (
-    <div className="answer">
+    <div className="answer" data-tour="answer">
       <h1 className="page-question">Who is editing which files right now?</h1>
       <p className="answer-text">
         {d.agents.length === 0 ? (
@@ -237,6 +237,7 @@ export function NowPage({ repo, data, d, overview }: { repo: string; data: HubDa
       <div className="grid-now">
         <Box
           id="box-agents"
+          tour="now-agents"
           icon="people"
           title="Live agents"
           count={d ? d.agents.length : undefined}
@@ -268,6 +269,7 @@ export function NowPage({ repo, data, d, overview }: { repo: string; data: HubDa
 
         <Box
           id="box-contested"
+          tour="now-contested"
           icon="exclamation-diamond"
           tone={d && d.contested.length > 0 ? 'bad' : 'ok'}
           title="Contested files"
@@ -292,6 +294,7 @@ export function NowPage({ repo, data, d, overview }: { repo: string; data: HubDa
 
         <Box
           id="box-prs"
+          tour="now-prs"
           icon="git"
           tone={d && d.prOverlaps.length > 0 ? 'warn' : 'brand'}
           title="Pull requests touching held files"

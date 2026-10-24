@@ -3,6 +3,10 @@ import { defineConfig, devices } from '@playwright/test'
 const uiPort = process.env['AGENTSCM_UI_PORT'] ?? '5184'
 const desktop = { viewport: { width: 1360, height: 900 } }
 const mobileSpec = /mobile\.spec\.ts/
+const phoneSpecs = /(mobile|tour)\.spec\.ts/
+// Specs start as a viewer who already dismissed the welcome tour; tour.spec.ts overrides this.
+const tourOff = JSON.stringify({ welcomeSeen: true, welcomeOff: true, autoplay: [], sectionsSeen: [] })
+const origin = `http://127.0.0.1:${uiPort}`
 
 export default defineConfig({
   testDir: 'tests/e2e',
@@ -12,15 +16,15 @@ export default defineConfig({
   timeout: 60_000,
   expect: { timeout: 10_000 },
   reporter: [['list']],
-  use: { baseURL: `http://127.0.0.1:${uiPort}`, trace: 'retain-on-failure' },
+  use: { baseURL: origin, trace: 'retain-on-failure', storageState: { cookies: [], origins: [{ origin, localStorage: [{ name: 'agentscm.tour.v1', value: tourOff }] }] } },
   projects: [
     // Desktop: the whole suite in all three engines.
     { name: 'chromium', use: { ...devices['Desktop Chrome'], ...desktop }, testIgnore: mobileSpec },
     { name: 'firefox', use: { ...devices['Desktop Firefox'], ...desktop }, testIgnore: mobileSpec },
     { name: 'webkit', use: { ...devices['Desktop Safari'], ...desktop }, testIgnore: mobileSpec },
     // Phones: the drawer and narrow-header flows on real device viewports and touch.
-    { name: 'mobile-chrome', use: { ...devices['Pixel 7'] }, testMatch: mobileSpec },
-    { name: 'mobile-safari', use: { ...devices['iPhone 14'] }, testMatch: mobileSpec },
+    { name: 'mobile-chrome', use: { ...devices['Pixel 7'] }, testMatch: phoneSpecs },
+    { name: 'mobile-safari', use: { ...devices['iPhone 14'] }, testMatch: phoneSpecs },
   ],
   webServer: { command: `npx vite --port ${uiPort} --strictPort`, url: `http://127.0.0.1:${uiPort}`, reuseExistingServer: true, timeout: 60_000 },
 })

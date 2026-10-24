@@ -14,7 +14,7 @@ function Loaded<T>({ poll, what, children }: { poll: Poll<T>; what: string; chil
 }
 
 const Cmd = ({ command, label }: { command: string; label: string }) => (
-  <div className="cmd">
+  <div className="cmd" data-tour="skills-command">
     <code aria-label={label}>{command}</code>
     <CopyButton text={command} />
   </div>
@@ -51,7 +51,7 @@ function HowItWorks({ c, pin }: { c: CatalogEntry; pin: Pin | null }) {
   const lines = pin && pin.walkthrough.length ? pin.walkthrough : c.walkthrough
   if (lines.length === 0) return null
   return (
-    <div className="skill-walkthrough">
+    <div className="skill-walkthrough" data-tour="skills-how">
       <h4 className="small fw-semibold mb-1">How it works</h4>
       <ol className="small">{lines.map((l, i) => <li key={i}>{stepText(l)}</li>)}</ol>
       {c.procedure && (
@@ -67,7 +67,7 @@ function HowItWorks({ c, pin }: { c: CatalogEntry; pin: Pin | null }) {
 function SkillHead({ c, children }: { c: CatalogEntry; children?: ReactNode }) {
   const { enforced, planned } = enforcement(c.gates)
   return (
-    <div className="skill-head">
+    <div className="skill-head" data-tour="skills-head">
       <strong>{c.name}</strong> <span className="muted">v{c.workflow_version}</span> <code className="small muted">sha256:{shortSha(c.sha256)}</code>
       {c.first_party && <Pill tone="brand" icon="patch-check">First-party</Pill>}
       {enforced.length > 0 && <Pill tone="ok" icon="shield-check">Enforced: {enforced.join(', ')}</Pill>}
@@ -101,7 +101,7 @@ function LibraryView({ repo, token }: { repo: string; token: string }) {
   const poll = usePoll((signal) => fetchLibrary(repo, token, signal), 15_000, `skills|${repo}`)
   return (
     <div className="page">
-      <div className="answer">
+      <div className="answer" data-tour="answer">
         <h1 className="page-question">Which workflows do agents in this repository have to follow?</h1>
         <p className="answer-text"><code>{repo}</code>{poll.kind === 'ready' && <> · <span>{adoptionLabel(poll.value.adoption.source, poll.value.adoption.default_branch)}</span></>}</p>
       </div>
@@ -119,7 +119,7 @@ function Library({ lib }: { lib: Library }) {
   const attention = lib.adoption.pins.filter((p) => p.status !== 'adopted')
   return (
     <>
-      <Box icon="check2-circle" title="Adopted" count={adopted.length} explain="Skills this repository's lock file pins. Agents are expected to follow them.">
+      <Box tour="skills-adopted" icon="check2-circle" title="Adopted" count={adopted.length} explain="Skills this repository's lock file pins. Agents are expected to follow them.">
         {adopted.length === 0 ? (
           <Empty icon="journal-check" title={lib.adoption.source === 'none' ? 'Not adopted' : 'Nothing adopted'}>No skill is pinned for this repository yet. Pick one under Available.</Empty>
         ) : (
@@ -127,7 +127,7 @@ function Library({ lib }: { lib: Library }) {
             {adopted.map(({ p, c }) => {
               const n = lib.counts[c.name] ?? { open: 0, at_stop_gate: 0, completed: 0 }
               return (
-                <li key={c.name} className="skill-item">
+                <li key={c.name} className="skill-item" data-tour="skills-item">
                   <SkillHead c={c} />
                   <p className="mb-1">{c.summary}</p>
                   <p className="small muted mb-1">{gateChain(c.gates)}</p>
@@ -143,13 +143,13 @@ function Library({ lib }: { lib: Library }) {
           </ul>
         )}
       </Box>
-      <Box icon="collection" title="Available" count={available.length} explain="Skills this hub ships that the repository has not pinned. The page never writes; it shows the command.">
+      <Box tour="skills-available" icon="collection" title="Available" count={available.length} explain="Skills this hub ships that the repository has not pinned. The page never writes; it shows the command.">
         {available.length === 0 ? (
           <Empty icon="collection" title="Everything is adopted">Every skill this hub ships is already pinned.</Empty>
         ) : (
           <ul className="skill-list">
             {available.map((c) => (
-              <li key={c.name} className="skill-item">
+              <li key={c.name} className="skill-item" data-tour="skills-item">
                 <SkillHead c={c} />
                 <p className="mb-1">{c.summary}</p>
                 <p className="small muted mb-1">{gateChain(c.gates)}</p>
@@ -194,7 +194,7 @@ function RunsList({ repo, token }: { repo: string; token: string }) {
   const [search, setSearch] = useState('')
   return (
     <div className="page">
-      <div className="answer">
+      <div className="answer" data-tour="answer">
         <h1 className="page-question">Where is each pull request in its workflow?</h1>
         <p className="answer-text"><a href={skillsHref}><Icon name="arrow-left" /> Skills library</a> · <code>{repo}</code></p>
       </div>
@@ -217,7 +217,7 @@ function RunsList({ repo, token }: { repo: string; token: string }) {
                 <span className="input-group-text"><Icon name="search" /></span>
                 <input className="form-control" aria-label="Search runs on this page" placeholder="Search runs on this page" value={search} onChange={(e) => setSearch(e.target.value)} />
               </div>
-              <Box icon="signpost-split" title={tab === 'open' ? 'Open runs' : 'Completed runs'} count={shown.length} explain="Searches only the runs loaded on this page.">
+              <Box tour="skills-runs" icon="signpost-split" title={tab === 'open' ? 'Open runs' : 'Completed runs'} count={shown.length} explain="Searches only the runs loaded on this page.">
                 {shown.length === 0 ? (
                   <Empty icon="signpost-split" title={search ? 'No runs match' : tab === 'open' ? 'No open runs' : 'No completed runs'}>{search ? 'Search covers only the runs loaded on this page.' : 'Runs start when an agent records the first evidence for a branch.'}</Empty>
                 ) : (
@@ -280,7 +280,7 @@ function Run({ run }: { run: RunView }) {
   const lastA = last ? assuranceView(last.assurance) : null
   return (
     <>
-      <div className="answer detail-head">
+      <div className="answer detail-head" data-tour="answer">
         <h1 className="page-question">{run.pull_request !== null ? `#${run.pull_request} · ` : ''}<code className="branch-name">{run.branch}</code></h1>
         <p className="answer-text">{run.skill.name} v{run.skill.workflow_version} · head <code>{shortSha(run.head_sha)}</code> · <Pill tone={runStateTone(run)}>{runStateLabel(run)}</Pill></p>
       </div>

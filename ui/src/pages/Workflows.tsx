@@ -253,11 +253,12 @@ function List({ token }: { token: string }) {
   const load = usePoll((signal) => fetchSkillWorkflows(token, signal, cursor ?? undefined), 0, String(cursor))
   return (
     <div className="page">
-      <div className="answer">
+      <div className="answer" data-tour="answer">
         <h1 className="page-question">Did the checks pass?</h1>
         <p className="answer-text">Tests and structured reviews retained for this repository. A passing run is evidence about one exact revision, not permission to land.</p>
       </div>
       <Box
+        tour="workflows-runs"
         icon="diagram-3"
         title="Workflow runs"
         explain="Skill workflows are multi-step checks (tests, reviews) run by a local controller and recorded on the hub."

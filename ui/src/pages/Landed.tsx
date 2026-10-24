@@ -123,7 +123,7 @@ function Detail({ repo, id, token }: { repo: string; id: string; token: string }
   return (
     <div className="page">
       <a href="#landed" className="back"><Icon name="arrow-left" /> All landed changes</a>
-      <div className="answer">
+      <div className="answer" data-tour="answer">
         <h1 className="page-question">
           <code className="branch-name">{p.branch || p.id}</code> <Icon name="arrow-right" className="muted" /> <code className="branch-name">{p.base}</code>
         </h1>
@@ -299,7 +299,7 @@ function List({ repo, token }: { repo: string; token: string }) {
   const failing = landed.filter((p) => details[p.id] && details[p.id] !== 'failed' && headline(shown(p)).tone === 'bad')
   return (
     <div className="page">
-      <div className="answer">
+      <div className="answer" data-tour="answer">
         <h1 className="page-question">Did our changes land, and did checks pass after?</h1>
         <p className="answer-text">
           {load.kind === 'loading'
@@ -312,7 +312,7 @@ function List({ repo, token }: { repo: string; token: string }) {
         </p>
       </div>
       <Lookup repo={repo} token={token} recent={recent} onOpen={(id) => { window.location.hash = landedHref(id).slice(1) }} />
-      <Box icon="rocket-takeoff" title="Recent changes" count={ready ? ready.publications.length : undefined} explain="Changes agents published to this repository through the hub, newest first. Each row shows how far it got.">
+      <Box tour="landed-list" icon="rocket-takeoff" title="Recent changes" count={ready ? ready.publications.length : undefined} explain="Changes agents published to this repository through the hub, newest first. Each row shows how far it got.">
         {load.kind === 'loading' ? (
           <Skeleton rows={4} />
         ) : load.kind === 'error' ? (

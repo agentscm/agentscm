@@ -5,6 +5,10 @@ import type { ThemePref } from '../storage.ts'
 import type { Whoami } from '../types.ts'
 import { ViewSettingsBox } from '../ViewSettings.tsx'
 import { Box, Icon, Pill, Skeleton, localDate } from '../ui.tsx'
+import { SECTIONS } from '../App.tsx'
+import { useTour } from '../tour/Tour.tsx'
+import { tourFor } from '../tour/content.ts'
+import { setAutoplay, setWelcome } from '../tour/state.ts'
 
 const CADENCE = [
   ['broadcast', 'Live agents, held files and activity', 'Every 5 seconds'],
@@ -20,7 +24,7 @@ export function SettingsPage({ token, whoami, pref, onPref, railCollapsed, onRai
   ]
   return (
     <div className="page">
-      <div className="answer">
+      <div className="answer" data-tour="answer">
         <h1 className="page-question">How is this page set up for me?</h1>
         <p className="answer-text">Appearance and token settings live in this browser only and never change the hub. Inline agent views are a hub setting shared by everyone.</p>
       </div>
@@ -31,7 +35,7 @@ export function SettingsPage({ token, whoami, pref, onPref, railCollapsed, onRai
               <div className="settings-label">Theme</div>
               <div className="muted small">Pick a fixed theme or follow your device’s setting.</div>
             </div>
-            <div className="choice-cards" role="radiogroup" aria-label="Theme">
+            <div className="choice-cards" data-tour="settings-theme" role="radiogroup" aria-label="Theme">
               {themes.map((t) => (
                 <button key={t.v} type="button" role="radio" aria-checked={pref === t.v} className={`choice${pref === t.v ? ' on' : ''}`} onClick={() => onPref(t.v)}>
                   <Icon name={t.icon} />
@@ -55,9 +59,11 @@ export function SettingsPage({ token, whoami, pref, onPref, railCollapsed, onRai
           </div>
         </Box>
 
+        <Walkthrough />
+
         <LocalServer />
 
-        <Box icon="key" title="Your token" explain="The token decides which repository you see. A read-only token can look but never change coordination.">
+        <Box tour="settings-token" icon="key" title="Your token" explain="The token decides which repository you see. A read-only token can look but never change coordination.">
           {!whoami ? (
             <Skeleton rows={2} />
           ) : (
@@ -116,7 +122,7 @@ function LocalServer() {
   const valid = validLocalBase(value)
   const status = usePoll((signal) => localStatus(signal), 0, `${saved}|${nonce}`)
   return (
-    <Box icon="laptop" title="This computer" explain="Templates and Timeline read from agentscm serve on this machine, never from the hub.">
+    <Box tour="settings-local" icon="laptop" title="This computer" explain="Templates and Timeline read from agentscm serve on this machine, never from the hub.">
       <form
         className="settings-row"
         onSubmit={(e) => {
@@ -148,6 +154,55 @@ function LocalServer() {
           <button type="submit" className="btn btn-outline-secondary" disabled={!valid}>Save and check</button>
         </div>
       </form>
+    </Box>
+  )
+}
+
+/** Per-viewer tour switches; stored in this browser only, like the theme. */
+function Walkthrough() {
+  const tour = useTour()
+  if (!tour) return null
+  const welcomeOn = !tour.prefs.welcomeSeen && !tour.prefs.welcomeOff
+  const pages = SECTIONS.filter((s) => tourFor(s.key))
+  return (
+    <Box id="feature-walkthrough" tour="settings-walkthrough" icon="signpost-split" title="Feature walkthrough" explain="Short guided tours that point at the real numbers on each page. Saved in this browser only.">
+      {!tour.remember && (
+        <p className="muted small">This browser is not keeping site data, so tours will not start by themselves. You can still run any of them below.</p>
+      )}
+      <div className="settings-row">
+        <div>
+          <div className="settings-label">Welcome tour</div>
+          <div className="muted small">Shows the top bar and what each section is for. Turn it on to see it again the next time you open the hub.</div>
+        </div>
+        <div className="d-flex align-items-center gap-2">
+          <button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => tour.start('welcome')}>Run now</button>
+          <div className="form-check form-switch m-0">
+            <input id="tour-welcome" className="form-check-input" type="checkbox" role="switch" checked={welcomeOn} disabled={!tour.remember} onChange={(e) => tour.update((p) => setWelcome(p, e.target.checked))} />
+            <label className="visually-hidden" htmlFor="tour-welcome">Show the welcome tour next time</label>
+          </div>
+        </div>
+      </div>
+      <div className="settings-label mt-3">Page tours</div>
+      <div className="muted small">Switch one on to play it by itself the next time you open that page. Every page also has a Tour this page button beside the breadcrumbs.</div>
+      <ul className="tour-list">
+        {pages.map((s) => (
+          <li key={s.key}>
+            <Icon name={s.icon} />
+            <span>
+              {s.label}
+              <span className="muted small"> · {s.question}</span>
+            </span>
+            <button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => {
+              window.location.hash = s.key
+              tour.start(s.key)
+            }} aria-label={`Run the ${s.label} tour now`}>Run now</button>
+            <div className="form-check form-switch m-0">
+              <input id={`tour-${s.key}`} className="form-check-input" type="checkbox" role="switch" checked={tour.prefs.autoplay.includes(s.key)} disabled={!tour.remember} onChange={(e) => tour.update((p) => setAutoplay(p, s.key, e.target.checked))} />
+              <label className="visually-hidden" htmlFor={`tour-${s.key}`}>Play the {s.label} tour on my next visit</label>
+            </div>
+          </li>
+        ))}
+      </ul>
     </Box>
   )
 }

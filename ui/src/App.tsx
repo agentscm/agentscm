@@ -22,6 +22,7 @@ import { SettingsPage } from './pages/Settings.tsx'
 import { AppChrome, type Badges, type SectionDef } from './TopNav.tsx'
 import { Icon, Notice } from './ui.tsx'
 import { usePoll } from './usePoll.ts'
+import { TourProvider } from './tour/Tour.tsx'
 import { hashPath } from './Pager.tsx'
 
 const darkQuery = '(prefers-color-scheme: dark)'
@@ -106,40 +107,42 @@ function Shell({ token, dark, pref, onPref, onUnauthorized, onForget }: { token:
   }, [])
 
   return (
-    <AppChrome
-      logo={<Logo dark={dark} height={26} />}
-      repo={repo}
-      sections={SECTIONS}
-      section={section}
-      badges={badges}
-      data={data}
-      d={d}
-      overview={overview.kind === 'ready' ? overview.value : null}
-      pref={pref}
-      onPref={onPref}
-      onForget={onForget}
-      collapsed={rail}
-      onCollapsed={changeRail}
-    >
-      {data.health?.demo && (
-        <Notice tone="brand" icon="play-circle" title="Demo hub">
-          Simulated agents working on your repository’s file names. Nothing is written to your repository; this page stops when <code>agentscm demo</code> does. To set it up for real, stop the demo and run <code>agentscm quickstart</code> (or <code>npx agentscm</code>).
-        </Notice>
-      )}
-      {section === 'now' && <NowPage repo={repo} data={data} d={d} overview={overview} />}
-      {section === 'work' && <WorkPage token={token} overview={overview} />}
-      {section === 'activity' && <ActivityPage d={d} events={data.activity?.events ?? null} fresh={data.fresh} repo={data.whoami?.token.repository ?? null} token={token} />}
-      {section === 'workflows' && <WorkflowsPage token={token} repository={data.whoami?.token.repository ?? null} />}
-      {section === 'change-record' && <ChangeRecordPage repo={data.whoami?.token.repository ?? null} token={token} />}
-      {section === 'landed' && <LandedPage repo={data.whoami?.token.repository ?? null} token={token} />}
-      {section === 'skills' && <SkillsPage repo={data.whoami?.token.repository ?? null} token={token} />}
-      {section === 'templates' && <TemplatesPage />}
-      {section === 'timeline' && <TimelinePage />}
-      {section === 'setup' && <SetupPage token={token} />}
-      {section === 'workspace' && <WorkspacePage />}
-      {section === 'health' && <HealthPage health={data.health} />}
-      {section === 'settings' && <SettingsPage token={token} whoami={data.whoami} pref={pref} onPref={onPref} railCollapsed={rail} onRail={changeRail} onForget={onForget} />}
-    </AppChrome>
+    <TourProvider section={section} data={data} d={d} overview={overview.kind === 'ready' ? overview.value : null}>
+      <AppChrome
+        logo={<Logo dark={dark} height={26} />}
+        repo={repo}
+        sections={SECTIONS}
+        section={section}
+        badges={badges}
+        data={data}
+        d={d}
+        overview={overview.kind === 'ready' ? overview.value : null}
+        pref={pref}
+        onPref={onPref}
+        onForget={onForget}
+        collapsed={rail}
+        onCollapsed={changeRail}
+      >
+        {data.health?.demo && (
+          <Notice tone="brand" icon="play-circle" title="Demo hub">
+            Simulated agents working on your repository’s file names. Nothing is written to your repository; this page stops when <code>agentscm demo</code> does. To set it up for real, stop the demo and run <code>agentscm quickstart</code> (or <code>npx agentscm</code>).
+          </Notice>
+        )}
+        {section === 'now' && <NowPage repo={repo} data={data} d={d} overview={overview} />}
+        {section === 'work' && <WorkPage token={token} overview={overview} />}
+        {section === 'activity' && <ActivityPage d={d} events={data.activity?.events ?? null} fresh={data.fresh} repo={data.whoami?.token.repository ?? null} token={token} />}
+        {section === 'workflows' && <WorkflowsPage token={token} repository={data.whoami?.token.repository ?? null} />}
+        {section === 'change-record' && <ChangeRecordPage repo={data.whoami?.token.repository ?? null} token={token} />}
+        {section === 'landed' && <LandedPage repo={data.whoami?.token.repository ?? null} token={token} />}
+        {section === 'skills' && <SkillsPage repo={data.whoami?.token.repository ?? null} token={token} />}
+        {section === 'templates' && <TemplatesPage />}
+        {section === 'timeline' && <TimelinePage />}
+        {section === 'setup' && <SetupPage token={token} />}
+        {section === 'workspace' && <WorkspacePage />}
+        {section === 'health' && <HealthPage health={data.health} />}
+        {section === 'settings' && <SettingsPage token={token} whoami={data.whoami} pref={pref} onPref={onPref} railCollapsed={rail} onRail={changeRail} onForget={onForget} />}
+      </AppChrome>
+    </TourProvider>
   )
 }
 
