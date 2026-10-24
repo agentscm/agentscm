@@ -561,6 +561,7 @@ pub(super) fn test_intent(id: &str, task: &str, paths: &[&str]) -> Intent {
             disabled: false,
         },
         via: Vec::new(),
+        session: None,
     }
 }
 

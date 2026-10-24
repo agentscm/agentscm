@@ -11,6 +11,8 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY LICENSE THIRD_PARTY_NOTICES.md ./
 COPY src ./src
+COPY examples/slack-manifest.json ./examples/slack-manifest.json
+COPY docs/assets/agentscm-icon.png ./docs/assets/agentscm-icon.png
 COPY --from=ui /ui/dist ./ui/dist
 COPY tools/portable-verifier ./tools/portable-verifier
 RUN cargo build --locked --release --features ui

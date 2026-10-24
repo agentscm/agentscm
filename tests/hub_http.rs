@@ -135,6 +135,7 @@ async fn whoami_attributes_the_owner() {
         assert_eq!(body["token"]["id"], json!(id));
         assert_eq!(body["token"]["name"], "builder");
         assert_eq!(body["token"]["repository"], "acme/widgets");
+        assert!(body["token"]["repository_id"].is_null());
         assert_eq!(
             body["owner"],
             json!({"provider": "github", "host": "github.com", "user_id": 42, "login": "alice"})

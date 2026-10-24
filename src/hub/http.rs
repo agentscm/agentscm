@@ -159,6 +159,14 @@ pub async fn serve(config: HubConfig) -> Result<()> {
             "workspace execution is unsupported on this platform".into(),
         ));
     }
+    if let Some(path) = std::env::var_os(super::slack::CONFIG_ENV) {
+        let slack = tokio::task::spawn_blocking(move || {
+            super::slack::Slack::from_file(std::path::Path::new(&path))
+        })
+        .await
+        .map_err(|_| HubError::Unavailable("Slack startup task failed".into()))??;
+        state = state.with_slack(slack);
+    }
     sync::start(&state).await?;
     if let Err(error) = sync::bootstrap(&state, signin, |name| std::env::var(name).ok()).await {
         eprintln!("hub: first-run setup link not created: {error}");
@@ -170,18 +178,25 @@ pub async fn serve(config: HubConfig) -> Result<()> {
         .as_ref()
         .filter(|execution| execution.server_execution_enabled())
         .map(|execution| execution.clone().spawn_worker());
-    axum::serve(
+    let slack_worker = state
+        .slack
+        .as_ref()
+        .map(|slack| slack.clone().spawn_worker(state.clone()));
+    let result = axum::serve(
         listener,
         router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown_signal())
     .await
-    .map_err(crate::Error::Io)?;
+    .map_err(crate::Error::Io);
+    if let Some(worker) = slack_worker {
+        worker.abort();
+    }
     #[cfg(unix)]
     if let Some(worker) = execution_worker {
         worker.abort();
     }
-    Ok(())
+    result.map_err(HubError::from)
 }
 
 pub struct ApiError {
@@ -385,6 +400,7 @@ async fn whoami(Reader(principal): Reader) -> Json<serde_json::Value> {
             "id": principal.token_id,
             "name": principal.name,
             "repository": principal.repository,
+            "repository_id": principal.repository_id,
             "expires_at": principal.expires_at,
             "read_only": principal.read_only,
         },

@@ -50,6 +50,7 @@ Without a terminal quickstart refuses unless you pass `--yes`, which takes the r
 | `--agent-token-file PATH` | Use this agent token instead of signing in; it is checked against the hub and used where it is. Needed for agent setup without a terminal. |
 | `--agent claude\|codex\|cursor\|copilot\|gemini` | Set up this coding agent (repeatable). Default: Claude Code if the `claude` CLI is on `PATH`. |
 | `--no-agents` | Do not set up any coding agent. |
+| `--slack-config-file ABSOLUTE_PATH` | Install a prepared private Slack bundle into a managed local Hub. See [Slack setup](slack.md). Requires `--hub local`; `--yes` alone never enables it. |
 | `--provider github\|gitlab` | Forge to sign in with (default: from `origin`). |
 | `--github-login LOGIN` | Your GitHub login for the local hub's administrator. With `--yes` it is required unless `gh api user` works; an unverified `git config github.user` is only offered in the interactive prompt. |
 | `--init` | Also run `agentscm init-repo` for this repository once a hub is chosen (with `--yes`, it is otherwise skipped). |

@@ -479,6 +479,8 @@ pub trait Store: Send + Sync {
     /// Events with `seq` greater than the argument, oldest first, at most 1000.
     /// Retained events in sequence order; operator-compacted work events can leave gaps.
     fn events_after(&self, seq: i64, limit: usize) -> Result<Vec<HubEvent>>;
+    /// The highest event `seq`, or 0 with no events.
+    fn latest_event_seq(&self) -> Result<i64>;
     fn work_start(&self, token: &str, start: &WorkStart, now: i64) -> Result<WorkStartResult>;
     /// Atomic compatibility start: reuse this session's unfinished lead work, or create one.
     fn work_start_auto(&self, token: &str, start: &WorkStart, now: i64) -> Result<WorkStartResult>;
