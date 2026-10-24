@@ -32,9 +32,9 @@ export function Explain({ text }: { text: string }) {
 }
 
 /** An evidence box: icon-badged header strip, optional count and explainer, then content. */
-export function Box({ id, icon, title, explain, count, tone = 'brand', actions, children, className = '', flush = false }: { id?: string; icon: string; title: string; explain?: string; count?: number | string; tone?: Tone; actions?: ReactNode; children: ReactNode; className?: string; flush?: boolean }) {
+export function Box({ id, tour, icon, title, explain, count, tone = 'brand', actions, children, className = '', flush = false }: { id?: string; /** Stable walkthrough anchor (`data-tour`). */ tour?: string; icon: string; title: string; explain?: string; count?: number | string; tone?: Tone; actions?: ReactNode; children: ReactNode; className?: string; flush?: boolean }) {
   return (
-    <section id={id} className={`box ${className}`} aria-labelledby={id ? `${id}-title` : undefined}>
+    <section id={id} data-tour={tour} className={`box ${className}`} aria-labelledby={id ? `${id}-title` : undefined}>
       <header className="box-head">
         <span className={`box-badge tone-${tone}`}>
           <Icon name={icon} />

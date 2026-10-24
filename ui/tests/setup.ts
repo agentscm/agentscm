@@ -1,5 +1,15 @@
 import { cleanup } from '@testing-library/react'
-import { afterEach } from 'vitest'
+import { afterEach, beforeEach } from 'vitest'
+
+// The welcome tour opens on first sign-in; app tests start as a viewer who has already dismissed it.
+export const TOUR_OFF = '{"welcomeSeen":true,"welcomeOff":true,"autoplay":[],"sectionsSeen":[]}'
+beforeEach(() => {
+  try {
+    window.localStorage.setItem('agentscm.tour.v1', TOUR_OFF)
+  } catch {
+    // storage unavailable: the tour then stays manual anyway
+  }
+})
 
 afterEach(() => {
   cleanup()

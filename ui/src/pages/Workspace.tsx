@@ -131,7 +131,7 @@ function Confirm({ label, icon, question, confirm, disabled, busy, onConfirm, to
 function Login() {
   const load = usePoll((signal) => workspaceRequest<{ providers: string[] }>('/login', { signal }), 0, 'login')
   return (
-    <Box icon="people" title="Sign in to your workspace" explain="The workspace uses your GitHub or GitLab account, not a token. Your operator must add your numeric forge identity first.">
+    <Box tour="workspace-signin" icon="people" title="Sign in to your workspace" explain="The workspace uses your GitHub or GitLab account, not a token. Your operator must add your numeric forge identity first.">
       <p>Manage members and run workflows with your forge account.</p>
       {load.kind === 'loading' && <Skeleton rows={1} />}
       {load.kind === 'error' && <Notice title={pollError(load)} action={<button className="btn btn-sm btn-outline-secondary" onClick={load.retry}>Retry</button>} />}
@@ -301,6 +301,7 @@ function Execution({ session }: { session: WorkspaceSession }) {
       {notice && <Notice tone="brand" icon="info-circle" title={notice} />}
       {!canExecute && <Notice tone="muted" icon="info-circle" title="You can inspect these repositories. Starting or cancelling runs requires the contributor role." />}
       <Box
+        tour="workspace-runs"
         icon="folder2-open"
         title="Recent runs"
         explain="Durable workspace execution state, newest first, 20 per page. Unknown and stale runs need operator review before a new attempt."
@@ -895,7 +896,7 @@ export function WorkspacePage() {
   const activeTab = route.tab === 'workflow' ? 'repositories' : route.tab
   return (
     <div className="page">
-      <div className="answer">
+      <div className="answer" data-tour="answer">
         <h1 className="page-question">Who can run what?</h1>
         <p className="answer-text">{s ? <>You’re signed in to <strong>{s.workspace.name}</strong> as {s.actor.user.login}.</> : 'The workspace holds shared repositories, members and workflow execution.'}</p>
       </div>
@@ -907,6 +908,7 @@ export function WorkspacePage() {
       {s && (
         <div className="stack">
           <Box
+            tour="workspace-you"
             icon="person-badge"
             title="You"
             explain="Your roles decide what you can do in this workspace."
@@ -940,7 +942,7 @@ export function WorkspacePage() {
             </ul>
           </Box>
           <PendingOperations session={s} />
-          <nav className="tabbar" aria-label="Workspace sections">
+          <nav className="tabbar" data-tour="workspace-tabs" aria-label="Workspace sections">
             {TABS.map((t) => (
               <a key={t.key} href={t.href} className={`tab${activeTab === t.key ? ' active' : ''}`} aria-current={activeTab === t.key ? 'page' : undefined}>
                 <Icon name={t.icon} /> {t.label}

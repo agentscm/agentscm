@@ -23,12 +23,12 @@ export function SetupPage({ token }: { token: string }) {
   const rows: SetupStatus[] = load.kind === 'ready' ? load.value : []
   return (
     <div className="page">
-      <div className="answer">
+      <div className="answer" data-tour="answer">
         <h1 className="page-question">Is my agent set up?</h1>
         <p className="answer-text">An agent is ready when it has proved, in one session, that it can reach the hub over MCP and that its edit hook fires on a real edit.</p>
       </div>
       <div className="grid-2 align-start">
-        <Box icon="patch-check" title="Verified sessions" count={rows.length} explain="Proof lasts up to 15 minutes after the agent’s last check, and never outlasts the agent’s own token (8 hours for client setup). Ready does not guarantee future quota or that every edit tool is covered.">
+        <Box tour="setup-sessions" icon="patch-check" title="Verified sessions" count={rows.length} explain="Proof lasts up to 15 minutes after the agent’s last check, and never outlasts the agent’s own token (8 hours for client setup). Ready does not guarantee future quota or that every edit tool is covered.">
           {load.kind === 'loading' && <Skeleton rows={3} />}
           {!available && load.kind !== 'loading' && <Notice tone="muted" icon="info-circle" title="Setup verification unavailable">No agent is marked ready until the hub answers again.</Notice>}
           {load.kind === 'ready' && rows.length === 0 && (
@@ -70,7 +70,7 @@ export function SetupPage({ token }: { token: string }) {
           </ul>
           {rows.length > 30 && <p className="small muted">Showing 30 setup sessions.</p>}
         </Box>
-        <Box icon="plug" title="Connect an agent" explain="Copies instructions your coding agent follows to install AgentSCM. Nothing runs from this page.">
+        <Box tour="setup-connect" icon="plug" title="Connect an agent" explain="Copies instructions your coding agent follows to install AgentSCM. Nothing runs from this page.">
           <ConnectAgent />
         </Box>
       </div>

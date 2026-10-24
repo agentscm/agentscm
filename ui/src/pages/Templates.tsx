@@ -188,16 +188,16 @@ export function TemplatesPage() {
   const preview = [inspect, handoff].find((p) => p.kind === 'ready' && p.value?.source === 'preview')
   return (
     <div className="page">
-      <div className="answer">
+      <div className="answer" data-tour="answer">
         <h1 className="page-question">Which workflow recipes can agents reuse?</h1>
         <p className="answer-text">A <strong>template</strong> is a saved recipe of checks (like “check these files, run the tests, then ask Claude to review”) that any change can reuse instead of writing its own.</p>
       </div>
       {preview && preview.kind === 'ready' && <PreviewBanner reason={preview.value?.reason} />}
       <div className="grid-2 align-start">
-        <Box icon="journal-code" title="See a change’s recipe" explain="Shows the template this computer uses, as it applies to one change: its steps, what each waits for, and which must pass. Same as skill-workflow library inspect.">
+        <Box tour="templates-recipe-lookup" icon="journal-code" title="See a change’s recipe" explain="Shows the template this computer uses, as it applies to one change: its steps, what each waits for, and which must pass. Same as skill-workflow library inspect.">
           <RecipeLookup recent={recentRecipes} onOpen={(change, library) => { setRecipe({ change, library }); setRecentRecipes(rememberId(RECENT.recipe, `${change}${PAIR}${library}`)) }} />
         </Box>
-        <Box icon="flag" title="Where did a run get to?" explain="A run is one go at a recipe's checks. This shows each step's result and what to do next. Same as skill-workflow handoff.">
+        <Box tour="templates-run-lookup" icon="flag" title="Where did a run get to?" explain="A run is one go at a recipe's checks. This shows each step's result and what to do next. Same as skill-workflow handoff.">
           <Lookup
             id="tpl-run"
             label="Run ID"
@@ -221,7 +221,7 @@ export function TemplatesPage() {
       {recipe === null && runId === null && (
         <Empty icon="journal-code" title="Open a change or a run to begin">Paste an ID above. This page reads from this computer only and never starts or approves anything.</Empty>
       )}
-      <p className="small muted"><Icon name="laptop" /> Read from <code>agentscm serve</code> on this computer, not from the hub.</p>
+      <p className="small muted" data-tour="templates-source"><Icon name="laptop" /> Read from <code>agentscm serve</code> on this computer, not from the hub.</p>
     </div>
   )
 }

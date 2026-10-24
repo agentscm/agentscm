@@ -113,7 +113,7 @@ export function ActivityPage({ d, events, fresh }: { d: Derived | null; events: 
   const shown = rows ? (expanded ? rows : rows.slice(0, 12)) : null
   return (
     <div className="page">
-      <div className="answer">
+      <div className="answer" data-tour="answer">
         <h1 className="page-question">What just happened?</h1>
         <p className="answer-text">The latest things agents did on this repository, newest first. New events slide in as they arrive.</p>
       </div>
@@ -123,7 +123,7 @@ export function ActivityPage({ d, events, fresh }: { d: Derived | null; events: 
         count={rows?.length}
         explain="Up to 30 recent hub events: sessions, announced work, refused and repeated edits, and handoffs between agents."
         actions={
-          <div className="btn-group btn-group-sm" role="group" aria-label="Filter events">
+          <div className="btn-group btn-group-sm" data-tour="activity-filter" role="group" aria-label="Filter events">
             {KINDS.map((k) => (
               <button key={k.key} type="button" className={`btn ${kind === k.key ? 'btn-secondary' : 'btn-outline-secondary'}`} aria-pressed={kind === k.key} onClick={() => setKind(k.key)}>
                 {k.label}
@@ -139,7 +139,7 @@ export function ActivityPage({ d, events, fresh }: { d: Derived | null; events: 
             Events appear here as agents start sessions, announce work and edit files.
           </Empty>
         ) : (
-          <ol className="timeline">
+          <ol className="timeline" data-tour="activity-feed">
             {shown.map(({ e, row }) => (
               <li key={e.id} className={`event tone-${row.tone}${fresh.has(e.id) ? ' is-fresh' : ''}`}>
                 <span className={`event-icon tone-${row.tone}`}>

@@ -68,10 +68,11 @@ function List() {
       </p>
       <Box
         icon="clock-history"
+        tour="timeline-list"
         title="Saved moments"
         count={value.entries.length}
         explain="Newest first. Tick two to compare them."
-        actions={picked.length === 2 ? <a className="btn btn-sm btn-primary" href={compareHref(picked[0]!, picked[1]!)}><Icon name="arrow-left-right" /> Compare these two</a> : <span className="small muted">{picked.length === 1 ? 'Tick one more to compare' : 'Tick two to compare'}</span>}
+        actions={picked.length === 2 ? <a data-tour="timeline-compare" className="btn btn-sm btn-primary" href={compareHref(picked[0]!, picked[1]!)}><Icon name="arrow-left-right" /> Compare these two</a> : <span data-tour="timeline-compare" className="small muted">{picked.length === 1 ? 'Tick one more to compare' : 'Tick two to compare'}</span>}
       >
         {value.entries.length === 0 ? (
           <Empty icon="camera" title="Nothing saved yet">Agents save a snapshot at the end of each turn once the timeline is on.</Empty>
@@ -219,7 +220,7 @@ export function TimelinePage() {
   const route = useRoute()
   return (
     <div className="page">
-      <div className="answer">
+      <div className="answer" data-tour="answer">
         <h1 className="page-question">What did this workspace look like earlier?</h1>
         <p className="answer-text">A <strong>snapshot</strong> is a saved picture of your files at one moment, so you can look back, compare two moments, or start again from one.</p>
       </div>

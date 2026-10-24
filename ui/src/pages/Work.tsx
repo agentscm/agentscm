@@ -154,7 +154,7 @@ function Board({ items, showFinished = false }: { items: WorkItem[]; showFinishe
           </button>
         ))}
       </div>
-      <div className={`board lanes-${lanes.length}`}>
+      <div data-tour="work-lanes" className={`board lanes-${lanes.length}`}>
         {lanes.map((s) => {
           const inLane = items.filter((i) => i.state === s)
           return (
@@ -845,7 +845,7 @@ export function WorkPage({ token, overview }: { token: string; overview: Poll<Wo
   ]
   return (
     <div className="page">
-      <div className="answer">
+      <div className="answer" data-tour="answer">
         <h1 className="page-question">Who owns which task?</h1>
         {ov ? (
           <p className="answer-text">
@@ -880,7 +880,7 @@ export function WorkPage({ token, overview }: { token: string; overview: Poll<Wo
           }
         />
       )}
-      <div className="tabbar" role="tablist" aria-label="Work views">
+      <div className="tabbar" data-tour="work-tabs" role="tablist" aria-label="Work views">
         {tabs.map((t) => (
           <button key={t.key} type="button" role="tab" aria-selected={tab === t.key} className={`tab${tab === t.key ? ' active' : ''}`} onClick={() => { window.location.hash = workTabHref(t.key).slice(1) }}>
             <Icon name={t.icon} /> {t.label}

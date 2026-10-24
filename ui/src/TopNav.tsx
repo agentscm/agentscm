@@ -11,6 +11,8 @@ import { workspaceRoute, workspaceRunHref } from './pages/Workspace.tsx'
 import { landedIdFromHash, landedHref } from './pages/Landed.tsx'
 import { compareHref, entryHref, timelineRoute } from './pages/Timeline.tsx'
 import { Icon, Tip, relative } from './ui.tsx'
+import { TourTrigger, useTour } from './tour/Tour.tsx'
+import { tourFor } from './tour/content.ts'
 
 export interface SectionDef {
   key: Section
@@ -90,7 +92,7 @@ function RepoSwitcher({ repo, onForget }: { repo: string; onForget: () => void }
   const ref = useDismiss(open, () => setOpen(false))
   return (
     <div className="pop" ref={ref}>
-      <button type="button" className={`repo-btn${open ? ' is-open' : ''}`} aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen((o) => !o)}>
+      <button type="button" data-tour="repo" className={`repo-btn${open ? ' is-open' : ''}`} aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen((o) => !o)}>
         <span className="repo-mark" aria-hidden="true"><Icon name="git" /></span>
         <span className="repo-name">{repo}</span>
         <Icon name="chevron-expand" className="repo-chevron" />
@@ -191,6 +193,8 @@ export interface Hit {
   label: string
   hint: string
   href: string
+  /** Runs instead of following href (the page-tour entry). */
+  run?: () => void
 }
 
 export function paletteHits(sections: SectionDef[], d: Derived | null, overview: WorkOverview | null): Hit[] {
@@ -203,14 +207,15 @@ export function paletteHits(sections: SectionDef[], d: Derived | null, overview:
   return hits
 }
 
-/** Empty query shows only pages; otherwise a case-insensitive match on label and hint, capped at 40. */
+/** Empty query shows only pages and help; otherwise a case-insensitive match on label and hint, capped at 40. */
 export function filterHits(all: Hit[], q: string): Hit[] {
   const needle = q.trim().toLowerCase()
-  const list = needle ? all.filter((h) => `${h.label} ${h.hint}`.toLowerCase().includes(needle)) : all.filter((h) => h.group === 'Pages')
+  const list = needle ? all.filter((h) => `${h.label} ${h.hint}`.toLowerCase().includes(needle)) : all.filter((h) => h.group === 'Pages' || h.group === 'Help')
   return list.slice(0, 40)
 }
 
-function CommandPalette({ onClose, sections, d, overview }: { onClose: () => void; sections: SectionDef[]; d: Derived | null; overview: WorkOverview | null }) {
+function CommandPalette({ onClose, sections, section, d, overview }: { onClose: () => void; sections: SectionDef[]; section: Section; d: Derived | null; overview: WorkOverview | null }) {
+  const tour = useTour()
   const [q, setQ] = useState('')
   const [sel, setSel] = useState(0)
   const input = useRef<HTMLInputElement>(null)
@@ -222,13 +227,20 @@ function CommandPalette({ onClose, sections, d, overview }: { onClose: () => voi
     return () => opener?.focus({ preventScroll: true })
   }, [])
 
-  const all = useMemo(() => paletteHits(sections, d, overview), [sections, d, overview])
+  const all = useMemo(() => {
+    const hits = paletteHits(sections, d, overview)
+    const here = sections.find((s) => s.key === section)
+    if (tour && here && tourFor(section)) hits.push({ group: 'Help', icon: 'signpost-split', label: 'Walk me through this page', hint: `A short tour of ${here.label}`, href: '', run: () => tour.start(section) })
+    if (tour) hits.push({ group: 'Help', icon: 'compass', label: 'Replay the welcome tour', hint: 'The top bar, the sections and what each one is for', href: '', run: () => tour.start('welcome') })
+    return hits
+  }, [sections, section, d, overview, tour])
   const shown = useMemo(() => filterHits(all, q), [all, q])
 
   const go = (h: Hit | undefined) => {
     if (!h) return
-    window.location.hash = h.href.slice(1)
     onClose()
+    if (h.run) h.run()
+    else window.location.hash = h.href.slice(1)
   }
   return (
     <div className="palette-scrim" onMouseDown={onClose}>
@@ -314,7 +326,7 @@ function SideNav({ sections, section, badges, collapsed, onCollapse, drawer, onC
       <aside className={`side${collapsed ? ' is-compact' : ''}${drawer ? ' is-open' : ''}`} aria-label="Hub sections">
         <nav className="side-nav">
           {GROUPS.map((g) => (
-            <div key={g.name} className="side-group">
+            <div key={g.name} className="side-group" data-tour={`nav-${g.name.toLowerCase().replaceAll(' ', '-')}`}>
               <div className="side-head">
                 <span>{g.name}</span>
                 <Tip text={g.tip} focusable className="side-head-tip"><Icon name="info-circle" /><span className="visually-hidden">{g.tip}</span></Tip>
@@ -433,10 +445,13 @@ function Breadcrumbs({ repo, section, overview, data }: { repo: string; section:
           })}
         </ol>
       </nav>
-      <Tip text={data.failing ? 'The hub did not answer the last refresh. Showing the last data that loaded; retrying with backoff.' : 'Live data refreshes every 5 seconds while this tab is visible.'} focusable className={`crumb-fresh${data.failing ? ' is-failing' : ''}`}>
-        <Icon name={data.failing ? 'exclamation-triangle' : 'arrow-repeat'} />
-        {data.failing ? 'Reconnecting…' : data.lastOk ? `Updated ${relative(data.lastOk / 1000, now)}` : 'Connecting…'}
-      </Tip>
+      <div className="crumb-tools">
+        <TourTrigger section={section.key} />
+        <Tip text={data.failing ? 'The hub did not answer the last refresh. Showing the last data that loaded; retrying with backoff.' : 'Live data refreshes every 5 seconds while this tab is visible.'} focusable className={`crumb-fresh${data.failing ? ' is-failing' : ''}`}>
+          <Icon name={data.failing ? 'exclamation-triangle' : 'arrow-repeat'} />
+          {data.failing ? 'Reconnecting…' : data.lastOk ? `Updated ${relative(data.lastOk / 1000, now)}` : 'Connecting…'}
+        </Tip>
+      </div>
     </div>
   )
 }
@@ -516,7 +531,7 @@ export function AppChrome({ logo, repo, sections, section, badges, data, d, over
         Skip to content
       </a>
       <header className="topbar">
-        <button ref={burger} type="button" className="burger" aria-label="Open navigation" aria-expanded={drawer} onClick={() => setDrawer(!drawer)}>
+        <button ref={burger} type="button" data-tour="menu" className="burger" aria-label="Open navigation" aria-expanded={drawer} onClick={() => setDrawer(!drawer)}>
           <Icon name={drawer ? 'x-lg' : 'list'} />
         </button>
         <a href="#now" className="topbar-logo" aria-label="AgentSCM Hub home">
@@ -525,7 +540,7 @@ export function AppChrome({ logo, repo, sections, section, badges, data, d, over
         <span className="topbar-div" aria-hidden="true" />
         <RepoSwitcher repo={repo} onForget={onForget} />
 
-        <button type="button" className="search-pill" onClick={() => setPalette(true)} aria-label="Search the hub">
+        <button type="button" data-tour="search" className="search-pill" onClick={() => setPalette(true)} aria-label="Search the hub">
           <Icon name="search" />
           <span className="search-text">Search agents, files, work…</span>
           <kbd>{isMac ? '⌘' : 'Ctrl'} K</kbd>
@@ -533,13 +548,13 @@ export function AppChrome({ logo, repo, sections, section, badges, data, d, over
 
         <div className="topbar-right">
           <Tip text={healthTip} placement="bottom">
-            <a href="#health" className={`health-chip${healthOk ? '' : ' is-bad'}`} aria-label={healthTip}>
+            <a href="#health" data-tour="live" className={`health-chip${healthOk ? '' : ' is-bad'}`} aria-label={healthTip}>
               <span className="live-dot" aria-hidden="true" />
               <span className="health-text">{data.failing ? 'Reconnecting' : healthOk ? 'Live' : data.health ? 'Degraded' : '…'}</span>
             </a>
           </Tip>
           <Tip text="Connect an agent: install the hook, mint a token, verify the setup." placement="bottom">
-            <a href="#setup" className="btn btn-sm btn-primary topbar-cta">
+            <a href="#setup" data-tour="connect" className="btn btn-sm btn-primary topbar-cta">
               <Icon name="plug" /> <span className="cta-text">Connect agent</span>
             </a>
           </Tip>
@@ -553,7 +568,7 @@ export function AppChrome({ logo, repo, sections, section, badges, data, d, over
           {children}
         </main>
       </div>
-      {palette && <CommandPalette onClose={() => setPalette(false)} sections={sections} d={d} overview={overview} />}
+      {palette && <CommandPalette onClose={() => setPalette(false)} sections={sections} section={section} d={d} overview={overview} />}
     </div>
   )
 }

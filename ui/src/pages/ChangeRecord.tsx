@@ -155,11 +155,11 @@ function Lookup() {
   const valid = validWorkId(workId)
   return (
     <div className="page">
-      <div className="answer">
+      <div className="answer" data-tour="answer">
         <h1 className="page-question">What is ready to hand off?</h1>
         <p className="answer-text">Open a work item to see its source, recorded checks, decision, gaps and next action.</p>
       </div>
-      <Box icon="search" title="Open a change record" explain="Use the durable work ID shown on the Work page or returned by an agent.">
+      <Box tour="change-lookup" icon="search" title="Open a change record" explain="Use the durable work ID shown on the Work page or returned by an agent.">
         <form
           className="lookup"
           onSubmit={(event) => {
@@ -297,7 +297,7 @@ function LatestAction({ summary }: { summary: ChangeRecordSummaryV1 }) {
   if (!action) return <Empty icon="clipboard2-x" title="No action captured">The record does not yet contain a source-bound action receipt.</Empty>
   return (
     <>
-      <div className="pills mb-3" aria-label="Latest action status">
+      <div className="pills mb-3" data-tour="change-latest" aria-label="Latest action status">
         <StatusPill status={ACTION_KIND[action.kind]} />
         <StatusPill status={OUTCOME[action.outcome]} />
         {action.kind === 'verification'
@@ -362,7 +362,7 @@ function Detail({ repo, token, workId }: { repo: string; token: string; workId: 
   return (
     <div className="page change-record-detail">
       <a href="#work" className="back"><Icon name="arrow-left" /> Work</a>
-      <div className="answer">
+      <div className="answer" data-tour="answer">
         <h1 className="page-question">{summary.intent.title}</h1>
         <p className="answer-text"><HandoffSummary summary={summary} /></p>
         <p className="small muted mb-0"><code className="text-break">{summary.work_id}</code>, generation {summary.generation}, record updated <Ago at={summary.as_of} /></p>
@@ -421,7 +421,7 @@ function Detail({ repo, token, workId }: { repo: string; token: string; workId: 
           </dl>
         </Box>
 
-        <Box icon="question-diamond" tone={summary.unknowns.length || summary.sessions.gaps ? 'warn' : 'ok'} title="Known gaps" count={summary.unknowns.length + summary.sessions.gaps} explain="Unknowns and capture gaps stay visible instead of becoming empty success states.">
+        <Box tour="change-gaps" icon="question-diamond" tone={summary.unknowns.length || summary.sessions.gaps ? 'warn' : 'ok'} title="Known gaps" count={summary.unknowns.length + summary.sessions.gaps} explain="Unknowns and capture gaps stay visible instead of becoming empty success states.">
           {summary.unknowns.length === 0 && summary.sessions.gaps === 0 ? (
             <Empty icon="check2-circle" title="No gaps reported in this projection">This statement is limited to the bounded fields shown here.</Empty>
           ) : (

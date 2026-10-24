@@ -28,7 +28,7 @@ export function ConnectAgent() {
   }
   return (
     <div className="connect">
-      <ol className="steps">
+      <ol className="steps" data-tour="setup-steps">
         {STEPS.map((s, i) => (
           <li key={s.title}>
             <span className="step-mark" aria-hidden="true">
@@ -43,7 +43,7 @@ export function ConnectAgent() {
           </li>
         ))}
       </ol>
-      <div className="connect-actions">
+      <div className="connect-actions" data-tour="setup-actions">
         <div className="muted small">
           Hub address <code>{origin}</code>
         </div>

@@ -223,17 +223,18 @@ function List({ token }: { token: string }) {
   const lookupValid = validSkillWorkflowRunId(lookup.trim())
   return (
     <div className="page">
-      <div className="answer">
+      <div className="answer" data-tour="answer">
         <h1 className="page-question">Did the checks pass?</h1>
         <p className="answer-text">Tests and structured reviews retained for this repository. A passing run is evidence about one exact revision, not permission to land.</p>
       </div>
       <Box
+        tour="workflows-runs"
         icon="diagram-3"
         title="Workflow runs"
         explain="Skill workflows are multi-step checks (tests, reviews) run by a local controller and recorded on the hub."
         count={load.kind === 'ready' && load.value.availability === 'available' ? load.value.runs.length : undefined}
         actions={
-          <form className="d-flex gap-2" onSubmit={(e) => { e.preventDefault(); if (lookupValid) window.location.hash = runHref(lookup.trim()) }}>
+          <form className="d-flex gap-2" data-tour="workflows-lookup" onSubmit={(e) => { e.preventDefault(); if (lookupValid) window.location.hash = runHref(lookup.trim()) }}>
             <input className="form-control form-control-sm" placeholder="Open run by ID" aria-label="Run ID" value={lookup} onChange={(e) => setLookup(e.target.value)} />
             <button className="btn btn-sm btn-outline-secondary" disabled={!lookupValid} type="submit"><Icon name="search" /></button>
           </form>
