@@ -297,6 +297,12 @@ run it in Terminal; it runs normal `client setup`, which may contact the Hub, re
 and create or replace a managed coordination token. The native client's own trust prompts still
 apply.
 
+Setup actions show a progress and result window with the client's next steps; they do not install
+the coding client itself. **Open Hub** uses the exact Hub's saved human sign-in to mint a 30-minute
+read-only token for the selected repository. The token goes to the browser in a URL fragment,
+which the UI removes. An existing browser sign-in is preserved. Missing or expired sign-in,
+changed checkout bindings and failed Hub requests produce a visible error.
+
 ## Usage telemetry
 
 ```sh

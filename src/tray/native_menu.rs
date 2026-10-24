@@ -77,6 +77,7 @@ pub(super) struct NativeMenuBridge {
     item: Retained<NSMenuItem>,
     target: Retained<Target>,
     switch: Option<Retained<NSSwitch>>,
+    login_state: Option<Retained<NSTextField>>,
     _view: Option<Retained<NSView>>,
     _text_views: Vec<Retained<NSView>>,
     tracking: Arc<AtomicBool>,
@@ -100,7 +101,7 @@ impl NativeMenuBridge {
         // NSSwitch was introduced in macOS 10.15, while AgentSCM still supports older macOS.
         // Looking up the class first avoids messaging an unavailable class; the existing Muda
         // CheckMenuItem remains the accessible legacy control when the lookup fails.
-        let (switch, view) = if AnyClass::get(c"NSSwitch").is_some() {
+        let (switch, login_state, view) = if AnyClass::get(c"NSSwitch").is_some() {
             let view = NSView::initWithFrame(
                 NSView::alloc(mtm),
                 NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(280.0, 32.0)),
@@ -108,31 +109,34 @@ impl NativeMenuBridge {
             let label = NSTextField::labelWithString(&NSString::from_str("Start at Login"), mtm);
             label.setFrame(NSRect::new(
                 NSPoint::new(16.0, 7.0),
-                NSSize::new(200.0, 18.0),
+                NSSize::new(130.0, 18.0),
             ));
+            let login_state = NSTextField::labelWithString(&NSString::new(), mtm);
+            login_state.setFrame(NSRect::new(
+                NSPoint::new(148.0, 7.0),
+                NSSize::new(70.0, 18.0),
+            ));
+            login_state.setFont(Some(&NSFont::systemFontOfSize(12.0)));
             let switch = NSSwitch::initWithFrame(
                 NSSwitch::alloc(mtm),
                 NSRect::new(NSPoint::new(224.0, 4.0), NSSize::new(44.0, 24.0)),
             );
-            switch.setState(if enabled {
-                NSControlStateValueOn
-            } else {
-                NSControlStateValueOff
-            });
             switch.setAccessibilityLabel(Some(&NSString::from_str("Start at Login")));
+            apply_login_state(&switch, &login_state, NativeLoginState::Confirmed(enabled));
             // SAFETY: Target implements loginSwitchChanged: with the NSSwitch sender signature and
             // is retained by this bridge for at least as long as the switch.
             unsafe {
                 switch.setTarget(Some(&target));
                 switch.setAction(Some(sel!(loginSwitchChanged:)));
                 view.addSubview(&label);
+                view.addSubview(&login_state);
                 view.addSubview(&switch);
             }
             item.setView(Some(&view));
             item.view()?;
-            (Some(switch), Some(view))
+            (Some(switch), Some(login_state), Some(view))
         } else {
-            (None, None)
+            (None, None, None)
         };
         let mut text_views = Vec::new();
         customize_menu(&menu, mtm, &mut text_views);
@@ -159,6 +163,7 @@ impl NativeMenuBridge {
             item,
             target,
             switch,
+            login_state,
             _view: view,
             _text_views: text_views,
             tracking,
@@ -170,18 +175,46 @@ impl NativeMenuBridge {
     }
 
     pub(super) fn set_enabled(&self, enabled: bool) {
-        if let Some(switch) = &self.switch {
-            switch.setState(if enabled {
-                NSControlStateValueOn
-            } else {
-                NSControlStateValueOff
-            });
+        self.set_login_state(NativeLoginState::Confirmed(enabled));
+    }
+
+    pub(super) fn set_login_state(&self, state: NativeLoginState) {
+        if let (Some(switch), Some(label)) = (&self.switch, &self.login_state) {
+            apply_login_state(switch, label, state);
         }
     }
 
     pub(super) fn is_installed(&self) -> bool {
         self.switch.is_none() || self.item.view().is_some()
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum NativeLoginState {
+    Confirmed(bool),
+    Pending(bool),
+}
+
+fn apply_login_state(switch: &NSSwitch, label: &NSTextField, state: NativeLoginState) {
+    let (enabled, checked, text, color) = match state {
+        NativeLoginState::Confirmed(true) => (true, true, "On", NSColor::controlAccentColor()),
+        NativeLoginState::Confirmed(false) => (true, false, "Off", NSColor::secondaryLabelColor()),
+        NativeLoginState::Pending(checked) => {
+            (false, checked, "Updating…", NSColor::secondaryLabelColor())
+        }
+    };
+    switch.setEnabled(enabled);
+    switch.setState(if checked {
+        NSControlStateValueOn
+    } else {
+        NSControlStateValueOff
+    });
+    switch.setAccessibilityValueDescription(Some(&NSString::from_str(text)));
+    label.setStringValue(&NSString::from_str(text));
+    label.setTextColor(Some(&color));
+    label.setAccessibilityLabel(Some(&NSString::from_str(&format!(
+        "Start at Login: {text}"
+    ))));
 }
 
 const TEXT_MARKER: &str = "__AGENTSCM_TEXT_";
@@ -343,6 +376,8 @@ fn symbol_for_title(title: &str) -> Option<&'static str> {
         "Connection Details" => Some("info.circle"),
         "Recent Activity" => Some("clock"),
         "Troubleshooting" => Some("wrench.and.screwdriver"),
+        "Hub Sign-in" => Some("key"),
+        "Copy GitHub Sign-in" | "Copy GitLab Sign-in" => Some("terminal"),
         "Copy Diagnostics" => Some("doc.on.doc"),
         "Copy Reconnect" => Some("arrow.triangle.2.circlepath"),
         "Copy Guidance Preview" => Some("text.book.closed"),

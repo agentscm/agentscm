@@ -24,6 +24,10 @@ use winit::window::WindowId;
 use crate::client_activity::{ActivityOutcome, ActivityPath};
 use crate::client_status::{BindingState, CredentialState, HubCheck, Snapshot};
 
+#[path = "hub_open.rs"]
+mod hub_open;
+#[path = "native_feedback.rs"]
+mod native_feedback;
 #[path = "native_menu.rs"]
 mod native_menu;
 
@@ -31,14 +35,14 @@ const READY: &str = "AGENTSCM_TRAY_READY";
 const ALREADY_RUNNING: &str = "AGENTSCM_TRAY_ALREADY_RUNNING";
 const RECENT_HUB_CHECK_SECONDS: i64 = 60;
 
-#[derive(Debug)]
 enum UserEvent {
     Menu(String),
     LaunchLogin(bool),
     LoginResult(bool, std::result::Result<(), String>),
     MenuTrackingEnded,
     Snapshot(std::result::Result<Snapshot, String>, ConfigStamp),
-    Integration(std::result::Result<String, String>),
+    Integration(crate::client_setup::Agent, std::result::Result<(), String>),
+    HubOpen(std::result::Result<Box<hub_open::PreparedOpen>, hub_open::OpenError>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -165,6 +169,9 @@ fn run_foreground(initial: Snapshot) -> Result<()> {
         initial_icon: Some(icon()?),
         tray: None,
         native_menu: Some(native_menu),
+        feedback: native_feedback::NativeFeedback::new()
+            .ok_or_else(|| Error::Invalid("cannot create tray action feedback".into()))?,
+        opening_hub: false,
         login_changing: false,
         menu_dirty: false,
         notice: None,
@@ -192,6 +199,8 @@ struct TrayApp {
     initial_icon: Option<Icon>,
     tray: Option<tray_icon::TrayIcon>,
     native_menu: Option<native_menu::NativeMenuBridge>,
+    feedback: native_feedback::NativeFeedback,
+    opening_hub: bool,
     login_changing: bool,
     menu_dirty: bool,
     notice: Option<Notice>,
@@ -270,6 +279,9 @@ impl TrayApp {
                 ));
                 return;
             };
+            if self.login_changing {
+                native_menu.set_login_state(native_menu::NativeLoginState::Pending(login_enabled));
+            }
             tray.set_menu(Some(Box::new(menu)));
             self.menu_key = key;
             self.native_menu = Some(native_menu);
@@ -356,6 +368,11 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                     self.replace_menu(None);
                 } else {
                     self.login_changing = true;
+                    if let Some(native_menu) = &self.native_menu {
+                        native_menu.set_login_state(native_menu::NativeLoginState::Pending(
+                            super::login::enabled(),
+                        ));
+                    }
                     spawn_login_change(
                         self.refresh_proxy.clone(),
                         desired,
@@ -383,24 +400,68 @@ impl ApplicationHandler<UserEvent> for TrayApp {
             }
             UserEvent::Menu(id) if id.starts_with("setup:") => {
                 self.notice = None;
-                if self.installing.swap(true, Ordering::AcqRel) {
+                if self.opening_hub || self.installing.load(Ordering::Acquire) {
                     self.notice = Some(Notice::Action(
-                        "Another agent integration setup is still running".into(),
+                        "An action is still running; wait for its result".into(),
                     ));
                     self.replace_menu(None);
                 } else if let Some(request) =
                     integration_request(&id, &self.snapshot, &self.executable)
                 {
+                    self.installing.store(true, Ordering::Release);
+                    self.feedback.show(
+                        &format!("Setting up {}…", request.label),
+                        "Configuring AgentSCM hooks and MCP for this checkout. Your coding client will ask for its own approvals when you open it.",
+                        true,
+                    );
                     spawn_integration(self.refresh_proxy.clone(), request);
                     self.notice = Some(Notice::Action("Setting up agent integration…".into()));
                     self.replace_menu(None);
                 } else {
-                    self.installing.store(false, Ordering::Release);
+                    self.feedback.show(
+                        "Setup could not start",
+                        "The checkout connection changed. Refresh connections and try again.",
+                        false,
+                    );
                     self.notice = Some(Notice::Action(
                         "The checkout connection changed; refresh and try again".into(),
                     ));
                     self.replace_menu(None);
                 }
+            }
+            UserEvent::Menu(id) if id.starts_with("hub:") => {
+                if self.opening_hub || self.installing.load(Ordering::Acquire) {
+                    self.notice = Some(Notice::Action(
+                        "An action is still running; wait for its result".into(),
+                    ));
+                } else {
+                    let request = self
+                        .snapshot
+                        .connections
+                        .iter()
+                        .find(|connection| id == format!("hub:{}", connection_identity(connection)))
+                        .ok_or(hub_open::OpenError::InvalidConnection)
+                        .and_then(hub_open::OpenRequest::from_status);
+                    match request {
+                        Ok(request) => {
+                            self.opening_hub = true;
+                            self.feedback.show(
+                                "Opening Hub…",
+                                "Preparing a read-only browser session for this repository.",
+                                true,
+                            );
+                            self.notice = Some(Notice::Action("Opening Hub…".into()));
+                            spawn_hub_open(self.refresh_proxy.clone(), request);
+                        }
+                        Err(error) => {
+                            self.feedback
+                                .show("Could not open Hub", &error.to_string(), false);
+                            self.notice =
+                                Some(Notice::Action(format!("Could not open Hub: {error}")));
+                        }
+                    }
+                }
+                self.replace_menu(None);
             }
             UserEvent::Menu(id) => {
                 self.notice = None;
@@ -424,16 +485,63 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                 };
                 self.replace_menu(Some(&notice));
             }
-            UserEvent::Integration(result) => {
+            UserEvent::Integration(agent, result) => {
                 self.installing.store(false, Ordering::Release);
                 self.notice = Some(Notice::Action(match result {
-                    Ok(agent) => format!("{agent} integration configured"),
-                    Err(error) => format!("Integration setup failed: {error}"),
+                    Ok(()) => {
+                        let label = agent_choices()
+                            .into_iter()
+                            .find(|(candidate, _)| *candidate == agent)
+                            .expect("known agent")
+                            .1;
+                        self.feedback.update(
+                            &format!("{label} integration configured"),
+                            setup_next_step(agent),
+                            false,
+                        );
+                        format!("{label} integration configured; open a fresh client session")
+                    }
+                    Err(error) => {
+                        self.feedback
+                            .update("Integration setup failed", &error, false);
+                        format!("Integration setup failed: {error}")
+                    }
                 }));
                 self.replace_menu(None);
                 if !self.refreshing.swap(true, Ordering::AcqRel) {
                     spawn_refresh(self.refresh_proxy.clone(), false);
                 }
+            }
+            UserEvent::HubOpen(result) => {
+                self.opening_hub = false;
+                let opened = result
+                    .map(|prepared| *prepared)
+                    .map_err(|error| error.to_string())
+                    .and_then(|prepared| {
+                        finish_hub_open(
+                            prepared,
+                            |prepared| {
+                                prepared
+                                    .validate_current()
+                                    .map_err(|error| error.to_string())
+                            },
+                            |prepared| {
+                                native_feedback::open_url(prepared.url()).map_err(str::to_owned)
+                            },
+                            revoke_hub_open,
+                        )
+                    });
+                match opened {
+                    Ok(()) => {
+                        self.feedback.update("Hub opened", "A read-only session was sent to your browser. An existing browser sign-in is kept; sign out there first to switch repositories.", false);
+                        self.notice = Some(Notice::Action("Hub opened in your browser".into()));
+                    }
+                    Err(error) => {
+                        self.feedback.update("Could not open Hub", &error, false);
+                        self.notice = Some(Notice::Action(format!("Could not open Hub: {error}")));
+                    }
+                }
+                self.replace_menu(None);
             }
         }
     }
@@ -572,10 +680,76 @@ fn spawn_integration(
             )
         }))
         .map_err(|_| "integration setup stopped unexpectedly".to_owned())
-        .and_then(|result| result.map_err(|error| bounded_error(&error.to_string())))
-        .map(|()| request.label.to_owned());
-        let _ = proxy.send_event(UserEvent::Integration(result));
+        .and_then(|result| result.map_err(|error| bounded_error(&error.to_string())));
+        let _ = proxy.send_event(UserEvent::Integration(request.agent, result));
     });
+}
+
+fn setup_next_step(agent: crate::client_setup::Agent) -> &'static str {
+    use crate::client_setup::Agent;
+    match agent {
+        Agent::Claude => {
+            "Open Claude Code in this checkout, review its plugin and MCP approvals, then start a fresh session. Setup configures AgentSCM; it does not install Claude Code."
+        }
+        Agent::Codex => {
+            "Open Codex in this checkout, approve the AgentSCM plugin and MCP server, reload hooks, then start a fresh chat. Setup configures AgentSCM; it does not install Codex."
+        }
+        Agent::Cursor => {
+            "Reopen this checkout in Cursor and review its hook and MCP approvals. Start a fresh agent session. Setup configures AgentSCM; it does not install Cursor."
+        }
+        Agent::Copilot => {
+            "Open Copilot CLI in this checkout, review its hook and MCP approvals, then start a fresh session. Setup configures AgentSCM; it does not install Copilot CLI."
+        }
+        Agent::Gemini => {
+            "Open Gemini CLI in this checkout, trust its project settings, and approve AgentSCM hooks and MCP. Start a fresh session. If Gemini CLI is not installed, install it first."
+        }
+    }
+}
+
+fn spawn_hub_open(
+    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    request: hub_open::OpenRequest,
+) {
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        let result = match &runtime {
+            Ok(runtime) => runtime.block_on(hub_open::prepare_open(request)),
+            Err(_) => Err(hub_open::OpenError::Unavailable),
+        };
+        if let Err(winit::event_loop::EventLoopClosed(UserEvent::HubOpen(Ok(prepared)))) =
+            proxy.send_event(UserEvent::HubOpen(result.map(Box::new)))
+            && let Ok(runtime) = runtime
+        {
+            runtime.block_on((*prepared).revoke());
+        }
+    });
+}
+
+fn revoke_hub_open(prepared: hub_open::PreparedOpen) {
+    std::thread::spawn(move || {
+        if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            runtime.block_on(prepared.revoke());
+        }
+    });
+}
+
+/// Keep the last binding check and browser handoff in one main-thread operation.
+fn finish_hub_open<T>(
+    prepared: T,
+    validate: impl FnOnce(&T) -> std::result::Result<(), String>,
+    open: impl FnOnce(&T) -> std::result::Result<(), String>,
+    revoke: impl FnOnce(T),
+) -> std::result::Result<(), String> {
+    let result = validate(&prepared).and_then(|()| open(&prepared));
+    if result.is_err() {
+        revoke(prepared);
+    }
+    result
 }
 
 fn bounded_error(error: &str) -> String {
@@ -743,6 +917,21 @@ fn build_menu(
         submenu.append(&recent).map_err(menu_error)?;
 
         let troubleshooting = Submenu::new("Troubleshooting", true);
+        let sign_in = Submenu::new("Hub Sign-in", true);
+        for (provider, label) in [
+            ("github", "Copy GitHub Sign-in"),
+            ("gitlab", "Copy GitLab Sign-in"),
+        ] {
+            sign_in
+                .append(&MenuItem::with_id(
+                    format!("copy-login:{identity}:{provider}"),
+                    label,
+                    true,
+                    None,
+                ))
+                .map_err(menu_error)?;
+        }
+        troubleshooting.append(&sign_in).map_err(menu_error)?;
         troubleshooting
             .append(&MenuItem::with_id(
                 format!("diagnostics:{identity}"),
@@ -1058,7 +1247,7 @@ fn title_agent(agent: &str) -> &str {
 }
 
 fn handle_action(id: &str, snapshot: &Snapshot, executable: &Path) {
-    if let Some(command) = terminal_setup_command(id, snapshot, executable) {
+    if let Some(command) = terminal_action_command(id, snapshot, executable) {
         copy_text(&command);
         return;
     }
@@ -1078,11 +1267,6 @@ fn handle_action(id: &str, snapshot: &Snapshot, executable: &Path) {
                 .args(super::open_argv(&connection.root))
                 .spawn();
         }
-        "hub" => {
-            let _ = Command::new("/usr/bin/open")
-                .args(super::open_argv(Path::new(&connection.hub)))
-                .spawn();
-        }
         "diagnostics" => copy_text(&diagnostics(connection)),
         "reconnect" => copy_text(&reconnect_command(connection)),
         "guidance" => copy_text(&guidance_command(connection)),
@@ -1090,24 +1274,34 @@ fn handle_action(id: &str, snapshot: &Snapshot, executable: &Path) {
     }
 }
 
-fn terminal_setup_command(id: &str, snapshot: &Snapshot, executable: &Path) -> Option<String> {
+fn terminal_action_command(id: &str, snapshot: &Snapshot, executable: &Path) -> Option<String> {
     let mut parts = id.split(':');
-    (parts.next()? == "copy-setup").then_some(())?;
+    let kind = parts.next()?;
     let identity = parts.next()?;
     let agent = parts.next()?;
-    if parts.next().is_some() || !agent_choices().iter().any(|(item, _)| item.name() == agent) {
+    if parts.next().is_some() {
         return None;
     }
     let connection = snapshot
         .connections
         .iter()
         .find(|connection| connection_identity(connection) == identity)?;
-    Some(terminal_setup_command_for(
-        executable,
-        agent,
-        &connection.hub,
-        &connection.root,
-    ))
+    if kind == "copy-login" {
+        return hub_login_command_for(executable, agent, &connection.hub);
+    }
+    (kind == "copy-setup" && agent_choices().iter().any(|(item, _)| item.name() == agent))
+        .then(|| terminal_setup_command_for(executable, agent, &connection.hub, &connection.root))
+}
+
+fn hub_login_command_for(executable: &Path, provider: &str, hub: &str) -> Option<String> {
+    matches!(provider, "github" | "gitlab").then(|| {
+        format!(
+            "{} hub login --hub {} --provider {}",
+            shell_quote(&executable.to_string_lossy()),
+            shell_quote(hub),
+            provider,
+        )
+    })
 }
 
 fn terminal_setup_command_for(executable: &Path, agent: &str, hub: &str, root: &Path) -> String {
@@ -1289,6 +1483,71 @@ impl InstanceLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copied_hub_login_uses_the_exact_hub_and_explicit_provider() {
+        let executable = Path::new("/Applications/AgentSCM versions/agentscm");
+        assert_eq!(hub_login_command_for(executable, "github", "https://hub.example/a'b"),
+            Some("'/Applications/AgentSCM versions/agentscm' hub login --hub 'https://hub.example/a'\\''b' --provider github".into()));
+        assert!(
+            hub_login_command_for(executable, "gitlab", "https://hub.example")
+                .unwrap()
+                .ends_with("--provider gitlab")
+        );
+        assert!(
+            hub_login_command_for(executable, "github; injected", "https://hub.example").is_none()
+        );
+    }
+
+    #[test]
+    fn changed_hub_binding_never_reaches_the_browser_and_is_revoked() {
+        let revoked = std::cell::Cell::new(false);
+        let result = finish_hub_open(
+            "prepared credential",
+            |_| Err("binding changed".into()),
+            |_| panic!("a stale credential must never reach the opener"),
+            |_| revoked.set(true),
+        );
+        assert_eq!(result, Err("binding changed".into()));
+        assert!(revoked.get());
+    }
+
+    #[test]
+    fn failed_browser_handoff_revokes_after_validation() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let result = finish_hub_open(
+            (),
+            |_| {
+                calls.borrow_mut().push("validate");
+                Ok(())
+            },
+            |_| {
+                calls.borrow_mut().push("open");
+                Err("no browser".into())
+            },
+            |_| calls.borrow_mut().push("revoke"),
+        );
+        assert_eq!(result, Err("no browser".into()));
+        assert_eq!(*calls.borrow(), ["validate", "open", "revoke"]);
+    }
+
+    #[test]
+    fn successful_browser_handoff_keeps_the_validated_token() {
+        let validated = std::cell::Cell::new(false);
+        finish_hub_open(
+            (),
+            |_| {
+                validated.set(true);
+                Ok(())
+            },
+            |_| {
+                assert!(validated.get());
+                Ok(())
+            },
+            |_| panic!("the browser now owns this token"),
+        )
+        .unwrap();
+    }
 
     #[test]
     fn copied_commands_quote_shell_metacharacters_as_data() {

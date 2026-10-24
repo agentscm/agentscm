@@ -95,10 +95,21 @@ Each checkout menu groups its status, opening actions, **Agent Integrations**, *
 **Recent Activity** and **Troubleshooting**. Connection Details shows the full checkout path and
 connection values.
 
+The Start at Login switch shows **On** or **Off**, and **Updating…** while a change is saved.
+**Open Hub** uses the saved sign-in for that exact Hub to create a read-only browser token valid
+for 30 minutes. It opens the Hub UI with that token in the URL fragment; the UI removes the
+fragment immediately. An existing browser sign-in is preserved, so sign out there first when
+switching repositories. If the saved sign-in is missing or expired, the tray shows an error
+with a sign-in instruction. Under **Troubleshooting → Hub Sign-in**, copy the GitHub or GitLab
+login command for that exact Hub and run it in Terminal; then retry Open Hub.
+
 For a connected checkout, choose **Agent Integrations** in its menu to configure Claude
 Code, Codex, Cursor, Copilot or Gemini. This installs AgentSCM's existing hooks, MCP connection
 and coordination skill; the native client's own trust prompts still apply. **Reapply** reruns
 that setup without signing in again. Connect a new checkout or Hub through quickstart.
+Setup opens a status window with progress, the result and the client's next steps. It does not
+install the coding client itself. Open the configured checkout in that client, review its own
+approvals, and start a fresh session before checking activity in the tray.
 If macOS starts the tray with a minimal `PATH`, an installed Claude Code or Codex CLI may be
 unavailable there. Use **Copy Terminal Setup** for that agent. The tray only copies this
 command: it runs normal `client setup` only after you paste and run it in Terminal. That guided
