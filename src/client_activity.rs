@@ -119,6 +119,7 @@ impl ActivityStore {
     }
 
     /// Discard observations after a suspend/wake or wall-clock discontinuity detected by the tray.
+    #[cfg(target_os = "macos")]
     pub(crate) fn clear(&mut self) {
         self.rows.clear();
     }
@@ -237,6 +238,7 @@ pub(crate) struct ActivityReceiver {
 impl ActivityReceiver {
     /// Bind after the tray has acquired its singleton lock. That lock makes removal of a
     /// same-owner stale socket from a crashed prior tray safe.
+    #[cfg(target_os = "macos")]
     pub(crate) fn bind() -> std::io::Result<Self> {
         let path = socket_path().ok_or_else(|| std::io::Error::other("config unavailable"))?;
         Self::bind_at(path)
@@ -402,6 +404,9 @@ mod tests {
                 .into_iter()
                 .collect()
         );
+        let observation = decode(&bytes, std::time::Instant::now()).unwrap();
+        assert_eq!(observation.path, ActivityPath::Hook);
+        assert_eq!(observation.outcome, ActivityOutcome::Acknowledged);
     }
 
     #[test]
@@ -479,10 +484,8 @@ mod tests {
         let mut store = ActivityStore::default();
         receiver.drain(&mut store);
         assert_eq!(store.len(), 1);
-        assert_eq!(
-            store.snapshot(BINDING, std::time::Instant::now())[0].agent,
-            None
-        );
+        let rows = store.snapshot(BINDING, std::time::Instant::now());
+        assert_eq!(rows[0].agent, None);
     }
 
     #[cfg(unix)]

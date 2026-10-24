@@ -13,7 +13,9 @@ use std::time::Duration;
 
 use agentscm::{Error, Result};
 use sha2::{Digest, Sha256};
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+use tray_icon::menu::{
+    CheckMenuItem, IconMenuItem, Menu, MenuEvent, MenuItem, NativeIcon, PredefinedMenuItem, Submenu,
+};
 use tray_icon::{Icon, TrayIconBuilder};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -24,12 +26,18 @@ use winit::window::WindowId;
 use crate::client_activity::{ActivityOutcome, ActivityPath};
 use crate::client_status::{BindingState, CredentialState, HubCheck, Snapshot};
 
+#[path = "native_menu.rs"]
+mod native_menu;
+
 const READY: &str = "AGENTSCM_TRAY_READY";
 const ALREADY_RUNNING: &str = "AGENTSCM_TRAY_ALREADY_RUNNING";
+const RECENT_HUB_CHECK_SECONDS: i64 = 60;
 
 #[derive(Debug)]
 enum UserEvent {
     Menu(String),
+    LaunchLogin(bool),
+    MenuTrackingEnded,
     Snapshot(std::result::Result<Snapshot, String>, ConfigStamp),
     Integration(std::result::Result<String, String>),
 }
@@ -115,13 +123,31 @@ fn run_foreground(initial: Snapshot) -> Result<()> {
         let _ = proxy.send_event(UserEvent::Menu(event.id.0));
     }));
 
-    let menu = build_menu(&initial, &activity, Some("Loading connected checkouts…"))?;
+    let login_enabled = super::login::enabled();
+    let menu = build_menu(
+        &initial,
+        &activity,
+        Some("Loading connected checkouts…"),
+        login_enabled,
+    )?;
     let refreshing = Arc::new(AtomicBool::new(false));
     let installing = Arc::new(AtomicBool::new(false));
     let refresh_proxy = event_loop.create_proxy();
     refreshing.store(true, Ordering::Release);
     spawn_refresh(refresh_proxy.clone(), true);
     let now = std::time::Instant::now();
+    let menu_key = menu_projection_key(
+        &initial,
+        &activity,
+        Some("Loading connected checkouts…"),
+        login_enabled,
+        agentscm::hub::store::unix_now(),
+        now,
+    );
+    let native_menu =
+        native_menu::NativeMenuBridge::attach(&menu, refresh_proxy.clone(), login_enabled)
+            .filter(native_menu::NativeMenuBridge::is_installed)
+            .ok_or_else(|| Error::Invalid("cannot install native tray menu controls".into()))?;
     let mut app = TrayApp {
         activity_receiver,
         activity,
@@ -133,11 +159,14 @@ fn run_foreground(initial: Snapshot) -> Result<()> {
         last_tick: now,
         last_wall: std::time::SystemTime::now(),
         last_menu: now,
+        menu_key,
         observed_config: config_stamp(),
         pending_config: None,
         initial_menu: Some(menu),
         initial_icon: Some(icon()?),
         tray: None,
+        native_menu: Some(native_menu),
+        menu_dirty: false,
         notice: None,
     };
     event_loop
@@ -156,28 +185,112 @@ struct TrayApp {
     last_tick: std::time::Instant,
     last_wall: std::time::SystemTime,
     last_menu: std::time::Instant,
+    menu_key: String,
     observed_config: ConfigStamp,
     pending_config: Option<(ConfigStamp, std::time::Instant)>,
     initial_menu: Option<Menu>,
     initial_icon: Option<Icon>,
     tray: Option<tray_icon::TrayIcon>,
-    notice: Option<String>,
+    native_menu: Option<native_menu::NativeMenuBridge>,
+    menu_dirty: bool,
+    notice: Option<Notice>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Notice {
+    Action(String),
+    Refresh(String),
+}
+
+impl Notice {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Action(message) | Self::Refresh(message) => message,
+        }
+    }
+}
+
+fn update_refresh_notice(persistent: &mut Option<Notice>, notice: Option<&str>) {
+    if let Some(notice) = notice {
+        *persistent = Some(Notice::Refresh(notice.to_owned()));
+    }
+}
+
+fn clear_refresh_notice(notice: &mut Option<Notice>) {
+    if matches!(notice, Some(Notice::Refresh(_))) {
+        *notice = None;
+    }
 }
 
 impl TrayApp {
-    fn replace_menu(&self, notice: Option<&str>) {
+    fn replace_menu(&mut self, notice: Option<&str>) {
+        update_refresh_notice(&mut self.notice, notice);
         let notice = projected_notice(
-            notice,
-            self.notice.as_deref(),
+            None,
+            self.notice.as_ref().map(Notice::as_str),
             self.refreshing.load(Ordering::Acquire) || self.pending_config.is_some(),
             self.snapshot.connections.is_empty(),
         );
+        let login_enabled = super::login::enabled();
+        let key = menu_projection_key(
+            &self.snapshot,
+            &self.activity,
+            notice,
+            login_enabled,
+            agentscm::hub::store::unix_now(),
+            std::time::Instant::now(),
+        );
+        let tracking = self
+            .native_menu
+            .as_ref()
+            .is_some_and(native_menu::NativeMenuBridge::is_tracking);
+        match menu_swap_decision(&self.menu_key, &key, tracking) {
+            MenuSwapDecision::Unchanged => {
+                self.menu_dirty = false;
+                return;
+            }
+            MenuSwapDecision::Defer => {
+                self.menu_dirty = true;
+                return;
+            }
+            MenuSwapDecision::Replace => {}
+        }
         if let (Some(tray), Ok(menu)) = (
             &self.tray,
-            build_menu(&self.snapshot, &self.activity, notice),
+            build_menu(&self.snapshot, &self.activity, notice, login_enabled),
         ) {
+            let Some(native_menu) = native_menu::NativeMenuBridge::attach(
+                &menu,
+                self.refresh_proxy.clone(),
+                login_enabled,
+            ) else {
+                self.notice = Some(Notice::Action(
+                    "Could not update native tray controls".into(),
+                ));
+                return;
+            };
             tray.set_menu(Some(Box::new(menu)));
+            self.menu_key = key;
+            self.native_menu = Some(native_menu);
+            self.menu_dirty = false;
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MenuSwapDecision {
+    Unchanged,
+    Defer,
+    Replace,
+}
+
+fn menu_swap_decision(current: &str, candidate: &str, tracking: bool) -> MenuSwapDecision {
+    if current == candidate {
+        MenuSwapDecision::Unchanged
+    } else if tracking {
+        MenuSwapDecision::Defer
+    } else {
+        MenuSwapDecision::Replace
     }
 }
 
@@ -225,8 +338,13 @@ impl ApplicationHandler<UserEvent> for TrayApp {
             }
             UserEvent::Menu(id) if id == "quit" => event_loop.exit(),
             UserEvent::Menu(id) if id == "launch-login" => {
-                self.notice = None;
                 let desired = !super::login::enabled();
+                let _ = self
+                    .refresh_proxy
+                    .send_event(UserEvent::LaunchLogin(desired));
+            }
+            UserEvent::LaunchLogin(desired) => {
+                self.notice = None;
                 let notice =
                     if let Err(error) = super::login::set_enabled(desired, &self.executable) {
                         error.to_string()
@@ -237,24 +355,35 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                             "Launch at login disabled".into()
                         }
                     };
-                self.notice = Some(notice);
+                if let Some(native_menu) = &self.native_menu {
+                    native_menu.set_enabled(super::login::enabled());
+                }
+                self.notice = Some(Notice::Action(notice));
                 self.replace_menu(None);
+            }
+            UserEvent::MenuTrackingEnded => {
+                if self.menu_dirty {
+                    self.replace_menu(None);
+                }
             }
             UserEvent::Menu(id) if id.starts_with("setup:") => {
                 self.notice = None;
                 if self.installing.swap(true, Ordering::AcqRel) {
-                    self.notice = Some("Another agent integration setup is still running".into());
+                    self.notice = Some(Notice::Action(
+                        "Another agent integration setup is still running".into(),
+                    ));
                     self.replace_menu(None);
                 } else if let Some(request) =
                     integration_request(&id, &self.snapshot, &self.executable)
                 {
                     spawn_integration(self.refresh_proxy.clone(), request);
-                    self.notice = Some("Setting up agent integration…".into());
+                    self.notice = Some(Notice::Action("Setting up agent integration…".into()));
                     self.replace_menu(None);
                 } else {
                     self.installing.store(false, Ordering::Release);
-                    self.notice =
-                        Some("The checkout connection changed; refresh and try again".into());
+                    self.notice = Some(Notice::Action(
+                        "The checkout connection changed; refresh and try again".into(),
+                    ));
                     self.replace_menu(None);
                 }
             }
@@ -267,6 +396,7 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                 self.refreshing.store(false, Ordering::Release);
                 if dispatched == config_stamp() {
                     self.snapshot = updated;
+                    clear_refresh_notice(&mut self.notice);
                 }
                 self.replace_menu(None);
             }
@@ -281,10 +411,10 @@ impl ApplicationHandler<UserEvent> for TrayApp {
             }
             UserEvent::Integration(result) => {
                 self.installing.store(false, Ordering::Release);
-                self.notice = Some(match result {
+                self.notice = Some(Notice::Action(match result {
                     Ok(agent) => format!("{agent} integration configured"),
                     Err(error) => format!("Integration setup failed: {error}"),
-                });
+                }));
                 self.replace_menu(None);
                 if !self.refreshing.swap(true, Ordering::AcqRel) {
                     spawn_refresh(self.refresh_proxy.clone(), false);
@@ -446,6 +576,7 @@ fn build_menu(
     snapshot: &Snapshot,
     activity: &crate::client_activity::ActivityStore,
     notice: Option<&str>,
+    login_enabled: bool,
 ) -> Result<Menu> {
     let now = agentscm::hub::store::unix_now();
     let menu = Menu::new();
@@ -467,6 +598,16 @@ fn build_menu(
             .and_then(|name| name.to_str())
             .unwrap_or(&connection.repository);
         let submenu = Submenu::new(super::clean_label(name), true);
+        let indicator = connection_indicator(connection, now);
+        submenu.set_native_icon(Some(indicator.native_icon()));
+        submenu
+            .append(&IconMenuItem::with_native_icon(
+                indicator.label(),
+                false,
+                Some(indicator.native_icon()),
+                None,
+            ))
+            .map_err(menu_error)?;
         submenu
             .append(&MenuItem::new(
                 format!("Repository: {}", super::clean_label(&connection.repository)),
@@ -516,6 +657,7 @@ fn build_menu(
             ))
             .map_err(menu_error)?;
         let integrations = Submenu::new("Set Up Agent Integration", true);
+        integrations.set_native_icon(Some(NativeIcon::Advanced));
         integrations
             .append(&MenuItem::new(
                 "Client CLI unavailable? Use guided Terminal setup.",
@@ -584,26 +726,29 @@ fn build_menu(
             .append(&PredefinedMenuItem::separator())
             .map_err(menu_error)?;
         submenu
-            .append(&MenuItem::with_id(
+            .append(&IconMenuItem::with_id_and_native_icon(
                 format!("root:{identity}"),
                 "Open Checkout",
                 true,
+                Some(NativeIcon::Folder),
                 None,
             ))
             .map_err(menu_error)?;
         submenu
-            .append(&MenuItem::with_id(
+            .append(&IconMenuItem::with_id_and_native_icon(
                 format!("hub:{identity}"),
                 "Open Hub",
                 true,
+                Some(NativeIcon::Network),
                 None,
             ))
             .map_err(menu_error)?;
         submenu
-            .append(&MenuItem::with_id(
+            .append(&IconMenuItem::with_id_and_native_icon(
                 format!("diagnostics:{identity}"),
                 "Copy Diagnostics",
                 true,
+                Some(NativeIcon::Info),
                 None,
             ))
             .map_err(menu_error)?;
@@ -631,19 +776,69 @@ fn build_menu(
         menu.append(&MenuItem::new(super::clean_label(notice), false, None))
             .map_err(menu_error)?;
     }
-    menu.append(&MenuItem::with_id("refresh", "Check Now", true, None))
-        .map_err(menu_error)?;
+    menu.append(&IconMenuItem::with_id_and_native_icon(
+        "refresh",
+        "Check Now",
+        true,
+        Some(NativeIcon::Refresh),
+        None,
+    ))
+    .map_err(menu_error)?;
     menu.append(&CheckMenuItem::with_id(
         "launch-login",
         "Start at Login (configured)",
         true,
-        super::login::enabled(),
+        login_enabled,
         None,
     ))
     .map_err(menu_error)?;
     menu.append(&MenuItem::with_id("quit", "Quit AgentSCM Tray", true, None))
         .map_err(menu_error)?;
     Ok(menu)
+}
+
+/// Key only the content users can see. The event loop may evaluate this every few seconds, but
+/// replacing an unchanged NSMenu while AppKit is tracking it dismisses the open tray menu.
+fn menu_projection_key(
+    snapshot: &Snapshot,
+    activity: &crate::client_activity::ActivityStore,
+    notice: Option<&str>,
+    login_enabled: bool,
+    now: i64,
+    monotonic_now: std::time::Instant,
+) -> String {
+    let mut key = serde_json::to_string(&snapshot.connections).unwrap_or_default();
+    key.push_str("\nnotice:");
+    key.push_str(notice.unwrap_or_default());
+    key.push_str("\nlogin:");
+    key.push(if login_enabled { '1' } else { '0' });
+    for connection in &snapshot.connections {
+        key.push_str("\nindicator:");
+        key.push_str(connection_indicator(connection, now).label());
+        key.push_str("\ncredential:");
+        key.push_str(credential_label(&connection.credential, now));
+        key.push_str("\nhub:");
+        key.push_str(&hub_label(&connection.hub_check, now));
+        for participation in &connection.recent_participation {
+            key.push(if participation_current(participation.expires_at, now) {
+                '1'
+            } else {
+                '0'
+            });
+        }
+        if let Some(binding) = connection.binding.activity_generation.as_deref() {
+            for row in activity
+                .snapshot(binding, monotonic_now)
+                .into_iter()
+                .rev()
+                .take(5)
+            {
+                key.push_str("\nactivity:");
+                key.push_str(&activity_label_at(&row, monotonic_now));
+            }
+        }
+    }
+    key
 }
 
 fn hub_label(check: &HubCheck, now: i64) -> String {
@@ -710,6 +905,91 @@ fn participation_current(expires_at: i64, now: i64) -> bool {
     expires_at > now
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectionIndicator {
+    Connected,
+    Attention,
+    Unknown,
+}
+
+impl ConnectionIndicator {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Connected => "Hub recently reachable",
+            Self::Attention => "Connection: attention needed",
+            Self::Unknown => "Connection: unknown",
+        }
+    }
+
+    fn native_icon(self) -> NativeIcon {
+        match self {
+            Self::Connected => NativeIcon::StatusAvailable,
+            Self::Attention => NativeIcon::StatusUnavailable,
+            Self::Unknown => NativeIcon::StatusNone,
+        }
+    }
+}
+
+fn connection_indicator(
+    connection: &crate::client_status::ConnectionStatus,
+    now: i64,
+) -> ConnectionIndicator {
+    indicator_state(
+        &connection.binding.state,
+        &connection.credential.state,
+        connection.credential.expires_at,
+        &connection.hub_check,
+        now,
+    )
+}
+
+fn indicator_state(
+    binding: &BindingState,
+    credential: &CredentialState,
+    credential_expires_at: Option<i64>,
+    hub_check: &HubCheck,
+    now: i64,
+) -> ConnectionIndicator {
+    let credential_expired = matches!(credential, CredentialState::Expired)
+        || credential_expires_at.is_some_and(|expires_at| expires_at <= now);
+    let hub_expired = matches!(
+        hub_check,
+        HubCheck::Valid { expires_at, .. } if *expires_at <= now
+    );
+    if matches!(binding, BindingState::Mismatch)
+        || credential_expired
+        || hub_expired
+        || matches!(
+            hub_check,
+            HubCheck::Rejected { checked_at } if hub_check_recent(*checked_at, now)
+        )
+    {
+        return ConnectionIndicator::Attention;
+    }
+    if matches!(binding, BindingState::Current)
+        && matches!(credential, CredentialState::Available)
+        && hub_recently_verified(hub_check, now)
+    {
+        return ConnectionIndicator::Connected;
+    }
+    ConnectionIndicator::Unknown
+}
+
+fn hub_recently_verified(check: &HubCheck, now: i64) -> bool {
+    matches!(
+        check,
+        HubCheck::Valid {
+            checked_at,
+            expires_at,
+            ..
+        } if *expires_at > now && hub_check_recent(*checked_at, now)
+    )
+}
+
+fn hub_check_recent(checked_at: i64, now: i64) -> bool {
+    checked_at <= now && now.saturating_sub(checked_at) <= RECENT_HUB_CHECK_SECONDS
+}
+
 fn projected_notice<'a>(
     explicit: Option<&'a str>,
     persistent: Option<&'a str>,
@@ -731,10 +1011,18 @@ fn unix_age_at(timestamp: i64, now: i64) -> String {
 }
 
 fn activity_label(row: &crate::client_activity::ActivityObservation) -> String {
-    let age = if row.observed_at.elapsed() < Duration::from_secs(60) {
+    activity_label_at(row, std::time::Instant::now())
+}
+
+fn activity_label_at(
+    row: &crate::client_activity::ActivityObservation,
+    now: std::time::Instant,
+) -> String {
+    let elapsed = now.saturating_duration_since(row.observed_at);
+    let age = if elapsed < Duration::from_secs(60) {
         "less than 1m ago".into()
     } else {
-        format!("{}m ago", row.observed_at.elapsed().as_secs() / 60)
+        format!("{}m ago", elapsed.as_secs() / 60)
     };
     let subject = match row.path {
         ActivityPath::Mcp => "MCP transport reply observed".to_owned(),
@@ -1063,6 +1351,193 @@ mod tests {
         assert_eq!(
             projected_notice(None, Some("Setup failed"), true, true),
             Some("Setup failed")
+        );
+    }
+
+    #[test]
+    fn unchanged_projection_does_not_request_a_native_menu_swap() {
+        let mut snapshot = Snapshot {
+            version: 1,
+            snapshot_at: 42,
+            connections: Vec::new(),
+        };
+        let activity = crate::client_activity::ActivityStore::default();
+        let monotonic = std::time::Instant::now();
+        let first = menu_projection_key(&snapshot, &activity, None, false, 100, monotonic);
+        snapshot.snapshot_at = 47;
+        let periodic = menu_projection_key(
+            &snapshot,
+            &activity,
+            None,
+            false,
+            105,
+            monotonic + Duration::from_secs(5),
+        );
+        assert_eq!(first, periodic);
+        assert_ne!(
+            first,
+            menu_projection_key(
+                &snapshot,
+                &activity,
+                Some("Checking…"),
+                false,
+                105,
+                monotonic,
+            )
+        );
+    }
+
+    #[test]
+    fn login_configuration_participates_in_empty_menu_projection() {
+        let snapshot = Snapshot {
+            version: 1,
+            snapshot_at: 42,
+            connections: Vec::new(),
+        };
+        let activity = crate::client_activity::ActivityStore::default();
+        let monotonic = std::time::Instant::now();
+        assert_ne!(
+            menu_projection_key(&snapshot, &activity, None, false, 100, monotonic),
+            menu_projection_key(&snapshot, &activity, None, true, 100, monotonic),
+        );
+    }
+
+    #[test]
+    fn explicit_notice_survives_tracking_until_catch_up_replacement() {
+        let mut persistent = None;
+        update_refresh_notice(&mut persistent, Some("Check failed: unavailable"));
+        let notice = projected_notice(None, persistent.as_ref().map(Notice::as_str), false, true);
+        assert_eq!(
+            menu_swap_decision("old", notice.unwrap(), true),
+            MenuSwapDecision::Defer
+        );
+
+        update_refresh_notice(&mut persistent, None);
+        let catch_up = projected_notice(None, persistent.as_ref().map(Notice::as_str), false, true);
+        assert_eq!(catch_up, Some("Check failed: unavailable"));
+        assert_eq!(
+            menu_swap_decision("old", catch_up.unwrap(), false),
+            MenuSwapDecision::Replace
+        );
+        clear_refresh_notice(&mut persistent);
+        assert_eq!(
+            projected_notice(None, persistent.as_ref().map(Notice::as_str), false, true,),
+            None
+        );
+    }
+
+    #[test]
+    fn successful_refresh_preserves_action_results_only() {
+        for message in [
+            "Integration setup failed: client unavailable",
+            "Launch at login enabled for the next login",
+        ] {
+            let mut notice = Some(Notice::Action(message.into()));
+            clear_refresh_notice(&mut notice);
+            assert_eq!(notice.as_ref().map(Notice::as_str), Some(message));
+        }
+
+        let mut notice = Some(Notice::Refresh("Check failed: unavailable".into()));
+        clear_refresh_notice(&mut notice);
+        assert_eq!(notice, None);
+    }
+
+    #[test]
+    fn changed_menu_defers_while_open_and_replaces_after_close() {
+        assert_eq!(
+            menu_swap_decision("old", "old", true),
+            MenuSwapDecision::Unchanged
+        );
+        assert_eq!(
+            menu_swap_decision("old", "new", true),
+            MenuSwapDecision::Defer
+        );
+        assert_eq!(
+            menu_swap_decision("old", "new", false),
+            MenuSwapDecision::Replace
+        );
+    }
+
+    #[test]
+    fn connection_indicators_keep_unknown_neutral() {
+        assert_eq!(
+            ConnectionIndicator::Connected.label(),
+            "Hub recently reachable"
+        );
+        assert_eq!(
+            ConnectionIndicator::Attention.label(),
+            "Connection: attention needed"
+        );
+        assert_eq!(ConnectionIndicator::Unknown.label(), "Connection: unknown");
+        assert_eq!(
+            ConnectionIndicator::Unknown.native_icon(),
+            NativeIcon::StatusNone
+        );
+    }
+
+    #[test]
+    fn hub_reachability_indicator_has_a_bounded_freshness_window() {
+        let check = |checked_at, expires_at| HubCheck::Valid {
+            checked_at,
+            provider: "github".into(),
+            host: "github.com".into(),
+            login: "member".into(),
+            expires_at,
+        };
+        assert!(hub_recently_verified(&check(40, 200), 100));
+        assert!(!hub_recently_verified(&check(39, 200), 100));
+        assert!(!hub_recently_verified(&check(101, 200), 100));
+        assert!(!hub_recently_verified(&check(40, 100), 100));
+        assert_eq!(
+            indicator_state(
+                &BindingState::Current,
+                &CredentialState::Available,
+                Some(200),
+                &check(39, 200),
+                100,
+            ),
+            ConnectionIndicator::Unknown
+        );
+        assert_eq!(
+            indicator_state(
+                &BindingState::Current,
+                &CredentialState::Available,
+                Some(200),
+                &check(39, 100),
+                100,
+            ),
+            ConnectionIndicator::Attention
+        );
+        let rejected = |checked_at| HubCheck::Rejected { checked_at };
+        assert_eq!(
+            indicator_state(
+                &BindingState::Current,
+                &CredentialState::Available,
+                Some(200),
+                &rejected(40),
+                100,
+            ),
+            ConnectionIndicator::Attention
+        );
+        assert_eq!(
+            indicator_state(
+                &BindingState::Current,
+                &CredentialState::Available,
+                Some(200),
+                &rejected(39),
+                100,
+            ),
+            ConnectionIndicator::Unknown
+        );
+        assert_eq!(
+            indicator_state(
+                &BindingState::Current,
+                &CredentialState::Available,
+                Some(200),
+                &rejected(101),
+                100,
+            ),
+            ConnectionIndicator::Unknown
         );
     }
 

@@ -133,7 +133,7 @@ fn invalid(message: &str) -> Error {
 }
 
 /// Produce a local-only snapshot unless `check` explicitly enables bounded Hub reads.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 pub(crate) async fn snapshot(check: bool) -> Result<Snapshot> {
     snapshot_for(check, None).await
 }
