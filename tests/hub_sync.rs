@@ -2414,3 +2414,45 @@ async fn a_lock_file_on_the_default_branch_becomes_the_adoption_and_wins_over_a_
     assert_eq!(library["adoption"]["source"], "default_branch");
     assert_eq!(library["adoption"]["pins"][0]["status"], "adopted");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connecting_the_forge_drops_a_checkout_adoption_when_the_default_branch_has_no_lock() {
+    use agentscm::skill_workflow::supported::{SkillLock, SkillPin, catalog_entry};
+
+    let env = Env::start().await;
+    let connection = env.connect_app().await;
+    env.install_widgets();
+    let agent = env.agent(1, "dev", "dev");
+    let pinned = serde_json::to_value(SkillLock {
+        version: 1,
+        skills: vec![SkillPin::first_party(
+            catalog_entry("pr-gate", 1).unwrap(),
+            None,
+        )],
+    })
+    .unwrap();
+
+    // A feature branch reports a lock before the repository is connected.
+    let (status, reply) = env
+        .call(
+            Method::PUT,
+            "/v1/hub/repos/acme%2Fwidgets/skills/adoption",
+            Some(&agent),
+            Some(pinned),
+        )
+        .await;
+    assert_eq!(
+        (status, reply["applied"].clone()),
+        (200, json!(true)),
+        "{reply}"
+    );
+
+    // The forge is read and its default branch has no lock: only that branch decides.
+    env.refresh(&connection).await;
+    let (status, library) = env
+        .get("/v1/hub/skills?repo=acme%2Fwidgets", Some(&agent))
+        .await;
+    assert_eq!(status, 200, "{library}");
+    assert_eq!(library["adoption"]["source"], "none", "{library}");
+    assert_eq!(library["adoption"]["pins"], json!([]), "{library}");
+}

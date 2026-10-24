@@ -4,7 +4,7 @@
     {
       "name": "pr-gate",
       "workflow_version": 1,
-      "sha256": "6b77ad6d0010dde324e2f59690cc96bdc507dcb181d02ddf38eedc53b939c0be",
+      "sha256": "aa420a27dc4badcb731daf68b3040b3f3e6ca6730bcaedcb73acab1d528dad57",
       "source": { "kind": "first_party" },
       "params": { "ci_label": "ci-extended", "merge_method": "squash" }
     }

@@ -435,9 +435,10 @@ fn record(store: &dyn Store, who: Recorder<'_>, mut evidence: Evidence) -> Out<R
 
 // ---- forge read -----------------------------------------------------------------------------
 
-/// Reads the lock file from the repository's default branch and makes it the adoption; no file
-/// (or an unreadable one) clears an earlier forge adoption. Errors are logged, never fatal: a
-/// skills read must not fail a repository sync.
+/// Reads the lock file from the repository's default branch and makes it the adoption. With a
+/// forge connected only that lock counts: no file (or an invalid one) clears every adoption, and
+/// a failed read still drops checkout reports. Errors are logged, never fatal: a skills read must
+/// not fail a repository sync.
 pub(super) async fn sync_adoption(
     state: &HubState,
     api: ForgeApi<'_>,
@@ -456,6 +457,14 @@ pub(super) async fn sync_adoption(
         Ok(read) => read,
         Err(error) => {
             eprintln!("hub: skills lock read for {}: {error:?}", repo.full_name);
+            let (store, name) = (state.store.clone(), repo.full_name.clone());
+            let cleared = blocking(state, move || {
+                store.skill_adoption_clear(&name, Some("reported_by_checkout"))
+            })
+            .await;
+            if let Err(error) = cleared {
+                eprintln!("hub: skills adoption store for {}: {error}", repo.full_name);
+            }
             return;
         }
     };
@@ -473,7 +482,7 @@ pub(super) async fn sync_adoption(
                 reported_by: None,
             })
             .map(|_| ()),
-        None => store.skill_adoption_clear_forge(&name),
+        None => store.skill_adoption_clear(&name, None),
     })
     .await;
     if let Err(error) = done {

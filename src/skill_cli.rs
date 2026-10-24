@@ -766,6 +766,21 @@ fn verdict_for_run(view: &RunView, local_head: Option<&str>) -> Verdict {
         .is_some_and(|g| !matches!(g, "merge" | "post_merge"));
     if let Some(local) = local_head.filter(|l| before_merge && *l != view.head_sha) {
         let short = |s: &str| s.chars().take(7).collect::<String>();
+        // The hub refuses evidence for a head the run already moved past, so asking for tests on
+        // it would loop until the continuation cap.
+        let seen = view
+            .stale_evidence
+            .iter()
+            .any(|e| e.evidence.head_sha == local);
+        if seen {
+            return Verdict::Block(bound(&format!(
+                "HEAD is {}, a commit pr-gate already moved past (it last saw {}); the hub refuses evidence for it. Return to {} with `git merge --ff-only {}`, or make a new commit and record tests for that commit (`agentscm skill evidence --gate tests ...`).",
+                short(local),
+                short(&view.head_sha),
+                short(&view.head_sha),
+                view.head_sha
+            )));
+        }
         return Verdict::Block(bound(&format!(
             "HEAD is {} but pr-gate last saw {}. Record tests for {} (`agentscm skill evidence --gate tests ...`); the review must be redone for the new commit.",
             short(local),

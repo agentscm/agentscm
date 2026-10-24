@@ -5710,11 +5710,12 @@ impl Store for PgStore {
             .ok_or_else(|| HubError::Unavailable("skill adoption vanished".into()))
     }
 
-    fn skill_adoption_clear_forge(&self, repo: &str) -> Result<()> {
+    fn skill_adoption_clear(&self, repo: &str, source: Option<&str>) -> Result<()> {
         self.run(false, |client| {
             client.execute(
-                "DELETE FROM hub_skill_adoptions WHERE repository = $1 AND source = 'default_branch'",
-                &[&repo],
+                "DELETE FROM hub_skill_adoptions
+                 WHERE repository = $1 AND ($2::TEXT IS NULL OR source = $2)",
+                &[&repo, &source],
             )?;
             Ok(())
         })

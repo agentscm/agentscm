@@ -35,3 +35,6 @@ Stop hook is installed (a hook running `agentscm skill stop --agent claude` or `
 
 Evidence is bound to a head commit. After a push, record the tests again for the new head and get a
 new review; evidence for an older head is refused and cannot move the run back.
+
+pr-gate gates work on a branch. A detached checkout (no branch) is not gated: the Stop hook lets
+the session finish and records nothing.

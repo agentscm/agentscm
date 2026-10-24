@@ -525,8 +525,8 @@ pub trait Store: Send + Sync {
     /// Stores an adoption and returns the one that applies: a `reported_by_checkout` row never
     /// replaces a `default_branch` row, which any `default_branch` row replaces.
     fn skill_adoption_put(&self, adoption: &SkillAdoption) -> Result<SkillAdoption>;
-    /// Drops a `default_branch` adoption (the lock file is gone from the default branch).
-    fn skill_adoption_clear_forge(&self, repo: &str) -> Result<()>;
+    /// Drops the repository's adoption from `source`, or from every source when `None`.
+    fn skill_adoption_clear(&self, repo: &str, source: Option<&str>) -> Result<()>;
     fn skill_evidence_add(&self, row: &EvidenceRow) -> Result<()>;
     /// A run's evidence in recorded order.
     fn skill_evidence(&self, repo: &str, run_id: &str) -> Result<Vec<EvidenceRow>>;

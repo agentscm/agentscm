@@ -308,7 +308,8 @@ blocking mechanism or claim stronger assurance than its evidence has.
 session, reviewer session, maintainer. **Parameters:** `ci_label` (default none), `merge_method`
 (default `any`), `retarget_stacked` (default true). **Follow when:** starting a task that will become
 a pull request, opening or updating one, before merging, after it merges. **Not for:** direct
-commits to the default branch or exploratory work that will not be merged.
+commits to the default branch or exploratory work that will not be merged. **Known limit:** the Stop hook gates work on a branch; a detached checkout is not gated, and
+the hook lets that session finish.
 
 | Gate | Evidence | Assurance | Enforced | Notes |
 |---|---|---|---|---|

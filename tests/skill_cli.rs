@@ -524,6 +524,29 @@ fn stop_blocks_when_head_moved_past_the_run_before_the_merge() {
 }
 
 #[test]
+fn stop_points_back_to_the_run_head_when_head_is_a_commit_the_run_moved_past() {
+    // The run moved from the local commit to b…; the hub would refuse tests for the old one.
+    let mut run: Value = serde_json::from_str(&run_json_at(&"b".repeat(40), "ci", false)).unwrap();
+    run["stale_evidence"] = json!([{"id": "e1", "session": "s", "agent": "claude",
+        "recorded_at": 1, "gate": "tests", "kind": "revision_tests", "head_sha": "@HEAD@",
+        "assurance": "self_reported", "summary": "ok"}]);
+    let (hub, _, head) = serve_with_head(vec![("by-branch", 200, run.to_string())]);
+    let fx = fixture(&hub);
+    let local = fx.feature_branch();
+    *head.lock().unwrap() = local.clone();
+    fx.ok(&["add", "pr-gate"]);
+    let out = fx.stop(false);
+    assert_eq!(out["decision"], "block", "{out}");
+    let reason = out["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("already moved past")
+            && reason.contains(&format!("git merge --ff-only {}", "b".repeat(40)))
+            && !reason.contains(&format!("Record tests for {}", &local[..7])),
+        "{reason}"
+    );
+}
+
+#[test]
 fn stop_allows_with_a_note_when_the_hub_has_not_adopted_the_skill() {
     let library = json!({"adoption": {"source": "none", "pins": []}}).to_string();
     let (hub, _) = serve(vec![("/v1/hub/skills?repo", 200, library)]);

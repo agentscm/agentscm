@@ -2291,7 +2291,24 @@ fn skill_adoption_and_evidence(db: &Db) {
         .skill_adoption_put(&adoption("reported_by_checkout", "{\"c\":3}"))
         .unwrap();
     assert_eq!(kept, forge);
-    store.skill_adoption_clear_forge(REPO).unwrap();
+    // Clearing one source leaves another; clearing every source drops a checkout report too.
+    store
+        .skill_adoption_clear(REPO, Some("reported_by_checkout"))
+        .unwrap();
+    assert_eq!(store.skill_adoption(REPO).unwrap(), Some(forge));
+    store.skill_adoption_clear(REPO, None).unwrap();
+    assert_eq!(store.skill_adoption(REPO).unwrap(), None);
+    store
+        .skill_adoption_put(&adoption("reported_by_checkout", "{\"d\":4}"))
+        .unwrap();
+    store
+        .skill_adoption_clear(REPO, Some("reported_by_checkout"))
+        .unwrap();
+    assert_eq!(store.skill_adoption(REPO).unwrap(), None);
+    store
+        .skill_adoption_put(&adoption("reported_by_checkout", "{\"e\":5}"))
+        .unwrap();
+    store.skill_adoption_clear(REPO, None).unwrap();
     assert_eq!(store.skill_adoption(REPO).unwrap(), None);
 
     let row = |id: &str, run: &str, branch: &str, at: i64| EvidenceRow {
