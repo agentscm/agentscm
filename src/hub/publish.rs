@@ -26,7 +26,7 @@ use super::external_runs::ExternalKind;
 use super::github::{Gh, GhError, parse_rfc3339, valid_ref_name};
 use super::http::{ApiError, Authenticated, JsonBody, Reader, blocking};
 use super::intent::scope;
-use super::store::{Event, Principal, lower_hex_of, unix_now};
+use super::store::{Event, Principal, Store, lower_hex_of, unix_now};
 use super::sync::{failed, find_repository};
 use super::{HubError, HubState, Result};
 use crate::backend::{ObjectKey, SOURCE_PROFILE_V1};
@@ -654,6 +654,20 @@ impl Publication {
 }
 
 /// Column order read by both backends' row mappers.
+/// Publications examined by one searched listing, newest first below the cursor.
+pub const SEARCH_SCAN_ROWS: usize = 256;
+
+/// One searched window of the listing; see [`Store::publication_search`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicationSearch {
+    /// Matches inside the window, newest first, at most the requested count.
+    pub rows: Vec<Publication>,
+    /// Id of the oldest publication examined; `None` when nothing lay below the cursor.
+    pub searched_to: Option<String>,
+    /// The window hit [`SEARCH_SCAN_ROWS`], so older publications may still match.
+    pub window_full: bool,
+}
+
 pub(super) const PUBLICATION_SELECT: &str = "SELECT p.id, p.repository, p.token, t.name, u.login,
         p.revision, p.event_seq, p.commit_sha, p.branch, p.base, CASE WHEN octet_length(p.manifest)<=2097152 THEN p.manifest END, p.branch_state,
         p.branch_message, p.pr_number, p.pr_node_id, p.pr_url, p.merge_commit, p.error,
@@ -935,14 +949,15 @@ pub(super) async fn publication_on_forge(
 }
 
 /// Publications listed per page by default and at most.
-const DEFAULT_LISTED: usize = 25;
-const MAX_LISTED: usize = 100;
+pub(super) const DEFAULT_LISTED: usize = 25;
+pub(super) const MAX_LISTED: usize = 100;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ListQuery {
     limit: Option<usize>,
     before: Option<String>,
+    q: Option<String>,
 }
 
 /// The repository's publications, newest first, for the status page. Store rows only: no forge
@@ -959,25 +974,50 @@ async fn list(
     if !(1..=MAX_LISTED).contains(&limit) {
         return Err(ApiError::invalid());
     }
+    let search = super::store::search_text(query.q.as_deref())?;
     let store = state.store.clone();
-    let mut rows = blocking(&state, move || {
-        // An unknown cursor is a bad request, not an empty page.
-        if let Some(before) = &query.before
-            && store.publication(&repo, before)?.is_none()
-        {
-            return Ok(None);
-        }
-        store
-            .publications(&repo, query.before.as_deref(), limit + 1)
-            .map(Some)
+    let page = blocking(&state, move || {
+        publication_page(
+            &*store,
+            &repo,
+            query.before.as_deref(),
+            search.as_deref(),
+            limit,
+        )
     })
     .await?
     .ok_or_else(ApiError::invalid)?;
-    let next_cursor = if rows.len() > limit {
-        rows.truncate(limit);
-        rows.last().map(|p| p.id.clone())
-    } else {
-        None
+    Ok(Json(page))
+}
+
+/// One page of the listing as JSON; `None` when `before` names no publication of `repo`.
+pub(super) fn publication_page(
+    store: &dyn Store,
+    repo: &str,
+    before: Option<&str>,
+    search: Option<&str>,
+    limit: usize,
+) -> Result<Option<Value>> {
+    // An unknown cursor is a bad request, not an empty page.
+    if let Some(before) = before
+        && store.publication(repo, before)?.is_none()
+    {
+        return Ok(None);
+    }
+    let (mut rows, search_info) = match search {
+        None => (store.publications(repo, before, limit + 1)?, None),
+        Some(search) => {
+            let found = store.publication_search(repo, before, search, limit + 1)?;
+            (found.rows, Some((found.searched_to, found.window_full)))
+        }
+    };
+    let more = rows.len() > limit;
+    rows.truncate(limit);
+    let next_cursor = match &search_info {
+        _ if more => rows.last().map(|p| p.id.clone()),
+        // The window ended before the page filled: older publications may still match.
+        Some((searched_to, true)) => searched_to.clone(),
+        _ => None,
     };
     let publications: Vec<Value> = rows
         .iter()
@@ -985,11 +1025,19 @@ async fn list(
             let mut item = p.to_json();
             item["created_at"] = json!(p.created_at);
             item["updated_at"] = json!(p.updated_at);
+            // Absent when the retained manifest cannot be read.
+            if let Ok(manifest) = p.manifest() {
+                item["title"] = json!(manifest.title);
+            }
             item
         })
         .collect();
-    Ok(Json(json!({"publications": publications,
-        "complete": next_cursor.is_none(), "next_cursor": next_cursor})))
+    let mut page = json!({"publications": publications,
+        "complete": next_cursor.is_none(), "next_cursor": next_cursor});
+    if let Some((searched_to, _)) = search_info {
+        page["searched_to"] = json!(searched_to);
+    }
+    Ok(Some(page))
 }
 
 async fn show(

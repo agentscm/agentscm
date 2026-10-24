@@ -1,5 +1,6 @@
 import { useState, type ReactNode } from 'react'
 import { overlaps, pathsOf, type Derived } from '../derive.ts'
+import { fetchActivityPage } from '../api.ts'
 import type { HubEvent } from '../types.ts'
 import { Ago, Avatar, Box, Empty, Icon, Path, Pill, Skeleton, viaLabel, type Tone } from '../ui.tsx'
 
@@ -105,12 +106,32 @@ const KINDS: { key: string; label: string; match: (k: string) => boolean }[] = [
   { key: 'session', label: 'Sessions', match: (k) => k.startsWith('session_') },
 ]
 
-export function ActivityPage({ d, events, fresh }: { d: Derived | null; events: HubEvent[] | null; fresh: ReadonlySet<string> }) {
+export function ActivityPage({ d, events: live, fresh, repo, token }: { d: Derived | null; events: HubEvent[] | null; fresh: ReadonlySet<string>; repo: string | null; token: string }) {
   const [kind, setKind] = useState('all')
   const [expanded, setExpanded] = useState(false)
+  // Older pages are appended below the live window; the live events keep updating at the top.
+  const [older, setOlder] = useState<HubEvent[]>([])
+  const [exhausted, setExhausted] = useState(false)
+  const [loadingOlder, setLoadingOlder] = useState(false)
+  const [olderError, setOlderError] = useState<string | null>(null)
+  const events = live ? [...new Map([...live, ...older].map((e) => [e.id, e])).values()].sort((a, b) => b.seq - a.seq) : null
+  const loadOlder = async () => {
+    if (!repo || !events || events.length === 0) return
+    setLoadingOlder(true)
+    setOlderError(null)
+    try {
+      const page = await fetchActivityPage(repo, token, new AbortController().signal, Math.min(...events.map((e) => e.seq)))
+      setOlder([...events, ...page.events])
+      setExhausted(page.next_before === null)
+    } catch {
+      setOlderError('Could not load older events.')
+    } finally {
+      setLoadingOlder(false)
+    }
+  }
   const match = KINDS.find((k) => k.key === kind)!.match
-  const rows = d && events ? events.filter((e) => match(e.kind)).map((e) => ({ e, row: describe(e, d) })).filter((x): x is { e: HubEvent; row: Row } => x.row !== null).slice(0, 30) : null
-  const shown = rows ? (expanded ? rows : rows.slice(0, 12)) : null
+  const rows = d && events ? events.filter((e) => match(e.kind)).map((e) => ({ e, row: describe(e, d) })).filter((x): x is { e: HubEvent; row: Row } => x.row !== null).slice(0, older.length ? undefined : 30) : null
+  const shown = rows ? (expanded || older.length ? rows : rows.slice(0, 12)) : null
   return (
     <div className="page">
       <div className="answer">
@@ -162,6 +183,12 @@ export function ActivityPage({ d, events, fresh }: { d: Derived | null; events: 
               </li>
             ))}
           </ol>
+        )}
+        {repo && rows && (
+          <div className="more-row" data-tour="activity-load-older">
+            {exhausted ? <span className="small muted"><Icon name="check2" /> That’s everything.</span> : <button type="button" className="btn btn-sm btn-outline-secondary" disabled={loadingOlder} onClick={() => void loadOlder()}><Icon name="clock-history" /> {loadingOlder ? 'Loading…' : 'Load older'}</button>}
+            {olderError && <span className="small text-danger-emphasis" role="alert">{olderError}</span>}
+          </div>
         )}
         {rows && rows.length > 12 && (
           <button type="button" className="btn btn-link btn-sm" onClick={() => setExpanded((x) => !x)}>

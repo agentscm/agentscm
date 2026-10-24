@@ -79,6 +79,7 @@ describe('Landed changes', () => {
   })
 
   it('pages with "Older changes" and only says "That’s everything" when the list is complete', async () => {
+    at('#landed')
     const sent = stub(showFixture, (url) => {
       if (!listRoute(url)) return undefined
       const before = url.searchParams.get('before')
@@ -148,8 +149,10 @@ describe('Landed changes', () => {
     render(<LandedPage repo={REPO} token="read-only" />)
     await screen.findByText(/recent changes landed/, {}, LOAD)
     const id = idOf('activity-pagination')
-    fireEvent.change(screen.getByLabelText('Change ID'), { target: { value: id } })
-    fireEvent.click(screen.getByRole('button', { name: /Open/ }))
+    const picker = screen.getByRole('combobox', { name: 'Find a change' })
+    fireEvent.focus(picker)
+    fireEvent.change(picker, { target: { value: id } })
+    fireEvent.keyDown(picker, { key: 'Enter' })
     await waitFor(() => expect(window.location.hash).toBe(`#landed/${id}`))
     await screen.findByText('How far it got', {}, LOAD)
     expect(localStorage.getItem('agentscm.hub.recentPublications')).toContain(id)
@@ -158,7 +161,10 @@ describe('Landed changes', () => {
 
 describe('Templates', () => {
   const openRecipe = (change: string, library: string) => {
-    fireEvent.change(screen.getByLabelText('Change ID'), { target: { value: change } })
+    const picker = screen.getByRole('combobox', { name: 'Change ID' })
+    fireEvent.focus(picker)
+    fireEvent.change(picker, { target: { value: change } })
+    fireEvent.keyDown(picker, { key: 'Enter' })
     fireEvent.change(screen.getByLabelText('Template file'), { target: { value: library } })
     fireEvent.click(screen.getAllByRole('button', { name: /Open/ })[0]!)
   }
@@ -173,11 +179,42 @@ describe('Templates', () => {
     await screen.findByText(/Preview data/, {}, LOAD)
     expect(screen.getByText('Check this path is in the change: src/lib.rs')).toBeTruthy()
     expect(screen.getByText('Required')).toBeTruthy()
-    fireEvent.change(screen.getByLabelText('Run ID'), { target: { value: 'loop-b863' } })
-    fireEvent.click(screen.getAllByRole('button', { name: /Open/ })[1]!)
+    const runPicker = screen.getByRole('combobox', { name: 'Run ID' })
+    fireEvent.focus(runPicker)
+    fireEvent.change(runPicker, { target: { value: 'loop-b863' } })
+    fireEvent.keyDown(runPicker, { key: 'Enter' })
     await screen.findByText('What to do next', {}, LOAD)
     expect(screen.getByRole('button', { name: /other-change · skills\/checks\/v2\/workflow\.json/ })).toBeTruthy()
     expect(screen.getByRole('button', { name: 'loop-b863' })).toBeTruthy()
+  })
+
+  it('editing the picked change clears it, so Open stays disabled until another is chosen', async () => {
+    stub(() => {
+      throw new TypeError('connection refused')
+    })
+    render(<TemplatesPage />)
+    const picker = screen.getByRole('combobox', { name: 'Change ID' })
+    fireEvent.focus(picker)
+    fireEvent.change(picker, { target: { value: 'change-a' } })
+    fireEvent.keyDown(picker, { key: 'Enter' })
+    fireEvent.change(screen.getByLabelText('Template file'), { target: { value: 'skills/x/workflow.json' } })
+    const open = screen.getAllByRole('button', { name: /Open/ })[0] as HTMLButtonElement
+    expect(open.disabled).toBe(false)
+    fireEvent.change(picker, { target: { value: 'change-b' } })
+    expect(open.disabled).toBe(true)
+  })
+
+  it('a plain word does not hijack Enter for the run picker', async () => {
+    stub(() => {
+      throw new TypeError('connection refused')
+    })
+    render(<TemplatesPage />)
+    const run = screen.getByRole('combobox', { name: 'Run ID' })
+    fireEvent.focus(run)
+    fireEvent.change(run, { target: { value: 'preview' } })
+    await screen.findAllByRole('option', { name: /preview-run/ }, LOAD)
+    fireEvent.keyDown(run, { key: 'Enter' })
+    expect(screen.queryByText(/^Run preview$/)).toBeNull()
   })
 
   it('asks the live server with both values and shows its own error as advice instead of sample data', async () => {
@@ -186,7 +223,7 @@ describe('Templates', () => {
     openRecipe('demo-change', 'skills/checks/v9/workflow.json')
     await screen.findByText(/--template-library/, {}, LOAD)
     expect(screen.queryByText(/Preview data/)).toBeNull()
-    expect(sent[0]!.url).toBe('/v1/local/skill-workflow-library?change=demo-change&library=skills%2Fchecks%2Fv9%2Fworkflow.json')
+    expect(sent.find((r) => r.url.includes('skill-workflow-library'))!.url).toBe('/v1/local/skill-workflow-library?change=demo-change&library=skills%2Fchecks%2Fv9%2Fworkflow.json')
   })
 })
 
@@ -207,6 +244,7 @@ describe('Timeline', () => {
 
   it('lists saved moments live, pages to older ones, and compares two across diff pages', async () => {
     stub(local, diffPages)
+    at('#timeline')
     render(<TimelinePage />)
     await screen.findByText('Saved moments', {}, LOAD)
     expect(screen.queryByText(/Preview data/)).toBeNull()

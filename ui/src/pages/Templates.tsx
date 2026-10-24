@@ -1,5 +1,6 @@
-import { useState } from 'react'
-import { fetchHandoff, inspectTemplate, type Handoff, type RunState, type TemplateAction, type TemplateInspect } from '../localApi.ts'
+import { useEffect, useState } from 'react'
+import { Combobox } from '../Combobox.tsx'
+import { fetchHandoff, fetchLocalChanges, fetchLocalRuns, inspectTemplate, type Handoff, type RunState, type TemplateAction, type TemplateInspect } from '../localApi.ts'
 import { Box, Empty, Explain, Icon, Notice, Pill, PreviewBanner, Skeleton, type Tone } from '../ui.tsx'
 import { usePoll } from '../usePoll.ts'
 
@@ -118,17 +119,34 @@ function rememberId(key: string, id: string): string[] {
   return next
 }
 
-/** A friendly single-field lookup: what to paste, where to find it, and the IDs opened before. */
-function Lookup({ id, label, placeholder, where, recent, onOpen }: { id: string; label: string; placeholder: string; where: string; recent: string[]; onOpen: (v: string) => void }) {
-  const [value, setValue] = useState('')
+/** Find a run on this computer by name, state, revision or ID; a pasted run ID opens directly. */
+function RunLookup({ recent, onOpen }: { recent: string[]; onOpen: (v: string) => void }) {
   return (
     <>
-      <form className="lookup" onSubmit={(e) => { e.preventDefault(); if (value.trim()) onOpen(value.trim()) }}>
-        <label className="visually-hidden" htmlFor={id}>{label}</label>
-        <input id={id} className="form-control" placeholder={placeholder} value={value} onChange={(e) => setValue(e.target.value)} spellCheck={false} autoComplete="off" aria-describedby={`${id}-help`} />
-        <button type="submit" className="btn btn-primary" disabled={!value.trim()}><Icon name="arrow-right" /> Open</button>
-      </form>
-      <div id={`${id}-help`} className="form-text">{where}</div>
+      <div className="lookup">
+        <Combobox
+          id="tpl-run"
+          data-tour="templates-run-picker"
+          label="Run ID"
+          placeholder="Find a run by name, state or ID"
+          describedBy="tpl-run-help"
+          looseId
+          parseId={(t) => (/^[A-Za-z0-9._-]{1,64}$/.test(t) ? t : null)}
+          onSelect={onOpen}
+          search={async (q, signal) => {
+            const r = (await fetchLocalRuns(signal, q ? { q } : {})).value
+            if (r.availability !== 'available') return { options: [] }
+            return {
+              more: r.next_cursor !== null,
+              options: r.runs.map((run) => {
+                const st = RUN[run.state]
+                return { value: run.run_id, text: run.name, label: run.name, secondary: run.run_id, meta: <><Pill tone={st.tone}>{st.word}</Pill> <span className="small muted">rev <code>{run.revision.slice(0, 10)}</code></span></> }
+              }),
+            }
+          }}
+        />
+      </div>
+      <div id="tpl-run-help" className="form-text">Your agent prints the run ID when a check starts; Timeline also shows it next to the snapshot it tested.</div>
       {recent.length > 0 && (
         <div className="recent">
           <span className="small muted">Opened recently:</span>
@@ -141,18 +159,60 @@ function Lookup({ id, label, placeholder, where, recent, onOpen }: { id: string;
   )
 }
 
+const MAX_CHANGE_PAGES = 5
+/** Change IDs on this computer: up to 5 pages of 100 are loaded and filtered in the browser. */
+function useLocalChanges(): { ids: { id: string; version: number }[]; more: boolean; loading: boolean; failed: boolean } {
+  const [state, setState] = useState<{ ids: { id: string; version: number }[]; more: boolean; loading: boolean; failed: boolean }>({ ids: [], more: false, loading: true, failed: false })
+  useEffect(() => {
+    const ctrl = new AbortController()
+    void (async () => {
+      const ids: { id: string; version: number }[] = []
+      let after: string | undefined
+      try {
+        for (let page = 0; page < MAX_CHANGE_PAGES; page++) {
+          const r = (await fetchLocalChanges(ctrl.signal, after)).value
+          ids.push(...r.changes)
+          after = r.next_after ?? undefined
+          if (!after) break
+        }
+        setState({ ids, more: after !== undefined, loading: false, failed: false })
+      } catch {
+        if (!ctrl.signal.aborted) setState({ ids, more: false, loading: false, failed: true })
+      }
+    })()
+    return () => ctrl.abort()
+  }, [])
+  return state
+}
+
 /** The recipe lookup needs two things: the change, and where the template file sits inside it. */
 function RecipeLookup({ recent, onOpen }: { recent: string[]; onOpen: (change: string, library: string) => void }) {
   const [change, setChange] = useState('')
   const [library, setLibrary] = useState('')
+  const changes = useLocalChanges()
   const ok = change.trim() !== '' && library.trim() !== ''
   return (
     <>
       <form className="lookup-2" onSubmit={(e) => { e.preventDefault(); if (ok) onOpen(change.trim(), library.trim()) }}>
         <div>
-          <label className="form-label small" htmlFor="tpl-change">Change ID</label>
-          <input id="tpl-change" className="form-control" placeholder="Change ID" value={change} onChange={(e) => setChange(e.target.value)} spellCheck={false} autoComplete="off" aria-describedby="tpl-change-help" />
-          <div id="tpl-change-help" className="form-text">Your agent shows it when it starts work; agentscm status lists it.</div>
+          <span className="form-label small d-block" aria-hidden="true">Change ID</span>
+          <Combobox
+            id="tpl-change"
+            data-tour="templates-change-picker"
+            label="Change ID"
+            placeholder={changes.loading ? 'Loading changes…' : 'Search changes or paste an ID'}
+            describedBy="tpl-change-help"
+            keepText
+            looseId
+            onTextChange={() => setChange('')}
+            parseId={(t) => (/^[A-Za-z0-9._:/-]{1,200}$/.test(t) ? t : null)}
+            emptyText={changes.failed ? 'Could not list changes. Paste an ID.' : 'No change matches. Paste an ID.'}
+            options={changes.ids.map((c) => ({ value: c.id, text: c.id, label: c.id, meta: <Pill tone="muted">version {c.version}</Pill> }))}
+            onSelect={setChange}
+          />
+          <div id="tpl-change-help" className="form-text">
+            {changes.more ? 'Showing the first 500 changes; paste an ID to open any other. ' : ''}Your agent shows it when it starts work; agentscm status lists it.
+          </div>
         </div>
         <div>
           <label className="form-label small" htmlFor="tpl-path">Template file</label>
@@ -198,11 +258,7 @@ export function TemplatesPage() {
           <RecipeLookup recent={recentRecipes} onOpen={(change, library) => { setRecipe({ change, library }); setRecentRecipes(rememberId(RECENT.recipe, `${change}${PAIR}${library}`)) }} />
         </Box>
         <Box icon="flag" title="Where did a run get to?" explain="A run is one go at a recipe's checks. This shows each step's result and what to do next. Same as skill-workflow handoff.">
-          <Lookup
-            id="tpl-run"
-            label="Run ID"
-            placeholder="Run ID"
-            where="Your agent prints the run ID when a check starts; Timeline also shows it next to the snapshot it tested."
+          <RunLookup
             recent={recentRuns}
             onOpen={(v) => { setRunId(v); setRecentRuns(rememberId(RECENT.run, v)) }}
           />

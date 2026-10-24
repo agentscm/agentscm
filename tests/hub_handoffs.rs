@@ -254,7 +254,7 @@ fn a_grant_moves_the_file_and_is_told_once(db: &Db) {
     // The status page sees all three kinds.
     let digest = agent_token_digest(&bob.secret).unwrap();
     let principal = store.authenticate(&digest, unix_now()).unwrap().unwrap();
-    let seen = store.repository_events(&principal, 100).unwrap();
+    let seen = store.repository_events(&principal, None, 100).unwrap();
     let kinds: Vec<&str> = seen.iter().map(|e| e.event.kind.as_str()).collect();
     assert!(kinds.contains(&"handoff_request") && kinds.contains(&"handoff_grant"));
 }

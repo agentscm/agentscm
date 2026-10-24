@@ -735,32 +735,95 @@ pub fn retained_definition(data_dir: &Path, run_id: &str) -> Result<WorkflowDefi
 pub struct RunPage {
     pub runs: Vec<RunSummary>,
     pub next_cursor: Option<String>,
+    /// Set only for a search: the oldest run sequence examined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub searched_to: Option<String>,
 }
 
 pub fn list_runs(data_dir: &Path, limit: usize) -> Result<Vec<RunSummary>> {
-    Ok(list_run_page(data_dir, limit, None)?.runs)
+    Ok(list_run_page(data_dir, limit, None, None)?.runs)
 }
 
-/// Newest-created runs using a bounded keyset cursor, never an unbounded scan.
-pub fn list_run_page(data_dir: &Path, limit: usize, before: Option<i64>) -> Result<RunPage> {
+/// Rows read below the cursor when a search text filters a page.
+const SEARCH_SCAN_ROWS: usize = 256;
+
+/// Newest-created runs using a bounded keyset cursor, never an unbounded scan. With `search`
+/// (lowercased substring of run id, name, source revision or state) at most
+/// [`SEARCH_SCAN_ROWS`] rows below the cursor are read; when that window ends before the page
+/// fills, the cursor is the last row read, because older runs may still match.
+pub fn list_run_page(
+    data_dir: &Path,
+    limit: usize,
+    before: Option<i64>,
+    search: Option<&str>,
+) -> Result<RunPage> {
     if !(1..=16).contains(&limit) || before.is_some_and(|value| value <= 0) {
         return Err(Error::Limit(
             "workflow list requires 1..16 runs and a positive cursor".into(),
         ));
     }
+    let needle = search.map(str::to_lowercase);
+    let fetch = if needle.is_some() {
+        SEARCH_SCAN_ROWS
+    } else {
+        limit + 1
+    };
     let journal = Journal::open(data_dir, OpenMode::Read)?;
+    // A search reads only the columns it matches on; full definitions load for the page alone.
     let mut statement = journal.connection.prepare(
-        "SELECT run_id,rowid FROM workflow_runs WHERE rowid<=?1 ORDER BY rowid DESC LIMIT ?2",
+        "SELECT run_id,rowid,state,
+            CASE WHEN ?3 AND json_valid(CAST(definition_json AS TEXT))
+                 THEN json_extract(CAST(definition_json AS TEXT),'$.name') END,
+            CASE WHEN ?3 AND json_valid(CAST(definition_json AS TEXT))
+                 THEN json_extract(CAST(definition_json AS TEXT),'$.source.revision') END
+         FROM workflow_runs WHERE rowid<=?1 ORDER BY rowid DESC LIMIT ?2",
     )?;
-    let mut ids = statement
+    let rows = statement
         .query_map(
-            params![before.map_or(i64::MAX, |value| value - 1), limit + 1],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            params![
+                before.map_or(i64::MAX, |value| value - 1),
+                fetch,
+                needle.is_some()
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let more = ids.len() > limit;
-    ids.truncate(limit);
-    let runs = ids
+    let window_full = rows.len() == SEARCH_SCAN_ROWS;
+    let mut searched_to = None;
+    // One more than a page: the extra match only says that older ones exist.
+    let mut picked: Vec<(String, i64)> = Vec::new();
+    for (run_id, sequence, state, name, revision) in rows {
+        searched_to = Some(sequence);
+        if let Some(needle) = &needle {
+            let found = [
+                Some(&run_id),
+                Some(&state),
+                name.as_ref(),
+                revision.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|text| text.to_lowercase().contains(needle.as_str()));
+            if !found {
+                continue;
+            }
+        }
+        picked.push((run_id, sequence));
+        if picked.len() > limit {
+            break;
+        }
+    }
+    let more = picked.len() > limit;
+    picked.truncate(limit);
+    let runs = picked
         .into_iter()
         .map(|(run_id, sequence)| {
             validate_run_id(&run_id)?;
@@ -779,10 +842,21 @@ pub fn list_run_page(data_dir: &Path, limit: usize, before: Option<i64>) -> Resu
         .collect::<Result<Vec<_>>>()?;
     let next_cursor = if more {
         runs.last().map(|run| run.sequence.clone())
+    } else if needle.is_some() && window_full {
+        searched_to.map(|sequence| sequence.to_string())
     } else {
         None
     };
-    Ok(RunPage { runs, next_cursor })
+    // With a search: the oldest sequence examined, so a client can say how far back it looked.
+    let searched_to = needle
+        .is_some()
+        .then(|| searched_to.map(|sequence| sequence.to_string()))
+        .flatten();
+    Ok(RunPage {
+        runs,
+        next_cursor,
+        searched_to,
+    })
 }
 
 /// Revalidate the entire retained graph before publishing an authority receipt.

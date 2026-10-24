@@ -951,7 +951,16 @@ async fn activity_is_authenticated_scoped_and_shaped() {
         hub.call(get.clone(), other, Some(&alice), None).await,
         (404, json!({"error": "not_found"}))
     );
-    for query in ["limit=0", "limit=101", "limit=-1", "limit=x", "foo=1"] {
+    for query in [
+        "limit=0",
+        "limit=101",
+        "limit=-1",
+        "limit=x",
+        "foo=1",
+        "before=0",
+        "before=-3",
+        "before=x",
+    ] {
         let url = format!("{ACTIVITY}?{query}");
         let (status, reply) = hub.call(get.clone(), &url, Some(&alice), None).await;
         assert_eq!(
@@ -963,7 +972,10 @@ async fn activity_is_authenticated_scoped_and_shaped() {
     let (status, empty) = hub.call(get.clone(), ACTIVITY, Some(&alice), None).await;
     assert_eq!(
         (status, empty),
-        (200, json!({"sessions": [], "events": []}))
+        (
+            200,
+            json!({"sessions": [], "events": [], "next_before": null})
+        )
     );
 
     let digest = agent_token_digest(&alice).unwrap();
@@ -983,6 +995,33 @@ async fn activity_is_authenticated_scoped_and_shaped() {
     hub.store
         .touch_session(&token.token_id, &call, unix_now())
         .unwrap();
+    // Paging by `before` walks every event once, newest first, and ends with a null cursor.
+    let (_, all) = hub.call(get.clone(), ACTIVITY, Some(&alice), None).await;
+    assert_eq!(all["next_before"], Value::Null);
+    let all_seqs: Vec<i64> = all["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["seq"].as_i64().unwrap())
+        .collect();
+    assert!(all_seqs.len() >= 2 && all_seqs.windows(2).all(|w| w[0] > w[1]));
+    let mut walked = Vec::new();
+    let mut url = format!("{ACTIVITY}?limit=1");
+    loop {
+        let (status, page) = hub.call(get.clone(), &url, Some(&alice), None).await;
+        assert_eq!(status, 200);
+        let events = page["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        walked.push(events[0]["seq"].as_i64().unwrap());
+        match page["next_before"].as_i64() {
+            Some(before) => {
+                assert_eq!(before, *walked.last().unwrap());
+                url = format!("{ACTIVITY}?limit=1&before={before}");
+            }
+            None => break,
+        }
+    }
+    assert_eq!(walked, all_seqs);
     let url = format!("{ACTIVITY}?limit=1");
     let (status, body) = hub.call(get, &url, Some(&alice), None).await;
     assert_eq!(status, 200);

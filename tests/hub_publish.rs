@@ -2117,6 +2117,10 @@ async fn publications_list_newest_first_and_read_only_reads_call_no_forge() {
         for item in items {
             assert!(item.get("external").is_none() && item.get("forge_check").is_none());
             assert!(item["created_at"].is_i64() && item["updated_at"].is_i64());
+            assert!(
+                item["title"].as_str().is_some_and(|t| !t.is_empty()),
+                "{item}"
+            );
             listed.push(item.clone());
         }
         assert_eq!(page["complete"], page["next_cursor"].is_null());
@@ -2155,6 +2159,55 @@ async fn publications_list_newest_first_and_read_only_reads_call_no_forge() {
     assert_eq!(status, 200, "{shown}");
     assert_eq!(shown["states"]["pull_request"]["state"], "opened");
     assert_eq!(env.requests("GET", "/pulls/1"), before);
+
+    // Search keeps its filter across cursors; wildcards are literal; `#N` names a pull request.
+    let ids_of = |page: &Value| -> Vec<String> {
+        page["publications"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let (_, one) = env
+        .api(Method::GET, &format!("{BASE}?q=FEAT%2FL1"), &reader, None)
+        .await;
+    assert_eq!(ids_of(&one), [created[2].clone()]);
+    assert!(
+        one["searched_to"].is_string() && one["complete"] == true,
+        "{one}"
+    );
+    assert!(whole.get("searched_to").is_none());
+    let (_, none) = env
+        .api(Method::GET, &format!("{BASE}?q=%25"), &reader, None)
+        .await;
+    assert!(ids_of(&none).is_empty() && none["complete"] == true);
+    let (_, pull) = env
+        .api(Method::GET, &format!("{BASE}?q=%231"), &reader, None)
+        .await;
+    assert_eq!(ids_of(&pull), std::slice::from_ref(&published));
+    let mut found = Vec::new();
+    let mut path = format!("{BASE}?limit=2&q=feat%2Fl");
+    loop {
+        let (status, page) = env.api(Method::GET, &path, &reader, None).await;
+        assert_eq!(status, 200, "{page}");
+        found.extend(ids_of(&page));
+        match page["next_cursor"].as_str() {
+            Some(cursor) => path = format!("{BASE}?limit=2&q=feat%2Fl&before={cursor}"),
+            None => break,
+        }
+    }
+    found.sort();
+    let mut expected = created.clone();
+    expected.sort();
+    assert_eq!(found, expected);
+    let long = "a".repeat(201);
+    for query in [format!("?q={long}"), "?q=a%01b".to_owned()] {
+        let (status, _) = env
+            .api(Method::GET, &format!("{BASE}{query}"), &reader, None)
+            .await;
+        assert_eq!(status, 400, "{query}");
+    }
 
     for query in [
         "?limit=0",

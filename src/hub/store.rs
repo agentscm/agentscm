@@ -22,15 +22,15 @@ use super::external_runs::{ExternalKind, ExternalObserved, ExternalRun};
 use super::handoff::{Answered, Asked};
 use super::insights::{InsightPage, InsightQuery, UsageReceipt, UsageRecord, WorkInsight};
 use super::intent::{Announced, Intent, NewIntent};
-use super::publish::{Create, NewPublication, Publication, Update};
+use super::publish::{Create, NewPublication, Publication, PublicationSearch, Update};
 use super::session::{SessionCall, Touched};
 use super::skills::{EvidenceRow, RunHead, SkillAdoption};
 use super::store_pg::PgStore;
 use super::store_sqlite::SqliteStore;
 use super::work::{
     Briefing, BriefingAck, BriefingQuery, WorkCheckpoint, WorkCheckpointResult, WorkCompaction,
-    WorkItem, WorkOverview, WorkOverviewQuery, WorkRepositoryScope, WorkScopeCheck, WorkStart,
-    WorkStartResult,
+    WorkItem, WorkOverview, WorkOverviewQuery, WorkRepositoryScope, WorkScopeCheck, WorkSearchPage,
+    WorkStart, WorkStartResult,
 };
 use super::{HubError, Result};
 use crate::team::auth::{Secret, generate_secret, lower_hex, token_digest};
@@ -245,8 +245,14 @@ pub trait Store: Send + Sync {
     /// owner host and provider) updated within `SESSION_TTL_SECONDS` of `now`, newest first, at most `limit`.
     fn live_sessions(&self, who: &Principal, now: i64, limit: usize) -> Result<Vec<SessionView>>;
     /// The status page's event kinds for the tokens and intents in `who`'s scope (as for
-    /// `live_sessions`, revoked tokens included), newest first, at most `limit`.
-    fn repository_events(&self, who: &Principal, limit: usize) -> Result<Vec<ActivityEvent>>;
+    /// `live_sessions`, revoked tokens included), newest first, with `seq` below `before` when
+    /// given, at most `limit`.
+    fn repository_events(
+        &self,
+        who: &Principal,
+        before: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<ActivityEvent>>;
     /// Fails with `Invalid` on a bad shape or a taken id; the event records `actor`.
     fn insert_connection(&self, new: &NewConnection, actor: &str) -> Result<Connection>;
     /// Oldest first, at most 1000.
@@ -471,6 +477,17 @@ pub trait Store: Send + Sync {
         before: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Publication>>;
+    /// Like [`Store::publications`] but only matches of `search` (already [`search_text`]-cleaned)
+    /// among the newest `SEARCH_SCAN_ROWS` publications below `before`: branch, base, title,
+    /// id, owner login or token name containing it, or the pull request number it names. Never
+    /// reads more than that window; the result says where it stopped.
+    fn publication_search(
+        &self,
+        repository: &str,
+        before: Option<&str>,
+        search: &str,
+        limit: usize,
+    ) -> Result<PublicationSearch>;
     /// The newest publication of each pull request number above `after` in `repository`
     /// (matched case-insensitively), omitting pull requests whose newest publication is merged,
     /// by number, at most `limit`. "Newest" is by `created_at`, then `id`, descending.
@@ -497,6 +514,19 @@ pub trait Store: Send + Sync {
         now: i64,
     ) -> Result<WorkCheckpointResult>;
     fn work_get(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkItem>>;
+    /// Work of the token's repository, finished work included, newest `created_at` then `id`
+    /// first, strictly after the `cursor` position (`<created_at>:<id>` from a previous page; it must name a work item of the token's repository with exactly that creation time), at most `limit` (see `MAX_WORK_SEARCH`).
+    /// `search` (already [`search_text`]-cleaned) keeps items whose title, branch, lead agent,
+    /// owner login, id or scope contains it, or whose source issue number it names. An unknown
+    /// cursor is `Invalid`.
+    fn work_search(
+        &self,
+        token: &str,
+        search: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+        now: i64,
+    ) -> Result<WorkSearchPage>;
     fn change_ingest(
         &self,
         token: &str,
@@ -872,6 +902,45 @@ pub(super) fn event_limit(limit: usize) -> i64 {
 }
 
 pub(super) const LIST_LIMIT: i64 = 1000;
+
+/// Longest list-search text, in bytes.
+pub const MAX_SEARCH_BYTES: usize = 200;
+
+/// Trimmed search text; empty means no filter. Over-long text or control characters are invalid.
+pub fn search_text(q: Option<&str>) -> Result<Option<String>> {
+    let Some(q) = q.map(str::trim).filter(|q| !q.is_empty()) else {
+        return Ok(None);
+    };
+    if q.len() > MAX_SEARCH_BYTES || q.chars().any(char::is_control) {
+        return Err(invalid(
+            "q must be at most 200 bytes without control characters",
+        ));
+    }
+    Ok(Some(q.to_owned()))
+}
+
+/// ASCII-case-insensitive (as SQLite `lower`) substring pattern for `lower(col) LIKE ? ESCAPE '\'`.
+pub fn like_pattern(q: &str) -> String {
+    let mut pattern = String::with_capacity(q.len() + 2);
+    pattern.push('%');
+    for c in q.to_ascii_lowercase().chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(c);
+    }
+    pattern.push('%');
+    pattern
+}
+
+/// The record number named by `123` or `#123`, if the search text is one.
+pub fn search_number(q: &str) -> Option<i64> {
+    let digits = q.strip_prefix('#').unwrap_or(q);
+    if digits.is_empty() || digits.len() > 18 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
 
 pub fn validate_login(login: &str) -> Result<()> {
     if login.is_empty() || login.len() > MAX_LOGIN_BYTES || login.chars().any(char::is_control) {

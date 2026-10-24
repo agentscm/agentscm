@@ -371,9 +371,10 @@ describe('change record route and page', () => {
   it('offers a read-only lookup and reports missing records plainly', async () => {
     vi.stubGlobal('fetch', async () => json(404, { error: 'not_found' }))
     render(<ChangeRecordPage repo="counterbranch/agentscm" token="read-token" />)
-    const input = screen.getByLabelText('Work ID')
+    const input = screen.getByRole('combobox', { name: 'Find a work item' })
+    fireEvent.focus(input)
     fireEvent.change(input, { target: { value: WORK_ID } })
-    fireEvent.click(screen.getByRole('button', { name: /Open/ }))
+    fireEvent.keyDown(input, { key: 'Enter' })
     expect(window.location.hash).toBe(changeRecordHref(WORK_ID))
 
     await act(async () => window.dispatchEvent(new HashChangeEvent('hashchange')))

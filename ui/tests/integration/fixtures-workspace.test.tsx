@@ -53,11 +53,10 @@ async function openComposerWithSubject() {
   render(<WorkspacePage />)
   const profile = await screen.findByRole('combobox', { name: 'Workflow profile' }, LOAD)
   fireEvent.change(profile, { target: { value: 'quality-gate' } })
-  const known = screen.getByRole('combobox', { name: 'Current native Changes' })
-  await waitFor(() => expect(within(known).getAllByRole('option')).toHaveLength(2), LOAD)
-  fireEvent.change(known, { target: { value: SUBJECT.change_id } })
-  expect((screen.getByRole('textbox', { name: /Native Change ID/ }) as HTMLInputElement).value).toBe(SUBJECT.change_id)
-  fireEvent.click(screen.getByRole('button', { name: 'Load revision' }))
+  const known = screen.getByRole('combobox', { name: 'Native Change' })
+  await waitFor(() => expect((known as HTMLInputElement).placeholder).not.toMatch(/Loading/), LOAD)
+  fireEvent.focus(known)
+  fireEvent.click(await screen.findByRole('option', { name: new RegExp(SUBJECT.change_id) }, LOAD))
   return screen.findByRole('region', { name: 'Revision to execute' }, LOAD)
 }
 
@@ -123,6 +122,7 @@ describe('signed-in overview', () => {
       if (path(url) !== `/repositories/${REPO}/runs`) return undefined
       return url.searchParams.get('before') === 'cursor-1' ? json(200, { runs: [page2], next_cursor: null }) : fromMock(url, init, (b) => ({ ...b, next_cursor: 'cursor-1' }))
     })
+    at('#workspace')
     render(<WorkspacePage />)
     await screen.findByText('synthetic-workspace-run', {}, LOAD)
     expect(sent.find((r) => r.url.includes('/runs?'))!.url).toBe(`/v1/hub/workspace/repositories/${REPO}/runs?limit=20`)
@@ -132,6 +132,16 @@ describe('signed-in overview', () => {
     expect((screen.getByRole('button', { name: /Older runs/ }) as HTMLButtonElement).disabled).toBe(true)
     fireEvent.click(screen.getByRole('button', { name: /Newer runs/ }))
     await screen.findByText('synthetic-workspace-run', {}, LOAD)
+  })
+})
+
+describe('stale selection', () => {
+  it('editing the Change text drops the loaded revision', async () => {
+    stubHub()
+    at('#workspace')
+    await openComposerWithSubject()
+    fireEvent.change(screen.getByRole('combobox', { name: 'Native Change' }), { target: { value: `${SUBJECT.change_id}-other` } })
+    expect(screen.queryByRole('region', { name: 'Revision to execute' })).toBeNull()
   })
 })
 

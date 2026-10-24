@@ -26,6 +26,7 @@ import {
 } from '../standup.ts'
 import { Ago, Avatar, Box, Empty, Explain, Icon, Notice, Path, Paths, Pill, Skeleton, Tip, localDate, type Tone } from '../ui.tsx'
 import { usePoll, type Poll } from '../usePoll.ts'
+import { hashPath, Pager } from '../Pager.tsx'
 
 const STATE: Record<WorkState, { label: string; tone: Tone; icon: string; tip: string }> = {
   active: { label: 'In progress', tone: 'brand', icon: 'play-circle', tip: 'The lead agent reports it is actively working on this.' },
@@ -394,10 +395,11 @@ function RequestQueue({ token, search }: { token: string; search: string }) {
             )
           })()}
           <Pager
-            page={page}
-            canNext={!load.value.complete}
-            onPrev={() => setPage((p) => p - 1)}
-            onNext={() => {
+            newerLabel="Previous"
+            olderLabel="Next"
+            status={`Page ${page + 1}`}
+            onNewer={page > 0 ? () => setPage((p) => p - 1) : undefined}
+            onOlder={load.value.complete ? undefined : () => {
               const b = load.value
               const next: CoordinationQuery = { after: b.next_after, through: b.through, limit: query.limit, activeOnly: query.activeOnly }
               setQueries((all) => (fresh ? [{ through: b.through, limit: query.limit, activeOnly: query.activeOnly }, next] : [...all.slice(0, page + 1), next]))
@@ -407,21 +409,6 @@ function RequestQueue({ token, search }: { token: string; search: string }) {
         </>
       )}
     </Box>
-  )
-}
-
-function Pager({ page, canNext, onPrev, onNext }: { page: number; canNext: boolean; onPrev: () => void; onNext: () => void }) {
-  if (page === 0 && !canNext) return null
-  return (
-    <nav className="pager" aria-label="Pages">
-      <button type="button" className="btn btn-sm btn-outline-secondary" disabled={page === 0} onClick={onPrev}>
-        <Icon name="chevron-left" /> Previous
-      </button>
-      <span className="small muted">Page {page + 1}</span>
-      <button type="button" className="btn btn-sm btn-outline-secondary" disabled={!canNext} onClick={onNext}>
-        Next <Icon name="chevron-right" />
-      </button>
-    </nav>
   )
 }
 
@@ -644,10 +631,11 @@ function History({ token }: { token: string }) {
         </div>
       )}
       <Pager
-        page={page}
-        canNext={canNext}
-        onPrev={() => setPage((p) => p - 1)}
-        onNext={() => {
+        newerLabel="Previous"
+        olderLabel="Next"
+        status={`Page ${page + 1}`}
+        onNewer={page > 0 ? () => setPage((p) => p - 1) : undefined}
+        onOlder={!canNext ? undefined : () => {
           const next: BriefingQuery = { after: b.next_after, ...(b.next_work_after ? { workAfter: b.next_work_after } : {}), workDone: b.next_work_done, through: b.through, limit: query.limit }
           setQueries((all) => [...all.slice(0, page + 1), next])
           setPage((p) => p + 1)
@@ -816,7 +804,7 @@ type Tab = 'working' | 'finished' | 'coordination' | 'history'
 const TABS: readonly Tab[] = ['working', 'finished', 'coordination', 'history']
 /** `#work/<tab>` (work ids are `wrk_…`, so the two never collide); breadcrumbs link to these. */
 export function workTabFromHash(hash = window.location.hash): Tab {
-  const t = hash.slice(1).split('/')[1] as Tab
+  const t = hashPath(hash).slice(1).split('/')[1] as Tab
   return TABS.includes(t) ? t : 'working'
 }
 export const workTabHref = (t: Tab) => (t === 'working' ? '#work' : `#work/${t}`)

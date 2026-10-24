@@ -7,6 +7,8 @@
 // answer, the adapter returns the fixtures and marks them `preview`, and every screen says so.
 import examples from './localExamples.json'
 import { clean } from './publications.ts'
+import { decodeSkillWorkflowListEnvelope } from './skillWorkflow.ts'
+import type { SkillWorkflowListEnvelope } from './types.ts'
 
 export type Source = 'live' | 'preview'
 export interface Read<T> {
@@ -303,6 +305,28 @@ export const inspectTemplate = (change: string, library: string, signal: AbortSi
   read(`/v1/local/skill-workflow-library?${q({ change, library })}`, decodeInspect, () => decodeInspect(FIXTURE_INSPECT()), signal)
 export const fetchHandoff = (runId: string, signal: AbortSignal) =>
   read(`/v1/local/skill-workflows/${encodeURIComponent(runId)}/handoff`, decodeHandoff, () => decodeHandoff(FIXTURE_HANDOFF()), signal)
+/** Retained runs on this computer, newest first (16 a page); `q` matches ID, name, revision or state. */
+export const fetchLocalRuns = (signal: AbortSignal, query: { before?: string; q?: string } = {}) =>
+  read(`/v1/local/skill-workflows?${q({ before: query.before, q: query.q || undefined })}`, decodeSkillWorkflowListEnvelope, () => FIXTURE_RUNS(query.before, query.q), signal)
+
+export interface LocalChanges {
+  changes: { id: string; version: number }[]
+  next_after: string | null
+}
+export function decodeLocalChanges(v: unknown): LocalChanges {
+  const root = rec(v)
+  return {
+    changes: (Array.isArray(root['changes']) ? root['changes'] : []).slice(0, 100).flatMap((c) => {
+      const r = rec(c)
+      const id = clean(r['id'], 200)
+      return id ? [{ id, version: num(r['version']) }] : []
+    }),
+    next_after: typeof root['next_after'] === 'string' && root['next_after'] !== '' ? clean(root['next_after'], 200) : null,
+  }
+}
+export const fetchLocalChanges = (signal: AbortSignal, after?: string) =>
+  read(`/v1/local/changes?${q({ limit: 100, after })}`, decodeLocalChanges, () => FIXTURE_CHANGES(after), signal)
+
 export const fetchTimeline = (signal: AbortSignal, before?: number) =>
   read(`/v1/local/workspace/timeline?${q({ limit: 25, before })}`, decodeTimeline, () => decodeTimeline(FIXTURE_TIMELINE(before)), signal)
 export const fetchEntry = (id: number, signal: AbortSignal) =>
@@ -338,3 +362,26 @@ export function FIXTURE_ENTRY(id: number) {
   return { version: 1, entry, evidence: { state: 'not_run' } }
 }
 export const FIXTURE_DIFF = (left: number, right: number) => ({ ...reply('diff'), left, right })
+
+const FIXTURE_STATES = ['succeeded', 'failed', 'running', 'blocked', 'completed_with_omissions', 'cancelled', 'pending'] as const
+const FIXTURE_NAMES = ['Check the change', 'Review the change', 'Release readiness']
+const FIXTURE_RUN_LIST = Array.from({ length: 40 }, (_, i) => ({
+  run_id: `preview-run-${String(40 - i).padStart(3, '0')}`,
+  revision: (i % 16).toString(16).repeat(64),
+  state: FIXTURE_STATES[i % FIXTURE_STATES.length]!,
+  name: FIXTURE_NAMES[i % FIXTURE_NAMES.length]!,
+  sequence: String(900 - i),
+}))
+/** 16 a page like the real list; with `q`, a case-insensitive match on ID, name, revision or state. */
+export function FIXTURE_RUNS(before?: string, query?: string): SkillWorkflowListEnvelope {
+  const needle = query?.trim().toLowerCase()
+  const rows = FIXTURE_RUN_LIST.filter((r) => (before === undefined || Number(r.sequence) < Number(before)) && (!needle || [r.run_id, r.name, r.revision, r.state].some((v) => v.toLowerCase().includes(needle))))
+  const runs = rows.slice(0, 16)
+  return { version: 1, availability: 'available', runs, next_cursor: rows.length > runs.length ? runs.at(-1)!.sequence : null }
+}
+const FIXTURE_CHANGE_LIST = Array.from({ length: 130 }, (_, i) => ({ id: `change-preview-${String(i + 1).padStart(3, '0')}`, version: (i % 5) + 1 }))
+export function FIXTURE_CHANGES(after?: string): LocalChanges {
+  const start = after ? FIXTURE_CHANGE_LIST.findIndex((c) => c.id === after) + 1 : 0
+  const changes = FIXTURE_CHANGE_LIST.slice(start, start + 100)
+  return { changes, next_after: start + 100 < FIXTURE_CHANGE_LIST.length ? changes.at(-1)!.id : null }
+}
