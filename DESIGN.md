@@ -4,11 +4,14 @@ description: A calm, read-only coordination Hub for seeing who owns each piece o
 colors:
   primary-light: "#4F5BD5"
   primary-dark: "#7C86FF"
-  canvas-light: "#F4F5F9"
-  canvas-dark: "#0A0C14"
+  chrome-light: "#E9EBF2"
+  chrome-dark: "#07080E"
+  canvas-light: "#F6F7FA"
+  canvas-dark: "#0D0F19"
   surface-light: "#FFFFFF"
-  surface-dark: "#121522"
+  surface-dark: "#151927"
   elevated-dark: "#1A1E30"
+  nav-active-light: "#DCDFF7"
   success: "#12B76A"
   warning: "#F79009"
   error: "#F04438"
@@ -56,10 +59,12 @@ spacing:
   section: "28px"
 components:
   navigation:
-    textColor: "{colors.primary-light}"
-    typography: "{typography.label}"
+    backgroundColor: "{colors.chrome-light}"
+    activeColor: "{colors.nav-active-light}"
+    typography: "{typography.body}"
     rounded: "{rounded.sm}"
-    height: "44px"
+    height: "40px"
+    width: "248px"
   filter-field:
     backgroundColor: "{colors.surface-light}"
     textColor: "{colors.primary-light}"
@@ -105,10 +110,10 @@ The palette is a neutral light/dark canvas with white or deep blue-black content
 - **Hub violet, dark** (`#7C86FF`): The same accent role in the dark theme.
 
 ### Neutral
-- **Cool canvas, light** (`#F4F5F9`): The light application background.
-- **Deep canvas, dark** (`#0A0C14`): The dark application background.
-- **White surface** (`#FFFFFF`): Light content, lane, card, and control surfaces.
-- **Deep surface** (`#121522`): Dark content surfaces.
+- **Chrome, light / dark** (`#E9EBF2` / `#07080E`): The top bar and the side rail, one shared surface.
+- **Sheet canvas, light / dark** (`#F6F7FA` / `#0D0F19`): The page itself, inset in the chrome.
+- **White surface** (`#FFFFFF`): Light content, card, and control surfaces.
+- **Deep surface** (`#151927`): Dark content surfaces.
 - **Elevated dark surface** (`#1A1E30`): Dark elevated controls and overlays.
 - **Theme text and border:** Use `--cb-text`, `--cb-text-2`, `--cb-text-3`, and `--cb-border` so contrast follows the active theme.
 
@@ -126,7 +131,8 @@ The palette is a neutral light/dark canvas with white or deep blue-black content
 **Character:** Compact, direct, and highly legible. Weight and line-height establish hierarchy; the Work surface avoids display faces and ornamental type.
 
 ### Hierarchy
-- **Display** (700, `clamp(24px, 2.5vw, 28px)`, 1.12): Work page and detail titles.
+- **Answer** (550, 22px, 1.38, `-0.015em`, 68ch measure): The one-sentence answer under each page's question. Facts inside it are 700-weight links with a thin offset underline, coloured by tone; the question above it is a 14px 600 `--hub-text-3` heading.
+- **Display** (700, `clamp(24px, 2.5vw, 28px)`, 1.12): Work detail titles.
 - **Title** (700, 24px on narrow screens, 1.12): Mobile title treatment and detail headings.
 - **Body** (400, 14px, 1.5): Card content, descriptions, action text, and history rows.
 - **Label** (650, 12px, 1.4, `0.03em`): Lane counts, table headings, state labels, and compact metadata.
@@ -139,11 +145,13 @@ The palette is a neutral light/dark canvas with white or deep blue-black content
 
 The Work surface begins with section navigation, a direct heading, read-only load status, and plain Working now / Recently finished / Needs coordination tabs. Search and counts apply only to the returned overview slice. The overview identifies its request-time upper bound and exposes incomplete current, recent, or overlap slices rather than implying a global all-clear. While the page is visible, the overview refreshes every 15 seconds without resetting the selected tab or search. A failed refresh keeps the last readable snapshot and labels its load time and error.
 
-Current work uses four desktop progress lanes: In progress, Blocked, Handover, and Paused. The board is a four-column grid with 12px gaps, 14px lane corners, 14px lane-heading and card insets, and an internally scrolling height of `clamp(240px, calc(100dvh - 570px), 460px)`. Recently finished uses a two-column task grid with the exact overview window above it. Needs coordination starts with a fixed-watermark page of compact directed-request summaries. Each summary exposes the stage, proposal, requester-to-target relationship and first concrete path reason; its native disclosure reveals all returned paths, receipts, responses and notes. Detected overlaps, other attention signals and recent decisions remain separate, count-labelled disclosures that are collapsed by default.
+Current work uses four desktop progress lanes: In progress, Blocked, Handover, and Paused. The board is a four-column grid with 14px gaps, 12px lane corners, 14px lane-heading and 10px card insets, and an internally scrolling height of `clamp(240px, calc(100dvh - 570px), 460px)`. Recently finished uses a two-column task grid with the exact overview window above it. Needs coordination starts with a fixed-watermark page of compact directed-request summaries. Each summary exposes the stage, proposal, requester-to-target relationship and first concrete path reason; its native disclosure reveals all returned paths, receipts, responses and notes. Detected overlaps, other attention signals and recent decisions remain separate, count-labelled disclosures that are collapsed by default.
 
 At 860px and below, the board becomes two columns, directed-request targets become a single queue, and detected-overlap rows stack the reason above the involved work. Change history keeps its date column in the stacked record. At 640px and below, the Work surface uses 16px horizontal padding with an 8px side bleed, controls keep 44px targets, lane buttons wrap at a 110px basis, only the selected lane is visible as one scrollable queue, recently finished becomes one column, and each involved work item receives its own separated row. The search input remains visually present while its redundant label is visually hidden and remains available to screen readers.
 
 ## Elevation & Depth
+
+**The Three Planes Rule.** The Hub has three planes, each one tonal step apart, so navigation never reads as content: **chrome** (the top bar and rail share one tinted surface with no dividing rules), the **sheet** (the content column, inset with a 14px top-left radius and a hairline edge shadow, carrying the breadcrumbs as its own header line), and **surfaces** (boxes and cards on the sheet). Tiles inside a box are tonal (`--hub-sunken`), never bordered, so a box never holds more boxes. On screens up to 960px wide the rail becomes a drawer and the sheet loses its corner. `main` takes focus on navigation for assistive technology but shows no ring, because it isn't a control.
 
 The Work register is flat and structural. Depth comes from tonal lane fields, a one-pixel `--cb-border` rule, white or deep content surfaces, and a small violet hover tint. The feature adds no shadow vocabulary or decorative gradient. Focus-visible targets use a 2px violet outline with a 3px offset, and reduced-motion users receive no row hover transition.
 
@@ -154,18 +162,36 @@ The Work register is flat and structural. Depth comes from tonal lane fields, a 
 
 ## Shapes
 
-The Hub uses gently rounded controls and surfaces: 12px is the primary control radius, 14px shapes lanes and detail action groups, and 20px remains the large theme radius. Cards use 12px corners; lane headings use 14px corners on the containing lane. Focusable controls keep a minimum 44px height. The history table uses separators and stacked records rather than card decoration.
+The Hub uses gently rounded controls and surfaces: 12px is the primary control and box radius, lanes use 12px, cards 10px, info bars 10px and nav rows 8px, the sheet's inset corner is 14px, and 20px remains the large theme radius. Lane headings follow the containing lane's corner. Focusable controls keep a minimum 44px height. The history table uses separators and stacked records rather than card decoration.
 
 ## Components
 
+### Navigation rail
+- **Shape:** A 248px rail (68px compact) on the chrome surface with no dividing rule. Group heads are 11px uppercase labels; their explainers appear on hover or focus. Rows are 40px, with a plain 20px icon in `--hub-text-3` and a 550-weight label.
+- **Behavior:** The active row takes the `--hub-nav-active` tint, a violet icon and a 650 label, and shows the page's question beneath it, wrapped rather than truncated. Other rows keep their question in the accessible name only, since each page opens with its question as its heading. The mobile drawer has room for the questions and no hover, so it shows every one. Badges stay compact counts beside the label, or a corner dot in the compact rail.
+
+### Top bar
+- **Shape:** It sits on the chrome surface, with the search field and the header "Connect agent" action as white controls with hairline borders. The header action is deliberately secondary (an outline button with violet text) so each page's filled primary action stays the only filled violet on screen.
+
+### Evidence boxes
+- **Shape:** 12px-corner surfaces with a 52px head of a plain 20px icon (tinted only for ok, warn or bad tones), a 15px 650 title, a plain count and an explainer that sits at rest opacity until the box is hovered or focused, then a hairline rule over the body.
+- **Behavior:** The head labels the data; it doesn't compete with it. Rows inside a box are separated by rules or proximity, not nested cards.
+
+### Info bars
+- **Shape:** One `Notice` pattern: a 10px-corner surface bar with a hairline in the tone and the tone on the icon. Warnings and errors add a soft tinted fill so problems still stand out. Retry and similar actions sit vertically centred at the end.
+
+### Tabs and pills
+- **Tabs:** One vocabulary across pages: an underline strip with a 2px violet indicator under the active tab, used for both button tabs and link tabs. Counts are small neutral or warning pills.
+- **Pills:** State pills keep a soft tonal fill, an icon and text. Muted pills are metadata and use a hairline outline instead of a fill. Inside agent rows, the connection (`Hook · Codex`) is plain secondary text. Pills may wrap inside narrow cards rather than overflow.
+
 ### Progress lanes
-- **Shape:** Four 14px-corner lanes on desktop with a sticky 76px heading and a scrollable card list; a defensive fifth finished lane may span the board when returned data requires it.
+- **Shape:** Four 12px-corner lanes on desktop with a sticky 76px heading and a scrollable card list; a defensive fifth finished lane may span the board when returned data requires it.
 - **Content hierarchy:** Agent and login, task title, labelled state and claim, reported blocker or next action, participants, then last check-in.
-- **State fields:** Active and handover use violet fields, blocked uses rose, paused uses amber, and finished uses green. Old or unknown check-ins say “still assigned.” Finished work has no assignment claim or warning.
+- **State fields:** Each lane is a quiet tonal column whose state colour sits in a 2px top cap and the heading icon: violet for active and handover, rose for blocked (its heading text is rose too), amber for paused, and green for finished. Old or unknown check-ins say “still assigned.” Finished work has no assignment claim or warning.
 
 ### Work cards
-- **Shape:** Neutral 12px-corner cards with 14px padding, one-pixel border, and a 10px internal gap.
-- **Behavior:** Source identity is compact and secondary. The title link, lead, state, and reported action form the primary scan path; participant details follow when present.
+- **Shape:** Neutral 10px-corner cards with 14px padding, a one-pixel border, and an 8px internal gap. The reported next action is text under a small label rather than a nested panel; only a blocker keeps a rose field. Check-in time and source share a ruled footer that wraps rather than splitting words.
+- **Behavior:** Source identity is compact and secondary. The title link, lead, state, and reported action form the primary scan path; participant details follow when present. Cards carry the state label but show a claim chip only when the claim needs attention (no recent or unknown check-in, still assigned). A live claim is the normal case for an unfinished lane, and the detail view still states it.
 
 ### Recently finished
 - **Shape:** A two-column task grid on larger screens and a single queue on narrow screens, preceded by the exact server-provided start and end times.
