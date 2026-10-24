@@ -2257,6 +2257,16 @@ a.run-row:hover {
 .lookup .form-control { max-width: 460px; }
 .lookup-2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; gap: 12px; margin-bottom: 16px; }
 .lookup-2 .form-control { max-width: none; }
+.combo { position: relative; flex: 1; min-width: 0; max-width: 460px; }
+.lookup-2 .combo { max-width: none; }
+.combo-pop { position: absolute; z-index: 30; left: 0; right: 0; margin-top: 4px; max-height: 360px; overflow: auto; background: var(--hub-surface); border: 1px solid var(--hub-rule-strong); border-radius: 12px; padding: 4px; }
+.combo-list { list-style: none; margin: 0; padding: 0; }
+.combo-opt { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; border-radius: 8px; cursor: pointer; }
+.combo-opt[aria-selected='true'] { background: var(--hub-brand-soft); }
+.combo-main { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; min-width: 0; }
+.combo-label { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.combo-id { font-size: 0.8em; overflow-wrap: anywhere; color: var(--hub-text-2); }
+.combo-note { padding: 8px 10px; }
 .recent { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 12px; }
 .recent-chip {
   padding: 2px 8px;

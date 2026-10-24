@@ -370,3 +370,121 @@ fn postgres_paged_delivery_is_retry_safe() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async { paged_delivery(Hub::start(Some(pg.url.clone())).await).await });
 }
+
+async fn work_search(hub: Hub) {
+    let (_, alice) = hub.token(21, "acme/widgets", false).await;
+    let (_, reader) = hub.token(22, "acme/widgets", true).await;
+    let (_, other_repo) = hub.token(23, "acme/private", false).await;
+    for n in 0..5 {
+        let (status, created) = hub
+            .call(
+                Method::POST,
+                "/v1/hub/standup/start",
+                &alice,
+                Some(
+                    json!({"request_key": format!("search-{n}"), "title": format!("Alpha task {n}"),
+                    "session": format!("s{n}"), "scope": [format!("src/m{n}.rs")],
+                    "branch": format!("feat/b{n}"), "worktree": format!("wt{n}"),
+                    "next_action": "go"}),
+                ),
+            )
+            .await;
+        assert_eq!(status, 200, "{created}");
+    }
+    let get = |path: String, secret: String| {
+        let hub = &hub;
+        async move { hub.call(Method::GET, &path, &secret, None).await }
+    };
+    // Pages follow the cursor without repeats; the last page is complete; an exact page is too.
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let mut path = "/v1/hub/standup/work?limit=2&q=ALPHA".to_owned();
+        if let Some(cursor) = &cursor {
+            path.push_str(&format!("&cursor={cursor}"));
+        }
+        let (status, page) = get(path, reader.clone()).await;
+        assert_eq!(status, 200, "{page}");
+        pages += 1;
+        let items = page["items"].as_array().unwrap();
+        assert!(items.len() <= 2);
+        for item in items {
+            assert_eq!(item["owner"], "contributor21");
+            assert!(item["title"].as_str().unwrap().starts_with("Alpha"));
+            assert!(item["branch"].is_string() && item["updated_at"].is_i64());
+            seen.push(item["id"].as_str().unwrap().to_owned());
+        }
+        assert_eq!(page["complete"], page["next_cursor"].is_null());
+        cursor = page["next_cursor"].as_str().map(str::to_owned);
+        if cursor.is_none() {
+            assert_eq!(items.len(), 1, "the last page holds the remainder");
+            break;
+        }
+    }
+    assert_eq!(pages, 3);
+    let unique: std::collections::BTreeSet<_> = seen.iter().collect();
+    assert_eq!((seen.len(), unique.len()), (5, 5));
+    let (_, exact) = get("/v1/hub/standup/work?limit=5".into(), alice.clone()).await;
+    assert_eq!(exact["items"].as_array().unwrap().len(), 5);
+    assert_eq!(
+        (exact["complete"].clone(), exact["next_cursor"].clone()),
+        (json!(true), Value::Null)
+    );
+
+    // Each text field narrows; wildcards are literal.
+    for (q, want) in [
+        ("m3.rs", 1),
+        ("feat%2Fb2", 1),
+        ("contributor21", 5),
+        ("test-agent", 5),
+        ("task%204", 1),
+        ("%25", 0),
+        ("w_k", 0),
+        ("%20%20", 5),
+    ] {
+        let (status, page) = get(format!("/v1/hub/standup/work?q={q}"), reader.clone()).await;
+        assert_eq!(status, 200, "{q}: {page}");
+        assert_eq!(page["items"].as_array().unwrap().len(), want, "{q}: {page}");
+    }
+    let id = seen[0].clone();
+    let (_, by_id) = get(format!("/v1/hub/standup/work?q={id}"), reader.clone()).await;
+    assert_eq!(by_id["items"][0]["id"], id.as_str());
+
+    // Bad input is a 400, never an empty page.
+    let long = "a".repeat(201);
+    for path in [
+        "/v1/hub/standup/work?limit=0".to_owned(),
+        "/v1/hub/standup/work?limit=51".to_owned(),
+        "/v1/hub/standup/work?limit=x".to_owned(),
+        format!("/v1/hub/standup/work?q={long}"),
+        "/v1/hub/standup/work?q=a%01b".to_owned(),
+        "/v1/hub/standup/work?cursor=wrk_missing".to_owned(),
+        "/v1/hub/standup/work?x=1".to_owned(),
+    ] {
+        assert_eq!(get(path.clone(), reader.clone()).await.0, 400, "{path}");
+    }
+    // Another repository sees none of it, and cannot use this repository's cursor.
+    let (status, page) = get("/v1/hub/standup/work".into(), other_repo.clone()).await;
+    assert_eq!((status, page["items"].as_array().unwrap().len()), (200, 0));
+    let (status, _) = get(format!("/v1/hub/standup/work?cursor={id}"), other_repo).await;
+    assert_eq!(status, 400);
+    assert_eq!(
+        get("/v1/hub/standup/work".into(), "nope".into()).await.0,
+        401
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn work_search_pages_filters_and_scopes() {
+    work_search(Hub::start(None).await).await;
+}
+
+#[test]
+fn work_search_on_postgres() {
+    let Some(pg) = hub_pg::PgSchema::create() else {
+        return;
+    };
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async { work_search(Hub::start(Some(pg.url.clone())).await).await });
+}

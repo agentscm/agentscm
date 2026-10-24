@@ -354,6 +354,44 @@ pub struct WorkOverlapPair {
     pub reasons_complete: bool,
 }
 
+/// One work item found by [`Store::work_search`]; enough to pick it, not to read it.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct WorkSearchItem {
+    pub id: String,
+    pub title: String,
+    pub state: String,
+    pub lead_agent: String,
+    pub owner: Option<String>,
+    pub branch: Option<String>,
+    pub source_issue: Option<String>,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct WorkSearchPage {
+    pub items: Vec<WorkSearchItem>,
+    pub next_cursor: Option<String>,
+    pub complete: bool,
+}
+
+impl WorkSearchPage {
+    /// `items` read with `limit + 1`: the extra row only says more exist.
+    pub(super) fn of(mut items: Vec<WorkSearchItem>, limit: usize) -> Self {
+        let more = items.len() > limit;
+        items.truncate(limit);
+        let next_cursor = more.then(|| items.last().map(|i| i.id.clone())).flatten();
+        Self {
+            items,
+            next_cursor,
+            complete: !more,
+        }
+    }
+}
+
+/// Work search page size by default and at most.
+pub const DEFAULT_WORK_SEARCH: usize = 20;
+pub const MAX_WORK_SEARCH: usize = 50;
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkOverview {

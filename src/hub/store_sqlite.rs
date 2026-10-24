@@ -57,7 +57,8 @@ use super::session::{
 use super::store::{
     ACTIVITY_KINDS, ActivityEvent, AgentToken, Event, ForgeIdentity, HubEvent, LIST_LIMIT,
     NAMED_MIGRATIONS, NewAgentToken, Principal, SessionView, Store, TokenDigest, User, event_limit,
-    lower_hex_of, new_id, pending, plan_named, session_key, unix_now, validate_login,
+    like_pattern, lower_hex_of, new_id, pending, plan_named, search_number, session_key, unix_now,
+    validate_login,
 };
 use super::work::{
     Briefing, BriefingAck, BriefingQuery, CLAIM_STALE_SECONDS, Checkpoint, CheckpointReceipt,
@@ -65,9 +66,10 @@ use super::work::{
     WORK_PAYLOAD_CAPACITY_BYTES, WorkCheckpoint, WorkCheckpointResult, WorkCompaction,
     WorkConflictKind, WorkEvent, WorkItem, WorkOutcome, WorkOutcomeKind, WorkOverview,
     WorkOverviewQuery, WorkParticipant, WorkRepositoryScope, WorkRole, WorkScopeCheck,
-    WorkScopeOverlap, WorkSource, WorkStart, WorkStartConflict, WorkStartResult, WorkState,
-    WorkWho, check_work_delivery_page, check_work_payload_capacity, normalized_scope,
-    scope_overlap_reasons, uncovered_scope, work_overlap_pairs, work_payload_row_bytes,
+    WorkScopeOverlap, WorkSearchItem, WorkSearchPage, WorkSource, WorkStart, WorkStartConflict,
+    WorkStartResult, WorkState, WorkWho, check_work_delivery_page, check_work_payload_capacity,
+    normalized_scope, scope_overlap_reasons, uncovered_scope, work_overlap_pairs,
+    work_payload_row_bytes,
 };
 use super::{HubError, Result};
 
@@ -4086,7 +4088,12 @@ impl Store for SqliteStore {
         Ok(sessions)
     }
 
-    fn repository_events(&self, who: &Principal, limit: usize) -> Result<Vec<ActivityEvent>> {
+    fn repository_events(
+        &self,
+        who: &Principal,
+        before: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<ActivityEvent>> {
         let conn = self.conn();
         // Driven from the subject index: the scope's token and intent ids, not every event.
         let mut statement = conn.prepare(&format!(
@@ -4100,6 +4107,7 @@ impl Store for SqliteStore {
                  UNION ALL
                  SELECT i.id FROM hub_intents i JOIN hub_agent_tokens t ON t.id = i.token
                  JOIN hub_users u ON u.id = t.owner WHERE {TOKEN_SCOPE})
+             AND (?6 IS NULL OR e.seq < ?6)
              ORDER BY e.seq DESC LIMIT ?5"
         ))?;
         let events = statement
@@ -4109,7 +4117,8 @@ impl Store for SqliteStore {
                     who.repository_id,
                     who.owner.identity.host,
                     who.owner.identity.provider,
-                    event_limit(limit)
+                    event_limit(limit),
+                    before
                 ],
                 |row| {
                     Ok(ActivityEvent {
@@ -5156,17 +5165,29 @@ impl Store for SqliteStore {
         &self,
         repository: &str,
         before: Option<&str>,
+        search: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Publication>> {
         let conn = self.conn();
+        let pattern = search.map(like_pattern);
+        let number = search.and_then(search_number);
         let mut statement = conn.prepare(&format!(
             "{PUBLICATION_SELECT} WHERE p.repository = ?1
              AND (?2 IS NULL OR (p.created_at, p.id) < (SELECT q.created_at, q.id
                  FROM hub_publications q WHERE q.repository = ?1 AND q.id = ?2))
+             AND (?4 IS NULL OR p.pr_number = ?5
+                 OR lower(p.branch) LIKE ?4 ESCAPE '\\' OR lower(p.base) LIKE ?4 ESCAPE '\\'
+                 OR lower(p.id) LIKE ?4 ESCAPE '\\' OR lower(u.login) LIKE ?4 ESCAPE '\\'
+                 OR lower(t.name) LIKE ?4 ESCAPE '\\'
+                 OR lower(json_extract(CASE WHEN length(p.manifest) <= 2097152 THEN p.manifest END,
+                     '$.title')) LIKE ?4 ESCAPE '\\')
              ORDER BY p.created_at DESC, p.id DESC LIMIT ?3"
         ))?;
         let rows = statement
-            .query_map(params![repository, before, limit as i64], publication_row)?
+            .query_map(
+                params![repository, before, limit as i64, pattern, number],
+                publication_row,
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -5505,6 +5526,82 @@ impl Store for SqliteStore {
         let item = scoped_work(&tx, &who, id, now)?;
         tx.commit()?;
         Ok(item)
+    }
+
+    fn work_search(
+        &self,
+        token: &str,
+        search: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+        now: i64,
+    ) -> Result<WorkSearchPage> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let who = work_who(&tx, token, now)?;
+        let after: Option<(i64, String)> = match cursor {
+            None => None,
+            Some(id) => Some(
+                tx.query_row(
+                    "SELECT updated_at, id FROM hub_work_items
+                     WHERE id = ?5 AND provider = ?1 AND host = ?2 AND repository = ?3
+                       AND repository_id IS ?4",
+                    params![
+                        who.owner.identity.provider,
+                        who.owner.identity.host,
+                        who.repository,
+                        who.repository_id,
+                        id
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| HubError::Invalid("unknown cursor".into()))?,
+            ),
+        };
+        let pattern = search.map(like_pattern);
+        let number = search.and_then(search_number).map(|n| n.to_string());
+        let mut statement = tx.prepare(
+            "SELECT w.id, w.title, w.state, w.lead_agent, u.login, w.branch, w.source_issue, w.updated_at
+             FROM hub_work_items w JOIN hub_users u ON u.id = w.owner
+             WHERE w.provider = ?1 AND w.host = ?2 AND w.repository = ?3 AND w.repository_id IS ?4
+               AND (?5 IS NULL OR (w.updated_at, w.id) < (?5, ?6))
+               AND (?7 IS NULL OR w.source_issue = ?8
+                 OR lower(w.title) LIKE ?7 ESCAPE '\\' OR lower(w.branch) LIKE ?7 ESCAPE '\\'
+                 OR lower(w.lead_agent) LIKE ?7 ESCAPE '\\' OR lower(u.login) LIKE ?7 ESCAPE '\\'
+                 OR lower(w.id) LIKE ?7 ESCAPE '\\' OR lower(w.scope) LIKE ?7 ESCAPE '\\')
+             ORDER BY w.updated_at DESC, w.id DESC LIMIT ?9",
+        )?;
+        let items = statement
+            .query_map(
+                params![
+                    who.owner.identity.provider,
+                    who.owner.identity.host,
+                    who.repository,
+                    who.repository_id,
+                    after.as_ref().map(|a| a.0),
+                    after.as_ref().map(|a| a.1.as_str()),
+                    pattern,
+                    number,
+                    limit as i64 + 1
+                ],
+                |row| {
+                    Ok(WorkSearchItem {
+                        id: row.get(0)?,
+                        title: row.get(1)?,
+                        state: row.get(2)?,
+                        lead_agent: row.get(3)?,
+                        owner: row.get(4)?,
+                        branch: row.get(5)?,
+                        source_issue: row.get(6)?,
+                        updated_at: row.get(7)?,
+                    })
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        tx.commit()?;
+        Ok(WorkSearchPage::of(items, limit))
     }
 
     fn change_ingest(

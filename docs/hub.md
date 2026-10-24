@@ -199,7 +199,7 @@ on no others:
 - `GET /v1/hub/health`, which needs no token
 - `GET /v1/hub/skill-workflows` for recent runs in an operator-mapped native repository
 - `GET /v1/hub/skill-workflows/{run_id}` for an operator-mapped native repository
-- `GET /v1/hub/standup/briefing` and `GET /v1/hub/standup/work/{id}` for the token's repository
+- `GET /v1/hub/standup/briefing`, `GET /v1/hub/standup/work?q=` (search) and `GET /v1/hub/standup/work/{id}` for the token's repository
 - `GET /v1/hub/repos/{repo}/change-records/{work_id}` for a concise source-bound handoff
 - `GET /v1/hub/repos/{repo}/publications` and `GET /v1/hub/repos/{repo}/publications/{id}`
   (stored state only; see [publications](#publishing-a-revision))
@@ -276,8 +276,10 @@ body or query string is a 400 with a fixed body.
   arrives or the time is up. A notice is published in the same process at
   once; otherwise the hub looks again every second, so a notice written by
   another hub process on the same database arrives within about a second.
-- `GET /v1/hub/repos/{repo}/activity?limit=<n>` is read-only and returns
-  `{"sessions": [S], "events": [E]}` for the token's repository. `S` is a live
+- `GET /v1/hub/repos/{repo}/activity?limit=<n>&before=<seq>` is read-only and returns
+  `{"sessions": [S], "events": [E], "next_before": seq|null}` for the token's repository.
+  `before` returns only events with a lower `seq`; `next_before` is the last returned event's
+  `seq` when older events exist, otherwise null. `sessions` does not page. `S` is a live
   session, one updated in the last 20 minutes, newest first, at most 200:
   `{key, agent: {token, name}, owner: {login}, intent, task, via, created_at,
   updated_at}` (`intent` and `task` may be null). A session's id is not
@@ -494,9 +496,19 @@ is 64 KiB. Tools:
 | `agentscm_work_insight` | `work_id` | Reads one bounded work insight projection. |
 | `agentscm_work_usage` | strict usage record | Idempotently reports partial token, attempt and optional cost evidence for the caller's current repository work. It does not prove complete capture or a verified bill. |
 
+Three read-only search tools are offered to read-only and writer tokens, with the bounds and reply
+shapes of their routes for the token's repository: `agentscm_work_search` `{q?, limit?, cursor?}` (as
+`GET /v1/hub/standup/work`), `agentscm_publications_list` `{q?, limit?, cursor?}` (as the publications
+list, `cursor` being `before`) and `agentscm_workflow_runs_list` `{q?, before?}` (as
+`GET /v1/hub/skill-workflows`). The work overview view also has a "Find work" box that calls
+`agentscm_work_search` and loads further pages on request.
+
 The six coordination tools use repo-relative path specs and carry the session's new notices.
 The workflow reads use no session and write no coordination events. `GET /v1/hub/skill-workflows`
-lists up to 16 newest-created retained runs for selection in the status page; the existing
+lists up to 16 newest-created retained runs for selection in the status page. `?before=<next_cursor>`
+pages older runs and `?q=TEXT` (200 bytes, case-insensitive) keeps runs whose id, workflow name, source
+revision or state contains it. A search reads at most 256 runs below the cursor, so a page can hold fewer
+than 16 runs while `next_cursor` is set because older runs may still match; follow it until it is null; the existing
 `GET /v1/hub/skill-workflows/{run_id}` returns one full retained projection. Read-only tokens discover
 only that tool; operator mapping and availability are described in the
 [workflow hub guide](advanced/skill-workflow-hub.md). Bad arguments and hub errors are tool results with
@@ -863,13 +875,16 @@ from it. The command authenticates with the agent token, configured as for
    it re-reads it, and records the merge once when GitHub reports it merged. Only an agent
    token's read does this. A read-only token gets the stored row with no forge call and no write.
    Its view of `pull_request` can lag until an agent read or the sync records the merge.
-5. `GET /v1/hub/repos/{repo}/publications?limit=25&before=ID` lists the repository's
+5. `GET /v1/hub/repos/{repo}/publications?limit=25&before=ID&q=TEXT` lists the repository's
    publications, newest first by creation time, then id. `limit` is 1 through 100. `before` is the
    previous page's `next_cursor`, which is a publication id; an unknown id is a 400. The reply is
    `{"publications": [...], "next_cursor": ID|null, "complete": bool}`, and `complete` is true
    exactly when `next_cursor` is null. Each item is the show reply plus `created_at` and
-   `updated_at` (unix seconds), without `forge_check` or `external`; fetch the publication for
-   those. The list reads the store only and calls no forge.
+   `updated_at` (unix seconds) and the manifest's `title` (omitted if the retained manifest cannot be read), without `forge_check` or `external`; fetch the publication for
+   those. The list reads the store only and calls no forge. `q` keeps publications whose branch,
+   base, title, id, owner login or agent name contains it (case-insensitive), or whose pull request
+   number it names (`123` or `#123`); it is at most 200 bytes with no control characters, and
+   `before` keeps paging inside the same `q`.
 
 The publication reports four states: `native_landed` (always true: the revision is
 already integrated natively), `branch` (`pending`, `created` or `rejected`, with the

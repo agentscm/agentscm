@@ -27,6 +27,8 @@ curl http://127.0.0.1:7331/health
 | `GET /v1/workflow/inspection?limit=4096` | The workflow subject's recorded diff. Each entry carries `before_text` or `before_base64`, and `after_text` or `after_base64`: `_text` when that side is valid UTF-8, `_base64` (standard alphabet) otherwise, and neither field for an absent side |
 | `GET /v1/collisions` | Git collision report (off unless `--collisions-repo` is set) |
 | `GET /v1/local/skill-workflow-library?change=…&library=…` | `skill-workflow library inspect` output for one template manifest |
+| `GET /v1/local/skill-workflows?before=…&q=…` | One page of 16 recent runs, `{"runs": [...], "next_cursor": …}`. `before` is the previous `next_cursor` (a positive integer); `q` is the shared search text below and matches run id, workflow name, source revision or state. With `q` at most 256 runs below the cursor are read, so a page can be short while `next_cursor` is set |
+| `GET /v1/local/changes?limit=50&after=…` | Current Change pointers by id, `{"changes": [{"id", "version"}], "next_after": id\|null}`. `limit` is 1 through 100; `after` is the previous `next_after`. `next_after` is null on the last page |
 | `GET /v1/local/skill-workflows/{run_id}/handoff` | `skill-workflow handoff` output for one retained run |
 | `GET /v1/local/workspace/timeline?limit=25&before=…` | `workspace timeline` page (off unless `--timeline-workspace` is set) |
 | `GET /v1/local/workspace/timeline/{id}` | `workspace entry` view |
@@ -135,7 +137,19 @@ port), or it gets 421. This stops a page whose DNS name was rebound to the loopb
 reading these routes as its own origin, with or without a token. A proxy in front of a `--public`
 bind must forward a loopback `Host`.
 
-Its repository-authenticated stand-up routes also include `POST /v1/hub/standup/usage`,
+List and search parameters share these rules on the Hub and on `serve`. `limit` is an integer in the
+endpoint's range, otherwise 400. `q` is trimmed; empty means no filter; more than 200 bytes or any
+control character is a 400. Matching is case-insensitive substring, and `%`, `_` and `\` in `q` are
+literal. Where a record has a number, `q` of `123` or `#123` also matches it exactly. A cursor is the
+opaque value the previous page returned (`next_cursor`, or `next_before` on activity); an unknown
+or malformed cursor is a 400, never an empty page. `q` applies on every page.
+
+Its repository-authenticated stand-up routes also include `GET /v1/hub/standup/work?q=…&limit=20&cursor=…`,
+which finds work by text, finished work included, newest `updated_at` first (limit 1 through 50;
+`cursor` is the previous `next_cursor`, a work id). It matches title, branch, lead agent, owner login,
+work id, scope paths and the source issue number. The reply is `{"items": [{id, title, state,
+lead_agent, owner, branch, source_issue, updated_at}], "next_cursor": id|null, "complete": bool}`.
+Read-only tokens may call it. Items of `GET /v1/hub/repos/{repo}/publications` also carry the manifest `title`. It also includes `POST /v1/hub/standup/usage`,
 `GET /v1/hub/standup/insights` and `GET /v1/hub/standup/work/{work_id}/insights`.
 The first stores one idempotent partial usage report; the GET routes return bounded
 work projections. See [work insights](work-insights.md) for pagination and evidence limits.

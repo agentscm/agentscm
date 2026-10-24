@@ -36,6 +36,8 @@ export interface Publication {
   revision: string
   commit: string
   branch: string
+  /** The change's title when the hub sends one. */
+  title: string | null
   base: string
   nativeLanded: boolean
   branchState: BranchState
@@ -106,6 +108,7 @@ export function decodePublication(v: unknown): Publication {
     revision: clean(p['revision'], 128),
     commit: clean(p['commit'], 64),
     branch: clean(p['branch']),
+    title: cleanOrNull(p['title']),
     base: clean(p['base']),
     nativeLanded: states['native_landed'] === true,
     branchState: pick(branch['state'], ['pending', 'created', 'rejected'] as const, 'unknown'),
@@ -162,9 +165,10 @@ export type PublicationList =
  * Newest first, `{publications, next_cursor, complete}`. Items have no `external` or `forge_check` (fetch the
  * show reply for those) and add `created_at`/`updated_at`. `next_cursor` is the last item's id.
  */
-export async function listPublications(repo: string, token: string, signal: AbortSignal, before?: string): Promise<PublicationList> {
-  const q = new URLSearchParams({ limit: '25' })
+export async function listPublications(repo: string, token: string, signal: AbortSignal, before?: string, opts: { q?: string; limit?: number } = {}): Promise<PublicationList> {
+  const q = new URLSearchParams({ limit: String(opts.limit ?? 25) })
   if (before) q.set('before', before)
+  if (opts.q) q.set('q', opts.q)
   try {
     const body = rec(await get(`${repoPath(repo)}?${q}`, token, signal))
     const items = Array.isArray(body['publications']) ? body['publications'] : []

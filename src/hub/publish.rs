@@ -26,7 +26,7 @@ use super::external_runs::ExternalKind;
 use super::github::{Gh, GhError, parse_rfc3339, valid_ref_name};
 use super::http::{ApiError, Authenticated, JsonBody, Reader, blocking};
 use super::intent::scope;
-use super::store::{Event, Principal, lower_hex_of, unix_now};
+use super::store::{Event, Principal, Store, lower_hex_of, unix_now};
 use super::sync::{failed, find_repository};
 use super::{HubError, HubState, Result};
 use crate::backend::{ObjectKey, SOURCE_PROFILE_V1};
@@ -935,14 +935,15 @@ pub(super) async fn publication_on_forge(
 }
 
 /// Publications listed per page by default and at most.
-const DEFAULT_LISTED: usize = 25;
-const MAX_LISTED: usize = 100;
+pub(super) const DEFAULT_LISTED: usize = 25;
+pub(super) const MAX_LISTED: usize = 100;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ListQuery {
     limit: Option<usize>,
     before: Option<String>,
+    q: Option<String>,
 }
 
 /// The repository's publications, newest first, for the status page. Store rows only: no forge
@@ -959,20 +960,37 @@ async fn list(
     if !(1..=MAX_LISTED).contains(&limit) {
         return Err(ApiError::invalid());
     }
+    let search = super::store::search_text(query.q.as_deref())?;
     let store = state.store.clone();
-    let mut rows = blocking(&state, move || {
-        // An unknown cursor is a bad request, not an empty page.
-        if let Some(before) = &query.before
-            && store.publication(&repo, before)?.is_none()
-        {
-            return Ok(None);
-        }
-        store
-            .publications(&repo, query.before.as_deref(), limit + 1)
-            .map(Some)
+    let page = blocking(&state, move || {
+        publication_page(
+            &*store,
+            &repo,
+            query.before.as_deref(),
+            search.as_deref(),
+            limit,
+        )
     })
     .await?
     .ok_or_else(ApiError::invalid)?;
+    Ok(Json(page))
+}
+
+/// One page of the listing as JSON; `None` when `before` names no publication of `repo`.
+pub(super) fn publication_page(
+    store: &dyn Store,
+    repo: &str,
+    before: Option<&str>,
+    search: Option<&str>,
+    limit: usize,
+) -> Result<Option<Value>> {
+    // An unknown cursor is a bad request, not an empty page.
+    if let Some(before) = before
+        && store.publication(repo, before)?.is_none()
+    {
+        return Ok(None);
+    }
+    let mut rows = store.publications(repo, before, search, limit + 1)?;
     let next_cursor = if rows.len() > limit {
         rows.truncate(limit);
         rows.last().map(|p| p.id.clone())
@@ -985,10 +1003,14 @@ async fn list(
             let mut item = p.to_json();
             item["created_at"] = json!(p.created_at);
             item["updated_at"] = json!(p.updated_at);
+            // Absent when the retained manifest cannot be read.
+            if let Ok(manifest) = p.manifest() {
+                item["title"] = json!(manifest.title);
+            }
             item
         })
         .collect();
-    Ok(Json(json!({"publications": publications,
+    Ok(Some(json!({"publications": publications,
         "complete": next_cursor.is_none(), "next_cursor": next_cursor})))
 }
 

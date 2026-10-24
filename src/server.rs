@@ -178,7 +178,9 @@ fn local_access(token: Option<String>, origins: Vec<String>) -> Result<LocalAcce
 fn router(state: AppState, access: LocalAccess) -> Router {
     let local = Router::new()
         .route("/v1/local/skill-workflow-library", get(library_inspect))
+        .route("/v1/local/skill-workflows", get(skill_workflow_page))
         .route("/v1/local/skill-workflows/{run_id}/handoff", get(handoff))
+        .route("/v1/local/changes", get(change_page))
         .route("/v1/local/workspace/timeline", get(timeline_page))
         .route("/v1/local/workspace/timeline/{id}", get(timeline_entry))
         .route("/v1/local/workspace/diff", get(timeline_diff))
@@ -300,6 +302,63 @@ fn authorized(token: Option<&str>, headers: &HeaderMap) -> bool {
             .zip(token.as_bytes())
             .fold(0, |acc, (x, y)| acc | (x ^ y))
             == 0
+}
+
+/// Pages recent workflow runs, optionally filtered by `q`, as the Hub does.
+async fn skill_workflow_page(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
+    let parsed = named_fields(raw.as_deref(), &["before", "q"]).and_then(|fields| {
+        let before: Option<i64> = optional_number(&fields, "before")?;
+        let search = agentscm::hub::store::search_text(fields.get("q").map(String::as_str))
+            .map_err(|_| {
+                ApiError::limit("q must be at most 200 bytes without control characters")
+            })?;
+        Ok((before, search))
+    });
+    let (before, search) = match parsed {
+        Ok(parsed) => parsed,
+        Err(error) => return read_error(error, "skill workflow list"),
+    };
+    let data_dir = state.data_dir.clone();
+    local_read(state, "skill workflow list", move || {
+        let page =
+            agentscm::skill_workflow_service::list_page(&data_dir, 16, before, search.as_deref())?;
+        Ok(serde_json::to_value(page)?)
+    })
+    .await
+}
+
+/// Pages current Change pointers by ID: `limit` (1..=100, default 50) and the last ID as `after`.
+async fn change_page(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
+    let parsed = named_fields(raw.as_deref(), &["limit", "after"]).and_then(|mut fields| {
+        let limit: usize = optional_number(&fields, "limit")?.unwrap_or(50);
+        if !(1..=100).contains(&limit) {
+            return Err(ApiError::limit("limit must be 1 through 100"));
+        }
+        let after = fields.remove("after");
+        if let Some(after) = &after {
+            check_text(after, "after")?;
+        }
+        Ok((limit, after))
+    });
+    let (limit, after) = match parsed {
+        Ok(parsed) => parsed,
+        Err(error) => return read_error(error, "change list"),
+    };
+    let data_dir = state.data_dir.clone();
+    local_read(state, "change list", move || {
+        // One extra row says whether more follow; at the 100-row cap a full page counts as more.
+        let mut changes = agentscm::authority::Authority::open_read_only(&data_dir)?
+            .list_changes((limit + 1).min(100), after.as_deref())?;
+        let more = changes.len() > limit || (limit == 100 && changes.len() == 100);
+        changes.truncate(limit);
+        let next_after = more.then(|| changes.last().map(|c| c.id.id.clone()));
+        let changes: Vec<_> = changes
+            .iter()
+            .map(|c| json!({"id": c.id.id, "version": c.version}))
+            .collect();
+        Ok(json!({"changes": changes, "next_after": next_after.flatten()}))
+    })
+    .await
 }
 
 async fn library_inspect(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {

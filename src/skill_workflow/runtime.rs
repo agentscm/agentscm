@@ -738,47 +738,86 @@ pub struct RunPage {
 }
 
 pub fn list_runs(data_dir: &Path, limit: usize) -> Result<Vec<RunSummary>> {
-    Ok(list_run_page(data_dir, limit, None)?.runs)
+    Ok(list_run_page(data_dir, limit, None, None)?.runs)
 }
 
-/// Newest-created runs using a bounded keyset cursor, never an unbounded scan.
-pub fn list_run_page(data_dir: &Path, limit: usize, before: Option<i64>) -> Result<RunPage> {
+/// Rows read below the cursor when a search text filters a page.
+const SEARCH_SCAN_ROWS: usize = 256;
+
+/// Newest-created runs using a bounded keyset cursor, never an unbounded scan. With `search`
+/// (lowercased substring of run id, name, source revision or state) at most
+/// [`SEARCH_SCAN_ROWS`] rows below the cursor are read; when that window ends before the page
+/// fills, the cursor is the last row read, because older runs may still match.
+pub fn list_run_page(
+    data_dir: &Path,
+    limit: usize,
+    before: Option<i64>,
+    search: Option<&str>,
+) -> Result<RunPage> {
     if !(1..=16).contains(&limit) || before.is_some_and(|value| value <= 0) {
         return Err(Error::Limit(
             "workflow list requires 1..16 runs and a positive cursor".into(),
         ));
     }
+    let needle = search.map(str::to_lowercase);
+    let fetch = if needle.is_some() {
+        SEARCH_SCAN_ROWS
+    } else {
+        limit + 1
+    };
     let journal = Journal::open(data_dir, OpenMode::Read)?;
     let mut statement = journal.connection.prepare(
         "SELECT run_id,rowid FROM workflow_runs WHERE rowid<=?1 ORDER BY rowid DESC LIMIT ?2",
     )?;
-    let mut ids = statement
+    let ids = statement
         .query_map(
-            params![before.map_or(i64::MAX, |value| value - 1), limit + 1],
+            params![before.map_or(i64::MAX, |value| value - 1), fetch],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let more = ids.len() > limit;
-    ids.truncate(limit);
-    let runs = ids
-        .into_iter()
-        .map(|(run_id, sequence)| {
-            validate_run_id(&run_id)?;
-            if sequence <= 0 {
-                return Err(Error::Invalid("invalid workflow creation sequence".into()));
+    let last_scanned = ids.last().map(|(_, sequence)| sequence.to_string());
+    let window_full = ids.len() == SEARCH_SCAN_ROWS;
+    let mut runs: Vec<RunSummary> = Vec::new();
+    let mut more = false;
+    for (run_id, sequence) in ids {
+        if needle.is_none() && runs.len() == limit {
+            more = true;
+            break;
+        }
+        validate_run_id(&run_id)?;
+        if sequence <= 0 {
+            return Err(Error::Invalid("invalid workflow creation sequence".into()));
+        }
+        let run = journal.stored_run(&run_id)?;
+        let summary = RunSummary {
+            run_id,
+            name: run.definition.name,
+            sequence: sequence.to_string(),
+            revision: run.definition.source.revision,
+            state: run.state,
+        };
+        if let Some(needle) = &needle {
+            let state = serde_json::to_value(summary.state)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_default();
+            let found = [&summary.run_id, &summary.name, &summary.revision, &state]
+                .iter()
+                .any(|text| text.to_lowercase().contains(needle.as_str()));
+            if !found {
+                continue;
             }
-            let run = journal.stored_run(&run_id)?;
-            Ok(RunSummary {
-                run_id,
-                name: run.definition.name,
-                sequence: sequence.to_string(),
-                revision: run.definition.source.revision,
-                state: run.state,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+            if runs.len() == limit {
+                more = true;
+                break;
+            }
+        }
+        runs.push(summary);
+    }
     let next_cursor = if more {
         runs.last().map(|run| run.sequence.clone())
+    } else if needle.is_some() && window_full {
+        last_scanned
     } else {
         None
     };

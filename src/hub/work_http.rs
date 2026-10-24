@@ -10,10 +10,11 @@ use serde_json::json;
 
 use super::http::{ApiError, Authenticated, JsonBody, Reader, blocking};
 use super::insights::{InsightPage, InsightQuery, UsageReceipt, UsageRecord, WorkInsight};
-use super::store::unix_now;
+use super::store::{search_text, unix_now};
 use super::work::{
-    Briefing, BriefingAck, BriefingQuery, CheckpointKind, WorkCheckpoint, WorkCheckpointResult,
-    WorkItem, WorkOverview, WorkOverviewQuery, WorkStart, WorkStartResult, WorkState,
+    Briefing, BriefingAck, BriefingQuery, CheckpointKind, DEFAULT_WORK_SEARCH, MAX_WORK_SEARCH,
+    WorkCheckpoint, WorkCheckpointResult, WorkItem, WorkOverview, WorkOverviewQuery,
+    WorkSearchPage, WorkStart, WorkStartResult, WorkState,
 };
 use super::{HubError, HubState};
 
@@ -29,6 +30,42 @@ pub fn routes() -> Router<HubState> {
         .route("/v1/hub/standup/insights", get(insights))
         .route("/v1/hub/standup/work/{id}/insights", get(insight))
         .route("/v1/hub/standup/work/{id}", get(work))
+        .route("/v1/hub/standup/work", get(work_search))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkSearchQuery {
+    q: Option<String>,
+    limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+/// Finds work of the token's repository by text, finished work included, one page at a time.
+async fn work_search(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+    query: std::result::Result<Query<WorkSearchQuery>, QueryRejection>,
+) -> Result<Json<WorkSearchPage>, ApiError> {
+    let Query(query) = query.map_err(|_| ApiError::invalid())?;
+    let limit = query.limit.unwrap_or(DEFAULT_WORK_SEARCH);
+    if !(1..=MAX_WORK_SEARCH).contains(&limit) {
+        return Err(ApiError::invalid());
+    }
+    let search = search_text(query.q.as_deref())?;
+    let store = state.store.clone();
+    Ok(Json(
+        blocking(&state, move || {
+            store.work_search(
+                &principal.token_id,
+                search.as_deref(),
+                query.cursor.as_deref(),
+                limit,
+                unix_now(),
+            )
+        })
+        .await?,
+    ))
 }
 
 async fn usage(

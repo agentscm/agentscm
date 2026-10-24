@@ -4,6 +4,8 @@ import { validSkillWorkflowRunId, validSkillWorkflowStepId } from '../skillWorkf
 import type { SkillWorkflowProjection, SkillWorkflowRunState, SkillWorkflowStep, SkillWorkflowStepState } from '../types.ts'
 import { Box, Empty, Explain, Icon, Notice, Path, Pill, Skeleton, Tip, type Tone } from '../ui.tsx'
 import { usePoll } from '../usePoll.ts'
+import { Combobox } from '../Combobox.tsx'
+import { hashPath, Pager, useHashCursor } from '../Pager.tsx'
 
 type Route = { kind: 'list' } | { kind: 'run'; runId: string; stepId?: string }
 
@@ -26,7 +28,7 @@ const decode = (v: string) => {
   }
 }
 export function routeFromHash(hash = window.location.hash): Route {
-  const parts = hash.slice(1).split('/')
+  const parts = hashPath(hash).slice(1).split('/')
   if (parts[0] !== 'workflows' || parts[1] !== 'runs' || !parts[2]) return { kind: 'list' }
   const runId = decode(parts[2])
   if (!runId || !validSkillWorkflowRunId(runId)) return { kind: 'list' }
@@ -213,14 +215,37 @@ function Run({ token, runId, stepId }: { token: string; runId: string; stepId?: 
   )
 }
 
+/** Find a retained run by name, state, revision or ID; a pasted run ID opens directly. */
+function RunPicker({ token }: { token: string }) {
+  return (
+    <Combobox
+      id="workflow-run-picker"
+      data-tour="workflow-run-picker"
+      label="Find a run"
+      placeholder="Find a run by name, state or ID"
+      parseId={(t) => (validSkillWorkflowRunId(t) ? t : null)}
+      onSelect={(id) => { window.location.hash = runHref(id).slice(1) }}
+      search={async (q, signal) => {
+        const r = await fetchSkillWorkflows(token, signal, undefined, q)
+        if (r.availability !== 'available') return { options: [] }
+        return {
+          more: r.next_cursor !== null,
+          options: r.runs.map((run) => {
+            const st = stateOf(run.state)
+            return { value: run.run_id, text: run.name, label: run.name, secondary: run.run_id, meta: <><Pill tone={st.tone}>{st.label}</Pill> <span className="small muted">rev <code>{run.revision.slice(0, 10)}</code></span></> }
+          }),
+        }
+      }}
+    />
+  )
+}
+
 function List({ token }: { token: string }) {
-  const [cursors, setCursors] = useState<(string | null)[]>([null])
+  const pager = useHashCursor()
   const [query, setQuery] = useState('')
   const [status, setStatus] = useState('all')
-  const [lookup, setLookup] = useState('')
-  const cursor = cursors[cursors.length - 1] ?? null
+  const cursor = pager.cursor
   const load = usePoll((signal) => fetchSkillWorkflows(token, signal, cursor ?? undefined), 0, String(cursor))
-  const lookupValid = validSkillWorkflowRunId(lookup.trim())
   return (
     <div className="page">
       <div className="answer">
@@ -233,10 +258,7 @@ function List({ token }: { token: string }) {
         explain="Skill workflows are multi-step checks (tests, reviews) run by a local controller and recorded on the hub."
         count={load.kind === 'ready' && load.value.availability === 'available' ? load.value.runs.length : undefined}
         actions={
-          <form className="d-flex gap-2" onSubmit={(e) => { e.preventDefault(); if (lookupValid) window.location.hash = runHref(lookup.trim()) }}>
-            <input className="form-control form-control-sm" placeholder="Open run by ID" aria-label="Run ID" value={lookup} onChange={(e) => setLookup(e.target.value)} />
-            <button className="btn btn-sm btn-outline-secondary" disabled={!lookupValid} type="submit"><Icon name="search" /></button>
-          </form>
+          <RunPicker token={token} />
         }
       >
         {load.kind === 'loading' && <Skeleton rows={4} />}
@@ -281,12 +303,7 @@ function List({ token }: { token: string }) {
                   })}
                 </ul>
               )}
-              {(cursors.length > 1 || nextCursor) && (
-                <nav className="pager">
-                  <button type="button" className="btn btn-sm btn-outline-secondary" disabled={cursors.length === 1} onClick={() => setCursors((c) => c.slice(0, -1))}><Icon name="chevron-left" /> Newer</button>
-                  <button type="button" className="btn btn-sm btn-outline-secondary" disabled={!nextCursor} onClick={() => nextCursor && setCursors((c) => [...c, nextCursor])}>Older <Icon name="chevron-right" /></button>
-                </nav>
-              )}
+              <Pager onNewer={pager.canNewer ? pager.newer : undefined} onOlder={nextCursor ? () => pager.older(nextCursor) : undefined} complete={!nextCursor} />
             </>
           )
         })()}

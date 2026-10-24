@@ -228,26 +228,65 @@ fn suite(store: Arc<dyn Store>) {
     done(store.create_publication(&capped, &over, now).unwrap());
 
     // Listing is newest first by created time, then id, and pages strictly before a cursor.
-    let all = store.publications(REPO, None, 100).unwrap();
+    let all = store.publications(REPO, None, None, 100).unwrap();
     assert!(all.len() > 2);
     assert!(
         all.windows(2)
             .all(|w| (w[0].created_at, &w[0].id) > (w[1].created_at, &w[1].id))
     );
-    assert_eq!(store.publications(REPO, None, 1).unwrap(), all[..1]);
+    assert_eq!(store.publications(REPO, None, None, 1).unwrap(), all[..1]);
     assert_eq!(
-        store.publications(REPO, Some(&all[1].id), 100).unwrap(),
+        store
+            .publications(REPO, Some(&all[1].id), None, 100)
+            .unwrap(),
         all[2..]
     );
     assert!(
         store
-            .publications(REPO, Some("pub_missing"), 100)
+            .publications(REPO, Some("pub_missing"), None, 100)
             .unwrap()
             .is_empty()
     );
     assert!(
         store
-            .publications("acme/other", None, 100)
+            .publications("acme/other", None, None, 100)
+            .unwrap()
+            .is_empty()
+    );
+
+    // Search: case-insensitive substring over branch, base, id, owner, agent and title, plus the
+    // pull request number; LIKE wildcards are literal; paging keeps the filter.
+    let titled = done(
+        store
+            .create_publication(&token, &new_on("Quarterly Rollup", "feat/title"), now)
+            .unwrap(),
+    );
+    let found = |q: &str| -> Vec<String> {
+        store
+            .publications(REPO, None, Some(q), 100)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect()
+    };
+    assert_eq!(found("QUARTERLY roll"), std::slice::from_ref(&titled.id));
+    assert_eq!(found("FEAT/TITLE"), std::slice::from_ref(&titled.id));
+    assert_eq!(found(&titled.id[4..12]), std::slice::from_ref(&titled.id));
+    assert_eq!(found("#12"), std::slice::from_ref(&id.to_owned()));
+    assert!(found("100%").is_empty() && found("p_b").is_empty() && found("\\").is_empty());
+    assert_eq!(
+        found("alice").len(),
+        store.publications(REPO, None, None, 100).unwrap().len()
+    );
+    let page = store.publications(REPO, None, Some("feat/n"), 2).unwrap();
+    let rest = store
+        .publications(REPO, Some(&page[1].id), Some("feat/n"), 100)
+        .unwrap();
+    assert_eq!(page.len() + rest.len(), found("feat/n").len());
+    assert!(rest.iter().all(|p| p.branch.starts_with("feat/n")));
+    assert!(
+        store
+            .publications("acme/other", None, Some("alice"), 100)
             .unwrap()
             .is_empty()
     );

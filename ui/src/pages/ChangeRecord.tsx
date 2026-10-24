@@ -17,8 +17,11 @@ import {
   type ChangeRecordSummaryV1,
   type ChangeRecordUnknown,
 } from '../changeRecord.ts'
-import { validWorkId } from '../standup.ts'
-import { Ago, Box, Empty, Explain, Icon, Notice, Path, Paths, Pill, Skeleton, type Tone } from '../ui.tsx'
+import { searchStandupWork, validWorkId, type WorkState } from '../standup.ts'
+import { StatePill } from './Work.tsx'
+import { Ago, Box, Empty, Explain, Icon, Notice, Path, Paths, Pill, Skeleton, relative, type Tone } from '../ui.tsx'
+import { Combobox } from '../Combobox.tsx'
+import { hashPath } from '../Pager.tsx'
 import { usePoll } from '../usePoll.ts'
 
 type Status = { label: string; tone: Tone; icon: string; explanation: string }
@@ -126,7 +129,7 @@ export const changeRecordHref = (workId: string) => `#change-record/${encodeURIC
 
 /** `#change-record/<work-id>` opens one concise record. Invalid or malformed IDs open the lookup. */
 export function changeRecordIdFromHash(hash = window.location.hash): string | null {
-  const match = /^#change-record\/([^/]+)$/.exec(hash)
+  const match = /^#change-record\/([^/]+)$/.exec(hashPath(hash))
   if (!match) return null
   try {
     const workId = decodeURIComponent(match[1]!)
@@ -149,40 +152,52 @@ function Fact({ label, children, explain }: { label: string; children: ReactNode
   )
 }
 
-function Lookup() {
-  const [value, setValue] = useState('')
-  const workId = value.trim()
-  const valid = validWorkId(workId)
+const WORK_STATE_PILL: Record<WorkState, true> = { active: true, blocked: true, handover: true, paused: true, finished: true }
+
+function Lookup({ token }: { token: string }) {
   return (
     <div className="page">
       <div className="answer">
         <h1 className="page-question">What is ready to hand off?</h1>
         <p className="answer-text">Open a work item to see its source, recorded checks, decision, gaps and next action.</p>
       </div>
-      <Box icon="search" title="Open a change record" explain="Use the durable work ID shown on the Work page or returned by an agent.">
-        <form
-          className="lookup"
-          onSubmit={(event) => {
-            event.preventDefault()
-            if (valid) window.location.hash = changeRecordHref(workId).slice(1)
-          }}
-        >
-          <label className="visually-hidden" htmlFor="change-record-work-id">Work ID</label>
-          <input
+      <Box icon="search" title="Open a change record" explain="Search by title, agent, branch or issue number, or paste the durable work ID shown on the Work page or returned by an agent.">
+        <div className="lookup">
+          <Combobox
             id="change-record-work-id"
-            className={`form-control${workId && !valid ? ' is-invalid' : ''}`}
-            placeholder="wrk_..."
-            value={value}
-            onChange={(event) => setValue(event.target.value)}
-            aria-describedby="change-record-work-id-help"
-            spellCheck={false}
-            autoComplete="off"
+            data-tour="change-record-picker"
+            label="Find a work item"
+            placeholder="Search by title, agent or branch, or paste a wrk_ ID"
+            describedBy="change-record-work-id-help"
+            parseId={(t) => (validWorkId(t) ? t : null)}
+            onSelect={(id) => { window.location.hash = changeRecordHref(id).slice(1) }}
+            search={async (q, signal) => {
+              const r = await searchStandupWork(token, signal, { q, limit: 10 })
+              return {
+                more: r.next_cursor !== null,
+                options: r.items.map((w) => ({
+                  value: w.id,
+                  text: w.title,
+                  secondary: w.id,
+                  label: (
+                    <>
+                      {w.title}
+                      {w.lead_agent ? <span className="small muted"> · {w.lead_agent}</span> : null}
+                      {w.branch ? <> <code className="branch-name small">{w.branch}</code></> : null}
+                    </>
+                  ),
+                  meta: (
+                    <>
+                      {w.state in WORK_STATE_PILL ? <StatePill state={w.state as WorkState} /> : w.state ? <Pill tone="muted">{w.state}</Pill> : null}
+                      {w.updated_at ? <span className="small muted">{relative(w.updated_at, Date.now())}</span> : null}
+                    </>
+                  ),
+                })),
+              }
+            }}
           />
-          <button type="submit" className="btn btn-primary" disabled={!valid}><Icon name="arrow-right" /> Open</button>
-        </form>
-        <div id="change-record-work-id-help" className={workId && !valid ? 'invalid-feedback d-block' : 'form-text'}>
-          {workId && !valid ? 'Enter a complete durable work ID.' : 'Opening a record is read-only and does not acknowledge or transfer the work.'}
         </div>
+        <div id="change-record-work-id-help" className="form-text">Opening a record is read-only and does not acknowledge or transfer the work.</div>
       </Box>
     </div>
   )
@@ -449,5 +464,5 @@ export function ChangeRecordPage({ repo, token }: { repo: string | null; token: 
     return () => window.removeEventListener('hashchange', onHash)
   }, [])
   if (!repo) return <Skeleton rows={4} />
-  return workId ? <Detail key={workId} repo={repo} token={token} workId={workId} /> : <Lookup />
+  return workId ? <Detail key={workId} repo={repo} token={token} workId={workId} /> : <Lookup token={token} />
 }

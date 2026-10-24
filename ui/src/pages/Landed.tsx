@@ -1,13 +1,15 @@
 import { useEffect, useState } from 'react'
 import { fetchPublication, headline, listPublications, listTrack, loadRecent, rememberRecent, track, validPublicationId, type ExternalRun, type ExternalState, type Outcome, type Publication, type Step } from '../publications.ts'
-import { Ago, Box, Empty, Explain, Icon, Notice, Pill, Skeleton, Tip, type Tone } from '../ui.tsx'
+import { Ago, Box, Empty, Explain, Icon, Notice, Pill, Skeleton, Tip, relative, type Tone } from '../ui.tsx'
+import { Combobox } from '../Combobox.tsx'
+import { hashPath, Pager, useHashCursor } from '../Pager.tsx'
 import { usePoll } from '../usePoll.ts'
 
 export const landedHref = (id: string) => `#landed/${encodeURIComponent(id)}`
 
 /** `#landed` is the list; `#landed/<id>` one change. A malformed id is just the list. */
 export function landedIdFromHash(hash = window.location.hash): string | null {
-  const m = /^#landed\/([^/]+)$/.exec(hash)
+  const m = /^#landed\/([^/]+)$/.exec(hashPath(hash))
   if (!m) return null
   try {
     const id = decodeURIComponent(m[1]!)
@@ -179,24 +181,49 @@ function Detail({ repo, id, token }: { repo: string; id: string; token: string }
   )
 }
 
-function Lookup({ recent, onOpen }: { recent: string[]; onOpen: (id: string) => void }) {
-  const [value, setValue] = useState('')
-  const id = value.trim()
-  const valid = validPublicationId(id)
+function Lookup({ repo, token, recent, onOpen }: { repo: string; token: string; recent: string[]; onOpen: (id: string) => void }) {
   return (
-    <Box icon="search" title="Open a change by ID" explain="A change's ID starts with pub_. The publishing agent prints it, and it appears in pull request comments the hub posts.">
-      <form
-        className="lookup"
-        onSubmit={(e) => {
-          e.preventDefault()
-          if (valid) onOpen(id)
-        }}
-      >
-        <label className="visually-hidden" htmlFor="landed-id">Change ID</label>
-        <input id="landed-id" className={`form-control${id && !valid ? ' is-invalid' : ''}`} placeholder="pub_…" value={value} onChange={(e) => setValue(e.target.value)} aria-describedby="landed-id-help" spellCheck={false} autoComplete="off" />
-        <button type="submit" className="btn btn-primary" disabled={!valid}><Icon name="arrow-right" /> Open</button>
-      </form>
-      <div id="landed-id-help" className={id && !valid ? 'invalid-feedback d-block' : 'form-text'}>{id && !valid ? 'An ID looks like pub_ followed by 32 letters and digits.' : 'Paste the ID of a change your agents published.'}</div>
+    <Box icon="search" title="Find a change" explain="Search by branch, title, pull request number or ID. A change's ID starts with pub_; the publishing agent prints it, and it appears in pull request comments the hub posts.">
+      <div className="lookup">
+        <Combobox
+          id="landed-id"
+          data-tour="landed-picker"
+          label="Find a change"
+          placeholder="Search by branch, title or PR number, or paste a pub_ ID"
+          describedBy="landed-id-help"
+          parseId={(t) => (validPublicationId(t) ? t : null)}
+          onSelect={(id) => onOpen(id)}
+          search={async (q, signal) => {
+            const r = await listPublications(repo, token, signal, undefined, { q, limit: 10 })
+            if (!r.supported) return { options: [] }
+            return {
+              more: r.nextCursor !== null,
+              options: r.publications.map((p) => {
+                const h = headline(p)
+                return {
+                  value: p.id,
+                  text: p.branch || p.id,
+                  secondary: p.id,
+                  label: (
+                    <>
+                      <code className="branch-name">{p.branch || p.id}</code>
+                      {p.pr.number !== null ? <span className="small muted"> · PR #{p.pr.number}</span> : null}
+                      {p.title ? <span className="small"> · {p.title}</span> : null}
+                    </>
+                  ),
+                  meta: (
+                    <>
+                      <Pill tone={h.tone}>{h.text}</Pill>
+                      {p.updatedAt ? <span className="small muted">{relative(p.updatedAt, Date.now())}</span> : null}
+                    </>
+                  ),
+                }
+              }),
+            }
+          }}
+        />
+      </div>
+      <div id="landed-id-help" className="form-text">Pick a change, or paste the ID of one your agents published.</div>
       {recent.length > 0 && (
         <div className="recent">
           <span className="small muted">Opened recently in this browser:</span>
@@ -255,8 +282,8 @@ function useDetails(repo: string, token: string, ids: string[]): Record<string, 
 }
 
 function List({ repo, token }: { repo: string; token: string }) {
-  const [cursors, setCursors] = useState<string[]>([''])
-  const cursor = cursors.at(-1) ?? ''
+  const pager = useHashCursor()
+  const cursor = pager.cursor ?? ''
   const load = usePoll((signal) => listPublications(repo, token, signal, cursor || undefined), cursor ? 0 : 15_000, `${repo}|${cursor}`)
   const recent = loadRecent()
   const ready = load.kind === 'ready' && load.value.supported ? load.value : null
@@ -282,7 +309,7 @@ function List({ repo, token }: { repo: string; token: string }) {
                 : <>{landed.length} of {ready.publications.length} recent change{ready.publications.length === 1 ? '' : 's'} landed{failing.length ? <>, and <span className="text-danger-emphasis">{failing.length} had a failure after landing</span></> : null}.</>}
         </p>
       </div>
-      <Lookup recent={recent} onOpen={(id) => { window.location.hash = landedHref(id).slice(1) }} />
+      <Lookup repo={repo} token={token} recent={recent} onOpen={(id) => { window.location.hash = landedHref(id).slice(1) }} />
       <Box icon="rocket-takeoff" title="Recent changes" count={ready ? ready.publications.length : undefined} explain="Changes agents published to this repository through the hub, newest first. Each row shows how far it got.">
         {load.kind === 'loading' ? (
           <Skeleton rows={4} />
@@ -313,14 +340,7 @@ function List({ repo, token }: { repo: string; token: string }) {
                 )
               })}
             </ul>
-            <nav className="pager">
-              {cursors.length > 1 && <button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => setCursors((c) => c.slice(0, -1))}><Icon name="chevron-left" /> Newer changes</button>}
-              {ready.nextCursor ? (
-                <button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => setCursors((c) => [...c, ready.nextCursor!])}>Older changes <Icon name="chevron-right" /></button>
-              ) : ready.complete ? (
-                <span className="small muted"><Icon name="check2" /> That’s everything.</span>
-              ) : null}
-            </nav>
+            <Pager newerLabel="Newer changes" olderLabel="Older changes" onNewer={pager.canNewer ? pager.newer : undefined} onOlder={ready.nextCursor ? () => pager.older(ready.nextCursor!) : undefined} complete={ready.complete} />
             <SyncNote />
           </>
         )}

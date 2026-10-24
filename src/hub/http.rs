@@ -2,12 +2,14 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use axum::extract::{FromRequest, FromRequestParts, Json, Path, RawQuery, Request, State};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{FromRequest, FromRequestParts, Json, Path, Query, RawQuery, Request, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Router, extract::rejection::JsonRejection};
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 
@@ -427,28 +429,39 @@ async fn skill_workflow(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillWorkflowsQuery {
+    before: Option<String>,
+    q: Option<String>,
+}
+
+/// Parses a positive decimal cursor with no sign or leading zero.
+pub(super) fn sequence_cursor(value: &str) -> std::result::Result<i64, ApiError> {
+    if value.is_empty()
+        || value.len() > 19
+        || value.starts_with('0')
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(ApiError::invalid());
+    }
+    value.parse::<i64>().map_err(|_| ApiError::invalid())
+}
+
 async fn skill_workflows(
     State(state): State<HubState>,
     Reader(principal): Reader,
-    RawQuery(raw): RawQuery,
+    query: std::result::Result<Query<SkillWorkflowsQuery>, QueryRejection>,
 ) -> std::result::Result<Response, ApiError> {
-    let before = match raw.as_deref().filter(|raw| !raw.is_empty()) {
-        None => None,
-        Some(raw) => {
-            let value = raw.strip_prefix("before=").ok_or_else(ApiError::invalid)?;
-            if value.is_empty()
-                || value.len() > 19
-                || value.starts_with('0')
-                || !value.bytes().all(|byte| byte.is_ascii_digit())
-            {
-                return Err(ApiError::invalid());
-            }
-            Some(value.parse::<i64>().map_err(|_| ApiError::invalid())?)
-        }
-    };
+    let Query(query) = query.map_err(|_| ApiError::invalid())?;
+    let before = query.before.as_deref().map(sequence_cursor).transpose()?;
+    let search = super::store::search_text(query.q.as_deref())?;
     let registry = state.skill_workflows.clone();
     let repository = principal.repository;
-    let outcome = blocking(&state, move || Ok(registry.page(&repository, before))).await?;
+    let outcome = blocking(&state, move || {
+        Ok(registry.page(&repository, before, search.as_deref()))
+    })
+    .await?;
     match outcome {
         Ok(envelope) => Ok(Json(envelope).into_response()),
         Err(SkillWorkflowReadError::InvalidRunId) => Err(ApiError::invalid()),

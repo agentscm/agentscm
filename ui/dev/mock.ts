@@ -92,7 +92,7 @@ function events() {
     const [kind, agent, login, data] = gen[(n - 1) % gen.length]!
     list.push({ id: `evt_extra_${n}`, kind, at: Math.floor(START / 1000) + n * 30, agent, owner: { login }, data })
   }
-  return list
+  return [...list, ...OLD_EVENTS]
     .sort((a, b) => b.at - a.at)
     .map((ev, i, all) => ({ seq: all.length - i, ...ev }))
 }
@@ -118,14 +118,14 @@ const WORKFLOW_NAMES = [
   'Documentation checks',
 ]
 const WORKFLOW_STATES = ['succeeded', 'failed', 'running', 'blocked', 'completed_with_omissions', 'cancelled', 'pending'] as const
-const WORKFLOW_RUNS = Array.from({ length: 45 }, (_, index) => {
+const WORKFLOW_RUNS = Array.from({ length: 60 }, (_, index) => {
   const special = [
     { run_id: 'claude-review-failed', state: 'failed', name: 'Claude code quality gate' },
     { run_id: 'claude-review-stale', state: 'succeeded', name: 'Billing change verification' },
     { run_id: 'claude-review-passed', state: 'succeeded', name: 'Claude code quality gate' },
   ][index]
   return {
-    run_id: special?.run_id ?? `retained-run-${String(45 - index).padStart(3, '0')}`,
+    run_id: special?.run_id ?? `retained-run-${String(60 - index).padStart(3, '0')}`,
     revision: (index % 16).toString(16).repeat(64),
     state: special?.state ?? WORKFLOW_STATES[index % WORKFLOW_STATES.length],
     name: special?.name ?? WORKFLOW_NAMES[index % WORKFLOW_NAMES.length],
@@ -235,6 +235,61 @@ function workflow(runId: string): Record<string, unknown> | null {
   }
 }
 
+const AGENT_NAMES = ['claude-code', 'codex', 'cursor', 'copilot']
+const TOPICS = ['invoice rounding', 'webhook retries', 'settings layout', 'tax split', 'ledger export', 'receipt footer', 'currency lookup', 'audit log', 'cache warmup', 'retry backoff']
+const hex32 = (n: number) => n.toString(16).padStart(32, '0')
+
+/** ~120 synthetic published changes, newest first. */
+const PUBLICATIONS = Array.from({ length: 120 }, (_, i) => {
+  const topic = TOPICS[i % TOPICS.length]!
+  const agent = AGENT_NAMES[i % AGENT_NAMES.length]!
+  const merged = i % 3 === 0
+  const prNumber = i % 4 === 3 ? null : 100 + (120 - i)
+  return {
+    id: `pub_${hex32(0xabc000 + 120 - i)}`,
+    repository: REPO,
+    revision: (i % 16).toString(16).repeat(64),
+    commit: (i % 16).toString(16).repeat(40),
+    branch: `agent/${agent}/${topic.replace(/ /g, '-')}-${120 - i}`,
+    title: `Synthetic ${topic} change ${120 - i}`,
+    base: 'main',
+    event_seq: 1000 - i,
+    created_at: ago(3600 + i * 3600),
+    updated_at: ago(1800 + i * 3600),
+    states: {
+      branch: { state: 'created', message: null },
+      native_landed: true,
+      pull_request: prNumber === null ? { state: 'pending' } : { state: merged ? 'merged' : 'opened', number: prNumber, html_url: `https://example.invalid/acme/widgets/pull/${prNumber}`, ...(merged ? { merge_commit: 'f'.repeat(40) } : {}) },
+    },
+  }
+})
+
+/** ~150 synthetic work items, most recently updated first. */
+const WORK_ITEMS = Array.from({ length: 150 }, (_, i) => {
+  const topic = TOPICS[i % TOPICS.length]!
+  return {
+    id: `wrk_${hex32(0xdef000 + 150 - i)}`,
+    title: `Synthetic ${topic} task ${150 - i}`,
+    state: (['active', 'blocked', 'handover', 'paused', 'finished'] as const)[i % 5],
+    lead_agent: AGENT_NAMES[i % AGENT_NAMES.length]!,
+    owner: i % 7 === 6 ? null : (['maria', 'dev', 'sam'] as const)[i % 3],
+    branch: i % 4 === 0 ? null : `agent/${topic.replace(/ /g, '-')}-${150 - i}`,
+    source_issue: i % 6 === 0 ? String(200 + i) : null,
+    updated_at: ago(600 + i * 1800),
+  }
+})
+
+/** ~200 older activity events (seq 1..200 are older than the live ones, which are numbered above them). */
+const OLD_EVENTS = Array.from({ length: 200 }, (_, i) => {
+  const agent = [A.mariaClaude, A.devCodex, A.mariaCodex, A.devCursor][i % 4]!
+  const login = ['maria', 'dev', 'maria', 'dev'][i % 4]!
+  const kind = ['session_started', 'intent_announced', 'edit_repeated', 'intent_released'][i % 4]!
+  const data = kind === 'session_started' ? { via: 'hook:claude' } : kind === 'intent_announced' ? { task: `Synthetic ${TOPICS[i % TOPICS.length]}`, paths: ['src/billing.rs'] } : kind === 'edit_repeated' ? { paths: ['src/tax.rs'] } : {}
+  return { id: `evt_old_${i}`, kind, at: Math.floor(START / 1000) - 7200 - (200 - i) * 120, agent, owner: { login }, data }
+})
+
+const clampLimit = (raw: string | null, dflt: number, max: number) => Math.min(max, Math.max(1, Number(raw ?? dflt) || dflt))
+
 export type Scenario = 'full' | 'empty' | 'down' | 'demo'
 
 export function mockHub(scenario: Scenario = 'full'): Plugin {
@@ -300,14 +355,44 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
           if (empty || scenario === 'demo') return send(200, { version: 1, availability: 'available', runs: [], next_cursor: null })
           const before = url.searchParams.get('before')
           if (before !== null && !/^[1-9][0-9]{0,18}$/.test(before)) return send(400, { error: 'invalid before cursor' })
+          const q = url.searchParams.get('q')?.trim().toLowerCase()
           const candidates = before === null ? WORKFLOW_RUNS : WORKFLOW_RUNS.filter((run) => BigInt(run.sequence) < BigInt(before))
-          const runs = candidates.slice(0, 16)
+          const matches = q ? candidates.filter((run) => [run.run_id, run.name, run.revision, run.state].some((v) => (v ?? '').toLowerCase().includes(q))) : candidates
+          const runs = matches.slice(0, 16)
           return send(200, {
             version: 1,
             availability: 'available',
             runs,
-            next_cursor: candidates.length > runs.length ? runs.at(-1)?.sequence ?? null : null,
+            next_cursor: matches.length > runs.length ? runs.at(-1)?.sequence ?? null : null,
           })
+        }
+        if (url.pathname === '/standup/work') {
+          if (empty || scenario === 'demo') return send(200, { items: [], next_cursor: null, complete: true })
+          const q = url.searchParams.get('q')?.trim().toLowerCase().replace(/^#/, '')
+          const cursor = url.searchParams.get('cursor')
+          const limit = clampLimit(url.searchParams.get('limit'), 20, 50)
+          const start = cursor === null ? 0 : WORK_ITEMS.findIndex((w) => w.id === cursor) + 1
+          if (cursor !== null && start === 0) return send(400, { error: 'invalid' })
+          const matches = WORK_ITEMS.slice(start).filter((w) => !q || [w.title, w.branch, w.lead_agent, w.owner, w.id, w.source_issue].some((v) => !!v && v.toLowerCase().includes(q)))
+          const items = matches.slice(0, limit)
+          const more = matches.length > items.length
+          return send(200, { items, next_cursor: more ? items.at(-1)!.id : null, complete: !more })
+        }
+        if (url.pathname === `/repos/${encodeURIComponent(REPO)}/publications`) {
+          if (empty || scenario === 'demo') return send(200, { publications: [], next_cursor: null, complete: true })
+          const q = url.searchParams.get('q')?.trim().toLowerCase().replace(/^#/, '')
+          const before = url.searchParams.get('before')
+          const limit = clampLimit(url.searchParams.get('limit'), 25, 100)
+          const start = before === null ? 0 : PUBLICATIONS.findIndex((p) => p.id === before) + 1
+          if (before !== null && start === 0) return send(400, { error: 'invalid' })
+          const matches = PUBLICATIONS.slice(start).filter((p) => !q || [p.branch, p.title, p.base, p.id, String((p.states.pull_request as { number?: number }).number ?? '')].some((v) => v.toLowerCase().includes(q)))
+          const items = matches.slice(0, limit)
+          const more = matches.length > items.length
+          return send(200, { publications: items, next_cursor: more ? items.at(-1)!.id : null, complete: !more })
+        }
+        if (url.pathname.startsWith(`/repos/${encodeURIComponent(REPO)}/publications/`)) {
+          const found = PUBLICATIONS.find((p) => url.pathname.endsWith(p.id))
+          return found ? send(200, found) : send(404, { error: 'not found' })
         }
         if (url.pathname.startsWith('/skill-workflows/')) {
           const runId = decodeURIComponent(url.pathname.slice('/skill-workflows/'.length))
@@ -318,7 +403,16 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
           if (scenario === 'demo') return send(200, { ...work(), pull_requests: [], connected: false })
           return send(200, empty ? { intents: [], intents_truncated: false, pull_requests: [], branches: [], connected: false, truncated: {} } : work())
         }
-        if (url.pathname === `/repos/${encodeURIComponent(REPO)}/activity`) return send(200, empty ? { sessions: [], events: [] } : activity())
+        if (url.pathname === `/repos/${encodeURIComponent(REPO)}/activity`) {
+          if (empty) return send(200, { sessions: [], events: [], next_before: null })
+          const all = activity()
+          const limit = clampLimit(url.searchParams.get('limit'), 50, 200)
+          const rawBefore = url.searchParams.get('before')
+          if (rawBefore !== null && !/^[1-9][0-9]{0,15}$/.test(rawBefore)) return send(400, { error: 'invalid' })
+          const older = rawBefore === null ? all.events : all.events.filter((e) => e.seq < Number(rawBefore))
+          const events = older.slice(0, limit)
+          return send(200, { ...all, events, next_before: older.length > events.length ? events.at(-1)!.seq : null })
+        }
         send(404, { error: 'not found' })
       })
     },

@@ -60,6 +60,13 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&get, "/v1/hub/standup/insights".into(), "".into(), Allowed);
     row(&get, "/v1/hub/standup/work/missing/insights".into(), "".into(), Status(404));
     row(&get, "/v1/hub/standup/work/missing".into(), "".into(), Status(404));
+    row(&get, "/v1/hub/standup/work?q=x".into(), "".into(), Allowed);
+    row(&get, format!("{REPO}/publications?q=x"), "".into(), Allowed);
+    row(&get, "/v1/hub/skill-workflows?q=x".into(), "".into(), Allowed);
+    row(&get, format!("{REPO}/activity?before=5"), "".into(), Allowed);
+    for tool in ["agentscm_work_search", "agentscm_publications_list", "agentscm_workflow_runs_list"] {
+        row(&post, "/mcp".into(), format!(r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{tool}","arguments":{{"q":"x"}}}}}}"#), Allowed);
+    }
     for path in ["start", "checkpoint", "ack"] {
         row(&post, format!("/v1/hub/standup/{path}"), "{}".into(), AgentOnly);
     }

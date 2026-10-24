@@ -236,20 +236,22 @@ impl SkillWorkflowRegistry {
         &self,
         hub_repository: &str,
     ) -> std::result::Result<SkillWorkflowListEnvelope, ReadError> {
-        self.page(hub_repository, None)
+        self.page(hub_repository, None, None)
     }
 
     pub fn page(
         &self,
         hub_repository: &str,
         before: Option<i64>,
+        search: Option<&str>,
     ) -> std::result::Result<SkillWorkflowListEnvelope, ReadError> {
         let (binding, _authority) = match self.current_binding(hub_repository) {
             Ok(current) => current,
             Err(reason) => return Ok(SkillWorkflowListEnvelope::unavailable(reason)),
         };
-        let page = skill_workflow_service::list_page(&binding.data_dir, MAX_RECENT_RUNS, before)
-            .map_err(read_error)?;
+        let page =
+            skill_workflow_service::list_page(&binding.data_dir, MAX_RECENT_RUNS, before, search)
+                .map_err(read_error)?;
         for run in &page.runs {
             let definition =
                 crate::skill_workflow::runtime::retained_definition(&binding.data_dir, &run.run_id)
