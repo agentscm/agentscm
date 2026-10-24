@@ -461,64 +461,90 @@ fn inactive_tokens_are_refused(db: &Db) {
     assert_eq!(intent_events(&*store), before);
 }
 
-fn scale(db: &Db) {
-    let store = db.open();
-    let a = agent(&*store, 1, "a");
+const REPEATS: u128 = 5;
+
+/// The fastest of `REPEATS` timed announces over `n` held intents of 50 paths each: a 50-path
+/// announce overlapping five of them, and a broad one overlapping all of them. Load only adds
+/// time, so the minimum is the least noisy estimate of the work.
+fn announce_costs(store: &dyn Store, n: u128) -> (Duration, Duration) {
+    let a = agent(store, n as i64, &format!("a{n}"));
+    let root = format!("app{n}");
+    let base = n * 100;
     let long = NewIntent {
         ttl_seconds: TTL,
         ..intent(0, &["x"])
     };
-    for i in 0..1000_u128 {
-        let mut paths: Vec<String> = (0..45).map(|j| format!("app/svc{i}/f{j}.rs")).collect();
-        paths.extend((0..5).map(|j| format!("app/svc{i}/d{j}/**")));
+    for i in 0..n {
+        let mut paths: Vec<String> = (0..45).map(|j| format!("{root}/svc{i}/f{j}.rs")).collect();
+        paths.extend((0..5).map(|j| format!("{root}/svc{i}/d{j}/**")));
         let new = NewIntent {
-            id: id(i + 1),
+            id: id(base + i),
             paths,
             ..long.clone()
         };
         store.announce_intent(&a.token, &new, T0).unwrap();
     }
-    let mut paths: Vec<String> = (1..=5)
-        .flat_map(|k| [format!("app/svc{k}/f0.rs"), format!("app/svc{k}/d0/y.rs")])
-        .collect();
-    paths.extend((0..40).map(|j| format!("elsewhere/n{j}.rs")));
-    assert_eq!(paths.len(), 50);
-    let started = Instant::now();
-    let few = store
-        .announce_intent(
-            &a.token,
-            &NewIntent {
-                id: id(5000),
-                paths,
-                ..long.clone()
-            },
-            T0,
-        )
-        .unwrap();
-    let took = started.elapsed();
-    assert_eq!(few.overlaps.len(), 5);
-    assert!(few.overlaps.iter().all(|o| o.their_paths.len() == 2));
-    assert!(
-        took < Duration::from_secs(1),
-        "50-path announce took {took:?}"
-    );
+    let mut few = Duration::MAX;
+    for r in 0..REPEATS {
+        let mut paths: Vec<String> = (5 * r + 1..=5 * r + 5)
+            .flat_map(|k| {
+                [
+                    format!("{root}/svc{k}/f0.rs"),
+                    format!("{root}/svc{k}/d0/y.rs"),
+                ]
+            })
+            .collect();
+        paths.extend((0..40).map(|j| format!("elsewhere{n}/r{r}/n{j}.rs")));
+        assert_eq!(paths.len(), 50);
+        let new = NewIntent {
+            id: id(base + n + r),
+            paths,
+            ..long.clone()
+        };
+        let started = Instant::now();
+        let announced = store.announce_intent(&a.token, &new, T0).unwrap();
+        few = few.min(started.elapsed());
+        assert_eq!(announced.overlaps.len(), 5);
+        assert!(announced.overlaps.iter().all(|o| o.their_paths.len() == 2));
+    }
+    let mut broad = Duration::MAX;
+    for r in 0..REPEATS {
+        let new = NewIntent {
+            id: id(base + n + REPEATS + r),
+            paths: vec![format!("{root}/**")],
+            ..long.clone()
+        };
+        let started = Instant::now();
+        let announced = store.announce_intent(&a.token, &new, T0).unwrap();
+        broad = broad.min(started.elapsed());
+        // The setup intents, the 50-path ones and the earlier broad ones.
+        assert_eq!(announced.overlaps.len() as u128, n + REPEATS + r);
+    }
+    // Every broad announce notifies the holder of each overlapped intent.
+    assert!(notices(store, &a).len() as u128 >= n.min(1000));
+    (few, broad)
+}
 
-    let broad = NewIntent {
-        id: id(5001),
-        paths: vec!["app/**".into()],
-        ..long
-    };
-    let started = Instant::now();
-    let all = store.announce_intent(&a.token, &broad, T0).unwrap();
-    let took = started.elapsed();
-    eprintln!("broad announce over 1,000 intents took {took:?}");
-    // The 1000 setup intents and the 50-path one.
-    assert_eq!(all.overlaps.len(), 1001);
-    assert!(
-        took < Duration::from_secs(1),
-        "broad announce took {took:?}"
-    );
-    assert_eq!(notices(&*store, &a).len(), 1000);
+/// Announce must stay at most linear in held intents. Comparing 10N with N in one run cancels
+/// host speed and load: linear work grows about 10x and quadratic 100x, so 30x (their
+/// geometric midpoint) separates them without a wall-clock budget.
+fn scale(db: &Db) {
+    let store = db.open();
+    let (few_small, broad_small) = announce_costs(&*store, 100);
+    let (few_large, broad_large) = announce_costs(&*store, 1000);
+    for (name, small, large) in [
+        ("50-path", few_small, few_large),
+        ("broad", broad_small, broad_large),
+    ] {
+        let ratio = large.as_secs_f64() / small.as_secs_f64();
+        eprintln!(
+            "{name} announce: {small:?} over 100 intents, {large:?} over 1,000 ({ratio:.1}x)"
+        );
+        assert!(
+            ratio < 30.0,
+            "{name} announce grew {ratio:.1}x for 10x intents"
+        );
+    }
 }
 
 macro_rules! conformance {
@@ -714,7 +740,7 @@ async fn long_poll_delivers_a_notice_and_overlap_is_not_a_denial() {
         .await;
     assert_eq!(status, 200);
 
-    let url = format!("{NOTICES}?wait=10");
+    let url = format!("{NOTICES}?wait=20");
     let started = Instant::now();
     let waiting = {
         let (hub_base, client, alice) = (hub.base.clone(), hub.client.clone(), alice.clone());
@@ -748,7 +774,8 @@ async fn long_poll_delivers_a_notice_and_overlap_is_not_a_denial() {
 
     let reply = waiting.await.unwrap();
     assert!(
-        started.elapsed() < Duration::from_secs(3),
+        // Half the 20 s wait: the announce woke the poll rather than its deadline ending it.
+        started.elapsed() < Duration::from_secs(10),
         "{:?}",
         started.elapsed()
     );

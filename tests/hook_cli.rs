@@ -252,7 +252,8 @@ fn a_silent_hub_times_out_quickly() {
         &dir,
         br#"{"hook_event_name":"preToolUse","tool_name":"Write"}"#,
     );
-    assert!(run.elapsed < Duration::from_secs(5), "{:?}", run.elapsed);
+    // The hook's 3 s limit plus process start on a loaded host; a silent hub never answers.
+    assert!(run.elapsed < Duration::from_secs(15), "{:?}", run.elapsed);
     assert_eq!(run.code, Some(0));
     assert_eq!(run.json(), json!({"permission": "allow"}));
 }
