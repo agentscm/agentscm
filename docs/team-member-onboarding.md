@@ -47,7 +47,7 @@ paths, but no Hub token. Different checkouts can therefore remain connected to d
 A linked worktree created from a connected checkout (`git worktree add`, which Claude Code and
 Codex use for new sessions, inside the checkout or beside it) uses that checkout's connection with
 no further setup. The worktree must share the checkout's Git directory and keep its `origin`; a
-separate or nested clone, a submodule or a copied `.git` file is never covered. The user-scope
+separate or nested clone, a submodule, a copied `.git` file or a symlinked `.git` is never covered. The user-scope
 Claude Code and Codex plugins therefore coordinate in new worktrees at once. A Git-excluded
 `.mcp.json` or `.codex/config.toml` entry is not copied into a new worktree, so the MCP tools are
 available there only where such an entry exists.
@@ -252,7 +252,7 @@ Before approving hooks or MCP configuration:
 3. Accept the coding client's own project, MCP and hook trust prompts. Generating or installing a
    plugin does not supply that approval.
 
-`agentscm quickstart` and `agentscm client setup` are one path: after its hub question and collision check, quickstart runs `client setup` for each coding agent (`--agent`, repeatable; Claude Code by default when the `claude` CLI is on `PATH`; `--no-agents` skips it). Agents set up either way appear on the Connect agents page. A client token lasts 30 days, the hub maximum. At a terminal, `client connect` and `client setup` wait for the hub's GitHub App to be installed on the repository: they print where to install it and wait for Enter. Each Git worktree is its own checkout and needs its own `client setup`.
+`agentscm quickstart` and `agentscm client setup` are one path: after its hub question and collision check, quickstart runs `client setup` for each coding agent (`--agent`, repeatable; Claude Code by default when the `claude` CLI is on `PATH`; `--no-agents` skips it). Agents set up either way appear on the Connect agents page. A client token lasts 30 days, the hub maximum. At a terminal, `client connect` and `client setup` wait for the hub's GitHub App to be installed on the repository: they print where to install it and wait for Enter. A linked Git worktree uses its checkout's connection; a separate clone needs its own `client setup`.
 
 `agentscm client remove --root PATH` undoes `client setup` for one checkout: it takes the agents' entries out of the checkout's files, uninstalls the Claude Code or Codex plugin when no other connected checkout uses it, revokes the managed token (the token revokes itself through `DELETE /v1/hub/token`, so no sign-in is needed), then removes the connection and deletes the token file. If the token can't be revoked, it says so, exits non-zero and keeps the connection and token file so that running it again retries. `agentscm uninstall` runs `client remove` for every checkout quickstart connected, then undoes the rest of quickstart's setup.
 

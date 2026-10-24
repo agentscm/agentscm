@@ -1248,7 +1248,7 @@ async fn agents_stage(cx: &mut Cx<'_>) {
         cx.live.agent_error = Some(short(&error));
     } else if cx.found.worktrees {
         println!(
-            "Each Git worktree is its own checkout: in every worktree you start agents in, run `{} client setup --agent AGENT --hub {hub}`.",
+            "Git worktrees of this checkout use its connection; a separate clone needs its own `{} client setup --agent AGENT --hub {hub}`.",
             cli_command(cx)
         );
     }

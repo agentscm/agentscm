@@ -593,7 +593,12 @@ pub(crate) fn connection_for_checkout<'a>(
 /// checkout; a copied, forged or submodule pointer fails these checks.
 fn common_dir(root: &Path) -> Option<PathBuf> {
     let dot_git = root.join(".git");
-    if dot_git.is_dir() {
+    let kind = std::fs::symlink_metadata(&dot_git).ok()?.file_type();
+    // A symlinked `.git` would borrow another checkout's Git directory without being its worktree.
+    if kind.is_symlink() {
+        return None;
+    }
+    if kind.is_dir() {
         return dot_git.canonicalize().ok();
     }
     let read = |path: &Path| std::fs::read_to_string(path).ok();
@@ -1038,6 +1043,18 @@ mod tests {
         std::fs::create_dir(&copied).unwrap();
         std::fs::copy(beside.join(".git"), copied.join(".git")).unwrap();
         assert_eq!(connection_for_checkout(&connections, &copied), None);
+
+        // A symlinked `.git`, to the shared directory or to a worktree's file, is refused too.
+        #[cfg(unix)]
+        for (name, target) in [
+            ("linked-dir", main.join(".git")),
+            ("linked-file", beside.join(".git")),
+        ] {
+            let fake = dir.path().join(name);
+            std::fs::create_dir(&fake).unwrap();
+            std::os::unix::fs::symlink(target, fake.join(".git")).unwrap();
+            assert_eq!(connection_for_checkout(&connections, &fake), None, "{name}");
+        }
 
         let both = [
             connection(beside.canonicalize().unwrap(), "acme/widgets"),
