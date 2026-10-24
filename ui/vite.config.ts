@@ -48,7 +48,7 @@ export default defineConfig({
   resolve: { dedupe: ['react', 'react-dom'] },
   server: {
     host: '127.0.0.1',
-    port: 5184,
+    port: Number(process.env['AGENTSCM_UI_PORT'] ?? 5184),
     strictPort: true,
     // `agentscm serve` on this machine answers /v1/local (Templates, Timeline); it must come before /v1 (the hub).
     proxy: mock

@@ -26,6 +26,7 @@
 - [Slack adapter](slack.md) and [capability map](slack-capabilities.md): optional direct messages for coordination moments that need a person, with handoff buttons.
 - [Multi-user coordination hub](hub.md), including [what the hub stores](hub.md#data-the-hub-stores)
 - [Deployment](deployment.md)
+- [Hosted hub setup (agent-guided, unsupported in the alpha)](hosted.md)
 
 ## Reference
 
@@ -50,5 +51,4 @@ token dashboard and MCP inspect retained runs.
 
 - [Contributing](../CONTRIBUTING.md), [security policy](../SECURITY.md) and [code of conduct](../CODE_OF_CONDUCT.md)
 - [Contributor testing](contributor-testing.md): the nextest gate, focused iteration, coverage comparison and reproducible timing
-- [Local source install helper](setup.md)
 - [Releasing](releasing.md)

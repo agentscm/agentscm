@@ -63,7 +63,7 @@ case "$url" in */SHA256SUMS) cp "$SUMS" "$out" ;; *) printf '#!/bin/sh\\nexit 0\
 
   const quiet = run(validSums, {}, { curl, gh });
   assert.equal(quiet.status, 0, quiet.stderr);
-  assert.match(quiet.stdout, /Verified checksum and build provenance\. Set AGENTSCM_INSTALL_VERBOSE=1 for details\./);
+  assert.match(quiet.stdout, /Verified provenance with GitHub attestations\. Set AGENTSCM_INSTALL_VERBOSE=1 for details\./);
   assert.doesNotMatch(`${quiet.stdout}${quiet.stderr}`, /verified attestation|upgrade gh now/);
 
   const verbose = run(validSums, { AGENTSCM_INSTALL_VERBOSE: '1' }, { curl, gh });
@@ -85,4 +85,17 @@ case "$url" in */SHA256SUMS) cp "$SUMS" "$out" ;; *) printf '#!/bin/sh\\nexit 0\
   assert.notEqual(failed.status, 0);
   assert.match(failed.stderr, /attestation mismatch/);
   assert.match(failed.stderr, /build provenance verification failed; not running the binary/);
+});
+
+test('install.sh says only the checksum was checked when gh is signed out', { skip }, () => {
+  const binary = '#!/bin/sh\nexit 0\n';
+  const sums = `${crypto.createHash('sha256').update(binary).digest('hex')}  agentscm-${target}\n`;
+  const curl = `#!/bin/sh
+for a; do [ "$prev" = -o ] && out=$a; prev=$a; url=$a; done
+case "$url" in */SHA256SUMS) cp "$SUMS" "$out" ;; *) printf '#!/bin/sh\\nexit 0\\n' >"$out" ;; esac
+`;
+  const r = run(sums, {}, { curl, gh: '#!/bin/sh\n[ "$1" = auth ] && exit 1\nexit 0\n' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^Checked the SHA-256 checksum from the release \(provenance not checked: the GitHub CLI \(gh\) is not signed in.*\)\.$/m);
+  assert.doesNotMatch(r.stdout, /Verified/);
 });

@@ -106,7 +106,8 @@ declared skill file from the immutable revision, so it does not follow host file
 
 For a command step, declare the recipe using its full native source path in `skill.resources`,
 then use its path relative to the skill directory as `action.runner`. For example, a package with
-`skills/native-workflow/SKILL.md` and `skills/native-workflow/runner.json` uses:
+`skills/native-workflow/SKILL.md` and a runner recipe file `skills/native-workflow/runner.json` (an example
+path; this repository ships only `SKILL.md`) uses:
 
 ```json
 {

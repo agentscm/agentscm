@@ -45,6 +45,9 @@ pub enum HubChoice {
     Existing,
     /// Only the collision check and hooks; no live warnings yet.
     Skip,
+    /// Print the hosted guide, then connect only if --hub-url is given (chosen with --hosted).
+    #[value(skip)]
+    Hosted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -70,6 +73,13 @@ pub struct QuickstartArgs {
     /// The local hub's administrator must then be given with --github-login.
     #[arg(long)]
     yes: bool,
+    /// Run everything on this machine (recommended for the alpha); same as --hub local.
+    #[arg(long, conflicts_with_all = ["hub", "hosted"])]
+    local: bool,
+    /// Use a shared hub on a server: prints the agent-guided hosted guide (unsupported in
+    /// the alpha), then connects only when --hub-url is given.
+    #[arg(long, conflicts_with = "hub")]
+    hosted: bool,
     /// How to get live warnings.
     #[arg(long, value_enum)]
     hub: Option<HubChoice>,
@@ -136,13 +146,21 @@ pub struct UninstallArgs {
 }
 
 const NEEDS_TERMINAL: &str = "agentscm quickstart asks questions, and there is no terminal here. \
-To run it without one, pass --yes and choose with flags: --hub local|existing|skip, --hub-url URL, \
+To run it without one, pass --yes and choose with flags: --local (recommended) or --hosted, \
+--hub local|existing|skip, --hub-url URL, \
 --agent-token-file PATH, --agent-name NAME, --ttl 30d, --provider github|gitlab, --github-login LOGIN, \
 --hub-runtime native|docker, --hub-port PORT, --hub-project NAME, \
 --slack-config-file ABSOLUTE_PATH, --hook user|project|none, --no-collisions, --init";
 
 const HUB_EXPLAINED: &str =
     "A hub is a small shared server that lets agents on different machines see each other's work.";
+
+const HOSTED_GUIDE: &str = "\
+Hosted (a shared hub on a server) is not supported in the alpha: it will likely break and is not \
+for production. Quickstart does not set up a server. Hand this guide to your coding agent and work \
+through it together:
+  https://github.com/counterbranch/agentscm/blob/main/docs/hosted.md
+If your team's hub already runs, give its URL to connect this machine to it.";
 
 fn invalid(message: &str) -> Error {
     Error::Invalid(message.to_owned())
@@ -401,8 +419,8 @@ struct Live {
 }
 
 impl Live {
-    /// The last line of every run.
-    fn line(&self) -> String {
+    /// The last line of every run; `cli` is the program to run again (see `cli_command`).
+    fn line(&self, cli: &str) -> String {
         let off = |reason: &str, todo: &str| format!("Live warnings: off — {reason} ({todo})");
         if let Some(command) = &self.pending_local {
             return off(
@@ -413,19 +431,21 @@ impl Live {
         match (&self.hub, &self.repo) {
             (None, _) => off(
                 "no hub chosen",
-                "run `agentscm quickstart --hub existing --hub-url URL`, or `--hub local` for a managed local hub",
+                &format!(
+                    "run `{cli} quickstart --local` for a hub on this machine, or `--hosted --hub-url URL` for your team's hub"
+                ),
             ),
             (Some(url), _) if !self.hub_up => off(
                 &format!("the hub at {url} isn't answering"),
-                "start it, then run `agentscm quickstart` again",
+                &format!("start it, then run `{cli} quickstart` again"),
             ),
             (Some(_), None) => off(
                 "no agent token or hub settings were saved",
-                "run `agentscm quickstart` again, or pass `--agent-token-file`",
+                &format!("run `{cli} quickstart` again, or pass `--agent-token-file`"),
             ),
             (Some(_), Some(_)) if !self.hooks => off(
                 "no Claude Code hooks were added",
-                "run `agentscm quickstart --hook project`",
+                &format!("run `{cli} quickstart --hook project`"),
             ),
             (Some(url), Some(repo)) => format!("Live warnings: on (hub {url}, repo {repo})"),
         }
@@ -456,6 +476,13 @@ pub async fn run(args: QuickstartArgs) -> Result<u8> {
     // write. Supplying this flag is the only way quickstart enables the optional Slack adapter.
     preflight_slack(&args)?;
     let ui = Ui { yes: args.yes };
+    if args.yes
+        && (args.local || matches!(args.hub, Some(HubChoice::Local)))
+        && args.github_login.is_none()
+        && Manifest::load()?.is_none_or(|m| m.local_hub.is_none() && m.native_hub.is_none())
+    {
+        hub_setup::github_login(None, &ui).map_err(|message| invalid(&message))?;
+    }
     let home = home_dir()?;
     let _quickstart_lease = manifest::acquire_lease()?;
     let cwd = std::env::current_dir()?;
@@ -486,19 +513,26 @@ pub async fn run(args: QuickstartArgs) -> Result<u8> {
         cx.manifest.bin_dir = Some(binary::bin_dir(&cx.home));
     }
     status(&cx).await;
-    collisions_step(&cx);
+    // Local or hosted is the first question; the collision check does not depend on it.
     if let Some(url) = choose_hub(&mut cx).await {
         cx.live.hub_up = healthy(&cx.client, &url).await;
         cx.live.hub = Some(url.clone());
-        if !cx.live.hub_up {
-            println!(
-                "The hub at {url} isn't answering; live warnings will start working once it is."
-            );
-        }
         if let Some(staged) = token_stage(&mut cx, &url).await {
             hub_json_stage(&mut cx, &url, &staged);
         }
+        if !cx.live.hub_up {
+            if cx.live.repo.is_some() {
+                println!(
+                    "The hub at {url} isn't answering; its settings are saved, so live warnings start once it answers."
+                );
+            } else {
+                println!(
+                    "The hub at {url} isn't answering, so nothing was saved for it. Start it, then run quickstart again."
+                );
+            }
+        }
     }
+    collisions_step(&cx);
     hook_stage(&mut cx);
     init_stage(&mut cx);
     if !cx.manifest.is_empty() {
@@ -517,14 +551,22 @@ pub async fn run(args: QuickstartArgs) -> Result<u8> {
             binary::quote(dir)
         );
     }
-    println!("{}", cx.live.line());
+    if let (Some(url), Some(repo), true) = (&cx.live.hub, &cx.live.repo, cx.live.hub_up) {
+        println!("Hub status page: {url}/ui/");
+        println!(
+            "Sign in there with a read-only token: {command} hub token create --read-only --name status-page --repo {repo} --ttl 30d"
+        );
+    }
+    println!("{}", cx.live.line(&command));
     if let Some(failure) = cx.failure {
         return Err(invalid(&failure));
     }
     if cx.live.pending_local.is_some() {
         return Ok(3);
     }
-    if (matches!(args.hub, Some(HubChoice::Local | HubChoice::Existing)) || args.hub_url.is_some())
+    if (args.local
+        || matches!(args.hub, Some(HubChoice::Local | HubChoice::Existing))
+        || args.hub_url.is_some())
         && (!cx.live.hub_up || cx.live.repo.is_none())
     {
         return Err(invalid(
@@ -666,6 +708,9 @@ fn summarize(report: &Value) -> String {
     let checked = report["items"].as_array().map_or(0, Vec::len);
     let list = report["collisions"].as_array().cloned().unwrap_or_default();
     let conflicts = list.iter().filter(|c| c["level"] == "conflict").count();
+    if checked < 2 && !report["truncated"].is_string() {
+        return "No other branches or worktrees to compare yet.".into();
+    }
     let noun = if checked == 1 {
         "branch/worktree"
     } else {
@@ -753,7 +798,11 @@ fn collisions_step(cx: &Cx<'_>) {
 async fn choose_hub(cx: &mut Cx<'_>) -> Option<String> {
     let current = current_hub();
     let mut choice = cx.args.hub;
-    if choice.is_none() && cx.args.hub_url.is_some() {
+    if cx.args.local {
+        choice = Some(HubChoice::Local);
+    } else if cx.args.hosted {
+        choice = Some(HubChoice::Hosted);
+    } else if choice.is_none() && cx.args.hub_url.is_some() {
         choice = Some(HubChoice::Existing);
     }
     if choice.is_none() && cx.args.slack_config_file.is_some() {
@@ -785,10 +834,33 @@ async fn choose_hub(cx: &mut Cx<'_>) -> Option<String> {
                 return None;
             }
             HubChoice::Existing => return existing_hub(cx, current.map(|c| c.url)),
+            HubChoice::Hosted => {
+                println!("{HOSTED_GUIDE}\n");
+                let url = match &cx.args.hub_url {
+                    Some(url) => url.clone(),
+                    None => cx.ui.ask("Hub URL (leave empty to skip for now)", ""),
+                };
+                if url.is_empty() {
+                    println!(
+                        "Skipping live warnings. Run quickstart again with --hosted --hub-url URL once the hub runs.\n"
+                    );
+                    return None;
+                }
+                return checked_hub_url(&url);
+            }
             HubChoice::Local => match local_hub(cx).await {
                 Ok(url) => return url,
                 Err(message) => {
                     println!("{message}");
+                    // Both runtimes' busy-port errors say "already in use".
+                    if message.contains("already in use")
+                        && let Some(port) = free_port()
+                    {
+                        println!(
+                            "To use a free port, run: {} quickstart --local --hub-port {port}",
+                            cli_command(cx)
+                        );
+                    }
                     if cx.ui.yes {
                         cx.failure = Some(message);
                         return None;
@@ -808,15 +880,15 @@ fn menu(cx: &Cx<'_>, with_local: bool) -> HubChoice {
         .as_ref()
         .is_none_or(|r| r.forge == Forge::Github);
     let mut options = vec![
-        "Connect to a hub that already runs (your team's; you need its URL)",
+        "Hosted: a shared hub on a server for a team (unsupported in the alpha; your agent follows a guide)",
         "Skip live warnings for now",
     ];
-    let mut choices = vec![HubChoice::Existing, HubChoice::Skip];
+    let mut choices = vec![HubChoice::Hosted, HubChoice::Skip];
     let mut default = 1;
     if with_local {
         options.insert(
             0,
-            "Start a hub on this machine (native when supported; Docker fallback; GitHub only)",
+            "Run it on this machine (recommended for the alpha; GitHub only)",
         );
         choices.insert(0, HubChoice::Local);
         default = if (native_hub_supported() || cx.found.docker) && github {
@@ -827,7 +899,7 @@ fn menu(cx: &Cx<'_>, with_local: bool) -> HubChoice {
     }
     choices[cx
         .ui
-        .choose("How should live warnings work?", &options, default)]
+        .choose("Where should AgentSCM run?", &options, default)]
 }
 
 fn existing_hub(cx: &Cx<'_>, configured: Option<String>) -> Option<String> {
@@ -840,11 +912,15 @@ fn existing_hub(cx: &Cx<'_>, configured: Option<String>) -> Option<String> {
         }
         (None, configured) => cx.ui.ask("Hub URL", &configured.unwrap_or_default()),
     };
-    match check_base_url(&url) {
+    checked_hub_url(&url)
+}
+
+fn checked_hub_url(url: &str) -> Option<String> {
+    match check_base_url(url) {
         Ok(url) => Some(url),
         Err(_) => {
             println!(
-                "That hub URL isn't usable: it must be https://host, or http:// for a loopback address, with no credentials."
+                "That hub URL isn't usable: it must be https://host, or http://127.0.0.1:PORT for a hub on this machine (not localhost), with no credentials."
             );
             None
         }
@@ -858,6 +934,13 @@ fn valid_hub_project(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn free_port() -> Option<u16> {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|listener| listener.local_addr())
+        .map(|addr| addr.port())
+        .ok()
 }
 
 fn native_hub_supported() -> bool {
@@ -1555,6 +1638,12 @@ fn hook_stage(cx: &mut Cx<'_>) {
                 return;
             }
         }
+        None if cx.live.hub.is_none() => {
+            println!(
+                "Not adding the Claude Code hooks: they need a hub to report to. Use --hook project to add them anyway."
+            );
+            return;
+        }
         None => {
             let options = [
                 "This project only (.claude/settings.local.json)",
@@ -1700,6 +1789,7 @@ fn hook_stage(cx: &mut Cx<'_>) {
         return;
     }
     if let Some((plan, exe)) = &program {
+        let parent_new = dir.parent().is_some_and(|p| !p.exists());
         if matches!(plan, binary::Program::Copy)
             && let Err(why) = binary::install(&dir, exe, env!("CARGO_PKG_VERSION"))
         {
@@ -1708,6 +1798,7 @@ fn hook_stage(cx: &mut Cx<'_>) {
         }
         if !matches!(plan, binary::Program::Bare) {
             cx.manifest.bin_dir = Some(dir);
+            cx.manifest.bin_parent_created |= parent_new;
         }
     }
     let env_sha = http
@@ -1778,12 +1869,17 @@ fn write_settings(
     added: Vec<Added>,
     form: Written,
 ) -> std::result::Result<(), String> {
+    let mut created_dir = None;
     let backup = if existed {
         Some(make_backup(path)?)
     } else {
-        path.parent()
-            .map_or(Ok(()), |dir| std::fs::create_dir_all(resolve(dir)))
-            .map_err(|e| e.to_string())?;
+        if let Some(dir) = path.parent() {
+            let real = resolve(dir);
+            if !real.exists() {
+                created_dir = Some(dir.to_owned());
+            }
+            std::fs::create_dir_all(real).map_err(|e| e.to_string())?;
+        }
         None
     };
     let text = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())? + "\n";
@@ -1824,6 +1920,7 @@ fn write_settings(
             added,
             written_hash: hash,
             env_token_sha: form.env_sha,
+            created_dir,
         }),
     }
     cx.manifest.save().map_err(|e| e.to_string())
@@ -1853,7 +1950,8 @@ fn init_stage(cx: &mut Cx<'_>) {
     };
     if is_loopback(&hub) {
         println!(
-            "Skipping repository agent config: this hub runs on this machine. When you have a shared hub, run `agentscm init-repo --hub-url URL`."
+            "Skipping repository agent config: this hub runs on this machine. When you have a shared hub, run `{} init-repo --hub-url URL`.",
+            cli_command(cx)
         );
         return;
     }
@@ -1861,7 +1959,7 @@ fn init_stage(cx: &mut Cx<'_>) {
         cx.args.init
     } else {
         cx.ui.confirm(
-            "Also add AgentSCM to this repository's agent config (MCP, hooks and instructions for Claude Code, Codex, Cursor and Copilot)? It writes files you can commit.",
+            "Also add AgentSCM to this repository's agent config (MCP, hooks and instructions for Claude Code, Codex, Cursor, Copilot and Gemini)? It writes files you can commit.",
             true,
         )
     };
@@ -1939,8 +2037,13 @@ fn summary(cx: &Cx<'_>, changed: bool) {
     }
     if let Some(dir) = &m.bin_dir {
         line(format!(
-            "{}: the agentscm program the hooks call",
-            shown(dir, home)
+            "{}: the agentscm program{}",
+            shown(dir, home),
+            if m.hooks.is_empty() {
+                ""
+            } else {
+                " the hooks call"
+            }
         ));
     }
     for record in &m.hooks {
@@ -2029,17 +2132,17 @@ fn surgical_undo(record: &HookRecord, text: &str) -> std::result::Result<String,
 }
 
 pub async fn uninstall(args: UninstallArgs) -> Result<()> {
+    let ui = Ui { yes: args.yes };
+    let _quickstart_lease = manifest::acquire_lease()?;
+    let Some(mut m) = Manifest::load()? else {
+        println!("Nothing to undo: nothing was installed by quickstart.");
+        return Ok(());
+    };
     if !args.yes && !std::io::stdin().is_terminal() {
         return Err(invalid(
             "agentscm uninstall asks before it removes anything, and there is no terminal here. Pass --yes (and --remove-hub-data to delete the local hub's data).",
         ));
     }
-    let ui = Ui { yes: args.yes };
-    let _quickstart_lease = manifest::acquire_lease()?;
-    let Some(mut m) = Manifest::load()? else {
-        println!("Nothing to undo: quickstart hasn't installed anything here.");
-        return Ok(());
-    };
     let home = home_dir()?;
     let programs = m
         .bin_dir
@@ -2154,6 +2257,10 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
     for record in &m.hooks {
         let (done, message) = undo_hooks(record);
         println!("{message}.");
+        if done && let Some(dir) = &record.created_dir {
+            // Only an empty directory goes.
+            let _ = std::fs::remove_dir(dir);
+        }
         if !done {
             manual.push(format!(
                 "edit {} and remove the hooks whose commands end in `intent start|check|done --hook claude`",
@@ -2234,6 +2341,9 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
         }
         // Only an empty directory goes.
         let _ = std::fs::remove_dir(&dir);
+        if !failed && m.bin_parent_created {
+            let _ = dir.parent().map(std::fs::remove_dir);
+        }
         if failed {
             manual.push(format!(
                 "rm {}/agentscm {}/agentscm-*",
@@ -2342,7 +2452,7 @@ mod tests {
             pending_local: Some("/opt/agentscm quickstart --hub local".into()),
             ..Live::default()
         };
-        let line = live.line();
+        let line = live.line("agentscm");
         assert!(line.contains("finish creating and installing the app"));
         assert!(line.contains("`/opt/agentscm quickstart --hub local`"));
         assert!(!line.contains("agent-token-file"));
@@ -2393,6 +2503,8 @@ mod tests {
     fn terminal_refusal_lists_the_flags() {
         for flag in [
             "--yes",
+            "--local",
+            "--hosted",
             "--hub",
             "--hub-url",
             "--agent-token-file",
@@ -2419,6 +2531,8 @@ mod tests {
             agent_name: None,
             ttl: "30d".into(),
             slack_config_file: Some(std::env::temp_dir().join("does-not-exist")),
+            local: false,
+            hosted: false,
             provider: None,
             hook: None,
             no_collisions: false,
@@ -2432,24 +2546,24 @@ mod tests {
     fn the_last_line_says_why_warnings_are_off() {
         let mut live = Live::default();
         assert!(
-            live.line()
+            live.line("agentscm")
                 .starts_with("Live warnings: off — no hub chosen (")
         );
         live.hub = Some("http://h".into());
         assert_eq!(
-            live.line(),
+            live.line("agentscm"),
             "Live warnings: off — the hub at http://h isn't answering (start it, then run `agentscm quickstart` again)"
         );
         live.hub_up = true;
         assert!(
-            live.line()
+            live.line("agentscm")
                 .contains("no agent token or hub settings were saved")
         );
         live.repo = Some("acme/widgets".into());
-        assert!(live.line().contains("no Claude Code hooks"));
+        assert!(live.line("agentscm").contains("no Claude Code hooks"));
         live.hooks = true;
         assert_eq!(
-            live.line(),
+            live.line("agentscm"),
             "Live warnings: on (hub http://h, repo acme/widgets)"
         );
     }
@@ -2519,6 +2633,7 @@ mod tests {
             added,
             written_hash: String::new(),
             env_token_sha: Some(sha_hex(b"tok")),
+            created_dir: None,
         };
         let text = serde_json::to_string(&settings).unwrap();
         std::fs::write(&path, &text).unwrap();

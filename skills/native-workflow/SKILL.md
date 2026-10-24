@@ -1,5 +1,5 @@
 ---
-name: native-source-workflow
+name: native-workflow
 description: Define a bounded local workflow that checks exact files in one immutable AgentSCM revision.
 ---
 

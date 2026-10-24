@@ -24,7 +24,7 @@ const nativeFetch = globalThis.fetch
 const hubEnv = envFile(`${seed}.hub.env`)
 const tokens = envFile(`${seed}.data/tokens.env`)
 
-export const HUB = hubEnv['AGENTSCM_HUB'] ?? 'http://127.0.0.1:7332'
+export const HUB = process.env['AGENTSCM_HUB'] ?? hubEnv['AGENTSCM_HUB'] ?? 'http://127.0.0.1:7332'
 export const READ_TOKEN = hubEnv['READ_TOKEN'] ?? ''
 /** An agent (write) token for one synthetic agent; never used by the UI itself. */
 export const AGENT_TOKEN = tokens['RUNE'] ?? ''

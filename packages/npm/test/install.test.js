@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { NOTICE_TEXT, targetFor, assetNameFor, installNames, urlFor, launchArgs, verifiedInstallEnv, parseSums, matches, localSums, ghVerifyArgs, provenanceGap, checkProvenance } = require('../lib/install.js');
+const { NOTICE_TEXT, targetFor, assetNameFor, installNames, urlFor, launchArgs, verifiedInstallEnv, parseSums, matches, localSums, ghVerifyArgs, provenanceGap, checkProvenance, provenanceLine } = require('../lib/install.js');
 
 const fixtures = path.join(__dirname, 'fixtures');
 const sums = fs.readFileSync(path.join(fixtures, 'SHA256SUMS'), 'utf8');
@@ -170,4 +170,21 @@ test('failed provenance verification exposes captured diagnostics', () => {
   } finally {
     console.error = error;
   }
+});
+
+test('--version answers from package.json without notice or download', async () => {
+  const lines = [];
+  const orig = console.log;
+  console.log = (...a) => lines.push(a.join(' '));
+  try {
+    assert.equal(await require('../lib/install.js').main(['--version']), 0);
+  } finally {
+    console.log = orig;
+  }
+  assert.deepEqual(lines, [`agentscm ${require('../package.json').version}`]);
+});
+
+test('provenance line says exactly what was checked', () => {
+  assert.equal(provenanceLine('the GitHub CLI (gh) is not installed'), 'Checked the SHA-256 checksum (provenance not checked: the GitHub CLI (gh) is not installed).');
+  assert.match(provenanceLine(null), /^Verified provenance with GitHub attestations\./);
 });

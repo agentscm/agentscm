@@ -25,7 +25,11 @@ npm run test:e2e    # Playwright: Chromium, Firefox, WebKit, Pixel 7 and iPhone 
 npm run test:all    # lint, tsc, Vitest, Playwright
 ```
 
-Integration and e2e tests need the seeded hub on :7332 and skip with a message without it. The MCP
+Another hub or UI port (e.g. a second worktree already holds 7332 and 5184):
+`AGENTSCM_DEV_HUB_PORT=7372 ui/dev-seed/start.sh`, then in `ui/` run the suites with
+`AGENTSCM_HUB=http://127.0.0.1:7372 AGENTSCM_UI_PORT=5194` set (vite proxy, Vitest integration and Playwright all read them).
+
+Integration and e2e tests need the seeded hub on :7332 (default) and skip with a message without it. The MCP
 tests start work through the hub's JSON-RPC endpoint with seeded agent tokens, so each run leaves
 finished "E2E probe" items under Recently finished. Install the browsers once with
 `npx playwright install chromium firefox webkit`. Desktop projects run the whole suite; the two phone
