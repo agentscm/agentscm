@@ -90,6 +90,13 @@
           "source_commit": {"type": ["string", "null"], "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},
           "input_tokens": {"type": ["integer", "null"], "minimum": 0, "maximum": 1000000000000},
           "output_tokens": {"type": ["integer", "null"], "minimum": 0, "maximum": 1000000000000},
+          "cache_read_input_tokens": {"type": ["integer", "null"], "minimum": 0, "maximum": 1000000000000},
+          "cache_creation_input_tokens": {"type": ["integer", "null"], "minimum": 0, "maximum": 1000000000000},
+          "action_id": {"type": ["string", "null"], "maxLength": 255},
+          "attempt_id": {"type": ["string", "null"], "maxLength": 255},
+          "provider_request_id": {"type": ["string", "null"], "maxLength": 255},
+          "provider_event_id": {"type": ["string", "null"], "maxLength": 255},
+          "measurement_scope": {"type": ["string", "null"], "enum": ["request", "session_cumulative", null], "description": "Session-cumulative observations are retained separately and excluded from usage totals."},
           "cost": {"oneOf": [{"type": "null"}, {"$ref": "#/components/schemas/ReportedCost"}]}
         }
       },

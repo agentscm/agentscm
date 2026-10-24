@@ -53,6 +53,7 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&get, format!("{REPO}/intents"), "".into(), Allowed);
     row(&get, format!("{REPO}/work"), "".into(), Allowed);
     row(&get, format!("{REPO}/activity"), "".into(), Allowed);
+    row(&get, format!("{REPO}/change-records/wrk_missing"), "".into(), Status(404));
     row(&get, "/v1/hub/skill-workflows".into(), "".into(), Allowed);
     row(&get, "/v1/hub/skill-workflows/missing".into(), "".into(), Allowed);
     row(&get, "/v1/hub/standup/briefing".into(), "".into(), Allowed);
@@ -76,12 +77,17 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&get, format!("{REPO}/publications/{id}"), "".into(), Status(404));
     row(&put, format!("{REPO}/publications/{id}/blobs/{hash}"), "x".into(), AgentOnly);
     row(&post, format!("{REPO}/publications/{id}/run"), "{}".into(), AgentOnly);
+    row(&get, format!("{REPO}/change-records/current?session_id=session-1"), "".into(), AgentOnly);
+    row(&post, format!("{REPO}/change-records/events"), "{}".into(), AgentOnly);
+    row(&post, format!("{REPO}/change-records/actions/start"), "{}".into(), AgentOnly);
+    row(&post, format!("{REPO}/change-records/actions/finish"), "{}".into(), AgentOnly);
     // /mcp: negotiation and the repository-scoped workflow read are side-effect-free.
     row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{}}}"#.into(), Allowed);
     row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.into(), Allowed);
     row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#.into(), Allowed);
     row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_workflow_status","arguments":{"run_id":"missing"}}}"#.into(), Allowed);
     row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_work_briefing","arguments":{}}}"#.into(), Allowed);
+    row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_change_record","arguments":{"work_id":"wrk_missing"}}}"#.into(), Allowed);
     // Coordination and checkpoint tools mutate state.
     for tool in [
         "agentscm_start",

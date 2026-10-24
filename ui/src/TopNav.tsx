@@ -5,6 +5,7 @@ import type { ThemePref } from './storage.ts'
 import { useNow, type HubData } from './useHub.ts'
 import type { Section } from './App.tsx'
 import { workTabFromHash, workTabHref } from './pages/Work.tsx'
+import { changeRecordHref, changeRecordIdFromHash } from './pages/ChangeRecord.tsx'
 import { routeFromHash as workflowRouteFromHash, runHref as workflowRunHref } from './pages/Workflows.tsx'
 import { workspaceRoute, workspaceRunHref } from './pages/Workspace.tsx'
 import { landedIdFromHash, landedHref } from './pages/Landed.tsx'
@@ -388,6 +389,9 @@ export function crumbsFor(hash: string, section: SectionDef, overview: WorkOverv
       out.push({ label: `Run ${run.length > 14 ? `${run.slice(0, 14)}…` : run}`, href: workflowRunHref(run), mono: true })
       if (route.stepId) out.push({ label: `Step ${route.stepId}`, mono: true })
     }
+  } else if (section.key === 'change-record') {
+    const id = changeRecordIdFromHash(hash)
+    if (id) out.push({ label: `Work ${id.slice(0, 12)}…`, href: changeRecordHref(id), mono: true })
   } else if (section.key === 'landed') {
     const id = landedIdFromHash(hash)
     if (id) out.push({ label: `Change ${id.slice(0, 12)}…`, href: landedHref(id), mono: true })

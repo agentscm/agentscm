@@ -77,6 +77,22 @@ every agent obeyed it. Hooks still handle coordination only.
 
 If the binary or the hub is missing, the hooks do nothing visible (see below).
 
+### Optional Claude Code change capture
+
+The experimental [change-capture adapter](change-capture.md) is separate from the coordination
+hooks written by `init-repo` or quickstart. On Unix, after a checkout has a saved write-capable
+`agentscm client connect` binding, an operator can run `agentscm change-capture configure` once to
+add marked project-local Claude hooks while preserving unrelated entries. Each hook resolves the
+session's current authorized Work and generation before it associates an event or action.
+
+The default `metadata-only` mode sends bounded typed facts and artifact identities to the Hub.
+Optional selected conversation/tool bodies, captured source bytes and command output remain in the
+operator's private local spool. Ordinary shell success is an execution outcome, not a passing
+verification. The local client reports pass/fail only for an exact configured verification recipe
+match; the Hub stores that as caller asserted and does not validate it against an independent recipe
+registry. Other agent hosts do not have equivalent coverage in this path. See the
+[implementation status](implementation/agentscm-build-status.md) for qualification limits.
+
 ## What `agentscm hook` does
 
 `agentscm hook <claude|codex|cursor|copilot|generic> [--hub-url URL]` reads the agent's hook JSON on standard input, sends it unchanged to `POST /v1/hub/hook/<agent>` with the token as a bearer header (for an edit, the JSON includes the edit's contents; the hub keeps only [the few fields it needs](hub.md#data-the-hub-stores)), and prints the hub's reply, which is already in the agent's own hook output format.
@@ -128,8 +144,10 @@ does not expose Hub work tools. The equivalent universal CLI path is
 the same record. Grok has no native AgentSCM adapter; when configured as a Hub MCP client, it can
 use the same MCP tool.
 
-These are structured reports, not automatic usage capture. Use `unknown` for an agent, provider or
-model label the client cannot determine, and omit token or cost fields that are unavailable. Do not
+These tools accept structured caller reports. The optional Claude change-capture history reader
+can submit observed request usage automatically when an explicit local history root is configured.
+Use `unknown` for an agent, provider or model label the client cannot determine, and omit token or
+cost fields that are unavailable. Do not
 treat missing values as zero. A `provider_result` basis is still a caller report; the Hub does not
 verify it against a provider. See [work insights](work-insights.md) for the record and evidence limits.
 

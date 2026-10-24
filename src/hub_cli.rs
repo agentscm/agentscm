@@ -779,7 +779,9 @@ pub(crate) fn write_private(path: &std::path::Path, contents: &str) -> Result<()
     let mut file = options.open(&temp)?;
     let result = (|| {
         file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
         std::fs::rename(&temp, path)?;
+        std::fs::File::open(dir)?.sync_all()?;
         Ok(())
     })();
     let _ = std::fs::remove_file(&temp);

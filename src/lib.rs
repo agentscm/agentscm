@@ -9,6 +9,9 @@ pub mod autopsy;
 pub mod backend;
 pub mod backend_s3;
 pub mod candidate;
+#[cfg(unix)]
+pub mod change_capture;
+pub mod change_record;
 pub mod checks;
 pub mod context;
 pub mod error;

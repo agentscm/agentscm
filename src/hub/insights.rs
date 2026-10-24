@@ -63,6 +63,13 @@ pub(crate) fn record_completion(
             source_commit: None,
             input_tokens: None,
             output_tokens: None,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+            action_id: None,
+            attempt_id: None,
+            provider_request_id: None,
+            provider_event_id: None,
+            measurement_scope: None,
             cost: None,
         },
         now,
@@ -74,6 +81,15 @@ pub(crate) fn record_completion(
 pub enum UsageBasis {
     Reported,
     ProviderResult,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageMeasurementScope {
+    /// One provider request/response exchange. These records may be summed when identities differ.
+    Request,
+    /// A provider's final cumulative session total. Never add this to request-scoped observations.
+    SessionCumulative,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -129,6 +145,20 @@ pub struct UsageRecord {
     pub source_commit: Option<String>,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measurement_scope: Option<UsageMeasurementScope>,
     pub cost: Option<ReportedCost>,
 }
 
@@ -156,9 +186,24 @@ impl UsageRecord {
                 "source_commit must be a full lowercase Git object ID",
             ));
         }
-        for count in [self.input_tokens, self.output_tokens]
-            .into_iter()
-            .flatten()
+        for (name, value) in [
+            ("action_id", self.action_id.as_deref()),
+            ("attempt_id", self.attempt_id.as_deref()),
+            ("provider_request_id", self.provider_request_id.as_deref()),
+            ("provider_event_id", self.provider_event_id.as_deref()),
+        ] {
+            if let Some(value) = value {
+                super::intent::text(name, value, 255)?;
+            }
+        }
+        for count in [
+            self.input_tokens,
+            self.output_tokens,
+            self.cache_read_input_tokens,
+            self.cache_creation_input_tokens,
+        ]
+        .into_iter()
+        .flatten()
         {
             if !(0..=MAX_MEASUREMENT).contains(&count) {
                 return Err(invalid("token count is out of bounds"));
@@ -457,8 +502,13 @@ pub fn summarize_usage(observations: &[UsageObservation]) -> Result<UsageSummary
     let mut output_known = 0;
     let mut missing_cost = 0;
     let mut failed = 0;
+    let mut summarized_observations = 0;
     for observation in observations {
         let r = &observation.request;
+        if r.measurement_scope == Some(UsageMeasurementScope::SessionCumulative) {
+            continue;
+        }
+        summarized_observations += 1;
         let key = (
             r.agent.clone(),
             r.provider.clone(),
@@ -518,8 +568,8 @@ pub fn summarize_usage(observations: &[UsageObservation]) -> Result<UsageSummary
         }
     }
     Ok(UsageSummary {
-        observations: observations.len(),
-        coverage: if observations.is_empty() {
+        observations: summarized_observations,
+        coverage: if summarized_observations == 0 {
             "unknown"
         } else {
             "partial"
@@ -689,6 +739,13 @@ mod tests {
                 source_commit: None,
                 input_tokens: None,
                 output_tokens: None,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
+                action_id: None,
+                attempt_id: None,
+                provider_request_id: None,
+                provider_event_id: None,
+                measurement_scope: None,
                 cost: None,
             },
         }
@@ -789,6 +846,40 @@ mod tests {
         assert_eq!(summary.token_groups.len(), 2);
         assert_eq!(summary.cost_groups.len(), 2);
         assert_eq!(summary.input_known_observations, 2);
+    }
+    #[test]
+    fn cumulative_session_usage_is_retained_but_not_added_to_request_usage() {
+        let mut request = observation("claude");
+        request.request.input_tokens = Some(7);
+        request.request.output_tokens = Some(11);
+        request.request.measurement_scope = Some(UsageMeasurementScope::Request);
+        let mut cumulative = request.clone();
+        cumulative.request.observation_id = "session-total".into();
+        cumulative.request.input_tokens = Some(70);
+        cumulative.request.output_tokens = Some(110);
+        cumulative.request.measurement_scope = Some(UsageMeasurementScope::SessionCumulative);
+
+        let summary = summarize_usage(&[request, cumulative]).unwrap();
+        assert_eq!(summary.observations, 1);
+        assert_eq!(summary.input_tokens, Some(7));
+        assert_eq!(summary.output_tokens, Some(11));
+        assert_eq!(summary.input_known_observations, 1);
+        assert_eq!(summary.output_known_observations, 1);
+    }
+    #[test]
+    fn absent_usage_metadata_keeps_the_legacy_canonical_shape() {
+        let encoded = serde_json::to_value(observation("generic").request).unwrap();
+        for field in [
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "action_id",
+            "attempt_id",
+            "provider_request_id",
+            "provider_event_id",
+            "measurement_scope",
+        ] {
+            assert!(encoded.get(field).is_none(), "unexpected {field}");
+        }
     }
     #[test]
     fn bounded_measurements_remain_exact_in_json_clients() {
