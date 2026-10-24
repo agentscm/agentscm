@@ -150,7 +150,7 @@ const STATUS = {
   error: { tone: 'bad', icon: 'x-octagon', word: 'Not answering properly' },
 } as const
 
-/** Where Templates and Timeline read from: `agentscm serve` on this computer. Loopback only, its own token. */
+/** Local read features use `agentscm serve` on this computer and its own token. */
 function LocalServer() {
   const [saved, setSaved] = useState(loadLocalBase)
   const [draft, setDraft] = useState(saved)
@@ -160,7 +160,7 @@ function LocalServer() {
   const valid = validLocalBase(value)
   const status = usePoll((signal) => localStatus(signal), 0, `${saved}|${nonce}`)
   return (
-    <Box tour="settings-local" icon="laptop" title="This computer" explain="Templates and Timeline read from agentscm serve on this machine, never from the hub.">
+    <Box tour="settings-local" icon="laptop" title="This computer" explain="Repository explorer, Templates and Timeline read from agentscm serve on this machine.">
       <form
         className="settings-row"
         onSubmit={(e) => {
@@ -174,8 +174,9 @@ function LocalServer() {
       >
         <div>
           <label className="settings-label" htmlFor="local-base">Local read API</label>
-          <div className="muted small">Leave the address empty to use this page’s own address. Only addresses on this computer are allowed, such as http://127.0.0.1:7331. A token is needed only for a different address: it is agentscm serve’s own read token, never your hub token, and is kept for this tab only.</div>
+          <div className="muted small">Leave the address empty to use this page’s own address. Only addresses on this computer are allowed, such as http://127.0.0.1:7331. The repository explorer always requires the local service’s read token. Other local features also require it when configured. Use the local read token here; it is kept for this tab only.</div>
           <div className="mt-2">
+            <span className="small muted me-2">Timeline connection:</span>
             {status.kind === 'ready' ? <Pill tone={STATUS[status.value].tone} icon={STATUS[status.value].icon}>{STATUS[status.value].word}</Pill> : status.kind === 'loading' ? <span className="small muted">Checking…</span> : <Pill tone="bad">Could not check</Pill>}
           </div>
         </div>
@@ -187,7 +188,7 @@ function LocalServer() {
           </div>
           <div>
             <label className="visually-hidden" htmlFor="local-token">Local read token</label>
-            <input id="local-token" type="password" className="form-control" placeholder="Local read token (optional)" value={token} onChange={(e) => setToken(e.target.value)} autoComplete="off" disabled={value === ''} />
+            <input id="local-token" type="password" className="form-control" placeholder="Local read token" value={token} onChange={(e) => setToken(e.target.value)} autoComplete="off" />
           </div>
           <button type="submit" className="btn btn-outline-secondary" disabled={!valid}>Save and check</button>
         </div>

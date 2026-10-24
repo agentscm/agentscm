@@ -228,7 +228,7 @@ export function saveLocalBase(v: string): void {
     /* not saved in this browser */
   }
 }
-/** Only needed cross-origin. Its own local secret (AGENTSCM_SERVE_READ_TOKEN), never the hub token; kept for this tab only. */
+/** The local service secret (AGENTSCM_SERVE_READ_TOKEN), never the hub token; kept for this tab only. */
 export function loadLocalToken(): string {
   try {
     return window.sessionStorage.getItem(TOKEN_KEY) ?? ''

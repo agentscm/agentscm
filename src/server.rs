@@ -20,6 +20,9 @@ use serde::Serialize;
 use serde_json::json;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+#[cfg(unix)]
+mod explorer;
+
 const MAX_CONCURRENCY: usize = 256;
 const MAX_QUERY_BYTES: usize = 4 * 1024;
 const MAX_SOURCE_BYTES: usize = 8 * 1024 * 1024;
@@ -36,6 +39,8 @@ struct AppState {
     collisions: Option<Arc<PathBuf>>,
     /// Native workspace whose timeline `/v1/local/workspace` reads, chosen by the operator.
     timeline: Option<Arc<PathBuf>>,
+    #[cfg(unix)]
+    explorer: Option<Arc<agentscm::repo_explorer::Explorer>>,
 }
 
 /// Token and browser origins guarding `/v1/local`, fixed at startup.
@@ -80,15 +85,32 @@ struct ResponseGuard {
     _permit: OwnedSemaphorePermit,
 }
 
-pub async fn serve(
-    data_dir: PathBuf,
-    bind: SocketAddr,
-    public: bool,
-    max_concurrency: usize,
-    collisions: Option<PathBuf>,
-    timeline: Option<PathBuf>,
-    browser_origins: Vec<String>,
-) -> Result<()> {
+pub struct ServeOptions {
+    pub data_dir: PathBuf,
+    pub bind: SocketAddr,
+    pub public: bool,
+    pub max_concurrency: usize,
+    pub collisions: Option<PathBuf>,
+    pub timeline: Option<PathBuf>,
+    pub browser_origins: Vec<String>,
+    pub explorer_repo: Option<PathBuf>,
+    pub explorer_repository: Option<String>,
+    pub explorer_spool: Option<PathBuf>,
+}
+
+pub async fn serve(options: ServeOptions) -> Result<()> {
+    let ServeOptions {
+        data_dir,
+        bind,
+        public,
+        max_concurrency,
+        collisions,
+        timeline,
+        browser_origins,
+        explorer_repo,
+        explorer_repository,
+        explorer_spool,
+    } = options;
     if !bind.ip().is_loopback() && !public {
         return Err(Error::Invalid(
             "binding a non-loopback address requires --public".into(),
@@ -98,6 +120,21 @@ pub async fn serve(
         return Err(Error::Limit(format!(
             "max concurrency must be between 1 and {MAX_CONCURRENCY}"
         )));
+    }
+
+    let access = local_access(std::env::var(READ_TOKEN_ENV).ok(), browser_origins)?;
+    if explorer_repo.is_some() && (!bind.ip().is_loopback() || access.token.is_none()) {
+        return Err(Error::Invalid(format!(
+            "the repository explorer requires a loopback bind address and {READ_TOKEN_ENV}"
+        )));
+    }
+    #[cfg(unix)]
+    let explorer = explorer::open(explorer_repo, explorer_repository, explorer_spool)?;
+    #[cfg(not(unix))]
+    if explorer_repo.is_some() || explorer_repository.is_some() || explorer_spool.is_some() {
+        return Err(Error::Invalid(
+            "the repository explorer needs a Unix host".into(),
+        ));
     }
 
     // Validate and initialize the engine before reporting the listening address.
@@ -111,7 +148,6 @@ pub async fn serve(
         }
         path => path.map(Arc::new),
     };
-    let access = local_access(std::env::var(READ_TOKEN_ENV).ok(), browser_origins)?;
     let timeline = match timeline {
         Some(root) => {
             let root = std::fs::canonicalize(root)?;
@@ -135,6 +171,8 @@ pub async fn serve(
         work: Arc::new(Semaphore::new(max_concurrency)),
         collisions,
         timeline,
+        #[cfg(unix)]
+        explorer,
     };
     let app = router(state, access);
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -183,7 +221,10 @@ fn router(state: AppState, access: LocalAccess) -> Router {
         .route("/v1/local/changes", get(change_page))
         .route("/v1/local/workspace/timeline", get(timeline_page))
         .route("/v1/local/workspace/timeline/{id}", get(timeline_entry))
-        .route("/v1/local/workspace/diff", get(timeline_diff))
+        .route("/v1/local/workspace/diff", get(timeline_diff));
+    #[cfg(unix)]
+    let local = local.merge(explorer::routes());
+    let local = local
         .layer(middleware::from_fn_with_state(
             Arc::new(access),
             local_guard,
@@ -236,6 +277,17 @@ async fn local_guard(
                 "local",
             )
         }
+    } else if request.uri().path().starts_with("/v1/local/explorer/")
+        && request.headers().contains_key(header::ORIGIN)
+        && origin.is_none()
+    {
+        read_error(
+            ApiError {
+                status: StatusCode::FORBIDDEN,
+                message: "origin is not allowed; start serve with --browser-origin".into(),
+            },
+            "repository explorer",
+        )
     } else if !authorized(access.token.as_deref(), request.headers()) {
         let mut response = read_error(
             ApiError {
@@ -1146,6 +1198,8 @@ mod tests {
             work: Arc::new(Semaphore::new(1)),
             collisions: None,
             timeline: None,
+            #[cfg(unix)]
+            explorer: None,
         };
         let permit = reserve_work(&state).unwrap();
         let response = workflow_status(State(state.clone()), RawQuery(None)).await;
@@ -1166,6 +1220,8 @@ mod tests {
             work: Arc::new(Semaphore::new(1)),
             collisions: None,
             timeline: None,
+            #[cfg(unix)]
+            explorer: None,
         };
         let permit = reserve_work(&state).unwrap();
         let response = skill_workflow(
@@ -1192,6 +1248,8 @@ mod tests {
             work: Arc::clone(&work),
             collisions: None,
             timeline: None,
+            #[cfg(unix)]
+            explorer: None,
         };
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
