@@ -13,6 +13,16 @@ fn parse_confirm(answer: &str, default_yes: bool) -> Option<bool> {
     }
 }
 
+fn ask(mut read: impl FnMut() -> Option<String>, default_yes: bool) -> Option<bool> {
+    for _ in 0..MAX_TRIES {
+        if let Some(choice) = parse_confirm(&read()?, default_yes) {
+            return Some(choice);
+        }
+        println!("Please answer y or n.");
+    }
+    None
+}
+
 pub(crate) struct Ui {
     pub(crate) yes: bool,
 }
@@ -32,20 +42,14 @@ impl Ui {
     /// Only an empty answer takes the default; anything unrecognised is asked again, and
     /// three misses or end of input mean no.
     pub(crate) fn confirm(&self, question: &str, default_yes: bool) -> bool {
-        if self.yes {
-            return true;
-        }
+        self.yes || self.answer(question, default_yes).unwrap_or(false)
+    }
+
+    /// Like `confirm`, but `None` when nobody answered (end of input or three misses), for
+    /// choices that must not be recorded without a real answer.
+    pub(crate) fn answer(&self, question: &str, default_yes: bool) -> Option<bool> {
         let hint = if default_yes { "[Y/n]" } else { "[y/N]" };
-        for _ in 0..MAX_TRIES {
-            let Some(answer) = self.read(&format!("{question} {hint} ")) else {
-                return false;
-            };
-            if let Some(choice) = parse_confirm(&answer, default_yes) {
-                return choice;
-            }
-            println!("Please answer y or n.");
-        }
-        false
+        ask(|| self.read(&format!("{question} {hint} ")), default_yes)
     }
 
     /// The 0-based index of the chosen option; `default` on Enter, end of input, or after
@@ -124,5 +128,18 @@ mod tests {
         assert_eq!(parse_confirm("Yes", false), Some(true));
         assert_eq!(parse_confirm("n", true), Some(false));
         assert_eq!(parse_confirm("yse", true), None);
+    }
+
+    #[test]
+    fn no_answer_is_not_a_no() {
+        let answers = |list: &[&str]| {
+            let mut list: Vec<String> = list.iter().map(|a| a.to_string()).collect();
+            list.reverse();
+            move || list.pop()
+        };
+        assert_eq!(super::ask(answers(&[]), true), None);
+        assert_eq!(super::ask(answers(&["yse", "x", "?"]), true), None);
+        assert_eq!(super::ask(answers(&["yse", "n"]), true), Some(false));
+        assert_eq!(super::ask(answers(&[""]), true), Some(true));
     }
 }
