@@ -57,6 +57,24 @@ fn person(store: &dyn Store, dir: &Path, id: i64, login: &str, agent: &str) -> (
     (binding, token)
 }
 
+/// A message's header, fields (`Label: value`) and context lines, joined by ` | `.
+fn rendered(body: &Value) -> String {
+    let mut parts = Vec::new();
+    for block in body["blocks"].as_array().unwrap() {
+        let texts: Vec<&Value> = match block["type"].as_str().unwrap() {
+            "header" => vec![&block["text"]],
+            "section" => block["fields"].as_array().unwrap().iter().collect(),
+            "context" => block["elements"].as_array().unwrap().iter().collect(),
+            _ => Vec::new(),
+        };
+        for text in texts {
+            assert_eq!(text["type"], "plain_text");
+            parts.push(text["text"].as_str().unwrap().replacen('\n', ": ", 1));
+        }
+    }
+    parts.join(" | ")
+}
+
 impl Fixture {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
@@ -191,20 +209,14 @@ impl Fixture {
         assert!(!self.edit(&self.bob, "b").repeated.is_empty());
     }
 
-    /// The direct messages sent so far, as (Slack user, text).
+    /// The direct messages sent so far, as (Slack user, rendered text).
     fn sent(&self) -> Vec<(String, String)> {
         self.calls
             .lock()
             .unwrap()
             .iter()
             .filter(|(path, _)| path == "/api/chat.postMessage")
-            .map(|(_, body)| {
-                let text = body["blocks"][0]["text"]["text"].as_str().unwrap();
-                (
-                    body["channel"].as_str().unwrap().to_owned(),
-                    text.to_owned(),
-                )
-            })
+            .map(|(_, body)| (body["channel"].as_str().unwrap().to_owned(), rendered(body)))
             .collect()
     }
 
@@ -285,7 +297,7 @@ impl Fixture {
     /// `user` clicks the button `action_id` of their latest direct message.
     async fn click(&self, user: &str, action_id: &str) -> StatusCode {
         let message = self.sent_body(user);
-        let button = message["blocks"][1]["elements"]
+        let button = message["blocks"][2]["elements"]
             .as_array()
             .unwrap()
             .iter()
@@ -357,16 +369,16 @@ async fn a_repeated_edit_messages_both_people_and_the_holder_hands_over_with_a_b
     let holder = &sent.iter().find(|(user, _)| user == "U1").unwrap().1;
     assert_eq!(
         holder,
-        "bob's agent codex edited src/widget.rs in acme/widgets after AgentSCM said your agent claude is working on it. Hand the file over, or keep it and agree with them who goes first."
+        "Another agent edited a file your agent holds | File: src/widget.rs | Repository: acme/widgets | Your agent: claude | Their agent: bob's codex | Hand it over, or keep it and agree who goes first."
     );
     let repeater = &sent.iter().find(|(user, _)| user == "U2").unwrap().1;
     assert_eq!(
         repeater,
-        "Your agent codex edited src/widget.rs in acme/widgets after AgentSCM said alice's agent claude is working on it. Agree with them who goes first."
+        "Your agent edited a file another agent holds | File: src/widget.rs | Repository: acme/widgets | Your agent: codex | Their agent: alice's claude | Agree with them who goes first."
     );
     // Only the holder's message carries the handoff buttons; both link the Hub.
     let buttons = |user: &str| {
-        f.sent_body(user)["blocks"][1]["elements"]
+        f.sent_body(user)["blocks"][2]["elements"]
             .as_array()
             .unwrap()
             .iter()
@@ -378,7 +390,7 @@ async fn a_repeated_edit_messages_both_people_and_the_holder_hands_over_with_a_b
 
     // Bob cannot answer for alice's agent with her button.
     let alice_message = f.sent_body("U1");
-    let value = &alice_message["blocks"][1]["elements"][0]["value"];
+    let value = &alice_message["blocks"][2]["elements"][0]["value"];
     assert_eq!(
         f.click_value("U2", YES, value, &alice_message).await,
         StatusCode::FORBIDDEN
@@ -387,10 +399,19 @@ async fn a_repeated_edit_messages_both_people_and_the_holder_hands_over_with_a_b
     let update = f.update().await;
     assert_eq!(update["channel"], "D1");
     assert_eq!(update["ts"], "1.2");
+    // The header and fields stay; the buttons and guidance become the outcome.
+    let kinds: Vec<_> = update["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["header", "section", "context"]);
     assert_eq!(
-        update["blocks"][1]["elements"][0]["text"],
-        "You handed src/widget.rs to bob's agent codex; their agent is told on its next call."
+        rendered(&update),
+        "Another agent edited a file your agent holds | File: src/widget.rs | Repository: acme/widgets | Your agent: claude | Their agent: bob's codex | Handed to bob's codex"
     );
+    assert_eq!(update["text"], "Handed to bob's codex");
     let holders: Vec<String> = tokio::task::block_in_place(|| {
         f.store()
             .live_intents(REPO, unix_now(), 10)
@@ -472,8 +493,8 @@ async fn the_holder_button_answers_for_the_session_that_holds_the_file() {
     assert_eq!(f.click("U1", YES).await, StatusCode::OK);
     let update = f.update().await;
     assert_eq!(
-        update["blocks"][1]["elements"][0]["text"],
-        "You handed src/widget.rs to bob's agent codex; their agent is told on its next call."
+        update["blocks"][2]["elements"][0]["text"],
+        "Handed to bob's codex"
     );
 }
 
@@ -494,8 +515,8 @@ async fn a_slow_message_update_does_not_delay_the_button_acknowledgement() {
             .any(|(path, _)| path == "/api/chat.update")
     );
     assert_eq!(
-        f.update().await["blocks"][1]["elements"][0]["text"],
-        "You handed src/widget.rs to bob's agent codex; their agent is told on its next call."
+        f.update().await["blocks"][2]["elements"][0]["text"],
+        "Handed to bob's codex"
     );
 }
 
@@ -540,9 +561,9 @@ async fn a_repeated_edit_of_several_held_files_is_one_message_without_buttons() 
     assert_eq!(holder.len(), 1, "{holder:?}");
     assert_eq!(
         holder[0].1,
-        "bob's agent codex edited src/gadget.rs, src/widget.rs in acme/widgets after AgentSCM said your agent claude is working on them. Hand the files over, or keep them and agree with them who goes first."
+        "Another agent edited files your agent holds | Files: src/gadget.rs\nsrc/widget.rs | Repository: acme/widgets | Your agent: claude | Their agent: bob's codex | Hand them over, or keep them and agree who goes first."
     );
-    let buttons: Vec<_> = f.sent_body("U1")["blocks"][1]["elements"]
+    let buttons: Vec<_> = f.sent_body("U1")["blocks"][2]["elements"]
         .as_array()
         .unwrap()
         .iter()
@@ -575,11 +596,11 @@ async fn a_declined_handoff_messages_both_people_with_the_reason() {
     assert_eq!(sent.len(), 2, "{sent:?}");
     assert!(sent.contains(&(
         "U2".into(),
-        "alice's agent claude kept src/widget.rs in acme/widgets, which your agent codex asked for (reason: \"mid-refactor\"). Agree with them who goes first.".into()
+        "Another agent kept a file your agent asked for | File: src/widget.rs | Repository: acme/widgets | Your agent: codex | Their agent: alice's claude | Reason: mid-refactor | Agree with them who goes first.".into()
     )));
     assert!(sent.contains(&(
         "U1".into(),
-        "Your agent claude kept src/widget.rs in acme/widgets, which bob's agent codex asked for (reason: \"mid-refactor\"). Agree with them who goes first.".into()
+        "Your agent kept a file | File: src/widget.rs | Repository: acme/widgets | Your agent: claude | Their agent: bob's codex | Reason: mid-refactor | Agree with them who goes first.".into()
     )));
 }
 
@@ -609,11 +630,11 @@ async fn similar_work_messages_the_starter_and_the_lead() {
     assert_eq!(sent.len(), 2, "{sent:?}");
     assert!(sent.contains(&(
         "U2".into(),
-        "Your agent codex started \"switch migrations to filename-based discovery\" in acme/widgets, which reads like alice's agent claude \"make db migrations filename based\"; open pull request #9. Check whether it is the same work.".into()
+        "Your agent started similar work | Task: switch migrations to filename-based discovery | Repository: acme/widgets | Your agent: codex | Reads like: alice's claude: make db migrations filename based\nOpen pull request #9 | Check whether it is the same work.".into()
     )));
     assert!(sent.contains(&(
         "U1".into(),
-        "bob's agent codex started \"switch migrations to filename-based discovery\" in acme/widgets, which reads like your agent claude's work \"make db migrations filename based\". Check with them whether it is the same work.".into()
+        "Similar work started | Task: switch migrations to filename-based discovery | Repository: acme/widgets | Their agent: bob's codex | Your agent: claude | Your work: make db migrations filename based | Check with them whether it is the same work.".into()
     )));
 }
 
@@ -689,11 +710,54 @@ async fn uninstall_stops_messages_and_survives_restart() {
 fn message_text_cannot_mention_or_link() {
     let body = message(
         "<!channel> & <http://x|y>",
+        &[("File", "<@U1>".into())],
+        "<!here>",
         None,
         "https://hub.example.test/ui/",
     );
-    assert_eq!(body["text"], "&lt;!channel&gt; &amp; &lt;http://x|y&gt;");
-    assert_eq!(body["blocks"][0]["text"]["type"], "plain_text");
+    assert_eq!(
+        body["text"],
+        "&lt;!channel&gt; &amp; &lt;http://x|y&gt;: &lt;@U1&gt;"
+    );
+    rendered(&body);
+}
+
+#[test]
+fn a_long_path_and_hostile_login_stay_plain_text_within_slack_limits() {
+    let hostile = format!("<!channel>\u{7}*bold* <http://x|y> {}", "&".repeat(5000));
+    let long = format!("src/{}.rs", "a/".repeat(3000));
+    let paths: Vec<String> = (0..12).map(|n| format!("{long}{n}")).collect();
+    let who = label(&hostile, &hostile);
+    let fields = [
+        files(&paths),
+        ("Repository", sanitize(&hostile, TEXT_CHARS)),
+        ("Your agent", sanitize(&hostile, NAME_CHARS)),
+        ("Their agent", who.clone()),
+    ];
+    let headline = format!("Another agent edited {hostile}");
+    let body = message(
+        &headline,
+        &fields,
+        &hostile,
+        Some(("token", None, &long)),
+        "https://hub.example.test/ui/",
+    );
+    let blocks = body["blocks"].as_array().unwrap();
+    let header = blocks[0]["text"]["text"].as_str().unwrap();
+    assert!(header.chars().count() <= 150);
+    let section = blocks[1]["fields"].as_array().unwrap();
+    assert!(section.len() <= 10);
+    for field in section {
+        let text = field["text"].as_str().unwrap();
+        assert!(text.chars().count() <= 2000);
+        assert!(!text.chars().any(|c| c.is_control() && c != '\n'));
+    }
+    assert!(section[0]["text"].as_str().unwrap().ends_with("\n+7 more"));
+    // A button value past Slack's limit sends the message without the handoff buttons.
+    assert_eq!(blocks[2]["elements"].as_array().unwrap().len(), 1);
+    let text = body["text"].as_str().unwrap();
+    assert!(!text.contains('<') && !text.contains('>'));
+    assert!(!rendered(&body).contains('\u{7}'));
 }
 
 #[test]
