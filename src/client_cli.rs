@@ -232,17 +232,52 @@ pub(crate) async fn setup(
     program: &Path,
     wait: Option<&AppWait<'_>>,
 ) -> Result<()> {
-    let _lifecycle = lifecycle_lock()?;
-    validate_setup_program(program)?;
-    for agent in agents {
-        crate::client_setup::preflight(*agent, &root, program)?;
+    connect_inner(
+        args,
+        root,
+        wait,
+        Some(SetupInstallation { agents, program }),
+    )
+    .await
+}
+
+#[cfg(unix)]
+struct SetupInstallation<'a> {
+    agents: &'a [crate::client_setup::Agent],
+    program: &'a Path,
+}
+
+#[cfg(not(unix))]
+type SetupInstallation<'a> = std::marker::PhantomData<&'a ()>;
+
+#[cfg(unix)]
+fn validate_setup_installation(setup: &SetupInstallation<'_>, root: &Path) -> Result<()> {
+    validate_setup_program(setup.program)?;
+    for agent in setup.agents {
+        crate::client_setup::preflight(*agent, root, setup.program)?;
     }
-    connect_inner(args, root.clone(), wait).await?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_setup_installation(setup: &SetupInstallation<'_>, _root: &Path) -> Result<()> {
+    let _ = setup;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn install_setup(setup: &SetupInstallation<'_>, root: &Path) -> Result<()> {
     // Recorded first, so `client remove` also takes out a plugin a failed install left behind.
-    for agent in agents {
-        record_agent(&root, *agent)?;
-        crate::client_setup::install(*agent, &root, program)?;
+    for agent in setup.agents {
+        record_agent(root, *agent)?;
+        crate::client_setup::install(*agent, root, setup.program)?;
     }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn install_setup(setup: &SetupInstallation<'_>, _root: &Path) -> Result<()> {
+    let _ = setup;
     Ok(())
 }
 
@@ -891,11 +926,146 @@ pub(crate) async fn connect(
     root: PathBuf,
     wait: Option<&AppWait<'_>>,
 ) -> Result<()> {
-    let _lifecycle = lifecycle_lock()?;
-    connect_inner(args, root, wait).await
+    connect_inner(args, root, wait, None).await
 }
 
-async fn connect_inner(args: ConnectArgs, root: PathBuf, wait: Option<&AppWait<'_>>) -> Result<()> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProgramIdentity {
+    length: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+fn program_identity(path: &Path) -> Result<ProgramIdentity> {
+    let metadata = path.metadata()?;
+    if !metadata.is_file() {
+        return Err(invalid("the AgentSCM executable is not a file"));
+    }
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    Ok(ProgramIdentity {
+        length: metadata.len(),
+        modified: metadata.modified().ok(),
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+    })
+}
+
+fn optional_program_identity(path: &Path) -> Result<Option<ProgramIdentity>> {
+    match path.metadata() {
+        Ok(_) => program_identity(path).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+struct ProgramFence {
+    paths: Vec<(PathBuf, Option<ProgramIdentity>)>,
+}
+
+fn invocation_program_fence() -> Result<ProgramFence> {
+    let running = std::env::current_exe()?;
+    let identity = program_identity(&running)?;
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|home| !home.is_empty()));
+    let stable = home.map(|home| {
+        PathBuf::from(home)
+            .join(".agentscm/bin")
+            .join(if cfg!(windows) {
+                "agentscm.exe"
+            } else {
+                "agentscm"
+            })
+    });
+    let manifest = crate::hub_cli::config_dir()?.join("agentscm/quickstart.json");
+    let manifest_identity = optional_program_identity(&manifest)?;
+    let mut paths = vec![(running, Some(identity)), (manifest, manifest_identity)];
+    if let Some(stable) = stable {
+        let stable_identity = optional_program_identity(&stable)?;
+        paths.push((stable, stable_identity));
+    }
+    Ok(ProgramFence { paths })
+}
+
+fn setup_program_identity(setup: &SetupInstallation<'_>) -> Result<ProgramIdentity> {
+    #[cfg(unix)]
+    return program_identity(setup.program);
+    #[cfg(not(unix))]
+    {
+        let _ = setup;
+        Ok(ProgramIdentity {
+            length: 0,
+            modified: None,
+        })
+    }
+}
+
+fn revalidate_after_wait(
+    root: &Path,
+    origin: (&str, &str),
+    existing: Option<&Connection>,
+    checked_token: Option<(&Path, Option<&str>)>,
+    setup: Option<&SetupInstallation<'_>>,
+    expected_setup_program: Option<&ProgramIdentity>,
+    invocation_program: &ProgramFence,
+) -> Result<()> {
+    if root.canonicalize().ok().as_deref() != Some(root)
+        || canonical_root(root).ok().as_deref() != Some(root)
+        || !origin_identity(root).is_ok_and(|(host, repo)| {
+            host.eq_ignore_ascii_case(origin.0) && repo.eq_ignore_ascii_case(origin.1)
+        })
+    {
+        return Err(invalid("the checkout origin changed during setup; retry"));
+    }
+    let latest = load()?
+        .into_iter()
+        .find(|connection| connection.root == root);
+    if latest.as_ref() != existing {
+        return Err(invalid("the client connection changed during setup; retry"));
+    }
+    if let Some((path, expected)) = checked_token
+        && read_token(path).ok().as_deref() != expected
+    {
+        return Err(invalid("the client token changed during setup; retry"));
+    }
+    if invocation_program
+        .paths
+        .iter()
+        .any(|(path, expected)| optional_program_identity(path).ok().as_ref() != Some(expected))
+    {
+        return Err(invalid(
+            "the AgentSCM installation changed during setup; retry",
+        ));
+    }
+    if let Some(setup) = setup {
+        validate_setup_installation(setup, root)?;
+        if setup_program_identity(setup).ok().as_ref() != expected_setup_program {
+            return Err(invalid(
+                "the installed AgentSCM executable changed during setup; retry",
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn connect_inner(
+    args: ConnectArgs,
+    root: PathBuf,
+    wait: Option<&AppWait<'_>>,
+    setup: Option<SetupInstallation<'_>>,
+) -> Result<()> {
+    let initial_lifecycle = lifecycle_lock()?;
+    let invocation_program = invocation_program_fence()?;
+    if let Some(setup) = setup.as_ref() {
+        validate_setup_installation(setup, &root)?;
+    }
+    let setup_program_identity = setup.as_ref().map(setup_program_identity).transpose()?;
     let (origin_host, inferred_repo) = origin_identity(&root)?;
     let repo = match args.repo {
         Some(repo) if !valid_repo(&repo) => {
@@ -905,7 +1075,7 @@ async fn connect_inner(args: ConnectArgs, root: PathBuf, wait: Option<&AppWait<'
             return Err(invalid("--repo does not match the checkout origin"));
         }
         Some(repo) => repo,
-        None => inferred_repo,
+        None => inferred_repo.clone(),
     };
     let hub = check_base_url(&args.hub).map_err(map_hub_error)?;
     let supplied_token = match args.token_file {
@@ -920,8 +1090,12 @@ async fn connect_inner(args: ConnectArgs, root: PathBuf, wait: Option<&AppWait<'
         }
         None => None,
     };
+    let supplied_secret = supplied_token.as_deref().map(read_token).transpose()?;
     let connections = load()?;
     let existing = connections.iter().find(|saved| saved.root == root).cloned();
+    let existing_token = existing
+        .as_ref()
+        .map(|saved| (saved.token_file.clone(), read_token(&saved.token_file).ok()));
     let changed = existing.as_ref().is_some_and(|saved| {
         saved.hub != hub
             || !saved.repo.eq_ignore_ascii_case(&repo)
@@ -935,12 +1109,29 @@ async fn connect_inner(args: ConnectArgs, root: PathBuf, wait: Option<&AppWait<'
             "a different client connection already exists for this checkout; review `agentscm client list`, then pass --replace",
         ));
     }
+    drop(initial_lifecycle);
     if supplied_token.is_none()
         && !changed
         && let Some(saved) = existing.as_ref().filter(|saved| is_current(saved))
-        && let Ok(verified) = verify(saved).await
+        && let Some(saved_token) = existing_token
+            .as_ref()
+            .and_then(|(_, token)| token.as_ref())
+        && let Ok(verified) = verify_token(saved, saved_token).await
     {
+        let final_lifecycle = lifecycle_lock()?;
+        revalidate_after_wait(
+            &root,
+            (&origin_host, &inferred_repo),
+            existing.as_ref(),
+            Some((&saved.token_file, Some(saved_token))),
+            setup.as_ref(),
+            setup_program_identity.as_ref(),
+            &invocation_program,
+        )?;
         if saved.repo == verified.repository {
+            if let Some(setup) = setup.as_ref() {
+                install_setup(setup, &root)?;
+            }
             println!(
                 "Connection is already valid for {} at {} as {}:{}@{}; token expires at {} and permits coordination.",
                 saved.repo,
@@ -958,6 +1149,9 @@ async fn connect_inner(args: ConnectArgs, root: PathBuf, wait: Option<&AppWait<'
             let mut corrected = saved.clone();
             corrected.repo = verified.repository.clone();
             update(&root, Some(saved), Some(corrected.clone()))?;
+            if let Some(setup) = setup.as_ref() {
+                install_setup(setup, &root)?;
+            }
             println!(
                 "Connection is already valid for {} at {} as {}:{}@{}; token expires at {} and permits coordination.",
                 corrected.repo,
@@ -969,10 +1163,11 @@ async fn connect_inner(args: ConnectArgs, root: PathBuf, wait: Option<&AppWait<'
             );
             return Ok(());
         }
+        drop(final_lifecycle);
     }
     let mut connection = Connection {
         root: root.clone(),
-        origin_host,
+        origin_host: origin_host.clone(),
         hub,
         repo,
         token_file: supplied_token.clone().unwrap_or_default(),
@@ -989,7 +1184,13 @@ async fn connect_inner(args: ConnectArgs, root: PathBuf, wait: Option<&AppWait<'
     };
     let mut owned_minted = None;
     let verified = if supplied_token.is_some() {
-        let verified = verify(&connection).await?;
+        let verified = verify_token(
+            &connection,
+            supplied_secret
+                .as_deref()
+                .ok_or_else(|| invalid("cannot read token file"))?,
+        )
+        .await?;
         connection.repo = verified.repository.clone();
         verified
     } else {
@@ -1022,10 +1223,6 @@ async fn connect_inner(args: ConnectArgs, root: PathBuf, wait: Option<&AppWait<'
         };
         connection.owned_token_id = Some(minted.id.clone());
         connection.owned_token_expires_at = Some(verified.expires_at);
-        if let Err(error) = write_owned_token(&connection.token_file, &minted.token) {
-            revoke_minted(&connection, &minted).await;
-            return Err(error);
-        }
         owned_minted = Some(minted);
         verified
     };
@@ -1041,21 +1238,66 @@ async fn connect_inner(args: ConnectArgs, root: PathBuf, wait: Option<&AppWait<'
         connection.owned_token_id = saved.owned_token_id.clone();
         connection.owned_token_expires_at = saved.owned_token_expires_at;
     }
-    if let Err(error) = update(&root, existing.as_ref(), Some(connection.clone())) {
-        if owned_minted.is_some() {
-            let _ = std::fs::remove_file(&connection.token_file);
+    let final_lifecycle = match lifecycle_lock() {
+        Ok(lifecycle) => lifecycle,
+        Err(error) => {
+            if let Some(minted) = owned_minted.as_ref() {
+                revoke_minted(&connection, minted).await;
+            }
+            return Err(error);
         }
+    };
+    let checked_token = supplied_token
+        .as_deref()
+        .map(|path| (path, supplied_secret.as_deref()))
+        .or_else(|| {
+            existing_token
+                .as_ref()
+                .map(|(path, token)| (path.as_path(), token.as_deref()))
+        });
+    if let Err(error) = revalidate_after_wait(
+        &root,
+        (&origin_host, &inferred_repo),
+        existing.as_ref(),
+        checked_token,
+        setup.as_ref(),
+        setup_program_identity.as_ref(),
+        &invocation_program,
+    ) {
+        drop(final_lifecycle);
         if let Some(minted) = owned_minted.as_ref() {
             revoke_minted(&connection, minted).await;
         }
         return Err(error);
     }
-    if let Some(saved) = existing.as_ref()
-        && saved.token_file != connection.token_file
-        && saved.owned_token_id.is_some()
+    if let Some(minted) = owned_minted.as_ref()
+        && let Err(error) = write_owned_token(&connection.token_file, &minted.token)
     {
+        drop(final_lifecycle);
+        revoke_minted(&connection, minted).await;
+        return Err(error);
+    }
+    if let Err(error) = update(&root, existing.as_ref(), Some(connection.clone())) {
+        if owned_minted.is_some() {
+            let _ = std::fs::remove_file(&connection.token_file);
+        }
+        drop(final_lifecycle);
+        if let Some(minted) = owned_minted.as_ref() {
+            revoke_minted(&connection, minted).await;
+        }
+        return Err(error);
+    }
+    let install_result = setup
+        .as_ref()
+        .map_or(Ok(()), |setup| install_setup(setup, &root));
+    let retired = existing.as_ref().filter(|saved| {
+        saved.token_file != connection.token_file && saved.owned_token_id.is_some()
+    });
+    drop(final_lifecycle);
+    if let Some(saved) = retired {
         retire_owned(saved).await;
     }
+    install_result?;
     println!(
         "Connected {} to {} for {} as {}:{}@{}; token expires at {} and permits coordination.",
         connection.root.display(),

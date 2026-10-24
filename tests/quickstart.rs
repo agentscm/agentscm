@@ -3163,6 +3163,347 @@ fn client_remove_honors_the_shared_lifecycle_lease() {
 }
 
 #[test]
+fn app_install_wait_releases_client_lifecycle_and_uninstall_fences_mutation() {
+    for (command, independent_copy) in [("setup", false), ("connect", false), ("connect", true)] {
+        app_install_wait_case(command, independent_copy);
+    }
+}
+
+fn app_install_wait_case(client_command: &str, independent_copy: bool) {
+    use std::fs::File;
+    use std::io::{Read, Write};
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let machine = Machine::transient().with_claude();
+    let repo = machine.repo();
+    let installed = install_dir_program(&machine);
+    ok(&run_as(
+        &machine,
+        &installed,
+        repo.path(),
+        &[
+            "quickstart",
+            "--yes",
+            "--hub",
+            "skip",
+            "--no-agents",
+            "--no-collisions",
+        ],
+    ));
+    let invocation = if independent_copy {
+        let path = machine.home.path().join("cache/agentscm");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::copy(&installed, &path).unwrap();
+        let installed_metadata = installed.metadata().unwrap();
+        let copy_metadata = path.metadata().unwrap();
+        assert_ne!(
+            (installed_metadata.dev(), installed_metadata.ino()),
+            (copy_metadata.dev(), copy_metadata.ino())
+        );
+        path
+    } else {
+        installed.clone()
+    };
+    #[cfg(target_os = "macos")]
+    let tray_login = {
+        let path = machine
+            .home
+            .path()
+            .join("Library/LaunchAgents/com.counterbranch.agentscm.tray.plist");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let stable = machine.bin_dir().join("agentscm");
+        let config = machine.home.path().join(".config");
+        let body = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>com.counterbranch.agentscm.tray</string>\n<key>ProgramArguments</key><array><string>{}</string><string>--no-telemetry</string><string>tray</string><string>--foreground</string></array>\n<key>EnvironmentVariables</key><dict><key>XDG_CONFIG_HOME</key><string>{}</string></dict>\n<key>RunAtLoad</key><true/>\n</dict></plist>\n",
+            stable.display(),
+            config.display()
+        );
+        std::fs::write(&path, body).unwrap();
+        path
+    };
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let hub = format!("http://{}", listener.local_addr().unwrap());
+    let (paused_tx, paused_rx) = mpsc::channel();
+    let expires_at = unix_now() + 3600;
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut requests = Vec::new();
+        let mut mints = 0;
+        let mut deleted = false;
+        while Instant::now() < deadline && !deleted {
+            let (mut stream, _) = match listener.accept() {
+                Ok(accepted) => accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("fake Hub accept failed: {error}"),
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let mut chunk = [0_u8; 4096];
+                let count = stream.read(&mut chunk).unwrap();
+                assert_ne!(count, 0, "request ended before its headers");
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let first = String::from_utf8_lossy(&request)
+                .lines()
+                .next()
+                .unwrap()
+                .to_owned();
+            requests.push(first.clone());
+            let (status, body) = match first.as_str() {
+                "GET /v1/hub/session HTTP/1.1" => (
+                    200,
+                    json!({"user":{"provider":"github","host":"github.com"}}),
+                ),
+                "GET /v1/hub/connections HTTP/1.1" => (200, json!({"connections":[]})),
+                "POST /v1/hub/tokens HTTP/1.1" => {
+                    mints += 1;
+                    if mints < 3 {
+                        (403, json!({"error":"not_connected"}))
+                    } else {
+                        (201, json!({"id":"tok_wait","token":"minted-secret"}))
+                    }
+                }
+                "GET /v1/hub/whoami HTTP/1.1" => (
+                    200,
+                    json!({
+                        "token":{"repository":REPO,"read_only":false,"expires_at":expires_at},
+                        "owner":{"provider":"github","host":"github.com","login":"octo"}
+                    }),
+                ),
+                "DELETE /v1/hub/tokens/tok_wait HTTP/1.1" => {
+                    deleted = true;
+                    (200, json!({}))
+                }
+                other => panic!("unexpected fake Hub request: {other}"),
+            };
+            let body = body.to_string();
+            write!(
+                stream,
+                "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            if mints == 2 {
+                paused_tx.send(()).unwrap();
+            }
+        }
+        assert!(deleted, "setup did not revoke the unused minted token");
+        requests
+    });
+
+    std::fs::create_dir_all(machine.config()).unwrap();
+    std::fs::write(
+        machine.config().join("hub-session.json"),
+        json!({"hub":hub,"session":"saved-session","expires_at":expires_at}).to_string(),
+    )
+    .unwrap();
+
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    // SAFETY: openpty initializes both descriptors; null termios and winsize request defaults.
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        },
+        0
+    );
+    // SAFETY: openpty returned two new owned descriptors above.
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    // SAFETY: openpty returned two new owned descriptors above.
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let args = match client_command {
+        "setup" => vec!["client", "setup", "--agent", "claude", "--hub", &hub],
+        "connect" => vec!["client", "connect", "--hub", &hub],
+        _ => unreachable!(),
+    };
+    let mut command = machine.command_as(&invocation, repo.path(), &args);
+    command
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave));
+    let mut setup = command.spawn().unwrap();
+    paused_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+    // The setup process is now waiting for Enter. Uninstall must be able to take the lifecycle
+    // lease, remove its owned program, and finish rather than racing with a stale setup writer.
+    let uninstalled = machine.run(repo.path(), &["uninstall", "--yes"]);
+    assert!(uninstalled.status.success(), "{uninstalled:?}");
+    assert!(!machine.bin_dir().exists());
+    #[cfg(target_os = "macos")]
+    assert!(!tray_login.exists());
+    master.write_all(b"\n").unwrap();
+    assert!(
+        !setup.wait().unwrap().success(),
+        "{client_command} independent_copy={independent_copy} resumed successfully after uninstall"
+    );
+    let requests = server.join().unwrap();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request == "DELETE /v1/hub/tokens/tok_wait HTTP/1.1"),
+        "{client_command} independent_copy={independent_copy}: {requests:?}"
+    );
+    assert!(machine.connections().is_empty());
+    assert!(!machine.config().join("tokens").exists());
+    assert!(!repo.path().join(".mcp.json").exists());
+    assert!(
+        !machine.claude_log().contains("install"),
+        "{client_command} independent_copy={independent_copy}"
+    );
+}
+
+#[test]
+fn client_connect_supports_explicit_config_without_home() {
+    let hub = Hub::start();
+    for empty_home in [false, true] {
+        let machine = Machine::new();
+        let repo = machine.repo();
+        let token = hub.token_file(machine.home.path());
+        let config = machine.home.path().join("explicit-config");
+        let mut command = machine.command(
+            repo.path(),
+            &[
+                "client",
+                "connect",
+                "--hub",
+                &hub.url,
+                "--token-file",
+                token.to_str().unwrap(),
+            ],
+        );
+        command
+            .env_remove("HOME")
+            .env_remove("USERPROFILE")
+            .env("XDG_CONFIG_HOME", &config);
+        if empty_home {
+            command.env("HOME", "");
+        }
+        ok(&command.output().unwrap());
+        let saved: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(config.join("agentscm/connections.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved["connections"][0]["repo"], REPO);
+    }
+}
+
+#[test]
+fn client_connect_rejects_local_state_changed_during_hub_wait() {
+    use std::io::{Read, Write};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    for changed in ["binding", "origin", "token"] {
+        let machine = Machine::new();
+        let repo = machine.repo();
+        let root = repo.path().canonicalize().unwrap();
+        let token = machine.home.path().join("saved.token");
+        std::fs::write(&token, "saved-secret\n").unwrap();
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let hub = format!("http://{}", listener.local_addr().unwrap());
+        let expires_at = unix_now() + 3600;
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let mut chunk = [0_u8; 4096];
+                let count = stream.read(&mut chunk).unwrap();
+                assert_ne!(count, 0, "request ended before its headers");
+                request.extend_from_slice(&chunk[..count]);
+            }
+            assert_eq!(
+                String::from_utf8_lossy(&request).lines().next(),
+                Some("GET /v1/hub/whoami HTTP/1.1")
+            );
+            entered_tx.send(()).unwrap();
+            resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let body = json!({
+                "token":{"repository":REPO,"read_only":false,"expires_at":expires_at},
+                "owner":{"provider":"github","host":"github.com","login":"octo"}
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+
+        std::fs::create_dir_all(machine.config()).unwrap();
+        let mut connection = json!({
+            "root":root,
+            "origin_host":"github.com",
+            "hub":hub,
+            "repo":REPO,
+            "token_file":token
+        });
+        let connections = machine.config().join("connections.json");
+        std::fs::write(
+            &connections,
+            json!({"version":1,"connections":[connection.clone()]}).to_string(),
+        )
+        .unwrap();
+        let mut command = machine.command(repo.path(), &["client", "connect", "--hub", &hub]);
+        let child = command.spawn().unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        match changed {
+            "binding" => {
+                connection["report_completion"] = json!(true);
+                std::fs::write(
+                    &connections,
+                    json!({"version":1,"connections":[connection]}).to_string(),
+                )
+                .unwrap();
+            }
+            "origin" => machine.git(
+                repo.path(),
+                &[
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "git@github.com:acme/other.git",
+                ],
+            ),
+            "token" => std::fs::write(&token, "changed-secret\n").unwrap(),
+            _ => unreachable!(),
+        }
+        resume_tx.send(()).unwrap();
+        let output = child.wait_with_output().unwrap();
+        server.join().unwrap();
+        assert!(!output.status.success(), "{changed}: {output:?}");
+        assert!(
+            !out(&output).contains("Connection is already valid"),
+            "{changed}: {output:?}"
+        );
+    }
+}
+
+#[test]
 fn final_uninstall_cleanup_excludes_setup_and_retains_program_when_busy() {
     use std::fs::OpenOptions;
     use std::os::fd::AsRawFd;
@@ -3766,6 +4107,63 @@ fn uninstall_that_cannot_revoke_fails_and_keeps_what_a_retry_needs() {
             .len(),
         1
     );
+}
+
+#[test]
+fn failed_install_after_replacement_still_retires_the_old_managed_token() {
+    let (hub, machine) = (Hub::start(), Machine::new().with_claude());
+    let repo = machine.repo();
+    let initial = hub.token_file(machine.home.path());
+    ok(&machine.run(
+        repo.path(),
+        &quick(&hub.url, &initial, &["--no-collisions"]),
+    ));
+    let old_secret = machine.own_the_connection(&hub);
+    let old_file = PathBuf::from(machine.connections()[0]["token_file"].as_str().unwrap());
+    assert_eq!(whoami_status(&hub, &old_secret), 200);
+
+    let replacement = hub.token_file_for(machine.home.path(), REPO, "replacement.token");
+    let shim = machine.bin.path().join("claude");
+    let original = std::fs::read_to_string(&shim).unwrap();
+    std::fs::write(
+        &shim,
+        original.replacen(
+            '\n',
+            "\ncase \"$2\" in install|update|enable) exit 1;; esac\n",
+            1,
+        ),
+    )
+    .unwrap();
+    let output = machine.run(
+        repo.path(),
+        &[
+            "client",
+            "setup",
+            "--agent",
+            "claude",
+            "--hub",
+            &hub.url,
+            "--token-file",
+            replacement.to_str().unwrap(),
+            "--replace",
+        ],
+    );
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(whoami_status(&hub, &old_secret), 401);
+    assert!(!old_file.exists());
+    let saved = machine.connections();
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    assert_eq!(
+        saved[0]["token_file"],
+        replacement.canonicalize().unwrap().to_str().unwrap()
+    );
+    assert!(saved[0]["owned_token_id"].is_null());
+    assert_eq!(saved[0]["agents"], json!(["claude"]));
+
+    std::fs::write(&shim, original).unwrap();
+    ok(&machine.run(repo.path(), &["client", "remove"]));
+    assert!(machine.connections().is_empty());
+    assert!(replacement.exists());
 }
 
 #[test]
