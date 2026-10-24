@@ -35,6 +35,7 @@
 - [Native CLI reference](reference/cli.md)
 - [Specification (draft)](spec/agentic-scm.md) and [architecture](architecture.md)
 - [Roadmap](roadmap.md)
+- [Design: supported skills (proposed)](design/supported-skills.md)
 
 ## Advanced and experimental
 
