@@ -119,11 +119,11 @@ impl Server {
         let base = format!("http://{}", listener.local_addr()?);
         let (shutdown, stopped) = oneshot::channel::<()>();
         let task = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    let _ = stopped.await;
-                })
-                .await
+            agentscm::http_listener::serve(listener, app, async {
+                let _ = stopped.await;
+            })
+            .await;
+            Ok(())
         });
         Ok(Self {
             base,

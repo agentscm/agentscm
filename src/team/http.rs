@@ -218,10 +218,7 @@ pub async fn serve(config: TeamConfig) -> Result<()> {
         "team listener ready on {}",
         listener.local_addr().map_err(Error::Io)?
     );
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(Error::Io)?;
+    crate::http_listener::serve(listener, app, shutdown_signal()).await;
     Ok(())
 }
 
@@ -1211,6 +1208,33 @@ pub(crate) async fn shutdown_signal() {
 mod tests {
     use super::*;
     use crate::team::service::validate_origin;
+
+    /// The full team router needs a fresh PostgreSQL 18; this serves its own capabilities
+    /// route and request-limit middleware through the listener that `serve` uses.
+    #[tokio::test]
+    async fn the_team_listener_cuts_off_trickled_request_headers() {
+        let app = Router::new()
+            .route("/v1/team/capabilities", get(capabilities))
+            .layer(middleware::from_fn(request_limits));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let limit = std::time::Duration::from_millis(300);
+        tokio::spawn(crate::http_listener::serve_with(
+            listener,
+            app,
+            limit,
+            std::future::pending(),
+        ));
+        let capabilities = reqwest::get(format!("http://{address}/v1/team/capabilities"))
+            .await
+            .unwrap();
+        assert_eq!(capabilities.status(), StatusCode::OK);
+        let (elapsed, response) =
+            crate::http_listener::tests::trickle_headers(address, "/v1/team/capabilities").await;
+        assert!(elapsed >= limit, "{elapsed:?}");
+        assert!(elapsed < std::time::Duration::from_secs(3), "{elapsed:?}");
+        assert!(!response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+    }
 
     #[tokio::test]
     async fn typed_source_failures_are_distinct_and_do_not_echo_object_ids() {
