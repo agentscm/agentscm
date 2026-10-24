@@ -786,7 +786,7 @@ fn build_menu(
     if snapshot.connections.is_empty() && notice.is_none() {
         menu.append(&native_text_item(
             "empty",
-            "No connected checkouts\nRun agentscm quickstart in a checkout to begin.",
+            "No connected checkouts\nRun npx agentscm in a checkout to begin.",
         ))
         .map_err(menu_error)?;
     }
@@ -1268,8 +1268,8 @@ fn handle_action(id: &str, snapshot: &Snapshot, executable: &Path) {
                 .spawn();
         }
         "diagnostics" => copy_text(&diagnostics(connection)),
-        "reconnect" => copy_text(&reconnect_command(connection)),
-        "guidance" => copy_text(&guidance_command(connection)),
+        "reconnect" => copy_text(&reconnect_command(connection, executable)),
+        "guidance" => copy_text(&guidance_command(connection, executable)),
         _ => {}
     }
 }
@@ -1354,18 +1354,26 @@ fn hub_kind(check: &HubCheck) -> &'static str {
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
-fn reconnect_command(connection: &crate::client_status::ConnectionStatus) -> String {
+fn reconnect_command(
+    connection: &crate::client_status::ConnectionStatus,
+    executable: &Path,
+) -> String {
     format!(
-        "agentscm client connect --hub {} --repo {} --root {}",
+        "{} client connect --hub {} --repo {} --root {}",
+        shell_quote(&executable.to_string_lossy()),
         shell_quote(&connection.hub),
         shell_quote(&connection.repository),
         shell_quote(&connection.root.to_string_lossy())
     )
 }
-fn guidance_command(connection: &crate::client_status::ConnectionStatus) -> String {
+fn guidance_command(
+    connection: &crate::client_status::ConnectionStatus,
+    executable: &Path,
+) -> String {
     format!(
-        "cd {} && agentscm init-repo --hub-url {}",
+        "cd {} && {} init-repo --hub-url {}",
         shell_quote(&connection.root.to_string_lossy()),
+        shell_quote(&executable.to_string_lossy()),
         shell_quote(&connection.hub)
     )
 }
@@ -1561,6 +1569,80 @@ mod tests {
             ),
             "'/Applications/AgentSCM versions/agentscm'\\''current' client setup --agent 'codex' --hub 'https://hub.example.test/a'\\''b' --root '/tmp/a b;$(touch nope)'"
         );
+    }
+
+    #[test]
+    fn copied_recovery_commands_work_without_path_and_keep_arguments_literal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("AgentSCM 'current;$(touch injected)");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' \"$(pwd -P)\" \"$@\" > \"$CAPTURE\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let root = temp.path().join("checkout 'quote';$(touch injected)");
+        std::fs::create_dir(&root).unwrap();
+        let connection = crate::client_status::ConnectionStatus {
+            root: root.clone(),
+            repository: "example/project".into(),
+            hub: "https://hub.example/a'b;$(touch injected)".into(),
+            agents: vec![],
+            binding: crate::client_status::BindingStatus {
+                state: BindingState::Current,
+                generation: None,
+                activity_generation: None,
+            },
+            credential: crate::client_status::CredentialStatus {
+                kind: crate::client_status::CredentialKind::External,
+                state: CredentialState::Available,
+                expires_at: None,
+            },
+            hub_check: HubCheck::Skipped,
+            recent_participation: vec![],
+        };
+        let capture = temp.path().join("arguments");
+        for (command, directory, arguments) in [
+            (
+                reconnect_command(&connection, &executable),
+                temp.path(),
+                vec![
+                    "client",
+                    "connect",
+                    "--hub",
+                    &connection.hub,
+                    "--repo",
+                    &connection.repository,
+                    "--root",
+                    root.to_str().unwrap(),
+                ],
+            ),
+            (
+                guidance_command(&connection, &executable),
+                root.as_path(),
+                vec!["init-repo", "--hub-url", &connection.hub],
+            ),
+        ] {
+            let output = Command::new("/bin/sh")
+                .args(["-c", &command])
+                .current_dir(temp.path())
+                .env_clear()
+                .env("PATH", "")
+                .env("CAPTURE", &capture)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let directory = directory.canonicalize().unwrap();
+            let expected = std::iter::once(directory.to_str().unwrap())
+                .chain(arguments)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(std::fs::read_to_string(&capture).unwrap(), expected + "\n");
+        }
+        assert!(!temp.path().join("injected").exists());
+        assert!(!root.join("injected").exists());
     }
 
     #[test]

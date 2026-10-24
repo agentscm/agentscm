@@ -53,8 +53,8 @@ pub struct InitArgs {
     /// Agents to write instructions for, comma separated (default: all).
     #[arg(long, value_delimiter = ',', value_enum)]
     agents: Option<Vec<Agent>>,
-    /// The hub, for the setup command printed at the end (default: AGENTSCM_HUB_URL, then
-    /// hub.json). It is not written to any file.
+    /// The hub for the `client setup` command written into the instruction files and printed at
+    /// the end (default: AGENTSCM_HUB_URL, then hub.json; a placeholder when neither is set).
     #[arg(long)]
     hub_url: Option<String>,
     /// Write without asking.

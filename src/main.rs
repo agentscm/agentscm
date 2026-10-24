@@ -229,8 +229,10 @@ enum Command {
     /// program copy and a local hub.
     Uninstall(quickstart::UninstallArgs),
     /// Agent hook client: reads the hook JSON on stdin, asks the hub, prints the agent's reply.
-    /// Always exits 0 and fails open. Usage: `agentscm hook <claude|codex|cursor|copilot|generic>
-    /// [--hub-url URL]`; the token comes from AGENTSCM_HUB_TOKEN(_FILE) or hub.json.
+    /// Always exits 0 and fails open. Usage: `agentscm hook <claude|codex|cursor|copilot|gemini>
+    /// --client-connection` (what `client setup` writes; hub, repository and token come from the
+    /// saved connection), or `agentscm hook <agent|generic> [--hub-url URL] [--repo OWNER/NAME]`
+    /// with the token from AGENTSCM_HUB_TOKEN(_FILE) or hub.json.
     Hook(hook_cli::HookArgs),
     /// Write this Git repository's shared agent instructions (AGENTS.md and the files that point
     /// each agent at it). Hooks and MCP come from `agentscm client setup` on each machine.

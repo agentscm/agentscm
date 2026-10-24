@@ -249,7 +249,7 @@ export const validLocalBase = (v: string) => v === '' || /^https?:\/\/(127\.0\.0
 
 /** What a person should do about a local server error, in plain words. */
 function adviceFor(status: number): string {
-  if (status === 404) return 'Not found. If nothing here ever loads, start agentscm serve with --timeline-workspace (for Timeline) or --template-library (for Templates).'
+  if (status === 404) return 'Not found. For Templates, check the change ID and library path. If Timeline never loads, start agentscm serve with --timeline-workspace.'
   if (status === 400) return 'The local server could not use that value. Check the ID and try again.'
   if (status === 401) return 'The local server needs its read token. Add it in Settings → This computer.'
   if (status === 421) return 'The local read API refused this page’s address; open the hub UI on localhost.'

@@ -39,7 +39,7 @@ pub enum HubChoice {
     Local,
     /// Connect to a hub that already runs; needs --hub-url.
     Existing,
-    /// Only the collision check and hooks; no live warnings yet.
+    /// Only the collision check; with no hub, no agents are set up and there are no live warnings.
     Skip,
     /// Print the hosted guide, then connect only if --hub-url is given (chosen with --hosted).
     #[value(skip)]
