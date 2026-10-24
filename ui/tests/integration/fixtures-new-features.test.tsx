@@ -221,7 +221,7 @@ describe('Templates', () => {
     const sent = stub(() => json(404, { error: 'manifest not found' }))
     render(<TemplatesPage />)
     openRecipe('demo-change', 'skills/checks/v9/workflow.json')
-    await screen.findByText(/--template-library/, {}, LOAD)
+    await screen.findByText(/check the change ID and library path/, {}, LOAD)
     expect(screen.queryByText(/Preview data/)).toBeNull()
     expect(sent.find((r) => r.url.includes('skill-workflow-library'))!.url).toBe('/v1/local/skill-workflow-library?change=demo-change&library=skills%2Fchecks%2Fv9%2Fworkflow.json')
   })
