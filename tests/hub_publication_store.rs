@@ -269,14 +269,16 @@ fn suite(store: Arc<dyn Store>) {
             .map(|p| p.id)
             .collect()
     };
-    // Matching is ASCII-case-insensitive; non-ASCII text matches at its own case.
+    // Matching folds ASCII case on both backends; PostgreSQL's ILIKE may also fold non-ASCII by locale.
     let accented = done(
         store
             .create_publication(&token, &new_on("Café Ünï report", "feat/uni"), now)
             .unwrap(),
     );
     assert_eq!(found("Café Ünï"), std::slice::from_ref(&accented.id));
-    assert_eq!(found("ünï").len(), 0);
+    if store.backend() == "sqlite" {
+        assert_eq!(found("ünï").len(), 0);
+    }
     assert_eq!(found("CAFé"), std::slice::from_ref(&accented.id));
     assert_eq!(found("QUARTERLY roll"), std::slice::from_ref(&titled.id));
     assert_eq!(found("FEAT/TITLE"), std::slice::from_ref(&titled.id));
