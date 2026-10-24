@@ -2,7 +2,11 @@
 
 All notable changes are listed here, newest first. AgentSCM is alpha: any release may change the CLI, the HTTP API, storage and schemas without a migration.
 
-## 0.1.0-alpha.5 (2026-10-24)
+## 0.1.0-alpha.6 (2026-10-25)
+
+- 0.1.0-alpha.5 was not released: its Linux musl binaries failed to link after its container image was pushed, so it has no GitHub release, npm package or attestations. Use 0.1.0-alpha.6, which contains everything listed below.
+
+- Fixed: the static Linux (musl) binaries link again. Local change capture's no-replace export rename now calls the `renameat2` system call directly instead of a libc wrapper that musl does not provide.
 
 - Optional macOS menu-bar companion in the existing binary: `npx agentscm tray`, or `--tray` after successful quickstart setup. It shows saved checkout connections, recent Hub checks and observed hook/MCP activity, configures coding-agent integrations with visible results, and opens a short-lived read-only Hub session. Start at Login is opt-in and its owned setting is removed when uninstall removes the program. The tray is an unsigned, unnotarized alpha; native UI and OS login/logout acceptance remain incomplete. See [install options](docs/install.md#where-files-go).
 
