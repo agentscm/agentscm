@@ -282,11 +282,11 @@ pub fn router(state: HubState) -> Router {
     let workspace_routes = workspace::routes()
         .merge(workspace_http::routes())
         .merge(workspace_agent_tasks::routes())
-        .merge(workspace_publication::routes())
+        .merge(workspace_publication::status_routes())
         .merge(workspace_source_http::routes());
     #[cfg(not(unix))]
     let workspace_routes = workspace::routes();
-    Router::new()
+    let router = Router::new()
         .merge(http::routes())
         .merge(onboarding::routes())
         .merge(work_http::routes())
@@ -300,8 +300,17 @@ pub fn router(state: HubState) -> Router {
         .merge(workspace_routes)
         .fallback(http::not_found)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .layer(axum::middleware::from_fn(request_timeout))
-        .with_state(state)
+        .layer(axum::middleware::from_fn(request_timeout));
+    // Merged after the global timeout layer, so these routes use their own bound.
+    #[cfg(unix)]
+    let router = router.merge(
+        workspace_publication::routes()
+            .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+            .layer(axum::middleware::from_fn(
+                workspace_publication::processing_timeout,
+            )),
+    );
+    router.with_state(state)
 }
 
 /// Longest any request may run; the notices long-poll caps at 25 seconds and uploads at 8 MiB.

@@ -3,10 +3,13 @@
 //! Operator-pinned preparation, branch transport and bound forge publication.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
-use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::body::{Body, Bytes};
+use axum::extract::{Path, Request, State};
+use axum::http::StatusCode;
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::post;
 use serde::{Deserialize, Serialize};
@@ -107,15 +110,24 @@ impl From<CandidateExportRecord> for PublicationCandidate {
     }
 }
 
+/// Several Git transport commands, each bounded at 60 seconds, can outlast the Hub's
+/// 30-second request cap on a loaded host, so processing on these routes gets longer.
+const PROCESSING_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Reading a retained outcome runs no Git transport and keeps the Hub-wide bound.
+pub fn status_routes() -> Router<HubState> {
+    Router::new().route(
+        "/v1/hub/workspace/repositories/{repository}/profiles/{profile}/attachments/{attachment}/publication/status",
+        post(status),
+    )
+}
+
+/// Routes that run Git transport or forge calls; mount them behind [`processing_timeout`].
 pub fn routes() -> Router<HubState> {
     Router::new()
         .route(
             "/v1/hub/workspace/repositories/{repository}/profiles/{profile}/attachments/{attachment}/publication",
             post(prepare),
-        )
-        .route(
-            "/v1/hub/workspace/repositories/{repository}/profiles/{profile}/attachments/{attachment}/publication/status",
-            post(status),
         )
         .route(
             "/v1/hub/workspace/repositories/{repository}/profiles/{profile}/attachments/{attachment}/publication/branch",
@@ -137,6 +149,60 @@ pub fn routes() -> Router<HubState> {
             "/v1/hub/workspace/repositories/{repository}/profiles/{profile}/attachments/{attachment}/publication/mcp",
             post(mcp),
         )
+}
+
+pub(super) async fn processing_timeout(request: Request, next: Next) -> Response {
+    bounded(super::REQUEST_TIMEOUT, PROCESSING_TIMEOUT, request, next).await
+}
+
+async fn bounded(read: Duration, processing: Duration, request: Request, next: Next) -> Response {
+    let (parts, body) = request.into_parts();
+    // Reading the body keeps the Hub's slow-client bound; only processing is longer.
+    let body =
+        match tokio::time::timeout(read, axum::body::to_bytes(body, super::MAX_BODY_BYTES)).await {
+            Ok(Ok(body)) => body,
+            Ok(Err(_)) => return ApiError::invalid().into_response(),
+            Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
+        };
+    let still_running = still_running(parts.uri.path(), &body);
+    tokio::time::timeout(
+        processing,
+        next.run(Request::from_parts(parts, Body::from(body))),
+    )
+    .await
+    .unwrap_or(still_running)
+}
+
+/// The blocking work keeps running past the bound, so instead of a failure that may
+/// later succeed, name the idempotent call that reads its retained outcome.
+fn still_running(path: &str, body: &[u8]) -> Response {
+    if path.ends_with("/publication/mcp") {
+        let message = serde_json::from_slice::<serde_json::Value>(body).unwrap_or_default();
+        let tool = match message["params"]["name"].as_str() {
+            Some("agentscm_prepare_attached_publication") => "agentscm_attached_publication_status",
+            Some("agentscm_publish_attached_branch") => "agentscm_recover_attached_branch",
+            Some(tool) => tool,
+            None => "the same tool",
+        };
+        return mcp_error(
+            &message["id"],
+            -32000,
+            &format!("publication is still running; call {tool} with the same request ids"),
+        );
+    }
+    let follow_up = match path
+        .rsplit_once("/publication")
+        .map_or("", |(_, suffix)| suffix)
+    {
+        "" => "status",
+        "/branch" => "branch/recover",
+        suffix => suffix.trim_start_matches('/'),
+    };
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"state":"still_running","follow_up":follow_up})),
+    )
+        .into_response()
 }
 
 fn access(profile: &AttachedPublicationProfile) -> Result<Access> {
@@ -1371,6 +1437,127 @@ fn forge_recover_schema() -> serde_json::Value {
 mod tests {
     use super::*;
     use crate::candidate::CandidateSubject;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const GLOBAL: Duration = Duration::from_millis(100);
+    const SLOW: Duration = Duration::from_millis(400);
+
+    /// Mirrors `hub::router`: publication routes merge after the Hub-wide timeout layer.
+    /// The slow publication hands its work to a task that outlives the request future,
+    /// as `blocking` does, and reports through `finished`.
+    async fn serve(processing: Duration, finished: Arc<AtomicBool>) -> std::net::SocketAddr {
+        let slow_work = move || {
+            let finished = finished.clone();
+            async move {
+                tokio::spawn(async move {
+                    tokio::time::sleep(SLOW).await;
+                    finished.store(true, Ordering::Release);
+                })
+                .await
+                .unwrap();
+            }
+        };
+        let publication = Router::new()
+            .route("/x/publication", post(slow_work.clone()))
+            .route("/x/publication/branch", post(slow_work))
+            .layer(axum::middleware::from_fn(move |request, next| {
+                bounded(GLOBAL, processing, request, next)
+            }));
+        let app = Router::new()
+            .route(
+                "/x/publication/status",
+                post(|| async { tokio::time::sleep(SLOW).await }),
+            )
+            .layer(axum::middleware::from_fn(|request, next| {
+                super::super::timeout_after(GLOBAL, request, next)
+            }))
+            .merge(publication);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        address
+    }
+
+    async fn post_status(address: std::net::SocketAddr, path: &str) -> (u16, Vec<u8>) {
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}{path}"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        (status, response.bytes().await.unwrap().to_vec())
+    }
+
+    #[tokio::test]
+    async fn publication_processing_outlasts_the_hub_cap_while_other_routes_keep_it() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let address = serve(Duration::from_secs(5), finished.clone()).await;
+        assert_eq!(post_status(address, "/x/publication/branch").await.0, 200);
+        assert!(finished.load(Ordering::Acquire));
+        assert_eq!(post_status(address, "/x/publication/status").await.0, 408);
+    }
+
+    #[tokio::test]
+    async fn publication_past_its_bound_names_the_follow_up_for_work_that_finishes() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let address = serve(GLOBAL, finished.clone()).await;
+        for (path, follow_up) in [
+            ("/x/publication/branch", "branch/recover"),
+            ("/x/publication", "status"),
+        ] {
+            let (status, body) = post_status(address, path).await;
+            assert_eq!(status, 202);
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body, json!({"state":"still_running","follow_up":follow_up}));
+        }
+        tokio::time::sleep(SLOW).await;
+        assert!(finished.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn publication_body_reads_keep_the_hub_slow_client_bound() {
+        let address = serve(Duration::from_secs(5), Arc::new(AtomicBool::new(false))).await;
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(
+                b"POST /x/publication/branch HTTP/1.1\r\nhost: x\r\ncontent-length: 2\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 408"), "{response:?}");
+    }
+
+    #[test]
+    fn mcp_past_its_bound_is_a_json_rpc_error_naming_the_recovery_tool() {
+        let body = json!({"jsonrpc":"2.0","id":7,"method":"tools/call",
+            "params":{"name":"agentscm_publish_attached_branch","arguments":{}}});
+        let response = still_running("/x/publication/mcp", &serde_json::to_vec(&body).unwrap());
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response);
+        assert_eq!(body["id"], 7);
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("agentscm_recover_attached_branch")
+        );
+    }
+
+    fn response_json(response: Response) -> serde_json::Value {
+        let bytes = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
     use crate::context::ChangeId;
     use crate::git_export::ExportState;
     use crate::skill_workflow::AuthenticatedAgentIdentity;
