@@ -170,18 +170,74 @@ pub async fn serve(config: HubConfig) -> Result<()> {
         .as_ref()
         .filter(|execution| execution.server_execution_enabled())
         .map(|execution| execution.clone().spawn_worker());
-    axum::serve(
+    serve_connections(
         listener,
-        router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        router(state),
+        HEADER_READ_TIMEOUT,
+        shutdown_signal(),
     )
-    .with_graceful_shutdown(shutdown_signal())
-    .await
-    .map_err(crate::Error::Io)?;
+    .await;
     #[cfg(unix)]
     if let Some(worker) = execution_worker {
         worker.abort();
     }
     Ok(())
+}
+
+/// A client must send its whole request head within this; trickled headers do not extend it.
+const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Like `axum::serve` with graceful shutdown and `ConnectInfo<SocketAddr>`, but with a timer,
+/// without which hyper silently disables its header read timeout.
+pub(super) async fn serve_connections(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    header_read_timeout: std::time::Duration,
+    shutdown: impl std::future::Future<Output = ()>,
+) {
+    let (stop, stopped) = tokio::sync::watch::channel(());
+    let mut connections = tokio::task::JoinSet::new();
+    let mut shutdown = std::pin::pin!(shutdown);
+    loop {
+        let (stream, peer) = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => accepted,
+                // Like axum: back off on errors such as running out of file descriptors.
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+            },
+            () = &mut shutdown => break,
+        };
+        let app = app.clone();
+        let mut stopped = stopped.clone();
+        connections.spawn(async move {
+            let service = hyper::service::service_fn(move |request: hyper::Request<_>| {
+                let mut request = request.map(axum::body::Body::new);
+                request
+                    .extensions_mut()
+                    .insert(axum::extract::ConnectInfo(peer));
+                tower_service::Service::call(&mut app.clone(), request)
+            });
+            let connection = hyper::server::conn::http1::Builder::new()
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(header_read_timeout)
+                .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                .with_upgrades();
+            let mut connection = std::pin::pin!(connection);
+            tokio::select! {
+                _ = connection.as_mut() => {}
+                _ = stopped.changed() => {
+                    connection.as_mut().graceful_shutdown();
+                    let _ = connection.await;
+                }
+            }
+        });
+        while connections.try_join_next().is_some() {}
+    }
+    drop(stop);
+    while connections.join_next().await.is_some() {}
 }
 
 pub struct ApiError {
@@ -451,8 +507,72 @@ async fn skill_workflows(
 mod tests {
     use axum::body::Body;
     use serde::Deserialize;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
+
+    async fn listen(header_read_timeout: std::time::Duration) -> SocketAddr {
+        let app = Router::new().route(
+            "/peer",
+            get(
+                |axum::Extension(axum::extract::ConnectInfo(peer)): axum::Extension<
+                    axum::extract::ConnectInfo<SocketAddr>,
+                >| async move { peer.ip().to_string() },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(serve_connections(
+            listener,
+            app,
+            header_read_timeout,
+            std::future::pending(),
+        ));
+        address
+    }
+
+    #[tokio::test]
+    async fn served_requests_carry_the_peer_address() {
+        let address = listen(HEADER_READ_TIMEOUT).await;
+        let body = reqwest::get(format!("http://{address}/peer"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(body, "127.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn trickled_request_headers_are_cut_off_at_the_read_timeout() {
+        let limit = std::time::Duration::from_millis(300);
+        let address = listen(limit).await;
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+        let started = std::time::Instant::now();
+        // Each header line arrives well inside the bound; together they outlast it.
+        tokio::spawn(async move {
+            let _ = writer.write_all(b"GET /peer HTTP/1.1\r\n").await;
+            for _ in 0..60 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                if writer.write_all(b"x-slow: 1\r\n").await.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            reader.read_to_end(&mut response),
+        )
+        .await
+        .expect("the server closes the connection")
+        .ok();
+        let elapsed = started.elapsed();
+        assert!(elapsed >= limit, "{elapsed:?}");
+        assert!(elapsed < std::time::Duration::from_secs(3), "{elapsed:?}");
+        assert!(!response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+    }
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]

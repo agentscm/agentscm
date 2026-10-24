@@ -2,7 +2,11 @@
 //!
 //! Operator-pinned preparation, branch transport and bound forge publication.
 
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::Router;
@@ -12,6 +16,7 @@ use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::post;
+use http_body::Frame;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -112,7 +117,7 @@ impl From<CandidateExportRecord> for PublicationCandidate {
 
 /// Several Git transport commands, each bounded at 60 seconds, can outlast the Hub's
 /// 30-second request cap on a loaded host, so processing on these routes gets longer.
-const PROCESSING_TIMEOUT: Duration = Duration::from_secs(120);
+pub(super) const PROCESSING_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Reading a retained outcome runs no Git transport and keeps the Hub-wide bound.
 pub fn status_routes() -> Router<HubState> {
@@ -151,26 +156,101 @@ pub fn routes() -> Router<HubState> {
         )
 }
 
-pub(super) async fn processing_timeout(request: Request, next: Next) -> Response {
-    bounded(super::REQUEST_TIMEOUT, PROCESSING_TIMEOUT, request, next).await
+/// Bounds these routes like the Hub-wide request timeout, except that processing may take
+/// `processing`. The body must still arrive within the Hub's request bound; it is read by
+/// the handler's extractors after authentication, with their usual rejections.
+pub(super) async fn processing_timeout(
+    State(state): State<HubState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    bounded(
+        super::REQUEST_TIMEOUT,
+        state.publication_processing_timeout,
+        request,
+        next,
+    )
+    .await
 }
 
 async fn bounded(read: Duration, processing: Duration, request: Request, next: Next) -> Response {
-    let (parts, body) = request.into_parts();
-    // Reading the body keeps the Hub's slow-client bound; only processing is longer.
-    let body =
-        match tokio::time::timeout(read, axum::body::to_bytes(body, super::MAX_BODY_BYTES)).await {
-            Ok(Ok(body)) => body,
-            Ok(Err(_)) => return ApiError::invalid().into_response(),
-            Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
-        };
-    let still_running = still_running(parts.uri.path(), &body);
-    tokio::time::timeout(
-        processing,
-        next.run(Request::from_parts(parts, Body::from(body))),
-    )
-    .await
-    .unwrap_or(still_running)
+    let path = request.uri().path().to_owned();
+    let body = Arc::new(BodyRead::default());
+    let deadline = Box::pin(tokio::time::sleep(read));
+    let request = request.map(|inner| {
+        Body::new(TimedBody {
+            inner,
+            deadline,
+            read: body.clone(),
+        })
+    });
+    match tokio::time::timeout(processing, next.run(request)).await {
+        Ok(_) if body.expired.load(Ordering::Acquire) => {
+            StatusCode::REQUEST_TIMEOUT.into_response()
+        }
+        Ok(response) => response,
+        Err(_) => still_running(&path, &body.bytes.lock().unwrap_or_else(|e| e.into_inner())),
+    }
+}
+
+/// What the handler read of the body: whether its deadline passed, and a bounded copy of
+/// the bytes so a timed-out MCP call can still be answered with its JSON-RPC id.
+#[derive(Default)]
+struct BodyRead {
+    expired: AtomicBool,
+    bytes: Mutex<Vec<u8>>,
+}
+
+struct TimedBody {
+    inner: Body,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+    read: Arc<BodyRead>,
+}
+
+impl http_body::Body for TimedBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<Frame<Bytes>, axum::Error>>> {
+        if let Poll::Ready(frame) = Pin::new(&mut self.inner).poll_frame(cx) {
+            if let Some(data) = frame
+                .as_ref()
+                .and_then(|frame| frame.as_ref().ok())
+                .and_then(Frame::data_ref)
+            {
+                let mut bytes = self.read.bytes.lock().unwrap_or_else(|e| e.into_inner());
+                let room = super::MAX_BODY_BYTES.saturating_sub(bytes.len());
+                bytes.extend_from_slice(&data[..room.min(data.len())]);
+            }
+            return Poll::Ready(frame);
+        }
+        if self.deadline.as_mut().poll(cx).is_ready() {
+            self.read.expired.store(true, Ordering::Release);
+            return Poll::Ready(Some(Err(axum::Error::new("request body timed out"))));
+        }
+        Poll::Pending
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Runs a handler's whole body as its own task, so a request dropped at the processing
+/// bound does not cancel work that `still_running` reports as continuing.
+async fn detached<T: Send + 'static>(
+    work: impl Future<Output = std::result::Result<T, ApiError>> + Send + 'static,
+) -> std::result::Result<T, ApiError> {
+    tokio::spawn(work)
+        .await
+        .map_err(|_| ApiError::from(HubError::Unavailable("publication task failed".into())))?
 }
 
 /// The blocking work keeps running past the bound, so instead of a failure that may
@@ -809,27 +889,27 @@ async fn mcp(
                 Some("agentscm_publish_attached_forge") => {
                     let request =
                         serde_json::from_value(arguments).map_err(|_| ApiError::invalid())?;
-                    forge_call(
+                    detached(forge_call(
                         state.clone(),
                         actor,
                         repository,
                         profile,
                         attachment,
                         request,
-                    )
+                    ))
                     .await?
                 }
                 Some("agentscm_recover_attached_forge") => {
                     let request =
                         serde_json::from_value(arguments).map_err(|_| ApiError::invalid())?;
-                    forge_recover_call(
+                    detached(forge_recover_call(
                         state.clone(),
                         actor,
                         repository,
                         profile,
                         attachment,
                         request,
-                    )
+                    ))
                     .await?
                 }
                 Some("agentscm_prepare_attached_publication") => {
@@ -1278,9 +1358,11 @@ async fn forge_publish(
     Path((repository, profile, attachment)): Path<(String, String, String)>,
     JsonBody(request): JsonBody<ForgeRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, ApiError> {
-    forge_call(state, actor, repository, profile, attachment, request)
-        .await
-        .map(Json)
+    detached(forge_call(
+        state, actor, repository, profile, attachment, request,
+    ))
+    .await
+    .map(Json)
 }
 
 async fn forge_call(
@@ -1371,9 +1453,11 @@ async fn forge_recover(
     Path((repository, profile, attachment)): Path<(String, String, String)>,
     JsonBody(request): JsonBody<RecoverForgeRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, ApiError> {
-    forge_recover_call(state, actor, repository, profile, attachment, request)
-        .await
-        .map(Json)
+    detached(forge_recover_call(
+        state, actor, repository, profile, attachment, request,
+    ))
+    .await
+    .map(Json)
 }
 
 async fn forge_recover_call(
@@ -1437,52 +1521,37 @@ fn forge_recover_schema() -> serde_json::Value {
 mod tests {
     use super::*;
     use crate::candidate::CandidateSubject;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    const GLOBAL: Duration = Duration::from_millis(100);
-    const SLOW: Duration = Duration::from_millis(400);
-
-    /// Mirrors `hub::router`: publication routes merge after the Hub-wide timeout layer.
-    /// The slow publication hands its work to a task that outlives the request future,
-    /// as `blocking` does, and reports through `finished`.
-    async fn serve(processing: Duration, finished: Arc<AtomicBool>) -> std::net::SocketAddr {
-        let slow_work = move || {
-            let finished = finished.clone();
-            async move {
-                tokio::spawn(async move {
-                    tokio::time::sleep(SLOW).await;
-                    finished.store(true, Ordering::Release);
-                })
-                .await
+    fn hub_state(dir: &std::path::Path) -> HubState {
+        let store =
+            crate::hub::store::open(&format!("sqlite://{}", dir.join("hub.sqlite").display()))
                 .unwrap();
-            }
-        };
-        let publication = Router::new()
-            .route("/x/publication", post(slow_work.clone()))
-            .route("/x/publication/branch", post(slow_work))
-            .layer(axum::middleware::from_fn(move |request, next| {
-                bounded(GLOBAL, processing, request, next)
-            }));
-        let app = Router::new()
-            .route(
-                "/x/publication/status",
-                post(|| async { tokio::time::sleep(SLOW).await }),
-            )
-            .layer(axum::middleware::from_fn(|request, next| {
-                super::super::timeout_after(GLOBAL, request, next)
-            }))
-            .merge(publication);
+        HubState::new(
+            store,
+            Arc::new(crate::backend::LocalBackend::open(dir.join("objects")).unwrap()),
+        )
+    }
+
+    /// Serves `crate::hub::bounded`, the wiring `hub::router` uses, around injected routes.
+    /// Tests run with paused time, so the production 30- and 120-second bounds apply.
+    async fn serve(
+        routes: Router<HubState>,
+        publication: Router<HubState>,
+        dir: &std::path::Path,
+    ) -> std::net::SocketAddr {
+        let state = hub_state(dir);
+        let app = crate::hub::bounded(routes, publication, &state).with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await });
         address
     }
 
-    async fn post_status(address: std::net::SocketAddr, path: &str) -> (u16, Vec<u8>) {
+    async fn send(address: std::net::SocketAddr, path: &str, body: Vec<u8>) -> (u16, Vec<u8>) {
         let response = reqwest::Client::new()
             .post(format!("http://{address}{path}"))
-            .body("{}")
+            .body(body)
             .send()
             .await
             .unwrap();
@@ -1490,48 +1559,115 @@ mod tests {
         (status, response.bytes().await.unwrap().to_vec())
     }
 
-    #[tokio::test]
-    async fn publication_processing_outlasts_the_hub_cap_while_other_routes_keep_it() {
-        let finished = Arc::new(AtomicBool::new(false));
-        let address = serve(Duration::from_secs(5), finished.clone()).await;
-        assert_eq!(post_status(address, "/x/publication/branch").await.0, 200);
-        assert!(finished.load(Ordering::Acquire));
-        assert_eq!(post_status(address, "/x/publication/status").await.0, 408);
+    /// Sends a request head promising a body that never arrives; returns the reply and when.
+    async fn stalled_body(address: std::net::SocketAddr, path: &str) -> (Vec<u8>, Duration) {
+        let started = tokio::time::Instant::now();
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(
+                format!("POST {path} HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = vec![0; 4096];
+        let read = stream.read(&mut response).await.unwrap();
+        response.truncate(read);
+        (response, started.elapsed())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
+    async fn publication_processing_outlasts_the_hub_cap_while_other_routes_keep_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let slow = || async { tokio::time::sleep(Duration::from_secs(45)).await };
+        let address = serve(
+            Router::new().route("/x/publication/status", post(slow)),
+            Router::new().route("/x/publication/branch", post(slow)),
+            dir.path(),
+        )
+        .await;
+        assert_eq!(send(address, "/x/publication/branch", vec![]).await.0, 200);
+        assert_eq!(send(address, "/x/publication/status", vec![]).await.0, 408);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn publication_past_its_bound_names_the_follow_up_for_work_that_finishes() {
+        let dir = tempfile::tempdir().unwrap();
         let finished = Arc::new(AtomicBool::new(false));
-        let address = serve(GLOBAL, finished.clone()).await;
+        let done = finished.clone();
+        let slow = move || {
+            let done = done.clone();
+            detached(async move {
+                tokio::time::sleep(Duration::from_secs(150)).await;
+                done.store(true, Ordering::Release);
+                Ok(())
+            })
+        };
+        let address = serve(
+            Router::new(),
+            Router::new()
+                .route("/x/publication", post(slow.clone()))
+                .route("/x/publication/branch", post(slow)),
+            dir.path(),
+        )
+        .await;
         for (path, follow_up) in [
             ("/x/publication/branch", "branch/recover"),
             ("/x/publication", "status"),
         ] {
-            let (status, body) = post_status(address, path).await;
+            let (status, body) = send(address, path, vec![]).await;
             assert_eq!(status, 202);
             let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body, json!({"state":"still_running","follow_up":follow_up}));
+            // The first request's work outlived its 202 and finished during the second.
+            assert_eq!(finished.load(Ordering::Acquire), path == "/x/publication");
         }
-        tokio::time::sleep(SLOW).await;
-        assert!(finished.load(Ordering::Acquire));
     }
 
-    #[tokio::test]
-    async fn publication_body_reads_keep_the_hub_slow_client_bound() {
-        let address = serve(Duration::from_secs(5), Arc::new(AtomicBool::new(false))).await;
-        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
-        stream
-            .write_all(
-                b"POST /x/publication/branch HTTP/1.1\r\nhost: x\r\ncontent-length: 2\r\n\r\n",
-            )
-            .await
-            .unwrap();
-        let mut response = Vec::new();
-        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
-            .await
-            .unwrap()
-            .unwrap();
+    #[tokio::test(start_paused = true)]
+    async fn publication_bodies_keep_the_hub_read_bound_and_size_rejections() {
+        let dir = tempfile::tempdir().unwrap();
+        let address = serve(
+            Router::new(),
+            Router::new()
+                .route("/x/publication/mcp", post(|_: Bytes| async {}))
+                .route(
+                    "/x/publication/branch",
+                    post(|JsonBody(_): JsonBody<serde_json::Value>| async {}),
+                ),
+            dir.path(),
+        )
+        .await;
+        let (response, elapsed) = stalled_body(address, "/x/publication/branch").await;
         assert!(response.starts_with(b"HTTP/1.1 408"), "{response:?}");
+        assert!(elapsed >= Duration::from_secs(30) && elapsed < Duration::from_secs(31));
+        let oversized = vec![b' '; super::super::MAX_BODY_BYTES + 1];
+        assert_eq!(
+            send(address, "/x/publication/mcp", oversized.clone())
+                .await
+                .0,
+            413
+        );
+        // `JsonBody` answers every failure, including size, with its fixed 400.
+        assert_eq!(
+            send(address, "/x/publication/branch", oversized).await.0,
+            400
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn publication_routes_authenticate_before_reading_the_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = crate::hub::router(hub_state(dir.path()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let (response, elapsed) = stalled_body(
+            address,
+            "/v1/hub/workspace/repositories/r/profiles/p/attachments/a/publication",
+        )
+        .await;
+        assert!(!response.starts_with(b"HTTP/1.1 408"), "{response:?}");
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
     }
 
     #[test]

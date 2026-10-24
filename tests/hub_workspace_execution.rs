@@ -3570,6 +3570,68 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
         }
         assert!(fake.with(|s| s.repos[&100].pulls.is_empty()));
         fake.with(|s| s.repos.get_mut(&100).unwrap().pulls.insert(1, hidden_pull));
+        // A recovery that outlasts the processing bound while provider sync holds the repo
+        // lock answers 202, then really completes once the lock is released.
+        let held = Arc::new(tokio::sync::Semaphore::new(0));
+        fake.with(|s| s.stall_next = Some(("/repos/synthetic/project".into(), held.clone())));
+        let sync_state = publication_state.clone();
+        let sync = tokio::spawn(async move { agentscm::hub::sync::poll_once(&sync_state).await });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while fake.with(|s| s.stall_next.is_some()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sync never reached the forge"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let short_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let short_base = format!("http://{}", short_listener.local_addr().unwrap());
+        let short_app = agentscm::hub::router(
+            publication_state
+                .clone()
+                .with_publication_processing_timeout(std::time::Duration::from_secs(2)),
+        );
+        let short_server = tokio::spawn(async move {
+            axum::serve(short_listener, short_app).await.unwrap();
+        });
+        let pending = json_request(
+            client
+                .post(format!(
+                    "{short_base}{REPO}/profiles/checks/attachments/{}/publication/forge/recover",
+                    state.id
+                ))
+                .bearer_auth(&token),
+            &recovery,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(pending.status().as_u16(), 202);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&pending.bytes().await.unwrap()).unwrap(),
+            json!({"state":"still_running","follow_up":"forge/recover"})
+        );
+        // Adoption by the detached recovery sets the PR number; sync alone does not.
+        let attempting = || {
+            env.store
+                .publication("synthetic/project", publication_id)
+                .unwrap()
+                .unwrap()
+                .pr_number
+                .is_none()
+        };
+        assert!(attempting());
+        held.add_permits(1);
+        sync.await.unwrap().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while attempting() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "detached recovery never finished"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        short_server.abort();
         // Concurrent retries adopt the one exact PR; durable attempting forbids another create.
         let (a, b) = tokio::join!(
             json_request(

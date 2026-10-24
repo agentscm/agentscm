@@ -623,11 +623,12 @@ os._exit(0)
 
     #[test]
     fn continuous_trickle_has_an_absolute_drain_deadline_and_retains_partial_bytes() {
-        let started = Instant::now();
         let result = capture(Command::new("/usr/bin/python3").args(["-c", "import os,time; child=os.fork();\nif child: os._exit(0)\nfor _ in range(400):\n os.write(1,b'x'); time.sleep(0.01)\n"]), Duration::from_secs(2), 1024, &Cancellation::default()).unwrap();
         assert_eq!(result.stop, Some(Stop::Io));
         assert!(!result.stdout.is_empty());
-        assert!(started.elapsed() < POST_EXIT_DRAIN + Duration::from_secs(1));
+        // The writer needs at least four seconds for all 400 bytes; the deadline ends the
+        // capture first. Counting bytes keeps interpreter startup out of the measurement.
+        assert!(result.stdout.len() < 400, "{}", result.stdout.len());
     }
 
     #[test]

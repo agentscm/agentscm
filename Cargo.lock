@@ -13,6 +13,8 @@ dependencies = [
  "ed25519-dalek",
  "getrandom 0.4.3",
  "http-body",
+ "hyper",
+ "hyper-util",
  "libc",
  "postgres",
  "reqwest",
@@ -24,6 +26,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml_edit",
+ "tower-service",
 ]
 
 [[package]]
