@@ -80,8 +80,8 @@ at task start and dependency expansion, using a configured native store or a ded
 Git worktree. Rerun `init-repo` to review the updated instruction block; hooks still handle
 coordination, and selection does not narrow required checks or establish model-cost savings.
 
-Quickstart recommends user hooks when it detects Git worktrees, skips team repository
-config for a local hub, defaults to a native managed hub on Apple Silicon macOS with an explicit Docker fallback, and prints the executable path and PATH guidance for later commands.
+Quickstart sets up each coding agent through `agentscm client setup`, so it appears on the
+hub's Connect agents page, defaults to a native managed hub on Apple Silicon macOS with an explicit Docker fallback, and prints the executable path and PATH guidance for later commands.
 See [guided setup](docs/setup-guide.md) for details.
 
 ## The native workflow loop
