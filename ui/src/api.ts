@@ -3,6 +3,7 @@
 import { decodeSkillWorkflowEnvelope, decodeSkillWorkflowListEnvelope } from './skillWorkflow.ts'
 import { decodeSetup } from './onboarding.ts'
 import type { ViewOverride, ViewSettings, ViewSettingsReport, Activity, Health, HubEvent, Intent, Session, SkillWorkflowEnvelope, SkillWorkflowListEnvelope, Whoami, Work } from './types.ts'
+import { withTimeout } from './timeout.ts'
 
 export const AGENT_TOKEN_MESSAGE = 'This is an agent token, which can change coordination. The status page needs a read-only token.'
 
@@ -16,7 +17,7 @@ export class ApiError extends Error {
 
 async function getJson(path: string, signal: AbortSignal, token?: string): Promise<unknown> {
   const res = await fetch(path, {
-    signal,
+    signal: withTimeout(signal),
     cache: 'no-store',
     credentials: 'omit',
     headers: token ? { Authorization: `Bearer ${token}` } : {},
@@ -33,7 +34,7 @@ export async function fetchSetup(token: string, signal: AbortSignal) {
 
 async function getBoundedJson(path: string, signal: AbortSignal, token: string): Promise<unknown> {
   const res = await fetch(path, {
-    signal,
+    signal: withTimeout(signal),
     cache: 'no-store',
     credentials: 'omit',
     headers: { Authorization: `Bearer ${token}` },

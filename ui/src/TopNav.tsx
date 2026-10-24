@@ -2,7 +2,7 @@ import { skillRunHref, skillRunsHref, skillsRoute } from './skills.ts'
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { Derived } from './derive.ts'
 import { workHref, workIdFromHash, type WorkOverview } from './standup.ts'
-import type { ThemePref } from './storage.ts'
+import { loadSingleKeys, type ThemePref } from './storage.ts'
 import { useNow, type HubData } from './useHub.ts'
 import type { Section } from './App.tsx'
 import { workTabFromHash, workTabHref } from './pages/Work.tsx'
@@ -236,6 +236,9 @@ function CommandPalette({ onClose, sections, section, d, overview }: { onClose: 
     return hits
   }, [sections, section, d, overview, tour])
   const shown = useMemo(() => filterHits(all, q), [all, q])
+  useEffect(() => {
+    if (shown.length > 0) document.getElementById(`hit-${sel}`)?.scrollIntoView?.({ block: 'nearest' })
+  }, [sel, shown.length])
 
   const go = (h: Hit | undefined) => {
     if (!h) return
@@ -501,7 +504,7 @@ export function AppChrome({ logo, repo, sections, section, badges, data, d, over
   }, [section])
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const typing = e.target instanceof HTMLElement && (/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) || e.target.isContentEditable)
+      const typing = e.target instanceof HTMLElement && (/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) || e.target.isContentEditable) || !loadSingleKeys()
       if ((e.key === 'k' && (e.metaKey || e.ctrlKey)) || (e.key === '/' && !typing)) {
         e.preventDefault()
         setPalette(true)
@@ -569,7 +572,7 @@ export function AppChrome({ logo, repo, sections, section, badges, data, d, over
       <SideNav sections={sections} section={section} badges={badges} collapsed={collapsed} onCollapse={() => onCollapsed(!collapsed)} drawer={drawer} onClose={() => setDrawer(false)} />
       <div className="content">
         <Breadcrumbs repo={repo} section={current} overview={overview} data={data} />
-        <main className="main" id="main" tabIndex={-1} data-tour="main">
+        <main className="main" id="main" tabIndex={-1} data-tour="main" data-section={current.key}>
           {children}
         </main>
       </div>

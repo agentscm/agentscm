@@ -76,3 +76,23 @@ export function saveTheme(t: ThemePref): void {
     /* ignore */
   }
 }
+
+const KEYS_KEY = 'agentscm.shortcuts'
+
+/** Single-key shortcuts (`/`, `[`) are on unless switched off in Settings (WCAG 2.1.4); ⌘K / Ctrl K always works. */
+export function loadSingleKeys(): boolean {
+  try {
+    return window.localStorage.getItem(KEYS_KEY) !== 'off'
+  } catch {
+    return true
+  }
+}
+
+export function saveSingleKeys(on: boolean): void {
+  try {
+    if (on) window.localStorage.removeItem(KEYS_KEY)
+    else window.localStorage.setItem(KEYS_KEY, 'off')
+  } catch {
+    /* ignore */
+  }
+}

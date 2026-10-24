@@ -4,14 +4,16 @@ description: A calm, read-only coordination Hub for seeing who owns each piece o
 colors:
   primary-light: "#4F5BD5"
   primary-dark: "#7C86FF"
-  chrome-light: "#E9EBF2"
-  chrome-dark: "#07080E"
-  canvas-light: "#F6F7FA"
-  canvas-dark: "#0D0F19"
+  chrome-light: "#E3E6EF"
+  chrome-dark: "#05060B"
+  canvas-light: "#F4F5F9"
+  canvas-dark: "#0F1220"
   surface-light: "#FFFFFF"
-  surface-dark: "#151927"
+  surface-dark: "#171B2A"
+  surface-head-light: "#F9FAFC"
+  surface-head-dark: "#1B2032"
   elevated-dark: "#1A1E30"
-  nav-active-light: "#DCDFF7"
+  nav-active-light: "#D3D7F5"
   success: "#12B76A"
   warning: "#F79009"
   error: "#F04438"
@@ -110,15 +112,19 @@ The palette is a neutral light/dark canvas with white or deep blue-black content
 - **Hub violet, dark** (`#7C86FF`): The same accent role in the dark theme.
 
 ### Neutral
-- **Chrome, light / dark** (`#E9EBF2` / `#07080E`): The top bar and the side rail, one shared surface.
-- **Sheet canvas, light / dark** (`#F6F7FA` / `#0D0F19`): The page itself, inset in the chrome.
+- **Chrome, light / dark** (`#E3E6EF` / `#05060B`): The top bar and the side rail, one shared surface.
+- **Sheet canvas, light / dark** (`#F4F5F9` / `#0F1220`): The page itself, inset in the chrome.
 - **White surface** (`#FFFFFF`): Light content, card, and control surfaces.
-- **Deep surface** (`#151927`): Dark content surfaces.
+- **Deep surface** (`#171B2A`): Dark content surfaces, with a 1px top highlight (`inset 0 1px 0 rgba(255,255,255,.04)`).
+- **Box head band** (`--hub-surface-head`, `#F9FAFC` / `#1B2032`): The tinted head of every evidence box.
+- **Rules** (`--hub-rule` / `--hub-rule-strong`): 10% / 18% ink in light, 8% / 15% white in dark.
 - **Elevated dark surface** (`#1A1E30`): Dark elevated controls and overlays.
 - **Theme text and border:** Use `--cb-text`, `--cb-text-2`, `--cb-text-3`, and `--cb-border` so contrast follows the active theme.
 
 ### Named Rules
 **The Semantic Field Rule.** State fields use violet for active or handover, rose for blocked, amber for paused or stale, and green for finished or active assignment; every field includes text.
+
+**The Colour For Meaning Rule.** State is carried by tone, never by grey: a change waiting to merge is violet, one still getting ready is muted, a fully passed landing is green, and failed or blocked is rose. A box takes the tone its data implies (contested files rose when any exist, otherwise green; pull requests touching held files amber when any; workflow runs and recent changes rose when one failed). Counts stay plain and every tone carries text.
 
 **The Ownership First Rule.** Keep the lead agent and task legible before source identities, bookkeeping, and technical identifiers.
 
@@ -151,11 +157,21 @@ At 860px and below, the board becomes two columns, directed-request targets beco
 
 ## Elevation & Depth
 
-**The Three Planes Rule.** The Hub has three planes, each one tonal step apart, so navigation never reads as content: **chrome** (the top bar and rail share one tinted surface with no dividing rules), the **sheet** (the content column, inset with a 14px top-left radius and a hairline edge shadow, carrying the breadcrumbs as its own header line), and **surfaces** (boxes and cards on the sheet). Tiles inside a box are tonal (`--hub-sunken`), never bordered, so a box never holds more boxes. On screens up to 960px wide the rail becomes a drawer and the sheet loses its corner. `main` takes focus on navigation for assistive technology but shows no ring, because it isn't a control.
+**The Three Planes Rule.** The Hub has three planes, each one tonal step apart, so navigation never reads as content: **chrome** (`#E3E6EF` / `#05060B`; the top bar and rail share one tinted surface with no dividing rules), the **sheet** (`#F4F5F9` / `#0F1220`; the content column, inset with a 14px top-left radius and a clearly visible edge, carrying the breadcrumbs as its own header line), and **surfaces** (`#FFFFFF` / `#171B2A`; boxes and cards on the sheet). Tiles inside a box are tonal (`--hub-sunken`), never bordered, so a box never holds more boxes. On screens up to 960px wide the rail becomes a drawer and the sheet loses its corner. `main` takes focus on navigation for assistive technology but shows no ring, because it isn't a control.
 
 The Work register is flat and structural. Depth comes from tonal lane fields, a one-pixel `--cb-border` rule, white or deep content surfaces, and a small violet hover tint. The feature adds no shadow vocabulary or decorative gradient. Focus-visible targets use a 2px violet outline with a 3px offset, and reduced-motion users receive no row hover transition.
 
 ### Named Rules
+**The Visible Step Rule.** Each plane is at least one visible tonal step from its neighbour in both themes; if nav, header and sections read as one grey field, raise the step, not the borders.
+
+**The Masthead Rule.** The question, its one-sentence answer and any facts row form a masthead: the question carries its page icon in brand ink, the answer stays at reading size, and a full-width hairline with 28px of space below separates it from the content.
+
+**The Head Band and Cap Rule.** Every box head is a `--hub-surface-head` band under a 2px top cap, the same vocabulary as the Work lanes. Ok, warn and bad boxes cap in their tone; brand boxes cap quietly (brand at low strength) and muted boxes in `--hub-rule-strong`.
+
+**The Section Rhythm Rule.** Stacked boxes sit 24px apart (`--hub-gap`); the masthead hairline adds 8px before the first section.
+
+**The Sentence Case Rule.** No tracked uppercase eyebrows: nav group heads, owner group heads, work-card Next and Blocker labels and table headings are 12px, weight 650, `--hub-text-3`, in sentence case. Inline links carry no appended arrow; arrows stay on real Next, Back and relationship glyphs.
+
 **The Bounded Register Rule.** Keep the active page compact, keep pagination in the reading path, and let the fixed watermark define the briefing boundary.
 
 **The Flat Work Rule.** Use tonal fields and restrained borders before adding elevation to a coordination row or detail section.
@@ -167,14 +183,14 @@ The Hub uses gently rounded controls and surfaces: 12px is the primary control a
 ## Components
 
 ### Navigation rail
-- **Shape:** A 248px rail (68px compact) on the chrome surface with no dividing rule. Group heads are 11px uppercase labels; on desktop their explainers appear on hover or focus, and in the mobile drawer they are always visible. Rows are 40px, with a plain 20px icon in `--hub-text-3` and a 550-weight label.
-- **Behavior:** The active row takes the `--hub-nav-active` tint, a violet icon and a 650 label, and shows the page's question beneath it, wrapped rather than truncated. Other rows keep their question in the accessible name only, since each page opens with its question as its heading. The mobile drawer has room for the questions and no hover, so it shows every one. Badges stay compact counts beside the label, or a corner dot in the compact rail.
+- **Shape:** A 248px rail (68px compact) on the chrome surface with no dividing rule. Group heads are sentence-case 12px 650 `--hub-text-3` labels; on desktop their explainers appear on hover or focus, and in the mobile drawer they are always visible. Rows are 40px, with a plain 20px icon in `--hub-text-3` and a 550-weight label.
+- **Behavior:** The active row takes the `--hub-nav-active` tint, a 3px brand bar at its left edge, a violet icon and a 650 label, and shows the page's question beneath it, wrapped rather than truncated. Other rows keep their question in the accessible name only, since each page opens with its question as its heading. The mobile drawer has room for the questions and no hover, so it shows every one. Badges stay compact counts beside the label, or a corner dot in the compact rail.
 
 ### Top bar
 - **Shape:** It sits on the chrome surface, with the search field and the header "Connect agent" action as white controls with hairline borders. The header action is deliberately secondary (an outline button with violet text) so each page's filled primary action stays the only filled violet on screen.
 
 ### Evidence boxes
-- **Shape:** 12px-corner surfaces with a 52px head of a plain 20px icon (tinted only for ok, warn or bad tones), a 15px 650 title, a plain count and an explainer at 0.8 rest opacity (at least 3:1 against the surface in both themes) that reaches full opacity when the box is hovered or the explainer focused, then a hairline rule over the body.
+- **Shape:** 12px-corner surfaces under a 2px tone cap, with a 52px head band (`--hub-surface-head`) of a plain 20px icon (tinted only for ok, warn or bad tones), a 16px 650 title, a plain count and an explainer at 0.8 rest opacity (at least 3:1 against the surface in both themes) that reaches full opacity when the box is hovered or the explainer focused, then a hairline rule over the body.
 - **Behavior:** The head labels the data; it doesn't compete with it. Rows inside a box are separated by rules or proximity, not nested cards.
 
 ### Info bars

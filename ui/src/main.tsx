@@ -41,7 +41,8 @@ window.addEventListener('hashchange', () => {
   if (new URLSearchParams(window.location.hash.slice(1)).has('token')) window.location.reload()
 })
 
-void adoptFragmentToken().then(() =>
+// A slow hub must not hold the first render: give the link check a few seconds, then show the page anyway.
+void Promise.race([adoptFragmentToken(), new Promise((resolve) => setTimeout(resolve, 6000))]).then(() =>
   createRoot(document.getElementById('root')!).render(
     <StrictMode>
       <ErrorBoundary>

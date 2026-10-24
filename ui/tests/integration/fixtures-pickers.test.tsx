@@ -31,8 +31,9 @@ describe('Landed picker', () => {
     fireEvent.focus(picker)
     await screen.findAllByRole('option', {}, LOAD)
     fireEvent.change(picker, { target: { value: 'retry-backoff-111' } })
+    // The previous options stay visible while the search runs, so wait for the request itself.
+    await waitFor(() => expect(sent.some((r) => r.url.includes('/publications?') && r.url.includes('q=retry-backoff-111') && r.url.includes('limit=10'))).toBe(true), LOAD)
     const option = await screen.findByRole('option', { name: /retry-backoff-111/ }, LOAD)
-    expect(sent.some((r) => r.url.includes('/publications?') && r.url.includes('q=retry-backoff-111') && r.url.includes('limit=10'))).toBe(true)
     // Human label first (branch, PR number, title), the ID only as secondary text.
     expect(option.textContent).toContain('PR #211')
     expect(option.textContent).toContain('Synthetic retry backoff change 111')

@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { loadLocalBase, loadLocalToken, localStatus, saveLocalBase, saveLocalToken, validLocalBase } from '../localApi.ts'
 import { usePoll } from '../usePoll.ts'
-import type { ThemePref } from '../storage.ts'
+import { loadSingleKeys, saveSingleKeys, type ThemePref } from '../storage.ts'
 import type { Whoami } from '../types.ts'
 import { ViewSettingsBox } from '../ViewSettings.tsx'
 import { Box, Icon, Pill, Skeleton, localDate } from '../ui.tsx'
@@ -22,6 +22,7 @@ export function SettingsPage({ token, whoami, pref, onPref, railCollapsed, onRai
     { v: 'system', icon: 'circle-half', label: 'System', hint: 'Follows your device' },
     { v: 'dark', icon: 'moon-stars', label: 'Dark', hint: 'Always dark' },
   ]
+  const [singleKeys, setSingleKeys] = useState(loadSingleKeys)
   return (
     <div className="page">
       <div className="answer" data-tour="answer">
@@ -55,6 +56,16 @@ export function SettingsPage({ token, whoami, pref, onPref, railCollapsed, onRai
             <div className="form-check form-switch m-0">
               <input id="rail-compact" className="form-check-input" type="checkbox" role="switch" checked={railCollapsed} onChange={(e) => onRail(e.target.checked)} />
               <label className="visually-hidden" htmlFor="rail-compact">Compact sidebar</label>
+            </div>
+          </div>
+          <div className="settings-row">
+            <div>
+              <div className="settings-label">Single-key shortcuts</div>
+              <div className="muted small">Let <kbd>/</kbd> open search and <kbd>[</kbd> collapse the sidebar. Switch off if they trigger by accident; <kbd>Ctrl</kbd> <kbd>K</kbd> or <kbd>⌘</kbd> <kbd>K</kbd> still opens search.</div>
+            </div>
+            <div className="form-check form-switch m-0">
+              <input id="single-keys" className="form-check-input" type="checkbox" role="switch" checked={singleKeys} onChange={(e) => { setSingleKeys(e.target.checked); saveSingleKeys(e.target.checked) }} />
+              <label className="visually-hidden" htmlFor="single-keys">Single-key shortcuts</label>
             </div>
           </div>
         </Box>

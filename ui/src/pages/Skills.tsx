@@ -52,7 +52,7 @@ function HowItWorks({ c, pin }: { c: CatalogEntry; pin: Pin | null }) {
   if (lines.length === 0) return null
   return (
     <div className="skill-walkthrough" data-tour="skills-how">
-      <h4 className="small fw-semibold mb-1">How it works</h4>
+      <h3 className="small fw-semibold mb-1">How it works</h3>
       <ol className="small">{lines.map((l, i) => <li key={i}>{stepText(l)}</li>)}</ol>
       {c.procedure && (
         <details className="small">
@@ -134,7 +134,7 @@ function Library({ lib }: { lib: Library }) {
                   <Applicability c={c} />
                   <HowItWorks c={c} pin={p} />
                   <Params c={c} pin={p} />
-                  <p className="small mb-2">{n.open} open run{n.open === 1 ? '' : 's'} · {n.at_stop_gate} at a stop gate · {n.completed} completed <a className="ms-2" href={skillRunsHref}>View runs <Icon name="arrow-right" /></a></p>
+                  <p className="small mb-2">{n.open} open run{n.open === 1 ? '' : 's'} · {n.at_stop_gate} at a stop gate · {n.completed} completed <a className="ms-2" href={skillRunsHref}>View runs</a></p>
                   <p className="small muted mb-1">To remove it, run this in the repository, then commit the lock file:</p>
                   <Cmd command={removeCommand(c.name)} label={`Remove ${c.name}`} />
                 </li>

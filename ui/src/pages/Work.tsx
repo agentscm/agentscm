@@ -163,7 +163,7 @@ function Board({ items, showFinished = false }: { items: WorkItem[]; showFinishe
             <section key={s} className={`lane tone-${STATE[s].tone}${mobileLane === s ? ' is-picked' : ''}`} aria-label={STATE[s].label}>
               <header className="lane-head">
                 <Icon name={STATE[s].icon} />
-                <span>{STATE[s].label}</span>
+                <h2 className="lane-title">{STATE[s].label}</h2>
                 <span className="lane-count">{inLane.length}</span>
                 <Explain text={STATE[s].tip} />
               </header>
@@ -273,7 +273,7 @@ function Request({ r }: { r: CoordinationRequest }) {
           </div>
           {r.proposal.work_id && (
             <div>
-              <WorkLink id={r.proposal.work_id}>Open the requesting work <Icon name="arrow-right" /></WorkLink>
+              <WorkLink id={r.proposal.work_id}>Open the requesting work</WorkLink>
             </div>
           )}
         </div>

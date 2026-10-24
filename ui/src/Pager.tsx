@@ -1,6 +1,6 @@
 // One pager for every list that can grow, plus a hook that keeps the current cursor in the hash query
 // (`#landed?before=<cursor>`) so a page can be linked to and Back works.
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Icon } from './ui.tsx'
 
 /** The hash without its `?query`: route parsers use this so a cursor never breaks routing. */
@@ -58,19 +58,33 @@ export function useHashCursor(param = 'before'): HashCursor {
   }
 }
 
+// A clicked button can vanish (last page, or the list shows a skeleton while the next page loads); the nav takes focus then.
+let refocusUntil = 0
+
 /** Newer / Older buttons with an "everything" end state. Pass `onNewer`/`onOlder` only when that move exists. */
 export function Pager({ onNewer, onOlder, complete = false, newerLabel = 'Newer', olderLabel = 'Older', status, tour = 'pager' }: { onNewer?: (() => void) | undefined; onOlder?: (() => void) | undefined; complete?: boolean; newerLabel?: string; olderLabel?: string; status?: string; tour?: string }) {
+  const nav = useRef<HTMLElement>(null)
+  useEffect(() => {
+    if (Date.now() < refocusUntil && (!document.activeElement || document.activeElement === document.body)) {
+      refocusUntil = 0
+      nav.current?.focus({ preventScroll: true })
+    }
+  })
   if (!onNewer && !onOlder && !complete) return null
+  const keepFocus = (go: () => void) => () => {
+    refocusUntil = Date.now() + 5000
+    go()
+  }
   return (
-    <nav className="pager" aria-label="Pages" data-tour={tour}>
+    <nav ref={nav} tabIndex={-1} className="pager" aria-label="Pages" data-tour={tour}>
       {(onNewer || onOlder) && (
-        <button type="button" className="btn btn-sm btn-outline-secondary" disabled={!onNewer} onClick={onNewer}>
+        <button type="button" className="btn btn-sm btn-outline-secondary" disabled={!onNewer} onClick={onNewer && keepFocus(onNewer)}>
           <Icon name="chevron-left" /> {newerLabel}
         </button>
       )}
       {status && <span className="small muted">{status}</span>}
       {onOlder ? (
-        <button type="button" className="btn btn-sm btn-outline-secondary" onClick={onOlder}>
+        <button type="button" className="btn btn-sm btn-outline-secondary" onClick={keepFocus(onOlder)}>
           {olderLabel} <Icon name="chevron-right" />
         </button>
       ) : complete ? (

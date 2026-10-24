@@ -259,7 +259,11 @@ function useDetails(repo: string, token: string, ids: string[]): Record<string, 
   useEffect(() => {
     if (!key) return
     const ctrl = new AbortController()
+    let running = false
     const run = async () => {
+      // Skip ticks while the tab is hidden or the previous run is still going.
+      if (running || document.hidden) return
+      running = true
       const queue = key.split(',')
       const worker = async () => {
         for (let id = queue.shift(); id !== undefined; id = queue.shift()) {
@@ -271,7 +275,11 @@ function useDetails(repo: string, token: string, ids: string[]): Record<string, 
           }
         }
       }
-      await Promise.all(Array.from({ length: Math.min(DETAIL_WORKERS, queue.length) }, worker))
+      try {
+        await Promise.all(Array.from({ length: Math.min(DETAIL_WORKERS, queue.length) }, worker))
+      } finally {
+        running = false
+      }
     }
     void run()
     const timer = window.setInterval(() => void run(), DETAIL_EVERY_MS)
@@ -312,7 +320,7 @@ function List({ repo, token }: { repo: string; token: string }) {
         </p>
       </div>
       <Lookup repo={repo} token={token} recent={recent} onOpen={(id) => { window.location.hash = landedHref(id).slice(1) }} />
-      <Box tour="landed-list" icon="rocket-takeoff" title="Recent changes" count={ready ? ready.publications.length : undefined} explain="Changes agents published to this repository through the hub, newest first. Each row shows how far it got.">
+      <Box tour="landed-list" icon="rocket-takeoff" tone={failing.length ? 'bad' : 'brand'} title="Recent changes" count={ready ? ready.publications.length : undefined} explain="Changes agents published to this repository through the hub, newest first. Each row shows how far it got.">
         {load.kind === 'loading' ? (
           <Skeleton rows={4} />
         ) : load.kind === 'error' ? (

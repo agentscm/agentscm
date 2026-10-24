@@ -2,6 +2,7 @@
 // contract; every string comes from agents or a repository, so decoding is defensive and the page only GETs.
 import type { Step } from './publications.ts'
 import type { Tone } from './ui.tsx'
+import { withTimeout } from './timeout.ts'
 
 export type GateState = 'done' | 'current' | 'not_reached'
 export type AdoptionSource = 'default_branch' | 'reported_by_checkout' | 'none'
@@ -211,7 +212,7 @@ export function decodeLibrary(v: unknown): Library {
 
 const MAX_BYTES = 2 * 1024 * 1024
 async function getJson(path: string, token: string, signal: AbortSignal): Promise<unknown> {
-  const res = await fetch(path, { signal, cache: 'no-store', credentials: 'omit', headers: { Authorization: `Bearer ${token}` } })
+  const res = await fetch(path, { signal: withTimeout(signal), cache: 'no-store', credentials: 'omit', headers: { Authorization: `Bearer ${token}` } })
   if (!res.ok) throw new Error(res.status === 404 ? 'Not found' : `HTTP ${res.status}`)
   const text = await res.text()
   if (text.length > MAX_BYTES) throw new Error('The hub reply was too large to show.')

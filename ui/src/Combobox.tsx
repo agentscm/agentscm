@@ -92,7 +92,7 @@ export function Combobox({ id, label, placeholder, onSelect, options, search, pa
 
   const pasted = parseId?.(text) ?? null
   const current = remote?.key === key ? remote : null
-  const shown: ComboOption[] = search ? (current?.result?.options ?? []) : (options ?? []).filter((o) => !typed || !text || o.text.toLowerCase().includes(text.toLowerCase()))
+  const shown: ComboOption[] = search ? ((current ?? remote)?.result?.options ?? []) : (options ?? []).filter((o) => !typed || !text || o.text.toLowerCase().includes(text.toLowerCase()))
   const result = current?.result ?? null
   const canMore = !!result?.more && !!result.loadMore
   const moreOption: ComboOption[] = canMore ? [{ value: MORE, text: '', label: loadingMore ? 'Searching…' : (result.moreLabel ?? 'Show more results') }] : []
@@ -102,6 +102,8 @@ export function Combobox({ id, label, placeholder, onSelect, options, search, pa
   const items: ComboOption[] = [...(pastedOption && !looseId ? [pastedOption] : []), ...rest2, ...(pastedOption && looseId ? [pastedOption] : []), ...moreOption]
   const strictPasted = !!pastedOption && !looseId
   const loading = !!search && !current
+  // Keep the last results visible (dimmed) until the new ones land, so typing doesn't flash the list away.
+  const stale = loading && shown.length > 0
   const failed = !!search && !!current && current.result === null
 
   const loadMore = () => {
@@ -120,6 +122,10 @@ export function Combobox({ id, label, placeholder, onSelect, options, search, pa
     setQuery(keepText ? o.text : '')
     onSelect(o.value, o)
   }
+  const activeId = open && active >= 0 && items[active] ? `${uid}-opt-${active}` : undefined
+  useEffect(() => {
+    document.getElementById(activeId ?? '')?.scrollIntoView?.({ block: 'nearest' })
+  }, [activeId])
   const move = (to: number) => {
     setOpen(true)
     setActive(items.length === 0 ? -1 : ((to % items.length) + items.length) % items.length)
@@ -168,7 +174,7 @@ export function Combobox({ id, label, placeholder, onSelect, options, search, pa
         aria-expanded={open}
         aria-controls={open ? listId : undefined}
         aria-autocomplete="list"
-        aria-activedescendant={open && active >= 0 && items[active] ? `${uid}-opt-${active}` : undefined}
+        aria-activedescendant={activeId}
         aria-describedby={describedBy}
         placeholder={placeholder}
         value={query}
@@ -193,7 +199,7 @@ export function Combobox({ id, label, placeholder, onSelect, options, search, pa
       {open && (
         <div className="combo-pop" onMouseDown={(e) => e.preventDefault()}>
           {items.length > 0 && (
-            <ul id={listId} role="listbox" aria-label={label} className="combo-list">
+            <ul id={listId} role="listbox" aria-label={label} className={`combo-list${stale ? ' is-stale' : ''}`}>
               {items.map((o, i) => (
                 <li key={o.value} id={`${uid}-opt-${i}`} role="option" aria-selected={i === active} className="combo-opt" onMouseEnter={() => setActive(i)} onClick={() => pick(o)}>
                   <span className="combo-main">

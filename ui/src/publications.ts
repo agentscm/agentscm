@@ -2,6 +2,7 @@
 // landed. Only GETs. Every string comes from the hub or the forge, so it is decoded defensively.
 import { ApiError } from './api.ts'
 import type { Tone } from './ui.tsx'
+import { withTimeout } from './timeout.ts'
 
 export type BranchState = 'pending' | 'created' | 'rejected' | 'unknown'
 export type PrState = 'pending' | 'opened' | 'merged' | 'unknown'
@@ -130,7 +131,7 @@ export function decodePublication(v: unknown): Publication {
 const repoPath = (repo: string) => `/v1/hub/repos/${encodeURIComponent(repo)}/publications`
 
 async function get(path: string, token: string, signal: AbortSignal): Promise<unknown> {
-  const res = await fetch(path, { signal, cache: 'no-store', credentials: 'omit', headers: { Authorization: `Bearer ${token}` } })
+  const res = await fetch(path, { signal: withTimeout(signal), cache: 'no-store', credentials: 'omit', headers: { Authorization: `Bearer ${token}` } })
   if (!res.ok) {
     const body = res.status === 403 ? rec(await res.json().catch(() => null)) : {}
     throw new ApiError(res.status, body['error'] === 'read_only' ? 'read_only' : `HTTP ${res.status}`)
@@ -267,7 +268,7 @@ export function track(p: Publication): Step[] {
 export function headline(p: Publication): { tone: Tone; text: string } {
   const steps = track(p)
   if (p.branchState === 'rejected') return { tone: 'bad', text: 'Branch rejected' }
-  if (p.pr.state !== 'merged') return { tone: 'muted', text: p.pr.state === 'opened' ? 'Waiting to merge' : 'Getting ready' }
+  if (p.pr.state !== 'merged') return p.pr.state === 'opened' ? { tone: 'brand', text: 'Waiting to merge' } : { tone: 'muted', text: 'Getting ready' }
   const bad = steps.find((s) => s.tone === 'bad')
   if (bad) return { tone: 'bad', text: `Landed, ${bad.label === 'CI' ? 'CI' : 'a deploy'} failed after` }
   if (steps.some((s) => s.tone === 'brand')) return { tone: 'brand', text: 'Landed, checks still running' }

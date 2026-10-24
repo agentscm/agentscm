@@ -114,7 +114,7 @@ function Answer({ repo, d, overview, failing }: { repo: string; d: Derived | nul
       </p>
       {overlaps !== null && overlaps > 0 && (
         <a href="#work" className="answer-next">
-          <Icon name="sign-intersection-y" /> {plural(overlaps, 'task')} declare overlapping scope — review on Work <Icon name="arrow-right" />
+          <Icon name="sign-intersection-y" /> {plural(overlaps, 'task')} declare overlapping scope — review on Work
         </a>
       )}
     </div>

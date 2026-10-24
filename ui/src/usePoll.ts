@@ -12,7 +12,8 @@ const message = (e: unknown) => (e instanceof Error ? e.message : 'Unknown error
  * and labels the last good value instead of replacing it. `key` restarts from scratch.
  */
 export function usePoll<T>(load: (signal: AbortSignal) => Promise<T>, everyMs: number, key: string): Poll<T> {
-  const [state, setState] = useState<Poll<T>>({ kind: 'loading' })
+  // The state is tagged with the key it was loaded for; a result for another key reads as loading.
+  const [tagged, setTagged] = useState<{ key: string; poll: Poll<T> }>({ key, poll: { kind: 'loading' } })
   const [attempt, setAttempt] = useState(0)
   const latest = useRef(load)
   useEffect(() => {
@@ -24,6 +25,7 @@ export function usePoll<T>(load: (signal: AbortSignal) => Promise<T>, everyMs: n
     let timer: number | undefined
     let controller: AbortController | undefined
     let had = false
+    const setState = (next: Poll<T> | ((s: Poll<T>) => Poll<T>)) => setTagged((t) => ({ key, poll: typeof next === 'function' ? next(t.key === key ? t.poll : { kind: 'loading' }) : next }))
     const retry = () => {
       setState({ kind: 'loading' })
       setAttempt((n) => n + 1)
@@ -63,5 +65,5 @@ export function usePoll<T>(load: (signal: AbortSignal) => Promise<T>, everyMs: n
       document.removeEventListener('visibilitychange', onVisibility)
     }
   }, [everyMs, key, attempt])
-  return state
+  return tagged.key === key ? tagged.poll : { kind: 'loading' }
 }
