@@ -542,9 +542,10 @@ fn check_existing_claude_hooks(root: &Path) -> Result<()> {
         root.join(".claude/settings.local.json"),
     ] {
         if has_agentscm_hooks(&path)? {
-            return Err(invalid(
-                "existing AgentSCM Claude command hooks were found; review and remove only their old entries before installing the plugin to avoid duplicate hooks",
-            ));
+            return Err(invalid(&format!(
+                "{} has AgentSCM Claude Code hooks (command or HTTP) that the plugin would duplicate; remove only those entries before rerunning client setup",
+                path.display()
+            )));
         }
     }
     Ok(())

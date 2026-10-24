@@ -49,8 +49,8 @@ An **agent token** is a secret that lets one agent talk to the hub for one repos
    silently (see Limits).
 
 Setting this up for a whole team, or for agents other than Claude Code (Codex, Cursor, Copilot)? Use
-[`agentscm init-repo`](agents.md): it commits the hook and MCP config for each agent, and a Claude Code
-hook that calls the hub over HTTP, so Claude Code needs no install.
+[`agentscm init-repo`](agents.md): it commits shared instructions for each agent, and each developer then runs
+`agentscm client setup` to add that machine's hooks and MCP server.
 
 Optional: `AGENTSCM_MACHINE` names the computer in warnings (default: its hostname),
 and `AGENTSCM_TASK` sets the task text (default: `work on <branch>`).

@@ -224,6 +224,8 @@ page uses) are separate paths with separate token and configuration stores. `age
 quickstart; `agentscm client remove` undoes client setup. Only agents set up with `client setup` report
 on the Connect agents page.
 
+`agentscm init-repo` commits only shared agent instruction files (no MCP config, hooks or token). Each developer still runs `agentscm client setup --agent <agent> --hub <hub>` once per checkout, and the Connect agents page verifies the result.
+
 Then run `agentscm client list` and `agentscm client check` for the local binding. Start a real agent
 task and confirm that its session appears for the expected repository in the hosted Hub. A local
 configuration check proves only the local binding; a visible hosted session proves that one client

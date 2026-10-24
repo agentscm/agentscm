@@ -142,7 +142,7 @@ fn object<'a>(parent: &'a mut Map<String, Value>, key: &str) -> Result<&'a mut M
 fn check_mcp_entry(existing: &Value, root: &Path) -> Result<()> {
     if existing["args"] != mcp_args(root)? || existing["url"].is_string() {
         return Err(invalid(
-            "this file already has an AgentSCM MCP entry (a repository set up with `agentscm init-repo` gives its agents MCP through AGENTSCM_HUB_TOKEN); the hub's Connect agents page cannot verify this checkout through it, and `client setup` left it unchanged. To let `client setup` manage it instead, remove only the `agentscm` entry from this file and rerun",
+            "this file already has an `agentscm` MCP entry that `client setup` did not write, so it was left unchanged; remove only that entry and rerun to let `client setup` manage it",
         ));
     }
     Ok(())
@@ -340,7 +340,8 @@ fn json_edit(
         Some(text) => serde_json::from_str(text).map_err(|_| invalid("native configuration is not strict JSON; use the client's editor to migrate it first"))?,
         None => json!({}),
     };
-    edit(&mut value).map_err(|error| invalid(&format!("{relative}: {error}")))?;
+    edit(&mut value)
+        .map_err(|error| invalid(&format!("{relative}: {error}{}", team_note(root, relative))))?;
     let after = serde_json::to_string_pretty(&value)? + "\n";
     Ok(Edit {
         relative,
@@ -370,9 +371,10 @@ fn codex_mcp(root: &Path, program: &Path) -> Result<Edit> {
     };
     // Refuse alternate quoted/table forms too, rather than overwrite an unmanaged server.
     if head.contains("agentscm") || tail.contains("agentscm") {
-        return Err(invalid(
-            "existing AgentSCM Codex configuration needs reviewed migration",
-        ));
+        return Err(invalid(&format!(
+            "{relative} already has an `agentscm` MCP server outside the `{BEGIN}` block, which `client setup` did not write; remove that `[mcp_servers.agentscm]` entry and rerun{}",
+            team_note(root, relative)
+        )));
     }
     let body = format!(
         "{BEGIN}\n[mcp_servers.agentscm]\ncommand = {}\nargs = {}\nenv = {{ XDG_CONFIG_HOME = {} }}\nstartup_timeout_sec = 10\ntool_timeout_sec = 30\n{END}",
@@ -462,6 +464,18 @@ fn plan(agent: Agent, root: &Path, program: &Path) -> Result<Vec<Edit>> {
     Ok(edits)
 }
 
+/// A tracked file is the team's: a fix to it belongs in a commit, and setup would otherwise
+/// write this machine's paths into it.
+fn team_note(root: &Path, relative: &str) -> String {
+    if tracked(root, relative).unwrap_or(false) {
+        format!(
+            "; {relative} is tracked by Git, so make that change in a commit for the team, not only in this checkout"
+        )
+    } else {
+        String::new()
+    }
+}
+
 fn tracked(root: &Path, relative: &str) -> Result<bool> {
     let status = std::process::Command::new("git")
         .current_dir(root)
@@ -485,8 +499,12 @@ fn check_other_hooks(agent: Agent, root: &Path) -> Result<()> {
         })?;
         if let Some(existing) = value["mcpServers"].get("agentscm") {
             // Copilot loads both this Claude-compatible file and .github/mcp.json.
-            check_mcp_entry(existing, root)
-                .map_err(|error| invalid(&format!(".mcp.json: {error}")))?;
+            check_mcp_entry(existing, root).map_err(|error| {
+                invalid(&format!(
+                    ".mcp.json: {error}{}",
+                    team_note(root, ".mcp.json")
+                ))
+            })?;
         }
     }
     let home = std::env::var_os("HOME")
@@ -558,7 +576,7 @@ fn check_other_hooks(agent: Agent, root: &Path) -> Result<()> {
                 })
             {
                 return Err(invalid(&format!(
-                    "{}: another AgentSCM native hook or plugin is enabled (for example one written by `agentscm init-repo`); review its migration, or remove that file's AgentSCM entries, before setup",
+                    "{}: another AgentSCM native hook or plugin is enabled; review its migration, or remove that file's AgentSCM entries, before setup",
                     path.display()
                 )));
             }
@@ -905,6 +923,75 @@ mod tests {
             "env = {{ XDG_CONFIG_HOME = {} }}",
             json!(mcp_config_home(&crate::hub_cli::config_dir().unwrap()).unwrap())
         )));
+    }
+
+    #[test]
+    fn refusals_name_the_entry_and_send_tracked_fixes_to_a_team_commit() {
+        let (_dir, root) = repo();
+        let foreign =
+            r#"{"mcpServers":{"agentscm":{"type":"http","url":"https://h.example.test/mcp"}}}"#;
+        std::fs::write(root.join(".mcp.json"), foreign).unwrap();
+        let program = Path::new("/opt/agentscm");
+        let local = plan(Agent::Claude, &root, program)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            local.contains(".mcp.json") && local.contains("remove only that entry"),
+            "{local}"
+        );
+        assert!(!local.contains("tracked by Git"), "{local}");
+        assert!(
+            std::process::Command::new("git")
+                .args(["add", ".mcp.json"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let team = plan(Agent::Claude, &root, program)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            team.contains(".mcp.json is tracked by Git") && team.contains("commit for the team"),
+            "{team}"
+        );
+        std::fs::create_dir(root.join(".codex")).unwrap();
+        std::fs::write(
+            root.join(".codex/config.toml"),
+            "[mcp_servers.agentscm]\nurl = \"x\"\n",
+        )
+        .unwrap();
+        let codex = codex_mcp(&root, program).err().unwrap().to_string();
+        assert!(
+            codex.contains(".codex/config.toml") && codex.contains("[mcp_servers.agentscm]"),
+            "{codex}"
+        );
+    }
+
+    #[test]
+    fn init_repo_output_never_conflicts_with_client_setup() {
+        let (_dir, root) = repo();
+        let written = crate::init_cli::run_in(&root, None, None, &crate::prompt::Ui { yes: true })
+            .unwrap()
+            .written;
+        assert!(!written.is_empty());
+        for agent in [
+            Agent::Claude,
+            Agent::Codex,
+            Agent::Cursor,
+            Agent::Copilot,
+            Agent::Gemini,
+        ] {
+            let edits = plan(agent, &root, Path::new("/opt/agentscm")).unwrap();
+            assert!(
+                edits
+                    .iter()
+                    .all(|edit| written.iter().all(|path| path != Path::new(edit.relative))),
+                "{agent:?}"
+            );
+        }
     }
 
     #[test]
