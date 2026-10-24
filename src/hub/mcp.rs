@@ -574,21 +574,48 @@ fn try_args<T: DeserializeOwned>(arguments: Option<&Value>) -> std::result::Resu
     serde_json::from_value(arguments).map_err(|error| safe_detail(&error.to_string()))
 }
 
-/// Keeps only the schema side of a serde error: input values and unknown keys are never echoed.
+/// A detail built from the error's kind and the schema's own words only. Serde renders input
+/// values and unknown keys before its trailing "expected ..." text, so only that tail is kept,
+/// and only when it looks like schema text; anything else gets a fixed phrase.
 fn safe_detail(error: &str) -> String {
-    let error = error.split(" at line ").next().unwrap_or(error);
-    if error.starts_with("missing field `") {
-        return error.to_owned();
+    let schema = |text: &str| {
+        !text.is_empty()
+            && text.len() <= 160
+            && text
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || " `_-,.:".contains(c))
+    };
+    // Drop serde's trailing " at line N column M" position, when present.
+    let error = match error.rsplit_once(" at line ") {
+        Some((head, position))
+            if position
+                .split(" column ")
+                .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) =>
+        {
+            head
+        }
+        _ => error,
+    };
+    if let Some(field) = error
+        .strip_prefix("missing field `")
+        .and_then(|rest| rest.strip_suffix('`'))
+        .filter(|field| field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    {
+        return format!("missing field `{field}`");
     }
-    if error.starts_with("unknown field `") {
-        return match error.split_once(", expected ") {
-            Some((_, expected)) => format!("unknown field, expected {expected}"),
-            None => "unknown field".into(),
-        };
-    }
-    match error.split_once(", expected ") {
-        Some((_, expected)) => format!("wrong type or value, expected {expected}"),
-        None => "malformed arguments".into(),
+    let kind = if error.starts_with("unknown field `") {
+        "unknown field"
+    } else if error.starts_with("invalid type:")
+        || error.starts_with("invalid value:")
+        || error.starts_with("invalid length")
+    {
+        "wrong type or value"
+    } else {
+        return "malformed arguments".into();
+    };
+    match error.rsplit_once(", expected ") {
+        Some((_, expected)) if schema(expected) => format!("{kind}, expected {expected}"),
+        _ => kind.into(),
     }
 }
 
@@ -616,7 +643,7 @@ fn session_call(session: Option<String>, task: Option<String>, paths: Vec<String
     }
 }
 
-/// A tool result; reasons are fixed hub strings, never client input.
+/// A tool result; reasons are hub strings and schema text, never client input.
 fn result(text: &str, is_error: bool) -> Value {
     json!({"content": [{"type": "text", "text": text}], "isError": is_error})
 }
@@ -1645,5 +1672,22 @@ mod tests {
             "wrong type or value, expected a sequence"
         );
         assert_eq!(safe_detail("sekrit"), "malformed arguments");
+        // A hostile value or key that contains serde's own separator still leaks nothing.
+        assert_eq!(
+            safe_detail("invalid type: string \"x, expected sekrit\", expected a sequence"),
+            "wrong type or value, expected a sequence"
+        );
+        assert_eq!(
+            safe_detail("unknown field `a, expected sekrit`, expected `task` or `paths`"),
+            "unknown field, expected `task` or `paths`"
+        );
+        assert_eq!(
+            safe_detail("invalid value: string \"sekrit\", expected \"sekrit\""),
+            "wrong type or value"
+        );
+        assert_eq!(
+            safe_detail("missing field `a` sekrit`"),
+            "malformed arguments"
+        );
     }
 }
