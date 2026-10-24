@@ -87,7 +87,7 @@ reverses setup. Manage usage reporting with `agentscm telemetry status` and
 
 TEXT
 
-  [ -n "$VERSION" ] || die "set AGENTSCM_VERSION (for example AGENTSCM_VERSION=0.1.0-alpha.1)"
+  [ -n "$VERSION" ] || die "set AGENTSCM_VERSION (for example AGENTSCM_VERSION=0.1.0-alpha.N; see the GitHub Releases page)"
   case "$VERSION" in
     *[!A-Za-z0-9._-]*) die "invalid version" ;;
   esac
@@ -148,9 +148,9 @@ See https://github.com/$REPO/blob/v$VERSION/docs/install.md"
   mv -f "$tmp/link" "$link"
 
   if [ "$provenance_verified" = 1 ]; then
-    echo "Verified checksum and build provenance. Set AGENTSCM_INSTALL_VERBOSE=1 for details."
+    echo "Verified provenance with GitHub attestations. Set AGENTSCM_INSTALL_VERBOSE=1 for details."
   else
-    echo "Verified checksum; provenance was not checked ($gap)."
+    echo "Checked the SHA-256 checksum from the release (provenance not checked: $gap)."
   fi
 
   # Same rule as the npm package: no arguments or a leading flag starts the setup guide.

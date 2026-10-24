@@ -18,7 +18,13 @@ export function ConnectAgent() {
   const prompt = agentSetupPrompt(window.location.origin)
   const command = agent ? clientSetupCommand(window.location.origin, agent) : null
   if (!origin || !prompt) {
-    return <Notice title="This page is not served from a supported Hub address">Ask your operator for the Hub’s HTTPS URL. Setup commands are only offered for HTTPS or a loopback address.</Notice>
+    const { protocol, hostname, port } = window.location
+    const local = protocol === 'http:' && (hostname === 'localhost' || hostname.endsWith('.localhost'))
+    return (
+      <Notice title="This page is not served from a supported Hub address">
+        {local ? `Open this page at http://127.0.0.1${port ? `:${port}` : ''}/ui/ instead of ${hostname}. ` : 'Ask your operator for the Hub’s HTTPS URL. '}Setup commands are only offered for HTTPS or a loopback address.
+      </Notice>
+    )
   }
   return (
     <div className="connect">
@@ -70,8 +76,9 @@ export function ConnectAgent() {
             <CopyButton text={command} />
           </div>
         )}
+        {command && <p className="muted small mt-2 mb-0">Then run <code>npx agentscm client check</code> in the checkout (Hub binding only). Verify hooks and MCP from your agent.</p>}
       </details>
-      <p className="muted small mb-0">macOS and Linux. Your agent guides setup; you approve sign-in and trust. Configuration alone is not verification.</p>
+      <p className="muted small mb-0">macOS and Linux. Your agent guides setup; you approve sign-in and trust. Configuration alone is not verification. If this checkout already has hooks from <code>agentscm quickstart</code>, <code>client setup</code> can stop on them; run <code>agentscm uninstall</code> first. A repository set up with <code>agentscm init-repo</code> gets MCP through <code>AGENTSCM_HUB_TOKEN</code>, and this page cannot verify it.</p>
     </div>
   )
 }

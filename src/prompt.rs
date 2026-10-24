@@ -2,37 +2,58 @@
 //! question takes the recommended answer.
 use std::io::{BufRead, Write};
 
+const MAX_TRIES: usize = 3;
+
+fn parse_confirm(answer: &str, default_yes: bool) -> Option<bool> {
+    match answer.to_lowercase().as_str() {
+        "" => Some(default_yes),
+        "y" | "yes" => Some(true),
+        "n" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+fn ask(mut read: impl FnMut() -> Option<String>, default_yes: bool) -> Option<bool> {
+    for _ in 0..MAX_TRIES {
+        if let Some(choice) = parse_confirm(&read()?, default_yes) {
+            return Some(choice);
+        }
+        println!("Please answer y or n.");
+    }
+    None
+}
+
 pub(crate) struct Ui {
     pub(crate) yes: bool,
 }
 
 impl Ui {
-    fn read(&self, prompt: &str) -> String {
+    /// `None` at end of input.
+    fn read(&self, prompt: &str) -> Option<String> {
         print!("{prompt}");
         let _ = std::io::stdout().flush();
         let mut line = String::new();
-        // End of input answers like Enter: the default.
-        let _ = std::io::stdin().lock().read_line(&mut line);
-        line.trim().to_owned()
+        match std::io::stdin().lock().read_line(&mut line) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(line.trim().to_owned()),
+        }
     }
 
+    /// Only an empty answer takes the default; anything unrecognised is asked again, and
+    /// three misses or end of input mean no.
     pub(crate) fn confirm(&self, question: &str, default_yes: bool) -> bool {
-        if self.yes {
-            return true;
-        }
-        let hint = if default_yes { "[Y/n]" } else { "[y/N]" };
-        match self
-            .read(&format!("{question} {hint} "))
-            .to_lowercase()
-            .as_str()
-        {
-            "y" | "yes" => true,
-            "n" | "no" => false,
-            _ => default_yes,
-        }
+        self.yes || self.answer(question, default_yes).unwrap_or(false)
     }
 
-    /// The 0-based index of the chosen option; `default` on Enter or an unknown answer.
+    /// Like `confirm`, but `None` when nobody answered (end of input or three misses), for
+    /// choices that must not be recorded without a real answer.
+    pub(crate) fn answer(&self, question: &str, default_yes: bool) -> Option<bool> {
+        let hint = if default_yes { "[Y/n]" } else { "[y/N]" };
+        ask(|| self.read(&format!("{question} {hint} ")), default_yes)
+    }
+
+    /// The 0-based index of the chosen option; `default` on Enter, end of input, or after
+    /// three unusable answers.
     pub(crate) fn choose(&self, question: &str, options: &[&str], default: usize) -> usize {
         if self.yes {
             return default;
@@ -41,11 +62,23 @@ impl Ui {
         for (i, option) in options.iter().enumerate() {
             println!("  {}) {option}", i + 1);
         }
-        let answer = self.read(&format!("Choose 1-{} [{}]: ", options.len(), default + 1));
-        match answer.parse::<usize>() {
-            Ok(n) if (1..=options.len()).contains(&n) => n - 1,
-            _ => default,
+        for _ in 0..MAX_TRIES {
+            let Some(answer) =
+                self.read(&format!("Choose 1-{} [{}]: ", options.len(), default + 1))
+            else {
+                return default;
+            };
+            if answer.is_empty() {
+                return default;
+            }
+            if let Ok(n) = answer.parse::<usize>()
+                && (1..=options.len()).contains(&n)
+            {
+                return n - 1;
+            }
+            println!("Enter a number from 1 to {}.", options.len());
         }
+        default
     }
 
     /// A free-text answer, prefilled with `default`.
@@ -58,7 +91,9 @@ impl Ui {
         } else {
             format!(" [{default}]")
         };
-        let answer = self.read(&format!("{question}{hint}: "));
+        let answer = self
+            .read(&format!("{question}{hint}: "))
+            .unwrap_or_default();
         if answer.is_empty() {
             default.to_owned()
         } else {
@@ -77,7 +112,34 @@ impl Ui {
 
     pub(crate) fn pause(&self, message: &str) {
         if !self.yes {
-            self.read(&format!("{message} "));
+            let _ = self.read(&format!("{message} "));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_confirm;
+
+    #[test]
+    fn only_empty_input_takes_the_default() {
+        assert_eq!(parse_confirm("", true), Some(true));
+        assert_eq!(parse_confirm("", false), Some(false));
+        assert_eq!(parse_confirm("Yes", false), Some(true));
+        assert_eq!(parse_confirm("n", true), Some(false));
+        assert_eq!(parse_confirm("yse", true), None);
+    }
+
+    #[test]
+    fn no_answer_is_not_a_no() {
+        let answers = |list: &[&str]| {
+            let mut list: Vec<String> = list.iter().map(|a| a.to_string()).collect();
+            list.reverse();
+            move || list.pop()
+        };
+        assert_eq!(super::ask(answers(&[]), true), None);
+        assert_eq!(super::ask(answers(&["yse", "x", "?"]), true), None);
+        assert_eq!(super::ask(answers(&["yse", "n"]), true), Some(false));
+        assert_eq!(super::ask(answers(&[""]), true), Some(true));
     }
 }

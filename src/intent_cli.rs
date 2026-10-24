@@ -341,8 +341,9 @@ impl Hub {
         let var = |name| std::env::var(name).ok().filter(|v| !v.is_empty());
         let read = || {
             let path = config_dir()?.join("agentscm").join("hub.json");
-            std::fs::read_to_string(path)
-                .map_err(|_| invalid("no hub configured (see docs/intents.md)"))
+            std::fs::read_to_string(path).map_err(|_| {
+                invalid("no hub configured (run `agentscm quickstart` to connect one)")
+            })
         };
         let (url, token_file) = hub_config(
             var("AGENTSCM_HUB_URL"),

@@ -38,7 +38,7 @@ const AGENT_INSTRUCTIONS: &str = "AgentSCM coordinates durable shared work and t
     Use agentscm_work_usage only when a client or provider result supplies usage; use literal unknown labels when identities are unavailable and null for unknown counts. AgentSCM does not discover token billing or transcripts. Read agentscm_work_insight or agentscm_work_insights for conservative, report-only projections and inspect completeness fields. \
     Reuse work_id, a canonical forge source, or a stable request_key across sessions; a legacy task-only start is retry-safe only in its resolved session. \
     Claim work before taking a coordinated file path. Call agentscm_check before editing a file you have not \
-    edited yet in this session, and agentscm_done when finished. If a reply says another agent is \
+    edited yet in this session (hooks already check edits where installed), and agentscm_done when finished. If a reply says another agent is \
     already working on a file, do other work first or ask the user. When an edit is refused \
     because another agent holds the file, agentscm_ask asks that agent to hand it over, and \
     agentscm_handoff answers such a request. agentscm_workflow_status reads a retained native \
@@ -262,7 +262,10 @@ async fn mcp(
                         },
                     )
                 } else {
-                    Ok(refused("invalid setup arguments"))
+                    Ok(invalid_args(
+                        "agentscm_setup_status",
+                        "unexpected setup arguments",
+                    ))
                 }
             } else {
                 call(
@@ -563,12 +566,70 @@ fn tools(read_only: bool, settings: &ViewSettings) -> Value {
 }
 
 /// Parsed arguments; `None` for anything the tool does not accept.
-fn args<T: DeserializeOwned>(arguments: Option<&Value>) -> Option<T> {
+fn try_args<T: DeserializeOwned>(arguments: Option<&Value>) -> std::result::Result<T, String> {
     let arguments = match arguments {
         None | Some(Value::Null) => json!({}),
         Some(other) => other.clone(),
     };
-    serde_json::from_value(arguments).ok()
+    serde_json::from_value(arguments).map_err(|error| safe_detail(&error.to_string()))
+}
+
+/// A detail built from the error's kind and the schema's own words only. Serde renders input
+/// values and unknown keys before its trailing "expected ..." text, so only that tail is kept,
+/// and only when it looks like schema text; anything else gets a fixed phrase.
+fn safe_detail(error: &str) -> String {
+    let schema = |text: &str| {
+        !text.is_empty()
+            && text.len() <= 160
+            && text
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || " `_-,.:".contains(c))
+    };
+    // Drop serde's trailing " at line N column M" position, when present.
+    let error = match error.rsplit_once(" at line ") {
+        Some((head, position))
+            if position
+                .split(" column ")
+                .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) =>
+        {
+            head
+        }
+        _ => error,
+    };
+    if let Some(field) = error
+        .strip_prefix("missing field `")
+        .and_then(|rest| rest.strip_suffix('`'))
+        .filter(|field| field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    {
+        return format!("missing field `{field}`");
+    }
+    let kind = if error.starts_with("unknown field `") {
+        "unknown field"
+    } else if error.starts_with("invalid type:")
+        || error.starts_with("invalid value:")
+        || error.starts_with("invalid length")
+    {
+        "wrong type or value"
+    } else {
+        return "malformed arguments".into();
+    };
+    match error.rsplit_once(", expected ") {
+        Some((_, expected)) if schema(expected) => format!("{kind}, expected {expected}"),
+        _ => kind.into(),
+    }
+}
+
+fn args<T: DeserializeOwned>(arguments: Option<&Value>) -> Option<T> {
+    try_args(arguments).ok()
+}
+
+/// A malformed call is the caller's mistake, not a coordination outage.
+fn invalid_args(tool: &str, detail: &str) -> Value {
+    let detail: String = detail.chars().take(200).collect();
+    result(
+        &format!("AgentSCM: invalid arguments for {tool}: {detail}"),
+        true,
+    )
 }
 
 fn session_call(session: Option<String>, task: Option<String>, paths: Vec<String>) -> SessionCall {
@@ -582,7 +643,7 @@ fn session_call(session: Option<String>, task: Option<String>, paths: Vec<String
     }
 }
 
-/// A tool result; reasons are fixed hub strings, never client input.
+/// A tool result; reasons are hub strings and schema text, never client input.
 fn result(text: &str, is_error: bool) -> Value {
     json!({"content": [{"type": "text", "text": text}], "isError": is_error})
 }
@@ -745,8 +806,9 @@ async fn call_inner(
     }
     let arguments = params.and_then(|params| params.get("arguments"));
     if name == "agentscm_coordination_inbox" {
-        let Some(args) = args::<InboxArgs>(arguments) else {
-            return Ok(refused("invalid arguments"));
+        let args = match try_args::<InboxArgs>(arguments) {
+            Ok(value) => value,
+            Err(error) => return Ok(invalid_args(name, &error)),
         };
         let store = state.store.clone();
         let token = principal.token_id.clone();
@@ -788,8 +850,9 @@ async fn call_inner(
         let token = principal.token_id.clone();
         let outcome = match name {
             "agentscm_coordination_ack" => {
-                let Some(request) = args::<CoordinationAck>(arguments) else {
-                    return Ok(refused("invalid arguments"));
+                let request = match try_args::<CoordinationAck>(arguments) {
+                    Ok(value) => value,
+                    Err(error) => return Ok(invalid_args(name, &error)),
                 };
                 blocking(state, move || {
                     store.coordination_ack(&token, &request, unix_now())
@@ -797,8 +860,9 @@ async fn call_inner(
                 .await
             }
             "agentscm_coordination_reply" => {
-                let Some(request) = args::<CoordinationReply>(arguments) else {
-                    return Ok(refused("invalid arguments"));
+                let request = match try_args::<CoordinationReply>(arguments) {
+                    Ok(value) => value,
+                    Err(error) => return Ok(invalid_args(name, &error)),
                 };
                 blocking(state, move || {
                     store.coordination_reply(&token, &request, unix_now())
@@ -806,8 +870,9 @@ async fn call_inner(
                 .await
             }
             "agentscm_coordination_resolve" => {
-                let Some(request) = args::<CoordinationResolve>(arguments) else {
-                    return Ok(refused("invalid arguments"));
+                let request = match try_args::<CoordinationResolve>(arguments) {
+                    Ok(value) => value,
+                    Err(error) => return Ok(invalid_args(name, &error)),
                 };
                 blocking(state, move || {
                     store.coordination_resolve(&token, &request, unix_now())
@@ -815,8 +880,9 @@ async fn call_inner(
                 .await
             }
             _ => {
-                let Some(request) = args::<CoordinationWithdraw>(arguments) else {
-                    return Ok(refused("invalid arguments"));
+                let request = match try_args::<CoordinationWithdraw>(arguments) {
+                    Ok(value) => value,
+                    Err(error) => return Ok(invalid_args(name, &error)),
                 };
                 blocking(state, move || {
                     store.coordination_withdraw(&token, &request, unix_now())
@@ -830,8 +896,9 @@ async fn call_inner(
         });
     }
     if name == "agentscm_view_settings" {
-        let Some(change) = args::<ViewSettingsArgs>(arguments) else {
-            return Ok(refused("invalid arguments"));
+        let change = match try_args::<ViewSettingsArgs>(arguments) {
+            Ok(value) => value,
+            Err(error) => return Ok(invalid_args(name, &error)),
         };
         let store = state.store.clone();
         let owner = principal.owner.id.clone();
@@ -861,8 +928,9 @@ async fn call_inner(
         );
     }
     if name == "agentscm_work_overview" {
-        let Some(query) = args::<WorkOverviewQuery>(arguments) else {
-            return Ok(refused("invalid arguments"));
+        let query = match try_args::<WorkOverviewQuery>(arguments) {
+            Ok(value) => value,
+            Err(error) => return Ok(invalid_args(name, &error)),
         };
         let store = state.store.clone();
         let token = principal.token_id.clone();
@@ -878,8 +946,9 @@ async fn call_inner(
         );
     }
     if name == "agentscm_work_insight" {
-        let Some(WorkInsightArgs { work_id }) = args(arguments) else {
-            return Ok(refused("invalid arguments"));
+        let WorkInsightArgs { work_id } = match try_args(arguments) {
+            Ok(value) => value,
+            Err(error) => return Ok(invalid_args(name, &error)),
         };
         let store = state.store.clone();
         let token = principal.token_id.clone();
@@ -896,8 +965,9 @@ async fn call_inner(
         );
     }
     if name == "agentscm_work_insights" {
-        let Some(query) = args::<InsightQuery>(arguments) else {
-            return Ok(refused("invalid arguments"));
+        let query = match try_args::<InsightQuery>(arguments) {
+            Ok(value) => value,
+            Err(error) => return Ok(invalid_args(name, &error)),
         };
         let store = state.store.clone();
         let token = principal.token_id.clone();
@@ -913,8 +983,9 @@ async fn call_inner(
         );
     }
     if name == "agentscm_work_usage" {
-        let Some(usage) = args::<UsageRecord>(arguments) else {
-            return Ok(refused("invalid arguments"));
+        let usage = match try_args::<UsageRecord>(arguments) {
+            Ok(value) => value,
+            Err(error) => return Ok(invalid_args(name, &error)),
         };
         let store = state.store.clone();
         let token = principal.token_id.clone();
@@ -926,40 +997,46 @@ async fn call_inner(
         );
     }
     if name == "agentscm_workflow_status" {
-        let Some(WorkflowStatusArgs { run_id }) = args(arguments) else {
-            return Ok(refused("invalid arguments"));
+        let WorkflowStatusArgs { run_id } = match try_args(arguments) {
+            Ok(value) => value,
+            Err(error) => return Ok(invalid_args(name, &error)),
         };
         return Ok(workflow_status(state, principal, &run_id).await);
     }
     if name == "agentscm_work_briefing" {
-        let Some(arguments) = args::<BriefingArgs>(arguments) else {
-            return Ok(refused("invalid arguments"));
+        let arguments = match try_args::<BriefingArgs>(arguments) {
+            Ok(value) => value,
+            Err(error) => return Ok(invalid_args(name, &error)),
         };
         return Ok(work_briefing(state, principal, arguments).await);
     }
     if name == "agentscm_work_checkpoint" {
-        let Some(checkpoint) = args::<WorkCheckpoint>(arguments) else {
-            return Ok(refused("invalid arguments"));
+        let checkpoint = match try_args::<WorkCheckpoint>(arguments) {
+            Ok(value) => value,
+            Err(error) => return Ok(invalid_args(name, &error)),
         };
         return Ok(work_checkpoint(state, principal, checkpoint, completion_reporting).await);
     }
     if name == "agentscm_work_ack" {
-        let Some(ack) = args::<BriefingAck>(arguments) else {
-            return Ok(refused("invalid arguments"));
+        let ack = match try_args::<BriefingAck>(arguments) {
+            Ok(value) => value,
+            Err(error) => return Ok(invalid_args(name, &error)),
         };
         return Ok(work_ack(state, principal, ack).await);
     }
     if name == "agentscm_start" {
-        let Some(arguments) = args::<StartArgs>(arguments) else {
-            return Ok(refused("invalid arguments"));
+        let arguments = match try_args::<StartArgs>(arguments) {
+            Ok(value) => value,
+            Err(error) => return Ok(invalid_args(name, &error)),
         };
         return Ok(match start(state, principal, arguments).await {
             Ok(value) => value,
             Err(error) => hub_failure(&error),
         });
     }
-    let Some(outcome) = run(state, principal, name, arguments, completion_reporting).await else {
-        return Ok(refused("invalid arguments"));
+    let outcome = match run(state, principal, name, arguments, completion_reporting).await {
+        Ok(outcome) => outcome,
+        Err(detail) => return Ok(invalid_args(name, &detail)),
     };
     Ok(match outcome {
         Ok(text) => result(&text, false),
@@ -977,7 +1054,9 @@ async fn workflow_status(state: &HubState, principal: &Principal, run_id: &str) 
             Ok(text) => result(&text, false),
             Err(_) => refused("hub unavailable"),
         },
-        Ok(Err(SkillWorkflowReadError::InvalidRunId)) => refused("invalid arguments"),
+        Ok(Err(SkillWorkflowReadError::InvalidRunId)) => {
+            invalid_args("agentscm_workflow_status", "run_id is not a valid run id")
+        }
         Ok(Err(SkillWorkflowReadError::NotFound)) => refused("workflow run not found"),
         Ok(Err(SkillWorkflowReadError::Internal(detail))) => {
             eprintln!("hub workflow error: {detail}");
@@ -1136,25 +1215,25 @@ fn work_failure(error: &HubError) -> Value {
     })
 }
 
-/// `None`: the arguments do not fit the tool.
+/// `Err(detail)`: the arguments do not fit the tool.
 async fn run(
     state: &HubState,
     principal: &Principal,
     name: &str,
     arguments: Option<&Value>,
     completion_reporting: bool,
-) -> Option<Result<String>> {
+) -> std::result::Result<Result<String>, String> {
     let token = principal.token_id.clone();
-    Some(match name {
+    Ok(match name {
         "agentscm_check" => {
-            let CheckArgs { paths, session } = args(arguments)?;
+            let CheckArgs { paths, session } = try_args(arguments)?;
             if !(1..=MAX_CHECK_PATHS).contains(&paths.len()) {
-                return None;
+                return Err(format!("paths must hold 1 to {MAX_CHECK_PATHS} entries"));
             }
             check(state, principal, session_call(session, None, paths)).await
         }
         "agentscm_status" => {
-            let SessionArgs { session } = args(arguments)?;
+            let SessionArgs { session } = try_args(arguments)?;
             status_for(state, principal, session_call(session, None, Vec::new())).await
         }
         "agentscm_ask" => {
@@ -1162,7 +1241,7 @@ async fn run(
                 path,
                 note,
                 session,
-            } = args(arguments)?;
+            } = try_args(arguments)?;
             let store = state.store.clone();
             blocking(state, move || {
                 store
@@ -1183,7 +1262,7 @@ async fn run(
                 accept,
                 reason,
                 session,
-            } = args(arguments)?;
+            } = try_args(arguments)?;
             let (store, wanted) = (state.store.clone(), path.clone());
             blocking(state, move || {
                 store.answer_handoff(
@@ -1199,10 +1278,10 @@ async fn run(
             .map(|outcome| answered(&outcome, &path))
         }
         "agentscm_done" => {
-            let SessionArgs { session } = args(arguments)?;
+            let SessionArgs { session } = try_args(arguments)?;
             done(state, principal, session, completion_reporting).await
         }
-        _ => return None,
+        _ => return Err("unknown tool".into()),
     })
 }
 
@@ -1572,4 +1651,43 @@ async fn check(state: &HubState, principal: &Principal, call: SessionCall) -> Re
     } else {
         advice.text
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_detail;
+
+    #[test]
+    fn invalid_argument_details_never_echo_input() {
+        assert_eq!(
+            safe_detail("missing field `task` at line 1 column 2"),
+            "missing field `task`"
+        );
+        assert_eq!(
+            safe_detail("unknown field `sekrit`, expected `task` or `paths`"),
+            "unknown field, expected `task` or `paths`"
+        );
+        assert_eq!(
+            safe_detail("invalid type: string \"../sekrit\", expected a sequence"),
+            "wrong type or value, expected a sequence"
+        );
+        assert_eq!(safe_detail("sekrit"), "malformed arguments");
+        // A hostile value or key that contains serde's own separator still leaks nothing.
+        assert_eq!(
+            safe_detail("invalid type: string \"x, expected sekrit\", expected a sequence"),
+            "wrong type or value, expected a sequence"
+        );
+        assert_eq!(
+            safe_detail("unknown field `a, expected sekrit`, expected `task` or `paths`"),
+            "unknown field, expected `task` or `paths`"
+        );
+        assert_eq!(
+            safe_detail("invalid value: string \"sekrit\", expected \"sekrit\""),
+            "wrong type or value"
+        );
+        assert_eq!(
+            safe_detail("missing field `a` sekrit`"),
+            "malformed arguments"
+        );
+    }
 }

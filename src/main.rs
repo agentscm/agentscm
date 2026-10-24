@@ -145,8 +145,9 @@ enum Command {
         #[command(subcommand)]
         command: telemetry_cli::TelemetryCommand,
     },
-    /// [experimental] Initialize or inspect an explicitly owned local native installation.
+    /// [experimental] Contributor helper: initialize or inspect an explicitly owned local native installation. New users run `agentscm quickstart`.
     #[cfg(unix)]
+    #[command(hide = true)]
     Setup {
         #[command(subcommand)]
         command: setup_cli::SetupCommand,
@@ -560,7 +561,7 @@ enum ParsedCli {
     Exit(i32),
 }
 
-fn parse_cli(argv: Vec<OsString>) -> ParsedCli {
+fn parse_cli(argv: Vec<OsString>, terminal: bool) -> ParsedCli {
     match Cli::try_parse_from(&argv) {
         Ok(cli) => ParsedCli::Run(Box::new(cli)),
         Err(error) if error.use_stderr() => {
@@ -569,9 +570,15 @@ fn parse_cli(argv: Vec<OsString>) -> ParsedCli {
                 println!("{{}}");
                 return ParsedCli::Return;
             }
-            print_error(&Error::Invalid(error.to_string()));
             // Exit 2 blocks a Stop hook, so a parse error there is a non-blocking error.
-            ParsedCli::Exit(if is_stop_hook_invocation(&argv) { 1 } else { 2 })
+            let code = if is_stop_hook_invocation(&argv) { 1 } else { 2 };
+            if terminal {
+                // A person at a terminal gets clap's normal usage text, not a JSON blob.
+                let _ = error.print();
+            } else {
+                print_error(&Error::Invalid(error.to_string()));
+            }
+            ParsedCli::Exit(code)
         }
         Err(error) => {
             let _ = error.print();
@@ -588,7 +595,7 @@ fn parse_cli_on_bounded_stack() -> Result<ParsedCli> {
     let thread = std::thread::Builder::new()
         .name("agentscm-cli-parser".into())
         .stack_size(PARSER_STACK_BYTES)
-        .spawn(move || parse_cli(argv))?;
+        .spawn(move || parse_cli(argv, io::IsTerminal::is_terminal(&io::stderr())))?;
     match thread.join() {
         Ok(parsed) => Ok(parsed),
         Err(panic) => std::panic::resume_unwind(panic),
@@ -598,7 +605,9 @@ fn parse_cli_on_bounded_stack() -> Result<ParsedCli> {
 #[tokio::main]
 async fn main() {
     // Before clap: a bad flag must not exit non-zero (agents read that as "block").
-    if std::env::args_os().nth(1).is_some_and(|a| a == "hook") {
+    if std::env::args_os().nth(1).is_some_and(|a| a == "hook")
+        && !std::env::args_os().any(|a| a == "--help" || a == "-h")
+    {
         let args = std::env::args_os().skip(2);
         hook_cli::run_unparsed(args.map(|a| a.to_string_lossy().into_owned()).collect()).await;
     }
@@ -1043,9 +1052,9 @@ async fn run(cli: Cli) -> Result<RunExit> {
                     "CLI source response exceeds {MAX_OUTPUT_BYTES} bytes"
                 )));
             }
-            print_json(
-                &json!({"ok": true, "revision": revision, "path": path, "kind": kind, "content": content}),
-            );
+            let mut out = json!({"ok": true, "revision": revision, "path": path, "kind": kind});
+            agentscm::guided_service::content_fields(&mut out, "", Some(&content));
+            print_json(&out);
         }
         Command::Diff { left, right, limit } => {
             require_limit(limit, MAX_DIFF_LIMIT, "diff")?;
@@ -1393,6 +1402,37 @@ fn print_error(error: &Error) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stop_hook_parse_error_never_blocks_even_at_a_terminal() {
+        let exit = |args: &[&str], terminal: bool| {
+            let argv: Vec<OsString> = args.iter().map(OsString::from).collect();
+            let parsed = std::thread::Builder::new()
+                .stack_size(4 * 1024 * 1024)
+                .spawn(move || parse_cli(argv, terminal))
+                .unwrap()
+                .join()
+                .unwrap();
+            match parsed {
+                ParsedCli::Exit(code) => code,
+                _ => panic!("expected a parse error"),
+            }
+        };
+        for terminal in [false, true] {
+            let stop = [
+                "agentscm",
+                "skill-workflow",
+                "claude-stop",
+                "--no-such-flag",
+            ];
+            assert_eq!(exit(&stop, terminal), 1, "terminal={terminal}");
+            assert_eq!(
+                exit(&["agentscm", "quikstart"], terminal),
+                2,
+                "terminal={terminal}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn reconciliation_read_commands_never_initialize_a_missing_data_directory() {

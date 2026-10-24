@@ -639,6 +639,9 @@ fn summarize(report: &Value) -> String {
     let checked = report["items"].as_array().map_or(0, Vec::len);
     let list = report["collisions"].as_array().cloned().unwrap_or_default();
     let conflicts = list.iter().filter(|c| c["level"] == "conflict").count();
+    if checked < 2 && !report["truncated"].is_string() {
+        return "No other branches or worktrees to compare yet.".into();
+    }
     let noun = if checked == 1 {
         "branch/worktree"
     } else {
@@ -845,7 +848,7 @@ fn checked_hub_url(url: &str) -> Option<String> {
         Ok(url) => Some(url),
         Err(_) => {
             println!(
-                "That hub URL isn't usable: it must be https://host, or http:// for a loopback address, with no credentials."
+                "That hub URL isn't usable: it must be https://host, or http://127.0.0.1:PORT for a hub on this machine (not localhost), with no credentials."
             );
             None
         }
@@ -1547,6 +1550,12 @@ fn hook_stage(cx: &mut Cx<'_>) {
                 return;
             }
         }
+        None if cx.live.hub.is_none() => {
+            println!(
+                "Not adding the Claude Code hooks: they need a hub to report to. Use --hook project to add them anyway."
+            );
+            return;
+        }
         None => {
             let options = [
                 "This project only (.claude/settings.local.json)",
@@ -1692,6 +1701,7 @@ fn hook_stage(cx: &mut Cx<'_>) {
         return;
     }
     if let Some((plan, exe)) = &program {
+        let parent_new = dir.parent().is_some_and(|p| !p.exists());
         if matches!(plan, binary::Program::Copy)
             && let Err(why) = binary::install(&dir, exe, env!("CARGO_PKG_VERSION"))
         {
@@ -1700,6 +1710,7 @@ fn hook_stage(cx: &mut Cx<'_>) {
         }
         if !matches!(plan, binary::Program::Bare) {
             cx.manifest.bin_dir = Some(dir);
+            cx.manifest.bin_parent_created |= parent_new;
         }
     }
     let env_sha = http
@@ -1770,12 +1781,17 @@ fn write_settings(
     added: Vec<Added>,
     form: Written,
 ) -> std::result::Result<(), String> {
+    let mut created_dir = None;
     let backup = if existed {
         Some(make_backup(path)?)
     } else {
-        path.parent()
-            .map_or(Ok(()), |dir| std::fs::create_dir_all(resolve(dir)))
-            .map_err(|e| e.to_string())?;
+        if let Some(dir) = path.parent() {
+            let real = resolve(dir);
+            if !real.exists() {
+                created_dir = Some(dir.to_owned());
+            }
+            std::fs::create_dir_all(real).map_err(|e| e.to_string())?;
+        }
         None
     };
     let text = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())? + "\n";
@@ -1816,6 +1832,7 @@ fn write_settings(
             added,
             written_hash: hash,
             env_token_sha: form.env_sha,
+            created_dir,
         }),
     }
     cx.manifest.save().map_err(|e| e.to_string())
@@ -1854,7 +1871,7 @@ fn init_stage(cx: &mut Cx<'_>) {
         cx.args.init
     } else {
         cx.ui.confirm(
-            "Also add AgentSCM to this repository's agent config (MCP, hooks and instructions for Claude Code, Codex, Cursor and Copilot)? It writes files you can commit.",
+            "Also add AgentSCM to this repository's agent config (MCP, hooks and instructions for Claude Code, Codex, Cursor, Copilot and Gemini)? It writes files you can commit.",
             true,
         )
     };
@@ -1932,8 +1949,13 @@ fn summary(cx: &Cx<'_>, changed: bool) {
     }
     if let Some(dir) = &m.bin_dir {
         line(format!(
-            "{}: the agentscm program the hooks call",
-            shown(dir, home)
+            "{}: the agentscm program{}",
+            shown(dir, home),
+            if m.hooks.is_empty() {
+                ""
+            } else {
+                " the hooks call"
+            }
         ));
     }
     for record in &m.hooks {
@@ -2022,17 +2044,17 @@ fn surgical_undo(record: &HookRecord, text: &str) -> std::result::Result<String,
 }
 
 pub async fn uninstall(args: UninstallArgs) -> Result<()> {
+    let ui = Ui { yes: args.yes };
+    let _quickstart_lease = manifest::acquire_lease()?;
+    let Some(m) = Manifest::load()? else {
+        println!("Nothing to undo: nothing was installed by quickstart.");
+        return Ok(());
+    };
     if !args.yes && !std::io::stdin().is_terminal() {
         return Err(invalid(
             "agentscm uninstall asks before it removes anything, and there is no terminal here. Pass --yes (and --remove-hub-data to delete the local hub's data).",
         ));
     }
-    let ui = Ui { yes: args.yes };
-    let _quickstart_lease = manifest::acquire_lease()?;
-    let Some(m) = Manifest::load()? else {
-        println!("Nothing to undo: quickstart hasn't installed anything here.");
-        return Ok(());
-    };
     let home = home_dir()?;
     let programs = m
         .bin_dir
@@ -2147,6 +2169,10 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
     for record in &m.hooks {
         let (done, message) = undo_hooks(record);
         println!("{message}.");
+        if done && let Some(dir) = &record.created_dir {
+            // Only an empty directory goes.
+            let _ = std::fs::remove_dir(dir);
+        }
         if !done {
             manual.push(format!(
                 "edit {} and remove the hooks whose commands end in `intent start|check|done --hook claude`",
@@ -2227,6 +2253,9 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
         }
         // Only an empty directory goes.
         let _ = std::fs::remove_dir(&dir);
+        if !failed && m.bin_parent_created {
+            let _ = dir.parent().map(std::fs::remove_dir);
+        }
         if failed {
             manual.push(format!(
                 "rm {}/agentscm {}/agentscm-*",
@@ -2490,6 +2519,7 @@ mod tests {
             added,
             written_hash: String::new(),
             env_token_sha: Some(sha_hex(b"tok")),
+            created_dir: None,
         };
         let text = serde_json::to_string(&settings).unwrap();
         std::fs::write(&path, &text).unwrap();
