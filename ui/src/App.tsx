@@ -15,6 +15,7 @@ import { WorkflowsPage } from './pages/Workflows.tsx'
 import { ChangeRecordPage } from './pages/ChangeRecord.tsx'
 import { WorkspacePage } from './pages/Workspace.tsx'
 import { LandedPage } from './pages/Landed.tsx'
+import { SkillsPage } from './pages/Skills.tsx'
 import { TemplatesPage } from './pages/Templates.tsx'
 import { TimelinePage } from './pages/Timeline.tsx'
 import { SettingsPage } from './pages/Settings.tsx'
@@ -31,7 +32,7 @@ const subscribeDark = (cb: () => void) => {
 }
 const systemDark = () => window.matchMedia(darkQuery).matches
 
-export type Section = 'now' | 'work' | 'activity' | 'workflows' | 'change-record' | 'landed' | 'templates' | 'timeline' | 'setup' | 'workspace' | 'health' | 'settings'
+export type Section = 'now' | 'work' | 'activity' | 'workflows' | 'change-record' | 'landed' | 'skills' | 'templates' | 'timeline' | 'setup' | 'workspace' | 'health' | 'settings'
 
 export const SECTIONS: SectionDef[] = [
   { key: 'now', icon: 'broadcast', label: 'Right now', question: 'Who is editing which files?', group: 'Coordinate' },
@@ -40,6 +41,7 @@ export const SECTIONS: SectionDef[] = [
   { key: 'workflows', icon: 'diagram-3', label: 'Workflows', question: 'Did the checks pass?', group: 'Verify' },
   { key: 'change-record', icon: 'clipboard2-check', label: 'Change records', question: 'What is ready to hand off?', group: 'Verify' },
   { key: 'landed', icon: 'rocket-takeoff', label: 'Landed changes', question: 'Did our changes land, and did checks pass after?', group: 'Verify' },
+  { key: 'skills', icon: 'journal-check', label: 'Skills', question: 'Which workflows do agents in this repository have to follow?', group: 'Verify' },
   { key: 'templates', icon: 'journal-code', label: 'Templates', question: 'Which workflow recipes can agents reuse?', group: 'This computer' },
   { key: 'timeline', icon: 'camera', label: 'Timeline', question: 'What did this workspace look like earlier?', group: 'This computer' },
   { key: 'workspace', icon: 'people', label: 'Workspace', question: 'Who can run what?', group: 'Manage' },
@@ -130,6 +132,7 @@ function Shell({ token, dark, pref, onPref, onUnauthorized, onForget }: { token:
         {section === 'workflows' && <WorkflowsPage token={token} repository={data.whoami?.token.repository ?? null} />}
         {section === 'change-record' && <ChangeRecordPage repo={data.whoami?.token.repository ?? null} token={token} />}
         {section === 'landed' && <LandedPage repo={data.whoami?.token.repository ?? null} token={token} />}
+        {section === 'skills' && <SkillsPage repo={data.whoami?.token.repository ?? null} token={token} />}
         {section === 'templates' && <TemplatesPage />}
         {section === 'timeline' && <TimelinePage />}
         {section === 'setup' && <SetupPage token={token} />}

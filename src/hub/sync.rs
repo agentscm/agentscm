@@ -258,6 +258,8 @@ pub struct Sync {
     /// Per repository id, where the external run pass left off: the last pull request number
     /// checked for a merge and the last merged publication id read.
     external_cursors: Mutex<HashMap<String, (i64, String)>>,
+    /// Per repository id, the unix second the skills lock file was last read.
+    skill_reads: Mutex<HashMap<String, i64>>,
     /// Files already noticed per (intent, repository, pull request number).
     noticed: Mutex<HashMap<(String, String, i64), BTreeSet<String>>>,
 }
@@ -273,6 +275,19 @@ fn now_ms() -> i64 {
 }
 
 impl Sync {
+    /// True at most once per [`super::skills::READ_EVERY_SECONDS`] for a repository.
+    fn skill_read_due(&self, repository: &str) -> bool {
+        let now = unix_now();
+        let mut reads = lock(&self.skill_reads);
+        match reads.get(repository) {
+            Some(last) if now < last + super::skills::READ_EVERY_SECONDS => false,
+            _ => {
+                reads.insert(repository.to_owned(), now);
+                true
+            }
+        }
+    }
+
     /// Accepted webhook deliveries whose job has not finished.
     pub(super) fn pending_webhooks(&self) -> usize {
         self.pending.load(Ordering::Relaxed)
@@ -339,6 +354,7 @@ impl Sync {
             #[cfg(unix)]
             forge_cursors: Mutex::default(),
             external_cursors: Mutex::default(),
+            skill_reads: Mutex::default(),
             noticed: Mutex::default(),
         }
     }
@@ -944,6 +960,9 @@ async fn read_repo(
     #[cfg(unix)]
     super::forge_check::reconcile_repo(state, conn, repo, token, None).await?;
     super::external_runs::reconcile_repo(state, conn, repo, token).await?;
+    if sync.skill_read_due(&repo.id) {
+        super::skills::sync_adoption(state, api, repo, token).await;
+    }
     Ok(report)
 }
 

@@ -4,6 +4,7 @@ pub mod compiler;
 pub mod contracts;
 pub mod library;
 pub mod runtime;
+pub mod supported;
 pub mod task_contracts;
 pub use collector_transfer::*;
 pub use compiler::{CompiledPlan, compile, verify_current};

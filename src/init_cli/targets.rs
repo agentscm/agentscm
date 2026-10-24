@@ -52,9 +52,14 @@ pub(super) fn setup_command(agent: Agent, hub: Option<&str>) -> String {
 }
 
 /// The shared instructions, ending with the setup command for each of `agents`.
-fn snippet(agents: &[Agent], hub: Option<&str>) -> String {
+fn snippet(agents: &[Agent], hub: Option<&str>, skills: &str) -> String {
+    let skills = if skills.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n{skills}")
+    };
     let mut text = format!(
-        "{SNIPPET}\n\n### Connecting this checkout\n\nAgentSCM's MCP tools and edit hooks are set up on each machine, not committed. If they are missing here, ask the user to run this once in this checkout:\n"
+        "{SNIPPET}{skills}\n\n### Connecting this checkout\n\nAgentSCM's MCP tools and edit hooks are set up on each machine, not committed. If they are missing here, ask the user to run this once in this checkout:\n"
     );
     for agent in agents {
         let name = match agent {
@@ -94,7 +99,8 @@ impl Target {
 }
 
 /// The files for `agents` (which must not be empty), AGENTS.md last. Codex reads AGENTS.md.
-pub(super) fn targets(agents: &[Agent], hub: Option<&str>) -> Vec<Target> {
+/// `skills` is the Supported skills section (empty when the repo pins none).
+pub(super) fn targets(agents: &[Agent], hub: Option<&str>, skills: &str) -> Vec<Target> {
     let mut out = Vec::new();
     if agents.contains(&Agent::Claude) {
         out.push(Target {
@@ -107,14 +113,14 @@ pub(super) fn targets(agents: &[Agent], hub: Option<&str>) -> Vec<Target> {
             path: ".cursor/rules/agentscm.mdc",
             content: Content::Owned(format!(
                 "---\ndescription: Coordinate with other agents through AgentSCM\nalwaysApply: true\n---\n{}\n",
-                snippet(&[Agent::Cursor], hub)
+                snippet(&[Agent::Cursor], hub, skills)
             )),
         });
     }
     if agents.contains(&Agent::Copilot) {
         out.push(Target {
             path: ".github/copilot-instructions.md",
-            content: Content::Markdown(snippet(&[Agent::Copilot], hub)),
+            content: Content::Markdown(snippet(&[Agent::Copilot], hub, skills)),
         });
     }
     if agents.contains(&Agent::Gemini) {
@@ -125,7 +131,7 @@ pub(super) fn targets(agents: &[Agent], hub: Option<&str>) -> Vec<Target> {
     }
     out.push(Target {
         path: "AGENTS.md",
-        content: Content::Markdown(snippet(agents, hub)),
+        content: Content::Markdown(snippet(agents, hub, skills)),
     });
     out
 }
@@ -143,7 +149,7 @@ mod tests {
     ];
 
     fn render(path: &str) -> String {
-        targets(&ALL, None)
+        targets(&ALL, None, "")
             .into_iter()
             .find(|t| t.path == path)
             .unwrap_or_else(|| panic!("no target {path}"))
@@ -153,7 +159,7 @@ mod tests {
 
     #[test]
     fn only_instruction_files_are_written() {
-        let paths: Vec<_> = targets(&ALL, None).iter().map(|t| t.path).collect();
+        let paths: Vec<_> = targets(&ALL, None, "").iter().map(|t| t.path).collect();
         assert_eq!(
             paths,
             [
@@ -167,7 +173,7 @@ mod tests {
         assert_eq!(render("CLAUDE.md"), "@AGENTS.md\n");
         assert_eq!(render("GEMINI.md"), "@./AGENTS.md\n");
         assert!(render(".cursor/rules/agentscm.mdc").contains("alwaysApply: true"));
-        let codex: Vec<_> = targets(&[Agent::Codex], None)
+        let codex: Vec<_> = targets(&[Agent::Codex], None, "")
             .iter()
             .map(|t| t.path)
             .collect();
@@ -185,7 +191,7 @@ mod tests {
     #[test]
     fn each_instruction_file_names_a_setup_command_the_cli_accepts() {
         let hub = Some("https://hub.example.test");
-        for target in targets(&ALL, hub) {
+        for target in targets(&ALL, hub, "") {
             let text = target.build(None).unwrap();
             let found = commands(&text);
             let expected = match target.path {
@@ -208,5 +214,27 @@ mod tests {
             commands(&cursor),
             ["agentscm client setup --agent cursor --hub <HUB_URL>"]
         );
+    }
+
+    #[test]
+    fn supported_skills_section_only_with_a_lock() {
+        let without = render("AGENTS.md");
+        assert!(!without.contains("Supported skills"));
+        let lock = agentscm::skill_workflow::supported::SkillLock::parse(include_bytes!(
+            "../../agentscm-skills.lock.json"
+        ))
+        .unwrap();
+        let section = agentscm::skill_workflow::supported::instruction_section(&lock);
+        let with = targets(&ALL, None, &section)
+            .into_iter()
+            .find(|t| t.path == "AGENTS.md")
+            .unwrap()
+            .build(None)
+            .unwrap();
+        assert!(with.contains("### Supported skills"));
+        assert!(with.contains("pr-gate v1 (adopted)"));
+        assert!(with.contains("agentscm_skill_status"));
+        // Everything else is unchanged, and the section sits before the setup commands.
+        assert!(with.replace(&format!("\n\n{section}"), "") == without);
     }
 }
