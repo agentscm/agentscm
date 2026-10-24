@@ -94,7 +94,17 @@ Today's loop ran on Git and GitHub, not on a native target. On that path:
 
 ## 2. The library shape
 
-### 2.1 A supported skill is a template manifest, version 2
+### 2.1 A general-purpose catalog
+
+Supported skills are a library any repository can browse and adopt a few at a time into its own
+workflow. A first-party skill carries nothing specific to one repository: CI labels, merge methods,
+build parallelism and resource limits are parameters with general defaults, which a repository sets
+in its own lock file. AgentSCM's own repository adopts `pr-gate` with its own values (the
+`ci-extended` label, squash merges); a repository-specific AgentSCM workflow and a commercial or
+infrastructure-as-code offering can come later through the skill sources in 2.5, without changing
+the schema or the lock format.
+
+### 2.2 A supported skill is a template manifest, version 2
 
 A supported skill is a directory with the same layout as a reusable workflow template:
 
@@ -106,7 +116,15 @@ skills/supported/pr-gate/v1/runner.json   # optional command recipe for native s
 
 `skill.json` is a workflow template manifest with `version: 2`. Version 2 keeps every version 1
 field and rule (strict JSON, bounded size, the path is the version, subject bindings come from the
-Change, never from the manifest) and adds three sections:
+Change, never from the manifest) and adds these sections:
+
+- **`summary`** and **`applicability`**: when to use the skill, in a form an agent can act on
+  without a human prompt: `triggers` (moments such as "opening a pull request", "before merging a
+  pull request", "parallel sessions on one repository", "after a merge to the default branch"),
+  `prerequisites` (what must already be true) and `not_for` (when not to follow it).
+- **`parameters`**: named, typed values with defaults (`string`, `bool`, `integer`, optional
+  `enum`) that gates and next actions read, for example `ci_label` or `merge_method`. A repository
+  overrides them per pin; the manifest bytes, and so the pin, stay the same.
 
 - **`subjects`**: what a run is about: `git_pull_request` (a branch and pull request on a forge,
   identified by repository, number and head SHA) and/or `native_change` (an existing Change and
@@ -126,18 +144,29 @@ no gates.
   "version": 2,
   "name": "pr-gate",
   "workflow_version": 1,
+  "summary": "Evidence-gated pull requests: tests, independent review, fixes, CI and approval before merge, then a post-merge check.",
   "skill": { "entrypoint": "skills/supported/pr-gate/v1/SKILL.md", "resources": [] },
-  "subjects": ["git_pull_request", "native_change"],
+  "applicability": {
+    "triggers": ["starting a task that will become a pull request", "opening or updating a pull request", "before merging a pull request", "after a pull request merges"],
+    "prerequisites": ["a Git repository with pull requests on GitHub or GitLab", "the AgentSCM hub connected for this repository"],
+    "not_for": ["direct commits to the default branch", "exploratory work that will not be merged"]
+  },
+  "parameters": [
+    { "name": "ci_label", "type": "string", "default": null, "description": "Label that triggers the CI to wait for; null means whatever checks the repository requires." },
+    { "name": "merge_method", "type": "string", "enum": ["any", "merge", "squash", "rebase"], "default": "any", "description": "Required merge method." },
+    { "name": "retarget_stacked", "type": "bool", "default": true, "description": "Remind authors to retarget dependent pull requests after a merge." }
+  ],
+  "subjects": ["git_pull_request"],
   "roles": ["author", "reviewer", "maintainer"],
   "steps": [],
   "gates": [
-    { "id": "branch",   "evidence": [{ "kind": "task_branch" }],                          "by": "author",     "min_assurance": "observed",      "enforce": ["advise"] },
-    { "id": "tests",    "evidence": [{ "kind": "revision_tests", "bind": "head" }],        "by": "author",     "min_assurance": "self_reported", "enforce": ["stop"] },
-    { "id": "review",   "evidence": [{ "kind": "independent_review", "bind": "head" }],    "by": "reviewer",   "min_assurance": "self_reported", "enforce": ["stop"] },
-    { "id": "fix",      "evidence": [{ "kind": "findings_resolved", "bind": "head" }],     "by": "author",     "min_assurance": "self_reported", "enforce": ["stop"] },
-    { "id": "ci",       "evidence": [{ "kind": "hosted_ci", "label": "ci-extended", "bind": "head" }], "by": "author", "min_assurance": "observed", "enforce": ["forge_status"] },
-    { "id": "approval", "evidence": [{ "kind": "human_approval", "bind": "head" }],        "by": "maintainer", "min_assurance": "observed",      "enforce": ["forge_status"] },
-    { "id": "merge",    "evidence": [{ "kind": "merged", "method": "squash" }],            "by": "maintainer", "min_assurance": "observed",      "enforce": ["advise"] },
+    { "id": "branch",   "evidence": [{ "kind": "task_branch" }],                          "by": "author",     "min_assurance": "self_reported", "enforce": ["advise"] },
+    { "id": "tests",    "evidence": [{ "kind": "revision_tests", }],        "by": "author",     "min_assurance": "self_reported", "enforce": ["stop"] },
+    { "id": "review",   "evidence": [{ "kind": "independent_review", }],    "by": "reviewer",   "min_assurance": "self_reported", "enforce": ["stop"] },
+    { "id": "fix",      "evidence": [{ "kind": "findings_resolved", }],     "by": "author",     "min_assurance": "self_reported", "enforce": ["stop"] },
+    { "id": "ci",       "evidence": [{ "kind": "hosted_ci", "label_param": "ci_label" }], "by": "author", "min_assurance": "self_reported", "enforce": ["forge_status"] },
+    { "id": "approval", "evidence": [{ "kind": "human_approval", }],        "by": "maintainer", "min_assurance": "self_reported", "enforce": ["forge_status"] },
+    { "id": "merge",    "evidence": [{ "kind": "merged", "method_param": "merge_method" }], "by": "maintainer", "min_assurance": "self_reported", "enforce": ["advise"] },
     { "id": "post_merge", "evidence": [{ "kind": "post_merge_check", "on": "target_tip" }], "by": "author",    "min_assurance": "self_reported", "enforce": ["signal"] }
   ]
 }
@@ -161,46 +190,58 @@ no gates.
 `receipt` (an AgentSCM controller produced it for exact bytes), `observed` (the Hub read it from
 the forge or a store), `self_reported` (an agent said so through MCP or the CLI). A gate states the
 minimum it accepts. The Hub shows assurance next to every piece of evidence so a self-reported
-review never looks like a controller receipt.
+review never looks like a controller receipt. In `pr-gate` v1 every gate accepts self-reported
+evidence (decision 1 in section 7); a later version raises `ci`, `approval` and `merge` to
+`observed` once the Hub reads them from the forge.
 
-### 2.2 Adoption and pinning
+### 2.3 Adoption and pinning
 
-A repository opts in with a committed lock file reviewed like any other change:
+A repository browses the catalog (`agentscm skill list`, `agentscm skill show NAME`, MCP
+`agentscm_skill_list`, the Hub Skills page) and adopts a skill with `agentscm skill add NAME
+[--param k=v]`, which writes a pin into a committed lock file reviewed like any other change.
+`agentscm skill remove NAME` deletes the pin. The Hub page stays read-only: it shows the exact
+command to copy.
 
 ```json
-// .agentscm/skills.lock.json
+// agentscm-skills.lock.json
 {
   "version": 1,
   "skills": [
-    { "name": "pr-gate", "workflow_version": 1,
-      "path": "skills/supported/pr-gate/v1/skill.json",
-      "sha256": "…" }
+    { "name": "pr-gate", "workflow_version": 1, "sha256": "…",
+      "source": { "kind": "first_party" },
+      "params": { "ci_label": "ci-extended", "merge_method": "squash" } }
   ]
 }
 ```
 
-- **The pin is the path plus the SHA-256 of the manifest bytes**, the same identity a
+- **The pin is the name, version and SHA-256 of the manifest bytes**, the identity a
   `WorkflowTemplateReference` already carries. Upgrading is a reviewed edit to the lock file that
-  points at `v2/skill.json`; the v1 file is never rewritten.
+  names v2; the v1 bytes are never rewritten.
+- **Parameters** are overrides validated against the manifest's declared parameters; unknown names
+  or wrong types make the pin `invalid_params`. Effective values (defaults overlaid by the pin) are
+  shown wherever a run is shown.
 - **First-party skills ship in the binary.** The AgentSCM release embeds `skills/supported/*`, so
   the Hub can evaluate a pinned skill without reading the repository. The lock file's SHA must match
-  the embedded bytes; a mismatch is shown as `unknown skill version`, never silently resolved to
+  the embedded bytes; a mismatch is shown as `unknown_version`, never silently resolved to
   another version.
-- **Authority for adoption** is the lock file on the target's default branch. In phase 2 the Hub
-  learns it from the checkout through client setup and labels it `reported by checkout`; reading it
-  from the forge with the existing connection is a later step.
+- **Authority for adoption** is the lock file on the default branch (decision 3). When the Hub has a
+  forge connection for the repository it reads the lock file from the default branch; otherwise it
+  uses the lock file the checkout reports and labels it `reported by checkout`.
 - **Workspace-level adoption** (one skill required for every repository in a Community workspace)
   is a later step: a workspace setting that lists pins, shown alongside the repository's own.
 
-### 2.3 Discovery by agents
+### 2.4 Discovery by agents
 
 An agent should not need the orchestrator's prompt to know the rules.
 
-- **Instruction files.** When `.agentscm/skills.lock.json` exists, `init-repo` adds a short
-  *Supported skills* section inside its existing marked block: each adopted skill and version, one
-  line on what it requires, and the MCP tools to call. The block points at the skill's `SKILL.md`
+- **Instruction files.** When `agentscm-skills.lock.json` exists, `init-repo` adds a short
+  *Supported skills* section inside its existing marked block: each adopted skill and version, its
+  triggers ("Follow when: …"), its `not_for` line, and the commands and MCP tools to call. The block points at the skill's `SKILL.md`
   for the procedure instead of copying it.
-- **MCP.** Two Hub tools:
+- **MCP.** Three Hub tools:
+  - `agentscm_skill_list {repo}` → the catalog and this repository's pins with applicability
+    (triggers, prerequisites, not_for) and effective parameters, so an agent decides on its own when
+    a skill applies.
   - `agentscm_skill_status {repo, pull_request | branch}` → the run's current gate, the evidence
     each gate has (with assurance), what is missing and the next action for this session's role.
   - `agentscm_skill_evidence {repo, pull_request, gate, kind, head_sha, …}` → records
@@ -211,7 +252,7 @@ An agent should not need the orchestrator's prompt to know the rules.
   ("pr-gate v1 on #41: at *review*; needs an independent review of `a1b2c3d`"). The Stop hook
   enforces (below).
 
-### 2.4 Enforcement at existing choke points
+### 2.5 Enforcement at existing choke points
 
 Each gate's `enforce` field names one of four choke points. No new blocking mechanism is added.
 
@@ -223,16 +264,27 @@ Each gate's `enforce` field names one of four choke points. No new blocking mech
 | `advise`, `signal` | Instruction files, MCP status, Hub UI; `signal` also notifies other sessions (section 4.2) | Shown and recorded, never blocking. |
 
 What stays advice in every version of this design, and the docs will say so: branch per task,
-squash only (a forge repository setting AgentSCM can read and flag, not change), retargeting
+the merge method (a forge repository setting AgentSCM can read and flag, not change), retargeting
 stacked pull requests, and anything a session reports about itself. Self-reported evidence can
 satisfy a gate only when the gate says `min_assurance: self_reported`; the Hub never upgrades it.
 
-### 2.5 Third-party skills (later)
+### 2.6 Skill sources: the extension point
 
-A third-party skill is the same directory, vendored into the repository at a versioned path and
-pinned in the lock file by path and SHA. `agentscm skills add <git-url>@<commit>:<path>` would copy
-it, compute the SHA and write the lock entry for review. The Hub evaluates a vendored skill from the
-manifest bytes the checkout reports with the matching SHA, and labels it `third-party`. There is
+A pin's `source` says where the manifest bytes come from. Phase 2 resolves only `first_party`
+(embedded in the binary). The other kinds are reserved in the lock format now, so adding them later
+changes neither the schema nor existing lock files; until then they parse and resolve to
+`unsupported_source`:
+
+- `repo_local {path}`: a skill directory inside the repository itself, such as AgentSCM's own
+  internal workflow. The Hub evaluates it from the bytes the checkout or the default branch provides
+  with the matching SHA.
+- `third_party {url, commit, path}`: a skill vendored from another Git repository at an exact
+  commit; `agentscm skill add <git-url>@<commit>:<path>` would copy it, compute the SHA and write
+  the pin for review.
+- `private {registry, …}`: a skill from an organization's or a commercial catalog (for example an
+  infrastructure-as-code offering), fetched by exact SHA.
+
+Every non-first-party skill is labelled with its source in the CLI, MCP and Hub. There is
 no remote registry, no `latest` and no automatic update, consistent with the template library. A
 third-party skill can only compose the evidence kinds and choke points above; it cannot add a new
 blocking mechanism or claim stronger assurance than its evidence has.
@@ -241,18 +293,21 @@ blocking mechanism or claim stronger assurance than its evidence has.
 
 ### 3.1 (a) `pr-gate` v1
 
-**Subject:** one pull request (or one native Change). **Roles:** author session, reviewer
-session, maintainer.
+**Subject:** one pull request on any GitHub or GitLab repository, with any CI. **Roles:** author
+session, reviewer session, maintainer. **Parameters:** `ci_label` (default none), `merge_method`
+(default `any`), `retarget_stacked` (default true). **Follow when:** starting a task that will become
+a pull request, opening or updating one, before merging, after it merges. **Not for:** direct
+commits to the default branch or exploratory work that will not be merged.
 
 | Gate | Evidence | Assurance | Enforced | Notes |
 |---|---|---|---|---|
-| branch | `task_branch` | observed | advise | Flag pushes to the target and branches shared by two work items. |
+| branch | `task_branch` | self-reported (phase 2); observed later | advise | Flag pushes to the target and branches shared by two work items. |
 | tests | `revision_tests` on head | self-reported (phase 2); receipt when a managed recipe or native step exists | stop | The command and its result for the exact head SHA. A new push invalidates it. |
 | review | `independent_review` on head | self-reported; receipt for `claude_code_review` | stop | Reviewer session must differ from every author session that pushed to the head. Records findings with IDs and `blocking` flags. |
 | fix | `findings_resolved` | self-reported | stop | Each blocking finding is fixed at a later head (and the review is re-run on that head) or dismissed by a maintainer. |
-| ci | `hosted_ci` with label `ci-extended` | observed | forge status | Green on the exact head. If the label is missing the next action is "add `ci-extended`" (a maintainer action for same-repository pull requests). |
-| approval | `human_approval` on head | observed | forge status | Forge approval or native `approve`. |
-| merge | `merged` with method `squash` | observed | advise | When a stacked parent merges, the next action for the child is "retarget to `main`". |
+| ci | `hosted_ci` | self-reported (phase 2); observed later | forge status | Green on the exact head. With `ci_label` set, the next action names the label to add; with the default (null) it waits for whatever checks the repository requires. |
+| approval | `human_approval` on head | self-reported (phase 2); observed later | forge status | Forge approval or native `approve`. |
+| merge | `merged` | self-reported (phase 2); observed later | advise | Uses `merge_method` (default `any`). With `retarget_stacked` (default true), the next action reminds the author to retarget dependent pull requests to the default branch. |
 | post_merge | `post_merge_check` on target tip | self-reported or observed | signal | Hands off to `post-merge` (c). A failure raises the main-red signal. |
 
 Ordering: gates are evaluated in order; evidence bound to an older head is shown as `stale`, not
@@ -261,7 +316,10 @@ closes unmerged.
 
 ### 3.2 (b) `parallel-work` v1
 
-**Subject:** a set of sessions working on one repository at the same time.
+**Subject:** a set of sessions working on one repository at the same time. **Parameters:**
+`build_slots`, `disk_floor_gib`, `protected_ports` and `protected_containers`, all empty by default;
+a repository or machine sets its own values (AgentSCM's own would be 4 slots, an 8 GiB floor and its
+named services).
 
 | Gate | Evidence | Enforced | Today's equivalent |
 |---|---|---|---|
@@ -409,22 +467,25 @@ AgentSCM's own pull requests use:
 
 1. **Definition.** `src/skill_workflow/supported.rs`: template manifest version 2 (`subjects`,
    `roles`, `gates`, evidence kinds, assurance), strict parsing and bounds reusing `library.rs`;
-   a pure `evaluate(manifest, evidence, head_sha) -> RunView` (current gate, per-gate state, stale
-   evidence, next action). `skills/supported/pr-gate/v1/{SKILL.md, skill.json}` embedded in the
+   `summary`, `applicability` and `parameters`; a pure `evaluate(manifest, evidence, head_sha) ->
+   RunView` (current gate, per-gate state, stale evidence, next action from effective parameters). `skills/supported/pr-gate/v1/{SKILL.md, skill.json}` embedded in the
    binary. Unit tests for parsing, refusal of unknown fields and every gate transition, including a
    new push invalidating head-bound evidence and a reviewer equal to an author being refused.
-2. **Adoption and discovery.** `.agentscm/skills.lock.json` parsing; `client setup` reports the
-   lock file to the Hub (`reported by checkout`); `init-repo` adds the *Supported skills* section
-   when a lock file exists. Tests for both.
+2. **Catalog, adoption and discovery.** `agentscm-skills.lock.json` with `source` and `params`;
+   `agentscm skill list | show | add | remove` to browse and adopt; the checkout reports the lock
+   file to the Hub (`reported by checkout`), and the Hub reads it from the default branch when a
+   forge connection exists; `init-repo` adds the *Supported skills* section with triggers when a
+   lock file exists. Tests for each.
 3. **Hub storage and API.** `hub_skill_runs` and `hub_skill_evidence` (SQLite and PostgreSQL, with
    conformance tests); `GET /v1/hub/skills` (library: shipped, adopted, version) and
-   `GET /v1/hub/skills/runs` / `…/runs/{repo}/{pr}`; MCP `agentscm_skill_status` and
+   `GET /v1/hub/skills/runs` / `…/runs/{repo}/{pr}`; MCP `agentscm_skill_list`, `agentscm_skill_status` and
    `agentscm_skill_evidence` (self-reported; refuses a non-current head). Route and MCP tests.
 4. **Enforcement.** A `skill-stop` Stop-hook mode reusing `agent_stop.rs`: blocks the author
    session at tests, review or fix without evidence for the current head; never blocks on CI or
    approval; keeps the 8-continuation cap. Tests with fixture hook payloads, matching the existing
    Stop tests.
-5. **Hub UI.** The Skills library page and the runs list and run detail, mock endpoints in
+5. **Hub UI.** The Skills library page (browse with applicability, copyable adopt and remove
+   commands, effective parameters) and the runs list and run detail, mock endpoints in
    `ui/dev/mock.ts`, vitest unit tests, and Playwright specs for both pages (desktop and mobile).
 6. **Dogfood.** Adopt `pr-gate` v1 in this repository's lock file and run AgentSCM's next pull
    requests through it, recording which gates were self-reported.
@@ -438,13 +499,17 @@ native-subject compilation to target requirements.
 Validation for phase 2: `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`,
 the affected nextest binaries, and the UI vitest and Playwright suites for the new pages.
 
-## 7. Open questions for the maintainer
+## 7. Decisions
 
-1. Should a self-reported independent review be enough to pass the `review` gate in v1, or should
-   v1 require the `claude_code_review` receipt and stay native-only until the forge status lands?
-   This design chooses self-reported plus a visible assurance label, so the Git path works now.
-2. Is the Stop hook the right first enforcement point, given it is opt-in and live-qualified only in
-   print and exec modes? The alternative is to build the forge status first, which blocks merges
-   for everyone but has never run against live GitHub.
-3. Should adoption authority come from the default branch through the forge connection from day one
-   instead of `reported by checkout`?
+The maintainer settled the open questions on 2026-10-24 before phase 2:
+
+1. **Review evidence.** A self-reported independent review passes the `review` gate in v1. Every
+   gate that passed on self-reported evidence carries a visible `self-reported` assurance label in
+   the CLI, the MCP output and the Hub UI. A `claude_code_review` receipt remains the stronger
+   form when it exists.
+2. **Enforcement order.** The Stop hook (`skill-stop`) is the first enforcement point. The
+   `agentscm/skill/<name>` forge status comes next; #91 already posts the workflow status on
+   GitHub merge queue groups, so it can reuse that posting journal.
+3. **Adoption authority.** When the Hub has a forge connection for the repository, it reads
+   `agentscm-skills.lock.json` from the default branch. Otherwise it uses the lock file the
+   checkout reports and labels it `reported by checkout`.

@@ -24,6 +24,7 @@ use super::insights::{InsightPage, InsightQuery, UsageReceipt, UsageRecord, Work
 use super::intent::{Announced, Intent, NewIntent};
 use super::publish::{Create, NewPublication, Publication, Update};
 use super::session::{SessionCall, Touched};
+use super::skills::{EvidenceRow, RunHead, SkillAdoption};
 use super::store_pg::PgStore;
 use super::store_sqlite::SqliteStore;
 use super::work::{
@@ -520,6 +521,23 @@ pub trait Store: Send + Sync {
         work_id: &str,
         now: i64,
     ) -> Result<Option<ChangeRecordSummaryV1>>;
+    fn skill_adoption(&self, repo: &str) -> Result<Option<SkillAdoption>>;
+    /// Stores an adoption and returns the one that applies: a `reported_by_checkout` row never
+    /// replaces a `default_branch` row, which any `default_branch` row replaces.
+    fn skill_adoption_put(&self, adoption: &SkillAdoption) -> Result<SkillAdoption>;
+    /// Drops a `default_branch` adoption (the lock file is gone from the default branch).
+    fn skill_adoption_clear_forge(&self, repo: &str) -> Result<()>;
+    fn skill_evidence_add(&self, row: &EvidenceRow) -> Result<()>;
+    /// A run's evidence in recorded order.
+    fn skill_evidence(&self, repo: &str, run_id: &str) -> Result<Vec<EvidenceRow>>;
+    /// Runs of `repo`, most recently active first, optionally one branch or one run id.
+    fn skill_run_heads(
+        &self,
+        repo: &str,
+        branch: Option<&str>,
+        run_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RunHead>>;
     fn work_usage(&self, token: &str, usage: &UsageRecord, now: i64) -> Result<UsageReceipt>;
     fn work_insight(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkInsight>>;
     fn work_insights(&self, token: &str, query: &InsightQuery, now: i64) -> Result<InsightPage>;

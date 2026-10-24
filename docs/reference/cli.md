@@ -527,6 +527,19 @@ agentscm --data-dir ./agentscm-data git-snapshot capture --repository ./checkout
 
 `capture` writes `progress: ` lines to standard error when it is a terminal or when `--progress` is given (at most one line per file read chunk and per batch, plus one when the revision is published); standard output stays one JSON value, and on failure the error JSON is the last line of standard error. `preflight` is read-only and never opens the data directory. Unsupported entries (gitlinks, symlinks whose target is not an in-tree relative path, non-portable paths and others), uncommitted tracked changes (including edits hidden by skip-worktree or assume-unchanged) and configured Git filters make a tree ineligible; no partial snapshot is written. See [the Git snapshot guide](../advanced/git-snapshot.md) for the profile, receipt, Git invocation and limits.
 
+## Supported skills (experimental)
+
+`agentscm skill` browses the first-party skills embedded in the binary and adopts them per repository. Adoption is the lock file `agentscm-skills.lock.json` at the repository root; committing it is the review. Evidence an agent records is **self-reported**: the Hub stores what the session said, and every gate satisfied that way is labelled `[self-reported]` in `status` output.
+
+- `skill list [--json]` and `skill show NAME [--version N] [--json]` work offline: summary, when to follow it, prerequisites, what it is not for, parameters with defaults, gates (id, who, enforcement, minimum assurance) and an adopted marker from the lock file.
+- `skill add NAME [--version N] [--param key=value ...]` pins the embedded manifest (sha256, source `first_party`), validates parameters against it (`key=null` resets one) and prints a before/after of the pin. `skill remove NAME` removes it. Neither commits.
+- `skill report-adoption` sends the lock file to the Hub (`PUT /v1/hub/repos/{repo}/skills/adoption`) and prints which adoption source the Hub applies. A forge-read lock on the default branch takes precedence.
+- `skill status [--branch B] [--json]` shows the branch's run: gates, state, the next action and whether finishing is blocked.
+- `skill evidence --gate G --kind K --summary S [--url U] [--pr N] [--skill NAME] [--detail-json FILE] [--branch B]` records self-reported evidence at `git rev-parse HEAD`. A refusal (for example `stale_head`, `not_independent`) is printed with its message and exits non-zero.
+- `skill stop --agent claude|codex` is a Stop hook. It reads the hook JSON on standard input and blocks (`{"decision":"block","reason":...}`) while the branch's run needs the agent (`blocks_finish`), or when `pr-gate` is adopted, the branch is not the default branch, has commits ahead of it and has no run yet. It never blocks while waiting on CI, approval or merge, stops blocking after 8 consecutive continuations, and allows the stop with a warning on standard error when there is no lock file, no connection, the Hub is unreachable or the directory is not a Git repository.
+
+Status, evidence, report-adoption and stop use the checkout's `agentscm client connect` connection. `skill-workflow install-stop` only installs its own Stop subcommands, so add the hook by hand, for example in `.claude/settings.json`: `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"agentscm --data-dir ~/.agentscm skill stop --agent claude"}]}]}}`.
+
 ## Limits
 
 - Paths use portable ASCII, at most 1,024 bytes per path and 255 bytes per component. A checkpoint accepts at most 4,096 changed paths and 16,384 directory prefixes summed across those paths. This aggregate work limit is checked before publishing objects; it is not a latency guarantee.

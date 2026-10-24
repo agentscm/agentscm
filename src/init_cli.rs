@@ -152,8 +152,24 @@ struct Planned {
     status: Status,
 }
 
+/// The Supported skills section from the repository's lock file; empty when it is absent or
+/// does not parse (the instruction files then stay as they were).
+fn skills_section(root: &Path) -> String {
+    use agentscm::skill_workflow::supported::{LOCK_PATH, SkillLock, instruction_section};
+    // Same containment rule as the files init-repo writes.
+    let path = root.join(LOCK_PATH);
+    if !stays_inside(root, &path) {
+        return String::new();
+    }
+    std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| SkillLock::parse(&bytes).ok())
+        .map(|lock| instruction_section(&lock))
+        .unwrap_or_default()
+}
+
 fn plan(root: &Path, agents: &[Agent], hub: Option<&str>) -> Vec<Planned> {
-    targets::targets(agents, hub)
+    targets::targets(agents, hub, &skills_section(root))
         .into_iter()
         .map(|target| {
             let path = root.join(target.path);

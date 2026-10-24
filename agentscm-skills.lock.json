@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "skills": [
+    {
+      "name": "pr-gate",
+      "workflow_version": 1,
+      "sha256": "36409fa6c204af0c64a91123749ad405c154587041b8c2e279f5a0da5920b687",
+      "source": { "kind": "first_party" },
+      "params": { "ci_label": "ci-extended", "merge_method": "squash" }
+    }
+  ]
+}

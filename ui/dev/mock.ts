@@ -235,6 +235,55 @@ function workflow(runId: string): Record<string, unknown> | null {
   }
 }
 
+
+// ---------- supported skills (synthetic)
+const SHA_PR_GATE = '3f9a1c0de5b7a2486f0c9d1e3b5a7c9e1f3a5b7c9d1e3f5a7b9c1d3e5f7a9b1c'
+const SHA_POST_MERGE = 'a71c4e2b6d8f0a1c3e5b7d9f1a3c5e7b9d1f3a5c7e9b1d3f5a7c9e1b3d5f7a90'
+const PR_GATES = [
+  { id: 'branch', by: 'author', enforce: ['advise'] }, { id: 'tests', by: 'author', enforce: ['stop'] }, { id: 'review', by: 'reviewer', enforce: ['stop'] }, { id: 'fix', by: 'author', enforce: ['stop'] },
+  { id: 'ci', by: 'author', enforce: ['forge_status'] }, { id: 'approval', by: 'maintainer', enforce: ['forge_status'] }, { id: 'merge', by: 'maintainer', enforce: ['advise'] }, { id: 'post_merge', by: 'author', enforce: ['signal'] },
+]
+const SKILL_CATALOG = [
+  {
+    name: 'pr-gate', workflow_version: 1, sha256: SHA_PR_GATE, first_party: true, summary: 'Every pull request passes tests, an independent review, CI and approval before it merges.',
+    gates: PR_GATES.map(({ id, enforce }) => ({ id, enforce })),
+    applicability: { triggers: ['opening a pull request', 'before merging a pull request'], prerequisites: ['a GitHub or GitLab repository', 'a test command agents can run'], not_for: ['direct pushes to the default branch by a person'] },
+    parameters: [
+      { name: 'ci_label', description: 'Label that requests the extended CI run.', type: 'string', default: null },
+      { name: 'merge_method', description: 'Required merge method.', type: 'string', default: 'any', enum: ['merge', 'squash', 'rebase', 'any'] },
+    ],
+  },
+  {
+    name: 'post-merge-check', workflow_version: 1, sha256: SHA_POST_MERGE, first_party: true, summary: 'Run a regression pass on the target branch after each merge.',
+    gates: [{ id: 'merge', enforce: ['advise'] }, { id: 'post_merge', enforce: ['signal'] }],
+    applicability: { triggers: ['after a pull request merges'], prerequisites: ['a command that checks the target branch'], not_for: ['repositories without a stable default branch'] },
+    parameters: [],
+  },
+]
+const SKILL_RUNS = (() => {
+  const skill = { name: 'pr-gate', workflow_version: 1, sha256: SHA_PR_GATE }
+  const ev = (id: string, kind: string, head: string, summary: string, mins: number, assurance = 'self_reported') => ({ id, kind, head_sha: head, assurance, summary, url: null, session: 'ses_75a86944', agent: 'claude', recorded_at: ago(mins * 60), detail: null })
+  const gates = (states: string[], evidence: Record<string, ReturnType<typeof ev>[]>) =>
+    PR_GATES.map((g, i) => {
+      const e = evidence[g.id] ?? []
+      return { id: g.id, state: states[i], by: g.by, enforce: g.enforce, min_assurance: 'self_reported', assurance: states[i] === 'done' ? (e.some((x) => x.assurance === 'self_reported') ? 'self_reported' : (e[0]?.assurance ?? 'self_reported')) : null, evidence: e }
+    })
+  const H1 = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678', H2 = '9e8d7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e', H3 = '55af0e1b2c3d4e5f60718293a4b5c6d7e8f90123'
+  const D = 'done', C = 'current', N = 'not_reached'
+  return [
+    { run_id: 'run_41', repo: REPO, branch: 'feat/sync-retry-budget', pull_request: 41, head_sha: H1, state: 'open', skill, params: { ci_label: null, merge_method: 'squash' }, current_gate: 'review', next_action: 'Needs an independent review of a1b2c3d by another session.', blocks_finish: true,
+      gates: gates([D, D, C, N, N, N, N, N], { branch: [ev('e1', 'task_branch', H1, 'feat/sync-retry-budget from main', 40, 'observed')], tests: [ev('e2', 'revision_tests', H1, 'cargo nextest run exit 0 on a1b2c3d', 12)] }),
+      stale_evidence: [ev('e0', 'revision_tests', 'f00dfeed00000000000000000000000000000000', 'cargo nextest run exit 0 on f00dfee', 55)], updated_at: ago(12 * 60) },
+    { run_id: 'run_40', repo: REPO, branch: 'fix/cache-parsed-manifests', pull_request: 40, head_sha: H2, state: 'open', skill, params: { ci_label: null, merge_method: 'squash' }, current_gate: 'ci', next_action: 'Waiting for CI on 9e8d7f6: 4 of 6 checks are green.', blocks_finish: false,
+      gates: gates([D, D, D, D, C, N, N, N], { branch: [ev('f1', 'task_branch', H2, 'fix/cache-parsed-manifests from main', 180)], tests: [ev('f2', 'revision_tests', H2, 'npm test passed on 9e8d7f6', 150)], review: [ev('f3', 'independent_review', H2, 'Reviewed by another session, no blocking findings', 120)], fix: [ev('f4', 'findings_resolved', H2, 'No blocking findings to resolve', 118)] }),
+      stale_evidence: [], updated_at: ago(30 * 60) },
+    { run_id: 'run_38', repo: REPO, branch: 'chore/tighten-upload-limits', pull_request: 38, head_sha: H3, state: 'completed', skill, params: { ci_label: null, merge_method: 'squash' }, current_gate: null, next_action: 'Complete. Nothing to do.', blocks_finish: false,
+      gates: gates([D, D, D, D, D, D, D, D], Object.fromEntries(PR_GATES.map((g, i) => [g.id, [ev(`g${i}`, g.id === 'branch' ? 'task_branch' : 'workflow_receipt', H3, `${g.id} recorded on 55af0e1`, 3000 - i * 100, g.id === 'review' ? 'receipt' : g.id === 'branch' ? 'observed' : 'self_reported')]]))),
+      stale_evidence: [], updated_at: ago(2 * 3600) },
+  ]
+})()
+const LOCK_PIN = (over: Record<string, unknown> = {}) => ({ name: 'pr-gate', workflow_version: 1, path: null, sha256: SHA_PR_GATE, status: 'adopted', params: { merge_method: 'squash' }, source: { kind: 'first_party' }, ...over })
+
 export type Scenario = 'full' | 'empty' | 'down' | 'demo'
 
 export function mockHub(scenario: Scenario = 'full'): Plugin {
@@ -295,6 +344,20 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
             { ...base, agent: 'claude', key: 'a1b2c3d4e5f6', name: 'Claude Code' },
             { ...base, agent: 'codex', key: '9f8e7d6c5b4a', name: 'Codex', native_verified: false, blocker: 'trust', next_action: 'Review the generated AgentSCM plugin/hooks and MCP server in your host, approve them yourself, then start a fresh session. Never bypass trust.' },
           ])
+        }
+        if (url.pathname === '/skills') {
+          if (empty) return send(200, { catalog: [], adoption: { repo: REPO, source: 'none', observed_at: null, default_branch: null, pins: [] }, counts: {} })
+          return send(200, {
+            catalog: SKILL_CATALOG,
+            adoption: { repo: REPO, source: 'default_branch', observed_at: ago(300), default_branch: 'main', pins: [LOCK_PIN(), { name: 'legacy-review', workflow_version: 1, path: null, sha256: '0b2e'.padEnd(64, '0'), status: 'unknown_version', params: {}, source: { kind: 'first_party' } }] },
+            counts: { 'pr-gate': { open: 2, at_stop_gate: 1, completed: 1 } },
+          })
+        }
+        if (url.pathname.startsWith(`/repos/${encodeURIComponent(REPO)}/skills/runs`)) {
+          const rest = url.pathname.slice(`/repos/${encodeURIComponent(REPO)}/skills/runs`.length)
+          if (rest === '') return send(200, { runs: empty ? [] : SKILL_RUNS, truncated: false })
+          const found = SKILL_RUNS.find((r) => `/${r.run_id}` === rest)
+          return found && !empty ? send(200, found) : send(404, { error: 'not_found' })
         }
         if (url.pathname === '/skill-workflows') {
           if (empty || scenario === 'demo') return send(200, { version: 1, availability: 'available', runs: [], next_cursor: null })

@@ -2349,3 +2349,63 @@ async fn a_merge_tells_overlapping_intents_to_sync_but_not_the_merged_branch() {
         "the merged branch's own intent"
     );
 }
+
+// ---- supported skills adoption ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lock_file_on_the_default_branch_becomes_the_adoption_and_wins_over_a_checkout() {
+    use agentscm::skill_workflow::supported::{LOCK_PATH, SkillLock, SkillPin, catalog_entry};
+
+    let env = Env::start().await;
+    let connection = env.connect_app().await;
+    env.install_widgets();
+    let agent = env.agent(1, "dev", "dev");
+    let entry = catalog_entry("pr-gate", 1).unwrap();
+    let lock = |pins: Vec<SkillPin>| {
+        serde_json::to_value(SkillLock {
+            version: 1,
+            skills: pins,
+        })
+        .unwrap()
+    };
+    let adoption = "/v1/hub/repos/acme%2Fwidgets/skills/adoption";
+
+    // Nothing on the forge yet: a checkout's report applies.
+    let (status, reply) = env
+        .call(Method::PUT, adoption, Some(&agent), Some(lock(vec![])))
+        .await;
+    assert_eq!(
+        (status, reply["source"].clone(), reply["applied"].clone()),
+        (200, json!("reported_by_checkout"), json!(true)),
+        "{reply}"
+    );
+
+    // The lock file appears on the default branch; the next poll reads it.
+    let text = lock(vec![SkillPin::first_party(entry, None)]).to_string();
+    env.fake.with(|s| {
+        s.repos
+            .get_mut(&REPO_ID)
+            .unwrap()
+            .files
+            .insert(LOCK_PATH.into(), text);
+    });
+    env.refresh(&connection).await;
+    let (status, library) = env
+        .get("/v1/hub/skills?repo=acme%2Fwidgets", Some(&agent))
+        .await;
+    assert_eq!(status, 200, "{library}");
+    assert_eq!(library["adoption"]["source"], "default_branch");
+    assert_eq!(library["adoption"]["default_branch"], "main");
+    assert_eq!(library["adoption"]["pins"][0]["name"], "pr-gate");
+    assert_eq!(library["adoption"]["pins"][0]["status"], "adopted");
+
+    // A later checkout report no longer replaces it, and the reply says so.
+    let (_, reply) = env
+        .call(Method::PUT, adoption, Some(&agent), Some(lock(vec![])))
+        .await;
+    assert_eq!(
+        (reply["source"].clone(), reply["applied"].clone()),
+        (json!("default_branch"), json!(false)),
+        "{reply}"
+    );
+}

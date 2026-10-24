@@ -222,6 +222,31 @@ its output retains `"admission":"not_assessed"`.
 check and the other mutations are not available over HTTP. See
 [local template and timeline reads](../api.md#local-template-and-timeline-reads).
 
+## Supported skills: manifest version 2 and the lock file
+
+> **Experimental.** Interfaces and gate names may change.
+
+A supported skill is a first-party manifest embedded in the `agentscm` binary under
+`skills/supported/NAME/vN/skill.json`. Manifest `version: 2` keeps the version 1 fields and adds a
+one-line `summary`, `applicability` (`triggers`, `prerequisites`, `not_for`), `parameters`
+(`string`, `bool` or `integer`, each with a default and an optional `enum`), `subjects`, `roles`
+and `gates`. A gate names the role that records it (`by`), the evidence kinds it needs,
+`min_assurance` (`self_reported` < `observed` < `receipt`) and how it is enforced (`stop`,
+`forge_status`, `native`, `advise` or `signal`). Evidence parameters may refer to a manifest
+parameter, such as `label_param`. Unknown fields, duplicate gate ids and files over 256 KiB are
+refused.
+
+A repository adopts skills by committing `agentscm-skills.lock.json`: `version: 1` and up to 32
+pins of `name`, `workflow_version`, `sha256` of the exact manifest bytes, `source`
+(`{"kind":"first_party"}`; other kinds are reserved) and optional `params` overrides. A pin whose
+digest matches no embedded manifest is `unknown_version`, a reserved source is
+`unsupported_source`, and params the manifest does not declare are `invalid_params`; none of these
+resolves to another version. `agentscm init-repo` adds a short "Supported skills" section to the
+agent instruction files when this lock file exists.
+
+Evidence recorded by agents is **self-reported**. The hub labels it so wherever it is shown, and
+every version 1 gate accepts it. It is not proof that tests ran or that a review happened.
+
 ## Trust boundary and limits
 
 The local native data directory, its operator and configured runtimes remain trusted. This feature

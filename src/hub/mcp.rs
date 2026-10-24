@@ -310,6 +310,8 @@ fn read_only_call(method: &str, params: Option<&Value>) -> bool {
                     | "agentscm_change_record"
                     | "agentscm_workflow_status"
                     | "agentscm_coordination_inbox"
+                    | "agentscm_skill_list"
+                    | "agentscm_skill_status"
             )
         ))
 }
@@ -427,6 +429,24 @@ fn tools(read_only: bool, settings: &ViewSettings) -> Value {
             "work_id":{"type":"string","minLength":1,"maxLength":255,
                 "description":"Durable work ID whose retained change record should be read."}
         }), &["work_id"])});
+    let skill_list = json!({"name": "agentscm_skill_list",
+        "description": "Experimental. Lists the supported skills and which ones this repository adopted, each with when to follow it, its prerequisites, what it is not for, and its effective parameters. Also says where the adoption came from (the default branch on the forge, or reported by a checkout).",
+        "annotations": {"readOnlyHint": true},
+        "inputSchema": schema(json!({"repo": {"type": "string", "description": "Repository as owner/name."}}), &["repo"])});
+    let skill_status = json!({"name": "agentscm_skill_status",
+        "description": "Experimental. Shows the skill run for a branch: one line per gate, marked [self-reported] when an agent recorded the evidence itself, the next action, and whether finishing is blocked.",
+        "annotations": {"readOnlyHint": true},
+        "inputSchema": schema(json!({"repo": {"type": "string"}, "branch": {"type": "string"}}), &["repo", "branch"])});
+    let skill_evidence = json!({"name": "agentscm_skill_evidence",
+        "description": "Experimental. Records evidence for a gate of an adopted skill. It is stored as self-reported: the hub checks ordering (current head, independent reviewer) but not that the work happened. Refusals say why (stale_head, not_independent, not_adopted, unknown_gate).",
+        "inputSchema": schema(json!({
+            "repo": {"type": "string"}, "skill": {"type": "string"}, "gate": {"type": "string"},
+            "kind": {"type": "string", "enum": ["task_branch", "revision_tests", "independent_review", "findings_resolved", "hosted_ci", "human_approval", "merged", "post_merge_check", "workflow_receipt"]},
+            "head_sha": {"type": "string", "description": "40 lowercase hex commit the evidence is about."},
+            "summary": {"type": "string", "maxLength": 500}, "url": {"type": "string", "maxLength": 2048},
+            "branch": {"type": "string"}, "pull_request": {"type": "integer", "minimum": 1},
+            "detail": {"type": "object", "description": "command, exit_code, findings [{id, blocking, summary}], resolved [ids], dismissed [{id, reason}], label, method."},
+            "session": session}), &["repo", "skill", "gate", "kind", "head_sha", "summary", "branch"])});
     let mut inbox = json!({"name": "agentscm_coordination_inbox",
         "description": "Read durable coordination requests addressed to your session, including affected work, path overlaps and replies. Requests remain pending until explicit acknowledgement and response. On reconnect read a fresh inbox, then page the fixed watermark. Reading does not acknowledge delivery.",
         "annotations": {"readOnlyHint": true},
@@ -458,7 +478,9 @@ fn tools(read_only: bool, settings: &ViewSettings) -> Value {
             workflow,
             change_record,
             insight,
-            insights
+            insights,
+            skill_list,
+            skill_status
         ]);
     }
     let usage = json!({"name":"agentscm_work_usage",
@@ -588,6 +610,9 @@ fn tools(read_only: bool, settings: &ViewSettings) -> Value {
          "description": "Acknowledges one complete durable briefing after it was deliberately delivered. Never call this for a partial or unseen briefing.",
          "inputSchema": schema(json!({"delivery": {"type": "string"}}), &["delivery"])},
         workflow,
+        skill_list,
+        skill_status,
+        skill_evidence,
         {"name": "agentscm_view_settings",
          "description": "Reads or changes your own setting for inline views (MCP Apps) of work overview and coordination inbox. It affects only your own agents, not other users; your choice wins over the hub default, which a workspace administrator changes in the hub UI. Omit all arguments to read. Returns effective, hub_default and override.",
          "inputSchema": schema(json!({
@@ -605,7 +630,9 @@ fn tools(read_only: bool, settings: &ViewSettings) -> Value {
 }
 
 /// Parsed arguments; `None` for anything the tool does not accept.
-fn try_args<T: DeserializeOwned>(arguments: Option<&Value>) -> std::result::Result<T, String> {
+pub(super) fn try_args<T: DeserializeOwned>(
+    arguments: Option<&Value>,
+) -> std::result::Result<T, String> {
     let arguments = match arguments {
         None | Some(Value::Null) => json!({}),
         Some(other) => other.clone(),
@@ -663,7 +690,7 @@ fn args<T: DeserializeOwned>(arguments: Option<&Value>) -> Option<T> {
 }
 
 /// A malformed call is the caller's mistake, not a coordination outage.
-fn invalid_args(tool: &str, detail: &str) -> Value {
+pub(super) fn invalid_args(tool: &str, detail: &str) -> Value {
     let detail: String = detail.chars().take(200).collect();
     result(
         &format!("AgentSCM: invalid arguments for {tool}: {detail}"),
@@ -691,7 +718,7 @@ fn refused(reason: &str) -> Value {
     result(&unknown(reason), true)
 }
 
-fn hub_failure(error: &HubError) -> Value {
+pub(super) fn hub_failure(error: &HubError) -> Value {
     refused(match error {
         HubError::Busy => "hub busy",
         HubError::WorkCapacity => "work storage capacity reached",
@@ -838,13 +865,17 @@ async fn call_inner(
             | "agentscm_work_checkpoint"
             | "agentscm_work_ack"
             | "agentscm_workflow_status"
-    ) {
+    ) && !super::skills::is_tool(name)
+    {
         return Err(INVALID_PARAMS);
     }
     if foreign {
         return Ok(refused("this token is for another repository"));
     }
     let arguments = params.and_then(|params| params.get("arguments"));
+    if super::skills::is_tool(name) {
+        return Ok(super::skills::mcp_call(state, principal, name, arguments).await);
+    }
     if name == "agentscm_coordination_inbox" {
         let args = match try_args::<InboxArgs>(arguments) {
             Ok(value) => value,

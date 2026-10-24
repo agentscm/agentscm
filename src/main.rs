@@ -83,6 +83,8 @@ mod server;
 mod setup;
 #[cfg(unix)]
 mod setup_cli;
+#[cfg(unix)]
+mod skill_cli;
 mod skill_workflow_cli;
 #[cfg(unix)]
 mod skill_workflow_loop;
@@ -145,6 +147,12 @@ enum Command {
     LocalValidation {
         #[command(subcommand)]
         command: local_validation_cli::LocalValidationCommand,
+    },
+    /// [experimental] Browse, adopt and follow the supported skills (self-reported evidence).
+    #[cfg(unix)]
+    Skill {
+        #[command(subcommand)]
+        command: skill_cli::SkillCommand,
     },
     /// [experimental] Run bounded repository skill workflows on immutable local source.
     SkillWorkflow {
@@ -703,6 +711,10 @@ async fn run(cli: Cli) -> Result<RunExit> {
             if code != 0 {
                 return Ok(RunExit::SpecializedFailure(code));
             }
+        }
+        #[cfg(unix)]
+        Command::Skill { command } => {
+            skill_cli::run(&cli.data_dir, command).await?;
         }
         Command::SkillWorkflow { command } => {
             skill_workflow_cli::run(&cli.data_dir, command).await?;
