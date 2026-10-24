@@ -56,7 +56,16 @@ pub fn run(args: CollisionsArgs) -> Result<()> {
         include_merged: args.include_merged,
         deadline: None,
         max_bytes: None,
-    })?;
+    });
+    let report = match report {
+        Ok(report) => report,
+        // Same exit code as the JSON error path in main.
+        Err(error) if text => {
+            eprintln!("agentscm: collisions: {}", clean(&error.to_string()));
+            std::process::exit(1);
+        }
+        Err(error) => return Err(error),
+    };
     if text {
         print!("{}", render(&report, args.worktrees));
     } else {

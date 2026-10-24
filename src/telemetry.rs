@@ -659,7 +659,10 @@ pub(crate) fn onboard(noninteractive: bool, invocation_off: bool) -> Result<()> 
     }
     let ui = crate::prompt::Ui { yes: false };
     let default_yes = matches!(expected_profile, Profile::PermittedDefault);
-    let choice = ui.confirm("Share these pseudonymous usage indicators?", default_yes);
+    // No answer (end of input, or three unusable replies) records nothing: ask again next time.
+    let Some(choice) = ui.answer("Share these pseudonymous usage indicators?", default_yes) else {
+        return Ok(());
+    };
 
     // Never hold the common settings lock while waiting for terminal input. Re-read after the
     // prompt so a concurrent explicit opt-out or provisioning change always wins.

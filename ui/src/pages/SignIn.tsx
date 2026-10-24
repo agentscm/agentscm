@@ -4,7 +4,7 @@ import { Logo } from '../App.tsx'
 import { CopyButton, Explain, Icon, Notice } from '../ui.tsx'
 import { ConnectAgent } from './Connect.tsx'
 
-const CREATE = 'agentscm hub token create --read-only --name status-page --repo owner/name'
+const CREATE = 'agentscm hub token create --read-only --ttl 30d --name status-page --repo owner/name'
 
 export function SignIn({ dark, notice, onSignedIn }: { dark: boolean; notice: string | null; onSignedIn: (token: string, keep: boolean) => void }) {
   const [value, setValue] = useState('')

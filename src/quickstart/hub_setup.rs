@@ -67,7 +67,7 @@ pub(crate) fn github_login(given: Option<&str>, ui: &Ui) -> Result<String, Strin
         )
     };
     login_ok(&login).then_some(login).ok_or_else(|| {
-        "I need your GitHub login to make you the hub's administrator; pass --github-login (with --yes, or install gh and run gh auth login).".into()
+        "I need your GitHub login to make you the hub's administrator; with --yes, pass --github-login LOGIN (or sign in to gh so `gh api user` works).".into()
     })
 }
 

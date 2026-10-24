@@ -24,7 +24,7 @@ curl http://127.0.0.1:7331/health
 | `GET /v1/revisions/{revision}/file?path=…` | File bytes (8 MiB maximum); `X-Agentscm-Entry-Kind: regular\|executable\|symlink` names the entry kind (a symlink's bytes are its target) |
 | `GET /v1/diff?left=…&right=…&limit=1000` | Bounded diff (`limit` 1 through 10000). An entry is listed when its blob or kind differs; `before_kind`/`after_kind` (`executable` or `symlink`) appear only for a present non-regular side, so a mode-only change shows one kind field and regular-only entries are unchanged |
 | `GET /v1/workflow` | Guided workflow status |
-| `GET /v1/workflow/inspection?limit=4096` | Recorded before/after bytes of the workflow's subject |
+| `GET /v1/workflow/inspection?limit=4096` | The workflow subject's recorded diff. Each entry carries `before_text` or `before_base64`, and `after_text` or `after_base64`: `_text` when that side is valid UTF-8, `_base64` (standard alphabet) otherwise, and neither field for an absent side |
 | `GET /v1/collisions` | Git collision report (off unless `--collisions-repo` is set) |
 | `GET /v1/local/skill-workflow-library?change=…&library=…` | `skill-workflow library inspect` output for one template manifest |
 | `GET /v1/local/skill-workflows/{run_id}/handoff` | `skill-workflow handoff` output for one retained run |

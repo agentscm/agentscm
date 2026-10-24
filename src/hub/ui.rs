@@ -22,7 +22,8 @@ const STYLE: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/dis
 #[cfg(not(feature = "ui"))]
 const INDEX: &[u8] = b"<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
     <title>AgentSCM</title></head><body><p>This hub was built without the status page. \
-    The container image includes it.</p></body></html>";
+    Release binaries and the container image include it. From source, run `npm ci &amp;&amp; npm run build` \
+    in ui/, then `cargo build --features ui`.</p></body></html>";
 
 pub fn routes() -> Router<HubState> {
     let router = Router::new()

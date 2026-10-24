@@ -88,7 +88,11 @@ pub fn run(args: InitArgs) -> Result<()> {
     let ui = Ui { yes: args.yes };
     let agents = args.agents.as_deref();
     run_in(&root, args.hub_url.as_deref(), repo.as_deref(), agents, &ui)?;
-    print_next_steps(agents.unwrap_or(&ALL));
+    print_next_steps(
+        agents.unwrap_or(&ALL),
+        args.hub_url.as_deref(),
+        repo.as_deref(),
+    );
     Ok(())
 }
 
@@ -324,15 +328,25 @@ pub(crate) fn run_in(
     Ok(outcome)
 }
 
-pub(crate) fn print_next_steps(agents: &[Agent]) {
+pub(crate) fn print_next_steps(agents: &[Agent], hub: Option<&str>, repo: Option<&str>) {
     println!();
-    println!("Each developer sets one environment variable (an agent token is created with");
+    println!("Each developer sets one environment variable; no token is stored in the repository.");
+    println!("Create an agent token (the default lifetime is 8h; --ttl allows up to 30d):");
     println!(
-        "`agentscm hub token create --repo OWNER/NAME`); no token is stored in the repository:"
+        "  agentscm hub login --hub {} --provider github   (or gitlab)",
+        hub.unwrap_or("<hub url>")
+    );
+    println!(
+        "  agentscm hub token create --name <token name> --repo {} --ttl 30d",
+        repo.unwrap_or("OWNER/NAME")
     );
     println!("  export AGENTSCM_HUB_TOKEN=<agent token>");
     println!(
         "  PowerShell: $env:AGENTSCM_HUB_TOKEN = \"<agent token>\"   (persist with: setx AGENTSCM_HUB_TOKEN \"<agent token>\")"
+    );
+    println!();
+    println!(
+        "In a repository set up with `agentscm init-repo`, MCP works through AGENTSCM_HUB_TOKEN. The hub's Connect agents page cannot verify these checkouts."
     );
     println!();
     let has = |agent| agents.contains(&agent);
@@ -349,6 +363,14 @@ pub(crate) fn print_next_steps(agents: &[Agent]) {
     }
     if has(Agent::Copilot) {
         println!("- Copilot in VS Code prompts once for the token.");
+    }
+    if has(Agent::Cursor) {
+        println!("- Cursor: start it from a shell where AGENTSCM_HUB_TOKEN is set.");
+    }
+    if has(Agent::Gemini) {
+        println!(
+            "- Gemini: only GEMINI.md was written, with no MCP or hooks, so AgentSCM tools are not available to it yet; run `agentscm client setup --agent gemini --hub <hub url>` to add them."
+        );
     }
 }
 

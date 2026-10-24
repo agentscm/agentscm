@@ -305,6 +305,16 @@ fn end_to_end_with_a_given_token_then_the_hook_works() {
         "{said}"
     );
     assert!(said.contains(" uninstall`"), "{said}");
+    assert!(
+        said.contains(&format!("Hub status page: {}/ui/", hub.url)),
+        "{said}"
+    );
+    assert!(
+        said.contains(
+            " hub token create --read-only --name status-page --repo acme/widgets --ttl 30d"
+        ),
+        "{said}"
+    );
     assert_eq!(
         last_line(&output),
         format!("Live warnings: on (hub {}, repo acme/widgets)", hub.url)
@@ -827,17 +837,18 @@ fn a_requested_hub_that_is_down_fails_but_keeps_the_planned_hook() {
     let said = out(&output);
     assert!(
         said.contains(&format!(
-            "The hub at {url} isn't answering; live warnings will start working once it is."
+            "The hub at {url} isn't answering, so nothing was saved for it."
         )),
         "{said}"
     );
     assert!(repo.path().join(SETTINGS).exists());
     assert!(!machine.config().join("hub.json").exists());
-    assert_eq!(
-        last_line(&output),
-        format!(
-            "Live warnings: off — the hub at {url} isn't answering (start it, then run `agentscm quickstart` again)"
-        )
+    let last = last_line(&output);
+    assert!(
+        last.starts_with(&format!(
+            "Live warnings: off — the hub at {url} isn't answering (start it, then run `/"
+        )) && last.ends_with(" quickstart` again)"),
+        "{last}"
     );
 
     // With a token the user supplies, the settings are written even though it cannot be checked.
@@ -850,6 +861,7 @@ fn a_requested_hub_that_is_down_fails_but_keeps_the_planned_hook() {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     let said = out(&output);
     assert!(said.contains("hub isn't answering"), "{said}");
+    assert!(said.contains("its settings are saved"), "{said}");
     assert_eq!(
         json_file(&machine.config().join("hub.json"))["url"],
         url.as_str()
@@ -872,6 +884,47 @@ fn with_yes_the_hooks_wait_for_a_hub() {
 }
 
 #[test]
+fn hosted_prints_the_guide_and_sets_up_no_hub() {
+    let machine = Machine::new();
+    let repo = machine.repo();
+    let output = machine.run(
+        repo.path(),
+        &[
+            "quickstart",
+            "--yes",
+            "--hosted",
+            "--hook",
+            "none",
+            "--no-collisions",
+        ],
+    );
+    let said = ok(&output);
+    assert!(said.contains("not supported in the alpha"), "{said}");
+    assert!(said.contains("docs/hosted.md"), "{said}");
+    assert!(last_line(&output).starts_with("Live warnings: off — no hub chosen"));
+    assert!(!machine.config().join("quickstart.json").exists());
+    assert!(!machine.home.path().join(".agentscm/hub").exists());
+    let output = machine.run(repo.path(), &["quickstart", "--yes", "--local", "--hosted"]);
+    assert!(!output.status.success());
+}
+
+#[test]
+fn a_first_local_hub_with_yes_needs_its_administrator_before_any_write() {
+    let machine = Machine::new();
+    let repo = machine.repo();
+    for hub in [&["--local"][..], &["--hub", "local"]] {
+        let mut args = vec!["quickstart", "--yes", "--no-collisions"];
+        args.extend_from_slice(hub);
+        let output = machine.run(repo.path(), &args);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let said = String::from_utf8_lossy(&output.stderr);
+        assert!(said.contains("--github-login"), "{said}");
+        assert!(!machine.config().exists());
+        assert!(!machine.home.path().join(".agentscm").exists());
+    }
+}
+
+#[test]
 fn without_a_terminal_it_refuses_and_writes_nothing() {
     let machine = Machine::new();
     let repo = machine.repo();
@@ -891,8 +944,10 @@ fn without_a_terminal_it_refuses_and_writes_nothing() {
     assert!(!repo.path().join(".claude").exists());
     assert!(!machine.config().exists());
     assert!(!machine.home.path().join(".agentscm").exists());
+    // With nothing recorded there is nothing to refuse.
     let output = machine.run(repo.path(), &["uninstall"]);
-    assert!(!output.status.success());
+    assert!(output.status.success());
+    assert!(out(&output).contains("nothing was installed by quickstart"));
 }
 
 #[test]
@@ -917,9 +972,10 @@ fn running_from_the_install_directory_is_undoable_without_any_hook() {
         .command_as(&link, repo.path(), &args)
         .output()
         .unwrap());
+    // No hooks were written, so the summary must not claim hooks call the program.
     assert!(
         said.contains(&format!(
-            "{}: the agentscm program the hooks call",
+            "{}: the agentscm program\n",
             bin.display()
                 .to_string()
                 .replace(machine.home.path().to_str().unwrap(), "~")
@@ -1240,6 +1296,47 @@ fn hub_port_retry_reaches_docker_failure_after_an_occupied_first_port() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("registry denied pull"));
     assert!(!machine.home.path().join(".agentscm/hub").exists());
     assert!(!machine.config().join("quickstart.json").exists());
+}
+
+#[test]
+fn a_busy_hub_port_prints_a_rerun_command_with_a_free_port() {
+    let machine = Machine::new();
+    let repo = machine.repo();
+    fake_docker(&machine);
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = held.local_addr().unwrap().port().to_string();
+    let output = machine.run(
+        repo.path(),
+        &[
+            "quickstart",
+            "--yes",
+            "--local",
+            "--hub-runtime",
+            "docker",
+            "--hub-port",
+            &port,
+            "--github-login",
+            "octo",
+            "--hook",
+            "none",
+            "--no-collisions",
+        ],
+    );
+    drop(held);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let said = out(&output);
+    let hint = said
+        .lines()
+        .find_map(|line| line.strip_prefix("To use a free port, run: "))
+        .unwrap_or_else(|| panic!("{said}"));
+    let free: u16 = hint
+        .rsplit_once(" quickstart --local --hub-port ")
+        .unwrap_or_else(|| panic!("{hint}"))
+        .1
+        .parse()
+        .unwrap();
+    assert_ne!(free.to_string(), port);
+    assert!(!machine.home.path().join(".agentscm/hub").exists());
 }
 
 fn fake_docker(machine: &Machine) {
@@ -2125,4 +2222,54 @@ fn native_program_repairs_are_reported_but_true_noop_preserves_record() {
         assert!(noop.contains("No changes made."), "{missing}: {noop}");
         assert_eq!(std::fs::read(&record).unwrap(), before, "{missing}");
     }
+}
+
+#[test]
+fn a_fresh_repository_says_there_is_nothing_to_compare() {
+    let machine = Machine::new();
+    let repo = machine.repo();
+    let said = ok(&machine.run(
+        repo.path(),
+        &["quickstart", "--yes", "--hub", "skip", "--hook", "none"],
+    ));
+    if !said.contains("Couldn't check") {
+        assert!(
+            said.contains("No other branches or worktrees to compare yet."),
+            "{said}"
+        );
+    }
+    assert!(!said.contains("0 branches/worktrees checked"), "{said}");
+}
+
+#[test]
+fn uninstall_removes_only_the_empty_directories_quickstart_created() {
+    let machine = Machine::transient();
+    let repo = machine.repo();
+    let args = ["quickstart", "--yes", "--hub", "skip", "--hook", "project"];
+    ok(&machine.run(repo.path(), &args));
+    assert!(repo.path().join(".claude").is_dir() && machine.bin_dir().is_dir());
+    ok(&machine.run(repo.path(), &["uninstall", "--yes"]));
+    assert!(!repo.path().join(".claude").exists());
+    assert!(!machine.home.path().join(".agentscm").exists());
+
+    // A `.claude` that was already there, or holds anything else, stays.
+    let keep = machine.repo();
+    std::fs::create_dir_all(keep.path().join(".claude")).unwrap();
+    ok(&machine.run(keep.path(), &args));
+    ok(&machine.run(keep.path(), &["uninstall", "--yes"]));
+    assert!(keep.path().join(".claude").is_dir());
+    ok(&machine.run(repo.path(), &args));
+    std::fs::write(repo.path().join(".claude/notes"), "mine").unwrap();
+    ok(&machine.run(repo.path(), &["uninstall", "--yes"]));
+    assert!(repo.path().join(".claude/notes").exists());
+}
+
+#[test]
+fn uninstall_without_a_terminal_still_needs_yes_when_something_is_recorded() {
+    let machine = Machine::new();
+    let repo = machine.repo();
+    ok(&machine.run(repo.path(), &project_args()));
+    let output = machine.run(repo.path(), &["uninstall"]);
+    assert!(!output.status.success());
+    assert!(repo.path().join(SETTINGS).exists());
 }

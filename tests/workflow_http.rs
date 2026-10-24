@@ -229,7 +229,7 @@ fn real_workflow_inspection_is_bounded_token_free_and_does_not_change_the_sessio
             .as_array()
             .unwrap()
             .iter()
-            .any(|entry| entry["after_bytes"] == serde_json::json!([0, 255, 16]))
+            .any(|entry| entry["after_base64"] == "AP8Q")
     );
     assert_eq!(value["workspace_observation"], "not_observed");
     assert_eq!(value["admission"], "not_assessed");
@@ -367,19 +367,13 @@ fn source_diff_keeps_crlf_and_lone_cr_distinct_from_lf() {
             .as_array()
             .unwrap()
             .iter()
-            .any(
-                |entry| entry["before_bytes"] == serde_json::json!([97, 13, 10, 98])
-                    && entry["after_bytes"] == serde_json::json!([97, 10, 98])
-            )
+            .any(|entry| entry["before_text"] == "a\r\nb" && entry["after_text"] == "a\nb")
     );
     assert!(
         diff["entries"]
             .as_array()
             .unwrap()
             .iter()
-            .any(
-                |entry| entry["before_bytes"] == serde_json::json!([97, 13, 98])
-                    && entry["after_bytes"] == serde_json::json!([97, 10, 98])
-            )
+            .any(|entry| entry["before_text"] == "a\rb" && entry["after_text"] == "a\nb")
     );
 }

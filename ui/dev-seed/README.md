@@ -7,6 +7,13 @@ with synthetic agents through the real hook, MCP and stand-up HTTP endpoints.
 ui/dev-seed/start.sh
 ```
 
+- Port: `AGENTSCM_DEV_HUB_PORT=7372 ui/dev-seed/start.sh` serves on another port (default 7332); `.hub.env`
+  records it. Each worktree has its own `.data/`, so two worktrees only need different ports. The UI tests
+  and `npm run dev` read `AGENTSCM_HUB` (see `ui/README.md`).
+- Repository: the tokens are for `counterbranch/agentscm`. A scratch checkout used with them must have an
+  `origin` naming that repository, or `agentscm intent check` silently does nothing (wrong repository, no output).
+- `mint/` is a separate crate, built by `start.sh` with an absolute `CARGO_TARGET_DIR` (a relative one silently
+  builds nothing). To run it by hand, use `CARGO_TARGET_DIR=$PWD/target`.
 - `mint/` mints the tokens for synthetic users straight into the database. A real hub needs a forge sign-in to do this.
   Repository: `counterbranch/agentscm`.
 - `.hub.env` (written on start) holds `AGENTSCM_HUB` and the read-only `READ_TOKEN` for the UIs.
