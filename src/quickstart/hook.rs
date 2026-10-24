@@ -5,7 +5,9 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use super::manifest::{Added, sha_hex};
-use crate::init_cli::TOKEN_VAR;
+
+/// The environment variable that holds the agent token for the HTTP hooks.
+pub(crate) const TOKEN_VAR: &str = "AGENTSCM_HUB_TOKEN";
 
 /// The hooks of hooks/claude-code.example.json, kept here because container builds copy only
 /// `src/`; a test keeps the two equal.
@@ -42,15 +44,32 @@ fn commands(group: &Value) -> impl Iterator<Item = &str> {
         .filter_map(ident)
 }
 
-/// The HTTP form of the hooks (no SessionStart), for the hub at `hub` and, when known, `repo`.
+/// The HTTP form of the hooks for the hub at `hub` and, when known, `repo`. SessionStart is
+/// absent because Claude Code does not support HTTP hooks for it. With `?repo=owner/name`
+/// the hub ignores a token that belongs to another repository; the repo has passed
+/// `valid_repo`, so it needs no URL encoding.
 pub(crate) fn http_entries(hub: &str, repo: Option<&str>) -> Vec<Added> {
-    crate::init_cli::claude_hook_groups(hub, repo)
-        .into_iter()
-        .map(|(event, entry)| Added {
-            event: event.to_owned(),
-            entry,
-        })
-        .collect()
+    let guard = repo.map_or_else(String::new, |r| format!("?repo={r}"));
+    let hook = json!({
+        "type": "http",
+        "url": format!("{hub}/v1/hub/hook/claude{guard}"),
+        "headers": {"Authorization": format!("Bearer ${TOKEN_VAR}")},
+        "allowedEnvVars": [TOKEN_VAR],
+        "timeout": 5,
+    });
+    [
+        (
+            "PreToolUse",
+            json!({"matcher": "Edit|Write|MultiEdit", "hooks": [hook]}),
+        ),
+        ("SessionEnd", json!({"hooks": [hook]})),
+    ]
+    .into_iter()
+    .map(|(event, entry)| Added {
+        event: event.to_owned(),
+        entry,
+    })
+    .collect()
 }
 
 /// The three hook groups of hooks/claude-code.example.json, calling `program`.

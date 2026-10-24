@@ -1184,6 +1184,14 @@ async fn forge_check_view(
         "refused" => "refused",
         _ => "uncertain",
     }));
+    if conn.provider == "github" {
+        use super::forge_check::merge_group;
+        let groups = merge_group::pull_projections(state, &repo.id, number, 10).await?;
+        view["merge_queue"] = json!({
+            "readiness": merge_group::queue_readiness(&repo.id, target),
+            "groups": groups,
+        });
+    }
     Ok(Some(view))
 }
 

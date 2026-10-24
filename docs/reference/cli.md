@@ -158,11 +158,11 @@ agentscm demo [--no-open]
 ## Agent wiring
 
 ```sh
-agentscm init-repo [--agents claude,codex,cursor,copilot,gemini] [--hub-url URL] [--repo OWNER/NAME] [--yes]
+agentscm init-repo [--agents claude,codex,cursor,copilot,gemini] [--hub-url URL] [--yes]
 agentscm hook <claude|codex|cursor|copilot|generic> [--hub-url URL]   # called by agents, not by people
 ```
 
-`init-repo` writes the committed MCP, hook and instruction files for the chosen agents (all five by default) into the Git repository you are in. It needs no data directory, is idempotent and never writes a token. (`init` is the unrelated command that prepares a data directory.) `--repo` names the repository as `owner/name` (default: from the `origin` remote). `hook` takes the token from `AGENTSCM_HUB_TOKEN` or `AGENTSCM_HUB_TOKEN_FILE`, else `hub.json`. Details, the file list and limits: [supported agents](../agents.md).
+`init-repo` writes only the committed agent instruction files for the chosen agents (all five by default) into the Git repository you are in: `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `.cursor/rules/agentscm.mdc` and `.github/copilot-instructions.md`. It writes no MCP config, hooks or token. It needs no data directory and is idempotent. `--hub-url` only fills in the setup command it prints; it is written to no file. Each developer then runs `agentscm client setup --agent <agent> --hub <hub>` once per checkout. (`init` is the unrelated command that prepares a data directory.) `hook` takes the token from `AGENTSCM_HUB_TOKEN` or `AGENTSCM_HUB_TOKEN_FILE`, else `hub.json`. Details, the file list and limits: [supported agents](../agents.md).
 
 ## Serving
 

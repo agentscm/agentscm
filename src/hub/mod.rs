@@ -186,6 +186,12 @@ impl HubState {
         self
     }
 
+    /// Accepted webhook deliveries whose job has not finished; zero once every accepted
+    /// delivery has been handled.
+    pub fn webhook_jobs_pending(&self) -> usize {
+        self.sync.pending_webhooks()
+    }
+
     pub fn with_skill_workflows(mut self, registry: skill_workflow::SkillWorkflowRegistry) -> Self {
         self.skill_workflows = Arc::new(registry);
         self

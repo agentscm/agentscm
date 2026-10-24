@@ -10,8 +10,9 @@ use serde_json::json;
 
 use super::connection::{
     CONNECTION_SELECT, ConnectedRepository, Connection as ForgeConnection, DELIVERY_KEEP_SECONDS,
-    ForgeCheck, ForgeCheckReserve, NewConnection, NewForgeCheck, Observation, Observed, Outbound,
-    REPOSITORY_SELECT, gone_event, observation_kinds, validate_check_key, validate_check_phase,
+    ForgeCheck, ForgeCheckReserve, MergeGroup, NewConnection, NewForgeCheck, NewMergeGroup,
+    Observation, Observed, Outbound, REPOSITORY_SELECT, gone_event, is_lower_hex,
+    observation_kinds, validate_check_key, validate_check_phase, validate_group_note,
     validate_observation, validate_repository_row, validate_status,
 };
 use super::coordination::{
@@ -2566,6 +2567,42 @@ fn repository_by_rep(tx: &mut postgres::Transaction<'_>, id: &str) -> Result<Con
         .ok_or_else(|| HubError::Invalid("unknown repository".into()))
 }
 
+/// Ended merge groups are kept this long (30 days) before an observation of the repository drops them.
+const MERGE_GROUP_KEEP_SECONDS: i64 = 2_592_000;
+
+const MERGE_GROUP_COLUMNS: &str = "head_sha, head_ref, base_ref, base_sha, pr_number, pr_head_sha,
+    context, ended_reason, observed_at, ended_at, state, binding_digest, description, phase,
+    generation, updated_at, ruleset_requirement, status_source";
+
+fn merge_group_row(row: &postgres::Row) -> MergeGroup {
+    let head_sha: String = row.get(0);
+    let phase: Option<String> = row.get(13);
+    MergeGroup {
+        check: phase.map(|phase| ForgeCheck {
+            head_sha: head_sha.clone(),
+            state: row.get(10),
+            binding_digest: row.get(11),
+            description: row.get(12),
+            phase,
+            generation: row.get(14),
+            updated_at: row.get(15),
+        }),
+        head_sha,
+        head_ref: row.get(1),
+        base_ref: row.get(2),
+        base_sha: row.get(3),
+        pr_number: row.get(4),
+        pr_head_sha: row.get(5),
+        context: row.get(6),
+        ended_reason: row.get(7),
+        observed_at: row.get(8),
+        ended_at: row.get(9),
+        generation: row.get(14),
+        ruleset_requirement: row.get(16),
+        status_source: row.get(17),
+    }
+}
+
 fn intent_row(row: &postgres::Row) -> (Intent, String, Option<String>) {
     (
         Intent {
@@ -4592,6 +4629,223 @@ impl Store for PgStore {
                  WHERE repository = $1 AND number = $2 AND context = $3 AND generation = $4",
                 &[&repo, &number, &context, &generation, &now, &phase],
             )? == 1)
+        })
+    }
+
+    fn observe_merge_group(
+        &self,
+        repo: &str,
+        group: &NewMergeGroup,
+        ended: Option<&str>,
+        now: i64,
+    ) -> Result<MergeGroup> {
+        group.validate()?;
+        ended.map(validate_group_note).transpose()?;
+        let cutoff = now.saturating_sub(MERGE_GROUP_KEEP_SECONDS);
+        let ended_at = ended.map(|_| now);
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            // The repository row lock serializes its observations.
+            repository_by_rep(&mut tx, repo)?;
+            tx.execute(
+                "DELETE FROM hub_merge_groups
+                 WHERE repository = $1 AND ended_reason IS NOT NULL AND ended_at < $2",
+                &[&repo, &cutoff],
+            )?;
+            tx.execute(
+                "INSERT INTO hub_merge_groups (repository, head_sha, head_ref, base_ref,
+                     base_sha, pr_number, pr_head_sha, context, ended_reason, observed_at,
+                     ended_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $10)
+                 ON CONFLICT (repository, head_sha) DO NOTHING",
+                &[
+                    &repo,
+                    &group.head_sha,
+                    &group.head_ref,
+                    &group.base_ref,
+                    &group.base_sha,
+                    &group.pr_number,
+                    &group.pr_head_sha,
+                    &group.context,
+                    &ended,
+                    &now,
+                    &ended_at,
+                ],
+            )?;
+            if let Some(reason) = ended {
+                tx.execute(
+                    "UPDATE hub_merge_groups SET ended_reason = $3, ended_at = $4, updated_at = $4
+                     WHERE repository = $1 AND head_sha = $2 AND ended_reason IS NULL",
+                    &[&repo, &group.head_sha, &reason, &now],
+                )?;
+            }
+            let stored = tx.query_one(
+                &format!(
+                    "SELECT {MERGE_GROUP_COLUMNS} FROM hub_merge_groups
+                     WHERE repository = $1 AND head_sha = $2"
+                ),
+                &[&repo, &group.head_sha],
+            )?;
+            tx.commit()?;
+            Ok(merge_group_row(&stored))
+        })
+    }
+
+    fn merge_group(&self, repo: &str, head_sha: &str) -> Result<Option<MergeGroup>> {
+        if !is_lower_hex(head_sha, 40) {
+            return Err(HubError::Invalid("merge group is out of bounds".into()));
+        }
+        self.run(true, |client| {
+            Ok(client
+                .query_opt(
+                    &format!(
+                        "SELECT {MERGE_GROUP_COLUMNS} FROM hub_merge_groups
+                         WHERE repository = $1 AND head_sha = $2"
+                    ),
+                    &[&repo, &head_sha],
+                )?
+                .map(|row| merge_group_row(&row)))
+        })
+    }
+
+    fn active_merge_groups(&self, repo: &str, limit: usize) -> Result<Vec<MergeGroup>> {
+        self.run(true, |client| {
+            let limit = limit as i64;
+            Ok(client
+                .query(
+                    &format!(
+                        "SELECT {MERGE_GROUP_COLUMNS} FROM hub_merge_groups
+                         WHERE repository = $1 AND ended_reason IS NULL
+                         ORDER BY observed_at, head_sha COLLATE \"C\" LIMIT $2"
+                    ),
+                    &[&repo, &limit],
+                )?
+                .iter()
+                .map(merge_group_row)
+                .collect())
+        })
+    }
+
+    fn merge_groups_for_pull(
+        &self,
+        repo: &str,
+        pr_number: i64,
+        limit: usize,
+    ) -> Result<Vec<MergeGroup>> {
+        self.run(true, |client| {
+            let limit = limit as i64;
+            Ok(client
+                .query(
+                    &format!(
+                        "SELECT {MERGE_GROUP_COLUMNS} FROM hub_merge_groups
+                         WHERE repository = $1 AND pr_number = $2
+                         ORDER BY observed_at DESC, head_sha COLLATE \"C\" LIMIT $3"
+                    ),
+                    &[&repo, &pr_number, &limit],
+                )?
+                .iter()
+                .map(merge_group_row)
+                .collect())
+        })
+    }
+
+    fn end_merge_group(&self, repo: &str, head_sha: &str, reason: &str, now: i64) -> Result<bool> {
+        if !is_lower_hex(head_sha, 40) {
+            return Err(HubError::Invalid("merge group is out of bounds".into()));
+        }
+        validate_group_note(reason)?;
+        self.run(false, |client| {
+            Ok(client.execute(
+                "UPDATE hub_merge_groups SET ended_reason = $3, ended_at = $4, updated_at = $4
+                 WHERE repository = $1 AND head_sha = $2 AND ended_reason IS NULL",
+                &[&repo, &head_sha, &reason, &now],
+            )? == 1)
+        })
+    }
+
+    fn reserve_merge_group_check(
+        &self,
+        repo: &str,
+        head_sha: &str,
+        expected: i64,
+        new: &NewForgeCheck,
+        now: i64,
+    ) -> Result<ForgeCheckReserve> {
+        new.validate()?;
+        if new.head_sha != head_sha {
+            return Err(HubError::Invalid(
+                "forge check is not for this merge group".into(),
+            ));
+        }
+        self.run(false, |client| {
+            Ok(
+                if client.execute(
+                    "UPDATE hub_merge_groups SET state = $4, binding_digest = $5,
+                         description = $6, phase = 'attempting', generation = generation + 1,
+                         updated_at = $7
+                     WHERE repository = $1 AND head_sha = $2 AND generation = $3
+                         AND ended_reason IS NULL",
+                    &[
+                        &repo,
+                        &head_sha,
+                        &expected,
+                        &new.state,
+                        &new.binding_digest,
+                        &new.description,
+                        &now,
+                    ],
+                )? == 1
+                {
+                    ForgeCheckReserve::Reserved(expected.saturating_add(1))
+                } else {
+                    ForgeCheckReserve::Conflict
+                },
+            )
+        })
+    }
+
+    fn complete_merge_group_check(
+        &self,
+        repo: &str,
+        head_sha: &str,
+        generation: i64,
+        phase: &str,
+        now: i64,
+    ) -> Result<bool> {
+        if !is_lower_hex(head_sha, 40) {
+            return Err(HubError::Invalid("merge group is out of bounds".into()));
+        }
+        validate_check_phase(phase)?;
+        // No lifecycle guard: a post that happened after the group ended is still recorded.
+        self.run(false, |client| {
+            Ok(client.execute(
+                "UPDATE hub_merge_groups SET phase = $4, generation = generation + 1,
+                     updated_at = $5
+                 WHERE repository = $1 AND head_sha = $2 AND generation = $3",
+                &[&repo, &head_sha, &generation, &phase, &now],
+            )? == 1)
+        })
+    }
+
+    fn note_merge_group_source(
+        &self,
+        repo: &str,
+        head_sha: &str,
+        ruleset_requirement: &str,
+        status_source: &str,
+    ) -> Result<()> {
+        if !is_lower_hex(head_sha, 40) {
+            return Err(HubError::Invalid("merge group is out of bounds".into()));
+        }
+        validate_group_note(ruleset_requirement)?;
+        validate_group_note(status_source)?;
+        self.run(false, |client| {
+            client.execute(
+                "UPDATE hub_merge_groups SET ruleset_requirement = $3, status_source = $4
+                 WHERE repository = $1 AND head_sha = $2",
+                &[&repo, &head_sha, &ruleset_requirement, &status_source],
+            )?;
+            Ok(())
         })
     }
 

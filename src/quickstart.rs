@@ -1750,7 +1750,7 @@ fn hook_stage(cx: &mut Cx<'_>) {
     if env == Some(hook::Env::Foreign) {
         println!(
             "{name} already sets {} to a value I didn't write, so I left it alone; the hooks use it, so make sure it is this repository's agent token.",
-            crate::init_cli::TOKEN_VAR
+            hook::TOKEN_VAR
         );
     }
     let sets_token = matches!(env, Some(hook::Env::Set));
@@ -1955,18 +1955,14 @@ fn init_stage(cx: &mut Cx<'_>) {
         );
         return;
     }
-    let go = if cx.ui.yes {
-        cx.args.init
-    } else {
-        cx.ui.confirm(
-            "Also add AgentSCM to this repository's agent config (MCP, hooks and instructions for Claude Code, Codex, Cursor, Copilot and Gemini)? It writes files you can commit.",
-            true,
-        )
-    };
-    if !go {
+    if cx.ui.yes && !cx.args.init {
         return;
     }
-    match crate::init_cli::run_in(&root, Some(&hub), guard_repo(cx).as_deref(), None, cx.ui) {
+    // One question: init-repo shows the files and their diffs, then asks before writing.
+    println!(
+        "AgentSCM can also add this repository's agent instructions (AGENTS.md and the files that point Claude Code, Cursor, Copilot and Gemini at it), as files you can commit:"
+    );
+    match crate::init_cli::run_in(&root, None, Some(&hub), cx.ui) {
         Ok(outcome) => cx.init_written = outcome.written,
         Err(error) => println!("Couldn't add the agent config: {}.", short(&error)),
     }
@@ -2652,7 +2648,7 @@ mod tests {
     }
 
     fn hook_env() -> &'static str {
-        crate::init_cli::TOKEN_VAR
+        hook::TOKEN_VAR
     }
 
     #[cfg(unix)]

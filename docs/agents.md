@@ -23,14 +23,14 @@ Nothing is locked: a refusal happens once per session and file, a repeat always 
 
 | Tier | Agents | How |
 | --- | --- | --- |
-| **Wired by `agentscm init-repo`** | Claude Code, Codex CLI, Cursor, GitHub Copilot in VS Code | MCP config, hooks and instructions committed to the repository. |
+| **Instructions by `agentscm init-repo`** | Claude Code, Codex CLI, Cursor, GitHub Copilot in VS Code, Gemini CLI | Shared instruction files committed to the repository. No MCP config or hooks; those come from `client setup`. |
 | **Wired by `agentscm client setup --agent claude\|codex\|cursor\|copilot\|gemini`** | Claude Code, Codex CLI, Cursor, GitHub Copilot in VS Code, Gemini CLI | Binds one checkout to an existing hub and installs that agent's native hooks and MCP config locally, without committing files. Candidate behavior: not yet qualified end to end across all five clients or against a hosted hub ([onboarding](team-member-onboarding.md)). |
 | **Recipe** (hand configuration; not tested here) | Copilot coding agent and Copilot CLI, Gemini CLI and Antigravity, Windsurf, Devin, Amp, OpenCode, Cline | Point the agent's MCP client at the hub and give it the `AGENTS.md` snippet. |
 | **Advisory MCP only** | Roo | No hook; relies on the model following the instructions. |
 | **Not supported** | Aider | No hook or MCP client to attach to. |
 | **Untested** | Jules | Unknown. |
 
-"Wired" means the generated files match each vendor's current documentation (see [Verified against](#verified-against)). It does not mean the combination has been run in every product version. The hook client is tested against a stub hub with sample payloads written from the vendors' documentation, not in live sessions of each agent. Claude Code is the reference integration. The Codex, Cursor and Copilot wiring follows their documented hook formats. Gemini CLI gets instructions only: `init-repo` writes a `GEMINI.md` that imports `AGENTS.md`, but no MCP config and no hook, so nothing checks its edits unless you add the hub as an MCP server by hand (see [recipes](#recipes-for-other-agents)).
+"Wired" means the files `client setup` generates match each vendor's current documentation (see [Verified against](#verified-against)). It does not mean the combination has been run in every product version. The hook client is tested against a stub hub with sample payloads written from the vendors' documentation, not in live sessions of each agent. Claude Code is the reference integration. The Codex, Cursor and Copilot wiring follows their documented hook formats.
 
 ## Wire a repository
 
@@ -40,26 +40,20 @@ One person on the team runs, from the repository:
 agentscm init-repo --hub-url https://hub.example.com
 ```
 
-(`agentscm init` is the older command that prepares a hub data directory; `init-repo` is the one that writes agent config.) It shows the files it will create or change, with a diff, and asks once. `--agents claude,codex,cursor,copilot,gemini` limits it, `--yes` skips the question. It is safe to run again: files that are already right are reported unchanged and nothing is written. It never writes a token. Commit the result in one pull request.
+(`agentscm init` is the older command that prepares a hub data directory; `init-repo` is the one that writes agent instructions.) It shows the files it will create or change, with a diff, and asks once. `--agents claude,codex,cursor,copilot,gemini` limits it, `--yes` skips the question. It is safe to run again: files that are already right are reported unchanged and nothing is written. It writes no MCP config, hooks or token. Commit the result in one pull request. `--hub-url` is optional and only fills in the setup command it prints.
 
 | Agent | Files |
 | --- | --- |
-| Claude Code | `.mcp.json`, `.claude/settings.json`, `CLAUDE.md` (one line, `@AGENTS.md`) |
-| Codex CLI | `.codex/config.toml` (a marked block), `.codex/hooks.json` |
-| Cursor | `.cursor/mcp.json`, `.cursor/hooks.json`, `.cursor/rules/agentscm.mdc` |
-| Copilot in VS Code | `.vscode/mcp.json`, `.github/hooks/agentscm.json`, `.github/copilot-instructions.md` |
-| Gemini CLI | `GEMINI.md` (one import line; instructions only, no MCP config or hook) |
-| All | `AGENTS.md` (a marked block telling agents to start, to call `agentscm_check` before editing unless Claude Code, Codex or Copilot hooks already check their edits, to say so when coordination is unavailable, to do other work or ask when another agent holds a file, to answer handoff requests, and to finish) |
+| Claude Code | `CLAUDE.md` (one line, `@AGENTS.md`) |
+| Codex CLI | none; Codex reads `AGENTS.md` directly |
+| Cursor | `.cursor/rules/agentscm.mdc` |
+| Copilot in VS Code | `.github/copilot-instructions.md` |
+| Gemini CLI | `GEMINI.md` (one import line, `@./AGENTS.md`) |
+| All | `AGENTS.md` (a marked `<!-- agentscm:begin -->` block telling agents to start, to call `agentscm_check` before editing unless Claude Code, Codex or Copilot hooks already check their edits, to say so when coordination is unavailable, to do other work or ask when another agent holds a file, to answer handoff requests, and to finish) |
 
-Each developer then creates their own agent token (`agentscm hub token create --repo OWNER/NAME`, see [work intents](intents.md)) and sets it once in their shell profile:
+It then prints, per agent, `agentscm client setup --agent <agent> --hub <hub>`. Each developer runs that once per checkout: it signs in to the hub and adds that machine's MCP server and hooks (git-excluded local files or user-level plugins), and the hub's Connect agents page verifies them. See [onboarding](team-member-onboarding.md).
 
-```sh
-export AGENTSCM_HUB_TOKEN=<your agent token>
-```
-
-On Windows PowerShell, `setx AGENTSCM_HUB_TOKEN "<your agent token>"` and restart the terminal. Tokens never go into checked-in files: the generated config only names the variable. Copilot in VS Code asks for the token once, through VS Code's secret prompt, for its MCP server; its hook command (`agentscm hook copilot`) still reads `AGENTSCM_HUB_TOKEN`, so set the variable there too.
-
-These files need a hub that serves `/mcp` and `/v1/hub/hook/<agent>`. `init-repo` merges into existing JSON files: your own entries are kept, but keys are rewritten in alphabetical order, and a file with comments (JSONC) is left alone with a message.
+`init-repo` replaces only its marked block in existing files and leaves the rest alone.
 
 ### Choose source at task start and when dependencies grow
 
@@ -78,21 +72,21 @@ every agent obeyed it. Hooks still handle coordination only.
 
 ### What needs the `agentscm` binary
 
-- **Claude Code needs no install.** Its hooks are HTTP hooks that call the hub directly, and `.mcp.json` is a remote MCP server. Claude Code does not support HTTP hooks for `SessionStart`, so the session starts, for the hub, at the first edit check.
-- **Codex, Cursor and Copilot call `agentscm hook <agent>`** on each developer's machine, because their hooks run commands. Install it with `npx agentscm` or see [install](install.md). Their MCP servers need no install.
+- **Every agent connected with `client setup`** runs the `agentscm` binary on that machine: its hooks call `agentscm hook <agent> --client-connection` and its MCP server is the stdio `agentscm client mcp` proxy, both by absolute path. Install it with `npx agentscm` or see [install](install.md).
+- **Claude Code hooks from `agentscm quickstart` with a hub** are HTTP hooks that call the hub directly. Claude Code does not support HTTP hooks for `SessionStart`, so the session starts, for the hub, at the first edit check.
 
-If the binary or the hub is missing, the hooks do nothing visible (see below). MCP still works wherever the agent supports it.
+If the binary or the hub is missing, the hooks do nothing visible (see below).
 
 ## What `agentscm hook` does
 
 `agentscm hook <claude|codex|cursor|copilot|generic> [--hub-url URL]` reads the agent's hook JSON on standard input, sends it unchanged to `POST /v1/hub/hook/<agent>` with the token as a bearer header (for an edit, the JSON includes the edit's contents; the hub keeps only [the few fields it needs](hub.md#data-the-hub-stores)), and prints the hub's reply, which is already in the agent's own hook output format.
 
 - The token comes from `AGENTSCM_HUB_TOKEN`, else the file named by `AGENTSCM_HUB_TOKEN_FILE`, else `hub.json` as for `agentscm intent`. It is never a command-line argument.
-- The hub URL comes from `AGENTSCM_HUB_URL`, else `--hub-url` (the generated hook files carry it), else `hub.json`. A token stored in `hub.json` is only ever sent to the hub that file names, so a checked-in `--hub-url` cannot redirect it; to use a different hub, set `AGENTSCM_HUB_TOKEN`.
-- `--repo OWNER/NAME` (written by `init-repo` from the `origin` remote when it names exactly two path segments) adds `?repo=` to the hook and MCP URLs. If the token belongs to another repository the hub answers "coordination unknown" and records nothing, which catches one `AGENTSCM_HUB_TOKEN` reused across repositories.
+- The hub URL comes from `AGENTSCM_HUB_URL`, else `--hub-url`, else `hub.json`. A token stored in `hub.json` is only ever sent to the hub that file names, so a `--hub-url` in a hook command cannot redirect it; to use a different hub, set `AGENTSCM_HUB_TOKEN`.
+- `--repo OWNER/NAME` adds `?repo=` to the hook URL. If the token belongs to another repository the hub answers "coordination unknown" and records nothing, which catches one `AGENTSCM_HUB_TOKEN` reused across repositories.
 - It sends the Git root of the agent's working directory as `X-Agentscm-Root` so the hub can make edited paths repository-relative.
 - It gives up after 3 seconds.
-- `AGENTSCM_HUB_TOKEN` is sent to whatever hub URL the command carries, because you set it for this purpose. Treat a pull request that changes a `--hub-url` in a hook file like a change to your CI secrets: review it.
+- `AGENTSCM_HUB_TOKEN` is sent to whatever hub URL the command carries, because you set it for this purpose. AgentSCM no longer commits hook configuration; if you commit a hook command by hand, treat a change to its `--hub-url` like a change to your CI secrets: review it.
 - It prints only an allowlist of the hub's reply: context and message fields, Cursor's `permission` (always `allow`) and one kind of permission decision, a `deny` with a non-empty reason (the warn-once refusal), and that only for a pre-tool event and once per identical edit per session (a marker file, like the unknown note; a repeat of the same edit passes). It drops everything else (`ask`, `allow`, `defer`, a deny without a reason, `continue`, `decision`, `stopReason`, updated or modified inputs and tool output), so a wrong reply cannot stop the agent or rewrite its call.
 
 ### Hooks fail open
@@ -104,12 +98,12 @@ The cost is that failures are quiet. If warnings never appear, run `agentscm int
 ## Limits
 
 - A warning appears only for edits the agent makes through its file-edit tools. Files written by shell commands are not announced.
-- Claude Code, Codex and Copilot answer before the edit, in the same hook run, and can refuse it once. Claude Code shows a hook's added context to the model only after the tool ran, so a note alone arrives too late; that is why a contested edit is refused instead. The Copilot CLI's `preToolUse` has no field for a note, so it gets the refusal but no other notes. Cursor's `preToolUse` hook has no documented way to carry text to the model without denying the call, so `init-repo` wires Cursor's `postToolUse` hook instead: the file is announced and the warning arrives just after the first edit of it. Treat Cursor as warn-just-after.
+- Claude Code, Codex and Copilot answer before the edit, in the same hook run, and can refuse it once. Claude Code shows a hook's added context to the model only after the tool ran, so a note alone arrives too late; that is why a contested edit is refused instead. The Copilot CLI's `preToolUse` has no field for a note, so it gets the refusal but no other notes. Cursor's `preToolUse` hook has no documented way to carry text to the model without denying the call, so the Cursor hook is wired as `postToolUse` instead: the file is announced and the warning arrives just after the first edit of it. Treat Cursor as warn-just-after.
 - Claude Code's HTTP hook cannot tell the hub where the repository root is (the project directory is not available to HTTP-hook headers), so the hub makes paths relative to the directory the agent was started in. Start Claude Code at the repository root; from a subdirectory its edits are announced under shorter paths and may not match other agents' paths. The command hooks (`agentscm hook`) send the Git root and do not have this limit.
-- Codex hooks run only when the project is trusted, and Codex asks the developer to review new or changed hooks in `/hooks` once; regenerating the hook file asks again.
+- Codex hooks run only when the project is trusted, and Codex asks the developer to review new or changed hooks in `/hooks` once; changed hooks ask again.
 - Claude Code asks each developer to approve the project's MCP server and trust the folder before project hooks run.
 - Where the edited file path sits in Cursor, Copilot and Codex payloads is only partly documented; the hub reads the fields that vendor documents and ignores the rest.
-- The hub is trusted. Its replies go into each agent's context, and the URL that decides which hub that is sits in committed config: a hook's `--hub-url` and the MCP server URL. Whoever controls that URL controls the text the agents using the config see, and receives their token and hook payloads. Review changes to those files, and treat the hub as trusted.
+- The hub is trusted. Its replies go into each agent's context, and the URL that decides which hub that is sits in hook and MCP config: a hook's `--hub-url` and the MCP server URL. Whoever controls that URL controls the text the agents using the config see, and receives their token and hook payloads. Review changes to those files, and treat the hub as trusted.
 - Coverage depends on every agent on the team being wired. An unwired agent is invisible. A pull-request check as a backstop is planned, not built.
 - Stand-up claims persist across agent sessions, but only reported checkpoints are visible. A stale or unknown claim remains claimed; inspect the work and use the explicit takeover flow instead of assuming it is available.
 
@@ -160,12 +154,12 @@ Cell values:
 
 | Surface | MCP participation | Edit coordination | Completion trigger (Stop) | Blocking on completion |
 | --- | --- | --- | --- | --- |
-| Claude Code CLI | Not verified: `init-repo` writes `.mcp.json` from vendor docs; no client session was run. The hub tools are covered in the last row | Fixture-tested: pre-edit hook, refuses once per file and session | Live-qualified (print mode, CLI 2.1.304): local `claude-stop`. Fixture-tested: `remote-stop`, `task-stop` | Live-qualified (print mode, CLI 2.1.304): `claude-stop` blocked with the failing test's output, passed after the fix and stopped after 8 blocks. Fixture-tested: `remote-stop`, `task-stop`; at most 8 consecutive continuations; per vendor documentation checked 2026-10-20 the Claude cap resets on tool calls |
+| Claude Code CLI | Not verified: no client session was run. The hub tools are covered in the last row | Fixture-tested: pre-edit hook, refuses once per file and session | Live-qualified (print mode, CLI 2.1.304): local `claude-stop`. Fixture-tested: `remote-stop`, `task-stop` | Live-qualified (print mode, CLI 2.1.304): `claude-stop` blocked with the failing test's output, passed after the fix and stopped after 8 blocks. Fixture-tested: `remote-stop`, `task-stop`; at most 8 consecutive continuations; per vendor documentation checked 2026-10-20 the Claude cap resets on tool calls |
 | Claude Code desktop/IDE | Not verified: MCP config is the CLI's | Not verified: hook support in these surfaces is not checked | Not verified | Not verified |
-| Codex CLI | Not verified: `init-repo` writes `.codex/config.toml` from vendor docs; no client session was run | Fixture-tested: pre-edit hook, refuses once per file and session | Live-qualified (`codex exec` with `--dangerously-bypass-hook-trust`, CLI 0.163.0): local `codex-stop`. Fixture-tested: `remote-codex-stop`, `task-codex-stop` | Live-qualified (same mode): one block with feedback, then a pass after the fix. The 8-block bound was not live-tested; it is fixture-tested. Per vendor documentation checked 2026-10-20 Codex documents no cap of its own |
+| Codex CLI | Not verified: no client session was run | Fixture-tested: pre-edit hook, refuses once per file and session | Live-qualified (`codex exec` with `--dangerously-bypass-hook-trust`, CLI 0.163.0): local `codex-stop`. Fixture-tested: `remote-codex-stop`, `task-codex-stop` | Live-qualified (same mode): one block with feedback, then a pass after the fix. The 8-block bound was not live-tested; it is fixture-tested. Per vendor documentation checked 2026-10-20 Codex documents no cap of its own |
 | Codex IDE/desktop | Not verified | Not verified: hook support is not checked | Not verified | Not verified |
-| Cursor | Not verified: `init-repo` writes `.cursor/mcp.json` from vendor docs; no client session was run | Fixture-tested: post-edit note only; the hook cannot refuse | Not verified: no Stop adapter | Unsupported: no adapter, the edit hook cannot refuse, and per vendor documentation its `stop` hook can only return `followup_message` to continue (default `loop_limit` 5), not block |
-| Copilot | Not verified: `init-repo` writes `.vscode/mcp.json` from vendor docs; no client session was run | Fixture-tested: pre-edit hook, refuses once; the CLI gets the refusal but no notes | Not verified: no Stop adapter | Documented, not verified: Copilot CLI and cloud agent document `agentStop` with `decision: block` and `stop_hook_active`, capped at 8 consecutive blocks in the CLI. VS Code agent hooks (preview) document a `Stop` event; not verified. AgentSCM installs no adapter for either |
+| Cursor | Not verified: no client session was run | Fixture-tested: post-edit note only; the hook cannot refuse | Not verified: no Stop adapter | Unsupported: no adapter, the edit hook cannot refuse, and per vendor documentation its `stop` hook can only return `followup_message` to continue (default `loop_limit` 5), not block |
+| Copilot | Not verified: no client session was run | Fixture-tested: pre-edit hook, refuses once; the CLI gets the refusal but no notes | Not verified: no Stop adapter | Documented, not verified: Copilot CLI and cloud agent document `agentStop` with `decision: block` and `stop_hook_active`, capped at 8 consecutive blocks in the CLI. VS Code agent hooks (preview) document a `Stop` event; not verified. AgentSCM installs no adapter for either |
 | Any MCP client | Fixture-tested: the hub's `POST /mcp` coordination tools ([hub](hub.md#agent-sessions-mcp-and-hook-endpoints)), the workspace [agent-task MCP](advanced/agent-workflow-tasks.md) and the local [reusable-workflow stdio server](advanced/reusable-workflows.md#local-mcp-front-door) are exercised with synthetic protocol clients, not live vendor sessions. Hub coordination tools are advice only. The local server's configure and check tools require explicit startup grants; its paths and backends are fixed by the operator. A model can still skip calls | Unsupported: MCP alone has no hook, so no edit is intercepted | Unsupported: MCP has no completion event | Unsupported |
 
 Live qualification, 2026-10-20: one macOS machine, a synthetic fixture, a local native store, a Docker command check and a Claude review step. Claude Code print mode used `claude -p` with `--settings` pointing at a file written by `install-stop`. Codex used `codex exec` with hooks in an isolated `CODEX_HOME` `hooks.json` written by `install-stop`; hooks fired only with `--dangerously-bypass-hook-trust`, and a native workspace also needs `--skip-git-repo-check`. In both, an independent `skill-workflow check` confirmed a receipt for the current revision after the fix. Not live-tested: interactive Claude Code, Claude desktop/IDE, Codex interactive (`/hooks` trust), Codex IDE/desktop, the hosted `remote-*` stops and the agent-owned `task-stop` and `task-codex-stop`. The hosted and agent-owned stops are fixture-tested against a synthetic local HTTP hub harness, including token revocation, an unreachable endpoint, uncheckpointed edits and a stale subject.
