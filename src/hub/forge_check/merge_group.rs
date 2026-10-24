@@ -5,8 +5,9 @@
 //! differ from every pull request head, so a head success never carries over. Success needs the
 //! group commit's own tree to equal the tree the pinned native store qualified, on the very base
 //! the candidate was qualified against. A group stacked on other queued changes has no evidence
-//! for its combined source and stays pending. The webhook payload only names the group; its
-//! existence, tree and base are read again from GitHub.
+//! for its combined source and stays pending. The group commit, its base commit and the queued
+//! head come from GitHub's signed delivery; the group's existence, its tree and the pull request
+//! are read again from GitHub, and exact tree equality is what admits a success.
 use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 
@@ -383,8 +384,16 @@ pub(super) async fn reconcile_active(
         .filter(|p| p.publish_forge_status && p.repository_id.eq_ignore_ascii_case(&repo.full_name))
         .map(|p| p.target.clone())
         .collect();
+    // Readiness is an observation: a failed read must not hold back any group or pull request.
     for target in &targets {
-        observe_readiness(state, api, conn, repo, token, target).await?;
+        match observe_readiness(state, api, conn, repo, token, target).await {
+            Ok(()) => {}
+            Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
+            Err(GhError::Failed(detail)) => eprintln!(
+                "hub: merge queue readiness for {} {target}: {detail}",
+                repo.full_name
+            ),
+        }
     }
     for row in rows {
         match reconcile_group(state, conn, repo, token, &row).await {
@@ -458,8 +467,8 @@ async fn gone_reason(
 ) -> Gh<&'static str> {
     let pull = match api.pull_soft(token, &repo.full_name, row.pr_number).await {
         Ok(pull) => pull,
-        Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
-        Err(GhError::Failed(_)) => None,
+        // A failed read keeps the group current; the next pass classifies it, since ending is final.
+        Err(error) => return Err(error),
     };
     Ok(match pull {
         Some(pull) if pull["merged"] == true => {
@@ -898,18 +907,27 @@ async fn observe_readiness(
             let jwt = state.sync.jwt(conn).await?;
             match api.installation(&jwt, id).await {
                 Ok(found) => found,
-                Err(error @ GhError::Limited(_)) => return Err(error),
-                Err(GhError::Auth(_) | GhError::Failed(_)) => None,
+                Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
+                Err(GhError::Failed(_)) => None,
             }
         }
         _ => None,
     };
     let delivery = delivery_access(&conn.kind, installation.as_ref());
-    let undelivered = match api.queue_branches(token, &repo.full_name, target).await? {
+    let listed = match api.queue_branches(token, &repo.full_name, target).await {
+        Ok(listed) => listed,
+        Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
+        Err(GhError::Failed(_)) => None,
+    };
+    let undelivered = match listed {
         Some((branches, true)) => {
+            // The prefix also matches nested bases (`main/x` under `main`): keep this target's.
             let queued: Vec<(i64, String)> = branches
                 .into_iter()
-                .filter_map(|(name, sha)| Some((queue_branch(&name)?.pr_number, sha)))
+                .filter_map(|(name, sha)| {
+                    let queue = queue_branch(&name).filter(|q| q.base == target)?;
+                    Some((queue.pr_number, sha))
+                })
                 .collect();
             let (store, id) = (state.store.clone(), repo.id.clone());
             Some(
