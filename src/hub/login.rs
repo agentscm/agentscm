@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::forge_http::{Forge, check_base_url};
-use super::http::{ApiError, JsonBody, bearer, blocking};
+use super::http::{ApiError, JsonBody, Reader, bearer, blocking};
 use super::store::{
     ForgeIdentity, MAX_AGENT_TOKEN_TTL_SECONDS, User, mint_bound_agent_token, unix_now,
     validate_agent_name, validate_login, validate_repository,
@@ -556,6 +556,7 @@ pub fn routes() -> Router<HubState> {
         .route("/v1/hub/login/{provider}/device", post(device_start))
         .route("/v1/hub/tokens", post(create_token).get(list_tokens))
         .route("/v1/hub/tokens/{id}", delete(revoke_token))
+        .route("/v1/hub/token", delete(revoke_presented_token))
         .route("/v1/hub/session", get(session).delete(logout))
         .route("/v1/hub/users", get(list_users))
         .route("/v1/hub/users/{id}/disable", post(disable))
@@ -1259,6 +1260,24 @@ async fn revoke_token(
     } else {
         Err(not_found())
     }
+}
+
+/// An agent token revokes itself, so undoing a setup does not need a live sign-in.
+async fn revoke_presented_token(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+) -> ApiResult<StatusCode> {
+    let store = state.store.clone();
+    let workspace = state.workspace.clone();
+    blocking(&state, move || {
+        let operation = || store.revoke_owned_agent_token(&principal.owner.id, &principal.token_id);
+        match workspace {
+            Some(workspace) => workspace.with_identity_change(operation),
+            None => operation(),
+        }
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list_users(State(state): State<HubState>, human: HumanSession) -> ApiResult<Json<Value>> {

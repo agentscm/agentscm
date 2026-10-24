@@ -3224,16 +3224,24 @@ fn yes_without_claude_sets_up_no_agent() {
     let repo = machine.repo();
     let token = hub.token_file(machine.home.path());
     let output = machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"]));
-    // The requested hub is up but this checkout is not connected, so the run is incomplete.
-    assert_eq!(output.status.code(), Some(1), "{output:?}");
-    let said = out(&output);
+    // The hub is set up; with no agent found there is nothing to connect yet.
+    let said = ok(&output);
     assert!(
         said.contains("Claude Code wasn't found, so I'm not setting up a coding agent"),
         "{said}"
     );
+    for agent in ["claude", "codex", "cursor", "copilot", "gemini"] {
+        let line = format!("client setup --agent {agent} --hub {}", hub.url);
+        assert!(said.contains(&line), "{line}: {said}");
+    }
     assert!(machine.connections().is_empty());
     assert!(!repo.path().join(".mcp.json").exists());
-    assert!(last_line(&output).contains("this checkout isn't connected to the hub"));
+    assert!(
+        last_line(&output).contains("no coding agent was set up")
+            && last_line(&output).contains("quickstart --agent claude|codex"),
+        "{}",
+        last_line(&output)
+    );
 }
 
 #[test]
@@ -3248,7 +3256,7 @@ fn no_agents_skips_setup_even_with_claude_installed() {
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert!(machine.connections().is_empty() && machine.claude_log().is_empty());
     assert!(!repo.path().join(".mcp.json").exists());
-    assert!(last_line(&output).contains("this checkout isn't connected to the hub"));
+    assert!(last_line(&output).contains("no coding agent was set up"));
 }
 
 #[test]
@@ -3277,6 +3285,49 @@ fn without_a_terminal_it_refuses_and_writes_nothing() {
     let output = machine.run(repo.path(), &["uninstall"]);
     assert!(output.status.success());
     assert!(out(&output).contains("nothing was installed by quickstart"));
+}
+
+#[test]
+fn yes_with_an_expired_sign_in_refuses_at_once_instead_of_signing_in_again() {
+    let (hub, machine) = (Hub::start(), Machine::new().with_claude());
+    let repo = machine.repo();
+    std::fs::create_dir_all(machine.config()).unwrap();
+    let session = machine.config().join("hub-session.json");
+    // The hub does not know this session, as after it expired or the hub restarted.
+    std::fs::write(
+        &session,
+        json!({"hub": hub.url, "session": "expired", "expires_at": unix_now() + 3600}).to_string(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&session, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let started = std::time::Instant::now();
+    let output = machine.run(
+        repo.path(),
+        &[
+            "quickstart",
+            "--yes",
+            "--hub",
+            "existing",
+            "--hub-url",
+            &hub.url,
+            "--no-collisions",
+        ],
+    );
+    // A browser or device sign-in would wait for minutes.
+    assert!(started.elapsed() < std::time::Duration::from_secs(60));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let said = out(&output);
+    assert!(
+        said.contains("can't sign in again (no terminal, or --yes)")
+            && said.contains("pass --agent-token-file"),
+        "{said}"
+    );
+    assert!(
+        !said.contains("device") && !said.contains("browser"),
+        "{said}"
+    );
+    assert!(machine.connections().is_empty());
+    assert!(!repo.path().join(".mcp.json").exists());
 }
 
 #[test]
@@ -3366,4 +3417,196 @@ fn uninstall_without_a_terminal_still_needs_yes_when_something_is_recorded() {
     assert!(!output.status.success());
     assert!(repo.path().join(".mcp.json").exists());
     assert_eq!(machine.connections().len(), 1);
+}
+
+const FAKE_CODEX: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> "__STATE__/codex-log"
+[ "$*" = "plugin list --json" ] && printf '{"installed":[]}\n'
+exit 0
+"#;
+
+impl Machine {
+    /// Puts a fake `codex` next to the fake `claude`.
+    fn with_codex(self) -> Self {
+        let script = self.bin.path().join("codex");
+        std::fs::write(
+            &script,
+            FAKE_CODEX.replace("__STATE__", self.home.path().to_str().unwrap()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        self
+    }
+
+    /// Turns the checkout's connection into one `client setup` minted itself after a sign-in:
+    /// a new token in its own managed file. Returns the token's secret.
+    fn own_the_connection(&self, hub: &Hub) -> String {
+        use sha2::{Digest, Sha256};
+        let path = self.config().join("connections.json");
+        let mut all = json_file(&path);
+        let connection = &mut all["connections"][0];
+        let owner = hub
+            .store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: 1,
+                },
+                "octo",
+            )
+            .unwrap();
+        let (id, secret) = mint_agent_token(&*hub.store, &owner.id, "owned", REPO, 3600).unwrap();
+        let mut digest = Sha256::new();
+        for field in ["hub", "root", "origin_host", "repo"] {
+            digest.update(connection[field].as_str().unwrap().as_bytes());
+            digest.update([0]);
+        }
+        digest.update(id.as_bytes());
+        let suffix: String = digest.finalize()[..16]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let tokens = self.config().join("tokens");
+        std::fs::create_dir_all(&tokens).unwrap();
+        std::fs::set_permissions(&tokens, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let file = tokens.join(format!("client-{suffix}.token"));
+        std::fs::write(&file, format!("{}\n", secret.expose())).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        connection["token_file"] = json!(file);
+        connection["owned_token_id"] = json!(id);
+        connection["owned_token_expires_at"] = json!(unix_now() + 3600);
+        std::fs::write(&path, all.to_string()).unwrap();
+        secret.expose().to_owned()
+    }
+}
+
+fn whoami_status(hub: &Hub, secret: &str) -> u16 {
+    hub._runtime.block_on(async {
+        reqwest::Client::new()
+            .get(format!("{}/v1/hub/whoami", hub.url))
+            .bearer_auth(secret)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    })
+}
+
+#[test]
+fn uninstall_leaves_a_connection_quickstart_found_rather_than_made() {
+    let (hub, machine) = (Hub::start(), Machine::new().with_claude().with_codex());
+    let repo = machine.repo();
+    let token = hub.token_file(machine.home.path());
+    let token_text = std::fs::read(&token).unwrap();
+    ok(&machine.run(
+        repo.path(),
+        &[
+            "client",
+            "setup",
+            "--agent",
+            "codex",
+            "--hub",
+            &hub.url,
+            "--token-file",
+            token.to_str().unwrap(),
+        ],
+    ));
+    let codex_config = repo.path().join(".codex/config.toml");
+    let codex_before = std::fs::read(&codex_config).unwrap();
+    let said = ok(&machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"])));
+    assert!(said.contains("existed before quickstart"), "{said}");
+    assert!(
+        json_file(&machine.config().join("quickstart.json"))["clients"]
+            .as_array()
+            .is_none_or(|clients| clients.is_empty())
+    );
+    let _ = machine.run(repo.path(), &["uninstall", "--yes"]);
+    let connections = machine.connections();
+    assert_eq!(connections.len(), 1, "{connections:?}");
+    assert!(
+        connections[0]["agents"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("codex"))
+    );
+    assert_eq!(std::fs::read(&token).unwrap(), token_text);
+    assert_eq!(std::fs::read(&codex_config).unwrap(), codex_before);
+    let secret = String::from_utf8(token_text).unwrap();
+    assert_eq!(whoami_status(&hub, secret.trim()), 200);
+}
+
+#[test]
+fn uninstall_revokes_a_minted_token_with_the_token_itself() {
+    let (hub, machine) = (Hub::start(), Machine::new().with_claude());
+    let repo = machine.repo();
+    let token = hub.token_file(machine.home.path());
+    ok(&machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"])));
+    let secret = machine.own_the_connection(&hub);
+    assert_eq!(whoami_status(&hub, &secret), 200);
+    // No sign-in is saved: the token revokes itself.
+    assert!(!machine.config().join("hub-session.json").exists());
+    let said = ok(&machine.run(repo.path(), &["uninstall", "--yes"]));
+    assert!(said.contains("revoked token tok_"), "{said}");
+    assert_eq!(whoami_status(&hub, &secret), 401);
+    assert!(machine.connections().is_empty());
+    assert!(
+        !machine
+            .config()
+            .join("tokens")
+            .read_dir()
+            .unwrap()
+            .any(|_| true)
+    );
+}
+
+#[test]
+fn uninstall_that_cannot_revoke_fails_and_keeps_what_a_retry_needs() {
+    let (hub, machine) = (Hub::start(), Machine::new().with_claude());
+    let repo = machine.repo();
+    let token = hub.token_file(machine.home.path());
+    ok(&machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"])));
+    machine.own_the_connection(&hub);
+    drop(hub);
+    let output = machine.run(repo.path(), &["uninstall", "--yes"]);
+    assert_ne!(output.status.code(), Some(0), "{output:?}");
+    let said = out(&output);
+    assert!(said.contains("could not be revoked"), "{said}");
+    let connections = machine.connections();
+    assert_eq!(connections.len(), 1, "{connections:?}");
+    assert!(
+        connections[0]["agents"]
+            .as_array()
+            .is_none_or(|agents| agents.is_empty())
+    );
+    let file = PathBuf::from(connections[0]["token_file"].as_str().unwrap());
+    assert!(file.exists());
+    assert_eq!(
+        json_file(&machine.config().join("quickstart.json"))["clients"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn a_rerun_with_agents_changes_nothing() {
+    let (hub, machine) = (Hub::start(), Machine::new().with_claude());
+    let repo = machine.repo();
+    let token = hub.token_file(machine.home.path());
+    let args = quick(&hub.url, &token, &["--no-collisions"]);
+    ok(&machine.run(repo.path(), &args));
+    let files = [
+        machine.config().join("quickstart.json"),
+        machine.config().join("connections.json"),
+        repo.path().join(".mcp.json"),
+        token.clone(),
+    ];
+    let before: Vec<_> = files.iter().map(|f| std::fs::read(f).unwrap()).collect();
+    let said = ok(&machine.run(repo.path(), &args));
+    assert!(said.contains("No changes made."), "{said}");
+    let after: Vec<_> = files.iter().map(|f| std::fs::read(f).unwrap()).collect();
+    assert_eq!(after, before);
 }

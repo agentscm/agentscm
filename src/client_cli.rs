@@ -21,7 +21,7 @@ use crate::prompt::Ui;
 const TOKEN_BYTES: u64 = 16 * 1024;
 /// Hub maximum. Nothing renews agent tokens, so a shorter life stops every agent each day
 /// until someone signs in again; the token stays per repository and revocable.
-const AGENT_TOKEN_TTL: i64 = 30 * 24 * 60 * 60;
+const AGENT_TOKEN_TTL: i64 = agentscm::hub::store::MAX_AGENT_TOKEN_TTL_SECONDS;
 const REPLY_BYTES: usize = 64 * 1024;
 
 fn invalid(message: &str) -> Error {
@@ -79,6 +79,9 @@ pub(crate) struct ConnectArgs {
     /// Replace a different connection already bound to this checkout.
     #[arg(long)]
     pub(crate) replace: bool,
+    /// Refuse instead of starting a browser or device sign-in (quickstart with `--yes` or no terminal).
+    #[arg(skip)]
+    pub(crate) no_sign_in: bool,
 }
 
 #[cfg(unix)]
@@ -174,9 +177,10 @@ pub(crate) async fn setup(
         crate::client_setup::preflight(*agent, &root, program)?;
     }
     connect(args, root.clone(), wait).await?;
+    // Recorded first, so `client remove` also takes out a plugin a failed install left behind.
     for agent in agents {
-        crate::client_setup::install(*agent, &root, program)?;
         record_agent(&root, *agent)?;
+        crate::client_setup::install(*agent, &root, program)?;
     }
     Ok(())
 }
@@ -429,12 +433,26 @@ async fn mint_request(hub: &str, session: &str, repo: &str) -> Result<(u16, Valu
     .await
 }
 
-async fn session_for(hub: &str, provider: Provider, origin_host: &str) -> Result<String> {
+fn cannot_sign_in() -> Error {
+    invalid(
+        "the saved hub sign-in has expired or isn't accepted, and this run can't sign in again (no terminal, or --yes). Run quickstart at a terminal, or pass --agent-token-file",
+    )
+}
+
+async fn session_for(
+    hub: &str,
+    provider: Provider,
+    origin_host: &str,
+    no_sign_in: bool,
+) -> Result<String> {
     if has_session(Some(hub))? {
         let session = load_session(Some(hub))?.1;
         if hub_identity_matches(hub, &session, provider, origin_host).await? {
             return Ok(session);
         }
+    }
+    if no_sign_in {
+        return Err(cannot_sign_in());
     }
     sign_in(hub, provider_name(provider), Some(origin_host)).await?;
     let session = load_session(Some(hub))?.1;
@@ -526,9 +544,19 @@ async fn mint_agent_token(
     connection: &Connection,
     provider: Provider,
     wait: Option<&AppWait<'_>>,
+    no_sign_in: bool,
 ) -> Result<Minted> {
-    let mut session = session_for(&connection.hub, provider, &connection.origin_host).await?;
+    let mut session = session_for(
+        &connection.hub,
+        provider,
+        &connection.origin_host,
+        no_sign_in,
+    )
+    .await?;
     let (mut status, mut reply) = mint_request(&connection.hub, &session, &connection.repo).await?;
+    if status == 401 && no_sign_in {
+        return Err(cannot_sign_in());
+    }
     if status == 401 {
         sign_in(
             &connection.hub,
@@ -536,7 +564,7 @@ async fn mint_agent_token(
             Some(&connection.origin_host),
         )
         .await?;
-        session = session_for(&connection.hub, provider, &connection.origin_host).await?;
+        session = session_for(&connection.hub, provider, &connection.origin_host, false).await?;
         (status, reply) = mint_request(&connection.hub, &session, &connection.repo).await?;
     }
     if not_connected(status, &reply) {
@@ -617,6 +645,35 @@ fn warn_unrevoked(connection: &Connection, id: &str, expiry: i64) {
     );
 }
 
+/// Revokes a managed token with the token itself (no sign-in needed), else with a saved
+/// sign-in for its hub. A 401 to the token means it is already revoked or expired.
+async fn revoke_owned(connection: &Connection, id: &str, token: Option<&str>) -> bool {
+    let Ok(client) = forge_http::client() else {
+        return false;
+    };
+    if let Some(token) = token {
+        let target = format!("{}/v1/hub/token", connection.hub);
+        if let Ok((204 | 401, _)) = call(&client, Method::DELETE, &target, Some(token), None).await
+        {
+            return true;
+        }
+    }
+    let Ok((hub, session)) = load_session(Some(&connection.hub)) else {
+        return false;
+    };
+    hub == connection.hub
+        && call(
+            &client,
+            Method::DELETE,
+            &format!("{}/v1/hub/tokens/{id}", connection.hub),
+            Some(&session),
+            None,
+        )
+        .await
+        .is_ok_and(|(status, _)| matches!(status, 204 | 404))
+}
+
+/// Retires the managed token of a connection that `connect` just replaced.
 async fn retire_owned(connection: &Connection) {
     let (Some(id), Some(expiry)) = (
         connection.owned_token_id.as_deref(),
@@ -624,6 +681,7 @@ async fn retire_owned(connection: &Connection) {
     ) else {
         return;
     };
+    let token = read_token(&connection.token_file).ok();
     match remove_unreferenced_owned_file(connection) {
         Ok(RetiredFile::Referenced) => {
             eprintln!(
@@ -639,28 +697,7 @@ async fn retire_owned(connection: &Connection) {
             return;
         }
     }
-    let revoked = if let Ok((hub, session)) = load_session(Some(&connection.hub)) {
-        if hub == connection.hub {
-            if let Ok(client) = forge_http::client() {
-                call(
-                    &client,
-                    Method::DELETE,
-                    &format!("{}/v1/hub/tokens/{id}", connection.hub),
-                    Some(&session),
-                    None,
-                )
-                .await
-                .is_ok_and(|(status, _)| matches!(status, 204 | 404))
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-    if revoked {
+    if revoke_owned(connection, id, token.as_deref()).await {
         println!(
             "Deleted its token file and revoked token {id} on {}.",
             connection.hub
@@ -783,7 +820,7 @@ pub(crate) async fn connect(
         let provider = args.provider.or(inferred).ok_or_else(|| {
             invalid("cannot infer the forge sign-in provider for this origin; pass --provider github or --provider gitlab")
         })?;
-        let minted = mint_agent_token(&connection, provider, wait).await?;
+        let minted = mint_agent_token(&connection, provider, wait, args.no_sign_in).await?;
         let verified = match verify_token(&connection, &minted.token).await {
             Ok(verified) => verified,
             Err(error) => {
@@ -947,10 +984,45 @@ pub(crate) async fn remove_checkout(root: &Path) -> Result<()> {
             .any(|other| other.root != root && other.agents.contains(name));
         crate::client_setup::remove(agent, root, last)?;
     }
+    if let (Some(id), Some(expiry)) = (
+        connection.owned_token_id.as_deref(),
+        connection.owned_token_expires_at,
+    ) {
+        let shared = connections
+            .iter()
+            .any(|other| other.root != root && other.token_file == connection.token_file);
+        let token = read_token(&connection.token_file).ok();
+        if !shared && !revoke_owned(&connection, id, token.as_deref()).await {
+            // The connection and token file stay, so running `client remove` again retries.
+            let mut kept = connection.clone();
+            kept.agents.clear();
+            update(root, Some(&connection), Some(kept))?;
+            return Err(invalid(&format!(
+                "the agents' files were removed, but token {id} on {} could not be revoked (the hub did not answer or refused); it stays valid until unix {expiry}. Its connection and token file are kept: run `agentscm client remove --root {}` again when the hub answers (signing in with `agentscm hub login` first also lets it revoke)",
+                connection.hub,
+                root.display()
+            )));
+        }
+    }
     update(root, Some(&connection), None)?;
     println!("Removed the client connection for {}.", root.display());
-    if connection.owned_token_id.is_some() {
-        retire_owned(&connection).await;
+    if let (Some(id), Some(expiry)) = (
+        connection.owned_token_id.as_deref(),
+        connection.owned_token_expires_at,
+    ) {
+        match remove_unreferenced_owned_file(&connection) {
+            Ok(RetiredFile::Removed) => println!(
+                "Deleted its token file and revoked token {id} on {}.",
+                connection.hub
+            ),
+            Ok(RetiredFile::Referenced) => println!(
+                "Kept token {id} and its file: another client connection uses them (valid until unix {expiry})."
+            ),
+            Err(error) => eprintln!(
+                "warning: token {id} was revoked, but its file {} could not be deleted ({error})",
+                connection.token_file.display()
+            ),
+        }
     } else {
         println!(
             "The token file {} was given to setup, so it and its token were left unchanged.",

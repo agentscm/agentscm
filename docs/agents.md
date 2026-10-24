@@ -73,7 +73,7 @@ every agent obeyed it. Hooks still handle coordination only.
 ### What needs the `agentscm` binary
 
 - **Every agent connected with `client setup`** runs the `agentscm` binary on that machine: its hooks call `agentscm hook <agent> --client-connection` and its MCP server is the stdio `agentscm client mcp` proxy, both by absolute path. Install it with `npx agentscm` or see [install](install.md).
-- **Claude Code hooks from `agentscm quickstart` with a hub** are HTTP hooks that call the hub directly. Claude Code does not support HTTP hooks for `SessionStart`, so the session starts, for the hub, at the first edit check.
+- **Agents set up by `agentscm quickstart`** are the same: quickstart runs `client setup` for them.
 
 If the binary or the hub is missing, the hooks do nothing visible (see below).
 

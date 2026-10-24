@@ -282,6 +282,8 @@ struct Live {
     repo: Option<String>,
     /// Agents set up in this checkout.
     agents: Vec<String>,
+    /// This run tried to set up at least one agent.
+    wanted_agents: bool,
     pending_local: Option<String>,
 }
 
@@ -305,6 +307,10 @@ impl Live {
             (Some(url), _) if !self.hub_up => off(
                 &format!("the hub at {url} isn't answering"),
                 &format!("start it, then run `{cli} quickstart` again"),
+            ),
+            (Some(_), None) if !self.wanted_agents => off(
+                "no coding agent was set up",
+                &format!("run `{cli} quickstart --agent claude|codex|cursor|copilot|gemini`"),
             ),
             (Some(_), None) => off(
                 "this checkout isn't connected to the hub",
@@ -425,8 +431,8 @@ pub async fn run(args: QuickstartArgs) -> Result<u8> {
     if (args.local
         || matches!(args.hub, Some(HubChoice::Local | HubChoice::Existing))
         || args.hub_url.is_some())
-        // With --no-agents nothing is connected on purpose.
-        && (!cx.live.hub_up || (cx.live.repo.is_none() && !args.no_agents))
+        // Without an agent to set up (--no-agents, or none found) nothing is connected on purpose.
+        && (!cx.live.hub_up || (cx.live.repo.is_none() && cx.live.wanted_agents))
     {
         return Err(invalid(
             "the requested hub setup is incomplete; see the status and recovery instructions above",
@@ -1018,11 +1024,38 @@ fn chosen_agents(cx: &Cx<'_>) -> Vec<crate::client_setup::Agent> {
         cx.args.agent.clone()
     } else if cx.found.claude {
         vec![crate::client_setup::Agent::Claude]
-    } else {
-        println!(
-            "Claude Code wasn't found, so I'm not setting up a coding agent (use --agent to choose one)."
-        );
+    } else if cx.ui.yes {
+        println!("Claude Code wasn't found, so I'm not setting up a coding agent.");
         Vec::new()
+    } else {
+        use clap::ValueEnum;
+        let agents = crate::client_setup::Agent::value_variants();
+        let mut options: Vec<&str> = agents.iter().map(|agent| agent.name()).collect();
+        options.push("none for now");
+        let none = options.len() - 1;
+        let pick = cx.ui.choose(
+            "Claude Code wasn't found. Which coding agent should I set up?",
+            &options,
+            none,
+        );
+        agents
+            .get(pick)
+            .map(|agent| vec![*agent])
+            .unwrap_or_default()
+    }
+}
+
+/// The `client setup` line for every supported agent, for setting one up later.
+#[cfg(unix)]
+fn print_agent_setup_hints(cx: &Cx<'_>, hub: &str) {
+    use clap::ValueEnum;
+    println!("To set up a coding agent later, run one of these in this checkout:");
+    for agent in crate::client_setup::Agent::value_variants() {
+        println!(
+            "  {} client setup --agent {} --hub {hub}",
+            cli_command(cx),
+            agent.name()
+        );
     }
 }
 
@@ -1037,8 +1070,12 @@ async fn agents_stage(_cx: &mut Cx<'_>) {
 async fn agents_stage(cx: &mut Cx<'_>) {
     let agents = chosen_agents(cx);
     if agents.is_empty() {
+        if let (false, Some(hub), true) = (cx.args.no_agents, &cx.live.hub, cx.live.hub_up) {
+            print_agent_setup_hints(cx, hub);
+        }
         return;
     }
+    cx.live.wanted_agents = true;
     let names = agents
         .iter()
         .map(|agent| agent.name())
@@ -1060,9 +1097,11 @@ async fn agents_stage(cx: &mut Cx<'_>) {
         return;
     };
     let signed_in = hub_cli::has_session(Some(&hub)).unwrap_or(false);
-    if cx.args.agent_token_file.is_none() && !cx.tty && !signed_in {
+    // With --yes or no terminal nobody can finish a browser or device sign-in.
+    let no_sign_in = cx.ui.yes || !cx.tty;
+    if cx.args.agent_token_file.is_none() && no_sign_in && !signed_in {
         println!(
-            "Not setting up {names}: I can't sign in without a terminal; pass --agent-token-file."
+            "Not setting up {names}: this run can't sign in to the hub (no terminal, or --yes). Run quickstart at a terminal, or pass --agent-token-file."
         );
         return;
     }
@@ -1113,6 +1152,7 @@ async fn agents_stage(cx: &mut Cx<'_>) {
         provider: cx.args.provider,
         root: Some(root.clone()),
         replace,
+        no_sign_in,
         ..Default::default()
     };
     let wait = crate::client_cli::AppWait {
@@ -1123,10 +1163,19 @@ async fn agents_stage(cx: &mut Cx<'_>) {
     if !signed_in && hub_cli::has_session(Some(&hub)).unwrap_or(false) {
         cx.manifest.session = Some(SessionRecord { hub: hub.clone() });
     }
-    // A connection made before a later step failed is still quickstart's to undo.
+    // Uninstall undoes only a connection this run made (also when a later step failed), not one
+    // it found and kept, such as a manual `client setup`.
     if let Some(connection) = checkout_connection(&cx.found) {
-        if !cx.manifest.clients.contains(&connection.root) {
+        let created = existing.as_ref().is_none_or(|before| {
+            before.hub != connection.hub || before.token_file != connection.token_file
+        });
+        if created && !cx.manifest.clients.contains(&connection.root) {
             cx.manifest.clients.push(connection.root.clone());
+        } else if !cx.manifest.clients.contains(&connection.root) {
+            println!(
+                "This checkout's connection existed before quickstart, so `uninstall` leaves it; `{} client remove` takes it out.",
+                cli_command(cx)
+            );
         }
         cx.live.repo = Some(connection.repo.clone());
         cx.live.agents = connection.agents.clone();
