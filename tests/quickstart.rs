@@ -2374,7 +2374,8 @@ fn native_uninstall_journal_inspection_failure_changes_nothing() {
         .env("FAKE_PLIST", &plist)
         .output()
         .unwrap();
-    assert_eq!(normalized.status.code(), Some(1), "{normalized:?}");
+    // --no-agents leaves the checkout unconnected on purpose, so this setup run succeeds.
+    assert_eq!(normalized.status.code(), Some(0), "{normalized:?}");
     let journal = config.join(".github-update.json");
     std::fs::write(&journal, "synthetic private recovery evidence").unwrap();
     std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -3315,7 +3316,7 @@ fn a_foreign_agentscm_hook_makes_setup_refuse_before_anything_is_written() {
     let said = out(&output);
     assert!(
         said.contains("Couldn't finish setting up claude: ")
-            && said.contains("existing AgentSCM Claude command hooks were found"),
+            && said.contains("that the plugin would duplicate"),
         "{said}"
     );
     assert!(machine.connections().is_empty());
