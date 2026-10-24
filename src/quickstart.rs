@@ -887,6 +887,7 @@ async fn local_hub(cx: &mut Cx<'_>) -> std::result::Result<Option<String>, Strin
                 cx.args.slack_config_file.as_deref(),
                 Path::new("/data/secrets/slack"),
             )?;
+            cx.manifest.bin_parent_created |= !cx.home.join(".agentscm").exists();
             hub_local::start(
                 cx.ui,
                 cx.args.github_login.as_deref(),
@@ -1490,6 +1491,9 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
         manual.push(command);
         left.local_hub = Some(local.clone());
     }
+    if m.bin_parent_created && left.bin_dir.is_none() && left.local_hub.is_none() {
+        remove_created_root(&home);
+    }
     if left.is_empty() {
         let _ = std::fs::remove_file(manifest::path()?);
         println!("Removed quickstart's record.");
@@ -1505,6 +1509,13 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
     Err(invalid(
         "uninstall did not finish; see the list above (quickstart.json keeps what is left)",
     ))
+}
+
+/// Drops `~/.agentscm` (and an emptied `hubs`) that quickstart created, only if nothing is left.
+fn remove_created_root(home: &Path) {
+    let root = home.join(".agentscm");
+    let _ = std::fs::remove_dir(root.join("hubs"));
+    let _ = std::fs::remove_dir(root);
 }
 
 /// `Err` carries the command to finish by hand.
@@ -1550,6 +1561,20 @@ fn safe_hub_data_dir(dir: &Path, home: &Path, project: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn created_root_goes_only_when_empty() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".agentscm");
+        std::fs::create_dir_all(root.join("hubs")).unwrap();
+        std::fs::write(root.join("keep"), "x").unwrap();
+        remove_created_root(home.path());
+        assert!(root.join("keep").exists() && !root.join("hubs").exists());
+        std::fs::remove_file(root.join("keep")).unwrap();
+        std::fs::create_dir_all(root.join("hubs")).unwrap();
+        remove_created_root(home.path());
+        assert!(!root.exists());
+    }
 
     #[test]
     fn pending_local_setup_names_the_resume_command_instead_of_token_setup() {
