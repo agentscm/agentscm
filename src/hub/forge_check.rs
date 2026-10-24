@@ -331,6 +331,7 @@ pub(super) async fn reconcile_repo(
         .cloned()
         .collect();
     if only.is_none() {
+        merge_group::reconcile_active(state, conn, repo, token).await?;
         retire_disabled(state, conn, repo, token, &profiles).await?;
     }
     if profiles.is_empty() {
@@ -930,6 +931,8 @@ async fn publication_native(
     })
     .await
 }
+
+pub mod merge_group;
 
 #[cfg(test)]
 mod tests;
