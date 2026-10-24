@@ -286,6 +286,8 @@ struct Live {
     agents: Vec<String>,
     /// This run tried to set up at least one agent.
     wanted_agents: bool,
+    /// Why a requested local hub isn't running.
+    hub_error: Option<String>,
     pending_local: Option<String>,
 }
 
@@ -300,6 +302,13 @@ impl Live {
             );
         }
         match (&self.hub, &self.repo) {
+            (None, _) if self.hub_error.is_some() => off(
+                &format!(
+                    "local hub not started: {}",
+                    self.hub_error.as_deref().unwrap_or_default()
+                ),
+                &format!("fix that, then run `{cli} quickstart --local` again"),
+            ),
             (None, _) => off(
                 "no hub chosen",
                 &format!(
@@ -724,6 +733,7 @@ async fn choose_hub(cx: &mut Cx<'_>) -> Option<String> {
                             cli_command(cx)
                         );
                     }
+                    cx.live.hub_error = Some(message.clone());
                     if cx.ui.yes {
                         cx.failure = Some(message);
                         return None;
@@ -1650,6 +1660,20 @@ mod tests {
         };
         let error = preflight_slack(&args).unwrap_err().to_string();
         assert!(error.contains("requires a managed local Hub"));
+    }
+
+    #[test]
+    fn the_last_line_names_why_a_requested_local_hub_is_not_running() {
+        let live = Live {
+            hub_error: Some("Docker is not running.".into()),
+            ..Live::default()
+        };
+        let line = live.line("agentscm");
+        assert!(
+            line.starts_with("Live warnings: off — local hub not started: Docker is not running."),
+            "{line}"
+        );
+        assert!(!line.contains("no hub chosen"), "{line}");
     }
 
     #[test]
