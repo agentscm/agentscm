@@ -140,9 +140,11 @@ app does not offer the device flow, it uses a browser flow through a loopback
 port: it prints a hub URL to open, receives a one-time code on
 `127.0.0.1`, and trades it for the session using a PKCE verifier that never
 leaves the machine. The session (8 hours at most, and never longer than the
-forge's token) is saved to `$XDG_CONFIG_HOME/agentscm/hub-session.json`
-(else `~/.config/agentscm/...`) with mode 0600. It is sent only to the hub that
-issued it.
+forge's token) is saved to `$XDG_CONFIG_HOME/agentscm/hub-sessions.json`
+(else `~/.config/agentscm/...`) with mode 0600, one entry per hub (at most 32); the latest
+sign-in becomes the default hub. It is sent only to the hub that issued it.
+`agentscm hub sessions list` shows the saved sign-ins and their expiry, and
+`agentscm hub sessions remove --hub URL` forgets one locally without contacting its hub.
 
 - `agentscm hub token create --name N --repo owner/name [--ttl 8h] [--read-only]` asks the
   forge, with the person's own token, whether they can read the repository, and
@@ -150,9 +152,10 @@ issued it.
   forge repository id (403 `not_connected` otherwise); only then does it mint. The secret is the only line on stdout. `--ttl` takes
   `<n>s|m|h|d`, at most 30 days. `--read-only` makes a [read-only token](#read-only-tokens).
 - `agentscm hub token list` (read-only tokens are marked `read-only`) and `agentscm hub token revoke <tok_id>`.
-- `agentscm hub logout` ends the session on the hub (a failure is ignored) and
-  deletes the session file.
-- `--hub URL` on the token commands must match the hub in the session file.
+- `agentscm hub logout [--hub URL]` ends that hub's session on the hub (a failure is ignored)
+  and removes its saved entry.
+- `--hub URL` on the token commands picks the saved session for that hub (default: the default
+  hub); without a saved session for it the command fails.
 
 The browser flow sets the cookie `__Host-agentscm_login` (`Secure`, `HttpOnly`,
 `SameSite=Lax`, 10 minutes). Some browsers, notably Safari, drop `Secure`
@@ -176,8 +179,9 @@ sign-in there.
   `POST /v1/hub/login/{provider}/device` and `POST /v1/hub/login/device/poll`
   (`handle`; replies `pending`, `slow_down`, `expired`, `denied` or
   `signed_in` with the session). Failures are `login_failed` (400),
-  `login_denied` (403), `user_disabled` (403) or `device_flow_unavailable`
-  (409). A session secret is returned once, at `exchange` or `signed_in`.
+  `login_denied` (403), `user_disabled` (403), `device_flow_unavailable`
+  (409) or `too_many_logins` (429: one client address already has 8 pending browser or
+  device starts). A session secret is returned once, at `exchange` or `signed_in`.
 - Human session (`Authorization: Bearer <session>`; an agent token is refused
   here and a session is refused on `whoami`): `GET /v1/hub/session`,
   `DELETE /v1/hub/session` (204; ends this session),
@@ -203,12 +207,21 @@ on no others:
 - `GET /v1/hub/health`, which needs no token
 - `GET /v1/hub/skill-workflows` for recent runs in an operator-mapped native repository
 - `GET /v1/hub/skill-workflows/{run_id}` for an operator-mapped native repository
-- `GET /v1/hub/standup/briefing`, `GET /v1/hub/standup/work?q=` (search) and `GET /v1/hub/standup/work/{id}` for the token's repository
+- `GET /v1/hub/standup/briefing`, `GET /v1/hub/standup/overview`, `GET /v1/hub/standup/work?q=`
+  (search), `GET /v1/hub/standup/work/{id}`, `GET /v1/hub/standup/insights`,
+  `GET /v1/hub/standup/work/{id}/insights`, `GET /v1/hub/standup/coordination` and
+  `GET /v1/hub/standup/inbox` for the token's repository
+- `GET /v1/hub/view-settings` and `GET /v1/hub/onboarding` (the Connect agents page)
+- `GET /v1/hub/skills` and the `GET /v1/hub/repos/{repo}/skills/runs` routes (see the
+  [API](api.md#hub-supported-skills-routes-experimental))
 - `GET /v1/hub/repos/{repo}/change-records/{work_id}` for a concise source-bound handoff
 - `GET /v1/hub/repos/{repo}/publications` and `GET /v1/hub/repos/{repo}/publications/{id}`
   (stored state only; see [publications](#publishing-a-revision))
-- MCP `initialize`, `ping`, `tools/list`, `agentscm_workflow_status`, `agentscm_work_briefing`, and
-  `agentscm_change_record`
+- MCP `initialize`, `ping`, `tools/list`, `resources/list`, `resources/read`, and the tools
+  `agentscm_workflow_status`, `agentscm_work_briefing`, `agentscm_work_overview`,
+  `agentscm_work_insight`, `agentscm_work_insights`, `agentscm_change_record`,
+  `agentscm_work_search`, `agentscm_publications_list`, `agentscm_workflow_runs_list`,
+  `agentscm_coordination_inbox`, `agentscm_skill_list` and `agentscm_skill_status`
 
 Every other route that takes an agent token (announcing, renewing and releasing intents, `notices`,
 creating, uploading to and running publications, and coordination MCP mutation tools, including `agentscm_status`, which also renews a hold)
@@ -516,7 +529,7 @@ than 16 runs while `next_cursor` is set because older runs may still match; foll
 client can say it searched only part of the history. The scan reads only run id, state, name and
 revision per row; the existing
 `GET /v1/hub/skill-workflows/{run_id}` returns one full retained projection. Read-only tokens discover
-only that tool; operator mapping and availability are described in the
+only the read tools listed under [Read-only tokens](#read-only-tokens); operator mapping and availability are described in the
 [workflow hub guide](advanced/skill-workflow-hub.md). Bad arguments and hub errors are tool results with
 `isError: true` and the "coordination unknown" text.
 
@@ -576,7 +589,7 @@ references contain identities and availability, while selected prompt, tool and 
 in the private local spool.
 
 `GET /v1/hub/repos/{repo}/change-records/{work_id}`, the read-only MCP tool
-`agentscm_change_record`, `agentscm change-capture show`, and the Hub UI Change record page all read
+`agentscm_change_record`, `agentscm change-capture show`, and the Hub UI Change records page all read
 the same projection. It exposes bounded Work intent/scope, inspectable Git or native source facts,
 session gaps, action facts, a retained Work decision, next action, completeness and unknowns. An
 agent-authored decision remains a proposal rather than human approval. Reads do not acknowledge or
@@ -591,8 +604,12 @@ are pending. See [local change capture](change-capture.md) for configuration and
 
 ## Status page
 
-`/ui/` is a read-only page of what the hub knows about one repository: the live sessions and
-recent events from `GET /v1/hub/repos/{repo}/activity`. The container image serves it (it is built
+`/ui/` is a read-only page of what the hub knows about one repository. Its rail groups the pages:
+Coordinate (Right now, Work, Activity: live sessions and recent events from
+`GET /v1/hub/repos/{repo}/activity`, and work from the stand-up routes), Verify (Workflows, Change
+records, Landed changes, Skills), This computer (Templates and Timeline, which read a local
+`agentscm serve`, not the hub: see [local template and timeline reads](api.md#local-template-and-timeline-reads))
+and Manage (Workspace, Connect agents, Hub health, Settings). The container image serves it (it is built
 with `--features ui`, as are the release binaries); `/` and `/ui` redirect to it. A binary built
 from source without the feature answers `/ui/` with a short notice page and nothing else.
 
@@ -605,14 +622,14 @@ browser login and keeps a cookie session. The page polls every few seconds and r
 bounded recent-run list once and an individual run when selected. Mint a token only for this, so it
 can be revoked on its own:
 
+```sh
+agentscm hub token create --read-only --name status-page --repo owner/name
+```
+
 The Verify rail and each Work detail can open `#change-record/{work_id}`. That page performs one
 bounded read of the concise change-record projection and refreshes only on request. A missing record,
 authorization denial, unavailable service and incomplete evidence remain distinct states. The
 filled browser path still needs integrated qualification with a current captured record.
-
-```sh
-agentscm hub token create --read-only --name status-page --repo owner/name
-```
 
 Every `/ui/` response carries a `Content-Security-Policy` that allows scripts only from the hub
 itself, plus `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and `Cache-Control:
@@ -1339,7 +1356,12 @@ The container test does not include a forge. Pull-request overlaps (webhook and 
   is the forge's own spelling.
 - Expose the hub only to the people who use it, and rate-limit it at the proxy:
   unauthenticated sign-in starts call the forge and fill the bounded tables
-  (oldest entries are evicted when full).
+  (oldest entries are evicted when full). One client address may hold at most 8 pending
+  browser starts and 8 pending device starts (429 `too_many_logins` past that); behind a proxy on
+  a loopback or private address the last `X-Forwarded-For` entry is the client address. Every
+  request must send its whole request head within 30 seconds, and a request still running after
+  30 seconds gets 408 (attached-candidate publication operations have their own bound; see
+  [the API](api.md#workspace-attached-candidate-publication)).
 - The loopback flow trusts the local machine: a local process that gets a
   person to open a sign-in URL it built receives that person's session. Device
   codes can be phished like any device flow.

@@ -1,6 +1,6 @@
 # MCP Apps views for the hub: implementation spec (proposal)
 
-Status: implemented in the work-overview and coordination-inbox views with hub-side on/off settings (`agentscm_view_settings`, Settings page in the 1c UI). Not verified against a real host yet. Extends [mcp-ui-integration.md](mcp-ui-integration.md) (Direction 1). Host support is documented for Claude, VS Code Copilot, Cursor and ChatGPT; Claude Code is unverified (probably no). Re-check before shipping.
+Status: implemented in the work-overview and coordination-inbox views with hub-side on/off settings (`agentscm_view_settings`, Settings page in the 1c UI). Not verified against a real host yet. Extends the earlier `mcp-ui-integration.md` note (Direction 1), which is not in this repository. Host support is documented for Claude, VS Code Copilot, Cursor and ChatGPT; Claude Code is unverified (probably no). Re-check before shipping.
 
 ## Adversarial panel record
 

@@ -4,7 +4,7 @@ AgentSCM is alpha software. Small, focused pull requests are welcome; for anythi
 
 ## Set up
 
-Users run the container image (see the [README](README.md#quickstart)). To work on the code you need `git` 2.45.0 or newer and the Rust toolchain pinned in `rust-toolchain.toml` (installed by `rustup` on first use; it is also the minimum supported Rust version). The Git snapshot bridge enforces that Git minimum before it inspects a repository.
+Users install a release binary with `npx agentscm` (see the [README](README.md#quickstart)). To work on the code you need `git` 2.45.0 or newer and the Rust toolchain pinned in `rust-toolchain.toml` (installed by `rustup` on first use; it is also the minimum supported Rust version). The Git snapshot bridge enforces that Git minimum before it inspects a repository.
 
 ```sh
 cargo fmt --check

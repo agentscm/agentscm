@@ -35,7 +35,7 @@ the matching name. The member does not choose between hooks, MCP or APIs.
 Setup verifies the Hub URL and the clone's `origin`, then checks the selected agent's existing
 AgentSCM wiring. That preflight detects another enabled branded AgentSCM plugin or raw AgentSCM
 hook before token minting or binding mutation. Setup then signs you in through the Hub when needed,
-creates a private eight-hour token for that repository and binds the exact checkout root. It reuses
+creates a private 30-day token (the Hub maximum) for that repository and binds the exact checkout root. It reuses
 a current binding for the same root and Hub. The token is stored in a unique owner-only file and is
 never put in the repository, generated agent configuration, URL or command.
 
@@ -134,10 +134,10 @@ information.
 expiry; a supplied token is labelled as externally managed. `check` verifies the selected binding
 against its Hub.
 
-`remove` removes only the local binding. It never revokes a remote token or deletes a token file.
-Pass the exact absolute registered root; that lexical path still works after the checkout has been
-deleted. For a setup-created token, the command prints its ID and expiry so you can revoke it
-separately. AgentSCM never changes the lifecycle of a supplied token.
+`remove` takes AgentSCM's entries out of the checkout's agent files and removes the local binding.
+For a setup-created token it also revokes the remote token and deletes its file, as described
+below. Pass the exact absolute registered root; that lexical path still works after the checkout
+has been deleted. AgentSCM never changes the lifecycle of a supplied token.
 
 When setup successfully replaces or refreshes a token it created, it first commits the new binding.
 Under the connection lock it preserves an old managed token file if another binding still references
@@ -248,7 +248,7 @@ Before approving hooks or MCP configuration:
 
 `agentscm client remove --root PATH` undoes `client setup` for one checkout: it takes the agents' entries out of the checkout's files, uninstalls the Claude Code or Codex plugin when no other connected checkout uses it, revokes the managed token (the token revokes itself through `DELETE /v1/hub/token`, so no sign-in is needed), then removes the connection and deletes the token file. If the token can't be revoked, it says so, exits non-zero and keeps the connection and token file so that running it again retries. `agentscm uninstall` runs `client remove` for every checkout quickstart connected, then undoes the rest of quickstart's setup.
 
-`agentscm init-repo` commits only shared agent instruction files (no MCP config, hooks or token). Each developer still runs `agentscm client setup --agent <agent> --hub <hub>` once per checkout, and the Connect agents page verifies the result.
+`agentscm init-repo` writes only shared agent instruction files for the team to commit (no MCP config, hooks or token). Each developer still runs `agentscm client setup --agent <agent> --hub <hub>` once per checkout, and the Connect agents page verifies the result.
 
 Then run `agentscm client list` and `agentscm client check` for the local binding. Start a real agent
 task and confirm that its session appears for the expected repository in the hosted Hub. A local

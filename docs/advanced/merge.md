@@ -124,8 +124,8 @@ checks precede application. The workspace journal freezes both generations and
 the source bindings before filesystem mutation. Its existing staged replacement
 and recovery path preserves unexpected dirty bytes as blocked outcomes, and
 unrelated edits remain. Roll-back uses `workspace recover --choice roll-back`.
-Workspace schema v1 upgrades transactionally to v2, preserving old staged data
-and operation outcomes. Older binaries reject v2; back up source and workspace
+Workspace schemas v1 to v4 upgrade transactionally to v5, preserving old staged data
+and operation outcomes. Older binaries reject v5; back up source and workspace
 consistently before upgrading valuable data. See [workspace limits and filesystem
 race boundaries](workspace.md).
 

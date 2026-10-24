@@ -120,7 +120,7 @@ The palette is a neutral light/dark canvas with white or deep blue-black content
 - **Box head band** (`--hub-surface-head`, `#EEF1F7` / `#282E46`): The tinted head of every evidence box.
 - **Rules** (`--hub-rule` / `--hub-rule-strong`): 10% / 18% ink in light, 8% / 15% white in dark.
 - **Elevated dark surface** (`#1A1E30`): Dark elevated controls and overlays.
-- **Theme text and border:** Use `--cb-text`, `--cb-text-2`, `--cb-text-3`, and `--cb-border` so contrast follows the active theme.
+- **Theme text and border:** Use `--hub-text`, `--hub-text-2`, `--hub-text-3`, and `--hub-rule` / `--hub-rule-strong` so contrast follows the active theme.
 
 ### Named Rules
 **The Semantic Field Rule.** State fields use violet for active or handover, rose for blocked, amber for paused or stale, and green for finished or active assignment; every field includes text.
@@ -185,7 +185,7 @@ Touch targets stay at 44px in both modes and phones get the lighter increase.
 
 **The Three Planes Rule.** The Hub has three planes, each one tonal step apart, so navigation never reads as content: **chrome** (`#DDE0EC` / `#05060B`; the top bar and rail share one tinted surface with no dividing rules), the **sheet** (`#F6F7FB` / `#181C30`; the content column, inset with a 14px top-left radius and a clearly visible edge, carrying the breadcrumbs as its own header line), and **surfaces** (`#FFFFFF` / `#1F2438`; boxes and cards on the sheet). Tiles inside a box are tonal (`--hub-sunken`), never bordered, so a box never holds more boxes. On screens up to 960px wide the rail becomes a drawer and the sheet loses its corner. `main` takes focus on navigation for assistive technology but shows no ring, because it isn't a control.
 
-The Work register is flat and structural. Depth comes from tonal lane fields, a one-pixel `--cb-border` rule, white or deep content surfaces, and a small violet hover tint. The feature adds no shadow vocabulary or decorative gradient. Focus-visible targets use a 2px violet outline with a 3px offset, and reduced-motion users receive no row hover transition.
+The Work register is flat and structural. Depth comes from tonal lane fields, a one-pixel `--hub-rule` rule, white or deep content surfaces, and a small violet hover tint. The feature adds no shadow vocabulary or decorative gradient. Focus-visible targets use a 2px violet outline with a 3px offset, and reduced-motion users receive no row hover transition.
 
 ### Named Rules
 **The Visible Step Rule.** Each plane is at least one visible tonal step from its neighbour in both themes; if nav, header and sections read as one grey field, raise the step, not the borders.

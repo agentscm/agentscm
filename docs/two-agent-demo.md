@@ -71,4 +71,4 @@ This walkthrough uses `agentscm intent check`, which only advises: it never refu
 
 ## 5. Use it for real
 
-Put a token in a private file, write `~/.config/agentscm/hub.json` with the hub URL and the absolute token path, and merge [`hooks/claude-code.example.json`](../hooks/claude-code.example.json) into the project's `.claude/settings.json`, as described in [work intents](intents.md). To go beyond one host, put the hub behind TLS and follow the [hub guide](hub.md).
+On each machine, run `agentscm client setup --agent <agent> --hub <hub>` in the checkout (or `agentscm quickstart`, which runs it for you): it signs in, mints a private token and adds that agent's hooks and MCP server, as described in [supported agents](agents.md). A manual Claude Code setup with `hub.json` and [`hooks/claude-code.example.json`](../hooks/claude-code.example.json) is described in [work intents](intents.md). To go beyond one host, put the hub behind TLS and follow the [hub guide](hub.md).

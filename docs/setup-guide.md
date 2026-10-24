@@ -2,7 +2,7 @@
 
 > **Alpha: not for production.** The CLI and the files it writes may change without migration.
 
-`agentscm quickstart` (and `npx agentscm`, which runs it) sets AgentSCM up for the repository you are in. You choose from short menus; it never asks you to edit a file. Before each write it says what it will write and asks once. `agentscm uninstall` undoes the recorded local setup. Hub traffic goes only to the hub you choose. Product usage telemetry is a separate staged capability and is effectively inactive until an HTTPS endpoint and data-handling profile are configured. Unix only (macOS and Linux).
+`agentscm quickstart` (and `npx agentscm`, which runs it) sets AgentSCM up for the repository you are in. You choose from short menus; it never asks you to edit a file. Before each write it says what it will write and asks once. `agentscm uninstall` undoes the recorded local setup. Hub traffic goes only to the hub you choose. Product usage telemetry is a separate staged capability and is effectively inactive until an HTTPS endpoint and data-handling profile are configured. The full flow is Unix only (macOS and Linux); on [Windows](install.md#windows) it runs without the collision check and agent setup.
 
 ## Usage telemetry choice
 
@@ -43,10 +43,10 @@ Quickstart and uninstall share one lock for the user configuration directory. An
 
 ## Optional change-record capture
 
-Quickstart's coordination hooks do not enable the experimental change-capture path or create its
-checkout-bound client connection. On Unix, first save a write-capable connection with
-`agentscm client connect` (the separate `agentscm client setup` flow already does this), then an
-operator may configure Claude Code capture once:
+Quickstart's coordination hooks do not enable the experimental change-capture path. It needs a
+checkout-bound client connection: on Unix, quickstart's agent step and `agentscm client setup`
+save one, or save a write-capable connection with `agentscm client connect`. Then an operator may
+configure Claude Code capture once:
 
 ```sh
 agentscm change-capture configure \

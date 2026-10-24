@@ -53,7 +53,7 @@ AGENTSCM_TELEMETRY=off agentscm COMMAND
 agentscm --no-telemetry COMMAND
 ```
 
-The order is `DO_NOT_TRACK=1` or `AGENTSCM_TELEMETRY=off`, then `--no-telemetry`, then persistent `off`, then endpoint/profile/notice/consent eligibility.
+A set `CI` environment variable also disables telemetry as an environment override. The order is `DO_NOT_TRACK=1`, `AGENTSCM_TELEMETRY=off` or `CI`, then `--no-telemetry`, then persistent `off`, then endpoint/profile/notice/consent eligibility.
 
 ## Configure a staged endpoint
 

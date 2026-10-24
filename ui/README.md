@@ -32,8 +32,9 @@ Another hub or UI port (e.g. a second worktree already holds 7332 and 5184):
 Integration and e2e tests need the seeded hub on :7332 (default) and skip with a message without it. The MCP
 tests start work through the hub's JSON-RPC endpoint with seeded agent tokens, so each run leaves
 finished "E2E probe" items under Recently finished. Install the browsers once with
-`npx playwright install chromium firefox webkit`. Desktop projects run the whole suite; the two phone
-projects run `tests/e2e/mobile.spec.ts` (drawer, narrow header, no sideways scroll on any page).
+`npx playwright install chromium firefox webkit`. Desktop projects run every spec except the `*mobile.spec.ts`
+files; the two phone projects run the `*mobile.spec.ts` specs (drawer, narrow header, no sideways
+scroll on any page) and the `*tour.spec.ts` specs.
 
 ## Not covered by the dev hub
 
