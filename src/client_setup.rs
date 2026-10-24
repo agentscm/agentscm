@@ -593,6 +593,10 @@ fn installation_lock() -> Result<std::fs::File> {
 
 pub(crate) fn preflight(agent: Agent, root: &Path, program: &Path) -> Result<()> {
     let _lock = installation_lock()?;
+    preflight_locked(agent, root, program)
+}
+
+fn preflight_locked(agent: Agent, root: &Path, program: &Path) -> Result<()> {
     check_other_hooks(agent, root)?;
     plan(agent, root, program)?;
     if agent == Agent::Codex {
@@ -688,7 +692,7 @@ fn prune_empty_parents(path: &Path, root: &Path) {
     }
 }
 
-fn write_plan(root: &Path, edits: Vec<Edit>) -> Result<()> {
+fn write_plan(root: &Path, edits: Vec<Edit>, announce: bool) -> Result<()> {
     for edit in edits {
         let path = local_path(root, edit.relative)?;
         if read(&path)? != edit.before {
@@ -703,32 +707,46 @@ fn write_plan(root: &Path, edits: Vec<Edit>) -> Result<()> {
             ignore_new_file(root, edit.relative)?;
         }
         crate::hub_cli::write_private(&path, &edit.after)?;
-        println!("Configured {}", edit.relative);
+        if announce {
+            println!("Configured {}", edit.relative);
+        }
     }
     Ok(())
 }
 
 pub(crate) fn install(agent: Agent, root: &Path, program: &Path) -> Result<()> {
     let _lock = installation_lock()?;
+    install_locked(agent, root, program, true)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn install_quiet(agent: Agent, root: &Path, program: &Path) -> Result<()> {
+    let _lock = installation_lock()?;
+    install_locked(agent, root, program, false)
+}
+
+fn install_locked(agent: Agent, root: &Path, program: &Path, announce: bool) -> Result<()> {
     check_other_hooks(agent, root)?;
     let edits = plan(agent, root, program)?;
     if agent == Agent::Codex {
-        crate::client_plugin::install_for_root(root, program)?;
+        crate::client_plugin::install_for_root(root, program, announce)?;
     }
     if agent == Agent::Claude {
         crate::client_plugin::install_claude_for_root(root, program)?;
     }
-    write_plan(root, edits)?;
-    println!(
-        "Native {} hooks, coordination skill and checkout-scoped MCP are configured.",
-        agent.name()
-    );
-    println!(
-        "Review the client's own project, hook and MCP approvals, then start a fresh session and verify it reaches the expected repository. Setup does not grant trust."
-    );
-    println!(
-        "New local settings are Git-excluded. Review changes to any settings your repository already tracks; do not commit machine-specific configuration."
-    );
+    write_plan(root, edits, announce)?;
+    if announce {
+        println!(
+            "Native {} hooks, coordination skill and checkout-scoped MCP are configured.",
+            agent.name()
+        );
+        println!(
+            "Review the client's own project, hook and MCP approvals, then start a fresh session and verify it reaches the expected repository. Setup does not grant trust."
+        );
+        println!(
+            "New local settings are Git-excluded. Review changes to any settings your repository already tracks; do not commit machine-specific configuration."
+        );
+    }
     Ok(())
 }
 
@@ -808,6 +826,10 @@ fn without_ours(text: &str, root: &Path) -> Result<Value> {
 /// gone has nothing left to take out.
 pub(crate) fn remove(agent: Agent, root: &Path, last: bool) -> Result<()> {
     let _lock = installation_lock()?;
+    remove_locked(agent, root, last)
+}
+
+pub(crate) fn remove_locked(agent: Agent, root: &Path, last: bool) -> Result<()> {
     if root.is_dir() {
         remove_files(agent, root)?;
     }
@@ -903,7 +925,7 @@ mod tests {
             let path = root.join(kept.0);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, kept.1).unwrap();
-            write_plan(&root, plan(agent, &root, program).unwrap()).unwrap();
+            write_plan(&root, plan(agent, &root, program).unwrap(), true).unwrap();
             remove_files(agent, &root).unwrap();
             for relative in written_files(agent) {
                 if *relative != kept.0 {
@@ -1080,8 +1102,8 @@ mod tests {
     fn new_native_files_are_local_and_retries_do_not_duplicate_hooks() {
         let (_dir, root) = repo();
         let program = Path::new("/opt/agentscm");
-        write_plan(&root, plan(Agent::Gemini, &root, program).unwrap()).unwrap();
-        write_plan(&root, plan(Agent::Gemini, &root, program).unwrap()).unwrap();
+        write_plan(&root, plan(Agent::Gemini, &root, program).unwrap(), true).unwrap();
+        write_plan(&root, plan(Agent::Gemini, &root, program).unwrap(), true).unwrap();
         let text = std::fs::read_to_string(root.join(".gemini/settings.json")).unwrap();
         let value: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["hooks"]["BeforeTool"].as_array().unwrap().len(), 1);
@@ -1103,7 +1125,7 @@ mod tests {
         std::fs::write(&exclude, "/mine\n/.gemini/settings.json\n").unwrap();
         for agent in [Agent::Gemini, Agent::Cursor] {
             let edits = plan(agent, &root, Path::new("/opt/agentscm")).unwrap();
-            write_plan(&root, edits).unwrap();
+            write_plan(&root, edits, true).unwrap();
         }
         let text = std::fs::read_to_string(&exclude).unwrap();
         assert!(text.contains("/.cursor/mcp.json"), "{text}");
@@ -1270,11 +1292,13 @@ mod tests {
         write_plan(
             &root,
             plan(Agent::Claude, &root, Path::new("/old/agentscm")).unwrap(),
+            true,
         )
         .unwrap();
         write_plan(
             &root,
             plan(Agent::Copilot, &root, Path::new("/new/agentscm")).unwrap(),
+            true,
         )
         .unwrap();
         for (file, transport) in [(".mcp.json", "stdio"), (".github/mcp.json", "local")] {

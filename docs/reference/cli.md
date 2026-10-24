@@ -268,7 +268,34 @@ agentscm quickstart --yes --hub existing --hub-url https://hub.example.com \
 agentscm uninstall                      # asks first; --yes, --remove-hub-data
 ```
 
-Flags: `--yes`, `--init` (also run `init-repo`; with `--yes` it is skipped unless passed), `--hub local|existing|skip`, `--hub-url URL`, `--provider github|gitlab`, `--agent-token-file PATH` (skip sign-in and minting), `--github-login LOGIN` (required with `--yes --hub local` unless `gh` is signed in), `--agent claude|codex|cursor|copilot|gemini` (repeatable; default Claude Code if the `claude` CLI is on `PATH`), `--no-agents`, `--no-collisions`.
+Flags: `--yes`, `--init` (also run `init-repo`; with `--yes` it is skipped unless passed), `--tray` (macOS only; open the companion after successful setup), `--hub local|existing|skip`, `--hub-url URL`, `--provider github|gitlab`, `--agent-token-file PATH` (skip sign-in and minting), `--github-login LOGIN` (required with `--yes --hub local` unless `gh` is signed in), `--agent claude|codex|cursor|copilot|gemini` (repeatable; default Claude Code if the `claude` CLI is on `PATH`), `--no-agents`, `--no-collisions`.
+
+### Status-bar companion and client status
+
+`agentscm tray` opens the optional macOS status-bar companion and returns after its background
+process is ready. It reads the same checkout connections as the CLI. **Start at Login** is off by
+default and can be changed from the menu. This alpha has no separate app install or updater; the
+binary is currently unsigned and unnotarized. Linux and Windows retain the CLI status fallback:
+
+```sh
+agentscm client status [--root PATH] [--check] [--json]
+```
+
+Without `--check`, status reads local configuration only. `--check` performs bounded authenticated
+Hub reads and reports recent participation recorded by the existing native integrations. The tray
+also shows local hook and MCP transport outcomes observed while it is running; these observations
+stay in memory and expire. Missing or idle activity stays unknown. `--json` emits a versioned
+status contract, including separate onboarding and local-activity binding identifiers.
+
+Each connected checkout has **Set Up Agent Integration** actions for Claude Code, Codex, Cursor,
+Copilot and Gemini. They reuse the existing owned hooks, MCP and skill installers with the saved
+connection and stable installed binary. **Reapply** repeats setup; it does not certify runtime
+health or accept the native client's trust prompts. A tray started by macOS can have a minimal
+`PATH`, so Claude Code or Codex may be installed but unavailable to the tray. Each agent action has
+a **Copy Guided Terminal Setup** fallback. The copied command is executed only when you paste and
+run it in Terminal; it runs normal `client setup`, which may contact the Hub, request forge sign-in,
+and create or replace a managed coordination token. The native client's own trust prompts still
+apply.
 
 ## Usage telemetry
 

@@ -3095,6 +3095,74 @@ fn uninstall_removes_everything_quickstart_set_up() {
 }
 
 #[test]
+fn client_remove_honors_the_shared_lifecycle_lease() {
+    use std::fs::OpenOptions;
+    use std::os::fd::AsRawFd;
+
+    let (hub, machine) = (Hub::start(), Machine::new().with_claude());
+    let repo = machine.repo();
+    let token = hub.token_file(machine.home.path());
+    ok(&machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"])));
+    let registered_root = PathBuf::from(
+        machine.connections()[0]["root"]
+            .as_str()
+            .expect("saved connection root"),
+    );
+    let before = std::fs::read(machine.config().join("connections.json")).unwrap();
+    let configured = repo.path().join(".mcp.json");
+    assert!(configured.exists());
+
+    let lease_path = machine.config().join("client-lifecycle.lock");
+    let lease = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lease_path)
+        .unwrap();
+    // SAFETY: flock only reads the valid descriptor and has no pointer arguments.
+    assert_eq!(unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+    let blocked = machine.run(
+        repo.path(),
+        &[
+            "client",
+            "remove",
+            "--root",
+            registered_root.to_str().unwrap(),
+        ],
+    );
+    assert!(!blocked.status.success(), "{}", out(&blocked));
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr).contains("client connections are busy"),
+        "{}",
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+    assert_eq!(
+        std::fs::read(machine.config().join("connections.json")).unwrap(),
+        before
+    );
+    assert!(configured.exists());
+    assert!(token.exists());
+
+    drop(lease);
+    let removed = ok(&machine.run(
+        repo.path(),
+        &[
+            "client",
+            "remove",
+            "--root",
+            registered_root.to_str().unwrap(),
+        ],
+    ));
+    assert!(
+        removed.contains("Removed the client connection"),
+        "{removed}"
+    );
+    assert!(machine.connections().is_empty());
+    assert!(!configured.exists());
+    assert!(token.exists());
+}
+
+#[test]
 fn uninstall_keeps_what_the_user_added_to_mcp_json_and_ends_the_sign_in() {
     let (hub, machine) = (Hub::start(), Machine::new().with_claude());
     let repo = machine.repo();

@@ -428,7 +428,7 @@ fn check_installed_plugins() -> Result<()> {
     Ok(())
 }
 
-fn install(path: &Path) -> Result<()> {
+fn install(path: &Path, announce: bool) -> Result<()> {
     check_installed_plugins()?;
     for args in [
         vec![
@@ -440,13 +440,16 @@ fn install(path: &Path) -> Result<()> {
         ],
         vec!["plugin", "add", "agentscm@agentscm-client"],
     ] {
-        let status = std::process::Command::new("codex")
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .status()
-            .map_err(|_| {
-                invalid("could not run codex; install Codex CLI and rerun client setup")
-            })?;
+        let mut command = std::process::Command::new("codex");
+        command.args(args).stdin(std::process::Stdio::null());
+        if !announce {
+            command
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+        }
+        let status = command.status().map_err(|_| {
+            invalid("could not run codex; install Codex CLI and rerun client setup")
+        })?;
         if !status.success() {
             return Err(invalid(
                 "Codex plugin installation failed; resolve the CLI error and rerun setup. Use client check to inspect any saved checkout binding",
@@ -790,7 +793,7 @@ fn install_claude(root: &Path, path: &Path, files: &[(&'static str, Vec<u8>)]) -
     verify_claude_install(plugin, files)
 }
 
-pub(crate) fn install_for_root(root: &Path, program: &Path) -> Result<()> {
+pub(crate) fn install_for_root(root: &Path, program: &Path, announce: bool) -> Result<()> {
     run_for_root(
         PluginArgs {
             output: None,
@@ -798,6 +801,7 @@ pub(crate) fn install_for_root(root: &Path, program: &Path) -> Result<()> {
         },
         root,
         program,
+        announce,
     )
 }
 
@@ -923,10 +927,15 @@ pub(crate) fn remove(claude: bool) -> Result<()> {
 }
 
 pub fn run(args: PluginArgs) -> Result<()> {
-    run_for_root(args, &std::env::current_dir()?, &std::env::current_exe()?)
+    run_for_root(
+        args,
+        &std::env::current_dir()?,
+        &std::env::current_exe()?,
+        true,
+    )
 }
 
-fn run_for_root(args: PluginArgs, root: &Path, program: &Path) -> Result<()> {
+fn run_for_root(args: PluginArgs, root: &Path, program: &Path, announce: bool) -> Result<()> {
     if args.install {
         check_existing_hooks(root)?;
     }
@@ -936,22 +945,26 @@ fn run_for_root(args: PluginArgs, root: &Path, program: &Path) -> Result<()> {
     };
     prepare(&output, program)?;
     let path = std::fs::canonicalize(&output)?;
-    println!("Prepared local Codex marketplace at {}", path.display());
-    if args.install {
-        install(&path)?;
+    if announce {
+        println!("Prepared local Codex marketplace at {}", path.display());
     }
-    println!(
-        "codex plugin marketplace add {}",
-        shell_quote(&path.to_string_lossy())
-    );
-    println!("codex plugin add agentscm@agentscm-client");
-    println!("In Codex Settings > Hooks, select Reload hooks, then review and trust AgentSCM.");
-    println!(
-        "Use either this plugin or repository Codex hooks; remove duplicate AgentSCM hooks explicitly."
-    );
-    println!(
-        "Check each checkout with agentscm client check. Installation is not runtime verification."
-    );
+    if args.install {
+        install(&path, announce)?;
+    }
+    if announce {
+        println!(
+            "codex plugin marketplace add {}",
+            shell_quote(&path.to_string_lossy())
+        );
+        println!("codex plugin add agentscm@agentscm-client");
+        println!("In Codex Settings > Hooks, select Reload hooks, then review and trust AgentSCM.");
+        println!(
+            "Use either this plugin or repository Codex hooks; remove duplicate AgentSCM hooks explicitly."
+        );
+        println!(
+            "Check each checkout with agentscm client check. Installation is not runtime verification."
+        );
+    }
     Ok(())
 }
 

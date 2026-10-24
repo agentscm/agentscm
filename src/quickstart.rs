@@ -109,6 +109,9 @@ pub struct QuickstartArgs {
     /// skipped unless this is passed.
     #[arg(long)]
     init: bool,
+    /// Open the optional native status-bar companion after setup succeeds (macOS only).
+    #[arg(long)]
+    tray: bool,
 }
 
 impl QuickstartArgs {
@@ -136,7 +139,7 @@ To run it without one, pass --yes and choose with flags: --local (recommended) o
 --hub local|existing|skip, --hub-url URL, \
 --agent-token-file PATH, --provider github|gitlab, --github-login LOGIN, \
 --hub-runtime native|docker, --hub-port PORT, --hub-project NAME, \
---slack-config-file ABSOLUTE_PATH, --agent claude|codex|cursor|copilot|gemini (repeatable) or --no-agents, --no-collisions, --init";
+--slack-config-file ABSOLUTE_PATH, --agent claude|codex|cursor|copilot|gemini (repeatable) or --no-agents, --no-collisions, --init, --tray";
 
 const HUB_EXPLAINED: &str =
     "A hub is a small shared server that lets agents on different machines see each other's work.";
@@ -372,6 +375,9 @@ pub async fn run(args: QuickstartArgs) -> Result<u8> {
     if !args.yes && !tty {
         return Err(invalid(NEEDS_TERMINAL));
     }
+    if args.tray && !cfg!(target_os = "macos") {
+        return Err(invalid("--tray is currently supported only on macOS"));
+    }
     // Validate the complete private input before acquiring the lease or performing any install
     // write. Supplying this flag is the only way quickstart enables the optional Slack adapter.
     preflight_slack(&args)?;
@@ -448,6 +454,26 @@ pub async fn run(args: QuickstartArgs) -> Result<u8> {
             "Sign in there with a read-only token: {command} hub token create --read-only --name status-page --repo {repo} --ttl 30d"
         );
     }
+    #[cfg(target_os = "macos")]
+    println!(
+        "Optional status-bar companion: {command} tray (Start at Login is off until you enable it in the menu)."
+    );
+    // Without an agent to set up (--no-agents, or none found) nothing is connected on purpose.
+    let requested_hub_incomplete = (args.local
+        || matches!(args.hub, Some(HubChoice::Local | HubChoice::Existing))
+        || args.hub_url.is_some())
+        && !cx.live.declined
+        && (!cx.live.hub_up || (cx.live.repo.is_none() && cx.live.wanted_agents));
+    let tray_result = if args.tray
+        && cx.failure.is_none()
+        && cx.live.pending_local.is_none()
+        && cx.live.agent_error.is_none()
+        && !requested_hub_incomplete
+    {
+        launch_tray(&cx)
+    } else {
+        Ok(())
+    };
     println!("{}", cx.live.line(&command));
     if let Some(failure) = cx.failure {
         return Err(invalid(&failure));
@@ -460,17 +486,12 @@ pub async fn run(args: QuickstartArgs) -> Result<u8> {
             "setting up the coding agent failed; see the status and recovery instructions above",
         ));
     }
-    if (args.local
-        || matches!(args.hub, Some(HubChoice::Local | HubChoice::Existing))
-        || args.hub_url.is_some())
-        // Without an agent to set up (--no-agents, or none found) nothing is connected on purpose.
-        && !cx.live.declined
-        && (!cx.live.hub_up || (cx.live.repo.is_none() && cx.live.wanted_agents))
-    {
+    if requested_hub_incomplete {
         return Err(invalid(
             "the requested hub setup is incomplete; see the status and recovery instructions above",
         ));
     }
+    tray_result?;
     Ok(0)
 }
 
@@ -1268,6 +1289,24 @@ fn cli_command(cx: &Cx<'_>) -> String {
         .unwrap_or_else(|_| "npx agentscm".to_owned())
 }
 
+fn launch_tray(cx: &Cx<'_>) -> Result<()> {
+    let program = match &cx.manifest.bin_dir {
+        Some(dir) => dir.join(binary::LINK),
+        None => std::env::current_exe()?,
+    };
+    let status = std::process::Command::new(&program)
+        .args(["--no-telemetry", "tray"])
+        .status()?;
+    if status.success() {
+        println!("Opened the AgentSCM status-bar companion.");
+        Ok(())
+    } else {
+        Err(invalid(&format!(
+            "could not open the AgentSCM status-bar companion (exit status {status})"
+        )))
+    }
+}
+
 fn summary(cx: &Cx<'_>, changed: bool) {
     let m = &cx.manifest;
     let home = &cx.home;
@@ -1396,6 +1435,8 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
                 names.join(", ")
             }
         );
+        #[cfg(target_os = "macos")]
+        println!("  - remove the owned AgentSCM tray login setting when removing its program");
     }
     if let Some(l) = &m.local_hub {
         println!(
@@ -1481,11 +1522,28 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
             }
         }
     }
+    let retain_program = !crate::client_config::load()
+        .is_ok_and(|connections| connections.is_empty())
+        || left.native_hub.is_some()
+        || native_executable_drift;
+    let tray_cleanup_failed = if programs.is_some() && !retain_program {
+        match crate::tray::remove_login_setting() {
+            Ok(()) => false,
+            Err(error) => {
+                println!("Couldn't remove the tray login setting: {}.", short(&error));
+                manual.push(
+                    "review the AgentSCM tray login setting, then run `agentscm uninstall` again"
+                        .into(),
+                );
+                true
+            }
+        }
+    } else {
+        false
+    };
     if let Some((dir, _)) = programs.as_ref().filter(|_| {
         // Connections quickstart didn't make may run this program too.
-        !crate::client_config::load().is_ok_and(|connections| connections.is_empty())
-            || left.native_hub.is_some()
-            || native_executable_drift
+        retain_program || tray_cleanup_failed
     }) {
         println!(
             "Left the program files in {}: client connections or a managed hub still need them, or the native executable changed.",
@@ -1517,6 +1575,10 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
             left.bin_dir = Some(dir);
         } else {
             println!("Removed the program files in {}.", shown(&dir, &home));
+            #[cfg(target_os = "macos")]
+            println!(
+                "Tray login is disabled. If its menu is still open, choose Quit AgentSCM Tray."
+            );
         }
     }
     if let Some(local) = &m.local_hub
@@ -1656,6 +1718,7 @@ mod tests {
             "--slack-config-file",
             "--no-collisions",
             "--init",
+            "--tray",
         ] {
             assert!(NEEDS_TERMINAL.contains(flag), "{flag}");
         }
@@ -1681,6 +1744,7 @@ mod tests {
             no_agents: true,
             no_collisions: false,
             init: false,
+            tray: false,
         };
         let error = preflight_slack(&args).unwrap_err().to_string();
         assert!(error.contains("requires a managed local Hub"));

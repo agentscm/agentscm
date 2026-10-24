@@ -31,6 +31,10 @@ Your choice is stored in the per-user telemetry configuration. `agentscm telemet
 6. **Repository config for the team** (optional; `--init` without a terminal). If a hub is set up, quickstart offers to run [`agentscm init-repo`](agents.md) for this repository, which writes shared instruction files for Claude Code, Codex, Cursor, Copilot and Gemini CLI for you to review and commit. Hooks and MCP come from `agentscm client setup`, which each developer runs once per checkout; after writing the files quickstart prints that command with this hub's URL. These are repository files: they are not recorded in `quickstart.json` and `uninstall` leaves them.
 7. **Summary** of the recorded setup, and a record of it in `~/.config/agentscm/quickstart.json` (0600). It lists the checkouts quickstart connected; the connections themselves are in `connections.json`. Running quickstart again detects what exists and offers to keep it. A run that writes nothing says **No changes made.** Setup prints the executable path for subsequent commands and, for an installed binary, an `export PATH=...` command for the current shell. When a hub answers and this repository is set up, it also prints the hub's status page (`<hub>/ui/`) and the `hub token create --read-only` command for a token to sign in there. Hints name the program path they were run with, so they work before `agentscm` is on `PATH`. The last line of every run says whether live warnings are on (`Live warnings: on (hub <url>, repo <owner/name>)`) or off and why.
 
+On macOS, the summary also points to the optional status-bar companion. Run `agentscm tray`, or
+pass `--tray` to open it after successful setup. Quickstart never enables Start at Login; that
+setting is visible in the tray menu and is off by default.
+
 **Several repositories, one hub.** Run quickstart in each repository. Each checkout gets its own token and its own entry in `connections.json`; other checkouts' entries and files are never touched.
 
 If the hub isn't answering, quickstart reports the failure and the final live-warning status. Explicitly requested hub setup that remains incomplete exits non-zero.
@@ -81,6 +85,7 @@ Without a terminal quickstart refuses unless you pass `--yes`, which takes the r
 | `--provider github\|gitlab` | Forge to sign in with (default: from `origin`). |
 | `--github-login LOGIN` | Your GitHub login for the local hub's administrator. With `--yes` it is required unless `gh api user` works; an unverified `git config github.user` is only offered in the interactive prompt. |
 | `--init` | Also run `agentscm init-repo` for this repository once a hub is chosen (with `--yes`, it is otherwise skipped). |
+| `--tray` | On macOS, open the optional status-bar companion after setup succeeds. `--yes` does not open it unless this flag is present. |
 | `--no-collisions` | Skip the collision check. |
 
 With `--yes` or without a terminal quickstart never starts a browser or device sign-in. If there is no saved sign-in, or the hub no longer accepts it (it expired, or the hub restarted), quickstart says so at once and sets up no agent: run it at a terminal, or pass `--agent-token-file`. A new local hub still requires GitHub App setup in a browser; `--yes` prints the link and returns exit status **3** without waiting. Finish that step, then resume with the printed command, which includes the runtime, port and project. Exit status **0** means the requested setup completed; other failures exit non-zero.

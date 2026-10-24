@@ -35,6 +35,7 @@ The download and verification steps do not send product telemetry. After verific
 ```sh
 npx agentscm            # setup guide; flags go to `agentscm quickstart`
 npx agentscm uninstall  # any other subcommand is passed through as given
+npx agentscm tray       # optional macOS status-bar companion
 ```
 
 Needs Node 18 or later. The package has no dependencies and no install scripts. On Windows, run the same command in PowerShell:
@@ -85,6 +86,22 @@ current shell, or add that line to your shell's startup file for future terminal
 You can also keep using `npx agentscm <subcommand>`.
 
 Remove them with `agentscm uninstall`.
+
+The optional macOS tray is part of this same binary; no separate app install is needed. Run
+`npx agentscm tray`, or add `--tray` to quickstart to open it after successful setup. Start at
+Login is off until enabled in the tray menu. The alpha binary is not signed or notarized, and the
+tray does not update independently; install a newer AgentSCM release through the same installer.
+For a connected checkout, choose **Set Up Agent Integration** in its menu to configure Claude
+Code, Codex, Cursor, Copilot or Gemini. This installs AgentSCM's existing hooks, MCP connection
+and coordination skill; the native client's own trust prompts still apply. **Reapply** reruns
+that setup without signing in again. Connect a new checkout or Hub through quickstart.
+If macOS starts the tray with a minimal `PATH`, an installed Claude Code or Codex CLI may be
+unavailable there. Use **Copy Guided Terminal Setup** for that agent. The tray only copies this
+command: it runs normal `client setup` only after you paste and run it in Terminal. That guided
+command may contact the Hub, request forge sign-in, and create or replace a managed coordination
+token; the native client's own trust prompts still apply.
+Uninstall removes the owned tray login setting before removing its program. A running tray can
+be closed with **Quit AgentSCM Tray**.
 
 For an optional customer-operated Slack app, follow [Slack setup](slack.md). The same preparation commands support an installation agent, the official Slack CLI and manual app settings. A prepared private bundle can be supplied to `quickstart --hub local --slack-config-file ABSOLUTE_PATH`; installing the AgentSCM binary alone does not connect Slack.
 
