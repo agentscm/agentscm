@@ -21,6 +21,8 @@ pub mod onboarding;
 pub mod publish;
 pub mod session;
 pub mod skill_workflow;
+pub mod slack;
+pub mod slack_protocol;
 pub mod store;
 mod store_pg;
 mod store_sqlite;
@@ -140,6 +142,7 @@ pub struct HubState {
     onboarding: Arc<onboarding::Observations>,
     /// Set by `agentscm demo`; health says so, for the status page.
     demo: bool,
+    slack: Option<Arc<slack::Slack>>,
     workspace: Option<Arc<workspace::Workspace>>,
     #[cfg(unix)]
     workspace_execution: Option<Arc<workspace_execution::ExecutionService>>,
@@ -156,6 +159,7 @@ impl HubState {
             skill_workflows: Arc::new(skill_workflow::SkillWorkflowRegistry::unconfigured()),
             onboarding: Arc::new(onboarding::Observations::default()),
             demo: false,
+            slack: None,
             workspace: None,
             #[cfg(unix)]
             workspace_execution: None,
@@ -164,6 +168,11 @@ impl HubState {
 
     pub fn with_login(mut self, login: login::Login) -> Self {
         self.login = Arc::new(login);
+        self
+    }
+
+    pub fn with_slack(mut self, slack: slack::Slack) -> Self {
+        self.slack = Some(Arc::new(slack));
         self
     }
 
@@ -295,6 +304,7 @@ pub fn router(state: HubState) -> Router {
     Router::new()
         .merge(http::routes())
         .merge(onboarding::routes())
+        .merge(slack::routes())
         .merge(work_http::routes())
         .merge(intent::routes())
         .merge(hook::routes())

@@ -247,7 +247,7 @@ fn a_grant_moves_the_file_and_is_told_once(db: &Db) {
     assert_eq!(
         grants[0].1,
         json!({"request": grants[0].1["request"], "paths": [A], "session": "ha",
-            "from": {"agent": "agent2", "login": "user2"}, "reason": null})
+            "from": {"agent": "agent2", "login": "user2", "token": bob.token}, "reason": null})
     );
     assert!(events(&*store, "handoff_decline").is_empty());
 
@@ -295,7 +295,7 @@ fn a_decline_is_told_once_and_the_retry_passes(db: &Db) {
     assert_eq!(declines[0].0, alice.token);
     assert_eq!(
         declines[0].1["from"],
-        json!({"agent": "agent2", "login": "user2"})
+        json!({"agent": "agent2", "login": "user2", "token": bob.token})
     );
     assert_eq!(declines[0].1["session"], "ha");
     assert!(events(&*store, "handoff_grant").is_empty());

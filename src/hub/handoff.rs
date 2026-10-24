@@ -194,7 +194,8 @@ impl Event {
         reason: Option<&str>,
     ) -> Result<Self> {
         let data = json!({"request": request.id, "paths": [path], "session": session,
-            "from": {"agent": request.agent, "login": request.login}, "reason": reason});
+            "from": {"agent": request.agent, "login": request.login, "token": request.requester_token},
+            "reason": reason});
         Self::new(kind, holder, data)
     }
 }

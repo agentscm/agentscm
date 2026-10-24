@@ -72,6 +72,8 @@ pub struct Intent {
     /// Connection modes of the session holding this intent (`mcp`, `hook:<agent>`); empty when
     /// it was announced through the REST API.
     pub via: Vec<String>,
+    /// The session holding this intent; `None` when it was announced through the REST API.
+    pub session: Option<String>,
 }
 
 /// A live intent of someone else that overlaps an announce; paths are display specs.
@@ -427,10 +429,10 @@ pub(super) fn finish(rows: Vec<(Intent, String, Option<String>)>) -> Result<Vec<
         .collect()
 }
 
-/// Column order read by both backends' row mappers; `paths` and `via` are last.
+/// Column order read by both backends' row mappers; `paths`, `via` and `session` are last.
 pub(super) const INTENT_SELECT: &str = "SELECT i.id, i.repository, i.task, i.branch, i.base,
         i.machine, i.expires_at, i.token, t.name, u.id, u.provider, u.host, u.forge_user_id,
-        u.login, i.created_at, i.updated_at, i.paths, s.via
+        u.login, i.created_at, i.updated_at, i.paths, s.via, s.session
     FROM hub_intents i JOIN hub_agent_tokens t ON t.id = i.token JOIN hub_users u ON u.id = t.owner
     LEFT JOIN hub_sessions s ON s.intent = i.id";
 
