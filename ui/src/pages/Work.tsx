@@ -123,7 +123,8 @@ function WorkCard({ item, outcomeAt }: { item: WorkItem; outcomeAt?: number }) {
       </h3>
       <div className="pills">
         <StatePill state={item.state} />
-        <ClaimPill item={item} />
+        {/* In progress, a live claim is the normal case; elsewhere "Assigned" says the lead still holds it. */}
+        {(item.state !== 'active' || item.claim_status !== 'active') && <ClaimPill item={item} />}
       </div>
       <Action item={item} />
       {helpers.length > 0 && (

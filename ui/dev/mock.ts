@@ -47,6 +47,32 @@ function work() {
   }
 }
 
+/** Synthetic work overview: one item per progress lane, two recent outcomes and one declared-scope overlap. */
+function overview() {
+  const wid = (c: string) => `wrk_${c.repeat(32)}`
+  const cp = (kind: string, summary: string, next: string | null, secs: number, agent: string) => ({ kind, summary, next_action: next, source_refs: [], at: ago(secs), token: `tok_${agent}`, agent, session: `${agent}-session`, generation: 1 })
+  const item = (c: string, title: string, state: string, login: string, agent: string, scope: string[], secs: number, extra: Record<string, unknown> = {}) => ({
+    id: wid(c), repository: REPO, owner: `github:github.com:${login}`, owner_login: login, source: { kind: 'native', request_key: `req-${c}` }, title, state, claim_status: state === 'finished' ? 'unknown' : secs > 3600 ? 'stale' : 'active',
+    last_checkin_at: ago(secs), generation: 1, lead_token: `tok_${agent}`, lead_agent: agent, lead_session: `${agent}-session`,
+    participants: [{ owner: `github:github.com:${login}`, login, token: `tok_${agent}`, agent, session: `${agent}-session`, role: 'lead' }],
+    scope, branch: null, worktree: null, next_action: null, current: null, blocker: null, depends_on: [], related_work: [],
+    created_at: ago(secs + 3600), updated_at: ago(secs), created_seq: 1, updated_seq: 2, ...extra,
+  })
+  const billing = item('a', 'Refactor the billing module', 'active', 'maria', 'claude-code', ['src/billing.rs', 'src/tax.rs'], 60, { next_action: 'Split tax calculation out of invoice totals', current: cp('progress', 'Tax module extracted; tests green', 'Split tax calculation out of invoice totals', 60, 'claude-code') })
+  const rounding = item('b', 'Fix invoice rounding', 'active', 'dev', 'codex', ['src/billing.rs'], 300, { next_action: 'Add a regression test for JPY totals' })
+  const docs = item('c', 'Write the webhook retry documentation', 'blocked', 'maria', 'codex', ['docs/webhooks.md'], 900, { blocker: cp('blocker', 'Waiting on the retry policy decision from the API team', null, 900, 'codex') })
+  const settings = item('d', 'Tidy the settings page layout', 'handover', 'dev', 'cursor', ['web/settings/**'], 1800, { next_action: 'Pick up the responsive pass from the handover note' })
+  const ledger = item('e', 'Reconcile ledger exports', 'paused', 'sam', 'copilot', ['src/ledger.rs'], 7200, { next_action: 'Resume after the quarter-end freeze' })
+  const shipped = item('f', 'Round invoice totals per currency', 'finished', 'sam', 'copilot', ['src/invoice/totals.rs'], 1200)
+  return {
+    recent_since: ago(86400), until: ago(0),
+    current: [billing, rounding, docs, settings, ledger],
+    recent: [{ seq: 9, at: ago(1200), kind: 'completion', item: shipped }, { seq: 8, at: ago(2400), kind: 'decision', item: billing }],
+    overlaps: [{ left: billing, right: rounding, reasons: [{ left_path: 'src/billing.rs', right_path: 'src/billing.rs' }], reasons_complete: true }],
+    current_complete: true, recent_complete: true, overlaps_complete: true, history_retention_gap: false,
+  }
+}
+
 function events() {
   const e = (kind: string, secs: number, agent: { token: string; name: string }, login: string, data: Record<string, unknown>) => ({ id: `evt_${kind}_${secs}_${agent.token}`, kind, at: Math.floor(START / 1000) - secs, agent, owner: { login }, data })
   const list = [
@@ -356,6 +382,7 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
         }
         if (down) return send(503, { error: 'unavailable' })
         const empty = scenario === 'empty'
+        if (url.pathname === '/standup/overview') return send(200, empty ? { ...overview(), current: [], recent: [], overlaps: [] } : overview())
         if (url.pathname === '/onboarding') {
           const base = { owner: 'maria', expires_at: ago(-600), mcp_verified: true, native_verified: true, blocker: null, next_action: 'MCP and a native edit-hook check were observed for this connection and session. Continue work; this is coordination evidence, not a guarantee of future quota or complete tool coverage.' }
           return send(200, empty ? [] : [
