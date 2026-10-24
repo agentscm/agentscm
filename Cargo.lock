@@ -344,9 +344,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.3"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03bb0e1cc970d482d121d9a1744999169b69a07470b3d644a7894e53fcaf4574"
+checksum = "38d28fb6aa7dd680b3ffd1a3e64e115c177bdba63c0ae7f9cd48129ff05c4fa0"
 dependencies = [
  "cmov",
 ]
@@ -1705,9 +1705,9 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tokio"
-version = "1.52.1"
+version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b67dee974fe86fd92cc45b7a95fdd2f99a36a6d7b0d431a231178d3d670bbcc6"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
  "bytes",
  "libc",
