@@ -1,10 +1,16 @@
-import { createContext, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
+import { createContext, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { Section } from '../App.tsx'
 import type { Derived } from '../derive.ts'
 import type { WorkOverview } from '../standup.ts'
 import type { HubData } from '../useHub.ts'
 import { Icon } from '../ui.tsx'
 import { tourFor, type TourContext, type TourKey } from './content.ts'
+import './tour.css'
+import { Glyph, TourArt, WelcomeHero } from './art.tsx'
+import { useGlide, useSwap } from './motion.ts'
+import { placeCard, type Rect } from './place.ts'
+import { Spotlight } from './Spotlight.tsx'
+import { Trail } from './Trail.tsx'
 import { TOUR_KEY, canRemember, closeSection, closeWelcome, loadPrefs, savePrefs, shouldAutoplay, shouldWelcome, type TourPrefs } from './state.ts'
 
 interface TourApi {
@@ -87,13 +93,6 @@ export function TourTrigger({ section }: { section: Section }) {
       <span className="tour-trigger-text">Tour this page</span>
     </button>
   )
-}
-
-interface Rect {
-  top: number
-  left: number
-  width: number
-  height: number
 }
 
 const PAD = 6
@@ -183,8 +182,10 @@ function TourOverlay({ tourKey, data, d, overview, onClose, autoplayOn }: { tour
       frame = requestAnimationFrame(() => {
         const t = findTarget(step.target)
         const r = t?.getBoundingClientRect()
-        setRect(r ? { top: r.top - PAD, left: r.left - PAD, width: r.width + PAD * 2, height: r.height + PAD * 2 } : null)
-        setCardH(card.current?.offsetHeight ?? 0)
+        const next = r ? { top: r.top - PAD, left: r.left - PAD, width: r.width + PAD * 2, height: r.height + PAD * 2 } : null
+        // Only a changed number re-renders the overlay; the 500ms poll is otherwise free.
+        setRect((p) => (p && next && p.top === next.top && p.left === next.left && p.width === next.width && p.height === next.height ? p : next))
+        setCardH((p) => { const h = card.current?.offsetHeight ?? 0; return p === h ? p : h })
       })
     }
     measure()
@@ -241,64 +242,67 @@ function TourOverlay({ tourKey, data, d, overview, onClose, autoplayOn }: { tour
   const missing = !!step.target && !rect
   const shownTip = tip ?? (missing || step.tip ? (step.empty ?? null) : null)
 
-  // Card placement: below the target when it fits, else above, else beside it, else pinned to the bottom (phones: always a sheet).
-  const vw = window.innerWidth
-  const vh = window.innerHeight
-  const narrow = vw <= 640
-  const cardW = Math.min(380, vw - 32)
-  let style: CSSProperties
-  if (!rect) style = { inset: 0, margin: 'auto', height: 'fit-content', width: cardW } // no transform: the entrance animation owns it
-  else if (narrow) style = rect.top + rect.height / 2 > vh / 2 ? { top: 12, left: 12, right: 12 } : { bottom: 12, left: 12, right: 12 }
-  else {
-    const h = cardH || 280
-    const left = Math.max(16, Math.min(rect.left, vw - cardW - 16))
-    const below = rect.top + rect.height + 12
-    const above = rect.top - 12 - h
-    const right = rect.left + rect.width + 12
-    const beside = right + cardW <= vw - 16 ? right : rect.left - 12 - cardW >= 16 ? rect.left - 12 - cardW : null
-    const sideTop = Math.max(16, Math.min(rect.top, vh - h - 16))
-    // A target taller than the room above and below it gets the card beside it, so the card never covers it.
-    // Clamped, so a target still scrolling into view never drags the card off screen.
-    const fit = (top: number) => Math.min(Math.max(16, top), Math.max(16, vh - h - 16))
-    if (below + h <= vh - 16) style = { top: fit(below), left, width: cardW }
-    else if (above >= 16) style = { top: fit(above), left, width: cardW }
-    else if (beside !== null) style = { top: sideTop, left: beside, width: cardW }
-    else style = { top: Math.max(16, vh - h - 16), left, width: cardW }
-  }
+  // Placement is a pure decision (place.ts): beside, below or above the target; compact when narrow or the target is tall.
+  const [fullH, setFullH] = useState(470)
+  const [moreAt, setMoreAt] = useState<number | null>(null) // the step whose "More" is open
+  const more = moreAt === i
+  const hero = isWelcome && i === 0
+  const place = placeCard(rect, { fullH, h: cardH, hero }, { w: window.innerWidth, h: window.innerHeight })
+  const compact = place.compact
+  // Measure the card as it renders: its full height (with the illustration) feeds the compact decision.
+  useLayoutEffect(() => {
+    const h = card.current?.offsetHeight ?? 0
+    setCardH((p) => (p === h ? p : h))
+    if (!compact && h > 0) setFullH((p) => (p === h ? p : h))
+  }, [compact, i, more, rect, shownTip])
+  useGlide(card)
+  const swap = useRef<HTMLDivElement>(null)
+  useSwap(swap, i)
+  const showMore = !compact || more
 
   const titleId = `${ids}-title`
   return (
     <div className="tour-layer">
-      {/* The cutout: one box whose huge shadow dims everything else. Clicks behind the tour are blocked. */}
+      {/* Clicks behind the tour are blocked; the scrim itself is a picture. */}
       <div className="tour-block" onMouseDown={(e) => e.preventDefault()} />
-      {rect ? <div className="tour-hole" style={{ top: rect.top, left: rect.left, width: rect.width, height: rect.height }} aria-hidden="true" /> : <div className="tour-dim" aria-hidden="true" />}
-      <div ref={card} className={`tour-card${narrow ? ' is-sheet' : ''}`} style={style} role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={`${ids}-body`}>
-        <div className="tour-head">
-          <span className="tour-kicker">{tour.title}</span>
-          <button type="button" className="tour-x" onClick={() => onClose(dontShow)} aria-label="Close tour">
-            <Icon name="x-lg" />
-          </button>
-        </div>
-        <div className="tour-progress" aria-hidden="true">
-          {steps.map((_, n) => (
-            <span key={n} className={n === i ? 'on' : n < i ? 'done' : ''} />
-          ))}
-        </div>
-        <p className="visually-hidden" aria-live="polite" aria-atomic="true">
-          Step {i + 1} of {steps.length}: {step.title}
-        </p>
-        <h2 id={titleId} className="tour-title">{step.title}</h2>
-        <dl id={`${ids}-body`} className="tour-body">
-          <div><dt><Icon name="eye" /> What it shows</dt><dd>{step.what}</dd></div>
-          <div><dt><Icon name="exclamation-circle" /> Why it matters</dt><dd>{step.why}</dd></div>
-          <div><dt><Icon name="hand-index" /> How to use it</dt><dd>{step.how}</dd></div>
-        </dl>
-        {shownTip && (
-          <p className={`tour-tip${tip ? ' is-live' : ''}`}>
-            <Icon name={tip ? 'lightning-charge' : 'hourglass'} />
-            <span><strong>{tip ? 'On your screen now: ' : 'Nothing here yet: '}</strong>{shownTip}</span>
+      <Spotlight rect={rect} step={i} />
+      <div ref={card} className={`tour-card${place.sheet ? ' is-sheet' : ''}${compact ? ' is-compact' : ''}`} style={place.style} role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={`${ids}-body`}>
+        {!compact && <div className={`tour-band${hero ? ' is-hero' : ''}`}>{isWelcome ? <WelcomeHero still={!hero} key={hero ? 'hero' : 'still'} /> : <TourArt tourKey={tourKey} key={i} />}</div>}
+        <div className="tour-main">
+          <div className="tour-head">
+            <span className="tour-kicker">{tour.title}</span>
+            <button type="button" className="tour-x" onClick={() => onClose(dontShow)} aria-label="Close tour">
+              <Icon name="x-lg" />
+            </button>
+          </div>
+          <Trail i={i} n={steps.length} />
+          <p className="visually-hidden" aria-live="polite" aria-atomic="true">
+            Step {i + 1} of {steps.length}: {step.title}
           </p>
-        )}
+          <div ref={swap} className="tour-swap">
+            <h2 id={titleId} className="tour-title">{step.title}</h2>
+            <div id={`${ids}-body`} className="tour-swap">
+              <p className="tour-what">{step.what}</p>
+              {compact && (
+                <button type="button" className="tour-more" aria-expanded={more} aria-controls={`${ids}-more`} onClick={() => setMoreAt(more ? null : i)}>
+                  {more ? 'Less' : 'More'}
+                </button>
+              )}
+              {showMore && (
+                <dl id={`${ids}-more`} className="tour-body">
+                  <div className="tour-row"><Glyph kind="why" /><div><dt>Why it matters</dt><dd>{step.why}</dd></div></div>
+                  <div className="tour-row"><Glyph kind="how" /><div><dt>How to use it</dt><dd>{step.how}</dd></div></div>
+                </dl>
+              )}
+            </div>
+            {shownTip && (
+              <p className={`tour-tip${tip ? ' is-live' : ''}`}>
+                {tip ? <span className="tour-live-dot" aria-hidden="true" /> : <Glyph kind="wait" />}
+                <span><strong>{tip ? 'On your screen now: ' : 'Nothing here yet: '}</strong>{shownTip}</span>
+              </p>
+            )}
+          </div>
+        </div>
         <div className="tour-foot">
           {(isWelcome || autoplayOn) && (
             <label className="tour-check">
