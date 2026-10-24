@@ -357,7 +357,8 @@ pub async fn run(args: QuickstartArgs) -> Result<u8> {
     if (args.local
         || matches!(args.hub, Some(HubChoice::Local | HubChoice::Existing))
         || args.hub_url.is_some())
-        && (!cx.live.hub_up || cx.live.repo.is_none())
+        // With --no-agents nothing is connected on purpose.
+        && (!cx.live.hub_up || (cx.live.repo.is_none() && !args.no_agents))
     {
         return Err(invalid(
             "the requested hub setup is incomplete; see the status and recovery instructions above",
@@ -1056,7 +1057,7 @@ async fn agents_stage(cx: &mut Cx<'_>) {
 
 /// Offers `agentscm init-repo`'s instruction files once a hub is chosen. Failure is reported, not fatal.
 fn init_stage(cx: &mut Cx<'_>) {
-    let (Some(root), Some(_)) = (cx.found.repo_root.clone(), cx.live.hub.as_ref()) else {
+    let (Some(root), Some(hub)) = (cx.found.repo_root.clone(), cx.live.hub.clone()) else {
         if cx.args.init {
             println!(
                 "--init needs a Git repository and a hub, so I didn't add the agent instructions."
@@ -1074,6 +1075,17 @@ fn init_stage(cx: &mut Cx<'_>) {
     match crate::init_cli::run_in(&root, None, cx.ui) {
         Ok(outcome) => cx.init_written = outcome.written,
         Err(error) => println!("Couldn't add the agent instructions: {}.", short(&error)),
+    }
+    if !cx.init_written.is_empty() {
+        // The committed files carry no hooks or MCP: each machine connects its own agent.
+        println!(
+            "Instructions alone don't connect an agent. {}each developer runs, once per checkout: agentscm client setup --agent claude|codex|cursor|copilot|gemini --hub {hub}",
+            if cx.live.agents.is_empty() {
+                "On this machine and every other, "
+            } else {
+                "This checkout is set up; on every other machine, "
+            }
+        );
     }
 }
 

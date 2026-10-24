@@ -465,7 +465,47 @@ fn init_writes_only_instruction_files_even_for_a_local_hub() {
     // Instructions name no hub, so a hub on this machine no longer skips them.
     assert!(repo.path().join("AGENTS.md").exists(), "{said}");
     assert!(!repo.path().join(".claude/settings.json").exists());
-    assert!(said.contains("Repository files to review and commit"), "{said}");
+    assert!(
+        said.contains("Repository files to review and commit"),
+        "{said}"
+    );
+    // The committed files carry no hooks or MCP, so the per-machine command is printed.
+    assert!(
+        said.contains(&format!(
+            "This checkout is set up; on every other machine, each developer runs, once per checkout: agentscm client setup --agent claude|codex|cursor|copilot|gemini --hub {}",
+            hub.url
+        )),
+        "{said}"
+    );
+}
+
+#[test]
+fn init_without_an_agent_prints_the_setup_command_for_this_machine_too() {
+    let (hub, machine) = (Hub::start(), Machine::new());
+    let repo = machine.repo();
+    let said = ok(&machine.run(
+        repo.path(),
+        &[
+            "quickstart",
+            "--yes",
+            "--hub",
+            "existing",
+            "--hub-url",
+            &hub.url,
+            "--no-agents",
+            "--no-collisions",
+            "--init",
+        ],
+    ));
+    assert!(repo.path().join("AGENTS.md").exists(), "{said}");
+    assert!(machine.connections().is_empty());
+    assert!(
+        said.contains(&format!(
+            "On this machine and every other, each developer runs, once per checkout: agentscm client setup --agent claude|codex|cursor|copilot|gemini --hub {}",
+            hub.url
+        )),
+        "{said}"
+    );
 }
 
 #[test]
@@ -1846,7 +1886,7 @@ fn no_agents_skips_setup_even_with_claude_installed() {
         repo.path(),
         &quick(&hub.url, &token, &["--no-collisions", "--no-agents"]),
     );
-    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert!(machine.connections().is_empty() && machine.claude_log().is_empty());
     assert!(!repo.path().join(".mcp.json").exists());
     assert!(last_line(&output).contains("this checkout isn't connected to the hub"));
