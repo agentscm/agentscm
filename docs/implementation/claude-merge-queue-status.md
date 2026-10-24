@@ -2,48 +2,38 @@
 
 Owner: Claude. Integration owner for shared files: Codex. Codex's ledger: `docs/implementation/agentscm-build-status.md` on `feat/change-record-capture-v1`.
 
-## Baseline
+## Baseline and branch
 
-- Base: `f85d4e4a3604f43a82773263e2227f728e638a27`. Branch: `feat/github-merge-queue-checks` (worktree `agentscm-merge-queue`).
-- No push, PR, merge, protection change or deployment has happened.
+- Base: `f85d4e4a3604f43a82773263e2227f728e638a27`. Branch: `feat/github-merge-queue-checks`.
+- Contract: `merge-queue-contract/v1`, in `docs/advanced/github-merge-queue.md#integration-contract`.
 
-## Inventory (baseline gaps)
+## Inventory (baseline gaps, now closed or stated)
 
-- Hub workflow status `agentscm/workflow/<target>` (`src/hub/forge_check.rs`) is posted only on pull request heads. `webhook_work` (`src/hub/sync.rs`) drops every event except `pull_request` and `push`; the App manifest subscribes only to those. A required context therefore blocks queued merges.
-- Protection is reported as `protection: "unverified"` (`src/hub/publish.rs`); nothing reads rulesets or the status creator.
-- `agentscm/local-validation` is a separate verifier-workflow status (`worker_asserted`). This lane does not read or change it, and a green local-validation status satisfies nothing here.
+- `webhook_work` dropped `merge_group`; the App manifest did not request it. Closed.
+- A required `agentscm/workflow/<target>` blocked queued merges. Closed for single-entry groups; multi-entry groups stay pending (core gap below).
+- Protection was always `unverified`. The Hub now reports ruleset requirement and status source per group (read-only); classic branch protection is still not read (needs administration access).
+- `agentscm/local-validation` remains a separate, worker-asserted status. This lane does not read or change it.
 
-## Shared-file requests to Codex (integration owner)
+## Shared files this branch changes (integration owner: Codex)
 
-1. Named migration `merge_groups` (`src/hub/migrations/named/merge_groups.{sqlite,pg}.sql`): one new table `hub_merge_groups`. Named, so it takes no integer slot. Please do not reuse the name.
-2. `Store` trait (`src/hub/store.rs`) plus both impls: new methods appended at the end of the forge-check block only (`merge_group`, `observe_merge_group`, `active_merge_groups`, `reserve_merge_group_check`, `complete_merge_group_check`). Delivered as one isolated commit so it can be applied or rebased as a narrow patch.
-3. `src/hub/sync.rs` webhook filter and App manifest `default_events`: add `merge_group`. Small, isolated hunk.
-4. Projection: `forge_check::merge_group::Projection` (serializable) via `forge_check::merge_group::group_projection(state, repo_id, group_sha)`. Codex wires it into HTTP/UI/MCP; this lane does not edit `publish.rs` views, `http.rs`, UI or MCP.
-5. `docs/hub.md` (Codex-owned), in "Workflow status for candidate pull requests": replace the sentence "Merge queue (`merge_group`) is not supported; a required context will block queued merges." with "Merge queue groups get the same context on the group commit, under stricter exact-source rules; see [GitHub merge queues](advanced/github-merge-queue.md)." Add the guide to `docs/README.md`'s index (Codex-owned).
+Rebase `feat/change-record-capture-v1` onto this branch once it lands; expect textual conflicts only where both lanes append.
 
-## Contract
+- `src/hub/store.rs`, `store_sqlite.rs`, `store_pg.rs`: eight `merge_group*` methods appended after the forge-check block.
+- `src/hub/connection.rs`: `MergeGroup`, `NewMergeGroup`, `validate_group_note`.
+- Named migration `merge_groups` (no integer slot). Please do not reuse the name.
+- `src/hub/mod.rs`: `HubState::webhook_jobs_pending` (webhook backlog; used by tests as a completion signal).
+- `src/hub/sync.rs`: `merge_group` routing, manifest permission and event, `Sync::jwt` and `pending_webhooks` visibility.
+- `src/hub/publish.rs`: `forge_check.merge_queue` on the publication view.
+- `docs/hub.md`, `docs/api.md`, `docs/advanced/README.md`: pointers to the guide and the API fields.
+- `tests/hub_store_conformance.rs`, `tests/support/fake_github.rs`: additive.
 
-`merge-queue-contract/v1`, defined in `docs/advanced/github-merge-queue.md#integration-contract`. Pin the commit that lands this file on `feat/github-merge-queue-checks`.
+## Consumer fields for Codex (UI, MCP, readiness)
 
-## Commits (on `f85d4e4`)
+`forge_check::merge_group::{group_projection, pull_projections, queue_readiness}` and the publication API's `forge_check.merge_queue` (fields in `docs/api.md`). Do not scrape status descriptions.
 
-1. `1d9a3e7` Add a durable journal for GitHub merge queue groups — the shared-file patch (store trait, both impls, `connection.rs` types, named migration, conformance test). Apply or rebase as one unit.
-2. `3c8ad24` Post the Hub workflow status on merge queue groups — `forge_check/merge_group.rs` (owned), `github.rs` reads, poller hook in `forge_check.rs`, `merge_group` routing and manifest in `sync.rs`.
-3. `0fb3bce` Test merge queue group checks end to end against the fake GitHub.
-4. Docs and this ledger (next commit).
+## Remaining
 
-## Validation (local macOS, this branch)
-
-- `cargo clippy --all-targets --locked -- -D warnings`: clean. `cargo fmt --check`: clean.
-- `cargo nextest run --locked --lib -E 'test(merge_group) | test(manifest)'`: 17 passed.
-- `AGENTSCM_TEST_DATABASE_URL=<local PostgreSQL 18> cargo nextest run --locked -E 'binary(hub_store_conformance)'`: 60 passed, 0 skipped (`merge_group_journal` on both backends).
-- Same database: `binary(hub_merge_queue) | binary(hub_forge_check) | binary(hub_gitlab_forge_check) | binary(fake_github_smoke) | test(merge_group) | test(forge_check)`: 102 passed.
-- Not run: the full `cargo nextest run --locked`, doctests, S3, container smoke. These are left for the combined gate.
-- Live GitHub: not run (no authorized test repository). Fixture-only qualification.
-
-## Remaining for integration / release
-
-- Live qualification steps in the guide; payload field names and status-as-required-check acceptance are unconfirmed live.
-- Core: a group-subject assessment so multi-entry groups can qualify (contract in the guide). Until then, multi-entry groups stay pending.
-- Codex: wire `group_projection` into HTTP/UI/MCP; apply the `docs/hub.md` / `docs/README.md` patch above; changelog delta: "Hub: the opt-in workflow status is posted on GitHub merge queue groups under exact-tree rules (experimental, fake-tested)."
-- Existing GitHub Apps must add `merge_queues: read` and the `merge_group` event by hand.
+- Core: an assessment of a combined group source so multi-entry groups can qualify (fields in the guide's contract). Until then they stay pending.
+- Live qualification: GitHub refused a merge queue ruleset on a private Team-plan organization repository (422). Needs a public organization repository or a plan with private merge queues, an installed App and a webhook-reachable Hub.
+- Existing GitHub Apps must add `merge_queues: read` and the `merge_group` event; `delivery` readiness reports which is missing.
+- Changelog delta for the integration owner: "Hub: the opt-in workflow status is posted on GitHub merge queue groups under exact-tree rules, with delivery readiness and landed outcomes (experimental, fake-tested)."
