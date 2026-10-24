@@ -5,11 +5,20 @@ export function withTimeout(signal?: AbortSignal): AbortSignal {
   const limit = AbortSignal.timeout(FETCH_TIMEOUT_MS)
   if (!signal) return limit
   if (typeof AbortSignal.any === 'function') return AbortSignal.any([signal, limit])
-  // Older browsers (Safari before 17.4): relay both by hand.
+  // Older browsers (Safari before 17.4): relay both by hand, dropping the listeners once either fires
+  // (the limit always does within 15 s), so a long-lived caller signal does not collect one per fetch.
   const both = new AbortController()
-  for (const s of [signal, limit]) {
-    if (s.aborted) both.abort(s.reason)
-    else s.addEventListener('abort', () => both.abort(s.reason), { once: true })
+  const relay = (from: AbortSignal) => () => {
+    for (const [s, f] of relays) s.removeEventListener('abort', f)
+    both.abort(from.reason)
+  }
+  const relays = [signal, limit].map((s) => [s, relay(s)] as const)
+  for (const [s, f] of relays) {
+    if (s.aborted) {
+      f()
+      break
+    }
+    s.addEventListener('abort', f, { once: true })
   }
   return both.signal
 }

@@ -16,6 +16,32 @@ const CADENCE = [
   ['heart-pulse', 'Hub health', 'Every 15 seconds'],
 ] as const
 
+/** A WAI-ARIA radio group of cards: one tab stop, arrows/Home/End move the choice and the focus together. */
+function RadioCards<V extends string>({ label, tour, options, value, onChange }: { label: string; tour: string; options: { v: V; icon: string; label: string; hint: string }[]; value: V; onChange: (v: V) => void }) {
+  const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    const i = options.findIndex((o) => o.v === value)
+    const to = { ArrowRight: i + 1, ArrowDown: i + 1, ArrowLeft: i - 1, ArrowUp: i - 1, Home: 0, End: options.length - 1 }[e.key]
+    if (to === undefined) return
+    e.preventDefault()
+    const next = options[(to + options.length) % options.length]!
+    onChange(next.v)
+    e.currentTarget.querySelectorAll<HTMLElement>('[role="radio"]')[options.indexOf(next)]?.focus()
+  }
+  return (
+    <div className="choice-cards" data-tour={tour} role="radiogroup" aria-label={label} onKeyDown={onKeyDown}>
+      {options.map((t) => (
+        <button key={t.v} type="button" role="radio" aria-checked={value === t.v} tabIndex={value === t.v ? 0 : -1} className={`choice${value === t.v ? ' on' : ''}`} onClick={() => onChange(t.v)}>
+          <Icon name={t.icon} />
+          <span>
+            <strong>{t.label}</strong>
+            <span className="muted small">{t.hint}</span>
+          </span>
+        </button>
+      ))}
+    </div>
+  )
+}
+
 export function SettingsPage({ token, whoami, pref, onPref, density, onDensity, railCollapsed, onRail, onForget }: { token: string; whoami: Whoami | null; pref: ThemePref; onPref: (p: ThemePref) => void; density: Density; onDensity: (d: Density) => void; railCollapsed: boolean; onRail: (collapsed: boolean) => void; onForget: () => void }) {
   const themes: { v: ThemePref; icon: string; label: string; hint: string }[] = [
     { v: 'light', icon: 'sun', label: 'Light', hint: 'Always light' },
@@ -40,34 +66,14 @@ export function SettingsPage({ token, whoami, pref, onPref, density, onDensity, 
               <div className="settings-label">Theme</div>
               <div className="muted small">Pick a fixed theme or follow your device’s setting.</div>
             </div>
-            <div className="choice-cards" data-tour="settings-theme" role="radiogroup" aria-label="Theme">
-              {themes.map((t) => (
-                <button key={t.v} type="button" role="radio" aria-checked={pref === t.v} className={`choice${pref === t.v ? ' on' : ''}`} onClick={() => onPref(t.v)}>
-                  <Icon name={t.icon} />
-                  <span>
-                    <strong>{t.label}</strong>
-                    <span className="muted small">{t.hint}</span>
-                  </span>
-                </button>
-              ))}
-            </div>
+            <RadioCards label="Theme" tour="settings-theme" options={themes} value={pref} onChange={onPref} />
           </div>
           <div className="settings-row">
             <div>
               <div className="settings-label">Density</div>
               <div className="muted small">How much room rows, boxes and sections get.</div>
             </div>
-            <div className="choice-cards" data-tour="settings-density" role="radiogroup" aria-label="Density">
-              {densities.map((t) => (
-                <button key={t.v} type="button" role="radio" aria-checked={density === t.v} className={`choice${density === t.v ? ' on' : ''}`} onClick={() => onDensity(t.v)}>
-                  <Icon name={t.icon} />
-                  <span>
-                    <strong>{t.label}</strong>
-                    <span className="muted small">{t.hint}</span>
-                  </span>
-                </button>
-              ))}
-            </div>
+            <RadioCards label="Density" tour="settings-density" options={densities} value={density} onChange={onDensity} />
           </div>
           <div className="settings-row">
             <div>

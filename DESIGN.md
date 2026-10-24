@@ -4,21 +4,21 @@ description: A calm, read-only coordination Hub for seeing who owns each piece o
 colors:
   primary-light: "#4F5BD5"
   primary-dark: "#7C86FF"
-  chrome-light: "#E3E6EF"
+  chrome-light: "#DDE0EC"
   chrome-dark: "#05060B"
-  canvas-light: "#F4F5F9"
-  canvas-dark: "#0F1220"
+  canvas-light: "#F6F7FB"
+  canvas-dark: "#181C30"
   surface-light: "#FFFFFF"
-  surface-dark: "#171B2A"
-  surface-head-light: "#F9FAFC"
-  surface-head-dark: "#1B2032"
+  surface-dark: "#1F2438"
+  surface-head-light: "#EEF1F7"
+  surface-head-dark: "#282E46"
   elevated-dark: "#1A1E30"
   nav-active-light: "#D3D7F5"
   success: "#12B76A"
   warning: "#F79009"
   error: "#F04438"
-  success-ink-light: "#067647"
-  warning-ink-light: "#B54708"
+  success-ink-light: "#05663D"
+  warning-ink-light: "#9C3D06"
   error-ink-light: "#B42318"
   success-ink-dark: "#6CE9A6"
   warning-ink-dark: "#FEC84B"
@@ -58,7 +58,7 @@ spacing:
   md: "12px"
   lg: "16px"
   xl: "20px"
-  section: "28px"
+  section: "24px"
   section-spacious: "32px"
 components:
   navigation:
@@ -113,11 +113,11 @@ The palette is a neutral light/dark canvas with white or deep blue-black content
 - **Hub violet, dark** (`#7C86FF`): The same accent role in the dark theme.
 
 ### Neutral
-- **Chrome, light / dark** (`#E3E6EF` / `#05060B`): The top bar and the side rail, one shared surface.
-- **Sheet canvas, light / dark** (`#F4F5F9` / `#0F1220`): The page itself, inset in the chrome.
+- **Chrome, light / dark** (`#DDE0EC` / `#05060B`): The top bar and the side rail, one shared surface.
+- **Sheet canvas, light / dark** (`#F6F7FB` / `#181C30`): The page itself, inset in the chrome.
 - **White surface** (`#FFFFFF`): Light content, card, and control surfaces.
-- **Deep surface** (`#171B2A`): Dark content surfaces, with a 1px top highlight (`inset 0 1px 0 rgba(255,255,255,.04)`).
-- **Box head band** (`--hub-surface-head`, `#F9FAFC` / `#1B2032`): The tinted head of every evidence box.
+- **Deep surface** (`#1F2438`): Dark content surfaces, with a 1px top highlight (`inset 0 1px 0 rgba(255,255,255,.04)`).
+- **Box head band** (`--hub-surface-head`, `#EEF1F7` / `#282E46`): The tinted head of every evidence box.
 - **Rules** (`--hub-rule` / `--hub-rule-strong`): 10% / 18% ink in light, 8% / 15% white in dark.
 - **Elevated dark surface** (`#1A1E30`): Dark elevated controls and overlays.
 - **Theme text and border:** Use `--cb-text`, `--cb-text-2`, `--cb-text-3`, and `--cb-border` so contrast follows the active theme.
@@ -158,13 +158,15 @@ At 860px and below, the board becomes two columns, directed-request targets beco
 
 ## Density
 
-**The Two Densities Rule.** The Hub has two density modes, chosen in Settings and stored per browser (`agentscm.density`, set on `<html data-density>` before first paint). **Spacious** is the default; **Compact** is the dense register for big screens and is exactly the layout the sections above describe. Spacious overrides tokens only, all in `ui/src/density.css` (tour card values at the end of `ui/src/tour/tour.css`); the rules in `styles.css` carry the compact value as the `var()` fallback, so Compact sets nothing.
+**The Two Densities Rule.** The Hub has two density modes, chosen in Settings and stored per browser (`agentscm.density`, set on `<html data-density>` before first render). **Spacious** is the default; **Compact** is the dense register for big screens and is exactly the layout the sections above describe. Spacious overrides tokens only, all in `ui/src/density.css` (tour card values at the end of `ui/src/tour/tour.css`); the rules in `styles.css` carry the compact value as the `var()` fallback, so Compact sets nothing.
 
 | Token | Compact | Spacious (phone) |
 | --- | --- | --- |
 | Body size (`--bs-body-font-size`) | 14px | 15px |
 | Section and page gap (`--hub-gap`) | 24px | 32px (26px) |
 | Masthead space below (`--hub-answer-pad`) | 28px | 36px (28px) |
+| Space above the page (`--hub-main-top`) | 28px (22px) | 36px (26px) |
+| Question to answer gap (`--hub-answer-gap`) | 8px | 12px (10px) |
 | Top bar (`--hub-top-h`) | 56px | 62px (56px) |
 | Box head (`--hub-head-h`, `--hub-head-x`) | 52px, 18px | 58px, 22px (54px, 18px) |
 | Box body (`--hub-pad-box`) | 16 18 18 | 20 22 22 (18 18 20) |
@@ -172,13 +174,16 @@ At 860px and below, the board becomes two columns, directed-request targets beco
 | Activity row (`--hub-event-y`) | 8px | 11px (10px) |
 | Nav row, group gap (`--hub-nav-h`, `--hub-nav-group`) | 40px, 18px | 44px, 24px |
 | Lane and work-card padding | 11 14 10 / 12 14 | 14 16 12 / 16 18 (12 14 11 / 14 16) |
-| Tour card width, body line height | 400 (480 welcome), 1.5 | 440 (520), 1.6 |
+| Tour card width (welcome) | 400 (480) | 500 (580) |
+| Tour card type | as built | title 1.45rem, lead 1.0625rem, rows 0.97rem (phone: title 1.25rem, lead 1rem) |
+| Tour card band, hero, padding | as built | 116px, 188px, 24/30 (phone band 96px) |
+| Tour buttons, trail nodes, ring | as built | 44px buttons, 10px nodes, 20px ring |
 
 Touch targets stay at 44px in both modes and phones get the lighter increase.
 
 ## Elevation & Depth
 
-**The Three Planes Rule.** The Hub has three planes, each one tonal step apart, so navigation never reads as content: **chrome** (`#E3E6EF` / `#05060B`; the top bar and rail share one tinted surface with no dividing rules), the **sheet** (`#F4F5F9` / `#0F1220`; the content column, inset with a 14px top-left radius and a clearly visible edge, carrying the breadcrumbs as its own header line), and **surfaces** (`#FFFFFF` / `#171B2A`; boxes and cards on the sheet). Tiles inside a box are tonal (`--hub-sunken`), never bordered, so a box never holds more boxes. On screens up to 960px wide the rail becomes a drawer and the sheet loses its corner. `main` takes focus on navigation for assistive technology but shows no ring, because it isn't a control.
+**The Three Planes Rule.** The Hub has three planes, each one tonal step apart, so navigation never reads as content: **chrome** (`#DDE0EC` / `#05060B`; the top bar and rail share one tinted surface with no dividing rules), the **sheet** (`#F6F7FB` / `#181C30`; the content column, inset with a 14px top-left radius and a clearly visible edge, carrying the breadcrumbs as its own header line), and **surfaces** (`#FFFFFF` / `#1F2438`; boxes and cards on the sheet). Tiles inside a box are tonal (`--hub-sunken`), never bordered, so a box never holds more boxes. On screens up to 960px wide the rail becomes a drawer and the sheet loses its corner. `main` takes focus on navigation for assistive technology but shows no ring, because it isn't a control.
 
 The Work register is flat and structural. Depth comes from tonal lane fields, a one-pixel `--cb-border` rule, white or deep content surfaces, and a small violet hover tint. The feature adds no shadow vocabulary or decorative gradient. Focus-visible targets use a 2px violet outline with a 3px offset, and reduced-motion users receive no row hover transition.
 

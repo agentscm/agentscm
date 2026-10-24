@@ -14,4 +14,18 @@ describe('usePoll', () => {
     release('B')
     await waitFor(() => expect(result.current).toMatchObject({ kind: 'ready', value: 'B' }))
   })
+
+  it('keeps the shown value while a refresh nonce re-fetches', async () => {
+    let n = 0
+    let release: (v: string) => void = () => {}
+    const load = (): Promise<string> => new Promise((r) => { n++; release = r })
+    const { result, rerender } = renderHook(({ r }) => usePoll(load, 0, 'k', r), { initialProps: { r: 0 } })
+    release('A')
+    await waitFor(() => expect(result.current).toMatchObject({ kind: 'ready', value: 'A' }))
+    rerender({ r: 1 })
+    expect(result.current).toMatchObject({ kind: 'ready', value: 'A' })
+    await waitFor(() => expect(n).toBe(2))
+    release('B')
+    await waitFor(() => expect(result.current).toMatchObject({ kind: 'ready', value: 'B' }))
+  })
 })

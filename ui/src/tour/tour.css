@@ -42,7 +42,7 @@
 .tour-marks use { fill: none; stroke-linecap: square; stroke-linejoin: miter; }
 .tour-marks .halo { stroke: var(--hub-surface); stroke-width: 5.5; }
 .tour-marks .ink { stroke: var(--hub-brand-ink); stroke-width: 2.5; }
-:root[data-theme='dark'] .tour-marks .ink { stroke: var(--hub-brand); }
+:root[data-bs-theme='dark'] .tour-marks .ink { stroke: var(--hub-brand); }
 
 .tour-card {
   position: fixed;
@@ -156,20 +156,51 @@
 
 /* Density: Spacious (the default) gives the card more air; the width comes from place.ts. */
 :root[data-density='spacious'] .tour-layer {
-  --tour-main-pad: 18px 22px 6px;
-  --tour-gap: 14px;
-  --tour-rows: 14px;
+  --tour-main-pad: 24px 30px 8px;
+  --tour-gap: 18px;
+  --tour-rows: 18px;
   --tour-lh: 1.6;
-  --tour-foot-pad: 12px 22px 14px;
-  --tour-x: 22px;
+  --tour-foot-pad: 16px 30px 18px;
+  --tour-x: 30px;
 }
+/* Larger, not only airier: type, band, trail and buttons all step up. */
+:root[data-density='spacious'] .tour-card { border-radius: 20px; }
+:root[data-density='spacious'] .tour-band { height: 116px; }
+:root[data-density='spacious'] .tour-band.is-hero { height: 188px; }
+:root[data-density='spacious'] .tour-art { padding: 10px 0; }
+:root[data-density='spacious'] .tour-head { min-height: 32px; }
+:root[data-density='spacious'] .tour-kicker { font-size: 0.9rem; }
+:root[data-density='spacious'] .tour-x { width: 36px; height: 36px; font-size: 1.05rem; }
+:root[data-density='spacious'] .tour-title { font-size: 1.45rem; letter-spacing: -0.015em; }
+:root[data-density='spacious'] .tour-what { font-size: 1.0625rem; }
+:root[data-density='spacious'] .tour-row { grid-template-columns: 22px minmax(0, 1fr); gap: 12px; }
+:root[data-density='spacious'] .tour-glyph { width: 20px; height: 20px; }
+:root[data-density='spacious'] .tour-row dt { font-size: 0.875rem; }
+:root[data-density='spacious'] .tour-row dd { margin-top: 3px; font-size: 0.97rem; }
+:root[data-density='spacious'] .tour-more { min-height: 36px; font-size: 0.92rem; }
+:root[data-density='spacious'] .tour-tip { gap: 12px; padding: 14px 16px; border-radius: 12px; font-size: 0.94rem; }
+:root[data-density='spacious'] .tour-live-dot { width: 10px; height: 10px; margin-top: 7px; }
+:root[data-density='spacious'] .tour-check, :root[data-density='spacious'] .tour-count { font-size: 0.9rem; }
+:root[data-density='spacious'] .tour-buttons { gap: 10px; }
+:root[data-density='spacious'] .tour-buttons .btn { --bs-btn-padding-y: 0.5rem; --bs-btn-padding-x: 1.1rem; --bs-btn-font-size: 0.97rem; min-height: 44px; }
+:root[data-density='spacious'] .tour-keys { padding-bottom: 16px; font-size: 0.8rem; }
+:root[data-density='spacious'] .tour-trail { --r: 10px; height: 20px; }
+:root[data-density='spacious'] .tour-trail-line, :root[data-density='spacious'] .tour-trail-fill { top: 9px; }
+:root[data-density='spacious'] .tour-node { top: 10px; width: 10px; height: 10px; }
+:root[data-density='spacious'] .tour-trail-ring::before { top: 10px; width: 20px; height: 20px; }
+:root[data-density='spacious'] .tour-trail-ring::after { top: 10px; width: 8px; height: 8px; }
 @media (max-width: 640px) {
   :root[data-density='spacious'] .tour-layer {
-    --tour-main-pad: 12px 18px 4px;
-    --tour-gap: 10px;
-    --tour-rows: 11px;
+    --tour-main-pad: 14px 20px 4px;
+    --tour-gap: 12px;
+    --tour-rows: 13px;
     --tour-lh: 1.55;
-    --tour-foot-pad: 10px 18px 12px;
-    --tour-x: 18px;
+    --tour-foot-pad: 12px 20px 14px;
+    --tour-x: 20px;
   }
+  :root[data-density='spacious'] .tour-title { font-size: 1.25rem; }
+  :root[data-density='spacious'] .tour-what { font-size: 1rem; }
+  :root[data-density='spacious'] .tour-row dd { font-size: 0.94rem; }
+  :root[data-density='spacious'] .tour-band { height: 96px; }
+  :root[data-density='spacious'] .tour-band.is-hero { height: 140px; }
 }

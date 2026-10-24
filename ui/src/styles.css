@@ -4,24 +4,24 @@
 
 :root,
 [data-bs-theme='light'] {
-  --hub-chrome: #e3e6ef;
-  --hub-canvas: #f4f5f9;
+  --hub-chrome: #dde0ec;
+  --hub-canvas: #f6f7fb;
   --hub-rail: var(--hub-chrome);
   --hub-surface: #ffffff;
-  --hub-surface-head: #f9fafc;
+  --hub-surface-head: #eef1f7;
   --hub-sunken: #f4f5f8;
   --hub-text: #151a2d;
   --hub-text-2: #4a5168;
-  --hub-text-3: #5d6480;
+  --hub-text-3: #505773;
   --hub-nav-active: #d3d7f5;
   --hub-rule: rgba(21, 26, 45, 0.1);
   --hub-rule-strong: rgba(21, 26, 45, 0.18);
   --hub-brand: #4f5bd5;
   --hub-brand-ink: #3a45b8;
   --hub-brand-soft: #eceefd;
-  --hub-ok: #067647;
+  --hub-ok: #05663d;
   --hub-ok-soft: #e7f7ef;
-  --hub-warn: #b54708;
+  --hub-warn: #9c3d06;
   --hub-warn-soft: #fef3e2;
   --hub-bad: #b42318;
   --hub-bad-soft: #fdecea;
@@ -46,15 +46,15 @@
 
 [data-bs-theme='dark'] {
   --hub-chrome: #05060b;
-  --hub-canvas: #0f1220;
+  --hub-canvas: #181c30;
   --hub-rail: var(--hub-chrome);
-  --hub-surface: #171b2a;
-  --hub-surface-head: #1b2032;
+  --hub-surface: #1f2438;
+  --hub-surface-head: #282e46;
   --hub-sunken: #121625;
   --hub-nav-active: rgba(124, 134, 255, 0.2);
   --hub-text: #e8eaf4;
   --hub-text-2: #b3b8cc;
-  --hub-text-3: #9097b0;
+  --hub-text-3: #98a0ba;
   --hub-rule: rgba(255, 255, 255, 0.08);
   --hub-rule-strong: rgba(255, 255, 255, 0.15);
   --hub-brand: #7c86ff;
@@ -2425,7 +2425,6 @@ a.run-row:hover {
 /* The popup is exactly its combobox wide, so it never leaves its column or covers the nav; callers size the slot. */
 .combo-pop { position: absolute; z-index: 30; left: 0; right: 0; margin-top: 4px; max-height: 360px; overflow: auto; background: var(--hub-surface); border: 1px solid var(--hub-rule-strong); border-radius: 12px; padding: 4px; }
 .combo-list { list-style: none; margin: 0; padding: 0; }
-.combo-list.is-stale { opacity: 0.55; }
 .combo-opt { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; border-radius: 8px; cursor: pointer; }
 .combo-opt[aria-selected='true'] { background: var(--hub-brand-soft); }
 .combo-main { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; min-width: 0; }

@@ -58,21 +58,20 @@ export function useHashCursor(param = 'before'): HashCursor {
   }
 }
 
-// A clicked button can vanish (last page, or the list shows a skeleton while the next page loads); the nav takes focus then.
-let refocusUntil = 0
-
 /** Newer / Older buttons with an "everything" end state. Pass `onNewer`/`onOlder` only when that move exists. */
 export function Pager({ onNewer, onOlder, complete = false, newerLabel = 'Newer', olderLabel = 'Older', status, tour = 'pager' }: { onNewer?: (() => void) | undefined; onOlder?: (() => void) | undefined; complete?: boolean; newerLabel?: string; olderLabel?: string; status?: string; tour?: string }) {
   const nav = useRef<HTMLElement>(null)
+  // A clicked button can vanish (last page, or the list shows a skeleton while the next page loads); this nav then takes focus, once.
+  const refocusUntil = useRef(0)
   useEffect(() => {
-    if (Date.now() < refocusUntil && (!document.activeElement || document.activeElement === document.body)) {
-      refocusUntil = 0
+    if (Date.now() < refocusUntil.current && (!document.activeElement || document.activeElement === document.body)) {
+      refocusUntil.current = 0
       nav.current?.focus({ preventScroll: true })
     }
   })
   if (!onNewer && !onOlder && !complete) return null
   const keepFocus = (go: () => void) => () => {
-    refocusUntil = Date.now() + 5000
+    refocusUntil.current = Date.now() + 5000
     go()
   }
   return (

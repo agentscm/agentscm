@@ -16,8 +16,8 @@ export interface Placement {
 
 export const CARD_W = 400
 export const HERO_W = 480
-// Spacious density: 40px / 40px wider (tour.css sizes the padding to match).
-const WIDE = 40
+// Spacious density: 100px wider (tour.css sizes the type and padding to match).
+const WIDE = 100
 const GAP = 12
 const EDGE = 16
 const COMPACT_H = 300

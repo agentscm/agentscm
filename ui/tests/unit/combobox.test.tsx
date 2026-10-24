@@ -104,6 +104,27 @@ describe('Combobox (client filter)', () => {
 })
 
 describe('Combobox (server search)', () => {
+  it('keeps old results inert while a new search is pending, so Enter cannot pick them', async () => {
+    let release: (r: { options: ComboOption[] }) => void = () => {}
+    let asked = false
+    const search = (q: string) => (q ? new Promise<{ options: ComboOption[] }>((r) => { asked = true; release = r }) : Promise.resolve({ options: [opt('old', 'Old result')] }))
+    const onSelect = vi.fn()
+    render(<Combobox id="p" label="Pick" search={search} onSelect={onSelect} />)
+    fireEvent.focus(input())
+    await screen.findByRole('option', { name: /Old result/ })
+    fireEvent.change(input(), { target: { value: 'new' } })
+    await waitFor(() => expect(screen.getByRole('listbox').getAttribute('aria-busy')).toBe('true'))
+    fireEvent.keyDown(input(), { key: 'ArrowDown' })
+    fireEvent.keyDown(input(), { key: 'Enter' })
+    fireEvent.click(screen.getByRole('option', { name: /Old result/ }))
+    expect(onSelect).not.toHaveBeenCalled()
+    expect(screen.getByRole('option').getAttribute('aria-selected')).toBe('false')
+    await waitFor(() => expect(asked).toBe(true))
+    release({ options: [opt('fresh', 'Fresh result')] })
+    fireEvent.click(await screen.findByRole('option', { name: /Fresh result/ }))
+    expect(onSelect).toHaveBeenCalledWith('fresh', expect.anything())
+  })
+
   it('debounces typing, aborts the previous request and shows only the latest answer', async () => {
     const calls: { q: string; signal: AbortSignal }[] = []
     const search = (q: string, signal: AbortSignal) => {

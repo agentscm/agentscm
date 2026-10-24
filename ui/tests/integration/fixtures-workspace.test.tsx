@@ -104,6 +104,19 @@ describe('signed-in overview', () => {
     expect(writes(sent)).toEqual([])
   })
 
+  it('Refresh workspace keeps focus on its button and the page content in place', async () => {
+    stubHub()
+    render(<WorkspacePage />)
+    const refresh = await screen.findByRole('button', { name: 'Refresh workspace' }, LOAD)
+    refresh.focus()
+    const you = screen.getByRole('heading', { name: 'You' })
+    fireEvent.click(refresh)
+    await new Promise((r) => setTimeout(r, 50))
+    expect(screen.getByRole('button', { name: 'Refresh workspace' })).toBe(refresh)
+    expect(document.activeElement).toBe(refresh)
+    expect(screen.getByRole('heading', { name: 'You' })).toBe(you)
+  })
+
   it('section tabs follow the address and mark the current one', async () => {
     stubHub()
     at('#workspace/members')
