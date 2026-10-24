@@ -4755,8 +4755,10 @@ fn renameat_noreplace(
     })?;
     // SAFETY: both names are relative to the retained directory descriptor and remain valid for
     // the duration of the call. RENAME_NOREPLACE refuses an existing destination atomically.
+    // The raw syscall, because the musl that static release builds link has no renameat2 wrapper.
     let result = unsafe {
-        libc::renameat2(
+        libc::syscall(
+            libc::SYS_renameat2,
             source_directory.as_raw_fd(),
             from.as_ptr(),
             destination_directory.as_raw_fd(),
