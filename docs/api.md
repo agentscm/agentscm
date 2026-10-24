@@ -186,6 +186,18 @@ and `note` says branch protection, raw pushes and administrator bypass are not
 enforced or verified by AgentSCM. A GitLab status on the MR head is not a verified merged-result
 pipeline. See [workflow status](hub.md#workflow-status-for-candidate-pull-requests).
 
+On GitHub with the flag on, `forge_check.merge_queue` is added: `readiness` (null until the
+first poll after a start; otherwise `target`, `delivery` — `subscribed`, `permission_missing`,
+`event_not_subscribed`, `personal_token_unsupported` or `unknown` — `undelivered`, the pull
+request numbers of current queue branches no `merge_group` delivery named, or null when the
+listing was refused or truncated, and `checked_at`) and `groups`, at most 10 merge queue groups
+that queued this pull request, newest first: `kind` (`merge_group`), `context`, `group_sha`,
+`base_ref`, `base_sha`, `pr_number`, `pr_head_sha`, `stacked_on`, `lifecycle` (`current` or
+`ended`), `ended_reason`, `outcome` (`pending`, `landed`, `merged_reported`, `not_landed` or
+`unknown`), `state`, `description`, `binding_digest`, `posting` (`pending` before the first
+post, `uncertain`, `posted` or `refused`), `ruleset_requirement`, `status_source`,
+`observed_at` and `updated_at`. See [GitHub merge queues](advanced/github-merge-queue.md).
+
 ## Hub publication external outcomes
 
 This is the Hub, not `serve`. When the repository is listed in `AGENTSCM_GITHUB_EXTERNAL_RUNS`

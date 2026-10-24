@@ -273,6 +273,11 @@ fn now_ms() -> i64 {
 }
 
 impl Sync {
+    /// Accepted webhook deliveries whose job has not finished.
+    pub(super) fn pending_webhooks(&self) -> usize {
+        self.pending.load(Ordering::Relaxed)
+    }
+
     #[cfg(unix)]
     pub(super) fn forge_cursor(&self, repository: &str) -> i64 {
         lock(&self.forge_cursors)
@@ -385,7 +390,7 @@ impl Sync {
             .ok_or_else(|| GhError::Failed("no app credentials loaded for the connection".into()))
     }
 
-    async fn jwt(&self, conn: &Connection) -> Gh<String> {
+    pub(super) async fn jwt(&self, conn: &Connection) -> Gh<String> {
         let app = self.app(conn)?;
         Ok(app.key.jwt(app.app_id, unix_now())?)
     }
@@ -1720,7 +1725,7 @@ async fn webhook_work(
         }
         return Ok(());
     }
-    if !matches!(event, "pull_request" | "push") {
+    if !matches!(event, "pull_request" | "push" | "merge_group") {
         return Ok(());
     }
     let Some(repository_id) = payload["repository"]["id"].as_i64() else {
@@ -1739,6 +1744,16 @@ async fn webhook_work(
         let token = sync.token(conn, repo.installation_id).await?;
         let reads = async {
             match event {
+                // A merge queue group is judged on its own commit; no pull request or branch
+                // read stands in for it.
+                "merge_group" => {
+                    #[cfg(unix)]
+                    super::forge_check::merge_group::on_delivery(
+                        state, conn, &repo, &token, payload,
+                    )
+                    .await?;
+                    return Ok(());
+                }
                 "pull_request" => {
                     let number = payload["pull_request"]["number"]
                         .as_i64()
@@ -1969,11 +1984,11 @@ fn manifest(name: &str, public: &str, connection: &str) -> Value {
         "callback_urls": [format!("{public}/v1/hub/login/github/callback")],
         "public": false,
         "default_permissions": {"contents": "read", "metadata": "read",
-            "pull_requests": "write", "statuses": "write"}});
+            "pull_requests": "write", "statuses": "write", "merge_queues": "read"}});
     if webhook_reachable(public) {
         manifest["hook_attributes"] =
             json!({"url": format!("{public}/v1/hub/webhooks/github/{connection}")});
-        manifest["default_events"] = json!(["pull_request", "push"]);
+        manifest["default_events"] = json!(["pull_request", "push", "merge_group"]);
     }
     manifest
 }
@@ -2330,7 +2345,10 @@ mod tests {
             public["hook_attributes"]["url"],
             "https://hub.example.com/v1/hub/webhooks/github/con_1"
         );
-        assert_eq!(public["default_events"], json!(["pull_request", "push"]));
+        assert_eq!(
+            public["default_events"],
+            json!(["pull_request", "push", "merge_group"])
+        );
         for url in [
             "http://127.0.0.1:7332",
             "http://[::1]:7332",
