@@ -6,6 +6,14 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension, ToSql, Transaction, TransactionBehavior, params};
 use serde_json::json;
 
+use crate::change_record::{
+    ActionFinishV1, ActionMutationReceiptV1, ActionStartV1, CaptureBatchV1, CapturedEventKindV1,
+    CapturedEventV1, ChangeRecordSummaryV1, IngestReceiptV1,
+};
+
+use super::change_record::{
+    SessionStatsV1, StoredActionV1, StoredDecisionV1, project as project_change_record,
+};
 use super::connection::{
     CONNECTION_SELECT, ConnectedRepository, Connection as ForgeConnection, DELIVERY_KEEP_SECONDS,
     ForgeCheck, ForgeCheckReserve, MergeGroup, NewConnection, NewForgeCheck, NewMergeGroup,
@@ -62,6 +70,10 @@ use super::work::{
     scope_overlap_reasons, uncovered_scope, work_overlap_pairs, work_payload_row_bytes,
 };
 use super::{HubError, Result};
+
+const MAX_CHANGE_EVENTS_PER_SESSION: i64 = 100_000;
+const MAX_CHANGE_ACTIONS_PER_WORK: i64 = 10_000;
+const MAX_CHANGE_OPERATIONS_PER_WORK: i64 = 120_000;
 
 // shortcut: one serialized connection, no pool; upgrade when hub load needs concurrent DB work
 pub(super) struct SqliteStore {
@@ -291,7 +303,8 @@ fn sqlite_usage_summary(
                 COUNT(input_tokens), COUNT(output_tokens),
                 COALESCE(SUM(CASE WHEN cost_amount_micros IS NULL THEN 1 ELSE 0 END),0),
                 COALESCE(SUM(CASE WHEN outcome='failed' THEN 1 ELSE 0 END),0)
-           FROM hub_work_model_usage WHERE work=?1",
+           FROM hub_work_model_usage WHERE work=?1
+             AND COALESCE(json_extract(request,'$.measurement_scope'),'request')<>'session_cumulative'",
         [work],
         |r| {
             Ok((
@@ -308,6 +321,7 @@ fn sqlite_usage_summary(
     let mut statement = tx.prepare(
         "SELECT agent,model_provider,model,usage_basis,COUNT(*),SUM(input_tokens),SUM(output_tokens),COUNT(input_tokens),COUNT(output_tokens)
            FROM hub_work_model_usage WHERE work=?1
+             AND COALESCE(json_extract(request,'$.measurement_scope'),'request')<>'session_cumulative'
           GROUP BY agent,model_provider,model,usage_basis ORDER BY agent,model_provider,model,usage_basis LIMIT ?2")?;
     let mut token_groups = statement
         .query_map(params![work, (group_limit + 1) as i64], |r| {
@@ -342,6 +356,7 @@ fn sqlite_usage_summary(
     let mut statement = tx.prepare(
         "SELECT cost_kind,cost_currency,cost_basis,usage_basis,agent,model_provider,model,SUM(cost_amount_micros),COUNT(*)
            FROM hub_work_model_usage WHERE work=?1 AND cost_amount_micros IS NOT NULL
+             AND COALESCE(json_extract(request,'$.measurement_scope'),'request')<>'session_cumulative'
           GROUP BY cost_kind,cost_currency,cost_basis,usage_basis,agent,model_provider,model
           ORDER BY agent,model_provider,model,usage_basis,cost_kind,cost_currency,cost_basis LIMIT ?2")?;
     let mut cost_groups = statement
@@ -997,6 +1012,50 @@ fn unfinished_for_session(
     if snapshots.len() > 1 {
         return Err(HubError::Invalid(
             "session is lead for more than one unfinished work item".into(),
+        ));
+    }
+    snapshots
+        .into_iter()
+        .next()
+        .map(|snapshot| {
+            let mut item: WorkItem = json_value(&snapshot)?;
+            project_claim(tx, &mut item, now)?;
+            Ok(item)
+        })
+        .transpose()
+}
+
+fn active_capture_work_for_session(
+    tx: &Transaction<'_>,
+    who: &WorkWho,
+    session: &str,
+    now: i64,
+) -> Result<Option<WorkItem>> {
+    let mut statement = tx.prepare(
+        "SELECT item.snapshot FROM hub_work_items item
+         JOIN hub_work_participants participant ON participant.work=item.id
+         WHERE item.provider=?1 AND item.host=?2 AND item.repository=?3
+           AND item.repository_id IS ?4 AND item.state='active'
+           AND participant.token=?5 AND participant.session=?6
+           AND participant.generation=item.generation
+         ORDER BY item.id LIMIT 2",
+    )?;
+    let snapshots = statement
+        .query_map(
+            params![
+                who.owner.identity.provider,
+                who.owner.identity.host,
+                who.repository,
+                who.repository_id,
+                who.token,
+                session
+            ],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if snapshots.len() > 1 {
+        return Err(HubError::Invalid(
+            "session participates in more than one active work item".into(),
         ));
     }
     snapshots
@@ -5309,6 +5368,29 @@ impl Store for SqliteStore {
                 item.updated_seq
             )));
         }
+        for source in &checkpoint.source_refs {
+            if let SourceRef::PriorWorkVersion { work_id, event_seq } = source {
+                if work_id != &checkpoint.work_id {
+                    return Err(HubError::Invalid(
+                        "prior work version must reference the checkpoint work".into(),
+                    ));
+                }
+                let retained = tx
+                    .query_row(
+                        "SELECT 1 FROM hub_work_versions
+                         WHERE work = ?1 AND event_seq = ?2 AND event_seq <= ?3",
+                        params![work_id, event_seq, item.updated_seq],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if !retained {
+                    return Err(HubError::Invalid(
+                        "prior work version is unavailable".into(),
+                    ));
+                }
+            }
+        }
         if let Some(scope) = checkpoint.normalized_scope()? {
             let overlaps = work_scope_overlaps(&tx, &who, &scope, Some(&item.id), now)?;
             if !overlaps.is_empty() {
@@ -5423,6 +5505,588 @@ impl Store for SqliteStore {
         let item = scoped_work(&tx, &who, id, now)?;
         tx.commit()?;
         Ok(item)
+    }
+
+    fn change_ingest(
+        &self,
+        token: &str,
+        batch: &CaptureBatchV1,
+        now: i64,
+    ) -> Result<IngestReceiptV1> {
+        batch.validate()?;
+        let request = json_string(batch)?;
+        let identity = json_string(&batch.session)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let who = work_who(&tx, token, now)?;
+        if who.read_only {
+            return Err(HubError::Unauthorized);
+        }
+        let item = scoped_work(&tx, &who, &batch.work_id, now)?
+            .ok_or_else(|| HubError::Invalid("unknown work".into()))?;
+        if let Some((author, kind, retained, response)) = tx
+            .query_row(
+                "SELECT author_token,kind,request,response FROM hub_change_operations
+                 WHERE work=?1 AND operation_id=?2",
+                params![batch.work_id, batch.operation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+        {
+            if author == token && kind == "event_batch" && retained == request {
+                let mut receipt: IngestReceiptV1 = json_value(&response)?;
+                receipt.replayed = true;
+                tx.commit()?;
+                return Ok(receipt);
+            }
+            return Err(HubError::Invalid(
+                "operation_id is already used by a different capture request".into(),
+            ));
+        }
+        if item.state != WorkState::Active || item.generation != batch.generation {
+            return Err(HubError::Invalid(
+                "capture work is no longer current".into(),
+            ));
+        }
+        let participant = tx
+            .query_row(
+                "SELECT 1 FROM hub_work_participants
+                 WHERE work=?1 AND token=?2 AND session=?3 AND generation=?4",
+                params![
+                    batch.work_id,
+                    token,
+                    batch.session.session_id,
+                    batch.generation
+                ],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !participant {
+            return Err(HubError::Invalid(
+                "capture session is not a current work participant".into(),
+            ));
+        }
+        let existing = tx
+            .query_row(
+                "SELECT identity FROM hub_change_sessions
+                 WHERE work=?1 AND generation=?2 AND session_id=?3",
+                params![batch.work_id, batch.generation, batch.session.session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(retained_identity) = existing {
+            if retained_identity != identity {
+                return Err(HubError::Invalid(
+                    "capture session identity or generation changed".into(),
+                ));
+            }
+        } else {
+            let first = batch.events[0].observed_at;
+            tx.execute(
+                "INSERT INTO hub_change_sessions
+                 (work,session_id,generation,identity,watermark,event_count,gap_count,started,ended,
+                  start_sequence,end_sequence,lifecycle_valid,first_observed_at,last_observed_at,updated_at)
+                 VALUES (?1,?2,?3,?4,0,0,0,0,0,NULL,NULL,0,?5,?5,?6)",
+                params![
+                    batch.work_id,
+                    batch.session.session_id,
+                    batch.generation,
+                    identity,
+                    first,
+                    now
+                ],
+            )?;
+        }
+        let mut accepted = 0_usize;
+        let mut duplicate = 0_usize;
+        let mut new_event_bytes = 0_i64;
+        let mut watermark = 0_u64;
+        let mut gap_count = 0_usize;
+        let mut last_observed = 0_i64;
+        for event in &batch.events {
+            let encoded = json_string(event)?;
+            if let Some((sequence, retained)) = tx
+                .query_row(
+                    "SELECT sequence,event FROM hub_change_events
+                     WHERE work=?1 AND generation=?2 AND session_id=?3 AND event_id=?4",
+                    params![
+                        batch.work_id,
+                        batch.generation,
+                        batch.session.session_id,
+                        event.event_id
+                    ],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?
+            {
+                if sequence == event.sequence as i64 && retained == encoded {
+                    duplicate += 1;
+                    watermark = watermark.max(event.sequence);
+                    continue;
+                }
+                return Err(HubError::Invalid(
+                    "event_id is already used by different capture data".into(),
+                ));
+            }
+            if tx
+                .query_row(
+                    "SELECT 1 FROM hub_change_events
+                     WHERE work=?1 AND generation=?2 AND session_id=?3 AND sequence=?4",
+                    params![
+                        batch.work_id,
+                        batch.generation,
+                        batch.session.session_id,
+                        event.sequence as i64
+                    ],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some()
+            {
+                return Err(HubError::Invalid(
+                    "capture sequence is already used by another event".into(),
+                ));
+            }
+            tx.execute(
+                "INSERT INTO hub_change_events
+                 (work,generation,session_id,event_id,sequence,event,observed_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    batch.work_id,
+                    batch.generation,
+                    batch.session.session_id,
+                    event.event_id,
+                    event.sequence as i64,
+                    encoded,
+                    event.observed_at
+                ],
+            )?;
+            accepted += 1;
+            new_event_bytes = new_event_bytes
+                .checked_add(work_payload_row_bytes(encoded.len())?)
+                .ok_or_else(|| HubError::Invalid("change capture size is too large".into()))?;
+            gap_count += usize::from(event.gap.is_some());
+            watermark = watermark.max(event.sequence);
+            last_observed = last_observed.max(event.observed_at);
+        }
+        let retained_lifecycle = {
+            let mut statement = tx.prepare(
+                "SELECT sequence,event FROM hub_change_events
+                 WHERE work=?1 AND generation=?2 AND session_id=?3 ORDER BY sequence",
+            )?;
+            statement
+                .query_map(
+                    params![batch.work_id, batch.generation, batch.session.session_id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut start_sequences = Vec::new();
+        let mut end_sequences = Vec::new();
+        for (sequence, encoded) in &retained_lifecycle {
+            let event: CapturedEventV1 = json_value(encoded)?;
+            match event.kind {
+                CapturedEventKindV1::SessionStarted => start_sequences.push(*sequence),
+                CapturedEventKindV1::SessionEnded => end_sequences.push(*sequence),
+                _ => {}
+            }
+        }
+        let retained_watermark = retained_lifecycle
+            .last()
+            .map_or(0, |(sequence, _)| *sequence);
+        let start_sequence = (start_sequences.len() == 1).then(|| start_sequences[0]);
+        let end_sequence = (end_sequences.len() == 1).then(|| end_sequences[0]);
+        let lifecycle_valid = start_sequence == Some(1)
+            && end_sequence == Some(retained_watermark)
+            && retained_watermark > 1;
+        tx.execute(
+            "UPDATE hub_change_sessions SET
+                 watermark=?4, event_count=?5,
+                 gap_count=gap_count+?6, started=?7, ended=?8,
+                 start_sequence=?9,end_sequence=?10,lifecycle_valid=?11,
+                 last_observed_at=max(last_observed_at,?12), updated_at=?13
+             WHERE work=?1 AND generation=?2 AND session_id=?3",
+            params![
+                batch.work_id,
+                batch.generation,
+                batch.session.session_id,
+                retained_watermark,
+                retained_lifecycle.len() as i64,
+                gap_count as i64,
+                start_sequence.is_some(),
+                end_sequence.is_some(),
+                start_sequence,
+                end_sequence,
+                lifecycle_valid,
+                last_observed,
+                now
+            ],
+        )?;
+        let retained_events = retained_lifecycle.len() as i64;
+        let retained_operations: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM hub_change_operations WHERE work=?1",
+            [batch.work_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if retained_events > MAX_CHANGE_EVENTS_PER_SESSION
+            || retained_operations >= MAX_CHANGE_OPERATIONS_PER_WORK
+        {
+            return Err(HubError::WorkCapacity);
+        }
+        let capture_bytes = work_payload_row_bytes(request.len())?
+            .checked_add(new_event_bytes)
+            .ok_or_else(|| HubError::Invalid("change capture size is too large".into()))?;
+        adjust_work_payload_capacity(&tx, &who, capture_bytes, now)?;
+        let receipt = IngestReceiptV1 {
+            work_id: batch.work_id.clone(),
+            operation_id: batch.operation_id.clone(),
+            accepted,
+            duplicate,
+            watermark: retained_watermark as u64,
+            replayed: false,
+        };
+        tx.execute(
+            "INSERT INTO hub_change_operations
+             (work,operation_id,author_token,kind,request,response,received_at)
+             VALUES (?1,?2,?3,'event_batch',?4,?5,?6)",
+            params![
+                batch.work_id,
+                batch.operation_id,
+                token,
+                request,
+                json_string(&receipt)?,
+                now
+            ],
+        )?;
+        tx.commit()?;
+        Ok(receipt)
+    }
+
+    fn change_action_start(
+        &self,
+        token: &str,
+        start: &ActionStartV1,
+        now: i64,
+    ) -> Result<ActionMutationReceiptV1> {
+        start.validate()?;
+        let request = json_string(start)?;
+        if start.started_at > now.saturating_add(300) {
+            return Err(HubError::Invalid(
+                "action start time is too far in the future".into(),
+            ));
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let who = work_who(&tx, token, now)?;
+        if who.read_only {
+            return Err(HubError::Unauthorized);
+        }
+        let item = scoped_work(&tx, &who, &start.work_id, now)?
+            .ok_or_else(|| HubError::Invalid("unknown work".into()))?;
+        if let Some((author, kind, retained, response)) = tx
+            .query_row(
+                "SELECT author_token,kind,request,response FROM hub_change_operations
+                 WHERE work=?1 AND operation_id=?2",
+                params![start.work_id, start.operation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+        {
+            if author == token && kind == "action_start" && retained == request {
+                let mut receipt: ActionMutationReceiptV1 = json_value(&response)?;
+                receipt.replayed = true;
+                tx.commit()?;
+                return Ok(receipt);
+            }
+            return Err(HubError::Invalid(
+                "operation_id is already used by a different action request".into(),
+            ));
+        }
+        if item.state != WorkState::Active || item.generation != start.generation {
+            return Err(HubError::Invalid("action work is no longer current".into()));
+        }
+        if start.source.repository() != who.repository {
+            return Err(HubError::Invalid(
+                "action source belongs to another repository".into(),
+            ));
+        }
+        if tx
+            .query_row(
+                "SELECT 1 FROM hub_work_participants
+                 WHERE work=?1 AND token=?2 AND session=?3 AND generation=?4",
+                params![start.work_id, token, start.session_id, start.generation],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_none()
+        {
+            return Err(HubError::Invalid(
+                "action session is not a current work participant".into(),
+            ));
+        }
+        let action_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM hub_change_actions WHERE work=?1",
+            [start.work_id.as_str()],
+            |row| row.get(0),
+        )?;
+        let operation_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM hub_change_operations WHERE work=?1",
+            [start.work_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if action_count >= MAX_CHANGE_ACTIONS_PER_WORK
+            || operation_count >= MAX_CHANGE_OPERATIONS_PER_WORK
+        {
+            return Err(HubError::WorkCapacity);
+        }
+        adjust_work_payload_capacity(
+            &tx,
+            &who,
+            work_payload_row_bytes(request.len())?
+                .checked_mul(2)
+                .ok_or_else(|| HubError::Invalid("change capture size is too large".into()))?,
+            now,
+        )?;
+        let received_order: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(received_order),0)+1 FROM hub_change_actions WHERE work=?1",
+            [start.work_id.as_str()],
+            |row| row.get(0),
+        )?;
+        let source_id = start.source.stable_id()?;
+        tx.execute(
+            "INSERT INTO hub_change_actions
+             (work,action_id,generation,session_id,author_token,source_id,source_kind,start_request,
+              started_at,received_at,received_order,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?10)",
+            params![
+                start.work_id,
+                start.action_id,
+                start.generation,
+                start.session_id,
+                token,
+                source_id,
+                enum_name(&start.source.kind())?,
+                request,
+                start.started_at,
+                now,
+                received_order
+            ],
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::SqliteFailure(ref failure, _)
+                if failure.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                HubError::Invalid("action_id is already used".into())
+            }
+            error => error.into(),
+        })?;
+        let receipt = ActionMutationReceiptV1 {
+            work_id: start.work_id.clone(),
+            operation_id: start.operation_id.clone(),
+            action_id: start.action_id.clone(),
+            replayed: false,
+        };
+        tx.execute("INSERT INTO hub_change_operations (work,operation_id,author_token,kind,request,response,received_at) VALUES (?1,?2,?3,'action_start',?4,?5,?6)",params![start.work_id,start.operation_id,token,request,json_string(&receipt)?,now])?;
+        tx.commit()?;
+        Ok(receipt)
+    }
+
+    fn change_action_finish(
+        &self,
+        token: &str,
+        finish: &ActionFinishV1,
+        now: i64,
+    ) -> Result<ActionMutationReceiptV1> {
+        finish.validate()?;
+        if finish.assurance != crate::change_record::AssuranceBasisV1::CallerAsserted {
+            return Err(HubError::Invalid(
+                "agent capture can only record caller_asserted assurance".into(),
+            ));
+        }
+        let request = json_string(finish)?;
+        if finish.finished_at > now.saturating_add(300) {
+            return Err(HubError::Invalid(
+                "action finish time is too far in the future".into(),
+            ));
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let who = work_who(&tx, token, now)?;
+        if who.read_only {
+            return Err(HubError::Unauthorized);
+        }
+        let item = scoped_work(&tx, &who, &finish.work_id, now)?
+            .ok_or_else(|| HubError::Invalid("unknown work".into()))?;
+        if let Some((author,kind,retained,response))=tx.query_row("SELECT author_token,kind,request,response FROM hub_change_operations WHERE work=?1 AND operation_id=?2",params![finish.work_id,finish.operation_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()? {
+            if author==token&&kind=="action_finish"&&retained==request { let mut receipt:ActionMutationReceiptV1=json_value(&response)?;receipt.replayed=true;tx.commit()?;return Ok(receipt); }
+            return Err(HubError::Invalid("operation_id is already used by a different action request".into()));
+        }
+        if item.state != WorkState::Active || item.generation != finish.generation {
+            return Err(HubError::Invalid("action work is no longer current".into()));
+        }
+        let (author,generation,started_at,already,start_request):(String,i64,i64,Option<String>,String)=tx.query_row("SELECT author_token,generation,started_at,finish_request,start_request FROM hub_change_actions WHERE work=?1 AND action_id=?2",params![finish.work_id,finish.action_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?.ok_or_else(||HubError::Invalid("unknown action".into()))?;
+        if author != token || generation != finish.generation {
+            return Err(HubError::Invalid(
+                "action finish author or generation changed".into(),
+            ));
+        }
+        let retained_start: ActionStartV1 = json_value(&start_request)?;
+        if retained_start.kind == crate::change_record::ActionKindV1::Execution
+            && finish.result != crate::change_record::CheckResultV1::Unknown
+        {
+            return Err(HubError::Invalid(
+                "execution actions cannot assert verification results".into(),
+            ));
+        }
+        if retained_start.kind == crate::change_record::ActionKindV1::Verification
+            && retained_start.recipe_provenance
+                != crate::change_record::RecipeProvenanceV1::ConfiguredExactMatch
+            && matches!(
+                finish.result,
+                crate::change_record::CheckResultV1::Passed
+                    | crate::change_record::CheckResultV1::Failed
+            )
+        {
+            return Err(HubError::Invalid(
+                "verification result requires an exact configured recipe".into(),
+            ));
+        }
+        if already.is_some() {
+            return Err(HubError::Invalid("action is already finished".into()));
+        }
+        if finish.finished_at < started_at {
+            return Err(HubError::Invalid("action finish precedes its start".into()));
+        }
+        let operation_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM hub_change_operations WHERE work=?1",
+            [finish.work_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if operation_count >= MAX_CHANGE_OPERATIONS_PER_WORK {
+            return Err(HubError::WorkCapacity);
+        }
+        adjust_work_payload_capacity(
+            &tx,
+            &who,
+            work_payload_row_bytes(request.len())?
+                .checked_mul(2)
+                .ok_or_else(|| HubError::Invalid("change capture size is too large".into()))?,
+            now,
+        )?;
+        tx.execute("UPDATE hub_change_actions SET finish_request=?3,finished_at=?4,updated_at=?5 WHERE work=?1 AND action_id=?2",params![finish.work_id,finish.action_id,request,finish.finished_at,now])?;
+        let receipt = ActionMutationReceiptV1 {
+            work_id: finish.work_id.clone(),
+            operation_id: finish.operation_id.clone(),
+            action_id: finish.action_id.clone(),
+            replayed: false,
+        };
+        tx.execute("INSERT INTO hub_change_operations (work,operation_id,author_token,kind,request,response,received_at) VALUES (?1,?2,?3,'action_finish',?4,?5,?6)",params![finish.work_id,finish.operation_id,token,request,json_string(&receipt)?,now])?;
+        tx.commit()?;
+        Ok(receipt)
+    }
+
+    fn change_record(
+        &self,
+        token: &str,
+        work_id: &str,
+        now: i64,
+    ) -> Result<Option<ChangeRecordSummaryV1>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let who = work_who(&tx, token, now)?;
+        let Some(item) = scoped_work(&tx, &who, work_id, now)? else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let (count, gaps, complete): (i64, i64, i64) = tx.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(gap_count + CASE WHEN watermark > event_count THEN watermark-event_count ELSE 0 END),0),
+                    COALESCE(SUM(CASE WHEN lifecycle_valid=1 AND start_sequence=1
+                        AND end_sequence=watermark THEN 1 ELSE 0 END),0)
+             FROM hub_change_sessions WHERE work=?1 AND generation=?2",
+            params![work_id, item.generation],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let setup_observations: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM hub_change_events
+             WHERE work=?1 AND generation=?2 AND json_type(event,'$.setup') IS NOT NULL",
+            params![work_id, item.generation],
+            |row| row.get(0),
+        )?;
+        let usage_observations: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM hub_work_model_usage WHERE work=?1 AND generation=?2",
+            params![work_id, item.generation],
+            |row| row.get(0),
+        )?;
+        let action=tx.query_row("WITH scoped AS (
+                SELECT a.*,
+                    COALESCE(CAST(json_extract(a.start_request,'$.observed_order') AS INTEGER),0) AS observed_order,
+                    json_extract(a.start_request,'$.observation_scope_id') AS observation_scope_id,
+                    COALESCE(json_extract(a.start_request,'$.observation_scope_id'),a.action_id) AS scope_key
+                FROM hub_change_actions a WHERE a.work=?1 AND a.generation=?2
+            ), scope_state AS (
+                SELECT scoped.*,
+                    MIN(CASE WHEN observation_scope_id IS NOT NULL AND observed_order>0 THEN 1 ELSE 0 END)
+                        OVER (PARTITION BY scope_key,session_id) AS all_ordered
+                FROM scoped
+            ), ranked AS (
+                SELECT scope_state.*,
+                    ROW_NUMBER() OVER (PARTITION BY scope_key,session_id ORDER BY
+                        CASE WHEN all_ordered=1 THEN observed_order ELSE received_order END DESC,
+                        received_order DESC) AS scope_rank
+                FROM scope_state
+            )
+            SELECT start_request,finish_request,source_id FROM ranked
+            WHERE scope_rank=1 ORDER BY received_order DESC LIMIT 1",params![work_id,item.generation],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?))).optional()?.map(|(start,finish,source_id)| -> Result<StoredActionV1> {Ok(StoredActionV1{start:json_value(&start)?,finish:finish.map(|value|json_value(&value)).transpose()?,source_id})}).transpose()?;
+        let decision = tx
+            .query_row(
+                "SELECT event_seq,snapshot FROM hub_work_versions
+                 WHERE work=?1 AND json_extract(snapshot,'$.current.kind')='decision'
+                 ORDER BY event_seq DESC LIMIT 1",
+                [work_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .map(|(event_seq, snapshot)| -> Result<StoredDecisionV1> {
+                let retained: WorkItem = json_value(&snapshot)?;
+                Ok(StoredDecisionV1 {
+                    event_seq,
+                    checkpoint: retained.current.ok_or_else(|| {
+                        HubError::Unavailable("retained decision checkpoint is missing".into())
+                    })?,
+                })
+            })
+            .transpose()?;
+        let summary = project_change_record(
+            &item,
+            SessionStatsV1 {
+                count: count as usize,
+                gap_count: gaps as usize,
+                complete_count: complete as usize,
+                setup_observation_count: setup_observations as usize,
+                usage_observation_count: usage_observations as usize,
+            },
+            action,
+            decision,
+            now,
+        );
+        tx.commit()?;
+        Ok(Some(summary))
     }
 
     fn work_usage(&self, token: &str, usage: &UsageRecord, now: i64) -> Result<UsageReceipt> {
@@ -5578,6 +6242,21 @@ impl Store for SqliteStore {
         let tx = conn.transaction()?;
         let who = work_who(&tx, token, now)?;
         let item = unfinished_for_session(&tx, &who, session, now)?;
+        tx.commit()?;
+        Ok(item)
+    }
+
+    fn capture_work_for_session(
+        &self,
+        token: &str,
+        session: &str,
+        now: i64,
+    ) -> Result<Option<WorkItem>> {
+        super::intent::text("session", session, 255)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let who = work_who(&tx, token, now)?;
+        let item = active_capture_work_for_session(&tx, &who, session, now)?;
         tx.commit()?;
         Ok(item)
     }

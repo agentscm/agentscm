@@ -5,6 +5,16 @@ All notable changes are listed here, newest first. AgentSCM is alpha: any releas
 ## Unreleased
 
 - Optional Slack app (`AGENTSCM_SLACK_FILE`, `agentscm hub slack ...`, `quickstart --slack-config-file`): a direct message to each person involved when an agent edits a file again after AgentSCM refused it (`edit_repeated`), when a handoff is declined, and when new work reads like work already under way (`task_overlap`). The holder's message has buttons that answer the handoff for their own agent. Bot scope `chat:write` only; no channels, history, Home tab, slash command or Slack-side work forms. Handoff answer events now carry the requester's token in `from.token`. New store method `latest_event_seq`.
+- Experimental, Unix/Claude Code: add configure-once local change capture
+  with a bounded private spool, current-Work resolution on each hook, replay-safe Hub event/action
+  receipts and typed Git/native source bindings. Ordinary execution outcome is separate from an
+  exact-recipe verification result. Read one concise transcript-free intent/source/decision/next
+  action handoff through HTTP, `agentscm_change_record`, `agentscm change-capture show` or the Hub
+  UI. Existing Work versions retain declared intent/decision provenance; bounded observed setup
+  facts and opt-in, session-bound Claude history reads supply partial usage coverage through Work
+  Insights. Request usage and session totals remain separate. Conversation/tool bodies, captured
+  source bytes and command output stay local. See [local change capture](docs/change-capture.md)
+  and [qualification limits](docs/implementation/agentscm-build-status.md).
 
 - Fixed: an agent whose hook refuses contested edits (Claude Code, Codex, Copilot) was never refused when it had first named the file in `agentscm_start` or `agentscm_check`, because that MCP call already held the file and only new files were checked ([#83](https://github.com/counterbranch/agentscm/issues/83)). The hub now records which held files no refusing edit has checked yet and checks each on the session's first refusing edit, in either order of MCP call and first hook. Hub migration 20 adds that list to the session row. See [warn once](docs/hub.md#warn-once).
 

@@ -18,6 +18,7 @@ describe('sectionFromHash', () => {
     ['#work/coordination', 'work'],
     ['#activity', 'activity'],
     ['#workflows/runs/run_1/steps/s1', 'workflows'],
+    [`#change-record/${ID}`, 'change-record'],
     ['#settings', 'settings'],
     ['#health', 'health'],
     // The current status page's links keep working.
@@ -69,6 +70,12 @@ describe('crumbsFor', () => {
     const c = crumbsFor('#workflows/runs/run_0123456789abcdef/steps/lint', section('workflows'), null)
     expect(c.map((x) => x.label)).toEqual(['Workflows', 'Run run_0123456789…', 'Step lint'])
     expect(c[1]!.href).toBe('#workflows/runs/run_0123456789abcdef')
+  })
+  it('change record detail keeps the durable work id in its breadcrumb', () => {
+    expect(crumbsFor(`#change-record/${ID}`, section('change-record'), null)).toEqual([
+      { label: 'Change records', href: '#change-record', icon: 'clipboard2-check' },
+      { label: `Work ${ID.slice(0, 12)}…`, href: `#change-record/${ID}`, mono: true },
+    ])
   })
   it('other sections are a single crumb', () => {
     expect(crumbsFor('#health', section('health'), null)).toEqual([{ label: 'Hub health', href: '#health', icon: 'heart-pulse' }])

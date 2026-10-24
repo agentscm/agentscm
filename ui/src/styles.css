@@ -1584,6 +1584,12 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
   gap: 6px;
   flex-wrap: wrap;
 }
+.change-record-detail .tech {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.change-record-detail .tech > * {
+  min-width: 0;
+}
 
 /* Activity */
 .timeline {
@@ -1971,6 +1977,9 @@ a.run-row:hover {
 @media (max-width: 640px) {
   .main {
     padding: 22px 16px 48px;
+  }
+  .change-record-detail .tech {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 @media (prefers-reduced-motion: reduce) {

@@ -62,3 +62,25 @@ states are tested with fixture data instead, through a stubbed fetch that answer
 
 No end-to-end browser test covers the signed-in workspace, because the dev hub has no forge
 sign-in; those flows are covered by the fixture tests above.
+
+## Change records
+
+The read-only change-record view opens at `#change-record/<work-id>` and reads
+`GET /v1/hub/repos/<repository>/change-records/<work-id>` with the status-page token. It shows
+the bounded Work intent and scope, inspectable Git or native source binding, retained decision,
+next action and known gaps without requesting conversation content. A retained agent decision is
+shown as a proposal rather than human approval. Action type, execution outcome, verification
+result, current applicability, assurance, evidence availability and coverage remain separate;
+ordinary command success is never presented as a passing check, and a passing historical result
+or unavailable artifact is never presented as a current complete check. The page loads once and
+refreshes only when the viewer asks. The shared response is at most 48 KiB. It carries at most 16
+scope entries and 16 decision references, then reports exact omitted counts when fitting the
+envelope removes trailing entries; the page shows those omissions rather than treating the visible
+arrays as complete.
+
+The focused UI tests use synthetic response fixtures. They cover the response allowlist, bounded
+read, typed Git and native source facts, agent-proposal attribution, execution versus verification,
+route parsing, the concise filled state, missing records and authorization denial. Real Hub browser
+coverage follows both the Verify rail and a Work-detail link into the authenticated projection,
+including the explicit not-yet-captured state. The seeded Hub does not retain a filled change
+record, so the filled browser state remains fixture-tested.

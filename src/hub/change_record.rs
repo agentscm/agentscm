@@ -1,0 +1,304 @@
+//! Shared change-record projection over authoritative work and retained capture facts.
+
+use crate::change_record::{
+    ActionFinishV1, ActionOutcomeV1, ActionStartV1, ActionSummaryV1, ApplicabilityV1,
+    AssuranceBasisV1, ChangeRecordSummaryV1, CheckResultV1, CompletenessV1, ContentAvailabilityV1,
+    CoverageV1, DecisionAuthorKindV1, DecisionSourceRefV1, DecisionStatusV1, DecisionSummaryV1,
+    DriftV1, IntentSummaryV1, MAX_PROJECTED_DECISION_REFS, MAX_PROJECTED_SCOPE, RecipeProvenanceV1,
+    SessionCoverageV1, SubjectSummaryV1, UnknownFactV1,
+};
+
+use super::work::{Checkpoint, SourceRef, WorkItem};
+
+#[derive(Clone, Debug)]
+pub struct StoredActionV1 {
+    pub start: ActionStartV1,
+    pub finish: Option<ActionFinishV1>,
+    pub source_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SessionStatsV1 {
+    pub count: usize,
+    pub gap_count: usize,
+    pub complete_count: usize,
+    pub setup_observation_count: usize,
+    pub usage_observation_count: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct StoredDecisionV1 {
+    pub event_seq: i64,
+    pub checkpoint: Checkpoint,
+}
+
+pub fn project(
+    item: &WorkItem,
+    sessions: SessionStatsV1,
+    action: Option<StoredActionV1>,
+    decision: Option<StoredDecisionV1>,
+    as_of: i64,
+) -> ChangeRecordSummaryV1 {
+    let session_coverage = if sessions.count == 0 {
+        CoverageV1::Unknown
+    } else if sessions.gap_count == 0 && sessions.complete_count == sessions.count {
+        CoverageV1::Complete
+    } else {
+        CoverageV1::Partial
+    };
+    let subject = action.as_ref().map(|stored| SubjectSummaryV1 {
+        source_id: stored.source_id.clone(),
+        source_kind: stored.start.source.kind(),
+        source: stored.start.source.clone(),
+    });
+    let latest_action = action.as_ref().map(|stored| action_summary(item, stored));
+    let result_coverage = latest_action
+        .as_ref()
+        .map_or(CoverageV1::Unknown, |action| {
+            if action.result == CheckResultV1::Unknown {
+                CoverageV1::Unknown
+            } else {
+                action.coverage
+            }
+        });
+    let setup_coverage = if sessions.setup_observation_count == 0 {
+        CoverageV1::Unknown
+    } else {
+        CoverageV1::Partial
+    };
+    let usage_coverage = if sessions.usage_observation_count == 0 {
+        CoverageV1::Unknown
+    } else {
+        CoverageV1::Partial
+    };
+    let mut unknowns = Vec::new();
+    if session_coverage == CoverageV1::Unknown {
+        unknowns.push(UnknownFactV1::CaptureCoverage);
+    }
+    if latest_action.is_none() {
+        unknowns.extend([
+            UnknownFactV1::SourceApplicability,
+            UnknownFactV1::RecipeIdentity,
+            UnknownFactV1::Result,
+        ]);
+    } else if let Some(action) = &latest_action {
+        if action.recipe_provenance != RecipeProvenanceV1::ConfiguredExactMatch {
+            unknowns.push(UnknownFactV1::RecipeIdentity);
+        }
+        if action.applicability == ApplicabilityV1::Unknown {
+            unknowns.push(UnknownFactV1::SourceApplicability);
+        }
+        if action.result == CheckResultV1::Unknown {
+            unknowns.push(UnknownFactV1::Result);
+        }
+    }
+    if setup_coverage == CoverageV1::Unknown {
+        unknowns.push(UnknownFactV1::SetupIdentity);
+    }
+    if usage_coverage == CoverageV1::Unknown {
+        unknowns.push(UnknownFactV1::Usage);
+    }
+    unknowns.push(UnknownFactV1::HumanDecision);
+    let decision = decision_summary(item, decision);
+    ChangeRecordSummaryV1 {
+        schema_version: crate::change_record::SCHEMA_VERSION_V1,
+        work_id: item.id.clone(),
+        generation: item.generation,
+        as_of,
+        intent: IntentSummaryV1 {
+            title: item.title.clone(),
+            scope: item
+                .scope
+                .iter()
+                .take(MAX_PROJECTED_SCOPE)
+                .cloned()
+                .collect(),
+            scope_omitted: item.scope.len().saturating_sub(MAX_PROJECTED_SCOPE),
+        },
+        subject,
+        sessions: SessionCoverageV1 {
+            count: sessions.count,
+            coverage: session_coverage,
+            gaps: sessions.gap_count,
+        },
+        latest_action,
+        decision,
+        next_action: item.next_action.clone(),
+        completeness: CompletenessV1 {
+            events: session_coverage,
+            source: action
+                .as_ref()
+                .map_or(CoverageV1::Unknown, |stored| stored.start.source.coverage()),
+            // Digests supplied by the capture caller identify bytes but do not prove setup provenance.
+            setup: setup_coverage,
+            recipe: action.as_ref().map_or(CoverageV1::Unknown, |stored| {
+                if stored.start.recipe_provenance == RecipeProvenanceV1::ConfiguredExactMatch {
+                    CoverageV1::Partial
+                } else {
+                    CoverageV1::Unknown
+                }
+            }),
+            result: result_coverage,
+            usage: usage_coverage,
+        },
+        unknowns,
+    }
+}
+
+fn decision_summary(item: &WorkItem, stored: Option<StoredDecisionV1>) -> DecisionSummaryV1 {
+    let Some(stored) = stored else {
+        return DecisionSummaryV1 {
+            status: DecisionStatusV1::Missing,
+            reference: None,
+            summary: None,
+            source_refs: Vec::new(),
+            source_refs_omitted: 0,
+            author_kind: None,
+            author_agent: None,
+            at: None,
+            generation: None,
+        };
+    };
+    let source_refs_omitted = stored
+        .checkpoint
+        .source_refs
+        .len()
+        .saturating_sub(MAX_PROJECTED_DECISION_REFS);
+    DecisionSummaryV1 {
+        // A Work Decision is an authorized agent checkpoint. It does not prove human approval.
+        status: DecisionStatusV1::Proposed,
+        reference: Some(format!("work:{}:event:{}", item.id, stored.event_seq)),
+        summary: Some(stored.checkpoint.summary),
+        source_refs: stored
+            .checkpoint
+            .source_refs
+            .into_iter()
+            .take(MAX_PROJECTED_DECISION_REFS)
+            .map(|reference| match reference {
+                SourceRef::RepositoryPath { path, line } => {
+                    DecisionSourceRefV1::RepositoryPath { path, line }
+                }
+                SourceRef::Commit { oid, path } => DecisionSourceRefV1::Commit { oid, path },
+                SourceRef::Work { work_id } => DecisionSourceRefV1::Work { work_id },
+                SourceRef::CapturedEvent {
+                    session_id,
+                    event_id,
+                } => DecisionSourceRefV1::CapturedEvent {
+                    session_id,
+                    event_id,
+                },
+                SourceRef::PriorWorkVersion { work_id, event_seq } => {
+                    DecisionSourceRefV1::PriorWorkVersion { work_id, event_seq }
+                }
+            })
+            .collect(),
+        source_refs_omitted,
+        author_kind: Some(DecisionAuthorKindV1::Agent),
+        author_agent: Some(stored.checkpoint.agent),
+        at: Some(stored.checkpoint.at),
+        generation: Some(stored.checkpoint.generation),
+    }
+}
+
+fn action_summary(item: &WorkItem, stored: &StoredActionV1) -> ActionSummaryV1 {
+    let (outcome, result, assurance, coverage, finished_at, drift, availability) =
+        stored.finish.as_ref().map_or_else(
+            || {
+                (
+                    ActionOutcomeV1::Unknown,
+                    CheckResultV1::Unknown,
+                    AssuranceBasisV1::CallerAsserted,
+                    CoverageV1::Unknown,
+                    None,
+                    DriftV1::Unknown,
+                    ContentAvailabilityV1::Missing,
+                )
+            },
+            |finish| {
+                (
+                    finish.outcome,
+                    finish.result,
+                    finish.assurance,
+                    finish.coverage,
+                    Some(finish.finished_at),
+                    finish.drift,
+                    aggregate_availability(&finish.output_artifacts),
+                )
+            },
+        );
+    let applicability = if stored.start.generation != item.generation
+        || !matches!(drift, DriftV1::NoneObserved | DriftV1::Unknown)
+    {
+        ApplicabilityV1::Stale
+    } else {
+        // The stored work generation alone cannot prove the Git/native source is still current.
+        ApplicabilityV1::Unknown
+    };
+    ActionSummaryV1 {
+        action_id: stored.start.action_id.clone(),
+        source_id: stored.source_id.clone(),
+        kind: stored.start.kind,
+        outcome,
+        recipe_provenance: stored.start.recipe_provenance,
+        recipe_digest: stored.start.recipe_digest.clone(),
+        setup_digest: stored.start.setup_digest.clone(),
+        result,
+        applicability,
+        assurance,
+        coverage,
+        evidence_availability: availability,
+        started_at: stored.start.started_at,
+        finished_at,
+        drift,
+    }
+}
+
+fn aggregate_availability(
+    artifacts: &[crate::change_record::ArtifactRefV1],
+) -> ContentAvailabilityV1 {
+    use ContentAvailabilityV1 as Availability;
+    for state in [
+        Availability::IntegrityFailure,
+        Availability::Denied,
+        Availability::Deleted,
+        Availability::Expired,
+        Availability::Missing,
+    ] {
+        if artifacts
+            .iter()
+            .any(|artifact| artifact.availability == state)
+        {
+            return state;
+        }
+    }
+    if artifacts.is_empty() {
+        Availability::Missing
+    } else if artifacts
+        .iter()
+        .all(|artifact| artifact.availability == Availability::Shared)
+    {
+        Availability::Shared
+    } else if artifacts
+        .iter()
+        .all(|artifact| artifact.availability == Availability::Local)
+    {
+        Availability::Local
+    } else if artifacts
+        .iter()
+        .all(|artifact| artifact.availability == Availability::External)
+    {
+        Availability::External
+    } else {
+        Availability::Mixed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn availability_is_not_inferred_from_result() {
+        assert_eq!(aggregate_availability(&[]), ContentAvailabilityV1::Missing);
+    }
+}

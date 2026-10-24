@@ -26,7 +26,16 @@ The current lead reports concise checkpoints for progress, decisions, blockers, 
 
 - a repository-relative path and optional line;
 - a 40- or 64-character commit identifier and optional repository-relative path; or
-- another AgentSCM work identifier.
+- another AgentSCM work identifier;
+- a declared captured-event identity (`captured_event` with `session_id` and `event_id`); or
+- an exact earlier version of the same Work (`prior_work_version` with `work_id` and `event_seq`).
+
+Captured-event references are caller-declared metadata. The Hub does not fetch, retain or verify the
+referenced conversation body, and the reference does not establish human authorship or approval.
+Prior-Work-version references let a checkpoint explicitly correct or supersede an exact retained
+version of the same Work. The Hub checks that identity when recording the checkpoint, but later
+compaction can make the historical snapshot unavailable; the reference does not promise retention.
+The Work title, scope and existing checkpoint history continue to carry the intent semantics.
 
 References do not accept arbitrary URLs. Forge links shown by the Hub are constructed only for supported canonical GitHub or GitLab hosts. Checkpoint summaries and next actions are self-reports. A `finish` checkpoint records what the agent reported; it does not establish execution, review, acceptance, merge or native landing.
 

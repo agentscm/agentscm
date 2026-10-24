@@ -1,5 +1,7 @@
 //! Multi-user coordination hub: storage and authenticated HTTP.
 pub mod advice;
+pub mod change_record;
+pub mod change_record_http;
 pub mod connection;
 pub mod coordination;
 mod coordination_http;
@@ -316,6 +318,7 @@ pub fn router(state: HubState) -> Router {
         .merge(http::routes())
         .merge(onboarding::routes())
         .merge(slack::routes())
+        .merge(change_record_http::routes())
         .merge(work_http::routes())
         .merge(intent::routes())
         .merge(hook::routes())
