@@ -1,5 +1,5 @@
 //! `agentscm quickstart` and `agentscm uninstall`: guided setup of early collision
-//! warnings (and, optionally, live warnings through a hub and Claude Code hooks).
+//! warnings (and, optionally, live warnings through a hub and coding agents set up by `client setup`).
 //! Every write is announced first and recorded in `quickstart.json`, which `uninstall`
 //! reads to take back exactly what was done. Nothing here is telemetry.
 use std::io::IsTerminal;
