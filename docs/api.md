@@ -79,6 +79,39 @@ decision summary; those structured fields remain untrusted data, not instruction
 is `agentscm change-capture show`. See
 [local change capture](change-capture.md) and its [qualification limits](implementation/agentscm-build-status.md).
 
+## Hub supported-skills routes (Experimental)
+
+Supported skills are first-party, versioned procedures a repository adopts through a committed
+lock file (`agentscm-skills.lock.json`). The hub shows the catalog, where each repository's
+adoption came from, and per-branch runs of recorded evidence. Everything agents record is
+**self-reported**: the hub checks ordering (current head, an independent reviewer session) but not
+that the work happened, so every gate satisfied that way is labelled `self_reported` in the JSON,
+the UI and the MCP text.
+
+| Route | Token | Meaning |
+| --- | --- | --- |
+| `GET /v1/hub/skills?repo=owner/name` | read | Catalog (gates as `{id, enforce, by}`), the repository's adoption with each pin's status (`adopted`, `unknown_version`, `unsupported_source`, `invalid_params`) and run counts per skill. Without `repo`, the catalog only. |
+| `PUT /v1/hub/repos/{repo}/skills/adoption` | agent | A checkout reports its lock file. Stored as `reported_by_checkout` unless the hub already read the lock from the forge's default branch, which wins; the reply says which `source` applies and whether this report `applied`. |
+| `GET /v1/hub/repos/{repo}/skills/runs?state=open\|completed\|all&limit=` | read | `{runs, truncated}`; limit at most 100 (default 50, newest 100 runs scanned). |
+| `GET /v1/hub/repos/{repo}/skills/runs/by-branch?branch=` | read | One run, or 404 `not_found`. |
+| `GET /v1/hub/repos/{repo}/skills/runs/{run_id}` | read | One run. |
+| `POST /v1/hub/repos/{repo}/skills/evidence` | agent | Records evidence (`skill`, `gate`, `kind`, `head_sha`, `assurance: "self_reported"`, `summary`, `branch`, optional `url`, `pull_request`, `detail`, `session`) and returns the run. |
+
+`{repo}` is one URL-encoded `owner/name` segment. A run is keyed by repository, branch and skill and
+keeps at most 256 evidence records. Refusals are 409 with `{error, message}`: `not_adopted` (the
+skill is not an `adopted` pin), `stale_head`, `not_independent`, `unknown_gate` and `run_full`;
+malformed evidence is 400. Adoption is read from `agentscm-skills.lock.json` on the default branch of
+a connected repository about every five minutes (GitHub only reads are exercised by tests; GitLab
+reads the file through its raw-file API and accepts JSON files only). A missing or invalid file there
+clears the forge adoption.
+
+MCP tools: `agentscm_skill_list {repo}` (catalog with when to follow each skill, prerequisites,
+what it is not for, effective parameters and adoption source), `agentscm_skill_status {repo, branch}`
+(one line per gate, `[self-reported]` after gates satisfied by agent-recorded evidence, the next
+action and whether finishing is blocked) and `agentscm_skill_evidence {repo, skill, gate, kind,
+head_sha, summary, branch, url?, pull_request?, detail?, session?}`. The first two are available to
+read-only tokens; recording needs an agent token. Each returns structured JSON beside the text.
+
 ## Local template and timeline reads
 
 The `/v1/local` routes return exactly the JSON that the matching CLI command prints, without the

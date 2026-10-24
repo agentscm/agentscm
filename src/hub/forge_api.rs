@@ -162,6 +162,22 @@ impl ForgeApi<'_> {
         }
     }
 
+    /// A file of at most `max` bytes on `branch`; None when it does not exist. On GitLab only
+    /// JSON files are readable.
+    pub async fn file(
+        &self,
+        token: &str,
+        repo: &Repo,
+        path: &str,
+        branch: &str,
+        max: usize,
+    ) -> Gh<Option<Vec<u8>>> {
+        match self {
+            Self::Github(api) => api.file(token, &repo.full_name, path, branch, max).await,
+            Self::Gitlab(api) => api.file(token, repo.repository_id, path, branch, max).await,
+        }
+    }
+
     /// The commit a branch points at; None when it does not exist.
     pub async fn ref_sha(&self, token: &str, repo: &Repo, branch: &str) -> Gh<Option<String>> {
         match self {

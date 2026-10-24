@@ -56,6 +56,7 @@ use super::session::{
     Checked, DEFAULT_SESSION, NOTICES_PER_TOUCH, Row, SESSION_TTL_SECONDS, STALE_SESSION_SECONDS,
     SessionCall, Touched, check, check_name, expiry_cause, guard, held, plan as plan_touch,
 };
+use super::skills::{EvidenceRow, RunHead, SkillAdoption};
 use super::store::{
     ACTIVITY_KINDS, ActivityEvent, AgentToken, Event, ForgeIdentity, HubEvent, LIST_LIMIT,
     NAMED_MIGRATIONS, NewAgentToken, Principal, SessionView, Store, TokenDigest, User, event_limit,
@@ -5662,6 +5663,158 @@ impl Store for PgStore {
             if finish.finished_at<started_at{return Err(HubError::Invalid("action finish precedes its start".into()));}
             let operation_count:i64=tx.query_one("SELECT COUNT(*)::bigint FROM hub_change_operations WHERE work=$1",&[&finish.work_id])?.get(0);if operation_count>=MAX_CHANGE_OPERATIONS_PER_WORK{return Err(HubError::WorkCapacity);}let capture_bytes=work_payload_row_bytes(request.len())?.checked_mul(2).ok_or_else(||HubError::Invalid("change capture size is too large".into()))?;adjust_work_payload_capacity(&mut tx,&who,capture_bytes,now)?;
             tx.execute("UPDATE hub_change_actions SET finish_request=$3,finished_at=$4,updated_at=$5 WHERE work=$1 AND action_id=$2",&[&finish.work_id,&finish.action_id,&request,&finish.finished_at,&now])?;let receipt=ActionMutationReceiptV1{work_id:finish.work_id.clone(),operation_id:finish.operation_id.clone(),action_id:finish.action_id.clone(),replayed:false};tx.execute("INSERT INTO hub_change_operations (work,operation_id,author_token,kind,request,response,received_at) VALUES ($1,$2,$3,'action_finish',$4,$5,$6)",&[&finish.work_id,&finish.operation_id,&token,&request,&json_string(&receipt)?,&now])?;tx.commit()?;Ok(receipt)})
+    }
+
+    fn skill_adoption(&self, repo: &str) -> Result<Option<SkillAdoption>> {
+        self.run(true, |client| {
+            Ok(client
+                .query_opt(
+                    "SELECT repository, source, lock_json, default_branch, observed_at, reported_by
+                     FROM hub_skill_adoptions WHERE repository = $1",
+                    &[&repo],
+                )?
+                .map(|row| SkillAdoption {
+                    repository: row.get(0),
+                    source: row.get(1),
+                    lock_json: row.get(2),
+                    default_branch: row.get(3),
+                    observed_at: row.get(4),
+                    reported_by: row.get(5),
+                }))
+        })
+    }
+
+    fn skill_adoption_put(&self, a: &SkillAdoption) -> Result<SkillAdoption> {
+        self.run(false, |client| {
+            client.execute(
+                "INSERT INTO hub_skill_adoptions
+                     (repository, source, lock_json, default_branch, observed_at, reported_by)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (repository) DO UPDATE SET source = excluded.source,
+                     lock_json = excluded.lock_json, default_branch = excluded.default_branch,
+                     observed_at = excluded.observed_at, reported_by = excluded.reported_by
+                 WHERE excluded.source = 'default_branch'
+                    OR hub_skill_adoptions.source <> 'default_branch'",
+                &[
+                    &a.repository,
+                    &a.source,
+                    &a.lock_json,
+                    &a.default_branch,
+                    &a.observed_at,
+                    &a.reported_by,
+                ],
+            )?;
+            Ok(())
+        })?;
+        self.skill_adoption(&a.repository)?
+            .ok_or_else(|| HubError::Unavailable("skill adoption vanished".into()))
+    }
+
+    fn skill_adoption_clear(&self, repo: &str, source: Option<&str>) -> Result<()> {
+        self.run(false, |client| {
+            client.execute(
+                "DELETE FROM hub_skill_adoptions
+                 WHERE repository = $1 AND ($2::TEXT IS NULL OR source = $2)",
+                &[&repo, &source],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn skill_evidence_add(&self, r: &EvidenceRow) -> Result<()> {
+        self.run(false, |client| {
+            client.execute(
+                "INSERT INTO hub_skill_evidence (id, repository, branch, run_id, skill,
+                     skill_sha256, gate, kind, head_sha, assurance, summary, url, pull_request,
+                     detail, token_id, session, agent, recorded_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
+                &[
+                    &r.id,
+                    &r.repository,
+                    &r.branch,
+                    &r.run_id,
+                    &r.skill,
+                    &r.skill_sha256,
+                    &r.gate,
+                    &r.kind,
+                    &r.head_sha,
+                    &r.assurance,
+                    &r.summary,
+                    &r.url,
+                    &r.pull_request,
+                    &r.detail,
+                    &r.token_id,
+                    &r.session,
+                    &r.agent,
+                    &r.recorded_at,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn skill_evidence(&self, repo: &str, run_id: &str) -> Result<Vec<EvidenceRow>> {
+        self.run(true, |client| {
+            Ok(client
+                .query(
+                    "SELECT id, repository, branch, run_id, skill, skill_sha256, gate, kind,
+                            head_sha, assurance, summary, url, pull_request, detail, token_id,
+                            session, agent, recorded_at
+                     FROM hub_skill_evidence WHERE repository = $1 AND run_id = $2 ORDER BY seq",
+                    &[&repo, &run_id],
+                )?
+                .iter()
+                .map(|row| EvidenceRow {
+                    id: row.get(0),
+                    repository: row.get(1),
+                    branch: row.get(2),
+                    run_id: row.get(3),
+                    skill: row.get(4),
+                    skill_sha256: row.get(5),
+                    gate: row.get(6),
+                    kind: row.get(7),
+                    head_sha: row.get(8),
+                    assurance: row.get(9),
+                    summary: row.get(10),
+                    url: row.get(11),
+                    pull_request: row.get(12),
+                    detail: row.get(13),
+                    token_id: row.get(14),
+                    session: row.get(15),
+                    agent: row.get(16),
+                    recorded_at: row.get(17),
+                })
+                .collect())
+        })
+    }
+
+    fn skill_run_heads(
+        &self,
+        repo: &str,
+        branch: Option<&str>,
+        run_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RunHead>> {
+        self.run(true, |client| {
+            let limit = limit as i64;
+            Ok(client
+                .query(
+                    "SELECT run_id, branch, skill, skill_sha256 FROM hub_skill_evidence
+                     WHERE seq IN (SELECT MAX(seq) FROM hub_skill_evidence WHERE repository = $1
+                                   GROUP BY run_id)
+                       AND ($2::text IS NULL OR branch = $2) AND ($3::text IS NULL OR run_id = $3)
+                     ORDER BY seq DESC LIMIT $4",
+                    &[&repo, &branch, &run_id, &limit],
+                )?
+                .iter()
+                .map(|row| RunHead {
+                    run_id: row.get(0),
+                    branch: row.get(1),
+                    skill: row.get(2),
+                    skill_sha256: row.get(3),
+                })
+                .collect())
+        })
     }
 
     fn change_record(

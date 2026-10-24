@@ -447,6 +447,48 @@ impl Api {
             })
     }
 
+    /// A file of at most `max` bytes at `branch`; None when it does not exist. A directory, a
+    /// larger file or an unreadable reply is an error.
+    pub async fn file(
+        &self,
+        token: &str,
+        full_name: &str,
+        path: &str,
+        branch: &str,
+        max: usize,
+    ) -> Gh<Option<Vec<u8>>> {
+        if !valid_ref_name(branch) {
+            return Err(GhError::Failed("bad branch name".into()));
+        }
+        let url = format!(
+            "/repos/{full_name}/contents/{}?ref={}",
+            encode_path(path),
+            encode_path(branch)
+        );
+        let reply = self.get(token, &url).await?;
+        if reply.status == 404 {
+            return Ok(None);
+        }
+        let body = reply.ok("contents")?;
+        let unreadable = || GhError::Failed("unreadable reply from contents".into());
+        if body["type"] != "file" || body["encoding"] != "base64" {
+            return Err(unreadable());
+        }
+        if body["size"].as_u64().is_none_or(|size| size > max as u64) {
+            return Err(GhError::Failed(format!("file is larger than {max} bytes")));
+        }
+        let text: String = body["content"]
+            .as_str()
+            .ok_or_else(unreadable)?
+            .split_whitespace()
+            .collect();
+        let bytes = STANDARD.decode(text).map_err(|_| unreadable())?;
+        if bytes.len() > max {
+            return Err(unreadable());
+        }
+        Ok(Some(bytes))
+    }
+
     /// The login the token acts as.
     pub async fn user(&self, token: &str) -> Gh<(i64, String)> {
         let body = self.get(token, "/user").await?.ok("user")?;

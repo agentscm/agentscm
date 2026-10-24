@@ -11,6 +11,7 @@ use agentscm::hub::connection::{
 };
 use agentscm::hub::external_runs::{ExternalKind, ExternalObserved, ExternalOutcome, ExternalRun};
 use agentscm::hub::intent::NewIntent;
+use agentscm::hub::skills::{EvidenceRow, SkillAdoption};
 use agentscm::hub::store::{
     self, ForgeIdentity, MAX_AGENT_TOKEN_TTL_SECONDS, NewAgentToken, Store, agent_token_digest,
     mint_agent_token, mint_bound_agent_token, new_connection_id, unix_now,
@@ -2263,6 +2264,117 @@ fn forge_checks_showing_success_leave_out_merged_pull_requests(db: &Db) {
     assert_eq!(numbers, [12, 13]);
 }
 
+fn skill_adoption_and_evidence(db: &Db) {
+    let store = db.open();
+    let adoption = |source: &str, lock: &str| SkillAdoption {
+        repository: REPO.into(),
+        source: source.into(),
+        lock_json: lock.into(),
+        default_branch: (source == "default_branch").then(|| "main".to_owned()),
+        observed_at: 10,
+        reported_by: None,
+    };
+    assert_eq!(store.skill_adoption(REPO).unwrap(), None);
+    let checkout = store
+        .skill_adoption_put(&adoption("reported_by_checkout", "{\"a\":1}"))
+        .unwrap();
+    assert_eq!(checkout.lock_json, "{\"a\":1}");
+    // The forge replaces a checkout report; a checkout report never replaces the forge.
+    let forge = store
+        .skill_adoption_put(&adoption("default_branch", "{\"b\":2}"))
+        .unwrap();
+    assert_eq!(
+        (forge.source.as_str(), forge.default_branch.as_deref()),
+        ("default_branch", Some("main"))
+    );
+    let kept = store
+        .skill_adoption_put(&adoption("reported_by_checkout", "{\"c\":3}"))
+        .unwrap();
+    assert_eq!(kept, forge);
+    // Clearing one source leaves another; clearing every source drops a checkout report too.
+    store
+        .skill_adoption_clear(REPO, Some("reported_by_checkout"))
+        .unwrap();
+    assert_eq!(store.skill_adoption(REPO).unwrap(), Some(forge));
+    store.skill_adoption_clear(REPO, None).unwrap();
+    assert_eq!(store.skill_adoption(REPO).unwrap(), None);
+    store
+        .skill_adoption_put(&adoption("reported_by_checkout", "{\"d\":4}"))
+        .unwrap();
+    store
+        .skill_adoption_clear(REPO, Some("reported_by_checkout"))
+        .unwrap();
+    assert_eq!(store.skill_adoption(REPO).unwrap(), None);
+    store
+        .skill_adoption_put(&adoption("reported_by_checkout", "{\"e\":5}"))
+        .unwrap();
+    store.skill_adoption_clear(REPO, None).unwrap();
+    assert_eq!(store.skill_adoption(REPO).unwrap(), None);
+
+    let row = |id: &str, run: &str, branch: &str, at: i64| EvidenceRow {
+        id: id.into(),
+        repository: REPO.into(),
+        branch: branch.into(),
+        run_id: run.into(),
+        skill: "pr-gate".into(),
+        skill_sha256: "0".repeat(64),
+        gate: "tests".into(),
+        kind: "revision_tests".into(),
+        head_sha: "a".repeat(40),
+        assurance: "self_reported".into(),
+        summary: "ok".into(),
+        url: None,
+        pull_request: Some(4),
+        detail: Some("{\"exit_code\":0}".into()),
+        token_id: "tok_a".into(),
+        session: "s".into(),
+        agent: "claude".into(),
+        recorded_at: at,
+    };
+    store
+        .skill_evidence_add(&row("evd_1", "run_a", "feat/a", 1))
+        .unwrap();
+    store
+        .skill_evidence_add(&row("evd_2", "run_b", "feat/b", 2))
+        .unwrap();
+    store
+        .skill_evidence_add(&row("evd_3", "run_a", "feat/a", 3))
+        .unwrap();
+    assert!(
+        store
+            .skill_evidence_add(&row("evd_3", "run_a", "feat/a", 4))
+            .is_err()
+    );
+    let ids = |rows: Vec<EvidenceRow>| rows.into_iter().map(|r| r.id).collect::<Vec<_>>();
+    assert_eq!(
+        ids(store.skill_evidence(REPO, "run_a").unwrap()),
+        ["evd_1", "evd_3"]
+    );
+    assert_eq!(
+        store.skill_evidence(REPO, "run_a").unwrap()[0],
+        row("evd_1", "run_a", "feat/a", 1)
+    );
+    assert!(
+        store
+            .skill_evidence("other/repo", "run_a")
+            .unwrap()
+            .is_empty()
+    );
+    let runs = |branch, run, limit| {
+        store
+            .skill_run_heads(REPO, branch, run, limit)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.run_id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(runs(None, None, 10), ["run_a", "run_b"]);
+    assert_eq!(runs(None, None, 1), ["run_a"]);
+    assert_eq!(runs(Some("feat/b"), None, 10), ["run_b"]);
+    assert_eq!(runs(None, Some("run_b"), 10), ["run_b"]);
+    assert!(runs(Some("feat/b"), Some("run_a"), 10).is_empty());
+}
+
 macro_rules! conformance {
     ($($case:ident),* $(,)?) => {
         mod on_sqlite {
@@ -2307,6 +2419,7 @@ conformance!(
     upgrade_from_migration_3,
     upgrade_from_migration_14_with_publication,
     url_errors,
+    skill_adoption_and_evidence,
 );
 
 #[cfg(unix)]

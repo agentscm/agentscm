@@ -1,0 +1,176 @@
+{
+  "version": 2,
+  "name": "pr-gate",
+  "workflow_version": 1,
+  "summary": "Pull-request gate: task branch, tests, independent review, fixes, CI, approval, merge and a post-merge check.",
+  "applicability": {
+    "triggers": [
+      "opening a pull request",
+      "before finishing work on a task branch",
+      "before merging a pull request"
+    ],
+    "prerequisites": [
+      "a Git repository hosted on GitHub or GitLab",
+      "at least two agent sessions available for independent review"
+    ],
+    "not_for": [
+      "direct pushes to the default branch by a person",
+      "repositories without pull or merge requests"
+    ]
+  },
+  "parameters": [
+    {
+      "name": "ci_label",
+      "description": "Label to add to request the full CI run; null means whatever checks the repository requires.",
+      "type": "string",
+      "default": null
+    },
+    {
+      "name": "merge_method",
+      "description": "Required merge method, or any.",
+      "type": "string",
+      "default": "any",
+      "enum": [
+        "merge",
+        "squash",
+        "rebase",
+        "any"
+      ]
+    },
+    {
+      "name": "retarget_stacked",
+      "description": "Remind to retarget stacked pull requests after merging.",
+      "type": "bool",
+      "default": true
+    }
+  ],
+  "skill": {
+    "entrypoint": "src/skill_workflow/supported/pr_gate/v1/SKILL.md",
+    "resources": []
+  },
+  "steps": [],
+  "subjects": [
+    "git_pull_request"
+  ],
+  "roles": [
+    "author",
+    "reviewer",
+    "maintainer"
+  ],
+  "gates": [
+    {
+      "id": "branch",
+      "plain": "The author works on a branch made for this task, never on the default branch.",
+      "evidence": [
+        {
+          "kind": "task_branch"
+        }
+      ],
+      "by": "author",
+      "min_assurance": "self_reported",
+      "enforce": [
+        "advise"
+      ]
+    },
+    {
+      "id": "tests",
+      "plain": "The author runs the tests on the exact head commit.",
+      "evidence": [
+        {
+          "kind": "revision_tests"
+        }
+      ],
+      "by": "author",
+      "min_assurance": "self_reported",
+      "enforce": [
+        "stop"
+      ]
+    },
+    {
+      "id": "review",
+      "plain": "A different session reviews that exact commit and reports what it finds.",
+      "evidence": [
+        {
+          "kind": "independent_review"
+        }
+      ],
+      "by": "reviewer",
+      "min_assurance": "self_reported",
+      "enforce": [
+        "stop"
+      ]
+    },
+    {
+      "id": "fix",
+      "plain": "The author fixes every blocking finding, or dismisses it with a written reason.",
+      "evidence": [
+        {
+          "kind": "findings_resolved"
+        }
+      ],
+      "by": "author",
+      "min_assurance": "self_reported",
+      "enforce": [
+        "stop"
+      ]
+    },
+    {
+      "id": "ci",
+      "plain": "The hosted checks run on the current commit and must pass.",
+      "evidence": [
+        {
+          "kind": "hosted_ci",
+          "label_param": "ci_label"
+        }
+      ],
+      "by": "author",
+      "min_assurance": "self_reported",
+      "enforce": [
+        "forge_status"
+      ]
+    },
+    {
+      "id": "approval",
+      "plain": "A maintainer looks at the current commit and approves it.",
+      "evidence": [
+        {
+          "kind": "human_approval"
+        }
+      ],
+      "by": "maintainer",
+      "min_assurance": "self_reported",
+      "enforce": [
+        "forge_status"
+      ]
+    },
+    {
+      "id": "merge",
+      "plain": "A maintainer merges the pull request.",
+      "evidence": [
+        {
+          "kind": "merged",
+          "method_param": "merge_method"
+        }
+      ],
+      "by": "maintainer",
+      "min_assurance": "self_reported",
+      "enforce": [
+        "advise"
+      ]
+    },
+    {
+      "id": "post_merge",
+      "plain": "After the merge, the author checks the default branch still passes.",
+      "evidence": [
+        {
+          "kind": "post_merge_check"
+        }
+      ],
+      "by": "author",
+      "min_assurance": "self_reported",
+      "enforce": [
+        "signal"
+      ]
+    }
+  ]
+}

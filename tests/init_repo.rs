@@ -166,3 +166,24 @@ fn a_bad_saved_hub_url_warns_and_keeps_the_placeholder() {
     );
     assert!(!out.status.success());
 }
+
+#[test]
+fn a_skills_lock_adds_the_supported_skills_section_and_no_lock_adds_none() {
+    let (repo, home) = checkout();
+    let args = ["--yes", "--agents", "codex"];
+    assert!(init_repo(repo.path(), home.path(), &args).status.success());
+    let plain = std::fs::read_to_string(repo.path().join("AGENTS.md")).unwrap();
+    assert!(!plain.contains("Supported skills"));
+
+    let (repo, home) = checkout();
+    std::fs::copy(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/agentscm-skills.lock.json"),
+        repo.path().join("agentscm-skills.lock.json"),
+    )
+    .unwrap();
+    assert!(init_repo(repo.path(), home.path(), &args).status.success());
+    let text = std::fs::read_to_string(repo.path().join("AGENTS.md")).unwrap();
+    assert!(text.contains("### Supported skills"), "{text}");
+    assert!(text.contains("pr-gate v1 (adopted)"));
+    assert!(text.contains("Follow when:"));
+}

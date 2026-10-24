@@ -207,6 +207,36 @@ impl Api {
             })
     }
 
+    /// A JSON file of at most `max` bytes at `branch`, re-serialized; None when it does not
+    /// exist. Raw files that are not JSON are an error (the reply reader only keeps JSON).
+    pub async fn file(
+        &self,
+        token: &str,
+        project: i64,
+        path: &str,
+        branch: &str,
+        max: usize,
+    ) -> Gh<Option<Vec<u8>>> {
+        if !valid_ref_name(branch) {
+            return Err(GhError::Failed("bad branch name".into()));
+        }
+        let url = format!(
+            "/projects/{project}/repository/files/{}/raw?ref={}",
+            encode(path),
+            encode(branch)
+        );
+        let reply = self.get(token, &url).await?;
+        if reply.status == 404 {
+            return Ok(None);
+        }
+        let body = reply.ok("projects")?;
+        let bytes = serde_json::to_vec(&body).unwrap_or_default();
+        if body.is_null() || bytes.len() > max {
+            return Err(GhError::Failed("unreadable or oversized file".into()));
+        }
+        Ok(Some(bytes))
+    }
+
     /// The commit a branch points at; None when it does not exist. A bad name is an error.
     pub async fn ref_sha(&self, token: &str, project: i64, name: &str) -> Gh<Option<String>> {
         if !valid_ref_name(name) {
