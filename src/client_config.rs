@@ -588,6 +588,16 @@ pub(crate) fn connection_for_checkout<'a>(
         .map(|connection| (connection, checkout))
 }
 
+/// The main worktree of the checkout at `root`: its own root unless it is a verified linked
+/// worktree of a non-bare repository, whose shared Git directory is `<main>/.git`.
+pub(crate) fn main_checkout(root: &Path) -> PathBuf {
+    common_dir(root)
+        .filter(|common| common.file_name().is_some_and(|name| name == ".git"))
+        .and_then(|common| common.parent().map(Path::to_owned))
+        .filter(|main| repo_root(main).as_deref() == Some(main.as_path()))
+        .unwrap_or_else(|| root.to_owned())
+}
+
 /// The Git directory every worktree of the checkout at `root` shares. A linked worktree's `.git`
 /// file names its own directory under the shared `worktrees/`, which Git points back at the
 /// checkout; a copied, forged or submodule pointer fails these checks.
@@ -1038,6 +1048,15 @@ mod tests {
         std::fs::create_dir(&copied).unwrap();
         std::fs::copy(beside.join(".git"), copied.join(".git")).unwrap();
         assert_eq!(connection_for_checkout(&connections, &copied), None);
+        for checkout in [
+            &main,
+            &nested.canonicalize().unwrap(),
+            &beside.canonicalize().unwrap(),
+        ] {
+            assert_eq!(main_checkout(checkout), main);
+        }
+        assert_eq!(main_checkout(&copied), copied);
+        assert_eq!(main_checkout(&foreign), foreign);
 
         let both = [
             connection(beside.canonicalize().unwrap(), "acme/widgets"),

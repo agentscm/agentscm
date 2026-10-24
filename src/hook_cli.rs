@@ -155,7 +155,11 @@ async fn call_hub(
     let plugin_route = client_connection;
     let (url, token, repo, root, endpoint_agent, outbound, client_connection, report_completion) =
         if plugin_route {
-            let routed = route_client(&agent, &payload)?;
+            let routed = route_client(&agent, &payload).inspect_err(|reason| {
+                if [NO_CONNECTION, NO_EDIT_CONNECTION].contains(&reason.as_str()) {
+                    report_unconnected(&agent, &payload);
+                }
+            })?;
             (
                 routed.connection.hub.clone(),
                 Token::PrivateFile(routed.connection.token_file.clone()),
@@ -404,6 +408,11 @@ const MAX_WORKSPACE_ROOTS: usize = 16;
 /// Every new worktree of a connected checkout is covered, so this means the repository itself.
 const NO_CONNECTION: &str =
     "no client connection for this repository; run `agentscm quickstart` in it once";
+const NO_EDIT_CONNECTION: &str = "no client connection for an edit path";
+/// How often one agent re-reports the same unconnected checkout to the tray, and how long that
+/// report may hold the hook.
+const UNCONNECTED_EVERY: Duration = Duration::from_secs(5 * 60);
+const UNCONNECTED_WAIT: Duration = Duration::from_millis(500);
 const MAX_EDIT_PATHS: usize = 256;
 const PATCH_HEADERS: [&str; 4] = [
     "*** Update File: ",
@@ -628,7 +637,7 @@ fn route_client_with(
     let mut normalized = Vec::with_capacity(edits.len());
     for edit in &edits {
         let Some((connection, candidate)) = match_edit(payload, connections, &edit.path)? else {
-            return Err("no client connection for an edit path".into());
+            return Err(NO_EDIT_CONNECTION.into());
         };
         if let Some((selected, _)) = &selected
             && selected.root != connection.root
@@ -671,6 +680,43 @@ fn route_client_with(
         checkout,
         endpoint_agent: endpoint_agent.to_owned(),
     })
+}
+
+/// Tell a running tray that this agent works in a Git checkout with no client connection, so it
+/// can offer to connect it. Throttled per agent and checkout, bounded in time, and local only.
+fn report_unconnected(agent: &str, payload: &Value) {
+    let cwd = cwd_of(payload);
+    let Some(checkout) = repo_root(&cwd) else {
+        return;
+    };
+    let main = client_config::main_checkout(&checkout);
+    let key = format!("unconnected\0{agent}\0{}", main.display());
+    if !config_dir().is_ok_and(|config| due_marker(&config, &key, UNCONNECTED_EVERY)) {
+        return;
+    }
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let connections = client_config::load().unwrap_or_default();
+        let _ = sender.send(unconnected_checkout(&cwd, &connections));
+    });
+    if let Ok(Some((root, host, repo))) = receiver.recv_timeout(UNCONNECTED_WAIT) {
+        crate::client_activity::observe_unconnected(&root, &host, &repo, agent);
+    }
+}
+
+/// The main worktree, forge host and repository of the checkout containing `cwd`, when it has
+/// a supported `origin` and no client connection covers it.
+fn unconnected_checkout(
+    cwd: &Path,
+    connections: &[Connection],
+) -> Option<(PathBuf, String, String)> {
+    let checkout = repo_root(cwd)?;
+    if client_config::connection_for_checkout(connections, &checkout).is_some() {
+        return None;
+    }
+    let main = client_config::main_checkout(&checkout);
+    let (host, repo) = client_config::origin_identity(&main).ok()?;
+    Some((main, host, repo))
 }
 
 #[cfg(test)]
@@ -1042,6 +1088,22 @@ fn first_marker(config: &Path, key: &str) -> bool {
         }
     }
     true
+}
+
+/// True when `key` was not marked within `every`, and marks it now.
+fn due_marker(config: &Path, key: &str, every: Duration) -> bool {
+    use sha2::{Digest, Sha256};
+    let marker =
+        (config.join("agentscm").join("hook-notes")).join(format!("{:x}", Sha256::digest(key)));
+    let recent = (std::fs::metadata(&marker).and_then(|m| m.modified()))
+        .ok()
+        .and_then(|time| time.elapsed().ok())
+        .is_some_and(|age| age < every);
+    if recent {
+        return false;
+    }
+    let _ = std::fs::remove_file(&marker);
+    first_marker(config, key)
 }
 
 /// The reply for an unreachable hub; `note` is the reason to show, or `None` for the silent form.
@@ -1724,6 +1786,71 @@ mod tests {
         .unwrap();
         std::fs::write(own.join("commondir"), "../..\n").unwrap();
         path.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn only_unconnected_checkouts_with_a_supported_origin_are_reported() {
+        let git = |root: &Path, arguments: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(arguments)
+                .current_dir(root)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {arguments:?}");
+        };
+        let parent = tempfile::tempdir().unwrap();
+        let plain = parent.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        assert_eq!(unconnected_checkout(&plain, &[]), None);
+
+        let main = parent.path().join("main");
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        git(&main, &["init", "--quiet"]);
+        let main = main.canonicalize().unwrap();
+        assert_eq!(unconnected_checkout(&main, &[]), None, "no origin");
+        git(
+            &main,
+            &["remote", "add", "origin", "file:///synthetic/widgets.git"],
+        );
+        assert_eq!(unconnected_checkout(&main, &[]), None, "unsupported origin");
+
+        git(
+            &main,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/acme/widgets.git",
+            ],
+        );
+        let linked = linked_worktree(&main, &main.join(".claude/worktrees/task"));
+        let expected = Some((main.clone(), "github.com".into(), "acme/widgets".into()));
+        for cwd in [main.join("src"), linked.clone()] {
+            assert_eq!(unconnected_checkout(&cwd, &[]), expected);
+        }
+        let connections = [connection(&main, "acme/widgets")];
+        for cwd in [main.join("src"), linked] {
+            assert_eq!(unconnected_checkout(&cwd, &connections), None);
+        }
+    }
+
+    #[test]
+    fn due_markers_repeat_only_after_their_interval() {
+        let config = tempfile::tempdir().unwrap();
+        let every = Duration::from_secs(60);
+        assert!(due_marker(config.path(), "unconnected\0claude\0/a", every));
+        assert!(!due_marker(config.path(), "unconnected\0claude\0/a", every));
+        assert!(due_marker(config.path(), "unconnected\0codex\0/a", every));
+        assert!(due_marker(
+            config.path(),
+            "unconnected\0claude\0/a",
+            Duration::ZERO
+        ));
     }
 
     #[test]
