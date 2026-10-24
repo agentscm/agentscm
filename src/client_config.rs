@@ -67,7 +67,13 @@ pub(crate) struct Connection {
     pub(crate) owned_token_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) owned_token_expires_at: Option<i64>,
+    /// Agents `client setup` configured in this checkout, which `client remove` takes out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) agents: Vec<String>,
 }
+
+/// The names `client setup --agent` accepts.
+pub(crate) const AGENTS: [&str; 5] = ["claude", "codex", "cursor", "copilot", "gemini"];
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -117,6 +123,9 @@ fn checked(mut connection: Connection) -> Result<Connection> {
         || connection
             .owned_token_expires_at
             .is_some_and(|expiry| expiry <= 0)
+        || connection.agents.iter().enumerate().any(|(index, agent)| {
+            !AGENTS.contains(&agent.as_str()) || connection.agents[..index].contains(agent)
+        })
     {
         return Err(invalid("connections.json has an invalid connection"));
     }
@@ -591,6 +600,7 @@ mod tests {
             report_completion: false,
             owned_token_id: None,
             owned_token_expires_at: None,
+            agents: Vec::new(),
         }
     }
 
@@ -835,6 +845,7 @@ mod tests {
             report_completion: false,
             owned_token_id: None,
             owned_token_expires_at: None,
+            agents: Vec::new(),
         };
         assert!(is_current(&saved));
         std::fs::write(
