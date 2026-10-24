@@ -273,12 +273,12 @@ fn now_ms() -> i64 {
 }
 
 impl Sync {
-    #[cfg(unix)]
     /// Accepted webhook deliveries whose job has not finished.
     pub(super) fn pending_webhooks(&self) -> usize {
         self.pending.load(Ordering::Relaxed)
     }
 
+    #[cfg(unix)]
     pub(super) fn forge_cursor(&self, repository: &str) -> i64 {
         lock(&self.forge_cursors)
             .get(repository)
