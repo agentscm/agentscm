@@ -92,7 +92,7 @@ Each developer, from a clone of the connected repository:
 npx agentscm --hosted --hub-url https://hub.example.com
 ```
 
-This prints the hosted caveat and a link to this guide, then sets up that machine against the hub (sign-in, agent token and, when Claude Code is found, its hooks), the same as `agentscm quickstart --hub existing --hub-url URL`. For another agent (`claude`, `codex`, `cursor`, `copilot` or `gemini`) use the one-step form from [team member onboarding](team-member-onboarding.md):
+This prints the hosted caveat and a link to this guide, then sets up that machine against the hub (sign-in, then the same setup as `agentscm client setup` for Claude Code if the `claude` CLI is found), the same as `agentscm quickstart --hub existing --hub-url URL`. For another agent (`claude`, `codex`, `cursor`, `copilot` or `gemini`) use the one-step form from [team member onboarding](team-member-onboarding.md):
 
 ```sh
 npx agentscm client setup --agent codex --hub https://hub.example.com

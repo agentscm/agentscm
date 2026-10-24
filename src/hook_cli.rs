@@ -1248,6 +1248,7 @@ mod tests {
             report_completion: false,
             owned_token_id: None,
             owned_token_expires_at: None,
+            agents: Vec::new(),
         }
     }
 

@@ -259,16 +259,16 @@ Integration additionally binds an operation ID, protected target, expected targe
 
 ## Guided setup
 
-`agentscm quickstart` (what `npx agentscm` runs) detects the repository, Docker, a hub and Claude Code, runs collisions, sets up live warnings (a local hub with Docker, an existing hub, or none), signs in, mints an agent token for the repository and merges the Claude Code hooks. Every file it writes is announced first and recorded in `~/.config/agentscm/quickstart.json`; `agentscm uninstall` removes exactly those. Details and limits: [setup guide](../setup-guide.md).
+`agentscm quickstart` (what `npx agentscm` runs) detects the repository, Docker, a hub and Claude Code, runs collisions, sets up live warnings (a local hub with Docker, an existing hub, or none), signs in and sets up your coding agents through `agentscm client setup` (token, hooks, MCP entry and skill). Every file it writes is announced first. Quickstart's own files are recorded in `~/.config/agentscm/quickstart.json` and each connected checkout in `connections.json`; `agentscm uninstall` removes exactly those, running `agentscm client remove` for each checkout. Details and limits: [setup guide](../setup-guide.md).
 
 ```sh
 agentscm quickstart                     # interactive
 agentscm quickstart --yes --hub existing --hub-url https://hub.example.com \
-  --agent-token-file ~/.config/agentscm/tokens/acme-widgets.token --hook project
+  --agent-token-file ~/hub.token --agent claude
 agentscm uninstall                      # asks first; --yes, --remove-hub-data
 ```
 
-Flags: `--yes`, `--init` (also run `init-repo`; with `--yes` it is skipped unless passed), `--hub local|existing|skip`, `--hub-url URL`, `--provider github|gitlab`, `--agent-token-file PATH` (skip sign-in and minting), `--github-login LOGIN` (required with `--yes --hub local` unless `gh` is signed in), `--agent-name NAME`, `--ttl 30d`, `--hook user|project|none`, `--no-collisions`.
+Flags: `--yes`, `--init` (also run `init-repo`; with `--yes` it is skipped unless passed), `--hub local|existing|skip`, `--hub-url URL`, `--provider github|gitlab`, `--agent-token-file PATH` (skip sign-in and minting), `--github-login LOGIN` (required with `--yes --hub local` unless `gh` is signed in), `--agent claude|codex|cursor|copilot|gemini` (repeatable; default Claude Code if the `claude` CLI is on `PATH`), `--no-agents`, `--no-collisions`.
 
 ## Usage telemetry
 

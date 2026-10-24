@@ -38,9 +38,9 @@ An **agent token** is a secret that lets one agent talk to the hub for one repos
    `"tokens"` map from `owner/name` to an absolute token file path. A checkout whose
    Git remote names a repository in the map uses that file (the longest matching name
    wins); every other checkout uses `token_file`.
-   [`agentscm quickstart`](setup-guide.md) maintains this map.
+   Nothing writes this file any more; it is read for manual setups only.
 
-   `AGENTSCM_HUB_URL` and `AGENTSCM_HUB_TOKEN_FILE`, when both are set, win over the file;
+   `agentscm intent` looks for the hub in this order: `AGENTSCM_HUB_URL` with `AGENTSCM_HUB_TOKEN_FILE`; then the checkout's [client connection](team-member-onboarding.md) (from `agentscm client setup` or `quickstart`); then this file. The environment variables, when both are set, win over the file;
    that lets a project set them in the `env` of its `.claude/settings.json`. The URL
    must be `https://`, or `http://` only for a loopback address such as `127.0.0.1`.
 5. Merge [`hooks/claude-code.example.json`](../hooks/claude-code.example.json) into the
