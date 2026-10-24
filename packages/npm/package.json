@@ -1,6 +1,6 @@
 {
   "name": "agentscm",
-  "version": "0.1.0-alpha.4",
+  "version": "0.1.0-alpha.5",
   "description": "Downloads, verifies and starts the AgentSCM release binary.",
   "license": "FSL-1.1-ALv2",
   "repository": {"type": "git", "url": "git+https://github.com/counterbranch/agentscm.git"},
