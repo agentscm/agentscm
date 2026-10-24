@@ -1008,16 +1008,21 @@ mod tests {
         git(&main, &["config", "user.name", "AgentSCM Test"]);
         git(&main, &["config", "user.email", "test@example.invalid"]);
         git(&main, &["commit", "--quiet", "--allow-empty", "-m", "test"]);
-        let main = main.canonicalize().unwrap();
+        // Git gets plain paths: Windows canonical `\\?\` paths are not accepted by `worktree add`.
+        let checkout = main;
+        let main = checkout.canonicalize().unwrap();
         // Editors create session worktrees both inside the checkout and beside it.
-        let nested = main.join(".claude/worktrees/task");
+        let nested = checkout.join(".claude/worktrees/task");
         let beside = dir.path().join("beside");
         let third = dir.path().join("third");
         for linked in [&nested, &beside, &third] {
             let linked = linked.to_str().unwrap();
-            git(&main, &["worktree", "add", "--quiet", "--detach", linked]);
+            git(
+                &checkout,
+                &["worktree", "add", "--quiet", "--detach", linked],
+            );
         }
-        let foreign = main.join("vendor/other");
+        let foreign = checkout.join("vendor/other");
         std::fs::create_dir_all(&foreign).unwrap();
         git(&foreign, &["init", "--quiet"]);
         let connections = [connection(main.clone(), "acme/widgets")];
