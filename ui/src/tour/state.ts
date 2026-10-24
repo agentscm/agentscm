@@ -1,16 +1,17 @@
 // Per-viewer walkthrough preferences, kept in this browser only: the hub UI never writes them to the hub.
 // Pure and DOM-free apart from the guarded storage handle, so tests can pass their own.
 
-const KEY = 'agentscm.tour.v1'
+export const TOUR_KEY = 'agentscm.tour.v1'
+const KEY = TOUR_KEY
 
 export interface TourPrefs {
-  /** The welcome tour has been shown here once (finished, skipped or closed). */
+  /** The welcome tour was finished or turned off; kept equal to welcomeOff, read for older saved prefs. */
   welcomeSeen: boolean
   /** "Don't show again" was checked on the welcome tour. */
   welcomeOff: boolean
   /** Sections whose page tour plays by itself the first time the page opens. */
   autoplay: string[]
-  /** Sections whose page tour has been shown here at least once. */
+  /** Unused since the checkbox decides; kept so older saved prefs still parse. */
   sectionsSeen: string[]
 }
 
@@ -73,27 +74,17 @@ export function canRemember(s: Store | null = store()): boolean {
 
 export const shouldWelcome = (p: TourPrefs, remember: boolean): boolean => remember && !p.welcomeSeen && !p.welcomeOff
 
-export const shouldAutoplay = (p: TourPrefs, section: string, remember: boolean): boolean =>
-  remember && p.autoplay.includes(section) && !p.sectionsSeen.includes(section)
+export const shouldAutoplay = (p: TourPrefs, section: string, remember: boolean): boolean => remember && p.autoplay.includes(section)
 
 const toggle = (list: string[], v: string, on: boolean): string[] => (on ? [...new Set([...list, v])] : list.filter((x) => x !== v))
 
-/** Closing the welcome tour, any way: it counts as seen; the checkbox decides whether it may return. */
-export const closeWelcome = (p: TourPrefs, dontShow: boolean): TourPrefs => ({ ...p, welcomeSeen: true, welcomeOff: dontShow })
+/** `done`: finished, or closed with "Don't show again" ticked. Closing it any other way brings it back next time. */
+export const closeWelcome = (p: TourPrefs, done: boolean): TourPrefs => (done ? { ...p, welcomeSeen: true, welcomeOff: true } : p)
 
 /** Settings switch: on brings the welcome tour back at the next page load. */
 export const setWelcome = (p: TourPrefs, on: boolean): TourPrefs => (on ? { ...p, welcomeSeen: false, welcomeOff: false } : { ...p, welcomeSeen: true, welcomeOff: true })
 
-/** Closing a page tour; "Don't show again" there turns that page's auto-play off. */
-export const closeSection = (p: TourPrefs, section: string, dontShow: boolean): TourPrefs => ({
-  ...p,
-  sectionsSeen: toggle(p.sectionsSeen, section, true),
-  autoplay: dontShow ? toggle(p.autoplay, section, false) : p.autoplay,
-})
+/** Same rule for a page tour that plays by itself: finishing it or ticking the box switches its auto-play off (the Settings switch follows). */
+export const closeSection = (p: TourPrefs, section: string, done: boolean): TourPrefs => (done ? { ...p, autoplay: toggle(p.autoplay, section, false) } : p)
 
-/** Turning auto-play on also forgets "seen", so the tour plays on the next visit. */
-export const setAutoplay = (p: TourPrefs, section: string, on: boolean): TourPrefs => ({
-  ...p,
-  autoplay: toggle(p.autoplay, section, on),
-  sectionsSeen: on ? toggle(p.sectionsSeen, section, false) : p.sectionsSeen,
-})
+export const setAutoplay = (p: TourPrefs, section: string, on: boolean): TourPrefs => ({ ...p, autoplay: toggle(p.autoplay, section, on) })

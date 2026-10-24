@@ -6,7 +6,7 @@ import { derive } from '../../src/derive.ts'
 import type { WorkOverview } from '../../src/standup.ts'
 import { SECTION_TOURS, WELCOME, tourFor, type TourContext, type TourDef } from '../../src/tour/content.ts'
 import { DEFAULT_PREFS, canRemember, closeSection, closeWelcome, loadPrefs, savePrefs, setAutoplay, setWelcome, shouldAutoplay, shouldWelcome } from '../../src/tour/state.ts'
-import { TourProvider, TourTrigger } from '../../src/tour/Tour.tsx'
+import { TourProvider, TourTrigger, useTour } from '../../src/tour/Tour.tsx'
 import type { HubData } from '../../src/useHub.ts'
 import { stubHub } from '../fixtures/mockFetch.ts'
 
@@ -57,10 +57,10 @@ describe('tour preferences', () => {
     expect(shouldAutoplay(p, 'now', true)).toBe(true)
     expect(shouldAutoplay(p, 'now', false)).toBe(false)
     expect(shouldAutoplay(p, 'work', true)).toBe(false)
-    expect(shouldAutoplay({ ...p, sectionsSeen: ['now'] }, 'now', true)).toBe(false)
   })
-  it('closeWelcome marks seen; the checkbox decides whether it may return', () => {
-    expect(closeWelcome(DEFAULT_PREFS, false)).toMatchObject({ welcomeSeen: true, welcomeOff: false })
+  it('closeWelcome: closing without the box changes nothing; finishing or ticking it turns the tour off', () => {
+    expect(closeWelcome(DEFAULT_PREFS, false)).toEqual(DEFAULT_PREFS)
+    expect(shouldWelcome(closeWelcome(DEFAULT_PREFS, false), true)).toBe(true)
     expect(closeWelcome(DEFAULT_PREFS, true)).toMatchObject({ welcomeSeen: true, welcomeOff: true })
   })
   it('setWelcome brings the welcome tour back, or turns it off', () => {
@@ -69,14 +69,15 @@ describe('tour preferences', () => {
     expect(shouldWelcome(back, true)).toBe(true)
     expect(shouldWelcome(setWelcome(back, false), true)).toBe(false)
   })
-  it('closeSection / setAutoplay: seen, dont-show, and re-arming', () => {
+  it('closeSection / setAutoplay: the checkbox decides, and the Settings switch is the same list', () => {
     const armed = setAutoplay(DEFAULT_PREFS, 'now', true)
     expect(shouldAutoplay(armed, 'now', true)).toBe(true)
-    const seen = closeSection(armed, 'now', false)
-    expect(seen.autoplay).toEqual(['now'])
-    expect(shouldAutoplay(seen, 'now', true)).toBe(false)
-    expect(shouldAutoplay(setAutoplay(seen, 'now', true), 'now', true)).toBe(true) // switching on again replays
-    expect(closeSection(armed, 'now', true).autoplay).toEqual([])
+    const closed = closeSection(armed, 'now', false)
+    expect(closed.autoplay).toEqual(['now'])
+    expect(shouldAutoplay(closed, 'now', true)).toBe(true) // closed without the box: plays again next visit
+    const done = closeSection(armed, 'now', true)
+    expect(done.autoplay).toEqual([]) // finished or ticked: off, and the Settings switch reads the same list
+    expect(shouldAutoplay(setAutoplay(done, 'now', true), 'now', true)).toBe(true) // switching on again replays
     expect(setAutoplay(setAutoplay(armed, 'now', true), 'now', true).autoplay).toEqual(['now']) // no duplicates
     expect(setAutoplay(armed, 'now', false).autoplay).toEqual([])
     expect(armed.autoplay).toEqual(['now']) // pure
@@ -189,19 +190,48 @@ describe('TourProvider overlay', () => {
     const live = container.ownerDocument.querySelector('[aria-live="polite"]')!
     expect(live.textContent).toContain(`Step 1 of ${WELCOME.steps.length}`)
   })
-  it('Escape closes the tour, counts it seen, and returns focus', () => {
+  it('Escape or Skip without the box closes the tour, and it comes back next time', () => {
     fresh()
-    render(<div><button>earlier</button>{shell()}</div>)
+    const first = render(shell())
     fireEvent.keyDown(document, { key: 'Escape' })
     expect(dialog()).toBeNull()
-    expect(stored()).toMatchObject({ welcomeSeen: true, welcomeOff: false })
-  })
-  it('Skip and Done both close; Done on the last step too', () => {
-    fresh()
+    expect(shouldWelcome(loadPrefs(), true)).toBe(true)
+    first.unmount()
     render(shell())
+    expect(dialog()).not.toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Skip' }))
     expect(dialog()).toBeNull()
-    expect(stored().welcomeSeen).toBe(true)
+    expect(shouldWelcome(loadPrefs(), true)).toBe(true)
+  })
+  it('Done on the last step finishes the tour for good', () => {
+    fresh()
+    render(shell())
+    for (let n = 1; n < WELCOME.steps.length; n++) fireEvent.keyDown(document, { key: 'ArrowRight' })
+    fireEvent.click(screen.getByRole('button', { name: 'Done' }))
+    expect(stored()).toMatchObject({ welcomeSeen: true, welcomeOff: true })
+  })
+  it('writes onto what storage holds now, so another tab’s change survives', () => {
+    window.localStorage.setItem(KEY, JSON.stringify({ welcomeSeen: true, welcomeOff: true, autoplay: [], sectionsSeen: [] }))
+    const Switch = () => {
+      const tour = useTour()
+      return <button onClick={() => tour!.update((p) => setAutoplay(p, 'now', true))}>arm now</button>
+    }
+    render(<TourProvider section="settings" data={emptyData} d={null} overview={null}><Switch /></TourProvider>)
+    // Another tab switches the Work tour on after this one loaded.
+    window.localStorage.setItem(KEY, JSON.stringify({ welcomeSeen: true, welcomeOff: true, autoplay: ['work'], sectionsSeen: [] }))
+    fireEvent.click(screen.getByRole('button', { name: 'arm now' }))
+    expect(stored().autoplay).toEqual(['work', 'now'])
+  })
+  it('Back keeps focus on Back', async () => {
+    fresh()
+    render(shell())
+    fireEvent.keyDown(document, { key: 'ArrowRight' })
+    fireEvent.keyDown(document, { key: 'ArrowRight' })
+    const back = screen.getByRole('button', { name: /Back/ })
+    back.focus()
+    fireEvent.click(back)
+    await new Promise((r) => setTimeout(r, 10))
+    expect(document.activeElement?.textContent).toMatch(/Back/)
   })
   it('“Don’t show again” persists as welcomeOff', () => {
     fresh()
@@ -218,7 +248,7 @@ describe('TourProvider overlay', () => {
     expect(screen.getByRole('heading', { level: 2 }).textContent).toBe(SECTION_TOURS.now!.steps[0]!.title)
     expect(screen.queryByRole('checkbox', { name: 'Don’t show again' })).toBeNull() // only offered when auto-play is on
     fireEvent.keyDown(document, { key: 'Escape' })
-    expect(stored().sectionsSeen).toContain('now')
+    expect(dialog()).toBeNull()
   })
   it('auto-plays a page tour switched on in Settings, once', () => {
     window.localStorage.setItem(KEY, JSON.stringify({ welcomeSeen: true, welcomeOff: true, autoplay: ['now'], sectionsSeen: [] }))

@@ -5,7 +5,7 @@ import type { WorkOverview } from '../standup.ts'
 import type { HubData } from '../useHub.ts'
 import { Icon } from '../ui.tsx'
 import { tourFor, type TourContext, type TourKey } from './content.ts'
-import { canRemember, closeSection, closeWelcome, loadPrefs, savePrefs, shouldAutoplay, shouldWelcome, type TourPrefs } from './state.ts'
+import { TOUR_KEY, canRemember, closeSection, closeWelcome, loadPrefs, savePrefs, shouldAutoplay, shouldWelcome, type TourPrefs } from './state.ts'
 
 interface TourApi {
   prefs: TourPrefs
@@ -32,12 +32,22 @@ export function TourProvider({ section, data, d, overview, children }: { section
   const remember = init.remember
   const [prefs, setPrefs] = useState(init.prefs)
   const [active, setActive] = useState<TourKey | null>(init.first)
-  const update = useCallback((f: (p: TourPrefs) => TourPrefs) => {
-    setPrefs((p) => {
-      const next = f(p)
+  // Applied to what storage holds now, so a stale tab never overwrites another tab's change.
+  const update = useCallback(
+    (f: (p: TourPrefs) => TourPrefs) => {
+      if (!remember) return setPrefs(f)
+      const next = f(loadPrefs())
       savePrefs(next)
-      return next
-    })
+      setPrefs(next)
+    },
+    [remember],
+  )
+  useEffect(() => {
+    const on = (e: StorageEvent) => {
+      if (e.key === null || e.key === TOUR_KEY) setPrefs(loadPrefs())
+    }
+    window.addEventListener('storage', on)
+    return () => window.removeEventListener('storage', on)
   }, [])
   const start = useCallback((key: TourKey) => {
     if (tourFor(key)) setActive(key)
@@ -46,7 +56,9 @@ export function TourProvider({ section, data, d, overview, children }: { section
   const [visited, setVisited] = useState(section)
   if (visited !== section) {
     setVisited(section)
-    if (!active && shouldAutoplay(prefs, section, remember) && tourFor(section)) setActive(section)
+    // A page tour belongs to its page: leaving the page closes it (without counting as finished).
+    const stays = active === 'welcome' || active === section
+    if (!stays) setActive(shouldAutoplay(prefs, section, remember) && tourFor(section) ? section : null)
   }
 
   const close = useCallback(
@@ -135,22 +147,35 @@ function TourOverlay({ tourKey, data, d, overview, onClose, autoplayOn }: { tour
   // Focus moves into the card and returns to where it was when the tour closes.
   useLayoutEffect(() => {
     const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null
-    return () => opener?.focus({ preventScroll: true })
+    // The opener may be gone (Settings "Run now" changes page); the page itself is the next best place.
+    return () => (opener?.isConnected ? opener : document.getElementById('main'))?.focus({ preventScroll: true })
   }, [])
   useEffect(() => {
     // Deferred a task: started from ⌘K with Enter, the key's own press would otherwise land on the freshly focused Next and skip step one.
-    const t = window.setTimeout(() => card.current?.querySelector<HTMLElement>('.tour-primary')?.focus({ preventScroll: true }), 0)
+    // Keep focus where it is when it is still on a control in the card (Back stays on Back).
+    const t = window.setTimeout(() => {
+      const here = document.activeElement
+      if (!(here instanceof HTMLElement && here !== card.current && card.current?.contains(here))) card.current?.querySelector<HTMLElement>('.tour-primary')?.focus({ preventScroll: true })
+    }, 0)
     return () => window.clearTimeout(t)
   }, [i])
 
   // Bring the target into view, then follow it through scrolls, resizes and data refreshes.
   useEffect(() => {
     const el = findTarget(step.target)
-    el?.scrollIntoView({ block: 'center', inline: 'nearest', behavior: reducedMotion() ? 'auto' : 'smooth' })
+    // A target too tall to sit beside the card scrolls to its top (below the sticky top bar), so its start stays visible above the card.
+    const tall = !!el && el.getBoundingClientRect().height > window.innerHeight - (card.current?.offsetHeight ?? 300) - 48
+    const bring = (behavior: ScrollBehavior) => {
+      if (!el) return
+      if (!tall) return el.scrollIntoView({ block: 'center', inline: 'nearest', behavior })
+      const bar = document.querySelector<HTMLElement>('[data-tour="topbar"]')?.offsetHeight ?? 0
+      window.scrollTo({ top: window.scrollY + el.getBoundingClientRect().top - bar - 16, behavior })
+    }
+    bring(reducedMotion() ? 'auto' : 'smooth')
     // Moving through steps quickly can cancel a smooth scroll; if the target is still off screen, jump to it.
     const settle = window.setTimeout(() => {
       const r = el?.getBoundingClientRect()
-      if (el && r && (r.bottom < 0 || r.top > window.innerHeight)) el.scrollIntoView({ block: 'center', inline: 'nearest' })
+      if (r && (r.bottom < 0 || r.top > window.innerHeight)) bring('auto')
     }, 600)
     let frame = 0
     const measure = () => {
@@ -175,7 +200,7 @@ function TourOverlay({ tourKey, data, d, overview, onClose, autoplayOn }: { tour
     }
   }, [step])
 
-  const next = useCallback(() => (last ? onClose(dontShow) : setI((n) => n + 1)), [last, onClose, dontShow])
+  const next = useCallback(() => (last ? onClose(true) : setI((n) => n + 1)), [last, onClose])
   const back = useCallback(() => setI((n) => Math.max(0, n - 1)), [])
 
   // Capture phase, so the shell's own shortcuts (⌘K, [, Escape for the drawer) stay quiet while a tour is open.
