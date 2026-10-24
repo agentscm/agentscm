@@ -147,6 +147,11 @@ function TourOverlay({ tourKey, data, d, overview, onClose, autoplayOn }: { tour
   useEffect(() => {
     const el = findTarget(step.target)
     el?.scrollIntoView({ block: 'center', inline: 'nearest', behavior: reducedMotion() ? 'auto' : 'smooth' })
+    // Moving through steps quickly can cancel a smooth scroll; if the target is still off screen, jump to it.
+    const settle = window.setTimeout(() => {
+      const r = el?.getBoundingClientRect()
+      if (el && r && (r.bottom < 0 || r.top > window.innerHeight)) el.scrollIntoView({ block: 'center', inline: 'nearest' })
+    }, 600)
     let frame = 0
     const measure = () => {
       cancelAnimationFrame(frame)
@@ -164,6 +169,7 @@ function TourOverlay({ tourKey, data, d, overview, onClose, autoplayOn }: { tour
     return () => {
       cancelAnimationFrame(frame)
       window.clearInterval(poll)
+      window.clearTimeout(settle)
       window.removeEventListener('resize', measure)
       window.removeEventListener('scroll', measure, true)
     }
@@ -227,8 +233,10 @@ function TourOverlay({ tourKey, data, d, overview, onClose, autoplayOn }: { tour
     const beside = right + cardW <= vw - 16 ? right : rect.left - 12 - cardW >= 16 ? rect.left - 12 - cardW : null
     const sideTop = Math.max(16, Math.min(rect.top, vh - h - 16))
     // A target taller than the room above and below it gets the card beside it, so the card never covers it.
-    if (below + h <= vh - 16) style = { top: below, left, width: cardW }
-    else if (above >= 16) style = { top: above, left, width: cardW }
+    // Clamped, so a target still scrolling into view never drags the card off screen.
+    const fit = (top: number) => Math.min(Math.max(16, top), Math.max(16, vh - h - 16))
+    if (below + h <= vh - 16) style = { top: fit(below), left, width: cardW }
+    else if (above >= 16) style = { top: fit(above), left, width: cardW }
     else if (beside !== null) style = { top: sideTop, left: beside, width: cardW }
     else style = { top: Math.max(16, vh - h - 16), left, width: cardW }
   }
