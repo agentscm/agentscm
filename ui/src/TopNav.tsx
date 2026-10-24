@@ -1,3 +1,4 @@
+import { skillRunHref, skillRunsHref, skillsRoute } from './skills.ts'
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { Derived } from './derive.ts'
 import { workHref, workIdFromHash, type WorkOverview } from './standup.ts'
@@ -395,6 +396,10 @@ export function crumbsFor(hash: string, section: SectionDef, overview: WorkOverv
   } else if (section.key === 'landed') {
     const id = landedIdFromHash(hash)
     if (id) out.push({ label: `Change ${id.slice(0, 12)}…`, href: landedHref(id), mono: true })
+  } else if (section.key === 'skills') {
+    const route = skillsRoute(hash)
+    if (route.kind !== 'library') out.push({ label: 'Runs', href: skillRunsHref })
+    if (route.kind === 'run') out.push({ label: `Run ${route.runId.length > 14 ? `${route.runId.slice(0, 14)}…` : route.runId}`, href: skillRunHref(route.runId), mono: true })
   } else if (section.key === 'timeline') {
     const route = timelineRoute(hash)
     if (route.kind === 'entry') out.push({ label: `Saved moment #${route.id}`, href: entryHref(route.id) })

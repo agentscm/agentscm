@@ -194,7 +194,7 @@ export async function listPublications(repo: string, token: string, signal: Abor
 // ---------- The five-step track
 
 export interface Step {
-  key: 'branch' | 'pr' | 'merged' | 'ci' | 'deploys'
+  key: string
   label: string
   icon: string
   tone: Tone

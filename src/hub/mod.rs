@@ -23,6 +23,7 @@ pub mod onboarding;
 pub mod publish;
 pub mod session;
 pub mod skill_workflow;
+pub mod skills;
 pub mod slack;
 pub mod slack_protocol;
 pub mod store;
@@ -319,6 +320,7 @@ pub fn router(state: HubState) -> Router {
         .merge(onboarding::routes())
         .merge(slack::routes())
         .merge(change_record_http::routes())
+        .merge(skills::routes())
         .merge(work_http::routes())
         .merge(intent::routes())
         .merge(hook::routes())

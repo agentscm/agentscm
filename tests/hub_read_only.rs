@@ -88,6 +88,11 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&post, format!("{REPO}/change-records/events"), "{}".into(), AgentOnly);
     row(&post, format!("{REPO}/change-records/actions/start"), "{}".into(), AgentOnly);
     row(&post, format!("{REPO}/change-records/actions/finish"), "{}".into(), AgentOnly);
+    row(&get, "/v1/hub/skills".into(), "".into(), Allowed);
+    row(&get, format!("{REPO}/skills/runs"), "".into(), Allowed);
+    row(&get, format!("{REPO}/skills/runs/missing"), "".into(), Status(404));
+    row(&put, format!("{REPO}/skills/adoption"), "{}".into(), AgentOnly);
+    row(&post, format!("{REPO}/skills/evidence"), "{}".into(), AgentOnly);
     // /mcp: negotiation and the repository-scoped workflow read are side-effect-free.
     row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{}}}"#.into(), Allowed);
     row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.into(), Allowed);
@@ -106,6 +111,7 @@ fn routes() -> Vec<(Method, String, String, Want)> {
         "agentscm_work_checkpoint",
         "agentscm_work_ack",
         "agentscm_work_usage",
+        "agentscm_skill_evidence",
     ] {
         row(&post, "/mcp".into(), rpc(tool), AgentOnly);
     }

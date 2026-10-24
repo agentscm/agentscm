@@ -269,6 +269,8 @@ pub struct Repo {
     pub deployments: Vec<(Value, Vec<Value>)>,
     /// Rulesets applying to every branch, as `GET rules/branches/{branch}` lists them. None: `[]`.
     pub rules: Option<Value>,
+    /// Files on the default branch, path to text, as `GET contents/{path}` serves them.
+    pub files: BTreeMap<String, String>,
 }
 
 impl Repo {
@@ -296,6 +298,7 @@ impl Repo {
             runs: Vec::new(),
             deployments: Vec::new(),
             rules: None,
+            files: BTreeMap::new(),
         }
     }
 }
@@ -1170,6 +1173,17 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                         200,
                         json!({"id": r.id, "full_name": r.full_name, "node_id": r.node_id, "private": r.private, "default_branch": r.default_branch, "permissions": {"pull": true, "push": push}}),
                     )
+                }
+                (&Method::GET, ["contents", path @ ..]) => {
+                    use base64::Engine as _;
+                    match state.repos[&id].files.get(&path.join("/")) {
+                        Some(text) => json_reply(
+                            200,
+                            json!({"type": "file", "encoding": "base64", "size": text.len(),
+                                "content": base64::engine::general_purpose::STANDARD.encode(text)}),
+                        ),
+                        None => not_found(),
+                    }
                 }
                 (&Method::GET, ["pulls"]) => {
                     let repo = &state.repos[&id];
