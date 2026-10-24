@@ -324,7 +324,7 @@ function SideNav({ sections, section, badges, collapsed, onCollapse, drawer, onC
   return (
     <>
       {drawer && <div className="drawer-scrim" onClick={onClose} aria-hidden="true" />}
-      <aside className={`side${collapsed ? ' is-compact' : ''}${drawer ? ' is-open' : ''}`} aria-label="Hub sections">
+      <aside data-tour="nav" className={`side${collapsed ? ' is-compact' : ''}${drawer ? ' is-open' : ''}`} aria-label="Hub sections">
         <nav className="side-nav">
           {GROUPS.map((g) => (
             <div key={g.name} className="side-group" data-tour={`nav-${g.name.toLowerCase().replaceAll(' ', '-')}`}>
@@ -430,7 +430,7 @@ function Breadcrumbs({ repo, section, overview, data }: { repo: string; section:
   }, [])
   const crumbs = [{ label: repo, href: '#now', icon: 'git', mono: true } as Crumb, ...crumbsFor(hash, section, overview)]
   return (
-    <div className="crumbbar">
+    <div className="crumbbar" data-tour="crumbs">
       <nav aria-label="Breadcrumb">
         <ol className="crumbs">
           {crumbs.map((c, i) => {
@@ -535,7 +535,7 @@ export function AppChrome({ logo, repo, sections, section, badges, data, d, over
       }}>
         Skip to content
       </a>
-      <header className="topbar">
+      <header className="topbar" data-tour="topbar">
         <button ref={burger} type="button" data-tour="menu" className="burger" aria-label="Open navigation" aria-expanded={drawer} onClick={() => setDrawer(!drawer)}>
           <Icon name={drawer ? 'x-lg' : 'list'} />
         </button>
@@ -569,7 +569,7 @@ export function AppChrome({ logo, repo, sections, section, badges, data, d, over
       <SideNav sections={sections} section={section} badges={badges} collapsed={collapsed} onCollapse={() => onCollapsed(!collapsed)} drawer={drawer} onClose={() => setDrawer(false)} />
       <div className="content">
         <Breadcrumbs repo={repo} section={current} overview={overview} data={data} />
-        <main className="main" id="main" tabIndex={-1}>
+        <main className="main" id="main" tabIndex={-1} data-tour="main">
           {children}
         </main>
       </div>

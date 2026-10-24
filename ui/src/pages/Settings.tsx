@@ -141,7 +141,7 @@ function LocalServer() {
             {status.kind === 'ready' ? <Pill tone={STATUS[status.value].tone} icon={STATUS[status.value].icon}>{STATUS[status.value].word}</Pill> : status.kind === 'loading' ? <span className="small muted">Checking…</span> : <Pill tone="bad">Could not check</Pill>}
           </div>
         </div>
-        <div className="d-flex flex-column gap-2">
+        <div className="settings-control d-flex flex-column gap-2">
           <div>
             <label className="visually-hidden" htmlFor="local-base">Local read API address</label>
             <input id="local-base" className={`form-control${valid ? '' : ' is-invalid'}`} placeholder="Same address as this page" value={draft} onChange={(e) => setDraft(e.target.value)} spellCheck={false} aria-describedby="local-base-help" />
