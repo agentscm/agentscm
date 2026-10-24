@@ -29,7 +29,9 @@ pub(crate) mod process;
 
 use crate::prompt::Ui;
 use detect::{Detected, Forge};
-use manifest::{Manifest, SessionRecord, file_hash, sha_hex};
+#[cfg(unix)]
+use manifest::SessionRecord;
+use manifest::{Manifest, file_hash, sha_hex};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum HubChoice {
@@ -1633,6 +1635,11 @@ mod tests {
             "Live warnings: off — the hub at http://h isn't answering (start it, then run `agentscm quickstart` again)"
         );
         live.hub_up = true;
+        assert!(
+            live.line("agentscm")
+                .contains("no coding agent was set up (run `agentscm quickstart --agent claude|codex|cursor|copilot|gemini`)")
+        );
+        live.wanted_agents = true;
         assert!(
             live.line("agentscm")
                 .contains("this checkout isn't connected to the hub")
