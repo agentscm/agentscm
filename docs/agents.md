@@ -40,7 +40,7 @@ One person on the team runs, from the repository:
 agentscm init-repo --hub-url https://hub.example.com
 ```
 
-(`agentscm init` is the older command that prepares a hub data directory; `init-repo` is the one that writes agent instructions.) It shows the files it will create or change, with a diff, and asks once. `--agents claude,codex,cursor,copilot,gemini` limits it, `--yes` skips the question. It is safe to run again: files that are already right are reported unchanged and nothing is written. It writes no MCP config, hooks or token. Commit the result in one pull request. `--hub-url` is optional and only fills in the setup command it prints.
+(`agentscm init` is the unrelated command that creates the native source store in a data directory; `init-repo` is the one that writes agent instructions.) It shows the files it will create or change, with a diff, and asks once. `--agents claude,codex,cursor,copilot,gemini` limits it, `--yes` skips the question. It is safe to run again: files that are already right are reported unchanged and nothing is written. It writes no MCP config, hooks or token. Commit the result in one pull request. `--hub-url` is optional (default: `AGENTSCM_HUB_URL`, then `hub.json`); it fills in the `agentscm client setup` command written into the instruction files and the one it prints, which otherwise keep a `<HUB_URL>` placeholder.
 
 | Agent | Files |
 | --- | --- |
@@ -95,9 +95,11 @@ registry. Other agent hosts do not have equivalent coverage in this path. See th
 
 ## What `agentscm hook` does
 
-`agentscm hook <claude|codex|cursor|copilot|generic> [--hub-url URL]` reads the agent's hook JSON on standard input, sends it unchanged to `POST /v1/hub/hook/<agent>` with the token as a bearer header (for an edit, the JSON includes the edit's contents; the hub keeps only [the few fields it needs](hub.md#data-the-hub-stores)), and prints the hub's reply, which is already in the agent's own hook output format.
+`agentscm hook <claude|codex|cursor|copilot|generic> [--hub-url URL]` reads the agent's hook JSON on standard input, sends it unchanged to `POST /v1/hub/hook/<agent>` with the token as a bearer header (for an edit, the JSON includes the edit's contents; the hub keeps only [the few fields it needs](hub.md#data-the-hub-stores)), and prints the hub's reply, which is already in the agent's own hook output format. A Codex payload is first reduced to the fields coordination needs.
 
-- The token comes from `AGENTSCM_HUB_TOKEN`, else the file named by `AGENTSCM_HUB_TOKEN_FILE`, else the checkout's client connection, else `hub.json`, as for `agentscm intent`. It is never a command-line argument.
+The hooks written by `client setup` run `agentscm hook <agent> --client-connection` instead (for `claude`, `codex`, `cursor`, `copilot` or `gemini`). That mode takes the hub, repository and token only from the checkout's saved connection, makes edited paths repository-relative before sending, sends only the fields coordination needs, and refuses `--hub-url` and `--repo`. The token, hub URL, `--repo` and `X-Agentscm-Root` details below apply only without it.
+
+- The token comes from `AGENTSCM_HUB_TOKEN`, else the file named by `AGENTSCM_HUB_TOKEN_FILE`, else `hub.json`. It is never a command-line argument.
 - The hub URL comes from `AGENTSCM_HUB_URL`, else `--hub-url`, else `hub.json`. A token stored in `hub.json` is only ever sent to the hub that file names, so a `--hub-url` in a hook command cannot redirect it; to use a different hub, set `AGENTSCM_HUB_TOKEN`.
 - `--repo OWNER/NAME` adds `?repo=` to the hook URL. If the token belongs to another repository the hub answers "coordination unknown" and records nothing, which catches one `AGENTSCM_HUB_TOKEN` reused across repositories.
 - It sends the Git root of the agent's working directory as `X-Agentscm-Root` so the hub can make edited paths repository-relative.

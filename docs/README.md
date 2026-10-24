@@ -35,7 +35,7 @@
 - [Native CLI reference](reference/cli.md)
 - [Specification (draft)](spec/agentic-scm.md) and [architecture](architecture.md)
 - [Roadmap](roadmap.md)
-- [Design: supported skills (proposed)](design/supported-skills.md)
+- [Design: supported skills](design/supported-skills.md) (`pr-gate` v1 is built and experimental; the rest is proposed)
 
 ## Advanced and experimental
 

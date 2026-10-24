@@ -1,8 +1,11 @@
 # Design: AgentSCM supported skills
 
-> **Status: design proposal (phase 1).** Nothing in this document beyond the inventory in section 1
-> is implemented. Every new capability here is **Proposed** in the [roadmap](../roadmap.md). The
-> inventory describes the code at commit `325f862`.
+> **Status: design, with phase 2 built.** The phase 2 slice in section 6 (`pr-gate` v1, the lock
+> file, `agentscm skill`, the Hub runs API and MCP tools, the `agentscm skill stop` Stop hook and the
+> Hub Skills page) is implemented and **Experimental** in the [roadmap](../roadmap.md). Not built:
+> the `SessionStart` recap line (2.4), the `abandoned` run state, and everything section 6 lists
+> under "Not in phase 2", which stays **Proposed**. The inventory in section 1 describes the code at
+> commit `325f862`.
 
 A *supported skill* is a workflow that a repository (later, a workspace) adopts and that its
 agents must follow during ordinary development: how a task becomes a branch, which evidence a pull

@@ -93,7 +93,7 @@ the UI and the MCP text.
 | Route | Token | Meaning |
 | --- | --- | --- |
 | `GET /v1/hub/skills?repo=owner/name` | read | Catalog (gates as `{id, enforce, by}`), the repository's adoption with each pin's status (`adopted`, `unknown_version`, `unsupported_source`, `invalid_params`) and run counts per skill. Without `repo`, the catalog only. |
-| `PUT /v1/hub/repos/{repo}/skills/adoption` | agent | A checkout reports its lock file. Stored as `reported_by_checkout` unless the hub already read the lock from the forge's default branch, which wins; the reply says which `source` applies and whether this report `applied`. |
+| `PUT /v1/hub/repos/{repo}/skills/adoption` | agent | A checkout reports its lock file. Refused with 409 `forge_authoritative` when the repository has a forge connection, whose default-branch lock is then the only adoption. Otherwise stored as `reported_by_checkout` unless the hub already read the lock from the forge's default branch, which wins; the reply says which `source` applies and whether this report `applied`. |
 | `GET /v1/hub/repos/{repo}/skills/runs?state=open\|completed\|all&limit=` | read | `{runs, truncated}`; limit at most 100 (default 50, newest 100 runs scanned). |
 | `GET /v1/hub/repos/{repo}/skills/runs/by-branch?branch=` | read | One run, or 404 `not_found`. |
 | `GET /v1/hub/repos/{repo}/skills/runs/{run_id}` | read | One run. |
@@ -189,7 +189,7 @@ which finds work by text, finished work included, in creation order, newest firs
 `cursor` is the previous `next_cursor`, `<created_at>:<id>`, built from the immutable creation time,
 so an update between pages cannot repeat or skip an item; treat it as opaque). It matches title, branch, lead agent, owner login,
 work id, scope paths and the source issue number. The reply is `{"items": [{id, title, state,
-lead_agent, owner, branch, source_issue, updated_at, created_at}], "next_cursor": id|null, "complete": bool}`.
+lead_agent, owner, branch, source_issue, updated_at, created_at}], "next_cursor": cursor|null, "complete": bool}`.
 Read-only tokens may call it. Items of `GET /v1/hub/repos/{repo}/publications` also carry the manifest `title`. It also includes `POST /v1/hub/standup/usage`,
 `GET /v1/hub/standup/insights` and `GET /v1/hub/standup/work/{work_id}/insights`.
 The first stores one idempotent partial usage report; the GET routes return bounded

@@ -35,15 +35,18 @@ GET /v1/hub/skill-workflows
 GET /v1/hub/skill-workflows/{run_id}
 ```
 
-No query fields are accepted. The hub uses the token's repository as the only mapping key. Before
+The run route accepts no query fields. The collection route accepts only an optional `before`
+cursor (a previous page's `next_cursor`) and an optional `q` search text of at most 200 bytes.
+The hub uses the token's repository as the only mapping key. Before
 each journal read it reopens the native authority and compares its identity with the configured
 identity. A missing, unreadable or replaced authority returns an unavailable envelope without a
 retained projection. The retained run must also name the configured native identity.
 
-The collection route returns at most 16 summaries, newest-created first. Each summary contains
-only `run_id`, immutable source `revision` and retained `state`; it does not invent an update time
-or project a run's steps. The status page uses this list to open the newest run automatically and
-lets the reader select another recent run without knowing its identifier. A configured native
+The collection route returns at most 16 summaries per page, newest-created first, with a
+`next_cursor` for older runs. Each summary contains only `run_id`, workflow `name`, creation
+`sequence`, immutable source `revision` and retained `state`; it does not invent an update time
+or project a run's steps. The hub's Workflows page lists these runs and lets the reader find
+another run by name, state, revision or ID without knowing its identifier. A configured native
 store with no workflow journal returns an empty list without creating one.
 
 An available response has the same projection used by the trusted-local native read service:
@@ -82,12 +85,11 @@ checks; it is not an atomic snapshot against a hostile local operator or filesys
 
 The stateless MCP endpoint advertises `agentscm_workflow_status` with strict
 `{"run_id":"..."}` arguments. Its text content is the same versioned JSON envelope. The existing
-`?repo=` mismatch guard still applies. This one tool accepts read-only tokens and does not start or
+`?repo=` mismatch guard still applies. This tool accepts read-only tokens and does not start or
 heartbeat a coordination session. Read-only tokens may also use MCP initialization, ping and tool
-discovery so a normal client can reach it; their tool list contains only
-`agentscm_workflow_status`, and their initialization guidance describes only that read. Ordinary
-agent tokens see all seven tools. The six coordination tools retain their existing write-token
-behavior.
+discovery so a normal client can reach it; their tool list contains only the hub's read tools,
+including `agentscm_workflow_status`. Ordinary agent tokens also see the coordination and work
+tools, which retain their existing write-token behavior.
 
 The join performs reads only. Native workflow execution and lifecycle changes remain local CLI
 operations, and the hub has no workflow run, resume, cancel, approval or admission endpoint.

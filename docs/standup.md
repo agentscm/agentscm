@@ -105,7 +105,7 @@ agentscm work checkpoint --request checkpoint.json
 agentscm work ack dlv_…
 ```
 
-Continue with every cursor field returned by the previous page. `--work-done=true` is significant even when there is no `--work-after` value: it says the current-work snapshot is exhausted while event pages continue.
+Continue with every cursor field returned by the previous page. `--work-done` is significant even when there is no `--work-after` value: it says the current-work snapshot is exhausted while event pages continue.
 
 MCP tool replies carry compact coordination notices in text and `_meta.agentscm.coordination_notifications`; their primary structured result stays unchanged. Use the inbox tool for full request detail.
 
