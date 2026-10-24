@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use agentscm::hub::slack::setup::{JOURNAL_FILES, bundle_file_name, bundle_file_names};
 use serde::{Deserialize, Serialize};
 
 use super::SlackBundle;
@@ -385,18 +386,6 @@ fn load_receipt(config_dir: &Path, project: &str) -> Result<Receipt, String> {
     Ok(receipt)
 }
 
-fn valid_slack_leaf(name: &str) -> bool {
-    matches!(name, "config.json" | "signing-secret" | "bot-token")
-        || name
-            .strip_prefix("agent-")
-            .and_then(|rest| rest.strip_suffix(".token"))
-            .is_some_and(|index| {
-                index
-                    .parse::<usize>()
-                    .is_ok_and(|number| index == number.to_string())
-            })
-}
-
 fn validate_slack_state(
     data_dir: &Path,
     environment: &BTreeMap<String, String>,
@@ -426,11 +415,7 @@ fn validate_slack_state(
     }
     let report =
         agentscm::hub::slack::setup::check(&expected_config).map_err(|error| error.to_string())?;
-    let mut expected: BTreeSet<String> = ["config.json", "signing-secret", "bot-token"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
-    expected.extend((0..report.binding_count).map(|index| format!("agent-{index}.token")));
+    let expected: BTreeSet<String> = bundle_file_names(report.binding_ids.len()).collect();
     if files.keys().cloned().collect::<BTreeSet<_>>() != expected {
         return Err("The retained native Hub Slack receipt has an invalid file set.".into());
     }
@@ -444,10 +429,7 @@ fn validate_slack_state(
                 .map_err(|_| "A native Hub Slack file name is invalid.".to_owned())
         })
         .collect::<Result<BTreeSet<_>, _>>()?;
-    let journals: BTreeSet<String> = ["install.sqlite", "install.sqlite-wal", "install.sqlite-shm"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
+    let journals: BTreeSet<String> = JOURNAL_FILES.into_iter().map(str::to_owned).collect();
     if !actual.is_superset(&expected)
         || !actual
             .difference(&expected)
@@ -558,7 +540,7 @@ impl SlackSwap {
         if self.old_files.is_empty() {
             // A first install's rollback also drops the journal its Hub wrote, so a retry
             // finds no Slack directory without an ownership record.
-            for journal in ["install.sqlite", "install.sqlite-wal", "install.sqlite-shm"] {
+            for journal in JOURNAL_FILES {
                 match std::fs::remove_file(self.target.join(journal)) {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -610,12 +592,14 @@ impl Drop for SlackSwap {
 }
 
 fn recover_pending_slack(
+    project: &str,
     data_dir: &Path,
     receipt_file: &Path,
     expected_plist: &Path,
     manifest: &mut Manifest,
-) -> Result<bool, String> {
+) -> Result<(), String> {
     recover_pending_slack_with(
+        project,
         data_dir,
         receipt_file,
         expected_plist,
@@ -625,12 +609,13 @@ fn recover_pending_slack(
 }
 
 fn recover_pending_slack_with<F>(
+    project: &str,
     data_dir: &Path,
     receipt_file: &Path,
     expected_plist: &Path,
     manifest: &mut Manifest,
     save_manifest: F,
-) -> Result<bool, String>
+) -> Result<(), String>
 where
     F: FnOnce(&mut Manifest) -> Result<(), String>,
 {
@@ -646,7 +631,7 @@ where
             private_owned_dir(&next, "pending Slack staging directory")?;
             std::fs::remove_dir_all(next).map_err(|error| error.to_string())?;
         }
-        return Ok(false);
+        return Ok(());
     }
     private_owned_dir(&backup, "pending Slack rollback directory")?;
     if !backup.join("pending.json").exists() {
@@ -654,7 +639,7 @@ where
         if next.exists() {
             std::fs::remove_dir_all(next).map_err(|error| error.to_string())?;
         }
-        return Ok(false);
+        return Ok(());
     }
     let pending: PendingSlack = serde_json::from_slice(
         &std::fs::read(backup.join("pending.json")).map_err(|error| error.to_string())?,
@@ -664,7 +649,7 @@ where
         .old_files
         .keys()
         .chain(pending.new_files.keys())
-        .any(|name| !valid_slack_leaf(name))
+        .any(|name| !bundle_file_name(name))
     {
         return Err("The pending native Hub Slack update has invalid file names.".into());
     }
@@ -681,7 +666,7 @@ where
         if next.exists() {
             std::fs::remove_dir_all(next).map_err(|error| error.to_string())?;
         }
-        return Ok(false);
+        return Ok(());
     }
     let ready = backup
         .join("ready")
@@ -737,7 +722,7 @@ where
             std::fs::remove_dir_all(next).map_err(|error| error.to_string())?;
         }
         super::sync_dir(&parent)?;
-        return Ok(true);
+        return Ok(());
     }
     let prior_receipt = if pending.receipt_present {
         Some(std::fs::read(backup.join("retained.json")).map_err(|error| error.to_string())?)
@@ -756,6 +741,22 @@ where
         active: true,
     };
     swap.rollback()?;
+    // As in `start`, a first install keeps a receipt so a rerun adopts its data directory.
+    let retain = (old_record.is_none() && prior_receipt.is_none()).then(|| Receipt {
+        project: project.to_owned(),
+        environment: base_environment(data_dir),
+        slack_files: BTreeMap::new(),
+    });
+    if let Some(retained) = &retain {
+        atomic_private(
+            receipt_file,
+            &format!(
+                "{}\n",
+                serde_json::to_string_pretty(retained)
+                    .map_err(|_| "cannot encode native Hub ownership receipt")?
+            ),
+        )?;
+    }
     restore_private_file(expected_plist, &prior_plist)?;
     if let Some(record) = old_record.as_ref()
         && super::manifest::file_hash(expected_plist).as_deref() != Some(&record.plist_sha256)
@@ -774,13 +775,13 @@ where
         prior_plist: &prior_plist,
         manifest,
         prior_record: &old_record,
-        retain: &None,
+        retain: &retain,
         restart_previous: false,
     };
     validate_native_restoration(&recovery)?;
     std::fs::remove_dir_all(&backup).map_err(|error| error.to_string())?;
     super::sync_dir(&parent)?;
-    Ok(false)
+    Ok(())
 }
 
 struct SlackInstallPrior<'a> {
@@ -834,7 +835,7 @@ where
     let dir = data_dir.join("secrets").join("slack");
     if bundle.config != dir.join("config.json")
         || bundle.files.is_empty()
-        || !bundle.files.iter().all(|(name, _)| valid_slack_leaf(name))
+        || !bundle.files.iter().all(|(name, _)| bundle_file_name(name))
     {
         return Err("The prepared Slack bundle has an invalid target.".into());
     }
@@ -999,10 +1000,10 @@ fn plist_text(record: &Record, environment: &BTreeMap<String, String>) -> String
     text
 }
 
-fn base_environment(record: &Record) -> BTreeMap<String, String> {
+fn base_environment(data_dir: &Path) -> BTreeMap<String, String> {
     let mut environment = BTreeMap::from([(
         "AGENTSCM_DATABASE_URL".into(),
-        format!("sqlite://{}", record.data_dir.join("hub.sqlite").display()),
+        format!("sqlite://{}", data_dir.join("hub.sqlite").display()),
     )]);
     for key in ["AGENTSCM_GITHUB_APP_NAME", "AGENTSCM_GITHUB_APP_ORG"] {
         if let Ok(value) = std::env::var(key)
@@ -1706,7 +1707,8 @@ pub(crate) async fn start(
         stop_native_service(&target)?;
         service_loaded = false;
     }
-    let _recovered_slack_restart = recover_pending_slack(
+    recover_pending_slack(
+        &options.project,
         &record.data_dir,
         &receipt_path(&record.config_dir),
         &record.plist,
@@ -1760,7 +1762,7 @@ pub(crate) async fn start(
     private_owned_dir(&record.data_dir, "data directory")?;
     private_owned_dir(&record.data_dir.join("secrets"), "secrets directory")?;
     let mut environment = if record.environment.is_empty() {
-        base_environment(&record)
+        base_environment(&record.data_dir)
     } else {
         record.environment.clone()
     };
@@ -1777,9 +1779,30 @@ pub(crate) async fn start(
     };
     let retain = (existing.is_none() && prior_receipt.is_none()).then(|| Receipt {
         project: record.project.clone(),
-        environment: base_environment(&record),
+        environment: base_environment(&record.data_dir),
         slack_files: BTreeMap::new(),
     });
+    let plist = record.plist.clone();
+    let rollback = |swap: &mut Option<SlackSwap>,
+                    manifest: &mut Manifest,
+                    restart_previous: bool,
+                    cause: String| {
+        restore_native_update(
+            NativeRollback {
+                swap,
+                receipt: &receipt_file,
+                prior_receipt: &prior_receipt,
+                plist: &plist,
+                prior_plist: &prior_plist,
+                manifest,
+                prior_record: &existing,
+                retain: &retain,
+                restart_previous,
+            },
+            cause,
+            || launchctl(&["bootstrap", &domain, &plist.display().to_string()]),
+        )
+    };
     let slack_will_change = options.slack.as_ref().is_some_and(|bundle| {
         let files: BTreeMap<_, _> = bundle
             .files
@@ -1815,20 +1838,11 @@ pub(crate) async fn start(
             Ok(installed) => installed,
             Err(mut error) => {
                 slack_swap = error.swap.take().map(|swap| *swap);
-                return Err(restore_native_update(
-                    NativeRollback {
-                        swap: &mut slack_swap,
-                        receipt: &receipt_file,
-                        prior_receipt: &prior_receipt,
-                        plist: &record.plist,
-                        prior_plist: &prior_plist,
-                        manifest,
-                        prior_record: &existing,
-                        retain: &retain,
-                        restart_previous: service_was_loaded && !service_loaded,
-                    },
+                return Err(rollback(
+                    &mut slack_swap,
+                    manifest,
+                    service_was_loaded && !service_loaded,
                     error.message,
-                    || launchctl(&["bootstrap", &domain, &record.plist.display().to_string()]),
                 ));
             }
         };
@@ -1851,38 +1865,20 @@ pub(crate) async fn start(
         Ok(receipt) => receipt,
         Err(_) => {
             let error = "cannot encode native Hub ownership receipt".to_owned();
-            return Err(restore_native_update(
-                NativeRollback {
-                    swap: &mut slack_swap,
-                    receipt: &receipt_file,
-                    prior_receipt: &prior_receipt,
-                    plist: &record.plist,
-                    prior_plist: &prior_plist,
-                    manifest,
-                    prior_record: &existing,
-                    retain: &retain,
-                    restart_previous: service_was_loaded && !service_loaded,
-                },
+            return Err(rollback(
+                &mut slack_swap,
+                manifest,
+                service_was_loaded && !service_loaded,
                 error,
-                || launchctl(&["bootstrap", &domain, &record.plist.display().to_string()]),
             ));
         }
     };
     if let Err(error) = atomic_private(&receipt_file, &format!("{receipt}\n")) {
-        return Err(restore_native_update(
-            NativeRollback {
-                swap: &mut slack_swap,
-                receipt: &receipt_file,
-                prior_receipt: &prior_receipt,
-                plist: &record.plist,
-                prior_plist: &prior_plist,
-                manifest,
-                prior_record: &existing,
-                retain: &retain,
-                restart_previous: service_was_loaded && !service_loaded,
-            },
+        return Err(rollback(
+            &mut slack_swap,
+            manifest,
+            service_was_loaded && !service_loaded,
             error,
-            || launchctl(&["bootstrap", &domain, &record.plist.display().to_string()]),
         ));
     }
     let text = plist_text(&record, &environment);
@@ -1900,38 +1896,20 @@ pub(crate) async fn start(
         launchctl(&["bootstrap", &domain, &record.plist.display().to_string()])
     } else {
         if let Err(error) = atomic_private(&record.plist, &text) {
-            return Err(restore_native_update(
-                NativeRollback {
-                    swap: &mut slack_swap,
-                    receipt: &receipt_file,
-                    prior_receipt: &prior_receipt,
-                    plist: &record.plist,
-                    prior_plist: &prior_plist,
-                    manifest,
-                    prior_record: &existing,
-                    retain: &retain,
-                    restart_previous: service_was_loaded && !service_loaded,
-                },
+            return Err(rollback(
+                &mut slack_swap,
+                manifest,
+                service_was_loaded && !service_loaded,
                 error,
-                || launchctl(&["bootstrap", &domain, &record.plist.display().to_string()]),
             ));
         }
         manifest.native_hub = Some(record.clone());
         if let Err(error) = save_manifest_durable(manifest) {
-            return Err(restore_native_update(
-                NativeRollback {
-                    swap: &mut slack_swap,
-                    receipt: &receipt_file,
-                    prior_receipt: &prior_receipt,
-                    plist: &record.plist,
-                    prior_plist: &prior_plist,
-                    manifest,
-                    prior_record: &existing,
-                    retain: &retain,
-                    restart_previous: service_was_loaded && !service_loaded,
-                },
+            return Err(rollback(
+                &mut slack_swap,
+                manifest,
+                service_was_loaded && !service_loaded,
                 error,
-                || launchctl(&["bootstrap", &domain, &record.plist.display().to_string()]),
             ));
         }
         if service_loaded {
@@ -1940,27 +1918,18 @@ pub(crate) async fn start(
         launchctl(&["bootstrap", &domain, &record.plist.display().to_string()])
     };
     if let Err(error) = install {
-        return Err(restore_native_update(
-            NativeRollback {
-                swap: &mut slack_swap,
-                receipt: &receipt_file,
-                prior_receipt: &prior_receipt,
-                plist: &record.plist,
-                prior_plist: &prior_plist,
-                manifest,
-                prior_record: &existing,
-                retain: &retain,
-                restart_previous: service_was_loaded,
-            },
+        return Err(rollback(
+            &mut slack_swap,
+            manifest,
+            service_was_loaded,
             error,
-            || launchctl(&["bootstrap", &domain, &record.plist.display().to_string()]),
         ));
     }
     let mut runtime = NativeRuntime {
         url: format!("http://127.0.0.1:{}", options.port),
         record,
         environment,
-        domain,
+        domain: domain.clone(),
         freshly_started: !(unchanged && service_loaded),
         manifest,
     };
@@ -1992,26 +1961,11 @@ pub(crate) async fn start(
                 "{cause} Stopping the unhealthy Hub before credential recovery failed: {error}. The pending recovery evidence was retained."
             ));
         }
-        return Err(restore_native_update(
-            NativeRollback {
-                swap: &mut slack_swap,
-                receipt: &receipt_file,
-                prior_receipt: &prior_receipt,
-                plist: &runtime.record.plist,
-                prior_plist: &prior_plist,
-                manifest: runtime.manifest,
-                prior_record: &existing,
-                retain: &retain,
-                restart_previous: service_was_loaded,
-            },
+        return Err(rollback(
+            &mut slack_swap,
+            runtime.manifest,
+            service_was_loaded,
             cause,
-            || {
-                launchctl(&[
-                    "bootstrap",
-                    &runtime.domain,
-                    &runtime.record.plist.display().to_string(),
-                ])
-            },
         ));
     }
     if let Some(swap) = slack_swap.as_mut() {
@@ -2174,7 +2128,7 @@ mod tests {
     fn plist_has_exact_program_and_no_inherited_environment() {
         let temp = tempfile::tempdir().unwrap();
         let record = fixture(temp.path());
-        let text = plist_text(&record, &base_environment(&record));
+        let text = plist_text(&record, &base_environment(&record.data_dir));
         assert!(text.contains("<string>hub</string>"));
         assert!(text.contains("<string>serve</string>"));
         assert!(text.contains("127.0.0.1:7444"));
@@ -2189,7 +2143,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut record = fixture(temp.path());
         record.executable = PathBuf::from("/tmp/a&b<tool>");
-        let text = plist_text(&record, &base_environment(&record));
+        let text = plist_text(&record, &base_environment(&record.data_dir));
         assert!(text.contains("a&amp;b&lt;tool&gt;"));
         assert!(
             crate::quickstart::valid_hub_project("work-1")
@@ -2257,13 +2211,8 @@ mod tests {
         assert!(load_receipt(&config, "work").is_err());
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn native_slack_bundle_is_private_and_drift_checked() {
-        let temp = tempfile::tempdir().unwrap();
-        let native = temp.path().join("hub-native/work");
-        let data = native.join("data");
-        let target = data.join("secrets/slack");
+    /// A one-binding Slack bundle for the native Hub's Slack directory `target`.
+    fn synthetic_bundle(target: &Path) -> SlackBundle {
         let config = serde_json::to_vec_pretty(&serde_json::json!({
             "version": 1,
             "app_id": "A123",
@@ -2284,7 +2233,7 @@ mod tests {
             }]
         }))
         .unwrap();
-        let bundle = SlackBundle {
+        SlackBundle {
             config: target.join("config.json"),
             files: vec![
                 ("config.json".into(), config),
@@ -2292,7 +2241,60 @@ mod tests {
                 ("bot-token".into(), b"xoxb-synthetic".to_vec()),
                 ("agent-0.token".into(), vec![b'a'; 64]),
             ],
-        };
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupted_first_slack_install_recovers_to_a_retained_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let native = temp.path().join("hub-native/work");
+        let data = native.join("data");
+        let target = data.join("secrets/slack");
+        let plist = native.join("service.plist");
+        let (_files, mut interrupted) = install_slack_bundle(
+            &data,
+            &receipt_path(&native),
+            &synthetic_bundle(&target),
+            SlackInstallPrior {
+                files: &BTreeMap::new(),
+                receipt: None,
+                record: None,
+                plist_path: &plist,
+                plist: None,
+            },
+        )
+        .unwrap();
+        // The new Hub wrote its journal, then quickstart stopped before committing.
+        atomic_private(&target.join("install.sqlite"), "synthetic-journal").unwrap();
+        interrupted.as_mut().unwrap().active = false;
+        drop(interrupted);
+        let mut manifest = Manifest::default();
+        recover_pending_slack_with(
+            "work",
+            &data,
+            &receipt_path(&native),
+            &plist,
+            &mut manifest,
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(!target.exists());
+        assert!(!data.join("secrets/.slack-rollback").exists());
+        // A rerun adopts the data directory instead of refusing one nothing owns.
+        let retained = load_receipt(&native, "work").unwrap();
+        assert_eq!(retained.environment, base_environment(&data));
+        assert!(retained.slack_files.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_slack_bundle_is_private_and_drift_checked() {
+        let temp = tempfile::tempdir().unwrap();
+        let native = temp.path().join("hub-native/work");
+        let data = native.join("data");
+        let target = data.join("secrets/slack");
+        let bundle = synthetic_bundle(&target);
         let mut expanded_value: serde_json::Value =
             serde_json::from_slice(&bundle.files[0].1).unwrap();
         let mut second = expanded_value["bindings"][0].clone();
@@ -2394,16 +2396,15 @@ mod tests {
             native_hub: Some(old_record.clone()),
             ..Manifest::default()
         };
-        assert!(
-            !recover_pending_slack_with(
-                &data,
-                &receipt_path(&native),
-                &plist,
-                &mut recovered_manifest,
-                |_| Ok(())
-            )
-            .unwrap()
-        );
+        recover_pending_slack_with(
+            "work",
+            &data,
+            &receipt_path(&native),
+            &plist,
+            &mut recovered_manifest,
+            |_| Ok(()),
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&plist).unwrap(), old_plist);
         assert_eq!(
             recovered_manifest.native_hub.as_ref().unwrap().plist_sha256,

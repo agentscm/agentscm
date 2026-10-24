@@ -4,7 +4,6 @@ use crate::hub::session::SessionCall;
 use crate::hub::store::{self, ForgeIdentity, Store, mint_bound_agent_token};
 use crate::hub::work::WorkStart;
 use axum::extract::OriginalUri;
-use ring::hmac;
 use tempfile::TempDir;
 
 const REPO: &str = "acme/widgets";
@@ -17,6 +16,8 @@ struct Fixture {
     calls: Arc<Mutex<Vec<(String, Value)>>>,
     replies: Arc<Mutex<Vec<(u16, Value)>>>,
     auth_team: Arc<Mutex<String>>,
+    /// How long the fake Slack takes to answer `chat.update`.
+    update_delay: Arc<Mutex<Duration>>,
     /// Coding-agent tokens: alice's (Slack U1) and bob's (Slack U2).
     alice: String,
     bob: String,
@@ -78,12 +79,22 @@ impl Fixture {
         let calls = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let replies = Arc::new(Mutex::new(Vec::<(u16, Value)>::new()));
         let auth_team = Arc::new(Mutex::new("T123".to_owned()));
-        let (capture, outcomes, team) = (calls.clone(), replies.clone(), auth_team.clone());
+        let update_delay = Arc::new(Mutex::new(Duration::ZERO));
+        let (capture, outcomes, team, delay) = (
+            calls.clone(),
+            replies.clone(),
+            auth_team.clone(),
+            update_delay.clone(),
+        );
         let fake = Router::new().route(
             "/api/{method}",
             post(move |OriginalUri(uri): OriginalUri, body: Bytes| {
                 let (capture, outcomes, team) = (capture.clone(), outcomes.clone(), team.clone());
+                let delay = *delay.lock().unwrap();
                 async move {
+                    if uri.path() == "/api/chat.update" {
+                        tokio::time::sleep(delay).await;
+                    }
                     if uri.path() == "/api/auth.test" {
                         let team = team.lock().unwrap().clone();
                         return (
@@ -125,6 +136,7 @@ impl Fixture {
             calls,
             replies,
             auth_team,
+            update_delay,
             alice,
             bob,
             tasks: vec![fake_task, server],
@@ -208,6 +220,24 @@ impl Fixture {
             .clone()
     }
 
+    /// The `chat.update` a button click sent; it runs after the click is acknowledged.
+    async fn update(&self) -> Value {
+        for _ in 0..100 {
+            let update = self
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(path, _)| path == "/api/chat.update")
+                .map(|(_, body)| body.clone());
+            if let Some(update) = update {
+                return update;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("no chat.update was sent");
+    }
+
     fn state_of_messages(&self) -> Vec<String> {
         let db = self.slack();
         let db = db.database().unwrap();
@@ -223,11 +253,10 @@ impl Fixture {
 
     async fn post(&self, body: String, json_body: bool) -> (StatusCode, Value) {
         let timestamp = unix_now().to_string();
-        let signed = format!("v0:{timestamp}:{body}");
-        let key = hmac::Key::new(hmac::HMAC_SHA256, b"synthetic-signing-secret");
-        let signature = format!(
-            "v0={}",
-            crate::team::auth::lower_hex(hmac::sign(&key, signed.as_bytes()).as_ref())
+        let signature = crate::hub::slack_protocol::sign_request(
+            "synthetic-signing-secret",
+            &timestamp,
+            body.as_bytes(),
         );
         let response = reqwest::Client::new()
             .post(format!("http://{}/v1/hub/slack", self.address))
@@ -355,15 +384,7 @@ async fn a_repeated_edit_messages_both_people_and_the_holder_hands_over_with_a_b
         StatusCode::FORBIDDEN
     );
     assert_eq!(f.click("U1", YES).await, StatusCode::OK);
-    let update = f
-        .calls
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|(path, _)| path == "/api/chat.update")
-        .unwrap()
-        .1
-        .clone();
+    let update = f.update().await;
     assert_eq!(update["channel"], "D1");
     assert_eq!(update["ts"], "1.2");
     assert_eq!(
@@ -449,19 +470,48 @@ async fn the_holder_button_answers_for_the_session_that_holds_the_file() {
     assert!(!f.edit(&f.bob, "b").repeated.is_empty());
     f.run().await;
     assert_eq!(f.click("U1", YES).await, StatusCode::OK);
-    let update = f
-        .calls
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|(path, _)| path == "/api/chat.update")
-        .unwrap()
-        .1
-        .clone();
+    let update = f.update().await;
     assert_eq!(
         update["blocks"][1]["elements"][0]["text"],
         "You handed src/widget.rs to bob's agent codex; their agent is told on its next call."
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_message_update_does_not_delay_the_button_acknowledgement() {
+    let f = Fixture::new().await;
+    f.contest();
+    f.run().await;
+    // Within the API client's timeout, so the update completes, but only after the click.
+    *f.update_delay.lock().unwrap() = Duration::from_millis(1500);
+    assert_eq!(f.click("U1", YES).await, StatusCode::OK);
+    // The fake records an update once it answers; the click was acknowledged before that.
+    assert!(
+        !f.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(path, _)| path == "/api/chat.update")
+    );
+    assert_eq!(
+        f.update().await["blocks"][1]["elements"][0]["text"],
+        "You handed src/widget.rs to bob's agent codex; their agent is told on its next call."
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cursor_past_a_restored_event_log_restarts_at_its_newest_event() {
+    let f = Fixture::new().await;
+    // As if the Hub database were restored from a backup older than the Slack journal.
+    f.slack()
+        .database()
+        .unwrap()
+        .execute("UPDATE cursor SET seq=1000000 WHERE id=1", [])
+        .unwrap();
+    f.run().await;
+    f.contest();
+    f.run().await;
+    assert_eq!(f.sent().len(), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

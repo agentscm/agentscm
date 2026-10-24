@@ -4,11 +4,12 @@ use std::process::Command;
 use std::time::Duration;
 
 use agentscm::hub::forge_http::{check_base_url, send};
-use agentscm::hub::slack::{BindingConfig, SlackConfig, setup};
+use agentscm::hub::slack::{BindingConfig, SlackConfig, setup, slack_id};
+use agentscm::hub::slack_protocol::sign_request;
 use agentscm::hub::store::unix_now;
+use agentscm::team::auth::lower_hex;
 use agentscm::{Error, Result};
 use clap::{Args, Subcommand};
-use ring::hmac;
 use serde_json::{Value, json};
 
 #[derive(Debug, Subcommand)]
@@ -210,14 +211,18 @@ async fn configure(args: SetupArgs) -> Result<Value> {
 }
 
 async fn doctor(path: &Path, verify: bool, api_url: Option<&str>) -> Result<Value> {
-    let report = setup::check(path).map_err(crate::hub_cli::map_hub_error)?;
+    let setup::Loaded {
+        report,
+        config,
+        signing_secret,
+        bot_token,
+    } = setup::load(path).map_err(crate::hub_cli::map_hub_error)?;
     if !verify {
         return Ok(
             json!({"ok":true,"configuration":report,"live_verified":false,
             "next_action":"Run hub slack doctor --config-file CONFIG_FILE --verify after installing the app and starting the configured Hub."}),
         );
     }
-    let config = setup::read_config(path).map_err(crate::hub_cli::map_hub_error)?;
     let origin = api_origin(&config.hub_url, api_url)?;
     let client = client()?;
     for expected in &config.bindings {
@@ -236,21 +241,10 @@ async fn doctor(path: &Path, verify: bool, api_url: Option<&str>) -> Result<Valu
             ));
         }
     }
-    let bundle =
-        setup::bundle(path, Path::new("/slack-check")).map_err(crate::hub_cli::map_hub_error)?;
-    let file = |name: &str| -> Result<&str> {
-        bundle
-            .files()
-            .iter()
-            .find(|(key, _)| key == name)
-            .and_then(|(_, bytes)| std::str::from_utf8(bytes).ok())
-            .map(str::trim)
-            .ok_or_else(|| invalid("Slack credential unavailable"))
-    };
     let auth = request(
         client
             .post("https://slack.com/api/auth.test")
-            .bearer_auth(file("bot-token")?),
+            .bearer_auth(bot_token),
         "Slack bot identity check failed",
     )
     .await?;
@@ -268,14 +262,10 @@ async fn doctor(path: &Path, verify: bool, api_url: Option<&str>) -> Result<Valu
     let mut random = [0u8; 16];
     getrandom::fill(&mut random)
         .map_err(|_| invalid("Slack verification challenge unavailable"))?;
-    let challenge = hex(&random);
+    let challenge = lower_hex(&random);
     let body = json!({"type":"url_verification","challenge":challenge}).to_string();
     let stamp = unix_now().to_string();
-    let key = hmac::Key::new(hmac::HMAC_SHA256, file("signing-secret")?.as_bytes());
-    let signature = format!(
-        "v0={}",
-        hex(hmac::sign(&key, format!("v0:{stamp}:{body}").as_bytes()).as_ref())
-    );
+    let signature = sign_request(&signing_secret, &stamp, body.as_bytes());
     let response = request(client.post(&report.callback_url)
         .header("content-type", "application/json")
         .header("x-slack-request-timestamp", stamp)
@@ -293,8 +283,9 @@ async fn doctor(path: &Path, verify: bool, api_url: Option<&str>) -> Result<Valu
     )
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+/// `path` as one POSIX shell word.
+fn shell_quoted(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
 }
 
 async fn install(
@@ -303,12 +294,7 @@ async fn install(
     hub_url: Option<String>,
     slack_cli: Option<PathBuf>,
 ) -> Result<Value> {
-    if !team_id.starts_with('T')
-        || !(2..=32).contains(&team_id.len())
-        || !team_id
-            .bytes()
-            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
-    {
+    if !slack_id(&team_id, 'T') {
         return Err(invalid(
             "Select the intended Slack workspace with its explicit T… ID",
         ));
@@ -337,13 +323,23 @@ async fn install(
     .into_iter()
     .filter_map(|key| std::env::var_os(key).map(|value| (key, value)))
     .collect();
-    let program = slack_cli.unwrap_or_else(|| {
-        std::env::var_os("HOME")
+    let program = match slack_cli {
+        // The CLI runs in the project directory, so a relative path must be resolved here;
+        // a bare name is still looked up on PATH.
+        Some(path) if path.components().count() > 1 => std::path::absolute(path)?,
+        Some(path) => path,
+        None => std::env::var_os("HOME")
             .map(PathBuf::from)
             .map(|home| home.join(".slack/bin/slack"))
             .filter(|path| path.is_file())
-            .unwrap_or_else(|| PathBuf::from("slack"))
-    });
+            .unwrap_or_else(|| PathBuf::from("slack")),
+    };
+    let rerun = format!(
+        "cd {} && SLACK_CLI_APP_ICON_PATH={} {} app install --environment deployed --app deployed --team {team_id} --skip-update",
+        shell_quoted(&directory),
+        shell_quoted(&icon),
+        shell_quoted(&program)
+    );
     let status = tokio::task::spawn_blocking(move || {
         crate::quickstart::process::run(
             Command::new(program)
@@ -374,9 +370,9 @@ async fn install(
         )
     })?;
     if !status.success {
-        return Err(invalid(
-            "Slack CLI installation did not complete; resolve its reported login or workspace approval and resume in the same project",
-        ));
+        return Err(Error::Invalid(format!(
+            "Slack CLI installation did not complete. Its output was withheld because it can contain credentials; to read it, run `{rerun}`, resolve the login or workspace approval it reports, then rerun this command"
+        )));
     }
     // The provider CLI can exit zero after pending approval or an icon-upload failure.
     // Retain only the expected acknowledgement; never print captured provider output.
@@ -438,6 +434,15 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn shell_quoted_paths_survive_single_quotes() {
+        assert_eq!(shell_quoted(Path::new("/tmp/slack")), "'/tmp/slack'");
+        assert_eq!(
+            shell_quoted(Path::new("/Users/a/Jonny's projects")),
+            r"'/Users/a/Jonny'\''s projects'"
+        );
     }
 
     #[test]

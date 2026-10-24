@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use agentscm::hub::slack::setup::{bundle_file_name, bundle_file_names};
+
 use super::HubRuntime;
 use super::SlackBundle;
 use super::detect::which;
@@ -832,39 +834,11 @@ rm -rf "$backup" /data/secrets/.slack-next
 sync -f /data/secrets
 "#;
 
-fn valid_slack_leaf(name: &str) -> bool {
-    matches!(name, "config.json" | "signing-secret" | "bot-token")
-        || name
-            .strip_prefix("agent-")
-            .and_then(|rest| rest.strip_suffix(".token"))
-            .is_some_and(|index| {
-                index
-                    .parse::<usize>()
-                    .is_ok_and(|number| index == number.to_string())
-            })
-}
-
+/// Exactly the files of a bundle with 1 to 32 bindings, in any order and without repeats.
 fn valid_slack_files(files: &[String]) -> bool {
-    if !(4..=35).contains(&files.len())
-        || files.iter().collect::<BTreeSet<_>>().len() != files.len()
-        || !["config.json", "signing-secret", "bot-token"]
-            .into_iter()
-            .all(|required| files.iter().any(|name| name == required))
-    {
-        return false;
-    }
-    let mut agents: Vec<usize> = files
-        .iter()
-        .filter_map(|name| {
-            name.strip_prefix("agent-")?
-                .strip_suffix(".token")?
-                .parse()
-                .ok()
-        })
-        .collect();
-    agents.sort_unstable();
-    files.iter().all(|name| valid_slack_leaf(name))
-        && agents == (0..files.len() - 3).collect::<Vec<_>>()
+    (4..=35).contains(&files.len())
+        && files.iter().cloned().collect::<BTreeSet<_>>()
+            == bundle_file_names(files.len() - 3).collect()
 }
 
 fn slack_run_args(
@@ -1028,12 +1002,7 @@ fn quiesce_slack_helpers(project: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn run_slack(
-    dir: &Path,
-    project: &str,
-    args: &[String],
-    deadline: Duration,
-) -> Result<Output, String> {
+fn run_slack(project: &str, args: &[String], deadline: Duration) -> Result<Output, String> {
     quiesce_slack_helpers(project)?;
     let name = helper_name(args)?.to_owned();
     let output = match run(std::process::Command::new(docker()?).args(args), deadline) {
@@ -1054,12 +1023,11 @@ fn run_slack(
             )
         })?;
     }
-    let _ = dir;
     Ok(output)
 }
 
-fn run_slack_visible(dir: &Path, project: &str, args: &[String]) -> Result<bool, String> {
-    let output = run_slack(dir, project, args, Duration::from_secs(60))?;
+fn run_slack_visible(project: &str, args: &[String]) -> Result<bool, String> {
+    let output = run_slack(project, args, Duration::from_secs(60))?;
     if !output.success && !diagnostic(&output).is_empty() {
         eprintln!("{}", diagnostic(&output));
     }
@@ -1135,7 +1103,7 @@ fn validate_host_slack_receipt(receipt: &[u8]) -> Result<Vec<String>, String> {
             || !fields[0]
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            || !valid_slack_leaf(fields[1])
+            || !bundle_file_name(fields[1])
         {
             return Err("The Docker Slack digest receipt is invalid.".into());
         }
@@ -1249,7 +1217,6 @@ fn verify_slack_volume_with_receipt(
     }
     with_staged_slack_receipt(dir, receipt, |stage| {
         run_slack_visible(
-            dir,
             project,
             &slack_run_args(dir, project, Some(stage), "0:0", false, VERIFY_SLACK, files)?,
         )?
@@ -1270,7 +1237,7 @@ fn slack_volume_pending(dir: &Path, project: &str) -> Result<bool, String> {
         CHECK_SLACK_PENDING,
         &[],
     )?;
-    let output = run_slack(dir, project, &args, Duration::from_secs(60))?;
+    let output = run_slack(project, &args, Duration::from_secs(60))?;
     if !output.success {
         return Err("Docker could not inspect the private Slack transaction state.".into());
     }
@@ -1296,7 +1263,6 @@ fn finish_slack_volume_change(dir: &Path, project: &str) -> Result<(), String> {
         .ok_or_else(|| "The committed Docker Slack digest receipt is missing.".to_owned())?;
     with_staged_slack_receipt(dir, &receipt, |stage| {
         run_slack_visible(
-            dir,
             project,
             &slack_run_args(dir, project, Some(stage), "0:0", true, COMMIT_SLACK, &[])?,
         )?
@@ -1311,7 +1277,6 @@ fn reconcile_slack_volume_commit(dir: &Path, project: &str) -> Result<(), String
         .ok_or_else(|| "The committed Docker Slack digest receipt is missing.".to_owned())?;
     with_staged_slack_receipt(dir, &receipt, |stage| {
         run_slack_visible(
-            dir,
             project,
             &slack_run_args(
                 dir,
@@ -1334,7 +1299,6 @@ fn mark_slack_volume_commit(dir: &Path, project: &str) -> Result<(), String> {
         .ok_or_else(|| "The pending Docker Slack digest receipt is missing.".to_owned())?;
     with_staged_slack_receipt(dir, &receipt, |stage| {
         run_slack_visible(
-            dir,
             project,
             &slack_run_args(
                 dir,
@@ -1353,7 +1317,6 @@ fn mark_slack_volume_commit(dir: &Path, project: &str) -> Result<(), String> {
 
 fn finalize_slack_volume_rollback(dir: &Path, project: &str) -> Result<(), String> {
     run_slack_visible(
-        dir,
         project,
         &slack_run_args(
             dir,
@@ -1374,12 +1337,12 @@ fn recover_slack_volume(
     project: &str,
     env: &Path,
     existing_env: &str,
-) -> Result<(String, bool), String> {
+) -> Result<String, String> {
     let receipt = read_slack_receipt(dir)?;
     let rollback_receipt = read_private_receipt(&slack_rollback_receipt_path(dir))?;
     let execute = |stage: Option<&Path>| {
         let args = slack_run_args(dir, project, stage, "0:0", true, RECOVER_SLACK, &[])?;
-        run_slack(dir, project, &args, Duration::from_secs(60))
+        run_slack(project, &args, Duration::from_secs(60))
     };
     let output = match receipt.as_deref() {
         Some(receipt) => with_staged_slack_receipt(dir, receipt, |stage| execute(Some(stage)))?,
@@ -1402,14 +1365,14 @@ fn recover_slack_volume(
             let text = env_text(existing_env, &[], &["AGENTSCM_SLACK_FILE", SLACK_FILES_ENV])?;
             write(env, &text)?;
             finish_host_slack_receipt(dir)?;
-            return Ok((text, false));
+            return Ok(text);
         }
         if rollback_receipt.is_some() {
             let files = recorded_slack_files(existing_env)?;
             validate_previous_slack_volume(dir, project, files.as_deref(), receipt.as_deref())?;
             finish_host_slack_receipt(dir)?;
         }
-        return Ok((existing_env.to_owned(), false));
+        return Ok(existing_env.to_owned());
     }
     if output
         .stdout
@@ -1421,7 +1384,7 @@ fn recover_slack_volume(
         })?;
         validate_previous_slack_volume(dir, project, Some(&files), receipt.as_deref())?;
         finish_host_slack_receipt(dir)?;
-        return Ok((existing_env.to_owned(), true));
+        return Ok(existing_env.to_owned());
     }
     let old = output
         .stdout
@@ -1456,7 +1419,7 @@ fn recover_slack_volume(
     write(env, &text)?;
     finalize_slack_volume_rollback(dir, project)?;
     finish_host_slack_receipt(dir)?;
-    Ok((text, false))
+    Ok(text)
 }
 
 fn rollback_slack_volume(
@@ -1466,7 +1429,7 @@ fn rollback_slack_volume(
     previous_receipt: Option<&[u8]>,
 ) -> Result<bool, String> {
     let args = slack_run_args(dir, project, None, "0:0", true, ROLLBACK_SLACK, &[])?;
-    let output = run_slack(dir, project, &args, Duration::from_secs(60))?;
+    let output = run_slack(project, &args, Duration::from_secs(60))?;
     if !output.success {
         return Err("Docker could not restore the previous private Slack bundle.".into());
     }
@@ -1502,7 +1465,6 @@ fn validate_previous_slack_volume(
         return verify_slack_volume_with_receipt(dir, project, files, receipt);
     }
     run_slack_visible(
-        dir,
         project,
         &slack_run_args(
             dir,
@@ -1569,7 +1531,7 @@ fn verify_expected_slack_volume(
 ) -> Result<(), String> {
     with_staged_slack_bundle(dir, bundle, |stage, files| {
         let check = slack_run_args(dir, project, Some(stage), "0:0", true, CHECK_SLACK, files)?;
-        let output = run_slack(dir, project, &check, Duration::from_secs(60))?;
+        let output = run_slack(project, &check, Duration::from_secs(60))?;
         if !output.success
             || !output
                 .stdout
@@ -1586,7 +1548,7 @@ fn verify_expected_slack_volume(
 fn install_slack_volume(dir: &Path, project: &str, bundle: &SlackBundle) -> Result<bool, String> {
     with_staged_slack_bundle(dir, bundle, |stage, files| {
         let check = slack_run_args(dir, project, Some(stage), "0:0", true, CHECK_SLACK, files)?;
-        let output = run_slack(dir, project, &check, Duration::from_secs(60))?;
+        let output = run_slack(project, &check, Duration::from_secs(60))?;
         if !output.success {
             return Err("Docker could not compare the prepared private Slack bundle.".to_owned());
         }
@@ -1610,7 +1572,7 @@ fn install_slack_volume(dir: &Path, project: &str, bundle: &SlackBundle) -> Resu
             return Err("Docker could not stop the Hub before replacing its Slack bundle.".into());
         }
         let args = slack_run_args(dir, project, Some(stage), "0:0", true, INSTALL_SLACK, files)?;
-        let output = run_slack(dir, project, &args, Duration::from_secs(60))?;
+        let output = run_slack(project, &args, Duration::from_secs(60))?;
         if !output.success {
             if !diagnostic(&output).is_empty() {
                 eprintln!("{}", diagnostic(&output));
@@ -1727,7 +1689,6 @@ impl Runtime for DockerRuntime {
 }
 
 struct SlackRecovery<'a> {
-    manifest: &'a mut Manifest,
     prior_record: &'a Option<LocalHubRecord>,
     compose: &'a Path,
     prior_compose: Option<&'a Vec<u8>>,
@@ -1755,10 +1716,13 @@ fn same_optional_file(path: &Path, expected: Option<&Vec<u8>>) -> Result<(), Str
     }
 }
 
-fn validate_docker_restoration(context: &SlackRecovery<'_>) -> Result<(), String> {
+fn validate_docker_restoration(
+    context: &SlackRecovery<'_>,
+    manifest: &Manifest,
+) -> Result<(), String> {
     same_optional_file(context.compose, context.prior_compose)?;
     same_optional_file(context.env, context.prior_env)?;
-    let record_matches = match (&context.manifest.local_hub, context.prior_record) {
+    let record_matches = match (&manifest.local_hub, context.prior_record) {
         (None, None) => true,
         (Some(actual), Some(expected)) => {
             actual.dir == expected.dir
@@ -1858,7 +1822,8 @@ where
 
 async fn recover_slack_update(
     runtime: &DockerRuntime,
-    recovery_context: SlackRecovery<'_>,
+    manifest: &mut Manifest,
+    recovery_context: &SlackRecovery<'_>,
     cause: String,
 ) -> String {
     let mut recovery = Vec::new();
@@ -1893,12 +1858,12 @@ async fn recover_slack_update(
     if let Err(error) = restore_file(recovery_context.env, recovery_context.prior_env) {
         recovery.push(format!("restoring .env failed: {error}"));
     }
-    recovery_context.manifest.local_hub = recovery_context.prior_record.clone();
-    if let Err(error) = recovery_context.manifest.save() {
+    manifest.local_hub = recovery_context.prior_record.clone();
+    if let Err(error) = manifest.save() {
         recovery.push(format!("restoring the quickstart record failed: {error}"));
     }
     if recovery.is_empty()
-        && let Err(error) = validate_docker_restoration(&recovery_context)
+        && let Err(error) = validate_docker_restoration(recovery_context, manifest)
     {
         recovery.push(format!(
             "validating the restored Docker Hub failed: {error}"
@@ -2043,8 +2008,7 @@ pub(crate) async fn start(
                         .into(),
                 );
             }
-            let (existing_env, _) =
-                recover_slack_volume(&dir, &options.project, &env, &existing_env)?;
+            let existing_env = recover_slack_volume(&dir, &options.project, &env, &existing_env)?;
             (existing_env, true)
         } else {
             (existing_env, false)
@@ -2138,8 +2102,7 @@ pub(crate) async fn start(
                     .into(),
             );
         }
-        let (recovered_env, _) =
-            recover_slack_volume(&dir, &options.project, &env, &preinstall_env)?;
+        let recovered_env = recover_slack_volume(&dir, &options.project, &env, &preinstall_env)?;
         if recovered_env != preinstall_env {
             return Err(
                 "The recovered Docker Slack wiring did not match the fresh setup state.".into(),
@@ -2152,6 +2115,15 @@ pub(crate) async fn start(
         project: options.project.clone(),
         url: url.clone(),
     };
+    let recovery = SlackRecovery {
+        prior_record: &prior_record,
+        compose: &compose,
+        prior_compose: prior_compose.as_ref(),
+        env: &env,
+        prior_env: prior_env.as_ref(),
+        prior_slack_files: prior_slack_files.as_deref(),
+        prior_slack_receipt: prior_slack_receipt.as_deref(),
+    };
     let slack_result = if let Some(bundle) = options.slack.as_ref() {
         prepare_slack_receipt(&dir, prior_slack_receipt.as_deref())
             .and_then(|()| install_slack_volume(&dir, &options.project, bundle))
@@ -2163,21 +2135,7 @@ pub(crate) async fn start(
     let slack_changed = match slack_result {
         Ok(changed) => changed,
         Err(error) => {
-            return Err(recover_slack_update(
-                &runtime,
-                SlackRecovery {
-                    manifest,
-                    prior_record: &prior_record,
-                    compose: &compose,
-                    prior_compose: prior_compose.as_ref(),
-                    env: &env,
-                    prior_env: prior_env.as_ref(),
-                    prior_slack_files: prior_slack_files.as_deref(),
-                    prior_slack_receipt: prior_slack_receipt.as_deref(),
-                },
-                error,
-            )
-            .await);
+            return Err(recover_slack_update(&runtime, manifest, &recovery, error).await);
         }
     };
     if slack_changed {
@@ -2186,59 +2144,17 @@ pub(crate) async fn start(
             .as_ref()
             .ok_or_else(|| "The changed Docker Slack bundle is unavailable.".to_owned())?;
         if let Err(error) = publish_slack_receipt(&dir, &slack_bundle_receipt(bundle)) {
-            return Err(recover_slack_update(
-                &runtime,
-                SlackRecovery {
-                    manifest,
-                    prior_record: &prior_record,
-                    compose: &compose,
-                    prior_compose: prior_compose.as_ref(),
-                    env: &env,
-                    prior_env: prior_env.as_ref(),
-                    prior_slack_files: prior_slack_files.as_deref(),
-                    prior_slack_receipt: prior_slack_receipt.as_deref(),
-                },
-                error,
-            )
-            .await);
+            return Err(recover_slack_update(&runtime, manifest, &recovery, error).await);
         }
     } else if options.slack.is_some()
         && let Err(error) = finish_host_slack_receipt(&dir)
     {
-        return Err(recover_slack_update(
-            &runtime,
-            SlackRecovery {
-                manifest,
-                prior_record: &prior_record,
-                compose: &compose,
-                prior_compose: prior_compose.as_ref(),
-                env: &env,
-                prior_env: prior_env.as_ref(),
-                prior_slack_files: prior_slack_files.as_deref(),
-                prior_slack_receipt: prior_slack_receipt.as_deref(),
-            },
-            error,
-        )
-        .await);
+        return Err(recover_slack_update(&runtime, manifest, &recovery, error).await);
     }
     if rendered_env != preinstall_env
         && let Err(error) = write(&env, &rendered_env)
     {
-        return Err(recover_slack_update(
-            &runtime,
-            SlackRecovery {
-                manifest,
-                prior_record: &prior_record,
-                compose: &compose,
-                prior_compose: prior_compose.as_ref(),
-                env: &env,
-                prior_env: prior_env.as_ref(),
-                prior_slack_files: prior_slack_files.as_deref(),
-                prior_slack_receipt: prior_slack_receipt.as_deref(),
-            },
-            error,
-        )
-        .await);
+        return Err(recover_slack_update(&runtime, manifest, &recovery, error).await);
     }
     manifest.local_hub = Some(LocalHubRecord {
         dir: dir.clone(),
@@ -2247,21 +2163,9 @@ pub(crate) async fn start(
     });
     if let Err(error) = manifest.save() {
         if slack_changed {
-            return Err(recover_slack_update(
-                &runtime,
-                SlackRecovery {
-                    manifest,
-                    prior_record: &prior_record,
-                    compose: &compose,
-                    prior_compose: prior_compose.as_ref(),
-                    env: &env,
-                    prior_env: prior_env.as_ref(),
-                    prior_slack_files: prior_slack_files.as_deref(),
-                    prior_slack_receipt: prior_slack_receipt.as_deref(),
-                },
-                error.to_string(),
-            )
-            .await);
+            return Err(
+                recover_slack_update(&runtime, manifest, &recovery, error.to_string()).await,
+            );
         }
         manifest.local_hub = prior_record;
         restore_file(&compose, prior_compose.as_ref())?;
@@ -2269,21 +2173,7 @@ pub(crate) async fn start(
         return Err(error.to_string());
     }
     if slack_changed && let Err(error) = mark_slack_volume_commit(&dir, &options.project) {
-        return Err(recover_slack_update(
-            &runtime,
-            SlackRecovery {
-                manifest,
-                prior_record: &prior_record,
-                compose: &compose,
-                prior_compose: prior_compose.as_ref(),
-                env: &env,
-                prior_env: prior_env.as_ref(),
-                prior_slack_files: prior_slack_files.as_deref(),
-                prior_slack_receipt: prior_slack_receipt.as_deref(),
-            },
-            error,
-        )
-        .await);
+        return Err(recover_slack_update(&runtime, manifest, &recovery, error).await);
     }
     let startup = async {
         runtime.up(slack_changed || recovered_slack_restart)?;
@@ -2292,21 +2182,7 @@ pub(crate) async fn start(
     .await;
     if let Err(error) = startup {
         if slack_changed {
-            return Err(recover_slack_update(
-                &runtime,
-                SlackRecovery {
-                    manifest,
-                    prior_record: &prior_record,
-                    compose: &compose,
-                    prior_compose: prior_compose.as_ref(),
-                    env: &env,
-                    prior_env: prior_env.as_ref(),
-                    prior_slack_files: prior_slack_files.as_deref(),
-                    prior_slack_receipt: prior_slack_receipt.as_deref(),
-                },
-                error,
-            )
-            .await);
+            return Err(recover_slack_update(&runtime, manifest, &recovery, error).await);
         }
         return Err(format!("{error} Its setup remains recorded for recovery."));
     }
@@ -2537,9 +2413,7 @@ mod tests {
             validate_host_slack_receipt(format!("{}  config.json\n", "0".repeat(64)).as_bytes())
                 .is_err()
         );
-        assert!(
-            VALIDATE_SLACK_TXN.contains("install.sqlite|install.sqlite-wal|install.sqlite-shm")
-        );
+        assert!(VALIDATE_SLACK_TXN.contains(&agentscm::hub::slack::setup::JOURNAL_FILES.join("|")));
         assert!(!INSTALL_SLACK.contains("mv \"$target\""));
     }
 
