@@ -206,6 +206,24 @@ fn pins_of(adoption: Option<&SkillAdoption>) -> Vec<PinStatus> {
         .unwrap_or_default()
 }
 
+/// Pins as JSON; an adopted pin also carries its walkthrough with the pin's own settings.
+fn pins_json(pins: &[PinStatus]) -> Value {
+    let rows: Vec<Value> = pins
+        .iter()
+        .map(|p| {
+            let mut v = json!(p);
+            if let (AdoptionStatus::Adopted, Some(e)) =
+                (&p.status, supported::catalog_entry_by_sha256(&p.pin.sha256))
+                && let Ok(params) = e.manifest.effective_params(p.pin.params.as_ref())
+            {
+                v["walkthrough"] = json!(supported::walkthrough(&e.manifest, Some(&params)));
+            }
+            v
+        })
+        .collect();
+    json!(rows)
+}
+
 fn adopted_pin<'a>(pins: &'a [PinStatus], name: &str) -> Option<&'a PinStatus> {
     pins.iter()
         .find(|p| p.pin.name == name && p.status == AdoptionStatus::Adopted)
@@ -285,7 +303,7 @@ fn library(store: &dyn Store, repo: Option<&str>) -> Result<Value> {
             adoption["observed_at"] = json!(a.observed_at);
             adoption["default_branch"] = json!(a.default_branch);
         }
-        adoption["pins"] = json!(pins_of(stored.as_ref()));
+        adoption["pins"] = pins_json(&pins_of(stored.as_ref()));
         for view in views(store, repo, None, None, MAX_RUNS)? {
             let c = counts
                 .entry(view.skill.name.clone())
@@ -729,13 +747,26 @@ fn render_library(lib: &Value, pins: &[PinStatus]) -> String {
         lines.push(format!("  Follow when: {}", list(&a["triggers"])));
         lines.push(format!("  Prerequisites: {}", list(&a["prerequisites"])));
         lines.push(format!("  Not for: {}", list(&a["not_for"])));
+        let mut steps = entry["walkthrough"].clone();
         if let Some(pin) = pin {
             let params = supported::catalog_entry_by_sha256(sha)
                 .and_then(|e| e.manifest.effective_params(pin.pin.params.as_ref()).ok())
                 .unwrap_or_default();
             let text: Vec<String> = params.iter().map(|(k, v)| format!("{k}={v}")).collect();
             lines.push(format!("  Parameters: {}", text.join(", ")));
+            if let Some(e) = supported::catalog_entry_by_sha256(sha) {
+                steps = json!(supported::walkthrough(&e.manifest, Some(&params)));
+            }
         }
+        lines.push("  How it works:".into());
+        lines.extend(
+            steps
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(|l| format!("    {l}")),
+        );
     }
     for p in pins.iter().filter(|p| p.status != AdoptionStatus::Adopted) {
         lines.push(format!(

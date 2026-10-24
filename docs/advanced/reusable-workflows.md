@@ -236,6 +236,14 @@ and `gates`. A gate names the role that records it (`by`), the evidence kinds it
 parameter, such as `label_param`. Unknown fields, duplicate gate ids and files over 256 KiB are
 refused.
 
+Every gate also carries a required `plain` string (1 to 200 bytes): one plain-English line saying
+what happens at that gate. `agentscm skill show`, the Hub Skills library and the MCP
+`agentscm_skill_list` tool print a "How it works" walkthrough generated from the manifest alone:
+one line per gate, in order, with the `plain` text, who does it (the author agent, a different
+session, or a maintainer), the evidence it needs, the minimum assurance and whether the step blocks
+or only warns. Only the Stop hook and native approval block today; the forge merge check is planned
+and the walkthrough says so. Parameters, such as the CI label, change the wording.
+
 A repository adopts skills by committing `agentscm-skills.lock.json`: `version: 1` and up to 32
 pins of `name`, `workflow_version`, `sha256` of the exact manifest bytes, `source`
 (`{"kind":"first_party"}`; other kinds are reserved) and optional `params` overrides. A pin whose

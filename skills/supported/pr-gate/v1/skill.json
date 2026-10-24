@@ -60,6 +60,7 @@
   "gates": [
     {
       "id": "branch",
+      "plain": "The author works on a branch made for this task, never on the default branch.",
       "evidence": [
         {
           "kind": "task_branch"
@@ -73,6 +74,7 @@
     },
     {
       "id": "tests",
+      "plain": "The author runs the tests on the exact head commit.",
       "evidence": [
         {
           "kind": "revision_tests"
@@ -86,6 +88,7 @@
     },
     {
       "id": "review",
+      "plain": "A different session reviews that exact commit and reports what it finds.",
       "evidence": [
         {
           "kind": "independent_review"
@@ -99,6 +102,7 @@
     },
     {
       "id": "fix",
+      "plain": "The author fixes every blocking finding, or dismisses it with a written reason.",
       "evidence": [
         {
           "kind": "findings_resolved"
@@ -112,6 +116,7 @@
     },
     {
       "id": "ci",
+      "plain": "The hosted checks run on the current commit and must pass.",
       "evidence": [
         {
           "kind": "hosted_ci",
@@ -126,6 +131,7 @@
     },
     {
       "id": "approval",
+      "plain": "A maintainer looks at the current commit and approves it.",
       "evidence": [
         {
           "kind": "human_approval"
@@ -139,6 +145,7 @@
     },
     {
       "id": "merge",
+      "plain": "A maintainer merges the pull request.",
       "evidence": [
         {
           "kind": "merged",
@@ -153,6 +160,7 @@
     },
     {
       "id": "post_merge",
+      "plain": "After the merge, the author checks the default branch still passes.",
       "evidence": [
         {
           "kind": "post_merge_check"

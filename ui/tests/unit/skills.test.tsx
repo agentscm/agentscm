@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { SECTIONS, sectionFromHash } from '../../src/App.tsx'
 import { SkillsPage } from '../../src/pages/Skills.tsx'
 import {
-  addCommand, adoptionLabel, assuranceView, decodeRun, enforcedLabels, gateSteps, isSelfReported, removeCommand, runMatches, runStateLabel, skillsRoute, type Gate, type RunView,
+  addCommand, adoptionLabel, assuranceView, decodeRun, enforcement, gateSteps, isSelfReported, removeCommand, runMatches, runStateLabel, skillsRoute, type Gate, type RunView,
 } from '../../src/skills.ts'
 import { crumbsFor } from '../../src/TopNav.tsx'
 import { stubHub } from '../fixtures/mockFetch.ts'
@@ -45,7 +45,8 @@ describe('labels', () => {
     expect(adoptionLabel('none', null)).toBe('Not adopted')
   })
   it('only enforcing values count as enforced', () => {
-    expect(enforcedLabels([{ enforce: ['stop'] }, { enforce: ['forge_status', 'advise'] }, { enforce: ['signal'] }])).toEqual(['stop', 'forge status'])
+    expect(enforcement([{ enforce: ['stop'] }, { enforce: ['forge_status', 'advise'] }, { enforce: ['signal'] }])).toEqual({ enforced: ['Stop hook'], planned: ['merge check'] })
+    expect(enforcement([{ enforce: ['advise'] }, { enforce: ['signal'] }])).toEqual({ enforced: [], planned: [] })
   })
   it('builds the exact CLI commands', () => {
     const defs = [{ name: 'merge_method', description: '', type: 'string', default: 'any', enum: [] }]
@@ -88,6 +89,15 @@ describe('Skills page against the mock hub', () => {
     render(<SkillsPage repo="acme/widgets" token="read" />)
     expect(await screen.findByText('Adoption: read from main on the forge')).toBeTruthy()
     for (const t of ['When to use', 'Prerequisites', 'Not for']) expect(screen.getAllByText(t).length).toBeGreaterThan(0)
+    expect(screen.getAllByText('How it works').length).toBe(2)
+    // Adopted pr-gate uses the pin's walkthrough (merge method squash); numbers come from <ol>, not the text.
+    const steps = screen.getAllByRole('listitem').filter((li) => li.textContent?.startsWith('Tests: The author runs the tests'))
+    expect(steps.length).toBeGreaterThan(0)
+    expect(screen.getAllByText(/Needs: the merge \(squash\)/).length).toBe(1)
+    expect(screen.queryByText(/^1\. /)).toBeNull()
+    expect(screen.getByText(/Planned: merge check/)).toBeTruthy()
+    expect(screen.getByText(/Enforced: Stop hook/)).toBeTruthy()
+    expect(document.body.textContent).not.toMatch(/Enforced:[^.]*forge status/i)
     expect(screen.getByText('agentscm skill add post-merge-check')).toBeTruthy()
     expect(screen.getByText('agentscm skill remove pr-gate')).toBeTruthy()
     expect(screen.getByText('Unknown version')).toBeTruthy()

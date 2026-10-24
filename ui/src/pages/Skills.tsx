@@ -1,8 +1,8 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { Track } from './Landed.tsx'
 import {
-  GATE_STATE_VIEW, addCommand, adoptionLabel, assuranceView, enforcedLabels, fetchLibrary, fetchRun, fetchRuns, gateChain, gateLabel, gateSteps, lastEvidence, paramText, removeCommand,
-  runMatches, runStateLabel, runStateTone, selfReportedCount, shortSha, skillRunHref, skillRunsHref, skillsHref, skillsRoute, type CatalogEntry, type Evidence, type Library, type Pin, type RunView,
+  GATE_STATE_VIEW, addCommand, adoptionLabel, assuranceView, enforcement, fetchLibrary, fetchRun, fetchRuns, gateChain, gateLabel, gateSteps, lastEvidence, paramText, removeCommand,
+  runMatches, runStateLabel, stepText, runStateTone, selfReportedCount, shortSha, skillRunHref, skillRunsHref, skillsHref, skillsRoute, type CatalogEntry, type Evidence, type Library, type Pin, type RunView,
 } from '../skills.ts'
 import { Ago, Box, CopyButton, Empty, Icon, Notice, Pill, Skeleton } from '../ui.tsx'
 import { usePoll, type Poll } from '../usePoll.ts'
@@ -47,13 +47,25 @@ function Applicability({ c }: { c: CatalogEntry }) {
   )
 }
 
+function HowItWorks({ c, pin }: { c: CatalogEntry; pin: Pin | null }) {
+  const lines = pin && pin.walkthrough.length ? pin.walkthrough : c.walkthrough
+  if (lines.length === 0) return null
+  return (
+    <div className="skill-walkthrough">
+      <h4 className="small fw-semibold mb-1">How it works</h4>
+      <ol className="small">{lines.map((l, i) => <li key={i}>{stepText(l)}</li>)}</ol>
+    </div>
+  )
+}
+
 function SkillHead({ c, children }: { c: CatalogEntry; children?: ReactNode }) {
-  const enforced = enforcedLabels(c.gates)
+  const { enforced, planned } = enforcement(c.gates)
   return (
     <div className="skill-head">
       <strong>{c.name}</strong> <span className="muted">v{c.workflow_version}</span> <code className="small muted">sha256:{shortSha(c.sha256)}</code>
       {c.first_party && <Pill tone="brand" icon="patch-check">First-party</Pill>}
       {enforced.length > 0 && <Pill tone="ok" icon="shield-check">Enforced: {enforced.join(', ')}</Pill>}
+      {planned.length > 0 && <Pill tone="muted" icon="hourglass-split">Planned: {planned.join(', ')}</Pill>}
       {children}
     </div>
   )
@@ -114,6 +126,7 @@ function Library({ lib }: { lib: Library }) {
                   <p className="mb-1">{c.summary}</p>
                   <p className="small muted mb-1">{gateChain(c.gates)}</p>
                   <Applicability c={c} />
+                  <HowItWorks c={c} pin={p} />
                   <Params c={c} pin={p} />
                   <p className="small mb-2">{n.open} open run{n.open === 1 ? '' : 's'} · {n.at_stop_gate} at a stop gate · {n.completed} completed <a className="ms-2" href={skillRunsHref}>View runs <Icon name="arrow-right" /></a></p>
                   <p className="small muted mb-1">To remove it, run this in the repository, then commit the lock file:</p>
@@ -135,6 +148,7 @@ function Library({ lib }: { lib: Library }) {
                 <p className="mb-1">{c.summary}</p>
                 <p className="small muted mb-1">{gateChain(c.gates)}</p>
                 <Applicability c={c} />
+                <HowItWorks c={c} pin={null} />
                 <Params c={c} pin={null} />
                 <p className="small muted mb-1">To adopt it, run this in the repository, then commit <code>agentscm-skills.lock.json</code>:</p>
                 <Cmd command={addCommand(c.name)} label={`Adopt ${c.name}`} />

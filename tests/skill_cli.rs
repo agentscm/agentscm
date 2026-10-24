@@ -258,7 +258,10 @@ fn list_show_add_remove_round_trip() {
     assert_eq!(listed["skills"][0]["status"], "adopted");
     let shown = fx.ok(&["show", "pr-gate"]);
     assert!(
-        shown.contains("[adopted]") && shown.contains("post_merge by author"),
+        shown.contains("[adopted]")
+            && shown.contains("How it works:")
+            && shown.contains("2. Tests: The author runs the tests on the exact head commit. Done by the author agent.")
+            && shown.contains("green CI on the current head after adding the ci-extended label"),
         "{shown}"
     );
 

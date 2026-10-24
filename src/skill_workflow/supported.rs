@@ -24,6 +24,7 @@ const MAX_SUMMARY: usize = 500;
 const MAX_URL: usize = 2048;
 const MAX_LIST: usize = 64;
 const MAX_MANIFEST_SUMMARY: usize = 200;
+const MAX_PLAIN: usize = 200;
 
 /// Parameter values by name: manifest defaults overlaid by a pin's overrides.
 pub type Params = Map<String, Value>;
@@ -167,6 +168,8 @@ impl EvidenceSpec {
 #[serde(deny_unknown_fields)]
 pub struct GateDefinition {
     pub id: String,
+    /// One plain-English line saying what happens at this gate.
+    pub plain: String,
     pub evidence: Vec<EvidenceSpec>,
     pub by: Role,
     pub min_assurance: Assurance,
@@ -309,6 +312,11 @@ impl SupportedManifest {
             if !seen.insert(gate.id.as_str()) {
                 return Err(Error::Invalid(format!("duplicate gate id {}", gate.id)));
             }
+            if gate.plain.is_empty() || gate.plain.len() > MAX_PLAIN {
+                return Err(Error::Limit(
+                    "a gate's plain text requires 1 to 200 bytes".into(),
+                ));
+            }
             if gate.evidence.is_empty() || gate.evidence.len() > MAX_EVIDENCE_PER_GATE {
                 return Err(Error::Limit(
                     "a gate requires 1 to 8 evidence entries".into(),
@@ -376,6 +384,8 @@ pub struct CatalogEntry {
     pub applicability: Applicability,
     pub parameters: Vec<ParameterDefinition>,
     pub gates: Vec<GateDefinition>,
+    /// Plain-English steps with default parameters.
+    pub walkthrough: Vec<String>,
     pub first_party: bool,
     #[serde(skip)]
     pub manifest: SupportedManifest,
@@ -397,6 +407,7 @@ pub fn catalog() -> &'static [CatalogEntry] {
                     applicability: manifest.applicability.clone(),
                     parameters: manifest.parameters.clone(),
                     gates: manifest.gates.clone(),
+                    walkthrough: walkthrough(&manifest, None),
                     first_party: true,
                     manifest,
                 }
@@ -413,6 +424,109 @@ pub fn catalog_entry(name: &str, workflow_version: u32) -> Option<&'static Catal
 
 pub fn catalog_entry_by_sha256(sha256: &str) -> Option<&'static CatalogEntry> {
     catalog().iter().find(|e| e.sha256 == sha256)
+}
+
+// ---- Walkthrough ------------------------------------------------------------------------
+
+fn evidence_words(spec: &EvidenceSpec, params: &Params) -> String {
+    let text = |name: &Option<String>| {
+        name.as_ref()
+            .and_then(|n| params.get(n))
+            .and_then(Value::as_str)
+            .filter(|v| *v != "any")
+            .map(str::to_owned)
+    };
+    match spec {
+        EvidenceSpec::TaskBranch => "the task branch".into(),
+        EvidenceSpec::RevisionTests => "test results for the current head".into(),
+        EvidenceSpec::IndependentReview => "an independent review of the current head".into(),
+        EvidenceSpec::FindingsResolved => {
+            "every blocking finding fixed or dismissed with a reason".into()
+        }
+        EvidenceSpec::HostedCi { label, label_param } => {
+            let mut s = String::from("green CI on the current head");
+            if let Some(l) = label.clone().or_else(|| text(label_param)) {
+                s += &format!(" after adding the {l} label");
+            }
+            s
+        }
+        EvidenceSpec::HumanApproval => "maintainer approval of the current head".into(),
+        EvidenceSpec::Merged {
+            method,
+            method_param,
+        } => match method.clone().or_else(|| text(method_param)) {
+            Some(m) => format!("the merge ({m})"),
+            None => "the merge".into(),
+        },
+        EvidenceSpec::PostMergeCheck => {
+            "a regression pass on the default branch after the merge".into()
+        }
+        EvidenceSpec::WorkflowReceipt { .. } => "a native workflow receipt".into(),
+    }
+}
+
+fn enforce_words(e: Enforce) -> &'static str {
+    match e {
+        Enforce::Stop => {
+            "Blocks: the Stop hook keeps the author's session from finishing until this is recorded."
+        }
+        Enforce::ForgeStatus => {
+            "Warns only for now: a merge check (forge status) is planned but not built."
+        }
+        Enforce::Native => "Blocks native approval and landing for this target.",
+        Enforce::Advise => "Warns only.",
+        Enforce::Signal => "Recorded only; the planned main-red alert is not built yet.",
+    }
+}
+
+/// One plain-English line per gate, in order, generated from the manifest alone. `params`
+/// are the effective parameters; `None` means the manifest defaults.
+pub fn walkthrough(manifest: &SupportedManifest, params: Option<&Params>) -> Vec<String> {
+    let defaults = manifest.effective_params(None).unwrap_or_default();
+    let params = params.unwrap_or(&defaults);
+    manifest
+        .gates
+        .iter()
+        .enumerate()
+        .map(|(i, g)| {
+            let who = match g.by {
+                Role::Author => "the author agent",
+                Role::Reviewer => "a different session (not the author)",
+                Role::Maintainer => "a maintainer (a person)",
+            };
+            let needs: Vec<String> = g
+                .evidence
+                .iter()
+                .map(|s| evidence_words(s, params))
+                .collect();
+            let level = match g.min_assurance {
+                Assurance::SelfReported => "self-reported or stronger",
+                Assurance::Observed => "observed by the hub or stronger",
+                Assurance::Receipt => "an AgentSCM receipt",
+            };
+            let enforce: Vec<&str> = g.enforce.iter().map(|e| enforce_words(*e)).collect();
+            format!(
+                "{}. {}: {} Done by {who}. Needs: {} ({level}). {}",
+                i + 1,
+                gate_title(&g.id),
+                g.plain,
+                needs.join("; "),
+                enforce.join(" ")
+            )
+        })
+        .collect()
+}
+
+/// `post_merge` becomes "Post merge"; a two-letter id such as `ci` is an acronym.
+fn gate_title(id: &str) -> String {
+    if id.len() <= 2 {
+        return id.to_uppercase();
+    }
+    let spaced = id.replace('_', " ");
+    let mut c = spaced.chars();
+    c.next()
+        .map(|f| f.to_uppercase().chain(c).collect())
+        .unwrap_or_default()
 }
 
 // ---- Lock file --------------------------------------------------------------------------
@@ -922,7 +1036,7 @@ fn satisfied(
     (true, weakest)
 }
 
-fn next_action(gate: &str, head: &str, params: &Params) -> String {
+fn next_action(manifest: &SupportedManifest, gate: &str, head: &str, params: &Params) -> String {
     let text = |name: &str| {
         params
             .get(name)
@@ -956,7 +1070,10 @@ fn next_action(gate: &str, head: &str, params: &Params) -> String {
             s
         }
         "post_merge" => "Run the post-merge regression pass on the final main and record it.".into(),
-        other => format!("Record evidence for gate {other}."),
+        other => manifest.gate(other).map_or_else(
+            || format!("Record evidence for gate {other}."),
+            |g| g.plain.clone(),
+        ),
     }
 }
 
@@ -996,7 +1113,7 @@ pub fn evaluate(
     let (state, next, blocks) = match open_gate {
         Some(g) => (
             RunState::Open,
-            next_action(&g.id, &head, &identity.params),
+            next_action(manifest, &g.id, &head, &identity.params),
             g.enforce.contains(&Enforce::Stop),
         ),
         None => (RunState::Completed, "All gates are complete.".into(), false),
@@ -1207,6 +1324,44 @@ mod tests {
         assert!(matches!(bad(undeclared.to_string()), Error::Invalid(_)));
         let big = format!("{good}{}", " ".repeat(MAX_BYTES));
         assert!(matches!(bad(big), Error::Limit(_)));
+    }
+
+    #[test]
+    fn gate_plain_is_required_and_bounded() {
+        let good = String::from_utf8(PR_GATE_V1.to_vec()).unwrap();
+        let first = "The author works on a branch made for this task, never on the default branch.";
+        assert!(good.contains(first));
+        let bad = |s: String| SupportedManifest::parse(s.as_bytes()).unwrap_err();
+        assert!(matches!(bad(good.replacen(first, "", 1)), Error::Limit(_)));
+        assert!(matches!(
+            bad(good.replacen(first, &"x".repeat(201), 1)),
+            Error::Limit(_)
+        ));
+        assert!(matches!(
+            bad(good.replacen(&format!("\"plain\": \"{first}\","), "", 1)),
+            Error::Json(_)
+        ));
+    }
+
+    #[test]
+    fn walkthrough_has_a_line_per_gate_with_honest_enforcement() {
+        let m = manifest();
+        let w = walkthrough(&m, None);
+        assert_eq!(w.len(), m.gates.len());
+        assert!(w[1].starts_with("2. Tests: The author runs the tests on the exact head commit. Done by the author agent."));
+        assert!(w[1].contains("Blocks: the Stop hook"));
+        assert!(w[2].contains("a different session (not the author)"));
+        assert!(w[4].starts_with("5. CI: "));
+        assert!(w[4].contains("planned but not built"));
+        assert!(w[5].contains("a maintainer (a person)"));
+        assert!(w[7].contains("Recorded only; the planned main-red alert is not built yet."));
+        assert!(!w[4].contains("label"));
+        let mut p = m.effective_params(None).unwrap();
+        p.insert("ci_label".into(), "ci-extended".into());
+        p.insert("merge_method".into(), "squash".into());
+        let w = walkthrough(&m, Some(&p));
+        assert!(w[4].contains("green CI on the current head after adding the ci-extended label"));
+        assert!(w[6].contains("the merge (squash)"));
     }
 
     #[test]

@@ -142,6 +142,15 @@ async fn library_shows_the_catalog_with_and_without_adoption_and_flags_an_unknow
     assert_eq!(bare["catalog"][0]["name"], "pr-gate");
     assert_eq!(bare["catalog"][0]["gates"][0]["id"], "branch");
     assert_eq!(bare["catalog"][0]["gates"][1]["enforce"], json!(["stop"]));
+    let steps = bare["catalog"][0]["walkthrough"].as_array().unwrap();
+    assert_eq!(steps.len(), 8);
+    assert!(
+        steps[1]
+            .as_str()
+            .unwrap()
+            .starts_with("2. Tests: The author runs the tests on the exact head commit."),
+        "{steps:?}"
+    );
     assert_eq!(bare["adoption"]["source"], "none");
     let (_, none) = hub
         .send(
@@ -395,7 +404,9 @@ async fn mcp_tools_list_status_and_record_with_labels_and_named_errors() {
     assert!(
         text.contains("Follow when:")
             && text.contains("Prerequisites:")
-            && text.contains("Not for:"),
+            && text.contains("Not for:")
+            && text.contains("How it works:")
+            && text.contains("2. Tests: The author runs the tests on the exact head commit."),
         "{text}"
     );
     hub.adopt();
@@ -408,6 +419,12 @@ async fn mcp_tools_list_status_and_record_with_labels_and_named_errors() {
     assert_eq!(
         listed["structuredContent"]["adoption"]["source"],
         "default_branch"
+    );
+    assert_eq!(
+        listed["structuredContent"]["adoption"]["pins"][0]["walkthrough"]
+            .as_array()
+            .map(Vec::len),
+        Some(8)
     );
 
     let recorded = hub

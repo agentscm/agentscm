@@ -243,10 +243,25 @@ const PR_GATES = [
   { id: 'branch', by: 'author', enforce: ['advise'] }, { id: 'tests', by: 'author', enforce: ['stop'] }, { id: 'review', by: 'reviewer', enforce: ['stop'] }, { id: 'fix', by: 'author', enforce: ['stop'] },
   { id: 'ci', by: 'author', enforce: ['forge_status'] }, { id: 'approval', by: 'maintainer', enforce: ['forge_status'] }, { id: 'merge', by: 'maintainer', enforce: ['advise'] }, { id: 'post_merge', by: 'author', enforce: ['signal'] },
 ]
+// Written by hand from the manifest walkthrough rules; the real lines come from the hub.
+const SELF = 'self-reported or stronger'
+const STOP = "Blocks: the Stop hook keeps the author's session from finishing until this is recorded."
+const FORGE = 'Warns only for now: a merge check (forge status) is planned but not built.'
+const walk = (merge: string): string[] => [
+  `1. Branch: The author works on a branch made for this task, never on the default branch. Done by the author agent. Needs: the task branch (${SELF}). Warns only.`,
+  `2. Tests: The author runs the tests on the exact head commit. Done by the author agent. Needs: test results for the current head (${SELF}). ${STOP}`,
+  `3. Review: A different session reviews that exact commit and reports what it finds. Done by a different session (not the author). Needs: an independent review of the current head (${SELF}). ${STOP}`,
+  `4. Fix: The author fixes every blocking finding, or dismisses it with a written reason. Done by the author agent. Needs: every blocking finding fixed or dismissed with a reason (${SELF}). ${STOP}`,
+  `5. CI: The hosted checks run on the current commit and must pass. Done by the author agent. Needs: green CI on the current head (${SELF}). ${FORGE}`,
+  `6. Approval: A maintainer looks at the current commit and approves it. Done by a maintainer (a person). Needs: maintainer approval of the current head (${SELF}). ${FORGE}`,
+  `7. Merge: A maintainer merges the pull request. Done by a maintainer (a person). Needs: the merge${merge} (${SELF}). Warns only.`,
+  `8. Post merge: After the merge, the author checks the default branch still passes. Done by the author agent. Needs: a regression pass on the default branch after the merge (${SELF}). Recorded only; the planned main-red alert is not built yet.`,
+]
 const SKILL_CATALOG = [
   {
     name: 'pr-gate', workflow_version: 1, sha256: SHA_PR_GATE, first_party: true, summary: 'Every pull request passes tests, an independent review, CI and approval before it merges.',
     gates: PR_GATES.map(({ id, enforce }) => ({ id, enforce })),
+    walkthrough: walk(''),
     applicability: { triggers: ['opening a pull request', 'before merging a pull request'], prerequisites: ['a GitHub or GitLab repository', 'a test command agents can run'], not_for: ['direct pushes to the default branch by a person'] },
     parameters: [
       { name: 'ci_label', description: 'Label that requests the extended CI run.', type: 'string', default: null },
@@ -256,6 +271,7 @@ const SKILL_CATALOG = [
   {
     name: 'post-merge-check', workflow_version: 1, sha256: SHA_POST_MERGE, first_party: true, summary: 'Run a regression pass on the target branch after each merge.',
     gates: [{ id: 'merge', enforce: ['advise'] }, { id: 'post_merge', enforce: ['signal'] }],
+    walkthrough: walk('').slice(6).map((l, i) => l.replace(/^\d+/, String(i + 1))),
     applicability: { triggers: ['after a pull request merges'], prerequisites: ['a command that checks the target branch'], not_for: ['repositories without a stable default branch'] },
     parameters: [],
   },
@@ -282,7 +298,7 @@ const SKILL_RUNS = (() => {
       stale_evidence: [], updated_at: ago(2 * 3600) },
   ]
 })()
-const LOCK_PIN = (over: Record<string, unknown> = {}) => ({ name: 'pr-gate', workflow_version: 1, path: null, sha256: SHA_PR_GATE, status: 'adopted', params: { merge_method: 'squash' }, source: { kind: 'first_party' }, ...over })
+const LOCK_PIN = (over: Record<string, unknown> = {}) => ({ name: 'pr-gate', workflow_version: 1, path: null, sha256: SHA_PR_GATE, status: 'adopted', params: { merge_method: 'squash' }, walkthrough: walk(' (squash)'), source: { kind: 'first_party' }, ...over })
 
 export type Scenario = 'full' | 'empty' | 'down' | 'demo'
 

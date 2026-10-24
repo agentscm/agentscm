@@ -18,9 +18,11 @@ export interface Param { name: string; description: string; type: string; defaul
 export interface CatalogEntry {
   name: string; workflow_version: number; sha256: string; summary: string; gates: { id: string; enforce: string[] }[]; first_party: boolean
   applicability: { triggers: string[]; prerequisites: string[]; not_for: string[] }; parameters: Param[]
+  /** One plain-English line per gate, numbered by the hub ("1. Branch: ..."). */
+  walkthrough: string[]
 }
 export type PinStatus = 'adopted' | 'unknown_version' | 'unsupported_source' | 'invalid_params'
-export interface Pin { name: string; workflow_version: number; path: string | null; sha256: string; status: PinStatus; params: Record<string, unknown>; source: string }
+export interface Pin { name: string; workflow_version: number; path: string | null; sha256: string; status: PinStatus; params: Record<string, unknown>; source: string; walkthrough: string[] }
 export interface Library {
   catalog: CatalogEntry[]
   adoption: { repo: string; source: AdoptionSource; observed_at: number | null; default_branch: string | null; pins: Pin[] }
@@ -98,14 +100,15 @@ export function adoptionLabel(source: AdoptionSource, defaultBranch: string | nu
   if (source === 'reported_by_checkout') return 'Adoption: reported by checkout'
   return 'Not adopted'
 }
-const ENFORCING: Record<string, string> = { stop: 'stop', forge_status: 'forge status', native: 'native' }
-/** Distinct enforcing values across a skill's gates; advise and signal are not enforcement. */
-export function enforcedLabels(gates: { enforce: string[] }[]): string[] {
-  const seen = new Set<string>()
-  for (const g of gates) for (const e of g.enforce) if (ENFORCING[e]) seen.add(ENFORCING[e]!)
-  return [...seen]
+const ENFORCED: Record<string, string> = { stop: 'Stop hook', native: 'native' }
+/** Only built enforcement points count as enforced; forge_status (merge check) is planned; advise and signal are neither. */
+export function enforcement(gates: { enforce: string[] }[]): { enforced: string[]; planned: string[] } {
+  const all = new Set(gates.flatMap((g) => g.enforce))
+  return { enforced: Object.keys(ENFORCED).filter((k) => all.has(k)).map((k) => ENFORCED[k]!), planned: all.has('forge_status') ? ['merge check'] : [] }
 }
 export const gateChain = (gates: { id: string }[]) => gates.map((g) => gateLabel(g.id).toLowerCase()).join(' → ')
+/** The hub numbers its lines; the page numbers them with <ol>. */
+export const stepText = (line: string) => line.replace(/^\d+\.\s+/, '')
 export const shortSha = (s: string) => s.slice(0, 7)
 const SAFE_ARG = /^[A-Za-z0-9_.:/@+=-]+$/
 const shellArg = (v: string) => (SAFE_ARG.test(v) ? v : `'${v.replaceAll("'", `'\\''`)}'`)
@@ -185,7 +188,7 @@ export function decodeLibrary(v: unknown): Library {
         const q = rec(x, 'skills')
         return { name: str(q['name'], 'skills'), description: typeof q['description'] === 'string' ? q['description'] : '', type: str(q['type'], 'skills'), default: q['default'] ?? null, enum: strs(q['enum']) }
       })
-      return { name: str(r['name'], 'skills'), workflow_version: num(r['workflow_version'], 'skills'), sha256: str(r['sha256'], 'skills'), summary: str(r['summary'], 'skills'), gates, first_party: r['first_party'] === true, applicability: { triggers: strs(ap['triggers']), prerequisites: strs(ap['prerequisites']), not_for: strs(ap['not_for']) }, parameters }
+      return { name: str(r['name'], 'skills'), workflow_version: num(r['workflow_version'], 'skills'), sha256: str(r['sha256'], 'skills'), summary: str(r['summary'], 'skills'), gates, first_party: r['first_party'] === true, applicability: { triggers: strs(ap['triggers']), prerequisites: strs(ap['prerequisites']), not_for: strs(ap['not_for']) }, parameters, walkthrough: strs(r['walkthrough']) }
     }),
     adoption: {
       repo: str(a['repo'], 'skills'), source: source as AdoptionSource, observed_at: nullable(a['observed_at'], (x) => num(x, 'skills')), default_branch: nullable(a['default_branch'], (x) => str(x, 'skills')),
@@ -194,7 +197,7 @@ export function decodeLibrary(v: unknown): Library {
         const status = r['status']
         if (status !== 'adopted' && status !== 'unknown_version' && status !== 'unsupported_source' && status !== 'invalid_params') bad('pin status')
         const src = r['source']
-        return { name: str(r['name'], 'skills'), workflow_version: num(r['workflow_version'], 'skills'), path: nullable(r['path'], (x) => str(x, 'skills')), sha256: str(r['sha256'], 'skills'), status: status as PinStatus, params: rec(r['params'] ?? {}, 'skills'), source: typeof src === 'object' && src !== null && typeof (src as { kind?: unknown }).kind === 'string' ? (src as { kind: string }).kind : 'first_party' }
+        return { name: str(r['name'], 'skills'), workflow_version: num(r['workflow_version'], 'skills'), path: nullable(r['path'], (x) => str(x, 'skills')), sha256: str(r['sha256'], 'skills'), status: status as PinStatus, params: rec(r['params'] ?? {}, 'skills'), walkthrough: list(r['walkthrough'] ?? [], 'skills').map((e) => str(e, 'skills')), source: typeof src === 'object' && src !== null && typeof (src as { kind?: unknown }).kind === 'string' ? (src as { kind: string }).kind : 'first_party' }
       }),
     },
     counts,

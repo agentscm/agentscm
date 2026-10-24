@@ -133,7 +133,11 @@ Change, never from the manifest) and adds these sections:
   `reviewer` (a session or person distinct from every author session for the reviewed head),
   `maintainer` (a person with write access who approves or merges).
 - **`gates`**: an ordered list of named states. Each gate lists the evidence it needs, which role
-  produces it, how strongly it must be established, and where it is enforced.
+  produces it, how strongly it must be established, and where it is enforced. Each gate also has a
+  required `plain` string (1 to 200 bytes): one plain-English line saying what happens. The Hub
+  library, `agentscm skill show` and the MCP skill list print a walkthrough generated from the
+  manifest alone (the `plain` line plus who does it, the evidence, the minimum assurance and
+  whether the step blocks or only warns), so the wording has a single source.
 
 The existing `steps` stay exactly as they are: executable checks (source paths, command, Claude Code
 review) that a gate can cite as evidence for native subjects. A version 1 manifest is a skill with
@@ -200,7 +204,9 @@ A repository browses the catalog (`agentscm skill list`, `agentscm skill show NA
 `agentscm_skill_list`, the Hub Skills page) and adopts a skill with `agentscm skill add NAME
 [--param k=v]`, which writes a pin into a committed lock file reviewed like any other change.
 `agentscm skill remove NAME` deletes the pin. The Hub page stays read-only: it shows the exact
-command to copy.
+command to copy. The lock lives at the repository root as `agentscm-skills.lock.json`, not under
+`.agentscm/`, because that directory is AgentSCM's ignored local data directory and Git snapshot
+capture excludes it.
 
 ```json
 // agentscm-skills.lock.json
@@ -321,12 +327,12 @@ closes unmerged.
 a repository or machine sets its own values (AgentSCM's own would be 4 slots, an 8 GiB floor and its
 named services).
 
-| Gate | Evidence | Enforced | Today's equivalent |
-|---|---|---|---|
-| claim | A stand-up claim and an intent for the files the session will edit | advise (the pre-edit hook already refuses the first contested edit) | `agentscm_start` |
-| resources | A resource claim for each heavy resource (build slot, disk budget, port, container) before using it | advise in v1; `stop` once resource claims exist (4.1) | `/tmp/agentscm-capacity-*.txt` |
-| collisions | A collision check against every open sibling branch before opening or updating a pull request, with each overlap acknowledged or coordinated | stop (blocks finishing with an unchecked open pull request) | `git merge-tree` by hand |
-| release | Intents and resource claims released, build artifacts cleaned | stop (blocks finishing while this session holds a resource claim) | `cargo clean`, deleting the note |
+| Gate | Evidence | Enforced | Today's equivalent | `plain` |
+|---|---|---|---|---|
+| claim | A stand-up claim and an intent for the files the session will edit | advise (the pre-edit hook already refuses the first contested edit) | `agentscm_start` | The session says which files it will edit before editing them. |
+| resources | A resource claim for each heavy resource (build slot, disk budget, port, container) before using it | advise in v1; `stop` once resource claims exist (4.1) | `/tmp/agentscm-capacity-*.txt` | The session reserves each heavy resource before using it. |
+| collisions | A collision check against every open sibling branch before opening or updating a pull request, with each overlap acknowledged or coordinated | stop (blocks finishing with an unchecked open pull request) | `git merge-tree` by hand | The session checks for overlap with every other open branch before opening a pull request. |
+| release | Intents and resource claims released, build artifacts cleaned | stop (blocks finishing while this session holds a resource claim) | `cargo clean`, deleting the note | The session gives back its claims and cleans up what it built. |
 
 The collisions gate makes collision detection run without anyone remembering to: the Stop hook
 calls the existing `agentscm collisions` scan for the session's branch and records the result as
@@ -336,11 +342,11 @@ evidence.
 
 **Subject:** one merge commit on the target.
 
-| Gate | Evidence | Enforced |
-|---|---|---|
-| tip | The current target tip includes the merge (later merges are fine) | advise |
-| regression | The repository gate (for AgentSCM: fmt, clippy, nextest, doctests) on that tip, bound to its SHA | signal |
-| verdict | Green → the target is marked green at that SHA. Red → the main-red signal names the first red SHA, the merges since the last green SHA and who ran the check | signal |
+| Gate | Evidence | Enforced | `plain` |
+|---|---|---|---|
+| tip | The current target tip includes the merge (later merges are fine) | advise | The target branch already contains this merge. |
+| regression | The repository gate (for AgentSCM: fmt, clippy, nextest, doctests) on that tip, bound to its SHA | signal | The full repository check runs on the merged tip. |
+| verdict | Green → the target is marked green at that SHA. Red → the main-red signal names the first red SHA, the merges since the last green SHA and who ran the check | signal | The target is marked green, or red with the first bad commit named. |
 
 The orchestrator ran this by hand after every merge. As a skill, the session that merged owns it,
 and any session can take it over through a stand-up handover.

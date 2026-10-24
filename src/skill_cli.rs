@@ -233,7 +233,12 @@ fn lock_for_cwd() -> Result<Option<SkillLock>> {
     }
 }
 
-fn describe(entry: &CatalogEntry, label: Option<&str>, full: bool) -> String {
+fn describe(
+    entry: &CatalogEntry,
+    label: Option<&str>,
+    full: bool,
+    walkthrough: &[String],
+) -> String {
     let a = &entry.applicability;
     let mut out = format!("{} v{}", entry.name, entry.workflow_version);
     if let Some(label) = label {
@@ -256,20 +261,9 @@ fn describe(entry: &CatalogEntry, label: Option<&str>, full: bool) -> String {
     }
     if full {
         let _ = writeln!(out, "  sha256: {}", entry.sha256);
-        let _ = writeln!(out, "  Gates (id, by, enforce, min assurance):");
-        for g in &entry.manifest.gates {
-            let _ = writeln!(
-                out,
-                "    {} by {} enforce {} min {}",
-                g.id,
-                json!(g.by).as_str().unwrap_or(""),
-                g.enforce
-                    .iter()
-                    .map(|e| json!(e).as_str().unwrap_or("").to_owned())
-                    .collect::<Vec<_>>()
-                    .join(","),
-                json!(g.min_assurance).as_str().unwrap_or("")
-            );
+        let _ = writeln!(out, "  How it works:");
+        for line in walkthrough {
+            let _ = writeln!(out, "    {line}");
         }
     } else {
         let _ = writeln!(
@@ -304,7 +298,7 @@ fn list(as_json: bool) -> Result<()> {
     for e in supported::catalog() {
         println!(
             "{}",
-            describe(e, Some(&adoption_label(lock.as_ref(), e)), false)
+            describe(e, Some(&adoption_label(lock.as_ref(), e)), false, &[])
         );
     }
     Ok(())
@@ -341,9 +335,24 @@ fn show(name: &str, version: Option<u32>, as_json: bool) -> Result<()> {
         println!("{}", serde_json::to_value(entry)?);
     } else {
         let lock = lock_for_cwd()?;
+        // The adopted pin's settings change the wording (CI label, merge method).
+        let pin = lock.as_ref().and_then(|l| {
+            supported::resolve(l)
+                .into_iter()
+                .find(|p| p.pin.sha256 == entry.sha256 && p.status == AdoptionStatus::Adopted)
+        });
+        let params = entry
+            .manifest
+            .effective_params(pin.as_ref().and_then(|p| p.pin.params.as_ref()))?;
+        let lines = supported::walkthrough(&entry.manifest, Some(&params));
         println!(
             "{}",
-            describe(entry, Some(&adoption_label(lock.as_ref(), entry)), true)
+            describe(
+                entry,
+                Some(&adoption_label(lock.as_ref(), entry)),
+                true,
+                &lines
+            )
         );
     }
     Ok(())
