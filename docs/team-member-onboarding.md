@@ -70,6 +70,26 @@ If setup reports that the repository is not connected or your identity cannot ac
 Hub operator to fix the existing repository connection. Team-member setup does not install or
 reconfigure the Hub's forge application.
 
+## Optional: configure local change capture
+
+On Unix, a team that is piloting [local change capture](change-capture.md) can configure one cloned
+checkout after the agent-led setup has saved its client connection. Run the exact command and
+action rules supplied by the team operator; choose a private absolute spool outside the clone.
+Configuration preserves unrelated Claude Code hooks and resolves current authorized Work on every
+hook invocation, so it does not pin the checkout permanently to the Work active during setup.
+
+The default `metadata-only` mode shares bounded event/source/action facts and opaque artifact
+identities. `local-conversation` additionally retains selected visible bodies in the local spool;
+those bodies are not sent in shared envelopes. Ordinary command success is not a passing check.
+Use `agentscm change-capture show --root /path/to/clone --work-id wrk_…` for the concise read-only
+handoff and `agentscm change-capture unconfigure --root /path/to/clone` to remove the marked hooks,
+disable new capture, and retain the existing spool safety lineage. Inspect it with
+`agentscm change-capture status --root /path/to/clone`; a bounded `change-capture export` is local
+evidence and is not a resumable spool. Rebinding the same checkout to a different spool identity is
+unavailable in this version. Unconfigure changes only AgentSCM's marked capture hooks; unrelated
+hooks remain intact. The [implementation status](implementation/agentscm-build-status.md) records
+the tested local slice and remaining host, platform and release limits.
+
 ## Advanced: bind an existing token file
 
 If you already have your own agent token in a private absolute-path file, bind it without guided

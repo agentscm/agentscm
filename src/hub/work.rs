@@ -77,9 +77,25 @@ pub enum CheckpointKind {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SourceRef {
-    RepositoryPath { path: String, line: Option<u32> },
-    Commit { oid: String, path: Option<String> },
-    Work { work_id: String },
+    RepositoryPath {
+        path: String,
+        line: Option<u32>,
+    },
+    Commit {
+        oid: String,
+        path: Option<String>,
+    },
+    Work {
+        work_id: String,
+    },
+    CapturedEvent {
+        session_id: String,
+        event_id: String,
+    },
+    PriorWorkVersion {
+        work_id: String,
+        event_seq: i64,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -585,6 +601,19 @@ impl SourceRef {
                 }
             }
             Self::Work { work_id } => validate_id("work", work_id, "wrk")?,
+            Self::CapturedEvent {
+                session_id,
+                event_id,
+            } => {
+                captured_identifier("captured event session_id", session_id)?;
+                captured_identifier("captured event event_id", event_id)?;
+            }
+            Self::PriorWorkVersion { work_id, event_seq } => {
+                validate_id("prior work version", work_id, "wrk")?;
+                if *event_seq < 1 {
+                    return Err(invalid("prior work version event_seq must be positive"));
+                }
+            }
         }
         Ok(())
     }
@@ -749,6 +778,21 @@ fn option_text(name: &str, value: &Option<String>, max: usize) -> Result<()> {
         .map(|value| text(name, value, max))
         .transpose()
         .map(|_| ())
+}
+
+fn captured_identifier(name: &str, value: &str) -> Result<()> {
+    let valid = !value.is_empty()
+        && value.len() <= MAX_LABEL_BYTES
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'@')
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(invalid(&format!(
+            "{name} must be 1..{MAX_LABEL_BYTES} bytes of identifier characters"
+        )))
+    }
 }
 
 pub(super) fn validate_id(name: &str, value: &str, prefix: &str) -> Result<()> {

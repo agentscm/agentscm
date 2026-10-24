@@ -880,6 +880,119 @@ fn repository_namespaces_fence_work_and_relations(db: &Db) {
     );
 }
 
+fn intent_provenance_refs_require_exact_same_work_versions_and_replay(db: &Db) {
+    let store = db.open();
+    let lead = agent(&*store, 1);
+    let now = unix_now();
+    let work = store
+        .work_start(
+            &lead.token,
+            &native_start("intent-provenance", "intent provenance", "intent-session"),
+            now,
+        )
+        .unwrap()
+        .item;
+    let mut foreign_start = native_start("other-intent", "other intent", "other-session");
+    foreign_start.scope = vec!["other/**".into()];
+    let foreign_start = store.work_start(&lead.token, &foreign_start, now).unwrap();
+    assert!(foreign_start.created);
+    assert!(foreign_start.conflict.is_none());
+    let foreign = foreign_start.item;
+    assert_ne!(foreign.id, work.id);
+
+    let declared_event = SourceRef::CapturedEvent {
+        session_id: "conversation-session".into(),
+        event_id: "message:42".into(),
+    };
+    let mut observed = checkpoint(
+        &work.id,
+        "intent-observed",
+        1,
+        "intent-session",
+        CheckpointKind::Progress,
+        "captured the declared intent event",
+    );
+    observed.expected_updated_seq = Some(work.updated_seq);
+    observed.source_refs = vec![declared_event.clone()];
+    let observed = store
+        .work_checkpoint(&lead.token, &observed, now + 1)
+        .unwrap();
+    assert_eq!(
+        observed.item.current.as_ref().unwrap().source_refs,
+        [declared_event]
+    );
+
+    let superseded = SourceRef::PriorWorkVersion {
+        work_id: work.id.clone(),
+        event_seq: observed.receipt.event_seq,
+    };
+    let mut correction = checkpoint(
+        &work.id,
+        "intent-correction",
+        1,
+        "intent-session",
+        CheckpointKind::Decision,
+        "correct the prior intent checkpoint",
+    );
+    correction.expected_updated_seq = Some(observed.item.updated_seq);
+    correction.source_refs = vec![superseded.clone()];
+    let corrected = store
+        .work_checkpoint(&lead.token, &correction, now + 2)
+        .unwrap();
+    assert_eq!(
+        corrected.item.current.as_ref().unwrap().source_refs,
+        [superseded]
+    );
+
+    let mut later = checkpoint(
+        &work.id,
+        "intent-later",
+        1,
+        "intent-session",
+        CheckpointKind::Progress,
+        "continued after the correction",
+    );
+    later.expected_updated_seq = Some(corrected.item.updated_seq);
+    let later = store.work_checkpoint(&lead.token, &later, now + 3).unwrap();
+
+    let replay = store
+        .work_checkpoint(&lead.token, &correction, now + 4)
+        .unwrap();
+    assert!(replay.receipt.replayed);
+    assert_eq!(replay.receipt.event_seq, corrected.receipt.event_seq);
+    assert_eq!(replay.item.updated_seq, later.item.updated_seq);
+
+    let mut foreign_version = checkpoint(
+        &work.id,
+        "foreign-prior-version",
+        1,
+        "intent-session",
+        CheckpointKind::Decision,
+        "invalid cross-work correction",
+    );
+    foreign_version.expected_updated_seq = Some(later.item.updated_seq);
+    foreign_version.source_refs = vec![SourceRef::PriorWorkVersion {
+        work_id: foreign.id,
+        event_seq: foreign.updated_seq,
+    }];
+    assert_invalid(
+        store.work_checkpoint(&lead.token, &foreign_version, now + 5),
+        "prior work version must reference the checkpoint work",
+    );
+
+    let mut missing_version = foreign_version;
+    missing_version.operation_id = "missing-prior-version".into();
+    missing_version.summary = "invalid missing correction target".into();
+    missing_version.source_refs = vec![SourceRef::PriorWorkVersion {
+        work_id: work.id,
+        event_seq: i64::MAX,
+    }];
+    assert_invalid(
+        store.work_checkpoint(&lead.token, &missing_version, now + 6),
+        "prior work version is unavailable",
+    );
+}
+
 fn participants_replays_and_takeovers_are_fenced(db: &Db) {
     let store = db.open();
     let alice = agent(&*store, 1);
@@ -1896,6 +2009,7 @@ conformance!(
     native_and_automatic_starts_have_explicit_retry_rules,
     authorization_and_claim_projection_keep_old_claims_visible,
     repository_namespaces_fence_work_and_relations,
+    intent_provenance_refs_require_exact_same_work_versions_and_replay,
     participants_replays_and_takeovers_are_fenced,
     blocker_metadata_and_restart_are_durable,
     stale_observed_pause_cannot_overwrite_newer_checkpoint,

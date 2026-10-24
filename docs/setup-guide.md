@@ -37,6 +37,33 @@ If the hub isn't answering, quickstart reports the failure and the final live-wa
 
 Quickstart and uninstall share one lock for the user configuration directory. An overlapping run stops with a retry message before changing installed state. The private `quickstart.lock` file remains after uninstall so later runs use the same lock.
 
+## Optional change-record capture
+
+Quickstart's coordination hooks do not enable the experimental change-capture path or create its
+checkout-bound client connection. On Unix, first save a write-capable connection with
+`agentscm client connect` (the separate `agentscm client setup` flow already does this), then an
+operator may configure Claude Code capture once:
+
+```sh
+agentscm change-capture configure \
+  --root /absolute/repository \
+  --spool /absolute/private/spool \
+  --worktree-id checkout_example \
+  --setup-digest 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --action-rule Bash=execution:partial:process_exit_code
+```
+
+Choose the absolute spool outside public repository source. `metadata-only` is the default; do not
+choose `local-conversation` until its local retention and access policy are deliberate. The command
+adds only marked capture hooks and preserves unrelated hooks. Disable capture with
+`agentscm change-capture unconfigure --root /absolute/repository`; this removes AgentSCM's marked
+hooks but retains the checkout's private spool safety identity.
+Use `agentscm change-capture status --root /absolute/repository` and the read-only `inspect` or
+non-resumable `export` commands to diagnose retained evidence. Reconfiguring that checkout to a
+different spool identity is unavailable in this version. `agentscm uninstall` does
+not own this separate configuration. See [local change capture](change-capture.md) and the [implementation status](implementation/agentscm-build-status.md)
+for the tested local slice and remaining host, platform and release limits.
+
 ## Running without a terminal (CI)
 
 Without a terminal quickstart refuses unless you pass `--yes`, which takes the recommended setup answers. Telemetry still requires an earlier eligible choice or explicit enablement. Choose with flags:

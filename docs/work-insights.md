@@ -80,11 +80,19 @@ AgentSCM does not claim automatic session-usage capture for those clients.
   "source_commit": null,
   "input_tokens": 1200,
   "output_tokens": 300,
+  "measurement_scope": "request",
   "cost": null
 }
 ```
 
 Use the literal label `unknown` when the client cannot determine its agent, provider or model identity. Do not infer a provider from the agent name: an agent client and its model provider are separate fields. Token counts may be omitted independently. Missing tokens or cost mean unknown, not zero.
+
+Provider-backed clients may also include cache-read and cache-creation input counts, action or
+attempt identities, and native provider request or event identities. These are optional facts and
+are omitted from legacy canonical records when absent. `measurement_scope` is either `request` or
+`session_cumulative`. Insight token and cost totals include request-scoped and legacy records but
+exclude cumulative session records, which are retained only as separate evidence. This prevents a
+provider's final total from being added to the request records that contributed to it.
 
 `usage_basis` is `reported` for a client-supplied record. `provider_result` means the caller says
 the counts came from a structured provider result; the Hub does not verify that claim. A cost, when

@@ -115,6 +115,13 @@ retained step evidence and workspace permissions.
 Its [work insights](docs/work-insights.md) API exposes bounded reported duration,
 partial usage reports and stored publication observations without turning them into approval or landing claims.
 
+The experimental [local change-capture](docs/change-capture.md) path can bind an observed Claude
+Code action to inspectable Git or native source facts and expose a concise Hub handoff: bounded Work
+intent, action-bound source, action outcome, verification result, decision, gaps and next action. Local
+conversation bodies and command output stay in an operator-chosen private spool; the shared record
+contains typed metadata and artifact identities. The [implementation status](docs/implementation/agentscm-build-status.md)
+records the qualified slice and remaining runtime and release limits.
+
 <a href="docs/assets/hub-workflow.jpg">
   <img src="docs/assets/hub-workflow.jpg" alt="AgentSCM Hub inspecting a source-check workflow, revision freshness and separate native landing status" width="640">
 </a>

@@ -30,6 +30,8 @@ export type WorkSourceRef =
   | { kind: 'repository_path'; path: string; line: number | null }
   | { kind: 'commit'; oid: string; path: string | null }
   | { kind: 'work'; work_id: string }
+  | { kind: 'captured_event'; session_id: string; event_id: string }
+  | { kind: 'prior_work_version'; work_id: string; event_seq: number }
 
 export interface WorkParticipant {
   owner: string
@@ -289,6 +291,7 @@ const enumValue = <T extends string>(value: unknown, values: ReadonlySet<T>, fie
 const WORK_ID = /^wrk_[0-9a-f]{32}$/
 const DELIVERY_ID = /^dlv_[0-9a-f]{32}$/
 const COMMIT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i
+const CAPTURED_ID = /^[A-Za-z0-9._:@-]+$/
 const ROLES = new Set<WorkRole>(['lead', 'helper', 'reviewer'])
 const STATES = new Set<WorkState>(['active', 'blocked', 'paused', 'finished', 'handover'])
 const CLAIM_STATUSES = new Set<ClaimStatus>(['active', 'stale', 'unknown'])
@@ -358,6 +361,20 @@ function sourceRef(value: unknown): WorkSourceRef {
     }
   }
   if (item['kind'] === 'work') return { kind: 'work', work_id: workId(item['work_id'], 'checkpoint.source_ref.work_id') }
+  if (item['kind'] === 'captured_event') {
+    const sessionId = boundedText(item['session_id'], 'checkpoint.source_ref.session_id', MAX_LABEL_BYTES)
+    const eventId = boundedText(item['event_id'], 'checkpoint.source_ref.event_id', MAX_LABEL_BYTES)
+    if (!CAPTURED_ID.test(sessionId)) fail('checkpoint.source_ref.session_id')
+    if (!CAPTURED_ID.test(eventId)) fail('checkpoint.source_ref.event_id')
+    return { kind: 'captured_event', session_id: sessionId, event_id: eventId }
+  }
+  if (item['kind'] === 'prior_work_version') {
+    return {
+      kind: 'prior_work_version',
+      work_id: workId(item['work_id'], 'checkpoint.source_ref.work_id'),
+      event_seq: positiveInteger(item['event_seq'], 'checkpoint.source_ref.event_seq'),
+    }
+  }
   return fail('checkpoint.source_ref.kind')
 }
 

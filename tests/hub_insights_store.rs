@@ -261,6 +261,13 @@ fn usage(work_id: &str, observation_id: &str, generation: i64, session: &str) ->
         source_commit: None,
         input_tokens: Some(7),
         output_tokens: Some(11),
+        cache_read_input_tokens: None,
+        cache_creation_input_tokens: None,
+        action_id: None,
+        attempt_id: None,
+        provider_request_id: None,
+        provider_event_id: None,
+        measurement_scope: None,
         cost: None,
     }
 }

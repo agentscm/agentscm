@@ -33,6 +33,7 @@ test('every section is reachable from the rail with a matching breadcrumb and pa
     ['Work', /Who owns which task\?/],
     ['Activity', /What just happened\?|happened in this repository/],
     ['Workflows', /checks|workflow/i],
+    ['Change records', /What is ready to hand off\?/],
     ['Workspace', /workspace/i],
     ['Connect agents', /agent/i],
     ['Hub health', /Is the hub OK\?/],
@@ -60,6 +61,17 @@ test('⌘K search opens a work item and the breadcrumb names it', async ({ page 
   await expect(page).toHaveURL(/#work\/wrk_[0-9a-f]{32}$/)
   await expect(crumbs(page).locator('[aria-current="page"]')).toHaveText(/Rebuild the hub status page shell/)
   await expect(main(page)).toContainText('Rebuild the hub status page shell')
+})
+
+test('a work item opens its authenticated change-record projection', async ({ page }) => {
+  await signIn(page, '#work')
+  await main(page).getByRole('link', { name: 'Rebuild the hub status page shell' }).first().click()
+  await main(page).getByRole('link', { name: 'Change record' }).click()
+  await expect(page).toHaveURL(/#change-record\/wrk_[0-9a-f]{32}$/)
+  await expect(crumbs(page).locator('[aria-current="page"]')).toContainText('Work wrk_')
+  await expect(main(page).getByRole('heading', { level: 1, name: 'Rebuild the hub status page shell' })).toBeVisible()
+  await expect(main(page)).toContainText('No source-bound action has been captured.')
+  await expect(main(page)).toContainText('No action captured')
 })
 
 test('a directed request expands to show targets, receipts and paths', async ({ page }) => {

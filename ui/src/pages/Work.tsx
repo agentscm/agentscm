@@ -661,6 +661,12 @@ function History({ token }: { token: string }) {
 function Ref({ r, item }: { r: WorkSourceRef; item: WorkItem }) {
   if (r.kind === 'work') return <WorkLink id={r.work_id} />
   if (r.kind === 'repository_path') return <Path>{`${r.path}${r.line === null ? '' : `:${r.line}`}`}</Path>
+  if (r.kind === 'captured_event') {
+    return <span title="Caller-declared metadata reference; any local event body is unavailable here and the Work view does not verify conversation content.">Declared captured event <code>{r.session_id} / {r.event_id}</code></span>
+  }
+  if (r.kind === 'prior_work_version') {
+    return <span title="The exact Work version identity was checked when this checkpoint was recorded; its older snapshot may no longer be retained.">Supersedes version <code>{r.event_seq}</code> of <WorkLink id={r.work_id} /></span>
+  }
   const href = safeCommitHref(item.source, r.oid)
   const text = <code>{r.oid.slice(0, 12)}{r.path ? ` · ${r.path}` : ''}</code>
   return href ? <a href={href} target="_blank" rel="noreferrer noopener">{text} <Icon name="box-arrow-up-right" /></a> : text
@@ -719,6 +725,9 @@ function Detail({ id, token }: { id: string; token: string }) {
                   <ClaimPill item={item} />
                   <Source item={item} />
                 </div>
+                <a className="btn btn-sm btn-outline-secondary" href={`#change-record/${encodeURIComponent(item.id)}`}>
+                  <Icon name="clipboard2-check" /> Change record
+                </a>
               </header>
               {item.state !== 'finished' && item.claim_status !== 'active' && (
                 <Notice title={item.claim_status === 'stale' ? 'No recent check-in' : 'Check-in unknown'}>This task is still assigned. Coordinate with the lead before taking it over.</Notice>

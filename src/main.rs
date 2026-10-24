@@ -38,6 +38,10 @@ mod agent_task_stop;
 #[cfg(unix)]
 mod attached_worktree_cli;
 mod autopsy_cli;
+#[cfg(unix)]
+mod change_capture_cli;
+#[cfg(unix)]
+mod change_capture_client;
 mod client_cli;
 mod client_config;
 mod client_mcp;
@@ -118,6 +122,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// [experimental] Capture local agent events and observed command receipts.
+    #[cfg(unix)]
+    ChangeCapture {
+        #[command(subcommand)]
+        command: change_capture_cli::ChangeCaptureCommand,
+    },
     /// [experimental] Bind an existing Git worktree to native source qualification.
     #[cfg(unix)]
     AttachedWorktree {
@@ -676,6 +686,13 @@ enum RunExit {
 
 async fn run(cli: Cli) -> Result<RunExit> {
     match cli.command {
+        #[cfg(unix)]
+        Command::ChangeCapture { command } => {
+            let code = change_capture_cli::run(command).await?;
+            if code != 0 {
+                return Ok(RunExit::SpecializedFailure(code));
+            }
+        }
         #[cfg(unix)]
         Command::AgentTask { command } => {
             print_json(&agent_task_cli::run(&cli.data_dir, command).await?);

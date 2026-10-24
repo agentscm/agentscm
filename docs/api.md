@@ -37,6 +37,48 @@ own routes, including the agent MCP endpoint `POST /mcp` and the hook endpoints
 `POST /v1/hub/hook/{agent}`; see the [hub guide](hub.md#routes) and
 [agent sessions](hub.md#agent-sessions-mcp-and-hook-endpoints).
 
+## Hub change-record routes
+
+These routes belong to `agentscm hub serve`, not the unauthenticated local `serve` API above. They
+are repository-scoped and require `Authorization: Bearer <token>`:
+
+| Route | Token and effect |
+|---|---|
+| `GET /v1/hub/repos/{repo}/change-records/current?session_id=…` | Write-capable agent token; resolves that native session's current authorized Work and generation without changing it |
+| `POST /v1/hub/repos/{repo}/change-records/events` | Write-capable participating agent token; idempotently appends one bounded event batch |
+| `POST /v1/hub/repos/{repo}/change-records/actions/start` | Write-capable participating agent token; retains a source-bound action start |
+| `POST /v1/hub/repos/{repo}/change-records/actions/finish` | Write-capable participating agent token; retains typed execution outcome and verification result separately |
+| `GET /v1/hub/repos/{repo}/change-records/{work_id}` | Agent or read-only token; returns one concise read-only projection, or 404 when none exists |
+
+The version-1 read response keeps Work intent and scope, typed Git or native source facts, session
+coverage, the latest action, retained decision, next action, completeness and unknowns. Action
+kind, execution outcome, verification result, applicability, assurance, evidence availability and
+coverage are separate fields. Artifact references contain bounded digest/size/media/retention/
+availability metadata, not host paths or content. The response does not include conversation bodies
+or transcript-derived summaries. Setup and recipe digests identify retained inputs but do not, by
+themselves, establish complete provenance. The encoded response is at most 48 KiB. Scope and
+decision-reference arrays each begin with at most 16 entries in retained order; if the complete
+envelope would exceed that limit, trailing entries are removed deterministically and
+`scope_omitted` or `source_refs_omitted` reports the exact count.
+
+Decision references can include caller-declared captured-event identities and an exact earlier
+version of the same Work. A captured-event reference is metadata only: this API neither fetches nor
+returns its conversation body and does not present it as verified or human-approved. A prior-Work
+version was checked when its checkpoint was recorded, but the older snapshot may later be outside
+retention.
+
+“Latest action” uses durable local observation order only among actions produced by the same
+identified local observation ledger. It first selects one representative per ledger, then uses the
+Hub's monotonic receipt order across independent or legacy/unidentified ledgers. Caller timestamps
+are display facts and never establish global chronology, so the cross-ledger fallback is an
+ingestion order rather than proof of causal execution order.
+
+MCP exposes the same read projection as `agentscm_change_record({"work_id":"wrk_…"})`, including
+to read-only tokens. Its fixed narration never interpolates the caller-authored Work title or
+decision summary; those structured fields remain untrusted data, not instructions. The CLI wrapper
+is `agentscm change-capture show`. See
+[local change capture](change-capture.md) and its [qualification limits](implementation/agentscm-build-status.md).
+
 ## Local template and timeline reads
 
 The `/v1/local` routes return exactly the JSON that the matching CLI command prints, without the

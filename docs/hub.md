@@ -204,9 +204,11 @@ on no others:
 - `GET /v1/hub/skill-workflows` for recent runs in an operator-mapped native repository
 - `GET /v1/hub/skill-workflows/{run_id}` for an operator-mapped native repository
 - `GET /v1/hub/standup/briefing` and `GET /v1/hub/standup/work/{id}` for the token's repository
+- `GET /v1/hub/repos/{repo}/change-records/{work_id}` for a concise source-bound handoff
 - `GET /v1/hub/repos/{repo}/publications` and `GET /v1/hub/repos/{repo}/publications/{id}`
   (stored state only; see [publications](#publishing-a-revision))
-- MCP `initialize`, `ping`, `tools/list`, `agentscm_workflow_status`, and `agentscm_work_briefing`
+- MCP `initialize`, `ping`, `tools/list`, `agentscm_workflow_status`, `agentscm_work_briefing`, and
+  `agentscm_change_record`
 
 Every other route that takes an agent token (announcing, renewing and releasing intents, `notices`,
 creating, uploading to and running publications, and coordination MCP mutation tools, including `agentscm_status`, which also renews a hold)
@@ -542,6 +544,37 @@ id; their intents write the usual intent events. `GET /v1/hub/health` adds
 "hook_p95_ms"}`, counted by this hub process since it started (p95 over the
 last 1024 hook calls). Session rows untouched for 7 days are pruned.
 
+## Change-record capture and handoff
+
+The experimental Unix capture client adds a separate Claude Code hook set after a checkout has an
+existing saved client connection. `agentscm change-capture configure` is a configure-once operation:
+each hook invocation resolves the session's current authorized Work and generation, appends locally
+before delivery, and replays a bounded ordered page. It does not reuse one fixed Work generation.
+Unresolved hooks stay as bounded sanitized local facts and are never later attached to a Work item.
+
+The Hub accepts bounded event batches and source-bound action starts/finishes on the
+`/v1/hub/repos/{repo}/change-records/...` routes. Ordinary command execution has an outcome but an
+unknown verification result. The local client reports a verification pass or failure only for a
+configured exact recipe match. The Hub treats that match and result as caller asserted; it does not
+validate them against an independent recipe registry. Setup and recipe digests are identities, not
+complete provenance. Shared artifact
+references contain identities and availability, while selected prompt, tool and output bodies stay
+in the private local spool.
+
+`GET /v1/hub/repos/{repo}/change-records/{work_id}`, the read-only MCP tool
+`agentscm_change_record`, `agentscm change-capture show`, and the Hub UI Change record page all read
+the same projection. It exposes bounded Work intent/scope, inspectable Git or native source facts,
+session gaps, action facts, a retained Work decision, next action, completeness and unknowns. An
+agent-authored decision remains a proposal rather than human approval. Reads do not acknowledge or
+transfer work and never return conversation bodies or transcript-derived summaries. The encoded
+projection is at most 48 KiB, with at most 16 retained scope entries and 16 decision references;
+exact omission counts identify trailing entries removed deterministically to fit the envelope.
+MCP narration is fixed factual text: caller-authored intent titles and decision summaries remain
+explicitly untrusted structured data and are not interpolated into that narration.
+
+This path remains alpha. Real Claude host, complete integrated browser, and deployment qualification
+are pending. See [local change capture](change-capture.md) for configuration and exact limits.
+
 ## Status page
 
 `/ui/` is a read-only page of what the hub knows about one repository: the live sessions and
@@ -557,6 +590,11 @@ browser login and keeps a cookie session. The page polls every few seconds and r
 `work`, `activity`, `health` and `/v1/hub/onboarding` (the Connect agents page); the workflow panel also reads the
 bounded recent-run list once and an individual run when selected. Mint a token only for this, so it
 can be revoked on its own:
+
+The Verify rail and each Work detail can open `#change-record/{work_id}`. That page performs one
+bounded read of the concise change-record projection and refreshes only on request. A missing record,
+authorization denial, unavailable service and incomplete evidence remain distinct states. The
+filled browser path still needs integrated qualification with a current captured record.
 
 ```sh
 agentscm hub token create --read-only --name status-page --repo owner/name
@@ -1213,7 +1251,16 @@ docker compose -f compose.hub.yaml --profile default run --rm -T --no-deps --ent
 docker compose -f compose.hub.yaml --profile default up -d hub
 ```
 
-For PostgreSQL use `pg_dump` and your S3 provider's own tools.
+For PostgreSQL use `pg_dump` and your S3 provider's own tools. Keep passwords out of
+`pg_dump` and `pg_restore` command arguments and logs; use a mode-`0600` libpq password or
+service file and pass only its path and non-secret service name to the client process.
+
+An older AgentSCM binary refuses a database that contains a schema migration it does not know.
+Do not delete migration markers or tables to make that binary start: those rows are part of the
+database's durable format. Restart with the binary that wrote the database, or stop every hub and
+restore a complete pre-upgrade backup into an empty database that is dedicated to the older
+binary. Test a restored copy before replacing the original; never run old and new binaries against
+the same database during recovery.
 
 [`.github/hub-e2e.sh`](../.github/hub-e2e.sh) runs both profiles in CI: two agents with different
 tokens on different machine names, the second one is warned about the first, the warning survives a
@@ -1323,11 +1370,21 @@ are configured.
 
 What the hub keeps, in its database and object store:
 
+- Change capture: bounded session event facts and gaps, idempotent operation receipts,
+  source-bound action starts and finishes, typed Git/native source bindings, artifact identities
+  and availability, plus the retained Work fields used by the concise handoff. The Hub does not
+  receive the private spool's conversation bodies, tool input/output, command output, source bytes
+  or host paths through this path.
+
 - Work usage observations: at most 500 immutable reports per work item, containing bounded
-  agent/provider/model labels, attempt phase and outcome, optional token counts, optional
-  caller-supplied cost evidence and an optional source commit. The stored record also retains
+  agent/provider/model labels, attempt phase and outcome, optional token and cache-token counts,
+  optional provider request/event and action/attempt identities, a request or session-cumulative
+  measurement scope, optional caller-supplied cost evidence and an optional source commit. The
+  stored record also retains
   its native session label and an author token ID reference for authorization and retry handling
-  (not the token secret). Insight responses omit those session labels and token references. The Hub does not capture prompts, responses or transcript contents for this feature.
+  (not the token secret). Insight responses omit those session labels and token references. The Hub
+  does not capture prompts, responses or transcript contents for this feature. Session-cumulative
+  observations are retained separately and excluded from insight totals.
 
 - People: forge provider and host, numeric forge user id, login name, whether
   the account is disabled, and when it was created. No name, email address,

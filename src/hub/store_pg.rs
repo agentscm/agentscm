@@ -8,6 +8,14 @@ use postgres::config::{Host, SslMode};
 use postgres::{Client, Config, IsolationLevel, NoTls};
 use serde_json::json;
 
+use crate::change_record::{
+    ActionFinishV1, ActionMutationReceiptV1, ActionStartV1, CaptureBatchV1, CapturedEventKindV1,
+    CapturedEventV1, ChangeRecordSummaryV1, IngestReceiptV1,
+};
+
+use super::change_record::{
+    SessionStatsV1, StoredActionV1, StoredDecisionV1, project as project_change_record,
+};
 use super::connection::{
     CONNECTION_SELECT, ConnectedRepository, Connection as ForgeConnection, DELIVERY_KEEP_SECONDS,
     ForgeCheck, ForgeCheckReserve, MergeGroup, NewConnection, NewForgeCheck, NewMergeGroup,
@@ -81,6 +89,10 @@ const WORK_CAPACITY_LOCK_CLASS: i32 = 0x6167_6579;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TCP_USER_TIMEOUT: Duration = Duration::from_secs(15);
 const KEEPALIVES_IDLE: Duration = Duration::from_secs(30);
+
+const MAX_CHANGE_EVENTS_PER_SESSION: i64 = 100_000;
+const MAX_CHANGE_ACTIONS_PER_WORK: i64 = 10_000;
+const MAX_CHANGE_OPERATIONS_PER_WORK: i64 = 120_000;
 
 // shortcut: one serialized connection, no pool; upgrade when hub load needs concurrent DB work
 pub(super) struct PgStore {
@@ -393,14 +405,14 @@ fn pg_usage_summary(
     work: &str,
     group_limit: usize,
 ) -> Result<UsageSummary> {
-    let r=tx.query_one("SELECT COUNT(*)::bigint,SUM(input_tokens)::bigint,SUM(output_tokens)::bigint,COUNT(input_tokens)::bigint,COUNT(output_tokens)::bigint,COUNT(*) FILTER (WHERE cost_amount_micros IS NULL)::bigint,COUNT(*) FILTER (WHERE outcome='failed')::bigint FROM hub_work_model_usage WHERE work=$1",&[&work])?;
+    let r=tx.query_one("SELECT COUNT(*)::bigint,SUM(input_tokens)::bigint,SUM(output_tokens)::bigint,COUNT(input_tokens)::bigint,COUNT(output_tokens)::bigint,COUNT(*) FILTER (WHERE cost_amount_micros IS NULL)::bigint,COUNT(*) FILTER (WHERE outcome='failed')::bigint FROM hub_work_model_usage WHERE work=$1 AND COALESCE(request::jsonb->>'measurement_scope','request')<>'session_cumulative'",&[&work])?;
     let observations: i64 = r.get(0);
     let mut token_groups = Vec::new();
-    for r in tx.query("SELECT agent,model_provider,model,usage_basis,COUNT(*)::bigint,SUM(input_tokens)::bigint,SUM(output_tokens)::bigint,COUNT(input_tokens)::bigint,COUNT(output_tokens)::bigint FROM hub_work_model_usage WHERE work=$1 GROUP BY agent,model_provider,model,usage_basis ORDER BY agent COLLATE \"C\",model_provider COLLATE \"C\",model COLLATE \"C\",usage_basis COLLATE \"C\" LIMIT $2",&[&work,&((group_limit+1)as i64)])? {
+    for r in tx.query("SELECT agent,model_provider,model,usage_basis,COUNT(*)::bigint,SUM(input_tokens)::bigint,SUM(output_tokens)::bigint,COUNT(input_tokens)::bigint,COUNT(output_tokens)::bigint FROM hub_work_model_usage WHERE work=$1 AND COALESCE(request::jsonb->>'measurement_scope','request')<>'session_cumulative' GROUP BY agent,model_provider,model,usage_basis ORDER BY agent COLLATE \"C\",model_provider COLLATE \"C\",model COLLATE \"C\",usage_basis COLLATE \"C\" LIMIT $2",&[&work,&((group_limit+1)as i64)])? {
         let basis:String=r.get(3); token_groups.push(TokenGroup { agent:r.get(0),provider:r.get(1),model:r.get(2),usage_basis:serde_json::from_str(&format!("\"{basis}\"")).map_err(|e|HubError::Unavailable(e.to_string()))?,observations:r.get::<_,i64>(4) as usize,input_tokens:r.get(5),output_tokens:r.get(6),input_known_observations:r.get::<_,i64>(7) as usize,output_known_observations:r.get::<_,i64>(8) as usize });
     }
     let mut cost_groups = Vec::new();
-    for r in tx.query("SELECT cost_kind,cost_currency,cost_basis,usage_basis,agent,model_provider,model,SUM(cost_amount_micros)::bigint,COUNT(*)::bigint FROM hub_work_model_usage WHERE work=$1 AND cost_amount_micros IS NOT NULL GROUP BY cost_kind,cost_currency,cost_basis,usage_basis,agent,model_provider,model ORDER BY agent COLLATE \"C\",model_provider COLLATE \"C\",model COLLATE \"C\",usage_basis COLLATE \"C\",cost_kind COLLATE \"C\",cost_currency COLLATE \"C\",cost_basis COLLATE \"C\" LIMIT $2",&[&work,&((group_limit+1)as i64)])? {
+    for r in tx.query("SELECT cost_kind,cost_currency,cost_basis,usage_basis,agent,model_provider,model,SUM(cost_amount_micros)::bigint,COUNT(*)::bigint FROM hub_work_model_usage WHERE work=$1 AND cost_amount_micros IS NOT NULL AND COALESCE(request::jsonb->>'measurement_scope','request')<>'session_cumulative' GROUP BY cost_kind,cost_currency,cost_basis,usage_basis,agent,model_provider,model ORDER BY agent COLLATE \"C\",model_provider COLLATE \"C\",model COLLATE \"C\",usage_basis COLLATE \"C\",cost_kind COLLATE \"C\",cost_currency COLLATE \"C\",cost_basis COLLATE \"C\" LIMIT $2",&[&work,&((group_limit+1)as i64)])? {
         let kind:String=r.get(0); let usage_basis:String=r.get(3); cost_groups.push(CostGroup { kind:serde_json::from_str(&format!("\"{kind}\"")).map_err(|e|HubError::Unavailable(e.to_string()))?,currency:r.get(1),basis:r.get(2),usage_basis:serde_json::from_str(&format!("\"{usage_basis}\"")).map_err(|e|HubError::Unavailable(e.to_string()))?,agent:r.get(4),provider:r.get(5),model:r.get(6),amount_micros:r.get(7),observations:r.get::<_,i64>(8) as usize });
     }
     let groups_complete = token_groups.len() <= group_limit && cost_groups.len() <= group_limit;
@@ -985,6 +997,44 @@ fn unfinished_for_session(
     if rows.len() > 1 {
         return Err(HubError::Invalid(
             "session is lead for more than one unfinished work item".into(),
+        ));
+    }
+    rows.first()
+        .map(|row| {
+            let snapshot: String = row.get(0);
+            let mut item: WorkItem = json_value(&snapshot)?;
+            project_claim(tx, &mut item, now)?;
+            Ok(item)
+        })
+        .transpose()
+}
+
+fn active_capture_work_for_session(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    session: &str,
+    now: i64,
+) -> Result<Option<WorkItem>> {
+    let rows = tx.query(
+        "SELECT item.snapshot FROM hub_work_items item
+         JOIN hub_work_participants participant ON participant.work=item.id
+         WHERE item.provider=$1 AND item.host=$2 AND item.repository=$3
+           AND item.repository_id IS NOT DISTINCT FROM $4 AND item.state='active'
+           AND participant.token=$5 AND participant.session=$6
+           AND participant.generation=item.generation
+         ORDER BY item.id LIMIT 2",
+        &[
+            &who.owner.identity.provider,
+            &who.owner.identity.host,
+            &who.repository,
+            &who.repository_id,
+            &who.token,
+            &session,
+        ],
+    )?;
+    if rows.len() > 1 {
+        return Err(HubError::Invalid(
+            "session participates in more than one active work item".into(),
         ));
     }
     rows.first()
@@ -5357,6 +5407,27 @@ impl Store for PgStore {
                     item.updated_seq
                 )));
             }
+            for source in &checkpoint.source_refs {
+                if let SourceRef::PriorWorkVersion { work_id, event_seq } = source {
+                    if work_id != &checkpoint.work_id {
+                        return Err(HubError::Invalid(
+                            "prior work version must reference the checkpoint work".into(),
+                        ));
+                    }
+                    let retained = tx
+                        .query_opt(
+                            "SELECT 1 FROM hub_work_versions
+                             WHERE work = $1 AND event_seq = $2 AND event_seq <= $3",
+                            &[work_id, event_seq, &item.updated_seq],
+                        )?
+                        .is_some();
+                    if !retained {
+                        return Err(HubError::Invalid(
+                            "prior work version is unavailable".into(),
+                        ));
+                    }
+                }
+            }
             if let Some(scope) = checkpoint.normalized_scope()? {
                 let overlaps = work_scope_overlaps(&mut tx, &who, &scope, Some(&item.id), now)?;
                 if !overlaps.is_empty() {
@@ -5475,6 +5546,158 @@ impl Store for PgStore {
         })
     }
 
+    fn change_ingest(
+        &self,
+        token: &str,
+        batch: &CaptureBatchV1,
+        now: i64,
+    ) -> Result<IngestReceiptV1> {
+        batch.validate()?;
+        let request = json_string(batch)?;
+        let identity = json_string(&batch.session)?;
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            if who.read_only {
+                return Err(HubError::Unauthorized);
+            }
+            let item = scoped_work(&mut tx, &who, &batch.work_id, now, true)?
+                .ok_or_else(|| HubError::Invalid("unknown work".into()))?;
+            if let Some(row)=tx.query_opt("SELECT author_token,kind,request,response FROM hub_change_operations WHERE work=$1 AND operation_id=$2",&[&batch.work_id,&batch.operation_id])? {
+                let author:String=row.get(0);let kind:String=row.get(1);let retained:String=row.get(2);let response:String=row.get(3);
+                if author==token&&kind=="event_batch"&&retained==request {let mut receipt:IngestReceiptV1=json_value(&response)?;receipt.replayed=true;tx.commit()?;return Ok(receipt);}
+                return Err(HubError::Invalid("operation_id is already used by a different capture request".into()));
+            }
+            if item.state != WorkState::Active || item.generation != batch.generation {
+                return Err(HubError::Invalid("capture work is no longer current".into()));
+            }
+            if tx.query_opt("SELECT 1 FROM hub_work_participants WHERE work=$1 AND token=$2 AND session=$3 AND generation=$4",&[&batch.work_id,&token,&batch.session.session_id,&batch.generation])?.is_none() {
+                return Err(HubError::Invalid("capture session is not a current work participant".into()));
+            }
+            if let Some(row)=tx.query_opt("SELECT identity FROM hub_change_sessions WHERE work=$1 AND generation=$2 AND session_id=$3 FOR UPDATE",&[&batch.work_id,&batch.generation,&batch.session.session_id])? {
+                if row.get::<_,String>(0)!=identity {return Err(HubError::Invalid("capture session identity changed".into()));}
+            } else {
+                let first=batch.events[0].observed_at;
+                tx.execute("INSERT INTO hub_change_sessions (work,session_id,generation,identity,watermark,event_count,gap_count,started,ended,start_sequence,end_sequence,lifecycle_valid,first_observed_at,last_observed_at,updated_at) VALUES ($1,$2,$3,$4,0,0,0,FALSE,FALSE,NULL,NULL,FALSE,$5,$5,$6)",&[&batch.work_id,&batch.session.session_id,&batch.generation,&identity,&first,&now])?;
+            }
+            let mut accepted=0_usize;let mut duplicate=0_usize;let mut new_event_bytes=0_i64;let mut watermark=0_u64;let mut gap_count=0_usize;let mut last_observed=0_i64;
+            for event in &batch.events {
+                let encoded=json_string(event)?;
+                if let Some(row)=tx.query_opt("SELECT sequence,event FROM hub_change_events WHERE work=$1 AND generation=$2 AND session_id=$3 AND event_id=$4",&[&batch.work_id,&batch.generation,&batch.session.session_id,&event.event_id])? {
+                    if row.get::<_,i64>(0)==event.sequence as i64&&row.get::<_,String>(1)==encoded {duplicate+=1;watermark=watermark.max(event.sequence);continue;}
+                    return Err(HubError::Invalid("event_id is already used by different capture data".into()));
+                }
+                let sequence=event.sequence as i64;
+                if tx.query_opt("SELECT 1 FROM hub_change_events WHERE work=$1 AND generation=$2 AND session_id=$3 AND sequence=$4",&[&batch.work_id,&batch.generation,&batch.session.session_id,&sequence])?.is_some(){return Err(HubError::Invalid("capture sequence is already used by another event".into()));}
+                tx.execute("INSERT INTO hub_change_events (work,generation,session_id,event_id,sequence,event,observed_at) VALUES ($1,$2,$3,$4,$5,$6,$7)",&[&batch.work_id,&batch.generation,&batch.session.session_id,&event.event_id,&sequence,&encoded,&event.observed_at])?;
+                accepted+=1;new_event_bytes=new_event_bytes.checked_add(work_payload_row_bytes(encoded.len())?).ok_or_else(||HubError::Invalid("change capture size is too large".into()))?;gap_count+=usize::from(event.gap.is_some());watermark=watermark.max(event.sequence);last_observed=last_observed.max(event.observed_at);
+            }
+            let rows=tx.query("SELECT sequence,event FROM hub_change_events WHERE work=$1 AND generation=$2 AND session_id=$3 ORDER BY sequence",&[&batch.work_id,&batch.generation,&batch.session.session_id])?;
+            let mut start_sequences=Vec::new();let mut end_sequences=Vec::new();
+            for row in &rows {let sequence:i64=row.get(0);let encoded:String=row.get(1);let retained:CapturedEventV1=json_value(&encoded)?;match retained.kind{CapturedEventKindV1::SessionStarted=>start_sequences.push(sequence),CapturedEventKindV1::SessionEnded=>end_sequences.push(sequence),_=>{}}}
+            let retained_watermark=rows.last().map_or(0,|row|row.get::<_,i64>(0));let retained_events=rows.len() as i64;
+            let start_sequence=(start_sequences.len()==1).then(||start_sequences[0]);let end_sequence=(end_sequences.len()==1).then(||end_sequences[0]);let lifecycle_valid=start_sequence==Some(1)&&end_sequence==Some(retained_watermark)&&retained_watermark>1;let gaps_i64=gap_count as i64;
+            tx.execute("UPDATE hub_change_sessions SET watermark=$4,event_count=$5,gap_count=gap_count+$6,started=$7,ended=$8,start_sequence=$9,end_sequence=$10,lifecycle_valid=$11,last_observed_at=GREATEST(last_observed_at,$12),updated_at=$13 WHERE work=$1 AND generation=$2 AND session_id=$3",&[&batch.work_id,&batch.generation,&batch.session.session_id,&retained_watermark,&retained_events,&gaps_i64,&start_sequence.is_some(),&end_sequence.is_some(),&start_sequence,&end_sequence,&lifecycle_valid,&last_observed,&now])?;
+            let retained_operations:i64=tx.query_one("SELECT COUNT(*)::bigint FROM hub_change_operations WHERE work=$1",&[&batch.work_id])?.get(0);
+            if retained_events>MAX_CHANGE_EVENTS_PER_SESSION||retained_operations>=MAX_CHANGE_OPERATIONS_PER_WORK{return Err(HubError::WorkCapacity);}
+            let capture_bytes=work_payload_row_bytes(request.len())?.checked_add(new_event_bytes).ok_or_else(||HubError::Invalid("change capture size is too large".into()))?;
+            adjust_work_payload_capacity(&mut tx,&who,capture_bytes,now)?;
+            let receipt=IngestReceiptV1{work_id:batch.work_id.clone(),operation_id:batch.operation_id.clone(),accepted,duplicate,watermark:retained_watermark as u64,replayed:false};
+            tx.execute("INSERT INTO hub_change_operations (work,operation_id,author_token,kind,request,response,received_at) VALUES ($1,$2,$3,'event_batch',$4,$5,$6)",&[&batch.work_id,&batch.operation_id,&token,&request,&json_string(&receipt)?,&now])?;
+            tx.commit()?;Ok(receipt)
+        })
+    }
+
+    fn change_action_start(
+        &self,
+        token: &str,
+        start: &ActionStartV1,
+        now: i64,
+    ) -> Result<ActionMutationReceiptV1> {
+        start.validate()?;
+        let request = json_string(start)?;
+        if start.started_at > now.saturating_add(300) {
+            return Err(HubError::Invalid(
+                "action start time is too far in the future".into(),
+            ));
+        }
+        self.run(false,|client|{let mut tx=client.transaction()?;let who=work_who(&mut tx,token,now)?;if who.read_only{return Err(HubError::Unauthorized);}let item=scoped_work(&mut tx,&who,&start.work_id,now,true)?.ok_or_else(||HubError::Invalid("unknown work".into()))?;
+            if let Some(row)=tx.query_opt("SELECT author_token,kind,request,response FROM hub_change_operations WHERE work=$1 AND operation_id=$2",&[&start.work_id,&start.operation_id])?{let author:String=row.get(0);let kind:String=row.get(1);let retained:String=row.get(2);let response:String=row.get(3);if author==token&&kind=="action_start"&&retained==request{let mut receipt:ActionMutationReceiptV1=json_value(&response)?;receipt.replayed=true;tx.commit()?;return Ok(receipt);}return Err(HubError::Invalid("operation_id is already used by a different action request".into()));}
+            if item.state!=WorkState::Active||item.generation!=start.generation{return Err(HubError::Invalid("action work is no longer current".into()));}
+            if start.source.repository()!=who.repository{return Err(HubError::Invalid("action source belongs to another repository".into()));}
+            if tx.query_opt("SELECT 1 FROM hub_work_participants WHERE work=$1 AND token=$2 AND session=$3 AND generation=$4",&[&start.work_id,&token,&start.session_id,&start.generation])?.is_none(){return Err(HubError::Invalid("action session is not a current work participant".into()));}
+            if tx.query_opt("SELECT 1 FROM hub_change_actions WHERE work=$1 AND action_id=$2",&[&start.work_id,&start.action_id])?.is_some(){return Err(HubError::Invalid("action_id is already used".into()));}
+            let action_count:i64=tx.query_one("SELECT COUNT(*)::bigint FROM hub_change_actions WHERE work=$1",&[&start.work_id])?.get(0);let operation_count:i64=tx.query_one("SELECT COUNT(*)::bigint FROM hub_change_operations WHERE work=$1",&[&start.work_id])?.get(0);if action_count>=MAX_CHANGE_ACTIONS_PER_WORK||operation_count>=MAX_CHANGE_OPERATIONS_PER_WORK{return Err(HubError::WorkCapacity);}
+            let capture_bytes=work_payload_row_bytes(request.len())?.checked_mul(2).ok_or_else(||HubError::Invalid("change capture size is too large".into()))?;adjust_work_payload_capacity(&mut tx,&who,capture_bytes,now)?;
+            let received_order:i64=tx.query_one("SELECT COALESCE(MAX(received_order),0)+1 FROM hub_change_actions WHERE work=$1",&[&start.work_id])?.get(0);
+            let source_id=start.source.stable_id()?;let source_kind=enum_name(&start.source.kind())?;
+            tx.execute("INSERT INTO hub_change_actions (work,action_id,generation,session_id,author_token,source_id,source_kind,start_request,started_at,received_at,received_order,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$10)",&[&start.work_id,&start.action_id,&start.generation,&start.session_id,&token,&source_id,&source_kind,&request,&start.started_at,&now,&received_order])?;
+            let receipt=ActionMutationReceiptV1{work_id:start.work_id.clone(),operation_id:start.operation_id.clone(),action_id:start.action_id.clone(),replayed:false};tx.execute("INSERT INTO hub_change_operations (work,operation_id,author_token,kind,request,response,received_at) VALUES ($1,$2,$3,'action_start',$4,$5,$6)",&[&start.work_id,&start.operation_id,&token,&request,&json_string(&receipt)?,&now])?;tx.commit()?;Ok(receipt)})
+    }
+
+    fn change_action_finish(
+        &self,
+        token: &str,
+        finish: &ActionFinishV1,
+        now: i64,
+    ) -> Result<ActionMutationReceiptV1> {
+        finish.validate()?;
+        if finish.assurance != crate::change_record::AssuranceBasisV1::CallerAsserted {
+            return Err(HubError::Invalid(
+                "agent capture can only record caller_asserted assurance".into(),
+            ));
+        }
+        let request = json_string(finish)?;
+        if finish.finished_at > now.saturating_add(300) {
+            return Err(HubError::Invalid(
+                "action finish time is too far in the future".into(),
+            ));
+        }
+        self.run(false,|client|{let mut tx=client.transaction()?;let who=work_who(&mut tx,token,now)?;if who.read_only{return Err(HubError::Unauthorized);}let item=scoped_work(&mut tx,&who,&finish.work_id,now,true)?.ok_or_else(||HubError::Invalid("unknown work".into()))?;
+            if let Some(row)=tx.query_opt("SELECT author_token,kind,request,response FROM hub_change_operations WHERE work=$1 AND operation_id=$2",&[&finish.work_id,&finish.operation_id])?{let author:String=row.get(0);let kind:String=row.get(1);let retained:String=row.get(2);let response:String=row.get(3);if author==token&&kind=="action_finish"&&retained==request{let mut receipt:ActionMutationReceiptV1=json_value(&response)?;receipt.replayed=true;tx.commit()?;return Ok(receipt);}return Err(HubError::Invalid("operation_id is already used by a different action request".into()));}
+            if item.state!=WorkState::Active||item.generation!=finish.generation{return Err(HubError::Invalid("action work is no longer current".into()));}
+            let row=tx.query_opt("SELECT author_token,generation,started_at,finish_request,start_request FROM hub_change_actions WHERE work=$1 AND action_id=$2 FOR UPDATE",&[&finish.work_id,&finish.action_id])?.ok_or_else(||HubError::Invalid("unknown action".into()))?;let author:String=row.get(0);let generation:i64=row.get(1);let started_at:i64=row.get(2);let already:Option<String>=row.get(3);let start_request:String=row.get(4);if author!=token||generation!=finish.generation{return Err(HubError::Invalid("action finish author or generation changed".into()));}let retained_start:ActionStartV1=json_value(&start_request)?;if retained_start.kind==crate::change_record::ActionKindV1::Execution&&finish.result!=crate::change_record::CheckResultV1::Unknown{return Err(HubError::Invalid("execution actions cannot assert verification results".into()));}
+            if retained_start.kind==crate::change_record::ActionKindV1::Verification&&retained_start.recipe_provenance!=crate::change_record::RecipeProvenanceV1::ConfiguredExactMatch&&matches!(finish.result,crate::change_record::CheckResultV1::Passed|crate::change_record::CheckResultV1::Failed){return Err(HubError::Invalid("verification result requires an exact configured recipe".into()));}
+            if already.is_some(){return Err(HubError::Invalid("action is already finished".into()));}
+            if finish.finished_at<started_at{return Err(HubError::Invalid("action finish precedes its start".into()));}
+            let operation_count:i64=tx.query_one("SELECT COUNT(*)::bigint FROM hub_change_operations WHERE work=$1",&[&finish.work_id])?.get(0);if operation_count>=MAX_CHANGE_OPERATIONS_PER_WORK{return Err(HubError::WorkCapacity);}let capture_bytes=work_payload_row_bytes(request.len())?.checked_mul(2).ok_or_else(||HubError::Invalid("change capture size is too large".into()))?;adjust_work_payload_capacity(&mut tx,&who,capture_bytes,now)?;
+            tx.execute("UPDATE hub_change_actions SET finish_request=$3,finished_at=$4,updated_at=$5 WHERE work=$1 AND action_id=$2",&[&finish.work_id,&finish.action_id,&request,&finish.finished_at,&now])?;let receipt=ActionMutationReceiptV1{work_id:finish.work_id.clone(),operation_id:finish.operation_id.clone(),action_id:finish.action_id.clone(),replayed:false};tx.execute("INSERT INTO hub_change_operations (work,operation_id,author_token,kind,request,response,received_at) VALUES ($1,$2,$3,'action_finish',$4,$5,$6)",&[&finish.work_id,&finish.operation_id,&token,&request,&json_string(&receipt)?,&now])?;tx.commit()?;Ok(receipt)})
+    }
+
+    fn change_record(
+        &self,
+        token: &str,
+        work_id: &str,
+        now: i64,
+    ) -> Result<Option<ChangeRecordSummaryV1>> {
+        self.run(true,|client|{let mut tx=client.build_transaction().isolation_level(IsolationLevel::RepeatableRead).start()?;let who=work_who(&mut tx,token,now)?;let Some(item)=scoped_work(&mut tx,&who,work_id,now,false)? else {tx.commit()?;return Ok(None)};
+            let row=tx.query_one("SELECT COUNT(*)::bigint,COALESCE(SUM(gap_count + CASE WHEN watermark > event_count THEN watermark-event_count ELSE 0 END),0)::bigint,COALESCE(COUNT(*) FILTER (WHERE lifecycle_valid AND start_sequence=1 AND end_sequence=watermark),0)::bigint FROM hub_change_sessions WHERE work=$1 AND generation=$2",&[&work_id,&item.generation])?;let count:i64=row.get(0);let gaps:i64=row.get(1);let complete:i64=row.get(2);
+            let setup_observations:i64=tx.query_one("SELECT COUNT(*)::bigint FROM hub_change_events WHERE work=$1 AND generation=$2 AND event::jsonb ? 'setup'",&[&work_id,&item.generation])?.get(0);
+            let usage_observations:i64=tx.query_one("SELECT COUNT(*)::bigint FROM hub_work_model_usage WHERE work=$1 AND generation=$2",&[&work_id,&item.generation])?.get(0);
+            let action=tx.query_opt("WITH scoped AS (
+                    SELECT a.*,
+                        COALESCE((a.start_request::jsonb->>'observed_order')::bigint,0) AS observed_order,
+                        a.start_request::jsonb->>'observation_scope_id' AS observation_scope_id,
+                        COALESCE(a.start_request::jsonb->>'observation_scope_id',a.action_id) AS scope_key
+                    FROM hub_change_actions a WHERE a.work=$1 AND a.generation=$2
+                ), scope_state AS (
+                    SELECT scoped.*,
+                        MIN(CASE WHEN observation_scope_id IS NOT NULL AND observed_order>0 THEN 1 ELSE 0 END)
+                            OVER (PARTITION BY scope_key,session_id) AS all_ordered
+                    FROM scoped
+                ), ranked AS (
+                    SELECT scope_state.*,
+                        ROW_NUMBER() OVER (PARTITION BY scope_key,session_id ORDER BY
+                            CASE WHEN all_ordered=1 THEN observed_order ELSE received_order END DESC,
+                            received_order DESC) AS scope_rank
+                    FROM scope_state
+                )
+                SELECT start_request,finish_request,source_id FROM ranked
+                WHERE scope_rank=1 ORDER BY received_order DESC LIMIT 1",&[&work_id,&item.generation])?.map(|r| -> Result<StoredActionV1> {let start:String=r.get(0);let finish:Option<String>=r.get(1);Ok(StoredActionV1{start:json_value(&start)?,finish:finish.map(|value|json_value(&value)).transpose()?,source_id:r.get(2)})}).transpose()?;
+            let decision=tx.query_opt("SELECT event_seq,snapshot::text FROM hub_work_versions WHERE work=$1 AND snapshot::jsonb #>> '{current,kind}'='decision' ORDER BY event_seq DESC LIMIT 1",&[&work_id])?.map(|r| -> Result<StoredDecisionV1> {let retained:WorkItem=json_value(&r.get::<_,String>(1))?;Ok(StoredDecisionV1{event_seq:r.get(0),checkpoint:retained.current.ok_or_else(||HubError::Unavailable("retained decision checkpoint is missing".into()))?})}).transpose()?;
+            let summary=project_change_record(&item,SessionStatsV1{count:count as usize,gap_count:gaps as usize,complete_count:complete as usize,setup_observation_count:setup_observations as usize,usage_observation_count:usage_observations as usize},action,decision,now);tx.commit()?;Ok(Some(summary))})
+    }
+
     fn work_usage(&self, token: &str, usage: &UsageRecord, now: i64) -> Result<UsageReceipt> {
         usage.validate()?;
         let request = json_string(usage)?;
@@ -5528,6 +5751,22 @@ impl Store for PgStore {
             let mut tx = client.transaction()?;
             let who = work_who(&mut tx, token, now)?;
             let item = unfinished_for_session(&mut tx, &who, session, now)?;
+            tx.commit()?;
+            Ok(item)
+        })
+    }
+
+    fn capture_work_for_session(
+        &self,
+        token: &str,
+        session: &str,
+        now: i64,
+    ) -> Result<Option<WorkItem>> {
+        super::intent::text("session", session, 255)?;
+        self.run(true, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            let item = active_capture_work_for_session(&mut tx, &who, session, now)?;
             tx.commit()?;
             Ok(item)
         })

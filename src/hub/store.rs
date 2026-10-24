@@ -5,6 +5,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
+use crate::change_record::{
+    ActionFinishV1, ActionMutationReceiptV1, ActionStartV1, CaptureBatchV1, ChangeRecordSummaryV1,
+    IngestReceiptV1,
+};
+
 use super::connection::{
     ConnectedRepository, Connection, ForgeCheck, ForgeCheckReserve, MergeGroup, NewConnection,
     NewForgeCheck, NewMergeGroup, Observation, Observed, Outbound,
@@ -491,11 +496,42 @@ pub trait Store: Send + Sync {
         now: i64,
     ) -> Result<WorkCheckpointResult>;
     fn work_get(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkItem>>;
+    fn change_ingest(
+        &self,
+        token: &str,
+        batch: &CaptureBatchV1,
+        now: i64,
+    ) -> Result<IngestReceiptV1>;
+    fn change_action_start(
+        &self,
+        token: &str,
+        start: &ActionStartV1,
+        now: i64,
+    ) -> Result<ActionMutationReceiptV1>;
+    fn change_action_finish(
+        &self,
+        token: &str,
+        finish: &ActionFinishV1,
+        now: i64,
+    ) -> Result<ActionMutationReceiptV1>;
+    fn change_record(
+        &self,
+        token: &str,
+        work_id: &str,
+        now: i64,
+    ) -> Result<Option<ChangeRecordSummaryV1>>;
     fn work_usage(&self, token: &str, usage: &UsageRecord, now: i64) -> Result<UsageReceipt>;
     fn work_insight(&self, token: &str, id: &str, now: i64) -> Result<Option<WorkInsight>>;
     fn work_insights(&self, token: &str, query: &InsightQuery, now: i64) -> Result<InsightPage>;
     /// The token/session's one unfinished lead claim. Multiple matches are invalid.
     fn work_for_session(&self, token: &str, session: &str, now: i64) -> Result<Option<WorkItem>>;
+    /// The token/session's unique active participant claim for native change capture.
+    fn capture_work_for_session(
+        &self,
+        token: &str,
+        session: &str,
+        now: i64,
+    ) -> Result<Option<WorkItem>>;
     /// Resolve the explicit or most recently touched session without touching it.
     fn session_name_for(&self, token: &str, session: Option<&str>, now: i64) -> Result<String>;
     fn work_briefing(&self, token: &str, query: &BriefingQuery, now: i64) -> Result<Briefing>;

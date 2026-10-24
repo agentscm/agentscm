@@ -17,6 +17,144 @@ Every command accepts `--data-dir`; its default is `.agentscm`. The global `--no
 - `hook` reads an agent's hook JSON on standard input and prints that agent's reply; it always exits 0, even on usage errors, and prints a valid "no information" reply when the hub cannot be consulted. `init-repo` prints plain text, shows a diff and asks before writing; without a terminal it needs `--yes`. See [supported agents](../agents.md).
 - `quickstart` and `uninstall` are guided and print plain text. Without a terminal they need `--yes`; otherwise they refuse and list their flags. `uninstall` exits nonzero when it could not undo something, and keeps its record of it.
 
+### `work`
+
+`agentscm work start` and `agentscm work checkpoint` read strict JSON requests from a file or
+standard input. Checkpoint `source_refs` accept repository paths, commit identities, Work
+identities, declared captured-event metadata and exact prior versions of the checkpoint's own Work:
+
+```json
+[
+  {"kind":"captured_event","session_id":"session-1","event_id":"message:42"},
+  {"kind":"prior_work_version","work_id":"wrk_0123456789abcdef0123456789abcdef","event_seq":91}
+]
+```
+
+Captured-event identities are declarations; the CLI and Hub do not fetch or verify a conversation
+body. A prior-Work version can explicitly identify the checkpoint being corrected or superseded.
+The Hub requires that exact same-Work version to exist when first recording the checkpoint, while
+an exact operation replay continues to return its original receipt. See [stand-up and handover](../standup.md).
+
+### `change-capture` (experimental, Unix)
+
+After `agentscm client connect` has saved a write-capable connection for a checkout, configure its
+Claude Code capture hooks once:
+
+```sh
+agentscm change-capture configure \
+  --root /absolute/repository \
+  --spool /absolute/private/spool \
+  --worktree-id checkout_example \
+  --base-ref origin/main \
+  --setup-digest 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --capture-mode metadata-only \
+  --max-spool-records 4096 \
+  --max-spool-bytes 67108864 \
+  --max-artifact-bytes 16777216 \
+  --action-rule Bash=execution:partial:process_exit_code \
+  --action-rule Write=execution:unknown:unverified \
+  --recipe-file /absolute/private/test-recipe.json
+```
+
+A recipe file is private mode-0600 JSON with `id`, an absolute-executable `argv`, `coverage`,
+`timeout_seconds` and `max_output_bytes`. Configuration accepts at most 16 distinct recipe ids and
+digests and requires at least 48 private spool records and 65536 total spool bytes when a recipe is
+configured. On `SessionStart`, the hook supplies bounded guidance containing the exact absolute
+`agentscm change-capture run-recipe --id ...` invocation. The managed command accepts no command,
+source, Work, generation or result overrides; it requires Claude's child-session marker and session
+identity, the configured repository root as its current directory, and an exact current authorized
+target before it starts the child. It clears the child environment and restores only the bounded
+local execution allowlist described in the capture guide. Its real child exit status determines a
+caller-asserted configured-check result. Ordinary direct Bash remains an execution with unknown
+verification. The Hub does not provide a trusted recipe registry or independent assurance.
+SIGINT and SIGTERM cancel and reap the runner's owned child process group and retain an incomplete
+receipt. A hard kill or process crash can leave only the already-durable start; it does not turn
+that invocation into a passing result or authorize an automatic rerun. The retained uncertainty
+fences the same Work, checkout and recipe across session, generation, source and setup changes.
+After verifying that the same local host has rebooted, run the same visible command with
+`reconcile-recipe` in place of `run-recipe`. Reconciliation records the original attempt as
+incomplete with an unknown result before another run is allowed. A same-boot, foreign-host or
+missing host/boot identity remains unresolved; the local runner does not claim general subprocess
+containment.
+
+Recipe execution and reconciliation serialize through one checkout-wide local lock for the
+configured root, repository and worktree. A concurrent reconcile response reports
+`reason: "checkout_in_use"` and `scope: "configured_checkout"`; this broader lock does not mean
+the requested Work or recipe already has an attempt. Unresolved attempts remain separately fenced
+by Work, checkout and recipe and continue to require current authorization.
+
+The command preserves unrelated hooks. Each installed hook resolves the current authorized Work
+and generation for its native session, appends to the private spool, then attempts bounded ordered
+delivery through the saved connection. `metadata-only` is the default. `local-conversation` retains
+selected visible bodies only in the spool; they are not placed in shared envelopes.
+
+Execution success is not a passing verification. An exact verification rule has the form
+`Bash=verification:complete:process_exit_code:<lowercase-sha256>`. The local client reports
+`passed` or `failed` only for an exact configured recipe match. The Hub retains that as a
+caller-asserted claim; it does not have an independent recipe registry. Setup and recipe digests are
+bounded identities and do not establish complete provenance. Read the shared projection without
+changing Hub state with:
+
+```sh
+agentscm change-capture show --root /absolute/repository --work-id wrk_example
+agentscm change-capture status --root /absolute/repository
+agentscm change-capture inspect --spool /absolute/private/spool
+agentscm change-capture export --spool /absolute/private/spool --destination /absolute/private/archive
+agentscm change-capture reconcile-recipe --id RECIPE_ID
+agentscm change-capture pending --spool /absolute/private/spool
+agentscm change-capture deferred --spool /absolute/private/spool
+agentscm change-capture quarantine --spool /absolute/private/spool
+agentscm change-capture prune-quarantine --spool /absolute/private/spool OPAQUE_NAME
+agentscm change-capture compact --spool /absolute/private/spool --limit 100
+agentscm change-capture settings-recovery --root /absolute/repository
+agentscm change-capture unconfigure --root /absolute/repository
+```
+
+`inspect` is a bounded read-only view. It does not recover, clean, change modes, acquire mutation
+authority, or make a copied spool resumable. `export` copies bounded local evidence to a new private
+archive and likewise grants no authority; it refuses the export before creating the destination if
+any source file exceeds the 64 MiB exact-hash limit. A checkout's first successful configuration retains the
+exact v4 spool identity and namespace as its safety lineage. Later configuration may update rules,
+recipes, setup and equal-or-larger limits only when that same identity is present, including after
+an identity-preserving offline path move. Guarded identity checks refuse a replacement inode, legacy
+or partial spool, namespace change, or lower limit before that guarded operation mutates capture
+state. Live moves, restores, and replacements are unsupported; a change is detected when a guarded
+path check observes it, rather than by continuous path containment. `unconfigure` removes the marked
+hooks and disables new capture while retaining this lineage; configuring the same checkout against
+a different spool is unavailable in this version. `status` reports active, disabled, or paused state
+and embeds the read-only inspection result. A disabled binding can still reconcile an already
+retained uncertain recipe attempt when current authorization and the existing reboot proof allow
+it; it cannot start a new recipe. At most 128 checkout lineages are retained in this local config;
+disabled lineages are not silently evicted to make room.
+
+`reconcile-recipe` looks up the retained attempt by recipe id under the Work that is currently
+authorized for the native session. It does not require that recipe to remain in the current
+configuration and never executes it. An uncertain attempt retained for a different Work remains
+blocked and visible through inspection; the command does not redirect it to the current Work or
+invent authorization for the historical Work.
+
+Spool limits are stored with the checkout binding. `pending` excludes an outbox envelope only when
+its regular acknowledgement marker contains the exact envelope digest. `compact` removes only
+exactly acknowledged envelope bytes and retains bounded replay/conflict facts, provider usage and
+completed action receipts. If a concurrent
+settings writer or interrupted settings transaction leaves recovery material, `settings-recovery`
+lists it. Restore one inspected displaced inode with `--restore TRANSACTION`; remove only unchanged
+entries with `--prune-unchanged`. Reconcile an inspected crash plus late-editor write with
+`--reconcile-changed TRANSACTION`; the command preserves the active settings and retained late
+bytes, and later writes block again until another explicit reconciliation. Late editor writes are
+retained and never pruned automatically. `quarantine` lists bounded invalid crash remnants, and
+`prune-quarantine` deletes only exact opaque names copied from that listing.
+
+`show` returns the same at-most-48-KiB projection as HTTP and MCP. It includes at most 16 retained
+scope entries and 16 retained decision references; exact `scope_omitted` and
+`source_refs_omitted` counts identify any trailing entries removed to fit the envelope.
+
+`pending` shows shareable queued envelopes. `deferred` shows sanitized hooks that could not resolve
+current authorized Work and will never be rewritten into an associated action. `observe` and
+`import-claude` are explicit local operations; run their `--help` before supplying source, session
+and operation identities. See [local change capture](../change-capture.md) for privacy, source and
+qualification limits. Real-host and complete integrated qualification remain pending.
+
 ### `attached-worktree` (experimental, Unix)
 
 `attach`, `state`, `capture` and `refresh` retain the Git-authoritative source lifecycle described in the [attached worktree guide](../advanced/attached-git-worktrees.md). `preview` uses the shared bounded selector without consuming an operation ID. `bind-context` joins an existing Authority Change; `compare` checks source/target/context/policy/evidence; `prepare --operation-id ID` retains a fixed typed unlanded commit in an owned mirror. `publish-branch` uses the attachment's endpoint through Mirror's local/HTTPS transport, explicit credentials/trust and an exact expected-OID lease; `recover-branch` observes an uncertain push. `publish-pr` uses the existing authenticated Hub bridge (GitHub PR or GitLab MR; see the [guide](../advanced/attached-git-worktrees.md)), with `--operation-id` naming the branch receipt and `--previous-publication` naming a prior PR association for continuation. `recover-pr --id ATTACHMENT --publication PUBLICATION_ID` only observes. Historical receipts do not imply current qualification. Run `agentscm attached-worktree COMMAND --help` for arguments.
