@@ -3408,6 +3408,24 @@ fn uninstall_removes_the_program_directory_quickstart_created() {
 }
 
 #[test]
+fn a_failed_agent_step_ends_non_zero_and_the_last_line_says_so() {
+    let (hub, machine) = (Hub::start(), Machine::transient().with_claude());
+    let repo = machine.repo();
+    let token = hub.token_file(machine.home.path());
+    // Fails when it cannot be asked about installed plugins, as a half-working install does.
+    let shim = machine.bin.path().join("claude");
+    let body = std::fs::read_to_string(&shim).unwrap();
+    std::fs::write(&shim, body.replacen("\n", "\ncase \"$*\" in *install*) exit 1;; esac\n", 1)).unwrap();
+    let output = machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"]));
+    let line = last_line(&output);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        line.starts_with("Live warnings: off — coding agent setup failed"),
+        "{line}"
+    );
+}
+
+#[test]
 fn uninstall_without_a_terminal_still_needs_yes_when_something_is_recorded() {
     let (hub, machine) = (Hub::start(), Machine::new().with_claude());
     let repo = machine.repo();

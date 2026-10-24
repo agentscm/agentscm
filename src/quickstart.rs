@@ -288,6 +288,8 @@ struct Live {
     wanted_agents: bool,
     /// The user answered no to "Go ahead?" for the agent setup.
     declined: bool,
+    /// Why setting up the coding agents failed.
+    agent_error: Option<String>,
     /// Why a requested local hub isn't running.
     hub_error: Option<String>,
     pending_local: Option<String>,
@@ -301,6 +303,12 @@ impl Live {
             return off(
                 "the local hub is waiting for GitHub App setup",
                 &format!("finish creating and installing the app, then run `{command}`"),
+            );
+        }
+        if let Some(error) = &self.agent_error {
+            return off(
+                &format!("coding agent setup failed: {error}"),
+                &format!("fix that, then run `{cli} quickstart` again"),
             );
         }
         if self.declined {
@@ -446,6 +454,11 @@ pub async fn run(args: QuickstartArgs) -> Result<u8> {
     }
     if cx.live.pending_local.is_some() {
         return Ok(3);
+    }
+    if cx.live.agent_error.is_some() {
+        return Err(invalid(
+            "setting up the coding agent failed; see the status and recovery instructions above",
+        ));
     }
     if (args.local
         || matches!(args.hub, Some(HubChoice::Local | HubChoice::Existing))
@@ -1211,6 +1224,7 @@ async fn agents_stage(cx: &mut Cx<'_>) {
     let _ = cx.manifest.save();
     if let Err(error) = result {
         println!("Couldn't finish setting up {names}: {}.", short(&error));
+        cx.live.agent_error = Some(short(&error));
     } else if cx.found.worktrees {
         println!(
             "Each Git worktree is its own checkout: in every worktree you start agents in, run `{} client setup --agent AGENT --hub {hub}`.",
