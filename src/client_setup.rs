@@ -604,7 +604,7 @@ pub(crate) fn preflight(agent: Agent, root: &Path, program: &Path) -> Result<()>
     Ok(())
 }
 
-fn ignore_new_file(root: &Path, relative: &str) -> Result<()> {
+fn exclude_path(root: &Path) -> Result<PathBuf> {
     let output = std::process::Command::new("git")
         .current_dir(root)
         .args(["rev-parse", "--git-path", "info/exclude"])
@@ -614,7 +614,16 @@ fn ignore_new_file(root: &Path, relative: &str) -> Result<()> {
     }
     let path =
         String::from_utf8(output.stdout).map_err(|_| invalid("Git exclude path is not UTF-8"))?;
-    let path = root.join(path.trim());
+    Ok(root.join(path.trim()))
+}
+
+/// Lists the exclude lines setup added, so removal takes out those and no others.
+fn added_excludes(exclude: &Path) -> PathBuf {
+    exclude.with_file_name("agentscm-excluded")
+}
+
+fn ignore_new_file(root: &Path, relative: &str) -> Result<()> {
+    let path = exclude_path(root)?;
     let text = read(&path)?.unwrap_or_default();
     let line = format!("/{relative}");
     if !text.lines().any(|existing| existing == line) {
@@ -627,10 +636,56 @@ fn ignore_new_file(root: &Path, relative: &str) -> Result<()> {
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(path)?;
+            .open(&path)?;
         file.write_all(format!("{prefix}{line}\n").as_bytes())?;
+        let mut record = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(added_excludes(&path))?;
+        record.write_all(format!("{line}\n").as_bytes())?;
     }
     Ok(())
+}
+
+/// Takes `relative` back out of the Git exclude if setup added it; a line that was already
+/// there is never touched.
+fn unignore_file(root: &Path, relative: &str) -> Result<()> {
+    let path = exclude_path(root)?;
+    let record = added_excludes(&path);
+    let line = format!("/{relative}");
+    let Some(recorded) = read(&record)? else {
+        return Ok(());
+    };
+    if !recorded.lines().any(|existing| existing == line) {
+        return Ok(());
+    }
+    let without = |text: &str| -> String {
+        text.lines()
+            .filter(|existing| *existing != line)
+            .map(|existing| format!("{existing}\n"))
+            .collect()
+    };
+    if let Some(text) = read(&path)? {
+        std::fs::write(&path, without(&text))?;
+    }
+    let rest = without(&recorded);
+    if rest.is_empty() {
+        std::fs::remove_file(&record)?;
+    } else {
+        std::fs::write(&record, rest)?;
+    }
+    Ok(())
+}
+
+/// Removes `path`'s parent directories that are now empty, stopping at the checkout root.
+fn prune_empty_parents(path: &Path, root: &Path) {
+    let mut dir = path.parent();
+    while let Some(d) = dir.filter(|d| *d != root && d.starts_with(root)) {
+        if std::fs::remove_dir(d).is_err() {
+            break;
+        }
+        dir = d.parent();
+    }
 }
 
 fn write_plan(root: &Path, edits: Vec<Edit>) -> Result<()> {
@@ -772,8 +827,8 @@ fn remove_files(agent: Agent, root: &Path) -> Result<()> {
             if relative.ends_with("SKILL.md") {
                 if text == SKILL || text == PREVIOUS_SKILL {
                     std::fs::remove_file(&path)?;
-                    // Only directories left empty go.
-                    let _ = path.parent().map(std::fs::remove_dir);
+                    prune_empty_parents(&path, root);
+                    unignore_file(root, relative)?;
                     println!("Removed {relative}");
                 }
                 continue;
@@ -803,6 +858,8 @@ fn remove_files(agent: Agent, root: &Path) -> Result<()> {
             }
             if after.trim().is_empty() {
                 std::fs::remove_file(&path)?;
+                prune_empty_parents(&path, root);
+                unignore_file(root, relative)?;
                 println!("Removed {relative}");
             } else {
                 crate::hub_cli::write_private(&path, &after)?;
@@ -1036,6 +1093,31 @@ mod tests {
                 .unwrap()
                 .success()
         );
+    }
+
+    #[test]
+    fn remove_takes_out_empty_directories_and_the_exclude_lines_setup_added() {
+        let (_dir, root) = repo();
+        let exclude = exclude_path(&root).unwrap();
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        std::fs::write(&exclude, "/mine\n/.gemini/settings.json\n").unwrap();
+        for agent in [Agent::Gemini, Agent::Cursor] {
+            let edits = plan(agent, &root, Path::new("/opt/agentscm")).unwrap();
+            write_plan(&root, edits).unwrap();
+        }
+        let text = std::fs::read_to_string(&exclude).unwrap();
+        assert!(text.contains("/.cursor/mcp.json"), "{text}");
+        for agent in [Agent::Gemini, Agent::Cursor] {
+            remove_files(agent, &root).unwrap();
+        }
+        assert!(root.is_dir());
+        assert!(!root.join(".cursor").exists() && !root.join(".gemini").exists());
+        // A line that was already there stays; only the added ones go.
+        assert_eq!(
+            std::fs::read_to_string(&exclude).unwrap(),
+            "/mine\n/.gemini/settings.json\n"
+        );
+        assert!(!added_excludes(&exclude).exists());
     }
 
     #[test]
