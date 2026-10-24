@@ -239,10 +239,9 @@ Before approving hooks or MCP configuration:
 3. Accept the coding client's own project, MCP and hook trust prompts. Generating or installing a
    plugin does not supply that approval.
 
-`agentscm quickstart` (Claude Code hooks only) and `agentscm client setup` (the path the Connect agents
-page uses) are separate paths with separate token and configuration stores. `agentscm uninstall` undoes
-quickstart; `agentscm client remove` undoes client setup. Only agents set up with `client setup` report
-on the Connect agents page.
+`agentscm quickstart` and `agentscm client setup` are one path: after its hub question and collision check, quickstart runs `client setup` for each coding agent (`--agent`, repeatable; Claude Code by default when the `claude` CLI is on `PATH`; `--no-agents` skips it). Agents set up either way appear on the Connect agents page. A client token lasts 30 days, the hub maximum. At a terminal, `client connect` and `client setup` wait for the hub's GitHub App to be installed on the repository: they print where to install it and wait for Enter. Each Git worktree is its own checkout and needs its own `client setup`.
+
+`agentscm client remove --root PATH` undoes `client setup` for one checkout: it takes the agents' entries out of the checkout's files, uninstalls the Claude Code or Codex plugin when no other connected checkout uses it, revokes the managed token (the token revokes itself through `DELETE /v1/hub/token`, so no sign-in is needed), then removes the connection and deletes the token file. If the token can't be revoked, it says so, exits non-zero and keeps the connection and token file so that running it again retries. `agentscm uninstall` runs `client remove` for every checkout quickstart connected, then undoes the rest of quickstart's setup.
 
 `agentscm init-repo` commits only shared agent instruction files (no MCP config, hooks or token). Each developer still runs `agentscm client setup --agent <agent> --hub <hub>` once per checkout, and the Connect agents page verifies the result.
 

@@ -505,7 +505,7 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
           const blocked = c.count('[data-tour="setup-sessions"] .setup-row .pill.tone-warn')
           return n === 0 ? null : blocked > 0 ? `${plural(blocked, 'session')} ${blocked === 1 ? 'is' : 'are'} Blocked. The line under each says what stops it.` : `${plural(n, 'session')} listed and none Blocked.`
         },
-        empty: 'Sessions appear here after an agent set up with agentscm client setup verifies itself. Agents from agentscm quickstart do not appear.',
+        empty: 'Sessions appear here once an agent set up with agentscm client setup or agentscm quickstart verifies itself.',
       },
       {
         target: T('setup-steps', 'setup-connect'),

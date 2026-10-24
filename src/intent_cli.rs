@@ -307,7 +307,8 @@ pub(crate) fn vet(url: &str, token_file: PathBuf) -> Result<(String, PathBuf)> {
 }
 
 /// The vetted URL and token file: the environment when both variables are set, else hub.json
-/// (with the token chosen for the checkout at `cwd`).
+/// (with the token chosen for the checkout at `cwd`). `Hub::connect_in` puts the checkout's
+/// client connection before hub.json.
 fn hub_config(
     env_url: Option<String>,
     env_file: Option<String>,
@@ -345,12 +346,20 @@ impl Hub {
                 invalid("no hub configured (run `agentscm quickstart` to connect one)")
             })
         };
-        let (url, token_file) = hub_config(
-            var("AGENTSCM_HUB_URL"),
-            var("AGENTSCM_HUB_TOKEN_FILE"),
-            read,
-            cwd,
-        )?;
+        let (env_url, env_file) = (var("AGENTSCM_HUB_URL"), var("AGENTSCM_HUB_TOKEN_FILE"));
+        // The checkout's `client setup` connection is more specific than hub.json.
+        let saved = (env_url.is_none() || env_file.is_none())
+            .then(|| {
+                let connections = crate::client_config::load().ok()?;
+                crate::client_config::connection_for_path(&connections, cwd)
+                    .filter(|connection| crate::client_config::is_current(connection))
+                    .map(|connection| (connection.hub.clone(), connection.token_file.clone()))
+            })
+            .flatten();
+        let (url, token_file) = match saved {
+            Some(saved) => saved,
+            None => hub_config(env_url, env_file, read, cwd)?,
+        };
         let token = std::fs::read_to_string(token_file)
             .map_err(|_| invalid("cannot read the token file"))?
             .trim()

@@ -28,12 +28,12 @@ export function SetupPage({ token }: { token: string }) {
         <p className="answer-text">An agent is ready when it has proved, in one session, that it can reach the hub over MCP and that its edit hook fires on a real edit.</p>
       </div>
       <div className="grid-2 align-start">
-        <Box tour="setup-sessions" icon="patch-check" title="Verified sessions" count={rows.length} explain="Proof lasts up to 15 minutes after the agent’s last check, and never outlasts the agent’s own token (8 hours for client setup). Ready does not guarantee future quota or that every edit tool is covered.">
+        <Box tour="setup-sessions" icon="patch-check" title="Verified sessions" count={rows.length} explain="Proof lasts up to 15 minutes after the agent’s last check, and never outlasts the agent’s own token (30 days for client setup). Ready does not guarantee future quota or that every edit tool is covered.">
           {load.kind === 'loading' && <Skeleton rows={3} />}
           {!available && load.kind !== 'loading' && <Notice tone="muted" icon="info-circle" title="Setup verification unavailable">No agent is marked ready until the hub answers again.</Notice>}
           {load.kind === 'ready' && rows.length === 0 && (
             <Empty icon="plug" title="No verified setup yet">
-              Copy the instructions to your agent, resolve any sign-in or approval blockers, then verify a native edit. Only agents set up with <code>agentscm client setup</code> report here; agents set up with <code>agentscm quickstart</code> do not appear.
+              Copy the instructions to your agent, resolve any sign-in or approval blockers, then verify a native edit. Agents set up with <code>agentscm client setup</code> or <code>agentscm quickstart</code> report here.
             </Empty>
           )}
           <ul className="plain-list">

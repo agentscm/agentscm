@@ -208,10 +208,12 @@ enum Command {
     /// Try AgentSCM with no setup: simulate three agents against a throwaway local hub, using
     /// file names from this Git repository. Never writes to the repository.
     Demo(demo_cli::DemoArgs),
-    /// Guided setup: check for colliding branches, then optionally connect a hub and
-    /// add Claude Code hooks. Asks before every change; `agentscm uninstall` undoes it.
+    /// Guided setup: check for colliding branches, then optionally start or connect a hub and
+    /// set up coding agents with `client setup`. Asks before every change; `agentscm uninstall`
+    /// undoes it.
     Quickstart(quickstart::QuickstartArgs),
-    /// Undo what `agentscm quickstart` set up (hooks, tokens, hub settings, local hub).
+    /// Undo what `agentscm quickstart` recorded: client connections, plugin and MCP entries, the
+    /// program copy and a local hub.
     Uninstall(quickstart::UninstallArgs),
     /// Agent hook client: reads the hook JSON on stdin, asks the hub, prints the agent's reply.
     /// Always exits 0 and fails open. Usage: `agentscm hook <claude|codex|cursor|copilot|generic>
@@ -1421,6 +1423,22 @@ fn print_error(error: &Error) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quickstart_and_uninstall_help_describe_current_behaviour() {
+        let root = <Cli as clap::CommandFactory>::command();
+        let about = |name: &str| {
+            root.find_subcommand(name)
+                .unwrap()
+                .get_about()
+                .unwrap()
+                .to_string()
+        };
+        assert!(about("quickstart").contains("client setup"));
+        assert!(!about("quickstart").contains("Claude Code hooks"));
+        let uninstall = about("uninstall");
+        assert!(uninstall.contains("client connections") && !uninstall.contains("hooks, tokens"));
+    }
 
     #[test]
     fn a_stop_hook_parse_error_never_blocks_even_at_a_terminal() {
