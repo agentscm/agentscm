@@ -44,6 +44,14 @@ checkout-scoped local MCP server. The MCP command uses the private root binding 
 existing Hub. Generated client configuration contains the installed AgentSCM binary and checkout
 paths, but no Hub token. Different checkouts can therefore remain connected to different Hubs.
 
+A linked worktree created from a connected checkout (`git worktree add`, which Claude Code and
+Codex use for new sessions, inside the checkout or beside it) uses that checkout's connection with
+no further setup. The worktree must share the checkout's Git directory and keep its `origin`; a
+separate or nested clone, a submodule or a copied `.git` file is never covered. The user-scope
+Claude Code and Codex plugins therefore coordinate in new worktrees at once. A Git-excluded
+`.mcp.json` or `.codex/config.toml` entry is not copied into a new worktree, so the MCP tools are
+available there only where such an entry exists.
+
 On macOS, `npx agentscm tray` can show these connections in the optional status-bar companion;
 there is no separate app install. Start at Login is off until the member enables it in the menu.
 On every platform, `agentscm client status --check` provides the CLI view. Activity is based on
@@ -248,7 +256,7 @@ Before approving hooks or MCP configuration:
 
 `agentscm client remove --root PATH` undoes `client setup` for one checkout: it takes the agents' entries out of the checkout's files, uninstalls the Claude Code or Codex plugin when no other connected checkout uses it, revokes the managed token (the token revokes itself through `DELETE /v1/hub/token`, so no sign-in is needed), then removes the connection and deletes the token file. If the token can't be revoked, it says so, exits non-zero and keeps the connection and token file so that running it again retries. `agentscm uninstall` runs `client remove` for every checkout quickstart connected, then undoes the rest of quickstart's setup.
 
-`agentscm init-repo` writes only shared agent instruction files for the team to commit (no MCP config, hooks or token). Each developer still runs `agentscm client setup --agent <agent> --hub <hub>` once per checkout, and the Connect agents page verifies the result.
+`agentscm init-repo` writes only shared agent instruction files for the team to commit (no MCP config, hooks or token). Each developer still runs `agentscm client setup --agent <agent> --hub <hub>` once per clone (its linked worktrees are covered), and the Connect agents page verifies the result.
 
 Then run `agentscm client list` and `agentscm client check` for the local binding. Start a real agent
 task and confirm that its session appears for the expected repository in the hosted Hub. A local

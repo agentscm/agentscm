@@ -10,7 +10,9 @@ use agentscm::hub::forge_http::{self, send_full};
 use agentscm::{Error, Result};
 
 use crate::client_cli::read_token;
-use crate::client_config::{Connection, canonical_root, is_current, load};
+use crate::client_config::{
+    Connection, canonical_root, connection_for_checkout, is_current, is_current_in, load,
+};
 use crate::hub_cli::map_hub_error;
 
 const REQUEST_BYTES: usize = 1024 * 1024;
@@ -30,9 +32,12 @@ fn selected(root: &Path, connections: &[Connection]) -> Result<Connection> {
 
 fn connection(root: Option<&Path>) -> Result<(Connection, String)> {
     let cwd = std::env::current_dir()?;
-    let root = canonical_root(root.unwrap_or(&cwd))?;
-    let connection = selected(&root, &load()?)?;
-    if !is_current(&connection) {
+    let checkout = canonical_root(root.unwrap_or(&cwd))?;
+    let connections = load()?;
+    let connection = connection_for_checkout(&connections, &checkout)
+        .map(|(connection, _)| connection.clone())
+        .ok_or_else(|| invalid("this checkout has no saved client connection"))?;
+    if !is_current_in(&connection, &checkout) {
         return Err(invalid(
             "the saved client connection no longer matches this checkout",
         ));

@@ -487,8 +487,8 @@ struct Hub {
 impl Hub {
     fn for_dir(dir: &Path) -> Result<Self> {
         let connections = client_config::load()?;
-        let connection = client_config::connection_for_path(&connections, dir)
-            .filter(|c| client_config::is_current(c))
+        let (connection, _) = client_config::connection_for_checkout(&connections, dir)
+            .filter(|(c, checkout)| client_config::is_current_in(c, checkout))
             .ok_or_else(|| {
                 invalid(
                     "no client connection for this checkout; run `agentscm client connect` first",
