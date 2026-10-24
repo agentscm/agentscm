@@ -4,8 +4,10 @@
 //! A missing, stopped, or backpressured tray is deliberately indistinguishable from success here:
 //! activity reporting must never extend or change the client request path.
 
+#[cfg(unix)]
+use std::path::Path;
 #[cfg(any(unix, test))]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

@@ -95,6 +95,9 @@ Each checkout menu groups its status, opening actions, **Agent Integrations**, *
 **Recent Activity** and **Troubleshooting**. Connection Details shows the full checkout path and
 connection values.
 
+Copied reconnect, repository-guidance and Terminal setup commands use the running executable's
+full path, so they work before `agentscm` is on your shell's `PATH`.
+
 The Start at Login switch shows **On** or **Off**, and **Updating…** while a change is saved.
 **Open Hub** uses the saved sign-in for that exact Hub to create a read-only browser token valid
 for 30 minutes. It opens the Hub UI with that token in the URL fragment; the UI removes the
