@@ -182,13 +182,7 @@ pub async fn serve(config: HubConfig) -> Result<()> {
         .slack
         .as_ref()
         .map(|slack| slack.clone().spawn_worker(state.clone()));
-    let result = axum::serve(
-        listener,
-        router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await
-    .map_err(crate::Error::Io);
+    crate::http_listener::serve(listener, router(state), shutdown_signal()).await;
     if let Some(worker) = slack_worker {
         worker.abort();
     }
@@ -196,7 +190,7 @@ pub async fn serve(config: HubConfig) -> Result<()> {
     if let Some(worker) = execution_worker {
         worker.abort();
     }
-    result.map_err(HubError::from)
+    Ok(())
 }
 
 pub struct ApiError {

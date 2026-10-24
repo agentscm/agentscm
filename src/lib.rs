@@ -26,6 +26,8 @@ pub mod git_snapshot;
 pub mod guided_service;
 pub mod history;
 pub(crate) mod hmac;
+#[doc(hidden)]
+pub mod http_listener;
 pub mod hub;
 #[doc(hidden)]
 pub mod lease;

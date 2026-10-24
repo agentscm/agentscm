@@ -364,6 +364,9 @@ pub struct FakeState {
     pub omit_pull_repos: bool,
     /// Build every created commit with a different message, so its SHA differs from the client's.
     pub alter_commit_messages: bool,
+    /// Hold the first request whose path contains this until the semaphore has a permit;
+    /// `None` once a request has taken it.
+    pub stall_next: Option<(String, Arc<tokio::sync::Semaphore>)>,
     /// The login recorded as `creator` of statuses posted through the API. Default: the
     /// caller's own login (`<slug>[bot]` for an installation token).
     pub status_creator: Option<String>,
@@ -457,6 +460,18 @@ async fn entry(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let gate = {
+        let mut state = ctx.state.lock().unwrap();
+        match &state.stall_next {
+            Some((path, _)) if uri.path().contains(path.as_str()) => {
+                state.stall_next.take().map(|(_, gate)| gate)
+            }
+            _ => None,
+        }
+    };
+    if let Some(gate) = gate {
+        let _ = gate.acquire().await;
+    }
     handle(&ctx, &method, &uri, &headers, &body)
 }
 

@@ -344,7 +344,8 @@ fn validate_token(raw: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn lower_hex(bytes: &[u8]) -> String {
+/// Lowercase hex of `bytes`.
+pub fn lower_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len() * 2);
     for byte in bytes {

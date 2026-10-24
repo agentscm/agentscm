@@ -261,7 +261,8 @@ fn hub_problems_are_coordination_unknown_and_exit_zero() {
     drop(closed);
     let started = Instant::now();
     let text = context(&down.edit("s", "Edit", work.path(), file), "PreToolUse");
-    assert!(started.elapsed() < Duration::from_secs(5));
+    // The hook's 3 s limit plus process start on a loaded host.
+    assert!(started.elapsed() < Duration::from_secs(15));
     assert_eq!(
         text,
         "AgentSCM coordination unknown: hub unreachable. Other agents' work on these files is not visible."

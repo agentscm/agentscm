@@ -214,7 +214,8 @@ fn cancellation_interrupts_probe_and_image_acquisition_before_create() {
             .collect(&fixture.request, &fixture.snapshot(), &cancellation)
             .expect("cancel bounded acquisition");
         canceller.join().expect("phase canceller");
-        assert!(receive.recv().unwrap().elapsed() < Duration::from_secs(2));
+        // Half the fake runtime's 10 s hang: cancellation, not the hang ending, stopped it.
+        assert!(receive.recv().unwrap().elapsed() < Duration::from_secs(5));
         assert_eq!(record.outcome, ExecutionOutcome::Cancelled);
         assert!(record.cleanup_confirmed);
         assert!(!record.isolation_observed);
