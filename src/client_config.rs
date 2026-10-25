@@ -289,8 +289,21 @@ pub(crate) fn update(
         root,
         expected,
         replacement,
-        crate::change_capture_client::lower_sharing_for_connection_change,
+        lower_sharing,
     )
+}
+
+/// Change capture, and so conversation sharing, exists only on Unix; elsewhere there is nothing to lower.
+fn lower_sharing(root: &Path, replacement: Option<&Connection>) -> Result<()> {
+    #[cfg(unix)]
+    {
+        crate::change_capture_client::lower_sharing_for_connection_change(root, replacement)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, replacement);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
