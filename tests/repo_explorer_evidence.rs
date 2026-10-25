@@ -596,3 +596,47 @@ fn retained_files(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     values.sort_by(|left, right| left.0.cmp(&right.0));
     values
 }
+
+#[test]
+fn a_conversation_without_recorded_actions_is_listed_by_work_not_by_commit() {
+    let (_temp, root, spool) = spool_fixture();
+    let transcript = "{\"type\":\"user\",\"sessionId\":\"session-lone\",\"timestamp\":\"2026-10-23T11:00:00Z\",\"uuid\":\"u9\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"SYNTHETIC_LONE_PROMPT\"}]}}\n";
+    import_jsonl(
+        Cursor::new(transcript),
+        &capture_request("wrk_lone", "session-lone", "capture:lone"),
+        &spool,
+    )
+    .unwrap();
+
+    let explorer = EvidenceExplorer::open(&root, REPOSITORY).unwrap();
+    // No action binds this Work to any commit, so commit evidence must not invent one.
+    let at_commit = explorer
+        .evidence(COMMIT_ONE, None, None, None, 100)
+        .unwrap();
+    assert!(at_commit.entries.is_empty());
+
+    let listed = explorer.sessions(None, 25).unwrap();
+    assert_eq!(listed.sessions.len(), 1);
+    let session = &listed.sessions[0];
+    assert_eq!(
+        (session.work_id.as_str(), session.session_id.as_str()),
+        ("wrk_lone", "session-lone")
+    );
+    assert_eq!(session.relation, EvidenceRelationV1::SameWorkSession);
+    assert!(listed.complete);
+
+    let conversation = explorer
+        .conversation(&session.work_id, &session.session_id, None, 25)
+        .unwrap();
+    assert!(conversation.events.iter().any(|event| {
+        event
+            .body
+            .content
+            .as_deref()
+            .is_some_and(|text| text.contains("SYNTHETIC_LONE_PROMPT"))
+    }));
+
+    let first = explorer.sessions(None, 1).unwrap();
+    assert!(first.next_cursor.is_none());
+    assert!(explorer.sessions(Some("x1:s:bogus:0"), 1).is_err());
+}
