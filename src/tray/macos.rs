@@ -183,9 +183,13 @@ fn run_foreground(initial: Snapshot) -> Result<()> {
         menu_dirty: false,
         notice: None,
     };
-    event_loop
+    // This computer's Hub page runs while the tray does, so Open Hub opens at once.
+    let local_page = crate::open_cli::LocalPage::start_in_background();
+    let result = event_loop
         .run_app(&mut app)
-        .map_err(|error| Error::Invalid(format!("tray event loop failed: {error}")))
+        .map_err(|error| Error::Invalid(format!("tray event loop failed: {error}")));
+    local_page.stop_if_started();
+    result
 }
 
 struct TrayApp {
