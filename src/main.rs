@@ -76,6 +76,8 @@ mod local_recovery_cli;
 mod local_validation_cli;
 #[cfg(unix)]
 mod merge_cli;
+#[cfg(unix)]
+mod pipeline_cli;
 mod prompt;
 #[cfg(unix)]
 mod publish_cli;
@@ -163,6 +165,12 @@ enum Command {
     SkillWorkflow {
         #[command(subcommand)]
         command: skill_workflow_cli::SkillWorkflowCommand,
+    },
+    /// [experimental] Install repository rules and run local productive pipelines.
+    #[cfg(unix)]
+    Pipeline {
+        #[command(subcommand)]
+        command: pipeline_cli::PipelineCommand,
     },
     /// Inspect or change pseudonymous product telemetry.
     Telemetry {
@@ -738,6 +746,10 @@ async fn run(cli: Cli) -> Result<RunExit> {
         }
         Command::SkillWorkflow { command } => {
             skill_workflow_cli::run(&cli.data_dir, command).await?;
+        }
+        #[cfg(unix)]
+        Command::Pipeline { command } => {
+            print_json(&pipeline_cli::run(&cli.data_dir, command).await?);
         }
         Command::Telemetry { command } => {
             match telemetry_cli::run(command, cli.no_telemetry).await? {

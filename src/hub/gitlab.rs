@@ -144,6 +144,16 @@ impl Api {
         Ok(paged)
     }
 
+    /// Bounded recent merged proposals for opt-in local rule reconciliation.
+    pub async fn recent_closed_pulls(&self, token: &str, project: i64) -> Gh<Paged> {
+        let path = format!(
+            "/projects/{project}/merge_requests?state=merged&order_by=updated_at&sort=desc"
+        );
+        let mut paged = self.paged(token, &path, 1).await?;
+        paged.items = paged.items.iter().map(pull_json).collect();
+        Ok(paged)
+    }
+
     pub async fn pull(&self, token: &str, project: i64, iid: i64) -> Gh<Option<Value>> {
         let reply = self
             .get(token, &format!("/projects/{project}/merge_requests/{iid}"))
@@ -686,7 +696,8 @@ fn pull_json(mr: &Value) -> Value {
     json!({"number": mr["iid"], "node_id": format!("gid://gitlab/MergeRequest/{}", mr["id"]),
         "title": mr["title"], "state": if open { "open" } else { "closed" },
         "draft": mr["draft"].as_bool().or(mr["work_in_progress"].as_bool()).unwrap_or(false),
-        "merged": merged, "body": mr["description"],
+        "merged": merged, "body": mr["description"], "labels": mr["labels"],
+        "squash_commit_sha": mr["squash_commit_sha"],
         "source_project_id": mr["source_project_id"], "target_project_id": mr["target_project_id"],
         "merge_commit_sha": if mr["merge_commit_sha"].is_null() { &mr["squash_commit_sha"] } else { &mr["merge_commit_sha"] },
         "head": {"ref": mr["source_branch"], "sha": mr["sha"]},

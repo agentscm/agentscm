@@ -37,6 +37,14 @@ impl ForgeApi<'_> {
         }
     }
 
+    /// One bounded page, newest updated first; unread pages remain an explicit coverage gap.
+    pub async fn recent_closed_pulls(&self, token: &str, repo: &Repo) -> Gh<Paged> {
+        match self {
+            Self::Github(api) => api.recent_closed_pulls(token, &repo.full_name).await,
+            Self::Gitlab(api) => api.recent_closed_pulls(token, repo.repository_id).await,
+        }
+    }
+
     pub async fn pull(&self, token: &str, repo: &Repo, number: i64) -> Gh<Option<Value>> {
         match self {
             Self::Github(api) => api.pull(token, &repo.full_name, number).await,

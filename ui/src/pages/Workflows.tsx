@@ -53,13 +53,17 @@ function requestError(message: string, status?: number): string {
 function nextAction(p: SkillWorkflowProjection): { tone: Tone; icon: string; title: string; body: string } {
   const { run, present_applicability: a } = p
   const landing = p.present_landing_binding
+  const productive = run.steps.some((s) => s.action)
   const findings = run.steps.reduce((n, s) => n + (s.review?.findings.filter((f) => f.severity !== 'note').length ?? 0), 0)
+  if (run.steps.some((s) => s.action?.outcome === 'uncertain')) return { tone: 'warn', icon: 'question-circle', title: 'Inspect the interrupted action', body: 'The action may have run. Inspect its retained outcome before starting new work; replay could repeat its effects.' }
+  if (productive && a.state !== 'current') return { tone: 'warn', icon: 'arrow-clockwise', title: 'These outputs belong to an earlier source binding', body: a.reason ?? 'Restore the source binding or start a fresh run for the current source. Historical artifacts do not establish a current result.' }
   if (a.state !== 'current') return { tone: a.state === 'stale' ? 'warn' : 'bad', icon: 'arrow-clockwise', title: a.state === 'stale' ? 'Rerun on the current source' : 'Restore the native binding', body: a.reason ?? 'The current native source binding cannot be verified. This run cannot support a new landing.' }
   if (landing && landing.state !== 'current') return { tone: landing.state === 'stale' ? 'warn' : 'bad', icon: 'link-45deg', title: landing.state === 'stale' ? 'Refresh the landing binding' : 'Inspect the landing binding', body: landing.reason ?? 'The current Change, review context, policy, or protected target cannot be verified for this run.' }
-  if (findings > 0 || run.state === 'failed' || run.state === 'blocked') return { tone: 'bad', icon: 'tools', title: findings > 0 ? `Resolve ${findings} review finding${findings === 1 ? '' : 's'}` : 'Fix the failing required step', body: 'Apply the fixes, checkpoint a fresh immutable revision, and run the workflow again.' }
+  if (findings > 0 || run.state === 'failed' || run.state === 'blocked') return { tone: 'bad', icon: 'tools', title: findings > 0 ? `Resolve ${findings} review finding${findings === 1 ? '' : 's'}` : 'Fix the failing required step', body: productive ? 'Inspect the action result and required runtime capabilities. Missing or invalid artifacts cannot satisfy downstream inputs.' : 'Apply the fixes, checkpoint a fresh immutable revision, and run the workflow again.' }
   if (run.state === 'pending' || run.state === 'running') return { tone: 'brand', icon: 'hourglass-split', title: 'Workflow is still in progress', body: 'Refresh after the local controller finishes or recovers its current step.' }
   if (run.state === 'completed_with_omissions') return { tone: 'warn', icon: 'list-check', title: 'Review optional omissions', body: 'Required steps passed, but omitted work remains visible.' }
   if (run.state === 'cancelled') return { tone: 'warn', icon: 'play', title: 'Start a fresh run', body: 'This cancelled run cannot establish a current passing result.' }
+  if (productive) return { tone: 'muted', icon: 'file-earmark-text', title: 'Declared outputs were produced', body: 'Artifact format and size were validated. Content has not been independently verified, approved, or published by these actions.' }
   if (!landing) return { tone: 'ok', icon: 'check-circle', title: 'Recorded source checks passed', body: 'This source-only workflow is not a native landing decision.' }
   return { tone: 'ok', icon: 'shield-check', title: 'Checks and bindings are current', body: 'Native landing still revalidates this exact immutable revision.' }
 }
@@ -95,6 +99,22 @@ function StepDetail({ step }: { step: SkillWorkflowStep }) {
         {step.needs.length > 0 && <span className="small muted"><Icon name="diagram-2" /> after {step.needs.join(', ')}</span>}
       </div>
       {step.detail && <p>{step.detail}</p>}
+      {step.action && (
+        <div className="mb-3">
+          <h3 className="h6">Productive action</h3>
+          <p className="small">{step.action.outcome === null ? 'Dispatch reserved; no terminal result recorded.' : `Execution: ${step.action.outcome.replaceAll('_', ' ')}.`} {step.action.observed_model ? `Observed model: ${step.action.observed_model}.` : 'No model identity recorded.'}</p>
+          <p className="small muted">Output validation is separate from independent verification, approval and publication.</p>
+          {step.action.artifact && (
+            <dl className="tech">
+              <dt>Retained artifact</dt><dd>{step.action.artifact.name}</dd>
+              <dt>Format</dt><dd>{step.action.artifact.media_type}</dd>
+              <dt>Size</dt><dd>{step.action.artifact.bytes.toLocaleString()} bytes</dd>
+              <dt>Content digest</dt><dd><code className="text-break">{step.action.artifact.sha256}</code></dd>
+            </dl>
+          )}
+          <details className="disclosure"><summary>Execution profile identity</summary><code className="text-break">{step.action.profile_digest}</code></details>
+        </div>
+      )}
       {step.execution && (
         <div className="small mb-3">
           <span className="label">Command execution</span> attempt <code>{step.execution.attempt_id}</code> · gen {step.execution.generation} · {step.execution.state}
@@ -255,14 +275,14 @@ function List({ token }: { token: string }) {
     <div className="page">
       <div className="answer" data-tour="answer">
         <h1 className="page-question">Did the checks pass?</h1>
-        <p className="answer-text">Tests and structured reviews retained for this repository. A passing run is evidence about one exact revision, not permission to land.</p>
+        <p className="answer-text">Checks, structured reviews and productive actions retained for this repository. Each run belongs to one exact revision; producing an artifact does not verify its content or permit landing.</p>
       </div>
       <Box
         tour="workflows-runs"
         tone={load.kind === 'ready' && load.value.availability === 'available' && load.value.runs.some((r) => r.state === 'failed' || r.state === 'blocked') ? 'bad' : 'brand'}
         icon="diagram-3"
         title="Workflow runs"
-        explain="Skill workflows are multi-step checks (tests, reviews) run by a local controller and recorded on the hub."
+        explain="Skill workflows compose checks, reviews and artifact-producing actions. Select a run to inspect what each step actually recorded."
         count={load.kind === 'ready' && load.value.availability === 'available' ? load.value.runs.length : undefined}
         actions={
           <RunPicker token={token} />

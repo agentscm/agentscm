@@ -509,6 +509,15 @@ impl Api {
         self.paged(token, &path, None, MAX_PULL_PAGES, etag).await
     }
 
+    /// Bounded recent closed proposals for opt-in local rule reconciliation. Each
+    /// candidate is re-read individually before it can be accepted as merged.
+    pub async fn recent_closed_pulls(&self, token: &str, full_name: &str) -> Gh<Paged> {
+        let path = format!("/repos/{full_name}/pulls?state=closed&sort=updated&direction=desc");
+        self.paged_with(token, &path, None, 1, None, true)
+            .await?
+            .ok_or_else(|| GhError::Failed("unexpected 304 from pulls".into()))
+    }
+
     pub async fn pull(&self, token: &str, full_name: &str, number: i64) -> Gh<Option<Value>> {
         let reply = self
             .get(token, &format!("/repos/{full_name}/pulls/{number}"))

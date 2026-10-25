@@ -222,13 +222,6 @@ fn assert_attached_publication_boundary(
     assert!(authority.target("main").unwrap().is_none());
 }
 
-mod fake_docker {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/common/fake_docker.rs"
-    ));
-}
-
 async fn execution_env(
     root: &std::path::Path,
     native: &NativeSourceProfile,
@@ -705,6 +698,89 @@ fn stop_feedback(output: &Value) -> Value {
     serde_json::from_str(output["reason"].as_str().unwrap()).unwrap()
 }
 
+#[test]
+fn stable_fake_docker_keeps_socket_state_isolated() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let docker = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/fake_docker.py");
+    let mut sockets = Vec::new();
+    let mut configurations = Vec::new();
+    for (name, scenario, expected_os) in [
+        ("first", "success", "linux"),
+        ("second", "unavailable", "darwin"),
+    ] {
+        let state = root.path().join(name);
+        fs::create_dir(&state).unwrap();
+        fs::write(state.join("scenario"), scenario).unwrap();
+        let socket = root.path().join(format!("{name}.sock"));
+        sockets.push(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        fs::write(
+            root.path().join(format!("{name}.sock.fixture-state-dir")),
+            state.to_str().unwrap(),
+        )
+        .unwrap();
+        configurations.push((state, socket, expected_os));
+    }
+    let children: Vec<_> = configurations
+        .into_iter()
+        .map(|(state, socket, expected_os)| {
+            let child = Command::new(docker)
+                .env("HOME", &home)
+                .args(["--host", &format!("unix://{}", socket.display())])
+                .args(["--config", "unused", "info", "--format", "{{json .}}"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            (state, expected_os, child)
+        })
+        .collect();
+    for (state, expected_os, child) in children {
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let info: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(info["OSType"], expected_os);
+        assert_eq!(
+            fs::read_to_string(state.join("calls.jsonl")).unwrap(),
+            "[\"info\", \"--format\", \"{{json .}}\"]\n"
+        );
+    }
+    assert!(!home.join("calls.jsonl").exists());
+}
+
+#[test]
+fn stable_fake_docker_rejects_invalid_socket_state_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let docker = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/fake_docker.py");
+    let sidecar = root.path().join("docker.sock.fixture-state-dir");
+    let socket = root.path().join("docker.sock");
+    for contents in [
+        String::new(),
+        "relative-state".to_owned(),
+        root.path()
+            .join("missing-state")
+            .to_str()
+            .unwrap()
+            .to_owned(),
+    ] {
+        fs::write(&sidecar, contents).unwrap();
+        let output = Command::new(docker)
+            .env("HOME", root.path())
+            .args(["--host", &format!("unix://{}", socket.display()), "info"])
+            .current_dir(root.path())
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("fixture state directory must be an existing absolute directory"),
+            "{output:?}"
+        );
+        assert!(!root.path().join("calls.jsonl").exists());
+    }
+}
+
 fn source_command_profile(
     root: &std::path::Path,
     docker: &std::path::Path,
@@ -712,7 +788,18 @@ fn source_command_profile(
     docker_config: &std::path::Path,
 ) -> (NativeSourceProfile, CollectorProfile) {
     let backend = OciBackend::new(docker, docker_socket, docker_config).unwrap();
-    let runtime_identity = backend.probe().identity.expect("fake Docker is available");
+    let probe = backend.probe();
+    let runtime_identity = probe.identity.unwrap_or_else(|| {
+        let mut sidecar = docker_socket.as_os_str().to_owned();
+        sidecar.push(".fixture-state-dir");
+        let calls = fs::read_to_string(sidecar).ok().and_then(|home| {
+            fs::read_to_string(std::path::Path::new(&home).join("calls.jsonl")).ok()
+        });
+        panic!(
+            "fake Docker is available: detail={:?}, calls={calls:?}",
+            probe.detail
+        );
+    });
     let environment = std::collections::BTreeMap::new();
     let recipe = CommandRecipe {
         version: 1,
@@ -1351,20 +1438,19 @@ async fn agent_owned_transport_lifecycle_mode(attached: bool, revocation: &str) 
         fs::create_dir(directory).unwrap();
         fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
     }
-    let docker = root.path().join("docker.py");
-    let fake = fake_docker::FAKE_DOCKER.replace(
-        "home = pathlib.Path(os.environ[\"HOME\"])",
-        &format!(
-            "home = pathlib.Path({})",
-            serde_json::to_string(docker_home.to_str().unwrap()).unwrap()
-        ),
-    );
-    fs::write(&docker, fake).unwrap();
-    fs::set_permissions(&docker, fs::Permissions::from_mode(0o700)).unwrap();
+    let docker = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/fake_docker.py"
+    ));
     let docker_socket = root.path().join("docker.sock");
+    fs::write(
+        root.path().join("docker.sock.fixture-state-dir"),
+        docker_home.to_str().unwrap(),
+    )
+    .unwrap();
     let _socket = std::os::unix::net::UnixListener::bind(&docker_socket).unwrap();
     let (mut native, collector_profile) =
-        source_command_profile(root.path(), &docker, &docker_socket, &docker_config);
+        source_command_profile(root.path(), docker, &docker_socket, &docker_config);
     let engine = Engine::open(&native.profile.data_dir).unwrap();
     let (env, service) = agent_only_env(root.path(), &native).await;
     let git_fixture = if attached {

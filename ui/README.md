@@ -85,3 +85,8 @@ route parsing, the concise filled state, missing records and authorization denia
 coverage follows both the Verify rail and a Work-detail link into the authenticated projection,
 including the explicit not-yet-captured state. The seeded Hub does not retain a filled change
 record, so the filled browser state remains fixture-tested.
+
+Productive action metadata can be inspected with `MOCK=1` at
+`#workflows/runs/productive-artifacts/steps/draft`. This synthetic fixture shows
+separate productive execution, output identity and unverified content; it starts
+no agent and performs no publication. Artifact bodies remain on the local runner.
