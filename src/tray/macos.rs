@@ -534,6 +534,9 @@ impl ApplicationHandler<UserEvent> for TrayApp {
             UserEvent::Snapshot(Ok(updated), dispatched) => {
                 self.refreshing.store(false, Ordering::Release);
                 if dispatched == config_stamp() {
+                    for connection in &updated.connections {
+                        self.activity.forget_unconnected(&connection.root);
+                    }
                     self.snapshot = updated;
                     clear_refresh_notice(&mut self.notice);
                 }

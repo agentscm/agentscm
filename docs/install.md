@@ -120,7 +120,8 @@ a session lists the checkout at the agent's next hook. The tray forgets it after
 sleep, or on quit, keeping at most eight. **Connect with**
 an agent runs the same steps as `agentscm client setup --agent AGENT --hub HUB` for the main
 checkout, with the Hub of your most recent saved sign-in and without starting a new sign-in; the
-result window names the Hub. The row then becomes a normal connected checkout. When there is no
+result window names the Hub. The row then becomes a normal connected checkout; if that connection
+is removed later, the checkout is listed again only once an agent runs there again. When there is no
 saved sign-in, or it has expired, **Copy Terminal Setup** copies `agentscm quickstart` for that
 checkout. Connect a checkout to a different Hub through quickstart.
 Setup opens a status window with progress, the result and the client's next steps. It does not

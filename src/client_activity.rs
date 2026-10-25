@@ -176,6 +176,12 @@ impl ActivityStore {
         self.unconnected.push(seen);
     }
 
+    /// Drop the sighting of a checkout that is now connected. Removing that connection later
+    /// lists it again only after an agent is seen there again.
+    pub(crate) fn forget_unconnected(&mut self, root: &Path) {
+        self.unconnected.retain(|row| row.root != root);
+    }
+
     /// Fresh unconnected checkouts, most recently seen first.
     pub(crate) fn unconnected(&self, now: std::time::Instant) -> Vec<UnconnectedCheckout> {
         let mut rows = self
@@ -714,6 +720,20 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn a_connected_checkout_is_forgotten_until_it_is_seen_again() {
+        let now = std::time::Instant::now();
+        let mut store = ActivityStore::default();
+        store.push_unconnected(seen("/synthetic/a", "claude", now));
+        store.push_unconnected(seen("/synthetic/b", "codex", now));
+        store.forget_unconnected(Path::new("/synthetic/a"));
+        let rows = store.unconnected(now);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].root, Path::new("/synthetic/b"));
+        store.push_unconnected(seen("/synthetic/a", "claude", now + Duration::from_secs(1)));
+        assert_eq!(store.unconnected(now + Duration::from_secs(1)).len(), 2);
     }
 
     #[test]
