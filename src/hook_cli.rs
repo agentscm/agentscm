@@ -401,6 +401,9 @@ fn with_root_header(
 }
 
 const MAX_WORKSPACE_ROOTS: usize = 16;
+/// Every new worktree of a connected checkout is covered, so this means the repository itself.
+const NO_CONNECTION: &str =
+    "no client connection for this repository; run `agentscm quickstart` in it once";
 const MAX_EDIT_PATHS: usize = 256;
 const PATCH_HEADERS: [&str; 4] = [
     "*** Update File: ",
@@ -418,6 +421,8 @@ struct EditPath {
 #[derive(Debug)]
 struct RoutedClient {
     connection: Connection,
+    /// The registered root, or a linked worktree of it.
+    checkout: PathBuf,
     endpoint_agent: String,
     payload: Value,
 }
@@ -521,17 +526,16 @@ fn unique_connection(
 ) -> Result<Option<(&Connection, PathBuf)>, String> {
     let mut found: Vec<(&Connection, PathBuf)> = Vec::new();
     for candidate in candidates {
-        if let Some(connection) = client_config::connection_for_path(connections, &candidate) {
-            let resolved = client_config::resolved(&candidate);
-            let existing = resolved
-                .as_deref()
-                .and_then(|path| path.ancestors().find(|path| path.exists()));
-            if existing.and_then(repo_root).as_deref() != Some(connection.root.as_path()) {
+        let connection = match client_config::connection_for_checkout(connections, &candidate) {
+            Some((connection, _)) => connection,
+            // An unregistered nested Git checkout must never inherit the parent's credential.
+            None if client_config::connection_for_path(connections, &candidate).is_some() => {
                 return Err("path belongs to another Git checkout".into());
             }
-            if !found.iter().any(|(saved, _)| saved.root == connection.root) {
-                found.push((connection, candidate));
-            }
+            None => continue,
+        };
+        if !found.iter().any(|(saved, _)| saved.root == connection.root) {
+            found.push((connection, candidate));
         }
     }
     match found.len() {
@@ -552,14 +556,19 @@ fn match_edit<'a>(
     {
         return Err("too many workspace roots".into());
     }
+    // A containing root without a checkout match is kept so the caller refuses a nested checkout.
+    let route = |candidate: &Path| {
+        client_config::connection_for_checkout(connections, candidate)
+            .map(|(connection, _)| connection)
+            .or_else(|| client_config::connection_for_path(connections, candidate))
+    };
     let path = Path::new(path);
     if path.is_absolute() {
-        return Ok(client_config::connection_for_path(connections, path)
-            .map(|connection| (connection, path.to_owned())));
+        return Ok(route(path).map(|connection| (connection, path.to_owned())));
     }
     if let Some(cwd) = payload["cwd"].as_str() {
         let candidate = Path::new(cwd).join(path);
-        if let Some(connection) = client_config::connection_for_path(connections, &candidate) {
+        if let Some(connection) = route(&candidate) {
             return Ok(Some((connection, candidate)));
         }
     }
@@ -600,7 +609,7 @@ fn match_session<'a>(
 fn route_client(agent: &str, payload: &Value) -> Result<RoutedClient, String> {
     let connections = client_config::load().map_err(|_| "client connections unavailable")?;
     let routed = route_client_with(agent, payload, &connections)?;
-    if !client_config::is_current(&routed.connection) {
+    if !client_config::is_current_in(&routed.connection, &routed.checkout) {
         return Err("client connection no longer matches this checkout".into());
     }
     Ok(routed)
@@ -612,48 +621,54 @@ fn route_client_with(
     connections: &[Connection],
 ) -> Result<RoutedClient, String> {
     if connections.is_empty() {
-        return Err("no client connection for this checkout".into());
+        return Err(NO_CONNECTION.into());
     }
     let edits = edit_paths(agent, payload)?;
-    let mut selected: Option<Connection> = None;
+    let mut selected: Option<(Connection, PathBuf)> = None;
     let mut normalized = Vec::with_capacity(edits.len());
     for edit in &edits {
         let Some((connection, candidate)) = match_edit(payload, connections, &edit.path)? else {
             return Err("no client connection for an edit path".into());
         };
-        let connection = connection.clone();
-        if selected
-            .as_ref()
-            .is_some_and(|selected| selected.root != connection.root)
+        if let Some((selected, _)) = &selected
+            && selected.root != connection.root
         {
             return Err("edit crosses configured repositories".into());
         }
-        let relative = client_config::relative(&connection.root, &candidate)
-            .ok_or_else(|| "edit path is outside the configured repository".to_owned())?;
         // An unregistered nested Git checkout must never inherit the parent's credential.
-        let resolved = client_config::resolved(&candidate);
-        let existing = resolved
-            .as_deref()
-            .and_then(|path| path.ancestors().find(|path| path.exists()));
-        if existing.and_then(repo_root).as_deref() != Some(connection.root.as_path()) {
+        let Some((_, checkout)) = client_config::connection_for_checkout(connections, &candidate)
+            .filter(|(routed, _)| routed.root == connection.root)
+        else {
             return Err("edit path belongs to another Git checkout".into());
+        };
+        if selected
+            .as_ref()
+            .is_some_and(|(_, selected)| *selected != checkout)
+        {
+            return Err("edit crosses Git worktrees".into());
         }
-        selected = Some(connection);
+        let relative = client_config::relative(&checkout, &candidate)
+            .ok_or_else(|| "edit path is outside the configured repository".to_owned())?;
+        selected = Some((connection.clone(), checkout));
         normalized.push(EditPath {
             header: edit.header,
             path: relative,
         });
     }
-    let connection = match selected {
-        Some(connection) => connection,
+    let (connection, checkout) = match selected {
+        Some(selected) => selected,
         None => match_session(payload, connections)?
-            .map(|(connection, _)| connection.clone())
-            .ok_or_else(|| "no client connection for this checkout".to_owned())?,
+            .and_then(|(_, candidate)| {
+                client_config::connection_for_checkout(connections, &candidate)
+            })
+            .map(|(connection, checkout)| (connection.clone(), checkout))
+            .ok_or_else(|| NO_CONNECTION.to_owned())?,
     };
     let endpoint_agent = if agent == "gemini" { "generic" } else { agent };
     Ok(RoutedClient {
         payload: sanitized_client(agent, payload, &normalized)?,
         connection,
+        checkout,
         endpoint_agent: endpoint_agent.to_owned(),
     })
 }
@@ -1696,6 +1711,54 @@ mod tests {
         );
     }
 
+    /// The layout `git worktree add` leaves: a `.git` file and a back-pointing private directory.
+    fn linked_worktree(main: &Path, path: &Path) -> PathBuf {
+        let own = main.join(".git/worktrees").join(path.file_name().unwrap());
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::write(path.join(".git"), format!("gitdir: {}\n", own.display())).unwrap();
+        std::fs::write(
+            own.join("gitdir"),
+            format!("{}\n", path.join(".git").display()),
+        )
+        .unwrap();
+        std::fs::write(own.join("commondir"), "../..\n").unwrap();
+        path.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn linked_worktree_sessions_and_edits_use_the_registered_connection() {
+        let parent = tempfile::tempdir().unwrap();
+        let main = git_repo(parent.path(), "main");
+        let nested = linked_worktree(&main, &main.join(".claude/worktrees/task"));
+        let beside = linked_worktree(&main, &parent.path().join("beside"));
+        let connections = [connection(&main, "acme/widgets")];
+        for checkout in [&nested, &beside] {
+            let session =
+                json!({"hook_event_name":"SessionStart", "session_id":"s", "cwd":checkout});
+            let routed = route_client_with("claude", &session, &connections).unwrap();
+            assert_eq!(routed.connection, connections[0]);
+            assert_eq!(&routed.checkout, checkout);
+            let edit = json!({"hook_event_name":"PreToolUse", "session_id":"s", "cwd":checkout,
+                "tool_name":"Write", "tool_input":{"file_path":checkout.join("src/a.rs")}});
+            let routed = route_client_with("claude", &edit, &connections).unwrap();
+            assert_eq!(&routed.checkout, checkout);
+            let sent = routed.payload.to_string();
+            assert!(
+                sent.contains("src/a.rs") && !sent.contains("worktrees"),
+                "{sent}"
+            );
+        }
+        let crossing = json!({"hook_event_name":"PreToolUse", "session_id":"s", "cwd":main,
+            "tool_name":"apply_patch", "tool_input":format!(
+                "*** Begin Patch\n*** Update File: {}/a.rs\n*** Move to: {}/a.rs\n*** End Patch",
+                main.display(), beside.display())});
+        assert_eq!(
+            route_codex_with(&crossing, &connections).unwrap_err(),
+            "edit crosses Git worktrees"
+        );
+    }
+
     #[test]
     fn codex_session_route_rejects_multiple_registered_workspace_roots() {
         let parent = tempfile::tempdir().unwrap();
@@ -1726,7 +1789,7 @@ mod tests {
         );
         assert_eq!(
             route_codex_with(&json!({"hook_event_name":"SessionEnd"}), &connections).unwrap_err(),
-            "no client connection for this checkout"
+            NO_CONNECTION
         );
     }
 

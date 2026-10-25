@@ -2,6 +2,10 @@
 
 All notable changes are listed here, newest first. AgentSCM is alpha: any release may change the CLI, the HTTP API, storage and schemas without a migration.
 
+## Unreleased
+
+- Fixed: hooks, the client MCP server and Hub-backed CLI commands started in a linked Git worktree of a connected checkout now use that checkout's connection, so sessions that Claude Code or Codex start in a new worktree coordinate without running setup again. Edit paths are reported relative to the worktree. Separate or nested clones, submodules and copied `.git` files still never inherit a connection. With no connection, the hook note now names `agentscm quickstart`.
+
 ## 0.1.0-alpha.6 (2026-10-25)
 
 - 0.1.0-alpha.5 was not released: its Linux musl binaries failed to link after its container image was pushed, so it has no GitHub release, npm package or attestations. Use 0.1.0-alpha.6, which contains everything listed below.
