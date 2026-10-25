@@ -38,6 +38,7 @@
 - [Specification (draft)](spec/agentic-scm.md) and [architecture](architecture.md)
 - [Roadmap](roadmap.md)
 - [Design: supported skills](design/supported-skills.md) (`pr-gate` v1 is built and experimental; the rest is proposed)
+- [Design: Hub dashboard prototype](design/hub-prototype/README.md) (a clickable local prototype with synthetic data; not the shipped Hub)
 
 ## Advanced and experimental
 

@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+  <link rel="icon" href="logo-mark.png">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgentSCM Hub</title>
+<script>
+  // Set the theme before first paint so there is no light flash in dark mode.
+  (function () { var q = new URLSearchParams(location.search), t = q.get('mode'); if (!t) { try { t = localStorage.getItem('hubstory.theme'); } catch (e) {} } if (!t) t = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'; document.documentElement.setAttribute('data-bs-theme', t); var d = q.get('density'); if (d === null) { try { d = localStorage.getItem('agentscm.hub.density'); } catch (e) {} } if (d && d !== 'spacious') document.documentElement.setAttribute('data-density', d); var s = new URLSearchParams(location.search).get('skin'); if (s === null) { try { s = localStorage.getItem('agentscm.hub.skin'); } catch (e) {} } if (s) document.documentElement.setAttribute('data-skin', s); })();
+</script>
+<link rel="stylesheet" href="vendor/bootstrap.min.css">
+<link rel="stylesheet" href="vendor/bootstrap-icons.min.css">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Onest:wght@300;400;500;600;700&family=Schibsted+Grotesk:wght@400;500;600;700&family=Unbounded:wght@300;400;500;600&display=swap">
+<link rel="stylesheet" href="hub.css">
+<link rel="stylesheet" href="skins.css">
+</head>
+<body>
+<a class="skip visually-hidden-focusable" href="#main">Skip to content</a>
+<header id="top" class="topbar"></header>
+<div class="shell">
+  <div id="rail" class="rail offcanvas-lg offcanvas-start" tabindex="-1" aria-label="Navigation"></div>
+  <main id="main" class="sheet" tabindex="-1"><div id="page"><p class="loading"><span class="spinner-border spinner-border-sm" aria-hidden="true"></span> Connecting to the story stream…</p></div></main>
+</div>
+<div id="toasts" class="toast-stack" aria-live="polite"></div>
+<p class="stream-lost-note" role="status"><i class="bi bi-wifi-off" aria-hidden="true"></i> Lost the local story server. Is <code>node server.mjs</code> still running?</p>
+<script src="vendor/bootstrap.bundle.min.js"></script>
+<script type="module">
+  import { startApp, loadView } from './core.js';
+  // Paint once the main faces are in, so text doesn't reflow a moment later. Never wait more than 1.2 s.
+  const faces = ['300 1em Onest', '400 1em Onest', '600 1em Onest', '400 1em "JetBrains Mono"'].map(f => document.fonts.load(f));
+  await Promise.race([Promise.all(faces), new Promise(r => setTimeout(r, 1200))]);
+  startApp(await loadView());
+</script>
+</body>
+</html>
