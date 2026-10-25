@@ -588,7 +588,11 @@ export function decodeExplorerSessions(value: unknown): ExplorerSessionPage {
   const page: ExplorerSessionPage = {
     version: 1,
     repository: nonempty(raw['repository'], `${path}.repository`, 256),
-    sessions: array(raw['sessions'], `${path}.sessions`, 200).map((item, index) => decodeSessionEvidence(item && typeof item === 'object' && !Array.isArray(item) ? { entry: 'session', ...item } : item, `${path}.sessions[${index}]`)),
+    sessions: array(raw['sessions'], `${path}.sessions`, 200).map((item, index) => {
+      // The listing sends bare session facts; the `entry` tag belongs to evidence pages only.
+      if (item === null || typeof item !== 'object' || Array.isArray(item) || 'entry' in item) fail(`${path}.sessions[${index}]`)
+      return decodeSessionEvidence({ entry: 'session', ...(item as Record<string, unknown>) }, `${path}.sessions[${index}]`)
+    }),
     projection_coverage: decodeProjectionCoverage(raw['projection_coverage'], `${path}.projection_coverage`),
     next_cursor: nullableCursor(raw['next_cursor'], `${path}.next_cursor`),
     complete: bool(raw['complete'], `${path}.complete`),

@@ -640,3 +640,55 @@ fn a_conversation_without_recorded_actions_is_listed_by_work_not_by_commit() {
     assert!(first.next_cursor.is_none());
     assert!(explorer.sessions(Some("x1:s:bogus:0"), 1).is_err());
 }
+
+#[test]
+fn saved_sessions_page_newest_first_and_cursors_stay_bound_to_their_query() {
+    let (_temp, root, spool) = spool_fixture();
+    let import = |work: &str, session: &str, at: &str| {
+        let line = format!(
+            "{{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"{at}\",\"uuid\":\"u-{session}\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"SYNTHETIC\"}}]}}}}\n"
+        );
+        import_jsonl(
+            Cursor::new(line),
+            &capture_request(work, session, &format!("capture:{session}")),
+            &spool,
+        )
+        .unwrap();
+    };
+    import("wrk_a", "session-old", "2026-10-23T09:00:00Z");
+    import("wrk_b", "session-tie-b", "2026-10-23T10:00:00Z");
+    import("wrk_a", "session-tie-a", "2026-10-23T10:00:00Z");
+
+    let explorer = EvidenceExplorer::open(&root, REPOSITORY).unwrap();
+    let all = explorer.sessions(None, 25).unwrap();
+    let order: Vec<_> = all.sessions.iter().map(|s| s.session_id.as_str()).collect();
+    // Newest first; equal times fall back to Work and session identity, descending.
+    assert_eq!(order, ["session-tie-b", "session-tie-a", "session-old"]);
+
+    let mut walked = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = explorer.sessions(cursor.as_deref(), 1).unwrap();
+        assert_eq!(page.complete, page.next_cursor.is_none());
+        walked.extend(page.sessions.into_iter().map(|s| s.session_id));
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(walked, order);
+
+    let first = explorer.sessions(None, 1).unwrap();
+    let next = first.next_cursor.unwrap();
+    assert!(
+        explorer
+            .conversation("wrk_a", "session-old", Some(&next), 25)
+            .is_err(),
+        "a sessions cursor cannot page a conversation"
+    );
+    import("wrk_c", "session-new", "2026-10-23T11:00:00Z");
+    assert!(
+        explorer.sessions(Some(&next), 1).is_err(),
+        "a cursor from an earlier projection is refused"
+    );
+}

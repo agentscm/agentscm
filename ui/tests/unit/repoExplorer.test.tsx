@@ -210,9 +210,13 @@ describe('repository explorer journey', () => {
     await user.click(screen.getByRole('button', { name: 'Browse all saved conversations' }))
     expect(screen.getByRole('tab', { name: /Conversations/ }).getAttribute('aria-selected')).toBe('true')
     expect(await screen.findByText(/not tied to the commit you are viewing/)).toBeTruthy()
-    expect(screen.getByText('Some capture is missing')).toBeTruthy()
-    await user.click(screen.getByRole('button', { name: 'Open conversation' }))
+    expect(screen.getByText('Some saved capture is missing')).toBeTruthy()
+    expect(screen.getByText('Saved text is checked when you open a conversation.')).toBeTruthy()
+    const open = screen.getByRole('button', { name: 'Open conversation' })
+    await user.click(open)
     expect(await screen.findByText('<script>alert("quoted")</script>')).toBeTruthy()
+    await user.click(screen.getByRole('button', { name: 'Close conversation' }))
+    await waitFor(() => expect(document.activeElement).toBe(open))
   })
 
   it('supports list and tab arrow keys', async () => {
@@ -340,5 +344,6 @@ describe('saved conversation listing', () => {
     expect(() => decodeExplorerSessions({ ...page, sessions: [{ ...session, relation: 'exact_source_binding' }] })).toThrow()
     expect(() => decodeExplorerSessions({ ...page, next_cursor: 'more', complete: true })).toThrow()
     expect(() => decodeExplorerSessions({ ...page, extra: 1 })).toThrow()
+    expect(() => decodeExplorerSessions({ ...page, sessions: [{ ...session, entry: 'session' }] })).toThrow()
   })
 })
