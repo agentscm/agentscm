@@ -69,7 +69,8 @@ impl WorkspaceGuard<'_> {
             HubError::Invalid(_)
             | HubError::Unauthorized
             | HubError::WorkOverlap(_)
-            | HubError::WorkCoordinationRequired { .. } => {
+            | HubError::WorkCoordinationRequired { .. }
+            | HubError::WorkPreflight(_) => {
                 crate::Error::Conflict("workspace task authorization changed".into())
             }
         }
@@ -1102,7 +1103,11 @@ async fn mcp(
             -32603,
             "temporarily unavailable; inspect task status or recovery before retrying",
         ),
-        Err(HubError::WorkOverlap(_) | HubError::WorkCoordinationRequired { .. }) => axum::Json(
+        Err(
+            HubError::WorkOverlap(_)
+            | HubError::WorkCoordinationRequired { .. }
+            | HubError::WorkPreflight(_),
+        ) => axum::Json(
             json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":"AgentSCM task request conflicted with current state; inspect task status or recovery"}],"isError":true}}),
         )
         .into_response(),

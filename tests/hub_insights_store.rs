@@ -133,6 +133,7 @@ fn start(key: &str, title: &str, session: &str) -> WorkStart {
         depends_on: vec![],
         related_work: vec![],
         takeover_generation: None,
+        preflight: None,
     }
 }
 
@@ -151,6 +152,7 @@ fn join(work_id: &str, session: &str, role: WorkRole) -> WorkStart {
         depends_on: vec![],
         related_work: vec![],
         takeover_generation: None,
+        preflight: None,
     }
 }
 

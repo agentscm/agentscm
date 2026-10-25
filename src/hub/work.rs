@@ -8,6 +8,7 @@ use super::coordination::CoordinationRequest;
 use super::github::valid_ref_name;
 use super::intent::{display, overlaps, spec_key, text};
 use super::store::{User, validate_repository};
+use super::work_preflight::{WorkPreflightRequest, WorkPreflightResult};
 use super::{HubError, Result};
 
 pub const MAX_WORK_PAGE: usize = 100;
@@ -61,6 +62,8 @@ pub struct WorkStart {
     #[serde(default)]
     pub related_work: Vec<String>,
     pub takeover_generation: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preflight: Option<WorkPreflightRequest>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -262,6 +265,10 @@ pub struct WorkCompaction {
     pub retention_floor: i64,
     pub deleted_coordination_requests: u64,
     pub coordination_retention_floor: i64,
+    #[serde(default)]
+    pub deleted_merge_observations: u64,
+    #[serde(default)]
+    pub merge_retention_floor: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -276,6 +283,8 @@ pub struct WorkStartResult {
     pub context: Option<WorkOverview>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coordination_request: Option<CoordinationRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preflight: Option<WorkPreflightResult>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -561,6 +570,9 @@ impl WorkStart {
             .is_some_and(|generation| generation < 1)
         {
             return Err(invalid("takeover_generation must be positive"));
+        }
+        if let Some(preflight) = &self.preflight {
+            preflight.validate()?;
         }
         Ok(scope)
     }

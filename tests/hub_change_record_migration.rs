@@ -177,6 +177,7 @@ fn seed_representative_work(db: &Db) -> Fixture {
                 depends_on: vec![],
                 related_work: vec![],
                 takeover_generation: None,
+                preflight: None,
             },
             unix_now(),
         )

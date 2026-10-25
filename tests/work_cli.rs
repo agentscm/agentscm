@@ -6,7 +6,11 @@ use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 
 use agentscm::backend::LocalBackend;
-use agentscm::hub::store::{ForgeIdentity, Store, mint_agent_token, unix_now};
+use agentscm::hub::catchup::CatchupPreviewQuery;
+use agentscm::hub::publish::{Create, NewPublication, Update, derive_id};
+use agentscm::hub::store::{
+    ForgeIdentity, Store, mint_agent_token, mint_bound_agent_token, unix_now,
+};
 use agentscm::hub::work::{
     WorkCheckpointResult, WorkCompaction, WorkConflictKind, WorkStartResult,
 };
@@ -66,6 +70,30 @@ impl Hub {
         )
         .unwrap();
         Client::new(&self.url, token_id, secret.expose())
+    }
+
+    fn bound_client(&self, user_id: i64, login: &str, repository_id: i64) -> Client {
+        let identity = ForgeIdentity {
+            provider: "github".into(),
+            host: "github.com".into(),
+            user_id,
+        };
+        let owner = self.store.upsert_user(&identity, login).unwrap();
+        let (token_id, secret, _) = mint_bound_agent_token(
+            &*self.store,
+            &owner.id,
+            &format!("agent-{user_id}"),
+            REPOSITORY,
+            repository_id,
+            3600,
+            false,
+        )
+        .unwrap();
+        Client::new(&self.url, token_id, secret.expose())
+    }
+
+    fn sqlite(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open(self.database.strip_prefix("sqlite://").unwrap()).unwrap()
     }
 }
 
@@ -151,6 +179,94 @@ impl Client {
         }
         command.output().unwrap()
     }
+
+    fn repair_merge(
+        &self,
+        database: Option<&OsStr>,
+        repository: &str,
+        publication: &str,
+        merge_commit: &str,
+        apply: bool,
+    ) -> Output {
+        const DATABASE_ENV: &str = "AGENTSCM_TEST_WORK_DATABASE";
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agentscm"));
+        command
+            .args([
+                "work",
+                "repair-merge",
+                "--database-env",
+                DATABASE_ENV,
+                "--repository",
+                repository,
+                "--publication",
+                publication,
+                "--merge-commit",
+                merge_commit,
+            ])
+            .env_clear()
+            .env("HOME", self.config.path())
+            .env("XDG_CONFIG_HOME", self.config.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(database) = database {
+            command.env(DATABASE_ENV, database);
+        }
+        if apply {
+            command.arg("--apply");
+        }
+        command.output().unwrap()
+    }
+}
+
+fn publication(branch: &str) -> NewPublication {
+    let commit = "b".repeat(40);
+    NewPublication {
+        id: derive_id(REPOSITORY, 3, &commit, branch),
+        manifest: serde_json::from_value(serde_json::json!({
+            "revision": "a".repeat(64), "event_seq": 3, "commit": commit,
+            "tree": "c".repeat(40), "parent": "d".repeat(40), "branch": branch,
+            "base": "main", "title": "Repair projection", "body": "", "message": "message\n",
+            "author": {"name":"A","email":"a@example.invalid","date":"2026-10-25T00:00:00Z"},
+            "committer": {"name":"A","email":"a@example.invalid","date":"2026-10-25T00:00:00Z"},
+            "changes": [{"path":"src/a.rs","mode":"100644","blob":"e".repeat(40),
+                "sha256":"f".repeat(64),"size":5}]
+        }))
+        .unwrap(),
+    }
+}
+
+fn create_pull_publication(
+    hub: &Hub,
+    client: &Client,
+    branch: &str,
+    number: i64,
+    now: i64,
+) -> String {
+    let publication = publication(branch);
+    assert!(matches!(
+        hub.store
+            .create_publication(&client.token_id, &publication, now)
+            .unwrap(),
+        Create::Done(_)
+    ));
+    hub.store
+        .update_publication(&publication.id, &Update::BranchAttempt, now)
+        .unwrap();
+    hub.store
+        .update_publication(&publication.id, &Update::BranchCreated, now)
+        .unwrap();
+    hub.store
+        .update_publication(
+            &publication.id,
+            &Update::PullRequest {
+                number,
+                node_id: format!("PR_{number}"),
+                html_url: format!("https://github.example/acme/widgets/pull/{number}"),
+            },
+            now,
+        )
+        .unwrap();
+    publication.id
 }
 
 fn conflict_result(output: &Output, expected: WorkConflictKind) -> WorkStartResult {
@@ -167,6 +283,202 @@ fn conflict_result(output: &Output, expected: WorkConflictKind) -> WorkStartResu
         })
     );
     result
+}
+
+fn cli_error(output: &Output) -> serde_json::Value {
+    assert!(!output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    serde_json::from_slice(&output.stderr).unwrap()
+}
+
+#[test]
+fn repair_merge_previews_and_applies_only_the_guarded_retained_failure() {
+    let hub = Hub::start();
+    let client = hub.bound_client(91, "repairer", 991);
+    let now = unix_now();
+    let publication = create_pull_publication(&hub, &client, "repair-merge", 91, now);
+    let invalid_commit = format!("legacy\n{}", "x".repeat(4096));
+    hub.sqlite()
+        .execute(
+            "UPDATE hub_publications SET merge_commit=?2,updated_at=?3 WHERE id=?1",
+            rusqlite::params![publication, invalid_commit, now + 1],
+        )
+        .unwrap();
+    hub.store
+        .work_catchup_preview(
+            &client.token_id,
+            &CatchupPreviewQuery {
+                subscriber: "agent:repair-cli".into(),
+            },
+            now + 2,
+        )
+        .unwrap();
+    assert_eq!(
+        hub.sqlite()
+            .query_row(
+                "SELECT COUNT(*) FROM hub_catchup_publication_failures WHERE publication=?1",
+                [&publication],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+
+    let repaired_commit = "9".repeat(40);
+    let preview = client.repair_merge(
+        Some(OsStr::new(&hub.database)),
+        REPOSITORY,
+        &publication,
+        &repaired_commit,
+        false,
+    );
+    assert!(preview.status.success(), "{preview:?}");
+    let preview_json: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(
+        preview_json["previous_merge_commit_sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&preview.stdout).unwrap(),
+        serde_json::json!({
+            "publication": publication,
+            "repository": REPOSITORY,
+            "previous_merge_commit_sha256": store::lower_hex_of(invalid_commit.as_bytes()),
+            "proposed_merge_commit": repaired_commit,
+            "applied": false
+        })
+    );
+    assert_eq!(
+        hub.store
+            .publication(REPOSITORY, &publication)
+            .unwrap()
+            .unwrap()
+            .merge_commit
+            .as_deref(),
+        Some(invalid_commit.as_str())
+    );
+
+    let wrong_repository = client.repair_merge(
+        Some(OsStr::new(&hub.database)),
+        "acme/other",
+        &publication,
+        &repaired_commit,
+        false,
+    );
+    assert_eq!(
+        cli_error(&wrong_repository)["error"],
+        "invalid: unknown publication in repository"
+    );
+    let unknown = client.repair_merge(
+        Some(OsStr::new(&hub.database)),
+        REPOSITORY,
+        "pub_00000000000000000000000000000000",
+        &repaired_commit,
+        false,
+    );
+    assert_eq!(
+        cli_error(&unknown)["error"],
+        "invalid: unknown publication in repository"
+    );
+    for malformed in ["9".repeat(39), "A".repeat(40), "z".repeat(40)] {
+        let output = client.repair_merge(
+            Some(OsStr::new(&hub.database)),
+            REPOSITORY,
+            &publication,
+            &malformed,
+            false,
+        );
+        assert_eq!(
+            cli_error(&output)["error"],
+            "invalid: merge commit must be 40 or 64 lowercase hexadecimal characters"
+        );
+    }
+
+    let applied = client.repair_merge(
+        Some(OsStr::new(&hub.database)),
+        REPOSITORY,
+        &publication,
+        &repaired_commit,
+        true,
+    );
+    assert!(applied.status.success(), "{applied:?}");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&applied.stdout).unwrap(),
+        serde_json::json!({
+            "publication": publication,
+            "repository": REPOSITORY,
+            "previous_merge_commit_sha256": store::lower_hex_of(invalid_commit.as_bytes()),
+            "proposed_merge_commit": repaired_commit,
+            "applied": true
+        })
+    );
+    assert_eq!(
+        hub.store
+            .publication(REPOSITORY, &publication)
+            .unwrap()
+            .unwrap()
+            .merge_commit
+            .as_deref(),
+        Some(repaired_commit.as_str())
+    );
+    assert_eq!(
+        hub.sqlite()
+            .query_row(
+                "SELECT COUNT(*) FROM hub_catchup_publication_failures WHERE publication=?1",
+                [&publication],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+
+    let valid_publication = create_pull_publication(&hub, &client, "valid-merge-fact", 92, now + 4);
+    let valid_commit = "8".repeat(40);
+    hub.store
+        .update_publication(
+            &valid_publication,
+            &Update::Merged {
+                merge_commit: valid_commit.clone(),
+            },
+            now + 5,
+        )
+        .unwrap();
+    for apply in [false, true] {
+        let refused = client.repair_merge(
+            Some(OsStr::new(&hub.database)),
+            REPOSITORY,
+            &valid_publication,
+            &valid_commit,
+            apply,
+        );
+        assert_eq!(
+            cli_error(&refused)["error"],
+            "invalid: no retained catch-up projection failure for publication"
+        );
+    }
+    let refused = client.repair_merge(
+        Some(OsStr::new(&hub.database)),
+        REPOSITORY,
+        &valid_publication,
+        &"7".repeat(40),
+        true,
+    );
+    assert_eq!(
+        cli_error(&refused)["error"],
+        "invalid: no retained catch-up projection failure for publication"
+    );
+    assert_eq!(
+        hub.store
+            .publication(REPOSITORY, &valid_publication)
+            .unwrap()
+            .unwrap()
+            .merge_commit
+            .as_deref(),
+        Some(valid_commit.as_str())
+    );
 }
 
 #[test]
@@ -281,5 +593,56 @@ fn start_claim_conflicts_keep_json_and_exit_nonzero() {
     conflict_result(
         &second_client.start(&request.to_string()),
         WorkConflictKind::GenerationChanged,
+    );
+}
+
+#[test]
+fn catchup_read_does_not_acknowledge_until_the_exact_delivery_is_marked_reviewed() {
+    use agentscm::hub::catchup::{CatchupAck, CatchupAckResult, CatchupAckStatus, CatchupPage};
+    let hub = Hub::start();
+    let client = hub.client(17, "reader");
+    let first = client.request("catchup", "{}");
+    assert!(first.status.success(), "{first:?}");
+    let page: CatchupPage = serde_json::from_slice(&first.stdout).unwrap();
+    assert!(page.complete);
+    let repeated = client.request("catchup", "{}");
+    assert!(repeated.status.success(), "{repeated:?}");
+    let repeated: CatchupPage = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert_eq!(repeated.event_from, page.event_from);
+    assert_eq!(repeated.merge_from, page.merge_from);
+    let ack = CatchupAck {
+        delivery: page.delivery,
+        expected_event_from: page.event_from,
+        expected_merge_from: page.merge_from,
+    };
+    let marked = client.request("catchup-ack", &serde_json::to_string(&ack).unwrap());
+    assert!(marked.status.success(), "{marked:?}");
+    let result: CatchupAckResult = serde_json::from_slice(&marked.stdout).unwrap();
+    assert_eq!(result.status, CatchupAckStatus::Advanced);
+    let retry = client.request("catchup-ack", &serde_json::to_string(&ack).unwrap());
+    assert!(retry.status.success(), "{retry:?}");
+    let retry: CatchupAckResult = serde_json::from_slice(&retry.stdout).unwrap();
+    assert_eq!(retry.status, CatchupAckStatus::AlreadyAcknowledged);
+}
+
+#[test]
+fn preflight_reports_missing_source_without_creating_work() {
+    use agentscm::hub::work_preflight::{
+        WorkPreflightReason, WorkPreflightResult, WorkPreflightStatus,
+    };
+    let hub = Hub::start();
+    let client = hub.client(18, "reader");
+    let result = client.request("preflight", r#"{"request_key":"inspect-only","title":"Inspect source","session":"agent","scope":["src/a.rs"]}"#);
+    assert!(result.status.success(), "{result:?}");
+    let result: WorkPreflightResult = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(result.status, WorkPreflightStatus::Unknown);
+    assert!(result.reasons.contains(&WorkPreflightReason::MissingSource));
+    assert!(result.subject_match.is_none());
+    assert!(
+        hub.store
+            .work_search(&client.token_id, None, None, 100, unix_now())
+            .unwrap()
+            .items
+            .is_empty()
     );
 }

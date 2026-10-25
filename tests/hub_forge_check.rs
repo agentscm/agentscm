@@ -1059,5 +1059,7 @@ async fn a_publication_to_another_host_is_never_reconciled_against_a_same_named_
         "a merge was recorded on the other host's publication"
     );
     assert_eq!(foreign[0].pr_number, Some(2));
-    assert_eq!(pull_reads(&env, 2), 0);
+    // Ordinary catch-up observes the actual merge on this repository, independently of
+    // the foreign publication. It does not reconcile or mutate that publication.
+    assert_eq!(pull_reads(&env, 2), 1);
 }

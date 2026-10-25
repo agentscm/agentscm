@@ -378,6 +378,7 @@ fn start_with(
         depends_on: vec![],
         related_work: vec![],
         takeover_generation: None,
+        preflight: None,
     }
 }
 
@@ -1817,8 +1818,13 @@ fn postgres_read_briefings_share_the_repository_maintenance_lock(db: &Db) {
         },
     );
     let mut lock_client = postgres::Client::connect(&db.url, NoTls).unwrap();
-    let scope =
-        serde_json::to_string(&("github", "github.com", REPO, Some(REPOSITORY_ID))).unwrap();
+    let scope = serde_json::to_string(&(
+        "github",
+        "github.com",
+        format!("@repo-id:{REPOSITORY_ID}"),
+        Some(REPOSITORY_ID),
+    ))
+    .unwrap();
     for preview in [false, true] {
         lock_client
             .execute(

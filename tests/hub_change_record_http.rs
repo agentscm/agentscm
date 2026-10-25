@@ -241,6 +241,7 @@ async fn session_setups_reach_the_projection_and_are_trimmed_first() {
         depends_on: vec![],
         related_work: vec![],
         takeover_generation: None,
+        preflight: None,
     };
     let work = hub
         .store
@@ -306,6 +307,7 @@ async fn read_token_gets_exact_projection_and_failures_are_explicit() {
                 depends_on: vec![],
                 related_work: vec![],
                 takeover_generation: None,
+                preflight: None,
             },
             unix_now(),
         )
@@ -528,6 +530,7 @@ async fn minimum_configured_spool_completes_one_managed_recipe() {
                 depends_on: vec![],
                 related_work: vec![],
                 takeover_generation: None,
+                preflight: None,
             },
             unix_now(),
         )
@@ -872,6 +875,7 @@ async fn hook_cli_accepts_canonical_alias_and_records_outage_as_a_gap() {
                 depends_on: vec![],
                 related_work: vec![],
                 takeover_generation: None,
+                preflight: None,
             },
             now,
         )
@@ -1737,6 +1741,7 @@ mod shared_bodies {
                         depends_on: vec![],
                         related_work: vec![],
                         takeover_generation: None,
+                        preflight: None,
                     },
                     unix_now(),
                 )
@@ -1759,6 +1764,7 @@ mod shared_bodies {
                         depends_on: vec![],
                         related_work: vec![],
                         takeover_generation: None,
+                        preflight: None,
                     },
                     unix_now(),
                 )
@@ -3666,6 +3672,7 @@ async fn capture_continues_after_the_hub_pauses_work_on_session_end() {
                 depends_on: vec![],
                 related_work: vec![],
                 takeover_generation: None,
+                preflight: None,
             },
             unix_now(),
         )

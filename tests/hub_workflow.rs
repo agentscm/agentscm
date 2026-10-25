@@ -1434,6 +1434,7 @@ fn postgres_finish_and_live_heartbeat_share_one_lock_order() {
                 depends_on: Vec::new(),
                 related_work: Vec::new(),
                 takeover_generation: None,
+                preflight: None,
             },
             now,
         )
@@ -1865,6 +1866,7 @@ fn assert_managed_touch_transitions_are_atomic(database: &str) {
                 depends_on: Vec::new(),
                 related_work: Vec::new(),
                 takeover_generation: None,
+                preflight: None,
             },
             now,
         )
@@ -1996,6 +1998,7 @@ fn assert_managed_touch_transitions_are_atomic(database: &str) {
                 depends_on: Vec::new(),
                 related_work: Vec::new(),
                 takeover_generation: Some(resumed_takeover.generation),
+                preflight: None,
             },
             takeover_at,
         )
@@ -2067,6 +2070,7 @@ fn assert_managed_touch_transitions_are_atomic(database: &str) {
                 depends_on: Vec::new(),
                 related_work: Vec::new(),
                 takeover_generation: None,
+                preflight: None,
             },
             takeover_at + 2,
         )

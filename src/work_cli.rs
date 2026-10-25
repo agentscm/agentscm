@@ -4,6 +4,7 @@ use std::io::{self, Read};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use agentscm::hub::catchup::{CatchupAck, CatchupPublicationRepair, CatchupQuery};
 use agentscm::hub::coordination::{
     CoordinationAck, CoordinationReply, CoordinationResolve, CoordinationWithdraw,
 };
@@ -26,6 +27,24 @@ const REQUEST_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Subcommand)]
 pub enum WorkCommand {
+    /// Inspect exact Work subjects, scope overlaps and the merge watermark without claiming work.
+    Preflight {
+        /// Strict WorkStart JSON, including any source revision and checked merge identities.
+        #[arg(long, default_value = "-")]
+        request: PathBuf,
+    },
+    /// Read a fixed return-to-work delivery without marking it reviewed.
+    Catchup {
+        /// Strict CatchupQuery JSON for a subscriber or page continuation; - reads stdin.
+        #[arg(long)]
+        request: Option<PathBuf>,
+    },
+    /// Explicitly mark a fully delivered catch-up window reviewed.
+    CatchupAck {
+        /// Strict CatchupAck JSON using the exact delivered identity and starting cursors.
+        #[arg(long, default_value = "-")]
+        request: PathBuf,
+    },
     /// Submit one caller-reported usage observation for durable work.
     Usage {
         /// Strict UsageRecord JSON file, or - for standard input.
@@ -160,6 +179,35 @@ pub enum WorkCommand {
         #[arg(long)]
         apply: bool,
     },
+    /// Preview or apply guarded repair of one retained merged-publication projection failure.
+    RepairMerge {
+        /// Explicit SQLite or passwordless PostgreSQL URL. Use --database-env for secret URLs.
+        #[arg(
+            long,
+            conflicts_with = "database_env",
+            required_unless_present = "database_env"
+        )]
+        database: Option<String>,
+        /// Name of an environment variable containing the database URL.
+        #[arg(
+            long,
+            conflicts_with = "database",
+            required_unless_present = "database"
+        )]
+        database_env: Option<String>,
+        /// Exact canonical owner/name repository retained on the publication.
+        #[arg(long)]
+        repository: String,
+        /// Exact retained publication id.
+        #[arg(long)]
+        publication: String,
+        /// Replacement merge commit: 40 or 64 lowercase hexadecimal characters.
+        #[arg(long)]
+        merge_commit: String,
+        /// Apply the guarded repair. Omit for a read-only proposal preview.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 pub(crate) fn telemetry_action(command: &WorkCommand) -> bool {
@@ -167,9 +215,11 @@ pub(crate) fn telemetry_action(command: &WorkCommand) -> bool {
         WorkCommand::Inbox { .. }
         | WorkCommand::Overview { .. }
         | WorkCommand::Briefing { .. }
+        | WorkCommand::Catchup { .. }
+        | WorkCommand::Preflight { .. }
         | WorkCommand::Insight { .. }
         | WorkCommand::Insights { .. } => false,
-        WorkCommand::Compact { apply, .. } => *apply,
+        WorkCommand::Compact { apply, .. } | WorkCommand::RepairMerge { apply, .. } => *apply,
         WorkCommand::CoordinationAck { .. }
         | WorkCommand::CoordinationReply { .. }
         | WorkCommand::CoordinationResolve { .. }
@@ -178,6 +228,7 @@ pub(crate) fn telemetry_action(command: &WorkCommand) -> bool {
         | WorkCommand::Usage { .. }
         | WorkCommand::Checkpoint { .. }
         | WorkCommand::Ack { .. } => true,
+        WorkCommand::CatchupAck { .. } => true,
     }
 }
 
@@ -203,6 +254,30 @@ pub async fn run(command: WorkCommand) -> Result<()> {
             };
             let result = store
                 .work_compact(&scope, before, apply, unix_now())
+                .map_err(map_hub_error)?;
+            println!("{}", serde_json::to_value(result)?);
+            return Ok(());
+        }
+        WorkCommand::RepairMerge {
+            database,
+            database_env,
+            repository,
+            publication,
+            merge_commit,
+            apply,
+        } => {
+            let database = database_url(database, database_env)?;
+            let store = store::open(&database).map_err(map_hub_error)?;
+            let result = store
+                .repair_catchup_publication_merge(
+                    &CatchupPublicationRepair {
+                        repository,
+                        publication,
+                        merge_commit,
+                        apply,
+                    },
+                    unix_now(),
+                )
                 .map_err(map_hub_error)?;
             println!("{}", serde_json::to_value(result)?);
             return Ok(());
@@ -352,6 +427,38 @@ pub async fn run(command: WorkCommand) -> Result<()> {
                 false,
             )
         }
+        WorkCommand::Preflight { request } => {
+            let request: WorkStart = read_request(&request)?;
+            (
+                hub.call(
+                    Method::POST,
+                    "/v1/hub/standup/preflight",
+                    Some(json!(request)),
+                )
+                .await?,
+                false,
+            )
+        }
+        WorkCommand::Catchup { request } => {
+            let query: CatchupQuery = match request {
+                Some(path) => read_request(&path)?,
+                None => CatchupQuery::default(),
+            };
+            let path = query_path("/v1/hub/standup/catchup", serde_json::to_value(query)?)?;
+            (hub.call(Method::GET, &path, None).await?, false)
+        }
+        WorkCommand::CatchupAck { request } => {
+            let request: CatchupAck = read_request(&request)?;
+            (
+                hub.call(
+                    Method::POST,
+                    "/v1/hub/standup/catchup/ack",
+                    Some(json!(request)),
+                )
+                .await?,
+                false,
+            )
+        }
         WorkCommand::Overview {
             recent_since,
             limit,
@@ -442,7 +549,9 @@ pub async fn run(command: WorkCommand) -> Result<()> {
                 false,
             )
         }
-        WorkCommand::Compact { .. } => unreachable!("compaction returned before hub connection"),
+        WorkCommand::Compact { .. } | WorkCommand::RepairMerge { .. } => {
+            unreachable!("local maintenance returned before hub connection")
+        }
     };
     println!("{reply}");
     if claim_conflict {
@@ -468,6 +577,33 @@ fn read_request<T: DeserializeOwned>(path: &PathBuf) -> Result<T> {
         return Err(invalid("work request exceeds 1 MiB"));
     }
     serde_json::from_str(&text).map_err(|_| invalid("work request is not valid strict JSON"))
+}
+
+fn query_path(path: &str, query: serde_json::Value) -> Result<String> {
+    let mut url = reqwest::Url::parse(&format!("http://hub{path}"))
+        .map_err(|_| invalid("cannot construct work query"))?;
+    let fields = query
+        .as_object()
+        .ok_or_else(|| invalid("invalid work query"))?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        for (key, value) in fields {
+            match value {
+                serde_json::Value::Null => {}
+                serde_json::Value::String(value) => {
+                    pairs.append_pair(key, value);
+                }
+                serde_json::Value::Number(value) => {
+                    pairs.append_pair(key, &value.to_string());
+                }
+                _ => return Err(invalid("invalid work query field")),
+            }
+        }
+    }
+    url.as_str()
+        .strip_prefix("http://hub")
+        .map(str::to_owned)
+        .ok_or_else(|| invalid("cannot construct work query"))
 }
 
 fn invalid(message: &str) -> Error {

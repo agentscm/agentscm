@@ -206,6 +206,7 @@ fn start_scope(
         depends_on: Vec::new(),
         related_work: Vec::new(),
         takeover_generation: None,
+        preflight: None,
     }
 }
 

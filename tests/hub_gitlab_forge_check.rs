@@ -1047,7 +1047,8 @@ async fn a_publication_to_another_host_is_never_reconciled_against_a_same_number
         1,
         "a merge was recorded on the other host's publication"
     );
-    assert_eq!(env.requests_to("/merge_requests/2"), 0);
+    // The bounded catch-up read is independent of the foreign publication above.
+    assert_eq!(env.requests_to("/merge_requests/2"), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

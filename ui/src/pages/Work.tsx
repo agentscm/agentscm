@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react'
+import { CatchupPanel } from '../Catchup.tsx'
 import {
   currentLeadParticipant,
   fetchBriefing,
@@ -869,6 +870,7 @@ export function WorkPage({ token, overview }: { token: string; overview: Poll<Wo
           }
         />
       )}
+      <CatchupPanel token={token} />
       <div className="tabbar" data-tour="work-tabs" role="tablist" aria-label="Work views">
         {tabs.map((t) => (
           <button key={t.key} type="button" role="tab" aria-selected={tab === t.key} className={`tab${tab === t.key ? ' active' : ''}`} onClick={() => { window.location.hash = workTabHref(t.key).slice(1) }}>
