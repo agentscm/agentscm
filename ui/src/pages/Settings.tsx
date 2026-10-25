@@ -104,7 +104,7 @@ export function SettingsPage({ token, whoami, pref, onPref, density, onDensity, 
 
         {isLocalCredential(token) ? (
           <Box tour="settings-local" icon="laptop" title="This computer" explain="This page comes from AgentSCM on your computer. It reads your files and saved conversations here, and your team’s Hub with a read-only connection.">
-            <ComputerSettings token={token} />
+            <ComputerSettings />
           </Box>
         ) : (
           <LocalServer />

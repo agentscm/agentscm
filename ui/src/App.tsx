@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useState, useSyncExternalStore } from 'react'
-import { ComputerNotices } from './ComputerBar.tsx'
+import { ComputerNotices, LocalComputerProvider } from './ComputerBar.tsx'
 import { derive } from './derive.ts'
 import { isLocalCredential, onFrontDoor } from './frontDoor.ts'
 import { fetchOverview } from './standup.ts'
@@ -110,7 +110,7 @@ function Shell({ token, dark, pref, onPref, density, onDensity, onUnauthorized, 
     saveRail(v)
   }, [])
 
-  return (
+  const shell = (
     <TourProvider section={section} data={data} d={d} overview={overview.kind === 'ready' ? overview.value : null}>
       <AppChrome
         logo={<Logo dark={dark} height={26} />}
@@ -128,7 +128,7 @@ function Shell({ token, dark, pref, onPref, density, onDensity, onUnauthorized, 
         collapsed={rail}
         onCollapsed={changeRail}
       >
-        {isLocalCredential(token) && <ComputerNotices token={token} />}
+        <ComputerNotices />
         {data.health?.demo && (
           <Notice tone="brand" icon="play-circle" title="Demo hub">
             Simulated agents working on your repository’s file names. Nothing is written to your repository; this page stops when <code>agentscm demo</code> does. To set it up for real, stop the demo and run <code>agentscm quickstart</code> (or <code>npx agentscm</code>).
@@ -151,6 +151,8 @@ function Shell({ token, dark, pref, onPref, density, onDensity, onUnauthorized, 
       </AppChrome>
     </TourProvider>
   )
+  // On this computer's own Hub page, one read of the connection serves the menu, notices and Settings.
+  return isLocalCredential(token) ? <LocalComputerProvider token={token}>{shell}</LocalComputerProvider> : shell
 }
 
 export default function App() {
