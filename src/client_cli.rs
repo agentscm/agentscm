@@ -321,16 +321,7 @@ pub(crate) fn setup_existing_agent(
         expected_generation,
         agent,
     )?;
-    let home = std::env::var_os("HOME").ok_or_else(|| invalid("HOME is not set"))?;
-    let stable = PathBuf::from(home).join(".agentscm/bin/agentscm");
-    let installed = std::fs::canonicalize(&stable).map_err(|_| {
-        invalid("restart AgentSCM from the installed ~/.agentscm/bin/agentscm link")
-    })?;
-    if installed != std::fs::canonicalize(running_program)? {
-        return Err(invalid(
-            "restart AgentSCM from the installed ~/.agentscm/bin/agentscm link",
-        ));
-    }
+    let stable = installed_program(running_program)?;
     crate::client_setup::preflight(agent, root, &stable)?;
     let latest = load()?
         .into_iter()
@@ -349,6 +340,41 @@ pub(crate) fn setup_existing_agent(
     // The compare-and-swap also fences reapplication if the connection changed during preflight.
     update(root, Some(&latest), Some(replacement))?;
     crate::client_setup::install_quiet(agent, root, &stable)
+}
+
+/// `client setup` for a checkout the tray saw an agent use without a connection. The tray has
+/// no terminal, so this never starts a sign-in; it uses the saved session for `hub`.
+#[cfg(target_os = "macos")]
+pub(crate) async fn setup_unconnected(
+    agent: crate::client_setup::Agent,
+    root: &Path,
+    hub: &str,
+    running_program: &Path,
+) -> Result<()> {
+    let root = canonical_root(root)?;
+    let stable = installed_program(running_program)?;
+    let args = ConnectArgs {
+        hub: hub.to_owned(),
+        no_sign_in: true,
+        ..ConnectArgs::default()
+    };
+    setup(&[agent], args, root, &stable, None).await
+}
+
+/// The stable `~/.agentscm/bin/agentscm` link, which hooks must run, when it is this program.
+#[cfg(target_os = "macos")]
+fn installed_program(running_program: &Path) -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").ok_or_else(|| invalid("HOME is not set"))?;
+    let stable = PathBuf::from(home).join(".agentscm/bin/agentscm");
+    let installed = std::fs::canonicalize(&stable).map_err(|_| {
+        invalid("restart AgentSCM from the installed ~/.agentscm/bin/agentscm link")
+    })?;
+    if installed != std::fs::canonicalize(running_program)? {
+        return Err(invalid(
+            "restart AgentSCM from the installed ~/.agentscm/bin/agentscm link",
+        ));
+    }
+    Ok(stable)
 }
 
 pub(crate) fn lifecycle_lock() -> Result<std::fs::File> {

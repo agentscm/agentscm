@@ -71,6 +71,7 @@ enum Operation {
     Diff,
     Search,
     Evidence,
+    Sessions,
     Conversation,
 }
 
@@ -84,6 +85,7 @@ impl Operation {
             "diff" => Self::Diff,
             "search" => Self::Search,
             "evidence" => Self::Evidence,
+            "sessions" => Self::Sessions,
             "conversation" => Self::Conversation,
             _ => return None,
         })
@@ -98,6 +100,7 @@ impl Operation {
             Self::Diff => &["left", "right", "path", "cursor", "limit"],
             Self::Search => &["commit", "q", "cursor", "limit"],
             Self::Evidence => &["commit", "path", "work_id", "cursor", "limit"],
+            Self::Sessions => &["cursor", "limit"],
             Self::Conversation => &["work_id", "session_id", "cursor", "limit"],
         }
     }
@@ -158,8 +161,10 @@ async fn read(
         Ok(value) => value.unwrap_or(operation.default_limit()),
         Err(error) => return read_error(error, "repository explorer"),
     };
-    if matches!(operation, Operation::Evidence | Operation::Conversation)
-        && explorer.evidence.is_none()
+    if matches!(
+        operation,
+        Operation::Evidence | Operation::Sessions | Operation::Conversation
+    ) && explorer.evidence.is_none()
     {
         return failure(
             StatusCode::NOT_FOUND,
@@ -269,6 +274,10 @@ fn project(
                 optional("cursor"),
                 limit,
             )?)?
+        }
+        Operation::Sessions => {
+            let evidence = explorer.evidence.as_ref().ok_or(Error::SourceDenied)?;
+            serde_json::to_value(evidence.sessions(optional("cursor"), limit)?)?
         }
         Operation::Conversation => {
             let evidence = explorer.evidence.as_ref().ok_or(Error::SourceDenied)?;

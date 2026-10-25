@@ -74,6 +74,11 @@ recorded source to the selected commit does not say that the current working tre
 Different source and unknown applicability remain visible. A successful process with partial
 coverage is not a complete verification result.
 
+The Evidence tab lists conversations whose Work has a recorded action for the selected commit. The
+**Conversations** tab lists every saved conversation for the repository, newest first, so a
+session with no recorded action is still reachable. Being listed there means only that the
+conversation belongs to its Work and session; it is not associated with any commit.
+
 Conversation candidates share a Work and session with recorded activity. Capture v1 does not
 establish which prompt caused a file or hunk, so the explorer does not present those associations
 as authorship or motivation. A path selection does not strengthen that relationship. Work links
@@ -126,6 +131,7 @@ use an explicitly allowed origin. Unknown or duplicate query fields are rejected
 | `diff` | `left`, `right` | `path`, `cursor`, `limit` |
 | `search` | `commit`, `q` | `cursor`, `limit` |
 | `evidence` | `commit` | `path`, `work_id`, `cursor`, `limit` |
+| `sessions` | — | `cursor`, `limit` |
 | `conversation` | `work_id`, `session_id` | `cursor`, `limit` |
 
 Except for `summary`, source arguments must be full lowercase commit IDs. Cursors are opaque and
