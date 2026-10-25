@@ -9,6 +9,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -247,6 +248,12 @@ const MAX_INSPECTION_RETURNED: usize = 100;
 const MAX_INSPECTION_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_INSPECTION_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_INSPECTION_DEPTH: usize = 32;
+const MAX_READ_ONLY_ENVELOPES: usize = 8_192;
+const MAX_READ_ONLY_EVENTS: usize = 100_000;
+const MAX_READ_ONLY_ENVELOPE_BYTES: u64 = 1024 * 1024;
+const MAX_READ_ONLY_COMPACTION_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_READ_ONLY_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
+const READ_ONLY_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -582,6 +589,43 @@ pub struct LocalSpool {
     identity: SpoolIdentityV1,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadOnlyEnvelopeState {
+    Pending,
+    Acknowledged,
+    Compacted,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ReadOnlyEnvelope {
+    pub envelope: CaptureEnvelopeV1,
+    pub state: ReadOnlyEnvelopeState,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ReadOnlySpoolProjection {
+    pub envelopes: Vec<ReadOnlyEnvelope>,
+    pub compacted_event_batches_unattributed: usize,
+}
+
+/// Descriptor-pinned reader for an existing private spool.
+///
+/// This reader never initializes, recovers, locks or rewrites spool state. The namespace and
+/// fixed v4 identity are checked before retained facts are interpreted. Child directories remain
+/// pinned by descriptor so replacing a pathname after startup cannot redirect evidence reads.
+pub(crate) struct ReadOnlySpool {
+    root_path: PathBuf,
+    root: File,
+    outbox: File,
+    acknowledged: File,
+    artifacts: File,
+    outbox_identity: FileIdentityV1,
+    acknowledged_identity: FileIdentityV1,
+    artifacts_identity: FileIdentityV1,
+    identity: SpoolIdentityV1,
+    namespace: SpoolNamespaceV1,
+}
+
 #[derive(Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SequenceState {
@@ -656,6 +700,378 @@ impl Drop for ManagedCaptureGuard {
     fn drop(&mut self) {
         // SAFETY: the descriptor remains owned by `self.0` for this call.
         unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+impl ReadOnlySpool {
+    pub(crate) fn open(root: impl AsRef<Path>, repository: &str) -> Result<Self> {
+        let root = root.as_ref();
+        if !root.is_absolute() {
+            return Err(CaptureError::Invalid(
+                "capture spool directory must be absolute".into(),
+            ));
+        }
+        if !bounded_text(repository, 1_024) {
+            return Err(CaptureError::Invalid(
+                "capture repository namespace is invalid".into(),
+            ));
+        }
+
+        let root_directory = open_private_directory(root)?;
+        validate_private_metadata(&root_directory.metadata()?, "capture spool root")?;
+        let root_identity = file_identity(&root_directory)?;
+        if path_identity(root)? != root_identity {
+            return Err(CaptureError::Conflict(
+                "spool_v4_identity_mismatch: capture spool directory changed during read-only open"
+                    .into(),
+            ));
+        }
+
+        let format: SpoolIdentityV1 = serde_json::from_slice(&read_private_bounded_at(
+            &root_directory,
+            OsStr::new("capture-spool-v4.json"),
+            MAX_DEFERRED_BYTES,
+        )?)?;
+        validate_format_v4(&format)?;
+        if format.root != root_identity {
+            return Err(CaptureError::Conflict(
+                "spool_v4_identity_mismatch: capture spool root identity changed".into(),
+            ));
+        }
+        for (name, expected) in [
+            (OsStr::new("spool.lock"), format.spool_lock),
+            (OsStr::new("managed-capture.lock"), format.managed_lock),
+        ] {
+            let lock = openat_private_regular_read_only(&root_directory, name)?;
+            if file_identity(&lock)? != expected {
+                return Err(CaptureError::Conflict(format!(
+                    "spool_v4_identity_mismatch: {} identity changed",
+                    name.to_string_lossy()
+                )));
+            }
+        }
+
+        let namespace: SpoolNamespaceV1 = serde_json::from_slice(&read_private_bounded_at(
+            &root_directory,
+            OsStr::new("namespace-v1.json"),
+            MAX_DEFERRED_BYTES,
+        )?)?;
+        validate_namespace(&namespace)?;
+        if namespace.repository != repository {
+            return Err(CaptureError::Conflict(
+                "capture spool namespace does not match the selected repository".into(),
+            ));
+        }
+
+        let open_directory = |name: &'static str| -> Result<File> {
+            let directory = openat_file(
+                &root_directory,
+                OsStr::new(name),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            )?;
+            validate_private_metadata(
+                &directory.metadata()?,
+                &format!("capture directory {name}"),
+            )?;
+            Ok(directory)
+        };
+        let outbox = open_directory("outbox")?;
+        let acknowledged = open_directory("acknowledged")?;
+        let artifacts = open_directory("artifacts")?;
+        let outbox_identity = file_identity(&outbox)?;
+        let acknowledged_identity = file_identity(&acknowledged)?;
+        let artifacts_identity = file_identity(&artifacts)?;
+
+        // A valid v4 spool always has this state. Reading it here rejects partial initialization
+        // without running the writer's recovery path.
+        let compaction: CompactionStateV1 = serde_json::from_slice(&read_private_bounded_at(
+            &root_directory,
+            OsStr::new("compaction-v1.json"),
+            MAX_READ_ONLY_COMPACTION_BYTES,
+        )?)?;
+        if compaction.entries.len() > MAX_READ_ONLY_ENVELOPES
+            || !valid_compaction_state(&compaction)
+        {
+            return Err(CaptureError::Invalid(
+                "capture compaction index is invalid".into(),
+            ));
+        }
+
+        Ok(Self {
+            root_path: root.to_owned(),
+            root: root_directory,
+            outbox,
+            acknowledged,
+            artifacts,
+            outbox_identity,
+            acknowledged_identity,
+            artifacts_identity,
+            identity: format,
+            namespace,
+        })
+    }
+
+    fn verify_pinned_identity(&self) -> Result<()> {
+        if file_identity(&self.root)? != self.identity.root
+            || path_identity(&self.root_path)? != self.identity.root
+        {
+            return Err(CaptureError::Conflict(
+                "spool_v4_identity_mismatch: pinned capture spool identity changed".into(),
+            ));
+        }
+        for (name, pinned, expected) in [
+            ("outbox", &self.outbox, self.outbox_identity),
+            (
+                "acknowledged",
+                &self.acknowledged,
+                self.acknowledged_identity,
+            ),
+            ("artifacts", &self.artifacts, self.artifacts_identity),
+        ] {
+            if file_identity(pinned)? != expected {
+                return Err(CaptureError::Conflict(
+                    "spool_v4_identity_mismatch: pinned capture directory changed".into(),
+                ));
+            }
+            let current = openat_file(
+                &self.root,
+                OsStr::new(name),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            )?;
+            validate_private_metadata(&current.metadata()?, &format!("capture directory {name}"))?;
+            if file_identity(&current)? != expected {
+                return Err(CaptureError::Conflict(format!(
+                    "spool_v4_identity_mismatch: capture directory {name} was replaced"
+                )));
+            }
+        }
+        let namespace: SpoolNamespaceV1 = serde_json::from_slice(&read_private_bounded_at(
+            &self.root,
+            OsStr::new("namespace-v1.json"),
+            MAX_DEFERRED_BYTES,
+        )?)?;
+        validate_namespace(&namespace)?;
+        if namespace != self.namespace {
+            return Err(CaptureError::Conflict(
+                "capture spool namespace changed after read-only open".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn projection(&self) -> Result<ReadOnlySpoolProjection> {
+        self.verify_pinned_identity()?;
+        let deadline = Instant::now()
+            .checked_add(READ_ONLY_SCAN_TIMEOUT)
+            .ok_or_else(|| CaptureError::Limit("evidence scan deadline overflowed".into()))?;
+        let compaction_bytes = read_private_bounded_at(
+            &self.root,
+            OsStr::new("compaction-v1.json"),
+            MAX_READ_ONLY_COMPACTION_BYTES,
+        )?;
+        let mut total_bytes = compaction_bytes.len() as u64;
+        let compaction: CompactionStateV1 = serde_json::from_slice(&compaction_bytes)?;
+        if compaction.entries.len() > MAX_READ_ONLY_ENVELOPES
+            || !valid_compaction_state(&compaction)
+        {
+            return Err(CaptureError::Limit(
+                "capture compaction index exceeds the evidence projection bound".into(),
+            ));
+        }
+        let outbox_names =
+            read_only_directory_entry_names(&self.outbox, MAX_READ_ONLY_ENVELOPES, deadline)?;
+        let acknowledged_names =
+            read_only_directory_entry_names(&self.acknowledged, MAX_READ_ONLY_ENVELOPES, deadline)?;
+        let acknowledged_keys: BTreeSet<Vec<u8>> = acknowledged_names
+            .iter()
+            .map(|name| name.as_bytes().to_vec())
+            .collect();
+        let mut retained = BTreeMap::<String, ReadOnlyEnvelope>::new();
+        for name in &outbox_names {
+            check_read_only_deadline(deadline)?;
+            let name = name.to_str().ok_or_else(|| {
+                CaptureError::Invalid("capture outbox filename is not UTF-8".into())
+            })?;
+            if owned_temp_target(name)
+                .is_some_and(|target| target.strip_suffix(".json").is_some_and(valid_digest))
+            {
+                continue;
+            }
+            let key = name.strip_suffix(".json").ok_or_else(|| {
+                CaptureError::Invalid("capture outbox filename is invalid".into())
+            })?;
+            if !valid_digest(key) {
+                return Err(CaptureError::Invalid(
+                    "capture outbox identity is invalid".into(),
+                ));
+            }
+            let bytes = read_private_bounded_at(
+                &self.outbox,
+                OsStr::new(name),
+                MAX_READ_ONLY_ENVELOPE_BYTES,
+            )?;
+            total_bytes = total_bytes
+                .checked_add(bytes.len() as u64)
+                .filter(|total| *total <= MAX_READ_ONLY_TOTAL_BYTES)
+                .ok_or_else(|| {
+                    CaptureError::Limit(
+                        "capture evidence projection exceeds its aggregate byte bound".into(),
+                    )
+                })?;
+            let envelope: CaptureEnvelopeV1 = serde_json::from_slice(&bytes)?;
+            envelope
+                .validate()
+                .map_err(|error| CaptureError::Invalid(error.to_string()))?;
+            if envelope_key(&envelope) != key {
+                return Err(CaptureError::Conflict(
+                    "retained envelope filename does not match its identity".into(),
+                ));
+            }
+            let state = if acknowledged_keys.contains(key.as_bytes()) {
+                let marker = read_private_bounded_at(&self.acknowledged, OsStr::new(key), 64)?;
+                total_bytes = total_bytes
+                    .checked_add(marker.len() as u64)
+                    .filter(|total| *total <= MAX_READ_ONLY_TOTAL_BYTES)
+                    .ok_or_else(|| {
+                        CaptureError::Limit(
+                            "capture evidence projection exceeds its aggregate byte bound".into(),
+                        )
+                    })?;
+                if marker != sha256(&bytes).as_bytes() {
+                    return Err(CaptureError::Conflict(
+                        "acknowledgement differs from the retained envelope".into(),
+                    ));
+                }
+                ReadOnlyEnvelopeState::Acknowledged
+            } else {
+                ReadOnlyEnvelopeState::Pending
+            };
+            if retained
+                .insert(key.to_owned(), ReadOnlyEnvelope { envelope, state })
+                .is_some()
+            {
+                return Err(CaptureError::Conflict(
+                    "capture spool contains duplicate envelope identities".into(),
+                ));
+            }
+        }
+
+        let mut compacted_event_batches_unattributed = 0usize;
+        for (key, compacted) in compaction.entries {
+            check_read_only_deadline(deadline)?;
+            let Some(envelope) = compacted.envelope else {
+                compacted_event_batches_unattributed =
+                    compacted_event_batches_unattributed.saturating_add(1);
+                continue;
+            };
+            if let Some(existing) = retained.get(&key) {
+                if sha256(&serde_json::to_vec(&existing.envelope)?) != compacted.digest {
+                    return Err(CaptureError::Conflict(
+                        "compacted envelope differs from retained bytes".into(),
+                    ));
+                }
+                continue;
+            }
+            retained.insert(
+                key,
+                ReadOnlyEnvelope {
+                    envelope,
+                    state: ReadOnlyEnvelopeState::Compacted,
+                },
+            );
+            if retained.len() > MAX_READ_ONLY_ENVELOPES {
+                return Err(CaptureError::Limit(
+                    "capture evidence projection contains too many retained envelopes".into(),
+                ));
+            }
+        }
+
+        let final_outbox_names =
+            read_only_directory_entry_names(&self.outbox, MAX_READ_ONLY_ENVELOPES, deadline)?;
+        let final_acknowledged_names =
+            read_only_directory_entry_names(&self.acknowledged, MAX_READ_ONLY_ENVELOPES, deadline)?;
+        let final_compaction_bytes = read_private_bounded_at(
+            &self.root,
+            OsStr::new("compaction-v1.json"),
+            MAX_READ_ONLY_COMPACTION_BYTES,
+        )?;
+        total_bytes = total_bytes
+            .checked_add(final_compaction_bytes.len() as u64)
+            .filter(|total| *total <= MAX_READ_ONLY_TOTAL_BYTES)
+            .ok_or_else(|| {
+                CaptureError::Limit(
+                    "capture evidence projection exceeds its aggregate byte bound".into(),
+                )
+            })?;
+        debug_assert!(total_bytes <= MAX_READ_ONLY_TOTAL_BYTES);
+        let projected_events = retained.values().try_fold(0usize, |total, retained| {
+            let events = match &retained.envelope {
+                CaptureEnvelopeV1::EventBatch(batch) => batch.events.len(),
+                CaptureEnvelopeV1::ActionStart(_)
+                | CaptureEnvelopeV1::ActionFinish(_)
+                | CaptureEnvelopeV1::Usage(_) => 0,
+            };
+            total
+                .checked_add(events)
+                .filter(|count| *count <= MAX_READ_ONLY_EVENTS)
+                .ok_or_else(|| {
+                    CaptureError::Limit(
+                        "capture evidence projection contains too many retained events".into(),
+                    )
+                })
+        })?;
+        debug_assert!(projected_events <= MAX_READ_ONLY_EVENTS);
+        check_read_only_deadline(deadline)?;
+        self.verify_pinned_identity()?;
+        if final_outbox_names != outbox_names
+            || final_acknowledged_names != acknowledged_names
+            || final_compaction_bytes != compaction_bytes
+        {
+            return Err(CaptureError::Conflict(
+                "capture spool changed during evidence projection; retry the read".into(),
+            ));
+        }
+
+        let mut envelopes: Vec<_> = retained.into_values().collect();
+        envelopes.sort_by(|left, right| {
+            delivery_key(&left.envelope).cmp(&delivery_key(&right.envelope))
+        });
+        Ok(ReadOnlySpoolProjection {
+            envelopes,
+            compacted_event_batches_unattributed,
+        })
+    }
+
+    pub(crate) fn read_artifact(
+        &self,
+        reference: &ArtifactRefV1,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>> {
+        self.verify_pinned_identity()?;
+        if reference.availability != ContentAvailabilityV1::Local {
+            return Err(CaptureError::NotFound(
+                "artifact is not recorded as locally available".into(),
+            ));
+        }
+        if reference.size_bytes > max_bytes {
+            return Err(CaptureError::Limit(
+                "artifact reference exceeds the evidence read bound".into(),
+            ));
+        }
+        let bytes = read_private_bounded_at(
+            &self.artifacts,
+            OsStr::new(&reference.digest),
+            reference.size_bytes,
+        )?;
+        if bytes.len() as u64 != reference.size_bytes || sha256(&bytes) != reference.digest {
+            return Err(CaptureError::Conflict(
+                "local artifact failed size or digest verification".into(),
+            ));
+        }
+        self.verify_pinned_identity()?;
+        Ok(bytes)
     }
 }
 
@@ -4702,6 +5118,48 @@ fn openat_file(directory: &File, name: &OsStr, flags: i32, mode: libc::mode_t) -
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
+fn openat_private_regular_read_only(directory: &File, name: &OsStr) -> Result<File> {
+    let file = openat_file(
+        directory,
+        name,
+        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(CaptureError::Conflict(format!(
+            "spool_private_permissions: {} is not a regular private file",
+            name.to_string_lossy()
+        )));
+    }
+    validate_private_metadata(
+        &metadata,
+        &format!("retained metadata {}", name.to_string_lossy()),
+    )?;
+    Ok(file)
+}
+
+fn read_private_bounded_at(directory: &File, name: &OsStr, max: u64) -> Result<Vec<u8>> {
+    let file = openat_private_regular_read_only(directory, name)?;
+    let initial_len = file.metadata()?.len();
+    if initial_len > max {
+        return Err(CaptureError::Limit(
+            "capture entry exceeds its read bound".into(),
+        ));
+    }
+    let read_limit = max
+        .checked_add(1)
+        .ok_or_else(|| CaptureError::Limit("capture read bound overflowed".into()))?;
+    let mut bytes = Vec::with_capacity(initial_len as usize);
+    (&file).take(read_limit).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        return Err(CaptureError::Limit(
+            "capture entry exceeds its read bound".into(),
+        ));
+    }
+    Ok(bytes)
+}
+
 fn mkdirat_private(directory: &File, name: &OsStr) -> Result<()> {
     let name = CString::new(name.as_bytes())
         .map_err(|_| CaptureError::Invalid("capture directory name contains NUL".into()))?;
@@ -5538,6 +5996,76 @@ fn directory_entry_names(directory: &File) -> Result<Vec<OsString>> {
         return Err(std::io::Error::last_os_error().into());
     }
     Ok(names)
+}
+
+fn read_only_directory_entry_names(
+    directory: &File,
+    max_entries: usize,
+    deadline: Instant,
+) -> Result<Vec<OsString>> {
+    let reopened = openat_file(
+        directory,
+        OsStr::new("."),
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )?;
+    let reopened = reopened.into_raw_fd();
+    // SAFETY: `reopened` is an owned directory descriptor.
+    let stream = unsafe { libc::fdopendir(reopened) };
+    if stream.is_null() {
+        let error = std::io::Error::last_os_error();
+        // SAFETY: fdopendir did not take ownership on failure.
+        unsafe { libc::close(reopened) };
+        return Err(error.into());
+    }
+    let mut names = Vec::new();
+    let result = loop {
+        if Instant::now() >= deadline {
+            break Err(CaptureError::Limit(
+                "capture evidence projection exceeded its time bound".into(),
+            ));
+        }
+        // SAFETY: the platform helper returns this thread's live errno slot.
+        unsafe { *directory_errno_location() = 0 };
+        // SAFETY: `stream` remains live until the final `closedir`.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            // SAFETY: the platform helper returns this thread's live errno slot.
+            let errno = unsafe { *directory_errno_location() };
+            if errno == 0 {
+                break Ok(());
+            }
+            break Err(CaptureError::Io(std::io::Error::from_raw_os_error(errno)));
+        }
+        // SAFETY: d_name is NUL terminated for a valid dirent.
+        let bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        names.push(OsString::from_vec(bytes.to_vec()));
+        if names.len() > max_entries {
+            break Err(CaptureError::Limit(
+                "capture evidence projection contains too many retained records".into(),
+            ));
+        }
+    };
+    // SAFETY: `stream` is live and closed exactly once.
+    let close_failed = unsafe { libc::closedir(stream) } == -1;
+    result?;
+    if close_failed {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    names.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    Ok(names)
+}
+
+fn check_read_only_deadline(deadline: Instant) -> Result<()> {
+    if Instant::now() >= deadline {
+        return Err(CaptureError::Limit(
+            "capture evidence projection exceeded its time bound".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_format_v4(format: &SpoolIdentityV1) -> Result<()> {

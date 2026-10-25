@@ -18,6 +18,7 @@ import { LandedPage } from './pages/Landed.tsx'
 import { SkillsPage } from './pages/Skills.tsx'
 import { TemplatesPage } from './pages/Templates.tsx'
 import { TimelinePage } from './pages/Timeline.tsx'
+import { ExplorerPage } from './pages/Explorer.tsx'
 import { SettingsPage } from './pages/Settings.tsx'
 import { AppChrome, type Badges, type SectionDef } from './TopNav.tsx'
 import { Icon, Notice } from './ui.tsx'
@@ -33,7 +34,7 @@ const subscribeDark = (cb: () => void) => {
 }
 const systemDark = () => window.matchMedia(darkQuery).matches
 
-export type Section = 'now' | 'work' | 'activity' | 'workflows' | 'change-record' | 'landed' | 'skills' | 'templates' | 'timeline' | 'setup' | 'workspace' | 'health' | 'settings'
+export type Section = 'now' | 'work' | 'activity' | 'workflows' | 'change-record' | 'landed' | 'skills' | 'templates' | 'timeline' | 'explorer' | 'setup' | 'workspace' | 'health' | 'settings'
 
 export const SECTIONS: SectionDef[] = [
   { key: 'now', icon: 'broadcast', label: 'Right now', question: 'Who is editing which files?', group: 'Coordinate' },
@@ -45,6 +46,7 @@ export const SECTIONS: SectionDef[] = [
   { key: 'skills', icon: 'journal-check', label: 'Skills', question: 'Which workflows do agents in this repository have to follow?', group: 'Verify' },
   { key: 'templates', icon: 'journal-code', label: 'Templates', question: 'Which workflow recipes can agents reuse?', group: 'This computer' },
   { key: 'timeline', icon: 'camera', label: 'Timeline', question: 'What did this workspace look like earlier?', group: 'This computer' },
+  { key: 'explorer', icon: 'folder2-open', label: 'Repository explorer', question: 'How did this code and its evidence come together?', group: 'This computer' },
   { key: 'workspace', icon: 'people', label: 'Workspace', question: 'Who can run what?', group: 'Manage' },
   { key: 'setup', icon: 'plug', label: 'Connect agents', question: 'Is my agent set up?', group: 'Manage' },
   { key: 'health', icon: 'heart-pulse', label: 'Hub health', question: 'Is the hub OK?', group: 'Manage' },
@@ -137,6 +139,7 @@ function Shell({ token, dark, pref, onPref, density, onDensity, onUnauthorized, 
         {section === 'skills' && <SkillsPage repo={data.whoami?.token.repository ?? null} token={token} />}
         {section === 'templates' && <TemplatesPage />}
         {section === 'timeline' && <TimelinePage />}
+        {section === 'explorer' && <ExplorerPage hubRepository={data.whoami?.token.repository ?? null} />}
         {section === 'setup' && <SetupPage token={token} />}
         {section === 'workspace' && <WorkspacePage />}
         {section === 'health' && <HealthPage health={data.health} />}

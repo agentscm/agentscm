@@ -3244,6 +3244,7 @@ fn app_install_wait_case(client_command: &str, independent_copy: bool) {
                 }
                 Err(error) => panic!("fake Hub accept failed: {error}"),
             };
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();

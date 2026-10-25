@@ -528,6 +528,16 @@ enum Command {
         /// omitted.
         #[arg(long)]
         timeline_workspace: Option<PathBuf>,
+        /// Browse this Git checkout read-only under /v1/local/explorer. Requires a local read
+        /// token and a loopback bind address.
+        #[arg(long, requires = "explorer_repository")]
+        explorer_repo: Option<PathBuf>,
+        /// Logical repository ID used to match locally captured evidence.
+        #[arg(long, requires = "explorer_repo")]
+        explorer_repository: Option<String>,
+        /// Opt in to reading visible conversation and action evidence from this private spool.
+        #[arg(long, requires = "explorer_repo")]
+        explorer_spool: Option<PathBuf>,
         /// Allow this exact browser origin to read /v1/local cross-origin (repeatable). Requires
         /// AGENTSCM_SERVE_READ_TOKEN.
         #[arg(long)]
@@ -1193,18 +1203,24 @@ async fn run(cli: Cli) -> Result<RunExit> {
             max_concurrency,
             collisions_repo,
             timeline_workspace,
+            explorer_repo,
+            explorer_repository,
+            explorer_spool,
             browser_origin,
             public,
         } => {
-            server::serve(
-                cli.data_dir,
+            server::serve(server::ServeOptions {
+                data_dir: cli.data_dir,
                 bind,
                 public,
                 max_concurrency,
-                collisions_repo,
-                timeline_workspace,
-                browser_origin,
-            )
+                collisions: collisions_repo,
+                timeline: timeline_workspace,
+                browser_origins: browser_origin,
+                explorer_repo,
+                explorer_repository,
+                explorer_spool,
+            })
             .await?;
         }
     }

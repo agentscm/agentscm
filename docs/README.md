@@ -22,6 +22,7 @@
 - [Local workspace snapshot timeline](workspace-timeline.md): capture and inspect bounded native-workspace observations, or fork an earlier observation into another Change
 - [Asynchronous agent stand-up](standup.md): durable work claims, checkpoint handovers and bounded catch-up
 - [Local change capture](change-capture.md): configure-once Claude hooks, source-bound action receipts and concise transcript-free handoff
+- [Repository explorer](repository-explorer.md): browse committed Git files, history and diffs alongside private local conversation and source-bound evidence
 - [Work insights](work-insights.md): bounded timing, coordination, usage reports and stored publication observations
 - [Supported coding agents](agents.md): Claude Code, Codex, Cursor, Copilot and others; `agentscm init-repo` and `agentscm hook`
 - [Slack adapter](slack.md) and [capability map](slack-capabilities.md): optional direct messages for coordination moments that need a person, with handoff buttons.

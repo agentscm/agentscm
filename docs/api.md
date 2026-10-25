@@ -170,7 +170,7 @@ port), or it gets 421. This stops a page whose DNS name was rebound to the loopb
 reading these routes as its own origin, with or without a token. A proxy in front of a `--public`
 bind must forward a loopback `Host`.
 
-List and search parameters share these rules on the Hub and on `serve`. `limit` is an integer in the
+Except for the repository explorer's literal source search, list and search parameters share these rules on the Hub and on `serve`. `limit` is an integer in the
 endpoint's range, otherwise 400. `q` is trimmed; empty means no filter; more than 200 bytes or any
 control character is a 400. Matching is case-insensitive substring, and `%`, `_` and `\` in `q` are
 literal. Case-insensitivity is ASCII-only on SQLite (a non-ASCII letter matches at its own case); PostgreSQL
@@ -200,6 +200,22 @@ accept the optional `x-agentscm-completion-reporting: true` header. Exactly one 
 enables a best-effort, idempotent completion observation; the default is off. It adds no response
 fields and does not alter completion success. See [completion reporting](work-insights.md#optional-completion-reporting)
 for the local toggle and the distinction between completion metadata and measured usage.
+
+## Local repository explorer
+
+`GET /v1/local/explorer/{summary,tree,file,history,diff,search,evidence,conversation}` reads one
+operator-selected Git checkout and optional private capture spool. See the
+[repository explorer guide](repository-explorer.md#read-api) for query fields, source identity,
+paging and availability semantics. All responses are versioned and bounded to 4 MiB; the total
+query string is bounded to 4 KiB. Tree/diff pages allow at most 200 entries; history, search,
+evidence and conversation pages allow at most 100.
+
+Explorer startup always requires a local read token and loopback bind. Every read uses the existing
+local token/Host guard. A browser `Origin` must match an explicitly configured `--browser-origin`;
+an unapproved origin is rejected before reading source or capture, including on a GET. The local
+read secret is separate from the Hub credential. These routes never resolve caller-supplied
+filesystem roots or arbitrary artifact identities and never expose private conversation through
+the Hub.
 
 ## Guided workflow observations
 
