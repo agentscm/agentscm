@@ -130,7 +130,11 @@ path check observes it, rather than by continuous path containment. `unconfigure
 hooks and disables new capture while retaining this lineage; configuring the same checkout against
 a different spool is unavailable in this version. `forget` removes only a disabled checkout's
 binding from the config so it can be set up again for another repository or Hub; it never deletes
-the spool and prints its path. `status` reports active, disabled, or paused state
+the spool and prints its path. `unconfigure` and `forget` also work on a deleted checkout: pass its
+absolute path as it was saved (symlinks in parent directories that still exist are resolved), and
+`unconfigure` fails when no binding matches. `forget` also removes the `.git/info/exclude` lines
+setup added for that checkout's settings file, unless another binding in the same repository still
+uses them. `status` reports active, disabled, or paused state
 and embeds the read-only inspection result. A disabled binding can still reconcile an already
 retained uncertain recipe attempt when current authorization and the existing reboot proof allow
 it; it cannot start a new recipe. At most 128 checkout lineages are retained in this local config;

@@ -1690,3 +1690,41 @@ fn a_disabled_capture_for_another_hub_is_explained_and_forgotten_without_deletin
     }
     assert!(spool.is_dir());
 }
+
+#[test]
+fn sharing_can_be_turned_off_after_a_reconnect_and_the_list_says_which_hub_it_was_set_for() {
+    let temp = TempDir::new().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap().join("widgets");
+    checkout(&root);
+    let (hub, _) = fake_hub();
+    let door = FrontDoor::start(&temp, &hub, &root);
+    let page = Page::new(&door);
+    let id = page.id_of("widgets");
+    assert_eq!(page.post(&id, &hub, "shared_conversation").0, 200);
+    let before = page.list().remove(0);
+    assert_eq!(before["lineage_mismatch"], false);
+    assert!(before["saved_hub"].is_null());
+
+    let other = "http://127.0.0.1:9";
+    set_hub(&door, other);
+    let moved = page.list().remove(0);
+    assert_eq!(moved["lineage_mismatch"], true);
+    assert_eq!(moved["saved_hub"], json!(hub));
+    assert_eq!(moved["saved_repository"], REPO);
+    assert_eq!(moved["mode"], "shared_conversation");
+    // Sharing cannot be (re)started for the new Hub, but it can be turned off.
+    assert_eq!(page.post(&id, other, "shared_conversation").0, 409);
+    let (status, reply) = page.post(&id, other, "metadata_only");
+    assert_eq!(status, 200, "{reply}");
+    let saved = bindings(&door).remove(0);
+    assert_eq!(saved["capture_mode"], "metadata_only");
+    assert_eq!(saved["hub"], json!(hub));
+
+    // A checkout the service no longer lists is a 404 the page can recover from.
+    let (status, reply) = page.post("0123456789abcdef01234567", other, "metadata_only");
+    assert_eq!(status, 404, "{reply}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&reply).unwrap()["error"],
+        "unknown_checkout"
+    );
+}

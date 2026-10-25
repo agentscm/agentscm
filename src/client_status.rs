@@ -45,6 +45,18 @@ pub(crate) struct ConnectionStatus {
     /// has no enabled binding or the capture config cannot be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) capture_mode: Option<CaptureModeV1>,
+    /// The repository and Hub this checkout's saved capture binding belongs to when that is not
+    /// what the checkout is connected to now. Sharing can then only be turned off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) capture_mismatch: Option<CaptureMismatch>,
+}
+
+/// Change capture is Unix-only, so only Unix code builds one.
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct CaptureMismatch {
+    pub(crate) repository: String,
+    pub(crate) hub: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -241,21 +253,23 @@ async fn collect_until(
 }
 
 /// Change capture is Unix-only, so elsewhere no checkout reports a capture mode.
-fn capture_mode_for(root: &Path) -> Option<CaptureModeV1> {
+fn capture_for(connection: &Connection) -> (Option<CaptureModeV1>, Option<CaptureMismatch>) {
     #[cfg(unix)]
     {
-        crate::change_capture_client::enabled_capture_mode(root)
+        crate::change_capture_client::capture_setting(connection).map_or((None, None), |setting| {
+            (setting.mode, setting.lineage_mismatch)
+        })
     }
     #[cfg(not(unix))]
     {
-        let _ = root;
-        None
+        let _ = connection;
+        (None, None)
     }
 }
 
 fn unresolved_status(connection: Connection, now: i64) -> ConnectionStatus {
     let credential = credential_status(&connection, false, now);
-    let capture_mode = capture_mode_for(&connection.root);
+    let (capture_mode, capture_mismatch) = capture_for(&connection);
     ConnectionStatus {
         root: connection.root,
         repository: connection.repo,
@@ -272,6 +286,7 @@ fn unresolved_status(connection: Connection, now: i64) -> ConnectionStatus {
         },
         recent_participation: Vec::new(),
         capture_mode,
+        capture_mismatch,
     }
 }
 
@@ -302,7 +317,7 @@ async fn connection_status(connection: Connection, check: bool, now: i64) -> Con
     if check && current && !still_current(&connection, generation.as_deref()) {
         return unresolved_status(connection, now);
     }
-    let capture_mode = capture_mode_for(&connection.root);
+    let (capture_mode, capture_mismatch) = capture_for(&connection);
     ConnectionStatus {
         root: connection.root,
         repository: connection.repo,
@@ -321,6 +336,7 @@ async fn connection_status(connection: Connection, check: bool, now: i64) -> Con
         hub_check,
         recent_participation,
         capture_mode,
+        capture_mismatch,
     }
 }
 
@@ -613,6 +629,20 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&status).unwrap()["capture_mode"],
             "shared_conversation"
+        );
+        assert!(
+            serde_json::to_value(&status)
+                .unwrap()
+                .get("capture_mismatch")
+                .is_none()
+        );
+        status.capture_mismatch = Some(CaptureMismatch {
+            repository: "owner/repo".into(),
+            hub: "https://old.example.test".into(),
+        });
+        assert_eq!(
+            serde_json::to_value(&status).unwrap()["capture_mismatch"]["hub"],
+            "https://old.example.test"
         );
     }
 

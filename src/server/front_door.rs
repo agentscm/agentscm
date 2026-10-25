@@ -793,8 +793,10 @@ async fn repositories(State(front_door): State<Arc<FrontDoor>>) -> Response {
 }
 
 /// The page's name for one checkout: derived from this service's random instance and the
-/// checkout's path, so it is not a path, cannot be computed from one by anyone else and is mapped
-/// back to the checkout here, never by the browser.
+/// checkout's path. It is opaque to the browser (not a path, and mapped back to the checkout here,
+/// never by the browser) and scoped to one service run, so ids change after a restart. It is a
+/// name, not a secret: the identity probe exposes the instance, so anyone who also knows a path
+/// could compute it. Using it still needs a live grant on the capture routes.
 fn checkout_id(instance: &str, connection: &Connection) -> String {
     let mut digest = Sha256::new();
     digest.update(instance.as_bytes());
@@ -805,16 +807,22 @@ fn checkout_id(instance: &str, connection: &Connection) -> String {
 
 /// One checkout's sharing state, with the repository and Hub the page shows the person.
 fn capture_row(instance: &str, connection: &Connection) -> serde_json::Value {
-    let setting = crate::change_capture_client::capture_setting(&connection.root);
+    let setting = crate::change_capture_client::capture_setting(connection);
+    let mismatch = setting
+        .as_ref()
+        .and_then(|setting| setting.lineage_mismatch.as_ref());
     json!({
         "id": checkout_id(instance, connection),
         "repository": connection.repo,
         "hub": connection.hub,
         "folder": connection.root.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default(),
-        "configured": setting.is_some_and(|setting| setting.configured),
-        "enabled": setting.is_some_and(|setting| setting.enabled),
-        "mode": setting.and_then(|setting| setting.mode),
+        "configured": setting.as_ref().is_some_and(|setting| setting.configured),
+        "enabled": setting.as_ref().is_some_and(|setting| setting.enabled),
+        "mode": setting.as_ref().and_then(|setting| setting.mode),
         "readable": setting.is_some(),
+        "lineage_mismatch": mismatch.is_some(),
+        "saved_repository": mismatch.map(|saved| saved.repository.as_str()),
+        "saved_hub": mismatch.map(|saved| saved.hub.as_str()),
     })
 }
 

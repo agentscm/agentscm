@@ -16,6 +16,10 @@ export interface SharingCheckout {
   mode: SharingMode | null
   /** False when the saved capture settings could not be read, so nothing is offered. */
   readable: boolean
+  /** True when the saved capture belongs to another repository or Hub than the one connected now. */
+  lineage_mismatch: boolean
+  saved_repository: string | null
+  saved_hub: string | null
 }
 
 const MODES = ['metadata_only', 'local_conversation', 'shared_conversation'] as const
@@ -29,6 +33,7 @@ const text = (value: unknown, path: string): string => {
   if (typeof value !== 'string' || value.length > 2048 || [...value].some((c) => c.charCodeAt(0) < 32 || (c.charCodeAt(0) >= 127 && c.charCodeAt(0) < 160))) throw new Error(`${path} must be text`)
   return value
 }
+const optionalText = (value: unknown, path: string): string | null => (value === null ? null : text(value, path))
 const flag = (value: unknown, path: string): boolean => {
   if (typeof value !== 'boolean') throw new Error(`${path} must be true or false`)
   return value
@@ -49,6 +54,9 @@ export function decodeCheckout(value: unknown, path = 'checkout'): SharingChecko
     enabled: flag(raw['enabled'], `${path}.enabled`),
     mode: mode as SharingMode | null,
     readable: flag(raw['readable'], `${path}.readable`),
+    lineage_mismatch: flag(raw['lineage_mismatch'], `${path}.lineage_mismatch`),
+    saved_repository: optionalText(raw['saved_repository'], `${path}.saved_repository`),
+    saved_hub: optionalText(raw['saved_hub'], `${path}.saved_hub`),
   }
 }
 
@@ -69,6 +77,23 @@ export async function fetchSharing(token: string, signal: AbortSignal): Promise<
 /** Sharing is on only while the checkout's capture is enabled in shared mode. */
 export const isSharing = (checkout: SharingCheckout): boolean => checkout.enabled && checkout.mode === 'shared_conversation'
 
+/** What the checkout's capture is doing, in the words the page shows. */
+export function sharingState(checkout: SharingCheckout): 'Not set up' | 'Off' | 'Metadata only' | 'Local only' | 'Shared with Hub' {
+  if (!checkout.configured) return 'Not set up'
+  if (!checkout.enabled) return 'Off'
+  if (checkout.mode === 'shared_conversation') return 'Shared with Hub'
+  return checkout.mode === 'local_conversation' ? 'Local only' : 'Metadata only'
+}
+
+/** A refused change; `code` is the service's error code, so the page can react to a changed list. */
+export class SharingError extends Error {
+  code: string | null
+  constructor(message: string, code: string | null) {
+    super(message)
+    this.code = code
+  }
+}
+
 /** Turn sharing on (after the person confirmed) or off for one listed checkout, named by its id. Returns its new state. */
 export async function setSharing(token: string, checkout: SharingCheckout, on: boolean, signal?: AbortSignal): Promise<SharingCheckout> {
   // The repository and Hub are what the person saw; the service refuses the change if the checkout
@@ -85,8 +110,10 @@ export async function setSharing(token: string, checkout: SharingCheckout, on: b
   })
   const reply: unknown = await res.json().catch(() => null)
   if (!res.ok) {
-    const message = reply && typeof reply === 'object' ? (reply as Record<string, unknown>)['message'] : null
-    throw new Error(typeof message === 'string' && message ? message.slice(0, 300) : `HTTP ${res.status}`)
+    const fields = reply && typeof reply === 'object' ? (reply as Record<string, unknown>) : {}
+    const message = fields['message']
+    const code = fields['error']
+    throw new SharingError(typeof message === 'string' && message ? message.slice(0, 300) : `HTTP ${res.status}`, typeof code === 'string' ? code : null)
   }
   return decodeCheckout(object(reply, 'reply')['checkout'])
 }

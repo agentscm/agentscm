@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { fetchSharing, isSharing, setSharing, type SharingCheckout } from './captureSharing.ts'
+import { fetchSharing, isSharing, setSharing, SharingError, sharingState, type SharingCheckout } from './captureSharing.ts'
 import { Box, Icon, Pill, Skeleton } from './ui.tsx'
 import { usePoll } from './usePoll.ts'
 
@@ -29,6 +29,7 @@ export function CaptureSharingBox({ token }: { token: string }) {
   const restoreFocus = useRef<string | null>(null)
   const switchId = (c: SharingCheckout) => `share-${c.id}`
   const confirmId = (c: SharingCheckout) => `share-confirm-${c.id}`
+  const aboutId = (c: SharingCheckout) => `share-about-${c.id}`
   useEffect(() => {
     if (confirming) confirmButton.current?.focus()
   }, [confirming])
@@ -47,7 +48,8 @@ export function CaptureSharingBox({ token }: { token: string }) {
       setConfirming(null)
       setAnnouncement(`Sharing ${on ? 'turned on' : 'turned off'} for ${checkout.repository} in ${checkout.folder}`)
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'The change failed')
+      // The list is re-read below either way; a checkout that vanished from it needs a fresh look.
+      setError(e instanceof SharingError && e.code === 'unknown_checkout' ? 'The checkout list changed; review and try again' : e instanceof Error ? e.message : 'The change failed')
       setAnnouncement('')
     } finally {
       restoreFocus.current = switchId(checkout)
@@ -69,15 +71,21 @@ export function CaptureSharingBox({ token }: { token: string }) {
       {state.kind === 'ready' &&
         state.value.map((checkout) => {
           const on = isSharing(checkout)
+          const state = sharingState(checkout)
           const open = confirming === checkout.id
           return (
             <div key={checkout.id} className="settings-row">
               <div>
                 <label className="settings-label" htmlFor={switchId(checkout)}>Share agent conversations with Hub</label>
-                <div className="small"><code>{checkout.repository}</code> <span className="muted">· {checkout.folder} · {checkout.hub}</span></div>
+                <div id={aboutId(checkout)} className="small"><code>{checkout.repository}</code> <span className="muted">· {checkout.folder} · {checkout.hub}</span></div>
                 <div className="mt-1">
-                  {on ? <Pill tone="brand" icon="cloud-upload">Shared with Hub</Pill> : <Pill tone="muted">Metadata only</Pill>}
+                  {on ? <Pill tone="brand" icon="cloud-upload">{state}</Pill> : <Pill tone="muted">{state}</Pill>}
                 </div>
+                {checkout.lineage_mismatch && (
+                  <p className="small mt-1 mb-0" role="note">
+                    Sharing was set for {checkout.saved_hub}; this checkout is now connected to {checkout.hub}. {on ? 'It can only be turned off here.' : 'It cannot be turned on here.'} To start fresh, run <code>agentscm change-capture unconfigure</code> and then <code>agentscm change-capture forget</code> for this checkout.
+                  </p>
+                )}
                 <div id={confirmId(checkout)} hidden={!open}>
                   {open && (
                     <div className="mt-2" role="group" aria-label={`Confirm sharing for ${checkout.repository} in ${checkout.folder}`}>
@@ -96,9 +104,9 @@ export function CaptureSharingBox({ token }: { token: string }) {
                   type="checkbox"
                   role="switch"
                   checked={on}
-                  aria-expanded={open}
+                  aria-describedby={aboutId(checkout)}
                   aria-controls={confirmId(checkout)}
-                  disabled={busy !== null || !checkout.readable}
+                  disabled={busy !== null || !checkout.readable || (checkout.lineage_mismatch && !on)}
                   onChange={(e) => {
                     setError(null)
                     if (e.target.checked) setConfirming(checkout.id)

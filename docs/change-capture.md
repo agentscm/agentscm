@@ -110,12 +110,14 @@ unsupported: older binaries cannot read the new session association records.
 
 Turning sharing on from either surface calls one library function, `enable_capture`, for a
 checkout that has a current client connection; turning it off calls `set_capture_mode`. All three
-surfaces read the setting through one function, `capture_setting` (configured, enabled, mode);
-nothing keeps a second copy of it.
+surfaces read the setting through one function, `capture_setting` (configured, enabled, mode, and
+`lineage_mismatch` with the repository and Hub the binding was saved for); nothing keeps a second
+copy of it. The page shows the distinct states Not set up (no binding), Off (disabled binding),
+Metadata only, Local only and Shared with Hub.
 
 **Consent is bound to what was shown.** The menu bar app and the page pass the repository and Hub
 they displayed. `enable_capture` (and `set_capture_mode` when it turns sharing on) read the
-checkout's connection under the capture config lock and refuse with `this checkout is now connected
+checkout's connection (connections lock, then the capture config lock) and refuse with `this checkout is now connected
 to <repository> on <hub>; refresh and confirm again` if it is not that one, so a checkout
 reconnected to another Hub between the consequences and the click is never shared there. Turning
 sharing off and the `set-mode` and `configure` commands (where you typed the command) pass no
@@ -125,7 +127,7 @@ the bindings read under that same lock, so a concurrent `configure` is not overw
 The menu bar app asks before it acts. Clicking **Share agent conversations with Hub** only opens
 the status window with the consequences and adds **Confirm: share conversations with <hub>** to
 that checkout's menu; only that item turns sharing on, and it disappears if the checkout, its Hub
-or its mode changes. Turning sharing off needs no confirmation. The page does the same with its own
+or its mode changes, or after two minutes. Turning sharing off needs no confirmation. The page does the same with its own
 confirmation panel.
 
 - With an enabled binding it only changes the mode, exactly like `set-mode`.
@@ -146,9 +148,16 @@ confirmation panel.
   measurement of the agent setup.
 
 A Claude settings file that one-step setup creates, and the transaction files saved beside it, are
-added to the repository's local `.git/info/exclude` unless Git already ignores them, so they never
-appear as untracked files. A file that already existed is not touched and the tracked `.gitignore`
-is never edited.
+added to the repository's local exclude unless Git already ignores them, so they never appear as
+untracked files. This is done only after the binding is installed, creates `.git/info` if the
+repository was cloned without it, and never fails the enable: if the exclude cannot be written the
+result carries a `warning` instead. A file that already existed is not touched and the tracked
+`.gitignore` is never edited. The exclude (`git rev-parse --git-path info/exclude`) is shared by
+every worktree of the repository, so the line applies to all of them. It stays after `unconfigure`;
+`forget` removes only the lines setup added for that checkout's settings file (recorded beside the
+exclude), and keeps them while another binding in the same repository still uses the same relative
+settings path. `forget` of a deleted checkout cannot reach its repository and leaves the exclude as
+it is.
 
 A binding records its Claude settings path (`claude_settings`) only when it is not the default, and
 `unconfigure` and re-enabling use the recorded file. A file that records it is version 6, which
@@ -165,7 +174,14 @@ that history apart. If the checkout is now connected to another repository or Hu
 on fails with that explanation instead of a lineage error. To start fresh run
 `agentscm change-capture unconfigure --root PATH` (if capture is still on), then
 `agentscm change-capture forget --root PATH`, which removes only a disabled binding from the config.
-It never deletes the spool: it prints the spool path (and `spool_retained: true`) so you can
+Both work on a checkout that has been deleted: pass its absolute path as it was saved; symlinks in
+the parent directories that still exist are resolved, the deleted part is matched as given, and
+nothing is touched in the missing tree (its hooks went with it). `unconfigure` fails with `no
+capture binding for this checkout` when nothing matches.
+Turning sharing off is always allowed, even after the checkout was reconnected to another Hub: it
+only switches the binding to `metadata-only`, never uploads and never changes the saved lineage.
+The tray and the page then say "Sharing was set for <hub>; this checkout is now connected to
+<other>" and offer only Off. It never deletes the spool: it prints the spool path (and `spool_retained: true`) so you can
 `export` or delete it yourself. The next enable creates a new spool and new random ids.
 
 What leaves the machine, and when:

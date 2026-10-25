@@ -218,7 +218,7 @@ struct TrayApp {
     notice: Option<Notice>,
     /// The checkout whose sharing the person was asked to confirm. Sharing turns on only from the
     /// explicit confirm item this makes the menu show, never from the first click.
-    pending_share: Option<ShareRequest>,
+    pending_share: Option<PendingShare>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -250,14 +250,13 @@ fn clear_refresh_notice(notice: &mut Option<Notice>) {
 impl TrayApp {
     fn replace_menu(&mut self, notice: Option<&str>) {
         update_refresh_notice(&mut self.notice, notice);
-        self.pending_share = self
-            .pending_share
-            .take()
-            .filter(|pending| pending_share_current(pending, &self.snapshot));
+        self.pending_share = self.pending_share.take().filter(|pending| {
+            pending_share_current(pending, &self.snapshot, std::time::Instant::now())
+        });
         let confirming = self
             .pending_share
             .as_ref()
-            .map(|pending| pending.identity.as_str());
+            .map(|pending| pending.request.identity.as_str());
         let notice = projected_notice(
             None,
             self.notice.as_ref().map(Notice::as_str),
@@ -469,12 +468,20 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                         "An action is still running; wait for its result".into(),
                     ));
                 } else {
-                    match share_step(&id, &self.snapshot, self.pending_share.as_ref()) {
+                    match share_step(
+                        &id,
+                        &self.snapshot,
+                        self.pending_share.as_ref(),
+                        std::time::Instant::now(),
+                    ) {
                         ShareStep::AskConfirmation(request) => {
                             let (title, body) = share_confirmation(&request);
                             self.feedback.show(&title, &body, false);
                             self.notice = Some(Notice::Action(title));
-                            self.pending_share = Some(request);
+                            self.pending_share = Some(PendingShare {
+                                request,
+                                asked_at: std::time::Instant::now(),
+                            });
                         }
                         ShareStep::Change(request) => {
                             self.pending_share = None;
@@ -921,10 +928,16 @@ enum ShareStep {
     Unavailable,
 }
 
-fn share_step(id: &str, snapshot: &Snapshot, pending: Option<&ShareRequest>) -> ShareStep {
+fn share_step(
+    id: &str,
+    snapshot: &Snapshot,
+    pending: Option<&PendingShare>,
+    now: std::time::Instant,
+) -> ShareStep {
     if let Some(identity) = id.strip_prefix("share-confirm:") {
         return pending
-            .filter(|pending| pending.identity == identity)
+            .filter(|pending| pending.request.identity == identity)
+            .filter(|pending| pending_share_current(pending, snapshot, now))
             .and_then(|_| share_request(&share_menu_id(identity), snapshot))
             .filter(|request| request.desired == CaptureModeV1::SharedConversation)
             .map_or(ShareStep::Unavailable, ShareStep::Change);
@@ -938,11 +951,25 @@ fn share_step(id: &str, snapshot: &Snapshot, pending: Option<&ShareRequest>) -> 
     }
 }
 
-/// Whether a pending confirmation still describes what the menu shows: the same checkout and Hub
-/// (the identity covers both), not yet shared.
-fn pending_share_current(pending: &ShareRequest, snapshot: &Snapshot) -> bool {
-    share_request(&share_menu_id(&pending.identity), snapshot)
-        .is_some_and(|request| request.desired == CaptureModeV1::SharedConversation)
+/// How long a share confirmation stays available after the person was asked.
+const SHARE_CONFIRM_TTL: Duration = Duration::from_secs(120);
+
+/// A share request the person was asked to confirm, and when.
+struct PendingShare {
+    request: ShareRequest,
+    asked_at: std::time::Instant,
+}
+
+/// Whether a pending confirmation still describes what the menu shows: asked within
+/// [`SHARE_CONFIRM_TTL`], the same checkout and Hub (the identity covers both), not yet shared.
+fn pending_share_current(
+    pending: &PendingShare,
+    snapshot: &Snapshot,
+    now: std::time::Instant,
+) -> bool {
+    now.saturating_duration_since(pending.asked_at) < SHARE_CONFIRM_TTL
+        && share_request(&share_menu_id(&pending.request.identity), snapshot)
+            .is_some_and(|request| request.desired == CaptureModeV1::SharedConversation)
 }
 
 fn share_confirmation(request: &ShareRequest) -> (String, String) {
@@ -953,6 +980,14 @@ fn share_confirmation(request: &ShareRequest) -> (String, String) {
             share_consequences(&request.hub),
             share_confirm_label(&request.hub)
         ),
+    )
+}
+
+fn share_mismatch_note(saved: &crate::client_status::CaptureMismatch, connected: &str) -> String {
+    format!(
+        "Sharing was set for {}; this checkout is now connected to {}.\nTurn sharing off here, or run `agentscm change-capture forget --root <checkout>` after unconfigure to start fresh.",
+        super::clean_label(&saved.hub),
+        super::clean_label(connected)
     )
 }
 
@@ -1370,12 +1405,22 @@ fn build_menu(
             ))
             .map_err(menu_error)?;
 
+        if let Some(mismatch) = &connection.capture_mismatch {
+            submenu
+                .append(&native_text_item(
+                    "sharing-mismatch",
+                    &share_mismatch_note(mismatch, &connection.hub),
+                ))
+                .map_err(menu_error)?;
+        }
+        let sharing_on = share_toggle_checked(connection.capture_mode);
         submenu
             .append(&CheckMenuItem::with_id(
                 share_menu_id(&identity),
                 "Share agent conversations with Hub",
-                true,
-                share_toggle_checked(connection.capture_mode),
+                // After a reconnect to another Hub, sharing can only be turned off.
+                sharing_on || connection.capture_mismatch.is_none(),
+                sharing_on,
                 None,
             ))
             .map_err(menu_error)?;
@@ -2206,6 +2251,7 @@ mod tests {
             hub_check: HubCheck::Skipped,
             recent_participation: vec![],
             capture_mode: mode,
+            capture_mismatch: None,
         }
     }
 
@@ -2256,8 +2302,13 @@ mod tests {
         let confirm = share_confirm_id(&identity(&snapshot, 0));
 
         // The toggle only asks, and says what sharing does and which item confirms it.
-        let ShareStep::AskConfirmation(asked) = share_step(&toggle, &snapshot, None) else {
+        let now = std::time::Instant::now();
+        let ShareStep::AskConfirmation(asked) = share_step(&toggle, &snapshot, None, now) else {
             panic!("the first click must only ask");
+        };
+        let pending = PendingShare {
+            request: asked.clone(),
+            asked_at: now,
         };
         let (title, body) = share_confirmation(&asked);
         assert_eq!(title, "Share conversations from unbound?");
@@ -2270,16 +2321,17 @@ mod tests {
         );
         // Clicking the toggle again asks again; it never turns anything on.
         assert!(matches!(
-            share_step(&toggle, &snapshot, Some(&asked)),
+            share_step(&toggle, &snapshot, Some(&pending), now),
             ShareStep::AskConfirmation(_)
         ));
 
         // The confirm item alone changes the setting, and only after the person was asked.
         assert!(matches!(
-            share_step(&confirm, &snapshot, None),
+            share_step(&confirm, &snapshot, None, now),
             ShareStep::Unavailable
         ));
-        let ShareStep::Change(request) = share_step(&confirm, &snapshot, Some(&asked)) else {
+        let ShareStep::Change(request) = share_step(&confirm, &snapshot, Some(&pending), now)
+        else {
             panic!("the confirm item must turn sharing on");
         };
         assert_eq!(request.desired, CaptureModeV1::SharedConversation);
@@ -2288,36 +2340,97 @@ mod tests {
 
         // A confirmation asked for another checkout does not confirm this one.
         let other = share_request(&share_menu_id(&identity(&snapshot, 1)), &snapshot).unwrap();
+        let other_pending = PendingShare {
+            request: other,
+            asked_at: now,
+        };
         assert!(matches!(
-            share_step(&confirm, &snapshot, Some(&other)),
+            share_step(&confirm, &snapshot, Some(&other_pending), now),
             ShareStep::Unavailable
         ));
 
         // Turning sharing off needs no confirmation.
         let off = share_menu_id(&identity(&snapshot, 1));
         assert!(matches!(
-            share_step(&off, &snapshot, None),
+            share_step(&off, &snapshot, None, now),
             ShareStep::Change(request) if request.desired == CaptureModeV1::MetadataOnly
         ));
 
         // The menu shows the confirm item only while the asked checkout is unchanged: another Hub
         // is another identity, and a checkout that now shares has nothing left to confirm.
-        assert!(pending_share_current(&asked, &snapshot));
+        assert!(pending_share_current(&pending, &snapshot, now));
         snapshot.connections[0].hub = "https://other.example".into();
-        assert!(!pending_share_current(&asked, &snapshot));
+        assert!(!pending_share_current(&pending, &snapshot, now));
         assert!(matches!(
-            share_step(&confirm, &snapshot, Some(&asked)),
+            share_step(&confirm, &snapshot, Some(&pending), now),
             ShareStep::Unavailable
         ));
         snapshot.connections[0].hub = "https://hub.example".into();
         snapshot.connections[0].capture_mode = Some(CaptureModeV1::SharedConversation);
-        assert!(!pending_share_current(&asked, &snapshot));
+        assert!(!pending_share_current(&pending, &snapshot, now));
+
+        // The confirmation lapses after two minutes: the menu drops it and the item does nothing.
+        snapshot.connections[0].capture_mode = None;
+        let late = now + SHARE_CONFIRM_TTL;
+        assert!(pending_share_current(
+            &pending,
+            &snapshot,
+            late - Duration::from_secs(1)
+        ));
+        assert!(!pending_share_current(&pending, &snapshot, late));
+        assert!(matches!(
+            share_step(&confirm, &snapshot, Some(&pending), late),
+            ShareStep::Unavailable
+        ));
+        // Asking again after it lapsed starts a fresh window.
+        assert!(matches!(
+            share_step(&toggle, &snapshot, Some(&pending), late),
+            ShareStep::AskConfirmation(_)
+        ));
+        snapshot.connections[0].capture_mode = Some(CaptureModeV1::SharedConversation);
 
         let activity = crate::client_activity::ActivityStore::default();
         let now = std::time::Instant::now();
         assert_ne!(
             menu_projection_key(&snapshot, &activity, None, false, None, 100, now),
             menu_projection_key(&snapshot, &activity, None, false, Some("x"), 100, now)
+        );
+    }
+
+    #[test]
+    fn a_reconnected_checkout_explains_the_saved_hub_and_can_only_turn_sharing_off() {
+        let mut connection =
+            share_connection("/synthetic/moved", Some(CaptureModeV1::SharedConversation));
+        connection.capture_mismatch = Some(crate::client_status::CaptureMismatch {
+            repository: "example/project".into(),
+            hub: "https://old.example".into(),
+        });
+        let note = share_mismatch_note(
+            connection.capture_mismatch.as_ref().unwrap(),
+            &connection.hub,
+        );
+        assert!(note.starts_with(
+            "Sharing was set for https://old.example; this checkout is now connected to https://hub.example."
+        ));
+        assert!(note.contains("change-capture forget"));
+        let snapshot = Snapshot {
+            version: 1,
+            snapshot_at: 0,
+            connections: vec![connection],
+        };
+        let id = share_menu_id(&connection_identity(&snapshot.connections[0]));
+        assert!(matches!(
+            share_step(&id, &snapshot, None, std::time::Instant::now()),
+            ShareStep::Change(request) if request.desired == CaptureModeV1::MetadataOnly
+        ));
+        let activity = crate::client_activity::ActivityStore::default();
+        let now = std::time::Instant::now();
+        let mut snapshot = snapshot;
+        let with = menu_projection_key(&snapshot, &activity, None, false, None, 100, now);
+        snapshot.connections[0].capture_mismatch = None;
+        assert_ne!(
+            with,
+            menu_projection_key(&snapshot, &activity, None, false, None, 100, now)
         );
     }
 
@@ -2499,6 +2612,7 @@ mod tests {
                 hub_check: HubCheck::Skipped,
                 recent_participation: vec![],
                 capture_mode: None,
+                capture_mismatch: None,
             });
         assert!(unconnected_rows(&snapshot, &activity, now).is_empty());
         assert!(
@@ -2544,6 +2658,7 @@ mod tests {
             hub_check: HubCheck::Skipped,
             recent_participation: vec![],
             capture_mode: None,
+            capture_mismatch: None,
         };
         let capture = temp.path().join("arguments");
         for (command, directory, arguments) in [

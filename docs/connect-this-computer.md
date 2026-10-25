@@ -46,8 +46,13 @@ explicit `confirm_sharing`; the service refuses a request without it and changes
 it off needs no confirmation, switches the checkout to `metadata-only` and stops future uploads.
 The request is a `POST` to `/v1/local/capture`, which needs the same live browser connection, loopback
 Host and own-origin check as every other route here, sets no cross-origin headers, accepts at most
-1 KiB, and names the checkout by the opaque `id` the list gives it (derived from the service's
-random instance and the checkout's path, mapped back only by the service), never by a path. Two
+1 KiB, and names the checkout by the `id` the list gives it, never by a path. The id is derived
+from the service's random instance and the checkout's path and mapped back only by the service, so
+it is opaque to the browser and valid for one service run (ids change after a restart). It is a
+name, not a secret: the unauthenticated identity probe exposes the instance, so anyone who also
+knew a path could compute it; the capture routes themselves need a live browser connection. If a
+change names a checkout that is no longer listed, the page re-reads the list and asks you to review
+and try again. Two
 checkouts of one repository and Hub are listed and controlled separately. The request also carries
 the repository and Hub the page showed; if the checkout is connected to anything else by then, the
 service refuses to turn sharing on and changes nothing.

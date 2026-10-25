@@ -269,6 +269,7 @@ pub(crate) fn acquire_lock(path: &Path) -> Result<File> {
 
 /// Holds the connections lock. Lock order everywhere: connections lock, then the change-capture
 /// config lock; nothing takes them the other way round.
+#[cfg(unix)]
 pub(crate) fn lock_connections() -> Result<File> {
     acquire_lock(&lock_path()?)
 }
@@ -649,6 +650,37 @@ pub(crate) fn relative(root: &Path, path: &Path) -> Option<String> {
         || joined.contains(['*', '\\'])
         || joined.chars().any(char::is_control);
     (!bad).then_some(joined)
+}
+
+/// Runs a test body in a child copy of this test binary whose `XDG_CONFIG_HOME` is a fresh temp
+/// directory, so no test changes this process's environment (that is not thread-safe under plain
+/// `cargo test`). Pass the body as a closure written directly in the test function: its type name
+/// is how the child finds the test to re-run.
+#[cfg(all(test, unix))]
+pub(crate) fn in_isolated_config_home(body: impl FnOnce(&Path)) {
+    const CHILD: &str = "AGENTSCM_TEST_CONFIG_HOME_CHILD";
+    if let Some(home) = std::env::var_os(CHILD) {
+        body(Path::new(&home));
+        return;
+    }
+    let name = std::any::type_name_of_val(&body)
+        .trim_end_matches("::{{closure}}")
+        .split_once("::")
+        .map(|(_, test)| test.to_owned())
+        .expect("test path");
+    let home = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
+        .env(CHILD, home.path())
+        .env("XDG_CONFIG_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "{name} failed in its isolated config home:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[cfg(test)]
