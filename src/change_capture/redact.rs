@@ -10,19 +10,24 @@
 
 use serde_json::Value;
 
-/// Normalized (lowercase, no `_`/`-`) name fragments that mark a field or variable as secret.
-const SECRET_WORDS: [&str; 11] = [
+/// Normalized (lowercase, no `_`/`-`) name suffixes that mark a field or variable as secret.
+/// Suffix matching keeps counters such as `max_tokens` and `input_tokens` readable.
+const SECRET_WORDS: [&str; 15] = [
     "password",
+    "passwords",
     "passwd",
     "secret",
+    "secrets",
     "token",
     "apikey",
     "accesskey",
     "privatekey",
     "authorization",
     "cookie",
+    "cookies",
     "sessionkey",
     "credential",
+    "credentials",
 ];
 
 const FIELD_REPLACEMENT: &str = "[REDACTED:field]";
@@ -318,7 +323,7 @@ fn is_secret_name(name: &[u8]) -> bool {
         .collect();
     SECRET_WORDS
         .iter()
-        .any(|word| find(&normalized, 0, word.as_bytes()).is_some())
+        .any(|word| normalized.ends_with(word.as_bytes()))
 }
 
 #[cfg(test)]
@@ -440,6 +445,12 @@ mod tests {
         assert_eq!(value["nested"][0]["token"], Value::Null);
         assert_eq!(value["private-key"]["inner"], "kept");
         assert_eq!(redact_json(&mut value), 0);
+        let mut counters = json!({"max_tokens": 4096, "input_tokens": 12, "token_count": 3});
+        assert_eq!(redact_json(&mut counters), 0);
+        assert_eq!(
+            redact("max_tokens: 4096 and tokenizer=bpe"),
+            ("max_tokens: 4096 and tokenizer=bpe".to_owned(), 0)
+        );
     }
 
     #[test]
