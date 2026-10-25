@@ -1,7 +1,9 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { ComputerNotices, LocalRepoSwitcher } from '../../src/ComputerBar.tsx'
+import type { ReactNode } from 'react'
+import { ComputerNotices, LocalComputerProvider } from '../../src/ComputerBar.tsx'
+import { LocalRepoSwitcher } from '../../src/TopNav.tsx'
 import { loadToken, saveToken } from '../../src/storage.ts'
 
 const GRANT = 'a'.repeat(64)
@@ -24,6 +26,7 @@ function stub(identity: Record<string, unknown>) {
 }
 
 const reload = vi.fn()
+const withComputer = (token: string, node: ReactNode) => <LocalComputerProvider token={token}>{node}</LocalComputerProvider>
 beforeEach(() => {
   localStorage.clear()
   saveToken(TOKEN, true)
@@ -39,7 +42,7 @@ describe('the repository menu on this computer’s Hub page', () => {
   it('names the computer, lists its repositories and switches with the same connection', async () => {
     stub({ repository: 'acme/widgets', hub: { url: 'https://hub.example', signed_in: true } })
     const user = userEvent.setup()
-    render(<LocalRepoSwitcher token={TOKEN} repo="acme/widgets" />)
+    render(withComputer(TOKEN, <LocalRepoSwitcher token={TOKEN} repo="acme/widgets" />))
     const button = await screen.findByRole('button', { name: 'acme/widgets on synthetic-mac' })
     await user.click(button)
     expect(screen.getByText(/On synthetic-mac/)).toBeTruthy()
@@ -54,7 +57,7 @@ describe('the repository menu on this computer’s Hub page', () => {
   it('disconnects this browser from the same menu', async () => {
     const calls = stub({ repository: 'acme/widgets', hub: { url: 'https://hub.example', signed_in: true } })
     const user = userEvent.setup()
-    render(<LocalRepoSwitcher token={TOKEN} repo="acme/widgets" />)
+    render(withComputer(TOKEN, <LocalRepoSwitcher token={TOKEN} repo="acme/widgets" />))
     await user.click(await screen.findByRole('button', { name: 'acme/widgets on synthetic-mac' }))
     await user.click(screen.getByRole('menuitem', { name: /Disconnect this browser/ }))
     await waitFor(() => expect(loadToken()).toBeNull())
@@ -65,18 +68,58 @@ describe('the repository menu on this computer’s Hub page', () => {
 describe('notices on this computer’s Hub page', () => {
   it('say nothing when all is well', async () => {
     const calls = stub({ repository: 'acme/widgets', hub: { url: 'https://hub.example', signed_in: true } })
-    const { container } = render(<ComputerNotices token={TOKEN} />)
+    const { container } = render(withComputer(TOKEN, <ComputerNotices />))
     await waitFor(() => expect(calls.some((c) => c.url === '/v1/local/identity')).toBe(true))
     expect(container.textContent).toBe('')
   })
 
   it('explain a missing Hub sign-in and a repository that is gone', async () => {
     stub({ repository: null, hub: null })
-    render(<ComputerNotices token={TOKEN} />)
+    render(withComputer(TOKEN, <ComputerNotices />))
     expect(await screen.findByText('That repository is no longer connected here')).toBeTruthy()
 
     stub({ repository: 'acme/widgets', hub: { url: 'https://hub.example', signed_in: false } })
-    render(<ComputerNotices token={`${TOKEN}x`} />)
+    render(withComputer(`${TOKEN}x`, <ComputerNotices />))
     expect(await screen.findByText(/agentscm hub login --hub https:\/\/hub.example/)).toBeTruthy()
+  })
+})
+
+describe('the menu behaves like the Hub’s other menus', () => {
+  it('switches even when the click does not move focus, as in Safari and Firefox', async () => {
+    stub({ repository: 'acme/widgets', hub: { url: 'https://hub.example', signed_in: true } })
+    render(withComputer(TOKEN, <LocalRepoSwitcher token={TOKEN} repo="acme/widgets" />))
+    const button = await screen.findByRole('button', { name: 'acme/widgets on synthetic-mac' })
+    button.focus()
+    fireEvent.click(button)
+    const gadgets = await screen.findByRole('menuitemradio', { name: /acme\/gadgets/ })
+    // Safari and Firefox do not focus a clicked button: the trigger loses focus to nothing first.
+    fireEvent.mouseDown(gadgets)
+    fireEvent.blur(button, { relatedTarget: null })
+    fireEvent.click(gadgets)
+    expect(loadToken()).toBe(`local:${GRANT}:acme/gadgets@https://hub.example`)
+  })
+
+  it('moves with arrow keys and returns focus on Escape', async () => {
+    stub({ repository: 'acme/widgets', hub: { url: 'https://hub.example', signed_in: true } })
+    const user = userEvent.setup()
+    render(withComputer(TOKEN, <LocalRepoSwitcher token={TOKEN} repo="acme/widgets" />))
+    const button = await screen.findByRole('button', { name: 'acme/widgets on synthetic-mac' })
+    await screen.findByText('acme/widgets')
+    await waitFor(() => expect(screen.queryByText('acme/gadgets')).toBeNull())
+    await user.click(button)
+    await screen.findByRole('menuitemradio', { name: /acme\/gadgets/ })
+    await user.keyboard('{ArrowDown}')
+    expect(document.activeElement?.textContent).toContain('acme/gadgets')
+    await user.keyboard('{Escape}')
+    expect(document.activeElement).toBe(button)
+  })
+
+  it('reads the connection once for the menu and the notices together', async () => {
+    const calls = stub({ repository: 'acme/widgets', hub: { url: 'https://hub.example', signed_in: true } })
+    render(withComputer(TOKEN, <><LocalRepoSwitcher token={TOKEN} repo="acme/widgets" /><ComputerNotices /></>))
+    await screen.findByRole('button', { name: 'acme/widgets on synthetic-mac' })
+    await waitFor(() => expect(calls.some((c) => c.url === '/v1/local/repositories')).toBe(true))
+    expect(calls.filter((c) => c.url === '/v1/local/identity')).toHaveLength(1)
+    expect(calls.filter((c) => c.url === '/v1/local/repositories')).toHaveLength(1)
   })
 })
