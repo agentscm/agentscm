@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { fetchSharing, isSharing, setSharing, type SharingCheckout } from './captureSharing.ts'
 import { Box, Icon, Pill, Skeleton } from './ui.tsx'
 import { usePoll } from './usePoll.ts'
@@ -19,26 +19,49 @@ export function SharingConsequences({ hub }: { hub: string }) {
 /** Conversation sharing for this computer's checkouts. Only the local service can change it. */
 export function CaptureSharingBox({ token }: { token: string }) {
   const [nonce, setNonce] = useState(0)
-  const state = usePoll((signal) => fetchSharing(token, signal), 0, `${token}|${nonce}`)
+  // A re-read after a change keeps the list mounted, so the keyboard position survives it.
+  const state = usePoll((signal) => fetchSharing(token, signal), 0, token, nonce)
   const [confirming, setConfirming] = useState<string | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const key = (c: SharingCheckout) => `${c.repository}@${c.hub}`
+  const [announcement, setAnnouncement] = useState('')
+  const confirmButton = useRef<HTMLButtonElement>(null)
+  const restoreFocus = useRef<string | null>(null)
+  const switchId = (c: SharingCheckout) => `share-${c.id}`
+  const confirmId = (c: SharingCheckout) => `share-confirm-${c.id}`
+  useEffect(() => {
+    if (confirming) confirmButton.current?.focus()
+  }, [confirming])
+  useEffect(() => {
+    if (busy === null && restoreFocus.current) {
+      document.getElementById(restoreFocus.current)?.focus()
+      restoreFocus.current = null
+    }
+  }, [busy])
   const change = async (checkout: SharingCheckout, on: boolean) => {
-    setBusy(key(checkout))
+    setBusy(checkout.id)
     setError(null)
+    setAnnouncement(`Updating conversation sharing for ${checkout.repository}…`)
     try {
       await setSharing(token, checkout, on)
       setConfirming(null)
+      setAnnouncement(`Sharing ${on ? 'turned on' : 'turned off'} for ${checkout.repository} in ${checkout.folder}`)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'The change failed')
+      setAnnouncement('')
     } finally {
+      restoreFocus.current = switchId(checkout)
       setBusy(null)
       setNonce((n) => n + 1)
     }
   }
+  const cancel = (checkout: SharingCheckout) => {
+    setConfirming(null)
+    document.getElementById(switchId(checkout))?.focus()
+  }
   return (
     <Box tour="settings-sharing" icon="chat-square-text" title="Conversation sharing" explain="Off by default, one checkout at a time. Turning it on sets up capture for that checkout if it was never set up.">
+      <div className="visually-hidden" role="status">{announcement}</div>
       {state.kind === 'loading' && <Skeleton rows={2} />}
       {state.kind === 'error' && <p className="small">Could not read the sharing settings on this computer.</p>}
       {error && <div className="alert alert-danger small" role="alert">{error}</div>}
@@ -46,39 +69,43 @@ export function CaptureSharingBox({ token }: { token: string }) {
       {state.kind === 'ready' &&
         state.value.map((checkout) => {
           const on = isSharing(checkout)
-          const id = `share-${key(checkout).replace(/[^A-Za-z0-9_-]/g, '_')}`
+          const open = confirming === checkout.id
           return (
-            <div key={key(checkout)} className="settings-row">
+            <div key={checkout.id} className="settings-row">
               <div>
-                <label className="settings-label" htmlFor={id}>Share agent conversations with Hub</label>
+                <label className="settings-label" htmlFor={switchId(checkout)}>Share agent conversations with Hub</label>
                 <div className="small"><code>{checkout.repository}</code> <span className="muted">· {checkout.folder} · {checkout.hub}</span></div>
                 <div className="mt-1">
                   {on ? <Pill tone="brand" icon="cloud-upload">Shared with Hub</Pill> : <Pill tone="muted">Metadata only</Pill>}
                 </div>
-                {confirming === key(checkout) && (
-                  <div className="mt-2" role="group" aria-label={`Confirm sharing for ${checkout.repository}`}>
-                    <div className="settings-label">Share conversations from this checkout?</div>
-                    <SharingConsequences hub={checkout.hub} />
-                    <button type="button" className="btn btn-sm btn-primary me-2" disabled={busy !== null} onClick={() => void change(checkout, true)}>Share conversations</button>
-                    <button type="button" className="btn btn-sm btn-outline-secondary" disabled={busy !== null} onClick={() => setConfirming(null)}>Cancel</button>
-                  </div>
-                )}
+                <div id={confirmId(checkout)} hidden={!open}>
+                  {open && (
+                    <div className="mt-2" role="group" aria-label={`Confirm sharing for ${checkout.repository} in ${checkout.folder}`}>
+                      <div className="settings-label">Share conversations from this checkout?</div>
+                      <SharingConsequences hub={checkout.hub} />
+                      <button ref={confirmButton} type="button" className="btn btn-sm btn-primary me-2" disabled={busy !== null} onClick={() => void change(checkout, true)}>Share conversations</button>
+                      <button type="button" className="btn btn-sm btn-outline-secondary" disabled={busy !== null} onClick={() => cancel(checkout)}>Cancel</button>
+                    </div>
+                  )}
+                </div>
               </div>
               <div className="form-check form-switch m-0">
                 <input
-                  id={id}
+                  id={switchId(checkout)}
                   className="form-check-input"
                   type="checkbox"
                   role="switch"
                   checked={on}
+                  aria-expanded={open}
+                  aria-controls={confirmId(checkout)}
                   disabled={busy !== null || !checkout.readable}
                   onChange={(e) => {
                     setError(null)
-                    if (e.target.checked) setConfirming(key(checkout))
+                    if (e.target.checked) setConfirming(checkout.id)
                     else void change(checkout, false)
                   }}
                 />
-                <Icon name={busy === key(checkout) ? 'hourglass-split' : 'chat-square-text'} />
+                <Icon name={busy === checkout.id ? 'hourglass-split' : 'chat-square-text'} />
               </div>
             </div>
           )

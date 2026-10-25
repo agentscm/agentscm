@@ -33,9 +33,10 @@ use crate::{client_config, hub_cli};
 mod settings_transaction;
 
 const CONFIG_VERSION: u8 = 5;
-/// Written only while a binding uses a mode older binaries cannot parse, so users who never opt
-/// in keep a config those binaries still read.
-const SHARED_CONFIG_VERSION: u8 = 6;
+/// Written only while a binding uses something older binaries cannot parse (the shared mode or a
+/// recorded Claude settings path), so users who never opt in keep a config those binaries still
+/// read. Older binaries refuse a version 6 file instead of silently dropping a field.
+const EXTENDED_CONFIG_VERSION: u8 = 6;
 const CONFIG_BYTES: u64 = 256 * 1024;
 const RECIPE_BYTES: u64 = 64 * 1024;
 const MAX_BINDINGS: usize = 128;
@@ -144,6 +145,13 @@ pub struct UnconfigureArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct ForgetArgs {
+    /// Canonical Git checkout whose disabled capture binding is removed from the config.
+    #[arg(long)]
+    root: PathBuf,
+}
+
+#[derive(Debug, Args)]
 pub struct SettingsRecoveryArgs {
     #[arg(long)]
     root: PathBuf,
@@ -181,6 +189,10 @@ pub struct CaptureBinding {
     pub capture_mode: CaptureModeV1,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_history_root: Option<PathBuf>,
+    /// The Claude settings file holding this binding's hooks when it is not the default
+    /// `ROOT/.claude/settings.local.json`; `None` means the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_settings: Option<PathBuf>,
     pub action_rules: Vec<ActionRuleV1>,
     #[serde(default)]
     pub configured_recipes: Vec<ConfiguredRecipeV1>,
@@ -262,7 +274,8 @@ fn load() -> Result<Vec<CaptureBinding>> {
     };
     let config: CaptureConfig =
         serde_json::from_str(&text).map_err(|_| invalid("change capture config is not valid"))?;
-    if !matches!(config.version, 2..=SHARED_CONFIG_VERSION) || config.bindings.len() > MAX_BINDINGS
+    if !matches!(config.version, 2..=EXTENDED_CONFIG_VERSION)
+        || config.bindings.len() > MAX_BINDINGS
     {
         return Err(invalid("change capture config is not valid"));
     }
@@ -273,12 +286,13 @@ fn load() -> Result<Vec<CaptureBinding>> {
 }
 
 fn save(bindings: &[CaptureBinding]) -> Result<()> {
-    let shared = bindings
-        .iter()
-        .any(|binding| binding.capture_mode == CaptureModeV1::SharedConversation);
+    let extended = bindings.iter().any(|binding| {
+        binding.capture_mode == CaptureModeV1::SharedConversation
+            || binding.claude_settings.is_some()
+    });
     let text = serde_json::to_string(&CaptureConfig {
-        version: if shared {
-            SHARED_CONFIG_VERSION
+        version: if extended {
+            EXTENDED_CONFIG_VERSION
         } else {
             CONFIG_VERSION
         },
@@ -318,6 +332,9 @@ fn validate_binding(binding: &CaptureBinding) -> Result<()> {
             .claude_history_root
             .as_ref()
             .is_some_and(|path| !path.is_absolute())
+        || binding.claude_settings.as_ref().is_some_and(|path| {
+            absolute_without_parent_components(path).is_err() || !path.starts_with(&binding.root)
+        })
     {
         return Err(invalid("change capture binding is invalid"));
     }
@@ -548,25 +565,82 @@ fn commit_binding(
     Ok(())
 }
 
+/// The repository and Hub a person was shown before agreeing to share. Turning sharing on is
+/// refused when the checkout is connected to anything else by the time the change is made.
+#[derive(Clone, Copy, Debug)]
+pub struct ExpectedTarget<'a> {
+    pub repository: &'a str,
+    pub hub: &'a str,
+}
+
+/// The config lock, held together with the checkout's connection and the bindings read under it,
+/// so a decision made from them cannot be overtaken by another writer.
+struct Locked {
+    _lock: ConfigLock,
+    connection: client_config::Connection,
+    bindings: Vec<CaptureBinding>,
+}
+
+/// Takes the config lock, then reads the checkout's connection and refuses a connection other than
+/// `expected`, so what the person agreed to is what the change applies to.
+fn lock_checkout(root: &Path, expected: Option<ExpectedTarget<'_>>) -> Result<Locked> {
+    let lock = acquire_lock()?;
+    let connection = connection_for(root)?;
+    if let Some(expected) = expected
+        && (!connection.repo.eq_ignore_ascii_case(expected.repository)
+            || connection.hub != expected.hub)
+    {
+        return Err(invalid(format!(
+            "this checkout is now connected to {} on {}; refresh and confirm again",
+            connection.repo, connection.hub
+        )));
+    }
+    Ok(Locked {
+        _lock: lock,
+        connection,
+        bindings: load()?,
+    })
+}
+
+/// The error for a saved capture whose repository or Hub is not the checkout's current one, with
+/// the supported way out.
+fn lineage_error(saved: &CaptureBinding, connection: &client_config::Connection) -> Error {
+    invalid(format!(
+        "this checkout's saved capture belongs to {} on {}, and its private spool keeps that history apart, so it cannot be reused for {} on {}. To start fresh, run `agentscm change-capture unconfigure --root <checkout>` if capture is still on, then `agentscm change-capture forget --root <checkout>` (the old spool stays on disk), then try again",
+        saved.repository, saved.hub, connection.repo, connection.hub
+    ))
+}
+
 /// Changes only the capture mode of an existing enabled binding. Retained local data is never
 /// touched, and hooks are left alone because they read the mode from the binding when they run.
-pub fn set_capture_mode(root: &Path, mode: CaptureModeV1) -> Result<Value> {
+///
+/// `expected` is what the person was shown; it is checked under the config lock when the mode is
+/// shared. Only the command line, where the person typed the command, passes `None`.
+pub fn set_capture_mode(
+    root: &Path,
+    mode: CaptureModeV1,
+    expected: Option<ExpectedTarget<'_>>,
+) -> Result<Value> {
     let root = client_config::canonical_root(root)?;
-    let connection = connection_for(&root)?;
-    let _lock = acquire_lock()?;
-    let old_bindings = load()?;
-    let mut binding = old_bindings
+    let locked = lock_checkout(
+        &root,
+        expected.filter(|_| mode == CaptureModeV1::SharedConversation),
+    )?;
+    set_mode_in(&locked, &root, mode)
+}
+
+fn set_mode_in(locked: &Locked, root: &Path, mode: CaptureModeV1) -> Result<Value> {
+    let mut binding = locked
+        .bindings
         .iter()
         .find(|binding| binding.root == root && binding.enabled)
         .cloned()
         .ok_or_else(|| invalid("no enabled capture binding for this checkout"))?;
-    if connection.repo != binding.repository || connection.hub != binding.hub {
-        return Err(invalid(
-            "capture binding namespace differs from client connection",
-        ));
+    if locked.connection.repo != binding.repository || locked.connection.hub != binding.hub {
+        return Err(lineage_error(&binding, &locked.connection));
     }
     binding.capture_mode = mode;
-    commit_binding(&old_bindings, binding, None)?;
+    commit_binding(&locked.bindings, binding, None)?;
     Ok(json!({"root": root, "capture_mode": mode}))
 }
 
@@ -603,88 +677,198 @@ pub fn enabled_capture_mode(root: &Path) -> Option<CaptureModeV1> {
     capture_setting(root)?.mode
 }
 
-/// Hash of a fixed label and the canonical root, so a default is stable for a checkout and
-/// differs between checkouts.
-fn root_digest(label: &str, root: &Path) -> String {
-    use sha2::{Digest, Sha256};
+fn random_hex(bytes: usize) -> Result<String> {
+    let mut random = vec![0_u8; bytes];
+    getrandom::fill(&mut random).map_err(|_| invalid("random source unavailable"))?;
+    Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
+}
 
-    let mut digest = Sha256::new();
-    digest.update(label.as_bytes());
-    digest.update([0]);
-    digest.update(root.as_os_str().as_encoded_bytes());
-    format!("{:x}", digest.finalize())
+/// The checkout's default branch as `origin/<name>` when `origin/HEAD` names a branch that
+/// resolves, else `origin/main`.
+fn default_base_ref(root: &Path) -> String {
+    let git = |args: &[&str]| -> Option<String> {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .output()
+            .ok()?;
+        let text = String::from_utf8(output.stdout).ok()?;
+        output.status.success().then(|| text.trim().to_owned())
+    };
+    git(&["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+        .filter(|name| {
+            name.len() > "origin/".len()
+                && name.len() <= 1024
+                && name.starts_with("origin/")
+                && !name.chars().any(char::is_control)
+        })
+        .filter(|name| {
+            git(&[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{name}^{{commit}}"),
+            ])
+            .is_some()
+        })
+        .unwrap_or_else(|| "origin/main".into())
+}
+
+/// A settings file that setup is about to create, and the transaction files saved beside it, are
+/// hidden from `git status` through the repository's local exclude unless Git already ignores
+/// them. The tracked `.gitignore` is never edited, and a file that already exists is left as it
+/// is.
+fn keep_new_settings_untracked(root: &Path, settings: &Path) -> Result<()> {
+    if settings.symlink_metadata().is_ok() {
+        return Ok(());
+    }
+    let (relative, name) = settings
+        .strip_prefix(root)
+        .ok()
+        .and_then(Path::to_str)
+        .zip(settings.file_name().and_then(std::ffi::OsStr::to_str))
+        .ok_or_else(|| invalid("Claude settings must be inside the configured checkout"))?;
+    let directory = relative.strip_suffix(name).unwrap_or_default();
+    for (sample, pattern) in [
+        (relative.to_owned(), relative.to_owned()),
+        (
+            format!("{directory}.{name}.agentscm-capture-sample"),
+            format!("{directory}.{name}.agentscm-capture-*"),
+        ),
+    ] {
+        if !git_ignores(root, &sample)? {
+            crate::client_setup::ignore_new_file(root, &pattern)?;
+        }
+    }
+    Ok(())
+}
+
+fn git_ignores(root: &Path, relative: &str) -> Result<bool> {
+    let status = std::process::Command::new("git")
+        .args(["check-ignore", "-q", "--", relative])
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .status()?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(invalid(
+            "cannot check whether Git ignores the Claude settings file",
+        )),
+    }
+}
+
+/// What [`enable_capture`] builds from the bindings read under the lock: `None` when the binding
+/// is already enabled and only its mode changes, else the spec that creates the binding or
+/// re-enables the disabled one.
+fn plan_enable(
+    bindings: &[CaptureBinding],
+    connection: &client_config::Connection,
+    root: &Path,
+    mode: CaptureModeV1,
+    spools: &Path,
+) -> Result<Option<BindingSpec>> {
+    let spec = match bindings.iter().find(|binding| binding.root == root) {
+        Some(saved) if saved.enabled => return Ok(None),
+        Some(saved) => {
+            if saved.repository != connection.repo || saved.hub != connection.hub {
+                return Err(lineage_error(saved, connection));
+            }
+            BindingSpec {
+                settings: settings_path(root, saved.claude_settings.clone())?,
+                root: root.to_owned(),
+                spool: saved.spool.clone(),
+                worktree_id: saved.worktree_id.clone(),
+                base_ref: saved.base_ref.clone(),
+                setup_digest: saved.setup_digest.clone(),
+                capture_mode: mode,
+                action_rules: saved.action_rules.clone(),
+                configured_recipes: saved.configured_recipes.clone(),
+                claude_history_root: saved.claude_history_root.clone(),
+                spool_limits: saved.spool_limits,
+            }
+        }
+        None => {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(spools)?;
+            BindingSpec {
+                spool: spools.join(random_hex(16)?),
+                worktree_id: format!("checkout_{}", random_hex(16)?),
+                base_ref: default_base_ref(root),
+                setup_digest: random_hex(32)?,
+                capture_mode: mode,
+                action_rules: vec![parse_rule("Bash=execution:partial:process_exit_code")?],
+                configured_recipes: Vec::new(),
+                settings: settings_path(root, None)?,
+                claude_history_root: None,
+                spool_limits: SpoolLimits::default(),
+                root: root.to_owned(),
+            }
+        }
+    };
+    Ok(Some(spec))
 }
 
 /// Makes capture available for a connected checkout in one step and sets its mode.
 ///
-/// - Enabled binding: only the mode changes, exactly like [`set_capture_mode`].
-/// - Disabled binding: re-enabled through [`configure_with`] with everything it saved (spool,
-///   worktree, base ref, setup digest, rules, recipes, limits); hooks are reinstalled at the
-///   default `ROOT/.claude/settings.local.json`.
-/// - No binding: created through [`configure_with`], the same path as `change-capture configure`,
-///   with these defaults. The private spool is `<config>/agentscm/capture-spools/<id>`, mode 0700,
-///   where `<id>` is derived from the canonical root. The worktree id is `checkout_<id>` from the
-///   same root, not a host path and stable across token changes. The base ref is `origin/main`.
-///   The setup digest is the SHA-256 of a fixed label and the root: a caller assertion that
-///   identifies this default, not a measurement of the agent setup. The only action rule is
-///   `Bash=execution:partial:process_exit_code`. Hooks go to the configure default.
+/// Everything is decided under the config lock, with the checkout's connection read there, and
+/// `expected` (the repository and Hub the person was shown) must match that connection.
 ///
-/// The checkout needs a current client connection. Any mode other than the one asked for is never
-/// chosen here, so `shared-conversation` is enabled only by an explicit request.
-pub fn enable_capture(root: &Path, mode: CaptureModeV1) -> Result<Value> {
+/// - Enabled binding: only the mode changes, exactly like [`set_capture_mode`].
+/// - Disabled binding: re-enabled through [`install_binding`] with everything it saved (spool,
+///   worktree, base ref, setup digest, rules, recipes, limits); hooks are reinstalled in the
+///   Claude settings file it recorded, or the default `ROOT/.claude/settings.local.json`. A
+///   binding saved for another repository or Hub is refused with the way to forget it.
+/// - No binding: created through [`install_binding`], the same path as
+///   `change-capture configure`, with these defaults. The private spool is
+///   `<config>/agentscm/capture-spools/<random>`, mode 0700. The worktree id is
+///   `checkout_<random>` and the setup digest is 32 random bytes, so neither can be recomputed
+///   from a path and none repeats on another computer; the saved binding keeps them stable. The
+///   setup digest is a caller assertion that identifies this default, not a measurement of the
+///   agent setup. The base ref is the checkout's default branch from `origin/HEAD` when it
+///   resolves, else `origin/main`. The only action rule is
+///   `Bash=execution:partial:process_exit_code`. Hooks go to the default Claude settings file,
+///   which Git's local exclude hides when setup creates it and Git does not already ignore it.
+///
+/// Any mode other than the one asked for is never chosen here, so `shared-conversation` is
+/// enabled only by an explicit request.
+pub fn enable_capture(
+    root: &Path,
+    mode: CaptureModeV1,
+    expected: ExpectedTarget<'_>,
+) -> Result<Value> {
     let root = client_config::canonical_root(root)?;
-    connection_for(&root)?;
-    let saved = load()?.into_iter().find(|binding| binding.root == root);
-    let spec = match saved {
-        Some(binding) if binding.enabled => return set_capture_mode(&root, mode),
-        Some(binding) => BindingSpec {
-            settings: settings_path(&root, None)?,
-            root,
-            spool: binding.spool,
-            worktree_id: binding.worktree_id,
-            base_ref: binding.base_ref,
-            setup_digest: binding.setup_digest,
-            capture_mode: mode,
-            action_rules: binding.action_rules,
-            configured_recipes: binding.configured_recipes,
-            claude_history_root: binding.claude_history_root,
-            spool_limits: binding.spool_limits,
-        },
-        None => {
-            let spools = hub_cli::config_dir()?
-                .join("agentscm")
-                .join("capture-spools");
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&spools)?;
-            BindingSpec {
-                spool: spools.join(&root_digest("agentscm-capture-spool-v1", &root)[..32]),
-                worktree_id: format!(
-                    "checkout_{}",
-                    &root_digest("agentscm-capture-worktree-v1", &root)[..32]
-                ),
-                base_ref: "origin/main".into(),
-                setup_digest: root_digest("agentscm-one-click-setup-v1", &root),
-                capture_mode: mode,
-                action_rules: vec![parse_rule("Bash=execution:partial:process_exit_code")?],
-                configured_recipes: Vec::new(),
-                settings: settings_path(&root, None)?,
-                claude_history_root: None,
-                spool_limits: SpoolLimits::default(),
-                root,
-            }
+    let locked = lock_checkout(&root, Some(expected))?;
+    let spools = hub_cli::config_dir()?
+        .join("agentscm")
+        .join("capture-spools");
+    match plan_enable(&locked.bindings, &locked.connection, &root, mode, &spools)? {
+        None => set_mode_in(&locked, &root, mode),
+        Some(spec) => {
+            keep_new_settings_untracked(&root, &spec.settings)?;
+            let mut result = install_binding(&locked.bindings, &locked.connection, spec)?;
+            result["capture_mode"] = json!(mode);
+            result["root"] = json!(root);
+            Ok(result)
         }
-    };
-    let root = spec.root.clone();
-    let mut result = configure_with(spec)?;
-    result["capture_mode"] = json!(mode);
-    result["root"] = json!(root);
-    Ok(result)
+    }
 }
 
 /// Everything a binding is built from. `configure` fills it from flags; [`enable_capture`] fills
-/// it from documented defaults or from the saved binding; both go through [`configure_with`].
+/// it from documented defaults or from the saved binding; both go through [`install_binding`].
 struct BindingSpec {
     root: PathBuf,
     spool: PathBuf,
@@ -721,10 +905,10 @@ pub fn configure(args: ConfigureArgs) -> Result<Value> {
         .as_deref()
         .map(canonical_history_root)
         .transpose()?;
-    configure_with(BindingSpec {
+    let spec = BindingSpec {
         spool: absolute_without_parent_components(&args.spool)?,
         settings: settings_path(&root, args.claude_settings)?,
-        root,
+        root: root.clone(),
         worktree_id: args.worktree_id,
         base_ref: args.base_ref,
         setup_digest: args.setup_digest,
@@ -733,10 +917,18 @@ pub fn configure(args: ConfigureArgs) -> Result<Value> {
         configured_recipes,
         claude_history_root,
         spool_limits,
-    })
+    };
+    let locked = lock_checkout(&root, None)?;
+    install_binding(&locked.bindings, &locked.connection, spec)
 }
 
-fn configure_with(spec: BindingSpec) -> Result<Value> {
+/// Validates and saves the binding `spec` describes and installs its hooks. The caller holds the
+/// config lock and has read `old_bindings` and `connection` under it.
+fn install_binding(
+    old_bindings: &[CaptureBinding],
+    connection: &client_config::Connection,
+    spec: BindingSpec,
+) -> Result<Value> {
     let BindingSpec {
         root,
         spool: requested_spool,
@@ -753,15 +945,12 @@ fn configure_with(spec: BindingSpec) -> Result<Value> {
     spool_limits
         .validate_action_capture()
         .map_err(|error| invalid(format!("local capture: {error}")))?;
-    let connection = connection_for(&root)?;
-    let _lock = acquire_lock()?;
-    let old_bindings = load()?;
     let saved = old_bindings.iter().find(|binding| binding.root == root);
     if let Some(saved) = saved {
-        if saved.repository != connection.repo
-            || saved.hub != connection.hub
-            || saved.worktree_id != worktree_id
-        {
+        if saved.repository != connection.repo || saved.hub != connection.hub {
+            return Err(lineage_error(saved, connection));
+        }
+        if saved.worktree_id != worktree_id {
             return Err(invalid(
                 "capture binding cannot switch namespace safety lineage for an existing checkout",
             ));
@@ -825,19 +1014,24 @@ fn configure_with(spec: BindingSpec) -> Result<Value> {
         setup_digest,
         capture_mode,
         claude_history_root,
+        claude_settings: (settings != default_settings(&root)).then(|| settings.clone()),
         action_rules,
         configured_recipes,
         spool_limits,
     };
-    commit_binding(&old_bindings, binding, Some(&settings))?;
+    commit_binding(old_bindings, binding, Some(&settings))?;
     Ok(json!({"configured": true, "root": root, "settings": settings}))
 }
 
 pub fn unconfigure(args: UnconfigureArgs) -> Result<Value> {
     let root = client_config::canonical_root(&args.root)?;
-    let settings = settings_path(&root, args.claude_settings)?;
     let _lock = acquire_lock()?;
     let old_bindings = load()?;
+    let recorded = old_bindings
+        .iter()
+        .find(|binding| binding.root == root)
+        .and_then(|binding| binding.claude_settings.clone());
+    let settings = settings_path(&root, args.claude_settings.or(recorded))?;
     let mut bindings = old_bindings.clone();
     let disabled = disable_binding(&mut bindings, &root);
     save(&bindings)?;
@@ -853,6 +1047,27 @@ pub fn unconfigure(args: UnconfigureArgs) -> Result<Value> {
         json!({"configured": false, "disabled": disabled, "lineage_retained": bindings.iter().any(|binding| binding.root == root),
         "root": root, "settings": settings}),
     )
+}
+
+/// Removes a disabled checkout's binding from the config so the checkout can be set up again for
+/// another repository or Hub. The binding's spool is never touched; its path is returned so the
+/// person can export or delete it.
+pub fn forget(args: ForgetArgs) -> Result<Value> {
+    let root = client_config::canonical_root(&args.root)?;
+    let _lock = acquire_lock()?;
+    let mut bindings = load()?;
+    let position = bindings
+        .iter()
+        .position(|binding| binding.root == root)
+        .ok_or_else(|| invalid("no capture binding for this checkout"))?;
+    if bindings[position].enabled {
+        return Err(invalid(
+            "capture is still enabled for this checkout; run `agentscm change-capture unconfigure --root <checkout>` first",
+        ));
+    }
+    let binding = bindings.remove(position);
+    save(&bindings)?;
+    Ok(json!({"forgotten": true, "root": root, "spool": binding.spool, "spool_retained": true}))
 }
 
 pub fn settings_recovery(args: SettingsRecoveryArgs) -> Result<Value> {
@@ -882,8 +1097,13 @@ fn absolute_without_parent_components(path: &Path) -> Result<PathBuf> {
     Ok(path.to_owned())
 }
 
+/// Where Claude hooks go unless a binding records another file.
+fn default_settings(root: &Path) -> PathBuf {
+    root.join(".claude/settings.local.json")
+}
+
 fn settings_path(root: &Path, requested: Option<PathBuf>) -> Result<PathBuf> {
-    let path = requested.unwrap_or_else(|| root.join(".claude/settings.local.json"));
+    let path = requested.unwrap_or_else(|| default_settings(root));
     let path = absolute_without_parent_components(&path)?;
     if !path.starts_with(root) {
         return Err(invalid(
@@ -1662,10 +1882,11 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CaptureBinding, CaptureSetting, HOOK_MARKER, disable_binding, install_hooks,
-        load_recipe_file, load_recipe_from_file, managed_recipe_invocations, parse_rule,
-        remove_owned_hooks, session_start_context, setting_in, validate_binding,
-        validate_binding_update,
+        CaptureBinding, CaptureSetting, ExpectedTarget, HOOK_MARKER, acquire_lock, disable_binding,
+        enable_capture, install_hooks, is_digest, is_identifier, load_recipe_file,
+        load_recipe_from_file, lock_checkout, managed_recipe_invocations, parse_rule, plan_enable,
+        remove_owned_hooks, save, session_start_context, set_capture_mode, setting_in,
+        validate_binding, validate_binding_update,
     };
     use agentscm::change_capture::claude_code::{ActionRuleV1, NativeResultSourceV1};
     use agentscm::change_capture::{
@@ -1702,6 +1923,7 @@ mod tests {
             setup_digest: "a".repeat(64),
             capture_mode: CaptureModeV1::MetadataOnly,
             claude_history_root: None,
+            claude_settings: None,
             action_rules: vec![ActionRuleV1 {
                 native_tool: "Bash".into(),
                 kind: ActionKindV1::Execution,
@@ -1956,5 +2178,163 @@ mod tests {
                 .count(),
             after_removal
         );
+    }
+
+    fn connection(root: &str, hub: &str) -> crate::client_config::Connection {
+        crate::client_config::Connection {
+            root: root.into(),
+            origin_host: "github.com".into(),
+            hub: hub.into(),
+            repo: "counterbranch/agentscm".into(),
+            token_file: "/synthetic/token".into(),
+            report_completion: false,
+            owned_token_id: None,
+            owned_token_expires_at: None,
+            agents: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_new_binding_gets_random_ids_and_a_saved_one_keeps_its_own() {
+        let spools = tempfile::tempdir().unwrap();
+        let hub = "http://127.0.0.1:49321";
+        let plan = |bindings: &[CaptureBinding], root: &str| {
+            plan_enable(
+                bindings,
+                &connection(root, hub),
+                std::path::Path::new(root),
+                CaptureModeV1::SharedConversation,
+                spools.path(),
+            )
+        };
+        let first = plan(&[], "/synthetic/one").unwrap().unwrap();
+        let second = plan(&[], "/synthetic/two").unwrap().unwrap();
+        let repeat = plan(&[], "/synthetic/one").unwrap().unwrap();
+        for (left, right) in [(&first, &second), (&first, &repeat)] {
+            assert_ne!(left.worktree_id, right.worktree_id);
+            assert_ne!(left.setup_digest, right.setup_digest);
+            assert_ne!(left.spool, right.spool);
+        }
+        assert!(first.spool.starts_with(spools.path()));
+        assert!(is_identifier(&first.worktree_id, "checkout_") && first.worktree_id.len() == 41);
+        assert!(is_digest(&first.setup_digest));
+        assert_eq!(first.base_ref, "origin/main");
+
+        let mut saved = recipe_binding(vec![]);
+        saved.enabled = false;
+        saved.claude_settings = Some("/tmp/agentscm-recipe-root/tools/claude.json".into());
+        validate_binding(&saved).unwrap();
+        let again = plan(&[saved.clone()], "/tmp/agentscm-recipe-root")
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.worktree_id, saved.worktree_id);
+        assert_eq!(again.setup_digest, saved.setup_digest);
+        assert_eq!(again.spool, saved.spool);
+        assert_eq!(Some(again.settings), saved.claude_settings);
+
+        saved.enabled = true;
+        assert!(
+            plan(&[saved.clone()], "/tmp/agentscm-recipe-root")
+                .unwrap()
+                .is_none()
+        );
+
+        // A disabled capture saved for another Hub is not reused; the error names the way out.
+        saved.enabled = false;
+        saved.hub = "http://127.0.0.1:1".into();
+        let error = plan(&[saved], "/tmp/agentscm-recipe-root").err().unwrap();
+        let message = error.to_string();
+        assert!(message.contains("change-capture forget"), "{message}");
+        assert!(message.contains("http://127.0.0.1:1"), "{message}");
+    }
+
+    #[test]
+    fn a_settings_path_outside_the_checkout_is_not_a_valid_binding() {
+        let mut binding = recipe_binding(vec![]);
+        binding.claude_settings = Some("/tmp/elsewhere/settings.json".into());
+        assert!(validate_binding(&binding).is_err());
+        binding.claude_settings = Some("/tmp/agentscm-recipe-root/../x/settings.json".into());
+        assert!(validate_binding(&binding).is_err());
+    }
+
+    #[test]
+    fn sharing_is_refused_for_a_connection_the_person_did_not_see_and_bindings_are_read_under_the_lock()
+     {
+        let config = tempfile::tempdir().unwrap();
+        // SAFETY: nextest runs each test in its own process, so no other thread reads it.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", config.path()) };
+        let root = config.path().canonicalize().unwrap().join("widgets");
+        std::fs::create_dir(&root).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/widgets.git",
+            ],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let agentscm = config.path().join("agentscm");
+        std::fs::create_dir_all(&agentscm).unwrap();
+        std::fs::write(
+            agentscm.join("connections.json"),
+            json!({"version": 1, "connections": [{
+                "root": root, "origin_host": "github.com", "hub": "http://127.0.0.1:9",
+                "repo": "acme/widgets", "token_file": agentscm.join("token")
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        let shared = CaptureModeV1::SharedConversation;
+        let seen = |hub| ExpectedTarget {
+            repository: "acme/widgets",
+            hub,
+        };
+        let elsewhere = seen("https://hub.example");
+
+        let error = enable_capture(&root, shared, elsewhere)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("now connected to") && error.contains("refresh and confirm again"));
+        let error = set_capture_mode(&root, shared, Some(elsewhere))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("now connected to"), "{error}");
+        let other_repository = ExpectedTarget {
+            repository: "acme/other",
+            hub: "http://127.0.0.1:9",
+        };
+        assert!(enable_capture(&root, shared, other_repository).is_err());
+        assert!(!agentscm.join("change-capture.json").exists());
+        // Turning sharing off needs no confirmation, so the expectation is not consulted.
+        let error = set_capture_mode(&root, CaptureModeV1::MetadataOnly, Some(elsewhere))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no enabled capture binding"), "{error}");
+
+        // A writer that holds the lock decides first: what is read afterwards sees its binding.
+        let lock = acquire_lock().unwrap();
+        let reader = {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                lock_checkout(&root, Some(seen("http://127.0.0.1:9")))
+                    .map(|locked| locked.bindings.len())
+            })
+        };
+        let mut binding = recipe_binding(vec![]);
+        binding.root = root.clone();
+        binding.spool = config.path().join("spool");
+        save(&[binding]).unwrap();
+        drop(lock);
+        assert_eq!(reader.join().unwrap().unwrap(), 1);
     }
 }

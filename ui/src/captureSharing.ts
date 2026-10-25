@@ -5,6 +5,8 @@
 export type SharingMode = 'metadata_only' | 'local_conversation' | 'shared_conversation'
 
 export interface SharingCheckout {
+  /** Opaque name the service gives this checkout, so two checkouts of one repository stay apart. */
+  id: string
   repository: string
   hub: string
   folder: string
@@ -36,7 +38,10 @@ export function decodeCheckout(value: unknown, path = 'checkout'): SharingChecko
   const raw = object(value, path)
   const mode = raw['mode']
   if (mode !== null && !(MODES as readonly unknown[]).includes(mode)) throw new Error(`${path}.mode is not a known mode`)
+  const id = text(raw['id'], `${path}.id`)
+  if (!/^[0-9a-f]{8,64}$/.test(id)) throw new Error(`${path}.id must be an opaque id`)
   return {
+    id,
     repository: text(raw['repository'], `${path}.repository`),
     hub: text(raw['hub'], `${path}.hub`),
     folder: text(raw['folder'], `${path}.folder`),
@@ -64,11 +69,12 @@ export async function fetchSharing(token: string, signal: AbortSignal): Promise<
 /** Sharing is on only while the checkout's capture is enabled in shared mode. */
 export const isSharing = (checkout: SharingCheckout): boolean => checkout.enabled && checkout.mode === 'shared_conversation'
 
-/** Turn sharing on (after the person confirmed) or off for one listed checkout. Returns its new state. */
+/** Turn sharing on (after the person confirmed) or off for one listed checkout, named by its id. Returns its new state. */
 export async function setSharing(token: string, checkout: SharingCheckout, on: boolean, signal?: AbortSignal): Promise<SharingCheckout> {
-  const body = on
-    ? { repository: checkout.repository, hub: checkout.hub, mode: 'shared_conversation', confirm_sharing: true }
-    : { repository: checkout.repository, hub: checkout.hub, mode: 'metadata_only' }
+  // The repository and Hub are what the person saw; the service refuses the change if the checkout
+  // is connected to anything else by now.
+  const shown = { id: checkout.id, repository: checkout.repository, hub: checkout.hub }
+  const body = on ? { ...shown, mode: 'shared_conversation', confirm_sharing: true } : { ...shown, mode: 'metadata_only' }
   const res = await fetch('/v1/local/capture', {
     method: 'POST',
     signal,

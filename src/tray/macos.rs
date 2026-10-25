@@ -141,6 +141,7 @@ fn run_foreground(initial: Snapshot) -> Result<()> {
         &activity,
         Some("Loading connected checkouts…"),
         login_enabled,
+        None,
     )?;
     let refreshing = Arc::new(AtomicBool::new(false));
     let installing = Arc::new(AtomicBool::new(false));
@@ -153,6 +154,7 @@ fn run_foreground(initial: Snapshot) -> Result<()> {
         &activity,
         Some("Loading connected checkouts…"),
         login_enabled,
+        None,
         agentscm::hub::store::unix_now(),
         now,
     );
@@ -184,6 +186,7 @@ fn run_foreground(initial: Snapshot) -> Result<()> {
         login_changing: false,
         menu_dirty: false,
         notice: None,
+        pending_share: None,
     };
     event_loop
         .run_app(&mut app)
@@ -213,6 +216,9 @@ struct TrayApp {
     login_changing: bool,
     menu_dirty: bool,
     notice: Option<Notice>,
+    /// The checkout whose sharing the person was asked to confirm. Sharing turns on only from the
+    /// explicit confirm item this makes the menu show, never from the first click.
+    pending_share: Option<ShareRequest>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -244,6 +250,14 @@ fn clear_refresh_notice(notice: &mut Option<Notice>) {
 impl TrayApp {
     fn replace_menu(&mut self, notice: Option<&str>) {
         update_refresh_notice(&mut self.notice, notice);
+        self.pending_share = self
+            .pending_share
+            .take()
+            .filter(|pending| pending_share_current(pending, &self.snapshot));
+        let confirming = self
+            .pending_share
+            .as_ref()
+            .map(|pending| pending.identity.as_str());
         let notice = projected_notice(
             None,
             self.notice.as_ref().map(Notice::as_str),
@@ -256,6 +270,7 @@ impl TrayApp {
             &self.activity,
             notice,
             login_enabled,
+            confirming,
             agentscm::hub::store::unix_now(),
             std::time::Instant::now(),
         );
@@ -276,7 +291,13 @@ impl TrayApp {
         }
         if let (Some(tray), Ok(menu)) = (
             &self.tray,
-            build_menu(&self.snapshot, &self.activity, notice, login_enabled),
+            build_menu(
+                &self.snapshot,
+                &self.activity,
+                notice,
+                login_enabled,
+                confirming,
+            ),
         ) {
             let Some(native_menu) = native_menu::NativeMenuBridge::attach(
                 &menu,
@@ -439,30 +460,46 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                     self.replace_menu(None);
                 }
             }
-            UserEvent::Menu(id) if id.starts_with("share-conv:") => {
+            UserEvent::Menu(id)
+                if id.starts_with("share-conv:") || id.starts_with("share-confirm:") =>
+            {
                 self.notice = None;
                 if self.opening_hub || self.installing.load(Ordering::Acquire) {
                     self.notice = Some(Notice::Action(
                         "An action is still running; wait for its result".into(),
                     ));
-                } else if let Some(request) = share_request(&id, &self.snapshot) {
-                    self.installing.store(true, Ordering::Release);
-                    self.feedback.show(
-                        "Updating conversation sharing…",
-                        &share_progress(&request),
-                        true,
-                    );
-                    self.notice = Some(Notice::Action("Updating conversation sharing…".into()));
-                    spawn_share_change(self.refresh_proxy.clone(), request);
                 } else {
-                    self.feedback.show(
-                        "Conversation sharing unavailable",
-                        "The checkout connection changed. Refresh connections and try again.",
-                        false,
-                    );
-                    self.notice = Some(Notice::Action(
-                        "Conversation sharing is unavailable; refresh and try again".into(),
-                    ));
+                    match share_step(&id, &self.snapshot, self.pending_share.as_ref()) {
+                        ShareStep::AskConfirmation(request) => {
+                            let (title, body) = share_confirmation(&request);
+                            self.feedback.show(&title, &body, false);
+                            self.notice = Some(Notice::Action(title));
+                            self.pending_share = Some(request);
+                        }
+                        ShareStep::Change(request) => {
+                            self.pending_share = None;
+                            self.installing.store(true, Ordering::Release);
+                            self.feedback.show(
+                                "Updating conversation sharing…",
+                                &share_progress(&request),
+                                true,
+                            );
+                            self.notice =
+                                Some(Notice::Action("Updating conversation sharing…".into()));
+                            spawn_share_change(self.refresh_proxy.clone(), request);
+                        }
+                        ShareStep::Unavailable => {
+                            self.pending_share = None;
+                            self.feedback.show(
+                                "Conversation sharing unavailable",
+                                "The checkout connection changed. Refresh connections and try again.",
+                                false,
+                            );
+                            self.notice = Some(Notice::Action(
+                                "Conversation sharing is unavailable; refresh and try again".into(),
+                            ));
+                        }
+                    }
                 }
                 self.replace_menu(None);
             }
@@ -830,9 +867,11 @@ fn spawn_integration(
     });
 }
 
+#[derive(Clone, Debug)]
 struct ShareRequest {
     identity: String,
     root: std::path::PathBuf,
+    repository: String,
     hub: String,
     label: String,
     desired: CaptureModeV1,
@@ -861,6 +900,62 @@ fn share_menu_id(identity: &str) -> String {
     format!("share-conv:{identity}")
 }
 
+fn share_confirm_id(identity: &str) -> String {
+    format!("share-confirm:{identity}")
+}
+
+fn share_confirm_label(hub: &str) -> String {
+    format!(
+        "Confirm: share conversations with {}",
+        super::clean_label(hub)
+    )
+}
+
+/// What a click on a sharing item does. Turning sharing on is two clicks: the toggle only asks,
+/// and the confirm item that then appears for that checkout is the one that changes anything.
+enum ShareStep {
+    /// Turning sharing on needs the person to confirm what it does first.
+    AskConfirmation(ShareRequest),
+    /// Turn sharing off, or on after the explicit confirmation.
+    Change(ShareRequest),
+    Unavailable,
+}
+
+fn share_step(id: &str, snapshot: &Snapshot, pending: Option<&ShareRequest>) -> ShareStep {
+    if let Some(identity) = id.strip_prefix("share-confirm:") {
+        return pending
+            .filter(|pending| pending.identity == identity)
+            .and_then(|_| share_request(&share_menu_id(identity), snapshot))
+            .filter(|request| request.desired == CaptureModeV1::SharedConversation)
+            .map_or(ShareStep::Unavailable, ShareStep::Change);
+    }
+    match share_request(id, snapshot) {
+        Some(request) if request.desired == CaptureModeV1::SharedConversation => {
+            ShareStep::AskConfirmation(request)
+        }
+        Some(request) => ShareStep::Change(request),
+        None => ShareStep::Unavailable,
+    }
+}
+
+/// Whether a pending confirmation still describes what the menu shows: the same checkout and Hub
+/// (the identity covers both), not yet shared.
+fn pending_share_current(pending: &ShareRequest, snapshot: &Snapshot) -> bool {
+    share_request(&share_menu_id(&pending.identity), snapshot)
+        .is_some_and(|request| request.desired == CaptureModeV1::SharedConversation)
+}
+
+fn share_confirmation(request: &ShareRequest) -> (String, String) {
+    (
+        format!("Share conversations from {}?", request.label),
+        format!(
+            "{} Nothing is shared yet. Open this checkout's menu and choose \"{}\" to turn sharing on.",
+            share_consequences(&request.hub),
+            share_confirm_label(&request.hub)
+        ),
+    )
+}
+
 /// The toggle flips the mode in the snapshot, not the checkmark AppKit just drew, so a stale or
 /// failed click can never request a change the user did not see. A checkout without an enabled
 /// binding is unchecked, and turning sharing on creates the binding.
@@ -877,6 +972,7 @@ fn share_request(id: &str, snapshot: &Snapshot) -> Option<ShareRequest> {
     Some(ShareRequest {
         identity: identity.to_owned(),
         root: connection.root.clone(),
+        repository: connection.repository.clone(),
         hub: connection.hub.clone(),
         label: connection
             .root
@@ -924,9 +1020,16 @@ fn spawn_share_change(proxy: winit::event_loop::EventLoopProxy<UserEvent>, reque
     std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if request.desired == CaptureModeV1::SharedConversation {
-                crate::change_capture_client::enable_capture(&request.root, request.desired)
+                crate::change_capture_client::enable_capture(
+                    &request.root,
+                    request.desired,
+                    crate::change_capture_client::ExpectedTarget {
+                        repository: &request.repository,
+                        hub: &request.hub,
+                    },
+                )
             } else {
-                crate::change_capture_client::set_capture_mode(&request.root, request.desired)
+                crate::change_capture_client::set_capture_mode(&request.root, request.desired, None)
             }
         }))
         .map_err(|_| "conversation sharing change stopped unexpectedly".to_owned())
@@ -1213,6 +1316,7 @@ fn build_menu(
     activity: &crate::client_activity::ActivityStore,
     notice: Option<&str>,
     login_enabled: bool,
+    confirming: Option<&str>,
 ) -> Result<Menu> {
     let now = agentscm::hub::store::unix_now();
     let menu = Menu::new();
@@ -1275,6 +1379,16 @@ fn build_menu(
                 None,
             ))
             .map_err(menu_error)?;
+        if confirming == Some(identity.as_str()) {
+            submenu
+                .append(&MenuItem::with_id(
+                    share_confirm_id(&identity),
+                    share_confirm_label(&connection.hub),
+                    true,
+                    None,
+                ))
+                .map_err(menu_error)?;
+        }
 
         let integrations = Submenu::new("Agent Integrations", true);
         for (agent, label) in agent_choices() {
@@ -1503,10 +1617,13 @@ fn menu_projection_key(
     activity: &crate::client_activity::ActivityStore,
     notice: Option<&str>,
     login_enabled: bool,
+    confirming: Option<&str>,
     now: i64,
     monotonic_now: std::time::Instant,
 ) -> String {
     let mut key = serde_json::to_string(&snapshot.connections).unwrap_or_default();
+    key.push_str("\nconfirming:");
+    key.push_str(confirming.unwrap_or_default());
     key.push_str("\nnotice:");
     key.push_str(notice.unwrap_or_default());
     key.push_str("\nlogin:");
@@ -2124,10 +2241,92 @@ mod tests {
     }
 
     #[test]
+    fn turning_sharing_on_takes_two_clicks_and_the_first_never_changes_anything() {
+        let mut snapshot = Snapshot {
+            version: 1,
+            snapshot_at: 0,
+            connections: vec![
+                share_connection("/synthetic/unbound", None),
+                share_connection("/synthetic/on", Some(CaptureModeV1::SharedConversation)),
+            ],
+        };
+        let identity =
+            |snapshot: &Snapshot, index: usize| connection_identity(&snapshot.connections[index]);
+        let toggle = share_menu_id(&identity(&snapshot, 0));
+        let confirm = share_confirm_id(&identity(&snapshot, 0));
+
+        // The toggle only asks, and says what sharing does and which item confirms it.
+        let ShareStep::AskConfirmation(asked) = share_step(&toggle, &snapshot, None) else {
+            panic!("the first click must only ask");
+        };
+        let (title, body) = share_confirmation(&asked);
+        assert_eq!(title, "Share conversations from unbound?");
+        assert!(body.contains(&share_consequences("https://hub.example")));
+        assert!(body.contains(&share_confirm_label("https://hub.example")));
+        assert!(body.contains("Nothing is shared yet"));
+        assert_eq!(
+            share_confirm_label("https://hub.example"),
+            "Confirm: share conversations with https://hub.example"
+        );
+        // Clicking the toggle again asks again; it never turns anything on.
+        assert!(matches!(
+            share_step(&toggle, &snapshot, Some(&asked)),
+            ShareStep::AskConfirmation(_)
+        ));
+
+        // The confirm item alone changes the setting, and only after the person was asked.
+        assert!(matches!(
+            share_step(&confirm, &snapshot, None),
+            ShareStep::Unavailable
+        ));
+        let ShareStep::Change(request) = share_step(&confirm, &snapshot, Some(&asked)) else {
+            panic!("the confirm item must turn sharing on");
+        };
+        assert_eq!(request.desired, CaptureModeV1::SharedConversation);
+        assert_eq!(request.repository, "example/project");
+        assert_eq!(request.hub, "https://hub.example");
+
+        // A confirmation asked for another checkout does not confirm this one.
+        let other = share_request(&share_menu_id(&identity(&snapshot, 1)), &snapshot).unwrap();
+        assert!(matches!(
+            share_step(&confirm, &snapshot, Some(&other)),
+            ShareStep::Unavailable
+        ));
+
+        // Turning sharing off needs no confirmation.
+        let off = share_menu_id(&identity(&snapshot, 1));
+        assert!(matches!(
+            share_step(&off, &snapshot, None),
+            ShareStep::Change(request) if request.desired == CaptureModeV1::MetadataOnly
+        ));
+
+        // The menu shows the confirm item only while the asked checkout is unchanged: another Hub
+        // is another identity, and a checkout that now shares has nothing left to confirm.
+        assert!(pending_share_current(&asked, &snapshot));
+        snapshot.connections[0].hub = "https://other.example".into();
+        assert!(!pending_share_current(&asked, &snapshot));
+        assert!(matches!(
+            share_step(&confirm, &snapshot, Some(&asked)),
+            ShareStep::Unavailable
+        ));
+        snapshot.connections[0].hub = "https://hub.example".into();
+        snapshot.connections[0].capture_mode = Some(CaptureModeV1::SharedConversation);
+        assert!(!pending_share_current(&asked, &snapshot));
+
+        let activity = crate::client_activity::ActivityStore::default();
+        let now = std::time::Instant::now();
+        assert_ne!(
+            menu_projection_key(&snapshot, &activity, None, false, None, 100, now),
+            menu_projection_key(&snapshot, &activity, None, false, Some("x"), 100, now)
+        );
+    }
+
+    #[test]
     fn share_outcome_states_what_the_change_does_and_does_not_do() {
         let mut request = ShareRequest {
             identity: "x".into(),
             root: "/synthetic/project".into(),
+            repository: "example/project".into(),
             hub: "https://hub.example.test".into(),
             label: "project".into(),
             desired: CaptureModeV1::SharedConversation,
@@ -2277,7 +2476,7 @@ mod tests {
             quickstart_command_for(Path::new("/opt/agent scm"), &rows[0]),
             "cd '/synthetic/widgets' && '/opt/agent scm' quickstart --agent 'codex'"
         );
-        let projected = menu_projection_key(&snapshot, &activity, None, false, 100, now);
+        let projected = menu_projection_key(&snapshot, &activity, None, false, None, 100, now);
         assert!(projected.contains("unconnected:acme/widgets"));
 
         snapshot
@@ -2443,13 +2642,14 @@ mod tests {
         };
         let activity = crate::client_activity::ActivityStore::default();
         let monotonic = std::time::Instant::now();
-        let first = menu_projection_key(&snapshot, &activity, None, false, 100, monotonic);
+        let first = menu_projection_key(&snapshot, &activity, None, false, None, 100, monotonic);
         snapshot.snapshot_at = 47;
         let periodic = menu_projection_key(
             &snapshot,
             &activity,
             None,
             false,
+            None,
             105,
             monotonic + Duration::from_secs(5),
         );
@@ -2461,6 +2661,7 @@ mod tests {
                 &activity,
                 Some("Checking…"),
                 false,
+                None,
                 105,
                 monotonic,
             )
@@ -2477,8 +2678,8 @@ mod tests {
         let activity = crate::client_activity::ActivityStore::default();
         let monotonic = std::time::Instant::now();
         assert_ne!(
-            menu_projection_key(&snapshot, &activity, None, false, 100, monotonic),
-            menu_projection_key(&snapshot, &activity, None, true, 100, monotonic),
+            menu_projection_key(&snapshot, &activity, None, false, None, 100, monotonic),
+            menu_projection_key(&snapshot, &activity, None, true, None, 100, monotonic),
         );
     }
 

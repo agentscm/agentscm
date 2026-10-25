@@ -626,7 +626,7 @@ fn added_excludes(exclude: &Path) -> PathBuf {
     exclude.with_file_name("agentscm-excluded")
 }
 
-fn ignore_new_file(root: &Path, relative: &str) -> Result<()> {
+pub(crate) fn ignore_new_file(root: &Path, relative: &str) -> Result<()> {
     let path = exclude_path(root)?;
     let text = read(&path)?.unwrap_or_default();
     let line = format!("/{relative}");

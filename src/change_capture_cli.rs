@@ -29,6 +29,9 @@ pub enum ChangeCaptureCommand {
     SetMode(change_capture_client::SetModeArgs),
     /// Disable one checkout, retain its spool lineage, and remove only AgentSCM's marked hooks.
     Unconfigure(change_capture_client::UnconfigureArgs),
+    /// Remove a disabled checkout's binding so it can be set up again for another repository or
+    /// Hub. Its private spool stays on disk and its path is printed.
+    Forget(change_capture_client::ForgetArgs),
     /// Inspect, restore, or prune bounded private Claude settings recovery entries.
     SettingsRecovery(change_capture_client::SettingsRecoveryArgs),
     /// Read one concise shared change record without running a model or mutating Hub state.
@@ -242,12 +245,16 @@ pub async fn run(command: ChangeCaptureCommand) -> Result<i32> {
         ChangeCaptureCommand::SetMode(args) => {
             println!(
                 "{}",
-                change_capture_client::set_capture_mode(&args.root, args.mode.into())?
+                change_capture_client::set_capture_mode(&args.root, args.mode.into(), None)?
             );
             Ok(0)
         }
         ChangeCaptureCommand::Unconfigure(args) => {
             println!("{}", change_capture_client::unconfigure(args)?);
+            Ok(0)
+        }
+        ChangeCaptureCommand::Forget(args) => {
+            println!("{}", change_capture_client::forget(args)?);
             Ok(0)
         }
         ChangeCaptureCommand::SettingsRecovery(args) => {
