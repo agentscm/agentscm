@@ -149,6 +149,15 @@ pub enum WorkState {
     Handover,
 }
 
+impl WorkState {
+    /// Change capture continues while the Work is still the session's own. A session end
+    /// pauses the Work and a resumed session keeps capturing, so Paused and Blocked count;
+    /// Finished and Handover end the session's claim.
+    pub(super) fn accepts_capture(self) -> bool {
+        matches!(self, Self::Active | Self::Paused | Self::Blocked)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimStatus {

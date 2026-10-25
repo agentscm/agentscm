@@ -1107,7 +1107,7 @@ fn unfinished_for_session(
         .transpose()
 }
 
-fn active_capture_work_for_session(
+fn current_capture_work_for_session(
     tx: &Transaction<'_>,
     who: &WorkWho,
     session: &str,
@@ -1117,7 +1117,7 @@ fn active_capture_work_for_session(
         "SELECT item.snapshot FROM hub_work_items item
          JOIN hub_work_participants participant ON participant.work=item.id
          WHERE item.provider=?1 AND item.host=?2 AND item.repository=?3
-           AND item.repository_id IS ?4 AND item.state='active'
+           AND item.repository_id IS ?4 AND item.state IN ('active','paused','blocked')
            AND participant.token=?5 AND participant.session=?6
            AND participant.generation=item.generation
          ORDER BY item.id LIMIT 2",
@@ -1137,7 +1137,7 @@ fn active_capture_work_for_session(
         .collect::<std::result::Result<Vec<_>, _>>()?;
     if snapshots.len() > 1 {
         return Err(HubError::Invalid(
-            "session participates in more than one active work item".into(),
+            "session participates in more than one capturable work item".into(),
         ));
     }
     snapshots
@@ -5782,7 +5782,7 @@ impl Store for SqliteStore {
                 "operation_id is already used by a different capture request".into(),
             ));
         }
-        if item.state != WorkState::Active || item.generation != batch.generation {
+        if !item.state.accepts_capture() || item.generation != batch.generation {
             return Err(HubError::Invalid(
                 "capture work is no longer current".into(),
             ));
@@ -6339,7 +6339,7 @@ impl Store for SqliteStore {
                 "operation_id is already used by a different action request".into(),
             ));
         }
-        if item.state != WorkState::Active || item.generation != start.generation {
+        if !item.state.accepts_capture() || item.generation != start.generation {
             return Err(HubError::Invalid("action work is no longer current".into()));
         }
         if start.source.repository() != who.repository {
@@ -6458,7 +6458,7 @@ impl Store for SqliteStore {
             if author==token&&kind=="action_finish"&&retained==request { let mut receipt:ActionMutationReceiptV1=json_value(&response)?;receipt.replayed=true;tx.commit()?;return Ok(receipt); }
             return Err(HubError::Invalid("operation_id is already used by a different action request".into()));
         }
-        if item.state != WorkState::Active || item.generation != finish.generation {
+        if !item.state.accepts_capture() || item.generation != finish.generation {
             return Err(HubError::Invalid("action work is no longer current".into()));
         }
         let (author,generation,started_at,already,start_request):(String,i64,i64,Option<String>,String)=tx.query_row("SELECT author_token,generation,started_at,finish_request,start_request FROM hub_change_actions WHERE work=?1 AND action_id=?2",params![finish.work_id,finish.action_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?.ok_or_else(||HubError::Invalid("unknown action".into()))?;
@@ -6967,7 +6967,7 @@ impl Store for SqliteStore {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let who = work_who(&tx, token, now)?;
-        let item = active_capture_work_for_session(&tx, &who, session, now)?;
+        let item = current_capture_work_for_session(&tx, &who, session, now)?;
         tx.commit()?;
         Ok(item)
     }

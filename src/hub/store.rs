@@ -671,7 +671,9 @@ pub trait Store: Send + Sync {
     fn work_insights(&self, token: &str, query: &InsightQuery, now: i64) -> Result<InsightPage>;
     /// The token/session's one unfinished lead claim. Multiple matches are invalid.
     fn work_for_session(&self, token: &str, session: &str, now: i64) -> Result<Option<WorkItem>>;
-    /// The token/session's unique active participant claim for native change capture.
+    /// The token/session's unique current-generation participant Work for native change capture.
+    /// Active, Paused and Blocked Work qualify (session end pauses it; resumed sessions keep
+    /// capturing); Finished and Handover do not. Never changes the Work state.
     fn capture_work_for_session(
         &self,
         token: &str,

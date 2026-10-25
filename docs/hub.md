@@ -586,7 +586,10 @@ The experimental Unix capture client adds a separate Claude Code hook set after 
 existing saved client connection. `agentscm change-capture configure` is a configure-once operation:
 each hook invocation resolves the session's current authorized Work and generation, appends locally
 before delivery, and replays a bounded ordered page. It does not reuse one fixed Work generation.
-Unresolved hooks stay as bounded sanitized local facts and are never later attached to a Work item.
+Capture targets a Work that is `active`, `paused` or `blocked` for the session at its current
+generation: session end pauses the Work and a resumed session keeps capturing, while `finished` and
+`handover` Work end capture. Unresolved hooks stay as bounded sanitized local facts and are never
+later attached to a Work item.
 
 The Hub accepts bounded event batches and source-bound action starts/finishes on the
 `/v1/hub/repos/{repo}/change-records/...` routes. Ordinary command execution has an outcome but an

@@ -3589,3 +3589,179 @@ mod shared_bodies {
         assert_eq!(relisted["entries"][0]["availability"], "deleted");
     }
 }
+
+/// A Claude session end makes the Hub pause the Work. The same session id, resumed, must keep
+/// delivering capture instead of deferring every event as having no current Work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capture_continues_after_the_hub_pauses_work_on_session_end() {
+    let hub = RestartableHub::start().await;
+    let owner = hub
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 43,
+            },
+            "capture-resume",
+        )
+        .unwrap();
+    let (token, secret, _) = mint_bound_agent_token(
+        &*hub.store,
+        &owner.id,
+        "capture-resume",
+        REPOSITORY,
+        78,
+        600,
+        false,
+    )
+    .unwrap();
+    let observed = "native-session-resume";
+    let work = hub
+        .store
+        .work_start(
+            &token,
+            &WorkStart {
+                work_id: None,
+                source: None,
+                request_key: Some("capture-after-pause".into()),
+                title: "capture after the session end pause".into(),
+                session: observed.into(),
+                role: WorkRole::Lead,
+                scope: vec!["tracked.txt".into()],
+                branch: None,
+                worktree: None,
+                next_action: None,
+                depends_on: vec![],
+                related_work: vec![],
+                takeover_generation: None,
+            },
+            unix_now(),
+        )
+        .unwrap()
+        .item;
+
+    let private = TempDir::new().unwrap();
+    let root = private.path().join("repo");
+    std::fs::create_dir(&root).unwrap();
+    run_git(&root, &["init", "--quiet", "--initial-branch=main"]);
+    run_git(&root, &["config", "user.email", "fixture@example.invalid"]);
+    run_git(&root, &["config", "user.name", "Synthetic Fixture"]);
+    std::fs::write(root.join("tracked.txt"), "fixture\n").unwrap();
+    run_git(&root, &["add", "tracked.txt"]);
+    run_git(&root, &["commit", "--quiet", "-m", "fixture"]);
+    run_git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/widgets.git",
+        ],
+    );
+    run_git(&root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    let root = root.canonicalize().unwrap();
+    let config = private.path().join("config");
+    let config_agentscm = config.join("agentscm");
+    std::fs::create_dir_all(&config_agentscm).unwrap();
+    let token_file = private.path().join("writer.token");
+    std::fs::write(&token_file, format!("{}\n", secret.expose())).unwrap();
+    std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::write(
+        config_agentscm.join("connections.json"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "connections": [{
+                "root": root,
+                "origin_host": "github.com",
+                "hub": hub.base,
+                "repo": REPOSITORY,
+                "token_file": token_file,
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let configure = vec![
+        "change-capture".into(),
+        "configure".into(),
+        "--root".into(),
+        root.display().to_string(),
+        "--spool".into(),
+        private.path().join("spool").display().to_string(),
+        "--worktree-id".into(),
+        "fixture-worktree".into(),
+        "--setup-digest".into(),
+        "5".repeat(64),
+        "--action-rule".into(),
+        "Bash=execution:partial:process_exit_code".into(),
+    ];
+    let configured = run_capture_cli(&config, private.path(), &configure, None);
+    assert!(
+        configured.status.success(),
+        "{}",
+        String::from_utf8_lossy(&configured.stderr)
+    );
+
+    let hook = |payload: Value| {
+        run_capture_cli(
+            &config,
+            private.path(),
+            &["change-capture".into(), "hook-claude".into()],
+            Some(&serde_json::to_vec(&payload).unwrap()),
+        )
+    };
+    let started = hook(
+        json!({"hook_event_name":"SessionStart","session_id":observed,"source":"startup","cwd":root}),
+    );
+    assert!(started.status.success());
+
+    // The Hub's own Claude hook endpoint pauses the Work for this session.
+    let ended = reqwest::Client::new()
+        .post(format!("{}/v1/hub/hook/claude", hub.base))
+        .bearer_auth(secret.expose())
+        .header("content-type", "application/json")
+        .body(
+            json!({"hook_event_name": "SessionEnd", "session_id": observed, "cwd": root})
+                .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ended.status(), StatusCode::OK);
+    let paused = hub
+        .store
+        .work_get(&token, &work.id, unix_now())
+        .unwrap()
+        .unwrap();
+    assert_eq!(paused.state, agentscm::hub::work::WorkState::Paused);
+
+    for payload in [
+        json!({"hook_event_name":"PreToolUse","session_id":observed,"tool_name":"Bash","tool_use_id":"resumed-tool","tool_input":{"command":"printf fixture"},"cwd":root}),
+        json!({"hook_event_name":"PostToolUse","session_id":observed,"tool_name":"Bash","tool_use_id":"resumed-tool","tool_input":{"command":"printf fixture"},"tool_response":{"exit_code":0},"cwd":root}),
+    ] {
+        let output = hook(payload);
+        assert!(output.status.success());
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("could not be resolved"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let record = hub
+        .store
+        .change_record(&token, &work.id, unix_now())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.latest_action.unwrap().outcome,
+        ActionOutcomeV1::Succeeded
+    );
+    // Capture never changes the Work state.
+    let still = hub
+        .store
+        .work_get(&token, &work.id, unix_now())
+        .unwrap()
+        .unwrap();
+    assert_eq!(still.state, agentscm::hub::work::WorkState::Paused);
+}

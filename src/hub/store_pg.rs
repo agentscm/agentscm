@@ -1089,7 +1089,7 @@ fn unfinished_for_session(
         .transpose()
 }
 
-fn active_capture_work_for_session(
+fn current_capture_work_for_session(
     tx: &mut postgres::Transaction<'_>,
     who: &WorkWho,
     session: &str,
@@ -1099,7 +1099,7 @@ fn active_capture_work_for_session(
         "SELECT item.snapshot FROM hub_work_items item
          JOIN hub_work_participants participant ON participant.work=item.id
          WHERE item.provider=$1 AND item.host=$2 AND item.repository=$3
-           AND item.repository_id IS NOT DISTINCT FROM $4 AND item.state='active'
+           AND item.repository_id IS NOT DISTINCT FROM $4 AND item.state IN ('active','paused','blocked')
            AND participant.token=$5 AND participant.session=$6
            AND participant.generation=item.generation
          ORDER BY item.id LIMIT 2",
@@ -1114,7 +1114,7 @@ fn active_capture_work_for_session(
     )?;
     if rows.len() > 1 {
         return Err(HubError::Invalid(
-            "session participates in more than one active work item".into(),
+            "session participates in more than one capturable work item".into(),
         ));
     }
     rows.first()
@@ -5799,7 +5799,7 @@ impl Store for PgStore {
                 if author==token&&kind=="event_batch"&&retained==request {let mut receipt:IngestReceiptV1=json_value(&response)?;receipt.replayed=true;tx.commit()?;return Ok(receipt);}
                 return Err(HubError::Invalid("operation_id is already used by a different capture request".into()));
             }
-            if item.state != WorkState::Active || item.generation != batch.generation {
+            if !item.state.accepts_capture() || item.generation != batch.generation {
                 return Err(HubError::Invalid("capture work is no longer current".into()));
             }
             if tx.query_opt("SELECT 1 FROM hub_work_participants WHERE work=$1 AND token=$2 AND session=$3 AND generation=$4",&[&batch.work_id,&token,&batch.session.session_id,&batch.generation])?.is_none() {
@@ -6158,7 +6158,7 @@ impl Store for PgStore {
         }
         self.run(false,|client|{let mut tx=client.transaction()?;let who=work_who(&mut tx,token,now)?;if who.read_only{return Err(HubError::Unauthorized);}let item=scoped_work(&mut tx,&who,&start.work_id,now,true)?.ok_or_else(||HubError::Invalid("unknown work".into()))?;
             if let Some(row)=tx.query_opt("SELECT author_token,kind,request,response FROM hub_change_operations WHERE work=$1 AND operation_id=$2",&[&start.work_id,&start.operation_id])?{let author:String=row.get(0);let kind:String=row.get(1);let retained:String=row.get(2);let response:String=row.get(3);if author==token&&kind=="action_start"&&retained==request{let mut receipt:ActionMutationReceiptV1=json_value(&response)?;receipt.replayed=true;tx.commit()?;return Ok(receipt);}return Err(HubError::Invalid("operation_id is already used by a different action request".into()));}
-            if item.state!=WorkState::Active||item.generation!=start.generation{return Err(HubError::Invalid("action work is no longer current".into()));}
+            if !item.state.accepts_capture()||item.generation!=start.generation{return Err(HubError::Invalid("action work is no longer current".into()));}
             if start.source.repository()!=who.repository{return Err(HubError::Invalid("action source belongs to another repository".into()));}
             if tx.query_opt("SELECT 1 FROM hub_work_participants WHERE work=$1 AND token=$2 AND session=$3 AND generation=$4",&[&start.work_id,&token,&start.session_id,&start.generation])?.is_none(){return Err(HubError::Invalid("action session is not a current work participant".into()));}
             if tx.query_opt("SELECT 1 FROM hub_change_actions WHERE work=$1 AND action_id=$2",&[&start.work_id,&start.action_id])?.is_some(){return Err(HubError::Invalid("action_id is already used".into()));}
@@ -6190,7 +6190,7 @@ impl Store for PgStore {
         }
         self.run(false,|client|{let mut tx=client.transaction()?;let who=work_who(&mut tx,token,now)?;if who.read_only{return Err(HubError::Unauthorized);}let item=scoped_work(&mut tx,&who,&finish.work_id,now,true)?.ok_or_else(||HubError::Invalid("unknown work".into()))?;
             if let Some(row)=tx.query_opt("SELECT author_token,kind,request,response FROM hub_change_operations WHERE work=$1 AND operation_id=$2",&[&finish.work_id,&finish.operation_id])?{let author:String=row.get(0);let kind:String=row.get(1);let retained:String=row.get(2);let response:String=row.get(3);if author==token&&kind=="action_finish"&&retained==request{let mut receipt:ActionMutationReceiptV1=json_value(&response)?;receipt.replayed=true;tx.commit()?;return Ok(receipt);}return Err(HubError::Invalid("operation_id is already used by a different action request".into()));}
-            if item.state!=WorkState::Active||item.generation!=finish.generation{return Err(HubError::Invalid("action work is no longer current".into()));}
+            if !item.state.accepts_capture()||item.generation!=finish.generation{return Err(HubError::Invalid("action work is no longer current".into()));}
             let row=tx.query_opt("SELECT author_token,generation,started_at,finish_request,start_request FROM hub_change_actions WHERE work=$1 AND action_id=$2 FOR UPDATE",&[&finish.work_id,&finish.action_id])?.ok_or_else(||HubError::Invalid("unknown action".into()))?;let author:String=row.get(0);let generation:i64=row.get(1);let started_at:i64=row.get(2);let already:Option<String>=row.get(3);let start_request:String=row.get(4);if author!=token||generation!=finish.generation{return Err(HubError::Invalid("action finish author or generation changed".into()));}let retained_start:ActionStartV1=json_value(&start_request)?;if retained_start.kind==crate::change_record::ActionKindV1::Execution&&finish.result!=crate::change_record::CheckResultV1::Unknown{return Err(HubError::Invalid("execution actions cannot assert verification results".into()));}
             if retained_start.kind==crate::change_record::ActionKindV1::Verification&&retained_start.recipe_provenance!=crate::change_record::RecipeProvenanceV1::ConfiguredExactMatch&&matches!(finish.result,crate::change_record::CheckResultV1::Passed|crate::change_record::CheckResultV1::Failed){return Err(HubError::Invalid("verification result requires an exact configured recipe".into()));}
             if already.is_some(){return Err(HubError::Invalid("action is already finished".into()));}
@@ -6471,7 +6471,7 @@ impl Store for PgStore {
         self.run(true, |client| {
             let mut tx = client.transaction()?;
             let who = work_who(&mut tx, token, now)?;
-            let item = active_capture_work_for_session(&mut tx, &who, session, now)?;
+            let item = current_capture_work_for_session(&mut tx, &who, session, now)?;
             tx.commit()?;
             Ok(item)
         })

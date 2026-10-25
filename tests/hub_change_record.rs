@@ -561,15 +561,19 @@ fn lifecycle_resume_and_replay(db: &Db) {
         4,
         CapturedEventKindV1::AssistantMessage,
     );
-    assert!(store.change_ingest(&token, &after_end, 410).is_err());
+    // A paused Work still accepts capture: session end pauses it and a resumed session keeps going.
+    assert!(
+        !store
+            .change_ingest(&token, &after_end, 410)
+            .unwrap()
+            .replayed
+    );
     let mut paused_action = action_start(&work_id, generation);
     paused_action.operation_id = "paused-new-action".into();
     paused_action.action_id = "paused-new-action".into();
-    assert!(
-        store
-            .change_action_start(&token, &paused_action, 411)
-            .is_err()
-    );
+    store
+        .change_action_start(&token, &paused_action, 411)
+        .unwrap();
 
     let resumed = store
         .work_start(
@@ -649,6 +653,165 @@ fn lifecycle_resume_and_replay(db: &Db) {
             .sessions
             .coverage,
         CoverageV1::Partial
+    );
+}
+
+fn checkpoint(
+    work_id: &str,
+    generation: i64,
+    seq: i64,
+    op: &str,
+    kind: CheckpointKind,
+) -> WorkCheckpoint {
+    WorkCheckpoint {
+        work_id: work_id.into(),
+        operation_id: op.into(),
+        generation,
+        session: "session-1".into(),
+        expected_updated_seq: Some(seq),
+        kind,
+        summary: "synthetic transition".into(),
+        next_action: None,
+        scope: None,
+        branch: None,
+        worktree: None,
+        resolve_blocker: false,
+        source_refs: vec![],
+        depends_on: vec![],
+        related_work: vec![],
+    }
+}
+
+fn updated_seq(store: &dyn Store, token: &str, work_id: &str) -> i64 {
+    store
+        .work_get(token, work_id, 500)
+        .unwrap()
+        .unwrap()
+        .updated_seq
+}
+
+fn capture_survives_pause_and_stops_at_end_of_claim(fresh: &dyn Fn() -> Db) {
+    let capturable = |store: &dyn Store, token: &str, work_id: &str, generation: i64, tag: &str| {
+        let target = store
+            .capture_work_for_session(token, "session-1", 501)
+            .unwrap();
+        let batch = event_batch_kind(
+            work_id,
+            generation,
+            &format!("{tag}-event"),
+            1,
+            CapturedEventKindV1::AssistantMessage,
+        );
+        let mut start = action_start(work_id, generation);
+        start.operation_id = format!("{tag}-start");
+        start.action_id = format!("{tag}-action");
+        let mut finish = action_finish(work_id, generation);
+        finish.operation_id = format!("{tag}-finish");
+        finish.action_id = format!("{tag}-action");
+        (
+            target.map(|item| (item.id, item.generation)),
+            store.change_ingest(token, &batch, 502).is_ok(),
+            store.change_action_start(token, &start, 503).is_ok(),
+            store.change_action_finish(token, &finish, 504).is_ok(),
+        )
+    };
+
+    // Paused and Blocked keep capturing without changing the Work state.
+    for (kind, tag) in [
+        (CheckpointKind::Pause, "paused"),
+        (CheckpointKind::Blocker, "blocked"),
+    ] {
+        let db = fresh();
+        let (store, token, work_id, generation) = setup(&db);
+        let seq = updated_seq(&*store, &token, &work_id);
+        store
+            .work_checkpoint(
+                &token,
+                &checkpoint(&work_id, generation, seq, tag, kind),
+                500,
+            )
+            .unwrap();
+        let after_transition = updated_seq(&*store, &token, &work_id);
+        assert_eq!(
+            capturable(&*store, &token, &work_id, generation, tag),
+            (Some((work_id.clone(), generation)), true, true, true)
+        );
+        assert_eq!(updated_seq(&*store, &token, &work_id), after_transition);
+    }
+
+    // Finish and Handover end the claim.
+    for (kind, tag) in [
+        (CheckpointKind::Finish, "finished"),
+        (CheckpointKind::Handover, "handover"),
+    ] {
+        let db = fresh();
+        let (store, token, work_id, generation) = setup(&db);
+        // An action started while the Work was current, so finish is refused only by state.
+        let mut open = action_start(&work_id, generation);
+        open.operation_id = format!("{tag}-open-start");
+        open.action_id = format!("{tag}-open");
+        store.change_action_start(&token, &open, 499).unwrap();
+        let seq = updated_seq(&*store, &token, &work_id);
+        store
+            .work_checkpoint(
+                &token,
+                &checkpoint(&work_id, generation, seq, tag, kind),
+                500,
+            )
+            .unwrap();
+        let mut finish = action_finish(&work_id, generation);
+        finish.operation_id = format!("{tag}-open-finish");
+        finish.action_id = format!("{tag}-open");
+        assert!(store.change_action_finish(&token, &finish, 504).is_err());
+        assert_eq!(
+            capturable(&*store, &token, &work_id, generation, tag),
+            (None, false, false, false)
+        );
+    }
+
+    // A takeover bumps the generation and fences the old session, even from Paused.
+    let db = fresh();
+    let (store, token, work_id, generation) = setup(&db);
+    let seq = updated_seq(&*store, &token, &work_id);
+    store
+        .work_checkpoint(
+            &token,
+            &checkpoint(
+                &work_id,
+                generation,
+                seq,
+                "pause-before-takeover",
+                CheckpointKind::Pause,
+            ),
+            500,
+        )
+        .unwrap();
+    let taken = store
+        .work_start(
+            &token,
+            &WorkStart {
+                work_id: Some(work_id.clone()),
+                source: None,
+                request_key: None,
+                title: "takeover".into(),
+                session: "session-2".into(),
+                role: WorkRole::Lead,
+                scope: vec![],
+                branch: None,
+                worktree: None,
+                next_action: None,
+                depends_on: vec![],
+                related_work: vec![],
+                takeover_generation: Some(generation),
+            },
+            500,
+        )
+        .unwrap()
+        .item;
+    assert_eq!(taken.generation, generation + 1);
+    assert_eq!(
+        capturable(&*store, &token, &work_id, generation, "fenced"),
+        (None, false, false, false)
     );
 }
 
@@ -916,6 +1079,7 @@ fn sqlite_action_capture_receipt() {
     action_capture_receipt(&db);
     lifecycle_resume_and_replay(&db);
     informational_events_do_not_change_lifecycle_coverage(&Db::sqlite);
+    capture_survives_pause_and_stops_at_end_of_claim(&Db::sqlite);
 }
 
 #[test]
@@ -924,6 +1088,7 @@ fn postgres_action_capture_receipt() {
         action_capture_receipt(&db);
         lifecycle_resume_and_replay(&db);
         informational_events_do_not_change_lifecycle_coverage(&|| Db::postgres().unwrap());
+        capture_survives_pause_and_stops_at_end_of_claim(&|| Db::postgres().unwrap());
     }
 }
 

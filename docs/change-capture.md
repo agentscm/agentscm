@@ -327,6 +327,15 @@ failed envelope bytes remain retained and unacknowledged for later retry and dia
 The spool is durably bound to its canonical Hub, repository, and worktree namespace and rejects a
 mismatched reuse.
 
+The Hub resolves the current target for a session whose Work is `active`, `paused` or `blocked`
+at the session's current generation, and accepts event batches and action starts and finishes for
+that Work in the same states. A Claude `SessionEnd` makes the Hub pause the session's Work, and a
+resumed session (`claude --resume`, same session id) keeps capturing while the Work stays paused,
+so excluding paused Work would defer the session's own `SessionEnd` and everything after a resume.
+`finished` and `handover` Work, and any older generation after a takeover, are refused. Capture
+only reads the state and never changes it; pausing, finishing and handing over remain Work
+checkpoints.
+
 When exact current Work resolution is unavailable or returns no authorized target, the hook keeps
 only a bounded sanitized local fact. It strips prompt text, tool input/output, error, and cwd even
 in local-conversation mode. Every deferred occurrence reserves a replay-stable sequence, including
