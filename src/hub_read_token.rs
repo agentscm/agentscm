@@ -10,8 +10,6 @@ use crate::client_status::HubCheck;
 
 pub(crate) const TOKEN_TTL_SECONDS: i64 = 30 * 60;
 const EXPIRY_SLOP_SECONDS: i64 = 60;
-/// The name the tray gives the tokens it mints; the local Hub page uses its own.
-pub(crate) const TRAY_TOKEN_NAME: &str = "agentscm-tray";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OpenError {
@@ -306,6 +304,8 @@ pub(crate) async fn revoke_token(
 #[cfg(test)]
 mod tests {
     use agentscm::hub::forge_http;
+
+    const TRAY_TOKEN_NAME: &str = "agentscm-tray";
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc;

@@ -13,6 +13,8 @@ use crate::hub_read_token::{
 };
 
 const MIN_OPEN_LIFETIME_SECONDS: i64 = 60;
+/// The name the tray gives the tokens it mints; the local Hub page uses its own.
+const TOKEN_NAME: &str = "agentscm-tray";
 
 /// The checkout identity selected by the menu snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,7 +131,7 @@ pub(super) async fn prepare_open(request: OpenRequest) -> Result<PreparedOpen, O
             repository: &request.repository,
             origin_host: &request.origin_host,
             provider: request.provider.as_deref(),
-            name: crate::hub_read_token::TRAY_TOKEN_NAME,
+            name: TOKEN_NAME,
         },
         agentscm::hub::store::unix_now(),
     )
