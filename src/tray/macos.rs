@@ -443,12 +443,14 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                     &self.activity,
                     std::time::Instant::now(),
                 );
-                let hub = crate::hub_cli::load_session(None).map(|(hub, _)| hub);
+                let hub = request
+                    .as_ref()
+                    .and_then(|request| target_hub(&request.host, &request.repo));
                 if self.opening_hub || self.installing.load(Ordering::Acquire) {
                     self.notice = Some(Notice::Action(
                         "An action is still running; wait for its result".into(),
                     ));
-                } else if let (Some(request), Ok(hub)) = (&request, &hub) {
+                } else if let (Some(request), Some(hub)) = (&request, &hub) {
                     self.installing.store(true, Ordering::Release);
                     self.feedback.show(
                         &format!("Connecting {}…", request.repo),
@@ -777,6 +779,7 @@ struct ConnectRequest {
     agent: crate::client_setup::Agent,
     label: &'static str,
     root: std::path::PathBuf,
+    host: String,
     repo: String,
 }
 
@@ -807,8 +810,35 @@ fn connect_request(
         agent,
         label,
         root: row.root,
+        host: row.host,
         repo: row.repo,
     })
+}
+
+/// The Hub a tray Connect uses for `host`/`repo`, with the saved sign-in it needs.
+fn target_hub(host: &str, repo: &str) -> Option<String> {
+    let connections = crate::client_config::load().unwrap_or_default();
+    connect_hub(host, repo, &connections, |hub| {
+        crate::hub_cli::load_session(hub).ok().map(|(hub, _)| hub)
+    })
+}
+
+/// A Hub another checkout of the same forge repository is connected to and still signed in to,
+/// so its agents meet the others; else the default saved sign-in.
+fn connect_hub(
+    host: &str,
+    repo: &str,
+    connections: &[crate::client_config::Connection],
+    signed_in: impl Fn(Option<&str>) -> Option<String>,
+) -> Option<String> {
+    connections
+        .iter()
+        .filter(|connection| {
+            connection.origin_host.eq_ignore_ascii_case(host)
+                && connection.repo.eq_ignore_ascii_case(repo)
+        })
+        .find_map(|connection| signed_in(Some(&connection.hub)))
+        .or_else(|| signed_in(None))
 }
 
 fn spawn_connect(
@@ -863,6 +893,7 @@ fn unconnected_identity(row: &crate::client_activity::UnconnectedCheckout) -> St
 fn unconnected_details(
     row: &crate::client_activity::UnconnectedCheckout,
     now: std::time::Instant,
+    hub: Option<&str>,
 ) -> String {
     let elapsed = now.saturating_duration_since(row.seen_at);
     let age = if elapsed < Duration::from_secs(60) {
@@ -878,9 +909,10 @@ fn unconnected_details(
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "Agent  {agents}\nLast seen  {age}\nForge  {}\nPath  {}",
+        "Agent  {agents}\nLast seen  {age}\nForge  {}\nPath  {}\nConnects to  {}",
         full_menu_value(&row.host),
         full_menu_value(&row.root.to_string_lossy()),
+        hub.map_or_else(|| "no saved Hub sign-in".to_owned(), full_menu_value),
     )
 }
 
@@ -1211,7 +1243,11 @@ fn build_menu(
         submenu
             .append(&native_text_item(
                 "details",
-                &unconnected_details(row, monotonic_now),
+                &unconnected_details(
+                    row,
+                    monotonic_now,
+                    target_hub(&row.host, &row.repo).as_deref(),
+                ),
             ))
             .map_err(menu_error)?;
         submenu
@@ -1320,7 +1356,11 @@ fn menu_projection_key(
     for row in unconnected_rows(snapshot, activity, monotonic_now) {
         key.push_str("\nunconnected:");
         key.push_str(&row.repo);
-        key.push_str(&unconnected_details(&row, monotonic_now));
+        key.push_str(&unconnected_details(
+            &row,
+            monotonic_now,
+            target_hub(&row.host, &row.repo).as_deref(),
+        ));
     }
     key
 }
@@ -1852,6 +1892,74 @@ mod tests {
             ),
             "'/Applications/AgentSCM versions/agentscm'\\''current' client setup --agent 'codex' --hub 'https://hub.example.test/a'\\''b' --root '/tmp/a b;$(touch nope)'"
         );
+    }
+
+    #[test]
+    fn connect_prefers_the_hub_the_repository_already_uses() {
+        let saved =
+            |root: &str, host: &str, repo: &str, hub: &str| crate::client_config::Connection {
+                root: root.into(),
+                origin_host: host.into(),
+                hub: hub.into(),
+                repo: repo.into(),
+                token_file: "/synthetic/token".into(),
+                report_completion: false,
+                owned_token_id: None,
+                owned_token_expires_at: None,
+                agents: Vec::new(),
+            };
+        let connections = [
+            saved(
+                "/synthetic/a",
+                "gitlab.com",
+                "acme/widgets",
+                "https://other.example.test",
+            ),
+            saved(
+                "/synthetic/b",
+                "github.com",
+                "Acme/Widgets",
+                "https://team.example.test",
+            ),
+            saved(
+                "/synthetic/c",
+                "github.com",
+                "acme/widgets",
+                "https://stale.example.test",
+            ),
+        ];
+        let signed_in = |hubs: &'static [&'static str]| {
+            move |hub: Option<&str>| match hub {
+                Some(hub) => hubs.contains(&hub).then(|| hub.to_owned()),
+                None => Some("https://default.example.test".to_owned()),
+            }
+        };
+        assert_eq!(
+            connect_hub(
+                "github.com",
+                "acme/widgets",
+                &connections,
+                signed_in(&["https://team.example.test"])
+            ),
+            Some("https://team.example.test".to_owned()),
+            "same forge repository, case-insensitive"
+        );
+        assert_eq!(
+            connect_hub("github.com", "acme/widgets", &connections, signed_in(&[])),
+            Some("https://default.example.test".to_owned()),
+            "no sign-in for that Hub any more"
+        );
+        assert_eq!(
+            connect_hub(
+                "github.com",
+                "acme/other",
+                &connections,
+                signed_in(&["https://team.example.test"])
+            ),
+            Some("https://default.example.test".to_owned()),
+            "another repository"
+        );
+        assert_eq!(connect_hub("github.com", "acme/other", &[], |_| None), None);
     }
 
     #[test]
