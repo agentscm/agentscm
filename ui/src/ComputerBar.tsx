@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import { disconnectComputer, fetchIdentity, fetchRepositories, localSelection, switchRepository, takeConnectOutcome, type ConnectedRepository, type ConnectOutcome, type Identity } from './frontDoor.ts'
+import { createContext, useContext, useMemo, useState, type ReactNode } from 'react'
+import { disconnectComputer, fetchIdentity, fetchRepositories, takeConnectOutcome, type ConnectedRepository, type ConnectOutcome, type Identity } from './frontDoor.ts'
 import { usePoll, type Poll } from './usePoll.ts'
 import { Icon, Notice } from './ui.tsx'
 
@@ -10,7 +10,7 @@ function connectOutcome(): ConnectOutcome | null {
   return outcome
 }
 
-const hostOf = (url: string) => {
+export const hostOf = (url: string) => {
   try {
     return new URL(url).host
   } catch {
@@ -18,100 +18,34 @@ const hostOf = (url: string) => {
   }
 }
 
-/** This computer's identity (rechecked every minute) and its connected repositories. */
-function useLocalComputer(token: string): { identity: Poll<Identity>; repositories: ConnectedRepository[] } {
-  const identity = usePoll((signal) => fetchIdentity(token, signal), 60_000, token)
-  const repositories = usePoll((signal) => fetchRepositories(token, signal), 0, token)
-  return { identity, repositories: repositories.kind === 'ready' ? repositories.value : [] }
+interface LocalComputer {
+  identity: Poll<Identity>
+  repositories: ConnectedRepository[]
 }
 
-const selectorOf = (r: ConnectedRepository) => `${r.repository}@${r.hub}`
+const LocalComputerContext = createContext<LocalComputer | null>(null)
 
 /**
- * The repository menu at the top of this computer's own Hub page: the connected computer, every
- * repository connected on it (the same repository on two Hubs is told apart by Hub), and Disconnect.
+ * Reads this computer's identity (rechecked every minute) and its connected repositories once for
+ * the whole page, for the repository menu, the notices and Settings.
  */
-export function LocalRepoSwitcher({ token, repo }: { token: string; repo: string }) {
-  const [open, setOpen] = useState(false)
-  const { identity, repositories } = useLocalComputer(token)
-  const computer = identity.kind === 'ready' ? identity.value.computer : 'This computer'
-  const repository = identity.kind === 'ready' ? identity.value.repository : repo
-  const hub = identity.kind === 'ready' ? identity.value.hub : null
-  const selection = localSelection(token) ?? repository ?? ''
-  const current = repositories.find((r) => selectorOf(r) === selection) ?? repositories.find((r) => r.repository.toLowerCase() === repository?.toLowerCase() && r.hub === hub?.url)
-  const repeated = (r: ConnectedRepository) => repositories.filter((o) => o.repository.toLowerCase() === r.repository.toLowerCase()).length > 1
-  return (
-    <div
-      className="pop"
-      onKeyDown={(e) => {
-        if (e.key === 'Escape') setOpen(false)
-      }}
-      onBlur={(e) => {
-        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setOpen(false)
-      }}
-    >
-      <button type="button" data-tour="repo" className={`repo-btn${open ? ' is-open' : ''}`} aria-haspopup="menu" aria-expanded={open} aria-label={`${repository ?? 'No repository'} on ${computer}`} onClick={() => setOpen((o) => !o)}>
-        <span className="repo-mark is-computer" aria-hidden="true"><Icon name="laptop" /></span>
-        <span className="repo-name">{repository ?? 'Choose a repository'}</span>
-        <Icon name="chevron-expand" className="repo-chevron" />
-      </button>
-      {open && (
-        <div className="pop-menu pop-left" role="menu">
-          <div className="pop-head">
-            <Icon name="laptop" /> On {computer}
-          </div>
-          {repositories.map((r) => {
-            const isCurrent = current !== undefined && selectorOf(r) === selectorOf(current)
-            return (
-              <button
-                key={selectorOf(r)}
-                type="button"
-                role="menuitemradio"
-                aria-checked={isCurrent}
-                className={`pop-item${isCurrent ? ' is-current' : ''}`}
-                onClick={() => {
-                  setOpen(false)
-                  if (!isCurrent && switchRepository(token, selectorOf(r))) window.location.reload()
-                }}
-              >
-                <span className="repo-mark" aria-hidden="true"><Icon name="git" /></span>
-                <span className="pop-main">
-                  <code>{r.repository}</code>
-                  <span className="pop-sub">
-                    {repeated(r) ? hostOf(r.hub) : r.folder && r.folder !== r.repository.split('/')[1] ? r.folder : 'Read-only team view'}
-                  </span>
-                </span>
-                {isCurrent && <Icon name="check2" className="pop-check" />}
-              </button>
-            )
-          })}
-          <p className="pop-note">
-            <Icon name="info-circle" /> Files and saved conversations come from this computer. Team work comes from each repository’s Hub, read-only.
-          </p>
-          <div className="pop-sep" />
-          <button
-            type="button"
-            role="menuitem"
-            className="pop-item"
-            onClick={() => {
-              setOpen(false)
-              void disconnectComputer().then(() => window.location.reload())
-            }}
-          >
-            <Icon name="box-arrow-right" />
-            <span className="pop-main">
-              Disconnect this browser<span className="pop-sub">Connect again with Open Hub or <code>agentscm open</code></span>
-            </span>
-          </button>
-        </div>
-      )}
-    </div>
-  )
+export function LocalComputerProvider({ token, children }: { token: string; children: ReactNode }) {
+  const identity = usePoll((signal) => fetchIdentity(token, signal), 60_000, token)
+  const repositories = usePoll((signal) => fetchRepositories(token, signal), 0, token)
+  const value = useMemo(() => ({ identity, repositories: repositories.kind === 'ready' ? repositories.value : [] }), [identity, repositories])
+  return <LocalComputerContext.Provider value={value}>{children}</LocalComputerContext.Provider>
 }
 
+/** What `LocalComputerProvider` read; `null` outside this computer's own Hub page. */
+export const useLocalComputer = () => useContext(LocalComputerContext)
+
+export const selectorOf = (r: ConnectedRepository) => `${r.repository}@${r.hub}`
+
 /** Only what needs doing on this computer's own Hub page; nothing when all is well. */
-export function ComputerNotices({ token }: { token: string }) {
-  const { identity, repositories } = useLocalComputer(token)
+export function ComputerNotices() {
+  const local = useLocalComputer()
+  if (!local) return null
+  const { identity, repositories } = local
   const used = connectOutcome() === 'used'
   const value = identity.kind === 'ready' ? identity.value : null
   return (
@@ -137,9 +71,11 @@ export function ComputerNotices({ token }: { token: string }) {
 }
 
 /** Settings → This computer: what is connected, and Disconnect. */
-export function ComputerSettings({ token }: { token: string }) {
-  const { identity } = useLocalComputer(token)
+export function ComputerSettings() {
+  const local = useLocalComputer()
   const [busy, setBusy] = useState(false)
+  if (!local) return null
+  const { identity } = local
   const value = identity.kind === 'ready' ? identity.value : null
   return (
     <div className="settings-row">
