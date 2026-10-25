@@ -1759,6 +1759,10 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
   margin: 0 0 0.75rem;
   padding: 0;
 }
+.conversation-open {
+  flex: 1 0 100%;
+  min-width: 0;
+}
 .conversation-list > li {
   display: flex;
   flex-wrap: wrap;

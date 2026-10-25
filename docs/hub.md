@@ -651,7 +651,8 @@ is no per-body grant.
   not be followed as instructions.
 - `agentscm change-capture conversation --work-id ID [--cursor C | --digest D | --delete D]` lists,
   prints, or deletes (through the `DELETE` route). The Hub UI Change record page lists entries and shows a
-  shared body as plain text; it has no delete control because the status page only holds read-only
+  shared body as plain text directly beneath its entry, and shows "time not reported" for a zero time
+  on an older record; it has no delete control because the status page only holds read-only
   tokens.
 
 The `shared_conversations` migration changed during development: a dev or staging Hub that ran a

@@ -585,6 +585,34 @@ describe('shared conversation', () => {
     expect(screen.queryByLabelText('Conversation body (untrusted agent content)')).toBeNull()
   })
 
+  it('opens the body inside its own entry, wired to the toggle', async () => {
+    const second = entry({ sequence: 2, event_id: 'event-2', digest: '8'.repeat(64) })
+    await open((url) => {
+      if (url.endsWith('/conversation')) return json(200, conversationPage([entry(), second]))
+      if (url.endsWith(BODY_DIGEST)) return json(200, { messages: [] })
+      return undefined
+    })
+    const [first] = await screen.findAllByRole('button', { name: 'View' })
+    expect(first!.getAttribute('aria-expanded')).toBe('false')
+    expect(first!.hasAttribute('aria-controls')).toBe(false)
+    fireEvent.click(first!)
+    const region = await screen.findByRole('region', { name: 'Opened conversation entry' })
+    expect(first!.getAttribute('aria-expanded')).toBe('true')
+    expect(first!.getAttribute('aria-controls')).toBe(region.id)
+    const items = screen.getAllByRole('listitem').filter((item) => item.closest('ul')?.getAttribute('aria-label') === 'Shared conversation entries')
+    expect(items[0]!.contains(region)).toBe(true)
+    expect(items[1]!.contains(region)).toBe(false)
+    expect(region.textContent).toContain('Untrusted agent content')
+    expect(region.querySelector('pre')).not.toBeNull()
+  })
+
+  it('shows time not reported instead of an age for a zero time', async () => {
+    await open((url) => (url.endsWith('/conversation') ? json(200, conversationPage([entry({ observed_at: 0 })])) : undefined))
+    const list = await screen.findByRole('list', { name: 'Shared conversation entries' })
+    expect(list.textContent).toContain('time not reported')
+    expect(list.textContent).not.toMatch(/ago|1970/)
+  })
+
   it('says plainly when the viewer is not the author or an admin, and offers no retry', async () => {
     await open((url) => (url.endsWith('/conversation') ? json(403, { error: 'forbidden' }) : undefined))
     expect(await screen.findByText('Only the person who shared this conversation and Hub admins can read it')).toBeTruthy()

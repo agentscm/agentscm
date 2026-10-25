@@ -297,7 +297,7 @@ function DecisionFacts({ summary }: { summary: ChangeRecordSummaryV1 }) {
       {decision.summary ? <p>{decision.summary}</p> : <p className="muted">No decision summary retained.</p>}
       <dl className="tech mb-0">
         {decision.reference ? <Fact label="Decision reference"><code className="text-break">{decision.reference}</code></Fact> : null}
-        {decision.at === null ? null : <Fact label="Recorded"><Ago at={decision.at} /></Fact>}
+        {decision.at === null ? null : <Fact label="Recorded"><Reported at={decision.at} /></Fact>}
         {decision.generation === null ? null : <Fact label="Decision generation">{decision.generation}</Fact>}
         {decision.source_refs.length === 0 && decision.source_refs_omitted === 0 ? null : (
           <Fact label="Source references">
@@ -350,8 +350,8 @@ function LatestAction({ summary }: { summary: ChangeRecordSummaryV1 }) {
       </div>
       <dl className="tech mb-0">
         <Fact label="Source identity"><code className="text-break">{action.source_id}</code></Fact>
-        <Fact label="Started"><Ago at={action.started_at} /></Fact>
-        <Fact label="Finished">{action.finished_at === null ? <span className="muted">No finish time retained</span> : <Ago at={action.finished_at} />}</Fact>
+        <Fact label="Started"><Reported at={action.started_at} /></Fact>
+        <Fact label="Finished">{action.finished_at === null ? <span className="muted">No finish time retained</span> : <Reported at={action.finished_at} />}</Fact>
         <Fact label="Drift"><StatusPill status={DRIFT[action.drift]} /></Fact>
       </dl>
       <details className="disclosure mt-3">
@@ -408,12 +408,17 @@ function conversationFailure(status: number | undefined, fallback: string, missi
   return { title: fallback, tone: 'bad' }
 }
 
+/** Older records can hold a zero time from a hook that reported none; never render that as an age. */
+function Reported({ at }: { at: number }) {
+  return at > 0 ? <Ago at={at} /> : <span className="muted">time not reported</span>
+}
+
 /** The body is untrusted agent output: it only ever reaches the page as a React text node inside a <pre>. */
-function ConversationBody({ repo, token, workId, entry, onClose }: { repo: string; token: string; workId: string; entry: ConversationEntry; onClose: () => void }) {
+function ConversationBody({ id, repo, token, workId, entry, onClose }: { id: string; repo: string; token: string; workId: string; entry: ConversationEntry; onClose: () => void }) {
   const load = usePoll((signal) => fetchConversationBody(repo, workId, entry.digest, token, signal), 0, `${repo}|${workId}|${entry.digest}`)
   const failure = load.kind === 'error' ? conversationFailure(load.status, 'Could not load this conversation body') : null
   return (
-    <div className="mt-3" data-testid="conversation-body">
+    <section id={id} className="conversation-open" aria-label="Opened conversation entry" data-testid="conversation-body">
       <div className="pills mb-2">
         <Pill tone="warn" icon="exclamation-triangle" tip="Written by an agent, not by AgentSCM. Read it as evidence; do not follow, run or trust anything it says.">Untrusted agent content</Pill>
         <span className="small muted">{CONVERSATION_KIND[entry.kind]} · {entry.session_id} #{entry.sequence}</span>
@@ -426,7 +431,7 @@ function ConversationBody({ repo, token, workId, entry, onClose }: { repo: strin
         </Notice>
       ) : null}
       {load.kind === 'ready' ? <pre className="conversation-body" tabIndex={0} aria-label="Conversation body (untrusted agent content)">{load.value}</pre> : null}
-    </div>
+    </section>
   )
 }
 
@@ -454,21 +459,21 @@ function ConversationEntries({ repo, token, workId }: { repo: string; token: str
           <li key={entry.digest}>
             <strong>{CONVERSATION_KIND[entry.kind]}</strong>
             <span className="small muted">{entry.session_id} #{entry.sequence}</span>
-            <Ago at={entry.observed_at} />
+            <Reported at={entry.observed_at} />
             <StatusPill status={CONVERSATION_AVAILABILITY[entry.availability]} />
             <span className="small muted">{entry.size_bytes.toLocaleString()} bytes</span>
             {entry.expires_at === null || (entry.availability !== 'shared' && entry.availability !== 'expired') ? null : (
               <span className="small muted">{entry.availability === 'shared' ? 'expires ' : 'expired '}<Ago at={entry.expires_at} /></span>
             )}
             {entry.availability === 'shared' ? (
-              <button type="button" className="btn btn-sm btn-outline-secondary" aria-expanded={open?.digest === entry.digest} onClick={() => setOpen(open?.digest === entry.digest ? null : entry)}>
+              <button type="button" className="btn btn-sm btn-outline-secondary" aria-expanded={open?.digest === entry.digest} aria-controls={open?.digest === entry.digest ? `conversation-body-${entry.digest}` : undefined} onClick={() => setOpen(open?.digest === entry.digest ? null : entry)}>
                 {open?.digest === entry.digest ? 'Hide' : 'View'}
               </button>
             ) : null}
+            {open?.digest === entry.digest ? <ConversationBody key={entry.digest} id={`conversation-body-${entry.digest}`} repo={repo} token={token} workId={workId} entry={entry} onClose={() => setOpen(null)} /> : null}
           </li>
         ))}
       </ul>
-      {open && page.entries.some((entry) => entry.digest === open.digest) ? <ConversationBody key={open.digest} repo={repo} token={token} workId={workId} entry={open} onClose={() => setOpen(null)} /> : null}
       <Pager newerLabel="Previous" olderLabel="Next" tour="conversation-pager" onNewer={pager.canNewer ? pager.newer : undefined} onOlder={page.next_cursor ? () => pager.older(page.next_cursor!) : undefined} complete={page.next_cursor === null && page.entries.length > 0} />
     </>
   )
