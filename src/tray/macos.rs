@@ -11,6 +11,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use agentscm::change_record::CaptureModeV1;
 use agentscm::{Error, Result};
 use sha2::{Digest, Sha256};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
@@ -42,6 +43,7 @@ enum UserEvent {
     MenuTrackingEnded,
     Snapshot(std::result::Result<Snapshot, String>, ConfigStamp),
     Integration(crate::client_setup::Agent, std::result::Result<(), String>),
+    ShareConversation(ShareRequest, std::result::Result<(), String>),
     HubOpen(std::result::Result<Box<hub_open::PreparedOpen>, hub_open::OpenError>),
 }
 
@@ -429,6 +431,52 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                     self.replace_menu(None);
                 }
             }
+            UserEvent::Menu(id) if id.starts_with("share-conv:") => {
+                self.notice = None;
+                if self.opening_hub || self.installing.load(Ordering::Acquire) {
+                    self.notice = Some(Notice::Action(
+                        "An action is still running; wait for its result".into(),
+                    ));
+                } else if let Some(request) = share_request(&id, &self.snapshot) {
+                    self.installing.store(true, Ordering::Release);
+                    self.feedback.show(
+                        "Updating conversation sharing…",
+                        "Changing this checkout's capture mode. Local data is not touched.",
+                        true,
+                    );
+                    self.notice = Some(Notice::Action("Updating conversation sharing…".into()));
+                    spawn_share_change(self.refresh_proxy.clone(), request);
+                } else {
+                    self.feedback.show(
+                        "Conversation sharing unavailable",
+                        "Run agentscm change-capture configure for this checkout first, then refresh.",
+                        false,
+                    );
+                    self.notice = Some(Notice::Action(
+                        "Conversation sharing is unavailable; refresh and try again".into(),
+                    ));
+                }
+                self.replace_menu(None);
+            }
+            UserEvent::ShareConversation(request, result) => {
+                self.installing.store(false, Ordering::Release);
+                let (title, body) = share_outcome(&request, &result);
+                self.feedback.update(&title, &body, false);
+                if result.is_ok()
+                    && let Some(connection) = self
+                        .snapshot
+                        .connections
+                        .iter_mut()
+                        .find(|connection| connection_identity(connection) == request.identity)
+                {
+                    connection.capture_mode = Some(request.desired);
+                }
+                self.notice = Some(Notice::Action(title));
+                self.replace_menu(None);
+                if !self.refreshing.swap(true, Ordering::AcqRel) {
+                    spawn_refresh(self.refresh_proxy.clone(), false);
+                }
+            }
             UserEvent::Menu(id) if id.starts_with("hub:") => {
                 if self.opening_hub || self.installing.load(Ordering::Acquire) {
                     self.notice = Some(Notice::Action(
@@ -685,6 +733,87 @@ fn spawn_integration(
     });
 }
 
+struct ShareRequest {
+    identity: String,
+    root: std::path::PathBuf,
+    label: String,
+    desired: CaptureModeV1,
+}
+
+fn share_menu_id(identity: &str) -> String {
+    format!("share-conv:{identity}")
+}
+
+/// The toggle flips the mode in the snapshot, not the checkmark AppKit just drew, so a stale or
+/// failed click can never request a change the user did not see. No enabled binding: no request.
+fn share_request(id: &str, snapshot: &Snapshot) -> Option<ShareRequest> {
+    let identity = id.strip_prefix("share-conv:")?;
+    let connection = snapshot
+        .connections
+        .iter()
+        .find(|connection| connection_identity(connection) == identity)?;
+    let desired = match connection.capture_mode? {
+        CaptureModeV1::SharedConversation => CaptureModeV1::MetadataOnly,
+        _ => CaptureModeV1::SharedConversation,
+    };
+    Some(ShareRequest {
+        identity: identity.to_owned(),
+        root: connection.root.clone(),
+        label: connection
+            .root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map_or_else(|| connection.repository.clone(), super::clean_label),
+        desired,
+    })
+}
+
+/// (checked, enabled) for the share toggle. Only an enabled binding can be changed.
+fn share_toggle_state(mode: Option<CaptureModeV1>) -> (bool, bool) {
+    (
+        mode == Some(CaptureModeV1::SharedConversation),
+        mode.is_some(),
+    )
+}
+
+fn share_outcome(
+    request: &ShareRequest,
+    result: &std::result::Result<(), String>,
+) -> (String, String) {
+    match (result, request.desired) {
+        (Err(error), _) => (
+            "Could not change conversation sharing".into(),
+            error.clone(),
+        ),
+        (Ok(()), CaptureModeV1::SharedConversation) => (
+            format!("Sharing on for {}", request.label),
+            format!(
+                "Sharing on for {}: new conversations are redacted and uploaded to the Hub, readable by you and Hub admins",
+                request.label
+            ),
+        ),
+        (Ok(()), _) => (
+            format!("Sharing off for {}", request.label),
+            "Sharing off: conversations stay on this machine; already-uploaded copies remain until they expire or you delete them".into(),
+        ),
+    }
+}
+
+fn spawn_share_change(proxy: winit::event_loop::EventLoopProxy<UserEvent>, request: ShareRequest) {
+    std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::change_capture_client::set_capture_mode(&request.root, request.desired)
+        }))
+        .map_err(|_| "conversation sharing change stopped unexpectedly".to_owned())
+        .and_then(|result| {
+            result
+                .map(|_| ())
+                .map_err(|error| bounded_error(&error.to_string()))
+        });
+        let _ = proxy.send_event(UserEvent::ShareConversation(request, result));
+    });
+}
+
 fn setup_next_step(agent: crate::client_setup::Agent) -> &'static str {
     use crate::client_setup::Agent;
     match agent {
@@ -828,6 +957,25 @@ fn build_menu(
                 None,
             ))
             .map_err(menu_error)?;
+
+        let (shared, share_enabled) = share_toggle_state(connection.capture_mode);
+        submenu
+            .append(&CheckMenuItem::with_id(
+                share_menu_id(&identity),
+                "Share agent conversations with Hub",
+                share_enabled,
+                shared,
+                None,
+            ))
+            .map_err(menu_error)?;
+        if !share_enabled {
+            submenu
+                .append(&native_text_item(
+                    "note",
+                    "Run agentscm change-capture configure for this checkout first.",
+                ))
+                .map_err(menu_error)?;
+        }
 
         let integrations = Submenu::new("Agent Integrations", true);
         for (agent, label) in agent_choices() {
@@ -1407,6 +1555,9 @@ fn config_stamp() -> ConfigStamp {
         crate::hub_cli::config_dir()
             .unwrap_or_default()
             .join("agentscm/connections.json"),
+        crate::hub_cli::config_dir()
+            .unwrap_or_default()
+            .join("agentscm/change-capture.json"),
     ];
     if let Ok(connections) = crate::client_config::load() {
         paths.extend(
@@ -1557,6 +1708,83 @@ mod tests {
         .unwrap();
     }
 
+    fn share_connection(
+        root: &str,
+        mode: Option<CaptureModeV1>,
+    ) -> crate::client_status::ConnectionStatus {
+        crate::client_status::ConnectionStatus {
+            root: root.into(),
+            repository: "example/project".into(),
+            hub: "https://hub.example".into(),
+            agents: vec![],
+            binding: crate::client_status::BindingStatus {
+                state: BindingState::Current,
+                generation: Some("generation".into()),
+                activity_generation: None,
+            },
+            credential: crate::client_status::CredentialStatus {
+                kind: crate::client_status::CredentialKind::External,
+                state: CredentialState::Available,
+                expires_at: None,
+            },
+            hub_check: HubCheck::Skipped,
+            recent_participation: vec![],
+            capture_mode: mode,
+        }
+    }
+
+    #[test]
+    fn share_toggle_flips_the_configured_mode_and_needs_an_enabled_binding() {
+        let snapshot = Snapshot {
+            version: 1,
+            snapshot_at: 0,
+            connections: vec![
+                share_connection("/synthetic/off", Some(CaptureModeV1::LocalConversation)),
+                share_connection("/synthetic/on", Some(CaptureModeV1::SharedConversation)),
+                share_connection("/synthetic/unbound", None),
+            ],
+        };
+        let id = |index: usize| share_menu_id(&connection_identity(&snapshot.connections[index]));
+        let off = share_request(&id(0), &snapshot).unwrap();
+        assert_eq!(off.desired, CaptureModeV1::SharedConversation);
+        assert_eq!(off.label, "off");
+        assert_eq!(off.root, Path::new("/synthetic/off"));
+        let on = share_request(&id(1), &snapshot).unwrap();
+        assert_eq!(on.desired, CaptureModeV1::MetadataOnly);
+        assert!(share_request(&id(2), &snapshot).is_none());
+        assert!(share_request("share-conv:unknown", &snapshot).is_none());
+        assert!(share_request("hub:unknown", &snapshot).is_none());
+
+        assert_eq!(share_toggle_state(None), (false, false));
+        assert_eq!(
+            share_toggle_state(Some(CaptureModeV1::MetadataOnly)),
+            (false, true)
+        );
+        assert_eq!(
+            share_toggle_state(Some(CaptureModeV1::SharedConversation)),
+            (true, true)
+        );
+    }
+
+    #[test]
+    fn share_outcome_states_what_the_change_does_and_does_not_do() {
+        let mut request = ShareRequest {
+            identity: "x".into(),
+            root: "/synthetic/project".into(),
+            label: "project".into(),
+            desired: CaptureModeV1::SharedConversation,
+        };
+        let (_, body) = share_outcome(&request, &Ok(()));
+        assert!(body.starts_with("Sharing on for project:"));
+        assert!(body.contains("redacted") && body.contains("Hub admins"));
+        request.desired = CaptureModeV1::MetadataOnly;
+        let (_, body) = share_outcome(&request, &Ok(()));
+        assert!(body.contains("stay on this machine") && body.contains("remain until"));
+        let (title, body) = share_outcome(&request, &Err("no enabled capture binding".into()));
+        assert_eq!(title, "Could not change conversation sharing");
+        assert_eq!(body, "no enabled capture binding");
+    }
+
     #[test]
     fn copied_commands_quote_shell_metacharacters_as_data() {
         assert_eq!(shell_quote("a'b;$(touch nope)"), "'a'\\''b;$(touch nope)'");
@@ -1602,6 +1830,7 @@ mod tests {
             },
             hub_check: HubCheck::Skipped,
             recent_participation: vec![],
+            capture_mode: None,
         };
         let capture = temp.path().join("arguments");
         for (command, directory, arguments) in [

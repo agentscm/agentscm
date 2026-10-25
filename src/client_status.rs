@@ -8,6 +8,7 @@ use std::time::Duration;
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 
+use agentscm::change_record::CaptureModeV1;
 use agentscm::hub::forge_http::{self, send};
 use agentscm::hub::onboarding::{Blocker, CLIENT_HEADER};
 use agentscm::hub::store::unix_now;
@@ -40,6 +41,10 @@ pub(crate) struct ConnectionStatus {
     pub(crate) credential: CredentialStatus,
     pub(crate) hub_check: HubCheck,
     pub(crate) recent_participation: Vec<Participation>,
+    /// Capture mode of this checkout's enabled change-capture binding. Absent when the checkout
+    /// has no enabled binding or the capture config cannot be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) capture_mode: Option<CaptureModeV1>,
 }
 
 #[derive(Debug, Serialize)]
@@ -237,6 +242,7 @@ async fn collect_until(
 
 fn unresolved_status(connection: Connection, now: i64) -> ConnectionStatus {
     let credential = credential_status(&connection, false, now);
+    let capture_mode = crate::change_capture_client::enabled_capture_mode(&connection.root);
     ConnectionStatus {
         root: connection.root,
         repository: connection.repo,
@@ -252,6 +258,7 @@ fn unresolved_status(connection: Connection, now: i64) -> ConnectionStatus {
             checked_at: unix_now(),
         },
         recent_participation: Vec::new(),
+        capture_mode,
     }
 }
 
@@ -282,6 +289,7 @@ async fn connection_status(connection: Connection, check: bool, now: i64) -> Con
     if check && current && !still_current(&connection, generation.as_deref()) {
         return unresolved_status(connection, now);
     }
+    let capture_mode = crate::change_capture_client::enabled_capture_mode(&connection.root);
     ConnectionStatus {
         root: connection.root,
         repository: connection.repo,
@@ -299,6 +307,7 @@ async fn connection_status(connection: Connection, check: bool, now: i64) -> Con
         credential,
         hub_check,
         recent_participation,
+        capture_mode,
     }
 }
 
@@ -575,6 +584,23 @@ mod tests {
             completed.get(Path::new("/fast")).unwrap().hub_check,
             HubCheck::Valid { .. }
         ));
+    }
+
+    #[test]
+    fn capture_mode_is_reported_only_when_a_binding_supplies_it() {
+        let mut status = unresolved_status(connection("/synthetic/unbound-checkout"), 1);
+        assert_eq!(status.capture_mode, None);
+        assert!(
+            serde_json::to_value(&status)
+                .unwrap()
+                .get("capture_mode")
+                .is_none()
+        );
+        status.capture_mode = Some(CaptureModeV1::SharedConversation);
+        assert_eq!(
+            serde_json::to_value(&status).unwrap()["capture_mode"],
+            "shared_conversation"
+        );
     }
 
     #[test]

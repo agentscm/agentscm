@@ -569,6 +569,19 @@ pub fn set_capture_mode(root: &Path, mode: CaptureModeV1) -> Result<Value> {
     Ok(json!({"root": root, "capture_mode": mode}))
 }
 
+/// Capture mode of the enabled binding for `root`. `None` means the checkout has no enabled
+/// binding or the config cannot be read, so callers must not offer to change the mode.
+pub fn enabled_capture_mode(root: &Path) -> Option<CaptureModeV1> {
+    enabled_mode(&load().ok()?, root)
+}
+
+fn enabled_mode(bindings: &[CaptureBinding], root: &Path) -> Option<CaptureModeV1> {
+    bindings
+        .iter()
+        .find(|binding| binding.root == root && binding.enabled)
+        .map(|binding| binding.capture_mode)
+}
+
 pub fn configure(args: ConfigureArgs) -> Result<Value> {
     let root = client_config::canonical_root(&args.root)?;
     let requested_spool = absolute_without_parent_components(&args.spool)?;
@@ -1420,9 +1433,9 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CaptureBinding, HOOK_MARKER, disable_binding, install_hooks, load_recipe_file,
-        load_recipe_from_file, managed_recipe_invocations, parse_rule, remove_owned_hooks,
-        session_start_context, validate_binding, validate_binding_update,
+        CaptureBinding, HOOK_MARKER, disable_binding, enabled_mode, install_hooks,
+        load_recipe_file, load_recipe_from_file, managed_recipe_invocations, parse_rule,
+        remove_owned_hooks, session_start_context, validate_binding, validate_binding_update,
     };
     use agentscm::change_capture::claude_code::{ActionRuleV1, NativeResultSourceV1};
     use agentscm::change_capture::{
@@ -1600,6 +1613,27 @@ mod tests {
             std::path::Path::new("/tmp/agentscm-recipe-root")
         ));
         assert_eq!(bindings.len(), 1);
+    }
+
+    #[test]
+    fn mode_is_offered_only_for_an_enabled_binding_of_that_root() {
+        let root = std::path::Path::new("/tmp/agentscm-recipe-root");
+        let mut bindings = vec![recipe_binding(vec![])];
+        assert_eq!(
+            enabled_mode(&bindings, root),
+            Some(CaptureModeV1::MetadataOnly)
+        );
+        bindings[0].capture_mode = CaptureModeV1::SharedConversation;
+        assert_eq!(
+            enabled_mode(&bindings, root),
+            Some(CaptureModeV1::SharedConversation)
+        );
+        assert_eq!(
+            enabled_mode(&bindings, std::path::Path::new("/tmp/other")),
+            None
+        );
+        bindings[0].enabled = false;
+        assert_eq!(enabled_mode(&bindings, root), None);
     }
 
     #[test]
