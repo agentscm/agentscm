@@ -70,7 +70,9 @@ Limits:
   created.
 - Redirects and retries are off; requests time out after 60 seconds.
 - Objects are never deleted, except shared-conversation bodies, which are removed after a
-  database tombstone (early deletion) or expiry.
+  database tombstone (early deletion) or expiry. A delete removes the current object version
+  only: on a versioned or object-locked bucket, noncurrent versions remain until the bucket's
+  lifecycle rules remove them.
 - The store must be case-sensitive (AWS S3 and R2 are); identifiers are used
   verbatim in object keys.
 - Proxy environment variables are ignored for object storage traffic.
@@ -611,7 +613,9 @@ explicitly untrusted structured data and are not interpolated into that narratio
 
 Bodies a checkout shared in `shared-conversation` mode are readable and deletable only by the human
 who declared them (any of that person's tokens for the repository; read-only tokens may read, not
-delete) and Hub admins (`AGENTSCM_ADMINS`). The Work owner has no special access unless they are the
+delete) and Hub admins (`AGENTSCM_ADMINS`). Admins can read every body, so list them as
+`provider:#<numeric user id>` (for example `github:#42`), which survives a rename or re-registered
+login, rather than by login name. The Work owner has no special access unless they are the
 author. Each human's declaration of a digest is its own row, so two authors of identical content
 each have their own entry, upload and expiry. The listing returns only the caller's own entries
 (an admin's returns all); a body `GET`, `PUT` or `DELETE` by someone who has no declaration of that

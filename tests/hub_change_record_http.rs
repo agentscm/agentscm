@@ -1634,6 +1634,8 @@ mod shared_bodies {
         /// A participant in the owner's Work who shares from their own session.
         helper_secret: String,
         helper_read_only_secret: String,
+        /// Body uploads (`PUT`) the Hub has received, whoever sent them.
+        puts: Arc<std::sync::atomic::AtomicUsize>,
         _directory: TempDir,
     }
 
@@ -1684,7 +1686,20 @@ mod shared_bodies {
                 .unwrap();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
-            let app = router(state.clone());
+            let puts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let app = router(state.clone()).layer(axum::middleware::from_fn_with_state(
+                puts.clone(),
+                |axum::extract::State(puts): axum::extract::State<
+                    Arc<std::sync::atomic::AtomicUsize>,
+                >,
+                 request: axum::extract::Request,
+                 next: axum::middleware::Next| async move {
+                    if request.method() == axum::http::Method::PUT {
+                        puts.fetch_add(1, Ordering::SeqCst);
+                    }
+                    next.run(request).await
+                },
+            ));
             tokio::spawn(async move { axum::serve(listener, app).await });
 
             let owner = user(&*store, 10, "owner");
@@ -1761,6 +1776,7 @@ mod shared_bodies {
                 admin_secret,
                 helper_secret,
                 helper_read_only_secret,
+                puts,
                 _directory: directory,
             }
         }
@@ -3270,6 +3286,32 @@ mod shared_bodies {
         assert_eq!(checkout.pending(), 0);
         assert_eq!(f.row().state, SharedBodyState::Deleted);
         assert!(f.object().is_none());
+        // The preflight reported it gone, so no upload was even attempted.
+        assert_eq!(f.puts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delivery_does_not_reupload_a_body_an_earlier_pass_stored() {
+        let f = Fixture::start_undeclared().await;
+        let checkout = Checkout::new(&f);
+        checkout.queue(&f);
+
+        f.backend.fail_put.store(true, Ordering::SeqCst);
+        checkout.deliver();
+        assert_eq!(checkout.pending(), 1);
+        assert_eq!(f.puts.load(Ordering::SeqCst), 1);
+
+        // The bytes arrive by another route before the next pass.
+        f.backend.fail_put.store(false, Ordering::SeqCst);
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(f.puts.load(Ordering::SeqCst), 2);
+        checkout.deliver();
+        assert_eq!(checkout.pending(), 0);
+        assert_eq!(f.puts.load(Ordering::SeqCst), 2);
+        assert_eq!(f.row().state, SharedBodyState::Available);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

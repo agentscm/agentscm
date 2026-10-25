@@ -15,8 +15,9 @@ use agentscm::change_capture::{
 };
 use agentscm::change_record::{
     ActionKindV1, CaptureBatchV1, CaptureEnvelopeV1, CaptureModeV1, CaptureTargetV1,
-    ChangeRecordResponseV1, ConversationPageV1, CoverageV1, MAX_CHANGE_RECORD_RESPONSE_BYTES,
-    MAX_SHARED_BODY_BYTES, RetentionClassV1,
+    ChangeRecordResponseV1, ConversationMissingRequestV1, ConversationMissingV1,
+    ConversationPageV1, CoverageV1, MAX_CHANGE_RECORD_RESPONSE_BYTES,
+    MAX_CONVERSATION_MISSING_DIGESTS, MAX_SHARED_BODY_BYTES, RetentionClassV1,
 };
 use agentscm::forge::encode_path_segment;
 use agentscm::hub::forge_http::{self, send};
@@ -1263,9 +1264,65 @@ enum BodyUpload {
     OutOfTime,
 }
 
-/// Uploads the shared-approved bodies an accepted event batch names. A transient failure is an
-/// error so the caller leaves the envelope pending; a body missing from the spool is skipped and
-/// stays declared on the Hub.
+/// Asks the Hub which of the batch's shared-approved digests still need bytes. `None` means no
+/// answer (older Hub, or a refusal the uploads will repeat), so the caller offers every body.
+async fn missing_digests(
+    client: &reqwest::Client,
+    connection: &client_config::Connection,
+    token: &str,
+    batch: &CaptureBatchV1,
+    deadline: tokio::time::Instant,
+) -> Result<Option<BTreeSet<String>>> {
+    let mut digests: Vec<&str> = Vec::new();
+    for artifact in batch
+        .events
+        .iter()
+        .filter_map(|event| event.artifact.as_ref())
+        .filter(|artifact| artifact.retention == RetentionClassV1::SharedApproved)
+    {
+        if !digests.contains(&artifact.digest.as_str()) {
+            digests.push(&artifact.digest);
+        }
+    }
+    if digests.is_empty() || digests.len() > MAX_CONVERSATION_MISSING_DIGESTS {
+        return Ok(None);
+    }
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Ok(None);
+    }
+    let body = serde_json::to_vec(&ConversationMissingRequestV1 {
+        digests: digests.iter().map(|digest| (*digest).to_owned()).collect(),
+    })
+    .map_err(|_| invalid("cannot encode body preflight"))?;
+    let request = client
+        .post(format!(
+            "{}/v1/hub/repos/{}/change-records/{}/conversation/missing",
+            connection.hub,
+            encode_path_segment(&connection.repo),
+            encode_path_segment(&batch.work_id),
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .bearer_auth(token)
+        .timeout(remaining)
+        .body(body);
+    let (status, body) = send(request, REPLY_BYTES)
+        .await
+        .map_err(|_| invalid("capture Hub body preflight unavailable"))?;
+    match status {
+        200 => Ok(serde_json::from_value::<ConversationMissingV1>(body)
+            .ok()
+            .map(|answer| answer.missing.into_iter().collect())),
+        s if s >= 500 => Err(invalid(format!(
+            "capture Hub body preflight returned status {s}"
+        ))),
+        _ => Ok(None),
+    }
+}
+
+/// Uploads the shared-approved bodies an accepted event batch names that the Hub still lacks
+/// (all of them when the Hub cannot say). A transient failure is an error so the caller leaves
+/// the envelope pending; a body missing from the spool is skipped and stays declared on the Hub.
 async fn upload_shared_bodies(
     client: &reqwest::Client,
     connection: &client_config::Connection,
@@ -1274,6 +1331,7 @@ async fn upload_shared_bodies(
     batch: &CaptureBatchV1,
     deadline: tokio::time::Instant,
 ) -> Result<BodyUpload> {
+    let only = missing_digests(client, connection, token, batch, deadline).await?;
     let mut seen = BTreeSet::new();
     for artifact in batch
         .events
@@ -1282,6 +1340,13 @@ async fn upload_shared_bodies(
     {
         if artifact.retention != RetentionClassV1::SharedApproved
             || !seen.insert(artifact.digest.as_str())
+        {
+            continue;
+        }
+        // Available or gone on the Hub: nothing to send.
+        if only
+            .as_ref()
+            .is_some_and(|missing| !missing.contains(&artifact.digest))
         {
             continue;
         }

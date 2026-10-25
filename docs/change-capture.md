@@ -107,18 +107,28 @@ file returns to version 5 when no checkout shares.
 What leaves the machine, and when:
 
 - **Redaction is client-side and best effort.** Before a body is retained, the client replaces
-  well-known credential shapes with `[REDACTED:<kind>]`: `github_token`, `gitlab_token`,
-  `slack_token`, `anthropic_key`, `openai_key`, `stripe_key`, `google_api_key`, `jwt`, `bearer`,
-  `private_key` (PEM blocks), `assignment` (the value in a `NAME=value` style assignment whose name
-  looks secret) and `field` (the value of a JSON field whose name ends in a secret word such as
-  `password`, `token`, `secret`, `apikey`, `authorization` or `cookie`). Matching on the name
+  well-known credential shapes with `[REDACTED:<kind>]`: `aws_access_key_id`, `github_token`,
+  `gitlab_token`, `slack_token`, `anthropic_key`, `openai_key`, `stripe_key`, `google_api_key`,
+  `npm_token`, `pypi_token`, `huggingface_token`, `jwt`, `bearer`, `private_key` (PEM blocks),
+  `url_password` (the password in `scheme://user:password@host`), `flag_value` (the value after a
+  secret-named `--flag`, the password of `curl -u user:pass`, and `-pVALUE` in a `mysql`,
+  `mysqldump`, `mysqladmin` or `mariadb` command), `assignment` (the value in a `NAME=value`,
+  `NAME: value` or `NAME => value` assignment whose name looks secret) and `field` (the value of a
+  JSON field whose name ends in a secret word such as `password`, `token`, `secret`, `apikey`,
+  `secretkey`, `signingkey`, `dsn`, `databaseurl`, `authorization` or `cookie`; when that value is
+  an object or array the whole subtree is replaced). Matching on the name
   suffix keeps counters such as `max_tokens` and `input_tokens` readable. A body that needed
   redaction carries a `redactions` count and the event stream gains a separate `redacted` gap, so
   the change record shows that a body was altered. Redaction is heuristic: it cannot recognise a
   secret with no distinctive shape, and it does not remove personal data, proprietary code or
   anything else a person would not want shared. The Hub does not re-check or verify redaction.
-  Treat `shared-conversation` as sharing the conversation with people who can read it, not as a
+  `--password-file PATH` is not redacted, and neither is `mysql -p VALUE` (the value is a database
+  name there). Treat `shared-conversation` as sharing the conversation with people who can read it, not as a
   guarantee that it is clean.
+- **Upgrade the Hub before clients.** The new event fields and kinds are rejected by an older Hub, so
+  envelopes from an upgraded client stay pending until the Hub is upgraded; metadata for a Work that
+  ends first is lost. Before each upload the client asks the Hub which bodies it still lacks and sends
+  only those.
 - **Bodies over 1 MiB stay local.** A body above the per-body cap is kept in the spool as
   work-local and is never uploaded.
 - **Mid-session switches stay local.** A session keeps the mode it started under for sharing:
