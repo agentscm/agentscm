@@ -23,6 +23,7 @@ use super::coordination::{
 };
 use super::http::{ApiError, Reader, blocking};
 use super::insights::{InsightQuery, UsageRecord};
+use super::merge_recap::WorkOverviewWithMergeRecap;
 use super::session::{SessionCall, announce_for, done_for, duplicates_for, others_for, status_for};
 use super::skill_workflow::ReadError as SkillWorkflowReadError;
 use super::store::{Principal, unix_now};
@@ -1042,7 +1043,24 @@ async fn call_inner(
         let token = principal.token_id.clone();
         return Ok(
             match blocking(state, move || {
-                store.work_overview(&token, &query, unix_now())
+                let now = unix_now();
+                let overview = store.work_overview(&token, &query, now)?;
+                let merge_recap = match store.work_merge_recap(
+                    &token,
+                    overview.recent_since,
+                    overview.until,
+                    now,
+                ) {
+                    Ok(recap) => Some(recap),
+                    Err(error) => {
+                        eprintln!("hub: merge recap for MCP work overview: {error}");
+                        None
+                    }
+                };
+                Ok(WorkOverviewWithMergeRecap {
+                    overview,
+                    merge_recap,
+                })
             })
             .await
             {
@@ -1678,13 +1696,20 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
     let store = state.store.clone();
     let token = principal.token_id.clone();
     let requested_session = session.clone();
-    let (briefing, context) = blocking(state, move || {
+    let (briefing, context, merge_recap) = blocking(state, move || {
         let now = unix_now();
         let subscriber = store.session_name_for(&token, requested_session.as_deref(), now)?;
-        Ok((
-            store.work_briefing_preview_for(&token, Some(&subscriber), 20, now)?,
-            store.work_overview(&token, &WorkOverviewQuery::default(), now)?,
-        ))
+        let briefing = store.work_briefing_preview_for(&token, Some(&subscriber), 20, now)?;
+        let context = store.work_overview(&token, &WorkOverviewQuery::default(), now)?;
+        let merge_recap =
+            match store.work_merge_recap(&token, context.recent_since, context.until, now) {
+                Ok(recap) => Some(recap),
+                Err(error) => {
+                    eprintln!("hub: merge recap for agentscm_start: {error}");
+                    None
+                }
+            };
+        Ok((briefing, context, merge_recap))
     })
     .await?;
 
@@ -1743,7 +1768,7 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
             WorkState::Paused | WorkState::Finished | WorkState::Handover
         )
     {
-        return Ok(start_result(String::new(), briefing, work));
+        return Ok(start_result(String::new(), briefing, work, merge_recap));
     }
 
     let advice = announce_for(
@@ -1789,10 +1814,15 @@ async fn start(state: &HubState, principal: &Principal, arguments: StartArgs) ->
     {
         parts.push(HOOKED.to_owned());
     }
-    Ok(start_result(parts.join("\n"), briefing, work))
+    Ok(start_result(parts.join("\n"), briefing, work, merge_recap))
 }
 
-fn start_result(coordination: String, briefing: Briefing, work: WorkStartResult) -> Value {
+fn start_result(
+    coordination: String,
+    briefing: Briefing,
+    work: WorkStartResult,
+    merge_recap: Option<super::merge_recap::MergeRecap>,
+) -> Value {
     let paused = matches!(
         work.item.state,
         WorkState::Paused | WorkState::Finished | WorkState::Handover
@@ -1839,6 +1869,7 @@ fn start_result(coordination: String, briefing: Briefing, work: WorkStartResult)
         "briefing": &briefing,
         "briefing_kind": "preview",
         "acknowledgement_required": false,
+        "merge_recap": &merge_recap,
         "work": &work,
         "alternatives": alternatives,
         "acknowledged": false,
@@ -1854,6 +1885,15 @@ fn start_result(coordination: String, briefing: Briefing, work: WorkStartResult)
             context.current.len(), context.recent.len(), context.overlaps.len(),
             context.current_complete, context.recent_complete, context.overlaps_complete,
             context.recent_since, context.until));
+    }
+    match &merge_recap {
+        Some(recap) => text.push_str(&format!(
+            "\nTracked merge recap: {} merges from {} through {} by last recorded update; complete within the bounded tracked-publication scan: {}. updated_at is not merge time.",
+            recap.merges.len(), recap.since, recap.until, recap.complete
+        )),
+        None => text.push_str(
+            "\nTracked merge recap is unavailable. Do not infer that no recent merges were recorded.",
+        ),
     }
     if let Some(request) = &work.coordination_request {
         text.push_str(&format!("\nCoordination request {} is queued for the affected leads. Queued is not received; inspect agentscm_coordination_inbox for receipts and replies.", request.id));

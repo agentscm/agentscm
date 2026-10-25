@@ -49,6 +49,7 @@ use super::intent::{
     Announced, Existing, INTENT_SELECT, Intent, NewIntent, Plan, Who, announced, display_all,
     finish, notice_events, plan, probe_set, validate_ttl,
 };
+use super::merge_recap::{MergeRecap, MergeRecapItem, QUERY_LIMIT, finish as finish_merge_recap};
 use super::publish::{
     Create, MAX_UNFINISHED, NewPublication, PUBLICATION_SELECT, Publication, PublicationSearch,
     SEARCH_SCAN_ROWS, Update,
@@ -5174,6 +5175,67 @@ impl Store for PgStore {
                 .iter()
                 .map(publication_row)
                 .collect()
+        })
+    }
+
+    fn work_merge_recap(
+        &self,
+        token: &str,
+        since: i64,
+        until: i64,
+        now: i64,
+    ) -> Result<MergeRecap> {
+        self.run(true, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            let rows = tx.query(
+                "WITH recent AS MATERIALIZED (
+                    SELECT p.id, p.updated_at
+                    FROM hub_publications p
+                    JOIN hub_agent_tokens t ON t.id = p.token
+                    JOIN hub_users u ON u.id = t.owner
+                    WHERE p.repository = $1 AND t.repository = $1
+                      AND t.repository_id IS NOT DISTINCT FROM $2
+                      AND u.provider = $3 AND u.host = $4
+                      AND p.pr_number IS NOT NULL AND p.merge_commit IS NOT NULL
+                      AND p.updated_at >= $5 AND p.updated_at <= $6
+                    ORDER BY p.updated_at DESC, p.id DESC LIMIT $7
+                 )
+                 SELECT left(p.id, 37),
+                        CASE WHEN octet_length(p.manifest) <= 2097152
+                                       AND p.manifest IS JSON OBJECT
+                             THEN CASE WHEN jsonb_typeof(p.manifest::jsonb -> 'title') = 'string'
+                                             AND octet_length(p.manifest::jsonb ->> 'title') <= 256
+                                        THEN p.manifest::jsonb ->> 'title' END END,
+                        left(p.branch, 256), left(p.base, 256), left(p.commit_sha, 65),
+                        left(p.merge_commit, 65), p.pr_number, p.updated_at
+                 FROM recent r JOIN hub_publications p ON p.id = r.id
+                 ORDER BY p.updated_at DESC, p.id DESC",
+                &[
+                    &who.repository,
+                    &who.repository_id,
+                    &who.owner.identity.provider,
+                    &who.owner.identity.host,
+                    &since,
+                    &until,
+                    &QUERY_LIMIT,
+                ],
+            )?;
+            let merges = rows
+                .iter()
+                .map(|row| MergeRecapItem {
+                    id: row.get(0),
+                    title: row.get(1),
+                    branch: row.get(2),
+                    base: row.get(3),
+                    head_commit: row.get(4),
+                    merge_commit: row.get(5),
+                    pull_number: row.get(6),
+                    updated_at: row.get(7),
+                })
+                .collect();
+            tx.commit()?;
+            finish_merge_recap(since, until, merges)
         })
     }
 

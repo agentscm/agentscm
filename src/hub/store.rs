@@ -22,6 +22,7 @@ use super::external_runs::{ExternalKind, ExternalObserved, ExternalRun};
 use super::handoff::{Answered, Asked};
 use super::insights::{InsightPage, InsightQuery, UsageReceipt, UsageRecord, WorkInsight};
 use super::intent::{Announced, Intent, NewIntent};
+use super::merge_recap::MergeRecap;
 use super::publish::{Create, NewPublication, Publication, PublicationSearch, Update};
 use super::session::{SessionCall, Touched};
 use super::skills::{EvidenceRow, RunHead, SkillAdoption};
@@ -477,6 +478,19 @@ pub trait Store: Send + Sync {
         before: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Publication>>;
+    /// Recent tracked merges in the authenticated Work repository identity. Reads at most 21
+    /// narrow matching rows; `scanned_count` includes the possible truncation marker.
+    fn work_merge_recap(
+        &self,
+        _token: &str,
+        _since: i64,
+        _until: i64,
+        _now: i64,
+    ) -> Result<MergeRecap> {
+        Err(HubError::Unavailable(
+            "merge recap projection unavailable".into(),
+        ))
+    }
     /// Like [`Store::publications`] but only matches of `search` (already [`search_text`]-cleaned)
     /// among the newest `SEARCH_SCAN_ROWS` publications below `before`: branch, base, title,
     /// id, owner login or token name containing it, or the pull request number it names. Never

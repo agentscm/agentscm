@@ -19,6 +19,7 @@ pub mod insights;
 pub mod intent;
 pub mod login;
 pub mod mcp;
+pub mod merge_recap;
 pub mod onboarding;
 #[cfg(unix)]
 pub mod pipeline_rules;

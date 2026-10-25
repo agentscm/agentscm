@@ -58,6 +58,43 @@ The Work dashboard separates **Working now**, **Recently finished** and **Needs 
 
 The dashboard uses authenticated read-only GETs. It never acknowledges a request or briefing and never changes an assignment. Each bounded section states its completeness; request pages retain their fixed upper watermark, and Change history retains the briefing cursor tuple. Stale and unknown claims remain assigned. Finished work carries no assignment claim and does not imply tests, review or merge.
 
+### Recent merge activity
+
+The HTTP and MCP Work overview also include `merge_recap`, a read-only summary of stored
+AgentSCM publications with recorded merge commits. The Hub Work page and inline MCP
+overview show these separately from agent-reported completions. MCP work start includes
+the same recap alongside its existing briefing and coordination result.
+
+The recap uses the overview's recent time window, with `time_basis: last_recorded_update`:
+an item's `updated_at` is its last stored publication update, not the time the forge
+merged it. Each item names the publication, pull request, head and merge commits, branch
+and base. Reading does not query the forge, acknowledge a briefing or alter a claim.
+
+Coverage is limited to retained AgentSCM publications in the authenticated provider,
+host, repository name and repository ID when available. Bound tokens see publications
+created by tokens for the same repository ID; unbound legacy tokens see publications
+created by unbound tokens. These are separate partitions within provider/host/name,
+matching Work's existing scope. Completeness applies only to that partition.
+Pull requests created outside that publication
+path may be absent. A narrow query inspects at most 21 matching publication records,
+returns at most 20 merges and reports `complete: false` when another match exists.
+`scanned_count` is the number of matching records inspected, not a count of all repository
+activity. Full publication manifests and conversation bodies are not returned by this read.
+The result limit does not bound database rows examined or query latency.
+A null or absent `merge_recap` means unavailable, not an empty merge history. Work and
+publication reads are separate observations, not an atomic joined snapshot.
+
+This is a recent-activity window, not a personal unread marker. Signing in or opening
+the overview does not establish what a person has read. A merge recap does not prove
+that an active Work item is finished or duplicated: there is no inferred association
+from matching titles or branches. Inspect current assignments and source before editing;
+the existing scope-admission and coordination rules still apply.
+
+The overview JSON adds the optional `merge_recap` field. Clients using a closed response
+schema must accept that extension; the existing Work fields retain their meaning.
+This projection requires PostgreSQL 16 or newer and was exercised on PostgreSQL 17.
+The bundled SQLite supports the query. A query failure leaves the recap unavailable.
+
 ## Before work and after an overlap
 
 1. Read `agentscm_work_overview` (or `agentscm work overview`) before planning. It shows unfinished assignments, declared overlaps, and reported outcomes in the last 24 hours by default. `recent_since` selects another starting time. A compacted history is explicitly incomplete.

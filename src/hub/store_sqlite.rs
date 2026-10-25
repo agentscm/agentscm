@@ -47,6 +47,7 @@ use super::intent::{
     Announced, Existing, INTENT_SELECT, Intent, NewIntent, Plan, Who, announced, display_all,
     finish, notice_events, plan, probe_set, validate_ttl,
 };
+use super::merge_recap::{MergeRecap, MergeRecapItem, QUERY_LIMIT, finish as finish_merge_recap};
 use super::publish::{
     Create, MAX_UNFINISHED, NewPublication, PUBLICATION_SELECT, Publication, PublicationSearch,
     SEARCH_SCAN_ROWS, Update,
@@ -5180,6 +5181,70 @@ impl Store for SqliteStore {
             .query_map(params![repository, before, limit as i64], publication_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    fn work_merge_recap(
+        &self,
+        token: &str,
+        since: i64,
+        until: i64,
+        now: i64,
+    ) -> Result<MergeRecap> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let who = work_who(&tx, token, now)?;
+        let mut statement = tx.prepare(
+            "WITH recent AS MATERIALIZED (
+                SELECT p.id, p.updated_at
+                FROM hub_publications p
+                JOIN hub_agent_tokens t ON t.id = p.token
+                JOIN hub_users u ON u.id = t.owner
+                WHERE p.repository = ?1 AND t.repository = ?1 AND t.repository_id IS ?2
+                  AND u.provider = ?3 AND u.host = ?4
+                  AND p.pr_number IS NOT NULL AND p.merge_commit IS NOT NULL
+                  AND p.updated_at >= ?5 AND p.updated_at <= ?6
+                ORDER BY p.updated_at DESC, p.id DESC LIMIT ?7
+             )
+             SELECT substr(p.id, 1, 37),
+                    CASE WHEN length(CAST(p.manifest AS BLOB)) <= 2097152
+                                   AND json_valid(p.manifest)
+                         THEN CASE WHEN json_type(p.manifest, '$.title') = 'text'
+                                         AND length(CAST(json_extract(p.manifest, '$.title') AS BLOB)) <= 256
+                                    THEN json_extract(p.manifest, '$.title') END END,
+                    substr(p.branch, 1, 256), substr(p.base, 1, 256),
+                    substr(p.commit_sha, 1, 65), substr(p.merge_commit, 1, 65),
+                    p.pr_number, p.updated_at
+             FROM recent r JOIN hub_publications p ON p.id = r.id
+             ORDER BY p.updated_at DESC, p.id DESC",
+        )?;
+        let merges = statement
+            .query_map(
+                params![
+                    who.repository,
+                    who.repository_id,
+                    who.owner.identity.provider,
+                    who.owner.identity.host,
+                    since,
+                    until,
+                    QUERY_LIMIT
+                ],
+                |row| {
+                    Ok(MergeRecapItem {
+                        id: row.get(0)?,
+                        title: row.get(1)?,
+                        branch: row.get(2)?,
+                        base: row.get(3)?,
+                        head_commit: row.get(4)?,
+                        merge_commit: row.get(5)?,
+                        pull_number: row.get(6)?,
+                        updated_at: row.get(7)?,
+                    })
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        tx.commit()?;
+        finish_merge_recap(since, until, merges)
     }
 
     fn publication_search(
