@@ -2,10 +2,11 @@
 
 use crate::change_record::{
     ActionFinishV1, ActionOutcomeV1, ActionStartV1, ActionSummaryV1, ApplicabilityV1,
-    AssuranceBasisV1, ChangeRecordSummaryV1, CheckResultV1, CompletenessV1, ContentAvailabilityV1,
-    CoverageV1, DecisionAuthorKindV1, DecisionSourceRefV1, DecisionStatusV1, DecisionSummaryV1,
-    DriftV1, IntentSummaryV1, MAX_PROJECTED_DECISION_REFS, MAX_PROJECTED_SCOPE, RecipeProvenanceV1,
-    SessionCoverageV1, SessionSetupV1, SubjectSummaryV1, UnknownFactV1,
+    AssuranceBasisV1, CapturedEventV1, ChangeRecordSummaryV1, CheckResultV1, CompletenessV1,
+    ContentAvailabilityV1, ConversationEntryV1, CoverageV1, DecisionAuthorKindV1,
+    DecisionSourceRefV1, DecisionStatusV1, DecisionSummaryV1, DriftV1, IntentSummaryV1,
+    MAX_PROJECTED_DECISION_REFS, MAX_PROJECTED_SCOPE, RecipeProvenanceV1, SessionCoverageV1,
+    SessionSetupV1, SubjectSummaryV1, UnknownFactV1,
 };
 
 use super::work::{Checkpoint, SourceRef, WorkItem};
@@ -73,6 +74,59 @@ impl SharedBodyRow {
             }
             (state, _) => state,
         }
+    }
+
+    /// What a listing says about the body at `now`. A missing or corrupt object is not visible
+    /// here; reading the body reports it.
+    fn availability_at(&self, now: i64) -> ContentAvailabilityV1 {
+        match self.state_at(now) {
+            SharedBodyState::Declared => ContentAvailabilityV1::Local,
+            SharedBodyState::Available => ContentAvailabilityV1::Shared,
+            SharedBodyState::Expired => ContentAvailabilityV1::Expired,
+            SharedBodyState::Deleted => ContentAvailabilityV1::Deleted,
+        }
+    }
+
+    /// The listing entry for this body and the retained JSON of the event that declared it.
+    pub(super) fn conversation_entry(
+        &self,
+        event: &str,
+        observed_at: i64,
+        now: i64,
+    ) -> Result<ConversationEntryV1> {
+        let event: CapturedEventV1 = serde_json::from_str(event)
+            .map_err(|error| HubError::Unavailable(error.to_string()))?;
+        Ok(ConversationEntryV1 {
+            session_id: self.session_id.clone(),
+            sequence: self.sequence,
+            event_id: self.event_id.clone(),
+            kind: event.kind,
+            observed_at,
+            digest: self.digest.clone(),
+            size_bytes: self.size_bytes,
+            availability: self.availability_at(now),
+            expires_at: self.expires_at,
+        })
+    }
+}
+
+/// The one read rule for shared conversation bodies and their listing: the Work's human owner
+/// (through any of that owner's tokens for the repository) and Hub admins. Every HTTP and MCP
+/// read goes through this.
+pub fn conversation_readable(caller_owns_work: bool, admin: bool) -> bool {
+    caller_owns_work || admin
+}
+
+/// One page of a Work's shared-conversation listing, read with one row beyond the page limit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedConversationRead {
+    pub caller_owns_work: bool,
+    pub entries: Vec<ConversationEntryV1>,
+}
+
+impl SharedBodyAccess {
+    pub fn readable(&self, admin: bool) -> bool {
+        conversation_readable(self.caller_owns_work, admin)
     }
 }
 

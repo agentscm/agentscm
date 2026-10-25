@@ -83,7 +83,10 @@ ingestion order rather than proof of causal execution order.
 MCP exposes the same read projection as `agentscm_change_record({"work_id":"wrk_…"})`, including
 to read-only tokens. Its fixed narration never interpolates the caller-authored Work title or
 decision summary; those structured fields remain untrusted data, not instructions. The CLI wrapper
-is `agentscm change-capture show`. See
+is `agentscm change-capture show`. Shared conversation bodies and their listing have separate,
+owner-and-admin-only reads (`GET .../change-records/{work_id}/conversation[/{sha256}]`, MCP
+`agentscm_shared_conversation`, `agentscm change-capture conversation`); see
+[shared conversation reads](hub.md#shared-conversation-reads). See
 [local change capture](change-capture.md) and its [qualification limits](implementation/agentscm-build-status.md).
 
 ## Hub supported-skills routes (Experimental)

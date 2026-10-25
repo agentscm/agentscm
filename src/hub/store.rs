@@ -10,7 +10,9 @@ use crate::change_record::{
     IngestReceiptV1,
 };
 
-use super::change_record::{SharedBodyAccess, SharedBodyRow, SharedBodyState};
+use super::change_record::{
+    SharedBodyAccess, SharedBodyRow, SharedBodyState, SharedConversationRead,
+};
 use super::connection::{
     ConnectedRepository, Connection, ForgeCheck, ForgeCheckReserve, MergeGroup, NewConnection,
     NewForgeCheck, NewMergeGroup, Observation, Observed, Outbound,
@@ -561,6 +563,16 @@ pub trait Store: Send + Sync {
         digest: &str,
         now: i64,
     ) -> Result<Option<SharedBodyAccess>>;
+    /// Up to `MAX_CONVERSATION_PAGE_ENTRIES + 1` shared-conversation entries of the Work after
+    /// `cursor`, ordered by (session_id bytewise, sequence, digest), when `token`'s repository
+    /// scope contains it. `None` for an unknown Work; a malformed cursor is `Invalid`.
+    fn shared_conversation_page(
+        &self,
+        token: &str,
+        work_id: &str,
+        cursor: Option<&str>,
+        now: i64,
+    ) -> Result<Option<SharedConversationRead>>;
     /// Moves a `declared` body to `available` with `expires_at = now + retention_seconds`.
     /// Returns the state afterwards (`None` for an unknown row), so a caller that lost a race
     /// to a delete or expiry sees it and must remove the object it wrote.

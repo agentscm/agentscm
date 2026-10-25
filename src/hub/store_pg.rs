@@ -11,12 +11,13 @@ use serde_json::json;
 use crate::change_record::{
     ActionFinishV1, ActionMutationReceiptV1, ActionStartV1, ArtifactRefV1, CaptureBatchV1,
     CapturedEventKindV1, CapturedEventV1, ChangeRecordSummaryV1, IngestReceiptV1,
-    MAX_PROJECTED_SESSION_SETUPS, RetentionClassV1, SessionSetupV1,
+    MAX_CONVERSATION_PAGE_ENTRIES, MAX_PROJECTED_SESSION_SETUPS, RetentionClassV1, SessionSetupV1,
+    parse_conversation_cursor,
 };
 
 use super::change_record::{
-    SessionStatsV1, SharedBodyAccess, SharedBodyRow, SharedBodyState, StoredActionV1,
-    StoredDecisionV1, project as project_change_record,
+    SessionStatsV1, SharedBodyAccess, SharedBodyRow, SharedBodyState, SharedConversationRead,
+    StoredActionV1, StoredDecisionV1, project as project_change_record,
 };
 use super::connection::{
     CONNECTION_SELECT, ConnectedRepository, Connection as ForgeConnection, DELIVERY_KEEP_SECONDS,
@@ -5872,6 +5873,61 @@ impl Store for PgStore {
                 declared_by_caller_owner: declarer.as_deref() == Some(who.owner.id.as_str()),
                 caller_owns_work: item.owner == who.owner.id,
                 row,
+            }))
+        })
+    }
+
+    fn shared_conversation_page(
+        &self,
+        token: &str,
+        work_id: &str,
+        cursor: Option<&str>,
+        now: i64,
+    ) -> Result<Option<SharedConversationRead>> {
+        let after = cursor.map(parse_conversation_cursor).transpose()?;
+        self.run(true, |client| {
+            let mut tx = client
+                .build_transaction()
+                .isolation_level(IsolationLevel::RepeatableRead)
+                .start()?;
+            let who = work_who(&mut tx, token, now)?;
+            let Some(item) = scoped_work(&mut tx, &who, work_id, now, false)? else {
+                return Ok(None);
+            };
+            let rows = tx.query(
+                &format!(
+                    "WITH page AS (
+                         SELECT {SHARED_BODY_COLUMNS} FROM hub_change_shared_bodies
+                         WHERE work=$1 AND ($2::text IS NULL
+                           OR (session_id COLLATE \"C\",sequence,digest COLLATE \"C\")
+                              > ($2::text COLLATE \"C\",$3::bigint,$4::text COLLATE \"C\"))
+                         ORDER BY session_id COLLATE \"C\",sequence,digest COLLATE \"C\" LIMIT $5)
+                     SELECT page.*, e.event, e.observed_at FROM page
+                     JOIN hub_change_events e ON e.work=page.work AND e.generation=page.generation
+                       AND e.session_id=page.session_id AND e.event_id=page.event_id
+                     ORDER BY page.session_id COLLATE \"C\",page.sequence,page.digest COLLATE \"C\""
+                ),
+                &[
+                    &work_id,
+                    &after.as_ref().map(|after| after.0.as_str()),
+                    &after.as_ref().map(|after| after.1 as i64),
+                    &after.as_ref().map(|after| after.2.as_str()),
+                    &(MAX_CONVERSATION_PAGE_ENTRIES as i64 + 1),
+                ],
+            )?;
+            let entries = rows
+                .iter()
+                .map(|row| {
+                    shared_body_row(row)?.conversation_entry(
+                        &row.get::<_, String>(15),
+                        row.get::<_, i64>(16),
+                        now,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Some(SharedConversationRead {
+                caller_owns_work: item.owner == who.owner.id,
+                entries,
             }))
         })
     }

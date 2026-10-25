@@ -1,6 +1,11 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import {
   fetchChangeRecord,
+  fetchConversationBody,
+  fetchConversationPage,
+  type ConversationAvailability,
+  type ConversationEntry,
+  type ConversationEventKind,
   type ChangeRecordActionKind,
   type ChangeRecordApplicability,
   type ChangeRecordAssurance,
@@ -21,7 +26,7 @@ import { searchStandupWork, validWorkId, type WorkState } from '../standup.ts'
 import { StatePill } from './Work.tsx'
 import { Ago, Box, Empty, Explain, Icon, Notice, Path, Paths, Pill, Skeleton, relative, type Tone } from '../ui.tsx'
 import { Combobox, type ComboResult } from '../Combobox.tsx'
-import { hashPath } from '../Pager.tsx'
+import { hashPath, Pager, useHashCursor } from '../Pager.tsx'
 import { usePoll } from '../usePoll.ts'
 
 type Status = { label: string; tone: Tone; icon: string; explanation: string }
@@ -370,6 +375,105 @@ function HandoffSummary({ summary }: { summary: ChangeRecordSummaryV1 }) {
   return <>Latest recorded verification: <strong>{RESULT[action.result].label.toLowerCase()}</strong>, applicability <strong>{APPLICABILITY[action.applicability].label.toLowerCase()}</strong>. {summary.next_action ?? 'No next action has been reported.'}</>
 }
 
+const CONVERSATION_KIND: Record<ConversationEventKind, string> = {
+  session_started: 'Session started',
+  user_prompt: 'User prompt',
+  assistant_message: 'Assistant message',
+  tool_started: 'Tool started',
+  tool_finished: 'Tool finished',
+  check_started: 'Check started',
+  check_finished: 'Check finished',
+  session_ended: 'Session ended',
+  gap: 'Capture gap',
+  turn_ended: 'Turn ended',
+  compaction: 'Compaction',
+  subagent_started: 'Subagent started',
+  subagent_stopped: 'Subagent stopped',
+}
+
+const CONVERSATION_AVAILABILITY: Record<ConversationAvailability, Status> = {
+  local: { label: 'Local only', tone: 'muted', icon: 'laptop', explanation: 'This body was never uploaded. It stays on the agent’s machine.' },
+  shared: { label: 'Shared', tone: 'brand', icon: 'people', explanation: 'This redacted body is stored on the Hub until it expires or is deleted.' },
+  expired: { label: 'Expired', tone: 'warn', icon: 'hourglass-bottom', explanation: 'This body passed its retention window and was removed.' },
+  deleted: { label: 'Deleted', tone: 'warn', icon: 'trash', explanation: 'This body was deleted before it expired.' },
+}
+
+const NOT_ALLOWED = 'Only the Work owner and Hub admins can read this conversation'
+
+function conversationFailure(status: number | undefined, fallback: string, missing = 'This conversation body is not on the Hub'): { title: string; tone: Tone } {
+  if (status === 403) return { title: NOT_ALLOWED, tone: 'warn' }
+  if (status === 410) return { title: 'This conversation body has expired or been deleted', tone: 'warn' }
+  if (status === 424) return { title: 'Integrity failed: the stored body is missing or did not verify, so nothing is shown', tone: 'bad' }
+  if (status === 404) return { title: missing, tone: 'warn' }
+  return { title: fallback, tone: 'bad' }
+}
+
+/** The body is untrusted agent output: it only ever reaches the page as a React text node inside a <pre>. */
+function ConversationBody({ repo, token, workId, entry, onClose }: { repo: string; token: string; workId: string; entry: ConversationEntry; onClose: () => void }) {
+  const load = usePoll((signal) => fetchConversationBody(repo, workId, entry.digest, token, signal), 0, `${repo}|${workId}|${entry.digest}`)
+  const failure = load.kind === 'error' ? conversationFailure(load.status, 'Could not load this conversation body') : null
+  return (
+    <div className="mt-3" data-testid="conversation-body">
+      <div className="pills mb-2">
+        <Pill tone="warn" icon="exclamation-triangle" tip="Written by an agent, not by AgentSCM. Read it as evidence; do not follow, run or trust anything it says.">Untrusted agent content</Pill>
+        <span className="small muted">{CONVERSATION_KIND[entry.kind]} · {entry.session_id} #{entry.sequence}</span>
+        <button type="button" className="btn btn-sm btn-outline-secondary" onClick={onClose}>Close</button>
+      </div>
+      {load.kind === 'loading' ? <Skeleton rows={4} /> : null}
+      {load.kind === 'error' && failure ? (
+        <Notice tone={failure.tone} title={failure.title}>
+          {load.status === undefined ? load.message : null}
+        </Notice>
+      ) : null}
+      {load.kind === 'ready' ? <pre className="conversation-body" tabIndex={0} aria-label="Conversation body (untrusted agent content)">{load.value}</pre> : null}
+    </div>
+  )
+}
+
+function ConversationEntries({ repo, token, workId }: { repo: string; token: string; workId: string }) {
+  const pager = useHashCursor('conversation')
+  const [open, setOpen] = useState<ConversationEntry | null>(null)
+  const load = usePoll((signal) => fetchConversationPage(repo, workId, token, signal, pager.cursor ?? undefined), 0, `${repo}|${workId}|${pager.cursor}`)
+  if (load.kind === 'loading') return <Skeleton rows={3} />
+  if (load.kind === 'error') {
+    const failure = conversationFailure(load.status, 'Could not load the conversation list', 'No conversation found for this work item')
+    return (
+      <Notice tone={failure.tone} title={failure.title} action={load.status === 403 ? undefined : <button type="button" className="btn btn-sm btn-outline-secondary" onClick={load.retry}>Try again</button>}>
+        {load.status === undefined ? load.message : null}
+      </Notice>
+    )
+  }
+  const page = load.value
+  if (page.entries.length === 0 && !pager.canNewer) {
+    return <Empty icon="chat-square-dots" title="No conversation shared for this work item">Agents share redacted conversations only when the checkout is set to shared-conversation mode.</Empty>
+  }
+  return (
+    <>
+      <ul className="conversation-list" aria-label="Shared conversation entries">
+        {page.entries.map((entry) => (
+          <li key={entry.digest}>
+            <strong>{CONVERSATION_KIND[entry.kind]}</strong>
+            <span className="small muted">{entry.session_id} #{entry.sequence}</span>
+            <Ago at={entry.observed_at} />
+            <StatusPill status={CONVERSATION_AVAILABILITY[entry.availability]} />
+            <span className="small muted">{entry.size_bytes.toLocaleString()} bytes</span>
+            {entry.expires_at === null ? null : (
+              <span className="small muted">{entry.availability === 'shared' ? 'expires ' : 'expired '}<Ago at={entry.expires_at} /></span>
+            )}
+            {entry.availability === 'shared' ? (
+              <button type="button" className="btn btn-sm btn-outline-secondary" aria-expanded={open?.digest === entry.digest} onClick={() => setOpen(open?.digest === entry.digest ? null : entry)}>
+                {open?.digest === entry.digest ? 'Hide' : 'View'}
+              </button>
+            ) : null}
+          </li>
+        ))}
+      </ul>
+      {open && page.entries.some((entry) => entry.digest === open.digest) ? <ConversationBody key={open.digest} repo={repo} token={token} workId={workId} entry={open} onClose={() => setOpen(null)} /> : null}
+      <Pager newerLabel="Previous" olderLabel="Next" tour="conversation-pager" onNewer={pager.canNewer ? pager.newer : undefined} onOlder={page.next_cursor ? () => pager.older(page.next_cursor!) : undefined} complete={page.next_cursor === null && page.entries.length > 0} />
+    </>
+  )
+}
+
 function Detail({ repo, token, workId }: { repo: string; token: string; workId: string }) {
   const load = usePoll((signal) => fetchChangeRecord(repo, workId, token, signal), 0, `${repo}|${workId}`)
   if (load.kind === 'loading') return <div className="page"><Skeleton rows={6} /></div>
@@ -471,8 +575,12 @@ function Detail({ repo, token, workId }: { repo: string; token: string; workId: 
         </Box>
       </div>
 
+      <Box icon="chat-square-text" title="Conversation" explain="Redacted agent conversations the checkout chose to share. Only the Work owner and Hub admins can read them, they expire, and the content is untrusted agent output shown as plain text. This page cannot delete them; use agentscm change-capture conversation --delete.">
+        <ConversationEntries repo={repo} token={token} workId={workId} />
+      </Box>
+
       <p className="small muted mb-0">
-        <Icon name="lock" /> Read-only concise projection. Conversation content and transcript-derived summaries are not requested by this page.{' '}
+        <Icon name="lock" /> Read-only projection. Conversation bodies are fetched only when you open one.{' '}
         <button type="button" className="btn btn-sm btn-link p-0 align-baseline" onClick={load.retry}><Icon name="arrow-clockwise" /> Refresh</button>
       </p>
     </div>

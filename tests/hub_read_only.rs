@@ -88,6 +88,10 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&post, format!("{REPO}/change-records/events"), "{}".into(), AgentOnly);
     row(&post, format!("{REPO}/change-records/actions/start"), "{}".into(), AgentOnly);
     row(&post, format!("{REPO}/change-records/actions/finish"), "{}".into(), AgentOnly);
+    row(&get, format!("{REPO}/change-records/wrk_missing/conversation"), "".into(), Status(404));
+    row(&get, format!("{REPO}/change-records/wrk_missing/conversation/{hash}"), "".into(), Status(404));
+    row(&put, format!("{REPO}/change-records/wrk_missing/conversation/{hash}"), "x".into(), AgentOnly);
+    row(&delete, format!("{REPO}/change-records/wrk_missing/conversation/{hash}"), "".into(), AgentOnly);
     row(&get, "/v1/hub/skills".into(), "".into(), Allowed);
     row(&get, format!("{REPO}/skills/runs"), "".into(), Allowed);
     row(&get, format!("{REPO}/skills/runs/missing"), "".into(), Status(404));
@@ -100,6 +104,7 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_workflow_status","arguments":{"run_id":"missing"}}}"#.into(), Allowed);
     row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_work_briefing","arguments":{}}}"#.into(), Allowed);
     row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_change_record","arguments":{"work_id":"wrk_missing"}}}"#.into(), Allowed);
+    row(&post, "/mcp".into(), r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agentscm_shared_conversation","arguments":{"work_id":"wrk_missing"}}}"#.into(), Allowed);
     // Coordination and checkpoint tools mutate state.
     for tool in [
         "agentscm_start",

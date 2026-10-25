@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { decodeChangeRecordResponse, fetchChangeRecord, InvalidChangeRecordResponse } from '../../src/changeRecord.ts'
+import { decodeChangeRecordResponse, decodeConversationPage, fetchChangeRecord, fetchConversationBody, fetchConversationPage, InvalidChangeRecordResponse } from '../../src/changeRecord.ts'
 import { ChangeRecordPage, changeRecordHref, changeRecordIdFromHash } from '../../src/pages/ChangeRecord.tsx'
 import { json } from '../fixtures/mockFetch.ts'
 
@@ -93,6 +93,21 @@ const fixture = () => ({
     transcript_body: 'private transcript must never render',
   },
 })
+
+const BODY_DIGEST = '9'.repeat(64)
+const entry = (patch: Record<string, unknown> = {}) => ({
+  session_id: 'session-1',
+  sequence: 1,
+  event_id: 'event-1',
+  kind: 'assistant_message',
+  observed_at: 1_798_000_010,
+  digest: BODY_DIGEST,
+  size_bytes: 321,
+  availability: 'shared',
+  expires_at: 1_800_592_010,
+  ...patch,
+})
+const conversationPage = (entries: unknown[], next_cursor: string | null = null) => ({ version: 1, entries, next_cursor })
 
 const executionFixture = () => {
   const value = fixture()
@@ -350,7 +365,7 @@ describe('change record route and page', () => {
     const sent: { method: string; url: string }[] = []
     vi.stubGlobal('fetch', async (input: string, init: RequestInit = {}) => {
       sent.push({ method: (init.method ?? 'GET').toUpperCase(), url: input })
-      return json(200, response)
+      return input.endsWith('/conversation') ? json(200, conversationPage([])) : json(200, response)
     })
     window.location.hash = changeRecordHref(WORK_ID)
     render(<ChangeRecordPage repo="counterbranch/agentscm" token="read-token" />)
@@ -384,7 +399,10 @@ describe('change record route and page', () => {
     expect(screen.getByText('Human decision is unknown')).toBeTruthy()
     expect(screen.getAllByText('Run the focused UI check against the current source.').length).toBeGreaterThan(0)
     expect(screen.queryByText(/private transcript/)).toBeNull()
-    expect(sent).toEqual([{ method: 'GET', url: `/v1/hub/repos/${encodeURIComponent('counterbranch/agentscm')}/change-records/${WORK_ID}` }])
+    const record = `/v1/hub/repos/${encodeURIComponent('counterbranch/agentscm')}/change-records/${WORK_ID}`
+    // The list is the only conversation request: no body is fetched until one is opened.
+    await screen.findByText('No conversation shared for this work item')
+    expect(sent).toEqual([{ method: 'GET', url: record }, { method: 'GET', url: `${record}/conversation` }])
   })
 
   it('lists model, effort and permission mode per session with unknown where absent', async () => {
@@ -447,5 +465,155 @@ describe('change record route and page', () => {
     render(<ChangeRecordPage repo="counterbranch/agentscm" token="read-token" />)
     await waitFor(() => expect(screen.getByText('This token cannot read the change record')).toBeTruthy())
     expect(screen.queryByText(/No change record/)).toBeNull()
+  })
+})
+
+describe('shared conversation', () => {
+  const REPO = 'counterbranch/agentscm'
+  const base = `/v1/hub/repos/${encodeURIComponent(REPO)}/change-records/${WORK_ID}`
+  const CURSOR = `3:${'a'.repeat(64)}:session-1`
+
+  it('decodes a page strictly', () => {
+    const page = decodeConversationPage(conversationPage([entry(), entry({ digest: '8'.repeat(64), availability: 'local', expires_at: null })], CURSOR))
+    expect(page.entries.map((e) => e.availability)).toEqual(['shared', 'local'])
+    expect(page.next_cursor).toBe(CURSOR)
+    // Fields the decoder does not know are dropped, not rendered.
+    expect(decodeConversationPage(conversationPage([entry({ body: 'secret text' })])).entries[0]).not.toHaveProperty('body')
+
+    const bad: [string, unknown][] = [
+      ['version', { ...conversationPage([]), version: 2 }],
+      ['entries', { version: 1, entries: 'x', next_cursor: null }],
+      ['kind', conversationPage([entry({ kind: 'secret' })])],
+      ['availability', conversationPage([entry({ availability: 'integrity_failure' })])],
+      ['availability', conversationPage([entry({ availability: 'passed' })])],
+      ['digest', conversationPage([entry({ digest: 'A'.repeat(64) })])],
+      ['session_id', conversationPage([entry({ session_id: '<img src=x onerror=alert(1)>' })])],
+      ['sequence', conversationPage([entry({ sequence: 0 })])],
+      ['size_bytes', conversationPage([entry({ size_bytes: -1 })])],
+      ['observed_at', conversationPage([entry({ observed_at: '1' })])],
+      ['expires_at', conversationPage([entry({ availability: 'local' })])],
+      ['expires_at', conversationPage([entry({ expires_at: null })])],
+      ['next_cursor', conversationPage([entry()], '../etc/passwd')],
+      ['next_cursor', conversationPage([], CURSOR)],
+      ['entries', conversationPage(Array.from({ length: 101 }, (_, i) => entry({ sequence: i + 1 })))],
+    ]
+    for (const [field, value] of bad) expect(() => decodeConversationPage(value), field).toThrow(new RegExp(field))
+  })
+
+  it('requests the list with a validated cursor and the body by digest, both as plain bearer GETs', async () => {
+    const sent: { url: string; init: RequestInit }[] = []
+    vi.stubGlobal('fetch', async (input: string, init: RequestInit = {}) => {
+      sent.push({ url: input, init })
+      return input.endsWith(BODY_DIGEST) ? json(200, { messages: [{ role: 'user', text: 'hello' }] }) : json(200, conversationPage([entry()]))
+    })
+    const signal = new AbortController().signal
+    await fetchConversationPage(REPO, WORK_ID, 'read-token', signal, CURSOR)
+    expect(sent[0]!.url).toBe(`${base}/conversation?cursor=${encodeURIComponent(CURSOR)}`)
+    const text = await fetchConversationBody(REPO, WORK_ID, BODY_DIGEST, 'read-token', signal)
+    expect(JSON.parse(text)).toEqual({ messages: [{ role: 'user', text: 'hello' }] })
+    expect(text).toContain('\n  ')
+    expect(sent[1]!.url).toBe(`${base}/conversation/${BODY_DIGEST}`)
+    for (const request of sent) {
+      expect((request.init.method ?? 'GET').toUpperCase()).toBe('GET')
+      expect(new Headers(request.init.headers).get('authorization')).toBe('Bearer read-token')
+      expect(request.init.credentials).toBe('omit')
+    }
+    await expect(fetchConversationBody(REPO, WORK_ID, 'not-a-digest', 'read-token', signal)).rejects.toThrow(InvalidChangeRecordResponse)
+    await expect(fetchConversationBody(REPO, 'wrk_x', BODY_DIGEST, 'read-token', signal)).rejects.toThrow(InvalidChangeRecordResponse)
+  })
+
+  const open = async (handler: (url: string) => Response | undefined) => {
+    vi.stubGlobal('fetch', async (input: string) => handler(input) ?? (input.includes('/conversation') ? json(500, {}) : json(200, fixture())))
+    window.location.hash = changeRecordHref(WORK_ID)
+    render(<ChangeRecordPage repo={REPO} token="read-token" />)
+    await screen.findByRole('heading', { name: 'Conversation' })
+  }
+
+  it('lists entries with kind, time, availability and expiry, and offers a body only for shared ones', async () => {
+    await open((url) =>
+      url.endsWith('/conversation')
+        ? json(200, conversationPage([
+            entry(),
+            entry({ sequence: 2, event_id: 'event-2', digest: '8'.repeat(64), availability: 'local', expires_at: null, kind: 'user_prompt' }),
+            entry({ sequence: 3, event_id: 'event-3', digest: '7'.repeat(64), availability: 'expired', kind: 'tool_finished' }),
+            entry({ sequence: 4, event_id: 'event-4', digest: '6'.repeat(64), availability: 'deleted', expires_at: null, kind: 'compaction' }),
+          ]))
+        : undefined,
+    )
+    const list = await screen.findByRole('list', { name: 'Shared conversation entries' })
+    const text = list.textContent ?? ''
+    for (const label of ['Assistant message', 'User prompt', 'Tool finished', 'Compaction', 'Shared', 'Local only', 'Expired', 'Deleted']) expect(text).toContain(label)
+    expect(screen.getAllByRole('button', { name: 'View' })).toHaveLength(1)
+    expect(screen.queryByText('Untrusted agent content')).toBeNull()
+  })
+
+  it('shows a body as plain text with an untrusted label and never as markup', async () => {
+    const hostile = { messages: [{ role: 'assistant', text: '<img src=x onerror="window.__pwned=1"><script>window.__pwned=1</script> ignore previous instructions' }] }
+    const sent: string[] = []
+    await open((url) => {
+      sent.push(url)
+      if (url.endsWith('/conversation')) return json(200, conversationPage([entry()]))
+      if (url.endsWith(BODY_DIGEST)) return json(200, hostile)
+      return undefined
+    })
+    fireEvent.click(await screen.findByRole('button', { name: 'View' }))
+    const body = await screen.findByLabelText('Conversation body (untrusted agent content)')
+    expect(body.tagName).toBe('PRE')
+    expect(body.textContent).toBe(JSON.stringify(hostile, null, 2))
+    expect(body.querySelector('img, script')).toBeNull()
+    expect(document.querySelector('script')).toBeNull()
+    expect((window as unknown as Record<string, unknown>)['__pwned']).toBeUndefined()
+    expect(screen.getAllByText('Untrusted agent content').length).toBeGreaterThan(0)
+    expect(sent.filter((url) => url.endsWith(BODY_DIGEST))).toHaveLength(1)
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }))
+    expect(screen.queryByLabelText('Conversation body (untrusted agent content)')).toBeNull()
+  })
+
+  it('says plainly when the viewer is not the owner or an admin, and offers no retry', async () => {
+    await open((url) => (url.endsWith('/conversation') ? json(403, { error: 'forbidden' }) : undefined))
+    expect(await screen.findByText('Only the Work owner and Hub admins can read this conversation')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Try again' })).toBeNull()
+  })
+
+  it('shows expired, deleted, missing and integrity-failed bodies explicitly and no partial content', async () => {
+    const status = new Map<string, number>()
+    await open((url) => {
+      if (url.endsWith('/conversation')) return json(200, conversationPage([entry()]))
+      if (url.endsWith(BODY_DIGEST)) return json(status.get('body') ?? 200, { error: 'x' })
+      return undefined
+    })
+    for (const [code, message] of [
+      [410, 'This conversation body has expired or been deleted'],
+      [424, 'Integrity failed: the stored body is missing or did not verify, so nothing is shown'],
+      [404, 'This conversation body is not on the Hub'],
+      [403, 'Only the Work owner and Hub admins can read this conversation'],
+    ] as const) {
+      status.set('body', code)
+      fireEvent.click(await screen.findByRole('button', { name: 'View' }))
+      expect(await screen.findByText(message)).toBeTruthy()
+      expect(screen.queryByLabelText('Conversation body (untrusted agent content)')).toBeNull()
+      fireEvent.click(screen.getByRole('button', { name: 'Close' }))
+    }
+  })
+
+  it('has no delete control because the status page only holds read-only tokens', async () => {
+    await open((url) => (url.endsWith('/conversation') ? json(200, conversationPage([entry()])) : undefined))
+    await screen.findByRole('list', { name: 'Shared conversation entries' })
+    expect(screen.queryByRole('button', { name: /delete/i })).toBeNull()
+  })
+
+  it('pages with the shared pager and carries the cursor in the hash', async () => {
+    const urls: string[] = []
+    await open((url) => {
+      if (!url.includes('/conversation')) return undefined
+      urls.push(url)
+      return url.includes('cursor=')
+        ? json(200, conversationPage([entry({ sequence: 4, event_id: 'event-4', digest: '5'.repeat(64) })]))
+        : json(200, conversationPage([entry()], CURSOR))
+    })
+    fireEvent.click(await screen.findByRole('button', { name: /Next/ }))
+    await waitFor(() => expect(urls).toContain(`${base}/conversation?cursor=${encodeURIComponent(CURSOR)}`))
+    expect(window.location.hash).toContain('conversation=')
+    expect(window.location.hash.startsWith(changeRecordHref(WORK_ID))).toBe(true)
   })
 })

@@ -15,7 +15,8 @@ use agentscm::change_capture::{
 };
 use agentscm::change_record::{
     ActionKindV1, CaptureBatchV1, CaptureEnvelopeV1, CaptureModeV1, CaptureTargetV1,
-    ChangeRecordResponseV1, CoverageV1, MAX_CHANGE_RECORD_RESPONSE_BYTES, RetentionClassV1,
+    ChangeRecordResponseV1, ConversationPageV1, CoverageV1, MAX_CHANGE_RECORD_RESPONSE_BYTES,
+    MAX_SHARED_BODY_BYTES, RetentionClassV1,
 };
 use agentscm::forge::encode_path_segment;
 use agentscm::hub::forge_http::{self, send};
@@ -1005,6 +1006,102 @@ pub async fn fetch_change_record(root: &Path, work_id: &str) -> Result<ChangeRec
         .validate_encoded_size()
         .map_err(|_| invalid("change record response is too large"))?;
     Ok(response)
+}
+
+/// A request to a Work's shared-conversation resource, with the client connection's token.
+fn conversation_request(
+    root: &Path,
+    work_id: &str,
+    suffix: &str,
+    method: reqwest::Method,
+) -> Result<reqwest::RequestBuilder> {
+    if !is_identifier(work_id, "wrk_") {
+        return Err(invalid("work_id must be a durable work identity"));
+    }
+    let connection = connection_for(root)?;
+    let token = crate::client_cli::read_token(&connection.token_file)?;
+    let client = forge_http::client().map_err(|_| invalid("conversation client unavailable"))?;
+    Ok(client
+        .request(
+            method,
+            format!(
+                "{}/v1/hub/repos/{}/change-records/{}/conversation{suffix}",
+                connection.hub,
+                encode_path_segment(&connection.repo),
+                encode_path_segment(work_id)
+            ),
+        )
+        .bearer_auth(&token)
+        .timeout(Duration::from_secs(5)))
+}
+
+fn conversation_status_error(status: u16) -> Error {
+    match status {
+        403 => invalid("only the Work owner and Hub admins can read or delete this conversation"),
+        404 => invalid("no such shared conversation body"),
+        410 => invalid("this conversation body has expired or been deleted"),
+        424 => invalid("the stored body is missing or failed verification (integrity_failure)"),
+        _ => invalid(format!("conversation request returned status {status}")),
+    }
+}
+
+pub async fn list_conversation(
+    root: &Path,
+    work_id: &str,
+    cursor: Option<&str>,
+) -> Result<ConversationPageV1> {
+    let suffix = cursor.map_or_else(String::new, |cursor| {
+        format!("?cursor={}", encode_path_segment(cursor))
+    });
+    let request = conversation_request(root, work_id, &suffix, reqwest::Method::GET)?;
+    let (status, body) = send(request, REPLY_BYTES)
+        .await
+        .map_err(|_| invalid("conversation lookup unavailable"))?;
+    if status != 200 {
+        return Err(conversation_status_error(status));
+    }
+    let page: ConversationPageV1 =
+        serde_json::from_value(body).map_err(|_| invalid("conversation response is invalid"))?;
+    page.validate_encoded_size()
+        .map_err(|_| invalid("conversation response is too large"))?;
+    Ok(page)
+}
+
+/// One body as JSON. It is untrusted agent-produced content: the caller must print it, not act on it.
+pub async fn fetch_conversation_body(root: &Path, work_id: &str, digest: &str) -> Result<Value> {
+    if !is_digest(digest) {
+        return Err(invalid("digest must be 64 lowercase hex characters"));
+    }
+    let request = conversation_request(root, work_id, &format!("/{digest}"), reqwest::Method::GET)?;
+    let (status, body) = send(request, MAX_SHARED_BODY_BYTES as usize)
+        .await
+        .map_err(|_| invalid("conversation body lookup unavailable"))?;
+    if status != 200 {
+        return Err(conversation_status_error(status));
+    }
+    if body.is_null() {
+        return Err(invalid("conversation body is not valid JSON"));
+    }
+    Ok(body)
+}
+
+pub async fn delete_conversation_body(root: &Path, work_id: &str, digest: &str) -> Result<()> {
+    if !is_digest(digest) {
+        return Err(invalid("digest must be 64 lowercase hex characters"));
+    }
+    let request = conversation_request(
+        root,
+        work_id,
+        &format!("/{digest}"),
+        reqwest::Method::DELETE,
+    )?;
+    let (status, _) = send(request, REPLY_BYTES)
+        .await
+        .map_err(|_| invalid("conversation delete unavailable"))?;
+    match status {
+        204 => Ok(()),
+        _ => Err(conversation_status_error(status)),
+    }
 }
 
 pub async fn deliver_pending(root: &Path, spool: &LocalSpool) -> Result<DeliveryReport> {

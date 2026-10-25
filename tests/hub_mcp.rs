@@ -514,6 +514,7 @@ async fn protocol_basics() {
             "agentscm_work_briefing",
             "agentscm_coordination_inbox",
             "agentscm_change_record",
+            "agentscm_shared_conversation",
             "agentscm_work_insight",
             "agentscm_work_insights",
             "agentscm_work_search",

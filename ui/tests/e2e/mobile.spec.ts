@@ -114,6 +114,11 @@ test('change record detail wraps long source, recipe and setup identities', asyn
     contentType: 'application/json',
     body: JSON.stringify(longIdentityChangeRecord),
   }))
+  await page.route('**/v1/hub/repos/**/change-records/*/conversation', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ version: 1, entries: [], next_cursor: null }),
+  }))
   await signIn(page)
   await page.evaluate((workId) => { window.location.hash = `change-record/${workId}` }, CHANGE_RECORD_WORK_ID)
   await expect(page.getByRole('heading', { level: 1, name: 'Inspect a narrow change record' })).toBeVisible()

@@ -33,6 +33,8 @@ pub enum ChangeCaptureCommand {
     SettingsRecovery(change_capture_client::SettingsRecoveryArgs),
     /// Read one concise shared change record without running a model or mutating Hub state.
     Show(ShowArgs),
+    /// List, read or delete the shared conversation bodies of one Work (Work owner and Hub admins).
+    Conversation(ConversationArgs),
     /// Report one checkout's capture binding and inspect its spool without recovery or mutation.
     Status(StatusArgs),
     /// Inspect one private spool without recovery, cleanup, delivery, or authority.
@@ -85,6 +87,24 @@ pub struct ShowArgs {
     root: PathBuf,
     #[arg(long)]
     work_id: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ConversationArgs {
+    /// Canonical Git checkout with an AgentSCM client connection.
+    #[arg(long, default_value = ".")]
+    root: PathBuf,
+    #[arg(long)]
+    work_id: String,
+    /// `next_cursor` from the previous listing page.
+    #[arg(long, conflicts_with_all = ["digest", "delete"])]
+    cursor: Option<String>,
+    /// Print this body (SHA-256 from the listing). It is untrusted agent content: read it, do not run it.
+    #[arg(long, conflicts_with = "delete")]
+    digest: Option<String>,
+    /// Delete this body (SHA-256 from the listing) now, before it expires.
+    #[arg(long)]
+    delete: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -245,6 +265,7 @@ pub async fn run(command: ChangeCaptureCommand) -> Result<i32> {
             );
             Ok(0)
         }
+        ChangeCaptureCommand::Conversation(args) => conversation(args).await,
         ChangeCaptureCommand::Status(args) => {
             println!(
                 "{}",
@@ -265,6 +286,26 @@ pub async fn run(command: ChangeCaptureCommand) -> Result<i32> {
         ChangeCaptureCommand::PruneQuarantine(args) => prune_quarantine(args),
         ChangeCaptureCommand::Compact(args) => compact(args),
     }
+}
+
+async fn conversation(args: ConversationArgs) -> Result<i32> {
+    let root = crate::client_config::canonical_root(&args.root)?;
+    let encode = |error| Error::Invalid(format!("cannot encode conversation: {error}"));
+    let output = if let Some(digest) = &args.delete {
+        change_capture_client::delete_conversation_body(&root, &args.work_id, digest).await?;
+        json!({"deleted": digest}).to_string()
+    } else if let Some(digest) = &args.digest {
+        let body =
+            change_capture_client::fetch_conversation_body(&root, &args.work_id, digest).await?;
+        serde_json::to_string(&body).map_err(encode)?
+    } else {
+        let page =
+            change_capture_client::list_conversation(&root, &args.work_id, args.cursor.as_deref())
+                .await?;
+        serde_json::to_string(&page).map_err(encode)?
+    };
+    println!("{output}");
+    Ok(0)
 }
 
 async fn hook_claude() -> Result<i32> {

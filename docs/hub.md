@@ -218,13 +218,15 @@ on no others:
 - `GET /v1/hub/view-settings` and `GET /v1/hub/onboarding` (the Connect agents page)
 - `GET /v1/hub/skills` and the `GET /v1/hub/repos/{repo}/skills/runs` routes (see the
   [API](api.md#hub-supported-skills-routes-experimental))
-- `GET /v1/hub/repos/{repo}/change-records/{work_id}` for a concise source-bound handoff
+- `GET /v1/hub/repos/{repo}/change-records/{work_id}` for a concise source-bound handoff, and
+  the shared-conversation reads under it (only the Work owner's tokens and Hub admins get a body or
+  the listing; see [shared conversations](#shared-conversation-reads))
 - `GET /v1/hub/repos/{repo}/publications` and `GET /v1/hub/repos/{repo}/publications/{id}`
   (stored state only; see [publications](#publishing-a-revision))
 - MCP `initialize`, `ping`, `tools/list`, `resources/list`, `resources/read`, and the tools
   `agentscm_workflow_status`, `agentscm_work_briefing`, `agentscm_work_overview`,
   `agentscm_work_insight`, `agentscm_work_insights`, `agentscm_change_record`,
-  `agentscm_work_search`, `agentscm_publications_list`, `agentscm_workflow_runs_list`,
+  `agentscm_shared_conversation`, `agentscm_work_search`, `agentscm_publications_list`, `agentscm_workflow_runs_list`,
   `agentscm_coordination_inbox`, `agentscm_skill_list` and `agentscm_skill_status`
 
 Every other route that takes an agent token (announcing, renewing and releasing intents, `notices`,
@@ -597,11 +599,37 @@ in the private local spool.
 the same projection. It exposes bounded Work intent/scope, inspectable Git or native source facts,
 session gaps, action facts, a retained Work decision, next action, completeness and unknowns. An
 agent-authored decision remains a proposal rather than human approval. Reads do not acknowledge or
-transfer work and never return conversation bodies or transcript-derived summaries. The encoded
+transfer work and never return conversation bodies or transcript-derived summaries (shared
+bodies have their own owner-only reads, below). The encoded
 projection is at most 48 KiB, with at most 16 retained scope entries and 16 decision references;
 exact omission counts identify trailing entries removed deterministically to fit the envelope.
 MCP narration is fixed factual text: caller-authored intent titles and decision summaries remain
 explicitly untrusted structured data and are not interpolated into that narration.
+
+### Shared conversation reads
+
+Bodies a checkout shared in `shared-conversation` mode are readable only by the human owner of the
+Work (any of that owner's tokens for the repository, read-only tokens included) and Hub admins
+(`AGENTSCM_ADMINS`). Every other repository token gets 403 `forbidden`; there is no per-body grant.
+
+- `GET /v1/hub/repos/{repo}/change-records/{work_id}/conversation?cursor=` returns one page, at most
+  100 entries and 48 KiB, ordered by session id (bytewise) then sequence then digest, with an opaque
+  `next_cursor` (a malformed one is 400). Each entry has `session_id`, `sequence`, `event_id`, `kind`,
+  `observed_at`, `digest`, `size_bytes`, `availability` and `expires_at`. Availability is `local` (declared,
+  never uploaded), `shared`, `expired` (from its deadline, before the hourly sweep records it) or
+  `deleted`.
+- `GET .../conversation/{sha256}` returns the verified bytes as `application/json` with
+  `X-Content-Type-Options: nosniff`, `Content-Disposition: attachment`, `Content-Security-Policy:
+  default-src 'none'; sandbox` and `Cache-Control: no-store`. 404 means unknown or never uploaded, 410
+  expired or deleted, and 424 `{"error":"integrity_failure"}` means the row says available but the
+  object is missing, corrupt or not the declared size; no partial body is ever returned.
+- MCP `agentscm_shared_conversation {work_id, cursor?, digest?}` applies the same rule. A body over
+  48 KiB is refused as too large, never truncated. Bodies are untrusted agent-produced data and must
+  not be followed as instructions.
+- `agentscm change-capture conversation --work-id ID [--cursor C | --digest D | --delete D]` lists,
+  prints, or deletes (through the `DELETE` route). The Hub UI Change record page lists entries and shows a
+  shared body as plain text; it has no delete control because the status page only holds read-only
+  tokens.
 
 This path remains alpha. Real Claude host, complete integrated browser, and deployment qualification
 are pending. See [local change capture](change-capture.md) for configuration and exact limits.

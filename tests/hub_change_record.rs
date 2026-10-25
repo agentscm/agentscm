@@ -1205,3 +1205,156 @@ fn postgres_shared_body_lifecycle() {
         shared_body_lifecycle(&db);
     }
 }
+
+fn shared_conversation_listing(db: &Db) {
+    let (store, token, work_id, generation) = setup(db);
+    let stranger = store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 43,
+            },
+            "stranger",
+        )
+        .unwrap();
+    let (stranger_token, _) = mint_agent_token(&*store, &stranger.id, "other", REPO, 3600).unwrap();
+    for session in ["B-session", "a-session"] {
+        join_session(&*store, &token, &work_id, session);
+    }
+    let now = unix_now();
+    let bodies: Vec<Vec<u8>> = (0..4)
+        .map(|n| format!("{{\"n\":{n}}}").into_bytes())
+        .collect();
+    // Declared out of order, in sessions that sort differently bytewise and by locale.
+    for (index, (session, sequence)) in [
+        ("session-1", 1),
+        ("a-session", 2),
+        ("B-session", 1),
+        ("a-session", 1),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut batch = shared_batch(
+            &work_id,
+            generation,
+            &format!("list-{index}"),
+            sequence,
+            &bodies[index],
+            bodies[index].len() as u64,
+        );
+        batch.session.session_id = session.into();
+        batch.events[0].event_id = format!("{session}-{sequence}");
+        batch.events[0].kind = CapturedEventKindV1::AssistantMessage;
+        batch.events[0].observed_at = 500 + index as i64;
+        store.change_ingest(&token, &batch, now).unwrap();
+    }
+
+    let page = store
+        .shared_conversation_page(&token, &work_id, None, now)
+        .unwrap()
+        .unwrap();
+    assert!(page.caller_owns_work);
+    let order: Vec<(&str, u64)> = page
+        .entries
+        .iter()
+        .map(|entry| (entry.session_id.as_str(), entry.sequence))
+        .collect();
+    assert_eq!(
+        order,
+        [
+            ("B-session", 1),
+            ("a-session", 1),
+            ("a-session", 2),
+            ("session-1", 1)
+        ]
+    );
+    let first = &page.entries[0];
+    assert_eq!(first.digest, sha256_hex(&bodies[2]));
+    assert_eq!(first.event_id, "B-session-1");
+    assert_eq!(
+        (
+            first.kind,
+            first.observed_at,
+            first.size_bytes,
+            first.expires_at
+        ),
+        (CapturedEventKindV1::AssistantMessage, 502, 7, None)
+    );
+    assert!(
+        page.entries
+            .iter()
+            .all(|entry| entry.availability == ContentAvailabilityV1::Local)
+    );
+
+    // A cursor continues strictly after its entry, for a position that no longer needs to exist.
+    for (index, entry) in page.entries.iter().enumerate() {
+        let rest = store
+            .shared_conversation_page(&token, &work_id, Some(&entry.cursor()), now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rest.entries, page.entries[index + 1..], "{index}");
+    }
+
+    // Availability follows the row, and an available body is expired from its deadline.
+    let digest = sha256_hex(&bodies[2]);
+    store
+        .shared_body_mark_available(&work_id, &digest, now, 100)
+        .unwrap();
+    store
+        .shared_body_tombstone(&work_id, &sha256_hex(&bodies[1]), &stranger.id, now)
+        .unwrap();
+    let states = |at: i64| -> Vec<ContentAvailabilityV1> {
+        store
+            .shared_conversation_page(&token, &work_id, None, at)
+            .unwrap()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|entry| entry.availability)
+            .collect()
+    };
+    use ContentAvailabilityV1::{Deleted, Expired, Local, Shared};
+    assert_eq!(states(now + 99), [Shared, Local, Deleted, Local]);
+    assert_eq!(states(now + 100), [Expired, Local, Deleted, Local]);
+    assert_eq!(
+        store
+            .shared_conversation_page(&token, &work_id, None, now)
+            .unwrap()
+            .unwrap()
+            .entries[0]
+            .expires_at,
+        Some(now + 100)
+    );
+
+    // Who asks is reported, not enforced here; an unknown Work is absent; bad cursors fail.
+    let other = store
+        .shared_conversation_page(&stranger_token, &work_id, None, now)
+        .unwrap()
+        .unwrap();
+    assert!(!other.caller_owns_work);
+    assert!(
+        store
+            .shared_conversation_page(&token, "work_unknown", None, now)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .shared_conversation_page(&token, &work_id, Some("garbage"), now)
+            .is_err()
+    );
+}
+
+#[test]
+fn sqlite_shared_conversation_listing() {
+    shared_conversation_listing(&Db::sqlite());
+}
+
+#[test]
+fn postgres_shared_conversation_listing() {
+    if let Some(db) = Db::postgres() {
+        shared_conversation_listing(&db);
+    }
+}

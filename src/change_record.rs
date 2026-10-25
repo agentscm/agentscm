@@ -19,6 +19,7 @@ pub const MAX_PROJECTED_DECISION_REFS: usize = 16;
 pub const MAX_PROJECTED_SESSION_SETUPS: usize = 16;
 /// Largest redacted conversation body that may be retained as `SharedApproved`.
 pub const MAX_SHARED_BODY_BYTES: u64 = 1024 * 1024;
+pub const MAX_CONVERSATION_PAGE_ENTRIES: usize = 100;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -673,6 +674,106 @@ impl ChangeRecordResponseV1 {
             return Err(HubError::Invalid(
                 "change record response exceeds the bounded projection".into(),
             ));
+        }
+        Ok(())
+    }
+}
+
+/// One shared-conversation body of a Work, without its content. `availability` is `local`
+/// (never uploaded), `shared`, `expired` or `deleted`; a missing or corrupt object is only
+/// discovered, and reported as `integrity_failure`, when the body itself is read.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConversationEntryV1 {
+    pub session_id: String,
+    pub sequence: u64,
+    pub event_id: String,
+    pub kind: CapturedEventKindV1,
+    pub observed_at: i64,
+    pub digest: String,
+    pub size_bytes: u64,
+    pub availability: ContentAvailabilityV1,
+    pub expires_at: Option<i64>,
+}
+
+impl ConversationEntryV1 {
+    /// Position after this entry: `<sequence>:<digest>:<session_id>`.
+    pub fn cursor(&self) -> String {
+        format!("{}:{}:{}", self.sequence, self.digest, self.session_id)
+    }
+}
+
+/// Reads a conversation cursor as (session_id, sequence, digest) to continue after.
+pub fn parse_conversation_cursor(cursor: &str) -> Result<(String, u64, String)> {
+    let mut parts = cursor.splitn(3, ':');
+    let (Some(sequence), Some(digest), Some(session)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return Err(invalid("malformed cursor"));
+    };
+    let sequence = (!sequence.is_empty()
+        && sequence.len() <= 18
+        && sequence.bytes().all(|b| b.is_ascii_digit()))
+    .then(|| sequence.parse::<u64>().ok())
+    .flatten()
+    .filter(|sequence| *sequence > 0);
+    let digest_ok = digest.len() == 64
+        && digest
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    match sequence {
+        Some(sequence) if digest_ok && identifier("cursor", session, 255).is_ok() => {
+            Ok((session.to_owned(), sequence, digest.to_owned()))
+        }
+        _ => Err(invalid("malformed cursor")),
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConversationPageV1 {
+    pub version: u16,
+    pub entries: Vec<ConversationEntryV1>,
+    pub next_cursor: Option<String>,
+}
+
+impl ConversationPageV1 {
+    /// `entries` read in order with one row beyond the page: the extra row only says more exist.
+    /// A page is cut at the entry limit or the encoded-size bound, whichever comes first.
+    pub fn bounded(mut entries: Vec<ConversationEntryV1>) -> Result<Self> {
+        let mut more = entries.len() > MAX_CONVERSATION_PAGE_ENTRIES;
+        entries.truncate(MAX_CONVERSATION_PAGE_ENTRIES);
+        let mut page = Self {
+            version: SCHEMA_VERSION_V1,
+            entries,
+            next_cursor: None,
+        };
+        loop {
+            page.next_cursor = more
+                .then(|| page.entries.last().map(ConversationEntryV1::cursor))
+                .flatten();
+            if page.validate_encoded_size().is_ok() {
+                break;
+            }
+            // The cursor is part of the bound, so it is recomputed after every cut.
+            if page.entries.pop().is_none() {
+                return Err(invalid("conversation page exceeds the bounded projection"));
+            }
+            more = true;
+        }
+        if more && page.next_cursor.is_none() {
+            return Err(invalid("conversation page exceeds the bounded projection"));
+        }
+        Ok(page)
+    }
+
+    pub fn validate_encoded_size(&self) -> Result<()> {
+        if self.entries.len() > MAX_CONVERSATION_PAGE_ENTRIES {
+            return Err(invalid("conversation page has too many entries"));
+        }
+        let bytes =
+            serde_json::to_vec(self).map_err(|_| invalid("conversation page is invalid"))?;
+        if bytes.len() > MAX_CHANGE_RECORD_RESPONSE_BYTES {
+            return Err(invalid("conversation page exceeds the bounded projection"));
         }
         Ok(())
     }
@@ -1519,5 +1620,85 @@ mod tests {
                 .to_string()
                 .contains("change record core exceeds the bounded projection")
         );
+    }
+
+    fn conversation_entry(index: u64, session_id: &str) -> ConversationEntryV1 {
+        ConversationEntryV1 {
+            session_id: session_id.into(),
+            sequence: index + 1,
+            event_id: "e".repeat(255),
+            kind: CapturedEventKindV1::AssistantMessage,
+            observed_at: 1,
+            digest: format!("{index:064x}"),
+            size_bytes: 10,
+            availability: ContentAvailabilityV1::Shared,
+            expires_at: Some(2),
+        }
+    }
+
+    #[test]
+    fn conversation_pages_stop_at_the_entry_limit_and_continue_after_the_last_entry() {
+        let entries: Vec<_> = (0..=MAX_CONVERSATION_PAGE_ENTRIES as u64)
+            .map(|index| conversation_entry(index, "s"))
+            .collect();
+        let page = ConversationPageV1::bounded(entries.clone()).unwrap();
+        assert_eq!(page.entries.len(), MAX_CONVERSATION_PAGE_ENTRIES);
+        let cursor = page.next_cursor.unwrap();
+        assert_eq!(cursor, entries[MAX_CONVERSATION_PAGE_ENTRIES - 1].cursor());
+        assert_eq!(
+            parse_conversation_cursor(&cursor).unwrap(),
+            ("s".to_owned(), 100, format!("{:064x}", 99))
+        );
+        let last = ConversationPageV1::bounded(entries[..3].to_vec()).unwrap();
+        assert_eq!((last.entries.len(), last.next_cursor), (3, None));
+    }
+
+    #[test]
+    fn conversation_pages_are_cut_to_the_encoded_size_bound() {
+        let session = "s".repeat(255);
+        let entries: Vec<_> = (0..=MAX_CONVERSATION_PAGE_ENTRIES as u64)
+            .map(|index| conversation_entry(index, &session))
+            .collect();
+        let page = ConversationPageV1::bounded(entries).unwrap();
+        assert!(page.entries.len() < MAX_CONVERSATION_PAGE_ENTRIES);
+        assert!(!page.entries.is_empty());
+        assert!(serde_json::to_vec(&page).unwrap().len() <= MAX_CHANGE_RECORD_RESPONSE_BYTES);
+        let cursor = page.next_cursor.as_deref().unwrap();
+        assert_eq!(cursor, page.entries.last().unwrap().cursor());
+        // The wire form is closed and the size check also applies to a decoded page.
+        let mut value = serde_json::to_value(&page).unwrap();
+        value["extra"] = json!(1);
+        assert!(serde_json::from_value::<ConversationPageV1>(value).is_err());
+        let mut oversized = page;
+        oversized.entries = (0..=MAX_CONVERSATION_PAGE_ENTRIES as u64)
+            .map(|index| conversation_entry(index, "s"))
+            .collect();
+        assert!(oversized.validate_encoded_size().is_err());
+    }
+
+    #[test]
+    fn conversation_cursors_are_validated() {
+        let digest = "a".repeat(64);
+        assert_eq!(
+            parse_conversation_cursor(&format!("7:{digest}:codex:session@1")).unwrap(),
+            ("codex:session@1".to_owned(), 7, digest.clone())
+        );
+        for bad in [
+            String::new(),
+            "7".into(),
+            format!("7:{digest}"),
+            format!("7:{digest}:"),
+            format!(":{digest}:s"),
+            format!("0:{digest}:s"),
+            format!("+7:{digest}:s"),
+            format!("1234567890123456789:{digest}:s"),
+            format!("7:{}:s", "A".repeat(64)),
+            format!("7:{}:s", "a".repeat(63)),
+            format!("7:{digest}:has space"),
+            format!("7:{digest}:../etc"),
+            format!("7:{digest}:{}", "s".repeat(256)),
+        ] {
+            assert!(parse_conversation_cursor(&bad).is_err(), "{bad}");
+        }
     }
 }

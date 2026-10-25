@@ -209,6 +209,10 @@ impl ApiError {
         Self { status, code }
     }
 
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
     pub fn invalid() -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,

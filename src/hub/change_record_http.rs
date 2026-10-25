@@ -5,17 +5,19 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Json, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 
 use crate::backend::{ImmutableBackend, ObjectKey, SOURCE_PROFILE_V1};
 use crate::change_record::{
     ActionFinishV1, ActionMutationReceiptV1, ActionStartV1, CaptureBatchV1, CaptureTargetV1,
-    ChangeRecordResponseV1, IngestReceiptV1, MAX_BATCH_BYTES, MAX_SHARED_BODY_BYTES,
+    ChangeRecordResponseV1, ConversationPageV1, IngestReceiptV1, MAX_BATCH_BYTES,
+    MAX_SHARED_BODY_BYTES,
 };
 use crate::store::digest;
 
-use super::change_record::SharedBodyState;
+use super::change_record::{SharedBodyState, conversation_readable};
 use super::http::{ApiError, Authenticated, JsonBody, Reader, blocking};
 use super::store::{Store, unix_now};
 use super::{HubError, HubState, Principal};
@@ -47,9 +49,14 @@ pub fn routes() -> Router<HubState> {
         )
         .route("/v1/hub/repos/{repo}/change-records/{work_id}", get(show))
         .route(
+            "/v1/hub/repos/{repo}/change-records/{work_id}/conversation",
+            get(list_conversation),
+        )
+        .route(
             "/v1/hub/repos/{repo}/change-records/{work_id}/conversation/{sha256}",
             put(upload_body)
                 .layer(DefaultBodyLimit::max(MAX_SHARED_BODY_BYTES as usize))
+                .get(read_body)
                 .delete(delete_body),
         )
 }
@@ -152,6 +159,133 @@ async fn show(
     let response = ChangeRecordResponseV1::bounded(summary)?;
     response.validate_encoded_size()?;
     Ok(Json(response))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConversationQuery {
+    cursor: Option<String>,
+}
+
+async fn list_conversation(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+    Path((repo, work_id)): Path<(String, String)>,
+    Query(query): Query<ConversationQuery>,
+) -> Result<Json<ConversationPageV1>, ApiError> {
+    scope(&principal, &repo)?;
+    Ok(Json(
+        conversation_page(&state, &principal, work_id, query.cursor).await?,
+    ))
+}
+
+/// The listing for the Work owner and Hub admins, shared by the HTTP and MCP reads.
+pub(super) async fn conversation_page(
+    state: &HubState,
+    principal: &Principal,
+    work_id: String,
+    cursor: Option<String>,
+) -> Result<ConversationPageV1, ApiError> {
+    let store = state.store.clone();
+    let token = principal.token_id.clone();
+    let read = blocking(state, move || {
+        store.shared_conversation_page(&token, &work_id, cursor.as_deref(), unix_now())
+    })
+    .await?
+    .ok_or_else(ApiError::not_found)?;
+    if !conversation_readable(
+        read.caller_owns_work,
+        state.login.is_admin_user(&principal.owner),
+    ) {
+        return Err(ApiError::forbidden());
+    }
+    let page = ConversationPageV1::bounded(read.entries)?;
+    page.validate_encoded_size()?;
+    Ok(page)
+}
+
+/// A shared body's verified bytes for the Work owner and Hub admins, shared by the HTTP and MCP
+/// reads. Unknown or never uploaded is `not_found`, expired or deleted is `gone`, and an
+/// object that is missing, corrupt or not the declared size is `integrity_failure` (424).
+pub(super) async fn conversation_body(
+    state: &HubState,
+    principal: &Principal,
+    work_id: String,
+    sha256: String,
+) -> Result<Vec<u8>, ApiError> {
+    if !lower_hex_digest(&sha256) {
+        return Err(ApiError::invalid());
+    }
+    let store = state.store.clone();
+    let objects = state.objects.clone();
+    let admin = state.login.is_admin_user(&principal.owner);
+    let token = principal.token_id.clone();
+    blocking(
+        state,
+        move || -> Result<Result<Vec<u8>, ApiError>, HubError> {
+            let now = unix_now();
+            let Some(access) = store.shared_body_lookup(&token, &work_id, &sha256, now)? else {
+                return Ok(Err(ApiError::not_found()));
+            };
+            if !access.readable(admin) {
+                return Ok(Err(ApiError::forbidden()));
+            }
+            match access.row.state_at(now) {
+                SharedBodyState::Declared => return Ok(Err(ApiError::not_found())),
+                SharedBodyState::Expired | SharedBodyState::Deleted => {
+                    return Ok(Err(ApiError::gone()));
+                }
+                SharedBodyState::Available => {}
+            }
+            match objects.get_verified(
+                &shared_body_key(&work_id, &sha256)?,
+                SHARED_BODY_INCARNATION,
+            ) {
+                Ok(bytes) if bytes.len() as u64 == access.row.size_bytes => Ok(Ok(bytes)),
+                Ok(_)
+                | Err(
+                    crate::Error::NotFound(_)
+                    | crate::Error::MissingObject(_)
+                    | crate::Error::Invalid(_),
+                ) => Ok(Err(ApiError::new(
+                    StatusCode::FAILED_DEPENDENCY,
+                    "integrity_failure",
+                ))),
+                Err(error) => Err(error.into()),
+            }
+        },
+    )
+    .await?
+}
+
+async fn read_body(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+    Path((repo, work_id, sha256)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    scope(&principal, &repo)?;
+    let bytes = conversation_body(&state, &principal, work_id, sha256).await?;
+    // The body is untrusted agent output: never let a browser render or sniff it.
+    let mut response = bytes.into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment; filename=\"conversation.json\""),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'none'; sandbox"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
 }
 
 fn scope(principal: &Principal, repo: &str) -> Result<(), ApiError> {
