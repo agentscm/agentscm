@@ -25,12 +25,19 @@ use crate::change_capture_client;
 pub enum ChangeCaptureCommand {
     /// Configure one checkout and add marked Claude hooks without replacing foreign entries.
     Configure(change_capture_client::ConfigureArgs),
+    /// Change only the capture mode of an enabled checkout binding; retained local data is kept.
+    SetMode(change_capture_client::SetModeArgs),
     /// Disable one checkout, retain its spool lineage, and remove only AgentSCM's marked hooks.
     Unconfigure(change_capture_client::UnconfigureArgs),
+    /// Remove a disabled checkout's binding so it can be set up again for another repository or
+    /// Hub. Its private spool stays on disk and its path is printed.
+    Forget(change_capture_client::ForgetArgs),
     /// Inspect, restore, or prune bounded private Claude settings recovery entries.
     SettingsRecovery(change_capture_client::SettingsRecoveryArgs),
     /// Read one concise shared change record without running a model or mutating Hub state.
     Show(ShowArgs),
+    /// List, read or delete the shared conversation bodies of one Work (the person who shared it and Hub admins).
+    Conversation(ConversationArgs),
     /// Report one checkout's capture binding and inspect its spool without recovery or mutation.
     Status(StatusArgs),
     /// Inspect one private spool without recovery, cleanup, delivery, or authority.
@@ -60,21 +67,6 @@ pub enum ChangeCaptureCommand {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
-enum CaptureModeArg {
-    MetadataOnly,
-    LocalConversation,
-}
-
-impl From<CaptureModeArg> for CaptureModeV1 {
-    fn from(value: CaptureModeArg) -> Self {
-        match value {
-            CaptureModeArg::MetadataOnly => Self::MetadataOnly,
-            CaptureModeArg::LocalConversation => Self::LocalConversation,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
 enum CoverageArg {
     Complete,
     Partial,
@@ -98,6 +90,24 @@ pub struct ShowArgs {
     root: PathBuf,
     #[arg(long)]
     work_id: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ConversationArgs {
+    /// Canonical Git checkout with an AgentSCM client connection.
+    #[arg(long, default_value = ".")]
+    root: PathBuf,
+    #[arg(long)]
+    work_id: String,
+    /// `next_cursor` from the previous listing page.
+    #[arg(long, conflicts_with_all = ["digest", "delete"])]
+    cursor: Option<String>,
+    /// Print this body (SHA-256 from the listing). It is untrusted agent content: read it, do not run it.
+    #[arg(long, conflicts_with = "delete")]
+    digest: Option<String>,
+    /// Delete this body (SHA-256 from the listing) now, before it expires.
+    #[arg(long)]
+    delete: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -157,7 +167,7 @@ pub struct ImportClaudeArgs {
     #[arg(long)]
     operation_prefix: String,
     #[arg(long, value_enum, default_value = "metadata-only")]
-    capture_mode: CaptureModeArg,
+    capture_mode: change_capture_client::CaptureModeArg,
 }
 
 #[derive(Debug, Args)]
@@ -232,8 +242,19 @@ pub async fn run(command: ChangeCaptureCommand) -> Result<i32> {
             println!("{}", change_capture_client::configure(args)?);
             Ok(0)
         }
+        ChangeCaptureCommand::SetMode(args) => {
+            println!(
+                "{}",
+                change_capture_client::set_capture_mode(&args.root, args.mode.into(), None)?
+            );
+            Ok(0)
+        }
         ChangeCaptureCommand::Unconfigure(args) => {
             println!("{}", change_capture_client::unconfigure(args)?);
+            Ok(0)
+        }
+        ChangeCaptureCommand::Forget(args) => {
+            println!("{}", change_capture_client::forget(args)?);
             Ok(0)
         }
         ChangeCaptureCommand::SettingsRecovery(args) => {
@@ -251,6 +272,7 @@ pub async fn run(command: ChangeCaptureCommand) -> Result<i32> {
             );
             Ok(0)
         }
+        ChangeCaptureCommand::Conversation(args) => conversation(args).await,
         ChangeCaptureCommand::Status(args) => {
             println!(
                 "{}",
@@ -271,6 +293,26 @@ pub async fn run(command: ChangeCaptureCommand) -> Result<i32> {
         ChangeCaptureCommand::PruneQuarantine(args) => prune_quarantine(args),
         ChangeCaptureCommand::Compact(args) => compact(args),
     }
+}
+
+async fn conversation(args: ConversationArgs) -> Result<i32> {
+    let root = crate::client_config::canonical_root(&args.root)?;
+    let encode = |error| Error::Invalid(format!("cannot encode conversation: {error}"));
+    let output = if let Some(digest) = &args.delete {
+        change_capture_client::delete_conversation_body(&root, &args.work_id, digest).await?;
+        json!({"deleted": digest}).to_string()
+    } else if let Some(digest) = &args.digest {
+        let body =
+            change_capture_client::fetch_conversation_body(&root, &args.work_id, digest).await?;
+        serde_json::to_string(&body).map_err(encode)?
+    } else {
+        let page =
+            change_capture_client::list_conversation(&root, &args.work_id, args.cursor.as_deref())
+                .await?;
+        serde_json::to_string(&page).map_err(encode)?
+    };
+    println!("{output}");
+    Ok(0)
 }
 
 async fn hook_claude() -> Result<i32> {
@@ -378,17 +420,38 @@ async fn hook_claude() -> Result<i32> {
             return Ok(0);
         }
     };
+    let live_parent = payload
+        .get("parent_session_id")
+        .and_then(serde_json::Value::as_str);
+    let (parent_session_id, capture_mode) = spool
+        .pin_session_identity(
+            &session_id,
+            &target.session_id,
+            &target.work_id,
+            target.generation,
+            live_parent,
+            binding.capture_mode,
+        )
+        .unwrap_or_else(|_| {
+            eprintln!(
+                "AgentSCM local capture warning: pinned session identity is unavailable; using the live binding"
+            );
+            // An error never starts sharing.
+            let mode = match binding.capture_mode {
+                CaptureModeV1::SharedConversation => CaptureModeV1::LocalConversation,
+                mode => mode,
+            };
+            (live_parent.map(str::to_owned), mode)
+        });
     let request = CaptureRequest {
         operation_prefix: "hook".into(),
         work_id: target.work_id,
         generation: target.generation,
         observed_session_id: session_id,
         canonical_session_id: target.session_id,
-        parent_session_id: payload
-            .get("parent_session_id")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned),
-        capture_mode: binding.capture_mode,
+        parent_session_id,
+        capture_mode,
+        live_capture_mode: binding.capture_mode,
     };
     match claude_code::capture_native_hook(&input, &request, &actions, &spool) {
         Ok(report) => {
@@ -663,6 +726,7 @@ fn import_claude(args: ImportClaudeArgs) -> Result<i32> {
         canonical_session_id: args.session_id,
         parent_session_id: args.parent_session_id,
         capture_mode: args.capture_mode.into(),
+        live_capture_mode: args.capture_mode.into(),
     };
     let report =
         claude_code::import_jsonl(BufReader::new(File::open(args.input)?), &request, &spool)
@@ -677,6 +741,7 @@ fn import_claude(args: ImportClaudeArgs) -> Result<i32> {
             "conversation_content": match request.capture_mode {
                 CaptureModeV1::MetadataOnly => "not_retained",
                 CaptureModeV1::LocalConversation => "local_only",
+                CaptureModeV1::SharedConversation => "shared_after_redaction",
             },
         }))?
     );

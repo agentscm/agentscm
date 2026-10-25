@@ -22,7 +22,7 @@ import {
   type ExplorerSessionPage,
   type ExplorerSummary,
 } from '../repoExplorer.ts'
-import { Ago, CopyButton, Empty, Icon, Notice, Pill, Skeleton, type Tone } from '../ui.tsx'
+import { Ago, CopyButton, Empty, Icon, Notice, Pill, Reported, Skeleton, type Tone } from '../ui.tsx'
 import { onFrontDoor } from '../frontDoor.ts'
 import '../explorer.css'
 
@@ -198,7 +198,7 @@ function WorkLink({ workId, repository, hubRepository }: { workId: string; repos
 function SessionRow({ entry, repository, hubRepository, onConversation }: { entry: ExplorerSessionEvidence; repository: string; hubRepository?: string | null; onConversation: (entry: ExplorerSessionEvidence) => void }) {
   return (
     <li className="explorer-evidence-row">
-      <div className="explorer-evidence-heading"><Icon name="chat-square-text" /><strong>{entry.harness === 'claude_code' ? 'Claude Code session' : 'Codex session'}</strong><Pill tone={entry.capture_mode === 'local_conversation' ? 'brand' : 'muted'}>{entry.capture_mode === 'local_conversation' ? 'Visible turns retained' : 'Metadata only'}</Pill></div>
+      <div className="explorer-evidence-heading"><Icon name="chat-square-text" /><strong>{entry.harness === 'claude_code' ? 'Claude Code session' : 'Codex session'}</strong><Pill tone={entry.capture_mode === 'metadata_only' ? 'muted' : 'brand'}>{{ metadata_only: 'Metadata only', local_conversation: 'Visible turns retained', shared_conversation: 'Shared with Hub' }[entry.capture_mode]}</Pill></div>
       <p>{entry.event_count} visible {entry.event_count === 1 ? 'event' : 'events'} in the retained session projection.</p>
       <p className="small muted">Same Work/session only · no prompt-to-file or authorship claim{entry.unavailable_body_count ? ` · ${entry.unavailable_body_count} unavailable bodies` : ''}{entry.capture_gap_count ? ` · ${entry.capture_gap_count} capture gaps` : ''}</p>
       <div className="explorer-row-actions"><button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => onConversation(entry)}>Open conversation</button><WorkLink workId={entry.work_id} repository={repository} hubRepository={hubRepository} /></div>
@@ -268,7 +268,7 @@ function Conversation({ selected, load, pager, onClose }: { selected: ExplorerSe
       {load.kind === 'error' && <Notice tone="bad" title="Could not read this conversation">{load.message}</Notice>}
       {load.kind === 'ready' && <>
         {!load.value.projection_coverage.complete && <Notice tone="warn" title="Conversation coverage is incomplete">{load.value.projection_coverage.unavailable_bodies > 0 ? `${load.value.projection_coverage.unavailable_bodies} ${load.value.projection_coverage.unavailable_bodies === 1 ? 'body is' : 'bodies are'} known to be unavailable. ` : ''}{load.value.projection_coverage.unverified_bodies > 0 ? `${load.value.projection_coverage.unverified_bodies} ${load.value.projection_coverage.unverified_bodies === 1 ? 'body has' : 'bodies have'} not been checked in this read. ` : ''}Missing or compacted content stays missing; the explorer does not reconstruct it.</Notice>}
-        {load.value.events.length === 0 ? <Empty icon="chat-square" title="No visible events retained" /> : <ol className="explorer-conversation-list">{load.value.events.map((event) => <li key={`${event.sequence}|${event.event_id}`} className={`kind-${event.kind}`}><div className="explorer-turn-head"><strong>{titleCase(event.kind)}</strong><span><Ago at={event.observed_at} /> · #{event.sequence}</span></div>{event.body.content !== null ? <pre><code>{event.body.content}</code></pre> : <p className="small muted">Body {titleCase(event.body.availability).toLowerCase()}.</p>}{event.gap && <p className="small warn-text">Missing sequence {event.gap.first_missing}–{event.gap.last_missing}: {titleCase(event.gap.reason).toLowerCase()}.</p>}</li>)}</ol>}
+        {load.value.events.length === 0 ? <Empty icon="chat-square" title="No visible events retained" /> : <ol className="explorer-conversation-list">{load.value.events.map((event) => <li key={`${event.sequence}|${event.event_id}`} className={`kind-${event.kind}`}><div className="explorer-turn-head"><strong>{titleCase(event.kind)}</strong><span><Reported at={event.observed_at} /> · #{event.sequence}</span></div>{event.body.content !== null ? <pre><code>{event.body.content}</code></pre> : <p className="small muted">Body {titleCase(event.body.availability).toLowerCase()}.</p>}{event.gap && <p className="small warn-text">Missing sequence {event.gap.first_missing}–{event.gap.last_missing}: {titleCase(event.gap.reason).toLowerCase()}.</p>}</li>)}</ol>}
         <CursorPaging previous={pager.newer} next={load.value.next_cursor} onNext={pager.older} label="Conversation" />
       </>}
     </aside>

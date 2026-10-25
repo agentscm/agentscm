@@ -91,9 +91,24 @@ The optional macOS tray is part of this same binary; no separate app install is 
 `npx agentscm tray`, or add `--tray` to quickstart to open it after successful setup. Start at
 Login is off until enabled in the tray menu. The alpha binary is not signed or notarized, and the
 tray does not update independently; install a newer AgentSCM release through the same installer.
-Each checkout menu groups its status, opening actions, **Agent Integrations**, **Connection Details**,
-**Recent Activity** and **Troubleshooting**. Connection Details shows the full checkout path and
+Each checkout menu groups its status, opening actions, a **Share agent conversations with Hub**
+switch, **Agent Integrations**, **Connection Details**, **Recent Activity** and **Troubleshooting**. Connection Details shows the full checkout path and
 connection values.
+
+The **Share agent conversations with Hub** item is off by default. Turning it on takes two steps:
+the first click only opens the status window with what sharing does and adds **Confirm: share
+conversations with <hub>** to that checkout's menu, and only that item changes anything. The
+confirmation names the Hub shown, and is refused if the checkout has since been connected to another
+one. Turning it on for a connected
+checkout sets capture up first if it never was (one step, documented defaults; see
+[change capture](change-capture.md#one-step-setup-from-the-menu-bar-and-the-local-page)) and
+switches that checkout to `shared-conversation` mode: new conversations are redacted on this
+machine on a best-effort basis and uploaded to the Hub, kept for the number of days the Hub reports (30 unless its operator changed it), where only you (the person who shared them) and Hub
+admins can read them. The status window says this before it turns on. The same switch is under
+**Settings → Conversation sharing** on the Hub page opened from this computer. Turning it off sets `metadata-only` (not a previous `local-conversation`); conversations stay on this machine,
+and copies already uploaded remain until they expire or you delete them. Nothing local is deleted.
+It is the same change as `agentscm change-capture set-mode`; see
+[sharing conversations](change-capture.md#sharing-conversations-with-the-hub).
 
 Copied reconnect, repository-guidance and Terminal setup commands use the running executable's
 full path, so they work before `agentscm` is on your shell's `PATH`.

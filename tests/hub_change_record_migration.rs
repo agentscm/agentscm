@@ -191,11 +191,12 @@ fn seed_representative_work(db: &Db) -> Fixture {
 
 fn remove_change_records(db: &Db) {
     db.execute(
-        "DROP TABLE hub_change_events;
+        "DROP TABLE hub_change_shared_bodies;
+         DROP TABLE hub_change_events;
          DROP TABLE hub_change_actions;
          DROP TABLE hub_change_sessions;
          DROP TABLE hub_change_operations;
-         DELETE FROM hub_named_migrations WHERE name = 'change_records';",
+         DELETE FROM hub_named_migrations WHERE name IN ('change_records', 'shared_conversations');",
     )
     .unwrap();
     assert_eq!(
@@ -241,6 +242,8 @@ fn write_change_record(store: &dyn Store, fixture: &Fixture) -> Value {
                     artifact: None,
                     setup: None,
                     gap: None,
+                    boundary: None,
+                    subagent: None,
                 }],
             },
             now,
@@ -318,9 +321,16 @@ fn assert_migrated_schema(db: &Db) {
         "hub_change_sessions",
         "hub_change_events",
         "hub_change_actions",
+        "hub_change_shared_bodies",
     ] {
         assert!(db.table_exists(table), "missing {table}");
     }
+    assert_eq!(
+        db.scalar("SELECT count(*) FROM hub_named_migrations WHERE name = 'shared_conversations'"),
+        1
+    );
+    assert!(db.index_exists("hub_change_shared_bodies_expiry"));
+    assert!(db.index_exists("hub_change_shared_bodies_sweep"));
     assert!(db.index_exists("hub_change_events_page"));
     assert!(db.index_exists("hub_change_actions_latest"));
 }
@@ -1231,5 +1241,42 @@ mod on_postgres {
         clone.cleanup();
         drop(db);
         original_database.cleanup();
+    }
+}
+
+fn shared_body_digest_must_be_lower_hex(db: &Db) {
+    drop(db.open());
+    let insert = |digest: &str| {
+        db.execute(&format!(
+            "INSERT INTO hub_change_shared_bodies
+             (work, digest, author, size_bytes, media, session_id, generation, event_id, sequence,
+              declared_token, declared_at, state)
+             VALUES ('work_none', '{digest}', 'usr_none', 1, 'json', 's', 1, 'e', 1, 'tok_none', 0,
+                     'declared')"
+        ))
+        .unwrap_err()
+        .to_lowercase()
+    };
+    // A well-formed digest gets past the checks and meets the foreign key instead.
+    assert!(insert(&"a".repeat(64)).contains("foreign key"));
+    for bad in [
+        "A".repeat(64),
+        "g".repeat(64),
+        "a".repeat(63),
+        "a".repeat(65),
+    ] {
+        assert!(insert(&bad).contains("check"), "{bad}");
+    }
+}
+
+#[test]
+fn sqlite_shared_body_digest_must_be_lower_hex() {
+    shared_body_digest_must_be_lower_hex(&Db::sqlite());
+}
+
+#[test]
+fn postgres_shared_body_digest_must_be_lower_hex() {
+    if let Some(db) = Db::postgres() {
+        shared_body_digest_must_be_lower_hex(&db);
     }
 }

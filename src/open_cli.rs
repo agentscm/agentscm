@@ -395,19 +395,18 @@ mod tests {
 
     #[test]
     fn the_handoff_file_is_owner_only_and_carries_the_link() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let config = tempfile::tempdir().unwrap();
-        // SAFETY: nextest runs each test in its own process, so no other thread reads it.
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", config.path()) };
-        let target = "http://127.0.0.1:7340/ui/#pair=aa&repo=acme/widgets@https://hub.example";
-        let path = handoff(target).unwrap();
-        assert!(path.starts_with(config.path()));
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o077,
-            0
-        );
-        let page = std::fs::read_to_string(&path).unwrap();
-        assert!(page.contains(&serde_json::to_string(target).unwrap()));
-        assert!(page.contains("pair=aa&amp;repo="));
+        crate::client_config::in_isolated_config_home(|config| {
+            use std::os::unix::fs::PermissionsExt as _;
+            let target = "http://127.0.0.1:7340/ui/#pair=aa&repo=acme/widgets@https://hub.example";
+            let path = handoff(target).unwrap();
+            assert!(path.starts_with(config));
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o077,
+                0
+            );
+            let page = std::fs::read_to_string(&path).unwrap();
+            assert!(page.contains(&serde_json::to_string(target).unwrap()));
+            assert!(page.contains("pair=aa&amp;repo="));
+        });
     }
 }

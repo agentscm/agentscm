@@ -60,6 +60,9 @@ pub enum HubCommand {
         /// How many days back a branch's last commit counts as recent.
         #[arg(long, default_value_t = 14, value_parser = clap::value_parser!(i64).range(1..=365))]
         activity_days: i64,
+        /// Days an uploaded shared-conversation body stays readable before it expires.
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(i64).range(1..=3650))]
+        shared_conversation_retention_days: i64,
     },
     /// Sign in to a hub; the session is saved for the token commands.
     Login {
@@ -224,6 +227,7 @@ pub async fn run(command: HubCommand, data_dir: &std::path::Path) -> Result<()> 
             secrets,
             poll_seconds,
             activity_days,
+            shared_conversation_retention_days,
         } => {
             let database_url = match std::env::var("AGENTSCM_DATABASE_URL") {
                 Ok(url) => url,
@@ -243,6 +247,7 @@ pub async fn run(command: HubCommand, data_dir: &std::path::Path) -> Result<()> 
                 secrets,
                 poll_seconds,
                 activity_days,
+                shared_conversation_retention_days,
             })
             .await
             .map_err(map_hub_error)

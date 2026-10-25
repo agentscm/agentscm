@@ -15,11 +15,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use agentscm::Result;
+use agentscm::change_record::CaptureModeV1;
 use agentscm::repo_explorer::Explorer;
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -47,6 +48,9 @@ const MAX_HUB_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_HUB_READS: usize = 8;
 /// How long the list of current connections is reused before Git is asked again.
 const CONNECTIONS_TTL: Duration = Duration::from_secs(5);
+/// How long a Hub's reported retention is reused, and how long the page waits to learn it.
+const RETENTION_TTL: Duration = Duration::from_secs(60);
+const RETENTION_TIMEOUT: Duration = Duration::from_secs(3);
 const SHUTDOWN_REVOKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The most one mint (session check, forge check, mint and confirmation) may take, so a slow
 /// Hub cannot hold a repository's token for longer.
@@ -84,6 +88,8 @@ pub(super) struct FrontDoor {
     retired: Arc<Mutex<Vec<CachedToken>>>,
     hub_reads: tokio::sync::Semaphore,
     client: reqwest::Client,
+    /// Days each Hub said it keeps a shared conversation (`None`: it did not say), by Hub URL.
+    retention: Mutex<HashMap<String, (Instant, Option<i64>)>>,
 }
 
 #[derive(Default)]
@@ -161,15 +167,22 @@ fn credential(headers: &HeaderMap) -> Option<(&str, &str)> {
         .split_once(':')
 }
 
+/// Every current checkout connection on this computer.
+fn all_connections() -> Vec<Connection> {
+    client_config::load()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(client_config::is_current)
+        .collect()
+}
+
 /// Every current connection on this computer, one per repository and Hub (the first checkout
 /// wins), which is what a selector can name. The same repository can be connected to different
 /// Hubs in different checkouts.
 fn current_connections() -> Vec<Connection> {
     let mut seen = std::collections::BTreeSet::new();
-    client_config::load()
-        .unwrap_or_default()
+    all_connections()
         .into_iter()
-        .filter(client_config::is_current)
         .filter(|connection| {
             seen.insert((connection.repo.to_ascii_lowercase(), connection.hub.clone()))
         })
@@ -218,9 +231,55 @@ impl FrontDoor {
             tokens: Mutex::new(HashMap::new()),
             retired: Arc::new(Mutex::new(Vec::new())),
             hub_reads: tokio::sync::Semaphore::new(MAX_HUB_READS),
+            retention: Mutex::new(HashMap::new()),
             client: agentscm::hub::forge_http::client()
                 .map_err(|_| agentscm::Error::Invalid("HTTP client unavailable".into()))?,
         })
+    }
+
+    fn cached_retention(&self, hub: &str) -> Option<(Instant, Option<i64>)> {
+        self.retention
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(hub)
+            .copied()
+    }
+
+    /// Days the connection's Hub says it keeps a shared conversation, from its `whoami` with the
+    /// checkout's own agent token. `None` when the Hub is unreachable, slow, older or says
+    /// nothing usable; the answer (or its absence) is reused for [`RETENTION_TTL`].
+    async fn retention_days(&self, connection: &Connection) -> Option<i64> {
+        if let Some((at, days)) = self.cached_retention(&connection.hub)
+            && at.elapsed() < RETENTION_TTL
+        {
+            return days;
+        }
+        let token_file = connection.token_file.clone();
+        let token = tokio::task::spawn_blocking(move || crate::client_cli::read_token(&token_file))
+            .await
+            .ok()
+            .and_then(Result::ok);
+        let days = match token {
+            Some(token) => tokio::time::timeout(
+                RETENTION_TIMEOUT,
+                crate::client_status::check_hub(connection, &token, None),
+            )
+            .await
+            .ok()
+            .and_then(|(check, _)| match check {
+                crate::client_status::HubCheck::Valid {
+                    shared_conversation_retention_days,
+                    ..
+                } => shared_conversation_retention_days,
+                _ => None,
+            }),
+            None => None,
+        };
+        self.retention
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(connection.hub.clone(), (Instant::now(), days));
+        days
     }
 
     pub(super) fn admin_secret(&self) -> &str {
@@ -579,6 +638,12 @@ pub(super) fn router(state: AppState, front_door: Arc<FrontDoor>) -> Router {
     let granted = Router::new()
         .route("/v1/local/repositories", get(repositories))
         .route("/v1/local/session", delete(disconnect))
+        .route(
+            "/v1/local/capture",
+            get(capture_settings)
+                .post(capture_change)
+                .layer(DefaultBodyLimit::max(1024)),
+        )
         .with_state(front_door.clone())
         .merge(selected)
         .layer(middleware::from_fn_with_state(front_door.clone(), guard));
@@ -776,6 +841,177 @@ async fn repositories(State(front_door): State<Arc<FrontDoor>>) -> Response {
         })
         .collect();
     Json(json!({"version": 1, "repositories": repositories})).into_response()
+}
+
+/// The page's name for one checkout: derived from this service's random instance and the
+/// checkout's path. It is opaque to the browser (not a path, and mapped back to the checkout here,
+/// never by the browser) and scoped to one service run, so ids change after a restart. It is a
+/// name, not a secret: the identity probe exposes the instance, so anyone who also knows a path
+/// could compute it. Using it still needs a live grant on the capture routes.
+fn checkout_id(instance: &str, connection: &Connection) -> String {
+    let mut digest = Sha256::new();
+    digest.update(instance.as_bytes());
+    digest.update([0]);
+    digest.update(connection.root.as_os_str().as_encoded_bytes());
+    format!("{:x}", digest.finalize())[..24].to_owned()
+}
+
+/// One checkout's sharing state, with the repository and Hub the page shows the person.
+fn capture_row(
+    instance: &str,
+    connection: &Connection,
+    retention_days: Option<i64>,
+) -> serde_json::Value {
+    let setting = crate::change_capture_client::capture_setting(connection);
+    let mismatch = setting
+        .as_ref()
+        .and_then(|setting| setting.lineage_mismatch.as_ref());
+    json!({
+        "id": checkout_id(instance, connection),
+        "repository": connection.repo,
+        "hub": connection.hub,
+        "folder": connection.root.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default(),
+        "configured": setting.as_ref().is_some_and(|setting| setting.configured),
+        "enabled": setting.as_ref().is_some_and(|setting| setting.enabled),
+        "mode": setting.as_ref().and_then(|setting| setting.mode),
+        "readable": setting.is_some(),
+        "lineage_mismatch": mismatch.is_some(),
+        "saved_repository": mismatch.map(|saved| saved.repository.as_str()),
+        "saved_hub": mismatch.map(|saved| saved.hub.as_str()),
+        // What this Hub said, or null when it did not; the page never states a number it lacks.
+        "shared_conversation_retention_days": retention_days,
+    })
+}
+
+async fn capture_settings(State(front_door): State<Arc<FrontDoor>>) -> Response {
+    let instance = front_door.instance.clone();
+    let (connections, mut rows) = tokio::task::spawn_blocking(move || {
+        let connections = all_connections();
+        let rows = connections
+            .iter()
+            .map(|connection| capture_row(&instance, connection, None))
+            .collect::<Vec<_>>();
+        (connections, rows)
+    })
+    .await
+    .unwrap_or_default();
+    // One lookup per Hub, all at once, so a slow Hub delays the list by one timeout at most.
+    let mut lookups = tokio::task::JoinSet::new();
+    let mut hubs = std::collections::BTreeSet::new();
+    for connection in &connections {
+        if hubs.insert(connection.hub.clone()) {
+            let (door, connection) = (front_door.clone(), connection.clone());
+            lookups.spawn(async move {
+                (
+                    connection.hub.clone(),
+                    door.retention_days(&connection).await,
+                )
+            });
+        }
+    }
+    let mut days: HashMap<String, Option<i64>> = HashMap::new();
+    while let Some(Ok((hub, found))) = lookups.join_next().await {
+        days.insert(hub, found);
+    }
+    for (row, connection) in rows.iter_mut().zip(&connections) {
+        row["shared_conversation_retention_days"] =
+            json!(days.get(&connection.hub).copied().flatten());
+    }
+    Json(json!({"version": 1, "checkouts": rows})).into_response()
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureChange {
+    /// The listed checkout's id.
+    id: String,
+    /// The repository and Hub the person was shown for that checkout. Turning sharing on is
+    /// refused if the checkout is connected to anything else by the time it is applied.
+    repository: String,
+    hub: String,
+    mode: CaptureModeV1,
+    /// Required to turn sharing on: the person has seen what leaves this computer.
+    #[serde(default)]
+    confirm_sharing: bool,
+}
+
+/// Turns conversation sharing on or off for one listed checkout. Sharing can start uploading
+/// conversation bodies, so it needs the page's own origin, a live grant and an explicit
+/// confirmation; the checkout is found by its listed id, never by a path.
+async fn capture_change(
+    State(front_door): State<Arc<FrontDoor>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let Ok(change) = serde_json::from_slice::<CaptureChange>(&body) else {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "expected {id, repository, hub, mode, confirm_sharing}",
+        );
+    };
+    let sharing = match change.mode {
+        CaptureModeV1::SharedConversation => true,
+        CaptureModeV1::MetadataOnly => false,
+        CaptureModeV1::LocalConversation => {
+            return refuse(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "mode must be metadata_only or shared_conversation",
+            );
+        }
+    };
+    if sharing && !change.confirm_sharing {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "confirmation_required",
+            "turning sharing on needs confirm_sharing: true after the person has seen what is uploaded",
+        );
+    }
+    let instance = front_door.instance.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let connection = all_connections()
+            .into_iter()
+            .find(|connection| checkout_id(&instance, connection) == change.id)?;
+        let expected = crate::change_capture_client::ExpectedTarget {
+            repository: &change.repository,
+            hub: &change.hub,
+        };
+        let result = if sharing {
+            crate::change_capture_client::enable_capture(&connection.root, change.mode, expected)
+        } else {
+            crate::change_capture_client::set_capture_mode(
+                &connection.root,
+                change.mode,
+                Some(expected),
+            )
+        };
+        Some(result.map(|_| connection))
+    })
+    .await;
+    match outcome {
+        Ok(Some(Ok(connection))) => {
+            let days = front_door
+                .cached_retention(&connection.hub)
+                .and_then(|(_, days)| days);
+            let row = capture_row(&front_door.instance, &connection, days);
+            Json(json!({"version": 1, "checkout": row})).into_response()
+        }
+        Ok(Some(Err(error))) => {
+            // The detail can name local paths, so it stays in this process's log.
+            eprintln!("local capture change refused: {error}");
+            refuse(
+                StatusCode::CONFLICT,
+                "capture_unavailable",
+                crate::change_capture_client::PageRefusal::of(&error).message(),
+            )
+        }
+        Ok(None) => refuse(StatusCode::NOT_FOUND, "unknown_checkout", REPOSITORY_GONE),
+        Err(_) => refuse(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "capture_failed",
+            "the change stopped unexpectedly",
+        ),
+    }
 }
 
 async fn disconnect(

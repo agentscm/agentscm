@@ -8,6 +8,7 @@ use std::time::Duration;
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 
+use agentscm::change_record::CaptureModeV1;
 use agentscm::hub::forge_http::{self, send};
 use agentscm::hub::onboarding::{Blocker, CLIENT_HEADER};
 use agentscm::hub::store::unix_now;
@@ -40,6 +41,22 @@ pub(crate) struct ConnectionStatus {
     pub(crate) credential: CredentialStatus,
     pub(crate) hub_check: HubCheck,
     pub(crate) recent_participation: Vec<Participation>,
+    /// Capture mode of this checkout's enabled change-capture binding. Absent when the checkout
+    /// has no enabled binding or the capture config cannot be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) capture_mode: Option<CaptureModeV1>,
+    /// The repository and Hub this checkout's saved capture binding belongs to when that is not
+    /// what the checkout is connected to now. Sharing can then only be turned off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) capture_mismatch: Option<CaptureMismatch>,
+}
+
+/// Change capture is Unix-only, so only Unix code builds one.
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct CaptureMismatch {
+    pub(crate) repository: String,
+    pub(crate) hub: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -92,6 +109,10 @@ pub(crate) enum HubCheck {
         host: String,
         login: String,
         expires_at: i64,
+        /// Days the Hub keeps an uploaded shared conversation, as the Hub reported. Absent from an
+        /// older Hub, so callers must not assume a number.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        shared_conversation_retention_days: Option<i64>,
     },
     Rejected {
         checked_at: i64,
@@ -235,8 +256,24 @@ async fn collect_until(
     completed
 }
 
+/// Change capture is Unix-only, so elsewhere no checkout reports a capture mode.
+fn capture_for(connection: &Connection) -> (Option<CaptureModeV1>, Option<CaptureMismatch>) {
+    #[cfg(unix)]
+    {
+        crate::change_capture_client::capture_setting(connection).map_or((None, None), |setting| {
+            (setting.mode, setting.lineage_mismatch)
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = connection;
+        (None, None)
+    }
+}
+
 fn unresolved_status(connection: Connection, now: i64) -> ConnectionStatus {
     let credential = credential_status(&connection, false, now);
+    let (capture_mode, capture_mismatch) = capture_for(&connection);
     ConnectionStatus {
         root: connection.root,
         repository: connection.repo,
@@ -252,6 +289,8 @@ fn unresolved_status(connection: Connection, now: i64) -> ConnectionStatus {
             checked_at: unix_now(),
         },
         recent_participation: Vec::new(),
+        capture_mode,
+        capture_mismatch,
     }
 }
 
@@ -282,6 +321,7 @@ async fn connection_status(connection: Connection, check: bool, now: i64) -> Con
     if check && current && !still_current(&connection, generation.as_deref()) {
         return unresolved_status(connection, now);
     }
+    let (capture_mode, capture_mismatch) = capture_for(&connection);
     ConnectionStatus {
         root: connection.root,
         repository: connection.repo,
@@ -299,6 +339,8 @@ async fn connection_status(connection: Connection, check: bool, now: i64) -> Con
         credential,
         hub_check,
         recent_participation,
+        capture_mode,
+        capture_mismatch,
     }
 }
 
@@ -444,7 +486,18 @@ pub(crate) async fn check_hub(
         Some(client_id) => onboarding(&client, connection, token, client_id).await,
         None => Vec::new(),
     };
-    finalize_hub_check(expires_at, unix_now(), provider, host, login, participation)
+    let retention_days = reply["shared_conversation_retention_days"]
+        .as_i64()
+        .filter(|days| (1..=3650).contains(days));
+    finalize_hub_check(
+        expires_at,
+        unix_now(),
+        provider,
+        host,
+        login,
+        retention_days,
+        participation,
+    )
 }
 
 fn finalize_hub_check(
@@ -453,6 +506,7 @@ fn finalize_hub_check(
     provider: &str,
     host: &str,
     login: &str,
+    shared_conversation_retention_days: Option<i64>,
     mut participation: Vec<Participation>,
 ) -> (HubCheck, Vec<Participation>) {
     if expires_at <= checked_at {
@@ -466,6 +520,7 @@ fn finalize_hub_check(
             host: crate::hub_cli::clean(host),
             login: crate::hub_cli::clean(login),
             expires_at,
+            shared_conversation_retention_days,
         },
         participation,
     )
@@ -561,6 +616,7 @@ mod tests {
                 host: "github.com".into(),
                 login: "synthetic".into(),
                 expires_at: 2,
+                shared_conversation_retention_days: None,
             };
             (root, status)
         });
@@ -575,6 +631,37 @@ mod tests {
             completed.get(Path::new("/fast")).unwrap().hub_check,
             HubCheck::Valid { .. }
         ));
+    }
+
+    #[test]
+    fn capture_mode_is_reported_only_when_a_binding_supplies_it() {
+        let mut status = unresolved_status(connection("/synthetic/unbound-checkout"), 1);
+        assert_eq!(status.capture_mode, None);
+        assert!(
+            serde_json::to_value(&status)
+                .unwrap()
+                .get("capture_mode")
+                .is_none()
+        );
+        status.capture_mode = Some(CaptureModeV1::SharedConversation);
+        assert_eq!(
+            serde_json::to_value(&status).unwrap()["capture_mode"],
+            "shared_conversation"
+        );
+        assert!(
+            serde_json::to_value(&status)
+                .unwrap()
+                .get("capture_mismatch")
+                .is_none()
+        );
+        status.capture_mismatch = Some(CaptureMismatch {
+            repository: "owner/repo".into(),
+            hub: "https://old.example.test".into(),
+        });
+        assert_eq!(
+            serde_json::to_value(&status).unwrap()["capture_mismatch"]["hub"],
+            "https://old.example.test"
+        );
     }
 
     #[test]
@@ -605,6 +692,7 @@ mod tests {
             "github",
             "github.com",
             "synthetic",
+            None,
             vec![participation(11)],
         );
         assert!(matches!(expired, HubCheck::Rejected { checked_at: 10 }));
@@ -616,6 +704,7 @@ mod tests {
             "github",
             "github.com",
             "synthetic",
+            Some(14),
             vec![participation(10), participation(11)],
         );
         assert!(matches!(
@@ -623,6 +712,7 @@ mod tests {
             HubCheck::Valid {
                 checked_at: 10,
                 expires_at: 20,
+                shared_conversation_retention_days: Some(14),
                 ..
             }
         ));

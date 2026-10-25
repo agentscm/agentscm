@@ -29,6 +29,7 @@ use agentscm::change_record::{
     AssuranceBasisV1, CaptureBatchV1, CaptureEnvelopeV1, CaptureModeV1, CapturedEventKindV1,
     CapturedEventV1, CheckResultV1, ContentAvailabilityV1, CoverageV1, DriftV1, GapReasonV1,
     RecipeProvenanceV1, RetentionClassV1, SCHEMA_VERSION_V1, SessionIdentityV1, SourceBindingV1,
+    ToolCompletionV1,
 };
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -47,6 +48,7 @@ fn capture_request(mode: CaptureModeV1) -> CaptureRequest {
         canonical_session_id: "session_fixture".into(),
         parent_session_id: None,
         capture_mode: mode,
+        live_capture_mode: mode,
     }
 }
 
@@ -389,6 +391,8 @@ fn sample_batch(operation_id: &str, event_id: &str) -> CaptureEnvelopeV1 {
             artifact: None,
             setup: None,
             gap: None,
+            boundary: None,
+            subagent: None,
         }],
     })
 }
@@ -1009,7 +1013,7 @@ fn spool_namespace_and_deferred_hooks_are_bounded_and_never_reassociated() {
     assert!(action.source.is_some());
     assert!(action.recipe_digest.is_some());
     assert_eq!(action.action_kind, Some(ActionKindV1::Execution));
-    assert_eq!(action.observed_at, 0);
+    assert!(action.observed_at > 1_700_000_000);
     let sanitized = serde_json::to_string(&deferred).unwrap();
     assert!(!sanitized.contains("DEFERRED_PRIVATE_884"));
     assert!(!sanitized.contains("DEFERRED_COMMAND_885"));
@@ -1059,6 +1063,193 @@ fn deferred_listing_uses_durable_receipt_order_when_provider_time_is_missing() {
     let deferred = reopened.deferred(10).unwrap();
     assert_eq!(deferred, vec![timed, untimed]);
     assert_eq!(deferred[1].observed_at, 0);
+}
+
+fn pending_event_times(spool: &LocalSpool) -> Vec<(String, i64)> {
+    spool
+        .pending(20)
+        .unwrap()
+        .iter()
+        .filter_map(|envelope| match envelope {
+            CaptureEnvelopeV1::EventBatch(batch) => Some(batch.events.iter()),
+            _ => None,
+        })
+        .flatten()
+        .map(|event| (event.event_id.clone(), event.observed_at))
+        .collect()
+}
+
+#[test]
+fn hook_without_timestamp_uses_receipt_time_and_keeps_it_on_rerun() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let request = capture_request(CaptureModeV1::MetadataOnly);
+    let session = &request.observed_session_id;
+    let untimed = format!(
+        r#"{{"hook_event_name":"PreToolUse","session_id":"{session}","tool_name":"Read","tool_use_id":"read_1","tool_input":{{}}}}"#
+    );
+    let timed = format!(
+        r#"{{"hook_event_name":"PostToolUse","session_id":"{session}","tool_name":"Read","tool_use_id":"read_1","tool_input":{{}},"tool_response":{{}},"timestamp":"2026-10-24T10:00:00Z"}}"#
+    );
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    capture_hook(untimed.as_bytes(), &request, &spool).unwrap();
+    capture_hook(timed.as_bytes(), &request, &spool).unwrap();
+    let first = pending_event_times(&spool);
+    let received = first.iter().find(|(_, at)| *at != 1_792_836_000).unwrap().1;
+    assert!(received >= before && received <= before + 60, "{first:?}");
+    assert!(
+        first.iter().any(|(_, at)| *at == 1_792_836_000),
+        "{first:?}"
+    );
+
+    // A later re-run is the same identity and the same retained bytes: no conflict, no new event.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    capture_hook(untimed.as_bytes(), &request, &spool).unwrap();
+    assert_eq!(pending_event_times(&spool), first);
+}
+
+fn acknowledge_and_compact(spool: &LocalSpool) {
+    for envelope in spool.pending(100).unwrap() {
+        spool.acknowledge(&envelope).unwrap();
+    }
+    spool.compact_acknowledged(100).unwrap();
+}
+
+#[test]
+fn resumed_session_hooks_survive_spool_compaction_and_receipt_time_changes() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let request = capture_request(CaptureModeV1::MetadataOnly);
+    let session = &request.observed_session_id;
+    let hook = |tool: &str, id: &str| {
+        format!(
+            r#"{{"hook_event_name":"PreToolUse","session_id":"{session}","tool_name":"{tool}","tool_use_id":"{id}","tool_input":{{}}}}"#
+        )
+    };
+    // No startup SessionStart, so every hook re-evaluates the adapter-started-late marker.
+    let first = hook("Read", "read_1");
+    assert_eq!(
+        capture_hook(first.as_bytes(), &request, &spool).unwrap(),
+        HookCaptureOutcome::Stored
+    );
+    acknowledge_and_compact(&spool);
+    std::thread::sleep(Duration::from_millis(1100));
+
+    let second = hook("Grep", "grep_1");
+    assert_eq!(
+        capture_hook(second.as_bytes(), &request, &spool).unwrap(),
+        HookCaptureOutcome::Stored
+    );
+    assert_eq!(pending_event_times(&spool).len(), 1);
+    // A stable-id event re-delivered after compaction is the original, not a conflict.
+    assert_eq!(
+        capture_hook(first.as_bytes(), &request, &spool).unwrap(),
+        HookCaptureOutcome::Duplicate
+    );
+    assert_eq!(pending_event_times(&spool).len(), 1);
+}
+
+#[test]
+fn adapter_started_late_marker_failure_is_reported_and_keeps_the_hook_event() {
+    let repo = git_fixture();
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let request = capture_request(CaptureModeV1::MetadataOnly);
+    let actions = ActionCaptureConfig {
+        source: git_request(&repo.path().canonicalize().unwrap()),
+        setup_digest: "1".repeat(64),
+        managed_invocations: Vec::new(),
+        rules: Vec::new(),
+    };
+    let hook = |id: &str| {
+        format!(
+            r#"{{"hook_event_name":"PreToolUse","session_id":"session_fixture","tool_name":"Read","tool_use_id":"{id}","tool_input":{{}}}}"#
+        )
+    };
+    let first = capture_native_hook(hook("read_1").as_bytes(), &request, &actions, &spool).unwrap();
+    assert!(first.warnings.is_empty());
+    // Corrupt the retained marker so the next attempt to re-evaluate it conflicts.
+    let mut changed = 0;
+    for entry in fs::read_dir(spool.root().join("outbox")).unwrap() {
+        let path = entry.unwrap().path();
+        let text = fs::read_to_string(&path).unwrap();
+        if text.contains("adapter_started_late") {
+            fs::write(
+                &path,
+                text.replace("adapter_started_late", "capture_interrupted"),
+            )
+            .unwrap();
+            changed += 1;
+        }
+    }
+    assert_eq!(changed, 1);
+    let second =
+        capture_native_hook(hook("read_2").as_bytes(), &request, &actions, &spool).unwrap();
+    assert_eq!(second.event, HookCaptureOutcome::Stored);
+    assert_eq!(second.warnings.len(), 1);
+    assert!(second.warnings[0].contains("adapter-started-late marker not retained"));
+}
+
+#[test]
+fn receipt_timed_redelivery_differing_only_in_time_is_a_duplicate() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let request = capture_request(CaptureModeV1::MetadataOnly);
+    let hook = br#"{"hook_event_name":"PreToolUse","session_id":"session_fixture","tool_name":"Read","tool_use_id":"read_1","tool_input":{}}"#;
+    capture_hook(hook, &request, &spool).unwrap();
+    // Simulate a concurrent hook that stored the same operation a second earlier.
+    for entry in fs::read_dir(spool.root().join("outbox")).unwrap() {
+        let path = entry.unwrap().path();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        for event in value["events"].as_array_mut().unwrap() {
+            let at = event["observed_at"].as_i64().unwrap();
+            event["observed_at"] = serde_json::json!(at - 1);
+        }
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+    let before = pending_event_times(&spool);
+    assert_eq!(
+        capture_hook(hook, &request, &spool).unwrap(),
+        HookCaptureOutcome::Duplicate
+    );
+    assert_eq!(pending_event_times(&spool), before);
+}
+
+#[test]
+fn concurrent_untimed_hooks_for_one_operation_store_one_event() {
+    let temp = TempDir::new().unwrap();
+    let spool = Arc::new(LocalSpool::open(temp.path().join("spool")).unwrap());
+    let barrier = Arc::new(Barrier::new(6));
+    let handles: Vec<_> = (0..6)
+        .map(|_| {
+            let (spool, barrier) = (spool.clone(), barrier.clone());
+            thread::spawn(move || {
+                let request = capture_request(CaptureModeV1::MetadataOnly);
+                let hook = br#"{"hook_event_name":"PreToolUse","session_id":"session_fixture","tool_name":"Read","tool_use_id":"read_1","tool_input":{}}"#;
+                barrier.wait();
+                capture_hook(hook, &request, &spool)
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+    assert_eq!(
+        spool
+            .pending(20)
+            .unwrap()
+            .iter()
+            .filter(
+                |envelope| matches!(envelope, CaptureEnvelopeV1::EventBatch(batch)
+                if batch.events.iter().any(|event| event.kind == CapturedEventKindV1::ToolStarted))
+            )
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -2843,6 +3034,7 @@ fn completed_works_compact_without_growing_checkout_lock_records() {
         canonical_session_id: "session_repeated".into(),
         parent_session_id: None,
         capture_mode: CaptureModeV1::MetadataOnly,
+        live_capture_mode: CaptureModeV1::MetadataOnly,
     };
     capture_hook(
         br#"{"hook_event_name":"SessionStart","session_id":"session_repeated","source":"startup"}"#,
@@ -2866,6 +3058,7 @@ fn completed_works_compact_without_growing_checkout_lock_records() {
             canonical_session_id: "session_repeated".into(),
             parent_session_id: None,
             capture_mode: CaptureModeV1::MetadataOnly,
+            live_capture_mode: CaptureModeV1::MetadataOnly,
         };
         let pre = serde_json::to_vec(&serde_json::json!({
             "hook_event_name": "PreToolUse",
@@ -3077,6 +3270,29 @@ fn observed_order_exhaustion_retains_hook_fact_and_one_priority_pause_gap() {
     assert_eq!(replay.action, NativeActionOutcome::Interrupted);
     assert_eq!(replay.event, HookCaptureOutcome::Duplicate);
     assert_eq!(spool.pending(20).unwrap().len(), pending.len());
+
+    // After compaction only digests remain; the pause marker is re-attempted on replay and a
+    // new receipt time must neither conflict nor drop the hook's own event.
+    acknowledge_and_compact(&spool);
+    std::thread::sleep(Duration::from_millis(1100));
+    let later = capture_native_hook(pre, &request, &actions, &spool).unwrap();
+    assert_eq!(later.action, NativeActionOutcome::Interrupted);
+    assert_eq!(later.event, HookCaptureOutcome::Duplicate);
+    assert!(
+        !later
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("marker failed"))
+    );
+    let next = br#"{"hook_event_name":"PreToolUse","session_id":"session_fixture","tool_name":"Bash","tool_use_id":"order_exhausted_2","tool_input":{"command":"true"}}"#;
+    let next = capture_native_hook(next, &request, &actions, &spool).unwrap();
+    assert_eq!(next.event, HookCaptureOutcome::Stored);
+    assert!(
+        !next
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("marker failed"))
+    );
 }
 
 #[test]
@@ -4071,6 +4287,7 @@ fn legacy_managed_marker_without_capture_binding_stays_unassociated() {
         canonical_session_id: "legacy_canonical".into(),
         parent_session_id: None,
         capture_mode: CaptureModeV1::MetadataOnly,
+        live_capture_mode: CaptureModeV1::MetadataOnly,
     };
     let actions = ActionCaptureConfig {
         source: git_request(&canonical),
@@ -4699,4 +4916,475 @@ fn contains_bytes(values: &[Vec<u8>], needle: &[u8]) -> bool {
     values
         .iter()
         .any(|value| value.windows(needle.len()).any(|window| window == needle))
+}
+
+fn captured_events(spool: &LocalSpool) -> Vec<(SessionIdentityV1, CapturedEventV1)> {
+    spool
+        .pending(100)
+        .unwrap()
+        .into_iter()
+        .flat_map(|envelope| match envelope {
+            CaptureEnvelopeV1::EventBatch(batch) => batch
+                .events
+                .into_iter()
+                .map(|event| (batch.session.clone(), event))
+                .collect(),
+            _ => Vec::new(),
+        })
+        .collect()
+}
+
+#[test]
+fn lifecycle_hooks_record_boundaries_subagents_tool_names_and_completion() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let request = capture_request(CaptureModeV1::MetadataOnly);
+    let capture = |payload: &str| capture_hook(payload.as_bytes(), &request, &spool).unwrap();
+    let base = r#""session_id":"session_fixture""#;
+    for payload in [
+        format!(
+            r#"{{"hook_event_name":"SessionStart",{base},"source":"startup","timestamp":"2026-10-24T10:00:00Z"}}"#
+        ),
+        format!(
+            r#"{{"hook_event_name":"PostToolUse",{base},"tool_name":"mcp__server__tool","tool_use_id":"tool_a"}}"#
+        ),
+        format!(
+            r#"{{"hook_event_name":"PostToolUseFailure",{base},"tool_name":"Bash","tool_use_id":"tool_b"}}"#
+        ),
+        format!(r#"{{"hook_event_name":"Stop",{base}}}"#),
+        format!(r#"{{"hook_event_name":"Stop",{base}}}"#),
+        format!(r#"{{"hook_event_name":"PreCompact",{base}}}"#),
+        format!(
+            r#"{{"hook_event_name":"SubagentStart",{base},"agent_id":"agent_1","agent_type":"Explore"}}"#
+        ),
+        format!(r#"{{"hook_event_name":"SubagentStop",{base},"agent_id":"agent_1"}}"#),
+        format!(
+            r#"{{"hook_event_name":"SessionStart",{base},"source":"compact","timestamp":"2026-10-24T10:00:01Z"}}"#
+        ),
+        format!(
+            r#"{{"hook_event_name":"SessionEnd",{base},"reason":"unlisted reason","timestamp":"2026-10-24T10:00:02Z"}}"#
+        ),
+    ] {
+        assert_eq!(capture(&payload), HookCaptureOutcome::Stored, "{payload}");
+    }
+    // A subagent marker without a usable agent id would be invalid on the Hub, so it is dropped.
+    assert_eq!(
+        capture(&format!(
+            r#"{{"hook_event_name":"SubagentStart",{base},"agent_type":"Explore"}}"#
+        )),
+        HookCaptureOutcome::Ignored
+    );
+
+    let events: Vec<_> = captured_events(&spool)
+        .into_iter()
+        .map(|(_, event)| event)
+        .collect();
+    let of = |kind| events.iter().filter(move |event| event.kind == kind);
+    assert_eq!(of(CapturedEventKindV1::TurnEnded).count(), 2);
+    assert_eq!(of(CapturedEventKindV1::Compaction).count(), 1);
+    // Informational markers without a host identity record no identity-uncertainty gap.
+    assert_eq!(of(CapturedEventKindV1::Gap).count(), 0);
+    let subagents: Vec<_> = events
+        .iter()
+        .filter_map(|event| event.subagent.as_ref())
+        .collect();
+    assert_eq!(subagents.len(), 2);
+    assert_eq!(subagents[0].agent_id, "agent_1");
+    assert_eq!(subagents[0].agent_type.as_deref(), Some("Explore"));
+    assert_eq!(subagents[1].agent_type, None);
+    let boundaries: Vec<_> = of(CapturedEventKindV1::SessionStarted)
+        .chain(of(CapturedEventKindV1::SessionEnded))
+        .map(|event| event.boundary.as_deref())
+        .collect();
+    assert_eq!(
+        boundaries,
+        [Some("startup"), Some("compact"), Some("other")]
+    );
+    let finishes: Vec<_> = of(CapturedEventKindV1::ToolFinished)
+        .map(|event| event.tool.as_ref().unwrap())
+        .collect();
+    assert_eq!(finishes.len(), 2);
+    assert_eq!(finishes[0].name.as_deref(), Some("mcp__server__tool"));
+    assert_eq!(finishes[0].completion, Some(ToolCompletionV1::Returned));
+    assert_eq!(finishes[1].name.as_deref(), Some("Bash"));
+    assert_eq!(finishes[1].completion, Some(ToolCompletionV1::Failed));
+}
+
+#[test]
+fn a_session_that_began_unshared_never_pins_the_shared_mode() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let pin = |work: &str, generation, mode| {
+        spool
+            .pin_session_identity(
+                "session_fixture",
+                "session_fixture",
+                work,
+                generation,
+                None,
+                mode,
+            )
+            .unwrap()
+            .1
+    };
+    assert_eq!(
+        pin("wrk_a", 1, CaptureModeV1::MetadataOnly),
+        CaptureModeV1::MetadataOnly
+    );
+    assert_eq!(
+        pin("wrk_a", 1, CaptureModeV1::SharedConversation),
+        CaptureModeV1::MetadataOnly
+    );
+    // A new generation or Work does not make the session shared either.
+    assert_eq!(
+        pin("wrk_a", 2, CaptureModeV1::SharedConversation),
+        CaptureModeV1::MetadataOnly
+    );
+    assert_eq!(
+        pin("wrk_b", 1, CaptureModeV1::SharedConversation),
+        CaptureModeV1::MetadataOnly
+    );
+    // A downgrade is honoured, and a session that began shared stays eligible.
+    assert_eq!(
+        pin("wrk_b", 2, CaptureModeV1::LocalConversation),
+        CaptureModeV1::LocalConversation
+    );
+    let spool = LocalSpool::open(temp.path().join("other")).unwrap();
+    let pin = |generation, mode| {
+        spool
+            .pin_session_identity(
+                "session_fixture",
+                "session_fixture",
+                "wrk_a",
+                generation,
+                None,
+                mode,
+            )
+            .unwrap()
+            .1
+    };
+    assert_eq!(
+        pin(1, CaptureModeV1::SharedConversation),
+        CaptureModeV1::SharedConversation
+    );
+    assert_eq!(
+        pin(2, CaptureModeV1::SharedConversation),
+        CaptureModeV1::SharedConversation
+    );
+}
+
+#[test]
+fn an_import_cannot_start_sharing_a_session_that_began_unshared() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let remember = |mode| {
+        spool
+            .remember_session_association(
+                "session_fixture",
+                "session_fixture",
+                "wrk_a",
+                1,
+                None,
+                mode,
+            )
+            .unwrap()
+    };
+    remember(CaptureModeV1::LocalConversation);
+    remember(CaptureModeV1::SharedConversation);
+    // The same Work and generation takes the pinned fast path.
+    let (_, mode) = spool
+        .pin_session_identity(
+            "session_fixture",
+            "session_fixture",
+            "wrk_a",
+            1,
+            None,
+            CaptureModeV1::SharedConversation,
+        )
+        .unwrap();
+    assert_eq!(mode, CaptureModeV1::LocalConversation);
+}
+
+#[test]
+fn session_identity_is_pinned_while_the_live_mode_gates_retention() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let pin = |parent: Option<&str>, mode, generation| {
+        spool
+            .pin_session_identity(
+                "session_fixture",
+                "session_fixture",
+                "wrk_fixture",
+                generation,
+                parent,
+                mode,
+            )
+            .unwrap()
+    };
+    assert_eq!(
+        pin(None, CaptureModeV1::MetadataOnly, 1),
+        (None, CaptureModeV1::MetadataOnly)
+    );
+    // A later toggle or a parent id that appears mid-session does not change the identity...
+    assert_eq!(
+        pin(Some("parent_fixture"), CaptureModeV1::LocalConversation, 1),
+        (None, CaptureModeV1::MetadataOnly)
+    );
+    // ...but a new Work generation is a new identity.
+    assert_eq!(
+        pin(Some("parent_fixture"), CaptureModeV1::LocalConversation, 2),
+        (
+            Some("parent_fixture".to_owned()),
+            CaptureModeV1::LocalConversation
+        )
+    );
+    pin(None, CaptureModeV1::MetadataOnly, 1);
+
+    let mut request = capture_request(CaptureModeV1::MetadataOnly);
+    request.live_capture_mode = CaptureModeV1::LocalConversation;
+    let prompt = |id: &str, body: &str| {
+        format!(
+            r#"{{"hook_event_name":"UserPromptSubmit","session_id":"session_fixture","prompt_id":"{id}","prompt":"{body}"}}"#
+        )
+    };
+    capture_hook(prompt("p1", "LIVE_BODY_ONE").as_bytes(), &request, &spool).unwrap();
+    request.live_capture_mode = CaptureModeV1::MetadataOnly;
+    capture_hook(prompt("p2", "LIVE_BODY_TWO").as_bytes(), &request, &spool).unwrap();
+
+    let captured = captured_events(&spool);
+    assert!(!captured.is_empty());
+    assert!(captured.iter().all(|(session, _)| session.capture_mode
+        == CaptureModeV1::MetadataOnly
+        && session.parent_session_id.is_none()));
+    let artifact_for = |sequence_kind: usize| {
+        captured
+            .iter()
+            .filter(|(_, event)| event.kind == CapturedEventKindV1::UserPrompt)
+            .nth(sequence_kind)
+            .unwrap()
+            .1
+            .artifact
+            .is_some()
+    };
+    assert!(
+        artifact_for(0),
+        "live local-conversation mode retains the body"
+    );
+    assert!(!artifact_for(1), "live metadata-only mode retains nothing");
+}
+
+fn synthetic_secrets() -> (String, String) {
+    (
+        ["gh", "p_"].concat() + &"a1B2".repeat(9),
+        ["hunter", "2-synthetic"].concat(),
+    )
+}
+
+fn shared_prompt_and_tool_hooks(token: &str, password: &str) -> [String; 3] {
+    [
+        format!(
+            r#"{{"hook_event_name":"UserPromptSubmit","session_id":"session_fixture","prompt_id":"p1","prompt":"please deploy with {token} today"}}"#
+        ),
+        format!(
+            r#"{{"hook_event_name":"PreToolUse","session_id":"session_fixture","tool_name":"Bash","tool_use_id":"t1","tool_input":{{"command":"deploy","password":"{password}","env":"DB_PASSWORD={password}"}}}}"#
+        ),
+        format!(
+            r#"{{"hook_event_name":"PostToolUse","session_id":"session_fixture","tool_name":"Read","tool_use_id":"t2","tool_response":{{"content":"Authorization: Bearer {token}"}}}}"#
+        ),
+    ]
+}
+
+#[test]
+fn shared_conversation_redacts_before_retention_and_marks_bodies_shared_approved() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let request = capture_request(CaptureModeV1::SharedConversation);
+    let (token, password) = synthetic_secrets();
+    for hook in shared_prompt_and_tool_hooks(&token, &password) {
+        assert_eq!(
+            capture_hook(hook.as_bytes(), &request, &spool).unwrap(),
+            HookCaptureOutcome::Stored
+        );
+    }
+
+    let retained = retained_bytes(spool.root());
+    assert!(!contains_bytes(&retained, token.as_bytes()));
+    assert!(!contains_bytes(&retained, password.as_bytes()));
+    assert!(contains_bytes(&retained, b"[REDACTED:github_token]"));
+    assert!(contains_bytes(&retained, b"[REDACTED:field]"));
+
+    let captured = captured_events(&spool);
+    let bodies: Vec<_> = captured
+        .iter()
+        .filter_map(|(_, event)| event.artifact.as_ref().map(|artifact| (event, artifact)))
+        .collect();
+    assert_eq!(bodies.len(), 3);
+    for (_, artifact) in &bodies {
+        assert_eq!(artifact.retention, RetentionClassV1::SharedApproved);
+        assert_eq!(artifact.media, ArtifactMediaV1::Json);
+        assert_eq!(artifact.availability, ContentAvailabilityV1::Local);
+        let bytes = spool.read_artifact(artifact).unwrap();
+        assert_eq!(format!("{:x}", Sha256::digest(&bytes)), artifact.digest);
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body["redactions"].as_u64().unwrap() >= 1);
+    }
+    let redacted_gaps = captured
+        .iter()
+        .filter(|(_, event)| {
+            event
+                .gap
+                .as_ref()
+                .is_some_and(|gap| gap.reason == GapReasonV1::Redacted)
+        })
+        .count();
+    assert_eq!(redacted_gaps, 3);
+    assert!(
+        captured
+            .iter()
+            .all(|(session, _)| session.capture_mode == CaptureModeV1::SharedConversation)
+    );
+
+    // Redaction is deterministic, so a replay is a duplicate rather than a second record.
+    let replay = shared_prompt_and_tool_hooks(&token, &password);
+    assert_eq!(
+        capture_hook(replay[0].as_bytes(), &request, &spool).unwrap(),
+        HookCaptureOutcome::Duplicate
+    );
+}
+
+#[test]
+fn local_conversation_keeps_unredacted_work_local_bodies() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let request = capture_request(CaptureModeV1::LocalConversation);
+    let (token, password) = synthetic_secrets();
+    for hook in shared_prompt_and_tool_hooks(&token, &password) {
+        capture_hook(hook.as_bytes(), &request, &spool).unwrap();
+    }
+    let retained = retained_bytes(spool.root());
+    assert!(contains_bytes(&retained, token.as_bytes()));
+    assert!(contains_bytes(&retained, password.as_bytes()));
+    let captured = captured_events(&spool);
+    assert!(captured.iter().all(|(_, event)| {
+        event
+            .artifact
+            .as_ref()
+            .is_none_or(|artifact| artifact.retention == RetentionClassV1::WorkLocal)
+            && event
+                .gap
+                .as_ref()
+                .is_none_or(|gap| gap.reason != GapReasonV1::Redacted)
+    }));
+}
+
+#[test]
+fn shared_mode_switch_mid_session_keeps_bodies_local_but_redacted() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    // The session was pinned while metadata-only; the binding now says shared.
+    let mut request = capture_request(CaptureModeV1::MetadataOnly);
+    request.live_capture_mode = CaptureModeV1::SharedConversation;
+    let (token, password) = synthetic_secrets();
+    for hook in shared_prompt_and_tool_hooks(&token, &password) {
+        capture_hook(hook.as_bytes(), &request, &spool).unwrap();
+    }
+    assert!(!contains_bytes(
+        &retained_bytes(spool.root()),
+        token.as_bytes()
+    ));
+    let captured = captured_events(&spool);
+    assert!(captured.iter().all(|(session, event)| {
+        session.capture_mode == CaptureModeV1::MetadataOnly
+            && event
+                .artifact
+                .as_ref()
+                .is_none_or(|artifact| artifact.retention == RetentionClassV1::WorkLocal)
+    }));
+    assert!(captured.iter().any(|(_, event)| event.artifact.is_some()));
+
+    // The reverse switch (pinned shared, live local) also never produces a shared artifact.
+    let reverse_spool = LocalSpool::open(temp.path().join("reverse")).unwrap();
+    let mut reverse = capture_request(CaptureModeV1::SharedConversation);
+    reverse.live_capture_mode = CaptureModeV1::LocalConversation;
+    capture_hook(
+        shared_prompt_and_tool_hooks(&token, &password)[0].as_bytes(),
+        &reverse,
+        &reverse_spool,
+    )
+    .unwrap();
+    assert!(captured_events(&reverse_spool).iter().all(|(_, event)| {
+        event
+            .artifact
+            .as_ref()
+            .is_none_or(|artifact| artifact.retention == RetentionClassV1::WorkLocal)
+    }));
+}
+
+#[test]
+fn oversized_shared_bodies_stay_work_local() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let request = capture_request(CaptureModeV1::SharedConversation);
+    let big = "a".repeat(agentscm::change_record::MAX_SHARED_BODY_BYTES as usize + 1024);
+    let transcript = format!(
+        "{{\"type\":\"user\",\"sessionId\":\"session_fixture\",\"timestamp\":\"2026-10-23T10:00:00Z\",\"uuid\":\"u1\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{big}\"}}]}}}}\n"
+    );
+    let report = import_jsonl(Cursor::new(transcript), &request, &spool).unwrap();
+    assert_eq!(report.events, 2);
+    let artifacts: Vec<_> = captured_events(&spool)
+        .into_iter()
+        .filter_map(|(_, event)| event.artifact)
+        .collect();
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(artifacts[0].retention, RetentionClassV1::WorkLocal);
+    assert_eq!(artifacts[0].availability, ContentAvailabilityV1::Local);
+}
+
+#[test]
+fn shared_import_with_many_redacted_bodies_splits_batches_within_gap_limit() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let request = capture_request(CaptureModeV1::SharedConversation);
+    let (token, _) = synthetic_secrets();
+    let mut transcript = String::new();
+    for index in 0..45 {
+        transcript.push_str(&format!(
+            "{{\"type\":\"user\",\"sessionId\":\"session_fixture\",\"timestamp\":\"2026-10-23T10:00:00Z\",\"uuid\":\"u{index}\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"deploy {index} with {token}\"}}]}}}}\n"
+        ));
+    }
+    let report = import_jsonl(Cursor::new(transcript), &request, &spool).unwrap();
+    assert!(report.batches >= 2);
+
+    let pending = spool.pending(100).unwrap();
+    let mut redacted = 0;
+    let mut all_events = Vec::new();
+    for envelope in &pending {
+        envelope.validate().unwrap();
+        let CaptureEnvelopeV1::EventBatch(batch) = envelope else {
+            panic!("only event batches expected");
+        };
+        assert!(batch.events.len() <= agentscm::change_record::MAX_EVENTS_PER_BATCH);
+        all_events.extend(batch.events.iter());
+    }
+    for event in &all_events {
+        let Some(gap) = event
+            .gap
+            .as_ref()
+            .filter(|g| g.reason == GapReasonV1::Redacted)
+        else {
+            continue;
+        };
+        redacted += 1;
+        // A redaction gap points at the altered body event, which exists with that sequence.
+        assert_eq!(gap.first_missing, gap.last_missing);
+        assert_ne!(gap.first_missing, event.sequence);
+        assert!(
+            all_events
+                .iter()
+                .any(|other| other.sequence == gap.first_missing
+                    && other.kind == CapturedEventKindV1::UserPrompt
+                    && other.artifact.is_some())
+        );
+    }
+    assert_eq!(redacted, 45);
 }

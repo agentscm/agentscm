@@ -608,7 +608,7 @@ fn preflight_locked(agent: Agent, root: &Path, program: &Path) -> Result<()> {
     Ok(())
 }
 
-fn exclude_path(root: &Path) -> Result<PathBuf> {
+pub(crate) fn exclude_path(root: &Path) -> Result<PathBuf> {
     let output = std::process::Command::new("git")
         .current_dir(root)
         .args(["rev-parse", "--git-path", "info/exclude"])
@@ -626,8 +626,12 @@ fn added_excludes(exclude: &Path) -> PathBuf {
     exclude.with_file_name("agentscm-excluded")
 }
 
-fn ignore_new_file(root: &Path, relative: &str) -> Result<()> {
+pub(crate) fn ignore_new_file(root: &Path, relative: &str) -> Result<()> {
     let path = exclude_path(root)?;
+    if let Some(info) = path.parent() {
+        // A repository cloned with an empty template has no `info/` directory yet.
+        std::fs::create_dir_all(info)?;
+    }
     let text = read(&path)?.unwrap_or_default();
     let line = format!("/{relative}");
     if !text.lines().any(|existing| existing == line) {
@@ -653,7 +657,7 @@ fn ignore_new_file(root: &Path, relative: &str) -> Result<()> {
 
 /// Takes `relative` back out of the Git exclude if setup added it; a line that was already
 /// there is never touched.
-fn unignore_file(root: &Path, relative: &str) -> Result<()> {
+pub(crate) fn unignore_file(root: &Path, relative: &str) -> Result<()> {
     let path = exclude_path(root)?;
     let record = added_excludes(&path);
     let line = format!("/{relative}");

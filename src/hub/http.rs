@@ -25,6 +25,8 @@ pub struct HubConfig {
     pub objects: PathBuf,
     pub bind: SocketAddr,
     pub public: bool,
+    /// Days a shared-conversation body stays readable after upload.
+    pub shared_conversation_retention_days: i64,
     /// Where browsers and forges reach this hub; default `http://<bind>`.
     pub public_url: Option<String>,
     /// Holds GitHub App credentials (mode 0700, created if absent).
@@ -120,7 +122,8 @@ pub async fn serve(config: HubConfig) -> Result<()> {
     let mut state = HubState::new(store.clone(), objects)
         .with_login(login)
         .with_sync(github)
-        .with_skill_workflows(workflows);
+        .with_skill_workflows(workflows)
+        .with_shared_conversation_retention_days(config.shared_conversation_retention_days)?;
     if let Some(path) = std::env::var_os("AGENTSCM_WORKSPACE_FILE") {
         let config = super::workspace::WorkspaceConfig::from_file(PathBuf::from(path).as_path())?;
         #[cfg(unix)]
@@ -174,6 +177,7 @@ pub async fn serve(config: HubConfig) -> Result<()> {
         eprintln!("hub: first-run setup link not created: {error}");
     }
     tokio::spawn(sync::poll_loop(state.clone(), config.poll_seconds));
+    tokio::spawn(super::change_record_http::sweep_loop(state.clone()));
     #[cfg(unix)]
     let execution_worker = state
         .workspace_execution
@@ -205,6 +209,10 @@ impl ApiError {
         Self { status, code }
     }
 
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
     pub fn invalid() -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -223,6 +231,20 @@ impl ApiError {
         Self {
             status: StatusCode::FORBIDDEN,
             code: "read_only",
+        }
+    }
+
+    pub fn forbidden() -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "forbidden",
+        }
+    }
+
+    pub fn gone() -> Self {
+        Self {
+            status: StatusCode::GONE,
+            code: "gone",
         }
     }
 
@@ -389,9 +411,13 @@ async fn view_settings(
     Ok(Json(report))
 }
 
-async fn whoami(Reader(principal): Reader) -> Json<serde_json::Value> {
+async fn whoami(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+) -> Json<serde_json::Value> {
     let owner = principal.owner;
     Json(json!({
+        "shared_conversation_retention_days": state.shared_conversation_retention_days,
         "token": {
             "id": principal.token_id,
             "name": principal.name,

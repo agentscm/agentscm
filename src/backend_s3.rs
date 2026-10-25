@@ -1,5 +1,6 @@
 //! S3-compatible [`ImmutableBackend`]: path-style requests signed with SigV4.
-//! Objects are written once with a conditional PUT and never deleted. Callers
+//! Objects are written once with a conditional PUT and deleted only for
+//! shared-conversation bodies after a database tombstone. Callers
 //! must be blocking threads (as with the sync Postgres client), never async tasks.
 
 use std::fmt;
@@ -379,6 +380,27 @@ impl ImmutableBackend for S3Backend {
             .block(self.fetch(&path, key.id()))?
             .ok_or_else(|| Error::MissingObject(key.id().to_owned()))?;
         Ok(Box::new(Cursor::new(bytes)))
+    }
+
+    fn delete_incarnation(&self, key: &ObjectKey, incarnation: &str) -> Result<()> {
+        let path = self.object_path(key, incarnation)?;
+        self.block(async {
+            let response = self
+                .request(Method::DELETE, &path, &[], digest(b""), Vec::new())
+                .await?;
+            match response.status().as_u16() {
+                // S3 answers 204 whether or not the key existed; some servers say 404.
+                200 | 204 => Ok(()),
+                404 => match failure(response).await {
+                    (_, Some(code)) if code == "NoSuchKey" => Ok(()),
+                    (status, code) => Err(http_error(status, code)),
+                },
+                _ => {
+                    let (status, code) = failure(response).await;
+                    Err(http_error(status, code))
+                }
+            }
+        })
     }
 
     fn get_range_verified(

@@ -7,6 +7,7 @@
 
 pub mod claude_code;
 pub mod codex;
+pub mod redact;
 pub mod spool;
 
 use std::ffi::{CString, OsStr};
@@ -2034,6 +2035,7 @@ mod tests {
                 canonical_session_id: "canonical_reconcile".into(),
                 parent_session_id: None,
                 capture_mode: crate::change_record::CaptureModeV1::MetadataOnly,
+                live_capture_mode: crate::change_record::CaptureModeV1::MetadataOnly,
             };
             let actions = claude_code::ActionCaptureConfig {
                 source: source.clone(),

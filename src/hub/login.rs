@@ -471,6 +471,11 @@ impl Login {
         listed(&self.config.admins, provider, id, login)
     }
 
+    /// True when the configured admin list names this stored user.
+    pub(super) fn is_admin_user(&self, user: &super::store::User) -> bool {
+        self.is_admin(&user.identity.provider, user.identity.user_id, &user.login)
+    }
+
     fn has_allow_list(&self) -> bool {
         !self.config.allowed.is_empty()
     }

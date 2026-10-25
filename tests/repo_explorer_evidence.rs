@@ -100,6 +100,7 @@ fn capture_request(work_id: &str, session_id: &str, prefix: &str) -> CaptureRequ
         canonical_session_id: session_id.into(),
         parent_session_id: None,
         capture_mode: CaptureModeV1::LocalConversation,
+        live_capture_mode: CaptureModeV1::LocalConversation,
     }
 }
 

@@ -28,7 +28,7 @@ describe.skipIf(!live)('the 1c app rendered against the live hub', () => {
     expect((await screen.findAllByText('counterbranch/agentscm', {}, LOAD)).length).toBeGreaterThan(0)
     const rail = within(screen.getByRole('complementary', { name: 'Hub sections' }))
     expect(rail.getAllByText(/^(Coordinate|Verify|This computer|Manage)$/).map((e) => e.textContent)).toEqual(['Coordinate', 'Verify', 'This computer', 'Manage'])
-    expect(rail.getAllByRole('link').map((a) => a.querySelector('.side-label')!.textContent)).toEqual(['Right now', 'Work', 'Activity', 'Workflows', 'Change records', 'Landed changes', 'Skills', 'Templates', 'Timeline', 'Workspace', 'Connect agents', 'Hub health', 'Settings'])
+    expect(rail.getAllByRole('link').map((a) => a.querySelector('.side-label')!.textContent)).toEqual(['Right now', 'Work', 'Activity', 'Workflows', 'Change records', 'Landed changes', 'Skills', 'Templates', 'Timeline', 'Repository explorer', 'Workspace', 'Connect agents', 'Hub health', 'Settings'])
     expect(screen.getByRole('navigation', { name: 'Breadcrumb' })).toBeTruthy()
   })
 

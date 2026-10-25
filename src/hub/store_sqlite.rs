@@ -7,12 +7,15 @@ use rusqlite::{Connection, OptionalExtension, ToSql, Transaction, TransactionBeh
 use serde_json::json;
 
 use crate::change_record::{
-    ActionFinishV1, ActionMutationReceiptV1, ActionStartV1, CaptureBatchV1, CapturedEventKindV1,
-    CapturedEventV1, ChangeRecordSummaryV1, IngestReceiptV1,
+    ActionFinishV1, ActionMutationReceiptV1, ActionStartV1, ArtifactRefV1, CaptureBatchV1,
+    CapturedEventKindV1, CapturedEventV1, ChangeRecordSummaryV1, ConversationEntryV1,
+    IngestReceiptV1, MAX_CONVERSATION_PAGE_ENTRIES, MAX_PROJECTED_SESSION_SETUPS, RetentionClassV1,
+    SessionSetupV1, parse_conversation_cursor,
 };
 
 use super::change_record::{
-    SessionStatsV1, StoredActionV1, StoredDecisionV1, project as project_change_record,
+    SessionStatsV1, SharedBodyAccess, SharedBodyRow, SharedBodyState, StoredActionV1,
+    StoredDecisionV1, project as project_change_record,
 };
 use super::connection::{
     CONNECTION_SELECT, ConnectedRepository, Connection as ForgeConnection, DELIVERY_KEEP_SECONDS,
@@ -256,6 +259,81 @@ fn work_who(tx: &Transaction<'_>, token: &str, now: i64) -> Result<WorkWho> {
         rusqlite::Error::QueryReturnedNoRows => HubError::Unauthorized,
         error => error.into(),
     })
+}
+
+const SHARED_BODY_COLUMNS: &str = "work,digest,size_bytes,session_id,generation,event_id,sequence,
+    declared_token,declared_at,state,uploaded_at,expires_at,deleted_at,deleted_by,physical_deleted_at,
+    author,delete_attempts";
+/// Where a query that appends columns after `SHARED_BODY_COLUMNS` finds them.
+const SHARED_BODY_COLUMN_COUNT: usize = 17;
+
+fn shared_body_row(row: &rusqlite::Row<'_>) -> Result<SharedBodyRow> {
+    Ok(SharedBodyRow {
+        work: row.get(0)?,
+        digest: row.get(1)?,
+        size_bytes: row.get::<_, i64>(2)? as u64,
+        session_id: row.get(3)?,
+        generation: row.get(4)?,
+        event_id: row.get(5)?,
+        sequence: row.get::<_, i64>(6)? as u64,
+        declared_token: row.get(7)?,
+        declared_at: row.get(8)?,
+        state: SharedBodyState::parse(&row.get::<_, String>(9)?)?,
+        uploaded_at: row.get(10)?,
+        expires_at: row.get(11)?,
+        deleted_at: row.get(12)?,
+        deleted_by: row.get(13)?,
+        physical_deleted_at: row.get(14)?,
+        author: row.get(15)?,
+        delete_attempts: row.get(16)?,
+    })
+}
+
+/// Records that an accepted event named a shared body for the human owning `token`. Each human's
+/// declaration of a digest is its own row, and a later one must agree on size with the same
+/// human's earlier one (never another's, which would leak that they declared it).
+fn declare_shared_body(
+    tx: &Transaction<'_>,
+    batch: &CaptureBatchV1,
+    token: &str,
+    event: &CapturedEventV1,
+    artifact: &ArtifactRefV1,
+    now: i64,
+) -> Result<()> {
+    let size = artifact.size_bytes as i64;
+    let declared: Option<i64> = tx
+        .query_row(
+            "SELECT size_bytes FROM hub_change_shared_bodies WHERE work=?1 AND digest=?2
+               AND author=(SELECT owner FROM hub_agent_tokens WHERE id=?3)",
+            params![batch.work_id, artifact.digest, token],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if declared.is_some_and(|declared| declared != size) {
+        return Err(HubError::Invalid(
+            "shared body digest was already declared with a different size".into(),
+        ));
+    }
+    tx.execute(
+        "INSERT INTO hub_change_shared_bodies
+         (work,digest,author,size_bytes,media,session_id,generation,event_id,sequence,
+          declared_token,declared_at,state)
+         VALUES (?1,?2,(SELECT owner FROM hub_agent_tokens WHERE id=?8),?3,'json',?4,?5,?6,?7,
+                 ?8,?9,'declared')
+         ON CONFLICT (work,digest,author) DO NOTHING",
+        params![
+            batch.work_id,
+            artifact.digest,
+            size,
+            batch.session.session_id,
+            batch.generation,
+            event.event_id,
+            event.sequence as i64,
+            token,
+            now
+        ],
+    )?;
+    Ok(())
 }
 
 fn role_name(role: WorkRole) -> &'static str {
@@ -1029,20 +1107,21 @@ fn unfinished_for_session(
         .transpose()
 }
 
-fn active_capture_work_for_session(
+fn current_capture_work_for_session(
     tx: &Transaction<'_>,
     who: &WorkWho,
     session: &str,
     now: i64,
 ) -> Result<Option<WorkItem>> {
     let mut statement = tx.prepare(
-        "SELECT item.snapshot FROM hub_work_items item
+        "SELECT item.snapshot, item.state='active', participant.role='lead'
+         FROM hub_work_items item
          JOIN hub_work_participants participant ON participant.work=item.id
          WHERE item.provider=?1 AND item.host=?2 AND item.repository=?3
-           AND item.repository_id IS ?4 AND item.state='active'
+           AND item.repository_id IS ?4 AND item.state IN ('active','paused','blocked')
            AND participant.token=?5 AND participant.session=?6
            AND participant.generation=item.generation
-         ORDER BY item.id LIMIT 2",
+         ORDER BY item.state='active' DESC, participant.role='lead' DESC, item.id LIMIT 2",
     )?;
     let snapshots = statement
         .query_map(
@@ -1054,18 +1133,30 @@ fn active_capture_work_for_session(
                 who.token,
                 session
             ],
-            |row| row.get::<_, String>(0),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, bool>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            },
         )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    if snapshots.len() > 1 {
+    // An active Work outranks paused or blocked ones, and the session's lead role breaks ties.
+    if let [
+        (_, first_active, first_lead),
+        (_, second_active, second_lead),
+    ] = snapshots.as_slice()
+        && (first_active, first_lead) == (second_active, second_lead)
+    {
         return Err(HubError::Invalid(
-            "session participates in more than one active work item".into(),
+            "session participates in more than one capturable work item".into(),
         ));
     }
     snapshots
         .into_iter()
         .next()
-        .map(|snapshot| {
+        .map(|(snapshot, _, _)| {
             let mut item: WorkItem = json_value(&snapshot)?;
             project_claim(tx, &mut item, now)?;
             Ok(item)
@@ -5704,7 +5795,7 @@ impl Store for SqliteStore {
                 "operation_id is already used by a different capture request".into(),
             ));
         }
-        if item.state != WorkState::Active || item.generation != batch.generation {
+        if !item.state.accepts_capture() || item.generation != batch.generation {
             return Err(HubError::Invalid(
                 "capture work is no longer current".into(),
             ));
@@ -5823,6 +5914,13 @@ impl Store for SqliteStore {
                     event.observed_at
                 ],
             )?;
+            if let Some(artifact) = event
+                .artifact
+                .as_ref()
+                .filter(|artifact| artifact.retention == RetentionClassV1::SharedApproved)
+            {
+                declare_shared_body(&tx, batch, token, event, artifact, now)?;
+            }
             accepted += 1;
             new_event_bytes = new_event_bytes
                 .checked_add(work_payload_row_bytes(encoded.len())?)
@@ -5848,7 +5946,12 @@ impl Store for SqliteStore {
         for (sequence, encoded) in &retained_lifecycle {
             let event: CapturedEventV1 = json_value(encoded)?;
             match event.kind {
-                CapturedEventKindV1::SessionStarted => start_sequences.push(*sequence),
+                // A compaction restart continues the same session, not a second origin.
+                CapturedEventKindV1::SessionStarted
+                    if event.boundary.as_deref() != Some("compact") =>
+                {
+                    start_sequences.push(*sequence)
+                }
                 CapturedEventKindV1::SessionEnded => end_sequences.push(*sequence),
                 _ => {}
             }
@@ -5924,6 +6027,284 @@ impl Store for SqliteStore {
         Ok(receipt)
     }
 
+    fn shared_body_lookup(
+        &self,
+        token: &str,
+        work_id: &str,
+        digest: &str,
+        now: i64,
+    ) -> Result<Option<SharedBodyAccess>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let who = work_who(&tx, token, now)?;
+        if scoped_work(&tx, &who, work_id, now)?.is_none() {
+            return Ok(None);
+        }
+        let rows = tx
+            .prepare(&format!(
+                "SELECT {SHARED_BODY_COLUMNS} FROM hub_change_shared_bodies
+                 WHERE work=?1 AND digest=?2 ORDER BY declared_at,author"
+            ))?
+            .query_map(params![work_id, digest], |row| Ok(shared_body_row(row)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(SharedBodyAccess {
+            rows,
+            caller: who.owner.id,
+        }))
+    }
+
+    fn shared_bodies_own(
+        &self,
+        token: &str,
+        work_id: &str,
+        digests: &[String],
+        now: i64,
+    ) -> Result<Option<Vec<SharedBodyRow>>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let who = work_who(&tx, token, now)?;
+        if scoped_work(&tx, &who, work_id, now)?.is_none() {
+            return Ok(None);
+        }
+        let mut statement = tx.prepare(&format!(
+            "SELECT {SHARED_BODY_COLUMNS} FROM hub_change_shared_bodies
+             WHERE work=?1 AND digest=?2 AND author=?3"
+        ))?;
+        let mut rows = Vec::new();
+        for digest in digests {
+            if let Some(row) = statement
+                .query_row(params![work_id, digest, who.owner.id], |row| {
+                    Ok(shared_body_row(row))
+                })
+                .optional()?
+            {
+                rows.push(row?);
+            }
+        }
+        drop(statement);
+        Ok(Some(rows))
+    }
+
+    fn shared_conversation_page(
+        &self,
+        token: &str,
+        work_id: &str,
+        cursor: Option<&str>,
+        all_authors: bool,
+        now: i64,
+    ) -> Result<Option<Vec<ConversationEntryV1>>> {
+        let after = cursor.map(parse_conversation_cursor).transpose()?;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let who = work_who(&tx, token, now)?;
+        if scoped_work(&tx, &who, work_id, now)?.is_none() {
+            return Ok(None);
+        }
+        let mut statement = tx.prepare(&format!(
+            "WITH page AS (
+                 SELECT {SHARED_BODY_COLUMNS} FROM hub_change_shared_bodies
+                 WHERE work=?1 AND (?2 IS NULL OR (session_id,sequence,digest) > (?2,?3,?4))
+                   AND (?6 OR author=?7)
+                 ORDER BY session_id,sequence,digest LIMIT ?5)
+             SELECT page.*, e.event, e.observed_at FROM page
+             JOIN hub_change_events e ON e.work=page.work AND e.generation=page.generation
+               AND e.session_id=page.session_id AND e.event_id=page.event_id
+             ORDER BY page.session_id,page.sequence,page.digest"
+        ))?;
+        let entries = statement
+            .query_map(
+                params![
+                    work_id,
+                    after.as_ref().map(|after| after.0.as_str()),
+                    after.as_ref().map(|after| after.1 as i64),
+                    after.as_ref().map(|after| after.2.as_str()),
+                    MAX_CONVERSATION_PAGE_ENTRIES as i64 + 1,
+                    all_authors,
+                    who.owner.id
+                ],
+                |row| {
+                    Ok((
+                        shared_body_row(row),
+                        row.get::<_, String>(SHARED_BODY_COLUMN_COUNT)?,
+                        row.get::<_, i64>(SHARED_BODY_COLUMN_COUNT + 1)?,
+                    ))
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|(body, event, observed_at)| body?.conversation_entry(&event, observed_at, now))
+            .collect::<Result<Vec<_>>>()?;
+        drop(statement);
+        Ok(Some(entries))
+    }
+
+    fn shared_body_mark_available(
+        &self,
+        work_id: &str,
+        digest: &str,
+        author: &str,
+        now: i64,
+        retention_seconds: i64,
+    ) -> Result<Option<SharedBodyState>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE hub_change_shared_bodies
+             SET state='available', uploaded_at=?4, expires_at=?4+?5
+             WHERE work=?1 AND digest=?2 AND author=?3 AND state='declared'",
+            params![work_id, digest, author, now, retention_seconds],
+        )?;
+        let state = tx
+            .query_row(
+                "SELECT state FROM hub_change_shared_bodies
+                 WHERE work=?1 AND digest=?2 AND author=?3",
+                params![work_id, digest, author],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|state| SharedBodyState::parse(&state))
+            .transpose()?;
+        tx.commit()?;
+        Ok(state)
+    }
+
+    fn shared_body_tombstone(
+        &self,
+        work_id: &str,
+        digest: &str,
+        author: Option<&str>,
+        actor: &str,
+        now: i64,
+    ) -> Result<Vec<SharedBodyRow>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE hub_change_shared_bodies
+             SET state='deleted', deleted_at=?4, deleted_by=?5
+             WHERE work=?1 AND digest=?2 AND (?3 IS NULL OR author=?3) AND state<>'deleted'",
+            params![work_id, digest, author, now, actor],
+        )?;
+        let rows = tx
+            .prepare(&format!(
+                "SELECT {SHARED_BODY_COLUMNS} FROM hub_change_shared_bodies
+                 WHERE work=?1 AND digest=?2 AND (?3 IS NULL OR author=?3) ORDER BY author"
+            ))?
+            .query_map(params![work_id, digest, author], |row| {
+                Ok(shared_body_row(row))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        tx.commit()?;
+        Ok(rows)
+    }
+
+    fn shared_bodies_expire(
+        &self,
+        now: i64,
+        limit: usize,
+        retention_seconds: i64,
+    ) -> Result<Vec<SharedBodyRow>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rows = {
+            let mut statement = tx.prepare(&format!(
+                "UPDATE hub_change_shared_bodies SET state='expired',
+                     expires_at=COALESCE(expires_at,declared_at+?3)
+                 WHERE (work,digest,author) IN (
+                     SELECT work,digest,author FROM hub_change_shared_bodies
+                     WHERE (state='available' AND expires_at<=?1)
+                        OR (state='declared' AND COALESCE(expires_at,declared_at+?3)<=?1)
+                     ORDER BY COALESCE(expires_at,declared_at+?3),work,digest,author LIMIT ?2)
+                 RETURNING {SHARED_BODY_COLUMNS}"
+            ))?;
+            statement
+                .query_map(params![now, limit as i64, retention_seconds], |row| {
+                    Ok(shared_body_row(row))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?
+        };
+        tx.commit()?;
+        Ok(rows)
+    }
+
+    fn shared_body_demote_available(
+        &self,
+        work_id: &str,
+        digest: &str,
+        author: Option<&str>,
+    ) -> Result<usize> {
+        Ok(self.conn().execute(
+            "UPDATE hub_change_shared_bodies SET state='declared'
+             WHERE work=?1 AND digest=?2 AND (?3 IS NULL OR author=?3) AND state='available'",
+            params![work_id, digest, author],
+        )?)
+    }
+
+    fn shared_bodies_pending_physical_delete(
+        &self,
+        now: i64,
+        limit: usize,
+    ) -> Result<Vec<SharedBodyRow>> {
+        let conn = self.conn();
+        let mut statement = conn.prepare(&format!(
+            "SELECT {SHARED_BODY_COLUMNS} FROM hub_change_shared_bodies
+             WHERE state IN ('expired','deleted') AND physical_deleted_at IS NULL
+               AND (next_delete_at IS NULL OR next_delete_at<=?1)
+             ORDER BY COALESCE(deleted_at,expires_at),work,digest,author LIMIT ?2"
+        ))?;
+        statement
+            .query_map(params![now, limit as i64], |row| Ok(shared_body_row(row)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .collect()
+    }
+
+    fn shared_body_object_in_use(&self, work_id: &str, digest: &str) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS (SELECT 1 FROM hub_change_shared_bodies
+                 WHERE work=?1 AND digest=?2 AND state='available')",
+            params![work_id, digest],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn shared_body_mark_physically_deleted(
+        &self,
+        work_id: &str,
+        digest: &str,
+        author: &str,
+        now: i64,
+    ) -> Result<()> {
+        self.conn().execute(
+            "UPDATE hub_change_shared_bodies SET physical_deleted_at=?4, next_delete_at=NULL
+             WHERE work=?1 AND digest=?2 AND author=?3 AND state IN ('expired','deleted')
+               AND physical_deleted_at IS NULL",
+            params![work_id, digest, author, now],
+        )?;
+        Ok(())
+    }
+
+    fn shared_body_delete_failed(
+        &self,
+        work_id: &str,
+        digest: &str,
+        author: &str,
+        retry_at: i64,
+    ) -> Result<()> {
+        self.conn().execute(
+            "UPDATE hub_change_shared_bodies
+             SET physical_deleted_at=NULL, delete_attempts=delete_attempts+1, next_delete_at=?4
+             WHERE work=?1 AND digest=?2 AND author=?3 AND state IN ('expired','deleted')",
+            params![work_id, digest, author, retry_at],
+        )?;
+        Ok(())
+    }
+
     fn change_action_start(
         &self,
         token: &str,
@@ -5971,7 +6352,7 @@ impl Store for SqliteStore {
                 "operation_id is already used by a different action request".into(),
             ));
         }
-        if item.state != WorkState::Active || item.generation != start.generation {
+        if !item.state.accepts_capture() || item.generation != start.generation {
             return Err(HubError::Invalid("action work is no longer current".into()));
         }
         if start.source.repository() != who.repository {
@@ -6090,7 +6471,7 @@ impl Store for SqliteStore {
             if author==token&&kind=="action_finish"&&retained==request { let mut receipt:ActionMutationReceiptV1=json_value(&response)?;receipt.replayed=true;tx.commit()?;return Ok(receipt); }
             return Err(HubError::Invalid("operation_id is already used by a different action request".into()));
         }
-        if item.state != WorkState::Active || item.generation != finish.generation {
+        if !item.state.accepts_capture() || item.generation != finish.generation {
             return Err(HubError::Invalid("action work is no longer current".into()));
         }
         let (author,generation,started_at,already,start_request):(String,i64,i64,Option<String>,String)=tx.query_row("SELECT author_token,generation,started_at,finish_request,start_request FROM hub_change_actions WHERE work=?1 AND action_id=?2",params![finish.work_id,finish.action_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?.ok_or_else(||HubError::Invalid("unknown action".into()))?;
@@ -6327,6 +6708,48 @@ impl Store for SqliteStore {
             params![work_id, item.generation],
             |row| row.get(0),
         )?;
+        let (setups, setups_omitted) = {
+            let mut statement = tx.prepare(
+                "WITH latest AS (
+                    SELECT session_id,
+                           json_extract(event,'$.setup.model') AS model,
+                           json_extract(event,'$.setup.permission_mode') AS permission_mode,
+                           json_extract(event,'$.setup.effort') AS effort,
+                           ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY sequence DESC) AS rank
+                    FROM hub_change_events
+                    WHERE work=?1 AND generation=?2 AND json_type(event,'$.setup') IS NOT NULL
+                ), picked AS (
+                    SELECT latest.*, COUNT(*) OVER () AS total FROM latest WHERE rank=1
+                )
+                SELECT picked.session_id, json_extract(s.identity,'$.parent_session_id'),
+                       picked.model, picked.permission_mode, picked.effort, picked.total
+                FROM picked JOIN hub_change_sessions s
+                  ON s.work=?1 AND s.generation=?2 AND s.session_id=picked.session_id
+                ORDER BY picked.session_id LIMIT ?3",
+            )?;
+            let mut total = 0_i64;
+            let setups = statement
+                .query_map(
+                    params![
+                        work_id,
+                        item.generation,
+                        MAX_PROJECTED_SESSION_SETUPS as i64
+                    ],
+                    |row| {
+                        total = row.get(5)?;
+                        Ok(SessionSetupV1 {
+                            session_id: row.get(0)?,
+                            parent_session_id: row.get(1)?,
+                            model: row.get(2)?,
+                            permission_mode: row.get(3)?,
+                            effort: row.get(4)?,
+                        })
+                    },
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let omitted = (total as u64).saturating_sub(setups.len() as u64);
+            (setups, omitted)
+        };
         let usage_observations: i64 = tx.query_row(
             "SELECT COUNT(*) FROM hub_work_model_usage WHERE work=?1 AND generation=?2",
             params![work_id, item.generation],
@@ -6379,6 +6802,8 @@ impl Store for SqliteStore {
                 complete_count: complete as usize,
                 setup_observation_count: setup_observations as usize,
                 usage_observation_count: usage_observations as usize,
+                setups,
+                setups_omitted,
             },
             action,
             decision,
@@ -6555,7 +6980,7 @@ impl Store for SqliteStore {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let who = work_who(&tx, token, now)?;
-        let item = active_capture_work_for_session(&tx, &who, session, now)?;
+        let item = current_capture_work_for_session(&tx, &who, session, now)?;
         tx.commit()?;
         Ok(item)
     }

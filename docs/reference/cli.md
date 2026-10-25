@@ -87,6 +87,12 @@ The command preserves unrelated hooks. Each installed hook resolves the current 
 and generation for its native session, appends to the private spool, then attempts bounded ordered
 delivery through the saved connection. `metadata-only` is the default. `local-conversation` retains
 selected visible bodies only in the spool; they are not placed in shared envelopes.
+`shared-conversation` also redacts them (best effort) and uploads them to the Hub after it accepts
+the event. Change an enabled binding's mode with `change-capture set-mode --root PATH --mode
+metadata-only|local-conversation|shared-conversation`, which never touches the spool. `change-capture
+conversation --work-id ID [--cursor C | --digest D | --delete D]` lists, prints or deletes shared
+bodies (the author and Hub admins only). See
+[sharing conversations](../change-capture.md#sharing-conversations-with-the-hub).
 
 Execution success is not a passing verification. An exact verification rule has the form
 `Bash=verification:complete:process_exit_code:<lowercase-sha256>`. The local client reports
@@ -108,6 +114,7 @@ agentscm change-capture prune-quarantine --spool /absolute/private/spool OPAQUE_
 agentscm change-capture compact --spool /absolute/private/spool --limit 100
 agentscm change-capture settings-recovery --root /absolute/repository
 agentscm change-capture unconfigure --root /absolute/repository
+agentscm change-capture forget --root /absolute/repository
 ```
 
 `inspect` is a bounded read-only view. It does not recover, clean, change modes, acquire mutation
@@ -121,7 +128,13 @@ or partial spool, namespace change, or lower limit before that guarded operation
 state. Live moves, restores, and replacements are unsupported; a change is detected when a guarded
 path check observes it, rather than by continuous path containment. `unconfigure` removes the marked
 hooks and disables new capture while retaining this lineage; configuring the same checkout against
-a different spool is unavailable in this version. `status` reports active, disabled, or paused state
+a different spool is unavailable in this version. `forget` removes only a disabled checkout's
+binding from the config so it can be set up again for another repository or Hub; it never deletes
+the spool and prints its path. `unconfigure` and `forget` also work on a deleted checkout: pass its
+absolute path as it was saved (symlinks in parent directories that still exist are resolved), and
+`unconfigure` fails when no binding matches. `forget` also removes the `.git/info/exclude` lines
+setup added for that checkout's settings file, unless another binding in the same repository still
+uses them. `status` reports active, disabled, or paused state
 and embeds the read-only inspection result. A disabled binding can still reconcile an already
 retained uncertain recipe attempt when current authorization and the existing reboot proof allow
 it; it cannot start a new recipe. At most 128 checkout lineages are retained in this local config;
@@ -147,7 +160,9 @@ retained and never pruned automatically. `quarantine` lists bounded invalid cras
 
 `show` returns the same at-most-48-KiB projection as HTTP and MCP. It includes at most 16 retained
 scope entries and 16 retained decision references; exact `scope_omitted` and
-`source_refs_omitted` counts identify any trailing entries removed to fit the envelope.
+`source_refs_omitted` counts identify any trailing entries removed to fit the envelope. When
+sessions reported setup it also carries up to 16 `session_setups` (model, effort and permission
+mode per session) and `session_setups_omitted`.
 
 `pending` shows shareable queued envelopes. `deferred` shows sanitized hooks that could not resolve
 current authorized Work and will never be rewritten into an associated action. `observe` and

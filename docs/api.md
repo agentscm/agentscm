@@ -63,6 +63,11 @@ decision-reference arrays each begin with at most 16 entries in retained order; 
 envelope would exceed that limit, trailing entries are removed deterministically and
 `scope_omitted` or `source_refs_omitted` reports the exact count.
 
+When any session reported setup, `session_setups` lists the latest reported `model`, `effort` and
+`permission_mode` per session (`null` when not reported) with the session's `parent_session_id`,
+ordered by session ID, at most 16 entries; `session_setups_omitted` counts the rest. Both fields
+are absent when empty. They are trimmed before any other field when the envelope is full.
+
 Decision references can include caller-declared captured-event identities and an exact earlier
 version of the same Work. A captured-event reference is metadata only: this API neither fetches nor
 returns its conversation body and does not present it as verified or human-approved. A prior-Work
@@ -78,7 +83,10 @@ ingestion order rather than proof of causal execution order.
 MCP exposes the same read projection as `agentscm_change_record({"work_id":"wrk_…"})`, including
 to read-only tokens. Its fixed narration never interpolates the caller-authored Work title or
 decision summary; those structured fields remain untrusted data, not instructions. The CLI wrapper
-is `agentscm change-capture show`. See
+is `agentscm change-capture show`. Shared conversation bodies and their listing have separate,
+author-and-admin-only reads (`GET .../change-records/{work_id}/conversation[/{sha256}]`, MCP
+`agentscm_shared_conversation`, `agentscm change-capture conversation`); see
+[shared conversation reads](hub.md#shared-conversation-reads). See
 [local change capture](change-capture.md) and its [qualification limits](implementation/agentscm-build-status.md).
 
 ## Hub supported-skills routes (Experimental)

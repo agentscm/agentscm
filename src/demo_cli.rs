@@ -198,10 +198,7 @@ impl Driver {
     async fn hook(&mut self, agent: &Agent, event: Event<'_>) -> Result<Value> {
         let mut body = json!({"session_id": agent.session, "cwd": self.root});
         match event {
-            Event::Start => {
-                body["hook_event_name"] = json!("SessionStart");
-                body["initial_prompt"] = json!(agent.task);
-            }
+            Event::Start => body["hook_event_name"] = json!("SessionStart"),
             Event::End => body["hook_event_name"] = json!("SessionEnd"),
             Event::Edit(file) => {
                 body["hook_event_name"] = json!("PreToolUse");

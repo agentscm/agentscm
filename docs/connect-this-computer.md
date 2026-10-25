@@ -33,6 +33,32 @@ There is no token to paste and no address to enter.
   and its own read-only access.
 - Saved conversations appear only for repositories where change capture was already set up.
   Opening the page never starts capture and never uploads conversations.
+- **Settings → Conversation sharing** lists the checkouts on this computer with a switch for
+  sharing agent conversations with the Hub. Apart from disconnecting this browser
+  (`DELETE /v1/local/session`), it is the only setting the page changes on this computer; see below.
+
+## Conversation sharing from the page
+
+Turning a switch on sets capture up for that checkout if it never was (same defaults as the menu
+bar app; see [sharing conversations](change-capture.md#one-step-setup-from-the-menu-bar-and-the-local-page))
+and switches it to `shared-conversation`. The page first shows what that does: conversations are
+redacted on this computer (best effort), uploaded to that checkout's Hub, kept for the number of days that Hub reports (or, if it did not
+say, for as long as its operator sets, 30 days unless changed) and readable by you and Hub admins. Only after you confirm does it send the request, with an
+explicit `confirm_sharing`; the service refuses a request without it and changes nothing. Turning
+it off needs no confirmation, switches the checkout to `metadata-only` and stops future uploads.
+The request is a `POST` to `/v1/local/capture`, which needs the same live browser connection, loopback
+Host and own-origin check as every other route here, sets no cross-origin headers, accepts at most
+1 KiB, and names the checkout by the `id` the list gives it, never by a path. The id is derived
+from the service's random instance and the checkout's path and mapped back only by the service, so
+it is opaque to the browser and valid for one service run (ids change after a restart). It is a
+name, not a secret: the unauthenticated identity probe exposes the instance, so anyone who also
+knew a path could compute it; the capture routes themselves need a live browser connection. If a
+change names a checkout that is no longer listed, the page re-reads the list and asks you to review
+and try again. Two
+checkouts of one repository and Hub are listed and controlled separately. The request also carries
+the repository and Hub the page showed; if the checkout is connected to anything else by then, the
+service refuses to turn sharing on and changes nothing.
+A page opened from a Hub elsewhere has no such control and points to the menu bar app and `agentscm open`.
 
 ## How the connection is protected
 

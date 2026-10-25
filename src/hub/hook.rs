@@ -862,9 +862,8 @@ fn pascal(agent: Agent, v: &Value, scope: &Scope) -> Call {
     let call = |kind, shape| Call::new(agent, kind, shape).session(str_at(v, "session_id"));
     let tool = str_at(v, "tool_name").unwrap_or_default();
     match str_at(v, "hook_event_name") {
-        Some("SessionStart") => {
-            call(Kind::Start, Shape::Hook("SessionStart")).task(str_at(v, "initial_prompt"))
-        }
+        // The start prompt is never read: it would become a team-visible task.
+        Some("SessionStart") => call(Kind::Start, Shape::Hook("SessionStart")),
         Some("PreToolUse") if is_edit(tool) => {
             let input = v.get("tool_input").unwrap_or(&Value::Null);
             call(Kind::Check, Shape::Hook("PreToolUse"))
@@ -895,7 +894,7 @@ fn copilot(v: &Value, scope: &Scope) -> Call {
         Some(_) => call(Kind::Ignore, Shape::Silent),
         None if v.get("reason").is_some() => call(Kind::Done, Shape::Silent),
         None if v.get("source").is_some() || v.get("initialPrompt").is_some() => {
-            call(Kind::Start, Shape::Camel).task(str_at(v, "initialPrompt"))
+            call(Kind::Start, Shape::Camel)
         }
         None => call(Kind::Ignore, Shape::Silent),
     }
@@ -1191,6 +1190,21 @@ mod tests {
         assert_eq!(edit_paths("apply_patch", &input).len(), 5);
         assert!(edit_paths("apply_patch", &json!({})).is_empty());
         assert_eq!(edit_paths("Write", &json!({"file_path": "x"})), ["x"]);
+    }
+
+    #[test]
+    fn session_start_prompts_are_not_stored_as_a_task() {
+        let parsed = parse(
+            Agent::Claude,
+            &json!({"hook_event_name": "SessionStart", "session_id": "s", "cwd": "/r",
+                "initial_prompt": "synthetic start prompt"}),
+        );
+        assert_eq!((parsed.kind, parsed.task), (Kind::Start, None));
+        let camel = parse(
+            Agent::Copilot,
+            &json!({"sessionId": "s", "initialPrompt": "synthetic start prompt"}),
+        );
+        assert_eq!((camel.kind, camel.task), (Kind::Start, None));
     }
 
     #[test]

@@ -11,12 +11,23 @@ The local spool is an absolute directory chosen by the operator. AgentSCM create
 with mode `0700` and files with mode `0600`. Conversation text, tool input, command arguments,
 stdout, stderr, source manifests, and captured source bytes remain there. A shareable envelope can
 contain only typed event facts and opaque artifact identities: digest, byte count, media type,
-retention class, and availability. Schema v1 rejects shared conversation retention.
+retention class, and availability. Conversation bodies leave the machine only for a checkout that
+opted into `shared-conversation` mode, as described in
+[Sharing conversations with the Hub](#sharing-conversations-with-the-hub); the Hub refuses a
+shared-approved body declared by a session that was not in that mode.
 
 Metadata-only capture does not retain conversation bodies. Local-conversation capture retains the
 selected visible prompt, assistant-message, tool-input, and tool-result blocks in the private
 spool. Claude thinking and redacted-thinking blocks are never selected. Passive hook capture does
 not call a model or send content to a provider.
+
+Capture has three modes per checkout, and `metadata-only` is the default:
+
+| Mode | Bodies kept locally | Bodies sent to the Hub |
+|---|---|---|
+| `metadata-only` | No | No |
+| `local-conversation` | Yes, unredacted | No |
+| `shared-conversation` | Yes, redacted | Yes, after the Hub accepts the event |
 
 The spool has finite operator-configured record, total-byte, and per-artifact limits and never
 silently evicts retained evidence. Defaults are 4,096 records, 64 MiB total, and 16 MiB per
@@ -57,7 +68,8 @@ quarantined so bounded inspection and explicit pruning remain available. Every o
 still counts the complete physical usage and refuses until capacity is restored; recovery itself
 has a fixed physical-record scan bound. Active writer temporary files are protected by the spool
 lock and are never quarantine
-prune targets. Automatic expiry and retention-policy deletion are not part of schema v1.
+prune targets. AgentSCM never expires or deletes anything in the local spool automatically. Only
+the Hub copies of shared bodies expire (see [retention and deletion](#retention-and-deletion)).
 
 The compaction index is the durable commit point. Crash recovery completes its exact envelope,
 acknowledgement, native-observation, active-order, and delivery-cursor cleanup. A cursor naming
@@ -67,17 +79,226 @@ replay while their active order-ledger entries are reclaimed. If the active orde
 its finite bound before compaction, the native hook retains the ordinary lifecycle fact, records
 one priority `capture_interrupted` pause marker, and remains fail-open.
 
+## Sharing conversations with the Hub
+
+This is opt-in per checkout and alpha. A checkout in `shared-conversation` mode retains the same
+selected bodies as `local-conversation` (visible prompts, assistant messages, tool input and tool
+results; never thinking blocks), but scrubs each one for secrets before it is written to the spool
+and then uploads it to the Hub's object store. Nothing is shared unless you choose the mode, and
+the choice applies to one checkout, not to a Hub, repository or user.
+
+Choose the mode when configuring (`change-capture configure --capture-mode shared-conversation`) or
+change it later on an enabled binding:
+
+```text
+agentscm change-capture set-mode --root /absolute/repository --mode shared-conversation
+agentscm change-capture set-mode --root /absolute/repository --mode metadata-only
+```
+
+`set-mode` changes only the stored mode. It requires an enabled capture binding for the checkout
+(run `configure` first), leaves hooks and the spool untouched, and never deletes local or Hub data.
+`change-capture status` reports the current `capture_mode`. The macOS menu-bar companion and the
+Hub page opened from this computer (**Settings → Conversation sharing**) have the same switch per
+checkout, **Share agent conversations with Hub**; it is unchecked by default and does not need
+`configure` first (see below). Turning it off only switches the mode. The capture config is written as version 6 only while
+some checkout is in `shared-conversation` mode or a binding records a non-default Claude settings
+path (see below); an older binary refuses a version 6 file instead of silently dropping a field,
+and the file returns to version 5 when neither applies. Downgrading the client after this release is
+unsupported: older binaries cannot read the new session association records.
+
+### One-step setup from the menu bar and the local page
+
+Turning sharing on from either surface calls one library function, `enable_capture`, for a
+checkout that has a current client connection; turning it off calls `set_capture_mode`. All three
+surfaces read the setting through one function, `capture_setting` (configured, enabled, mode, and
+`lineage_mismatch` with the repository and Hub the binding was saved for); nothing keeps a second
+copy of it. The page shows the distinct states Not set up (no binding), Off (disabled binding),
+Metadata only, Local only and Shared with Hub.
+
+**Consent is bound to what was shown.** The menu bar app and the page pass the repository and Hub
+they displayed. `enable_capture` (and `set_capture_mode` when it turns sharing on) read the
+checkout's connection (connections lock, then the capture config lock) and refuse with `this checkout is now connected
+to <repository> on <hub>; refresh and confirm again` if it is not that one, so a checkout
+reconnected to another Hub between the consequences and the click is never shared there. Turning
+sharing off and the `set-mode` and `configure` commands (where you typed the command) pass no
+expectation. Whether to create the binding, re-enable it or only change the mode is decided from
+the bindings read under that same lock, so a concurrent `configure` is not overwritten.
+
+The menu bar app asks before it acts. Clicking **Share agent conversations with Hub** only opens
+the status window with the consequences and adds **Confirm: share conversations with <hub>** to
+that checkout's menu; only that item turns sharing on, and it disappears if the checkout, its Hub
+or its mode changes, or after two minutes. Turning sharing off needs no confirmation. The page does the same with its own
+confirmation panel.
+
+- With an enabled binding it only changes the mode, exactly like `set-mode`.
+- With a disabled binding (after `unconfigure`) it re-enables through the `configure` code path with
+  everything the binding saved (spool, worktree id, base ref, setup digest, rules, recipes, limits)
+  and reinstalls the hooks in the Claude settings file the binding recorded (below), else the
+  default `ROOT/.claude/settings.local.json`.
+- With no binding it builds one through the same code path as `configure` with these defaults:
+  the private spool `<config>/agentscm/capture-spools/<random>` (mode 0700, 16 random bytes in
+  hex, recorded in the binding); worktree id `checkout_<32 random hex characters>`; setup digest 32
+  random bytes in hex; base ref the checkout's default branch from `origin/HEAD` as `origin/<name>`
+  when that resolves to a commit, else `origin/main`; one action rule,
+  `Bash=execution:partial:process_exit_code`; no recipes and no Claude history root; default spool
+  limits; hooks in `ROOT/.claude/settings.local.json`. The ids are random, not derived from the
+  path, so they cannot be recomputed offline from Hub records by guessing paths and two computers
+  with the same path never share one; the saved binding is what keeps them stable across
+  re-enables. The setup digest is a caller assertion that identifies this default, not a
+  measurement of the agent setup.
+
+A Claude settings file that one-step setup creates, and the transaction files saved beside it, are
+added to the repository's local exclude unless Git already ignores them, so they never appear as
+untracked files. This is done only after the binding is installed, creates `.git/info` if the
+repository was cloned without it, and never fails the enable: if the exclude cannot be written the
+result carries a `warning` instead. A file that already existed is not touched and the tracked
+`.gitignore` is never edited. The exclude (`git rev-parse --git-path info/exclude`) is shared by
+every worktree of the repository, so the line applies to all of them. It stays after `unconfigure`;
+`forget` removes only the lines setup added for that checkout's settings file (recorded beside the
+exclude), and keeps them while another binding in the same repository still uses the same relative
+settings path. `forget` of a deleted checkout cannot reach its repository and leaves the exclude as
+it is.
+
+A binding records its Claude settings path (`claude_settings`) only when it is not the default, and
+`unconfigure` and re-enabling use the recorded file. A file that records it is version 6, which
+older binaries refuse rather than ignore the field; bindings at the default path keep the config
+readable by them.
+
+A checkout without a current client connection gets the error `no client connection for this
+checkout` and nothing is changed. Only an explicit request for `shared-conversation` selects that
+mode; setting up capture in `metadata-only` mode never uploads a conversation body. Use
+`change-capture configure` for anything else (other rules, recipes, a history root, a chosen spool).
+
+A disabled binding keeps the repository and Hub it was saved for, because its private spool keeps
+that history apart. If the checkout is now connected to another repository or Hub, turning sharing
+on fails with that explanation instead of a lineage error. To start fresh run
+`agentscm change-capture unconfigure --root PATH` (if capture is still on), then
+`agentscm change-capture forget --root PATH`, which removes only a disabled binding from the config.
+Both work on a checkout that has been deleted: pass its absolute path as it was saved; symlinks in
+the parent directories that still exist are resolved, the deleted part is matched as given, and
+nothing is touched in the missing tree (its hooks went with it). `unconfigure` fails with `no
+capture binding for this checkout` when nothing matches.
+Turning sharing down (to `metadata-only`, or from `shared-conversation` to `local-conversation`)
+needs only the capture config lock, not a current client connection: it works after the connection
+was removed or the checkout was reconnected to another Hub, never opens the spool, never uploads and
+never changes the saved lineage. Raising the mode still needs a current connection and matching
+lineage. Removing or replacing a checkout's client connection (`client remove`, `client setup` for
+another repository or Hub) also lowers a `shared-conversation` binding for that checkout to
+`metadata-only`, so reconnecting the same repository and Hub never resumes sharing without a new
+confirmation. Capture hooks and delivery do nothing for a binding whose connection is absent.
+The tray and the page then say "Sharing was set for <hub>; this checkout is now connected to
+<other>" and offer only Off. It never deletes the spool: it prints the spool path (and `spool_retained: true`) so you can
+`export` or delete it yourself. The next enable creates a new spool and new random ids.
+
+What leaves the machine, and when:
+
+- **Redaction is client-side and best effort.** Before a body is retained, the client replaces
+  well-known credential shapes with `[REDACTED:<kind>]`: `aws_access_key_id`, `github_token`,
+  `gitlab_token`, `slack_token`, `anthropic_key`, `openai_key`, `stripe_key`, `google_api_key`,
+  `npm_token`, `pypi_token`, `huggingface_token`, `jwt`, `bearer`, `private_key` (PEM blocks),
+  `url_password` (the password in `scheme://user:password@host`), `flag_value` (the value after a
+  secret-named `--flag`, the password of `curl -u user:pass`, and `-pVALUE` in a `mysql`,
+  `mysqldump`, `mysqladmin` or `mariadb` command), `assignment` (the value in a `NAME=value`,
+  `NAME: value` or `NAME => value` assignment whose name looks secret) and `field` (the value of a
+  JSON field whose name ends in a secret word such as `password`, `token`, `secret`, `apikey`,
+  `secretkey`, `signingkey`, `dsn`, `databaseurl`, `authorization` or `cookie`; when that value is
+  an object or array the whole subtree is replaced). Matching on the name
+  suffix keeps counters such as `max_tokens` and `input_tokens` readable. `pass`, `pwd` and `auth`
+  count only as a separate name part (`pass`, `DB_PASS`, `dbPwd`, `auth`), so `bypass`, `compass`
+  and `oauth_state` stay readable. Values inside JSON that was escaped into a string
+  (`\"password\":\"x\"`) and token shapes glued to an identifier after `_` or `-`
+  (`X_ghp_...`) are recognised too. A body that needed
+  redaction carries a `redactions` count and the event stream gains a separate `redacted` gap, so
+  the change record shows that a body was altered. Redaction is heuristic: it cannot recognise a
+  secret with no distinctive shape, and it does not remove personal data, proprietary code or
+  anything else a person would not want shared. The Hub does not re-check or verify redaction.
+  `--password-file PATH` is not redacted, and neither is `mysql -p VALUE` (the value is a database
+  name there). Treat `shared-conversation` as sharing the conversation with people who can read it, not as a
+  guarantee that it is clean.
+- **Upgrade the Hub before clients.** The new event fields and kinds are rejected by an older Hub, so
+  envelopes from an upgraded client stay pending until the Hub is upgraded; metadata for a Work that
+  ends first is lost. Before each upload the client asks the Hub which bodies it still lacks and sends
+  only those.
+- **Bodies over 1 MiB stay local.** A body above the per-body cap is kept in the spool as
+  work-local and is never uploaded.
+- **Mid-session switches stay local.** A session keeps the mode it started under for sharing:
+  switching a checkout to `shared-conversation` while a Claude session is running keeps that
+  session's bodies local, and sharing starts with the next session. Switching away stops uploads
+  at the next delivery.
+- **Upload follows event acceptance.** The hook appends locally first and delivers the event
+  batch as before; only after the Hub accepts it (HTTP 200) are the batch's shared bodies
+  uploaded. A transient failure leaves the envelope pending for the next hook, and a body that
+  never uploads stays declared on the Hub as `local`. Hooks stay fail-open.
+
+Who can read or delete a shared body: the human who shared it (any of that person's tokens for the
+repository; read-only tokens may read but not delete) and Hub admins. The owner of the Work has no
+access to a helper's or reviewer's shared bodies unless they shared them. Each human's declaration of
+a body is its own row, so two people sharing identical content each read and delete their own. A
+listing shows a caller only their own entries (an admin sees all); a body request from anyone else
+gets 403, whether or not that digest exists. There is no per-body grant, and bodies are never included
+in the change-record projection or handoff.
+Read them with `agentscm change-capture conversation`:
+
+```text
+agentscm change-capture conversation --work-id wrk_example              # list entries
+agentscm change-capture conversation --work-id wrk_example --digest SHA256 # print one body
+agentscm change-capture conversation --work-id wrk_example --delete SHA256 # delete one body now
+```
+
+A printed body is untrusted agent output: read it, never run it. The routes, response limits and
+status codes are in [shared conversation reads](hub.md#shared-conversation-reads).
+
+### Retention and deletion
+
+The Hub keeps an uploaded body for 30 days by default; the operator changes this with
+`hub serve --shared-conversation-retention-days N` (1 to 3650). The Hub reports the configured
+number to authenticated clients as `shared_conversation_retention_days` in `GET /v1/hub/whoami`.
+`client status --check` carries it in the connection's `hub_check` (when the check is valid), the
+menu bar app reads it from there, and the local page's `GET /v1/local/capture` lists it per
+checkout (looked up with the checkout's own agent token and reused for a minute). Both surfaces
+then say "kept N days on <hub>". When the number is unknown (an older Hub, an unreachable or slow
+Hub, or no Hub check yet) they say "kept for as long as the Hub operator sets (30 days unless
+changed)" and never name a number they were not given. The deadline is set when the body
+is uploaded. A sweep every ten minutes expires due bodies and deletes their objects, in batches of
+100 until none are due or 30 seconds are spent (the rest waits for the next pass); an object whose
+removal fails is retried after 1 hour, doubling to at most a day, without holding up others. The author
+or a Hub admin can delete a body earlier with `--delete` or the HTTP `DELETE` route (an admin deletes
+every author's copy); deletion records a tombstone and then removes the object, so a deleted or
+expired body answers 410. When two people shared identical content the stored object is removed
+only once no other copy of it is available. A declaration that was never uploaded does not keep it;
+if it is removed first, the other author's later upload writes it again, and an available copy whose
+object is found missing returns to awaiting upload so the checkout uploads it again. A declaration
+still not uploaded when the retention period after its declaration ends expires without ever having
+an object. Identical bodies from the same author in one Work are stored once, under the first
+declaration, so a later identical body shares that entry and its expiry.
+
+Turning sharing off does not recall anything: copies already uploaded stay until they expire or
+are deleted. AgentSCM never deletes the local spool copy. Backups, exports or copies a reader
+made before expiry are outside the Hub's control.
+
 ## Claude Code adapter
 
 The native adapter accepts Claude Code command-hook JSON on stdin. Its supported input events are:
 
-- `SessionStart`: observed startup, resume, clear, compact, or fork boundary.
+- `SessionStart`: observed startup, resume, clear, compact, or fork boundary. An allowlisted
+  `source` (startup, resume, clear, compact) is kept as the event boundary; a compact restart
+  continues the same session and is not counted as a second original start.
 - `UserPromptSubmit`: visible prompt, if local-conversation capture is enabled.
 - `PreToolUse`: typed tool start and optional local tool input.
 - `PostToolUse` and `PostToolUseFailure`: typed tool finish and optional local result or error.
 - `MessageDisplay`: assistant-message fragments. When Claude Code supplies a message identity,
   fragment index, final flag, or timestamp, the adapter uses those correlation fields.
-- `SessionEnd`: session termination.
+- `Stop`, `PreCompact`, `SubagentStart` and `SubagentStop`: turn-ended, compaction and subagent
+  lifecycle markers. A subagent marker carries the subagent's `agent_id` and optional
+  `agent_type`; one without a valid `agent_id` is ignored. These markers are informational: they
+  never raise coverage, and they do not record an `identity_uncertain` gap when the host supplies no
+  identity.
+- `SessionEnd`: session termination. An allowlisted `reason` (clear, logout, prompt_input_exit) is
+  kept as the event boundary and any other reason is recorded as `other`.
+
+Tool facts also carry the bounded host tool name (for example `mcp__server__tool`) and, on finish
+events, whether the host reported the call as `returned` or `failed`. `returned` means the host
+hook fired for a finished call; it is not evidence that the call achieved anything.
 
 `Stop` is a turn boundary and is not recorded as session termination. Only a `SessionStart` whose
 documented source is `startup` establishes an original session boundary. A resume, clear, compact,
@@ -89,10 +310,15 @@ visible scope when its original start and end were both observed and it has no g
 Events without a provider identity or timestamp use a durable local occurrence number. The adapter
 records an `identity_uncertain` gap on each such invocation because the native contract cannot
 distinguish a retried hook from a legitimate repeated event. This preserves repeated identical
-prompts but may overcount retries; it does not claim exact replay identity. Missing provider times
-remain unavailable as `0`; local deferred diagnostics use a separate durable receipt order instead
-of presenting them as Unix-epoch events. Raw prompt and result bodies stay local and do not
-contribute to shared event identity.
+prompts but may overcount retries; it does not claim exact replay identity. Claude Code hook
+payloads normally carry no timestamp, so a hook without a valid one records the hook process's
+receipt time (Unix seconds) as `observed_at`; that time is a receipt time, not a host-reported one.
+It never enters event identity, which still hashes only the provider timestamp, and a re-run of
+the same operation, even after the spool has compacted it, is a duplicate of the retained event
+rather than a conflict, whatever its new receipt time. Transcript import keeps the
+transcript's own timestamps, and Hub records written before this behaviour may hold `0`, which the
+UI shows as "time not reported". Local deferred diagnostics also use a separate durable receipt
+order. Raw prompt and result bodies stay local and do not contribute to shared event identity.
 The native session id observed in a hook is validated separately from the Hub's canonical aliased
 session id. Event and action envelopes plus shared sequence state use the canonical id. For a
 provider-identified tool occurrence, the first durable claim records the observed identity, route,
@@ -190,7 +416,7 @@ read-only, but they cannot be enabled for configured execution or rebound to the
 This conservative refusal avoids splitting a possibly live legacy lock or granting replay authority
 to copied history.
 
-Configuration adds marked `agentscm change-capture hook-claude` entries for the seven lifecycle
+Configuration adds marked `agentscm change-capture hook-claude` entries for the eleven lifecycle
 groups and preserves unrelated hooks. Each hook has a 20-second host timeout. The hook resolves the
 exact current Work and generation for the native session on every invocation, appends locally
 before delivery, then replays at most ten pending envelopes in causal order through the existing
@@ -201,6 +427,15 @@ Only an HTTP 200 writes the separate acknowledgement; rejected, network-failed, 
 failed envelope bytes remain retained and unacknowledged for later retry and diagnosis.
 The spool is durably bound to its canonical Hub, repository, and worktree namespace and rejects a
 mismatched reuse.
+
+The Hub resolves the current target for a session whose Work is `active`, `paused` or `blocked`
+at the session's current generation, and accepts event batches and action starts and finishes for
+that Work in the same states. A Claude `SessionEnd` makes the Hub pause the session's Work, and a
+resumed session (`claude --resume`, same session id) keeps capturing while the Work stays paused,
+so excluding paused Work would defer the session's own `SessionEnd` and everything after a resume.
+`finished` and `handover` Work, and any older generation after a takeover, are refused. Capture
+only reads the state and never changes it; pausing, finishing and handing over remain Work
+checkpoints.
 
 When exact current Work resolution is unavailable or returns no authorized target, the hook keeps
 only a bounded sanitized local fact. It strips prompt text, tool input/output, error, and cwd even

@@ -3,10 +3,14 @@ import { validWorkId } from './standup.ts'
 import { withTimeout } from './timeout.ts'
 
 const MAX_RESPONSE_BYTES = 48 * 1024
+// The Hub refuses to retain a conversation body above 1 MiB; pretty-printing is done after this bound.
+const MAX_CONVERSATION_BODY_BYTES = 1024 * 1024
+const MAX_CONVERSATION_ENTRIES = 100
 const MAX_IDENTIFIER_BYTES = 255
 const MAX_PATH_BYTES = 1024
 const MAX_SCOPE = 16
 const MAX_SOURCE_REFS = 16
+const MAX_SESSION_SETUPS = 16
 const MAX_ARTIFACT_BYTES = 1024 * 1024 * 1024
 const textEncoder = new TextEncoder()
 const hiddenText = /[\p{Cc}\u00ad\u061c\u200b-\u200f\u2028-\u202e\u2060-\u2064\u2066-\u206f\ufeff\u{e0000}-\u{e007f}]/u
@@ -65,6 +69,15 @@ export type ChangeRecordDecisionRef =
   | { kind: 'captured_event'; session_id: string; event_id: string }
   | { kind: 'prior_work_version'; work_id: string; event_seq: number }
 
+/** Latest observed setup of one session. `null` means the setup event did not report the field. */
+export interface ChangeRecordSessionSetup {
+  session_id: string
+  parent_session_id: string | null
+  model: string | null
+  permission_mode: string | null
+  effort: string | null
+}
+
 export interface ChangeRecordSummaryV1 {
   schema_version: 1
   work_id: string
@@ -73,6 +86,8 @@ export interface ChangeRecordSummaryV1 {
   intent: { title: string; scope: string[]; scope_omitted: number }
   subject: { source_id: string; source_kind: 'native' | 'git'; source: ChangeRecordSource } | null
   sessions: { count: number; coverage: ChangeRecordCoverage; gaps: number }
+  session_setups: ChangeRecordSessionSetup[]
+  session_setups_omitted: number
   latest_action: {
     action_id: string
     source_id: string
@@ -303,6 +318,22 @@ export function decodeChangeRecordResponse(value: unknown, expectedWorkId?: stri
       })()
 
   const rawSessions = record(raw['sessions'], 'summary.sessions')
+  // The Hub omits both fields when no session reported setup; absent decodes to none observed.
+  const rawSetups = raw['session_setups'] === undefined ? [] : raw['session_setups']
+  const setupsArray: unknown[] = Array.isArray(rawSetups) ? rawSetups : fail('summary.session_setups')
+  if (setupsArray.length > MAX_SESSION_SETUPS) fail('summary.session_setups')
+  const sessionSetups = setupsArray.map((value, index): ChangeRecordSessionSetup => {
+    const field = `summary.session_setups[${index}]`
+    const item = record(value, field)
+    return {
+      session_id: identifier(item['session_id'], `${field}.session_id`),
+      parent_session_id: nullableIdentifier(item['parent_session_id'], `${field}.parent_session_id`),
+      model: nullableIdentifier(item['model'], `${field}.model`),
+      permission_mode: nullableIdentifier(item['permission_mode'], `${field}.permission_mode`),
+      effort: nullableIdentifier(item['effort'], `${field}.effort`),
+    }
+  })
+  const sessionSetupsOmitted = raw['session_setups_omitted'] === undefined ? 0 : integer(raw['session_setups_omitted'], 'summary.session_setups_omitted')
   const rawAction = raw['latest_action']
   const latestAction = rawAction === null
     ? null
@@ -385,6 +416,8 @@ export function decodeChangeRecordResponse(value: unknown, expectedWorkId?: stri
         coverage: enumValue(rawSessions['coverage'], COVERAGE, 'summary.sessions.coverage'),
         gaps: integer(rawSessions['gaps'], 'summary.sessions.gaps'),
       },
+      session_setups: sessionSetups,
+      session_setups_omitted: sessionSetupsOmitted,
       latest_action: latestAction,
       decision,
       next_action: nextAction,
@@ -394,7 +427,7 @@ export function decodeChangeRecordResponse(value: unknown, expectedWorkId?: stri
   }
 }
 
-async function boundedJson(path: string, token: string, signal: AbortSignal): Promise<unknown> {
+async function boundedJson(path: string, token: string, signal: AbortSignal, maxBytes = MAX_RESPONSE_BYTES): Promise<unknown> {
   const response = await fetch(path, {
     signal: withTimeout(signal),
     cache: 'no-store',
@@ -403,7 +436,7 @@ async function boundedJson(path: string, token: string, signal: AbortSignal): Pr
   })
   if (!response.ok) throw new ApiError(response.status, `HTTP ${response.status}`)
   const declared = Number(response.headers.get('content-length'))
-  if (Number.isFinite(declared) && declared > MAX_RESPONSE_BYTES) {
+  if (Number.isFinite(declared) && declared > maxBytes) {
     await response.body?.cancel()
     throw new InvalidChangeRecordResponse('Change record response is too large')
   }
@@ -416,7 +449,7 @@ async function boundedJson(path: string, token: string, signal: AbortSignal): Pr
       const next = await reader.read()
       if (next.done) break
       total += next.value.byteLength
-      if (total > MAX_RESPONSE_BYTES) {
+      if (total > maxBytes) {
         await reader.cancel()
         throw new InvalidChangeRecordResponse('Change record response is too large')
       }
@@ -442,4 +475,83 @@ export async function fetchChangeRecord(repo: string, workId: string, token: str
   if (!validWorkId(workId)) throw new InvalidChangeRecordResponse('Invalid work ID')
   const value = await boundedJson(`/v1/hub/repos/${encodeURIComponent(repo)}/change-records/${encodeURIComponent(workId)}`, token, signal)
   return decodeChangeRecordResponse(value, workId, repo)
+}
+
+export type ConversationEventKind =
+  | 'session_started' | 'user_prompt' | 'assistant_message' | 'tool_started' | 'tool_finished' | 'check_started'
+  | 'check_finished' | 'session_ended' | 'gap' | 'turn_ended' | 'compaction' | 'subagent_started' | 'subagent_stopped'
+/** What a listing can say. A body that fails verification is only found by reading it (HTTP 424). */
+export type ConversationAvailability = 'local' | 'shared' | 'expired' | 'deleted'
+
+export interface ConversationEntry {
+  session_id: string
+  sequence: number
+  event_id: string
+  kind: ConversationEventKind
+  observed_at: number
+  digest: string
+  size_bytes: number
+  availability: ConversationAvailability
+  expires_at: number | null
+}
+
+export interface ConversationPage {
+  version: 1
+  entries: ConversationEntry[]
+  next_cursor: string | null
+}
+
+const CONVERSATION_KIND = new Set<ConversationEventKind>([
+  'session_started', 'user_prompt', 'assistant_message', 'tool_started', 'tool_finished', 'check_started',
+  'check_finished', 'session_ended', 'gap', 'turn_ended', 'compaction', 'subagent_started', 'subagent_stopped',
+])
+const CONVERSATION_AVAILABILITY = new Set<ConversationAvailability>(['local', 'shared', 'expired', 'deleted'])
+
+export function decodeConversationPage(value: unknown): ConversationPage {
+  const envelope = record(value, 'conversation')
+  if (envelope['version'] !== 1) fail('conversation.version')
+  const raw: unknown[] = Array.isArray(envelope['entries']) ? envelope['entries'] : fail('conversation.entries')
+  if (raw.length > MAX_CONVERSATION_ENTRIES) fail('conversation.entries')
+  const entries = raw.map((value, index): ConversationEntry => {
+    const field = `conversation.entries[${index}]`
+    const item = record(value, field)
+    const availability = enumValue(item['availability'], CONVERSATION_AVAILABILITY, `${field}.availability`)
+    const expiresAt = nullableTimestamp(item['expires_at'], `${field}.expires_at`)
+    // A body never uploaded has no deadline; an uploaded one always does. A deleted one may be either.
+    if (availability === 'local' ? expiresAt !== null : availability !== 'deleted' && expiresAt === null) fail(`${field}.expires_at`)
+    return {
+      session_id: identifier(item['session_id'], `${field}.session_id`),
+      sequence: integer(item['sequence'], `${field}.sequence`, 1),
+      event_id: identifier(item['event_id'], `${field}.event_id`),
+      kind: enumValue(item['kind'], CONVERSATION_KIND, `${field}.kind`),
+      observed_at: timestamp(item['observed_at'], `${field}.observed_at`),
+      digest: digest(item['digest'], `${field}.digest`),
+      size_bytes: integer(item['size_bytes'], `${field}.size_bytes`, 0, MAX_ARTIFACT_BYTES),
+      availability,
+      expires_at: expiresAt,
+    }
+  })
+  const cursor = envelope['next_cursor']
+  const nextCursor = cursor === null ? null : typeof cursor === 'string' && CURSOR.test(cursor) && textEncoder.encode(cursor).byteLength <= 600 ? cursor : fail('conversation.next_cursor')
+  if (nextCursor !== null && entries.length === 0) fail('conversation.next_cursor')
+  return { version: 1, entries, next_cursor: nextCursor }
+}
+
+const CURSOR = /^[0-9]{1,18}:[0-9a-f]{64}:[A-Za-z0-9._:@-]{1,255}$/
+
+export function fetchConversationPage(repo: string, workId: string, token: string, signal: AbortSignal, cursor?: string): Promise<ConversationPage> {
+  if (!validWorkId(workId)) throw new InvalidChangeRecordResponse('Invalid work ID')
+  const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''
+  return boundedJson(`/v1/hub/repos/${encodeURIComponent(repo)}/change-records/${encodeURIComponent(workId)}/conversation${query}`, token, signal).then(decodeConversationPage)
+}
+
+/**
+ * One body, pretty-printed for display as text. It is untrusted agent content: never render it as markup.
+ * Errors carry the HTTP status: 403 not the author or an admin, 404 unknown, 410 expired or deleted,
+ * 424 the stored body is missing or failed verification.
+ */
+export async function fetchConversationBody(repo: string, workId: string, digestValue: string, token: string, signal: AbortSignal): Promise<string> {
+  if (!validWorkId(workId) || !/^[0-9a-f]{64}$/.test(digestValue)) throw new InvalidChangeRecordResponse('Invalid conversation request')
+  const value = await boundedJson(`/v1/hub/repos/${encodeURIComponent(repo)}/change-records/${encodeURIComponent(workId)}/conversation/${digestValue}`, token, signal, MAX_CONVERSATION_BODY_BYTES)
+  return JSON.stringify(value, null, 2)
 }

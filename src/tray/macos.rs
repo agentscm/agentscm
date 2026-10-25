@@ -11,6 +11,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use agentscm::change_record::CaptureModeV1;
 use agentscm::{Error, Result};
 use sha2::{Digest, Sha256};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
@@ -42,6 +43,7 @@ enum UserEvent {
     MenuTrackingEnded,
     Snapshot(std::result::Result<Snapshot, String>, ConfigStamp),
     Integration(crate::client_setup::Agent, std::result::Result<(), String>),
+    ShareConversation(ShareRequest, std::result::Result<(), String>),
     Connected(
         crate::client_setup::Agent,
         String,
@@ -139,6 +141,7 @@ fn run_foreground(initial: Snapshot) -> Result<()> {
         &activity,
         Some("Loading connected checkouts…"),
         login_enabled,
+        None,
     )?;
     let refreshing = Arc::new(AtomicBool::new(false));
     let installing = Arc::new(AtomicBool::new(false));
@@ -151,6 +154,7 @@ fn run_foreground(initial: Snapshot) -> Result<()> {
         &activity,
         Some("Loading connected checkouts…"),
         login_enabled,
+        None,
         agentscm::hub::store::unix_now(),
         now,
     );
@@ -182,6 +186,7 @@ fn run_foreground(initial: Snapshot) -> Result<()> {
         login_changing: false,
         menu_dirty: false,
         notice: None,
+        pending_share: None,
     };
     // This computer's Hub page runs while the tray does, so Open Hub opens at once.
     let local_page = crate::open_cli::LocalPage::start_in_background();
@@ -215,6 +220,9 @@ struct TrayApp {
     login_changing: bool,
     menu_dirty: bool,
     notice: Option<Notice>,
+    /// The checkout whose sharing the person was asked to confirm. Sharing turns on only from the
+    /// explicit confirm item this makes the menu show, never from the first click.
+    pending_share: Option<PendingShare>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -246,6 +254,13 @@ fn clear_refresh_notice(notice: &mut Option<Notice>) {
 impl TrayApp {
     fn replace_menu(&mut self, notice: Option<&str>) {
         update_refresh_notice(&mut self.notice, notice);
+        self.pending_share = self.pending_share.take().filter(|pending| {
+            pending_share_current(pending, &self.snapshot, std::time::Instant::now())
+        });
+        let confirming = self
+            .pending_share
+            .as_ref()
+            .map(|pending| pending.request.identity.as_str());
         let notice = projected_notice(
             None,
             self.notice.as_ref().map(Notice::as_str),
@@ -258,6 +273,7 @@ impl TrayApp {
             &self.activity,
             notice,
             login_enabled,
+            confirming,
             agentscm::hub::store::unix_now(),
             std::time::Instant::now(),
         );
@@ -278,7 +294,13 @@ impl TrayApp {
         }
         if let (Some(tray), Ok(menu)) = (
             &self.tray,
-            build_menu(&self.snapshot, &self.activity, notice, login_enabled),
+            build_menu(
+                &self.snapshot,
+                &self.activity,
+                notice,
+                login_enabled,
+                confirming,
+            ),
         ) {
             let Some(native_menu) = native_menu::NativeMenuBridge::attach(
                 &menu,
@@ -439,6 +461,76 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                         "The checkout connection changed; refresh and try again".into(),
                     ));
                     self.replace_menu(None);
+                }
+            }
+            UserEvent::Menu(id)
+                if id.starts_with("share-conv:") || id.starts_with("share-confirm:") =>
+            {
+                self.notice = None;
+                if self.opening_hub || self.installing.load(Ordering::Acquire) {
+                    self.notice = Some(Notice::Action(
+                        "An action is still running; wait for its result".into(),
+                    ));
+                } else {
+                    match share_step(
+                        &id,
+                        &self.snapshot,
+                        self.pending_share.as_ref(),
+                        std::time::Instant::now(),
+                    ) {
+                        ShareStep::AskConfirmation(request) => {
+                            let (title, body) = share_confirmation(&request);
+                            self.feedback.show(&title, &body, false);
+                            self.notice = Some(Notice::Action(title));
+                            self.pending_share = Some(PendingShare {
+                                request,
+                                asked_at: std::time::Instant::now(),
+                            });
+                        }
+                        ShareStep::Change(request) => {
+                            self.pending_share = None;
+                            self.installing.store(true, Ordering::Release);
+                            self.feedback.show(
+                                "Updating conversation sharing…",
+                                &share_progress(&request),
+                                true,
+                            );
+                            self.notice =
+                                Some(Notice::Action("Updating conversation sharing…".into()));
+                            spawn_share_change(self.refresh_proxy.clone(), request);
+                        }
+                        ShareStep::Unavailable => {
+                            self.pending_share = None;
+                            self.feedback.show(
+                                "Conversation sharing unavailable",
+                                "The checkout connection changed. Refresh connections and try again.",
+                                false,
+                            );
+                            self.notice = Some(Notice::Action(
+                                "Conversation sharing is unavailable; refresh and try again".into(),
+                            ));
+                        }
+                    }
+                }
+                self.replace_menu(None);
+            }
+            UserEvent::ShareConversation(request, result) => {
+                self.installing.store(false, Ordering::Release);
+                let (title, body) = share_outcome(&request, &result);
+                self.feedback.update(&title, &body, false);
+                if result.is_ok()
+                    && let Some(connection) = self
+                        .snapshot
+                        .connections
+                        .iter_mut()
+                        .find(|connection| connection_identity(connection) == request.identity)
+                {
+                    connection.capture_mode = Some(request.desired);
+                }
+                self.notice = Some(Notice::Action(title));
+                self.replace_menu(None);
+                if !self.refreshing.swap(true, Ordering::AcqRel) {
+                    spawn_refresh(self.refresh_proxy.clone(), false);
                 }
             }
             UserEvent::Menu(id) if id.starts_with("connect:") => {
@@ -786,6 +878,229 @@ fn spawn_integration(
     });
 }
 
+#[derive(Clone, Debug)]
+struct ShareRequest {
+    identity: String,
+    root: std::path::PathBuf,
+    repository: String,
+    hub: String,
+    label: String,
+    desired: CaptureModeV1,
+    /// Days the Hub said it keeps a shared conversation; `None` until a Hub check reports it.
+    retention_days: Option<i64>,
+}
+
+/// How long the Hub keeps a shared conversation, in the words every surface uses. Only a number
+/// the Hub reported is stated as fact.
+fn retention_phrase(hub: &str, days: Option<i64>) -> String {
+    match days {
+        Some(1) => format!("kept 1 day on {hub}"),
+        Some(days) => format!("kept {days} days on {hub}"),
+        None => "kept for as long as the Hub operator sets (30 days unless changed)".into(),
+    }
+}
+
+/// What turning sharing on does, in the words every surface uses.
+fn share_consequences(hub: &str, retention_days: Option<i64>) -> String {
+    format!(
+        "Conversations are redacted on this computer, uploaded to {hub}, {}, and readable by you and Hub admins. Redaction is best effort. Turning sharing off stops future uploads.",
+        retention_phrase(hub, retention_days)
+    )
+}
+
+fn share_progress(request: &ShareRequest) -> String {
+    if request.desired == CaptureModeV1::SharedConversation {
+        format!(
+            "Setting up capture for {} if needed, then turning sharing on. {}",
+            request.label,
+            share_consequences(&request.hub, request.retention_days)
+        )
+    } else {
+        "Switching this checkout to metadata only. Local data is not touched.".into()
+    }
+}
+
+fn share_menu_id(identity: &str) -> String {
+    format!("share-conv:{identity}")
+}
+
+fn share_confirm_id(identity: &str) -> String {
+    format!("share-confirm:{identity}")
+}
+
+fn share_confirm_label(hub: &str) -> String {
+    format!(
+        "Confirm: share conversations with {}",
+        super::clean_label(hub)
+    )
+}
+
+/// What a click on a sharing item does. Turning sharing on is two clicks: the toggle only asks,
+/// and the confirm item that then appears for that checkout is the one that changes anything.
+enum ShareStep {
+    /// Turning sharing on needs the person to confirm what it does first.
+    AskConfirmation(ShareRequest),
+    /// Turn sharing off, or on after the explicit confirmation.
+    Change(ShareRequest),
+    Unavailable,
+}
+
+fn share_step(
+    id: &str,
+    snapshot: &Snapshot,
+    pending: Option<&PendingShare>,
+    now: std::time::Instant,
+) -> ShareStep {
+    if let Some(identity) = id.strip_prefix("share-confirm:") {
+        return pending
+            .filter(|pending| pending.request.identity == identity)
+            .filter(|pending| pending_share_current(pending, snapshot, now))
+            .and_then(|_| share_request(&share_menu_id(identity), snapshot))
+            .filter(|request| request.desired == CaptureModeV1::SharedConversation)
+            .map_or(ShareStep::Unavailable, ShareStep::Change);
+    }
+    match share_request(id, snapshot) {
+        Some(request) if request.desired == CaptureModeV1::SharedConversation => {
+            ShareStep::AskConfirmation(request)
+        }
+        Some(request) => ShareStep::Change(request),
+        None => ShareStep::Unavailable,
+    }
+}
+
+/// How long a share confirmation stays available after the person was asked.
+const SHARE_CONFIRM_TTL: Duration = Duration::from_secs(120);
+
+/// A share request the person was asked to confirm, and when.
+struct PendingShare {
+    request: ShareRequest,
+    asked_at: std::time::Instant,
+}
+
+/// Whether a pending confirmation still describes what the menu shows: asked within
+/// [`SHARE_CONFIRM_TTL`], the same checkout and Hub (the identity covers both), not yet shared.
+fn pending_share_current(
+    pending: &PendingShare,
+    snapshot: &Snapshot,
+    now: std::time::Instant,
+) -> bool {
+    now.saturating_duration_since(pending.asked_at) < SHARE_CONFIRM_TTL
+        && share_request(&share_menu_id(&pending.request.identity), snapshot)
+            .is_some_and(|request| request.desired == CaptureModeV1::SharedConversation)
+}
+
+fn share_confirmation(request: &ShareRequest) -> (String, String) {
+    (
+        format!("Share conversations from {}?", request.label),
+        format!(
+            "{} Nothing is shared yet. Open this checkout's menu and choose \"{}\" to turn sharing on.",
+            share_consequences(&request.hub, request.retention_days),
+            share_confirm_label(&request.hub)
+        ),
+    )
+}
+
+fn share_mismatch_note(saved: &crate::client_status::CaptureMismatch, connected: &str) -> String {
+    format!(
+        "Sharing was set for {}; this checkout is now connected to {}.\nTurn sharing off here, or run `agentscm change-capture forget --root <checkout>` after unconfigure to start fresh.",
+        super::clean_label(&saved.hub),
+        super::clean_label(connected)
+    )
+}
+
+/// The toggle flips the mode in the snapshot, not the checkmark AppKit just drew, so a stale or
+/// failed click can never request a change the user did not see. A checkout without an enabled
+/// binding is unchecked, and turning sharing on creates the binding.
+fn share_request(id: &str, snapshot: &Snapshot) -> Option<ShareRequest> {
+    let identity = id.strip_prefix("share-conv:")?;
+    let connection = snapshot
+        .connections
+        .iter()
+        .find(|connection| connection_identity(connection) == identity)?;
+    let desired = match connection.capture_mode {
+        Some(CaptureModeV1::SharedConversation) => CaptureModeV1::MetadataOnly,
+        _ => CaptureModeV1::SharedConversation,
+    };
+    Some(ShareRequest {
+        identity: identity.to_owned(),
+        root: connection.root.clone(),
+        repository: connection.repository.clone(),
+        hub: connection.hub.clone(),
+        label: connection
+            .root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map_or_else(|| connection.repository.clone(), super::clean_label),
+        desired,
+        retention_days: match &connection.hub_check {
+            HubCheck::Valid {
+                shared_conversation_retention_days,
+                ..
+            } => *shared_conversation_retention_days,
+            _ => None,
+        },
+    })
+}
+
+/// Whether the share toggle is checked. It is always enabled: without a binding, a click sets
+/// capture up.
+fn share_toggle_checked(mode: Option<CaptureModeV1>) -> bool {
+    mode == Some(CaptureModeV1::SharedConversation)
+}
+
+fn share_outcome(
+    request: &ShareRequest,
+    result: &std::result::Result<(), String>,
+) -> (String, String) {
+    match (result, request.desired) {
+        (Err(error), _) => (
+            "Could not change conversation sharing".into(),
+            error.clone(),
+        ),
+        (Ok(()), CaptureModeV1::SharedConversation) => (
+            format!("Sharing on for {}", request.label),
+            format!(
+                "Sharing on for {}. {}",
+                request.label,
+                share_consequences(&request.hub, request.retention_days)
+            ),
+        ),
+        (Ok(()), _) => (
+            format!("Sharing off for {}", request.label),
+            format!(
+                "Sharing off for {}: new conversations are no longer uploaded; already-uploaded copies remain until they expire or you delete them",
+                request.label
+            ),
+        ),
+    }
+}
+
+fn spawn_share_change(proxy: winit::event_loop::EventLoopProxy<UserEvent>, request: ShareRequest) {
+    std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if request.desired == CaptureModeV1::SharedConversation {
+                crate::change_capture_client::enable_capture(
+                    &request.root,
+                    request.desired,
+                    crate::change_capture_client::ExpectedTarget {
+                        repository: &request.repository,
+                        hub: &request.hub,
+                    },
+                )
+            } else {
+                crate::change_capture_client::set_capture_mode(&request.root, request.desired, None)
+            }
+        }))
+        .map_err(|_| "conversation sharing change stopped unexpectedly".to_owned())
+        .and_then(|result| {
+            result
+                .map(|_| ())
+                .map_err(|error| bounded_error(&error.to_string()))
+        });
+        let _ = proxy.send_event(UserEvent::ShareConversation(request, result));
+    });
+}
+
 #[derive(Clone)]
 struct ConnectRequest {
     agent: crate::client_setup::Agent,
@@ -1060,6 +1375,7 @@ fn build_menu(
     activity: &crate::client_activity::ActivityStore,
     notice: Option<&str>,
     login_enabled: bool,
+    confirming: Option<&str>,
 ) -> Result<Menu> {
     let now = agentscm::hub::store::unix_now();
     let menu = Menu::new();
@@ -1112,6 +1428,36 @@ fn build_menu(
                 None,
             ))
             .map_err(menu_error)?;
+
+        if let Some(mismatch) = &connection.capture_mismatch {
+            submenu
+                .append(&native_text_item(
+                    "sharing-mismatch",
+                    &share_mismatch_note(mismatch, &connection.hub),
+                ))
+                .map_err(menu_error)?;
+        }
+        let sharing_on = share_toggle_checked(connection.capture_mode);
+        submenu
+            .append(&CheckMenuItem::with_id(
+                share_menu_id(&identity),
+                "Share agent conversations with Hub",
+                // After a reconnect to another Hub, sharing can only be turned off.
+                sharing_on || connection.capture_mismatch.is_none(),
+                sharing_on,
+                None,
+            ))
+            .map_err(menu_error)?;
+        if confirming == Some(identity.as_str()) {
+            submenu
+                .append(&MenuItem::with_id(
+                    share_confirm_id(&identity),
+                    share_confirm_label(&connection.hub),
+                    true,
+                    None,
+                ))
+                .map_err(menu_error)?;
+        }
 
         let integrations = Submenu::new("Agent Integrations", true);
         for (agent, label) in agent_choices() {
@@ -1340,10 +1686,13 @@ fn menu_projection_key(
     activity: &crate::client_activity::ActivityStore,
     notice: Option<&str>,
     login_enabled: bool,
+    confirming: Option<&str>,
     now: i64,
     monotonic_now: std::time::Instant,
 ) -> String {
     let mut key = serde_json::to_string(&snapshot.connections).unwrap_or_default();
+    key.push_str("\nconfirming:");
+    key.push_str(confirming.unwrap_or_default());
     key.push_str("\nnotice:");
     key.push_str(notice.unwrap_or_default());
     key.push_str("\nlogin:");
@@ -1751,6 +2100,9 @@ fn config_stamp() -> ConfigStamp {
         crate::hub_cli::config_dir()
             .unwrap_or_default()
             .join("agentscm/connections.json"),
+        crate::hub_cli::config_dir()
+            .unwrap_or_default()
+            .join("agentscm/change-capture.json"),
     ];
     if let Ok(connections) = crate::client_config::load() {
         paths.extend(
@@ -1901,6 +2253,292 @@ mod tests {
         .unwrap();
     }
 
+    fn share_connection(
+        root: &str,
+        mode: Option<CaptureModeV1>,
+    ) -> crate::client_status::ConnectionStatus {
+        crate::client_status::ConnectionStatus {
+            root: root.into(),
+            repository: "example/project".into(),
+            hub: "https://hub.example".into(),
+            agents: vec![],
+            binding: crate::client_status::BindingStatus {
+                state: BindingState::Current,
+                generation: Some("generation".into()),
+                activity_generation: None,
+            },
+            credential: crate::client_status::CredentialStatus {
+                kind: crate::client_status::CredentialKind::External,
+                state: CredentialState::Available,
+                expires_at: None,
+            },
+            hub_check: HubCheck::Skipped,
+            recent_participation: vec![],
+            capture_mode: mode,
+            capture_mismatch: None,
+        }
+    }
+
+    #[test]
+    fn a_share_request_carries_only_the_retention_the_hub_check_reported() {
+        let mut connection = share_connection("/synthetic/reported", None);
+        connection.hub_check = HubCheck::Valid {
+            checked_at: 1,
+            provider: "github".into(),
+            host: "github.com".into(),
+            login: "member".into(),
+            expires_at: 100,
+            shared_conversation_retention_days: Some(45),
+        };
+        let identity = connection_identity(&connection);
+        let mut snapshot = Snapshot {
+            version: 1,
+            snapshot_at: 0,
+            connections: vec![connection],
+        };
+        let id = share_menu_id(&identity);
+        assert_eq!(
+            share_request(&id, &snapshot).unwrap().retention_days,
+            Some(45)
+        );
+        // An unchecked, unreachable or older Hub leaves it unknown.
+        for check in [
+            HubCheck::Skipped,
+            HubCheck::Unavailable { checked_at: 1 },
+            HubCheck::Valid {
+                checked_at: 1,
+                provider: "github".into(),
+                host: "github.com".into(),
+                login: "member".into(),
+                expires_at: 100,
+                shared_conversation_retention_days: None,
+            },
+        ] {
+            snapshot.connections[0].hub_check = check;
+            assert_eq!(share_request(&id, &snapshot).unwrap().retention_days, None);
+        }
+    }
+
+    #[test]
+    fn share_toggle_flips_the_mode_and_a_click_without_a_binding_turns_sharing_on() {
+        let snapshot = Snapshot {
+            version: 1,
+            snapshot_at: 0,
+            connections: vec![
+                share_connection("/synthetic/off", Some(CaptureModeV1::LocalConversation)),
+                share_connection("/synthetic/on", Some(CaptureModeV1::SharedConversation)),
+                share_connection("/synthetic/unbound", None),
+            ],
+        };
+        let id = |index: usize| share_menu_id(&connection_identity(&snapshot.connections[index]));
+        let off = share_request(&id(0), &snapshot).unwrap();
+        assert_eq!(off.desired, CaptureModeV1::SharedConversation);
+        assert_eq!(off.label, "off");
+        assert_eq!(off.root, Path::new("/synthetic/off"));
+        let on = share_request(&id(1), &snapshot).unwrap();
+        assert_eq!(on.desired, CaptureModeV1::MetadataOnly);
+        let unbound = share_request(&id(2), &snapshot).unwrap();
+        assert_eq!(unbound.desired, CaptureModeV1::SharedConversation);
+        assert_eq!(unbound.hub, "https://hub.example");
+        assert!(share_request("share-conv:unknown", &snapshot).is_none());
+        assert!(share_request("hub:unknown", &snapshot).is_none());
+
+        assert!(!share_toggle_checked(None));
+        assert!(!share_toggle_checked(Some(CaptureModeV1::MetadataOnly)));
+        assert!(share_toggle_checked(Some(
+            CaptureModeV1::SharedConversation
+        )));
+    }
+
+    #[test]
+    fn turning_sharing_on_takes_two_clicks_and_the_first_never_changes_anything() {
+        let mut snapshot = Snapshot {
+            version: 1,
+            snapshot_at: 0,
+            connections: vec![
+                share_connection("/synthetic/unbound", None),
+                share_connection("/synthetic/on", Some(CaptureModeV1::SharedConversation)),
+            ],
+        };
+        let identity =
+            |snapshot: &Snapshot, index: usize| connection_identity(&snapshot.connections[index]);
+        let toggle = share_menu_id(&identity(&snapshot, 0));
+        let confirm = share_confirm_id(&identity(&snapshot, 0));
+
+        // The toggle only asks, and says what sharing does and which item confirms it.
+        let now = std::time::Instant::now();
+        let ShareStep::AskConfirmation(asked) = share_step(&toggle, &snapshot, None, now) else {
+            panic!("the first click must only ask");
+        };
+        let pending = PendingShare {
+            request: asked.clone(),
+            asked_at: now,
+        };
+        let (title, body) = share_confirmation(&asked);
+        assert_eq!(title, "Share conversations from unbound?");
+        assert!(body.contains(&share_consequences("https://hub.example", None)));
+        assert!(body.contains("as long as the Hub operator sets (30 days unless changed)"));
+        assert!(!body.contains("days on"));
+        assert!(body.contains(&share_confirm_label("https://hub.example")));
+        assert!(body.contains("Nothing is shared yet"));
+        assert_eq!(
+            share_confirm_label("https://hub.example"),
+            "Confirm: share conversations with https://hub.example"
+        );
+        // Clicking the toggle again asks again; it never turns anything on.
+        assert!(matches!(
+            share_step(&toggle, &snapshot, Some(&pending), now),
+            ShareStep::AskConfirmation(_)
+        ));
+
+        // The confirm item alone changes the setting, and only after the person was asked.
+        assert!(matches!(
+            share_step(&confirm, &snapshot, None, now),
+            ShareStep::Unavailable
+        ));
+        let ShareStep::Change(request) = share_step(&confirm, &snapshot, Some(&pending), now)
+        else {
+            panic!("the confirm item must turn sharing on");
+        };
+        assert_eq!(request.desired, CaptureModeV1::SharedConversation);
+        assert_eq!(request.repository, "example/project");
+        assert_eq!(request.hub, "https://hub.example");
+
+        // A confirmation asked for another checkout does not confirm this one.
+        let other = share_request(&share_menu_id(&identity(&snapshot, 1)), &snapshot).unwrap();
+        let other_pending = PendingShare {
+            request: other,
+            asked_at: now,
+        };
+        assert!(matches!(
+            share_step(&confirm, &snapshot, Some(&other_pending), now),
+            ShareStep::Unavailable
+        ));
+
+        // Turning sharing off needs no confirmation.
+        let off = share_menu_id(&identity(&snapshot, 1));
+        assert!(matches!(
+            share_step(&off, &snapshot, None, now),
+            ShareStep::Change(request) if request.desired == CaptureModeV1::MetadataOnly
+        ));
+
+        // The menu shows the confirm item only while the asked checkout is unchanged: another Hub
+        // is another identity, and a checkout that now shares has nothing left to confirm.
+        assert!(pending_share_current(&pending, &snapshot, now));
+        snapshot.connections[0].hub = "https://other.example".into();
+        assert!(!pending_share_current(&pending, &snapshot, now));
+        assert!(matches!(
+            share_step(&confirm, &snapshot, Some(&pending), now),
+            ShareStep::Unavailable
+        ));
+        snapshot.connections[0].hub = "https://hub.example".into();
+        snapshot.connections[0].capture_mode = Some(CaptureModeV1::SharedConversation);
+        assert!(!pending_share_current(&pending, &snapshot, now));
+
+        // The confirmation lapses after two minutes: the menu drops it and the item does nothing.
+        snapshot.connections[0].capture_mode = None;
+        let late = now + SHARE_CONFIRM_TTL;
+        assert!(pending_share_current(
+            &pending,
+            &snapshot,
+            late - Duration::from_secs(1)
+        ));
+        assert!(!pending_share_current(&pending, &snapshot, late));
+        assert!(matches!(
+            share_step(&confirm, &snapshot, Some(&pending), late),
+            ShareStep::Unavailable
+        ));
+        // Asking again after it lapsed starts a fresh window.
+        assert!(matches!(
+            share_step(&toggle, &snapshot, Some(&pending), late),
+            ShareStep::AskConfirmation(_)
+        ));
+        snapshot.connections[0].capture_mode = Some(CaptureModeV1::SharedConversation);
+
+        let activity = crate::client_activity::ActivityStore::default();
+        let now = std::time::Instant::now();
+        assert_ne!(
+            menu_projection_key(&snapshot, &activity, None, false, None, 100, now),
+            menu_projection_key(&snapshot, &activity, None, false, Some("x"), 100, now)
+        );
+    }
+
+    #[test]
+    fn a_reconnected_checkout_explains_the_saved_hub_and_can_only_turn_sharing_off() {
+        let mut connection =
+            share_connection("/synthetic/moved", Some(CaptureModeV1::SharedConversation));
+        connection.capture_mismatch = Some(crate::client_status::CaptureMismatch {
+            repository: "example/project".into(),
+            hub: "https://old.example".into(),
+        });
+        let note = share_mismatch_note(
+            connection.capture_mismatch.as_ref().unwrap(),
+            &connection.hub,
+        );
+        assert!(note.starts_with(
+            "Sharing was set for https://old.example; this checkout is now connected to https://hub.example."
+        ));
+        assert!(note.contains("change-capture forget"));
+        let snapshot = Snapshot {
+            version: 1,
+            snapshot_at: 0,
+            connections: vec![connection],
+        };
+        let id = share_menu_id(&connection_identity(&snapshot.connections[0]));
+        assert!(matches!(
+            share_step(&id, &snapshot, None, std::time::Instant::now()),
+            ShareStep::Change(request) if request.desired == CaptureModeV1::MetadataOnly
+        ));
+        let activity = crate::client_activity::ActivityStore::default();
+        let now = std::time::Instant::now();
+        let mut snapshot = snapshot;
+        let with = menu_projection_key(&snapshot, &activity, None, false, None, 100, now);
+        snapshot.connections[0].capture_mismatch = None;
+        assert_ne!(
+            with,
+            menu_projection_key(&snapshot, &activity, None, false, None, 100, now)
+        );
+    }
+
+    #[test]
+    fn share_outcome_states_what_the_change_does_and_does_not_do() {
+        let mut request = ShareRequest {
+            identity: "x".into(),
+            root: "/synthetic/project".into(),
+            repository: "example/project".into(),
+            hub: "https://hub.example.test".into(),
+            label: "project".into(),
+            desired: CaptureModeV1::SharedConversation,
+            retention_days: Some(7),
+        };
+        let (_, body) = share_outcome(&request, &Ok(()));
+        assert!(body.starts_with("Sharing on for project."));
+        assert!(body.contains("redacted on this computer"));
+        assert!(body.contains("uploaded to https://hub.example.test"));
+        assert!(body.contains("kept 7 days on https://hub.example.test"));
+        assert!(body.contains("Hub admins"));
+        assert!(share_progress(&request).contains("kept 7 days on"));
+        request.retention_days = Some(1);
+        assert!(share_progress(&request).contains("kept 1 day on"));
+        // A Hub that did not say how long is never given a number.
+        request.retention_days = None;
+        let unknown = share_progress(&request);
+        assert!(unknown.contains("as long as the Hub operator sets (30 days unless changed)"));
+        assert!(!unknown.contains("days on"));
+        request.retention_days = Some(7);
+        request.desired = CaptureModeV1::MetadataOnly;
+        let (_, body) = share_outcome(&request, &Ok(()));
+        assert!(body.starts_with("Sharing off for project:"));
+        assert!(body.contains("no longer uploaded") && body.contains("remain until"));
+        assert!(!share_progress(&request).contains("uploaded"));
+        let (title, body) = share_outcome(
+            &request,
+            &Err("no client connection for this checkout".into()),
+        );
+        assert_eq!(title, "Could not change conversation sharing");
+        assert_eq!(body, "no client connection for this checkout");
+    }
+
     #[test]
     fn copied_commands_quote_shell_metacharacters_as_data() {
         assert_eq!(shell_quote("a'b;$(touch nope)"), "'a'\\''b;$(touch nope)'");
@@ -2027,7 +2665,7 @@ mod tests {
             quickstart_command_for(Path::new("/opt/agent scm"), &rows[0]),
             "cd '/synthetic/widgets' && '/opt/agent scm' quickstart --agent 'codex'"
         );
-        let projected = menu_projection_key(&snapshot, &activity, None, false, 100, now);
+        let projected = menu_projection_key(&snapshot, &activity, None, false, None, 100, now);
         assert!(projected.contains("unconnected:acme/widgets"));
 
         snapshot
@@ -2049,6 +2687,8 @@ mod tests {
                 },
                 hub_check: HubCheck::Skipped,
                 recent_participation: vec![],
+                capture_mode: None,
+                capture_mismatch: None,
             });
         assert!(unconnected_rows(&snapshot, &activity, now).is_empty());
         assert!(
@@ -2093,6 +2733,8 @@ mod tests {
             },
             hub_check: HubCheck::Skipped,
             recent_participation: vec![],
+            capture_mode: None,
+            capture_mismatch: None,
         };
         let capture = temp.path().join("arguments");
         for (command, directory, arguments) in [
@@ -2191,13 +2833,14 @@ mod tests {
         };
         let activity = crate::client_activity::ActivityStore::default();
         let monotonic = std::time::Instant::now();
-        let first = menu_projection_key(&snapshot, &activity, None, false, 100, monotonic);
+        let first = menu_projection_key(&snapshot, &activity, None, false, None, 100, monotonic);
         snapshot.snapshot_at = 47;
         let periodic = menu_projection_key(
             &snapshot,
             &activity,
             None,
             false,
+            None,
             105,
             monotonic + Duration::from_secs(5),
         );
@@ -2209,6 +2852,7 @@ mod tests {
                 &activity,
                 Some("Checking…"),
                 false,
+                None,
                 105,
                 monotonic,
             )
@@ -2225,8 +2869,8 @@ mod tests {
         let activity = crate::client_activity::ActivityStore::default();
         let monotonic = std::time::Instant::now();
         assert_ne!(
-            menu_projection_key(&snapshot, &activity, None, false, 100, monotonic),
-            menu_projection_key(&snapshot, &activity, None, true, 100, monotonic),
+            menu_projection_key(&snapshot, &activity, None, false, None, 100, monotonic),
+            menu_projection_key(&snapshot, &activity, None, true, None, 100, monotonic),
         );
     }
 
@@ -2320,6 +2964,7 @@ mod tests {
             host: "github.com".into(),
             login: "member".into(),
             expires_at,
+            shared_conversation_retention_days: None,
         };
         assert!(hub_recently_verified(&check(40, 200), 100));
         assert!(!hub_recently_verified(&check(39, 200), 100));
@@ -2427,6 +3072,7 @@ mod tests {
             host: "github.com".into(),
             login: "member".into(),
             expires_at: 101,
+            shared_conversation_retention_days: None,
         };
         assert!(hub_label(&check, 100).starts_with("authenticated as member"));
         assert_eq!(

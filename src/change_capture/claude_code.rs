@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::change_capture::redact::redact_json;
 use crate::change_capture::spool::{
     LocalSpool, ManagedInvocationV1, NativeOccurrenceReceiptV1, NativeOccurrenceRouteV1,
     ProviderHistoryCursorV1,
@@ -24,9 +25,9 @@ use crate::change_capture::{
 use crate::change_record::{
     ActionFinishV1, ActionKindV1, ActionOutcomeV1, ActionStartV1, AgentHarnessV1, ArtifactMediaV1,
     CaptureBatchV1, CaptureEnvelopeV1, CaptureModeV1, CapturedEventKindV1, CapturedEventV1,
-    CheckResultV1, CoverageV1, DriftV1, GapFactV1, GapReasonV1, RecipeProvenanceV1,
-    RetentionClassV1, SCHEMA_VERSION_V1, SessionIdentityV1, SetupComponentV1, SetupObservationV1,
-    ToolFactV1, ToolKindV1,
+    CheckResultV1, CoverageV1, DriftV1, GapFactV1, GapReasonV1, MAX_SHARED_BODY_BYTES,
+    RecipeProvenanceV1, RetentionClassV1, SCHEMA_VERSION_V1, SessionIdentityV1, SetupComponentV1,
+    SetupObservationV1, SubagentFactV1, ToolCompletionV1, ToolFactV1, ToolKindV1,
 };
 use crate::hub::github::parse_rfc3339;
 use crate::hub::insights::{
@@ -51,8 +52,12 @@ pub struct CaptureRequest {
     pub observed_session_id: String,
     /// Hub-authoritative session identity after alias resolution.
     pub canonical_session_id: String,
+    /// Pinned with `capture_mode` per Work, generation and canonical session.
     pub parent_session_id: Option<String>,
+    /// Session identity sent to the Hub. Pinned so a later binding change cannot alter it.
     pub capture_mode: CaptureModeV1,
+    /// The binding's current mode. It alone decides whether bodies are retained.
+    pub live_capture_mode: CaptureModeV1,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -143,6 +148,8 @@ struct SelectedEvent {
     tool: Option<ToolFactV1>,
     local_body: Option<Value>,
     setup: Option<SetupObservationV1>,
+    boundary: Option<String>,
+    subagent: Option<SubagentFactV1>,
 }
 
 #[derive(Serialize)]
@@ -171,7 +178,20 @@ pub fn capture_hook(
     request: &CaptureRequest,
     spool: &LocalSpool,
 ) -> Result<HookCaptureOutcome> {
-    capture_hook_with_identity(input, request, spool, None)
+    let outcome = capture_hook_with_identity(input, request, spool, None);
+    for warning in take_hook_warnings() {
+        eprintln!("agentscm: {warning}");
+    }
+    outcome
+}
+
+thread_local! {
+    // Non-fatal capture notes from the shared hook path, surfaced through `NativeHookReport`.
+    static HOOK_WARNINGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn take_hook_warnings() -> Vec<String> {
+    HOOK_WARNINGS.with(|warnings| std::mem::take(&mut *warnings.borrow_mut()))
 }
 
 fn capture_hook_with_identity(
@@ -224,7 +244,6 @@ fn capture_hook_with_identity_mode(
         ensure_deferred_gaps(&request.observed_session_id, spool)?;
     }
     let provider_timestamp = payload.get("timestamp").and_then(Value::as_str);
-    let observed_at = provider_timestamp.and_then(parse_rfc3339).unwrap_or(0);
     let tool_name = payload.get("tool_name").and_then(Value::as_str);
     let provider_id = [
         "tool_use_id",
@@ -232,6 +251,7 @@ fn capture_hook_with_identity_mode(
         "message_id",
         "uuid",
         "request_id",
+        "agent_id",
     ]
     .iter()
     .find_map(|key| payload.get(*key).and_then(Value::as_str));
@@ -247,7 +267,7 @@ fn capture_hook_with_identity_mode(
         ),
         "PreToolUse" => (
             check_kind(CapturedEventKindV1::ToolStarted, tool_name),
-            Some(tool_fact(tool_name, provider_id)),
+            Some(tool_fact(tool_name, provider_id, None)),
             Some(json!({
                 "tool_name": tool_name,
                 "tool_input": payload.get("tool_input"),
@@ -255,7 +275,15 @@ fn capture_hook_with_identity_mode(
         ),
         "PostToolUse" | "PostToolUseFailure" => (
             check_kind(CapturedEventKindV1::ToolFinished, tool_name),
-            Some(tool_fact(tool_name, provider_id)),
+            Some(tool_fact(
+                tool_name,
+                provider_id,
+                Some(if event_name == "PostToolUse" {
+                    ToolCompletionV1::Returned
+                } else {
+                    ToolCompletionV1::Failed
+                }),
+            )),
             Some(json!({
                 "tool_name": tool_name,
                 "tool_response": payload.get("tool_response"),
@@ -275,16 +303,37 @@ fn capture_hook_with_identity_mode(
             }),
         ),
         "SessionEnd" => (CapturedEventKindV1::SessionEnded, None, None),
-        "Stop" => return Ok(HookCaptureOutcome::Ignored),
+        "Stop" => (CapturedEventKindV1::TurnEnded, None, None),
+        "PreCompact" => (CapturedEventKindV1::Compaction, None, None),
+        "SubagentStart" => (CapturedEventKindV1::SubagentStarted, None, None),
+        "SubagentStop" => (CapturedEventKindV1::SubagentStopped, None, None),
         _ => return Ok(HookCaptureOutcome::Ignored),
     };
+    let boundary = hook_boundary(event_name, payload);
+    let subagent = hook_subagent(event_name, payload);
+    if subagent.is_none()
+        && matches!(
+            kind,
+            CapturedEventKindV1::SubagentStarted | CapturedEventKindV1::SubagentStopped
+        )
+    {
+        return Ok(HookCaptureOutcome::Ignored);
+    }
     let starts_new_session = event_name == "SessionStart"
         && payload.get("source").and_then(Value::as_str) == Some("startup");
     if update_current_association
         && !starts_new_session
         && !spool.session_origin_observed(&request.canonical_session_id)?
     {
-        ensure_adapter_started_late_gap(request, spool)?;
+        // The marker is retried on every hook until the origin is seen, so a failure here must
+        // not cost the hook's own event.
+        if let Err(error) = ensure_adapter_started_late_gap(request, spool) {
+            HOOK_WARNINGS.with(|warnings| {
+                warnings
+                    .borrow_mut()
+                    .push(format!("adapter-started-late marker not retained: {error}"));
+            });
+        }
     }
     let identity_input = serde_json::to_vec(&json!({
         "session": session_id,
@@ -295,11 +344,21 @@ fn capture_hook_with_identity_mode(
         "message_index": payload.get("index"),
         "message_final": payload.get("final"),
     }))?;
-    let identity_uncertain =
+    let unstable_identity =
         identity_override.is_none() && provider_id.is_none() && provider_timestamp.is_none();
+    // A replayed turn, compaction or subagent marker is informational and cannot hide work, so
+    // it needs a unique occurrence id but not an identity-uncertainty gap on every turn.
+    let identity_uncertain = unstable_identity
+        && !matches!(
+            kind,
+            CapturedEventKindV1::TurnEnded
+                | CapturedEventKindV1::Compaction
+                | CapturedEventKindV1::SubagentStarted
+                | CapturedEventKindV1::SubagentStopped
+        );
     let event_id = match identity_override {
         Some(identity) => identity.event_id.to_owned(),
-        None if identity_uncertain => {
+        None if unstable_identity => {
             spool.uncertain_event_id(&request.canonical_session_id, &sha256(&identity_input))?
         }
         None => format!("evt:{}", sha256(&identity_input)),
@@ -308,6 +367,11 @@ fn capture_hook_with_identity_mode(
         || format!("cap:{}", sha256(event_id.as_bytes())),
         |identity| identity.operation_id.to_owned(),
     );
+    let provider_time = provider_timestamp.and_then(parse_rfc3339);
+    let observed_at = match provider_time {
+        Some(time) => time,
+        None => now_seconds()?,
+    };
     let selected = SelectedEvent {
         event_id: event_id.clone(),
         observed_at,
@@ -315,9 +379,16 @@ fn capture_hook_with_identity_mode(
         tool,
         local_body,
         setup: native_setup_observation(payload, spool)?,
+        boundary,
+        subagent,
     };
-    let (event, retention_missing) = retain_selected(selected, request, spool)?;
+    let Retained {
+        event,
+        retention_missing,
+        redacted_gap,
+    } = retain_selected(selected, request, spool)?;
     let mut events = vec![event];
+    events.extend(redacted_gap);
     if identity_uncertain {
         let gap_id = format!("gap:{}", sha256(format!("{event_id}\0identity").as_bytes()));
         let sequence = spool.sequence_for(&request.canonical_session_id, &gap_id)?;
@@ -334,6 +405,8 @@ fn capture_hook_with_identity_mode(
                 last_missing: sequence,
                 reason: GapReasonV1::IdentityUncertain,
             }),
+            boundary: None,
+            subagent: None,
         });
     }
     if retention_missing {
@@ -355,6 +428,8 @@ fn capture_hook_with_identity_mode(
                 last_missing: sequence,
                 reason: GapReasonV1::CaptureInterrupted,
             }),
+            boundary: None,
+            subagent: None,
         });
     }
     let first_missing = events.iter().map(|event| event.sequence).min().unwrap_or(1);
@@ -364,7 +439,11 @@ fn capture_hook_with_identity_mode(
         .max()
         .unwrap_or(first_missing);
     let envelope = CaptureEnvelopeV1::EventBatch(batch(request, operation_id.clone(), events));
-    let appended = match spool.append(&envelope) {
+    let append = |envelope: &CaptureEnvelopeV1| match provider_time {
+        Some(_) => spool.append(envelope),
+        None => spool.append_at_receipt(envelope),
+    };
+    let appended = match append(&envelope) {
         Ok(outcome) => outcome,
         Err(CaptureError::Limit(_)) => {
             let gap_id = format!(
@@ -384,12 +463,18 @@ fn capture_hook_with_identity_mode(
                     last_missing,
                     reason: GapReasonV1::CaptureInterrupted,
                 }),
+                boundary: None,
+                subagent: None,
             };
-            spool.append_priority(&CaptureEnvelopeV1::EventBatch(batch(
+            let gap = CaptureEnvelopeV1::EventBatch(batch(
                 request,
                 format!("cap:{}", sha256(gap_id.as_bytes())),
                 vec![gap],
-            )))?
+            ));
+            match provider_time {
+                Some(_) => spool.append_priority(&gap)?,
+                None => spool.append_priority_at_receipt(&gap)?,
+            }
         }
         Err(error) => return Err(error),
     };
@@ -442,6 +527,10 @@ pub fn deferred_native_hook(
         }
         "MessageDisplay" => Some(CapturedEventKindV1::AssistantMessage),
         "SessionEnd" => Some(CapturedEventKindV1::SessionEnded),
+        "Stop" => Some(CapturedEventKindV1::TurnEnded),
+        "PreCompact" => Some(CapturedEventKindV1::Compaction),
+        "SubagentStart" => Some(CapturedEventKindV1::SubagentStarted),
+        "SubagentStop" => Some(CapturedEventKindV1::SubagentStopped),
         _ => None,
     };
     let tool_kind = matches!(
@@ -461,6 +550,7 @@ pub fn deferred_native_hook(
         "message_id",
         "uuid",
         "request_id",
+        "agent_id",
     ]
     .iter()
     .find_map(|key| payload.get(*key).and_then(Value::as_str));
@@ -524,7 +614,10 @@ pub fn deferred_native_hook(
         reserved_sequence: Some(reserved_sequence),
         session_id: session_id.to_owned(),
         hook_event_name: event_name.to_owned(),
-        observed_at: provider_timestamp.and_then(parse_rfc3339).unwrap_or(0),
+        observed_at: match provider_timestamp.and_then(parse_rfc3339) {
+            Some(time) => time,
+            None => now_seconds()?,
+        },
         reason,
         input_digest,
         event_kind,
@@ -565,6 +658,7 @@ fn ensure_deferred_gaps(observed_session_id: &str, spool: &LocalSpool) -> Result
             canonical_session_id: deferred.target.canonical_session_id,
             parent_session_id: deferred.target.parent_session_id,
             capture_mode: deferred.target.capture_mode,
+            live_capture_mode: deferred.target.capture_mode,
         };
         let event = CapturedEventV1 {
             event_id: event_id.clone(),
@@ -579,6 +673,8 @@ fn ensure_deferred_gaps(observed_session_id: &str, spool: &LocalSpool) -> Result
                 last_missing: sequence,
                 reason: GapReasonV1::CaptureInterrupted,
             }),
+            boundary: None,
+            subagent: None,
         };
         let operation_id = format!("cap:{}", sha256(event_id.as_bytes()));
         spool.append_priority(&CaptureEnvelopeV1::EventBatch(batch(
@@ -602,10 +698,11 @@ fn ensure_adapter_started_late_gap(request: &CaptureRequest, spool: &LocalSpool)
         )
     );
     let sequence = spool.sequence_for(&request.canonical_session_id, &event_id)?;
+    let operation_id = format!("cap:{}", sha256(event_id.as_bytes()));
     let event = CapturedEventV1 {
         event_id: event_id.clone(),
         sequence,
-        observed_at: 0,
+        observed_at: now_seconds()?,
         kind: CapturedEventKindV1::Gap,
         tool: None,
         artifact: None,
@@ -615,9 +712,10 @@ fn ensure_adapter_started_late_gap(request: &CaptureRequest, spool: &LocalSpool)
             last_missing: sequence,
             reason: GapReasonV1::AdapterStartedLate,
         }),
+        boundary: None,
+        subagent: None,
     };
-    let operation_id = format!("cap:{}", sha256(event_id.as_bytes()));
-    spool.append_priority(&CaptureEnvelopeV1::EventBatch(batch(
+    spool.append_priority_at_receipt(&CaptureEnvelopeV1::EventBatch(batch(
         request,
         operation_id,
         vec![event],
@@ -637,10 +735,11 @@ fn record_action_capture_pause(request: &CaptureRequest, spool: &LocalSpool) -> 
         )
     );
     let sequence = spool.sequence_for(&request.canonical_session_id, &event_id)?;
+    let operation_id = format!("cap:{}", sha256(event_id.as_bytes()));
     let event = CapturedEventV1 {
         event_id: event_id.clone(),
         sequence,
-        observed_at: 0,
+        observed_at: now_seconds()?,
         kind: CapturedEventKindV1::Gap,
         tool: None,
         artifact: None,
@@ -650,9 +749,10 @@ fn record_action_capture_pause(request: &CaptureRequest, spool: &LocalSpool) -> 
             last_missing: sequence,
             reason: GapReasonV1::CaptureInterrupted,
         }),
+        boundary: None,
+        subagent: None,
     };
-    let operation_id = format!("cap:{}", sha256(event_id.as_bytes()));
-    spool.append_priority(&CaptureEnvelopeV1::EventBatch(batch(
+    spool.append_priority_at_receipt(&CaptureEnvelopeV1::EventBatch(batch(
         request,
         operation_id,
         vec![event],
@@ -664,6 +764,18 @@ fn record_action_capture_pause(request: &CaptureRequest, spool: &LocalSpool) -> 
 /// or finish. This observes a caller-controlled host and therefore emits only caller-asserted
 /// assurance. It never decides whether an action is approved.
 pub fn capture_native_hook(
+    input: &[u8],
+    request: &CaptureRequest,
+    actions: &ActionCaptureConfig,
+    spool: &LocalSpool,
+) -> Result<NativeHookReport> {
+    take_hook_warnings();
+    let mut report = capture_native_hook_inner(input, request, actions, spool)?;
+    report.warnings.extend(take_hook_warnings());
+    Ok(report)
+}
+
+fn capture_native_hook_inner(
     input: &[u8],
     request: &CaptureRequest,
     actions: &ActionCaptureConfig,
@@ -682,7 +794,7 @@ pub fn capture_native_hook(
         event_name,
         "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
     ) {
-        let event = capture_hook(input, request, spool)?;
+        let event = capture_hook_with_identity(input, request, spool, None)?;
         return Ok(NativeHookReport {
             event,
             action: NativeActionOutcome::NotApplicable,
@@ -1224,12 +1336,17 @@ fn capture_ordinary_claimed_action(
     let event = capture_claimed_event(input, request, claim, "post", false, spool)?;
     let mut warnings = Vec::new();
     let mut output_artifacts = Vec::new();
-    if request.capture_mode == CaptureModeV1::LocalConversation {
-        let output = serde_json::to_vec(&json!({
+    if request.live_capture_mode != CaptureModeV1::MetadataOnly {
+        let mut body = json!({
             "tool_name": native_tool,
             "tool_response": payload.get("tool_response"),
             "error": payload.get("error"),
-        }))?;
+        });
+        // Action outputs are never shared, but a shared-conversation checkout still scrubs them.
+        if request.live_capture_mode == CaptureModeV1::SharedConversation {
+            redact_json(&mut body);
+        }
+        let output = serde_json::to_vec(&body)?;
         match spool.retain_artifact(&output, ArtifactMediaV1::Json, RetentionClassV1::WorkLocal) {
             Ok(reference) => output_artifacts.push(reference),
             Err(error) => {
@@ -1539,6 +1656,7 @@ fn managed_marker_request(marker: &ManagedInvocationV1) -> CaptureRequest {
         canonical_session_id: marker.canonical_session_id.clone(),
         parent_session_id: marker.parent_session_id.clone(),
         capture_mode: marker.capture_mode.unwrap_or(CaptureModeV1::MetadataOnly),
+        live_capture_mode: marker.capture_mode.unwrap_or(CaptureModeV1::MetadataOnly),
     }
 }
 
@@ -2098,6 +2216,8 @@ fn record_provider_history_gap(
                     last_missing: sequence,
                     reason: GapReasonV1::CaptureInterrupted,
                 }),
+                boundary: None,
+                subagent: None,
             }],
         )
     };
@@ -2189,6 +2309,8 @@ pub fn import_jsonl(
             last_missing: initial_sequence,
             reason: GapReasonV1::AdapterStartedLate,
         }),
+        boundary: None,
+        subagent: None,
     }];
     let mut report = CaptureReport {
         gaps: 1,
@@ -2241,9 +2363,10 @@ pub fn import_jsonl(
         let (events, ignored) = select_line(parsed, request, lines)?;
         report.private_blocks_ignored = report.private_blocks_ignored.saturating_add(ignored);
         for event in events {
-            let (event, retention_missing) = retain_selected(event, request, spool)?;
-            selected.push(event);
-            missing = missing.saturating_add(u64::from(retention_missing));
+            let retained = retain_selected(event, request, spool)?;
+            selected.push(retained.event);
+            selected.extend(retained.redacted_gap);
+            missing = missing.saturating_add(u64::from(retained.retention_missing));
         }
     }
     let history_anchor = selected
@@ -2273,21 +2396,39 @@ pub fn import_jsonl(
                 last_missing: sequence.saturating_add(missing.saturating_sub(1)),
                 reason: GapReasonV1::CaptureInterrupted,
             }),
+            boundary: None,
+            subagent: None,
         });
         report.gaps += 1;
     }
     selected.sort_by_key(|event| event.sequence);
     report.events = selected.len();
-    for (index, events) in selected
-        .chunks(crate::change_record::MAX_EVENTS_PER_BATCH)
-        .enumerate()
-    {
+    for (index, events) in batch_chunks(&selected).into_iter().enumerate() {
         let operation_id = format!("{}:{index}", request.operation_prefix);
         let envelope = CaptureEnvelopeV1::EventBatch(batch(request, operation_id, events.to_vec()));
         spool.append(&envelope)?;
         report.batches += 1;
     }
     Ok(report)
+}
+
+/// Splits sequence-ordered events into runs that respect both the per-batch event and gap limits.
+fn batch_chunks(events: &[CapturedEventV1]) -> Vec<&[CapturedEventV1]> {
+    use crate::change_record::{MAX_EVENTS_PER_BATCH, MAX_GAPS_PER_SESSION};
+    let mut chunks = Vec::new();
+    let (mut start, mut gaps) = (0, 0);
+    for (index, event) in events.iter().enumerate() {
+        let is_gap = usize::from(event.gap.is_some());
+        if index - start == MAX_EVENTS_PER_BATCH || gaps + is_gap > MAX_GAPS_PER_SESSION {
+            chunks.push(&events[start..index]);
+            (start, gaps) = (index, 0);
+        }
+        gaps += is_gap;
+    }
+    if start < events.len() {
+        chunks.push(&events[start..]);
+    }
+    chunks
 }
 
 fn select_line(
@@ -2341,6 +2482,8 @@ fn select_line(
                 tool: None,
                 local_body: Some(json!({"content": block.get("text")})),
                 setup: None,
+                boundary: None,
+                subagent: None,
             }),
             ("assistant", "text") => selected.push(SelectedEvent {
                 event_id,
@@ -2349,6 +2492,8 @@ fn select_line(
                 tool: None,
                 local_body: Some(json!({"content": block.get("text")})),
                 setup: None,
+                boundary: None,
+                subagent: None,
             }),
             ("assistant", "tool_use") => {
                 let tool_name = block.get("name").and_then(Value::as_str);
@@ -2357,12 +2502,14 @@ fn select_line(
                     event_id,
                     observed_at,
                     kind: check_kind(CapturedEventKindV1::ToolStarted, tool_name),
-                    tool: Some(tool_fact(tool_name, request_id)),
+                    tool: Some(tool_fact(tool_name, request_id, None)),
                     local_body: Some(json!({
                         "tool_name": tool_name,
                         "tool_input": block.get("input"),
                     })),
                     setup: None,
+                    boundary: None,
+                    subagent: None,
                 });
             }
             ("user", "tool_result") => {
@@ -2371,12 +2518,24 @@ fn select_line(
                     event_id,
                     observed_at,
                     kind: CapturedEventKindV1::ToolFinished,
-                    tool: Some(tool_fact(None, request_id)),
+                    tool: Some(tool_fact(
+                        None,
+                        request_id,
+                        Some(
+                            if block.get("is_error").and_then(Value::as_bool) == Some(true) {
+                                ToolCompletionV1::Failed
+                            } else {
+                                ToolCompletionV1::Returned
+                            },
+                        ),
+                    )),
                     local_body: Some(json!({
                         "tool_result": block.get("content"),
                         "is_error": block.get("is_error"),
                     })),
                     setup: None,
+                    boundary: None,
+                    subagent: None,
                 });
             }
             (_, "thinking" | "redacted_thinking") => private = private.saturating_add(1),
@@ -2393,17 +2552,47 @@ fn select_line(
     Ok((selected, private))
 }
 
+struct Retained {
+    event: CapturedEventV1,
+    retention_missing: bool,
+    /// Present when redaction changed the retained body.
+    redacted_gap: Option<CapturedEventV1>,
+}
+
 fn retain_selected(
     event: SelectedEvent,
     request: &CaptureRequest,
     spool: &LocalSpool,
-) -> Result<(CapturedEventV1, bool)> {
+) -> Result<Retained> {
     let sequence = spool.sequence_for(&request.canonical_session_id, &event.event_id)?;
-    let (artifact, retention_missing) = match (request.capture_mode, event.local_body) {
-        (CaptureModeV1::LocalConversation, Some(body)) => {
-            let bytes = serde_json::to_vec(&body)?;
-            match spool.retain_artifact(&bytes, ArtifactMediaV1::Json, RetentionClassV1::WorkLocal)
+    let mut redactions = 0;
+    let body = match (request.live_capture_mode, event.local_body) {
+        (CaptureModeV1::LocalConversation, body) => body,
+        (CaptureModeV1::SharedConversation, Some(mut body)) => {
+            redactions = redact_json(&mut body);
+            if redactions > 0
+                && let Value::Object(map) = &mut body
             {
+                map.insert("redactions".to_owned(), json!(redactions));
+            }
+            Some(body)
+        }
+        _ => None,
+    };
+    let (artifact, retention_missing) = match body {
+        Some(body) => {
+            let bytes = serde_json::to_vec(&body)?;
+            // Validation uses the session's pinned mode, so a mid-session switch to sharing
+            // keeps bodies local until the next session. Oversized bodies also stay local.
+            let shared = request.live_capture_mode == CaptureModeV1::SharedConversation
+                && request.capture_mode == CaptureModeV1::SharedConversation
+                && u64::try_from(bytes.len()).is_ok_and(|size| size <= MAX_SHARED_BODY_BYTES);
+            let retention = if shared {
+                RetentionClassV1::SharedApproved
+            } else {
+                RetentionClassV1::WorkLocal
+            };
+            match spool.retain_artifact(&bytes, ArtifactMediaV1::Json, retention) {
                 Ok(reference) => (Some(reference), false),
                 Err(_) => (
                     Some(spool.missing_artifact_reference(
@@ -2415,10 +2604,36 @@ fn retain_selected(
                 ),
             }
         }
-        _ => (None, false),
+        None => (None, false),
     };
-    Ok((
-        CapturedEventV1 {
+    let redacted_gap = if redactions > 0 {
+        let gap_id = format!(
+            "gap:{}",
+            sha256(format!("{}\0redacted", event.event_id).as_bytes())
+        );
+        let gap_sequence = spool.sequence_for(&request.canonical_session_id, &gap_id)?;
+        Some(CapturedEventV1 {
+            event_id: gap_id,
+            sequence: gap_sequence,
+            observed_at: event.observed_at,
+            kind: CapturedEventKindV1::Gap,
+            tool: None,
+            artifact: None,
+            setup: None,
+            gap: Some(GapFactV1 {
+                // The altered event keeps its sequence; the range marks what was changed.
+                first_missing: sequence,
+                last_missing: sequence,
+                reason: GapReasonV1::Redacted,
+            }),
+            boundary: None,
+            subagent: None,
+        })
+    } else {
+        None
+    };
+    Ok(Retained {
+        event: CapturedEventV1 {
             event_id: event.event_id,
             sequence,
             observed_at: event.observed_at,
@@ -2427,9 +2642,12 @@ fn retain_selected(
             artifact,
             setup: event.setup,
             gap: None,
+            boundary: event.boundary,
+            subagent: event.subagent,
         },
         retention_missing,
-    ))
+        redacted_gap,
+    })
 }
 
 fn native_setup_observation(
@@ -2519,13 +2737,56 @@ fn batch(
     }
 }
 
-fn tool_fact(name: Option<&str>, request_id: Option<&str>) -> ToolFactV1 {
+fn tool_fact(
+    name: Option<&str>,
+    request_id: Option<&str>,
+    completion: Option<ToolCompletionV1>,
+) -> ToolFactV1 {
     ToolFactV1 {
         kind: tool_kind(name),
         request_id: request_id
             .filter(|value| identifier(value, 255))
             .map(str::to_owned),
+        name: name
+            .filter(|value| identifier(value, 128))
+            .map(str::to_owned),
+        completion,
     }
+}
+
+/// SessionStart `source` or SessionEnd `reason`, kept only when allowlisted.
+fn hook_boundary(event_name: &str, payload: &serde_json::Map<String, Value>) -> Option<String> {
+    let (field, allowed): (_, &[&str]) = match event_name {
+        "SessionStart" => ("source", &["startup", "resume", "clear", "compact"]),
+        "SessionEnd" => ("reason", &["clear", "logout", "prompt_input_exit"]),
+        _ => return None,
+    };
+    let value = payload.get(field).and_then(Value::as_str);
+    match (event_name, value) {
+        (_, Some(value)) if allowed.contains(&value) => Some(value.to_owned()),
+        ("SessionEnd", Some(_)) => Some("other".to_owned()),
+        _ => None,
+    }
+}
+
+fn hook_subagent(
+    event_name: &str,
+    payload: &serde_json::Map<String, Value>,
+) -> Option<SubagentFactV1> {
+    if !matches!(event_name, "SubagentStart" | "SubagentStop") {
+        return None;
+    }
+    let field = |key: &str, max| {
+        payload
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| identifier(value, max))
+            .map(str::to_owned)
+    };
+    Some(SubagentFactV1 {
+        agent_id: field("agent_id", 255)?,
+        agent_type: field("agent_type", 128),
+    })
 }
 
 fn check_kind(default: CapturedEventKindV1, tool_name: Option<&str>) -> CapturedEventKindV1 {

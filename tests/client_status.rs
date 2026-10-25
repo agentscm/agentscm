@@ -287,7 +287,8 @@ fn successful_check_sanitizes_onboarding_session_and_token() {
                 assert!(request.starts_with("GET /v1/hub/whoami "));
                 serde_json::json!({
                     "token":{"repository":"acme/success","read_only":false,"expires_at":expiry},
-                    "owner":{"provider":"github","host":"github.com","login":"synthetic-user"}
+                    "owner":{"provider":"github","host":"github.com","login":"synthetic-user"},
+                    "shared_conversation_retention_days": 12
                 })
             } else {
                 assert!(request.starts_with("GET /v1/hub/onboarding?agent=codex "));
@@ -323,9 +324,76 @@ fn successful_check_sanitizes_onboarding_session_and_token() {
     let value: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(value["connections"][0]["hub_check"]["state"], "valid");
     assert_eq!(
+        value["connections"][0]["hub_check"]["shared_conversation_retention_days"],
+        12
+    );
+    assert_eq!(
         value["connections"][0]["recent_participation"][0]["state"],
         "ready"
     );
+}
+
+/// Runs `client status --check` against a Hub whose `whoami` also carries `extra`.
+fn hub_check_with(extra: serde_json::Value) -> serde_json::Value {
+    let temp = tempfile::tempdir().unwrap();
+    let root = repo(temp.path(), "retention");
+    let token = temp.path().join("token");
+    std::fs::write(&token, "private-retention-token").unwrap();
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let expiry = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            + 300;
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 8192];
+        let _ = stream.read(&mut request).unwrap();
+        let mut body = serde_json::json!({
+            "token":{"repository":"acme/retention","read_only":false,"expires_at":expiry},
+            "owner":{"provider":"github","host":"github.com","login":"synthetic-user"}
+        });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let body = body.to_string();
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+    });
+    save(
+        temp.path(),
+        serde_json::json!([{
+            "root":root,"origin_host":"github.com","hub":format!("http://{address}"),
+            "repo":"acme/retention","token_file":token
+        }]),
+    );
+    let output = run(temp.path(), Some(&root), true);
+    server.join().unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    value["connections"][0]["hub_check"].clone()
+}
+
+#[test]
+fn hub_retention_is_reported_only_when_the_hub_says_a_valid_number() {
+    let reported = hub_check_with(serde_json::json!({"shared_conversation_retention_days": 3650}));
+    assert_eq!(reported["state"], "valid");
+    assert_eq!(reported["shared_conversation_retention_days"], 3650);
+    // An older Hub, or a value no Hub would configure, is unknown rather than a guessed number.
+    for extra in [
+        serde_json::json!({}),
+        serde_json::json!({"shared_conversation_retention_days": 0}),
+        serde_json::json!({"shared_conversation_retention_days": 3651}),
+        serde_json::json!({"shared_conversation_retention_days": "30"}),
+    ] {
+        let check = hub_check_with(extra.clone());
+        assert_eq!(check["state"], "valid", "{extra}");
+        assert!(
+            check.get("shared_conversation_retention_days").is_none(),
+            "{extra}"
+        );
+    }
 }
 
 #[test]

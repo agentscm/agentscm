@@ -135,6 +135,9 @@ impl From<crate::Error> for HubError {
     }
 }
 
+pub const DEFAULT_SHARED_CONVERSATION_RETENTION_DAYS: i64 = 30;
+pub const MAX_SHARED_CONVERSATION_RETENTION_DAYS: i64 = 3650;
+
 #[derive(Clone)]
 pub struct HubState {
     pub store: Arc<dyn Store>,
@@ -147,6 +150,8 @@ pub struct HubState {
     onboarding: Arc<onboarding::Observations>,
     /// Set by `agentscm demo`; health says so, for the status page.
     demo: bool,
+    /// Days an uploaded shared-conversation body stays readable.
+    shared_conversation_retention_days: i64,
     slack: Option<Arc<slack::Slack>>,
     workspace: Option<Arc<workspace::Workspace>>,
     #[cfg(unix)]
@@ -166,6 +171,7 @@ impl HubState {
             skill_workflows: Arc::new(skill_workflow::SkillWorkflowRegistry::unconfigured()),
             onboarding: Arc::new(onboarding::Observations::default()),
             demo: false,
+            shared_conversation_retention_days: DEFAULT_SHARED_CONVERSATION_RETENTION_DAYS,
             slack: None,
             workspace: None,
             #[cfg(unix)]
@@ -183,6 +189,17 @@ impl HubState {
     pub fn with_slack(mut self, slack: slack::Slack) -> Self {
         self.slack = Some(Arc::new(slack));
         self
+    }
+
+    /// Days to keep an uploaded shared-conversation body, 1 to 3650.
+    pub fn with_shared_conversation_retention_days(mut self, days: i64) -> Result<Self> {
+        if !(1..=MAX_SHARED_CONVERSATION_RETENTION_DAYS).contains(&days) {
+            return Err(HubError::Invalid(format!(
+                "shared conversation retention must be 1 to {MAX_SHARED_CONVERSATION_RETENTION_DAYS} days"
+            )));
+        }
+        self.shared_conversation_retention_days = days;
+        Ok(self)
     }
 
     pub fn with_demo(mut self) -> Self {

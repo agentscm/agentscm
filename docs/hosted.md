@@ -49,7 +49,7 @@ agentscm hub serve --bind 127.0.0.1:7332 --public-url https://hub.example.com \
   --objects /srv/agentscm/hub/objects --secrets /srv/agentscm/hub/secrets
 ```
 
-The database directory must exist. The secrets directory is created mode 0700, and the hub refuses to start if group or others can reach it. Other flags: `--poll-seconds`, `--activity-days`, `--public` (needed only for a non-loopback `--bind`). Run it under a supervisor with a single instance; see [Deployment](deployment.md).
+The database directory must exist. The secrets directory is created mode 0700, and the hub refuses to start if group or others can reach it. Other flags: `--poll-seconds`, `--activity-days`, `--shared-conversation-retention-days`, `--public` (needed only for a non-loopback `--bind`). Run it under a supervisor with a single instance; see [Deployment](deployment.md).
 
 Check: `docker compose -f compose.hub.yaml --profile default ps` shows `hub` running, or the binary stays up with no startup error.
 

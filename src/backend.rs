@@ -1,7 +1,7 @@
 //! Bounded immutable storage for calls already authorized by a trusted
 //! controller. The local adapter trusts its operator-owned filesystem and does
-//! not authenticate remote clients. Deletion is deliberately absent until an
-//! authority can target an already tombstoned physical incarnation.
+//! not authenticate remote clients. Deletion exists only for shared-conversation
+//! bodies, and only after the Hub database has tombstoned them.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
@@ -106,6 +106,15 @@ pub trait ImmutableBackend: Send + Sync {
     ) -> Result<Box<dyn Read + Send + '_>> {
         Err(Error::Invalid(
             "backend does not support raw encoded-object streams".into(),
+        ))
+    }
+
+    /// Removes one physical incarnation. Absent is success. Callers must have
+    /// recorded a database tombstone first; implementations without this
+    /// capability must reject it explicitly.
+    fn delete_incarnation(&self, _key: &ObjectKey, _incarnation: &str) -> Result<()> {
+        Err(Error::Invalid(
+            "backend does not support deleting an object incarnation".into(),
         ))
     }
 
@@ -355,6 +364,19 @@ impl ImmutableBackend for LocalBackend {
             )));
         }
         Ok(Box::new(file))
+    }
+
+    fn delete_incarnation(&self, key: &ObjectKey, incarnation: &str) -> Result<()> {
+        let path = self.object_path(key, incarnation)?;
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(Error::Io(error)),
+        }
+        match path.parent() {
+            Some(directory) => sync_directory(directory),
+            None => Ok(()),
+        }
     }
 
     fn get_range_verified(

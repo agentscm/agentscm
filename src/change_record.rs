@@ -1,8 +1,8 @@
 //! Versioned, bounded contracts for local capture and source-bound action receipts.
 //!
 //! These types deliberately contain no conversation text, commands, source paths or process
-//! output. Conversation bodies remain in the local capture store until the shared-retention
-//! privacy lifecycle is implemented and qualified.
+//! output. Conversation bodies remain in the local capture store; only redacted bodies of
+//! `shared_conversation` sessions may carry `SharedApproved` retention.
 
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +16,12 @@ pub const MAX_GAPS_PER_SESSION: usize = 32;
 pub const MAX_CHANGE_RECORD_RESPONSE_BYTES: usize = 48 * 1024;
 pub const MAX_PROJECTED_SCOPE: usize = 16;
 pub const MAX_PROJECTED_DECISION_REFS: usize = 16;
+pub const MAX_PROJECTED_SESSION_SETUPS: usize = 16;
+/// Largest redacted conversation body that may be retained as `SharedApproved`.
+pub const MAX_SHARED_BODY_BYTES: u64 = 1024 * 1024;
+pub const MAX_CONVERSATION_PAGE_ENTRIES: usize = 100;
+/// Digests one `conversation/missing` preflight may ask about.
+pub const MAX_CONVERSATION_MISSING_DIGESTS: usize = 100;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -29,6 +35,8 @@ pub enum AgentHarnessV1 {
 pub enum CaptureModeV1 {
     MetadataOnly,
     LocalConversation,
+    /// Redacted conversation bodies may be uploaded to the Hub for the person who shares them and Hub admins.
+    SharedConversation,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -53,6 +61,10 @@ pub enum CapturedEventKindV1 {
     CheckFinished,
     SessionEnded,
     Gap,
+    TurnEnded,
+    Compaction,
+    SubagentStarted,
+    SubagentStopped,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -74,6 +86,28 @@ pub struct ToolFactV1 {
     pub kind: ToolKindV1,
     /// Opaque provider request identity, restricted to identifier characters.
     pub request_id: Option<String>,
+    /// Raw host tool name (for example `mcp__server__tool`), bounded to 128 identifier bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// What the host reported when the tool finished. Absent on start events and when unobserved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<ToolCompletionV1>,
+}
+
+/// A host completion hook proves the call ended, not that it achieved anything.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCompletionV1 {
+    Returned,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentFactV1 {
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -174,6 +208,11 @@ pub struct CapturedEventV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup: Option<SetupObservationV1>,
     pub gap: Option<GapFactV1>,
+    /// Allowlisted session boundary: SessionStart `source` or SessionEnd `reason`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<SubagentFactV1>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -506,12 +545,49 @@ pub struct ChangeRecordSummaryV1 {
     pub intent: IntentSummaryV1,
     pub subject: Option<SubjectSummaryV1>,
     pub sessions: SessionCoverageV1,
+    /// Latest observed model, effort and permission mode per session, ordered by session id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_setups: Vec<SessionSetupV1>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub session_setups_omitted: u64,
     pub latest_action: Option<ActionSummaryV1>,
     pub decision: DecisionSummaryV1,
     /// Existing bounded work checkpoint field, not transcript-derived content.
     pub next_action: Option<String>,
     pub completeness: CompletenessV1,
     pub unknowns: Vec<UnknownFactV1>,
+}
+
+/// Setup facts from the latest setup observation of one session. `None` means not observed.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSetupV1 {
+    pub session_id: String,
+    pub parent_session_id: Option<String>,
+    pub model: Option<String>,
+    pub permission_mode: Option<String>,
+    pub effort: Option<String>,
+}
+
+impl SessionSetupV1 {
+    fn validate(&self) -> Result<()> {
+        identifier("session setup session_id", &self.session_id, 255)?;
+        for (name, value) in [
+            ("session setup parent_session_id", &self.parent_session_id),
+            ("session setup model", &self.model),
+            ("session setup permission_mode", &self.permission_mode),
+            ("session setup effort", &self.effort),
+        ] {
+            if let Some(value) = value {
+                identifier(name, value, 255)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -540,6 +616,11 @@ impl ChangeRecordResponseV1 {
             .len()
             > MAX_CHANGE_RECORD_RESPONSE_BYTES
         {
+            // Session setups are the least essential facts, so they are trimmed first.
+            if response.summary.session_setups.pop().is_some() {
+                response.summary.session_setups_omitted += 1;
+                continue;
+            }
             let scope_bytes = response
                 .summary
                 .intent
@@ -580,12 +661,138 @@ impl ChangeRecordResponseV1 {
     }
 
     pub fn validate_encoded_size(&self) -> Result<()> {
+        let setups = &self.summary.session_setups;
+        if setups.len() > MAX_PROJECTED_SESSION_SETUPS {
+            return Err(HubError::Invalid(
+                "change record has too many session setups".into(),
+            ));
+        }
+        for setup in setups {
+            setup.validate()?;
+        }
         let bytes = serde_json::to_vec(self)
             .map_err(|_| HubError::Invalid("change record response is invalid".into()))?;
         if bytes.len() > MAX_CHANGE_RECORD_RESPONSE_BYTES {
             return Err(HubError::Invalid(
                 "change record response exceeds the bounded projection".into(),
             ));
+        }
+        Ok(())
+    }
+}
+
+/// One shared-conversation body of a Work, without its content. `availability` is `local`
+/// (never uploaded), `shared`, `expired` or `deleted`; a missing or corrupt object is only
+/// discovered, and reported as `integrity_failure`, when the body itself is read.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConversationEntryV1 {
+    pub session_id: String,
+    pub sequence: u64,
+    pub event_id: String,
+    pub kind: CapturedEventKindV1,
+    pub observed_at: i64,
+    pub digest: String,
+    pub size_bytes: u64,
+    pub availability: ContentAvailabilityV1,
+    pub expires_at: Option<i64>,
+}
+
+impl ConversationEntryV1 {
+    /// Position after this entry: `<sequence>:<digest>:<session_id>`.
+    pub fn cursor(&self) -> String {
+        format!("{}:{}:{}", self.sequence, self.digest, self.session_id)
+    }
+}
+
+/// Reads a conversation cursor as (session_id, sequence, digest) to continue after.
+pub fn parse_conversation_cursor(cursor: &str) -> Result<(String, u64, String)> {
+    let mut parts = cursor.splitn(3, ':');
+    let (Some(sequence), Some(digest), Some(session)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return Err(invalid("malformed cursor"));
+    };
+    let sequence = (!sequence.is_empty()
+        && sequence.len() <= 18
+        && sequence.bytes().all(|b| b.is_ascii_digit()))
+    .then(|| sequence.parse::<u64>().ok())
+    .flatten()
+    .filter(|sequence| *sequence > 0);
+    let digest_ok = digest.len() == 64
+        && digest
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    match sequence {
+        Some(sequence) if digest_ok && identifier("cursor", session, 255).is_ok() => {
+            Ok((session.to_owned(), sequence, digest.to_owned()))
+        }
+        _ => Err(invalid("malformed cursor")),
+    }
+}
+
+/// Body of `POST .../conversation/missing`: lower-hex digests the caller declared.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConversationMissingRequestV1 {
+    pub digests: Vec<String>,
+}
+
+/// Which asked digests need an upload (`missing`, declared by the caller and not yet uploaded)
+/// and which can no longer be uploaded (`gone`: undeclared by the caller, expired or deleted).
+/// Digests already available are in neither.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConversationMissingV1 {
+    pub missing: Vec<String>,
+    pub gone: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConversationPageV1 {
+    pub version: u16,
+    pub entries: Vec<ConversationEntryV1>,
+    pub next_cursor: Option<String>,
+}
+
+impl ConversationPageV1 {
+    /// `entries` read in order with one row beyond the page: the extra row only says more exist.
+    /// A page is cut at the entry limit or the encoded-size bound, whichever comes first.
+    pub fn bounded(mut entries: Vec<ConversationEntryV1>) -> Result<Self> {
+        let mut more = entries.len() > MAX_CONVERSATION_PAGE_ENTRIES;
+        entries.truncate(MAX_CONVERSATION_PAGE_ENTRIES);
+        let mut page = Self {
+            version: SCHEMA_VERSION_V1,
+            entries,
+            next_cursor: None,
+        };
+        loop {
+            page.next_cursor = more
+                .then(|| page.entries.last().map(ConversationEntryV1::cursor))
+                .flatten();
+            if page.validate_encoded_size().is_ok() {
+                break;
+            }
+            // The cursor is part of the bound, so it is recomputed after every cut.
+            if page.entries.pop().is_none() {
+                return Err(invalid("conversation page exceeds the bounded projection"));
+            }
+            more = true;
+        }
+        if more && page.next_cursor.is_none() {
+            return Err(invalid("conversation page exceeds the bounded projection"));
+        }
+        Ok(page)
+    }
+
+    pub fn validate_encoded_size(&self) -> Result<()> {
+        if self.entries.len() > MAX_CONVERSATION_PAGE_ENTRIES {
+            return Err(invalid("conversation page has too many entries"));
+        }
+        let bytes =
+            serde_json::to_vec(self).map_err(|_| invalid("conversation page is invalid"))?;
+        if bytes.len() > MAX_CHANGE_RECORD_RESPONSE_BYTES {
+            return Err(invalid("conversation page exceeds the bounded projection"));
         }
         Ok(())
     }
@@ -633,7 +840,7 @@ impl CaptureBatchV1 {
         let mut previous = None;
         let mut gaps = 0;
         for event in &self.events {
-            event.validate()?;
+            event.validate(self.session.capture_mode)?;
             if previous.is_some_and(|sequence| event.sequence <= sequence) {
                 return Err(invalid(
                     "capture events must have increasing sequence numbers",
@@ -671,7 +878,7 @@ impl SessionIdentityV1 {
 }
 
 impl CapturedEventV1 {
-    fn validate(&self) -> Result<()> {
+    fn validate(&self, session_mode: CaptureModeV1) -> Result<()> {
         identifier("event_id", &self.event_id, 255)?;
         if self.sequence == 0 || self.observed_at < 0 {
             return Err(invalid(
@@ -682,6 +889,51 @@ impl CapturedEventV1 {
             && let Some(request_id) = &tool.request_id
         {
             identifier("tool request_id", request_id, 255)?;
+        }
+        if let Some(tool) = &self.tool
+            && let Some(name) = &tool.name
+        {
+            identifier("tool name", name, 128)?;
+        }
+        if let Some(subagent) = &self.subagent {
+            identifier("subagent agent_id", &subagent.agent_id, 255)?;
+            if let Some(agent_type) = &subagent.agent_type {
+                identifier("subagent agent_type", agent_type, 128)?;
+            }
+        }
+        if let Some(boundary) = &self.boundary
+            && !matches!(
+                (self.kind, boundary.as_str()),
+                (
+                    CapturedEventKindV1::SessionStarted,
+                    "startup" | "resume" | "clear" | "compact"
+                ) | (
+                    CapturedEventKindV1::SessionEnded,
+                    "clear" | "logout" | "prompt_input_exit" | "other"
+                )
+            )
+        {
+            return Err(invalid("event boundary is not allowlisted for its kind"));
+        }
+        if matches!(
+            self.kind,
+            CapturedEventKindV1::SubagentStarted | CapturedEventKindV1::SubagentStopped
+        ) != self.subagent.is_some()
+        {
+            return Err(invalid(
+                "subagent facts must appear exactly on subagent events",
+            ));
+        }
+        if self
+            .tool
+            .as_ref()
+            .is_some_and(|tool| tool.completion.is_some())
+            && !matches!(
+                self.kind,
+                CapturedEventKindV1::ToolFinished | CapturedEventKindV1::CheckFinished
+            )
+        {
+            return Err(invalid("tool completion must appear on finish events"));
         }
         let tool_event = matches!(
             self.kind,
@@ -695,9 +947,14 @@ impl CapturedEventV1 {
         }
         if let Some(artifact) = &self.artifact {
             artifact.validate()?;
-            if artifact.retention == RetentionClassV1::SharedApproved {
+            if artifact.retention == RetentionClassV1::SharedApproved
+                && !(session_mode == CaptureModeV1::SharedConversation
+                    && artifact.media == ArtifactMediaV1::Json
+                    && artifact.availability == ContentAvailabilityV1::Local
+                    && artifact.size_bytes <= MAX_SHARED_BODY_BYTES)
+            {
                 return Err(invalid(
-                    "shared artifact retention is unavailable in schema v1",
+                    "shared artifact retention requires a shared-conversation session and a bounded local JSON body",
                 ));
             }
         }
@@ -1092,12 +1349,145 @@ mod tests {
                 }),
                 setup: None,
                 gap: None,
+                boundary: None,
+                subagent: None,
             }],
         };
         assert!(batch.validate().is_err());
         batch.events[0].artifact = None;
         batch.events[0].event_id = "/private/tmp/transcript.jsonl".into();
         assert!(batch.validate().is_err());
+    }
+
+    #[test]
+    fn shared_approved_requires_a_shared_session_and_a_bounded_local_json_body() {
+        let shared = |mode, media, availability, size_bytes| {
+            let mut batch = batch_of(json!({
+                "event_id": "event-1", "sequence": 1, "observed_at": 1,
+                "kind": "assistant_message", "tool": null, "gap": null,
+                "artifact": {
+                    "digest": "a".repeat(64), "size_bytes": size_bytes, "media": media,
+                    "retention": "shared_approved", "availability": availability,
+                },
+            }));
+            batch.session.capture_mode = mode;
+            batch.validate().is_ok()
+        };
+        let mode = CaptureModeV1::SharedConversation;
+        assert!(shared(mode, "json", "local", MAX_SHARED_BODY_BYTES));
+        assert!(!shared(mode, "json", "local", MAX_SHARED_BODY_BYTES + 1));
+        assert!(!shared(mode, "text", "local", 10));
+        assert!(!shared(mode, "json", "missing", 10));
+        for other in [
+            CaptureModeV1::MetadataOnly,
+            CaptureModeV1::LocalConversation,
+        ] {
+            assert!(!shared(other, "json", "local", 10));
+        }
+    }
+
+    fn batch_of(event: serde_json::Value) -> CaptureBatchV1 {
+        serde_json::from_value(json!({
+            "schema_version": 1,
+            "operation_id": "upload-1",
+            "work_id": "wrk_0123456789abcdef0123456789abcdef",
+            "generation": 1,
+            "session": serde_json::to_value(session()).unwrap(),
+            "events": [event],
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn old_event_shapes_deserialize_and_new_fields_stay_off_the_wire() {
+        let batch = batch_of(json!({
+            "event_id": "event-1", "sequence": 1, "observed_at": 1,
+            "kind": "tool_finished",
+            "tool": {"kind": "read", "request_id": "toolu-1"},
+            "artifact": null, "gap": null,
+        }));
+        batch.validate().unwrap();
+        let event = &batch.events[0];
+        assert!(event.boundary.is_none() && event.subagent.is_none());
+        let tool = event.tool.as_ref().unwrap();
+        assert!(tool.name.is_none() && tool.completion.is_none());
+        let encoded = serde_json::to_string(&batch).unwrap();
+        for field in ["boundary", "subagent", "completion", "\"name\""] {
+            assert!(!encoded.contains(field), "{field} leaked: {encoded}");
+        }
+    }
+
+    #[test]
+    fn new_event_shapes_round_trip_and_are_bounded() {
+        let tool = batch_of(json!({
+            "event_id": "event-1", "sequence": 1, "observed_at": 1,
+            "kind": "tool_finished",
+            "tool": {"kind": "other", "request_id": null,
+                     "name": "mcp__server__tool", "completion": "returned"},
+            "artifact": null, "gap": null,
+        }));
+        tool.validate().unwrap();
+        let tool_again: CaptureBatchV1 =
+            serde_json::from_slice(&serde_json::to_vec(&tool).unwrap()).unwrap();
+        assert_eq!(tool, tool_again);
+        assert_eq!(
+            tool.events[0].tool.as_ref().unwrap().completion,
+            Some(ToolCompletionV1::Returned)
+        );
+
+        let mut overlong = tool.clone();
+        overlong.events[0].tool.as_mut().unwrap().name = Some("n".repeat(129));
+        assert!(overlong.validate().is_err());
+        let mut started = tool.clone();
+        started.events[0].kind = CapturedEventKindV1::ToolStarted;
+        assert!(
+            started.validate().is_err(),
+            "completion needs a finish event"
+        );
+
+        let subagent = batch_of(json!({
+            "event_id": "event-2", "sequence": 1, "observed_at": 1,
+            "kind": "subagent_started", "tool": null, "artifact": null, "gap": null,
+            "subagent": {"agent_id": "agent-1", "agent_type": "Explore"},
+        }));
+        subagent.validate().unwrap();
+        let mut bad = subagent.clone();
+        bad.events[0].subagent.as_mut().unwrap().agent_id = "a b".into();
+        assert!(bad.validate().is_err());
+        let mut missing = subagent;
+        missing.events[0].subagent = None;
+        assert!(missing.validate().is_err());
+
+        let turn_ended = |kind: &str, boundary: Option<&str>| {
+            batch_of(json!({
+                "event_id": "event-3", "sequence": 1, "observed_at": 1,
+                "kind": kind, "tool": null, "artifact": null, "gap": null,
+                "boundary": boundary,
+            }))
+        };
+        turn_ended("turn_ended", None).validate().unwrap();
+        turn_ended("compaction", None).validate().unwrap();
+        turn_ended("session_started", Some("compact"))
+            .validate()
+            .unwrap();
+        turn_ended("session_ended", Some("other"))
+            .validate()
+            .unwrap();
+        assert!(
+            turn_ended("session_started", Some("logout"))
+                .validate()
+                .is_err()
+        );
+        assert!(
+            turn_ended("session_ended", Some("/tmp/x"))
+                .validate()
+                .is_err()
+        );
+        assert!(
+            turn_ended("turn_ended", Some("startup"))
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]
@@ -1110,10 +1500,14 @@ mod tests {
             tool: Some(ToolFactV1 {
                 kind: ToolKindV1::Test,
                 request_id: Some(format!("request-{sequence}")),
+                name: None,
+                completion: None,
             }),
             artifact: None,
             setup: None,
             gap: None,
+            boundary: None,
+            subagent: None,
         };
         let batch = CaptureBatchV1 {
             schema_version: 1,
@@ -1172,6 +1566,69 @@ mod tests {
         response.validate_encoded_size().unwrap();
     }
 
+    fn setup_entry(index: usize) -> SessionSetupV1 {
+        SessionSetupV1 {
+            session_id: format!("session-{index:02}"),
+            parent_session_id: None,
+            model: Some("m".repeat(255)),
+            permission_mode: Some("p".repeat(255)),
+            effort: None,
+        }
+    }
+
+    #[test]
+    fn bounded_response_trims_session_setups_before_anything_else() {
+        let mut summary = summary();
+        summary.intent.scope = vec!["scope".into()];
+        summary.session_setups = (0..MAX_PROJECTED_SESSION_SETUPS).map(setup_entry).collect();
+        summary.next_action = Some("n".repeat(MAX_CHANGE_RECORD_RESPONSE_BYTES - 6_000));
+        let kept = summary.session_setups.clone();
+
+        let response = ChangeRecordResponseV1::bounded(summary).unwrap();
+        let omitted = response.summary.session_setups_omitted as usize;
+        assert!(omitted > 0);
+        // Trimming drops from the tail and never touches scope or decision references.
+        assert_eq!(
+            response.summary.session_setups,
+            kept[..kept.len() - omitted]
+        );
+        assert_eq!(response.summary.intent.scope, ["scope"]);
+        assert_eq!(response.summary.intent.scope_omitted, 0);
+        response.validate_encoded_size().unwrap();
+    }
+
+    #[test]
+    fn session_setups_are_validated_and_additive() {
+        let mut response = ChangeRecordResponseV1::bounded(summary()).unwrap();
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert!(encoded["summary"].get("session_setups").is_none());
+        assert!(encoded["summary"].get("session_setups_omitted").is_none());
+
+        response.summary.session_setups = vec![setup_entry(0)];
+        response.validate_encoded_size().unwrap();
+        for corrupt in [
+            |setup: &mut SessionSetupV1| setup.session_id = "bad id".into(),
+            |setup: &mut SessionSetupV1| setup.model = Some("<b>x</b>".into()),
+            |setup: &mut SessionSetupV1| setup.effort = Some(String::new()),
+            |setup: &mut SessionSetupV1| setup.parent_session_id = Some("p".repeat(256)),
+        ] {
+            let mut bad = response.clone();
+            corrupt(&mut bad.summary.session_setups[0]);
+            assert!(bad.validate_encoded_size().is_err());
+        }
+        response.summary.session_setups = (0..=MAX_PROJECTED_SESSION_SETUPS)
+            .map(|index| SessionSetupV1 {
+                model: None,
+                permission_mode: None,
+                ..setup_entry(index)
+            })
+            .collect();
+        assert!(response.validate_encoded_size().is_err());
+        let unknown = json!({"session_id": "s", "parent_session_id": null, "model": null,
+            "permission_mode": null, "effort": null, "extra": 1});
+        assert!(serde_json::from_value::<SessionSetupV1>(unknown).is_err());
+    }
+
     #[test]
     fn bounded_response_refuses_an_oversized_semantic_core() {
         let mut summary = summary();
@@ -1182,5 +1639,85 @@ mod tests {
                 .to_string()
                 .contains("change record core exceeds the bounded projection")
         );
+    }
+
+    fn conversation_entry(index: u64, session_id: &str) -> ConversationEntryV1 {
+        ConversationEntryV1 {
+            session_id: session_id.into(),
+            sequence: index + 1,
+            event_id: "e".repeat(255),
+            kind: CapturedEventKindV1::AssistantMessage,
+            observed_at: 1,
+            digest: format!("{index:064x}"),
+            size_bytes: 10,
+            availability: ContentAvailabilityV1::Shared,
+            expires_at: Some(2),
+        }
+    }
+
+    #[test]
+    fn conversation_pages_stop_at_the_entry_limit_and_continue_after_the_last_entry() {
+        let entries: Vec<_> = (0..=MAX_CONVERSATION_PAGE_ENTRIES as u64)
+            .map(|index| conversation_entry(index, "s"))
+            .collect();
+        let page = ConversationPageV1::bounded(entries.clone()).unwrap();
+        assert_eq!(page.entries.len(), MAX_CONVERSATION_PAGE_ENTRIES);
+        let cursor = page.next_cursor.unwrap();
+        assert_eq!(cursor, entries[MAX_CONVERSATION_PAGE_ENTRIES - 1].cursor());
+        assert_eq!(
+            parse_conversation_cursor(&cursor).unwrap(),
+            ("s".to_owned(), 100, format!("{:064x}", 99))
+        );
+        let last = ConversationPageV1::bounded(entries[..3].to_vec()).unwrap();
+        assert_eq!((last.entries.len(), last.next_cursor), (3, None));
+    }
+
+    #[test]
+    fn conversation_pages_are_cut_to_the_encoded_size_bound() {
+        let session = "s".repeat(255);
+        let entries: Vec<_> = (0..=MAX_CONVERSATION_PAGE_ENTRIES as u64)
+            .map(|index| conversation_entry(index, &session))
+            .collect();
+        let page = ConversationPageV1::bounded(entries).unwrap();
+        assert!(page.entries.len() < MAX_CONVERSATION_PAGE_ENTRIES);
+        assert!(!page.entries.is_empty());
+        assert!(serde_json::to_vec(&page).unwrap().len() <= MAX_CHANGE_RECORD_RESPONSE_BYTES);
+        let cursor = page.next_cursor.as_deref().unwrap();
+        assert_eq!(cursor, page.entries.last().unwrap().cursor());
+        // The wire form is closed and the size check also applies to a decoded page.
+        let mut value = serde_json::to_value(&page).unwrap();
+        value["extra"] = json!(1);
+        assert!(serde_json::from_value::<ConversationPageV1>(value).is_err());
+        let mut oversized = page;
+        oversized.entries = (0..=MAX_CONVERSATION_PAGE_ENTRIES as u64)
+            .map(|index| conversation_entry(index, "s"))
+            .collect();
+        assert!(oversized.validate_encoded_size().is_err());
+    }
+
+    #[test]
+    fn conversation_cursors_are_validated() {
+        let digest = "a".repeat(64);
+        assert_eq!(
+            parse_conversation_cursor(&format!("7:{digest}:codex:session@1")).unwrap(),
+            ("codex:session@1".to_owned(), 7, digest.clone())
+        );
+        for bad in [
+            String::new(),
+            "7".into(),
+            format!("7:{digest}"),
+            format!("7:{digest}:"),
+            format!(":{digest}:s"),
+            format!("0:{digest}:s"),
+            format!("+7:{digest}:s"),
+            format!("1234567890123456789:{digest}:s"),
+            format!("7:{}:s", "A".repeat(64)),
+            format!("7:{}:s", "a".repeat(63)),
+            format!("7:{digest}:has space"),
+            format!("7:{digest}:../etc"),
+            format!("7:{digest}:{}", "s".repeat(256)),
+        ] {
+            assert!(parse_conversation_cursor(&bad).is_err(), "{bad}");
+        }
     }
 }

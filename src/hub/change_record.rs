@@ -2,13 +2,156 @@
 
 use crate::change_record::{
     ActionFinishV1, ActionOutcomeV1, ActionStartV1, ActionSummaryV1, ApplicabilityV1,
-    AssuranceBasisV1, ChangeRecordSummaryV1, CheckResultV1, CompletenessV1, ContentAvailabilityV1,
-    CoverageV1, DecisionAuthorKindV1, DecisionSourceRefV1, DecisionStatusV1, DecisionSummaryV1,
-    DriftV1, IntentSummaryV1, MAX_PROJECTED_DECISION_REFS, MAX_PROJECTED_SCOPE, RecipeProvenanceV1,
-    SessionCoverageV1, SubjectSummaryV1, UnknownFactV1,
+    AssuranceBasisV1, CapturedEventV1, ChangeRecordSummaryV1, CheckResultV1, CompletenessV1,
+    ContentAvailabilityV1, ConversationEntryV1, CoverageV1, DecisionAuthorKindV1,
+    DecisionSourceRefV1, DecisionStatusV1, DecisionSummaryV1, DriftV1, IntentSummaryV1,
+    MAX_PROJECTED_DECISION_REFS, MAX_PROJECTED_SCOPE, RecipeProvenanceV1, SessionCoverageV1,
+    SessionSetupV1, SubjectSummaryV1, UnknownFactV1,
 };
 
 use super::work::{Checkpoint, SourceRef, WorkItem};
+use super::{HubError, Result};
+
+/// Lifecycle of one shared-conversation body declaration, keyed by (work, digest, author).
+/// `Declared` means an accepted event named the body but its author uploaded no bytes. The object
+/// is shared by every author's row for the same digest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SharedBodyState {
+    Declared,
+    Available,
+    Expired,
+    Deleted,
+}
+
+impl SharedBodyState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Declared => "declared",
+            Self::Available => "available",
+            Self::Expired => "expired",
+            Self::Deleted => "deleted",
+        }
+    }
+
+    pub(super) fn parse(value: &str) -> Result<Self> {
+        match value {
+            "declared" => Ok(Self::Declared),
+            "available" => Ok(Self::Available),
+            "expired" => Ok(Self::Expired),
+            "deleted" => Ok(Self::Deleted),
+            other => Err(HubError::Unavailable(format!(
+                "unknown shared body state {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedBodyRow {
+    pub work: String,
+    pub digest: String,
+    /// The human user whose token declared the body; only they and Hub admins may read or delete it.
+    pub author: String,
+    pub size_bytes: u64,
+    pub session_id: String,
+    pub generation: i64,
+    pub event_id: String,
+    pub sequence: u64,
+    pub declared_token: String,
+    pub declared_at: i64,
+    pub state: SharedBodyState,
+    pub uploaded_at: Option<i64>,
+    pub expires_at: Option<i64>,
+    pub deleted_at: Option<i64>,
+    pub deleted_by: Option<String>,
+    pub physical_deleted_at: Option<i64>,
+    /// Failed object removals so far; drives the sweep's retry backoff.
+    pub delete_attempts: i64,
+}
+
+impl SharedBodyRow {
+    /// The state a reader must act on at `now`: a body is expired from its `expires_at` even
+    /// before the sweep records it.
+    pub fn state_at(&self, now: i64) -> SharedBodyState {
+        match (self.state, self.expires_at) {
+            (SharedBodyState::Available, Some(expires)) if now >= expires => {
+                SharedBodyState::Expired
+            }
+            (state, _) => state,
+        }
+    }
+
+    /// What a listing says about the body at `now`. A missing or corrupt object is not visible
+    /// here; reading the body reports it.
+    fn availability_at(&self, now: i64) -> ContentAvailabilityV1 {
+        match self.state_at(now) {
+            SharedBodyState::Declared => ContentAvailabilityV1::Local,
+            SharedBodyState::Available => ContentAvailabilityV1::Shared,
+            SharedBodyState::Expired => ContentAvailabilityV1::Expired,
+            SharedBodyState::Deleted => ContentAvailabilityV1::Deleted,
+        }
+    }
+
+    /// The listing entry for this body and the retained JSON of the event that declared it.
+    pub(super) fn conversation_entry(
+        &self,
+        event: &str,
+        observed_at: i64,
+        now: i64,
+    ) -> Result<ConversationEntryV1> {
+        let event: CapturedEventV1 = serde_json::from_str(event)
+            .map_err(|error| HubError::Unavailable(error.to_string()))?;
+        Ok(ConversationEntryV1 {
+            session_id: self.session_id.clone(),
+            sequence: self.sequence,
+            event_id: self.event_id.clone(),
+            kind: event.kind,
+            observed_at,
+            digest: self.digest.clone(),
+            size_bytes: self.size_bytes,
+            availability: self.availability_at(now),
+            expires_at: self.expires_at,
+        })
+    }
+}
+
+/// The one access rule for shared conversation bodies and their listing, for reading and
+/// deleting alike: the human who declared the body (through any of their tokens) and Hub admins.
+/// The Work owner has no access of their own. Every HTTP and MCP path goes through this; the
+/// listing applies it in the store query.
+pub fn conversation_readable(author: &str, caller: &str, admin: bool) -> bool {
+    admin || author == caller
+}
+
+/// Every declaration of one digest in a Work, with who is asking.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedBodyAccess {
+    pub rows: Vec<SharedBodyRow>,
+    /// The caller's human owner.
+    pub caller: String,
+}
+
+impl SharedBodyAccess {
+    /// The caller's own declaration, whatever its state.
+    pub fn own(&self) -> Option<&SharedBodyRow> {
+        self.rows.iter().find(|row| row.author == self.caller)
+    }
+
+    /// The declaration a read or delete acts on: an available one (the caller's own first), else
+    /// the caller's own, else for an admin the first of the others. `None` means the caller may not act, whether or not the digest
+    /// exists.
+    pub fn accessible(&self, admin: bool, now: i64) -> Option<&SharedBodyRow> {
+        self.rows
+            .iter()
+            .filter(|row| conversation_readable(&row.author, &self.caller, admin))
+            .min_by_key(|row| {
+                (
+                    row.state_at(now) != SharedBodyState::Available,
+                    row.author != self.caller,
+                )
+            })
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct StoredActionV1 {
@@ -17,13 +160,16 @@ pub struct StoredActionV1 {
     pub source_id: String,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct SessionStatsV1 {
     pub count: usize,
     pub gap_count: usize,
     pub complete_count: usize,
     pub setup_observation_count: usize,
     pub usage_observation_count: usize,
+    /// Latest setup per session (at most `MAX_PROJECTED_SESSION_SETUPS`) and the count beyond them.
+    pub setups: Vec<SessionSetupV1>,
+    pub setups_omitted: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -121,6 +267,8 @@ pub fn project(
             coverage: session_coverage,
             gaps: sessions.gap_count,
         },
+        session_setups: sessions.setups,
+        session_setups_omitted: sessions.setups_omitted,
         latest_action,
         decision,
         next_action: item.next_action.clone(),
@@ -296,6 +444,70 @@ fn aggregate_availability(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(author: &str, state: SharedBodyState) -> SharedBodyRow {
+        SharedBodyRow {
+            work: "w".into(),
+            digest: "0".repeat(64),
+            author: author.into(),
+            size_bytes: 1,
+            session_id: "s".into(),
+            generation: 1,
+            event_id: "e".into(),
+            sequence: 1,
+            declared_token: "t".into(),
+            declared_at: 1,
+            state,
+            uploaded_at: Some(1),
+            expires_at: Some(10),
+            deleted_at: None,
+            deleted_by: None,
+            physical_deleted_at: None,
+            delete_attempts: 0,
+        }
+    }
+
+    #[test]
+    fn only_the_author_and_admins_may_act_and_an_admin_prefers_a_live_copy() {
+        assert!(conversation_readable("a", "a", false));
+        assert!(!conversation_readable("a", "b", false));
+        assert!(conversation_readable("a", "b", true));
+        let access = SharedBodyAccess {
+            rows: vec![
+                row("a", SharedBodyState::Deleted),
+                row("b", SharedBodyState::Available),
+            ],
+            caller: "c".into(),
+        };
+        assert!(access.own().is_none() && access.accessible(false, 0).is_none());
+        assert_eq!(access.accessible(true, 0).unwrap().author, "b");
+        // Past its deadline the available copy is no better than the deleted one.
+        assert_eq!(access.accessible(true, 10).unwrap().author, "a");
+        let access = SharedBodyAccess {
+            caller: "a".into(),
+            ..access
+        };
+        assert_eq!(access.accessible(false, 0).unwrap().author, "a");
+        // An admin prefers a live copy even over their own deleted one; others only see their own.
+        assert_eq!(access.accessible(true, 0).unwrap().author, "b");
+        assert!(
+            SharedBodyAccess {
+                rows: vec![],
+                caller: "a".into()
+            }
+            .accessible(true, 0)
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn available_bodies_expire_at_their_deadline_before_any_sweep() {
+        let mut row = row("a", SharedBodyState::Available);
+        assert_eq!(row.state_at(9), SharedBodyState::Available);
+        assert_eq!(row.state_at(10), SharedBodyState::Expired);
+        row.state = SharedBodyState::Deleted;
+        assert_eq!(row.state_at(99), SharedBodyState::Deleted);
+    }
 
     #[test]
     fn availability_is_not_inferred_from_result() {

@@ -7,9 +7,10 @@ use serde_json::{Value, json};
 
 use crate::change_record::{
     ActionFinishV1, ActionMutationReceiptV1, ActionStartV1, CaptureBatchV1, ChangeRecordSummaryV1,
-    IngestReceiptV1,
+    ConversationEntryV1, IngestReceiptV1,
 };
 
+use super::change_record::{SharedBodyAccess, SharedBodyRow, SharedBodyState};
 use super::connection::{
     ConnectedRepository, Connection, ForgeCheck, ForgeCheckReserve, MergeGroup, NewConnection,
     NewForgeCheck, NewMergeGroup, Observation, Observed, Outbound,
@@ -551,6 +552,103 @@ pub trait Store: Send + Sync {
         work_id: &str,
         now: i64,
     ) -> Result<Option<ChangeRecordSummaryV1>>;
+    /// Every declaration of (work, digest) when `token`'s repository scope contains the Work,
+    /// with the caller's human owner. `None` for an unknown Work; an undeclared digest has no rows.
+    fn shared_body_lookup(
+        &self,
+        token: &str,
+        work_id: &str,
+        digest: &str,
+        now: i64,
+    ) -> Result<Option<SharedBodyAccess>>;
+    /// The caller's own declarations among `digests` (none of anyone else's), when `token`'s
+    /// repository scope contains the Work. `None` for an unknown Work.
+    fn shared_bodies_own(
+        &self,
+        token: &str,
+        work_id: &str,
+        digests: &[String],
+        now: i64,
+    ) -> Result<Option<Vec<SharedBodyRow>>>;
+    /// Up to `MAX_CONVERSATION_PAGE_ENTRIES + 1` shared-conversation entries of the Work after
+    /// `cursor`, ordered by (session_id bytewise, sequence, digest), when `token`'s repository
+    /// scope contains it: the caller's own declarations, or every author's when `all_authors`
+    /// (a Hub admin; see `conversation_readable`). `None` for an unknown Work; a malformed cursor
+    /// is `Invalid`.
+    fn shared_conversation_page(
+        &self,
+        token: &str,
+        work_id: &str,
+        cursor: Option<&str>,
+        all_authors: bool,
+        now: i64,
+    ) -> Result<Option<Vec<ConversationEntryV1>>>;
+    /// Moves `author`'s `declared` body to `available` with `expires_at = now + retention_seconds`.
+    /// Returns the state afterwards (`None` for an unknown row), so a caller that lost a race
+    /// to a delete or expiry sees it and must remove the object it wrote.
+    fn shared_body_mark_available(
+        &self,
+        work_id: &str,
+        digest: &str,
+        author: &str,
+        now: i64,
+        retention_seconds: i64,
+    ) -> Result<Option<SharedBodyState>>;
+    /// Marks `author`'s body (every author's when `None`) deleted on behalf of user `actor`, and
+    /// returns the rows afterwards (empty for an unknown body). An already deleted row keeps its
+    /// first tombstone.
+    fn shared_body_tombstone(
+        &self,
+        work_id: &str,
+        digest: &str,
+        author: Option<&str>,
+        actor: &str,
+        now: i64,
+    ) -> Result<Vec<SharedBodyRow>>;
+    /// Marks up to `limit` available bodies with `expires_at <= now` expired, and declared
+    /// bodies still not uploaded `retention_seconds` after `declared_at` (they never had an
+    /// object of their own), oldest first, and returns them.
+    fn shared_bodies_expire(
+        &self,
+        now: i64,
+        limit: usize,
+        retention_seconds: i64,
+    ) -> Result<Vec<SharedBodyRow>>;
+    /// Moves `available` declarations of (work, digest) back to `declared` (only `author`'s when
+    /// given) because their object is gone or was never written, so the author's preflight lists
+    /// them missing and the client uploads again. Returns how many rows changed.
+    fn shared_body_demote_available(
+        &self,
+        work_id: &str,
+        digest: &str,
+        author: Option<&str>,
+    ) -> Result<usize>;
+    /// Up to `limit` expired or deleted bodies whose object has not been confirmed removed and
+    /// whose retry time has come, oldest tombstone first.
+    fn shared_bodies_pending_physical_delete(
+        &self,
+        now: i64,
+        limit: usize,
+    ) -> Result<Vec<SharedBodyRow>>;
+    /// Whether any declaration of (work, digest) is `available`, and so needs the shared object.
+    /// A `declared` one does not: its author's upload writes the object again.
+    fn shared_body_object_in_use(&self, work_id: &str, digest: &str) -> Result<bool>;
+    fn shared_body_mark_physically_deleted(
+        &self,
+        work_id: &str,
+        digest: &str,
+        author: &str,
+        now: i64,
+    ) -> Result<()>;
+    /// Records a failed object removal: the row is pending again (even if it was marked removed)
+    /// and is not retried before `retry_at`.
+    fn shared_body_delete_failed(
+        &self,
+        work_id: &str,
+        digest: &str,
+        author: &str,
+        retry_at: i64,
+    ) -> Result<()>;
     fn skill_adoption(&self, repo: &str) -> Result<Option<SkillAdoption>>;
     /// Stores an adoption and returns the one that applies: a `reported_by_checkout` row never
     /// replaces a `default_branch` row, which any `default_branch` row replaces.
@@ -573,7 +671,9 @@ pub trait Store: Send + Sync {
     fn work_insights(&self, token: &str, query: &InsightQuery, now: i64) -> Result<InsightPage>;
     /// The token/session's one unfinished lead claim. Multiple matches are invalid.
     fn work_for_session(&self, token: &str, session: &str, now: i64) -> Result<Option<WorkItem>>;
-    /// The token/session's unique active participant claim for native change capture.
+    /// The token/session's unique current-generation participant Work for native change capture.
+    /// Active, Paused and Blocked Work qualify (session end pauses it; resumed sessions keep
+    /// capturing); Finished and Handover do not. Never changes the Work state.
     fn capture_work_for_session(
         &self,
         token: &str,

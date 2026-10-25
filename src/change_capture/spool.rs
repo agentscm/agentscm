@@ -414,6 +414,10 @@ pub(crate) struct SessionAssociationV1 {
     pub generation: i64,
     pub parent_session_id: Option<String>,
     pub capture_mode: CaptureModeV1,
+    /// The mode this session was first seen with. Absent in older records, which count as
+    /// originally in `capture_mode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_capture_mode: Option<CaptureModeV1>,
 }
 
 #[derive(Clone, Debug)]
@@ -2076,16 +2080,72 @@ impl LocalSpool {
             generation,
             parent_session_id: parent_session_id.map(str::to_owned),
             capture_mode,
+            original_capture_mode: None,
         };
         validate_association(&association)?;
         let path = association_path(&self.root, observed_session_id);
-        let bytes = serde_json::to_vec(&association)?;
         let _lock = self.lock()?;
+        let first = load_association(&self.root, observed_session_id)?
+            .map_or(capture_mode, |earlier| earlier.first_capture_mode());
+        let association = SessionAssociationV1 {
+            capture_mode: clamp_shared(first, capture_mode),
+            original_capture_mode: Some(first),
+            ..association
+        };
+        let bytes = serde_json::to_vec(&association)?;
         if load_association(&self.root, observed_session_id)?.as_ref() == Some(&association) {
             return Ok(());
         }
         self.reserve_replace(&path, bytes.len() as u64)?;
         atomic_replace(&path, &bytes)
+    }
+
+    /// Returns the parent session and capture mode that identify this canonical session to the Hub,
+    /// pinning the supplied live values the first time the (Work, generation, session) is seen.
+    /// The Hub compares both as part of session identity, so a later mode change or a parent id
+    /// that appears mid-session must not alter what later batches carry.
+    pub fn pin_session_identity(
+        &self,
+        observed_session_id: &str,
+        canonical_session_id: &str,
+        work_id: &str,
+        generation: i64,
+        parent_session_id: Option<&str>,
+        capture_mode: CaptureModeV1,
+    ) -> Result<(Option<String>, CaptureModeV1)> {
+        let mut live = SessionAssociationV1 {
+            observed_session_id: observed_session_id.to_owned(),
+            canonical_session_id: canonical_session_id.to_owned(),
+            work_id: work_id.to_owned(),
+            generation,
+            parent_session_id: parent_session_id.map(str::to_owned),
+            capture_mode,
+            original_capture_mode: Some(capture_mode),
+        };
+        validate_association(&live)?;
+        let _lock = self.lock()?;
+        let earlier = load_association(&self.root, observed_session_id)?;
+        if let Some(pinned) = &earlier
+            && pinned.canonical_session_id == canonical_session_id
+            && pinned.work_id == work_id
+            && pinned.generation == generation
+        {
+            return Ok((
+                pinned.parent_session_id.clone(),
+                clamp_shared(pinned.first_capture_mode(), pinned.capture_mode),
+            ));
+        }
+        // A session that began unshared never starts sharing, even under a new Work or generation.
+        if let Some(earlier) = &earlier {
+            let first = earlier.first_capture_mode();
+            live.original_capture_mode = Some(first);
+            live.capture_mode = clamp_shared(first, capture_mode);
+        }
+        let bytes = serde_json::to_vec(&live)?;
+        let path = association_path(&self.root, observed_session_id);
+        self.reserve_replace(&path, bytes.len() as u64)?;
+        atomic_replace(&path, &bytes)?;
+        Ok((live.parent_session_id, live.capture_mode))
     }
 
     /// Returns deferred occurrences that were bound to the exact target current when capture was
@@ -2157,7 +2217,13 @@ impl LocalSpool {
         if path.exists() {
             let existing = read_bounded(&path, MAX_DEFERRED_BYTES)?;
             let existing = decode_deferred_record(&existing)?;
-            return if existing.hook == *deferred {
+            // The occurrence id already fixes any provider timestamp; a differing time is only a
+            // later receipt of the same hook, so it is the same record.
+            let same = DeferredHookV1 {
+                observed_at: existing.hook.observed_at,
+                ..deferred.clone()
+            };
+            return if existing.hook == same {
                 Ok(AppendOutcome::Duplicate)
             } else {
                 Err(CaptureError::Conflict(
@@ -2344,19 +2410,14 @@ impl LocalSpool {
         }
     }
 
-    /// Retains bytes before returning their reference. Shared retention is intentionally absent
-    /// from this M1 store.
+    /// Retains bytes before returning their reference. The caller decides the retention class;
+    /// envelope validation rejects `SharedApproved` outside shared-conversation event bodies.
     pub fn retain_artifact(
         &self,
         bytes: &[u8],
         media: ArtifactMediaV1,
         retention: RetentionClassV1,
     ) -> Result<ArtifactRefV1> {
-        if retention == RetentionClassV1::SharedApproved {
-            return Err(CaptureError::Invalid(
-                "shared conversation retention is unavailable in capture schema v1".into(),
-            ));
-        }
         let size_bytes = u64::try_from(bytes.len())
             .map_err(|_| CaptureError::Limit("artifact size is out of range".into()))?;
         if size_bytes > self.limits.max_artifact_bytes {
@@ -2429,7 +2490,7 @@ impl LocalSpool {
     }
 
     pub fn append(&self, envelope: &CaptureEnvelopeV1) -> Result<AppendOutcome> {
-        self.append_inner(envelope, false)
+        self.append_inner(envelope, false, false)
     }
 
     /// Atomically admits a new action start together with its durable local observation order.
@@ -2561,16 +2622,32 @@ impl LocalSpool {
     /// Retains a bounded health/gap envelope from the metadata headroom that ordinary content
     /// cannot consume. Callers must not use this path for ordinary events or artifacts.
     pub(crate) fn append_priority(&self, envelope: &CaptureEnvelopeV1) -> Result<AppendOutcome> {
-        if !matches!(envelope, CaptureEnvelopeV1::EventBatch(batch) if batch.events.iter().all(|event| event.kind == CapturedEventKindV1::Gap))
-        {
-            return Err(CaptureError::Invalid(
-                "priority capture append accepts gap events only".into(),
-            ));
-        }
-        self.append_inner(envelope, true)
+        check_priority_envelope(envelope)?;
+        self.append_inner(envelope, true, false)
     }
 
-    fn append_inner(&self, envelope: &CaptureEnvelopeV1, priority: bool) -> Result<AppendOutcome> {
+    /// Appends an event batch whose observation time is only the hook's receipt time. A retained
+    /// or compacted batch under the same operation id is a re-delivery of the same hook, so it is
+    /// a duplicate even though its receipt time differs. The check and the append share one lock.
+    pub(crate) fn append_at_receipt(&self, envelope: &CaptureEnvelopeV1) -> Result<AppendOutcome> {
+        self.append_inner(envelope, false, true)
+    }
+
+    /// Priority variant of [`Self::append_at_receipt`] for gap events.
+    pub(crate) fn append_priority_at_receipt(
+        &self,
+        envelope: &CaptureEnvelopeV1,
+    ) -> Result<AppendOutcome> {
+        check_priority_envelope(envelope)?;
+        self.append_inner(envelope, true, true)
+    }
+
+    fn append_inner(
+        &self,
+        envelope: &CaptureEnvelopeV1,
+        priority: bool,
+        receipt_timed: bool,
+    ) -> Result<AppendOutcome> {
         envelope
             .validate()
             .map_err(|error| CaptureError::Invalid(error.to_string()))?;
@@ -2580,7 +2657,9 @@ impl LocalSpool {
         let _lock = self.lock()?;
         if path.exists() {
             let existing = read_bounded(&path, self.limits.max_total_bytes)?;
-            return if existing == bytes {
+            let same_but_time = receipt_timed
+                && without_observation_time(&existing)? == without_observation_time(&bytes)?;
+            return if existing == bytes || same_but_time {
                 Ok(AppendOutcome::Duplicate)
             } else {
                 Err(CaptureError::Conflict(
@@ -2592,7 +2671,17 @@ impl LocalSpool {
             .entries
             .get(&key)
         {
-            return if compacted.digest == sha256(&bytes) {
+            // Digest-only compaction keeps no bytes to compare, so a receipt-timed re-delivery
+            // falls back to its operation id; only acknowledged envelopes are compacted.
+            let matches = match (&compacted.envelope, receipt_timed) {
+                (Some(retained), true) => {
+                    without_observation_time(&serde_json::to_vec(retained)?)?
+                        == without_observation_time(&bytes)?
+                }
+                (None, true) => true,
+                (_, false) => compacted.digest == sha256(&bytes),
+            };
+            return if matches {
                 Ok(AppendOutcome::Duplicate)
             } else {
                 Err(CaptureError::Conflict(
@@ -4190,6 +4279,28 @@ fn envelope_key(envelope: &CaptureEnvelopeV1) -> String {
     envelope_key_parts(kind, operation)
 }
 
+fn check_priority_envelope(envelope: &CaptureEnvelopeV1) -> Result<()> {
+    if matches!(envelope, CaptureEnvelopeV1::EventBatch(batch) if batch.events.iter().all(|event| event.kind == CapturedEventKindV1::Gap))
+    {
+        Ok(())
+    } else {
+        Err(CaptureError::Invalid(
+            "priority capture append accepts gap events only".into(),
+        ))
+    }
+}
+
+/// Canonical bytes of an event envelope with every observation time zeroed.
+fn without_observation_time(bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut envelope: CaptureEnvelopeV1 = serde_json::from_slice(bytes)?;
+    if let CaptureEnvelopeV1::EventBatch(batch) = &mut envelope {
+        for event in &mut batch.events {
+            event.observed_at = 0;
+        }
+    }
+    Ok(serde_json::to_vec(&envelope)?)
+}
+
 fn envelope_key_parts(kind: &str, operation: &str) -> String {
     sha256(format!("{kind}\0{operation}").as_bytes())
 }
@@ -4712,6 +4823,21 @@ fn validate_deferred(deferred: &DeferredHookV1) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+impl SessionAssociationV1 {
+    fn first_capture_mode(&self) -> CaptureModeV1 {
+        self.original_capture_mode.unwrap_or(self.capture_mode)
+    }
+}
+
+/// A session that began unshared never starts sharing: `live` is lowered to `first` otherwise.
+fn clamp_shared(first: CaptureModeV1, live: CaptureModeV1) -> CaptureModeV1 {
+    if live == CaptureModeV1::SharedConversation && first != CaptureModeV1::SharedConversation {
+        first
+    } else {
+        live
+    }
 }
 
 fn validate_association(association: &SessionAssociationV1) -> Result<()> {
@@ -6162,18 +6288,24 @@ fn validate_private_authority_layout(directory: &File, scan_files: bool) -> Resu
                     "capture spool privacy validation contains too many physical records".into(),
                 ));
             }
-            let file = openat_file(
+            let file = match openat_file(
                 &child,
                 &entry_name,
                 libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 0,
-            )
-            .map_err(|_| {
-                CaptureError::Conflict(format!(
-                    "spool_private_permissions: retained entry {} is unavailable",
-                    entry_name.to_string_lossy()
-                ))
-            })?;
+            ) {
+                Ok(file) => file,
+                // A concurrent writer renamed or removed it after the listing; nothing is exposed.
+                Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    continue;
+                }
+                Err(_) => {
+                    return Err(CaptureError::Conflict(format!(
+                        "spool_private_permissions: retained entry {} is unavailable",
+                        entry_name.to_string_lossy()
+                    )));
+                }
+            };
             let metadata = file.metadata()?;
             if !metadata.file_type().is_file() {
                 return Err(CaptureError::Conflict(format!(
@@ -6201,18 +6333,24 @@ fn validate_private_authority_layout(directory: &File, scan_files: bool) -> Resu
                     "capture spool privacy validation contains too many physical records".into(),
                 ));
             }
-            let file = openat_file(
+            let file = match openat_file(
                 directory,
                 &entry_name,
                 libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 0,
-            )
-            .map_err(|_| {
-                CaptureError::Conflict(format!(
-                    "spool_private_permissions: retained metadata {} is unavailable",
-                    entry_name.to_string_lossy()
-                ))
-            })?;
+            ) {
+                Ok(file) => file,
+                // A concurrent writer renamed or removed it after the listing; nothing is exposed.
+                Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    continue;
+                }
+                Err(_) => {
+                    return Err(CaptureError::Conflict(format!(
+                        "spool_private_permissions: retained metadata {} is unavailable",
+                        entry_name.to_string_lossy()
+                    )));
+                }
+            };
             let metadata = file.metadata()?;
             if !metadata.file_type().is_file() {
                 return Err(CaptureError::Conflict(format!(
@@ -6967,6 +7105,7 @@ fn usage(root: &Path, _configured_max: usize) -> Result<(usize, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::change_record::GapReasonV1;
 
     fn export_anchors(parent: &Path) -> Vec<PathBuf> {
         let mut anchors = fs::read_dir(parent)
@@ -8003,6 +8142,106 @@ mod tests {
         assert!(!root.join("capture-spool-v4.json").exists());
         assert!(!root.join("spool.lock").exists());
         assert!(!root.join("managed-capture.lock").exists());
+    }
+
+    fn gap_envelope(
+        operation_id: &str,
+        observed_at: i64,
+        reason: GapReasonV1,
+    ) -> CaptureEnvelopeV1 {
+        use crate::change_record::{
+            AgentHarnessV1, CaptureBatchV1, CapturedEventKindV1, CapturedEventV1, GapFactV1,
+            SessionIdentityV1,
+        };
+        CaptureEnvelopeV1::EventBatch(CaptureBatchV1 {
+            schema_version: crate::change_record::SCHEMA_VERSION_V1,
+            operation_id: operation_id.into(),
+            work_id: "wrk_receipt".into(),
+            generation: 1,
+            session: SessionIdentityV1 {
+                harness: AgentHarnessV1::ClaudeCode,
+                adapter_version: "test".into(),
+                session_id: "session_receipt".into(),
+                parent_session_id: None,
+                capture_mode: CaptureModeV1::MetadataOnly,
+            },
+            events: vec![CapturedEventV1 {
+                event_id: "gap:receipt".into(),
+                sequence: 1,
+                observed_at,
+                kind: CapturedEventKindV1::Gap,
+                tool: None,
+                artifact: None,
+                setup: None,
+                gap: Some(GapFactV1 {
+                    first_missing: 1,
+                    last_missing: 1,
+                    reason,
+                }),
+                boundary: None,
+                subagent: None,
+            }],
+        })
+    }
+
+    #[test]
+    fn receipt_timed_priority_redelivery_in_outbox_ignores_only_observation_time() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+        let operation = format!("cap:{}", "a".repeat(64));
+        let original = gap_envelope(&operation, 100, GapReasonV1::AdapterStartedLate);
+        assert_eq!(
+            spool.append_priority_at_receipt(&original).unwrap(),
+            AppendOutcome::Stored
+        );
+        let later = gap_envelope(&operation, 200, GapReasonV1::AdapterStartedLate);
+        assert_eq!(
+            spool.append_priority_at_receipt(&later).unwrap(),
+            AppendOutcome::Duplicate
+        );
+        let different = gap_envelope(&operation, 200, GapReasonV1::CaptureInterrupted);
+        assert!(matches!(
+            spool.append_priority_at_receipt(&different),
+            Err(CaptureError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn receipt_timed_redelivery_after_compaction_compares_retained_envelopes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+        let digest_only = format!("cap:{}", "b".repeat(64));
+        let replayable = format!("provider:history:{}:gap", "c".repeat(64));
+        for operation in [&digest_only, &replayable] {
+            let original = gap_envelope(operation, 100, GapReasonV1::AdapterStartedLate);
+            spool.append_priority_at_receipt(&original).unwrap();
+            spool.acknowledge(&original).unwrap();
+        }
+        spool.compact_acknowledged(10).unwrap();
+
+        // Digest-only history keeps no bytes, so the operation id alone decides.
+        let later = gap_envelope(&digest_only, 200, GapReasonV1::CaptureInterrupted);
+        assert_eq!(
+            spool.append_priority_at_receipt(&later).unwrap(),
+            AppendOutcome::Duplicate
+        );
+        // Replayable history keeps the envelope, so only the observation time may differ.
+        let later = gap_envelope(&replayable, 200, GapReasonV1::AdapterStartedLate);
+        assert_eq!(
+            spool.append_priority_at_receipt(&later).unwrap(),
+            AppendOutcome::Duplicate
+        );
+        let different = gap_envelope(&replayable, 200, GapReasonV1::CaptureInterrupted);
+        assert!(matches!(
+            spool.append_priority_at_receipt(&different),
+            Err(CaptureError::Conflict(_))
+        ));
+        // An untimed append still requires exact bytes.
+        let retimed = gap_envelope(&replayable, 200, GapReasonV1::AdapterStartedLate);
+        assert!(matches!(
+            spool.append_priority(&retimed),
+            Err(CaptureError::Conflict(_))
+        ));
     }
 
     #[test]

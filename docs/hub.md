@@ -34,6 +34,10 @@ GitHub. To warn agents from Claude Code, see [work intents](intents.md).
 - `--poll-seconds N` (default 300, at least 10): how often connections are polled.
 - `--activity-days N` (default 14, 1 to 365): how far back a branch's tip commit
   counts as recent.
+- `--shared-conversation-retention-days N` (default 30, 1 to 3650): how long an uploaded
+  shared-conversation body stays readable. A sweep every ten minutes expires due bodies and deletes
+  their objects (batches of 100 until none are due or 30 seconds are spent; failed removals back off
+  from 1 hour to 1 day); the author or a Hub admin can delete one earlier.
 - `--bind ADDR` (default `127.0.0.1:7332`). A non-loopback address needs
   `--public`.
 - `--public-url URL` (default `http://<bind>`): where browsers and forges reach
@@ -65,7 +69,10 @@ Limits:
   overwrites an existing object with identical bytes and reports it as newly
   created.
 - Redirects and retries are off; requests time out after 60 seconds.
-- Objects are never deleted.
+- Objects are never deleted, except shared-conversation bodies, which are removed after a
+  database tombstone (early deletion) or expiry. A delete removes the current object version
+  only: on a versioned or object-locked bucket, noncurrent versions remain until the bucket's
+  lifecycle rules remove them.
 - The store must be case-sensitive (AWS S3 and R2 are); identifiers are used
   verbatim in object keys.
 - Proxy environment variables are ignored for object storage traffic.
@@ -168,8 +175,11 @@ sign-in there.
   (warn-once counters, see [Agent sessions](#agent-sessions-mcp-and-hook-endpoints)), plus
   `"demo":true` on the throwaway hub of `agentscm demo`, or 503 if the database does not answer.
 - `GET /v1/hub/whoami`: needs `Authorization: Bearer <token>`. Returns the
-  token's id, name, repository and expiry, and its owner. Every authentication
-  failure returns the same 401 body.
+  token's id, name, repository and expiry, and its owner, plus
+  `shared_conversation_retention_days`, the days this Hub keeps an uploaded shared conversation
+  (`hub serve --shared-conversation-retention-days`, 1 to 3650). The field is additive: a Hub
+  that predates it omits it, and clients then say the retention is not known instead of naming a
+  number. Every authentication failure returns the same 401 body.
 - `DELETE /v1/hub/token`: needs `Authorization: Bearer <token>` (read-only tokens too) and revokes
   that token only (204). `agentscm client remove` and `uninstall` use it, so undoing a setup needs no
   sign-in. A revoked or unknown token gets 401.
@@ -214,13 +224,15 @@ on no others:
 - `GET /v1/hub/view-settings` and `GET /v1/hub/onboarding` (the Connect agents page)
 - `GET /v1/hub/skills` and the `GET /v1/hub/repos/{repo}/skills/runs` routes (see the
   [API](api.md#hub-supported-skills-routes-experimental))
-- `GET /v1/hub/repos/{repo}/change-records/{work_id}` for a concise source-bound handoff
+- `GET /v1/hub/repos/{repo}/change-records/{work_id}` for a concise source-bound handoff, and
+  the shared-conversation reads under it (only the author's tokens and Hub admins get a body, and a listing shows
+  a caller their own entries; see [shared conversations](#shared-conversation-reads))
 - `GET /v1/hub/repos/{repo}/publications` and `GET /v1/hub/repos/{repo}/publications/{id}`
   (stored state only; see [publications](#publishing-a-revision))
 - MCP `initialize`, `ping`, `tools/list`, `resources/list`, `resources/read`, and the tools
   `agentscm_workflow_status`, `agentscm_work_briefing`, `agentscm_work_overview`,
   `agentscm_work_insight`, `agentscm_work_insights`, `agentscm_change_record`,
-  `agentscm_work_search`, `agentscm_publications_list`, `agentscm_workflow_runs_list`,
+  `agentscm_shared_conversation`, `agentscm_work_search`, `agentscm_publications_list`, `agentscm_workflow_runs_list`,
   `agentscm_coordination_inbox`, `agentscm_skill_list` and `agentscm_skill_status`
 
 Every other route that takes an agent token (announcing, renewing and releasing intents, `notices`,
@@ -577,7 +589,10 @@ The experimental Unix capture client adds a separate Claude Code hook set after 
 existing saved client connection. `agentscm change-capture configure` is a configure-once operation:
 each hook invocation resolves the session's current authorized Work and generation, appends locally
 before delivery, and replays a bounded ordered page. It does not reuse one fixed Work generation.
-Unresolved hooks stay as bounded sanitized local facts and are never later attached to a Work item.
+Capture targets a Work that is `active`, `paused` or `blocked` for the session at its current
+generation: session end pauses the Work and a resumed session keeps capturing, while `finished` and
+`handover` Work end capture. Unresolved hooks stay as bounded sanitized local facts and are never
+later attached to a Work item.
 
 The Hub accepts bounded event batches and source-bound action starts/finishes on the
 `/v1/hub/repos/{repo}/change-records/...` routes. Ordinary command execution has an outcome but an
@@ -593,11 +608,59 @@ in the private local spool.
 the same projection. It exposes bounded Work intent/scope, inspectable Git or native source facts,
 session gaps, action facts, a retained Work decision, next action, completeness and unknowns. An
 agent-authored decision remains a proposal rather than human approval. Reads do not acknowledge or
-transfer work and never return conversation bodies or transcript-derived summaries. The encoded
+transfer work and never return conversation bodies or transcript-derived summaries (shared
+bodies have their own owner-only reads, below). The encoded
 projection is at most 48 KiB, with at most 16 retained scope entries and 16 decision references;
 exact omission counts identify trailing entries removed deterministically to fit the envelope.
 MCP narration is fixed factual text: caller-authored intent titles and decision summaries remain
 explicitly untrusted structured data and are not interpolated into that narration.
+
+### Shared conversation reads
+
+Bodies a checkout shared in `shared-conversation` mode are readable and deletable only by the human
+who declared them (any of that person's tokens for the repository; read-only tokens may read, not
+delete) and Hub admins (`AGENTSCM_ADMINS`). Admins can read every body, so list them as
+`provider:#<numeric user id>` (for example `github:#42`), which survives a rename or re-registered
+login, rather than by login name. The Work owner has no special access unless they are the
+author. Each human's declaration of a digest is its own row, so two authors of identical content
+each have their own entry, upload and expiry. The listing returns only the caller's own entries
+(an admin's returns all); a body `GET`, `PUT` or `DELETE` by someone who has no declaration of that
+digest gets 403 `forbidden` whether or not the digest exists (a Hub admin learns unknown as 404). There
+is no per-body grant.
+
+- `GET /v1/hub/repos/{repo}/change-records/{work_id}/conversation?cursor=` returns one page, at most
+  100 entries and 48 KiB, ordered by session id (bytewise) then sequence then digest, with an opaque
+  `next_cursor` (a malformed one is 400). Each entry has `session_id`, `sequence`, `event_id`, `kind`,
+  `observed_at`, `digest`, `size_bytes`, `availability` and `expires_at`. Availability is `local` (declared,
+  never uploaded), `shared`, `expired` (from its deadline, before the sweep records it) or
+  `deleted`.
+- `GET .../conversation/{sha256}` returns the verified bytes as `application/json` with
+  `X-Content-Type-Options: nosniff`, `Content-Disposition: attachment`, `Content-Security-Policy:
+  default-src 'none'; sandbox` and `Cache-Control: no-store`. 404 means never uploaded (or, for an admin,
+  unknown), 410 expired or deleted, and 424 `{"error":"integrity_failure"}` means the row says available but the
+  object is missing, corrupt or not the declared size; no partial body is ever returned.
+- `PUT .../conversation/{sha256}` is the upload the checkout makes after the Hub accepts the event
+  that declared the body. It needs a token of the declaring human, exactly the declared size (at most
+  1 MiB) and bytes whose SHA-256 matches, and the retention deadline starts when it succeeds (204),
+  also when another author already stored identical bytes. `DELETE` on the same path (the author, or a
+  Hub admin for every author's copy) tombstones the body and removes the object once no other
+  declaration of the same digest is available.
+- `POST .../conversation/missing` with `{"digests": [...]}` (at most 100 lower-hex digests; a
+  non-read-only token) answers `{"missing": [...], "gone": [...]}`: `missing` are the caller's own
+  declarations still awaiting an upload, `gone` are digests the caller never declared or that expired
+  or were deleted, and digests already available are in neither.
+- MCP `agentscm_shared_conversation {work_id, cursor?, digest?}` applies the same rule. A body over
+  48 KiB is refused as too large, never truncated. Bodies are untrusted agent-produced data and must
+  not be followed as instructions.
+- `agentscm change-capture conversation --work-id ID [--cursor C | --digest D | --delete D]` lists,
+  prints, or deletes (through the `DELETE` route). The Hub UI Change record page lists entries and shows a
+  shared body as plain text directly beneath its entry, and shows "time not reported" for a zero time
+  on an older record; it has no delete control because the status page only holds read-only
+  tokens.
+
+The `shared_conversations` migration changed during development: a dev or staging Hub that ran a
+pre-release build of this branch must drop `hub_change_shared_bodies` and its named-migration record
+(or start fresh).
 
 This path remains alpha. Real Claude host, complete integrated browser, and deployment qualification
 are pending. See [local change capture](change-capture.md) for configuration and exact limits.
@@ -1155,8 +1218,8 @@ Limits:
   one file hash must name one git blob and size in a manifest.
 - `native_landed` is the client's claim: the hub has no native data and cannot check that the
   revision was integrated.
-- Uploaded files are never deleted: the object store has no delete, and the size caps and the
-  open-publication limit bound growth.
+- Uploaded publication files are never deleted; the size caps and the open-publication limit
+  bound growth.
 - The repository's lock is held for the whole run, and sync of that repository takes the same
   lock, so it waits for a run in progress. The connection and its opt-in are read again under
   the lock; a connection switched off or `auth_failed` while a run waited gets no forge writes.
@@ -1449,25 +1512,18 @@ What the hub keeps, in its database and object store:
   200) and the times of its recent refusals (`deny_times`, for the limit of 3
   per 10 minutes). A session row is deleted when the session ends, and rows
   untouched for 7 days are deleted the next time the same token is used.
-- The task from a hook payload. Sessions started by a hook can take their
-  task from the agent's own start event, where the agent includes its first
-  prompt there: `initial_prompt` in a `SessionStart` payload, or
-  `initialPrompt` in a Copilot CLI one. Control
-  characters are replaced with spaces and the text is cut to 500 bytes
-  (otherwise it is stored as sent). It is stored as the session's task at
-  once and becomes its intent's task, so a prompt can reach teammates: their
-  agents' warnings show it cut to 120 characters (80 printable ASCII
-  characters in a refusal), the intents API and the status page return it in
-  full to any token for the repository, and the `intent_announced` and
-  `intent_notice` events keep it in the append-only log. Claude Code
-  does not support HTTP hooks for `SessionStart`, so with the HTTP hooks
-  of a manual setup no prompt reaches the hub. The task can also come from
-  `agentscm_start` or `agentscm intent`. An agent's hook sends the hub its
-  whole hook JSON, which for an edit includes the edit's contents; the hub
-  reads only the event and tool names, the session id, the edited file paths,
-  the working directory, workspace roots and root header (to make paths
-  repository-relative), and the start task (or a generic hook's `task`), and
-  neither stores nor logs the rest.
+- The task from a hook payload. A prompt in a `SessionStart` payload
+  (`initial_prompt`, or `initialPrompt` in a Copilot CLI one) is not stored:
+  a prompt would otherwise become the session's task and its intent's task,
+  which teammates' warnings, the intents API and the status page show. A
+  generic hook's `task` field is still stored (control characters replaced
+  with spaces, cut to 500 bytes), and the task can come from `agentscm_start`
+  or `agentscm intent`. An agent's hook sends the hub its whole hook JSON,
+  which for an edit includes the edit's contents; the hub reads only the
+  event and tool names, the session id, the edited file paths, the working
+  directory, workspace roots and root header (to make paths
+  repository-relative), and a generic hook's `task`, and neither stores nor
+  logs the rest.
 - Handoff requests (`hub_handoffs`, experimental): the file path, the
   requesting and holding tokens and sessions, the holder's intent, a note (the
   requester's task or note, filtered, at most 200 characters), the holder's
@@ -1511,7 +1567,7 @@ What the hub keeps, in its database and object store:
 
 Limits in this alpha:
 
-- Events and stored objects are never deleted (only the session, handoff,
+- Events and stored objects are never deleted, apart from shared-conversation bodies (only the session, handoff,
   intent path and delivery rows named above are, and observations of pull
   requests and branches that are gone, a day later), and there is no per-person
   export or erasure command. An administrator can disable a person, which

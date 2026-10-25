@@ -216,6 +216,9 @@ fn save_to(path: &Path, connections: &[Connection]) -> Result<()> {
     write_private(path, &text)
 }
 
+/// The refusal when the connections lock stays held past its wait.
+pub(crate) const BUSY: &str = "client connections are busy; retry";
+
 pub(crate) fn acquire_lock(path: &Path) -> Result<File> {
     let dir = path
         .parent()
@@ -260,11 +263,18 @@ pub(crate) fn acquire_lock(path: &Path) -> Result<File> {
                 std::thread::sleep(Duration::from_millis(25));
             }
             Err(TryLockError::WouldBlock) => {
-                return Err(invalid("client connections are busy; retry"));
+                return Err(invalid(BUSY));
             }
             Err(TryLockError::Error(error)) => return Err(error.into()),
         }
     }
+}
+
+/// Holds the connections lock. Lock order everywhere: connections lock, then the change-capture
+/// config lock; nothing takes them the other way round.
+#[cfg(unix)]
+pub(crate) fn lock_connections() -> Result<File> {
+    acquire_lock(&lock_path()?)
 }
 
 /// Compare and replace one root while retaining unrelated entries written concurrently.
@@ -273,9 +283,30 @@ pub(crate) fn update(
     expected: Option<&Connection>,
     replacement: Option<Connection>,
 ) -> Result<()> {
-    update_at(&path()?, &lock_path()?, root, expected, replacement)
+    update_with(
+        &path()?,
+        &lock_path()?,
+        root,
+        expected,
+        replacement,
+        lower_sharing,
+    )
 }
 
+/// Change capture, and so conversation sharing, exists only on Unix; elsewhere there is nothing to lower.
+fn lower_sharing(root: &Path, replacement: Option<&Connection>) -> Result<()> {
+    #[cfg(unix)]
+    {
+        crate::change_capture_client::lower_sharing_for_connection_change(root, replacement)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, replacement);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 fn update_at(
     config_path: &Path,
     lock_path: &Path,
@@ -283,9 +314,35 @@ fn update_at(
     expected: Option<&Connection>,
     replacement: Option<Connection>,
 ) -> Result<()> {
+    update_with(
+        config_path,
+        lock_path,
+        root,
+        expected,
+        replacement,
+        |_, _| Ok(()),
+    )
+}
+
+/// `before_save` runs under the connections lock, once the change is known to apply and before it
+/// is written, so a failure leaves the connection unchanged.
+fn update_with(
+    config_path: &Path,
+    lock_path: &Path,
+    root: &Path,
+    expected: Option<&Connection>,
+    replacement: Option<Connection>,
+    before_save: impl FnOnce(&Path, Option<&Connection>) -> Result<()>,
+) -> Result<()> {
     let _lock = acquire_lock(lock_path)?;
     let mut connections = load_from(config_path)?;
     replace(&mut connections, root, expected, replacement)?;
+    before_save(
+        root,
+        connections
+            .iter()
+            .find(|connection| connection.root == root),
+    )?;
     save_to(config_path, &connections)
 }
 
@@ -643,6 +700,37 @@ pub(crate) fn relative(root: &Path, path: &Path) -> Option<String> {
         || joined.contains(['*', '\\'])
         || joined.chars().any(char::is_control);
     (!bad).then_some(joined)
+}
+
+/// Runs a test body in a child copy of this test binary whose `XDG_CONFIG_HOME` is a fresh temp
+/// directory, so no test changes this process's environment (that is not thread-safe under plain
+/// `cargo test`). Pass the body as a closure written directly in the test function: its type name
+/// is how the child finds the test to re-run.
+#[cfg(all(test, unix))]
+pub(crate) fn in_isolated_config_home(body: impl FnOnce(&Path)) {
+    const CHILD: &str = "AGENTSCM_TEST_CONFIG_HOME_CHILD";
+    if let Some(home) = std::env::var_os(CHILD) {
+        body(Path::new(&home));
+        return;
+    }
+    let name = std::any::type_name_of_val(&body)
+        .trim_end_matches("::{{closure}}")
+        .split_once("::")
+        .map(|(_, test)| test.to_owned())
+        .expect("test path");
+    let home = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
+        .env(CHILD, home.path())
+        .env("XDG_CONFIG_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "{name} failed in its isolated config home:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[cfg(test)]

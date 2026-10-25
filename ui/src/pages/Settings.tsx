@@ -1,5 +1,6 @@
 import { ComputerSettings } from '../ComputerBar.tsx'
-import { isLocalCredential } from '../frontDoor.ts'
+import { CaptureSharingBox, CaptureSharingElsewhere } from '../CaptureSharing.tsx'
+import { isLocalCredential, onFrontDoor } from '../frontDoor.ts'
 import { useState } from 'react'
 import { loadLocalBase, loadLocalToken, localStatus, saveLocalBase, saveLocalToken, validLocalBase } from '../localApi.ts'
 import { usePoll } from '../usePoll.ts'
@@ -108,6 +109,8 @@ export function SettingsPage({ token, whoami, pref, onPref, density, onDensity, 
         ) : (
           <LocalServer />
         )}
+
+        {onFrontDoor() && isLocalCredential(token) ? <CaptureSharingBox token={token} /> : <CaptureSharingElsewhere />}
 
         {!isLocalCredential(token) && (
         <Box tour="settings-token" icon="key" title="Your token" explain="The token decides which repository you see. A read-only token can look but never change coordination.">

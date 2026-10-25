@@ -1,6 +1,6 @@
 # Change record implementation status
 
-> **Local validation recorded 24 October 2026:** M0 and the M1 capture/receipt/handoff slice are implemented and locally validated within the limits below. M2–M8 remain separate work.
+> **Local validation recorded 24 October 2026:** M0 and the M1 capture/receipt/handoff slice are implemented and locally validated within the limits below. A first M6 slice (opt-in shared conversations) is implemented and tested locally; the remainder of M6 and M2–M5 and M7–M8 remain separate work.
 
 ## Baseline and contracts
 
@@ -8,7 +8,7 @@ The change-record work extends the existing durable Work model. It does not repl
 
 - Shared change-record schema: version 1.
 - Hub storage migration: paired SQLite and PostgreSQL named migration `change_records`. Its upgrade, restore, and parity checks remain part of final validation.
-- Shared records contain bounded typed event and action facts plus opaque artifact identities. Conversation bodies, tool arguments, command output, captured source bytes, and manifests remain in an operator-chosen private local spool.
+- Shared records contain bounded typed event and action facts plus opaque artifact identities. Conversation bodies, tool arguments, command output, captured source bytes, and manifests remain in an operator-chosen private local spool, except the redacted conversation bodies of a checkout that opted into `shared-conversation` mode (see the M6 slice below).
 - Execution outcome, verification result, source applicability, assurance, evidence availability, coverage, drift, freshness, and decision state remain separate fields.
 - A configured exact recipe result is `caller_asserted`. The Hub is not an independent recipe registry or approval authority.
 - An agent-authored Work decision is projected as a proposal. Human approval remains separate and unknown until an authoritative human decision exists.
@@ -44,7 +44,7 @@ The M1 slice includes:
 - one concise change-record projection used by authenticated HTTP, `change-capture show`, the read-only MCP tool, and the Hub UI;
 - a transcript-free handoff containing Work intent, action-bound source, latest action, retained agent proposal, known gaps, and next action. An execution receipt alone does not establish that its source was tested.
 
-This slice is Unix-focused. The Claude Code adapter covers a defined set of visible lifecycle events; Codex exposes a narrower event set and is not claimed as equivalent coverage. Neither path is described as full transcript capture. Shared conversation retention, protected independent execution, human approval, and forge readiness are outside M1.
+This slice is Unix-focused. The Claude Code adapter covers a defined set of visible lifecycle events; Codex exposes a narrower event set and is not claimed as equivalent coverage. Neither path is described as full transcript capture. Protected independent execution, human approval, and forge readiness are outside M1. Shared conversation retention is not part of M1; its first slice is recorded under M6 below.
 
 M1 deliberately does not switch an already bound checkout to a different spool identity. Read-only
 inspection and export preserve diagnosis, and verified reboot reconciliation can close a retained
@@ -106,7 +106,7 @@ improvement or the M8 pilot.
 - **M3 — Queue-safe forge:** qualify exact-head and merge-group subjects, App identity, stale and group recovery, protection reporting, and provider contracts before any required-check rollout.
 - **M4 — Setup and risk governance:** complete setup provenance, deterministic risk policy, governed recipe provenance, authoritative human decisions, and protected-execution qualification.
 - **M5 — Complete handoff and review UX:** add search and drill-down, full timeline results, reproduction guidance, coordination handover, readiness explanations, an MCP App surface, and a second qualified agent adapter.
-- **M6 — Shared retention:** define and qualify team retention, access control, redaction and deletion, derivative invalidation, export, and operational recovery before enabling shared conversation bodies.
+- **M6 — Shared retention (first slice implemented, rest open):** implemented and tested locally against synthetic fixtures, the in-process Hub on SQLite (PostgreSQL parity tests skip unless a database is configured) and a local object store: an opt-in per-checkout `shared-conversation` capture mode (default `metadata-only`; `change-capture set-mode`, `configure --capture-mode`, and a macOS tray toggle), best-effort client-side redaction with a `redacted` gap, a 1 MiB per-body cap, upload after the Hub accepts the event, reads and deletion limited to the author's tokens and Hub admins (403 for other tokens; a listing shows a caller only their own entries), one global retention period (`hub serve --shared-conversation-retention-days`, default 30) with a ten-minute batched expiry sweep with retry backoff for failed removals, and early deletion by the author or an admin through the CLI or HTTP. Still open before M6 can be called complete: team-level retention policy beyond that single global setting; admin UI deletion (the Hub UI is read-only, so deletion is CLI or HTTP only); redaction verification on the Hub; export of shared bodies; derivative invalidation; backup and restore qualification; live S3-compatible delete qualification; and qualification of real Claude Code payloads for the `Stop`, `PreCompact` and subagent hooks, which are covered by synthetic fixtures only.
 - **M7 — Feedback and outcomes:** add bounded review and CI feedback, capacity policy, accepted-source mapping, revert handling, and complete usage and outcome views that preserve unknowns and abandoned work.
 - **M8 — Pilot and release qualification:** establish cross-surface parity, live adapter and forge coverage, upgrade and backup recovery, supported platform coverage, release gates, and an honestly measured transcript-withheld handoff pilot.
 
@@ -114,4 +114,4 @@ improvement or the M8 pilot.
 
 This ledger records local M1 validation. It does not establish deployment or M8 release qualification. Windows, Linux amd64, the default suite's skipped cases, multi-machine operation and equivalent capture across other agent hosts were not qualified by this run. Publication and merge status are recorded by the associated signed commit and pull request; they are not inferred from local test results.
 
-Do not claim complete conversation capture, independent verification, protected execution, equivalent support across agent hosts, shared transcript lifecycle support, merge-queue readiness, deployment readiness, or measured cost or quality improvement from M1.
+Do not claim complete conversation capture, independent verification, protected execution, equivalent support across agent hosts, merge-queue readiness, deployment readiness, or measured cost or quality improvement from M1. Do not claim that shared conversations are secret-free (redaction is best effort and unverified by the Hub), that a complete shared-transcript lifecycle exists (M6 is only partly implemented), that expiry or deletion removes copies a reader already made, or that the tray toggle has had human native UI acceptance.
