@@ -1,3 +1,5 @@
+import { LocalRepoSwitcher } from './ComputerBar.tsx'
+import { isLocalCredential } from './frontDoor.ts'
 import { skillRunHref, skillRunsHref, skillsRoute } from './skills.ts'
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { Derived } from './derive.ts'
@@ -464,8 +466,10 @@ function Breadcrumbs({ repo, section, overview, data }: { repo: string; section:
   )
 }
 
-export function AppChrome({ logo, repo, sections, section, badges, data, d, overview, pref, onPref, onForget, collapsed, onCollapsed, children }: {
+export function AppChrome({ logo, token, repo, sections, section, badges, data, d, overview, pref, onPref, onForget, collapsed, onCollapsed, children }: {
   logo: ReactNode
+  /** The Hub sign-in; on this computer's own page, its connection credential. */
+  token: string
   repo: string
   sections: SectionDef[]
   section: Section
@@ -546,7 +550,7 @@ export function AppChrome({ logo, repo, sections, section, badges, data, d, over
           {logo}
         </a>
         <span className="topbar-div" aria-hidden="true" />
-        <RepoSwitcher repo={repo} onForget={onForget} />
+        {isLocalCredential(token) ? <LocalRepoSwitcher token={token} repo={repo} /> : <RepoSwitcher repo={repo} onForget={onForget} />}
 
         <button type="button" data-tour="search" className="search-pill" onClick={() => setPalette(true)} aria-label="Search the hub">
           <Icon name="search" />

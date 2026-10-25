@@ -2600,21 +2600,5 @@ a.run-row:hover {
 .lane-title { margin: 0; font: inherit; color: inherit; }
 .ws-grid .combo { min-width: min(100%, 18rem); }
 
-/* This computer's own Hub page: which computer and repository you are looking at. */
-.computer-bar {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px 12px;
-  margin: 0 0 16px;
-  padding: 10px 14px;
-  border: 1px solid var(--hub-rule);
-  border-radius: 12px;
-  background: var(--hub-surface);
-  color: var(--hub-text-2);
-}
-.computer-bar > .bi { color: var(--hub-ok); }
-.computer-bar strong { color: var(--hub-text); }
-.computer-bar-repo { margin: 0; }
-.computer-bar-repo .form-select { min-width: 14rem; }
-.computer-bar > .btn { margin-left: auto; }
+/* This computer's own Hub page: the repository menu marks the computer. */
+.repo-mark.is-computer { color: var(--hub-ok); }

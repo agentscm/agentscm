@@ -21,7 +21,9 @@ There is no token to paste and no address to enter.
 
 - The first `agentscm open` starts AgentSCM's local Hub page in the background, on
   `http://127.0.0.1:7340` (or another free port). It keeps running after the terminal closes;
-  `agentscm open --stop` stops it. Open Hub in the menu bar app uses the same page.
+  `agentscm open --stop` stops it. The macOS menu bar app starts the same page when it starts
+  (if this computer has a connected checkout), so its Open Hub opens at once, and stops the page
+  again when you quit it, if it was the one that started it.
 - The page is the same Hub page your team's Hub serves, served from your computer. It reads your
   files and saved conversations directly. It fetches team data from each repository's own Hub
   with a read-only token for that one repository, minted from this computer's Hub sign-in. That

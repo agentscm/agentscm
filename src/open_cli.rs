@@ -97,7 +97,7 @@ pub(crate) async fn open_checkout(path: &Path) -> Result<Opened> {
         )));
     }
     let client = loopback_client()?;
-    let record = running_or_start(&client).await?;
+    let (record, _) = running_or_start(&client).await?;
     let code = mint_code(&client, &record).await?;
     let page = format!("{}/ui/", record.base);
     let selector = format!("{}@{}", connection.repo, connection.hub);
@@ -158,9 +158,9 @@ fn handoff(target: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// The live front door, confirmed by the instance it reports, or a newly started one. A lock
-/// keeps two concurrent `open`s from starting two services.
-async fn running_or_start(client: &reqwest::Client) -> Result<ServiceRecord> {
+/// The live front door, confirmed by the instance it reports, or a newly started one (`true`).
+/// A lock keeps two concurrent `open`s from starting two services.
+async fn running_or_start(client: &reqwest::Client) -> Result<(ServiceRecord, bool)> {
     let dir = local_service::ensure_dir()?;
     // Waiting for another `open` to finish starting blocks, so it waits off the async runtime.
     let lock_path = dir.join("open.lock");
@@ -174,7 +174,7 @@ async fn running_or_start(client: &reqwest::Client) -> Result<ServiceRecord> {
     if let Some(record) = local_service::load()?
         && confirmed(client, &record).await
     {
-        return Ok(record);
+        return Ok((record, false));
     }
     let log_path = dir.join("service.log");
     if std::fs::metadata(&log_path).is_ok_and(|metadata| metadata.len() > LOG_BYTES) {
@@ -211,7 +211,7 @@ async fn running_or_start(client: &reqwest::Client) -> Result<ServiceRecord> {
             std::thread::spawn(move || {
                 let _ = child.wait();
             });
-            return Ok(record);
+            return Ok((record, true));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -271,6 +271,85 @@ async fn mint_code(client: &reqwest::Client, record: &ServiceRecord) -> Result<S
         _ => Err(Error::Invalid(
             "the local Hub page refused to create a connection code".into(),
         )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+/// The local page as started by a long-lived owner such as the tray: started in the background
+/// when this computer has any connected checkout, and stopped again only if this owner started it.
+pub(crate) struct LocalPage {
+    started: std::sync::Arc<std::sync::Mutex<Option<u32>>>,
+    starting: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+#[cfg(target_os = "macos")]
+impl LocalPage {
+    pub(crate) fn start_in_background() -> Self {
+        let started = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let record = started.clone();
+        let starting = std::thread::spawn(move || {
+            if !client_config::load().is_ok_and(|connections| !connections.is_empty()) {
+                return;
+            }
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            let begun = runtime.block_on(async {
+                let client = loopback_client()?;
+                running_or_start(&client).await
+            });
+            if let Ok((service, true)) = begun {
+                *record
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(service.pid);
+            }
+        });
+        Self {
+            started,
+            starting: std::sync::Mutex::new(Some(starting)),
+        }
+    }
+
+    /// Stop the page if this owner started it and it is still that process.
+    pub(crate) fn stop_if_started(&self) {
+        // A quit during startup waits for the start to finish, so a page it launched is still
+        // known and stopped. The wait is bounded by the start's own lock wait and start timeout.
+        let starting = self
+            .starting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(starting) = starting {
+            let _ = starting.join();
+        }
+        let Some(pid) = *self
+            .started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        else {
+            return;
+        };
+        if local_service::load()
+            .ok()
+            .flatten()
+            .is_none_or(|record| record.pid != pid)
+        {
+            return;
+        }
+        // The owner may be running inside an async runtime (the tray is), where a second one
+        // cannot block; stop from a thread of its own and wait for it.
+        let stopping = std::thread::spawn(|| {
+            if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                let _ = runtime.block_on(stop());
+            }
+        });
+        let _ = stopping.join();
     }
 }
 
