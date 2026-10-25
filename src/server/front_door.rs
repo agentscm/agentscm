@@ -194,6 +194,17 @@ fn proxied(path: &str) -> bool {
         .any(|allowed| path == *allowed || path.starts_with(&format!("{allowed}/")))
 }
 
+/// The selected Hub's URL for an allowlisted read. Scheme, host and port always come from the
+/// saved Hub; the request supplies only the path below it and the query.
+fn hub_read_url(hub: &str, path: &str, query: Option<&str>) -> Option<reqwest::Url> {
+    let mut url = reqwest::Url::parse(hub).ok()?;
+    let joined = format!("{}{path}", url.path().trim_end_matches('/'));
+    url.set_path(&joined);
+    url.set_query(query);
+    url.set_fragment(None);
+    Some(url)
+}
+
 impl FrontDoor {
     pub(super) fn new() -> Result<Self> {
         Ok(Self {
@@ -790,9 +801,13 @@ async fn proxy(
             "this Hub area opens on the Hub itself",
         );
     }
-    let target = uri
-        .path_and_query()
-        .map_or(uri.path(), axum::http::uri::PathAndQuery::as_str);
+    let Some(target) = hub_read_url(&selected.hub, uri.path(), uri.query()) else {
+        return refuse(
+            StatusCode::BAD_GATEWAY,
+            "hub_unavailable",
+            "the saved Hub address is not usable",
+        );
+    };
     let mut refused: Option<String> = None;
     for _ in 0..2 {
         let token = match front_door.hub_token(&selected, refused.as_deref()).await {
@@ -809,7 +824,7 @@ async fn proxy(
         };
         let reply = front_door
             .client
-            .get(format!("{}{target}", selected.hub))
+            .get(target.clone())
             .bearer_auth(&token)
             .send()
             .await;
@@ -923,6 +938,39 @@ mod tests {
             other.grant_id(&grant).is_none(),
             "another process never honours it"
         );
+    }
+
+    #[test]
+    fn hub_reads_stay_on_the_saved_hub() {
+        let url = |hub, path, query| hub_read_url(hub, path, query).map(|url| url.to_string());
+        assert_eq!(
+            url(
+                "https://hub.example.test",
+                "/v1/hub/repos/a/b",
+                Some("limit=5")
+            )
+            .as_deref(),
+            Some("https://hub.example.test/v1/hub/repos/a/b?limit=5")
+        );
+        assert_eq!(
+            url("https://hub.example.test/agentscm/", "/v1/hub/whoami", None).as_deref(),
+            Some("https://hub.example.test/agentscm/v1/hub/whoami")
+        );
+        // Request text cannot reach another host through the path or the query.
+        for (path, query) in [
+            ("//other.example.test/v1/hub/whoami", None),
+            ("/v1/hub/whoami", Some("@other.example.test/")),
+            ("/v1/hub/whoami#@other.example.test", None),
+        ] {
+            let read = hub_read_url("https://hub.example.test", path, query).unwrap();
+            assert_eq!(
+                read.host_str(),
+                Some("hub.example.test"),
+                "{path} {query:?}"
+            );
+            assert_eq!(read.port_or_known_default(), Some(443));
+        }
+        assert!(hub_read_url("not a url", "/v1/hub/whoami", None).is_none());
     }
 
     #[test]
