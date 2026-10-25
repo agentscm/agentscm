@@ -34,6 +34,9 @@ GitHub. To warn agents from Claude Code, see [work intents](intents.md).
 - `--poll-seconds N` (default 300, at least 10): how often connections are polled.
 - `--activity-days N` (default 14, 1 to 365): how far back a branch's tip commit
   counts as recent.
+- `--shared-conversation-retention-days N` (default 30, 1 to 3650): how long an uploaded
+  shared-conversation body stays readable. An hourly sweep expires due bodies and deletes their
+  objects; the Work owner or a Hub admin can delete one earlier.
 - `--bind ADDR` (default `127.0.0.1:7332`). A non-loopback address needs
   `--public`.
 - `--public-url URL` (default `http://<bind>`): where browsers and forges reach
@@ -65,7 +68,8 @@ Limits:
   overwrites an existing object with identical bytes and reports it as newly
   created.
 - Redirects and retries are off; requests time out after 60 seconds.
-- Objects are never deleted.
+- Objects are never deleted, except shared-conversation bodies, which are removed after a
+  database tombstone (early deletion) or expiry.
 - The store must be case-sensitive (AWS S3 and R2 are); identifiers are used
   verbatim in object keys.
 - Proxy environment variables are ignored for object storage traffic.
@@ -1155,8 +1159,8 @@ Limits:
   one file hash must name one git blob and size in a manifest.
 - `native_landed` is the client's claim: the hub has no native data and cannot check that the
   revision was integrated.
-- Uploaded files are never deleted: the object store has no delete, and the size caps and the
-  open-publication limit bound growth.
+- Uploaded publication files are never deleted; the size caps and the open-publication limit
+  bound growth.
 - The repository's lock is held for the whole run, and sync of that repository takes the same
   lock, so it waits for a run in progress. The connection and its opt-in are read again under
   the lock; a connection switched off or `auth_failed` while a run waited gets no forge writes.
@@ -1504,7 +1508,7 @@ What the hub keeps, in its database and object store:
 
 Limits in this alpha:
 
-- Events and stored objects are never deleted (only the session, handoff,
+- Events and stored objects are never deleted, apart from shared-conversation bodies (only the session, handoff,
   intent path and delivery rows named above are, and observations of pull
   requests and branches that are gone, a day later), and there is no per-person
   export or erasure command. An administrator can disable a person, which

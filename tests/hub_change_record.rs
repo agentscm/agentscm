@@ -13,6 +13,7 @@ use agentscm::change_record::{
     SessionSetupV1, SetupObservationV1, SourceBindingV1, SubagentFactV1, ToolCompletionV1,
     ToolFactV1, ToolKindV1,
 };
+use agentscm::hub::change_record::SharedBodyState;
 use agentscm::hub::store::{self, ForgeIdentity, Store, mint_agent_token, unix_now};
 use agentscm::hub::work::{CheckpointKind, SourceRef, WorkCheckpoint, WorkRole, WorkStart};
 use hub_pg::PgSchema;
@@ -923,5 +924,284 @@ fn postgres_action_capture_receipt() {
         action_capture_receipt(&db);
         lifecycle_resume_and_replay(&db);
         informational_events_do_not_change_lifecycle_coverage(&|| Db::postgres().unwrap());
+    }
+}
+
+fn shared_batch(
+    work_id: &str,
+    generation: i64,
+    operation: &str,
+    sequence: u64,
+    body: &[u8],
+    size: u64,
+) -> CaptureBatchV1 {
+    let mut batch = event_batch(work_id, generation, operation, sequence);
+    batch.session.capture_mode = CaptureModeV1::SharedConversation;
+    batch.events[0].event_id = format!("shared-event-{operation}");
+    batch.events[0].artifact = Some(ArtifactRefV1 {
+        digest: sha256_hex(body),
+        size_bytes: size,
+        media: ArtifactMediaV1::Json,
+        retention: RetentionClassV1::SharedApproved,
+        availability: ContentAvailabilityV1::Local,
+    });
+    batch
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    agentscm::store::digest(bytes)
+}
+
+fn shared_body_lifecycle(db: &Db) {
+    let (store, token, work_id, generation) = setup(db);
+    let stranger = store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 43,
+            },
+            "stranger",
+        )
+        .unwrap();
+    let (stranger_token, _) = mint_agent_token(&*store, &stranger.id, "other", REPO, 3600).unwrap();
+    let now = unix_now();
+    let (first, second, third) = (
+        b"{\"a\":1}".as_slice(),
+        b"{\"b\":2}".as_slice(),
+        b"{\"c\":3}".as_slice(),
+    );
+    let digest = sha256_hex(first);
+
+    let receipt = store
+        .change_ingest(
+            &token,
+            &shared_batch(&work_id, generation, "one", 1, first, 7),
+            now,
+        )
+        .unwrap();
+    assert_eq!(receipt.accepted, 1);
+    let access = store
+        .shared_body_lookup(&token, &work_id, &digest, now)
+        .unwrap()
+        .unwrap();
+    assert_eq!(access.row.state, SharedBodyState::Declared);
+    assert_eq!((access.row.size_bytes, access.row.sequence), (7, 1));
+    assert_eq!(access.row.declared_at, now);
+    assert!(access.declared_by_caller_owner && access.caller_owns_work);
+    let other = store
+        .shared_body_lookup(&stranger_token, &work_id, &digest, now)
+        .unwrap()
+        .unwrap();
+    assert!(!other.declared_by_caller_owner && !other.caller_owns_work);
+    assert!(
+        store
+            .shared_body_lookup(&token, &work_id, &sha256_hex(b"nothing"), now)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .shared_body_lookup(&token, "work_unknown", &digest, now)
+            .unwrap()
+            .is_none()
+    );
+
+    // A replay and a second event naming the same body keep the first declaration.
+    let replay = store
+        .change_ingest(
+            &token,
+            &shared_batch(&work_id, generation, "one", 1, first, 7),
+            now + 1,
+        )
+        .unwrap();
+    assert!(replay.replayed);
+    store
+        .change_ingest(
+            &token,
+            &shared_batch(&work_id, generation, "two", 2, first, 7),
+            now + 2,
+        )
+        .unwrap();
+    let unchanged = store
+        .shared_body_lookup(&token, &work_id, &digest, now)
+        .unwrap()
+        .unwrap()
+        .row;
+    assert_eq!(
+        (unchanged.event_id.as_str(), unchanged.declared_at),
+        ("shared-event-one", now)
+    );
+
+    // The same digest declared with another size is refused and records nothing.
+    let conflict = store.change_ingest(
+        &token,
+        &shared_batch(&work_id, generation, "three", 3, first, 8),
+        now + 3,
+    );
+    assert!(matches!(conflict, Err(agentscm::hub::HubError::Invalid(_))));
+    // The refused batch rolled back whole, so its event id and sequence are still free.
+    let retried = store
+        .change_ingest(
+            &token,
+            &shared_batch(&work_id, generation, "three", 3, first, 7),
+            now + 3,
+        )
+        .unwrap();
+    assert_eq!(retried.accepted, 1);
+
+    assert_eq!(
+        store
+            .shared_body_mark_available("work_unknown", &digest, now, 100)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .shared_body_mark_available(&work_id, &digest, now + 10, 100)
+            .unwrap(),
+        Some(SharedBodyState::Available)
+    );
+    // A second upload does not extend the retention.
+    store
+        .shared_body_mark_available(&work_id, &digest, now + 50, 100)
+        .unwrap();
+    let row = store
+        .shared_body_lookup(&token, &work_id, &digest, now)
+        .unwrap()
+        .unwrap()
+        .row;
+    assert_eq!(
+        (row.uploaded_at, row.expires_at),
+        (Some(now + 10), Some(now + 110))
+    );
+    assert_eq!(row.state_at(now + 109), SharedBodyState::Available);
+    assert_eq!(row.state_at(now + 110), SharedBodyState::Expired);
+
+    assert!(
+        store
+            .shared_bodies_expire(now + 109, 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .shared_bodies_pending_physical_delete(10)
+            .unwrap()
+            .is_empty()
+    );
+    let expired = store.shared_bodies_expire(now + 110, 10).unwrap();
+    assert_eq!(expired.len(), 1);
+    assert_eq!(
+        (expired[0].digest.as_str(), expired[0].state),
+        (digest.as_str(), SharedBodyState::Expired)
+    );
+    assert!(
+        store
+            .shared_bodies_expire(now + 999, 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .shared_body_mark_available(&work_id, &digest, now + 120, 100)
+            .unwrap(),
+        Some(SharedBodyState::Expired)
+    );
+    assert_eq!(
+        store
+            .shared_bodies_pending_physical_delete(10)
+            .unwrap()
+            .len(),
+        1
+    );
+    store
+        .shared_body_mark_physically_deleted(&work_id, &digest, now + 130)
+        .unwrap();
+    assert!(
+        store
+            .shared_bodies_pending_physical_delete(10)
+            .unwrap()
+            .is_empty()
+    );
+
+    // A tombstone replaces expiry, keeps the first physical-removal time, and is final.
+    assert_eq!(
+        store
+            .shared_body_tombstone(&work_id, &digest, &stranger.id, now + 140)
+            .unwrap(),
+        Some(SharedBodyState::Expired)
+    );
+    assert_eq!(
+        store
+            .shared_body_tombstone(&work_id, &digest, "usr_later", now + 150)
+            .unwrap(),
+        Some(SharedBodyState::Deleted)
+    );
+    assert_eq!(
+        store
+            .shared_body_tombstone(&work_id, &sha256_hex(b"x"), "usr_x", now)
+            .unwrap(),
+        None
+    );
+    let row = store
+        .shared_body_lookup(&token, &work_id, &digest, now)
+        .unwrap()
+        .unwrap()
+        .row;
+    assert_eq!(row.state, SharedBodyState::Deleted);
+    assert_eq!(
+        (row.deleted_at, row.deleted_by.as_deref()),
+        (Some(now + 140), Some(stranger.id.as_str()))
+    );
+    assert_eq!(row.physical_deleted_at, Some(now + 130));
+    assert_eq!(
+        store
+            .shared_body_mark_available(&work_id, &digest, now + 160, 100)
+            .unwrap(),
+        Some(SharedBodyState::Deleted)
+    );
+
+    // Sweeps are bounded: three due bodies need two passes of two.
+    for (index, body) in [first, second, third].into_iter().enumerate().skip(1) {
+        let operation = format!("more-{index}");
+        store
+            .change_ingest(
+                &token,
+                &shared_batch(&work_id, generation, &operation, 10 + index as u64, body, 7),
+                now + 200,
+            )
+            .unwrap();
+        store
+            .shared_body_mark_available(&work_id, &sha256_hex(body), now + 200, 10)
+            .unwrap();
+    }
+    assert_eq!(store.shared_bodies_expire(now + 300, 1).unwrap().len(), 1);
+    assert_eq!(store.shared_bodies_expire(now + 300, 5).unwrap().len(), 1);
+    assert_eq!(
+        store
+            .shared_bodies_pending_physical_delete(1)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .shared_bodies_pending_physical_delete(5)
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn sqlite_shared_body_lifecycle() {
+    shared_body_lifecycle(&Db::sqlite());
+}
+
+#[test]
+fn postgres_shared_body_lifecycle() {
+    if let Some(db) = Db::postgres() {
+        shared_body_lifecycle(&db);
     }
 }

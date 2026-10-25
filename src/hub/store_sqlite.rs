@@ -7,13 +7,14 @@ use rusqlite::{Connection, OptionalExtension, ToSql, Transaction, TransactionBeh
 use serde_json::json;
 
 use crate::change_record::{
-    ActionFinishV1, ActionMutationReceiptV1, ActionStartV1, CaptureBatchV1, CapturedEventKindV1,
-    CapturedEventV1, ChangeRecordSummaryV1, IngestReceiptV1, MAX_PROJECTED_SESSION_SETUPS,
-    SessionSetupV1,
+    ActionFinishV1, ActionMutationReceiptV1, ActionStartV1, ArtifactRefV1, CaptureBatchV1,
+    CapturedEventKindV1, CapturedEventV1, ChangeRecordSummaryV1, IngestReceiptV1,
+    MAX_PROJECTED_SESSION_SETUPS, RetentionClassV1, SessionSetupV1,
 };
 
 use super::change_record::{
-    SessionStatsV1, StoredActionV1, StoredDecisionV1, project as project_change_record,
+    SessionStatsV1, SharedBodyAccess, SharedBodyRow, SharedBodyState, StoredActionV1,
+    StoredDecisionV1, project as project_change_record,
 };
 use super::connection::{
     CONNECTION_SELECT, ConnectedRepository, Connection as ForgeConnection, DELIVERY_KEEP_SECONDS,
@@ -257,6 +258,73 @@ fn work_who(tx: &Transaction<'_>, token: &str, now: i64) -> Result<WorkWho> {
         rusqlite::Error::QueryReturnedNoRows => HubError::Unauthorized,
         error => error.into(),
     })
+}
+
+const SHARED_BODY_COLUMNS: &str = "work,digest,size_bytes,session_id,generation,event_id,sequence,
+    declared_token,declared_at,state,uploaded_at,expires_at,deleted_at,deleted_by,physical_deleted_at";
+
+fn shared_body_row(row: &rusqlite::Row<'_>) -> Result<SharedBodyRow> {
+    Ok(SharedBodyRow {
+        work: row.get(0)?,
+        digest: row.get(1)?,
+        size_bytes: row.get::<_, i64>(2)? as u64,
+        session_id: row.get(3)?,
+        generation: row.get(4)?,
+        event_id: row.get(5)?,
+        sequence: row.get::<_, i64>(6)? as u64,
+        declared_token: row.get(7)?,
+        declared_at: row.get(8)?,
+        state: SharedBodyState::parse(&row.get::<_, String>(9)?)?,
+        uploaded_at: row.get(10)?,
+        expires_at: row.get(11)?,
+        deleted_at: row.get(12)?,
+        deleted_by: row.get(13)?,
+        physical_deleted_at: row.get(14)?,
+    })
+}
+
+/// Records that an accepted event named a shared body. The first declaration of (work, digest)
+/// wins; a later one must agree on size.
+fn declare_shared_body(
+    tx: &Transaction<'_>,
+    batch: &CaptureBatchV1,
+    token: &str,
+    event: &CapturedEventV1,
+    artifact: &ArtifactRefV1,
+    now: i64,
+) -> Result<()> {
+    let size = artifact.size_bytes as i64;
+    let inserted = tx.execute(
+        "INSERT INTO hub_change_shared_bodies
+         (work,digest,size_bytes,media,session_id,generation,event_id,sequence,
+          declared_token,declared_at,state)
+         VALUES (?1,?2,?3,'json',?4,?5,?6,?7,?8,?9,'declared')
+         ON CONFLICT (work,digest) DO NOTHING",
+        params![
+            batch.work_id,
+            artifact.digest,
+            size,
+            batch.session.session_id,
+            batch.generation,
+            event.event_id,
+            event.sequence as i64,
+            token,
+            now
+        ],
+    )?;
+    if inserted == 0 {
+        let declared: i64 = tx.query_row(
+            "SELECT size_bytes FROM hub_change_shared_bodies WHERE work=?1 AND digest=?2",
+            params![batch.work_id, artifact.digest],
+            |row| row.get(0),
+        )?;
+        if declared != size {
+            return Err(HubError::Invalid(
+                "shared body digest was already declared with a different size".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn role_name(role: WorkRole) -> &'static str {
@@ -5824,6 +5892,13 @@ impl Store for SqliteStore {
                     event.observed_at
                 ],
             )?;
+            if let Some(artifact) = event
+                .artifact
+                .as_ref()
+                .filter(|artifact| artifact.retention == RetentionClassV1::SharedApproved)
+            {
+                declare_shared_body(&tx, batch, token, event, artifact, now)?;
+            }
             accepted += 1;
             new_event_bytes = new_event_bytes
                 .checked_add(work_payload_row_bytes(encoded.len())?)
@@ -5928,6 +6003,156 @@ impl Store for SqliteStore {
         )?;
         tx.commit()?;
         Ok(receipt)
+    }
+
+    fn shared_body_lookup(
+        &self,
+        token: &str,
+        work_id: &str,
+        digest: &str,
+        now: i64,
+    ) -> Result<Option<SharedBodyAccess>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let who = work_who(&tx, token, now)?;
+        let Some(item) = scoped_work(&tx, &who, work_id, now)? else {
+            return Ok(None);
+        };
+        let Some(row) = tx
+            .query_row(
+                &format!(
+                    "SELECT {SHARED_BODY_COLUMNS} FROM hub_change_shared_bodies
+                     WHERE work=?1 AND digest=?2"
+                ),
+                params![work_id, digest],
+                |row| Ok(shared_body_row(row)),
+            )
+            .optional()?
+            .transpose()?
+        else {
+            return Ok(None);
+        };
+        let declarer: Option<String> = tx
+            .query_row(
+                "SELECT owner FROM hub_agent_tokens WHERE id=?1",
+                [&row.declared_token],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(Some(SharedBodyAccess {
+            declared_by_caller_owner: declarer.as_deref() == Some(who.owner.id.as_str()),
+            caller_owns_work: item.owner == who.owner.id,
+            row,
+        }))
+    }
+
+    fn shared_body_mark_available(
+        &self,
+        work_id: &str,
+        digest: &str,
+        now: i64,
+        retention_seconds: i64,
+    ) -> Result<Option<SharedBodyState>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE hub_change_shared_bodies
+             SET state='available', uploaded_at=?3, expires_at=?3+?4
+             WHERE work=?1 AND digest=?2 AND state='declared'",
+            params![work_id, digest, now, retention_seconds],
+        )?;
+        let state = tx
+            .query_row(
+                "SELECT state FROM hub_change_shared_bodies WHERE work=?1 AND digest=?2",
+                params![work_id, digest],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|state| SharedBodyState::parse(&state))
+            .transpose()?;
+        tx.commit()?;
+        Ok(state)
+    }
+
+    fn shared_body_tombstone(
+        &self,
+        work_id: &str,
+        digest: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<Option<SharedBodyState>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let before = tx
+            .query_row(
+                "SELECT state FROM hub_change_shared_bodies WHERE work=?1 AND digest=?2",
+                params![work_id, digest],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|state| SharedBodyState::parse(&state))
+            .transpose()?;
+        if before.is_some_and(|state| state != SharedBodyState::Deleted) {
+            tx.execute(
+                "UPDATE hub_change_shared_bodies
+                 SET state='deleted', deleted_at=?3, deleted_by=?4
+                 WHERE work=?1 AND digest=?2",
+                params![work_id, digest, now, actor],
+            )?;
+        }
+        tx.commit()?;
+        Ok(before)
+    }
+
+    fn shared_bodies_expire(&self, now: i64, limit: usize) -> Result<Vec<SharedBodyRow>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rows = {
+            let mut statement = tx.prepare(&format!(
+                "UPDATE hub_change_shared_bodies SET state='expired'
+                 WHERE state='available' AND (work,digest) IN (
+                     SELECT work,digest FROM hub_change_shared_bodies
+                     WHERE state='available' AND expires_at<=?1
+                     ORDER BY expires_at,work,digest LIMIT ?2)
+                 RETURNING {SHARED_BODY_COLUMNS}"
+            ))?;
+            statement
+                .query_map(params![now, limit as i64], |row| Ok(shared_body_row(row)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?
+        };
+        tx.commit()?;
+        Ok(rows)
+    }
+
+    fn shared_bodies_pending_physical_delete(&self, limit: usize) -> Result<Vec<SharedBodyRow>> {
+        let conn = self.conn();
+        let mut statement = conn.prepare(&format!(
+            "SELECT {SHARED_BODY_COLUMNS} FROM hub_change_shared_bodies
+             WHERE state IN ('expired','deleted') AND physical_deleted_at IS NULL
+             ORDER BY work,digest LIMIT ?1"
+        ))?;
+        statement
+            .query_map([limit as i64], |row| Ok(shared_body_row(row)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .collect()
+    }
+
+    fn shared_body_mark_physically_deleted(
+        &self,
+        work_id: &str,
+        digest: &str,
+        now: i64,
+    ) -> Result<()> {
+        self.conn().execute(
+            "UPDATE hub_change_shared_bodies SET physical_deleted_at=?3
+             WHERE work=?1 AND digest=?2 AND state IN ('expired','deleted')
+               AND physical_deleted_at IS NULL",
+            params![work_id, digest, now],
+        )?;
+        Ok(())
     }
 
     fn change_action_start(

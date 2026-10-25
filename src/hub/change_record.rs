@@ -9,6 +9,82 @@ use crate::change_record::{
 };
 
 use super::work::{Checkpoint, SourceRef, WorkItem};
+use super::{HubError, Result};
+
+/// Lifecycle of one shared-conversation body, keyed by (work, digest). `Declared` means an
+/// accepted event named the body but no bytes were uploaded; only `Available` rows have an object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SharedBodyState {
+    Declared,
+    Available,
+    Expired,
+    Deleted,
+}
+
+impl SharedBodyState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Declared => "declared",
+            Self::Available => "available",
+            Self::Expired => "expired",
+            Self::Deleted => "deleted",
+        }
+    }
+
+    pub(super) fn parse(value: &str) -> Result<Self> {
+        match value {
+            "declared" => Ok(Self::Declared),
+            "available" => Ok(Self::Available),
+            "expired" => Ok(Self::Expired),
+            "deleted" => Ok(Self::Deleted),
+            other => Err(HubError::Unavailable(format!(
+                "unknown shared body state {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedBodyRow {
+    pub work: String,
+    pub digest: String,
+    pub size_bytes: u64,
+    pub session_id: String,
+    pub generation: i64,
+    pub event_id: String,
+    pub sequence: u64,
+    pub declared_token: String,
+    pub declared_at: i64,
+    pub state: SharedBodyState,
+    pub uploaded_at: Option<i64>,
+    pub expires_at: Option<i64>,
+    pub deleted_at: Option<i64>,
+    pub deleted_by: Option<String>,
+    pub physical_deleted_at: Option<i64>,
+}
+
+impl SharedBodyRow {
+    /// The state a reader must act on at `now`: a body is expired from its `expires_at` even
+    /// before the sweep records it.
+    pub fn state_at(&self, now: i64) -> SharedBodyState {
+        match (self.state, self.expires_at) {
+            (SharedBodyState::Available, Some(expires)) if now >= expires => {
+                SharedBodyState::Expired
+            }
+            (state, _) => state,
+        }
+    }
+}
+
+/// A body row with what the calling token's human owner may do to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedBodyAccess {
+    pub row: SharedBodyRow,
+    /// The caller's token, or a token of the same human owner, declared the body.
+    pub declared_by_caller_owner: bool,
+    /// The caller's human owner owns the Work.
+    pub caller_owns_work: bool,
+}
 
 #[derive(Clone, Debug)]
 pub struct StoredActionV1 {
@@ -301,6 +377,31 @@ fn aggregate_availability(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn available_bodies_expire_at_their_deadline_before_any_sweep() {
+        let mut row = SharedBodyRow {
+            work: "w".into(),
+            digest: "0".repeat(64),
+            size_bytes: 1,
+            session_id: "s".into(),
+            generation: 1,
+            event_id: "e".into(),
+            sequence: 1,
+            declared_token: "t".into(),
+            declared_at: 1,
+            state: SharedBodyState::Available,
+            uploaded_at: Some(1),
+            expires_at: Some(10),
+            deleted_at: None,
+            deleted_by: None,
+            physical_deleted_at: None,
+        };
+        assert_eq!(row.state_at(9), SharedBodyState::Available);
+        assert_eq!(row.state_at(10), SharedBodyState::Expired);
+        row.state = SharedBodyState::Deleted;
+        assert_eq!(row.state_at(99), SharedBodyState::Deleted);
+    }
 
     #[test]
     fn availability_is_not_inferred_from_result() {

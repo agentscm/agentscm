@@ -10,6 +10,7 @@ use crate::change_record::{
     IngestReceiptV1,
 };
 
+use super::change_record::{SharedBodyAccess, SharedBodyRow, SharedBodyState};
 use super::connection::{
     ConnectedRepository, Connection, ForgeCheck, ForgeCheckReserve, MergeGroup, NewConnection,
     NewForgeCheck, NewMergeGroup, Observation, Observed, Outbound,
@@ -551,6 +552,44 @@ pub trait Store: Send + Sync {
         work_id: &str,
         now: i64,
     ) -> Result<Option<ChangeRecordSummaryV1>>;
+    /// The body row for (work, digest) when `token`'s repository scope contains the Work, with
+    /// the caller's rights to it. `None` for an unknown Work or an undeclared digest.
+    fn shared_body_lookup(
+        &self,
+        token: &str,
+        work_id: &str,
+        digest: &str,
+        now: i64,
+    ) -> Result<Option<SharedBodyAccess>>;
+    /// Moves a `declared` body to `available` with `expires_at = now + retention_seconds`.
+    /// Returns the state afterwards (`None` for an unknown row), so a caller that lost a race
+    /// to a delete or expiry sees it and must remove the object it wrote.
+    fn shared_body_mark_available(
+        &self,
+        work_id: &str,
+        digest: &str,
+        now: i64,
+        retention_seconds: i64,
+    ) -> Result<Option<SharedBodyState>>;
+    /// Marks the body deleted on behalf of user `actor`. Returns the state it had before
+    /// (`None` for an unknown row); an already deleted row keeps its first tombstone.
+    fn shared_body_tombstone(
+        &self,
+        work_id: &str,
+        digest: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<Option<SharedBodyState>>;
+    /// Marks up to `limit` available bodies with `expires_at <= now` expired and returns them.
+    fn shared_bodies_expire(&self, now: i64, limit: usize) -> Result<Vec<SharedBodyRow>>;
+    /// Up to `limit` expired or deleted bodies whose object has not been confirmed removed.
+    fn shared_bodies_pending_physical_delete(&self, limit: usize) -> Result<Vec<SharedBodyRow>>;
+    fn shared_body_mark_physically_deleted(
+        &self,
+        work_id: &str,
+        digest: &str,
+        now: i64,
+    ) -> Result<()>;
     fn skill_adoption(&self, repo: &str) -> Result<Option<SkillAdoption>>;
     /// Stores an adoption and returns the one that applies: a `reported_by_checkout` row never
     /// replaces a `default_branch` row, which any `default_branch` row replaces.

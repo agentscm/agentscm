@@ -1,18 +1,31 @@
 //! Authenticated HTTP transport for the shared change-record service.
 
-use axum::Router;
-use axum::extract::{DefaultBodyLimit, Json, Path, Query, State};
-use axum::routing::{get, post};
+use std::time::Duration;
 
+use axum::Router;
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, Json, Path, Query, State};
+use axum::http::StatusCode;
+use axum::routing::{get, post, put};
+
+use crate::backend::{ImmutableBackend, ObjectKey, SOURCE_PROFILE_V1};
 use crate::change_record::{
     ActionFinishV1, ActionMutationReceiptV1, ActionStartV1, CaptureBatchV1, CaptureTargetV1,
-    ChangeRecordResponseV1, IngestReceiptV1, MAX_BATCH_BYTES,
+    ChangeRecordResponseV1, IngestReceiptV1, MAX_BATCH_BYTES, MAX_SHARED_BODY_BYTES,
 };
+use crate::store::digest;
 
+use super::change_record::SharedBodyState;
 use super::http::{ApiError, Authenticated, JsonBody, Reader, blocking};
-use super::store::unix_now;
-use super::{HubState, Principal};
+use super::store::{Store, unix_now};
+use super::{HubError, HubState, Principal};
 use serde::Deserialize;
+
+const SHARED_BODY_DOMAIN: &str = "hub-conversation";
+const SHARED_BODY_INCARNATION: &str = "v1";
+/// Rows handled per sweep pass; the rest wait for the next one.
+const SWEEP_BATCH: usize = 100;
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 pub fn routes() -> Router<HubState> {
     Router::new()
@@ -33,6 +46,12 @@ pub fn routes() -> Router<HubState> {
             get(current_target),
         )
         .route("/v1/hub/repos/{repo}/change-records/{work_id}", get(show))
+        .route(
+            "/v1/hub/repos/{repo}/change-records/{work_id}/conversation/{sha256}",
+            put(upload_body)
+                .layer(DefaultBodyLimit::max(MAX_SHARED_BODY_BYTES as usize))
+                .delete(delete_body),
+        )
 }
 
 async fn ingest(
@@ -140,4 +159,164 @@ fn scope(principal: &Principal, repo: &str) -> Result<(), ApiError> {
         return Err(ApiError::unauthorized());
     }
     Ok(())
+}
+
+fn shared_body_key(work_id: &str, sha256: &str) -> Result<ObjectKey, HubError> {
+    Ok(ObjectKey::new(
+        SHARED_BODY_DOMAIN,
+        work_id,
+        SOURCE_PROFILE_V1,
+        sha256,
+    )?)
+}
+
+fn lower_hex_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Removes the object and records it. A failure leaves the row pending for the sweep.
+fn physically_delete(
+    store: &dyn Store,
+    objects: &dyn ImmutableBackend,
+    work_id: &str,
+    sha256: &str,
+    now: i64,
+) -> Result<(), HubError> {
+    let key = shared_body_key(work_id, sha256)?;
+    objects.delete_incarnation(&key, SHARED_BODY_INCARNATION)?;
+    store.shared_body_mark_physically_deleted(work_id, sha256, now)
+}
+
+/// A refusal the caller should see as a status, as opposed to a store failure.
+type Refusal = Result<(), ApiError>;
+
+async fn upload_body(
+    State(state): State<HubState>,
+    Authenticated(principal): Authenticated,
+    Path((repo, work_id, sha256)): Path<(String, String, String)>,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    scope(&principal, &repo)?;
+    if !lower_hex_digest(&sha256) {
+        return Err(ApiError::invalid());
+    }
+    let store = state.store.clone();
+    let objects = state.objects.clone();
+    let retention = state.shared_conversation_retention_days * 24 * 60 * 60;
+    let token = principal.token_id;
+    blocking(&state, move || -> Result<Refusal, HubError> {
+        let now = unix_now();
+        let Some(access) = store.shared_body_lookup(&token, &work_id, &sha256, now)? else {
+            return Ok(Err(ApiError::not_found()));
+        };
+        if !access.declared_by_caller_owner {
+            return Ok(Err(ApiError::forbidden()));
+        }
+        match access.row.state_at(now) {
+            SharedBodyState::Expired | SharedBodyState::Deleted => {
+                return Ok(Err(ApiError::gone()));
+            }
+            SharedBodyState::Available => return Ok(Ok(())),
+            SharedBodyState::Declared => {}
+        }
+        // Refused, never truncated: the bytes must be exactly the body the event declared.
+        if body.len() as u64 != access.row.size_bytes || digest(&body) != sha256 {
+            return Ok(Err(ApiError::invalid()));
+        }
+        let key = shared_body_key(&work_id, &sha256)?;
+        objects.prepare_publication(&key, SHARED_BODY_INCARNATION)?;
+        objects.put_if_absent(&key, SHARED_BODY_INCARNATION, &body)?;
+        match store.shared_body_mark_available(&work_id, &sha256, now, retention)? {
+            Some(SharedBodyState::Available) => Ok(Ok(())),
+            _ => {
+                // Deleted or expired while uploading: do not leave the bytes behind.
+                if let Err(error) = objects.delete_incarnation(&key, SHARED_BODY_INCARNATION) {
+                    eprintln!("hub: shared body cleanup deferred to the sweep: {error}");
+                }
+                Ok(Err(ApiError::gone()))
+            }
+        }
+    })
+    .await??;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_body(
+    State(state): State<HubState>,
+    Authenticated(principal): Authenticated,
+    Path((repo, work_id, sha256)): Path<(String, String, String)>,
+) -> Result<StatusCode, ApiError> {
+    scope(&principal, &repo)?;
+    if !lower_hex_digest(&sha256) {
+        return Err(ApiError::invalid());
+    }
+    let store = state.store.clone();
+    let objects = state.objects.clone();
+    let admin = state.login.is_admin_user(&principal.owner);
+    let token = principal.token_id;
+    let actor = principal.owner.id;
+    blocking(&state, move || -> Result<Refusal, HubError> {
+        let now = unix_now();
+        let Some(access) = store.shared_body_lookup(&token, &work_id, &sha256, now)? else {
+            return Ok(Err(ApiError::not_found()));
+        };
+        if !access.caller_owns_work && !admin {
+            return Ok(Err(ApiError::forbidden()));
+        }
+        // The tombstone is the decision; the object removal may fail and be retried by the sweep.
+        store.shared_body_tombstone(&work_id, &sha256, &actor, now)?;
+        if let Err(error) = physically_delete(&*store, &*objects, &work_id, &sha256, now) {
+            eprintln!("hub: shared body removal deferred to the sweep: {error}");
+        }
+        Ok(Ok(()))
+    })
+    .await??;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SweepReport {
+    pub expired: usize,
+    pub deleted: usize,
+    pub failed: usize,
+}
+
+/// One bounded retention pass at `now`: expires due bodies, then removes the objects of every
+/// expired or deleted body not yet confirmed gone. A failed removal stays pending for the next
+/// pass.
+pub async fn sweep_shared_bodies(state: &HubState, now: i64) -> Result<SweepReport, HubError> {
+    let store = state.store.clone();
+    let objects = state.objects.clone();
+    blocking(state, move || {
+        let mut report = SweepReport {
+            expired: store.shared_bodies_expire(now, SWEEP_BATCH)?.len(),
+            ..SweepReport::default()
+        };
+        for row in store.shared_bodies_pending_physical_delete(SWEEP_BATCH)? {
+            match physically_delete(&*store, &*objects, &row.work, &row.digest, now) {
+                Ok(()) => report.deleted += 1,
+                Err(error) => {
+                    report.failed += 1;
+                    eprintln!("hub: shared body removal failed, will retry: {error}");
+                }
+            }
+        }
+        Ok(report)
+    })
+    .await
+}
+
+/// Runs a sweep at startup and then hourly until the process exits.
+pub async fn sweep_loop(state: HubState) {
+    let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        if let Err(error) = sweep_shared_bodies(&state, unix_now()).await {
+            eprintln!("hub: shared body sweep failed: {error}");
+        }
+    }
 }

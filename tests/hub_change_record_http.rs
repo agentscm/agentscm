@@ -1526,3 +1526,688 @@ fn set_mode_changes_only_the_capture_mode_and_keeps_local_data() {
     ]);
     assert!(!unknown.status.success());
 }
+
+mod shared_bodies {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use agentscm::backend::{
+        ImmutableBackend, ObjectKey, ObjectMetadata, PutOutcome, SOURCE_PROFILE_V1,
+    };
+    use agentscm::hub::change_record::SharedBodyState;
+    use agentscm::hub::change_record_http::{SweepReport, sweep_shared_bodies};
+    use agentscm::hub::login::{Login, LoginConfig};
+    use agentscm::store::digest;
+
+    use super::*;
+
+    const SESSION: &str = "shared-session";
+    const DAY: i64 = 24 * 60 * 60;
+
+    /// Delegates to a local backend but can be told to fail the next deletion or every write.
+    struct Flaky {
+        inner: LocalBackend,
+        fail_delete: AtomicBool,
+        fail_put: AtomicBool,
+    }
+
+    impl ImmutableBackend for Flaky {
+        fn prepare_publication(&self, key: &ObjectKey, incarnation: &str) -> agentscm::Result<()> {
+            self.inner.prepare_publication(key, incarnation)
+        }
+
+        fn put_if_absent(
+            &self,
+            key: &ObjectKey,
+            incarnation: &str,
+            bytes: &[u8],
+        ) -> agentscm::Result<PutOutcome> {
+            if self.fail_put.load(Ordering::SeqCst) {
+                return Err(agentscm::Error::Io(std::io::Error::other("injected")));
+            }
+            self.inner.put_if_absent(key, incarnation, bytes)
+        }
+
+        fn get_verified(&self, key: &ObjectKey, incarnation: &str) -> agentscm::Result<Vec<u8>> {
+            self.inner.get_verified(key, incarnation)
+        }
+
+        fn inspect_verified(
+            &self,
+            key: &ObjectKey,
+            incarnation: &str,
+        ) -> agentscm::Result<ObjectMetadata> {
+            self.inner.inspect_verified(key, incarnation)
+        }
+
+        fn delete_incarnation(&self, key: &ObjectKey, incarnation: &str) -> agentscm::Result<()> {
+            if self.fail_delete.swap(false, Ordering::SeqCst) {
+                return Err(agentscm::Error::Io(std::io::Error::other("injected")));
+            }
+            self.inner.delete_incarnation(key, incarnation)
+        }
+
+        fn get_range_verified(
+            &self,
+            key: &ObjectKey,
+            incarnation: &str,
+            offset: u64,
+            length: u64,
+        ) -> agentscm::Result<Vec<u8>> {
+            self.inner
+                .get_range_verified(key, incarnation, offset, length)
+        }
+    }
+
+    struct Fixture {
+        base: String,
+        store: Arc<dyn Store>,
+        backend: Arc<Flaky>,
+        state: HubState,
+        client: reqwest::Client,
+        work_id: String,
+        generation: i64,
+        body: Vec<u8>,
+        sha: String,
+        owner: String,
+        owner_secret: String,
+        sibling_secret: String,
+        member_secret: String,
+        read_only_secret: String,
+        admin_secret: String,
+        _directory: TempDir,
+    }
+
+    fn user(store: &dyn Store, id: i64, login: &str) -> String {
+        store
+            .upsert_user(
+                &ForgeIdentity {
+                    provider: "github".into(),
+                    host: "github.com".into(),
+                    user_id: id,
+                },
+                login,
+            )
+            .unwrap()
+            .id
+    }
+
+    fn token(store: &dyn Store, owner: &str, name: &str, read_only: bool) -> (String, String) {
+        let (id, secret, _) =
+            mint_bound_agent_token(store, owner, name, REPOSITORY, 77, 3600, read_only).unwrap();
+        (id, secret.expose().to_owned())
+    }
+
+    impl Fixture {
+        /// The Work and body exist, but no event has declared the body yet.
+        async fn start_undeclared() -> Self {
+            let directory = TempDir::new().unwrap();
+            let database = format!("sqlite://{}", directory.path().join("hub.sqlite").display());
+            let store = store::open(&database).unwrap();
+            let backend = Arc::new(Flaky {
+                inner: LocalBackend::open(directory.path().join("objects")).unwrap(),
+                fail_delete: AtomicBool::new(false),
+                fail_put: AtomicBool::new(false),
+            });
+            let login = LoginConfig::from_lookup("", |name| {
+                (name == "AGENTSCM_ADMINS").then(|| "github:#900".to_owned())
+            })
+            .unwrap();
+            let state = HubState::new(store.clone(), backend.clone())
+                .with_login(Login::new(login).unwrap());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let app = router(state.clone());
+            tokio::spawn(async move { axum::serve(listener, app).await });
+
+            let owner = user(&*store, 10, "owner");
+            let member = user(&*store, 11, "member");
+            let admin = user(&*store, 900, "hub-admin");
+            let (owner_token, owner_secret) = token(&*store, &owner, "writer", false);
+            let (_, sibling_secret) = token(&*store, &owner, "sibling", false);
+            let (_, read_only_secret) = token(&*store, &owner, "reader", true);
+            let (_, member_secret) = token(&*store, &member, "member", false);
+            let (_, admin_secret) = token(&*store, &admin, "admin", false);
+            let work = store
+                .work_start(
+                    &owner_token,
+                    &WorkStart {
+                        work_id: None,
+                        source: None,
+                        request_key: Some("shared-body".into()),
+                        title: "share a conversation".into(),
+                        session: SESSION.into(),
+                        role: WorkRole::Lead,
+                        scope: vec!["src/**".into()],
+                        branch: None,
+                        worktree: None,
+                        next_action: None,
+                        depends_on: vec![],
+                        related_work: vec![],
+                        takeover_generation: None,
+                    },
+                    unix_now(),
+                )
+                .unwrap()
+                .item;
+            let body = br#"{"messages":[{"role":"user","text":"synthetic"}]}"#.to_vec();
+            let sha = digest(&body);
+            Self {
+                base,
+                store,
+                backend,
+                state,
+                client: reqwest::Client::new(),
+                work_id: work.id,
+                generation: work.generation,
+                body,
+                sha,
+                owner,
+                owner_secret,
+                sibling_secret,
+                member_secret,
+                read_only_secret,
+                admin_secret,
+                _directory: directory,
+            }
+        }
+
+        fn batch(&self, operation: &str) -> CaptureBatchV1 {
+            let mut batch = setup_batch(&self.work_id, self.generation, SESSION);
+            batch.operation_id = operation.into();
+            batch.session.capture_mode = CaptureModeV1::SharedConversation;
+            batch.events[0].setup = None;
+            batch.events[0].artifact = Some(ArtifactRefV1 {
+                digest: self.sha.clone(),
+                size_bytes: self.body.len() as u64,
+                media: ArtifactMediaV1::Json,
+                retention: RetentionClassV1::SharedApproved,
+                availability: ContentAvailabilityV1::Local,
+            });
+            batch
+        }
+
+        async fn start() -> Self {
+            let fixture = Self::start_undeclared().await;
+            let token = fixture.owner_token();
+            fixture
+                .store
+                .change_ingest(&token, &fixture.batch("shared-declare"), unix_now())
+                .unwrap();
+            fixture
+        }
+
+        fn url(&self, sha: &str) -> String {
+            format!(
+                "{}/v1/hub/repos/{REPOSITORY_PATH}/change-records/{}/conversation/{sha}",
+                self.base, self.work_id
+            )
+        }
+
+        async fn put(&self, secret: &str, sha: &str, body: Vec<u8>) -> StatusCode {
+            self.client
+                .put(self.url(sha))
+                .bearer_auth(secret)
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+
+        async fn delete(&self, secret: &str, sha: &str) -> StatusCode {
+            self.client
+                .delete(self.url(sha))
+                .bearer_auth(secret)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+
+        fn key(&self) -> ObjectKey {
+            ObjectKey::new(
+                "hub-conversation",
+                &self.work_id,
+                SOURCE_PROFILE_V1,
+                &self.sha,
+            )
+            .unwrap()
+        }
+
+        fn object(&self) -> Option<Vec<u8>> {
+            self.backend.get_verified(&self.key(), "v1").ok()
+        }
+
+        fn row(&self) -> agentscm::hub::change_record::SharedBodyRow {
+            let token = self.owner_token();
+            self.store
+                .shared_body_lookup(&token, &self.work_id, &self.sha, unix_now())
+                .unwrap()
+                .unwrap()
+                .row
+        }
+
+        fn owner_token(&self) -> String {
+            let digest = agentscm::hub::store::agent_token_digest(&self.owner_secret).unwrap();
+            self.store
+                .authenticate(&digest, unix_now())
+                .unwrap()
+                .unwrap()
+                .token_id
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upload_stores_the_exact_body_and_replays_idempotently() {
+        let f = Fixture::start().await;
+        assert_eq!(f.row().state, SharedBodyState::Declared);
+        assert!(f.object().is_none());
+
+        let before = unix_now();
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(f.object().as_deref(), Some(f.body.as_slice()));
+        let row = f.row();
+        assert_eq!(row.state, SharedBodyState::Available);
+        let expires = row.expires_at.unwrap();
+        assert!(expires >= before + 30 * DAY && expires <= unix_now() + 30 * DAY);
+
+        // A replay, including from another token of the same human, changes nothing.
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            f.put(&f.sibling_secret, &f.sha, f.body.clone()).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(f.row().expires_at, Some(expires));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upload_refuses_mismatches_unknown_digests_and_other_callers() {
+        let f = Fixture::start().await;
+        let mut other = f.body.clone();
+        other[10] ^= 1;
+        let truncated = f.body[..f.body.len() - 1].to_vec();
+        let undeclared = br#"{"other":true}"#.to_vec();
+        let undeclared_sha = digest(&undeclared);
+
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, other).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, truncated).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            f.put(&f.owner_secret, &undeclared_sha, undeclared).await,
+            StatusCode::NOT_FOUND
+        );
+        for bad in [f.sha.to_uppercase(), "abc".to_owned(), "g".repeat(64)] {
+            assert_eq!(
+                f.put(&f.owner_secret, &bad, f.body.clone()).await,
+                StatusCode::BAD_REQUEST,
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            f.put(&f.member_secret, &f.sha, f.body.clone()).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            f.put(&f.read_only_secret, &f.sha, f.body.clone()).await,
+            StatusCode::FORBIDDEN
+        );
+        let anonymous = f
+            .client
+            .put(f.url(&f.sha))
+            .body(f.body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+        let oversized = vec![b' '; 1024 * 1024 + 1];
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, oversized).await,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+
+        assert_eq!(f.row().state, SharedBodyState::Declared);
+        assert!(f.object().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_is_for_the_work_owner_or_a_hub_admin_and_blocks_later_uploads() {
+        let f = Fixture::start().await;
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            f.delete(&f.member_secret, &f.sha).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            f.delete(&f.read_only_secret, &f.sha).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(f.object().as_deref(), Some(f.body.as_slice()));
+        assert_eq!(
+            f.delete(&f.owner_secret, &"1".repeat(64)).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            f.delete(&f.owner_secret, "NOT-HEX").await,
+            StatusCode::BAD_REQUEST
+        );
+
+        assert_eq!(
+            f.delete(&f.sibling_secret, &f.sha).await,
+            StatusCode::NO_CONTENT
+        );
+        let row = f.row();
+        assert_eq!(row.state, SharedBodyState::Deleted);
+        assert_eq!(row.deleted_by.as_deref(), Some(f.owner.as_str()));
+        assert!(row.physical_deleted_at.is_some());
+        assert!(f.object().is_none());
+
+        // Deleting again is a no-op, and the body cannot come back.
+        assert_eq!(
+            f.delete(&f.owner_secret, &f.sha).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::GONE
+        );
+        assert!(f.object().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hub_admin_may_delete_before_any_upload() {
+        let f = Fixture::start().await;
+        assert_eq!(
+            f.delete(&f.admin_secret, &f.sha).await,
+            StatusCode::NO_CONTENT
+        );
+        let row = f.row();
+        assert_eq!(row.state, SharedBodyState::Deleted);
+        assert_ne!(row.deleted_by.as_deref(), Some(f.owner.as_str()));
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::GONE
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_sweep_expires_then_removes_objects_and_expired_bodies_stay_gone() {
+        let f = Fixture::start().await;
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::NO_CONTENT
+        );
+        let expires = f.row().expires_at.unwrap();
+
+        let early = sweep_shared_bodies(&f.state, expires - 1).await.unwrap();
+        assert_eq!(early, SweepReport::default());
+        assert!(f.object().is_some());
+
+        // Readers see the expiry at the deadline even before the sweep records it.
+        assert_eq!(f.row().state_at(expires), SharedBodyState::Expired);
+        assert_eq!(f.row().state, SharedBodyState::Available);
+
+        let report = sweep_shared_bodies(&f.state, expires).await.unwrap();
+        assert_eq!(
+            report,
+            SweepReport {
+                expired: 1,
+                deleted: 1,
+                failed: 0
+            }
+        );
+        assert!(f.object().is_none());
+        assert_eq!(f.row().state, SharedBodyState::Expired);
+        assert_eq!(
+            sweep_shared_bodies(&f.state, expires + 1).await.unwrap(),
+            SweepReport::default()
+        );
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::GONE
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_removal_stays_pending_until_a_later_sweep() {
+        let f = Fixture::start().await;
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::NO_CONTENT
+        );
+        f.backend.fail_delete.store(true, Ordering::SeqCst);
+        // The tombstone is the decision: the request succeeds though the object is still there.
+        assert_eq!(
+            f.delete(&f.owner_secret, &f.sha).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(f.row().state, SharedBodyState::Deleted);
+        assert!(f.row().physical_deleted_at.is_none());
+        assert!(f.object().is_some());
+
+        let report = sweep_shared_bodies(&f.state, unix_now()).await.unwrap();
+        assert_eq!(
+            report,
+            SweepReport {
+                expired: 0,
+                deleted: 1,
+                failed: 0
+            }
+        );
+        assert!(f.object().is_none());
+        assert!(f.row().physical_deleted_at.is_some());
+    }
+    /// A configured checkout whose spool already holds one shared-approved event batch.
+    struct Checkout {
+        config: std::path::PathBuf,
+        home: std::path::PathBuf,
+        root: std::path::PathBuf,
+        spool: std::path::PathBuf,
+        _private: TempDir,
+    }
+
+    impl Checkout {
+        fn new(f: &Fixture) -> Self {
+            let private = TempDir::new().unwrap();
+            let root = private.path().join("repo");
+            std::fs::create_dir(&root).unwrap();
+            run_git(&root, &["init", "--quiet", "--initial-branch=main"]);
+            run_git(&root, &["config", "user.email", "fixture@example.invalid"]);
+            run_git(&root, &["config", "user.name", "Synthetic Fixture"]);
+            std::fs::write(root.join("tracked.txt"), "fixture\n").unwrap();
+            run_git(&root, &["add", "tracked.txt"]);
+            run_git(&root, &["commit", "--quiet", "-m", "fixture"]);
+            run_git(
+                &root,
+                &[
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.com/acme/widgets.git",
+                ],
+            );
+            run_git(&root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+            let root = root.canonicalize().unwrap();
+            let config = private.path().join("config");
+            std::fs::create_dir_all(config.join("agentscm")).unwrap();
+            let token_file = private.path().join("token");
+            std::fs::write(&token_file, format!("{}\n", f.owner_secret)).unwrap();
+            std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::write(
+                config.join("agentscm/connections.json"),
+                serde_json::to_vec(&json!({
+                    "version": 1,
+                    "connections": [{
+                        "root": root,
+                        "origin_host": "github.com",
+                        "hub": f.base,
+                        "repo": REPOSITORY,
+                        "token_file": token_file,
+                    }]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let spool = private.path().join("spool");
+            let checkout = Self {
+                home: private.path().to_path_buf(),
+                config,
+                root,
+                spool,
+                _private: private,
+            };
+            let configured = checkout.cli(&[
+                "change-capture",
+                "configure",
+                "--root",
+                &checkout.root.display().to_string(),
+                "--spool",
+                &checkout.spool.display().to_string(),
+                "--worktree-id",
+                "shared-worktree",
+                "--setup-digest",
+                &"5".repeat(64),
+                "--action-rule",
+                "Bash=execution:partial:process_exit_code",
+                "--capture-mode",
+                "shared-conversation",
+            ]);
+            assert!(
+                configured.status.success(),
+                "{}",
+                String::from_utf8_lossy(&configured.stderr)
+            );
+            checkout
+        }
+
+        fn cli(&self, args: &[&str]) -> std::process::Output {
+            let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+            run_capture_cli(&self.config, &self.home, &args, None)
+        }
+
+        /// Retains the fixture body and queues the event batch that declares it.
+        fn queue(&self, f: &Fixture) {
+            let spool = agentscm::change_capture::LocalSpool::open(&self.spool).unwrap();
+            let reference = spool
+                .retain_artifact(
+                    &f.body,
+                    ArtifactMediaV1::Json,
+                    RetentionClassV1::SharedApproved,
+                )
+                .unwrap();
+            assert_eq!(reference.digest, f.sha);
+            spool
+                .append(&agentscm::change_record::CaptureEnvelopeV1::EventBatch(
+                    f.batch("queued-batch"),
+                ))
+                .unwrap();
+        }
+
+        /// A hook for a session with no Work: it captures nothing of its own but delivers.
+        fn deliver(&self) {
+            let payload = json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "unrelated-native-session",
+                "source": "startup",
+                "timestamp": "2026-10-24T10:00:00Z",
+                "cwd": self.root,
+            });
+            let output = run_capture_cli(
+                &self.config,
+                &self.home,
+                &["change-capture".into(), "hook-claude".into()],
+                Some(&serde_json::to_vec(&payload).unwrap()),
+            );
+            assert!(output.status.success());
+        }
+
+        fn pending(&self) -> u64 {
+            let output = self.cli(&[
+                "change-capture",
+                "pending",
+                "--spool",
+                &self.spool.display().to_string(),
+            ]);
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            report["count"]["present"].as_u64().unwrap()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delivery_uploads_bodies_in_shared_mode_and_acknowledges_only_afterwards() {
+        let f = Fixture::start_undeclared().await;
+        let checkout = Checkout::new(&f);
+        checkout.queue(&f);
+        assert_eq!(checkout.pending(), 1);
+
+        // The Hub accepts the events but cannot store the body: the envelope must stay pending.
+        f.backend.fail_put.store(true, Ordering::SeqCst);
+        checkout.deliver();
+        assert_eq!(checkout.pending(), 1);
+        assert_eq!(f.row().state, SharedBodyState::Declared);
+        assert!(f.object().is_none());
+
+        f.backend.fail_put.store(false, Ordering::SeqCst);
+        checkout.deliver();
+        assert_eq!(checkout.pending(), 0);
+        assert_eq!(f.row().state, SharedBodyState::Available);
+        assert_eq!(f.object().as_deref(), Some(f.body.as_slice()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delivery_acknowledges_a_body_the_owner_already_deleted() {
+        let f = Fixture::start().await;
+        assert_eq!(
+            f.delete(&f.owner_secret, &f.sha).await,
+            StatusCode::NO_CONTENT
+        );
+        let checkout = Checkout::new(&f);
+        checkout.queue(&f);
+        checkout.deliver();
+        assert_eq!(checkout.pending(), 0);
+        assert_eq!(f.row().state, SharedBodyState::Deleted);
+        assert!(f.object().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delivery_keeps_bodies_local_once_sharing_is_switched_off_or_the_body_is_missing() {
+        let f = Fixture::start_undeclared().await;
+        let off = Checkout::new(&f);
+        off.queue(&f);
+        let switched = off.cli(&[
+            "change-capture",
+            "set-mode",
+            "--root",
+            &off.root.display().to_string(),
+            "--mode",
+            "metadata-only",
+        ]);
+        assert!(switched.status.success());
+        off.deliver();
+        assert_eq!(off.pending(), 0);
+        assert_eq!(f.row().state, SharedBodyState::Declared);
+        assert!(f.object().is_none());
+
+        // A body that is no longer in the spool is skipped and stays declared on the Hub.
+        let missing = Checkout::new(&f);
+        missing.queue(&f);
+        std::fs::remove_file(missing.spool.join("artifacts").join(&f.sha)).unwrap();
+        missing.deliver();
+        assert_eq!(missing.pending(), 0);
+        assert_eq!(f.row().state, SharedBodyState::Declared);
+        assert!(f.object().is_none());
+    }
+}

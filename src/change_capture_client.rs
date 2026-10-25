@@ -10,12 +10,12 @@ use std::time::Duration;
 
 use agentscm::change_capture::claude_code::{ActionRuleV1, NativeResultSourceV1};
 use agentscm::change_capture::{
-    ConfiguredRecipeV1, LocalSpool, NamespaceBindOutcome, SpoolClassificationV1, SpoolIdentityV1,
-    SpoolLimits, SpoolNamespaceV1, inspect_spool,
+    CaptureError, ConfiguredRecipeV1, LocalSpool, NamespaceBindOutcome, SpoolClassificationV1,
+    SpoolIdentityV1, SpoolLimits, SpoolNamespaceV1, inspect_spool,
 };
 use agentscm::change_record::{
-    ActionKindV1, CaptureEnvelopeV1, CaptureModeV1, CaptureTargetV1, ChangeRecordResponseV1,
-    CoverageV1, MAX_CHANGE_RECORD_RESPONSE_BYTES,
+    ActionKindV1, CaptureBatchV1, CaptureEnvelopeV1, CaptureModeV1, CaptureTargetV1,
+    ChangeRecordResponseV1, CoverageV1, MAX_CHANGE_RECORD_RESPONSE_BYTES, RetentionClassV1,
 };
 use agentscm::forge::encode_path_segment;
 use agentscm::hub::forge_http::{self, send};
@@ -1081,7 +1081,34 @@ pub async fn deliver_pending(root: &Path, spool: &LocalSpool) -> Result<Delivery
                 return Err(invalid("capture Hub delivery unavailable"));
             }
         };
-        if status == 200 {
+        let mut uploaded = BodyUpload::Done;
+        if status == 200
+            && binding.capture_mode == CaptureModeV1::SharedConversation
+            && let CaptureEnvelopeV1::EventBatch(batch) = envelope
+        {
+            uploaded =
+                match upload_shared_bodies(&client, &connection, &token, spool, batch, deadline)
+                    .await
+                {
+                    Ok(uploaded) => uploaded,
+                    Err(error) => {
+                        spool
+                            .advance_delivery_cursor(envelope)
+                            .map_err(|error| invalid(format!("local capture: {error}")))?;
+                        return Err(error);
+                    }
+                };
+        }
+        if status == 200 && uploaded == BodyUpload::OutOfTime {
+            // Neither acknowledged nor skipped: the next pass starts at this envelope again.
+            break;
+        } else if status == 200 && uploaded == BodyUpload::Blocked {
+            // Bodies stay local and the envelope stays pending; replaying events is idempotent.
+            spool
+                .advance_delivery_cursor(envelope)
+                .map_err(|error| invalid(format!("local capture: {error}")))?;
+            blocked += 1;
+        } else if status == 200 {
             spool
                 .acknowledge(envelope)
                 .map_err(|error| invalid(format!("local capture: {error}")))?;
@@ -1114,6 +1141,80 @@ pub async fn deliver_pending(root: &Path, spool: &LocalSpool) -> Result<Delivery
         blocked,
         pending_page,
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BodyUpload {
+    /// Every body is on the Hub, gone from it for good, or unavailable locally.
+    Done,
+    /// The Hub refused a body for authorization or state reasons.
+    Blocked,
+    /// The pass deadline arrived first.
+    OutOfTime,
+}
+
+/// Uploads the shared-approved bodies an accepted event batch names. A transient failure is an
+/// error so the caller leaves the envelope pending; a body missing from the spool is skipped and
+/// stays declared on the Hub.
+async fn upload_shared_bodies(
+    client: &reqwest::Client,
+    connection: &client_config::Connection,
+    token: &str,
+    spool: &LocalSpool,
+    batch: &CaptureBatchV1,
+    deadline: tokio::time::Instant,
+) -> Result<BodyUpload> {
+    let mut seen = BTreeSet::new();
+    for artifact in batch
+        .events
+        .iter()
+        .filter_map(|event| event.artifact.as_ref())
+    {
+        if artifact.retention != RetentionClassV1::SharedApproved
+            || !seen.insert(artifact.digest.as_str())
+        {
+            continue;
+        }
+        let bytes = match spool.read_artifact(artifact) {
+            Ok(bytes) => bytes,
+            // Only a transient read failure is worth retrying; an absent, corrupt or unreadable
+            // body will not come back, so it stays declared on the Hub.
+            Err(CaptureError::Io(error)) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(invalid(format!("local capture: {error}")));
+            }
+            Err(_) => continue,
+        };
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(BodyUpload::OutOfTime);
+        }
+        let request = client
+            .put(format!(
+                "{}/v1/hub/repos/{}/change-records/{}/conversation/{}",
+                connection.hub,
+                encode_path_segment(&connection.repo),
+                encode_path_segment(&batch.work_id),
+                artifact.digest
+            ))
+            .header(CONTENT_TYPE, "application/json")
+            .bearer_auth(token)
+            .timeout(remaining)
+            .body(bytes);
+        let (status, _) = send(request, REPLY_BYTES)
+            .await
+            .map_err(|_| invalid("capture Hub body upload unavailable"))?;
+        match status {
+            // Gone: the Work owner deleted the body or it expired, so there is nothing to retry.
+            204 | 410 => {}
+            400 | 401 | 403 | 404 | 409 => return Ok(BodyUpload::Blocked),
+            _ => {
+                return Err(invalid(format!(
+                    "capture Hub body upload returned status {status}"
+                )));
+            }
+        }
+    }
+    Ok(BodyUpload::Done)
 }
 
 pub fn open_bound_spool(binding: &CaptureBinding) -> Result<LocalSpool> {

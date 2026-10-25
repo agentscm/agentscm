@@ -495,3 +495,78 @@ async fn dropping_inside_an_async_context_does_not_panic() {
     };
     drop(fixture.backend);
 }
+
+#[test]
+fn delete_removes_the_object_and_is_idempotent() {
+    let Some(fixture) = fixture() else { return };
+    let key = key("hub-conversation", "work-1", b"shared body");
+    fixture.put(&key, "v1", b"shared body").unwrap();
+
+    fixture.backend.delete_incarnation(&key, "v1").unwrap();
+    assert!(matches!(
+        fixture.backend.get_verified(&key, "v1"),
+        Err(Error::NotFound(_))
+    ));
+    fixture.backend.delete_incarnation(&key, "v1").unwrap();
+}
+
+/// Serves one scripted reply per connection and returns the request lines it saw.
+fn scripted_s3(
+    replies: &'static [(u16, &'static str)],
+) -> (String, thread::JoinHandle<Vec<String>>) {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let mut seen = Vec::new();
+        for (status, body) in replies {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8(head).unwrap();
+            seen.push(head.lines().next().unwrap().to_owned());
+            let reply = format!(
+                "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(reply.as_bytes()).unwrap();
+        }
+        seen
+    });
+    (endpoint, server)
+}
+
+#[test]
+fn delete_treats_204_and_no_such_key_as_removed_and_reports_other_failures() {
+    let (endpoint, server) = scripted_s3(&[
+        (204, ""),
+        (404, "<Error><Code>NoSuchKey</Code></Error>"),
+        (404, "<Error><Code>NoSuchBucket</Code></Error>"),
+        (403, "<Error><Code>AccessDenied</Code></Error>"),
+    ]);
+    let backend = S3Backend::open(S3Config {
+        endpoint,
+        region: "us-east-1".into(),
+        bucket: "bucket".into(),
+        prefix: "pfx".into(),
+        access_key_id: ["synthetic", "access"].join("-"),
+        secret_access_key: ["synthetic", "secret"].join("-"),
+    })
+    .unwrap();
+    let key = key("hub-conversation", "work-1", b"shared body");
+    backend.delete_incarnation(&key, "v1").unwrap();
+    backend.delete_incarnation(&key, "v1").unwrap();
+    assert!(backend.delete_incarnation(&key, "v1").is_err());
+    assert!(backend.delete_incarnation(&key, "v1").is_err());
+    let seen = server.join().unwrap();
+    let path = format!(
+        "DELETE /bucket/pfx/hub-conversation/work-1/{}/v1/{} HTTP/1.1",
+        SOURCE_PROFILE_V1,
+        key.id()
+    );
+    assert!(seen.iter().all(|line| *line == path), "{seen:?}");
+}

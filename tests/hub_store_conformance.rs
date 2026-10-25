@@ -741,6 +741,7 @@ fn named_migrations_are_a_set(db: &Db) {
          WHERE name = 'authorization_binding'"
     };
     assert_eq!(db.count(columns), 1);
+    assert_eq!(db.count("SELECT COUNT(*) FROM hub_change_shared_bodies"), 0);
     db.exec(
         "INSERT INTO hub_named_migrations (name, applied_at) VALUES ('from_a_newer_binary', 0)",
     )

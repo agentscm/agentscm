@@ -533,3 +533,34 @@ fn preparation_is_required_once_for_multiple_objects() {
         b"second"
     );
 }
+
+#[test]
+fn delete_removes_only_the_named_incarnation_and_is_idempotent() {
+    let directory = TempDir::new().unwrap();
+    let backend = LocalBackend::open(directory.path()).unwrap();
+    let key = key("hub-conversation", "work-1", b"shared body");
+    put(&backend, &key, "v1", b"shared body").unwrap();
+    put(&backend, &key, "v2", b"shared body").unwrap();
+
+    backend.delete_incarnation(&key, "v1").unwrap();
+    assert!(!object_path(&directory, &key, "v1").exists());
+    assert!(matches!(
+        backend.get_verified(&key, "v1"),
+        Err(Error::NotFound(_))
+    ));
+    assert_eq!(backend.get_verified(&key, "v2").unwrap(), b"shared body");
+
+    backend.delete_incarnation(&key, "v1").unwrap();
+    let never_written = self::key("hub-conversation", "work-1", b"other");
+    backend.delete_incarnation(&never_written, "v1").unwrap();
+}
+
+#[test]
+fn delete_default_is_explicitly_unsupported() {
+    let key = key("team", "repository", b"object");
+    assert!(matches!(
+        NoRawBackend.delete_incarnation(&key, "generation-1"),
+        Err(Error::Invalid(message))
+            if message == "backend does not support deleting an object incarnation"
+    ));
+}
