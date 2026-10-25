@@ -1013,7 +1013,7 @@ fn spool_namespace_and_deferred_hooks_are_bounded_and_never_reassociated() {
     assert!(action.source.is_some());
     assert!(action.recipe_digest.is_some());
     assert_eq!(action.action_kind, Some(ActionKindV1::Execution));
-    assert_eq!(action.observed_at, 0);
+    assert!(action.observed_at > 1_700_000_000);
     let sanitized = serde_json::to_string(&deferred).unwrap();
     assert!(!sanitized.contains("DEFERRED_PRIVATE_884"));
     assert!(!sanitized.contains("DEFERRED_COMMAND_885"));
@@ -1063,6 +1063,52 @@ fn deferred_listing_uses_durable_receipt_order_when_provider_time_is_missing() {
     let deferred = reopened.deferred(10).unwrap();
     assert_eq!(deferred, vec![timed, untimed]);
     assert_eq!(deferred[1].observed_at, 0);
+}
+
+fn pending_event_times(spool: &LocalSpool) -> Vec<(String, i64)> {
+    spool
+        .pending(20)
+        .unwrap()
+        .iter()
+        .filter_map(|envelope| match envelope {
+            CaptureEnvelopeV1::EventBatch(batch) => Some(batch.events.iter()),
+            _ => None,
+        })
+        .flatten()
+        .map(|event| (event.event_id.clone(), event.observed_at))
+        .collect()
+}
+
+#[test]
+fn hook_without_timestamp_uses_receipt_time_and_keeps_it_on_rerun() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let request = capture_request(CaptureModeV1::MetadataOnly);
+    let session = &request.observed_session_id;
+    let untimed = format!(
+        r#"{{"hook_event_name":"PreToolUse","session_id":"{session}","tool_name":"Read","tool_use_id":"read_1","tool_input":{{}}}}"#
+    );
+    let timed = format!(
+        r#"{{"hook_event_name":"PostToolUse","session_id":"{session}","tool_name":"Read","tool_use_id":"read_1","tool_input":{{}},"tool_response":{{}},"timestamp":"2026-10-24T10:00:00Z"}}"#
+    );
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    capture_hook(untimed.as_bytes(), &request, &spool).unwrap();
+    capture_hook(timed.as_bytes(), &request, &spool).unwrap();
+    let first = pending_event_times(&spool);
+    let received = first.iter().find(|(_, at)| *at != 1_792_836_000).unwrap().1;
+    assert!(received >= before && received <= before + 60, "{first:?}");
+    assert!(
+        first.iter().any(|(_, at)| *at == 1_792_836_000),
+        "{first:?}"
+    );
+
+    // A later re-run is the same identity and the same retained bytes: no conflict, no new event.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    capture_hook(untimed.as_bytes(), &request, &spool).unwrap();
+    assert_eq!(pending_event_times(&spool), first);
 }
 
 #[test]

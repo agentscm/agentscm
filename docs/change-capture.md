@@ -214,10 +214,14 @@ visible scope when its original start and end were both observed and it has no g
 Events without a provider identity or timestamp use a durable local occurrence number. The adapter
 records an `identity_uncertain` gap on each such invocation because the native contract cannot
 distinguish a retried hook from a legitimate repeated event. This preserves repeated identical
-prompts but may overcount retries; it does not claim exact replay identity. Missing provider times
-remain unavailable as `0`; local deferred diagnostics use a separate durable receipt order instead
-of presenting them as Unix-epoch events. Raw prompt and result bodies stay local and do not
-contribute to shared event identity.
+prompts but may overcount retries; it does not claim exact replay identity. Claude Code hook
+payloads normally carry no timestamp, so a hook without a valid one records the hook process's
+receipt time (Unix seconds) as `observed_at`; that time is a receipt time, not a host-reported one.
+It never enters event identity, which still hashes only the provider timestamp, and a re-run of
+the same operation reuses the time already retained so the bytes match. Transcript import keeps the
+transcript's own timestamps, and Hub records written before this behaviour may hold `0`, which the
+UI shows as "time not reported". Local deferred diagnostics also use a separate durable receipt
+order. Raw prompt and result bodies stay local and do not contribute to shared event identity.
 The native session id observed in a hook is validated separately from the Hub's canonical aliased
 session id. Event and action envelopes plus shared sequence state use the canonical id. For a
 provider-identified tool occurrence, the first durable claim records the observed identity, route,

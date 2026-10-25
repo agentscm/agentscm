@@ -231,7 +231,6 @@ fn capture_hook_with_identity_mode(
         ensure_deferred_gaps(&request.observed_session_id, spool)?;
     }
     let provider_timestamp = payload.get("timestamp").and_then(Value::as_str);
-    let observed_at = provider_timestamp.and_then(parse_rfc3339).unwrap_or(0);
     let tool_name = payload.get("tool_name").and_then(Value::as_str);
     let provider_id = [
         "tool_use_id",
@@ -347,6 +346,10 @@ fn capture_hook_with_identity_mode(
         || format!("cap:{}", sha256(event_id.as_bytes())),
         |identity| identity.operation_id.to_owned(),
     );
+    let observed_at = match provider_timestamp.and_then(parse_rfc3339) {
+        Some(time) => time,
+        None => receipt_time(spool, &operation_id)?,
+    };
     let selected = SelectedEvent {
         event_id: event_id.clone(),
         observed_at,
@@ -581,7 +584,10 @@ pub fn deferred_native_hook(
         reserved_sequence: Some(reserved_sequence),
         session_id: session_id.to_owned(),
         hook_event_name: event_name.to_owned(),
-        observed_at: provider_timestamp.and_then(parse_rfc3339).unwrap_or(0),
+        observed_at: match provider_timestamp.and_then(parse_rfc3339) {
+            Some(time) => time,
+            None => now_seconds()?,
+        },
         reason,
         input_digest,
         event_kind,
@@ -590,6 +596,15 @@ pub fn deferred_native_hook(
         recipe_digest,
         action_kind,
     })
+}
+
+/// Real hook payloads carry no timestamp, so the hook's receipt time stands in. Identity never
+/// reads it, and a re-run of the same operation keeps the retained time so the bytes match.
+fn receipt_time(spool: &LocalSpool, operation_id: &str) -> Result<i64> {
+    match spool.retained_event_time(operation_id)? {
+        Some(time) => Ok(time),
+        None => now_seconds(),
+    }
 }
 
 fn ensure_deferred_gaps(observed_session_id: &str, spool: &LocalSpool) -> Result<()> {
@@ -662,10 +677,11 @@ fn ensure_adapter_started_late_gap(request: &CaptureRequest, spool: &LocalSpool)
         )
     );
     let sequence = spool.sequence_for(&request.canonical_session_id, &event_id)?;
+    let operation_id = format!("cap:{}", sha256(event_id.as_bytes()));
     let event = CapturedEventV1 {
         event_id: event_id.clone(),
         sequence,
-        observed_at: 0,
+        observed_at: receipt_time(spool, &operation_id)?,
         kind: CapturedEventKindV1::Gap,
         tool: None,
         artifact: None,
@@ -678,7 +694,6 @@ fn ensure_adapter_started_late_gap(request: &CaptureRequest, spool: &LocalSpool)
         boundary: None,
         subagent: None,
     };
-    let operation_id = format!("cap:{}", sha256(event_id.as_bytes()));
     spool.append_priority(&CaptureEnvelopeV1::EventBatch(batch(
         request,
         operation_id,
@@ -699,10 +714,11 @@ fn record_action_capture_pause(request: &CaptureRequest, spool: &LocalSpool) -> 
         )
     );
     let sequence = spool.sequence_for(&request.canonical_session_id, &event_id)?;
+    let operation_id = format!("cap:{}", sha256(event_id.as_bytes()));
     let event = CapturedEventV1 {
         event_id: event_id.clone(),
         sequence,
-        observed_at: 0,
+        observed_at: receipt_time(spool, &operation_id)?,
         kind: CapturedEventKindV1::Gap,
         tool: None,
         artifact: None,
@@ -715,7 +731,6 @@ fn record_action_capture_pause(request: &CaptureRequest, spool: &LocalSpool) -> 
         boundary: None,
         subagent: None,
     };
-    let operation_id = format!("cap:{}", sha256(event_id.as_bytes()));
     spool.append_priority(&CaptureEnvelopeV1::EventBatch(batch(
         request,
         operation_id,

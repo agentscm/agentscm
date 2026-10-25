@@ -2217,7 +2217,13 @@ impl LocalSpool {
         if path.exists() {
             let existing = read_bounded(&path, MAX_DEFERRED_BYTES)?;
             let existing = decode_deferred_record(&existing)?;
-            return if existing.hook == *deferred {
+            // The occurrence id already fixes any provider timestamp; a differing time is only a
+            // later receipt of the same hook, so it is the same record.
+            let same = DeferredHookV1 {
+                observed_at: existing.hook.observed_at,
+                ..deferred.clone()
+            };
+            return if existing.hook == same {
                 Ok(AppendOutcome::Duplicate)
             } else {
                 Err(CaptureError::Conflict(
@@ -2659,6 +2665,19 @@ impl LocalSpool {
         self.reserve_envelope(envelope, bytes.len() as u64, priority)?;
         atomic_write(&path, &bytes)?;
         Ok(AppendOutcome::Stored)
+    }
+
+    /// Observation time of the event batch already retained for `operation_id`, if any.
+    pub(crate) fn retained_event_time(&self, operation_id: &str) -> Result<Option<i64>> {
+        let _lock = self.lock()?;
+        Ok(
+            match retained_envelope(&self.root, self.limits, "event", operation_id)? {
+                Some(CaptureEnvelopeV1::EventBatch(batch)) => {
+                    batch.events.first().map(|event| event.observed_at)
+                }
+                _ => None,
+            },
+        )
     }
 
     pub fn pending(&self, limit: usize) -> Result<Vec<CaptureEnvelopeV1>> {
