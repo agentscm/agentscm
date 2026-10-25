@@ -147,7 +147,11 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         )));
     }
 
-    let access = local_access(std::env::var(READ_TOKEN_ENV).ok(), browser_origins)?;
+    // The front door authorizes browsers itself; a read token in the environment is not its concern.
+    let token = (!front_door)
+        .then(|| std::env::var(READ_TOKEN_ENV).ok())
+        .flatten();
+    let access = local_access(token, browser_origins)?;
     if explorer_repo.is_some() && (!bind.ip().is_loopback() || access.token.is_none()) {
         return Err(Error::Invalid(format!(
             "the repository explorer requires a loopback bind address and {READ_TOKEN_ENV}"

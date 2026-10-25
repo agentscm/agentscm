@@ -125,9 +125,12 @@ pub(super) async fn prepare_open(request: OpenRequest) -> Result<PreparedOpen, O
         &client,
         &hub,
         &human_session,
-        &request.repository,
-        &request.origin_host,
-        request.provider.as_deref(),
+        &crate::hub_read_token::TokenRequest {
+            repository: &request.repository,
+            origin_host: &request.origin_host,
+            provider: request.provider.as_deref(),
+            name: crate::hub_read_token::TRAY_TOKEN_NAME,
+        },
         agentscm::hub::store::unix_now(),
     )
     .await?;

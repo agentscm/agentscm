@@ -96,8 +96,9 @@ export async function adoptFrontDoorLink(): Promise<boolean> {
 
 export interface Identity {
   computer: string
-  repository: string
-  hub: { url: string; signed_in: boolean }
+  /** Null when the selected repository is no longer connected on this computer. */
+  repository: string | null
+  hub: { url: string; signed_in: boolean } | null
   expires_at: number | null
 }
 
@@ -105,11 +106,11 @@ export async function fetchIdentity(token: string, signal: AbortSignal): Promise
   const res = await fetch('/v1/local/identity', { signal, cache: 'no-store', credentials: 'omit', headers: { Authorization: `Bearer ${token}` } })
   if (!res.ok) throw new Error(res.status === 401 ? 'not_connected' : `HTTP ${res.status}`)
   const body = rec(await res.json())
-  const hub = rec(body['hub'])
+  const hub = body['hub'] === null ? null : rec(body['hub'])
   return {
     computer: clean(body['computer'], 63) || 'This computer',
-    repository: clean(body['repository']),
-    hub: { url: clean(hub['url'], 300), signed_in: hub['signed_in'] === true },
+    repository: typeof body['repository'] === 'string' ? clean(body['repository']) : null,
+    hub: hub && { url: clean(hub['url'], 300), signed_in: hub['signed_in'] === true },
     expires_at: typeof body['expires_at'] === 'number' ? body['expires_at'] : null,
   }
 }

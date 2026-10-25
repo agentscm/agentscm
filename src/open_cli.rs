@@ -2,9 +2,11 @@
 //!
 //! It finds this user's local front door (`serve --front-door`) or starts it, mints a single-use
 //! connection code with the service's admin secret, and opens the default browser on the
-//! service's own page with the code in the URL fragment. The tray's Open Hub calls the same code.
+//! service's own page with the code in the URL fragment. The code reaches the browser through an
+//! owner-only file, never a process argument other users could list. The tray's Open Hub calls
+//! the same code.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -18,6 +20,10 @@ use crate::local_service::{self, ServiceRecord, valid_hex};
 /// The port the front door asks for first, so a bookmarked page usually keeps working.
 const DEFAULT_BIND: &str = "127.0.0.1:7340";
 const START_TIMEOUT: Duration = Duration::from_secs(15);
+const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+const LOG_BYTES: u64 = 1024 * 1024;
+/// Handoff files older than this hold only expired codes and are removed.
+const HANDOFF_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Args)]
 pub(crate) struct OpenArgs {
@@ -34,16 +40,15 @@ pub(crate) struct Opened {
 
 pub(crate) async fn run(args: OpenArgs) -> Result<()> {
     if args.stop {
-        return match stop().await? {
-            true => {
-                println!("Stopped this computer's AgentSCM Hub page.");
-                Ok(())
+        println!(
+            "{}",
+            if stop().await? {
+                "Stopped this computer's AgentSCM Hub page."
+            } else {
+                "This computer's AgentSCM Hub page is not running."
             }
-            false => {
-                println!("This computer's AgentSCM Hub page is not running.");
-                Ok(())
-            }
-        };
+        );
+        return Ok(());
     }
     let opened = open_checkout(&std::env::current_dir()?).await?;
     println!(
@@ -51,6 +56,16 @@ pub(crate) async fn run(args: OpenArgs) -> Result<()> {
         opened.repository, opened.page
     );
     Ok(())
+}
+
+/// Requests to this computer's own service never go through a configured HTTP proxy.
+fn loopback_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|_| Error::Invalid("HTTP client unavailable".into()))
 }
 
 /// Open the browser on `path`'s repository, starting the local service when needed.
@@ -75,45 +90,92 @@ pub(crate) async fn open_checkout(path: &Path) -> Result<Opened> {
             hub = connection.hub
         )));
     }
-    let client = agentscm::hub::forge_http::client()
-        .map_err(|_| Error::Invalid("HTTP client unavailable".into()))?;
+    let client = loopback_client()?;
     let record = running_or_start(&client).await?;
     let code = mint_code(&client, &record).await?;
     let page = format!("{}/ui/", record.base);
-    // Fragments are not sent to servers; the page removes this one from history before use.
-    crate::hub_cli::open_url(&format!(
-        "{page}#pair={code}&repo={}@{}",
-        connection.repo, connection.hub
-    ));
+    let selector = format!("{}@{}", connection.repo, connection.hub);
+    let target = format!("{page}#pair={code}&repo={}", fragment_value(&selector));
+    crate::hub_cli::open_url(&handoff(&target)?.display().to_string());
     Ok(Opened {
         repository: connection.repo.clone(),
         page,
     })
 }
 
-/// The live front door, confirmed by the instance it reports, or a newly started one.
+/// Percent-encode everything a URL fragment parameter cannot carry as-is.
+fn fragment_value(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/' | b':' | b'@')
+        {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+/// An owner-only page that sends the browser on to `target`, so the code never appears in a
+/// process argument. Older handoff files, whose codes have expired, are removed first.
+fn handoff(target: &str) -> Result<PathBuf> {
+    let dir = local_service::ensure_dir()?;
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let stale = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .is_ok_and(|modified| modified.elapsed().is_ok_and(|age| age > HANDOFF_MAX_AGE));
+            if entry.file_name().to_string_lossy().starts_with("open-") && stale {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    let path = dir.join(format!("open-{}.html", local_service::random_hex(8)?));
+    // `target` holds only hex, a loopback address and percent-encoded text; quote it for the
+    // script and the attribute anyway.
+    let quoted = serde_json::to_string(target)?;
+    let attribute = target.replace('&', "&amp;").replace('"', "&quot;");
+    crate::hub_cli::write_private(
+        &path,
+        &format!(
+            "<!doctype html><meta charset=\"utf-8\"><meta name=\"referrer\" content=\"no-referrer\">\
+             <meta http-equiv=\"refresh\" content=\"0;url={attribute}\"><title>Opening AgentSCM</title>\
+             <script>location.replace({quoted})</script><p>Opening AgentSCM…</p>\n"
+        ),
+    )?;
+    Ok(path)
+}
+
+/// The live front door, confirmed by the instance it reports, or a newly started one. A lock
+/// keeps two concurrent `open`s from starting two services.
 async fn running_or_start(client: &reqwest::Client) -> Result<ServiceRecord> {
+    let dir = local_service::ensure_dir()?;
+    let lock = private_file(&dir.join("open.lock"), false)?;
+    lock.lock()?;
     if let Some(record) = local_service::load()?
         && confirmed(client, &record).await
     {
         return Ok(record);
     }
-    let dir = local_service::ensure_dir()?;
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("service.log"))?;
+    let log_path = dir.join("service.log");
+    if std::fs::metadata(&log_path).is_ok_and(|metadata| metadata.len() > LOG_BYTES) {
+        let _ = std::fs::rename(&log_path, dir.join("service.log.1"));
+    }
+    let log = private_file(&log_path, true)?;
     let mut command = Command::new(std::env::current_exe()?);
     command
         .arg("--no-telemetry")
         .arg("--data-dir")
         .arg(dir.join("store"))
         .args(["serve", "--front-door", "--bind", DEFAULT_BIND])
+        .env_remove("AGENTSCM_SERVE_READ_TOKEN")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(log);
     // Its own process group: closing this terminal does not stop the page.
-    #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
     let mut child = command.spawn()?;
     let deadline = Instant::now() + START_TIMEOUT;
@@ -121,7 +183,7 @@ async fn running_or_start(client: &reqwest::Client) -> Result<ServiceRecord> {
         if let Some(status) = child.try_wait()? {
             return Err(Error::Invalid(format!(
                 "the local Hub page stopped while starting ({status}); see {}",
-                dir.join("service.log").display()
+                log_path.display()
             )));
         }
         if let Some(record) = local_service::load()?
@@ -135,8 +197,23 @@ async fn running_or_start(client: &reqwest::Client) -> Result<ServiceRecord> {
     let _ = child.kill();
     Err(Error::Invalid(format!(
         "the local Hub page did not start in time; see {}",
-        dir.join("service.log").display()
+        log_path.display()
     )))
+}
+
+fn private_file(path: &Path, append: bool) -> Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true);
+    if append {
+        options.append(true);
+    } else {
+        options.read(true).write(true);
+    }
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options.open(path)?;
+    // The mode above applies only when the file is created; an older file is narrowed too.
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    Ok(file)
 }
 
 /// Whether the listener at the record's address is the process that wrote it. Asked without
@@ -176,33 +253,61 @@ async fn mint_code(client: &reqwest::Client, record: &ServiceRecord) -> Result<S
     }
 }
 
-/// Stop the running front door after confirming which process it is.
+/// Stop the running front door after confirming which process it is, and wait for it to exit.
 pub(crate) async fn stop() -> Result<bool> {
     let Some(record) = local_service::load()? else {
         return Ok(false);
     };
-    let client = agentscm::hub::forge_http::client()
-        .map_err(|_| Error::Invalid("HTTP client unavailable".into()))?;
-    if !confirmed(&client, &record).await {
+    if !confirmed(&loopback_client()?, &record).await {
         return Ok(false);
     }
-    #[cfg(unix)]
-    {
-        let pid = libc::pid_t::try_from(record.pid)
-            .map_err(|_| Error::Invalid("the local Hub page's process id is invalid".into()))?;
-        // SAFETY: sends SIGTERM to the confirmed service process; no memory is shared.
-        if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
+    let pid = libc::pid_t::try_from(record.pid)
+        .map_err(|_| Error::Invalid("the local Hub page's process id is invalid".into()))?;
+    // SAFETY: sends SIGTERM to the confirmed service process; no memory is shared.
+    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    while local_service::process_alive(record.pid) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn the_default_bind_is_loopback() {
-        let address: std::net::SocketAddr = super::DEFAULT_BIND.parse().unwrap();
+        let address: std::net::SocketAddr = DEFAULT_BIND.parse().unwrap();
         assert!(address.ip().is_loopback());
+    }
+
+    #[test]
+    fn fragment_values_keep_only_safe_characters() {
+        assert_eq!(
+            fragment_value("acme/widgets@https://hub.example:8443/base"),
+            "acme/widgets@https://hub.example:8443/base"
+        );
+        assert_eq!(fragment_value("a&b+c%d#e f"), "a%26b%2Bc%25d%23e%20f");
+    }
+
+    #[test]
+    fn the_handoff_file_is_owner_only_and_carries_the_link() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let config = tempfile::tempdir().unwrap();
+        // SAFETY: nextest runs each test in its own process, so no other thread reads it.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", config.path()) };
+        let target = "http://127.0.0.1:7340/ui/#pair=aa&repo=acme/widgets@https://hub.example";
+        let path = handoff(target).unwrap();
+        assert!(path.starts_with(config.path()));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o077,
+            0
+        );
+        let page = std::fs::read_to_string(&path).unwrap();
+        assert!(page.contains(&serde_json::to_string(target).unwrap()));
+        assert!(page.contains("pair=aa&amp;repo="));
     }
 }

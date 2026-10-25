@@ -95,7 +95,9 @@ fn fake_hub() -> (String, Arc<Mutex<Vec<String>>>) {
                     200,
                     json!({"token": {"id": MINTED_ID, "name": "agentscm-tray", "repository": REPO, "repository_id": 7, "expires_at": expiry, "read_only": true}, "owner": {"provider": "github", "host": "github.com", "user_id": 1, "login": "synthetic"}}),
                 )
-            } else if line.starts_with("GET /v1/hub/repos/acme/widgets/work") {
+            } else if line.starts_with("GET /v1/hub/repos/acme%2Fwidgets/refused") {
+                (401, json!({"error": "unauthorized"}))
+            } else if line.starts_with("GET /v1/hub/repos/acme%2Fwidgets/work") {
                 (200, json!({"synthetic": "work page"}))
             } else if line.starts_with("DELETE /v1/hub/token ") {
                 (204, Value::Null)
@@ -355,7 +357,7 @@ fn one_connection_reads_this_computer_and_the_hub_without_handing_out_a_hub_toke
     );
 
     // The Hub, through a token the service minted from the saved session.
-    let (status, _, work) = door.request("GET", "/v1/hub/repos/acme/widgets/work?limit=5", &auth);
+    let (status, _, work) = door.request("GET", "/v1/hub/repos/acme%2Fwidgets/work?limit=5", &auth);
     assert_eq!(status, 200, "{work}");
     assert_eq!(
         serde_json::from_str::<Value>(&work).unwrap()["synthetic"],
@@ -369,16 +371,17 @@ fn one_connection_reads_this_computer_and_the_hub_without_handing_out_a_hub_toke
             .unwrap();
         assert!(mint.contains(&format!("authorization: Bearer {HUMAN_SESSION}")));
         assert!(mint.contains("\"read_only\":true"));
+        assert!(mint.contains("\"name\":\"agentscm-local-page\""));
         let read = seen
             .iter()
-            .find(|r| r.starts_with("GET /v1/hub/repos/acme/widgets/work?limit=5 "))
+            .find(|r| r.starts_with("GET /v1/hub/repos/acme%2Fwidgets/work?limit=5 "))
             .unwrap();
         assert!(read.contains(&format!("authorization: Bearer {MINTED}")));
         assert!(!read.contains(&grant) && !read.contains(HUMAN_SESSION));
     }
     // A second read reuses the cached token.
     assert_eq!(
-        door.request("GET", "/v1/hub/repos/acme/widgets/work", &auth)
+        door.request("GET", "/v1/hub/repos/acme%2Fwidgets/work", &auth)
             .0,
         200
     );
@@ -390,6 +393,23 @@ fn one_connection_reads_this_computer_and_the_hub_without_handing_out_a_hub_toke
             .count(),
         1
     );
+
+    // A Hub refusal of the computer's token mints once more, then reports a Hub problem rather
+    // than ending the browser's connection.
+    let mints = |seen: &Arc<Mutex<Vec<String>>>| {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.starts_with("POST /v1/hub/tokens "))
+            .count()
+    };
+    let before = mints(&seen);
+    assert_eq!(
+        door.request("GET", "/v1/hub/repos/acme%2Fwidgets/refused", &auth)
+            .0,
+        502
+    );
+    assert_eq!(mints(&seen), before + 1);
 
     // Naming the Hub selects the same checkout; naming another Hub selects nothing.
     let on_hub = format!("Bearer local:{grant}:{REPO}@{hub}");
@@ -410,7 +430,7 @@ fn one_connection_reads_this_computer_and_the_hub_without_handing_out_a_hub_toke
             &[("Authorization", &elsewhere)]
         )
         .0,
-        401
+        409
     );
 
     // Refusals: no credential, another site, an unconnected repository, writes, credential areas.
@@ -421,7 +441,7 @@ fn one_connection_reads_this_computer_and_the_hub_without_handing_out_a_hub_toke
     assert_eq!(
         door.request(
             "GET",
-            "/v1/hub/repos/acme/widgets/work",
+            "/v1/hub/repos/acme%2Fwidgets/work",
             &[
                 ("Authorization", &credential),
                 ("Origin", "https://evil.example")
@@ -438,15 +458,43 @@ fn one_connection_reads_this_computer_and_the_hub_without_handing_out_a_hub_toke
             &[("Authorization", &other)]
         )
         .0,
-        401
+        409,
+        "an unconnected repository keeps the connection"
+    );
+    let (status, _, gone) = door.request("GET", "/v1/local/identity", &[("Authorization", &other)]);
+    assert_eq!(status, 200);
+    assert!(serde_json::from_str::<Value>(&gone).unwrap()["repository"].is_null());
+    assert_eq!(
+        door.request(
+            "GET",
+            "/v1/local/repositories",
+            &[("Authorization", &other)]
+        )
+        .0,
+        200
     );
     assert_eq!(
-        door.request("POST", "/v1/hub/repos/acme/widgets/work", &auth)
+        door.request("POST", "/v1/hub/repos/acme%2Fwidgets/work", &auth)
             .0,
         405
     );
     assert_eq!(door.request("GET", "/v1/hub/workspace/me", &auth).0, 404);
     assert_eq!(door.request("GET", "/v1/hub/tokens", &auth).0, 404);
+    for path in [
+        "/v1/hub/repos/acme/%2e%2e/%2e%2e/tokens",
+        "/v1/hub/repos/acme/widgets/../../tokens",
+        "/v1/hub/session",
+    ] {
+        assert_eq!(door.request("GET", path, &auth).0, 404, "{path}");
+    }
+    assert!(
+        !seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.starts_with("GET /v1/hub/tokens") || r.starts_with("GET /v1/hub/session")),
+        "no refused path reached the Hub"
+    );
     let rebound = {
         let mut stream = TcpStream::connect(door.address).unwrap();
         stream

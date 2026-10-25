@@ -184,7 +184,11 @@ async fn read(
             permit,
         ),
         Err(error) => {
-            if let (Some(axum::Extension(selected)), Some(front_door)) = (&selected, &front_door) {
+            // A rejected query says nothing about the checkout; other failures may mean it moved.
+            if error.status != StatusCode::BAD_REQUEST
+                && let (Some(axum::Extension(selected)), Some(front_door)) =
+                    (&selected, &front_door)
+            {
                 front_door.forget_explorer(selected);
             }
             // Git and filesystem diagnostics can contain local paths or private

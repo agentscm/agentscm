@@ -176,7 +176,7 @@ pub(crate) fn loopback_base(base: &str) -> bool {
         && port.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-fn process_alive(pid: u32) -> bool {
+pub(crate) fn process_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         let Ok(pid) = libc::pid_t::try_from(pid) else {

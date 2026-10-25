@@ -10,7 +10,8 @@ use crate::client_status::HubCheck;
 
 pub(crate) const TOKEN_TTL_SECONDS: i64 = 30 * 60;
 const EXPIRY_SLOP_SECONDS: i64 = 60;
-const TOKEN_NAME: &str = "agentscm-tray";
+/// The name the tray gives the tokens it mints; the local Hub page uses its own.
+pub(crate) const TRAY_TOKEN_NAME: &str = "agentscm-tray";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OpenError {
@@ -100,17 +101,29 @@ pub(crate) struct MintedToken {
     pub(crate) expires_at: i64,
 }
 
+/// What a minted token is for: one repository on one forge, under a name the Hub lists.
+pub(crate) struct TokenRequest<'a> {
+    pub(crate) repository: &'a str,
+    pub(crate) origin_host: &'a str,
+    pub(crate) provider: Option<&'a str>,
+    pub(crate) name: &'a str,
+}
+
 pub(crate) async fn mint_and_confirm(
     client: &reqwest::Client,
     hub: &str,
     human_session: &str,
-    repository: &str,
-    origin_host: &str,
-    provider: Option<&str>,
+    request: &TokenRequest<'_>,
     now: i64,
 ) -> Result<MintedToken, OpenError> {
+    let TokenRequest {
+        repository,
+        origin_host,
+        provider,
+        name,
+    } = *request;
     let body = json!({
-        "name": TOKEN_NAME,
+        "name": name,
         "repository": repository,
         "ttl_seconds": TOKEN_TTL_SECONDS,
         "read_only": true,
@@ -307,7 +320,7 @@ mod tests {
         json!({
             "id": ID,
             "token": SECRET,
-            "name": TOKEN_NAME,
+            "name": TRAY_TOKEN_NAME,
             "repository": "acme/widgets",
             "repository_id": 7,
             "expires_at": expires_at,
@@ -319,7 +332,7 @@ mod tests {
         json!({
             "token": {
                 "id": ID,
-                "name": TOKEN_NAME,
+                "name": TRAY_TOKEN_NAME,
                 "repository": repository,
                 "repository_id": 7,
                 "expires_at": expires_at,
@@ -401,9 +414,12 @@ mod tests {
             client,
             hub,
             "human-session",
-            "acme/widgets",
-            "github.com",
-            Some("github"),
+            &TokenRequest {
+                repository: "acme/widgets",
+                origin_host: "github.com",
+                provider: Some("github"),
+                name: TRAY_TOKEN_NAME,
+            },
             now,
         )
         .await
@@ -443,7 +459,7 @@ mod tests {
         assert_eq!(
             body,
             json!({
-                "name": TOKEN_NAME,
+                "name": TRAY_TOKEN_NAME,
                 "repository": "acme/widgets",
                 "ttl_seconds": TOKEN_TTL_SECONDS,
                 "read_only": true,

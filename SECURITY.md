@@ -18,6 +18,7 @@ Out of scope: vulnerabilities in third-party dependencies with no AgentSCM-speci
 
 - Command execution runs a declared command in a hardened container. The test corpus in [docs/advanced/execution.md](docs/advanced/execution.md) covers a fixed list of controls on one runtime build and profile. It does not cover kernel or runc escapes, side channels or other runtimes, and the runner is not a sandbox for arbitrary hostile code.
 - The unauthenticated read-only API is meant for loopback. Exposing it on a network needs an authenticating, TLS-terminating proxy you operate.
+- `agentscm open` serves this computer's Hub page on loopback only. Browser connections are single-use codes exchanged by the page's own origin and held in the running service's memory; Hub reads use read-only, single-repository tokens that stay in the service. See [Open the Hub from this computer](docs/connect-this-computer.md).
 
 ## Instruction files are security-sensitive
 

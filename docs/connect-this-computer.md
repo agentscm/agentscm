@@ -21,7 +21,7 @@ There is no token to paste and no address to enter.
 
 - The first `agentscm open` starts AgentSCM's local Hub page in the background, on
   `http://127.0.0.1:7340` (or another free port). It keeps running after the terminal closes;
-  `agentscm open --stop` stops it. The tray starts and stops the same page.
+  `agentscm open --stop` stops it. Open Hub in the menu bar app uses the same page.
 - The page is the same Hub page your team's Hub serves, served from your computer. It reads your
   files and saved conversations directly. It fetches team data from each repository's own Hub
   with a read-only token for that one repository, minted from this computer's Hub sign-in. That
@@ -37,20 +37,26 @@ There is no token to paste and no address to enter.
 - `agentscm open` asks the running service for a connection code using a secret stored in an
   owner-only file (`$XDG_CONFIG_HOME/agentscm/front-door/service.json`, default under
   `~/.config`). Before sending that secret it checks which process is listening on the port.
-- The browser URL carries only that code, in the fragment, which browsers do not send to servers.
-  The page removes it from the address bar and history, then exchanges it once, within two
-  minutes, for a browser connection. The service accepts the exchange only from its own page.
+- The code reaches the browser through an owner-only file in that directory, not on a command
+  line, where other users of the computer could list it. The browser URL carries the code only in
+  the fragment, which browsers do not send to servers. The page removes it from the address bar
+  and history, then exchanges it once, within two minutes, for a browser connection. The service
+  accepts the exchange only from its own page.
 - The connection lives only in the running service's memory. Stopping or restarting the service
   ends every browser connection, so a connection taken from a browser cannot be used against a
   later service or another program on the same port. Choose Open Hub or run `agentscm open`
   again to reconnect.
 - The service answers only on loopback, refuses requests that name another host (DNS
-  rebinding) and refuses pages from any other origin. It forwards only Hub reads, never Hub sign-in,
-  workspace or token areas, and it revokes the tokens it minted when it stops.
+  rebinding) and refuses pages from any other origin. It forwards only the Hub reads the page
+  makes, in their plain form, never Hub sign-in, workspace or token areas. Requests to the service
+  itself bypass any configured HTTP proxy. It revokes the tokens it minted when it stops.
 
 ## Lifetime and disconnecting
 
-- A connection lasts while the local service runs, for up to seven days.
+- A connection lasts while the local service runs, for up to seven days. To renew it, choose Open
+  Hub or run `agentscm open` again.
+- If a repository stops being connected on this computer (its checkout moved, or its connection
+  was removed), the page says so and offers the others; the browser stays connected.
 - **Settings → This computer → Disconnect this browser** ends the connection for this browser.
 - `agentscm open --stop` ends every connection.
 
@@ -66,8 +72,8 @@ remains for a Hub page served elsewhere.
 
 ## Limits
 
-- The page runs on this computer only. To use it from another machine over SSH, forward the port
-  and open the page there; `agentscm open` itself launches a local browser.
+- The page runs on this computer only. Over SSH, `agentscm open` has no local browser to hand the
+  connection to; use the team's Hub there, with the manual setup for files.
 - Templates and Timeline read a native workspace chosen with `agentscm serve --timeline-workspace`;
   this page does not serve them and shows their labelled preview data.
 - Capture records a session in the repository where the agent started, so a session that edited
