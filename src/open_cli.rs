@@ -279,6 +279,7 @@ async fn mint_code(client: &reqwest::Client, record: &ServiceRecord) -> Result<S
 /// when this computer has any connected checkout, and stopped again only if this owner started it.
 pub(crate) struct LocalPage {
     started: std::sync::Arc<std::sync::Mutex<Option<u32>>>,
+    starting: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -286,7 +287,7 @@ impl LocalPage {
     pub(crate) fn start_in_background() -> Self {
         let started = std::sync::Arc::new(std::sync::Mutex::new(None));
         let record = started.clone();
-        std::thread::spawn(move || {
+        let starting = std::thread::spawn(move || {
             if !client_config::load().is_ok_and(|connections| !connections.is_empty()) {
                 return;
             }
@@ -306,11 +307,24 @@ impl LocalPage {
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(service.pid);
             }
         });
-        Self { started }
+        Self {
+            started,
+            starting: std::sync::Mutex::new(Some(starting)),
+        }
     }
 
     /// Stop the page if this owner started it and it is still that process.
     pub(crate) fn stop_if_started(&self) {
+        // A quit during startup waits for the start to finish, so a page it launched is still
+        // known and stopped. The wait is bounded by the start's own lock wait and start timeout.
+        let starting = self
+            .starting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(starting) = starting {
+            let _ = starting.join();
+        }
         let Some(pid) = *self
             .started
             .lock()
