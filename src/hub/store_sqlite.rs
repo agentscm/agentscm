@@ -6199,13 +6199,12 @@ impl Store for SqliteStore {
         let rows = {
             let mut statement = tx.prepare(&format!(
                 "UPDATE hub_change_shared_bodies SET state='expired',
-                     expires_at=CASE WHEN state='declared' THEN declared_at+?3 ELSE expires_at END
+                     expires_at=COALESCE(expires_at,declared_at+?3)
                  WHERE (work,digest,author) IN (
                      SELECT work,digest,author FROM hub_change_shared_bodies
                      WHERE (state='available' AND expires_at<=?1)
-                        OR (state='declared' AND declared_at+?3<=?1)
-                     ORDER BY CASE WHEN state='declared' THEN declared_at+?3 ELSE expires_at END,
-                              work,digest,author LIMIT ?2)
+                        OR (state='declared' AND COALESCE(expires_at,declared_at+?3)<=?1)
+                     ORDER BY COALESCE(expires_at,declared_at+?3),work,digest,author LIMIT ?2)
                  RETURNING {SHARED_BODY_COLUMNS}"
             ))?;
             statement

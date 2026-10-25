@@ -38,6 +38,9 @@ const SWEEP_BUSY_ATTEMPTS: usize = 12;
 /// A failed object removal is retried after one hour, doubling to at most a day.
 const DELETE_BACKOFF_FIRST: i64 = 60 * 60;
 const DELETE_BACKOFF_MAX: i64 = 24 * 60 * 60;
+/// An available row younger than this may be between its mark and its object write, so a read
+/// that finds no object leaves it alone.
+const UPLOAD_GRACE: i64 = 120;
 
 pub fn routes() -> Router<HubState> {
     Router::new()
@@ -273,8 +276,9 @@ pub(super) async fn conversation_body(
                     if matches!(
                         result,
                         Err(crate::Error::NotFound(_) | crate::Error::MissingObject(_))
-                    ) && let Err(error) =
-                        store.shared_body_demote_available(&work_id, &sha256, None)
+                    ) && row.uploaded_at.is_some_and(|at| now - at > UPLOAD_GRACE)
+                        && let Err(error) =
+                            store.shared_body_demote_available(&work_id, &sha256, None)
                     {
                         eprintln!("hub: shared body not demoted: {error}");
                     }
@@ -361,11 +365,27 @@ fn physically_delete(
     let removed = (|| {
         if !store.shared_body_object_in_use(&row.work, &row.digest)? {
             let key = shared_body_key(&row.work, &row.digest)?;
+            // Kept so an upload that was acknowledged while the object went away can be restored.
+            let bytes = match objects.get_verified(&key, SHARED_BODY_INCARNATION) {
+                Ok(bytes) => Some(bytes),
+                Err(
+                    crate::Error::NotFound(_)
+                    | crate::Error::MissingObject(_)
+                    | crate::Error::Invalid(_),
+                ) => None,
+                Err(error) => return Err(error.into()),
+            };
             objects.delete_incarnation(&key, SHARED_BODY_INCARNATION)?;
-            // An upload may have marked its row available while the object was going away; the
-            // bytes are not here to restore, so its author uploads again.
             if store.shared_body_object_in_use(&row.work, &row.digest)? {
-                store.shared_body_demote_available(&row.work, &row.digest, None)?;
+                let restored = bytes.is_some_and(|bytes| {
+                    objects
+                        .put_if_absent(&key, SHARED_BODY_INCARNATION, &bytes)
+                        .is_ok()
+                });
+                // Without the bytes the author uploads again.
+                if !restored {
+                    store.shared_body_demote_available(&row.work, &row.digest, None)?;
+                }
             }
         }
         store.shared_body_mark_physically_deleted(&row.work, &row.digest, &row.author, now)
@@ -446,10 +466,21 @@ async fn upload_body(
         // Deleted between the mark and the write: the remover found no object to take, so this
         // write must not leave the bytes behind.
         if !store.shared_body_object_in_use(&work_id, &sha256)? {
-            if let Err(error) = physically_delete(&*store, &*objects, row, now, true) {
-                eprintln!("hub: shared body cleanup deferred to the sweep: {error}");
-            }
-            return Ok(Err(ApiError::gone()));
+            let own = store
+                .shared_body_lookup(&token, &work_id, &sha256, unix_now())?
+                .and_then(|access| access.own().cloned());
+            return Ok(Err(match own {
+                // Demoted by a racing removal, not deleted: the client keeps the body pending.
+                Some(own) if own.state == SharedBodyState::Declared => {
+                    ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "retry_upload")
+                }
+                _ => {
+                    if let Err(error) = physically_delete(&*store, &*objects, row, now, true) {
+                        eprintln!("hub: shared body cleanup deferred to the sweep: {error}");
+                    }
+                    ApiError::gone()
+                }
+            }));
         }
         Ok(Ok(()))
     })

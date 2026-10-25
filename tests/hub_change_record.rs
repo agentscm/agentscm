@@ -1595,9 +1595,13 @@ fn shared_bodies_demote_and_expire_stale_declarations(db: &Db) {
         .shared_body_mark_available(&work_id, &one, &owner, now + 10, 100)
         .unwrap();
     assert_eq!(state(&one).expires_at, Some(now + 110));
+    // A row demoted after its upload keeps that upload's deadline rather than the declaration's.
+    store
+        .shared_body_demote_available(&work_id, &one, Some(&owner))
+        .unwrap();
 
     // At the retention period after its declaration a never-uploaded row expires without an
-    // object of its own; an available row waits for its own deadline.
+    // object of its own; a demoted row waits for its own deadline.
     assert!(
         store
             .shared_bodies_expire(now + 99, 10, 100)
@@ -1609,7 +1613,7 @@ fn shared_bodies_demote_and_expire_stale_declarations(db: &Db) {
     assert_eq!(expired[0].digest, two);
     assert_eq!(state(&two).state, SharedBodyState::Expired);
     assert_eq!(state(&two).expires_at, Some(now + 100));
-    assert_eq!(state(&one).state, SharedBodyState::Available);
+    assert_eq!(state(&one).state, SharedBodyState::Declared);
     assert_eq!(
         store
             .shared_bodies_expire(now + 110, 10, 100)

@@ -6040,13 +6040,11 @@ impl Store for PgStore {
                         "WITH due AS MATERIALIZED (
                              SELECT work AS w,digest AS d,author AS a FROM hub_change_shared_bodies
                              WHERE (state='available' AND expires_at<=$1)
-                                OR (state='declared' AND declared_at+$3<=$1)
-                             ORDER BY CASE WHEN state='declared' THEN declared_at+$3
-                                           ELSE expires_at END,work,digest,author LIMIT $2
+                                OR (state='declared' AND COALESCE(expires_at,declared_at+$3)<=$1)
+                             ORDER BY COALESCE(expires_at,declared_at+$3),work,digest,author LIMIT $2
                              FOR UPDATE SKIP LOCKED)
                          UPDATE hub_change_shared_bodies b SET state='expired',
-                             expires_at=CASE WHEN b.state='declared' THEN b.declared_at+$3
-                                             ELSE b.expires_at END
+                             expires_at=COALESCE(b.expires_at,b.declared_at+$3)
                          FROM due WHERE b.work=due.w AND b.digest=due.d AND b.author=due.a
                          RETURNING {SHARED_BODY_COLUMNS}"
                     ),

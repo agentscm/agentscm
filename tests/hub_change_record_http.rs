@@ -2389,6 +2389,16 @@ mod shared_bodies {
             StatusCode::NO_CONTENT
         );
         f.backend.delete_incarnation(&f.key(), "v1").unwrap();
+        // A fresh upload may be between its mark and its write: the read fails but demotes nothing.
+        let response = f.read(&f.owner_secret, &f.sha).await;
+        assert_eq!(response.status(), StatusCode::FAILED_DEPENDENCY);
+        assert_eq!(f.row().state, SharedBodyState::Available);
+        f.store
+            .shared_body_demote_available(&f.work_id, &f.sha, None)
+            .unwrap();
+        f.store
+            .shared_body_mark_available(&f.work_id, &f.sha, &f.row().author, unix_now() - 1000, DAY)
+            .unwrap();
         let response = f.read(&f.owner_secret, &f.sha).await;
         assert_eq!(response.status(), StatusCode::FAILED_DEPENDENCY);
         assert_eq!(
@@ -3136,9 +3146,9 @@ mod shared_bodies {
         assert!(f.row().physical_deleted_at.is_some());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_upload_marked_available_during_a_removal_is_demoted_and_uploads_again() {
-        let f = Fixture::start().await;
+    /// The owner deletes while the helper marks its row available inside the removal window,
+    /// and also writes its bytes there when `put_too`.
+    async fn owner_deletes_during_helper_upload(f: &Fixture, put_too: bool) {
         let helper_token = f.token_of(&f.helper_secret);
         f.declare_as(&helper_token, HELPER_SESSION, 1, &[&f.body]);
         assert_eq!(
@@ -3146,35 +3156,66 @@ mod shared_bodies {
             StatusCode::NO_CONTENT
         );
         // The helper's declaration does not keep the object, so the owner's delete removes it.
-        // The helper's upload marks its row available just after, before writing any bytes.
         let (store, work_id, sha) = (f.store.clone(), f.work_id.clone(), f.sha.clone());
         let helper = f.row_of(&f.helper_secret, &f.sha).author;
+        let (backend, key, body) = (f.backend.clone(), f.key(), f.body.clone());
         *f.backend.during_delete.lock().unwrap() = Some(Box::new(move || {
             store
                 .shared_body_mark_available(&work_id, &sha, &helper, unix_now(), DAY)
                 .unwrap();
+            if put_too {
+                backend.inner.put_if_absent(&key, "v1", &body).unwrap();
+            }
         }));
         assert_eq!(
             f.delete(&f.owner_secret, &f.sha).await,
             StatusCode::NO_CONTENT
         );
-        assert!(f.object().is_none());
-        assert_eq!(
-            f.row_of(&f.helper_secret, &f.sha).state,
-            SharedBodyState::Declared
-        );
-        let (_, answer) = f
-            .missing(Some(&f.helper_secret), json!({"digests": [f.sha]}))
-            .await;
-        assert_eq!(answer["missing"], json!([f.sha]));
-        // The helper's retry writes the object again.
-        assert_eq!(
-            f.put(&f.helper_secret, &f.sha, f.body.clone()).await,
-            StatusCode::NO_CONTENT
-        );
+        // The removal put the bytes back rather than losing an upload the client may have acked.
         assert_eq!(f.object().as_deref(), Some(f.body.as_slice()));
         assert_eq!(
+            f.row_of(&f.helper_secret, &f.sha).state,
+            SharedBodyState::Available
+        );
+        assert_eq!(
             f.read(&f.helper_secret, &f.sha).await.status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_upload_marked_available_during_a_removal_gets_its_object_restored() {
+        owner_deletes_during_helper_upload(&Fixture::start().await, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_acknowledged_upload_inside_a_removal_window_stays_available() {
+        owner_deletes_during_helper_upload(&Fixture::start().await, true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_upload_demoted_after_its_put_is_retryable_not_gone() {
+        let f = Fixture::start().await;
+        let (store, work_id, sha) = (f.store.clone(), f.work_id.clone(), f.sha.clone());
+        let author = f.row().author;
+        *f.backend.during_put.lock().unwrap() = Some(Box::new(move || {
+            store
+                .shared_body_demote_available(&work_id, &sha, Some(&author))
+                .unwrap();
+        }));
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(f.row().state, SharedBodyState::Declared);
+        // The retry succeeds and the body reads back.
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(f.row().state, SharedBodyState::Available);
+        assert_eq!(
+            f.read(&f.owner_secret, &f.sha).await.status(),
             StatusCode::OK
         );
     }

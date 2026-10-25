@@ -102,7 +102,8 @@ same switch per checkout, **Share agent conversations with Hub**; it is unchecke
 disabled until the checkout has an enabled capture binding, and shows the result in its status
 window. Turning it off only switches the mode. The capture config is written as version 6 only while
 some checkout is in `shared-conversation` mode; an older binary refuses a version 6 file, and the
-file returns to version 5 when no checkout shares.
+file returns to version 5 when no checkout shares. Downgrading the client after this release is
+unsupported: older binaries cannot read the new session association records.
 
 What leaves the machine, and when:
 

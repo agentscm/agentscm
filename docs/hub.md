@@ -651,6 +651,10 @@ is no per-body grant.
   shared body as plain text; it has no delete control because the status page only holds read-only
   tokens.
 
+The `shared_conversations` migration changed during development: a dev or staging Hub that ran a
+pre-release build of this branch must drop `hub_change_shared_bodies` and its named-migration record
+(or start fresh).
+
 This path remains alpha. Real Claude host, complete integrated browser, and deployment qualification
 are pending. See [local change capture](change-capture.md) for configuration and exact limits.
 

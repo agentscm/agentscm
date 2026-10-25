@@ -2085,11 +2085,11 @@ impl LocalSpool {
         validate_association(&association)?;
         let path = association_path(&self.root, observed_session_id);
         let _lock = self.lock()?;
+        let first = load_association(&self.root, observed_session_id)?
+            .map_or(capture_mode, |earlier| earlier.first_capture_mode());
         let association = SessionAssociationV1 {
-            original_capture_mode: Some(
-                load_association(&self.root, observed_session_id)?
-                    .map_or(capture_mode, |earlier| earlier.first_capture_mode()),
-            ),
+            capture_mode: clamp_shared(first, capture_mode),
+            original_capture_mode: Some(first),
             ..association
         };
         let bytes = serde_json::to_vec(&association)?;
@@ -2130,17 +2130,16 @@ impl LocalSpool {
             && pinned.work_id == work_id
             && pinned.generation == generation
         {
-            return Ok((pinned.parent_session_id.clone(), pinned.capture_mode));
+            return Ok((
+                pinned.parent_session_id.clone(),
+                clamp_shared(pinned.first_capture_mode(), pinned.capture_mode),
+            ));
         }
         // A session that began unshared never starts sharing, even under a new Work or generation.
         if let Some(earlier) = &earlier {
             let first = earlier.first_capture_mode();
             live.original_capture_mode = Some(first);
-            if capture_mode == CaptureModeV1::SharedConversation
-                && first != CaptureModeV1::SharedConversation
-            {
-                live.capture_mode = first;
-            }
+            live.capture_mode = clamp_shared(first, capture_mode);
         }
         let bytes = serde_json::to_vec(&live)?;
         let path = association_path(&self.root, observed_session_id);
@@ -4773,6 +4772,15 @@ fn validate_deferred(deferred: &DeferredHookV1) -> Result<()> {
 impl SessionAssociationV1 {
     fn first_capture_mode(&self) -> CaptureModeV1 {
         self.original_capture_mode.unwrap_or(self.capture_mode)
+    }
+}
+
+/// A session that began unshared never starts sharing: `live` is lowered to `first` otherwise.
+fn clamp_shared(first: CaptureModeV1, live: CaptureModeV1) -> CaptureModeV1 {
+    if live == CaptureModeV1::SharedConversation && first != CaptureModeV1::SharedConversation {
+        first
+    } else {
+        live
     }
 }
 

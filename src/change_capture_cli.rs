@@ -429,7 +429,12 @@ async fn hook_claude() -> Result<i32> {
             eprintln!(
                 "AgentSCM local capture warning: pinned session identity is unavailable; using the live binding"
             );
-            (live_parent.map(str::to_owned), binding.capture_mode)
+            // An error never starts sharing.
+            let mode = match binding.capture_mode {
+                CaptureModeV1::SharedConversation => CaptureModeV1::LocalConversation,
+                mode => mode,
+            };
+            (live_parent.map(str::to_owned), mode)
         });
     let request = CaptureRequest {
         operation_prefix: "hook".into(),

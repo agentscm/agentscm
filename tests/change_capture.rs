@@ -4864,6 +4864,38 @@ fn a_session_that_began_unshared_never_pins_the_shared_mode() {
 }
 
 #[test]
+fn an_import_cannot_start_sharing_a_session_that_began_unshared() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let remember = |mode| {
+        spool
+            .remember_session_association(
+                "session_fixture",
+                "session_fixture",
+                "wrk_a",
+                1,
+                None,
+                mode,
+            )
+            .unwrap()
+    };
+    remember(CaptureModeV1::LocalConversation);
+    remember(CaptureModeV1::SharedConversation);
+    // The same Work and generation takes the pinned fast path.
+    let (_, mode) = spool
+        .pin_session_identity(
+            "session_fixture",
+            "session_fixture",
+            "wrk_a",
+            1,
+            None,
+            CaptureModeV1::SharedConversation,
+        )
+        .unwrap();
+    assert_eq!(mode, CaptureModeV1::LocalConversation);
+}
+
+#[test]
 fn session_identity_is_pinned_while_the_live_mode_gates_retention() {
     let temp = TempDir::new().unwrap();
     let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
