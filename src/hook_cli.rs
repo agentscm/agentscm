@@ -1823,39 +1823,42 @@ mod tests {
         path.canonicalize().unwrap()
     }
 
+    /// Runs Git for a synthetic repository. Callers pass the plain temporary path: Windows
+    /// canonical `\\?\` paths are not accepted by every Git command.
+    fn git(root: &Path, arguments: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(arguments)
+            .current_dir(root)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {arguments:?}");
+    }
+
     #[test]
     fn only_unconnected_checkouts_with_a_supported_origin_are_reported() {
-        let git = |root: &Path, arguments: &[&str]| {
-            let status = std::process::Command::new("git")
-                .args(arguments)
-                .current_dir(root)
-                .env_remove("GIT_DIR")
-                .env_remove("GIT_WORK_TREE")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .unwrap();
-            assert!(status.success(), "git {arguments:?}");
-        };
         let parent = tempfile::tempdir().unwrap();
         let plain = parent.path().join("plain");
         std::fs::create_dir(&plain).unwrap();
         assert_eq!(unconnected_checkout(&plain, &[]), None);
 
-        let main = parent.path().join("main");
-        std::fs::create_dir_all(main.join("src")).unwrap();
-        git(&main, &["init", "--quiet"]);
-        let main = main.canonicalize().unwrap();
+        let checkout = parent.path().join("main");
+        std::fs::create_dir_all(checkout.join("src")).unwrap();
+        git(&checkout, &["init", "--quiet"]);
+        let main = checkout.canonicalize().unwrap();
         assert_eq!(unconnected_checkout(&main, &[]), None, "no origin");
         git(
-            &main,
+            &checkout,
             &["remote", "add", "origin", "file:///synthetic/widgets.git"],
         );
         assert_eq!(unconnected_checkout(&main, &[]), None, "unsupported origin");
 
         git(
-            &main,
+            &checkout,
             &[
                 "remote",
                 "set-url",
@@ -1877,34 +1880,18 @@ mod tests {
     #[test]
     fn markers_record_when_a_key_was_last_marked() {
         let config = tempfile::tempdir().unwrap();
-        let every = Duration::from_secs(60);
-        assert!(!marked_within(
+        let (config, every, key) = (
             config.path(),
+            Duration::from_secs(60),
             "unconnected\0claude\0/a",
-            every
-        ));
-        mark(config.path(), "unconnected\0claude\0/a");
-        assert!(marked_within(
-            config.path(),
-            "unconnected\0claude\0/a",
-            every
-        ));
-        assert!(!marked_within(
-            config.path(),
-            "unconnected\0codex\0/a",
-            every
-        ));
-        assert!(!marked_within(
-            config.path(),
-            "unconnected\0claude\0/a",
-            Duration::ZERO
-        ));
-        mark(config.path(), "unconnected\0claude\0/a");
-        assert!(marked_within(
-            config.path(),
-            "unconnected\0claude\0/a",
-            every
-        ));
+        );
+        assert!(!marked_within(config, key, every));
+        mark(config, key);
+        assert!(marked_within(config, key, every));
+        assert!(!marked_within(config, "unconnected\0codex\0/a", every));
+        assert!(!marked_within(config, key, Duration::ZERO));
+        mark(config, key);
+        assert!(marked_within(config, key, every));
     }
 
     #[cfg(unix)]
@@ -1919,27 +1906,16 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let repo = parent.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
-        for arguments in [
-            &["init", "--quiet"][..],
+        git(&repo, &["init", "--quiet"]);
+        git(
+            &repo,
             &[
                 "remote",
                 "add",
                 "origin",
                 "https://github.com/acme/widgets.git",
             ],
-        ] {
-            let status = std::process::Command::new("git")
-                .args(arguments)
-                .current_dir(&repo)
-                .env_remove("GIT_DIR")
-                .env_remove("GIT_WORK_TREE")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .unwrap();
-            assert!(status.success(), "git {arguments:?}");
-        }
+        );
         let repo = repo.canonicalize().unwrap();
         let config = parent.path().join("config");
         let tray = parent.path().join("tray");
@@ -1976,14 +1952,7 @@ mod tests {
         // A checkout with nothing to report is not checked again on every hook.
         let plain = parent.path().join("plain");
         std::fs::create_dir(&plain).unwrap();
-        let status = std::process::Command::new("git")
-            .args(["init", "--quiet"])
-            .current_dir(&plain)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .status()
-            .unwrap();
-        assert!(status.success());
+        git(&plain, &["init", "--quiet"]);
         let plain = plain.canonicalize().unwrap();
         report_unconnected_at(&config, &socket, "claude", plain.clone(), no_connections);
         assert!(marked_within(

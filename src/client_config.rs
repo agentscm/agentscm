@@ -1066,6 +1066,7 @@ mod tests {
             assert_eq!(main_checkout(checkout), main);
         }
         assert_eq!(main_checkout(&copied), copied);
+        let foreign = foreign.canonicalize().unwrap();
         assert_eq!(main_checkout(&foreign), foreign);
 
         // A symlinked `.git`, to the shared directory or to a worktree's file, is refused too.
