@@ -2,7 +2,7 @@
 
 All notable changes are listed here, newest first. AgentSCM is alpha: any release may change the CLI, the HTTP API, storage and schemas without a migration.
 
-## Unreleased
+## 0.1.0-alpha.7 (2026-10-26)
 
 - Conversation sharing is one step for a connected checkout. The macOS tray's **Share agent conversations with Hub** switch no longer needs `change-capture configure` first: turning it on creates the capture binding with documented defaults through the `configure` code path (private per-checkout spool, `origin/main`, one `Bash=execution:partial:process_exit_code` rule, caller-asserted setup digest), re-enables a disabled binding, or just changes the mode of an enabled one, and its status window says what sharing does. The Hub page opened from this computer (`agentscm open`) has the same switch under **Settings → Conversation sharing**, backed by `GET`/`POST /v1/local/capture`: the change needs the page's own origin and live connection, names the checkout by its listed repository and Hub, and turning sharing on needs an explicit confirmation. The tray, the page and the client status read the setting through one function. Fixed: the repository explorer failed to load a session captured in `shared-conversation` mode.
 
