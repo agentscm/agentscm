@@ -28,7 +28,7 @@ const hubData = (over: Partial<HubData> = {}): HubData => ({
 function Chrome({ overview = null, data = hubData() }: { overview?: WorkOverview | null; data?: HubData }) {
   return (
     <AppChrome
-      logo={<span>logo</span>}
+      token="read-only-hub-token" logo={<span>logo</span>}
       repo="acme/widgets"
       sections={SECTIONS}
       section="now"

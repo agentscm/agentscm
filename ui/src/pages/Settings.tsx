@@ -1,4 +1,4 @@
-import { ComputerBar } from '../ComputerBar.tsx'
+import { ComputerSettings } from '../ComputerBar.tsx'
 import { isLocalCredential } from '../frontDoor.ts'
 import { useState } from 'react'
 import { loadLocalBase, loadLocalToken, localStatus, saveLocalBase, saveLocalToken, validLocalBase } from '../localApi.ts'
@@ -103,7 +103,7 @@ export function SettingsPage({ token, whoami, pref, onPref, density, onDensity, 
 
         {isLocalCredential(token) ? (
           <Box tour="settings-local" icon="laptop" title="This computer" explain="This page comes from AgentSCM on your computer. It reads your files and saved conversations here, and your team’s Hub with a read-only connection.">
-            <ComputerBar token={token} allowDisconnect onDisconnected={() => window.location.reload()} />
+            <ComputerSettings token={token} />
           </Box>
         ) : (
           <LocalServer />
