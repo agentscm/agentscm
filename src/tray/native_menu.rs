@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -7,10 +8,10 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyClass;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, msg_send, sel};
 use objc2_app_kit::{
-    NSAccessibility, NSColor, NSControlStateValueOff, NSControlStateValueOn, NSFont,
-    NSFontWeightSemibold, NSImage, NSImageView, NSLineBreakMode, NSMenu,
-    NSMenuDidBeginTrackingNotification, NSMenuDidEndTrackingNotification, NSMenuItem, NSSwitch,
-    NSTextField, NSView,
+    NSAccessibility, NSApplication, NSAutoresizingMaskOptions, NSColor, NSControlStateValueOff,
+    NSControlStateValueOn, NSFont, NSFontWeightSemibold, NSImage, NSImageView, NSLineBreakMode,
+    NSMenu, NSMenuDidBeginTrackingNotification, NSMenuDidEndTrackingNotification, NSMenuItem,
+    NSSwitch, NSTextField, NSView,
 };
 use objc2_foundation::{
     NSNotification, NSNotificationCenter, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
@@ -25,6 +26,7 @@ use tray_icon::menu::ContextMenu;
 struct TargetIvars {
     proxy: EventLoopProxy<UserEvent>,
     tracking: Arc<AtomicBool>,
+    activated: Cell<bool>,
 }
 
 objc2::define_class!(
@@ -46,11 +48,23 @@ objc2::define_class!(
         #[unsafe(method(menuBeganTracking:))]
         fn menu_began_tracking(&self, _notification: &NSNotification) {
             set_tracking(&self.ivars().tracking, true);
+            // AppKit draws controls in an inactive app's menu in their grey, inactive style, so
+            // the tray is active only while its menu is open.
+            let app = NSApplication::sharedApplication(MainThreadMarker::from(self));
+            if !app.isActive() {
+                self.ivars().activated.set(true);
+                // `activate` needs macOS 14; this is its documented equivalent on older systems.
+                #[allow(deprecated)]
+                app.activateIgnoringOtherApps(true);
+            }
         }
 
         #[unsafe(method(menuEndedTracking:))]
         fn menu_ended_tracking(&self, _notification: &NSNotification) {
             set_tracking(&self.ivars().tracking, false);
+            if self.ivars().activated.replace(false) {
+                NSApplication::sharedApplication(MainThreadMarker::from(self)).deactivate();
+            }
             let _ = self.ivars().proxy.send_event(UserEvent::MenuTrackingEnded);
         }
     }
@@ -66,7 +80,11 @@ impl Target {
         proxy: EventLoopProxy<UserEvent>,
         tracking: Arc<AtomicBool>,
     ) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(TargetIvars { proxy, tracking });
+        let this = Self::alloc(mtm).set_ivars(TargetIvars {
+            proxy,
+            tracking,
+            activated: Cell::new(false),
+        });
         // SAFETY: NSObject's initializer has this signature and Target adds no init requirements.
         unsafe { msg_send![super(this), init] }
     }
@@ -77,7 +95,7 @@ pub(super) struct NativeMenuBridge {
     item: Retained<NSMenuItem>,
     target: Retained<Target>,
     switch: Option<Retained<NSSwitch>>,
-    login_state: Option<Retained<NSTextField>>,
+    login_title: Option<Retained<NSTextField>>,
     _view: Option<Retained<NSView>>,
     _text_views: Vec<Retained<NSView>>,
     tracking: Arc<AtomicBool>,
@@ -101,40 +119,22 @@ impl NativeMenuBridge {
         // NSSwitch was introduced in macOS 10.15, while AgentSCM still supports older macOS.
         // Looking up the class first avoids messaging an unavailable class; the existing Muda
         // CheckMenuItem remains the accessible legacy control when the lookup fails.
-        let (switch, login_state, view) = if AnyClass::get(c"NSSwitch").is_some() {
-            let view = NSView::initWithFrame(
-                NSView::alloc(mtm),
-                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(280.0, 32.0)),
-            );
-            let label = NSTextField::labelWithString(&NSString::from_str("Start at Login"), mtm);
-            label.setFrame(NSRect::new(
-                NSPoint::new(16.0, 7.0),
-                NSSize::new(130.0, 18.0),
-            ));
-            let login_state = NSTextField::labelWithString(&NSString::new(), mtm);
-            login_state.setFrame(NSRect::new(
-                NSPoint::new(148.0, 7.0),
-                NSSize::new(70.0, 18.0),
-            ));
-            login_state.setFont(Some(&NSFont::systemFontOfSize(12.0)));
-            let switch = NSSwitch::initWithFrame(
-                NSSwitch::alloc(mtm),
-                NSRect::new(NSPoint::new(224.0, 4.0), NSSize::new(44.0, 24.0)),
-            );
-            switch.setAccessibilityLabel(Some(&NSString::from_str("Start at Login")));
-            apply_login_state(&switch, &login_state, NativeLoginState::Confirmed(enabled));
+        let (switch, login_title, view) = if AnyClass::get(c"NSSwitch").is_some() {
+            let (view, title, switch) = login_row(mtm);
+            apply_login_state(&switch, &title, NativeLoginState::Confirmed(enabled));
             // SAFETY: Target implements loginSwitchChanged: with the NSSwitch sender signature and
             // is retained by this bridge for at least as long as the switch.
             unsafe {
                 switch.setTarget(Some(&target));
                 switch.setAction(Some(sel!(loginSwitchChanged:)));
-                view.addSubview(&label);
-                view.addSubview(&login_state);
-                view.addSubview(&switch);
             }
             item.setView(Some(&view));
             item.view()?;
-            (Some(switch), Some(login_state), Some(view))
+            // The hidden checkmark would otherwise reserve a state column, shifting every row
+            // whenever Start at Login changes.
+            item.setState(NSControlStateValueOff);
+            menu.setShowsStateColumn(false);
+            (Some(switch), Some(title), Some(view))
         } else {
             (None, None, None)
         };
@@ -163,7 +163,7 @@ impl NativeMenuBridge {
             item,
             target,
             switch,
-            login_state,
+            login_title,
             _view: view,
             _text_views: text_views,
             tracking,
@@ -179,8 +179,8 @@ impl NativeMenuBridge {
     }
 
     pub(super) fn set_login_state(&self, state: NativeLoginState) {
-        if let (Some(switch), Some(label)) = (&self.switch, &self.login_state) {
-            apply_login_state(switch, label, state);
+        if let (Some(switch), Some(title)) = (&self.switch, &self.login_title) {
+            apply_login_state(switch, title, state);
         }
     }
 
@@ -195,13 +195,79 @@ pub(super) enum NativeLoginState {
     Pending(bool),
 }
 
-fn apply_login_state(switch: &NSSwitch, label: &NSTextField, state: NativeLoginState) {
-    let (enabled, checked, text, color) = match state {
-        NativeLoginState::Confirmed(true) => (true, true, "On", NSColor::controlAccentColor()),
-        NativeLoginState::Confirmed(false) => (true, false, "Off", NSColor::secondaryLabelColor()),
-        NativeLoginState::Pending(checked) => {
-            (false, checked, "Updating…", NSColor::secondaryLabelColor())
-        }
+/// AppKit's menu metrics: the content inset at both edges, and the icon column before titles.
+const MENU_INSET: f64 = 14.0;
+const MENU_ICON: f64 = 16.0;
+const MENU_TITLE_X: f64 = MENU_INSET + MENU_ICON + 4.0;
+const MENU_ROW_HEIGHT: f64 = 24.0;
+
+/// A Start at Login row laid out like the native rows around it: icon and menu-font title in
+/// their columns, and a regular switch at the trailing edge. The menu sets its final width.
+fn login_row(
+    mtm: MainThreadMarker,
+) -> (Retained<NSView>, Retained<NSTextField>, Retained<NSSwitch>) {
+    let switch = NSSwitch::initWithFrame(
+        NSSwitch::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0)),
+    );
+    switch.sizeToFit();
+    let switch_size = switch.frame().size;
+    let height = MENU_ROW_HEIGHT.max(switch_size.height + 4.0);
+    let width = MENU_TITLE_X + 160.0 + switch_size.width + MENU_INSET;
+    let view = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height)),
+    );
+    view.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+    switch.setFrame(NSRect::new(
+        NSPoint::new(
+            width - MENU_INSET - switch_size.width,
+            ((height - switch_size.height) / 2.0).round(),
+        ),
+        switch_size,
+    ));
+    switch.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
+    switch.setAccessibilityLabel(Some(&NSString::from_str("Start at Login")));
+
+    let title = NSTextField::labelWithString(&NSString::from_str("Start at Login"), mtm);
+    title.setFont(Some(&NSFont::menuFontOfSize(0.0)));
+    title.sizeToFit();
+    let title_height = title.frame().size.height;
+    title.setFrame(NSRect::new(
+        NSPoint::new(MENU_TITLE_X, ((height - title_height) / 2.0).round()),
+        NSSize::new(
+            width - MENU_TITLE_X - switch_size.width - 2.0 * MENU_INSET,
+            title_height,
+        ),
+    ));
+    title.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+    view.addSubview(&title);
+    view.addSubview(&switch);
+    if let Some(image) = system_symbol("sunrise") {
+        let icon = NSImageView::initWithFrame(
+            NSImageView::alloc(mtm),
+            NSRect::new(
+                NSPoint::new(MENU_INSET, ((height - MENU_ICON) / 2.0).round()),
+                NSSize::new(MENU_ICON, MENU_ICON),
+            ),
+        );
+        icon.setImage(Some(&image));
+        view.addSubview(&icon);
+    }
+    (view, title, switch)
+}
+
+fn login_title(state: NativeLoginState) -> &'static str {
+    match state {
+        NativeLoginState::Confirmed(_) => "Start at Login",
+        NativeLoginState::Pending(_) => "Start at Login (Updating…)",
+    }
+}
+
+fn apply_login_state(switch: &NSSwitch, title: &NSTextField, state: NativeLoginState) {
+    let (enabled, checked, value) = match state {
+        NativeLoginState::Confirmed(on) => (true, on, if on { "On" } else { "Off" }),
+        NativeLoginState::Pending(checked) => (false, checked, "Updating…"),
     };
     switch.setEnabled(enabled);
     switch.setState(if checked {
@@ -209,12 +275,14 @@ fn apply_login_state(switch: &NSSwitch, label: &NSTextField, state: NativeLoginS
     } else {
         NSControlStateValueOff
     });
-    switch.setAccessibilityValueDescription(Some(&NSString::from_str(text)));
-    label.setStringValue(&NSString::from_str(text));
-    label.setTextColor(Some(&color));
-    label.setAccessibilityLabel(Some(&NSString::from_str(&format!(
-        "Start at Login: {text}"
-    ))));
+    switch.setAccessibilityValueDescription(Some(&NSString::from_str(value)));
+    title.setStringValue(&NSString::from_str(login_title(state)));
+    let color = if enabled {
+        NSColor::labelColor()
+    } else {
+        NSColor::disabledControlTextColor()
+    };
+    title.setTextColor(Some(&color));
 }
 
 const TEXT_MARKER: &str = "__AGENTSCM_TEXT_";
@@ -422,7 +490,7 @@ fn system_symbol(symbol: &str) -> Option<Retained<NSImage>> {
         None,
     )?;
     image.setTemplate(true);
-    image.setSize(NSSize::new(16.0, 16.0));
+    image.setSize(NSSize::new(MENU_ICON, MENU_ICON));
     Some(image)
 }
 
@@ -455,6 +523,14 @@ mod tests {
         );
         assert_eq!(symbol_for_title("Open Checkout"), Some("folder"));
         assert_eq!(symbol_for_title("Connection: unknown"), None);
+        assert_eq!(
+            login_title(NativeLoginState::Confirmed(true)),
+            "Start at Login"
+        );
+        assert_eq!(
+            login_title(NativeLoginState::Pending(false)),
+            "Start at Login (Updating…)"
+        );
         assert_eq!(
             menu_item_symbol("Open Hub", Some("exclamationmark.triangle"), true),
             Some("exclamationmark.triangle"),
