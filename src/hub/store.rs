@@ -605,9 +605,24 @@ pub trait Store: Send + Sync {
         actor: &str,
         now: i64,
     ) -> Result<Vec<SharedBodyRow>>;
-    /// Marks up to `limit` available bodies with `expires_at <= now` expired, oldest first, and
-    /// returns them.
-    fn shared_bodies_expire(&self, now: i64, limit: usize) -> Result<Vec<SharedBodyRow>>;
+    /// Marks up to `limit` available bodies with `expires_at <= now` expired, and declared
+    /// bodies still not uploaded `retention_seconds` after `declared_at` (they never had an
+    /// object of their own), oldest first, and returns them.
+    fn shared_bodies_expire(
+        &self,
+        now: i64,
+        limit: usize,
+        retention_seconds: i64,
+    ) -> Result<Vec<SharedBodyRow>>;
+    /// Moves `available` declarations of (work, digest) back to `declared` (only `author`'s when
+    /// given) because their object is gone or was never written, so the author's preflight lists
+    /// them missing and the client uploads again. Returns how many rows changed.
+    fn shared_body_demote_available(
+        &self,
+        work_id: &str,
+        digest: &str,
+        author: Option<&str>,
+    ) -> Result<usize>;
     /// Up to `limit` expired or deleted bodies whose object has not been confirmed removed and
     /// whose retry time has come, oldest tombstone first.
     fn shared_bodies_pending_physical_delete(
@@ -615,8 +630,8 @@ pub trait Store: Send + Sync {
         now: i64,
         limit: usize,
     ) -> Result<Vec<SharedBodyRow>>;
-    /// Whether any declaration of (work, digest) is `declared` or `available`, and so may still
-    /// need the shared object.
+    /// Whether any declaration of (work, digest) is `available`, and so needs the shared object.
+    /// A `declared` one does not: its author's upload writes the object again.
     fn shared_body_object_in_use(&self, work_id: &str, digest: &str) -> Result<bool>;
     fn shared_body_mark_physically_deleted(
         &self,

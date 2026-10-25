@@ -406,7 +406,8 @@ fn shared_body_row(row: &postgres::Row) -> Result<SharedBodyRow> {
 }
 
 /// Records that an accepted event named a shared body for the human owning `token`. Each human's
-/// declaration of a digest is its own row, and a later one must agree on size with any earlier.
+/// declaration of a digest is its own row, and a later one must agree on size with the same
+/// human's earlier one (never another's, which would leak that they declared it).
 fn declare_shared_body(
     tx: &mut postgres::Transaction<'_>,
     batch: &CaptureBatchV1,
@@ -418,8 +419,9 @@ fn declare_shared_body(
     let size = artifact.size_bytes as i64;
     let sequence = event.sequence as i64;
     let declared = tx.query_opt(
-        "SELECT size_bytes FROM hub_change_shared_bodies WHERE work=$1 AND digest=$2 LIMIT 1",
-        &[&batch.work_id, &artifact.digest],
+        "SELECT size_bytes FROM hub_change_shared_bodies WHERE work=$1 AND digest=$2
+           AND author=(SELECT owner FROM hub_agent_tokens WHERE id=$3)",
+        &[&batch.work_id, &artifact.digest, &token],
     )?;
     if declared.is_some_and(|declared| declared.get::<_, i64>(0) != size) {
         return Err(HubError::Invalid(
@@ -6023,7 +6025,12 @@ impl Store for PgStore {
         })
     }
 
-    fn shared_bodies_expire(&self, now: i64, limit: usize) -> Result<Vec<SharedBodyRow>> {
+    fn shared_bodies_expire(
+        &self,
+        now: i64,
+        limit: usize,
+        retention_seconds: i64,
+    ) -> Result<Vec<SharedBodyRow>> {
         self.run(false, |client| {
             let limit = limit as i64;
             client
@@ -6032,18 +6039,38 @@ impl Store for PgStore {
                         // MATERIALIZED: a semi-join over the subquery could ignore its LIMIT.
                         "WITH due AS MATERIALIZED (
                              SELECT work AS w,digest AS d,author AS a FROM hub_change_shared_bodies
-                             WHERE state='available' AND expires_at<=$1
-                             ORDER BY expires_at,work,digest,author LIMIT $2
+                             WHERE (state='available' AND expires_at<=$1)
+                                OR (state='declared' AND declared_at+$3<=$1)
+                             ORDER BY CASE WHEN state='declared' THEN declared_at+$3
+                                           ELSE expires_at END,work,digest,author LIMIT $2
                              FOR UPDATE SKIP LOCKED)
-                         UPDATE hub_change_shared_bodies b SET state='expired'
+                         UPDATE hub_change_shared_bodies b SET state='expired',
+                             expires_at=CASE WHEN b.state='declared' THEN b.declared_at+$3
+                                             ELSE b.expires_at END
                          FROM due WHERE b.work=due.w AND b.digest=due.d AND b.author=due.a
                          RETURNING {SHARED_BODY_COLUMNS}"
                     ),
-                    &[&now, &limit],
+                    &[&now, &limit, &retention_seconds],
                 )?
                 .iter()
                 .map(shared_body_row)
                 .collect()
+        })
+    }
+
+    fn shared_body_demote_available(
+        &self,
+        work_id: &str,
+        digest: &str,
+        author: Option<&str>,
+    ) -> Result<usize> {
+        self.run(false, |client| {
+            Ok(client.execute(
+                "UPDATE hub_change_shared_bodies SET state='declared'
+                 WHERE work=$1 AND digest=$2 AND ($3::text IS NULL OR author=$3)
+                   AND state='available'",
+                &[&work_id, &digest, &author],
+            )? as usize)
         })
     }
 
@@ -6075,7 +6102,7 @@ impl Store for PgStore {
             Ok(client
                 .query_one(
                     "SELECT EXISTS (SELECT 1 FROM hub_change_shared_bodies
-                     WHERE work=$1 AND digest=$2 AND state IN ('declared','available'))",
+                     WHERE work=$1 AND digest=$2 AND state='available')",
                     &[&work_id, &digest],
                 )?
                 .get(0))

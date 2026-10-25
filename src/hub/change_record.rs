@@ -137,8 +137,8 @@ impl SharedBodyAccess {
         self.rows.iter().find(|row| row.author == self.caller)
     }
 
-    /// The declaration a read or delete acts on: the caller's own, else for an admin the first
-    /// that is still available. `None` means the caller may not act, whether or not the digest
+    /// The declaration a read or delete acts on: an available one (the caller's own first), else
+    /// the caller's own, else for an admin the first of the others. `None` means the caller may not act, whether or not the digest
     /// exists.
     pub fn accessible(&self, admin: bool, now: i64) -> Option<&SharedBodyRow> {
         self.rows
@@ -146,8 +146,8 @@ impl SharedBodyAccess {
             .filter(|row| conversation_readable(&row.author, &self.caller, admin))
             .min_by_key(|row| {
                 (
-                    row.author != self.caller,
                     row.state_at(now) != SharedBodyState::Available,
+                    row.author != self.caller,
                 )
             })
     }
@@ -488,7 +488,8 @@ mod tests {
             ..access
         };
         assert_eq!(access.accessible(false, 0).unwrap().author, "a");
-        assert_eq!(access.accessible(true, 0).unwrap().author, "a");
+        // An admin prefers a live copy even over their own deleted one; others only see their own.
+        assert_eq!(access.accessible(true, 0).unwrap().author, "b");
         assert!(
             SharedBodyAccess {
                 rows: vec![],

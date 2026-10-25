@@ -168,8 +168,12 @@ removal fails is retried after 1 hour, doubling to at most a day, without holdin
 or a Hub admin can delete a body earlier with `--delete` or the HTTP `DELETE` route (an admin deletes
 every author's copy); deletion records a tombstone and then removes the object, so a deleted or
 expired body answers 410. When two people shared identical content the stored object is removed
-only once no other copy of it is declared or available, so an author who declared but never uploaded
-keeps it from being removed.
+only once no other copy of it is available. A declaration that was never uploaded does not keep it;
+if it is removed first, the other author's later upload writes it again, and an available copy whose
+object is found missing returns to awaiting upload so the checkout uploads it again. A declaration
+still not uploaded when the retention period after its declaration ends expires without ever having
+an object. Identical bodies from the same author in one Work are stored once, under the first
+declaration, so a later identical body shares that entry and its expiry.
 
 Turning sharing off does not recall anything: copies already uploaded stay until they expire or
 are deleted. AgentSCM never deletes the local spool copy. Backups, exports or copies a reader

@@ -4801,6 +4801,69 @@ fn lifecycle_hooks_record_boundaries_subagents_tool_names_and_completion() {
 }
 
 #[test]
+fn a_session_that_began_unshared_never_pins_the_shared_mode() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let pin = |work: &str, generation, mode| {
+        spool
+            .pin_session_identity(
+                "session_fixture",
+                "session_fixture",
+                work,
+                generation,
+                None,
+                mode,
+            )
+            .unwrap()
+            .1
+    };
+    assert_eq!(
+        pin("wrk_a", 1, CaptureModeV1::MetadataOnly),
+        CaptureModeV1::MetadataOnly
+    );
+    assert_eq!(
+        pin("wrk_a", 1, CaptureModeV1::SharedConversation),
+        CaptureModeV1::MetadataOnly
+    );
+    // A new generation or Work does not make the session shared either.
+    assert_eq!(
+        pin("wrk_a", 2, CaptureModeV1::SharedConversation),
+        CaptureModeV1::MetadataOnly
+    );
+    assert_eq!(
+        pin("wrk_b", 1, CaptureModeV1::SharedConversation),
+        CaptureModeV1::MetadataOnly
+    );
+    // A downgrade is honoured, and a session that began shared stays eligible.
+    assert_eq!(
+        pin("wrk_b", 2, CaptureModeV1::LocalConversation),
+        CaptureModeV1::LocalConversation
+    );
+    let spool = LocalSpool::open(temp.path().join("other")).unwrap();
+    let pin = |generation, mode| {
+        spool
+            .pin_session_identity(
+                "session_fixture",
+                "session_fixture",
+                "wrk_a",
+                generation,
+                None,
+                mode,
+            )
+            .unwrap()
+            .1
+    };
+    assert_eq!(
+        pin(1, CaptureModeV1::SharedConversation),
+        CaptureModeV1::SharedConversation
+    );
+    assert_eq!(
+        pin(2, CaptureModeV1::SharedConversation),
+        CaptureModeV1::SharedConversation
+    );
+}
+
+#[test]
 fn session_identity_is_pinned_while_the_live_mode_gates_retention() {
     let temp = TempDir::new().unwrap();
     let spool = LocalSpool::open(temp.path().join("spool")).unwrap();

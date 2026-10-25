@@ -249,6 +249,7 @@ pub(super) async fn conversation_body(
             let Some(row) = access.accessible(admin, now) else {
                 return Ok(Err(no_access(admin)));
             };
+            let row = row.clone();
             match row.state_at(now) {
                 SharedBodyState::Declared => return Ok(Err(ApiError::not_found())),
                 SharedBodyState::Expired | SharedBodyState::Deleted => {
@@ -261,15 +262,27 @@ pub(super) async fn conversation_body(
                 SHARED_BODY_INCARNATION,
             ) {
                 Ok(bytes) if bytes.len() as u64 == row.size_bytes => Ok(Ok(bytes)),
-                Ok(_)
+                result @ (Ok(_)
                 | Err(
                     crate::Error::NotFound(_)
                     | crate::Error::MissingObject(_)
                     | crate::Error::Invalid(_),
-                ) => Ok(Err(ApiError::new(
-                    StatusCode::FAILED_DEPENDENCY,
-                    "integrity_failure",
-                ))),
+                )) => {
+                    // A vanished object is not coming back by itself: demote the rows so the
+                    // authors' preflight lists the body missing and the clients upload it again.
+                    if matches!(
+                        result,
+                        Err(crate::Error::NotFound(_) | crate::Error::MissingObject(_))
+                    ) && let Err(error) =
+                        store.shared_body_demote_available(&work_id, &sha256, None)
+                    {
+                        eprintln!("hub: shared body not demoted: {error}");
+                    }
+                    Ok(Err(ApiError::new(
+                        StatusCode::FAILED_DEPENDENCY,
+                        "integrity_failure",
+                    )))
+                }
                 Err(error) => Err(error.into()),
             }
         },
@@ -349,6 +362,11 @@ fn physically_delete(
         if !store.shared_body_object_in_use(&row.work, &row.digest)? {
             let key = shared_body_key(&row.work, &row.digest)?;
             objects.delete_incarnation(&key, SHARED_BODY_INCARNATION)?;
+            // An upload may have marked its row available while the object was going away; the
+            // bytes are not here to restore, so its author uploads again.
+            if store.shared_body_object_in_use(&row.work, &row.digest)? {
+                store.shared_body_demote_available(&row.work, &row.digest, None)?;
+            }
         }
         store.shared_body_mark_physically_deleted(&row.work, &row.digest, &row.author, now)
     })();
@@ -407,18 +425,33 @@ async fn upload_body(
         }
         let key = shared_body_key(&work_id, &sha256)?;
         objects.prepare_publication(&key, SHARED_BODY_INCARNATION)?;
-        // Another author's upload of the same body may already be there; the bytes are the same.
-        objects.put_if_absent(&key, SHARED_BODY_INCARNATION, &body)?;
-        match store.shared_body_mark_available(&work_id, &sha256, &row.author, now, retention)? {
-            Some(SharedBodyState::Available) => Ok(Ok(())),
-            _ => {
-                // Deleted or expired while uploading: do not leave the bytes behind.
-                if let Err(error) = physically_delete(&*store, &*objects, row, now, true) {
-                    eprintln!("hub: shared body cleanup deferred to the sweep: {error}");
-                }
-                Ok(Err(ApiError::gone()))
-            }
+        // Available first, object second: a removal that sees this row available keeps the object
+        // or demotes the row, and the put restores bytes a racing removal took.
+        if store.shared_body_mark_available(&work_id, &sha256, &row.author, now, retention)?
+            != Some(SharedBodyState::Available)
+        {
+            // Deleted or expired while uploading.
+            return Ok(Err(ApiError::gone()));
         }
+        // Another author's upload of the same body may already be there; the bytes are the same.
+        if let Err(error) = objects.put_if_absent(&key, SHARED_BODY_INCARNATION, &body) {
+            // Never leave an available row without its object: let the client retry.
+            if let Err(revert) =
+                store.shared_body_demote_available(&work_id, &sha256, Some(&row.author))
+            {
+                eprintln!("hub: shared body not reverted: {revert}");
+            }
+            return Err(error.into());
+        }
+        // Deleted between the mark and the write: the remover found no object to take, so this
+        // write must not leave the bytes behind.
+        if !store.shared_body_object_in_use(&work_id, &sha256)? {
+            if let Err(error) = physically_delete(&*store, &*objects, row, now, true) {
+                eprintln!("hub: shared body cleanup deferred to the sweep: {error}");
+            }
+            return Ok(Err(ApiError::gone()));
+        }
+        Ok(Ok(()))
     })
     .await??;
     Ok(StatusCode::NO_CONTENT)
@@ -525,12 +558,15 @@ pub struct SweepReport {
 /// `SWEEP_BUDGET` is spent. A failed removal waits out its backoff, so it cannot starve the rest.
 pub async fn sweep_shared_bodies(state: &HubState, now: i64) -> Result<SweepReport, HubError> {
     let deadline = Instant::now() + SWEEP_BUDGET;
+    let retention = state.shared_conversation_retention_days * 24 * 60 * 60;
     let mut report = SweepReport::default();
     loop {
         let store = state.store.clone();
-        let expired = blocking(state, move || store.shared_bodies_expire(now, SWEEP_BATCH))
-            .await?
-            .len();
+        let expired = blocking(state, move || {
+            store.shared_bodies_expire(now, SWEEP_BATCH, retention)
+        })
+        .await?
+        .len();
         report.expired += expired;
         if expired < SWEEP_BATCH || Instant::now() >= deadline {
             break;

@@ -265,7 +265,10 @@ fn jwt_end(bytes: &[u8], start: usize) -> Option<usize> {
 fn pem_block_end(bytes: &[u8], start: usize) -> Option<usize> {
     let label_start = start + b"-----BEGIN ".len();
     let label_end = find(bytes, label_start, b"-----")?;
-    if !bytes[label_start..label_end].ends_with(b"PRIVATE KEY") || label_end - label_start > 64 {
+    if !(bytes[label_start..label_end].ends_with(b"PRIVATE KEY")
+        || bytes[label_start..label_end].ends_with(b"PRIVATE KEY BLOCK"))
+        || label_end - label_start > 64
+    {
         return None;
     }
     let after_begin = label_end + 5;
@@ -509,6 +512,18 @@ mod tests {
         let (out, _) = redact(&format!("a {begin}\nQUJD"));
         assert_eq!(out, "a [REDACTED:private_key]");
         assert_eq!(redact("-----BEGIN CERTIFICATE-----\nabc").1, 0);
+        let pgp = [
+            "-----BEGIN PGP ",
+            "PRIVATE KEY",
+            " BLOCK-----\nQUJD\n-----END PGP ",
+            "PRIVATE KEY",
+            " BLOCK-----",
+        ]
+        .concat();
+        assert_eq!(
+            redact(&format!("x\n{pgp}\ny")).0,
+            "x\n[REDACTED:private_key]\ny"
+        );
     }
 
     #[test]

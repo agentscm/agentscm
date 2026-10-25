@@ -1094,7 +1094,7 @@ fn shared_body_lifecycle(db: &Db) {
 
     assert!(
         store
-            .shared_bodies_expire(now + 109, 10)
+            .shared_bodies_expire(now + 109, 10, 1_000_000_000)
             .unwrap()
             .is_empty()
     );
@@ -1104,7 +1104,9 @@ fn shared_body_lifecycle(db: &Db) {
             .unwrap()
             .is_empty()
     );
-    let expired = store.shared_bodies_expire(now + 110, 10).unwrap();
+    let expired = store
+        .shared_bodies_expire(now + 110, 10, 1_000_000_000)
+        .unwrap();
     assert_eq!(expired.len(), 1);
     assert_eq!(
         (expired[0].digest.as_str(), expired[0].state),
@@ -1112,7 +1114,7 @@ fn shared_body_lifecycle(db: &Db) {
     );
     assert!(
         store
-            .shared_bodies_expire(now + 999, 10)
+            .shared_bodies_expire(now + 999, 10, 1_000_000_000)
             .unwrap()
             .is_empty()
     );
@@ -1191,8 +1193,20 @@ fn shared_body_lifecycle(db: &Db) {
             .shared_body_mark_available(&work_id, &sha256_hex(body), &owner, now + 200, 10)
             .unwrap();
     }
-    assert_eq!(store.shared_bodies_expire(now + 300, 1).unwrap().len(), 1);
-    assert_eq!(store.shared_bodies_expire(now + 300, 5).unwrap().len(), 1);
+    assert_eq!(
+        store
+            .shared_bodies_expire(now + 300, 1, 1_000_000_000)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .shared_bodies_expire(now + 300, 5, 1_000_000_000)
+            .unwrap()
+            .len(),
+        1
+    );
     assert_eq!(
         store
             .shared_bodies_pending_physical_delete(now + 999, 1)
@@ -1409,11 +1423,12 @@ fn shared_bodies_are_rows_per_author(db: &Db) {
         )
         .unwrap();
     // The helper declares the identical body from their own session without colliding.
-    let mut theirs = shared_batch(&work_id, generation, "theirs", 1, body, 10);
+    // A different size from another author's row is not an error and reveals nothing.
+    let mut theirs = shared_batch(&work_id, generation, "theirs", 1, body, 11);
     theirs.session.session_id = "helper-session".into();
     store.change_ingest(&helper_token, &theirs, now).unwrap();
-    // A different size for the same digest is refused whoever declares it.
-    let mut wrong = shared_batch(&work_id, generation, "wrong", 2, body, 11);
+    // Only the same author's own earlier size must agree.
+    let mut wrong = shared_batch(&work_id, generation, "wrong", 2, body, 12);
     wrong.session.session_id = "helper-session".into();
     assert!(matches!(
         store.change_ingest(&helper_token, &wrong, now),
@@ -1464,11 +1479,12 @@ fn shared_bodies_are_rows_per_author(db: &Db) {
     );
     assert_eq!(listed(&token, true), 2);
 
-    // The object is needed while any declaration is declared or available.
-    assert!(store.shared_body_object_in_use(&work_id, &digest).unwrap());
+    // The object is needed only while a declaration is available; a declared one writes it later.
+    assert!(!store.shared_body_object_in_use(&work_id, &digest).unwrap());
     store
         .shared_body_mark_available(&work_id, &digest, &owner, now, 100)
         .unwrap();
+    assert!(store.shared_body_object_in_use(&work_id, &digest).unwrap());
     let deleted = store
         .shared_body_tombstone(&work_id, &digest, Some(&helper.id), &helper.id, now)
         .unwrap();
@@ -1514,5 +1530,110 @@ fn sqlite_shared_bodies_are_rows_per_author() {
 fn postgres_shared_bodies_are_rows_per_author() {
     if let Some(db) = Db::postgres() {
         shared_bodies_are_rows_per_author(&db);
+    }
+}
+
+fn shared_bodies_demote_and_expire_stale_declarations(db: &Db) {
+    let (store, token, work_id, generation) = setup(db);
+    let now = unix_now();
+    let (first, second) = (b"{\"a\":1}".as_slice(), b"{\"b\":2}".as_slice());
+    let (one, two) = (sha256_hex(first), sha256_hex(second));
+    store
+        .change_ingest(
+            &token,
+            &shared_batch(&work_id, generation, "one", 1, first, 7),
+            now,
+        )
+        .unwrap();
+    store
+        .change_ingest(
+            &token,
+            &shared_batch(&work_id, generation, "two", 2, second, 7),
+            now,
+        )
+        .unwrap();
+    let access = store
+        .shared_body_lookup(&token, &work_id, &one, now)
+        .unwrap()
+        .unwrap();
+    let owner = access.caller;
+    let state = |digest: &str| {
+        store
+            .shared_body_lookup(&token, &work_id, digest, now)
+            .unwrap()
+            .unwrap()
+            .own()
+            .unwrap()
+            .clone()
+    };
+
+    store
+        .shared_body_mark_available(&work_id, &one, &owner, now, 100)
+        .unwrap();
+    // Only an available row is demoted, and only the named author's when one is given.
+    assert_eq!(
+        store
+            .shared_body_demote_available(&work_id, &one, Some("nobody"))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .shared_body_demote_available(&work_id, &two, None)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .shared_body_demote_available(&work_id, &one, Some(&owner))
+            .unwrap(),
+        1
+    );
+    assert_eq!(state(&one).state, SharedBodyState::Declared);
+    // A demoted row uploads again like a fresh declaration.
+    store
+        .shared_body_mark_available(&work_id, &one, &owner, now + 10, 100)
+        .unwrap();
+    assert_eq!(state(&one).expires_at, Some(now + 110));
+
+    // At the retention period after its declaration a never-uploaded row expires without an
+    // object of its own; an available row waits for its own deadline.
+    assert!(
+        store
+            .shared_bodies_expire(now + 99, 10, 100)
+            .unwrap()
+            .is_empty()
+    );
+    let expired = store.shared_bodies_expire(now + 100, 10, 100).unwrap();
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].digest, two);
+    assert_eq!(state(&two).state, SharedBodyState::Expired);
+    assert_eq!(state(&two).expires_at, Some(now + 100));
+    assert_eq!(state(&one).state, SharedBodyState::Available);
+    assert_eq!(
+        store
+            .shared_bodies_expire(now + 110, 10, 100)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .shared_bodies_pending_physical_delete(now + 110, 10)
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn sqlite_shared_bodies_demote_and_expire_stale_declarations() {
+    shared_bodies_demote_and_expire_stale_declarations(&Db::sqlite());
+}
+
+#[test]
+fn postgres_shared_bodies_demote_and_expire_stale_declarations() {
+    if let Some(db) = Db::postgres() {
+        shared_bodies_demote_and_expire_stale_declarations(&db);
     }
 }

@@ -33,7 +33,7 @@ pub enum ChangeCaptureCommand {
     SettingsRecovery(change_capture_client::SettingsRecoveryArgs),
     /// Read one concise shared change record without running a model or mutating Hub state.
     Show(ShowArgs),
-    /// List, read or delete the shared conversation bodies of one Work (Work owner and Hub admins).
+    /// List, read or delete the shared conversation bodies of one Work (the person who shared it and Hub admins).
     Conversation(ConversationArgs),
     /// Report one checkout's capture binding and inspect its spool without recovery or mutation.
     Status(StatusArgs),

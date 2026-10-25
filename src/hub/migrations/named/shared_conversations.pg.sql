@@ -19,9 +19,11 @@ CREATE TABLE hub_change_shared_bodies (
     physical_deleted_at BIGINT CHECK (physical_deleted_at IS NULL OR physical_deleted_at >= 0),
     delete_attempts BIGINT NOT NULL DEFAULT 0 CHECK (delete_attempts >= 0),
     next_delete_at BIGINT CHECK (next_delete_at IS NULL OR next_delete_at >= 0),
-    CHECK (state = 'declared' OR state = 'deleted' OR (uploaded_at IS NOT NULL AND expires_at IS NOT NULL)),
+    CHECK (state <> 'available' AND state <> 'expired' OR expires_at IS NOT NULL),
+    CHECK (state <> 'available' OR uploaded_at IS NOT NULL),
     CHECK ((state = 'deleted') = (deleted_at IS NOT NULL AND deleted_by IS NOT NULL)),
     PRIMARY KEY (work, digest, author)
 );
 CREATE INDEX hub_change_shared_bodies_expiry ON hub_change_shared_bodies (expires_at) WHERE state = 'available';
 CREATE INDEX hub_change_shared_bodies_sweep ON hub_change_shared_bodies (COALESCE(deleted_at, expires_at)) WHERE physical_deleted_at IS NULL AND state IN ('expired', 'deleted');
+CREATE INDEX hub_change_shared_bodies_stale ON hub_change_shared_bodies (declared_at) WHERE state = 'declared';

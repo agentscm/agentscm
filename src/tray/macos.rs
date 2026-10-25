@@ -794,7 +794,10 @@ fn share_outcome(
         ),
         (Ok(()), _) => (
             format!("Sharing off for {}", request.label),
-            "Sharing off: conversations stay on this machine; already-uploaded copies remain until they expire or you delete them".into(),
+            format!(
+                "Sharing off for {}: new conversations are no longer uploaded; already-uploaded copies remain until they expire or you delete them",
+                request.label
+            ),
         ),
     }
 }
@@ -1779,7 +1782,8 @@ mod tests {
         assert!(body.contains("redacted") && body.contains("Hub admins"));
         request.desired = CaptureModeV1::MetadataOnly;
         let (_, body) = share_outcome(&request, &Ok(()));
-        assert!(body.contains("stay on this machine") && body.contains("remain until"));
+        assert!(body.starts_with("Sharing off for project:"));
+        assert!(body.contains("no longer uploaded") && body.contains("remain until"));
         let (title, body) = share_outcome(&request, &Err("no enabled capture binding".into()));
         assert_eq!(title, "Could not change conversation sharing");
         assert_eq!(body, "no enabled capture binding");

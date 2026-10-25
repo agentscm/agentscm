@@ -1559,6 +1559,8 @@ mod shared_bodies {
         fail_delete_of: Arc<Mutex<Option<String>>>,
         /// Runs once, after the next write has stored its bytes.
         during_put: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        /// Runs once, after the next successful deletion has removed its object.
+        during_delete: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
     impl ImmutableBackend for Flaky {
@@ -1600,7 +1602,11 @@ mod shared_bodies {
             {
                 return Err(agentscm::Error::Io(std::io::Error::other("injected")));
             }
-            self.inner.delete_incarnation(key, incarnation)
+            let removed = self.inner.delete_incarnation(key, incarnation);
+            if let Some(step) = self.during_delete.lock().unwrap().take() {
+                step();
+            }
+            removed
         }
 
         fn get_range_verified(
@@ -1675,6 +1681,7 @@ mod shared_bodies {
                 fail_put: AtomicBool::new(false),
                 fail_delete_of: Arc::default(),
                 during_put: Mutex::new(None),
+                during_delete: Mutex::new(None),
             });
             let login = LoginConfig::from_lookup("", |name| {
                 (name == "AGENTSCM_ADMINS").then(|| "github:#900".to_owned())
@@ -2388,9 +2395,22 @@ mod shared_bodies {
             json_of(response).await,
             json!({"error": "integrity_failure"})
         );
-        // The listing only knows the row, so it still says shared.
+        // The row is demoted so the client uploads again, and the upload restores it.
+        assert_eq!(f.row().state, SharedBodyState::Declared);
         let (_, page) = f.list(&f.owner_secret, "").await;
-        assert_eq!(page["entries"][0]["availability"], "shared");
+        assert_eq!(page["entries"][0]["availability"], "local");
+        let (_, answer) = f
+            .missing(Some(&f.owner_secret), json!({"digests": [f.sha]}))
+            .await;
+        assert_eq!(answer["missing"], json!([f.sha]));
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            f.read(&f.owner_secret, &f.sha).await.status(),
+            StatusCode::OK
+        );
         // A caller without access is refused before the backend is consulted.
         assert_eq!(
             f.read(&f.member_secret, &f.sha).await.status(),
@@ -3114,6 +3134,132 @@ mod shared_bodies {
         );
         assert!(f.object().is_none());
         assert!(f.row().physical_deleted_at.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_upload_marked_available_during_a_removal_is_demoted_and_uploads_again() {
+        let f = Fixture::start().await;
+        let helper_token = f.token_of(&f.helper_secret);
+        f.declare_as(&helper_token, HELPER_SESSION, 1, &[&f.body]);
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::NO_CONTENT
+        );
+        // The helper's declaration does not keep the object, so the owner's delete removes it.
+        // The helper's upload marks its row available just after, before writing any bytes.
+        let (store, work_id, sha) = (f.store.clone(), f.work_id.clone(), f.sha.clone());
+        let helper = f.row_of(&f.helper_secret, &f.sha).author;
+        *f.backend.during_delete.lock().unwrap() = Some(Box::new(move || {
+            store
+                .shared_body_mark_available(&work_id, &sha, &helper, unix_now(), DAY)
+                .unwrap();
+        }));
+        assert_eq!(
+            f.delete(&f.owner_secret, &f.sha).await,
+            StatusCode::NO_CONTENT
+        );
+        assert!(f.object().is_none());
+        assert_eq!(
+            f.row_of(&f.helper_secret, &f.sha).state,
+            SharedBodyState::Declared
+        );
+        let (_, answer) = f
+            .missing(Some(&f.helper_secret), json!({"digests": [f.sha]}))
+            .await;
+        assert_eq!(answer["missing"], json!([f.sha]));
+        // The helper's retry writes the object again.
+        assert_eq!(
+            f.put(&f.helper_secret, &f.sha, f.body.clone()).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(f.object().as_deref(), Some(f.body.as_slice()));
+        assert_eq!(
+            f.read(&f.helper_secret, &f.sha).await.status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unuploaded_declaration_does_not_keep_the_object_and_expires_unused() {
+        let f = Fixture::start().await;
+        let helper_token = f.token_of(&f.helper_secret);
+        f.declare_as(&helper_token, HELPER_SESSION, 1, &[&f.body]);
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            f.delete(&f.owner_secret, &f.sha).await,
+            StatusCode::NO_CONTENT
+        );
+        assert!(f.object().is_none());
+        // The helper's later upload writes it again.
+        assert_eq!(
+            f.put(&f.helper_secret, &f.sha, f.body.clone()).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(f.object().as_deref(), Some(f.body.as_slice()));
+
+        // A declaration never uploaded expires at the retention period after it was declared.
+        let g = Fixture::start().await;
+        let declared = g.row().declared_at;
+        let report = sweep_shared_bodies(&g.state, declared + 30 * DAY - 1)
+            .await
+            .unwrap();
+        assert_eq!(report, SweepReport::default());
+        let report = sweep_shared_bodies(&g.state, declared + 30 * DAY)
+            .await
+            .unwrap();
+        assert_eq!(
+            report,
+            SweepReport {
+                expired: 1,
+                deleted: 1,
+                failed: 0
+            }
+        );
+        assert_eq!(g.row().state, SharedBodyState::Expired);
+        assert_eq!(
+            g.put(&g.owner_secret, &g.sha, g.body.clone()).await,
+            StatusCode::GONE
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_write_reverts_the_row_so_the_client_retries() {
+        let f = Fixture::start().await;
+        f.backend.fail_put.store(true, Ordering::SeqCst);
+        let status = f.put(&f.owner_secret, &f.sha, f.body.clone()).await;
+        assert!(status.is_server_error());
+        assert_eq!(f.row().state, SharedBodyState::Declared);
+        let (_, answer) = f
+            .missing(Some(&f.owner_secret), json!({"digests": [f.sha]}))
+            .await;
+        assert_eq!(answer["missing"], json!([f.sha]));
+        f.backend.fail_put.store(false, Ordering::SeqCst);
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(f.row().state, SharedBodyState::Available);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn another_authors_declared_size_neither_blocks_nor_reveals() {
+        let f = Fixture::start().await;
+        let mut batch = f.batch("other-size");
+        batch.session.session_id = HELPER_SESSION.into();
+        let artifact = batch.events[0].artifact.as_mut().unwrap();
+        artifact.size_bytes += 1;
+        f.store
+            .change_ingest(&f.token_of(&f.helper_secret), &batch, unix_now())
+            .unwrap();
+        // Each keeps their own declared size.
+        assert_eq!(f.row().size_bytes, f.body.len() as u64);
+        assert_eq!(
+            f.row_of(&f.helper_secret, &f.sha).size_bytes,
+            f.body.len() as u64 + 1
+        );
     }
 
     /// A configured checkout whose spool already holds one shared-approved event batch.

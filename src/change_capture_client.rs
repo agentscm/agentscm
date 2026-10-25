@@ -1051,7 +1051,9 @@ fn conversation_request(
 
 fn conversation_status_error(status: u16) -> Error {
     match status {
-        403 => invalid("only the Work owner and Hub admins can read or delete this conversation"),
+        403 => invalid(
+            "only the person who shared it and Hub admins can read or delete this conversation",
+        ),
         404 => invalid("no such shared conversation body"),
         410 => invalid("this conversation body has expired or been deleted"),
         424 => invalid("the stored body is missing or failed verification (integrity_failure)"),
@@ -1379,7 +1381,7 @@ async fn upload_shared_bodies(
             .await
             .map_err(|_| invalid("capture Hub body upload unavailable"))?;
         match status {
-            // Gone: the Work owner deleted the body or it expired, so there is nothing to retry.
+            // Gone: its author deleted the body or it expired, so there is nothing to retry.
             204 | 410 => {}
             400 | 401 | 403 | 404 | 409 => return Ok(BodyUpload::Blocked),
             _ => {

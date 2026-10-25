@@ -414,6 +414,10 @@ pub(crate) struct SessionAssociationV1 {
     pub generation: i64,
     pub parent_session_id: Option<String>,
     pub capture_mode: CaptureModeV1,
+    /// The mode this session was first seen with. Absent in older records, which count as
+    /// originally in `capture_mode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_capture_mode: Option<CaptureModeV1>,
 }
 
 #[derive(Clone, Debug)]
@@ -2076,11 +2080,19 @@ impl LocalSpool {
             generation,
             parent_session_id: parent_session_id.map(str::to_owned),
             capture_mode,
+            original_capture_mode: None,
         };
         validate_association(&association)?;
         let path = association_path(&self.root, observed_session_id);
-        let bytes = serde_json::to_vec(&association)?;
         let _lock = self.lock()?;
+        let association = SessionAssociationV1 {
+            original_capture_mode: Some(
+                load_association(&self.root, observed_session_id)?
+                    .map_or(capture_mode, |earlier| earlier.first_capture_mode()),
+            ),
+            ..association
+        };
+        let bytes = serde_json::to_vec(&association)?;
         if load_association(&self.root, observed_session_id)?.as_ref() == Some(&association) {
             return Ok(());
         }
@@ -2101,22 +2113,34 @@ impl LocalSpool {
         parent_session_id: Option<&str>,
         capture_mode: CaptureModeV1,
     ) -> Result<(Option<String>, CaptureModeV1)> {
-        let live = SessionAssociationV1 {
+        let mut live = SessionAssociationV1 {
             observed_session_id: observed_session_id.to_owned(),
             canonical_session_id: canonical_session_id.to_owned(),
             work_id: work_id.to_owned(),
             generation,
             parent_session_id: parent_session_id.map(str::to_owned),
             capture_mode,
+            original_capture_mode: Some(capture_mode),
         };
         validate_association(&live)?;
         let _lock = self.lock()?;
-        if let Some(pinned) = load_association(&self.root, observed_session_id)?
+        let earlier = load_association(&self.root, observed_session_id)?;
+        if let Some(pinned) = &earlier
             && pinned.canonical_session_id == canonical_session_id
             && pinned.work_id == work_id
             && pinned.generation == generation
         {
-            return Ok((pinned.parent_session_id, pinned.capture_mode));
+            return Ok((pinned.parent_session_id.clone(), pinned.capture_mode));
+        }
+        // A session that began unshared never starts sharing, even under a new Work or generation.
+        if let Some(earlier) = &earlier {
+            let first = earlier.first_capture_mode();
+            live.original_capture_mode = Some(first);
+            if capture_mode == CaptureModeV1::SharedConversation
+                && first != CaptureModeV1::SharedConversation
+            {
+                live.capture_mode = first;
+            }
         }
         let bytes = serde_json::to_vec(&live)?;
         let path = association_path(&self.root, observed_session_id);
@@ -4744,6 +4768,12 @@ fn validate_deferred(deferred: &DeferredHookV1) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+impl SessionAssociationV1 {
+    fn first_capture_mode(&self) -> CaptureModeV1 {
+        self.original_capture_mode.unwrap_or(self.capture_mode)
+    }
 }
 
 fn validate_association(association: &SessionAssociationV1) -> Result<()> {

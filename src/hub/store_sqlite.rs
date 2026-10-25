@@ -290,7 +290,8 @@ fn shared_body_row(row: &rusqlite::Row<'_>) -> Result<SharedBodyRow> {
 }
 
 /// Records that an accepted event named a shared body for the human owning `token`. Each human's
-/// declaration of a digest is its own row, and a later one must agree on size with any earlier.
+/// declaration of a digest is its own row, and a later one must agree on size with the same
+/// human's earlier one (never another's, which would leak that they declared it).
 fn declare_shared_body(
     tx: &Transaction<'_>,
     batch: &CaptureBatchV1,
@@ -302,8 +303,9 @@ fn declare_shared_body(
     let size = artifact.size_bytes as i64;
     let declared: Option<i64> = tx
         .query_row(
-            "SELECT size_bytes FROM hub_change_shared_bodies WHERE work=?1 AND digest=?2 LIMIT 1",
-            params![batch.work_id, artifact.digest],
+            "SELECT size_bytes FROM hub_change_shared_bodies WHERE work=?1 AND digest=?2
+               AND author=(SELECT owner FROM hub_agent_tokens WHERE id=?3)",
+            params![batch.work_id, artifact.digest, token],
             |row| row.get(0),
         )
         .optional()?;
@@ -6186,26 +6188,49 @@ impl Store for SqliteStore {
         Ok(rows)
     }
 
-    fn shared_bodies_expire(&self, now: i64, limit: usize) -> Result<Vec<SharedBodyRow>> {
+    fn shared_bodies_expire(
+        &self,
+        now: i64,
+        limit: usize,
+        retention_seconds: i64,
+    ) -> Result<Vec<SharedBodyRow>> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let rows = {
             let mut statement = tx.prepare(&format!(
-                "UPDATE hub_change_shared_bodies SET state='expired'
-                 WHERE state='available' AND (work,digest,author) IN (
+                "UPDATE hub_change_shared_bodies SET state='expired',
+                     expires_at=CASE WHEN state='declared' THEN declared_at+?3 ELSE expires_at END
+                 WHERE (work,digest,author) IN (
                      SELECT work,digest,author FROM hub_change_shared_bodies
-                     WHERE state='available' AND expires_at<=?1
-                     ORDER BY expires_at,work,digest,author LIMIT ?2)
+                     WHERE (state='available' AND expires_at<=?1)
+                        OR (state='declared' AND declared_at+?3<=?1)
+                     ORDER BY CASE WHEN state='declared' THEN declared_at+?3 ELSE expires_at END,
+                              work,digest,author LIMIT ?2)
                  RETURNING {SHARED_BODY_COLUMNS}"
             ))?;
             statement
-                .query_map(params![now, limit as i64], |row| Ok(shared_body_row(row)))?
+                .query_map(params![now, limit as i64, retention_seconds], |row| {
+                    Ok(shared_body_row(row))
+                })?
                 .collect::<std::result::Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>>>()?
         };
         tx.commit()?;
         Ok(rows)
+    }
+
+    fn shared_body_demote_available(
+        &self,
+        work_id: &str,
+        digest: &str,
+        author: Option<&str>,
+    ) -> Result<usize> {
+        Ok(self.conn().execute(
+            "UPDATE hub_change_shared_bodies SET state='declared'
+             WHERE work=?1 AND digest=?2 AND (?3 IS NULL OR author=?3) AND state='available'",
+            params![work_id, digest, author],
+        )?)
     }
 
     fn shared_bodies_pending_physical_delete(
@@ -6230,7 +6255,7 @@ impl Store for SqliteStore {
     fn shared_body_object_in_use(&self, work_id: &str, digest: &str) -> Result<bool> {
         Ok(self.conn().query_row(
             "SELECT EXISTS (SELECT 1 FROM hub_change_shared_bodies
-                 WHERE work=?1 AND digest=?2 AND state IN ('declared','available'))",
+                 WHERE work=?1 AND digest=?2 AND state='available')",
             params![work_id, digest],
             |row| row.get(0),
         )?)

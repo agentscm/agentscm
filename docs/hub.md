@@ -638,7 +638,7 @@ is no per-body grant.
   1 MiB) and bytes whose SHA-256 matches, and the retention deadline starts when it succeeds (204),
   also when another author already stored identical bytes. `DELETE` on the same path (the author, or a
   Hub admin for every author's copy) tombstones the body and removes the object once no other
-  declaration of the same digest is declared or available.
+  declaration of the same digest is available.
 - `POST .../conversation/missing` with `{"digests": [...]}` (at most 100 lower-hex digests; a
   non-read-only token) answers `{"missing": [...], "gone": [...]}`: `missing` are the caller's own
   declarations still awaiting an upload, `gone` are digests the caller never declared or that expired
