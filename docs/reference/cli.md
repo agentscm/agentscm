@@ -114,6 +114,7 @@ agentscm change-capture prune-quarantine --spool /absolute/private/spool OPAQUE_
 agentscm change-capture compact --spool /absolute/private/spool --limit 100
 agentscm change-capture settings-recovery --root /absolute/repository
 agentscm change-capture unconfigure --root /absolute/repository
+agentscm change-capture forget --root /absolute/repository
 ```
 
 `inspect` is a bounded read-only view. It does not recover, clean, change modes, acquire mutation
@@ -127,7 +128,9 @@ or partial spool, namespace change, or lower limit before that guarded operation
 state. Live moves, restores, and replacements are unsupported; a change is detected when a guarded
 path check observes it, rather than by continuous path containment. `unconfigure` removes the marked
 hooks and disables new capture while retaining this lineage; configuring the same checkout against
-a different spool is unavailable in this version. `status` reports active, disabled, or paused state
+a different spool is unavailable in this version. `forget` removes only a disabled checkout's
+binding from the config so it can be set up again for another repository or Hub; it never deletes
+the spool and prints its path. `status` reports active, disabled, or paused state
 and embeds the read-only inspection result. A disabled binding can still reconcile an already
 retained uncertain recipe attempt when current authorization and the existing reboot proof allow
 it; it cannot start a new recipe. At most 128 checkout lineages are retained in this local config;

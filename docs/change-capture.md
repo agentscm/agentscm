@@ -101,33 +101,72 @@ agentscm change-capture set-mode --root /absolute/repository --mode metadata-onl
 Hub page opened from this computer (**Settings → Conversation sharing**) have the same switch per
 checkout, **Share agent conversations with Hub**; it is unchecked by default and does not need
 `configure` first (see below). Turning it off only switches the mode. The capture config is written as version 6 only while
-some checkout is in `shared-conversation` mode; an older binary refuses a version 6 file, and the
-file returns to version 5 when no checkout shares. Downgrading the client after this release is
+some checkout is in `shared-conversation` mode or a binding records a non-default Claude settings
+path (see below); an older binary refuses a version 6 file instead of silently dropping a field,
+and the file returns to version 5 when neither applies. Downgrading the client after this release is
 unsupported: older binaries cannot read the new session association records.
 
 ### One-step setup from the menu bar and the local page
 
-Both switches call one library function, `enable_capture`, for a checkout that has a current client
-connection. All three surfaces read the setting through one function, `capture_setting`
-(configured, enabled, mode); nothing keeps a second copy of it.
+Turning sharing on from either surface calls one library function, `enable_capture`, for a
+checkout that has a current client connection; turning it off calls `set_capture_mode`. All three
+surfaces read the setting through one function, `capture_setting` (configured, enabled, mode);
+nothing keeps a second copy of it.
+
+**Consent is bound to what was shown.** The menu bar app and the page pass the repository and Hub
+they displayed. `enable_capture` (and `set_capture_mode` when it turns sharing on) read the
+checkout's connection under the capture config lock and refuse with `this checkout is now connected
+to <repository> on <hub>; refresh and confirm again` if it is not that one, so a checkout
+reconnected to another Hub between the consequences and the click is never shared there. Turning
+sharing off and the `set-mode` and `configure` commands (where you typed the command) pass no
+expectation. Whether to create the binding, re-enable it or only change the mode is decided from
+the bindings read under that same lock, so a concurrent `configure` is not overwritten.
+
+The menu bar app asks before it acts. Clicking **Share agent conversations with Hub** only opens
+the status window with the consequences and adds **Confirm: share conversations with <hub>** to
+that checkout's menu; only that item turns sharing on, and it disappears if the checkout, its Hub
+or its mode changes. Turning sharing off needs no confirmation. The page does the same with its own
+confirmation panel.
 
 - With an enabled binding it only changes the mode, exactly like `set-mode`.
 - With a disabled binding (after `unconfigure`) it re-enables through the `configure` code path with
   everything the binding saved (spool, worktree id, base ref, setup digest, rules, recipes, limits)
-  and reinstalls the hooks at the default settings path.
+  and reinstalls the hooks in the Claude settings file the binding recorded (below), else the
+  default `ROOT/.claude/settings.local.json`.
 - With no binding it builds one through the same code path as `configure` with these defaults:
-  the private spool `<config>/agentscm/capture-spools/<id>` (mode 0700, `<id>` the first 32 hex
-  characters of a SHA-256 of the canonical root); worktree id `checkout_<id'>` derived the same way
-  from a different fixed label (a stable opaque id, not a host path); base ref `origin/main`; one
-  action rule, `Bash=execution:partial:process_exit_code`; no recipes and no Claude history root;
-  default spool limits; hooks in `ROOT/.claude/settings.local.json`. The setup digest is the
-  SHA-256 of a fixed label and the root. It is a caller assertion that identifies this default, not
-  a measurement of the agent setup.
+  the private spool `<config>/agentscm/capture-spools/<random>` (mode 0700, 16 random bytes in
+  hex, recorded in the binding); worktree id `checkout_<32 random hex characters>`; setup digest 32
+  random bytes in hex; base ref the checkout's default branch from `origin/HEAD` as `origin/<name>`
+  when that resolves to a commit, else `origin/main`; one action rule,
+  `Bash=execution:partial:process_exit_code`; no recipes and no Claude history root; default spool
+  limits; hooks in `ROOT/.claude/settings.local.json`. The ids are random, not derived from the
+  path, so they cannot be recomputed offline from Hub records by guessing paths and two computers
+  with the same path never share one; the saved binding is what keeps them stable across
+  re-enables. The setup digest is a caller assertion that identifies this default, not a
+  measurement of the agent setup.
+
+A Claude settings file that one-step setup creates, and the transaction files saved beside it, are
+added to the repository's local `.git/info/exclude` unless Git already ignores them, so they never
+appear as untracked files. A file that already existed is not touched and the tracked `.gitignore`
+is never edited.
+
+A binding records its Claude settings path (`claude_settings`) only when it is not the default, and
+`unconfigure` and re-enabling use the recorded file. A file that records it is version 6, which
+older binaries refuse rather than ignore the field; bindings at the default path keep the config
+readable by them.
 
 A checkout without a current client connection gets the error `no client connection for this
 checkout` and nothing is changed. Only an explicit request for `shared-conversation` selects that
 mode; setting up capture in `metadata-only` mode never uploads a conversation body. Use
 `change-capture configure` for anything else (other rules, recipes, a history root, a chosen spool).
+
+A disabled binding keeps the repository and Hub it was saved for, because its private spool keeps
+that history apart. If the checkout is now connected to another repository or Hub, turning sharing
+on fails with that explanation instead of a lineage error. To start fresh run
+`agentscm change-capture unconfigure --root PATH` (if capture is still on), then
+`agentscm change-capture forget --root PATH`, which removes only a disabled binding from the config.
+It never deletes the spool: it prints the spool path (and `spool_retained: true`) so you can
+`export` or delete it yourself. The next enable creates a new spool and new random ids.
 
 What leaves the machine, and when:
 
