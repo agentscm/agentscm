@@ -74,6 +74,14 @@ describe('repository explorer decoders', () => {
     expect(() => decodeExplorerEvidence({ ...evidence(), entries: [{ ...sessionEntry(), relation: 'authored_file' }] })).toThrow(/malformed data/)
   })
 
+  it('decodes every capture mode a session can have and refuses an unknown one', () => {
+    for (const mode of ['metadata_only', 'local_conversation', 'shared_conversation']) {
+      const decoded = decodeExplorerEvidence({ ...evidence(), entries: [{ ...sessionEntry(), capture_mode: mode }] })
+      expect(decoded.entries[0]).toMatchObject({ capture_mode: mode })
+    }
+    expect(() => decodeExplorerEvidence({ ...evidence(), entries: [{ ...sessionEntry(), capture_mode: 'everything' }] })).toThrow(/capture_mode/)
+  })
+
   it('requires conversation event identity to match its selected Work and session', () => {
     expect(decodeExplorerConversation(conversation()).events[0]!.body.content).toContain('<script>')
     const wrong = conversation()

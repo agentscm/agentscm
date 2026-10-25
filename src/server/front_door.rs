@@ -15,11 +15,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use agentscm::Result;
+use agentscm::change_record::CaptureModeV1;
 use agentscm::repo_explorer::Explorer;
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -579,6 +580,12 @@ pub(super) fn router(state: AppState, front_door: Arc<FrontDoor>) -> Router {
     let granted = Router::new()
         .route("/v1/local/repositories", get(repositories))
         .route("/v1/local/session", delete(disconnect))
+        .route(
+            "/v1/local/capture",
+            get(capture_settings)
+                .post(capture_change)
+                .layer(DefaultBodyLimit::max(1024)),
+        )
         .with_state(front_door.clone())
         .merge(selected)
         .layer(middleware::from_fn_with_state(front_door.clone(), guard));
@@ -776,6 +783,113 @@ async fn repositories(State(front_door): State<Arc<FrontDoor>>) -> Response {
         })
         .collect();
     Json(json!({"version": 1, "repositories": repositories})).into_response()
+}
+
+/// One listed checkout's sharing state, named by the repository and Hub the page already lists.
+fn capture_row(connection: &Connection) -> serde_json::Value {
+    let setting = crate::change_capture_client::capture_setting(&connection.root);
+    json!({
+        "repository": connection.repo,
+        "hub": connection.hub,
+        "folder": connection.root.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default(),
+        "configured": setting.is_some_and(|setting| setting.configured),
+        "enabled": setting.is_some_and(|setting| setting.enabled),
+        "mode": setting.and_then(|setting| setting.mode),
+        "readable": setting.is_some(),
+    })
+}
+
+async fn capture_settings(State(front_door): State<Arc<FrontDoor>>) -> Response {
+    let checkouts = front_door.connected(true).await;
+    let rows =
+        tokio::task::spawn_blocking(move || checkouts.iter().map(capture_row).collect::<Vec<_>>())
+            .await
+            .unwrap_or_default();
+    Json(json!({"version": 1, "checkouts": rows})).into_response()
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureChange {
+    repository: String,
+    hub: String,
+    mode: CaptureModeV1,
+    /// Required to turn sharing on: the person has seen what leaves this computer.
+    #[serde(default)]
+    confirm_sharing: bool,
+}
+
+/// Turns conversation sharing on or off for one listed checkout. Sharing can start uploading
+/// conversation bodies, so it needs the page's own origin, a live grant and an explicit
+/// confirmation; the checkout is found by the listed repository and Hub, never by a path.
+async fn capture_change(
+    State(front_door): State<Arc<FrontDoor>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let Ok(change) = serde_json::from_slice::<CaptureChange>(&body) else {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "expected {repository, hub, mode, confirm_sharing}",
+        );
+    };
+    let sharing = match change.mode {
+        CaptureModeV1::SharedConversation => true,
+        CaptureModeV1::MetadataOnly => false,
+        CaptureModeV1::LocalConversation => {
+            return refuse(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "mode must be metadata_only or shared_conversation",
+            );
+        }
+    };
+    if sharing && !change.confirm_sharing {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "confirmation_required",
+            "turning sharing on needs confirm_sharing: true after the person has seen what is uploaded",
+        );
+    }
+    let connection = front_door
+        .connected(true)
+        .await
+        .iter()
+        .find(|connection| {
+            connection.repo.eq_ignore_ascii_case(&change.repository) && connection.hub == change.hub
+        })
+        .cloned();
+    let Some(connection) = connection else {
+        return refuse(StatusCode::NOT_FOUND, "unknown_checkout", REPOSITORY_GONE);
+    };
+    let root = connection.root.clone();
+    let mode = change.mode;
+    let outcome = tokio::task::spawn_blocking(move || {
+        if sharing {
+            crate::change_capture_client::enable_capture(&root, mode)
+        } else {
+            crate::change_capture_client::set_capture_mode(&root, mode)
+        }
+    })
+    .await;
+    match outcome {
+        Ok(Ok(_)) => {
+            let row = tokio::task::spawn_blocking(move || capture_row(&connection))
+                .await
+                .unwrap_or_default();
+            Json(json!({"version": 1, "checkout": row})).into_response()
+        }
+        Ok(Err(error)) => refuse(
+            StatusCode::CONFLICT,
+            "capture_unavailable",
+            &error.to_string(),
+        ),
+        Err(_) => refuse(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "capture_failed",
+            "the change stopped unexpectedly",
+        ),
+    }
 }
 
 async fn disconnect(

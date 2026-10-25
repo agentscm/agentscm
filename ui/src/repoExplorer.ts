@@ -158,7 +158,7 @@ export interface ExplorerSessionEvidence {
   generation: number
   session_id: string
   harness: 'claude_code' | 'codex'
-  capture_mode: 'metadata_only' | 'local_conversation'
+  capture_mode: 'metadata_only' | 'local_conversation' | 'shared_conversation'
   first_observed_at: number
   last_observed_at: number
   event_count: number
@@ -562,7 +562,7 @@ function decodeSessionEvidence(value: unknown, path: string): ExplorerSessionEvi
     generation: integer(raw['generation'], `${path}.generation`, 1),
     session_id: nonempty(raw['session_id'], `${path}.session_id`, 255),
     harness: enumValue(raw['harness'], ['claude_code', 'codex'] as const, `${path}.harness`),
-    capture_mode: enumValue(raw['capture_mode'], ['metadata_only', 'local_conversation'] as const, `${path}.capture_mode`),
+    capture_mode: enumValue(raw['capture_mode'], ['metadata_only', 'local_conversation', 'shared_conversation'] as const, `${path}.capture_mode`),
     first_observed_at: integer(raw['first_observed_at'], `${path}.first_observed_at`),
     last_observed_at: integer(raw['last_observed_at'], `${path}.last_observed_at`),
     event_count: integer(raw['event_count'], `${path}.event_count`),

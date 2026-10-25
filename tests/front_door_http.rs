@@ -228,6 +228,16 @@ impl FrontDoor {
     }
 
     fn request(&self, method: &str, path: &str, headers: &[(&str, &str)]) -> (u16, String, String) {
+        self.request_with_body(method, path, headers, "")
+    }
+
+    fn request_with_body(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> (u16, String, String) {
         let mut stream = TcpStream::connect(self.address).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(15)))
@@ -239,7 +249,7 @@ impl FrontDoor {
         for (name, value) in headers {
             request.push_str(&format!("{name}: {value}\r\n"));
         }
-        request.push_str("Content-Length: 0\r\n\r\n");
+        request.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
         stream.write_all(request.as_bytes()).unwrap();
         let mut response = String::new();
         stream
@@ -956,5 +966,198 @@ fn signing_this_computer_out_of_its_hub_revokes_the_page_token_on_next_use() {
         )
         .0,
         200
+    );
+}
+
+fn capture_config(door: &FrontDoor) -> Option<Value> {
+    fs::read_to_string(door.config.join("agentscm/change-capture.json"))
+        .ok()
+        .map(|text| serde_json::from_str(&text).unwrap())
+}
+
+#[test]
+fn local_settings_turn_sharing_on_only_with_confirmation_and_set_up_the_checkout_in_one_step() {
+    let temp = TempDir::new().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap().join("widgets");
+    checkout(&root);
+    let (hub, seen) = fake_hub();
+    let door = FrontDoor::start(&temp, &hub, &root);
+    let grant = connect(&door);
+    let credential = format!("Bearer local:{grant}:{REPO}");
+    let origin = door.origin();
+    let auth = [
+        ("Authorization", credential.as_str()),
+        ("Origin", origin.as_str()),
+    ];
+    let post = |headers: &[(&str, &str)], body: Value| {
+        door.request_with_body("POST", "/v1/local/capture", headers, &body.to_string())
+    };
+    let share = |confirm: Option<bool>| {
+        let mut body = json!({"repository": REPO, "hub": hub, "mode": "shared_conversation"});
+        if let Some(confirm) = confirm {
+            body["confirm_sharing"] = json!(confirm);
+        }
+        body
+    };
+
+    // Nothing is configured, and listing it does not configure it.
+    let (status, head, listed) = door.request("GET", "/v1/local/capture", &auth);
+    assert_eq!(status, 200, "{listed}");
+    assert!(!head.contains("access-control-allow"));
+    let listed: Value = serde_json::from_str(&listed).unwrap();
+    assert_eq!(listed["checkouts"][0]["repository"], REPO);
+    assert_eq!(listed["checkouts"][0]["configured"], false);
+    assert_eq!(listed["checkouts"][0]["mode"], Value::Null);
+    assert!(capture_config(&door).is_none());
+
+    // Another site, a missing or unknown grant, and a missing or false confirmation change nothing.
+    let foreign = [
+        ("Authorization", credential.as_str()),
+        ("Origin", "https://evil.example"),
+    ];
+    assert_eq!(post(&foreign, share(Some(true))).0, 403);
+    assert_eq!(
+        post(&[("Origin", origin.as_str())], share(Some(true))).0,
+        401
+    );
+    let stale = format!("Bearer local:{}:{REPO}", "0".repeat(grant.len()));
+    assert_eq!(
+        post(
+            &[
+                ("Authorization", stale.as_str()),
+                ("Origin", origin.as_str())
+            ],
+            share(Some(true))
+        )
+        .0,
+        401
+    );
+    let (status, _, refused) = post(&auth, share(None));
+    assert_eq!(status, 400, "{refused}");
+    assert!(refused.contains("confirmation_required"));
+    assert_eq!(post(&auth, share(Some(false))).0, 400);
+    // The wrong shape, an unlisted checkout, a mode the page does not set and a large body are refused.
+    assert_eq!(post(&auth, json!({"checkout": "/etc"})).0, 400);
+    assert_eq!(
+        post(
+            &auth,
+            json!({"repository": REPO, "hub": hub, "mode": "local_conversation"})
+        )
+        .0,
+        400
+    );
+    let unknown = json!({"repository": "acme/other", "hub": hub, "mode": "shared_conversation", "confirm_sharing": true});
+    assert_eq!(post(&auth, unknown).0, 404);
+    let other_hub = json!({"repository": REPO, "hub": "http://127.0.0.1:9", "mode": "shared_conversation", "confirm_sharing": true});
+    assert_eq!(post(&auth, other_hub).0, 404);
+    let large = json!({"repository": "x".repeat(4096), "hub": hub, "mode": "shared_conversation", "confirm_sharing": true});
+    assert_eq!(post(&auth, large).0, 413);
+    // Switching a checkout with no binding to metadata-only has nothing to change.
+    let off = json!({"repository": REPO, "hub": hub, "mode": "metadata_only"});
+    assert_eq!(post(&auth, off.clone()).0, 409);
+    assert!(capture_config(&door).is_none());
+    assert!(!root.join(".claude/settings.local.json").exists());
+
+    // Confirmed: one request creates the binding with the documented defaults and turns sharing on.
+    let (status, _, enabled) = post(&auth, share(Some(true)));
+    assert_eq!(status, 200, "{enabled}");
+    let enabled: Value = serde_json::from_str(&enabled).unwrap();
+    assert_eq!(enabled["checkout"]["mode"], "shared_conversation");
+    let config = capture_config(&door).unwrap();
+    assert_eq!(config["version"], 6);
+    let binding = config["bindings"][0].clone();
+    assert_eq!(binding["root"], json!(root));
+    assert_eq!(binding["capture_mode"], "shared_conversation");
+    assert_eq!(binding["base_ref"], "origin/main");
+    assert_eq!(binding["hub"], json!(hub));
+    assert!(
+        binding["worktree_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("checkout_")
+    );
+    assert_eq!(
+        binding["action_rules"],
+        json!([{"native_tool": "Bash", "kind": "execution", "coverage": "partial", "result_source": "process_exit_code", "recipe_digest": null}])
+    );
+    let spool = Path::new(binding["spool"].as_str().unwrap());
+    assert!(
+        spool.starts_with(
+            door.config
+                .join("agentscm/capture-spools")
+                .canonicalize()
+                .unwrap()
+        )
+    );
+    assert_eq!(
+        fs::metadata(spool).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert!(
+        fs::read_to_string(root.join(".claude/settings.local.json"))
+            .unwrap()
+            .contains("AGENTSCM_CAPTURE_HOOK_V1")
+    );
+
+    // The same binding is what `change-capture configure` builds from those values.
+    let run = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_agentscm"))
+            .args(args)
+            .env_clear()
+            .env("XDG_CONFIG_HOME", &door.config)
+            .env("HOME", temp.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let root_arg = root.to_str().unwrap();
+    run(&["change-capture", "unconfigure", "--root", root_arg]);
+    run(&[
+        "change-capture",
+        "configure",
+        "--root",
+        root_arg,
+        "--spool",
+        spool.to_str().unwrap(),
+        "--worktree-id",
+        binding["worktree_id"].as_str().unwrap(),
+        "--setup-digest",
+        binding["setup_digest"].as_str().unwrap(),
+        "--capture-mode",
+        "shared-conversation",
+        "--action-rule",
+        "Bash=execution:partial:process_exit_code",
+    ]);
+    assert_eq!(capture_config(&door).unwrap()["bindings"][0], binding);
+
+    // Off needs no confirmation and keeps the binding.
+    let (status, _, disabled) = post(&auth, off);
+    assert_eq!(status, 200, "{disabled}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&disabled).unwrap()["checkout"]["mode"],
+        "metadata_only"
+    );
+    // A disabled binding comes back through the same path with its saved spool and worktree.
+    run(&["change-capture", "unconfigure", "--root", root_arg]);
+    let (_, _, listed) = door.request("GET", "/v1/local/capture", &auth);
+    let listed: Value = serde_json::from_str(&listed).unwrap();
+    assert_eq!(listed["checkouts"][0]["configured"], true);
+    assert_eq!(listed["checkouts"][0]["enabled"], false);
+    assert_eq!(post(&auth, share(Some(true))).0, 200);
+    let again = capture_config(&door).unwrap()["bindings"][0].clone();
+    assert_eq!(again["spool"], binding["spool"]);
+    assert_eq!(again["worktree_id"], binding["worktree_id"]);
+    assert_eq!(again["enabled"], true);
+
+    // Setting this up never talked to the Hub about conversations.
+    assert!(
+        seen.lock()
+            .unwrap()
+            .iter()
+            .all(|request| !request.contains("change-record") && !request.contains("conversation"))
     );
 }
