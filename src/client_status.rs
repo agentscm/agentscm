@@ -359,7 +359,7 @@ fn credential_status(connection: &Connection, readable: bool, now: i64) -> Crede
     }
 }
 
-async fn check_hub(
+pub(crate) async fn check_hub(
     connection: &Connection,
     token: &str,
     client_id: Option<&str>,

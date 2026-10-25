@@ -839,6 +839,25 @@ pub fn capture_status(root: &Path) -> Result<Value> {
     }))
 }
 
+/// The enabled capture spool bound to exactly this checkout for `repository` and `hub`, found
+/// without opening or binding the spool, for read-only browsing.
+pub(crate) fn spool_for_checkout(
+    root: &Path,
+    repository: &str,
+    hub: &str,
+) -> Result<Option<PathBuf>> {
+    let root = client_config::canonical_root(root)?;
+    Ok(load()?
+        .into_iter()
+        .find(|binding| {
+            binding.enabled
+                && binding.root == root
+                && binding.repository == repository
+                && binding.hub == hub
+        })
+        .map(|binding| binding.spool))
+}
+
 pub fn binding_for_root(root: &Path) -> Result<CaptureBinding> {
     binding_for_root_mode(root, false)
 }

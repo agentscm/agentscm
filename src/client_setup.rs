@@ -746,6 +746,10 @@ fn install_locked(agent: Agent, root: &Path, program: &Path, announce: bool) -> 
         println!(
             "New local settings are Git-excluded. Review changes to any settings your repository already tracks; do not commit machine-specific configuration."
         );
+        #[cfg(unix)]
+        println!(
+            "Run `agentscm open` here to see this checkout's files, saved conversations and your team's work in your browser."
+        );
     }
     Ok(())
 }

@@ -50,6 +50,8 @@ enum UserEvent {
         std::result::Result<String, String>,
     ),
     HubOpen(std::result::Result<Box<hub_open::PreparedOpen>, hub_open::OpenError>),
+    /// Open Hub opened this computer's own Hub page (`agentscm open`).
+    HubOpenedLocally,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -628,6 +630,12 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                     spawn_refresh(self.refresh_proxy.clone(), false);
                 }
             }
+            UserEvent::HubOpenedLocally => {
+                self.opening_hub = false;
+                self.feedback.update("Hub opened", "Your browser opened this computer's Hub page, connected to your files, saved conversations and your team's work.", false);
+                self.notice = Some(Notice::Action("Hub opened in your browser".into()));
+                self.replace_menu(None);
+            }
             UserEvent::Connected(agent, repo, result) => {
                 self.installing.store(false, Ordering::Release);
                 self.notice = Some(Notice::Action(match result {
@@ -1107,6 +1115,15 @@ fn spawn_hub_open(
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build();
+        // This computer's own page first; the hosted Hub's read-only link only if it cannot start.
+        if let Ok(runtime) = &runtime
+            && runtime
+                .block_on(crate::open_cli::open_checkout(request.root()))
+                .is_ok()
+        {
+            let _ = proxy.send_event(UserEvent::HubOpenedLocally);
+            return;
+        }
         let result = match &runtime {
             Ok(runtime) => runtime.block_on(hub_open::prepare_open(request)),
             Err(_) => Err(hub_open::OpenError::Unavailable),
