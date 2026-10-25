@@ -6,6 +6,7 @@ import {
   fetchExplorerFile,
   fetchExplorerHistory,
   fetchExplorerSearch,
+  fetchExplorerSessions,
   fetchExplorerSummary,
   fetchExplorerTree,
   type ExplorerActionEvidence,
@@ -18,13 +19,14 @@ import {
   type ExplorerLimitState,
   type ExplorerSearchPage,
   type ExplorerSessionEvidence,
+  type ExplorerSessionPage,
   type ExplorerSummary,
 } from '../repoExplorer.ts'
 import { Ago, CopyButton, Empty, Icon, Notice, Pill, Skeleton, type Tone } from '../ui.tsx'
 import '../explorer.css'
 
 type Load<T> = { kind: 'idle' } | { kind: 'loading' } | { kind: 'error'; message: string } | { kind: 'ready'; value: T }
-type Tab = 'source' | 'history' | 'diff' | 'evidence'
+type Tab = 'source' | 'history' | 'diff' | 'evidence' | 'conversations'
 
 function useResource<T>(key: string | null, load: (signal: AbortSignal) => Promise<T>): Load<T> {
   const [state, setState] = useState<{ key: string | null; load: Load<T> }>({ key: null, load: { kind: 'idle' } })
@@ -192,7 +194,35 @@ function WorkLink({ workId, repository, hubRepository }: { workId: string; repos
   return hubRepository === repository ? <a href={`#coordination/work/${encodeURIComponent(workId)}`} className="explorer-work-link">Open Work <Icon name="arrow-up-right" /></a> : <span className="small muted">Work link unavailable for this Hub repository</span>
 }
 
-function EvidenceView({ load, pager, repository, hubRepository, viewedCommit, currentCommit, focusedWork, onFocusWork, onUseCurrent, onCompareSource, onConversation }: { load: Load<ExplorerEvidencePage>; pager: ReturnType<typeof useCursor>; repository: string; hubRepository?: string | null; viewedCommit: string; currentCommit: string; focusedWork?: string; onFocusWork: (value?: string) => void; onUseCurrent: () => void; onCompareSource: (left: string, right: string) => void; onConversation: (entry: ExplorerSessionEvidence) => void }) {
+function SessionRow({ entry, repository, hubRepository, onConversation }: { entry: ExplorerSessionEvidence; repository: string; hubRepository?: string | null; onConversation: (entry: ExplorerSessionEvidence) => void }) {
+  return (
+    <li className="explorer-evidence-row">
+      <div className="explorer-evidence-heading"><Icon name="chat-square-text" /><strong>{entry.harness === 'claude_code' ? 'Claude Code session' : 'Codex session'}</strong><Pill tone={entry.capture_mode === 'local_conversation' ? 'brand' : 'muted'}>{entry.capture_mode === 'local_conversation' ? 'Visible turns retained' : 'Metadata only'}</Pill></div>
+      <p>{entry.event_count} visible {entry.event_count === 1 ? 'event' : 'events'} in the retained session projection.</p>
+      <p className="small muted">Same Work/session only · no prompt-to-file or authorship claim{entry.unavailable_body_count ? ` · ${entry.unavailable_body_count} unavailable bodies` : ''}{entry.capture_gap_count ? ` · ${entry.capture_gap_count} capture gaps` : ''}</p>
+      <div className="explorer-row-actions"><button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => onConversation(entry)}>Open conversation</button><WorkLink workId={entry.work_id} repository={repository} hubRepository={hubRepository} /></div>
+    </li>
+  )
+}
+
+/** Every saved conversation for this repository, reachable from its Work even with no recorded commit. */
+function ConversationsView({ load, pager, repository, hubRepository, onConversation }: { load: Load<ExplorerSessionPage>; pager: ReturnType<typeof useCursor>; repository: string; hubRepository?: string | null; onConversation: (entry: ExplorerSessionEvidence) => void }) {
+  if (load.kind === 'idle' || load.kind === 'loading') return <Skeleton rows={6} />
+  if (load.kind === 'error') return <Notice tone="bad" title="Could not read saved conversations">{load.message}</Notice>
+  const page = load.value
+  const coverage = page.projection_coverage
+  return (
+    <>
+      <p className="explorer-conversations-intro">Saved on this computer for <code>{page.repository}</code>, newest first. Each conversation belongs to its Work and session; it is not tied to the commit you are viewing unless the Evidence tab shows a recorded action for it.</p>
+      {(coverage.unavailable_bodies > 0 || coverage.capture_gaps > 0 || coverage.compacted_event_batches_unattributed > 0) && <Notice tone="warn" icon="archive-fill" title="Some saved capture is missing">Across all saved conversations for this repository: {coverage.unavailable_bodies > 0 ? `${coverage.unavailable_bodies} visible ${coverage.unavailable_bodies === 1 ? 'body is' : 'bodies are'} unavailable. ` : ''}{coverage.capture_gaps > 0 ? `${coverage.capture_gaps} capture ${coverage.capture_gaps === 1 ? 'gap is' : 'gaps are'} retained. ` : ''}{coverage.compacted_event_batches_unattributed > 0 ? `${coverage.compacted_event_batches_unattributed} compacted event ${coverage.compacted_event_batches_unattributed === 1 ? 'batch is' : 'batches are'} no longer attributable to a session. ` : ''}Missing content stays missing.</Notice>}
+      {coverage.unverified_bodies > 0 && <p className="small muted">Saved text is checked when you open a conversation.</p>}
+      {page.sessions.length === 0 ? <Empty icon="chat-square" title="No saved conversations on this computer">Conversations appear here only when capture was turned on for an agent session in this repository. Connecting a computer never starts capture.</Empty> : <ol className="explorer-evidence-list">{page.sessions.map((entry) => <SessionRow key={`${entry.work_id}|${entry.generation}|${entry.session_id}`} entry={entry} repository={repository} hubRepository={hubRepository} onConversation={onConversation} />)}</ol>}
+      <CursorPaging previous={pager.newer} next={page.next_cursor} onNext={pager.older} label="Conversations" />
+    </>
+  )
+}
+
+function EvidenceView({ load, pager, repository, hubRepository, viewedCommit, currentCommit, focusedWork, onFocusWork, onUseCurrent, onCompareSource, onConversation, onBrowseConversations }: { load: Load<ExplorerEvidencePage>; pager: ReturnType<typeof useCursor>; repository: string; hubRepository?: string | null; viewedCommit: string; currentCommit: string; focusedWork?: string; onFocusWork: (value?: string) => void; onUseCurrent: () => void; onCompareSource: (left: string, right: string) => void; onConversation: (entry: ExplorerSessionEvidence) => void; onBrowseConversations: () => void }) {
   if (load.kind === 'idle') return <Empty icon="journal-check" title="Choose a file">Recorded actions and same-Work sessions will appear here when retained locally.</Empty>
   if (load.kind === 'loading') return <Skeleton rows={7} />
   if (load.kind === 'error') return <Notice tone="bad" title="Could not read retained evidence">{load.message}</Notice>
@@ -208,7 +238,7 @@ function EvidenceView({ load, pager, repository, hubRepository, viewedCommit, cu
         {coverage.capture_gaps > 0 ? `${coverage.capture_gaps} capture ${coverage.capture_gaps === 1 ? 'gap is' : 'gaps are'} retained.` : ''}
       </Notice>
       {focusedWork && <div className="explorer-filter"><span>Showing surrounding evidence for <code>{focusedWork}</code></span><button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => onFocusWork()}>Clear Work filter</button></div>}
-      {page.entries.length === 0 ? <Empty icon="journal-x" title="No retained evidence for this selection">This does not mean no work happened. Capture may be disabled, compacted or associated only with another source.</Empty> : (
+      {page.entries.length === 0 ? <Empty icon="journal-x" title="No retained evidence for this selection">This does not mean no work happened. Capture may be disabled, compacted or associated only with another source. <button type="button" className="btn btn-sm btn-link p-0 align-baseline" onClick={onBrowseConversations}>Browse all saved conversations</button></Empty> : (
         <ol className="explorer-evidence-list">
           {page.entries.map((entry, index) => entry.entry === 'action' ? (
             <li key={`action|${entry.work_id}|${entry.action_id}|${index}`} className="explorer-evidence-row">
@@ -218,12 +248,7 @@ function EvidenceView({ load, pager, repository, hubRepository, viewedCommit, cu
               <div className="explorer-row-actions"><button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => onFocusWork(entry.work_id)}>Show surrounding Work context</button>{entry.source.kind === 'git' && entry.source.head !== viewedCommit && <button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => { if (entry.source.kind === 'git') onCompareSource(entry.source.head, viewedCommit) }}>Compare recorded source</button>}<WorkLink workId={entry.work_id} repository={repository} hubRepository={hubRepository} /></div>
             </li>
           ) : (
-            <li key={`session|${entry.work_id}|${entry.session_id}|${index}`} className="explorer-evidence-row">
-              <div className="explorer-evidence-heading"><Icon name="chat-square-text" /><strong>{entry.harness === 'claude_code' ? 'Claude Code session' : 'Codex session'}</strong><Pill tone={entry.capture_mode === 'local_conversation' ? 'brand' : 'muted'}>{entry.capture_mode === 'local_conversation' ? 'Visible turns retained' : 'Metadata only'}</Pill></div>
-              <p>{entry.event_count} visible {entry.event_count === 1 ? 'event' : 'events'} in the retained session projection.</p>
-              <p className="small muted">Same Work/session only · no prompt-to-file or authorship claim{entry.unavailable_body_count ? ` · ${entry.unavailable_body_count} unavailable bodies` : ''}{entry.capture_gap_count ? ` · ${entry.capture_gap_count} capture gaps` : ''}</p>
-              <div className="explorer-row-actions"><button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => onConversation(entry)}>Open conversation</button><WorkLink workId={entry.work_id} repository={repository} hubRepository={hubRepository} /></div>
-            </li>
+            <SessionRow key={`session|${entry.work_id}|${entry.session_id}|${index}`} entry={entry} repository={repository} hubRepository={hubRepository} onConversation={onConversation} />
           ))}
         </ol>
       )}
@@ -425,18 +450,23 @@ function ExplorerBody({ summary, hubRepository, onOpenRevision }: { summary: Exp
   const [evidenceCommit, setEvidenceCommit] = useState(summary.commit)
   const [focusedWork, setFocusedWork] = useState<string | undefined>()
   const [conversation, setConversation] = useState<ExplorerSessionEvidence | null>(null)
+  // Closing returns focus to the control that opened the conversation, wherever it was.
+  const opener = useRef<HTMLElement | null>(null)
+  const openConversation = (entry: ExplorerSessionEvidence) => { opener.current = document.activeElement instanceof HTMLElement ? document.activeElement : null; setConversation(entry) }
   const treePager = useCursor(`${summary.commit}|${directory}`)
   const historyPager = useCursor(`${summary.commit}|${selectedPath ?? ''}`)
   const searchPager = useCursor(`${summary.commit}|${searchQuery ?? ''}`)
   const diffPager = useCursor(`${comparison?.left ?? ''}|${comparison?.right ?? ''}|${selectedPath ?? ''}`)
   const evidencePager = useCursor(`${evidenceCommit}|${selectedPath ?? ''}|${focusedWork ?? ''}`)
   const conversationPager = useCursor(`${conversation?.work_id ?? ''}|${conversation?.session_id ?? ''}`)
+  const sessionsPager = useCursor(summary.repository_id)
   const tree = useResource(`tree|${summary.commit}|${directory}|${treePager.cursor ?? ''}`, (signal) => fetchExplorerTree(summary.commit, directory, signal, treePager.cursor, summary.repository_id))
   const search = useResource<ExplorerSearchPage>(searchQuery ? `search|${summary.commit}|${searchQuery}|${searchPager.cursor ?? ''}` : null, (signal) => fetchExplorerSearch(summary.commit, searchQuery!, signal, searchPager.cursor, summary.repository_id))
   const file = useResource<ExplorerFile>(selectedPath && tab === 'source' ? `file|${summary.commit}|${selectedPath}` : null, (signal) => fetchExplorerFile(summary.commit, selectedPath!, signal, summary.repository_id))
   const history = useResource<ExplorerHistoryPage>(tab === 'history' ? `history|${summary.commit}|${selectedPath ?? ''}|${historyPager.cursor ?? ''}` : null, (signal) => fetchExplorerHistory(summary.commit, selectedPath, signal, historyPager.cursor, summary.repository_id))
   const diff = useResource<ExplorerDiffPage>(tab === 'diff' && comparison ? `diff|${comparison.left}|${comparison.right}|${selectedPath ?? ''}|${diffPager.cursor ?? ''}` : null, (signal) => fetchExplorerDiff(comparison!.left, comparison!.right, selectedPath, signal, diffPager.cursor, summary.repository_id))
   const evidence = useResource<ExplorerEvidencePage>(tab === 'evidence' ? `evidence|${evidenceCommit}|${selectedPath ?? ''}|${focusedWork ?? ''}|${evidencePager.cursor ?? ''}` : null, (signal) => fetchExplorerEvidence(evidenceCommit, selectedPath, signal, focusedWork, evidencePager.cursor, summary.repository_id))
+  const sessions = useResource<ExplorerSessionPage>(tab === 'conversations' ? `sessions|${sessionsPager.cursor ?? ''}` : null, (signal) => fetchExplorerSessions(signal, sessionsPager.cursor, summary.repository_id))
   const conversationLoad = useResource<ExplorerConversationPage>(conversation ? `conversation|${conversation.work_id}|${conversation.session_id}|${conversationPager.cursor ?? ''}` : null, (signal) => fetchExplorerConversation(conversation!.work_id, conversation!.session_id, signal, conversationPager.cursor, summary.repository_id))
 
   const openDirectory = (path: string) => { setDirectory(path); setSelectedPath(null); setSearchQuery(null); setSearchText(''); setTab('source'); setComparison(null); setEvidenceCommit(summary.commit); setConversation(null) }
@@ -473,10 +503,10 @@ function ExplorerBody({ summary, hubRepository, onOpenRevision }: { summary: Exp
         </aside>
         <section className="explorer-inspector" aria-label="Source inspection">
           <header className="explorer-inspector-head"><div><span className="small muted">{summary.repository_label}</span><h2 title={selectedPath ?? undefined}>{selectedPath ?? 'Choose a current file'}</h2>{contextFile && <span className="small muted"><code>{shortOid(contextFile.oid)}</code>{contextFile.size !== null && <> · {bytes(contextFile.size)}</>}</span>}</div><CopyButton text={context} label="Copy context" className="btn btn-outline-secondary" /></header>
-          <div className="tabbar" role="tablist" aria-label="File inspection"><button type="button" role="tab" aria-selected={tab === 'source'} tabIndex={tab === 'source' ? 0 : -1} className={`tab${tab === 'source' ? ' active' : ''}`} onKeyDown={TabKeys} onClick={() => setTab('source')}><Icon name="file-earmark-code" /> Source</button><button type="button" role="tab" aria-selected={tab === 'history'} tabIndex={tab === 'history' ? 0 : -1} className={`tab${tab === 'history' ? ' active' : ''}`} onKeyDown={TabKeys} onClick={() => setTab('history')}><Icon name="clock-history" /> History</button><button type="button" role="tab" aria-selected={tab === 'diff'} tabIndex={tab === 'diff' ? 0 : -1} className={`tab${tab === 'diff' ? ' active' : ''}`} onKeyDown={TabKeys} onClick={() => setTab('diff')}><Icon name="file-diff" /> Diff</button><button id="explorer-evidence-tab" type="button" role="tab" aria-selected={tab === 'evidence'} tabIndex={tab === 'evidence' ? 0 : -1} className={`tab${tab === 'evidence' ? ' active' : ''}`} onKeyDown={TabKeys} onClick={() => setTab('evidence')}><Icon name="journal-check" /> Evidence{evidenceCount !== undefined && <span className="tab-count">{evidenceCount}</span>}</button></div>
-          <div className="explorer-tab-panel" role="tabpanel">{tab === 'source' ? <FileView load={selectedPath ? file : { kind: 'idle' }} /> : tab === 'history' ? <HistoryView load={history} pager={historyPager} path={selectedPath} onBrowse={onOpenRevision} onCompare={(left, right) => { setComparison({ left, right }); setEvidenceCommit(right); diffPager.reset(); setTab('diff') }} /> : tab === 'diff' ? <DiffView load={diff} pager={diffPager} /> : <EvidenceView load={evidence} pager={evidencePager} repository={summary.repository_id} hubRepository={hubRepository} viewedCommit={evidenceCommit} currentCommit={summary.commit} focusedWork={focusedWork} onUseCurrent={() => { setEvidenceCommit(summary.commit); setFocusedWork(undefined); evidencePager.reset() }} onFocusWork={(value) => { setFocusedWork(value); evidencePager.reset() }} onCompareSource={(left, right) => { setComparison({ left, right }); diffPager.reset(); setTab('diff') }} onConversation={(entry) => setConversation(entry)} />}</div>
+          <div className="tabbar" role="tablist" aria-label="File inspection"><button type="button" role="tab" aria-selected={tab === 'source'} tabIndex={tab === 'source' ? 0 : -1} className={`tab${tab === 'source' ? ' active' : ''}`} onKeyDown={TabKeys} onClick={() => setTab('source')}><Icon name="file-earmark-code" /> Source</button><button type="button" role="tab" aria-selected={tab === 'history'} tabIndex={tab === 'history' ? 0 : -1} className={`tab${tab === 'history' ? ' active' : ''}`} onKeyDown={TabKeys} onClick={() => setTab('history')}><Icon name="clock-history" /> History</button><button type="button" role="tab" aria-selected={tab === 'diff'} tabIndex={tab === 'diff' ? 0 : -1} className={`tab${tab === 'diff' ? ' active' : ''}`} onKeyDown={TabKeys} onClick={() => setTab('diff')}><Icon name="file-diff" /> Diff</button><button id="explorer-evidence-tab" type="button" role="tab" aria-selected={tab === 'evidence'} tabIndex={tab === 'evidence' ? 0 : -1} className={`tab${tab === 'evidence' ? ' active' : ''}`} onKeyDown={TabKeys} onClick={() => setTab('evidence')}><Icon name="journal-check" /> Evidence{evidenceCount !== undefined && <span className="tab-count">{evidenceCount}</span>}</button><button id="explorer-conversations-tab" type="button" role="tab" aria-selected={tab === 'conversations'} tabIndex={tab === 'conversations' ? 0 : -1} className={`tab${tab === 'conversations' ? ' active' : ''}`} onKeyDown={TabKeys} onClick={() => setTab('conversations')}><Icon name="chat-square-text" /> Conversations</button></div>
+          <div className="explorer-tab-panel" role="tabpanel">{tab === 'source' ? <FileView load={selectedPath ? file : { kind: 'idle' }} /> : tab === 'history' ? <HistoryView load={history} pager={historyPager} path={selectedPath} onBrowse={onOpenRevision} onCompare={(left, right) => { setComparison({ left, right }); setEvidenceCommit(right); diffPager.reset(); setTab('diff') }} /> : tab === 'diff' ? <DiffView load={diff} pager={diffPager} /> : tab === 'conversations' ? <ConversationsView load={sessions} pager={sessionsPager} repository={summary.repository_id} hubRepository={hubRepository} onConversation={openConversation} /> : <EvidenceView load={evidence} pager={evidencePager} repository={summary.repository_id} hubRepository={hubRepository} viewedCommit={evidenceCommit} currentCommit={summary.commit} focusedWork={focusedWork} onUseCurrent={() => { setEvidenceCommit(summary.commit); setFocusedWork(undefined); evidencePager.reset() }} onFocusWork={(value) => { setFocusedWork(value); evidencePager.reset() }} onCompareSource={(left, right) => { setComparison({ left, right }); diffPager.reset(); setTab('diff') }} onConversation={openConversation} onBrowseConversations={() => setTab('conversations')} />}</div>
         </section>
-        {conversation && <Conversation selected={conversation} load={conversationLoad} pager={conversationPager} onClose={() => { setConversation(null); window.setTimeout(() => document.getElementById('explorer-evidence-tab')?.focus()) }} />}
+        {conversation && <Conversation selected={conversation} load={conversationLoad} pager={conversationPager} onClose={() => { setConversation(null); window.setTimeout(() => (opener.current?.isConnected ? opener.current : document.getElementById(tab === 'conversations' ? 'explorer-conversations-tab' : 'explorer-evidence-tab'))?.focus()) }} />}
       </div>
     </>
   )
@@ -490,7 +520,7 @@ export function ExplorerPage({ hubRepository }: { hubRepository?: string | null 
     <div className="page explorer-page">
       <div className="answer">
         <h1 className="page-question">What happened around this code?</h1>
-        <p className="answer-text">Explore committed files, history and evidence.</p>
+        <p className="answer-text">Explore committed files, history, evidence and saved agent conversations.</p>
         <p className="answer-fact"><Icon name="laptop" /> Read-only from your local checkout. Refresh observes the selected ref without changing your files.</p>
       </div>
       {summary.kind === 'loading' && <Skeleton rows={6} />}

@@ -320,3 +320,5 @@
 @media (prefers-reduced-motion: reduce) {
   .explorer-file-list button { transition: none; }
 }
+
+.explorer-conversations-intro { max-width: 70ch; color: var(--hub-text-2); margin: 0 0 12px; }

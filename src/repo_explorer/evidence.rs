@@ -153,6 +153,19 @@ pub struct EvidencePageV1 {
     pub complete: bool,
 }
 
+/// Retained sessions for this repository, newest first. Each belongs to its Work; none of them is
+/// claimed to be associated with any source revision.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionPageV1 {
+    pub version: u8,
+    pub repository: String,
+    pub sessions: Vec<SessionEvidenceV1>,
+    pub projection_coverage: ProjectionCoverageV1,
+    pub next_cursor: Option<String>,
+    pub complete: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ConversationBodyV1 {
@@ -357,6 +370,83 @@ impl EvidenceExplorer {
             projection_coverage,
             next_cursor,
             complete,
+        })
+    }
+
+    /// Every retained session, so a saved conversation is reachable from its Work even when no
+    /// recorded action ties it to the commit being viewed.
+    pub fn sessions(&self, cursor: Option<&str>, limit: usize) -> Result<SessionPageV1> {
+        validate_limit(limit)?;
+        let projection = self.spool.projection().map_err(map_capture_error)?;
+        let fingerprint = projection_fingerprint(&projection)?;
+        let query = query_digest(&["sessions", &self.repository, &fingerprint]);
+        let offset = decode_cursor(cursor, "s", &query)?;
+        // `conversation` reads a session across its generations, so list it once that way.
+        let mut merged = BTreeMap::<(String, String), SessionAggregate>::new();
+        for session in retained_sessions(&projection)? {
+            match merged.entry((session.work_id.clone(), session.session_id.clone())) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(session);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let kept = entry.get_mut();
+                    kept.generation = kept.generation.max(session.generation);
+                    kept.first_observed_at = kept.first_observed_at.min(session.first_observed_at);
+                    kept.last_observed_at = kept.last_observed_at.max(session.last_observed_at);
+                    kept.event_count = kept.event_count.saturating_add(session.event_count);
+                    kept.unavailable_body_count = kept
+                        .unavailable_body_count
+                        .saturating_add(session.unavailable_body_count);
+                    kept.unverified_body_count = kept
+                        .unverified_body_count
+                        .saturating_add(session.unverified_body_count);
+                    kept.capture_gap_count = kept
+                        .capture_gap_count
+                        .saturating_add(session.capture_gap_count);
+                }
+            }
+        }
+        let mut sessions = merged.into_values().collect::<Vec<_>>();
+        sessions.sort_by(|left, right| {
+            (right.last_observed_at, &right.work_id, &right.session_id).cmp(&(
+                left.last_observed_at,
+                &left.work_id,
+                &left.session_id,
+            ))
+        });
+        let unavailable_bodies = sessions.iter().map(|s| s.unavailable_body_count).sum();
+        let unverified_bodies = sessions.iter().map(|s| s.unverified_body_count).sum();
+        let capture_gaps = sessions.iter().map(|s| s.capture_gap_count).sum();
+        let projection_coverage = coverage(
+            &projection,
+            unavailable_bodies,
+            unverified_bodies,
+            capture_gaps,
+        );
+        let sessions = sessions
+            .into_iter()
+            .map(|session| SessionEvidenceV1 {
+                relation: EvidenceRelationV1::SameWorkSession,
+                work_id: session.work_id,
+                generation: session.generation,
+                session_id: session.session_id,
+                harness: session.harness,
+                capture_mode: session.capture_mode,
+                first_observed_at: session.first_observed_at,
+                last_observed_at: session.last_observed_at,
+                event_count: session.event_count,
+                unavailable_body_count: session.unavailable_body_count,
+                capture_gap_count: session.capture_gap_count,
+            })
+            .collect();
+        let (sessions, next_cursor) = page(sessions, offset, limit, "s", &query)?;
+        Ok(SessionPageV1 {
+            version: 1,
+            repository: self.repository.clone(),
+            complete: next_cursor.is_none(),
+            sessions,
+            projection_coverage,
+            next_cursor,
         })
     }
 
@@ -640,10 +730,13 @@ fn retained_sessions(projection: &ReadOnlySpoolProjection) -> Result<Vec<Session
         let CaptureEnvelopeV1::EventBatch(batch) = &retained.envelope else {
             continue;
         };
-        let Some(first) = batch.events.first() else {
+        // Batches need not be ordered by time, so take the extremes rather than the ends.
+        let (Some(first_at), Some(last_at)) = (
+            batch.events.iter().map(|event| event.observed_at).min(),
+            batch.events.iter().map(|event| event.observed_at).max(),
+        ) else {
             continue;
         };
-        let last = batch.events.last().expect("validated nonempty batch");
         let key = (
             batch.work_id.clone(),
             batch.generation,
@@ -679,8 +772,8 @@ fn retained_sessions(projection: &ReadOnlySpoolProjection) -> Result<Vec<Session
                         "retained session identity has conflicting capture facts".into(),
                     ));
                 }
-                session.first_observed_at = session.first_observed_at.min(first.observed_at);
-                session.last_observed_at = session.last_observed_at.max(last.observed_at);
+                session.first_observed_at = session.first_observed_at.min(first_at);
+                session.last_observed_at = session.last_observed_at.max(last_at);
                 session.event_count = session.event_count.saturating_add(batch.events.len());
                 session.unavailable_body_count =
                     session.unavailable_body_count.saturating_add(unavailable);
@@ -697,8 +790,8 @@ fn retained_sessions(projection: &ReadOnlySpoolProjection) -> Result<Vec<Session
                         session_id: batch.session.session_id.clone(),
                         harness: batch.session.harness,
                         capture_mode: batch.session.capture_mode,
-                        first_observed_at: first.observed_at,
-                        last_observed_at: last.observed_at,
+                        first_observed_at: first_at,
+                        last_observed_at: last_at,
                         event_count: batch.events.len(),
                         unavailable_body_count: unavailable,
                         unverified_body_count: unverified,
