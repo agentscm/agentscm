@@ -5034,3 +5034,52 @@ fn oversized_shared_bodies_stay_work_local() {
     assert_eq!(artifacts[0].retention, RetentionClassV1::WorkLocal);
     assert_eq!(artifacts[0].availability, ContentAvailabilityV1::Local);
 }
+
+#[test]
+fn shared_import_with_many_redacted_bodies_splits_batches_within_gap_limit() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let request = capture_request(CaptureModeV1::SharedConversation);
+    let (token, _) = synthetic_secrets();
+    let mut transcript = String::new();
+    for index in 0..45 {
+        transcript.push_str(&format!(
+            "{{\"type\":\"user\",\"sessionId\":\"session_fixture\",\"timestamp\":\"2026-10-23T10:00:00Z\",\"uuid\":\"u{index}\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"deploy {index} with {token}\"}}]}}}}\n"
+        ));
+    }
+    let report = import_jsonl(Cursor::new(transcript), &request, &spool).unwrap();
+    assert!(report.batches >= 2);
+
+    let pending = spool.pending(100).unwrap();
+    let mut redacted = 0;
+    let mut all_events = Vec::new();
+    for envelope in &pending {
+        envelope.validate().unwrap();
+        let CaptureEnvelopeV1::EventBatch(batch) = envelope else {
+            panic!("only event batches expected");
+        };
+        assert!(batch.events.len() <= agentscm::change_record::MAX_EVENTS_PER_BATCH);
+        all_events.extend(batch.events.iter());
+    }
+    for event in &all_events {
+        let Some(gap) = event
+            .gap
+            .as_ref()
+            .filter(|g| g.reason == GapReasonV1::Redacted)
+        else {
+            continue;
+        };
+        redacted += 1;
+        // A redaction gap points at the altered body event, which exists with that sequence.
+        assert_eq!(gap.first_missing, gap.last_missing);
+        assert_ne!(gap.first_missing, event.sequence);
+        assert!(
+            all_events
+                .iter()
+                .any(|other| other.sequence == gap.first_missing
+                    && other.kind == CapturedEventKindV1::UserPrompt
+                    && other.artifact.is_some())
+        );
+    }
+    assert_eq!(redacted, 45);
+}

@@ -12,7 +12,7 @@ use serde_json::Value;
 
 /// Normalized (lowercase, no `_`/`-`) name suffixes that mark a field or variable as secret.
 /// Suffix matching keeps counters such as `max_tokens` and `input_tokens` readable.
-const SECRET_WORDS: [&str; 15] = [
+const SECRET_WORDS: [&str; 25] = [
     "password",
     "passwords",
     "passwd",
@@ -28,6 +28,16 @@ const SECRET_WORDS: [&str; 15] = [
     "sessionkey",
     "credential",
     "credentials",
+    "secretkey",
+    "secretkeybase",
+    "accountkey",
+    "signingkey",
+    "encryptionkey",
+    "masterkey",
+    "clientkey",
+    "dsn",
+    "databaseurl",
+    "connectionstring",
 ];
 
 const FIELD_REPLACEMENT: &str = "[REDACTED:field]";
@@ -50,7 +60,7 @@ pub fn redact_json(value: &mut Value) -> usize {
                 let secret_field = is_secret_name(key.as_bytes())
                     && match item {
                         Value::String(text) => text != FIELD_REPLACEMENT,
-                        Value::Number(_) => true,
+                        Value::Number(_) | Value::Object(_) | Value::Array(_) => true,
                         _ => false,
                     };
                 if secret_field {
@@ -93,6 +103,9 @@ fn redact_text(text: &str) -> Option<(String, usize)> {
         if is_ident(bytes[i]) && (i == 0 || !is_ident(bytes[i - 1])) {
             let name_end = run_end(bytes, i, is_ident);
             if let Some((from, end, kind)) = token_at(bytes, i) {
+                replace(&mut out, &mut copied, from, end, kind);
+                i = end;
+            } else if let Some((from, end, kind)) = context_value(bytes, i, name_end) {
                 replace(&mut out, &mut copied, from, end, kind);
                 i = end;
             } else if let Some((from, end)) = assignment_value(bytes, i, name_end) {
@@ -201,6 +214,15 @@ fn token_at(bytes: &[u8], i: usize) -> Option<(usize, usize, &'static str)> {
             return Some((i, end, "stripe_key"));
         }
     }
+    if let Some(end) = prefixed(b"npm_", is_alnum, 36) {
+        return Some((i, end, "npm_token"));
+    }
+    if let Some(end) = prefixed(b"pypi-", is_ident, 50) {
+        return Some((i, end, "pypi_token"));
+    }
+    if let Some(end) = prefixed(b"hf_", is_alnum, 30) {
+        return Some((i, end, "huggingface_token"));
+    }
     if let Some(end) = prefixed(b"AIza", is_ident, 35) {
         return Some((i, end, "google_api_key"));
     }
@@ -262,33 +284,43 @@ fn find(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
         .map(|offset| from + offset)
 }
 
-/// For a secret-named identifier run `[start, name_end)` followed by `=` or `:`, returns the
-/// value range to replace.
+fn is_blank(byte: Option<&u8>) -> bool {
+    matches!(byte, Some(b' ' | b'\t'))
+}
+
+/// For a secret-named identifier run `[start, name_end)` followed by `=`, `:` or `=>`, returns
+/// the value range to replace.
 fn assignment_value(bytes: &[u8], start: usize, name_end: usize) -> Option<(usize, usize)> {
     if !is_secret_name(&bytes[start..name_end]) {
         return None;
     }
-    let blank = |pos: usize| matches!(bytes.get(pos), Some(b' ' | b'\t'));
     let mut pos = name_end;
     if matches!(bytes.get(pos), Some(b'"' | b'\'')) {
         pos += 1;
     }
-    while blank(pos) {
+    while is_blank(bytes.get(pos)) {
         pos += 1;
     }
-    if !matches!(bytes.get(pos), Some(b'=' | b':')) {
-        return None;
+    match bytes.get(pos) {
+        Some(b'=') if bytes.get(pos + 1) == Some(&b'>') => pos += 2,
+        Some(b'=' | b':') => pos += 1,
+        _ => return None,
     }
-    pos += 1;
-    while blank(pos) {
+    while is_blank(bytes.get(pos)) {
         pos += 1;
     }
+    value_at(bytes, pos)
+}
+
+/// The (optionally quoted) value starting at `pos`, or `None` when empty or already redacted.
+fn value_at(bytes: &[u8], pos: usize) -> Option<(usize, usize)> {
     let quote = bytes
         .get(pos)
         .copied()
         .filter(|byte| matches!(byte, b'"' | b'\''));
     let value_start = pos + usize::from(quote.is_some());
-    let end = bytes[value_start..]
+    let end = bytes
+        .get(value_start..)?
         .iter()
         .position(|byte| match quote {
             Some(quote) => *byte == quote || *byte == b'\n',
@@ -301,10 +333,10 @@ fn assignment_value(bytes: &[u8], start: usize, name_end: usize) -> Option<(usiz
     let value = &bytes[value_start..end];
     if quote.is_none()
         && (value.eq_ignore_ascii_case(b"bearer") || value.eq_ignore_ascii_case(b"basic"))
-        && blank(end)
+        && is_blank(bytes.get(end))
     {
         let mut credential = end;
-        while blank(credential) {
+        while is_blank(bytes.get(credential)) {
             credential += 1;
         }
         let tail = run_len(bytes, credential, is_bearer_token);
@@ -313,6 +345,78 @@ fn assignment_value(bytes: &[u8], start: usize, name_end: usize) -> Option<(usiz
         }
     }
     Some((value_start, end))
+}
+
+/// Secrets recognized by the surrounding syntax rather than by their own shape: URL userinfo
+/// passwords, `--secret-flag VALUE`, `curl -u user:pass` and `mysql -pVALUE`.
+fn context_value(
+    bytes: &[u8],
+    start: usize,
+    name_end: usize,
+) -> Option<(usize, usize, &'static str)> {
+    if bytes[name_end..].starts_with(b"://") {
+        return url_password(bytes, name_end + 3).map(|(from, end)| (from, end, "url_password"));
+    }
+    let name = &bytes[start..name_end];
+    let after_blank = || {
+        let mut pos = name_end;
+        while is_blank(bytes.get(pos)) {
+            pos += 1;
+        }
+        (pos > name_end).then_some(pos)
+    };
+    if name.starts_with(b"--") && is_secret_name(name) {
+        let pos = after_blank().filter(|pos| bytes.get(*pos) != Some(&b'-'))?;
+        return value_at(bytes, pos).map(|(from, end)| (from, end, "flag_value"));
+    }
+    if matches!(name, b"-u" | b"--user" | b"--proxy-user") && in_command(bytes, start, &["curl"]) {
+        let (from, end) = value_at(bytes, after_blank()?)?;
+        let colon = from + bytes[from..end].iter().position(|byte| *byte == b':')?;
+        return (colon + 1 < end).then_some((colon + 1, end, "flag_value"));
+    }
+    // `-p VALUE` (with a space) makes mysql prompt and treat VALUE as a database name.
+    if name.len() > 2
+        && name.starts_with(b"-p")
+        && in_command(
+            bytes,
+            start,
+            &["mysql", "mysqldump", "mysqladmin", "mariadb"],
+        )
+    {
+        return value_at(bytes, start + 2).map(|(from, end)| (from, end, "flag_value"));
+    }
+    None
+}
+
+/// True when one of `commands` appears as a word earlier in the same shell segment, looking
+/// back at most 512 bytes.
+fn in_command(bytes: &[u8], at: usize, commands: &[&str]) -> bool {
+    let window = &bytes[at.saturating_sub(512)..at];
+    let segment = window
+        .iter()
+        .rposition(|byte| matches!(byte, b'\n' | b';' | b'|' | b'&'))
+        .map_or(window, |pos| &window[pos + 1..]);
+    segment
+        .split(|byte| !is_ident(*byte))
+        .any(|word| commands.iter().any(|command| word == command.as_bytes()))
+}
+
+/// For the authority starting at `start` (after `://`), the password range of
+/// `user:password@host`, or `None` when there is no userinfo password.
+fn url_password(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+    let authority_len = bytes.get(start..)?.iter().position(|byte| {
+        byte.is_ascii_whitespace()
+            || matches!(byte, b'/' | b'?' | b'#' | b'"' | b'\'' | b'`' | b'<' | b'>')
+    });
+    let authority = &bytes[start..authority_len.map_or(bytes.len(), |len| start + len)];
+    // Passwords may contain a raw `@`, so the host starts after the last one.
+    let at = start + authority.iter().rposition(|byte| *byte == b'@')?;
+    let colon = start
+        + authority[..at - start]
+            .iter()
+            .position(|byte| *byte == b':')?;
+    (colon + 1 < at && !bytes[colon + 1..at].starts_with(REDACTED_PREFIX.as_bytes()))
+        .then_some((colon + 1, at))
 }
 
 fn is_secret_name(name: &[u8]) -> bool {
@@ -437,13 +541,13 @@ mod tests {
             "note": "plain",
         });
         let count = redact_json(&mut value);
-        assert_eq!(count, 3);
+        assert_eq!(count, 4);
         assert_eq!(value["password"], FIELD_REPLACEMENT);
         assert_eq!(value["nested"][0]["Client_Secret"], FIELD_REPLACEMENT);
         assert_eq!(value["nested"][0]["apiKey"], FIELD_REPLACEMENT);
         assert_eq!(value["nested"][0]["flag"], true);
         assert_eq!(value["nested"][0]["token"], Value::Null);
-        assert_eq!(value["private-key"]["inner"], "kept");
+        assert_eq!(value["private-key"], FIELD_REPLACEMENT);
         assert_eq!(redact_json(&mut value), 0);
         let mut counters = json!({"max_tokens": 4096, "input_tokens": 12, "token_count": 3});
         assert_eq!(redact_json(&mut counters), 0);
@@ -451,6 +555,122 @@ mod tests {
             redact("max_tokens: 4096 and tokenizer=bpe"),
             ("max_tokens: 4096 and tokenizer=bpe".to_owned(), 0)
         );
+    }
+
+    #[test]
+    fn redacts_new_secret_names_and_whole_subtrees() {
+        let mut value = json!({
+            "secret_key_base": "a", "AccountKey": "b", "signing-key": "c",
+            "encryption_key": "d", "masterKey": "e", "client_key": "f",
+            "SENTRY_DSN": "g", "database_url": "h", "connection_string": "i",
+            "secretKey": "j",
+            "credentials": {"user": "u", "pass": ["x"]},
+            "cookies": [{"a": "b"}],
+            "keyboard": {"kept": "yes"},
+        });
+        assert_eq!(redact_json(&mut value), 12);
+        assert_eq!(value["credentials"], FIELD_REPLACEMENT);
+        assert_eq!(value["cookies"], FIELD_REPLACEMENT);
+        assert_eq!(value["keyboard"]["kept"], "yes");
+        assert_eq!(redact_json(&mut value), 0);
+        assert_eq!(
+            redact("DATABASE_URL=x").0,
+            "DATABASE_URL=[REDACTED:assignment]"
+        );
+    }
+
+    #[test]
+    fn redacts_url_userinfo_passwords_only() {
+        for (input, want) in [
+            (
+                "postgres://bob:hunter2@db.local:5432/app",
+                "postgres://bob:[REDACTED:url_password]@db.local:5432/app",
+            ),
+            (
+                "git+ssh://bob:p@ss@host/repo",
+                "git+ssh://bob:[REDACTED:url_password]@host/repo",
+            ),
+            (
+                "see \"https://u:pw@example.com\" ok",
+                "see \"https://u:[REDACTED:url_password]@example.com\" ok",
+            ),
+        ] {
+            assert_eq!(redact(input), (want.to_owned(), 1), "{input}");
+        }
+        for input in [
+            "http://host/path",
+            "https://example.com/a:b@c",
+            "https://token@example.com/x",
+            "ssh://git@github.com/o/r.git",
+            "http://host:8080/x?u=a:b@c",
+            "https://u:@host",
+            "https://u:[REDACTED:url_password]@host",
+        ] {
+            assert_eq!(redact(input), (input.to_owned(), 0), "{input}");
+        }
+    }
+
+    #[test]
+    fn redacts_cli_flag_values() {
+        for (input, want) in [
+            (
+                "run --password hunter2 now",
+                "run --password [REDACTED:flag_value] now",
+            ),
+            ("--api-key 'k k'", "--api-key '[REDACTED:flag_value]'"),
+            ("tool --secret=abc", "tool --secret=[REDACTED:assignment]"),
+            (
+                "curl -u bob:pw https://h/x",
+                "curl -u bob:[REDACTED:flag_value] https://h/x",
+            ),
+            (
+                "cd x && curl --user \"bob:pw\" h",
+                "cd x && curl --user \"bob:[REDACTED:flag_value]\" h",
+            ),
+            (
+                "mysql -u root -phunter2 db",
+                "mysql -u root -p[REDACTED:flag_value] db",
+            ),
+            ("password => 'x'", "password => '[REDACTED:assignment]'"),
+            (":api_key=>\"x\"", ":api_key=>\"[REDACTED:assignment]\""),
+        ] {
+            assert_eq!(redact(input), (want.to_owned(), 1), "{input}");
+        }
+        for input in [
+            "tool --password-file /etc/pw --max-tokens 100",
+            "--token --verbose",
+            "docker run -u 1000:1000 img",
+            "sort -u a:b",
+            "git push -u origin main",
+            "mysql -p db",
+            "echo -phunter2",
+            "curl -u bob h",
+            "--password",
+        ] {
+            assert_eq!(redact(input), (input.to_owned(), 0), "{input}");
+        }
+    }
+
+    #[test]
+    fn redacts_registry_token_prefixes() {
+        for (secret, kind) in [
+            (["np", "m_"].concat() + &repeat('a', 36), "npm_token"),
+            (["py", "pi-"].concat() + &repeat('B', 50), "pypi_token"),
+            (["h", "f_"].concat() + &repeat('c', 30), "huggingface_token"),
+        ] {
+            assert_eq!(
+                redact(&format!("x {secret} y")),
+                (format!("x [REDACTED:{kind}] y"), 1)
+            );
+        }
+        for input in [
+            format!("npm_{}", repeat('a', 35)),
+            format!("pypi-{}", repeat('a', 49)),
+            format!("hf_{}", repeat('a', 29)),
+            "npm_config_registry hf_hub".to_owned(),
+        ] {
+            assert_eq!(redact(&input), (input.clone(), 0), "{input}");
+        }
     }
 
     #[test]

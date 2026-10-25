@@ -2355,16 +2355,32 @@ pub fn import_jsonl(
     }
     selected.sort_by_key(|event| event.sequence);
     report.events = selected.len();
-    for (index, events) in selected
-        .chunks(crate::change_record::MAX_EVENTS_PER_BATCH)
-        .enumerate()
-    {
+    for (index, events) in batch_chunks(&selected).into_iter().enumerate() {
         let operation_id = format!("{}:{index}", request.operation_prefix);
         let envelope = CaptureEnvelopeV1::EventBatch(batch(request, operation_id, events.to_vec()));
         spool.append(&envelope)?;
         report.batches += 1;
     }
     Ok(report)
+}
+
+/// Splits sequence-ordered events into runs that respect both the per-batch event and gap limits.
+fn batch_chunks(events: &[CapturedEventV1]) -> Vec<&[CapturedEventV1]> {
+    use crate::change_record::{MAX_EVENTS_PER_BATCH, MAX_GAPS_PER_SESSION};
+    let mut chunks = Vec::new();
+    let (mut start, mut gaps) = (0, 0);
+    for (index, event) in events.iter().enumerate() {
+        let is_gap = usize::from(event.gap.is_some());
+        if index - start == MAX_EVENTS_PER_BATCH || gaps + is_gap > MAX_GAPS_PER_SESSION {
+            chunks.push(&events[start..index]);
+            (start, gaps) = (index, 0);
+        }
+        gaps += is_gap;
+    }
+    if start < events.len() {
+        chunks.push(&events[start..]);
+    }
+    chunks
 }
 
 fn select_line(
@@ -2557,8 +2573,9 @@ fn retain_selected(
             artifact: None,
             setup: None,
             gap: Some(GapFactV1 {
-                first_missing: gap_sequence,
-                last_missing: gap_sequence,
+                // The altered event keeps its sequence; the range marks what was changed.
+                first_missing: sequence,
+                last_missing: sequence,
                 reason: GapReasonV1::Redacted,
             }),
             boundary: None,
