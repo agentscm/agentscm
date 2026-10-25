@@ -300,19 +300,27 @@ impl FrontDoor {
     /// This computer's current connections, rechecked with Git at most every few seconds unless
     /// `fresh` asks for a recheck now.
     async fn connected(&self, fresh: bool) -> Arc<Vec<Connection>> {
+        let asked = Instant::now();
         let mut cached = self.connections.lock().await;
-        if !fresh
-            && let Some((at, connections)) = cached.as_ref()
-            && at.elapsed() < CONNECTIONS_TTL
+        // A forced recheck reuses a list checked after it was asked for, so a burst of requests
+        // waiting on this lock checks Git once without missing a checkout connected just before.
+        if let Some((at, connections)) = cached.as_ref()
+            && if fresh {
+                *at >= asked
+            } else {
+                at.elapsed() < CONNECTIONS_TTL
+            }
         {
             return connections.clone();
         }
+        // Stamped with when the check began: it reflects nothing connected after that.
+        let checked = Instant::now();
         let connections = Arc::new(
             tokio::task::spawn_blocking(current_connections)
                 .await
                 .unwrap_or_default(),
         );
-        *cached = Some((Instant::now(), connections.clone()));
+        *cached = Some((checked, connections.clone()));
         connections
     }
 
