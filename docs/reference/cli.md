@@ -305,6 +305,11 @@ run it in Terminal; it runs normal `client setup`, which may contact the Hub, re
 and create or replace a managed coordination token. The native client's own trust prompts still
 apply.
 
+A Git checkout where a client-connection hook ran without a connection is listed under **Not
+connected** while the tray runs (local only, at most eight, forgotten after an hour). **Connect
+with** an agent runs `client setup` for its main checkout against the Hub of the most recent saved
+sign-in, without starting a new sign-in; **Copy Terminal Setup** copies `quickstart` instead.
+
 Setup actions show a progress and result window with the client's next steps; they do not install
 the coding client itself. **Open Hub** uses the exact Hub's saved human sign-in to mint a 30-minute
 read-only token for the selected repository. The token goes to the browser in a URL fragment,

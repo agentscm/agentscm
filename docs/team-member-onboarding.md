@@ -54,7 +54,9 @@ available there only where such an entry exists.
 
 On macOS, `npx agentscm tray` can show these connections in the optional status-bar companion;
 there is no separate app install. Start at Login is off until the member enables it in the menu.
-On every platform, `agentscm client status --check` provides the CLI view. Activity is based on
+If the user-scope plugin runs in a checkout that was never connected, the tray lists that checkout
+under **Not connected** and offers **Connect**, which runs `client setup` with the member's saved
+Hub sign-in. On every platform, `agentscm client status --check` provides the CLI view. Activity is based on
 recent observed MCP and native hook participation, so missing or idle activity remains unknown.
 
 | Coding agent | Native components written or installed | Review and refresh in the host |

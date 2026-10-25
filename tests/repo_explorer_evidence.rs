@@ -597,3 +597,99 @@ fn retained_files(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     values.sort_by(|left, right| left.0.cmp(&right.0));
     values
 }
+
+#[test]
+fn a_conversation_without_recorded_actions_is_listed_by_work_not_by_commit() {
+    let (_temp, root, spool) = spool_fixture();
+    let transcript = "{\"type\":\"user\",\"sessionId\":\"session-lone\",\"timestamp\":\"2026-10-23T11:00:00Z\",\"uuid\":\"u9\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"SYNTHETIC_LONE_PROMPT\"}]}}\n";
+    import_jsonl(
+        Cursor::new(transcript),
+        &capture_request("wrk_lone", "session-lone", "capture:lone"),
+        &spool,
+    )
+    .unwrap();
+
+    let explorer = EvidenceExplorer::open(&root, REPOSITORY).unwrap();
+    // No action binds this Work to any commit, so commit evidence must not invent one.
+    let at_commit = explorer
+        .evidence(COMMIT_ONE, None, None, None, 100)
+        .unwrap();
+    assert!(at_commit.entries.is_empty());
+
+    let listed = explorer.sessions(None, 25).unwrap();
+    assert_eq!(listed.sessions.len(), 1);
+    let session = &listed.sessions[0];
+    assert_eq!(
+        (session.work_id.as_str(), session.session_id.as_str()),
+        ("wrk_lone", "session-lone")
+    );
+    assert_eq!(session.relation, EvidenceRelationV1::SameWorkSession);
+    assert!(listed.complete);
+
+    let conversation = explorer
+        .conversation(&session.work_id, &session.session_id, None, 25)
+        .unwrap();
+    assert!(conversation.events.iter().any(|event| {
+        event
+            .body
+            .content
+            .as_deref()
+            .is_some_and(|text| text.contains("SYNTHETIC_LONE_PROMPT"))
+    }));
+
+    let first = explorer.sessions(None, 1).unwrap();
+    assert!(first.next_cursor.is_none());
+    assert!(explorer.sessions(Some("x1:s:bogus:0"), 1).is_err());
+}
+
+#[test]
+fn saved_sessions_page_newest_first_and_cursors_stay_bound_to_their_query() {
+    let (_temp, root, spool) = spool_fixture();
+    let import = |work: &str, session: &str, at: &str| {
+        let line = format!(
+            "{{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"{at}\",\"uuid\":\"u-{session}\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"SYNTHETIC\"}}]}}}}\n"
+        );
+        import_jsonl(
+            Cursor::new(line),
+            &capture_request(work, session, &format!("capture:{session}")),
+            &spool,
+        )
+        .unwrap();
+    };
+    import("wrk_a", "session-old", "2026-10-23T09:00:00Z");
+    import("wrk_b", "session-tie-b", "2026-10-23T10:00:00Z");
+    import("wrk_a", "session-tie-a", "2026-10-23T10:00:00Z");
+
+    let explorer = EvidenceExplorer::open(&root, REPOSITORY).unwrap();
+    let all = explorer.sessions(None, 25).unwrap();
+    let order: Vec<_> = all.sessions.iter().map(|s| s.session_id.as_str()).collect();
+    // Newest first; equal times fall back to Work and session identity, descending.
+    assert_eq!(order, ["session-tie-b", "session-tie-a", "session-old"]);
+
+    let mut walked = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = explorer.sessions(cursor.as_deref(), 1).unwrap();
+        assert_eq!(page.complete, page.next_cursor.is_none());
+        walked.extend(page.sessions.into_iter().map(|s| s.session_id));
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(walked, order);
+
+    let first = explorer.sessions(None, 1).unwrap();
+    let next = first.next_cursor.unwrap();
+    assert!(
+        explorer
+            .conversation("wrk_a", "session-old", Some(&next), 25)
+            .is_err(),
+        "a sessions cursor cannot page a conversation"
+    );
+    import("wrk_c", "session-new", "2026-10-23T11:00:00Z");
+    assert!(
+        explorer.sessions(Some(&next), 1).is_err(),
+        "a cursor from an earlier projection is refused"
+    );
+}

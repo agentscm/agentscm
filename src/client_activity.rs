@@ -4,7 +4,6 @@
 //! A missing, stopped, or backpressured tray is deliberately indistinguishable from success here:
 //! activity reporting must never extend or change the client request path.
 
-#[cfg(unix)]
 use std::path::Path;
 #[cfg(any(unix, test))]
 use std::path::PathBuf;
@@ -15,13 +14,25 @@ use sha2::{Digest, Sha256};
 use crate::client_config::Connection;
 
 const VERSION: u8 = 1;
-const DATAGRAM_BYTES: usize = 1024;
+/// Room for the longest valid unconnected report: a JSON-escaped root of [`MAX_ROOT_BYTES`].
+const DATAGRAM_BYTES: usize = 16 * 1024;
+const MAX_ROOT_BYTES: usize = 4096;
+/// Unix datagram sockets cap one message at their buffer size: 2 KiB to send and 4 KiB to
+/// receive by default on macOS. Both ends raise it so every valid report fits.
+#[cfg(unix)]
+const SOCKET_BUFFER_BYTES: libc::c_int = 64 * 1024;
 #[cfg(any(target_os = "macos", test))]
 const MAX_ROWS: usize = 256;
 #[cfg(any(target_os = "macos", test))]
 const MAX_DRAIN: usize = 64;
 #[cfg(any(target_os = "macos", test))]
 pub(crate) const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+#[cfg(any(target_os = "macos", test))]
+const MAX_UNCONNECTED: usize = 8;
+/// The hook repeats an unconnected sighting every few minutes while an agent keeps working.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const UNCONNECTED_STALE_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(60 * 60);
 
 /// Local activity fence for one exact saved destination and credential.
 /// This is separate from the Hub-facing onboarding client identity.
@@ -70,6 +81,17 @@ struct WireObservation {
     outcome: ActivityOutcome,
 }
 
+/// A coding agent ran in a Git checkout with no client connection. `root` is the main worktree.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WireUnconnected {
+    version: u8,
+    root: String,
+    host: String,
+    repo: String,
+    agent: String,
+}
+
 /// One observation timestamped by the receiving tray's monotonic clock.
 #[derive(Clone, Debug)]
 #[cfg(any(target_os = "macos", test))]
@@ -88,11 +110,23 @@ impl ActivityObservation {
     }
 }
 
+/// An unconnected checkout, deduplicated by main worktree, with its agents oldest first.
+#[derive(Clone, Debug)]
+#[cfg(any(target_os = "macos", test))]
+pub(crate) struct UnconnectedCheckout {
+    pub(crate) root: PathBuf,
+    pub(crate) host: String,
+    pub(crate) repo: String,
+    pub(crate) agents: Vec<String>,
+    pub(crate) seen_at: std::time::Instant,
+}
+
 /// Bounded tray-owned activity state. A snapshot is fenced to the caller's current binding.
 #[derive(Debug, Default)]
 #[cfg(any(target_os = "macos", test))]
 pub(crate) struct ActivityStore {
     rows: std::collections::VecDeque<ActivityObservation>,
+    unconnected: Vec<UnconnectedCheckout>,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -120,10 +154,51 @@ impl ActivityStore {
         self.rows.len()
     }
 
+    pub(crate) fn push_unconnected(&mut self, seen: UnconnectedCheckout) {
+        if let Some(row) = self
+            .unconnected
+            .iter_mut()
+            .find(|row| row.root == seen.root)
+        {
+            row.agents.retain(|agent| !seen.agents.contains(agent));
+            row.agents.extend(seen.agents);
+            row.host = seen.host;
+            row.repo = seen.repo;
+            row.seen_at = seen.seen_at;
+            return;
+        }
+        if self.unconnected.len() == MAX_UNCONNECTED
+            && let Some(oldest) =
+                (0..self.unconnected.len()).min_by_key(|index| self.unconnected[*index].seen_at)
+        {
+            self.unconnected.swap_remove(oldest);
+        }
+        self.unconnected.push(seen);
+    }
+
+    /// Drop the sighting of a checkout that is now connected. Removing that connection later
+    /// lists it again only after an agent is seen there again.
+    pub(crate) fn forget_unconnected(&mut self, root: &Path) {
+        self.unconnected.retain(|row| row.root != root);
+    }
+
+    /// Fresh unconnected checkouts, most recently seen first.
+    pub(crate) fn unconnected(&self, now: std::time::Instant) -> Vec<UnconnectedCheckout> {
+        let mut rows = self
+            .unconnected
+            .iter()
+            .filter(|row| now.saturating_duration_since(row.seen_at) <= UNCONNECTED_STALE_AFTER)
+            .cloned()
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|row| std::cmp::Reverse(row.seen_at));
+        rows
+    }
+
     /// Discard observations after a suspend/wake or wall-clock discontinuity detected by the tray.
     #[cfg(target_os = "macos")]
     pub(crate) fn clear(&mut self) {
         self.rows.clear();
+        self.unconnected.clear();
     }
 }
 
@@ -156,8 +231,40 @@ fn decode(bytes: &[u8], observed_at: std::time::Instant) -> Option<ActivityObser
     })
 }
 
+fn valid_unconnected(root: &str, host: &str, repo: &str, agent: &str) -> bool {
+    let printable = |text: &str| !text.is_empty() && !text.chars().any(char::is_control);
+    printable(root)
+        && root.len() <= MAX_ROOT_BYTES
+        && Path::new(root).is_absolute()
+        && printable(host)
+        && host.len() <= 253
+        && !host.contains(char::is_whitespace)
+        && crate::intent_cli::valid_repo(repo)
+        && valid_agent(Some(agent))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn decode_unconnected(bytes: &[u8], seen_at: std::time::Instant) -> Option<UnconnectedCheckout> {
+    if bytes.is_empty() || bytes.len() > DATAGRAM_BYTES {
+        return None;
+    }
+    let wire: WireUnconnected = serde_json::from_slice(bytes).ok()?;
+    if wire.version != VERSION
+        || !valid_unconnected(&wire.root, &wire.host, &wire.repo, &wire.agent)
+    {
+        return None;
+    }
+    Some(UnconnectedCheckout {
+        root: PathBuf::from(wire.root),
+        host: wire.host,
+        repo: wire.repo,
+        agents: vec![wire.agent],
+        seen_at,
+    })
+}
+
 #[cfg(unix)]
-fn socket_path() -> Option<PathBuf> {
+pub(crate) fn socket_path() -> Option<PathBuf> {
     crate::hub_cli::config_dir()
         .ok()
         .map(|dir| dir.join("agentscm").join("tray").join("activity.sock"))
@@ -186,45 +293,106 @@ fn observe_at(
     path: ActivityPath,
     outcome: ActivityOutcome,
 ) {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    use std::os::unix::net::UnixDatagram;
-
     if !valid_binding(binding) || !valid_agent(agent) {
         return;
     }
+    send_at(
+        pathname,
+        &WireObservation {
+            version: VERSION,
+            binding: binding.to_owned(),
+            agent: agent.map(str::to_owned),
+            path,
+            outcome,
+        },
+    );
+}
+
+/// Whether a tray is bound to the socket at `pathname`. A stale socket left by a tray that
+/// crashed refuses the connection.
+#[cfg(unix)]
+pub(crate) fn listening_at(pathname: &Path) -> bool {
+    std::os::unix::net::UnixDatagram::unbound()
+        .and_then(|socket| socket.connect(pathname))
+        .is_ok()
+}
+
+/// Report a coding agent working in a checkout that has no client connection. Like [`observe`],
+/// this never waits for the tray, and nothing leaves the machine. True when a tray accepted it.
+#[cfg(unix)]
+pub(crate) fn observe_unconnected_at(
+    pathname: &Path,
+    root: &Path,
+    host: &str,
+    repo: &str,
+    agent: &str,
+) -> bool {
+    let Some(root) = root.to_str() else {
+        return false;
+    };
+    if !valid_unconnected(root, host, repo, agent) {
+        return false;
+    }
+    send_at(
+        pathname,
+        &WireUnconnected {
+            version: VERSION,
+            root: root.to_owned(),
+            host: host.to_owned(),
+            repo: repo.to_owned(),
+            agent: agent.to_owned(),
+        },
+    )
+}
+
+/// True when the datagram was queued at a listening, owner-controlled socket.
+#[cfg(unix)]
+fn send_at(pathname: &Path, wire: &impl Serialize) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::net::UnixDatagram;
+
     let Some(parent) = pathname.parent() else {
-        return;
+        return false;
     };
     let Ok(metadata) = std::fs::symlink_metadata(parent) else {
-        return;
+        return false;
     };
     // SAFETY: geteuid has no arguments or memory access preconditions.
     if !metadata.file_type().is_dir()
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.permissions().mode() & 0o077 != 0
     {
-        return;
+        return false;
     }
-    let wire = WireObservation {
-        version: VERSION,
-        binding: binding.to_owned(),
-        agent: agent.map(str::to_owned),
-        path,
-        outcome,
-    };
-    let Ok(bytes) = serde_json::to_vec(&wire) else {
-        return;
+    let Ok(bytes) = serde_json::to_vec(wire) else {
+        return false;
     };
     if bytes.len() > DATAGRAM_BYTES {
-        return;
+        return false;
     }
     let Ok(socket) = UnixDatagram::unbound() else {
-        return;
+        return false;
     };
-    if socket.set_nonblocking(true).is_err() {
-        return;
+    socket.set_nonblocking(true).is_ok()
+        && set_buffer(&socket, libc::SO_SNDBUF)
+        && socket.send_to(&bytes, pathname).is_ok()
+}
+
+#[cfg(unix)]
+fn set_buffer(socket: &std::os::unix::net::UnixDatagram, option: libc::c_int) -> bool {
+    use std::os::fd::AsRawFd;
+    let size = SOCKET_BUFFER_BYTES;
+    // SAFETY: the descriptor stays open for the call, and the value pointer and length describe
+    // `size`, which outlives it.
+    unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            option,
+            (&raw const size).cast(),
+            size_of::<libc::c_int>() as libc::socklen_t,
+        ) == 0
     }
-    let _ = socket.send_to(&bytes, pathname);
 }
 
 /// Tray-owned socket lifecycle. The tray is responsible for singleton coordination before bind.
@@ -291,6 +459,9 @@ impl ActivityReceiver {
         }
         let identity = (metadata.dev(), metadata.ino());
         socket.set_nonblocking(true)?;
+        if !set_buffer(&socket, libc::SO_RCVBUF) {
+            return Err(std::io::Error::last_os_error());
+        }
         Ok(Self {
             socket,
             path,
@@ -304,12 +475,15 @@ impl ActivityReceiver {
     }
 
     fn drain_with_limit(&self, store: &mut ActivityStore, limit: usize) {
-        let mut bytes = [0_u8; DATAGRAM_BYTES + 1];
+        let mut bytes = vec![0_u8; DATAGRAM_BYTES + 1];
         for _ in 0..limit {
             match self.socket.recv(&mut bytes) {
                 Ok(size) if size <= DATAGRAM_BYTES => {
-                    if let Some(observation) = decode(&bytes[..size], std::time::Instant::now()) {
+                    let now = std::time::Instant::now();
+                    if let Some(observation) = decode(&bytes[..size], now) {
                         store.push(observation);
+                    } else if let Some(seen) = decode_unconnected(&bytes[..size], now) {
+                        store.push_unconnected(seen);
                     }
                 }
                 Ok(_) => {}
@@ -335,6 +509,7 @@ impl Drop for ActivityReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     const BINDING: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -456,6 +631,227 @@ mod tests {
         );
     }
 
+    fn seen(root: &str, agent: &str, seen_at: std::time::Instant) -> UnconnectedCheckout {
+        UnconnectedCheckout {
+            root: PathBuf::from(root),
+            host: "github.com".into(),
+            repo: "acme/widgets".into(),
+            agents: vec![agent.into()],
+            seen_at,
+        }
+    }
+
+    /// An absolute root on every platform: `/synthetic/x` has no drive and is relative on Windows.
+    fn absolute(name: &str) -> String {
+        std::env::temp_dir().join(name).to_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn unconnected_wire_format_round_trips_and_is_distinct_from_activity() {
+        let root = absolute("acme widgets");
+        let bytes = serde_json::to_vec(&WireUnconnected {
+            version: VERSION,
+            root: root.clone(),
+            host: "github.com".into(),
+            repo: "acme/widgets".into(),
+            agent: "claude".into(),
+        })
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let keys = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            ["agent", "host", "repo", "root", "version"]
+                .into_iter()
+                .collect()
+        );
+        let now = std::time::Instant::now();
+        let decoded = decode_unconnected(&bytes, now).unwrap();
+        assert_eq!(decoded.root, PathBuf::from(root));
+        assert_eq!(decoded.agents, ["claude"]);
+        assert!(decode(&bytes, now).is_none());
+
+        let activity = serde_json::to_vec(&WireObservation {
+            version: VERSION,
+            binding: BINDING.into(),
+            agent: None,
+            path: ActivityPath::Mcp,
+            outcome: ActivityOutcome::Acknowledged,
+        })
+        .unwrap();
+        assert!(decode_unconnected(&activity, now).is_none());
+    }
+
+    #[test]
+    fn invalid_unconnected_input_is_ignored() {
+        let now = std::time::Instant::now();
+        let valid = absolute("root");
+        // Each case breaks one rule of an otherwise valid observation.
+        assert!(valid_unconnected(
+            &valid,
+            "github.com",
+            "acme/widgets",
+            "claude"
+        ));
+        let broken = absolute("\nroot");
+        for (root, host, repo, agent) in [
+            ("relative/root", "github.com", "acme/widgets", "claude"),
+            (broken.as_str(), "github.com", "acme/widgets", "claude"),
+            (valid.as_str(), "", "acme/widgets", "claude"),
+            (valid.as_str(), "git hub.com", "acme/widgets", "claude"),
+            (valid.as_str(), "github.com", "not-a-repo", "claude"),
+            (valid.as_str(), "github.com", "acme/widgets", "unknown"),
+        ] {
+            assert!(
+                !valid_unconnected(root, host, repo, agent),
+                "{root} {host} {repo} {agent}"
+            );
+            let bytes = serde_json::to_vec(&WireUnconnected {
+                version: VERSION,
+                root: root.into(),
+                host: host.into(),
+                repo: repo.into(),
+                agent: agent.into(),
+            })
+            .unwrap();
+            assert!(decode_unconnected(&bytes, now).is_none());
+        }
+        let wire = serde_json::json!({"version":1, "root":valid, "host":"github.com", "repo":"a/b", "agent":"codex"});
+        assert!(decode_unconnected(&serde_json::to_vec(&wire).unwrap(), now).is_some());
+        for (key, value) in [
+            ("version", serde_json::json!(2)),
+            ("token", serde_json::json!("x")),
+        ] {
+            let mut changed = wire.clone();
+            changed[key] = value;
+            assert!(
+                decode_unconnected(&serde_json::to_vec(&changed).unwrap(), now).is_none(),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_connected_checkout_is_forgotten_until_it_is_seen_again() {
+        let now = std::time::Instant::now();
+        let mut store = ActivityStore::default();
+        store.push_unconnected(seen("/synthetic/a", "claude", now));
+        store.push_unconnected(seen("/synthetic/b", "codex", now));
+        store.forget_unconnected(Path::new("/synthetic/a"));
+        let rows = store.unconnected(now);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].root, Path::new("/synthetic/b"));
+        store.push_unconnected(seen("/synthetic/a", "claude", now + Duration::from_secs(1)));
+        assert_eq!(store.unconnected(now + Duration::from_secs(1)).len(), 2);
+    }
+
+    #[test]
+    fn unconnected_rows_dedupe_by_checkout_expire_and_are_capped() {
+        let start = std::time::Instant::now();
+        let mut store = ActivityStore::default();
+        store.push_unconnected(seen("/synthetic/a", "claude", start));
+        store.push_unconnected(seen(
+            "/synthetic/a",
+            "codex",
+            start + Duration::from_secs(1),
+        ));
+        store.push_unconnected(seen(
+            "/synthetic/a",
+            "claude",
+            start + Duration::from_secs(2),
+        ));
+        let rows = store.unconnected(start + Duration::from_secs(2));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agents, ["codex", "claude"]);
+        assert_eq!(rows[0].seen_at, start + Duration::from_secs(2));
+
+        for index in 0..MAX_UNCONNECTED + 2 {
+            store.push_unconnected(seen(
+                &format!("/synthetic/{index}"),
+                "gemini",
+                start + Duration::from_secs(10 + index as u64),
+            ));
+        }
+        let now = start + Duration::from_secs(100);
+        let rows = store.unconnected(now);
+        assert_eq!(rows.len(), MAX_UNCONNECTED);
+        assert_eq!(
+            rows[0].root,
+            PathBuf::from(format!("/synthetic/{}", MAX_UNCONNECTED + 1))
+        );
+        assert!(!rows.iter().any(|row| row.root == Path::new("/synthetic/a")));
+        assert!(!rows.iter().any(|row| row.root == Path::new("/synthetic/0")));
+        assert!(
+            store
+                .unconnected(
+                    start
+                        + UNCONNECTED_STALE_AFTER
+                        + Duration::from_secs(10 + MAX_UNCONNECTED as u64 + 2)
+                )
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unconnected_observations_reach_the_receiver() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private").join("activity.sock");
+        let receiver = ActivityReceiver::bind_at(path.clone()).unwrap();
+        observe_unconnected_at(
+            &path,
+            Path::new("/synthetic/widgets"),
+            "github.com",
+            "acme/widgets",
+            "codex",
+        );
+        observe_unconnected_at(
+            &path,
+            Path::new("relative"),
+            "github.com",
+            "acme/widgets",
+            "codex",
+        );
+        let mut store = ActivityStore::default();
+        receiver.drain(&mut store);
+        assert_eq!(store.len(), 0);
+        let rows = store.unconnected(std::time::Instant::now());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].repo, "acme/widgets");
+        assert_eq!(rows[0].agents, ["codex"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_longest_valid_root_is_delivered_and_longer_roots_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private").join("activity.sock");
+        let receiver = ActivityReceiver::bind_at(path.clone()).unwrap();
+        // Quotes and backslashes double in JSON, so this is the largest possible report.
+        let longest = format!("/{}", "\"\\".repeat((MAX_ROOT_BYTES - 1) / 2));
+        assert!(longest.len() <= MAX_ROOT_BYTES && longest.len() > MAX_ROOT_BYTES - 2);
+        let too_long = format!("/{}", "a".repeat(MAX_ROOT_BYTES));
+        for root in [&too_long, &longest] {
+            observe_unconnected_at(
+                &path,
+                Path::new(root),
+                &"h".repeat(253),
+                "acme/widgets",
+                "copilot",
+            );
+        }
+        let mut store = ActivityStore::default();
+        receiver.drain(&mut store);
+        let rows = store.unconnected(std::time::Instant::now());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].root, Path::new(&longest));
+    }
+
     #[cfg(unix)]
     #[test]
     fn missing_receiver_is_silent_and_receiver_drains_valid_only() {
@@ -472,6 +868,7 @@ mod tests {
         let path = dir.path().join("private").join("activity.sock");
         let receiver = ActivityReceiver::bind_at(path.clone()).unwrap();
         let sender = std::os::unix::net::UnixDatagram::unbound().unwrap();
+        assert!(set_buffer(&sender, libc::SO_SNDBUF));
         sender.send_to(b"bad", &path).unwrap();
         sender
             .send_to(&vec![b'x'; DATAGRAM_BYTES * 2], &path)
