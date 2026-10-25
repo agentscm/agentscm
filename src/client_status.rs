@@ -240,9 +240,22 @@ async fn collect_until(
     completed
 }
 
+/// Change capture is Unix-only, so elsewhere no checkout reports a capture mode.
+fn capture_mode_for(root: &Path) -> Option<CaptureModeV1> {
+    #[cfg(unix)]
+    {
+        crate::change_capture_client::enabled_capture_mode(root)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        None
+    }
+}
+
 fn unresolved_status(connection: Connection, now: i64) -> ConnectionStatus {
     let credential = credential_status(&connection, false, now);
-    let capture_mode = crate::change_capture_client::enabled_capture_mode(&connection.root);
+    let capture_mode = capture_mode_for(&connection.root);
     ConnectionStatus {
         root: connection.root,
         repository: connection.repo,
@@ -289,7 +302,7 @@ async fn connection_status(connection: Connection, check: bool, now: i64) -> Con
     if check && current && !still_current(&connection, generation.as_deref()) {
         return unresolved_status(connection, now);
     }
-    let capture_mode = crate::change_capture_client::enabled_capture_mode(&connection.root);
+    let capture_mode = capture_mode_for(&connection.root);
     ConnectionStatus {
         root: connection.root,
         repository: connection.repo,
