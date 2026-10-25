@@ -267,6 +267,12 @@ pub(crate) fn acquire_lock(path: &Path) -> Result<File> {
     }
 }
 
+/// Holds the connections lock. Lock order everywhere: connections lock, then the change-capture
+/// config lock; nothing takes them the other way round.
+pub(crate) fn lock_connections() -> Result<File> {
+    acquire_lock(&lock_path()?)
+}
+
 /// Compare and replace one root while retaining unrelated entries written concurrently.
 pub(crate) fn update(
     root: &Path,

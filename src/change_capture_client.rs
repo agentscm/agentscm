@@ -573,17 +573,21 @@ pub struct ExpectedTarget<'a> {
     pub hub: &'a str,
 }
 
-/// The config lock, held together with the checkout's connection and the bindings read under it,
-/// so a decision made from them cannot be overtaken by another writer.
+/// The connections lock and the config lock, held together with the checkout's connection and the
+/// bindings read under them, so a decision made from them cannot be overtaken by a reconnect or
+/// another writer.
 struct Locked {
+    _connections: File,
     _lock: ConfigLock,
     connection: client_config::Connection,
     bindings: Vec<CaptureBinding>,
 }
 
-/// Takes the config lock, then reads the checkout's connection and refuses a connection other than
-/// `expected`, so what the person agreed to is what the change applies to.
+/// Takes the connections lock, then the config lock (the one global order), reads the checkout's
+/// connection and refuses a connection other than `expected`, so what the person agreed to is what
+/// the change applies to. A reconnect waits until the caller drops the result.
 fn lock_checkout(root: &Path, expected: Option<ExpectedTarget<'_>>) -> Result<Locked> {
+    let connections = client_config::lock_connections()?;
     let lock = acquire_lock()?;
     let connection = connection_for(root)?;
     if let Some(expected) = expected
@@ -596,6 +600,7 @@ fn lock_checkout(root: &Path, expected: Option<ExpectedTarget<'_>>) -> Result<Lo
         )));
     }
     Ok(Locked {
+        _connections: connections,
         _lock: lock,
         connection,
         bindings: load()?,
@@ -1023,8 +1028,33 @@ fn install_binding(
     Ok(json!({"configured": true, "root": root, "settings": settings}))
 }
 
+/// The root a binding is stored under. A checkout that no longer exists cannot be canonicalized,
+/// so it is matched by the absolute path given, normalized lexically; the flag says the tree is
+/// gone.
+fn binding_root(path: &Path) -> Result<(PathBuf, bool)> {
+    if std::fs::symlink_metadata(path).is_ok() {
+        return Ok((client_config::canonical_root(path)?, false));
+    }
+    if !path.is_absolute() {
+        return Err(invalid(
+            "the checkout no longer exists; give its absolute path as it was saved",
+        ));
+    }
+    let mut root = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                root.pop();
+            }
+            part => root.push(part),
+        }
+    }
+    Ok((root, true))
+}
+
 pub fn unconfigure(args: UnconfigureArgs) -> Result<Value> {
-    let root = client_config::canonical_root(&args.root)?;
+    let (root, gone) = binding_root(&args.root)?;
     let _lock = acquire_lock()?;
     let old_bindings = load()?;
     let recorded = old_bindings
@@ -1035,7 +1065,8 @@ pub fn unconfigure(args: UnconfigureArgs) -> Result<Value> {
     let mut bindings = old_bindings.clone();
     let disabled = disable_binding(&mut bindings, &root);
     save(&bindings)?;
-    if let Err(error) = install_hooks(&root, &settings, false) {
+    // Hooks lived inside the deleted tree, so there is nothing to remove.
+    if !gone && let Err(error) = install_hooks(&root, &settings, false) {
         if let Err(rollback) = save(&old_bindings) {
             return Err(invalid(format!(
                 "Claude hook removal failed ({error}); capture binding rollback also failed ({rollback})"
@@ -1043,17 +1074,20 @@ pub fn unconfigure(args: UnconfigureArgs) -> Result<Value> {
         }
         return Err(error);
     }
-    Ok(
-        json!({"configured": false, "disabled": disabled, "lineage_retained": bindings.iter().any(|binding| binding.root == root),
-        "root": root, "settings": settings}),
-    )
+    let mut result = json!({"configured": false, "disabled": disabled, "lineage_retained": bindings.iter().any(|binding| binding.root == root),
+        "root": root, "settings": settings, "hooks_removed": !gone});
+    if gone {
+        result["note"] =
+            json!("the checkout no longer exists, so its Claude hooks were not touched");
+    }
+    Ok(result)
 }
 
 /// Removes a disabled checkout's binding from the config so the checkout can be set up again for
 /// another repository or Hub. The binding's spool is never touched; its path is returned so the
-/// person can export or delete it.
+/// person can export or delete it. Works for a checkout that has been deleted.
 pub fn forget(args: ForgetArgs) -> Result<Value> {
-    let root = client_config::canonical_root(&args.root)?;
+    let (root, _) = binding_root(&args.root)?;
     let _lock = acquire_lock()?;
     let mut bindings = load()?;
     let position = bindings
@@ -1882,19 +1916,22 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CaptureBinding, CaptureSetting, ExpectedTarget, HOOK_MARKER, acquire_lock, disable_binding,
-        enable_capture, install_hooks, is_digest, is_identifier, load_recipe_file,
-        load_recipe_from_file, lock_checkout, managed_recipe_invocations, parse_rule, plan_enable,
-        remove_owned_hooks, save, session_start_context, set_capture_mode, setting_in,
-        validate_binding, validate_binding_update,
+        CaptureBinding, CaptureSetting, ExpectedTarget, ForgetArgs, HOOK_MARKER, UnconfigureArgs,
+        acquire_lock, deliver_pending, disable_binding, enable_capture, forget, install_hooks,
+        is_digest, is_identifier, load, load_recipe_file, load_recipe_from_file, lock_checkout,
+        managed_recipe_invocations, parse_rule, plan_enable, remove_owned_hooks, save,
+        session_start_context, set_capture_mode, setting_in, unconfigure, validate_binding,
+        validate_binding_update,
     };
     use agentscm::change_capture::claude_code::{ActionRuleV1, NativeResultSourceV1};
     use agentscm::change_capture::{
-        ConfiguredRecipeV1, FileIdentityV1, MIN_ACTION_CAPTURE_BYTES, MIN_ACTION_CAPTURE_RECORDS,
-        SpoolIdentityV1, SpoolLimits,
+        ConfiguredRecipeV1, FileIdentityV1, LocalSpool, MIN_ACTION_CAPTURE_BYTES,
+        MIN_ACTION_CAPTURE_RECORDS, SpoolIdentityV1, SpoolLimits,
     };
     use agentscm::change_record::{ActionKindV1, CaptureModeV1, CoverageV1};
     use serde_json::json;
+    use std::path::PathBuf;
+    use std::time::Duration;
 
     fn recipe_binding(recipes: Vec<ConfiguredRecipeV1>) -> CaptureBinding {
         CaptureBinding {
@@ -2257,9 +2294,8 @@ mod tests {
         assert!(validate_binding(&binding).is_err());
     }
 
-    #[test]
-    fn sharing_is_refused_for_a_connection_the_person_did_not_see_and_bindings_are_read_under_the_lock()
-     {
+    /// A real Git checkout connected to `http://127.0.0.1:9`, with the config dir pointed at a temp dir.
+    fn connected_checkout() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let config = tempfile::tempdir().unwrap();
         // SAFETY: nextest runs each test in its own process, so no other thread reads it.
         unsafe { std::env::set_var("XDG_CONFIG_HOME", config.path()) };
@@ -2285,15 +2321,26 @@ mod tests {
         }
         let agentscm = config.path().join("agentscm");
         std::fs::create_dir_all(&agentscm).unwrap();
+        connect(&agentscm, &root, "http://127.0.0.1:9");
+        (config, root, agentscm)
+    }
+
+    fn connect(agentscm: &std::path::Path, root: &std::path::Path, hub: &str) {
         std::fs::write(
             agentscm.join("connections.json"),
             json!({"version": 1, "connections": [{
-                "root": root, "origin_host": "github.com", "hub": "http://127.0.0.1:9",
+                "root": root, "origin_host": "github.com", "hub": hub,
                 "repo": "acme/widgets", "token_file": agentscm.join("token")
             }]})
             .to_string(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn sharing_is_refused_for_a_connection_the_person_did_not_see_and_bindings_are_read_under_the_lock()
+     {
+        let (config, root, agentscm) = connected_checkout();
         let shared = CaptureModeV1::SharedConversation;
         let seen = |hub| ExpectedTarget {
             repository: "acme/widgets",
@@ -2336,5 +2383,90 @@ mod tests {
         save(&[binding]).unwrap();
         drop(lock);
         assert_eq!(reader.join().unwrap().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_reconnect_during_enable_is_not_overtaken_and_enable_refuses_the_new_hub() {
+        let (_config, root, agentscm) = connected_checkout();
+        let held = crate::client_config::lock_connections().unwrap();
+        let enable = {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                enable_capture(
+                    &root,
+                    CaptureModeV1::SharedConversation,
+                    ExpectedTarget {
+                        repository: "acme/widgets",
+                        hub: "http://127.0.0.1:9",
+                    },
+                )
+            })
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !enable.is_finished(),
+            "enable must wait for the connections lock"
+        );
+        connect(&agentscm, &root, "https://hub.example");
+        drop(held);
+        let error = enable.join().unwrap().unwrap_err().to_string();
+        assert!(error.contains("on https://hub.example"), "{error}");
+        assert!(!agentscm.join("change-capture.json").exists());
+    }
+
+    #[test]
+    fn delivery_uploads_nothing_when_the_connection_no_longer_matches_the_binding() {
+        let (config, root, agentscm) = connected_checkout();
+        let spool_root = config.path().join("spool");
+        let spool = LocalSpool::open_with_limits(&spool_root, SpoolLimits::default()).unwrap();
+        let mut binding = recipe_binding(vec![]);
+        binding.root = root.clone();
+        binding.spool = spool.root().to_owned();
+        binding.repository = "acme/widgets".into();
+        binding.hub = "http://127.0.0.1:9".into();
+        save(&[binding]).unwrap();
+        connect(&agentscm, &root, "https://hub.example");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(deliver_pending(&root, &spool))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("namespace differs from client connection"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_deleted_checkout_can_be_unconfigured_and_forgotten_and_keeps_its_spool() {
+        let (config, root, _agentscm) = connected_checkout();
+        let mut binding = recipe_binding(vec![]);
+        binding.root = root.clone();
+        binding.spool = config.path().join("spool");
+        std::fs::create_dir(&binding.spool).unwrap();
+        binding.claude_settings = None;
+        save(&[binding.clone()]).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        let given = root.join("sub/..");
+        let forget_args = || ForgetArgs {
+            root: given.clone(),
+        };
+
+        let error = forget(forget_args()).unwrap_err().to_string();
+        assert!(error.contains("still enabled"), "{error}");
+        let result = unconfigure(UnconfigureArgs {
+            root: given.clone(),
+            claude_settings: None,
+        })
+        .unwrap();
+        assert_eq!(result["disabled"], true);
+        assert_eq!(result["hooks_removed"], false);
+        let result = forget(forget_args()).unwrap();
+        assert_eq!(result["spool"], json!(binding.spool));
+        assert!(binding.spool.exists());
+        assert!(load().unwrap().is_empty());
     }
 }
