@@ -2490,7 +2490,7 @@ impl LocalSpool {
     }
 
     pub fn append(&self, envelope: &CaptureEnvelopeV1) -> Result<AppendOutcome> {
-        self.append_inner(envelope, false)
+        self.append_inner(envelope, false, false)
     }
 
     /// Atomically admits a new action start together with its durable local observation order.
@@ -2622,16 +2622,32 @@ impl LocalSpool {
     /// Retains a bounded health/gap envelope from the metadata headroom that ordinary content
     /// cannot consume. Callers must not use this path for ordinary events or artifacts.
     pub(crate) fn append_priority(&self, envelope: &CaptureEnvelopeV1) -> Result<AppendOutcome> {
-        if !matches!(envelope, CaptureEnvelopeV1::EventBatch(batch) if batch.events.iter().all(|event| event.kind == CapturedEventKindV1::Gap))
-        {
-            return Err(CaptureError::Invalid(
-                "priority capture append accepts gap events only".into(),
-            ));
-        }
-        self.append_inner(envelope, true)
+        check_priority_envelope(envelope)?;
+        self.append_inner(envelope, true, false)
     }
 
-    fn append_inner(&self, envelope: &CaptureEnvelopeV1, priority: bool) -> Result<AppendOutcome> {
+    /// Appends an event batch whose observation time is only the hook's receipt time. A retained
+    /// or compacted batch under the same operation id is a re-delivery of the same hook, so it is
+    /// a duplicate even though its receipt time differs. The check and the append share one lock.
+    pub(crate) fn append_at_receipt(&self, envelope: &CaptureEnvelopeV1) -> Result<AppendOutcome> {
+        self.append_inner(envelope, false, true)
+    }
+
+    /// Priority variant of [`Self::append_at_receipt`] for gap events.
+    pub(crate) fn append_priority_at_receipt(
+        &self,
+        envelope: &CaptureEnvelopeV1,
+    ) -> Result<AppendOutcome> {
+        check_priority_envelope(envelope)?;
+        self.append_inner(envelope, true, true)
+    }
+
+    fn append_inner(
+        &self,
+        envelope: &CaptureEnvelopeV1,
+        priority: bool,
+        receipt_timed: bool,
+    ) -> Result<AppendOutcome> {
         envelope
             .validate()
             .map_err(|error| CaptureError::Invalid(error.to_string()))?;
@@ -2641,7 +2657,9 @@ impl LocalSpool {
         let _lock = self.lock()?;
         if path.exists() {
             let existing = read_bounded(&path, self.limits.max_total_bytes)?;
-            return if existing == bytes {
+            let same_but_time = receipt_timed
+                && without_observation_time(&existing)? == without_observation_time(&bytes)?;
+            return if existing == bytes || same_but_time {
                 Ok(AppendOutcome::Duplicate)
             } else {
                 Err(CaptureError::Conflict(
@@ -2653,7 +2671,9 @@ impl LocalSpool {
             .entries
             .get(&key)
         {
-            return if compacted.digest == sha256(&bytes) {
+            // Compaction keeps only a digest, so a receipt-timed re-delivery cannot be compared
+            // beyond its operation id, which already fixes the hook's identity.
+            return if receipt_timed || compacted.digest == sha256(&bytes) {
                 Ok(AppendOutcome::Duplicate)
             } else {
                 Err(CaptureError::Conflict(
@@ -2665,19 +2685,6 @@ impl LocalSpool {
         self.reserve_envelope(envelope, bytes.len() as u64, priority)?;
         atomic_write(&path, &bytes)?;
         Ok(AppendOutcome::Stored)
-    }
-
-    /// Observation time of the event batch already retained for `operation_id`, if any.
-    pub(crate) fn retained_event_time(&self, operation_id: &str) -> Result<Option<i64>> {
-        let _lock = self.lock()?;
-        Ok(
-            match retained_envelope(&self.root, self.limits, "event", operation_id)? {
-                Some(CaptureEnvelopeV1::EventBatch(batch)) => {
-                    batch.events.first().map(|event| event.observed_at)
-                }
-                _ => None,
-            },
-        )
     }
 
     pub fn pending(&self, limit: usize) -> Result<Vec<CaptureEnvelopeV1>> {
@@ -4262,6 +4269,28 @@ fn envelope_key(envelope: &CaptureEnvelopeV1) -> String {
         CaptureEnvelopeV1::Usage(value) => ("usage", value.observation_id.as_str()),
     };
     envelope_key_parts(kind, operation)
+}
+
+fn check_priority_envelope(envelope: &CaptureEnvelopeV1) -> Result<()> {
+    if matches!(envelope, CaptureEnvelopeV1::EventBatch(batch) if batch.events.iter().all(|event| event.kind == CapturedEventKindV1::Gap))
+    {
+        Ok(())
+    } else {
+        Err(CaptureError::Invalid(
+            "priority capture append accepts gap events only".into(),
+        ))
+    }
+}
+
+/// Canonical bytes of an event envelope with every observation time zeroed.
+fn without_observation_time(bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut envelope: CaptureEnvelopeV1 = serde_json::from_slice(bytes)?;
+    if let CaptureEnvelopeV1::EventBatch(batch) = &mut envelope {
+        for event in &mut batch.events {
+            event.observed_at = 0;
+        }
+    }
+    Ok(serde_json::to_vec(&envelope)?)
 }
 
 fn envelope_key_parts(kind: &str, operation: &str) -> String {

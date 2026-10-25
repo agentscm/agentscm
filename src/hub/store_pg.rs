@@ -1096,13 +1096,14 @@ fn current_capture_work_for_session(
     now: i64,
 ) -> Result<Option<WorkItem>> {
     let rows = tx.query(
-        "SELECT item.snapshot FROM hub_work_items item
+        "SELECT item.snapshot, item.state='active', participant.role='lead'
+         FROM hub_work_items item
          JOIN hub_work_participants participant ON participant.work=item.id
          WHERE item.provider=$1 AND item.host=$2 AND item.repository=$3
            AND item.repository_id IS NOT DISTINCT FROM $4 AND item.state IN ('active','paused','blocked')
            AND participant.token=$5 AND participant.session=$6
            AND participant.generation=item.generation
-         ORDER BY item.id LIMIT 2",
+         ORDER BY item.state='active' DESC, participant.role='lead' DESC, item.id LIMIT 2",
         &[
             &who.owner.identity.provider,
             &who.owner.identity.host,
@@ -1112,7 +1113,11 @@ fn current_capture_work_for_session(
             &session,
         ],
     )?;
-    if rows.len() > 1 {
+    // An active Work outranks paused or blocked ones, and the session's lead role breaks ties.
+    if let [first, second] = rows.as_slice()
+        && (first.get::<_, bool>(1), first.get::<_, bool>(2))
+            == (second.get::<_, bool>(1), second.get::<_, bool>(2))
+    {
         return Err(HubError::Invalid(
             "session participates in more than one capturable work item".into(),
         ));

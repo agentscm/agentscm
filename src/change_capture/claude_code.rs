@@ -312,7 +312,11 @@ fn capture_hook_with_identity_mode(
         && !starts_new_session
         && !spool.session_origin_observed(&request.canonical_session_id)?
     {
-        ensure_adapter_started_late_gap(request, spool)?;
+        // The marker is retried on every hook until the origin is seen, so a failure here must
+        // not cost the hook's own event.
+        if let Err(error) = ensure_adapter_started_late_gap(request, spool) {
+            eprintln!("agentscm: adapter-started-late marker not retained: {error}");
+        }
     }
     let identity_input = serde_json::to_vec(&json!({
         "session": session_id,
@@ -346,9 +350,10 @@ fn capture_hook_with_identity_mode(
         || format!("cap:{}", sha256(event_id.as_bytes())),
         |identity| identity.operation_id.to_owned(),
     );
-    let observed_at = match provider_timestamp.and_then(parse_rfc3339) {
+    let provider_time = provider_timestamp.and_then(parse_rfc3339);
+    let observed_at = match provider_time {
         Some(time) => time,
-        None => receipt_time(spool, &operation_id)?,
+        None => now_seconds()?,
     };
     let selected = SelectedEvent {
         event_id: event_id.clone(),
@@ -417,7 +422,11 @@ fn capture_hook_with_identity_mode(
         .max()
         .unwrap_or(first_missing);
     let envelope = CaptureEnvelopeV1::EventBatch(batch(request, operation_id.clone(), events));
-    let appended = match spool.append(&envelope) {
+    let append = |envelope: &CaptureEnvelopeV1| match provider_time {
+        Some(_) => spool.append(envelope),
+        None => spool.append_at_receipt(envelope),
+    };
+    let appended = match append(&envelope) {
         Ok(outcome) => outcome,
         Err(CaptureError::Limit(_)) => {
             let gap_id = format!(
@@ -440,11 +449,15 @@ fn capture_hook_with_identity_mode(
                 boundary: None,
                 subagent: None,
             };
-            spool.append_priority(&CaptureEnvelopeV1::EventBatch(batch(
+            let gap = CaptureEnvelopeV1::EventBatch(batch(
                 request,
                 format!("cap:{}", sha256(gap_id.as_bytes())),
                 vec![gap],
-            )))?
+            ));
+            match provider_time {
+                Some(_) => spool.append_priority(&gap)?,
+                None => spool.append_priority_at_receipt(&gap)?,
+            }
         }
         Err(error) => return Err(error),
     };
@@ -598,15 +611,6 @@ pub fn deferred_native_hook(
     })
 }
 
-/// Real hook payloads carry no timestamp, so the hook's receipt time stands in. Identity never
-/// reads it, and a re-run of the same operation keeps the retained time so the bytes match.
-fn receipt_time(spool: &LocalSpool, operation_id: &str) -> Result<i64> {
-    match spool.retained_event_time(operation_id)? {
-        Some(time) => Ok(time),
-        None => now_seconds(),
-    }
-}
-
 fn ensure_deferred_gaps(observed_session_id: &str, spool: &LocalSpool) -> Result<()> {
     for deferred in spool.deferred_gaps(observed_session_id)? {
         // Without an alias, the reserved observed-session sequence is already in the canonical
@@ -681,7 +685,7 @@ fn ensure_adapter_started_late_gap(request: &CaptureRequest, spool: &LocalSpool)
     let event = CapturedEventV1 {
         event_id: event_id.clone(),
         sequence,
-        observed_at: receipt_time(spool, &operation_id)?,
+        observed_at: now_seconds()?,
         kind: CapturedEventKindV1::Gap,
         tool: None,
         artifact: None,
@@ -694,7 +698,7 @@ fn ensure_adapter_started_late_gap(request: &CaptureRequest, spool: &LocalSpool)
         boundary: None,
         subagent: None,
     };
-    spool.append_priority(&CaptureEnvelopeV1::EventBatch(batch(
+    spool.append_priority_at_receipt(&CaptureEnvelopeV1::EventBatch(batch(
         request,
         operation_id,
         vec![event],
@@ -718,7 +722,7 @@ fn record_action_capture_pause(request: &CaptureRequest, spool: &LocalSpool) -> 
     let event = CapturedEventV1 {
         event_id: event_id.clone(),
         sequence,
-        observed_at: receipt_time(spool, &operation_id)?,
+        observed_at: now_seconds()?,
         kind: CapturedEventKindV1::Gap,
         tool: None,
         artifact: None,
@@ -731,7 +735,7 @@ fn record_action_capture_pause(request: &CaptureRequest, spool: &LocalSpool) -> 
         boundary: None,
         subagent: None,
     };
-    spool.append_priority(&CaptureEnvelopeV1::EventBatch(batch(
+    spool.append_priority_at_receipt(&CaptureEnvelopeV1::EventBatch(batch(
         request,
         operation_id,
         vec![event],

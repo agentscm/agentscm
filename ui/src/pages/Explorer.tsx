@@ -20,7 +20,7 @@ import {
   type ExplorerSessionEvidence,
   type ExplorerSummary,
 } from '../repoExplorer.ts'
-import { Ago, CopyButton, Empty, Icon, Notice, Pill, Skeleton, type Tone } from '../ui.tsx'
+import { Ago, CopyButton, Empty, Icon, Notice, Pill, Reported, Skeleton, type Tone } from '../ui.tsx'
 import '../explorer.css'
 
 type Load<T> = { kind: 'idle' } | { kind: 'loading' } | { kind: 'error'; message: string } | { kind: 'ready'; value: T }
@@ -242,7 +242,7 @@ function Conversation({ selected, load, pager, onClose }: { selected: ExplorerSe
       {load.kind === 'error' && <Notice tone="bad" title="Could not read this conversation">{load.message}</Notice>}
       {load.kind === 'ready' && <>
         {!load.value.projection_coverage.complete && <Notice tone="warn" title="Conversation coverage is incomplete">{load.value.projection_coverage.unavailable_bodies > 0 ? `${load.value.projection_coverage.unavailable_bodies} ${load.value.projection_coverage.unavailable_bodies === 1 ? 'body is' : 'bodies are'} known to be unavailable. ` : ''}{load.value.projection_coverage.unverified_bodies > 0 ? `${load.value.projection_coverage.unverified_bodies} ${load.value.projection_coverage.unverified_bodies === 1 ? 'body has' : 'bodies have'} not been checked in this read. ` : ''}Missing or compacted content stays missing; the explorer does not reconstruct it.</Notice>}
-        {load.value.events.length === 0 ? <Empty icon="chat-square" title="No visible events retained" /> : <ol className="explorer-conversation-list">{load.value.events.map((event) => <li key={`${event.sequence}|${event.event_id}`} className={`kind-${event.kind}`}><div className="explorer-turn-head"><strong>{titleCase(event.kind)}</strong><span><Ago at={event.observed_at} /> · #{event.sequence}</span></div>{event.body.content !== null ? <pre><code>{event.body.content}</code></pre> : <p className="small muted">Body {titleCase(event.body.availability).toLowerCase()}.</p>}{event.gap && <p className="small warn-text">Missing sequence {event.gap.first_missing}–{event.gap.last_missing}: {titleCase(event.gap.reason).toLowerCase()}.</p>}</li>)}</ol>}
+        {load.value.events.length === 0 ? <Empty icon="chat-square" title="No visible events retained" /> : <ol className="explorer-conversation-list">{load.value.events.map((event) => <li key={`${event.sequence}|${event.event_id}`} className={`kind-${event.kind}`}><div className="explorer-turn-head"><strong>{titleCase(event.kind)}</strong><span><Reported at={event.observed_at} /> · #{event.sequence}</span></div>{event.body.content !== null ? <pre><code>{event.body.content}</code></pre> : <p className="small muted">Body {titleCase(event.body.availability).toLowerCase()}.</p>}{event.gap && <p className="small warn-text">Missing sequence {event.gap.first_missing}–{event.gap.last_missing}: {titleCase(event.gap.reason).toLowerCase()}.</p>}</li>)}</ol>}
         <CursorPaging previous={pager.newer} next={load.value.next_cursor} onNext={pager.older} label="Conversation" />
       </>}
     </aside>

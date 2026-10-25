@@ -1111,6 +1111,106 @@ fn hook_without_timestamp_uses_receipt_time_and_keeps_it_on_rerun() {
     assert_eq!(pending_event_times(&spool), first);
 }
 
+fn acknowledge_and_compact(spool: &LocalSpool) {
+    for envelope in spool.pending(100).unwrap() {
+        spool.acknowledge(&envelope).unwrap();
+    }
+    spool.compact_acknowledged(100).unwrap();
+}
+
+#[test]
+fn resumed_session_hooks_survive_spool_compaction_and_receipt_time_changes() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let request = capture_request(CaptureModeV1::MetadataOnly);
+    let session = &request.observed_session_id;
+    let hook = |tool: &str, id: &str| {
+        format!(
+            r#"{{"hook_event_name":"PreToolUse","session_id":"{session}","tool_name":"{tool}","tool_use_id":"{id}","tool_input":{{}}}}"#
+        )
+    };
+    // No startup SessionStart, so every hook re-evaluates the adapter-started-late marker.
+    let first = hook("Read", "read_1");
+    assert_eq!(
+        capture_hook(first.as_bytes(), &request, &spool).unwrap(),
+        HookCaptureOutcome::Stored
+    );
+    acknowledge_and_compact(&spool);
+    std::thread::sleep(Duration::from_millis(1100));
+
+    let second = hook("Grep", "grep_1");
+    assert_eq!(
+        capture_hook(second.as_bytes(), &request, &spool).unwrap(),
+        HookCaptureOutcome::Stored
+    );
+    assert_eq!(pending_event_times(&spool).len(), 1);
+    // A stable-id event re-delivered after compaction is the original, not a conflict.
+    assert_eq!(
+        capture_hook(first.as_bytes(), &request, &spool).unwrap(),
+        HookCaptureOutcome::Duplicate
+    );
+    assert_eq!(pending_event_times(&spool).len(), 1);
+}
+
+#[test]
+fn receipt_timed_redelivery_differing_only_in_time_is_a_duplicate() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let request = capture_request(CaptureModeV1::MetadataOnly);
+    let hook = br#"{"hook_event_name":"PreToolUse","session_id":"session_fixture","tool_name":"Read","tool_use_id":"read_1","tool_input":{}}"#;
+    capture_hook(hook, &request, &spool).unwrap();
+    // Simulate a concurrent hook that stored the same operation a second earlier.
+    for entry in fs::read_dir(spool.root().join("outbox")).unwrap() {
+        let path = entry.unwrap().path();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        for event in value["events"].as_array_mut().unwrap() {
+            let at = event["observed_at"].as_i64().unwrap();
+            event["observed_at"] = serde_json::json!(at - 1);
+        }
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+    let before = pending_event_times(&spool);
+    assert_eq!(
+        capture_hook(hook, &request, &spool).unwrap(),
+        HookCaptureOutcome::Duplicate
+    );
+    assert_eq!(pending_event_times(&spool), before);
+}
+
+#[test]
+fn concurrent_untimed_hooks_for_one_operation_store_one_event() {
+    let temp = TempDir::new().unwrap();
+    let spool = Arc::new(LocalSpool::open(temp.path().join("spool")).unwrap());
+    let barrier = Arc::new(Barrier::new(6));
+    let handles: Vec<_> = (0..6)
+        .map(|_| {
+            let (spool, barrier) = (spool.clone(), barrier.clone());
+            thread::spawn(move || {
+                let request = capture_request(CaptureModeV1::MetadataOnly);
+                let hook = br#"{"hook_event_name":"PreToolUse","session_id":"session_fixture","tool_name":"Read","tool_use_id":"read_1","tool_input":{}}"#;
+                barrier.wait();
+                capture_hook(hook, &request, &spool)
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+    assert_eq!(
+        spool
+            .pending(20)
+            .unwrap()
+            .iter()
+            .filter(
+                |envelope| matches!(envelope, CaptureEnvelopeV1::EventBatch(batch)
+                if batch.events.iter().any(|event| event.kind == CapturedEventKindV1::ToolStarted))
+            )
+            .count(),
+        1
+    );
+}
+
 #[test]
 fn deferred_alias_gap_keeps_original_target_across_resumed_generation() {
     let repo = git_fixture();
@@ -3129,6 +3229,29 @@ fn observed_order_exhaustion_retains_hook_fact_and_one_priority_pause_gap() {
     assert_eq!(replay.action, NativeActionOutcome::Interrupted);
     assert_eq!(replay.event, HookCaptureOutcome::Duplicate);
     assert_eq!(spool.pending(20).unwrap().len(), pending.len());
+
+    // After compaction only digests remain; the pause marker is re-attempted on replay and a
+    // new receipt time must neither conflict nor drop the hook's own event.
+    acknowledge_and_compact(&spool);
+    std::thread::sleep(Duration::from_millis(1100));
+    let later = capture_native_hook(pre, &request, &actions, &spool).unwrap();
+    assert_eq!(later.action, NativeActionOutcome::Interrupted);
+    assert_eq!(later.event, HookCaptureOutcome::Duplicate);
+    assert!(
+        !later
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("marker failed"))
+    );
+    let next = br#"{"hook_event_name":"PreToolUse","session_id":"session_fixture","tool_name":"Bash","tool_use_id":"order_exhausted_2","tool_input":{"command":"true"}}"#;
+    let next = capture_native_hook(next, &request, &actions, &spool).unwrap();
+    assert_eq!(next.event, HookCaptureOutcome::Stored);
+    assert!(
+        !next
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("marker failed"))
+    );
 }
 
 #[test]

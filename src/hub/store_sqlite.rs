@@ -1114,13 +1114,14 @@ fn current_capture_work_for_session(
     now: i64,
 ) -> Result<Option<WorkItem>> {
     let mut statement = tx.prepare(
-        "SELECT item.snapshot FROM hub_work_items item
+        "SELECT item.snapshot, item.state='active', participant.role='lead'
+         FROM hub_work_items item
          JOIN hub_work_participants participant ON participant.work=item.id
          WHERE item.provider=?1 AND item.host=?2 AND item.repository=?3
            AND item.repository_id IS ?4 AND item.state IN ('active','paused','blocked')
            AND participant.token=?5 AND participant.session=?6
            AND participant.generation=item.generation
-         ORDER BY item.id LIMIT 2",
+         ORDER BY item.state='active' DESC, participant.role='lead' DESC, item.id LIMIT 2",
     )?;
     let snapshots = statement
         .query_map(
@@ -1132,10 +1133,22 @@ fn current_capture_work_for_session(
                 who.token,
                 session
             ],
-            |row| row.get::<_, String>(0),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, bool>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            },
         )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    if snapshots.len() > 1 {
+    // An active Work outranks paused or blocked ones, and the session's lead role breaks ties.
+    if let [
+        (_, first_active, first_lead),
+        (_, second_active, second_lead),
+    ] = snapshots.as_slice()
+        && (first_active, first_lead) == (second_active, second_lead)
+    {
         return Err(HubError::Invalid(
             "session participates in more than one capturable work item".into(),
         ));
@@ -1143,7 +1156,7 @@ fn current_capture_work_for_session(
     snapshots
         .into_iter()
         .next()
-        .map(|snapshot| {
+        .map(|(snapshot, _, _)| {
             let mut item: WorkItem = json_value(&snapshot)?;
             project_claim(tx, &mut item, now)?;
             Ok(item)

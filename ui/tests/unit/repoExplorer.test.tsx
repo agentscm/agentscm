@@ -145,6 +145,36 @@ describe('repository explorer journey', () => {
     expect(screen.getByText(BLOB.slice(0, 12)).parentElement?.textContent).toBe(BLOB.slice(0, 12))
   })
 
+  it('shows time not reported instead of an age for a zero-time conversation event', async () => {
+    const zero = conversation()
+    zero.events[0]!.observed_at = 0
+    vi.stubGlobal('fetch', async (input: string | URL | Request) => {
+      const url = new URL(String(input), 'http://localhost')
+      if (url.pathname.endsWith('/summary')) return json(summary())
+      if (url.pathname.endsWith('/tree')) {
+        const path = url.searchParams.get('path') ?? ''
+        return json({ version: 1, repository_id: REPO, commit: COMMIT, tree: TREE, path, entries: path === '' ? [{ path: 'src', name: 'src', kind: 'directory', oid: TREE, size: null }] : [{ path: 'src/lib.rs', name: 'lib.rs', kind: 'file', oid: BLOB, size: 22 }], next: null, complete: true, limit_state: 'complete' })
+      }
+      if (url.pathname.endsWith('/file')) return json({ version: 1, repository_id: REPO, commit: COMMIT, tree: TREE, path: 'src/lib.rs', kind: 'file', oid: BLOB, size: 22, state: 'text', content: 'pub fn explorer() {}\n' })
+      if (url.pathname.endsWith('/history')) return json({ version: 1, repository_id: REPO, commit: COMMIT, tree: TREE, path: 'src/lib.rs', path_interpretation: 'exact', entries: [{ oid: HISTORICAL, parents: [PARENT], author_name: 'Builder', author_time: 1_798_000_000, subject: 'Add repository explorer' }], next: null, complete: true, limit_state: 'complete', shallow: false })
+      if (url.pathname.endsWith('/diff')) return json({ version: 1, repository_id: REPO, left: PARENT, left_tree: TREE, right: HISTORICAL, right_tree: TREE, path: 'src/lib.rs', changes: [], patch: { state: 'text', content: '', truncated: false }, next: null, complete: true, limit_state: 'complete' })
+      if (url.pathname.endsWith('/evidence')) return json(evidence(url.searchParams.get('commit') ?? COMMIT))
+      if (url.pathname.endsWith('/conversation')) return json(zero)
+      throw new Error(`unexpected URL ${url}`)
+    })
+    const user = userEvent.setup()
+    render(<ExplorerPage hubRepository={REPO} />)
+    await user.click(await screen.findByText('src'))
+    await user.click(await screen.findByText('lib.rs'))
+    await user.click(await screen.findByRole('tab', { name: 'History' }))
+    await user.click(await screen.findByRole('button', { name: /View change/ }))
+    await user.click(await screen.findByRole('tab', { name: /Evidence/ }))
+    await user.click(await screen.findByRole('button', { name: 'Open conversation' }))
+    const turn = (await screen.findByText('<script>alert("quoted")</script>')).closest('li')!
+    expect(turn.textContent).toContain('time not reported')
+    expect(turn.textContent).not.toMatch(/ago|years/)
+  })
+
   it('moves from current files to history, diff, evidence, visible conversation and bounded copy', async () => {
     const calls: string[] = []
     vi.stubGlobal('fetch', async (input: string | URL | Request) => {

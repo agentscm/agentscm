@@ -137,6 +137,11 @@ export function Ago({ at }: { at: number }) {
   )
 }
 
+/** Older records can hold a zero time from a hook that reported none; never render that as an age. */
+export function Reported({ at }: { at: number }) {
+  return at > 0 ? <Ago at={at} /> : <span className="muted">time not reported</span>
+}
+
 export function CopyButton({ text, label = 'Copy', className = 'btn btn-sm btn-outline-secondary' }: { text: string; label?: string; className?: string }) {
   const [state, setState] = useState<'idle' | 'ok' | 'fail'>('idle')
   const timer = useRef<number>()

@@ -15,7 +15,9 @@ use agentscm::change_record::{
 };
 use agentscm::hub::change_record::SharedBodyState;
 use agentscm::hub::store::{self, ForgeIdentity, Store, mint_agent_token, unix_now};
-use agentscm::hub::work::{CheckpointKind, SourceRef, WorkCheckpoint, WorkRole, WorkStart};
+use agentscm::hub::work::{
+    CheckpointKind, SourceRef, WorkCheckpoint, WorkItem, WorkRole, WorkStart,
+};
 use hub_pg::PgSchema;
 use tempfile::TempDir;
 
@@ -1073,6 +1075,75 @@ fn postgres_session_setups() {
     }
 }
 
+fn pause_work(store: &dyn Store, token: &str, work: &WorkItem, session: &str, tag: &str) {
+    let seq = updated_seq(store, token, &work.id);
+    let mut pause = checkpoint(&work.id, work.generation, seq, tag, CheckpointKind::Pause);
+    pause.session = session.into();
+    store.work_checkpoint(token, &pause, 500).unwrap();
+}
+
+fn capture_target_prefers_active_then_lead(fresh: &dyn Fn() -> Db) {
+    let db = fresh();
+    let (store, token, led, generation) = setup(&db);
+    let owner = store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 42,
+            },
+            "builder",
+        )
+        .unwrap();
+    let (other, _) = mint_agent_token(&*store, &owner.id, "other", REPO, 3600).unwrap();
+    let lead_other = |session: &str| {
+        store
+            .work_start(
+                &other,
+                &WorkStart {
+                    work_id: None,
+                    source: None,
+                    request_key: Some(format!("ambiguity-{session}")),
+                    title: format!("ambiguity fixture {session}"),
+                    session: session.into(),
+                    role: WorkRole::Lead,
+                    scope: vec![],
+                    branch: None,
+                    worktree: None,
+                    next_action: None,
+                    depends_on: vec![],
+                    related_work: vec![],
+                    takeover_generation: None,
+                },
+                unix_now(),
+            )
+            .unwrap()
+            .item
+    };
+    let (x, y) = (lead_other("lead-x"), lead_other("lead-y"));
+    join_session(&*store, &token, &x.id, "session-1");
+    join_session(&*store, &token, &y.id, "session-1");
+    let target = || {
+        store
+            .capture_work_for_session(&token, "session-1", 501)
+            .map(|item| item.map(|item| item.id))
+    };
+    // Active and led by the session beats two active Works it only helps.
+    assert_eq!(target().unwrap(), Some(led.clone()));
+
+    // Paused loses to active; two equal helper rows stay ambiguous.
+    let led_item = store.work_get(&token, &led, 500).unwrap().unwrap();
+    assert_eq!(led_item.generation, generation);
+    pause_work(&*store, &token, &led_item, "session-1", "amb-led");
+    assert!(target().is_err());
+    pause_work(&*store, &other, &x, "lead-x", "amb-x");
+    assert_eq!(target().unwrap(), Some(y.id.clone()));
+
+    // With everything paused the session's lead role decides.
+    pause_work(&*store, &other, &y, "lead-y", "amb-y");
+    assert_eq!(target().unwrap(), Some(led));
+}
+
 #[test]
 fn sqlite_action_capture_receipt() {
     let db = Db::sqlite();
@@ -1080,6 +1151,7 @@ fn sqlite_action_capture_receipt() {
     lifecycle_resume_and_replay(&db);
     informational_events_do_not_change_lifecycle_coverage(&Db::sqlite);
     capture_survives_pause_and_stops_at_end_of_claim(&Db::sqlite);
+    capture_target_prefers_active_then_lead(&Db::sqlite);
 }
 
 #[test]
@@ -1089,6 +1161,7 @@ fn postgres_action_capture_receipt() {
         lifecycle_resume_and_replay(&db);
         informational_events_do_not_change_lifecycle_coverage(&|| Db::postgres().unwrap());
         capture_survives_pause_and_stops_at_end_of_claim(&|| Db::postgres().unwrap());
+        capture_target_prefers_active_then_lead(&|| Db::postgres().unwrap());
     }
 }
 

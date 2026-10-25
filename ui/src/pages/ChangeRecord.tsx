@@ -24,7 +24,7 @@ import {
 } from '../changeRecord.ts'
 import { searchStandupWork, validWorkId, type WorkState } from '../standup.ts'
 import { StatePill } from './Work.tsx'
-import { Ago, Box, Empty, Explain, Icon, Notice, Path, Paths, Pill, Skeleton, relative, type Tone } from '../ui.tsx'
+import { Ago, Box, Empty, Explain, Icon, Notice, Path, Paths, Pill, Reported, Skeleton, relative, type Tone } from '../ui.tsx'
 import { Combobox, type ComboResult } from '../Combobox.tsx'
 import { hashPath, Pager, useHashCursor } from '../Pager.tsx'
 import { usePoll } from '../usePoll.ts'
@@ -406,11 +406,6 @@ function conversationFailure(status: number | undefined, fallback: string, missi
   if (status === 424) return { title: 'Integrity failed: the stored body is missing or did not verify, so nothing is shown', tone: 'bad' }
   if (status === 404) return { title: missing, tone: 'warn' }
   return { title: fallback, tone: 'bad' }
-}
-
-/** Older records can hold a zero time from a hook that reported none; never render that as an age. */
-function Reported({ at }: { at: number }) {
-  return at > 0 ? <Ago at={at} /> : <span className="muted">time not reported</span>
 }
 
 /** The body is untrusted agent output: it only ever reaches the page as a React text node inside a <pre>. */

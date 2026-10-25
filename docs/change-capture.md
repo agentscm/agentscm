@@ -218,7 +218,8 @@ prompts but may overcount retries; it does not claim exact replay identity. Clau
 payloads normally carry no timestamp, so a hook without a valid one records the hook process's
 receipt time (Unix seconds) as `observed_at`; that time is a receipt time, not a host-reported one.
 It never enters event identity, which still hashes only the provider timestamp, and a re-run of
-the same operation reuses the time already retained so the bytes match. Transcript import keeps the
+the same operation, even after the spool has compacted it, is a duplicate of the retained event
+rather than a conflict, whatever its new receipt time. Transcript import keeps the
 transcript's own timestamps, and Hub records written before this behaviour may hold `0`, which the
 UI shows as "time not reported". Local deferred diagnostics also use a separate durable receipt
 order. Raw prompt and result bodies stay local and do not contribute to shared event identity.
