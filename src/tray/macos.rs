@@ -449,7 +449,7 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                     self.installing.store(true, Ordering::Release);
                     self.feedback.show(
                         "Updating conversation sharing…",
-                        "Changing this checkout's capture mode. Local data is not touched.",
+                        &share_progress(&request),
                         true,
                     );
                     self.notice = Some(Notice::Action("Updating conversation sharing…".into()));
@@ -457,7 +457,7 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                 } else {
                     self.feedback.show(
                         "Conversation sharing unavailable",
-                        "Run agentscm change-capture configure for this checkout first, then refresh.",
+                        "The checkout connection changed. Refresh connections and try again.",
                         false,
                     );
                     self.notice = Some(Notice::Action(
@@ -833,8 +833,28 @@ fn spawn_integration(
 struct ShareRequest {
     identity: String,
     root: std::path::PathBuf,
+    hub: String,
     label: String,
     desired: CaptureModeV1,
+}
+
+/// What turning sharing on does, in the words every surface uses.
+fn share_consequences(hub: &str) -> String {
+    format!(
+        "Conversations are redacted on this computer, uploaded to {hub}, kept 30 days by default, and readable by you and Hub admins. Redaction is best effort. Turning sharing off stops future uploads."
+    )
+}
+
+fn share_progress(request: &ShareRequest) -> String {
+    if request.desired == CaptureModeV1::SharedConversation {
+        format!(
+            "Setting up capture for {} if needed, then turning sharing on. {}",
+            request.label,
+            share_consequences(&request.hub)
+        )
+    } else {
+        "Switching this checkout to metadata only. Local data is not touched.".into()
+    }
 }
 
 fn share_menu_id(identity: &str) -> String {
@@ -842,20 +862,22 @@ fn share_menu_id(identity: &str) -> String {
 }
 
 /// The toggle flips the mode in the snapshot, not the checkmark AppKit just drew, so a stale or
-/// failed click can never request a change the user did not see. No enabled binding: no request.
+/// failed click can never request a change the user did not see. A checkout without an enabled
+/// binding is unchecked, and turning sharing on creates the binding.
 fn share_request(id: &str, snapshot: &Snapshot) -> Option<ShareRequest> {
     let identity = id.strip_prefix("share-conv:")?;
     let connection = snapshot
         .connections
         .iter()
         .find(|connection| connection_identity(connection) == identity)?;
-    let desired = match connection.capture_mode? {
-        CaptureModeV1::SharedConversation => CaptureModeV1::MetadataOnly,
+    let desired = match connection.capture_mode {
+        Some(CaptureModeV1::SharedConversation) => CaptureModeV1::MetadataOnly,
         _ => CaptureModeV1::SharedConversation,
     };
     Some(ShareRequest {
         identity: identity.to_owned(),
         root: connection.root.clone(),
+        hub: connection.hub.clone(),
         label: connection
             .root
             .file_name()
@@ -865,12 +887,10 @@ fn share_request(id: &str, snapshot: &Snapshot) -> Option<ShareRequest> {
     })
 }
 
-/// (checked, enabled) for the share toggle. Only an enabled binding can be changed.
-fn share_toggle_state(mode: Option<CaptureModeV1>) -> (bool, bool) {
-    (
-        mode == Some(CaptureModeV1::SharedConversation),
-        mode.is_some(),
-    )
+/// Whether the share toggle is checked. It is always enabled: without a binding, a click sets
+/// capture up.
+fn share_toggle_checked(mode: Option<CaptureModeV1>) -> bool {
+    mode == Some(CaptureModeV1::SharedConversation)
 }
 
 fn share_outcome(
@@ -885,8 +905,9 @@ fn share_outcome(
         (Ok(()), CaptureModeV1::SharedConversation) => (
             format!("Sharing on for {}", request.label),
             format!(
-                "Sharing on for {}: new conversations are redacted and uploaded to the Hub, readable by you and Hub admins",
-                request.label
+                "Sharing on for {}. {}",
+                request.label,
+                share_consequences(&request.hub)
             ),
         ),
         (Ok(()), _) => (
@@ -902,7 +923,11 @@ fn share_outcome(
 fn spawn_share_change(proxy: winit::event_loop::EventLoopProxy<UserEvent>, request: ShareRequest) {
     std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::change_capture_client::set_capture_mode(&request.root, request.desired)
+            if request.desired == CaptureModeV1::SharedConversation {
+                crate::change_capture_client::enable_capture(&request.root, request.desired)
+            } else {
+                crate::change_capture_client::set_capture_mode(&request.root, request.desired)
+            }
         }))
         .map_err(|_| "conversation sharing change stopped unexpectedly".to_owned())
         .and_then(|result| {
@@ -1241,24 +1266,15 @@ fn build_menu(
             ))
             .map_err(menu_error)?;
 
-        let (shared, share_enabled) = share_toggle_state(connection.capture_mode);
         submenu
             .append(&CheckMenuItem::with_id(
                 share_menu_id(&identity),
                 "Share agent conversations with Hub",
-                share_enabled,
-                shared,
+                true,
+                share_toggle_checked(connection.capture_mode),
                 None,
             ))
             .map_err(menu_error)?;
-        if !share_enabled {
-            submenu
-                .append(&native_text_item(
-                    "note",
-                    "Run agentscm change-capture configure for this checkout first.",
-                ))
-                .map_err(menu_error)?;
-        }
 
         let integrations = Submenu::new("Agent Integrations", true);
         for (agent, label) in agent_choices() {
@@ -2077,7 +2093,7 @@ mod tests {
     }
 
     #[test]
-    fn share_toggle_flips_the_configured_mode_and_needs_an_enabled_binding() {
+    fn share_toggle_flips_the_mode_and_a_click_without_a_binding_turns_sharing_on() {
         let snapshot = Snapshot {
             version: 1,
             snapshot_at: 0,
@@ -2094,19 +2110,17 @@ mod tests {
         assert_eq!(off.root, Path::new("/synthetic/off"));
         let on = share_request(&id(1), &snapshot).unwrap();
         assert_eq!(on.desired, CaptureModeV1::MetadataOnly);
-        assert!(share_request(&id(2), &snapshot).is_none());
+        let unbound = share_request(&id(2), &snapshot).unwrap();
+        assert_eq!(unbound.desired, CaptureModeV1::SharedConversation);
+        assert_eq!(unbound.hub, "https://hub.example");
         assert!(share_request("share-conv:unknown", &snapshot).is_none());
         assert!(share_request("hub:unknown", &snapshot).is_none());
 
-        assert_eq!(share_toggle_state(None), (false, false));
-        assert_eq!(
-            share_toggle_state(Some(CaptureModeV1::MetadataOnly)),
-            (false, true)
-        );
-        assert_eq!(
-            share_toggle_state(Some(CaptureModeV1::SharedConversation)),
-            (true, true)
-        );
+        assert!(!share_toggle_checked(None));
+        assert!(!share_toggle_checked(Some(CaptureModeV1::MetadataOnly)));
+        assert!(share_toggle_checked(Some(
+            CaptureModeV1::SharedConversation
+        )));
     }
 
     #[test]
@@ -2114,19 +2128,27 @@ mod tests {
         let mut request = ShareRequest {
             identity: "x".into(),
             root: "/synthetic/project".into(),
+            hub: "https://hub.example.test".into(),
             label: "project".into(),
             desired: CaptureModeV1::SharedConversation,
         };
         let (_, body) = share_outcome(&request, &Ok(()));
-        assert!(body.starts_with("Sharing on for project:"));
-        assert!(body.contains("redacted") && body.contains("Hub admins"));
+        assert!(body.starts_with("Sharing on for project."));
+        assert!(body.contains("redacted on this computer"));
+        assert!(body.contains("uploaded to https://hub.example.test"));
+        assert!(body.contains("30 days") && body.contains("Hub admins"));
+        assert!(share_progress(&request).contains("30 days"));
         request.desired = CaptureModeV1::MetadataOnly;
         let (_, body) = share_outcome(&request, &Ok(()));
         assert!(body.starts_with("Sharing off for project:"));
         assert!(body.contains("no longer uploaded") && body.contains("remain until"));
-        let (title, body) = share_outcome(&request, &Err("no enabled capture binding".into()));
+        assert!(!share_progress(&request).contains("uploaded"));
+        let (title, body) = share_outcome(
+            &request,
+            &Err("no client connection for this checkout".into()),
+        );
         assert_eq!(title, "Could not change conversation sharing");
-        assert_eq!(body, "no enabled capture binding");
+        assert_eq!(body, "no client connection for this checkout");
     }
 
     #[test]

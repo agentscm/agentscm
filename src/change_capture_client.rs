@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -570,30 +570,142 @@ pub fn set_capture_mode(root: &Path, mode: CaptureModeV1) -> Result<Value> {
     Ok(json!({"root": root, "capture_mode": mode}))
 }
 
-/// Capture mode of the enabled binding for `root`. `None` means the checkout has no enabled
-/// binding or the config cannot be read, so callers must not offer to change the mode.
-pub fn enabled_capture_mode(root: &Path) -> Option<CaptureModeV1> {
-    enabled_mode(&load().ok()?, root)
+/// What a checkout's saved capture binding says, for every surface that shows or offers the
+/// sharing switch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct CaptureSetting {
+    /// A binding exists, enabled or not.
+    pub configured: bool,
+    pub enabled: bool,
+    /// The binding's mode while it is enabled; `None` otherwise.
+    pub mode: Option<CaptureModeV1>,
 }
 
-fn enabled_mode(bindings: &[CaptureBinding], root: &Path) -> Option<CaptureModeV1> {
-    bindings
-        .iter()
-        .find(|binding| binding.root == root && binding.enabled)
-        .map(|binding| binding.capture_mode)
+/// The one read path for the tray, the local Settings page and the client status. `None` means the
+/// capture config cannot be read, so callers must not offer to change anything.
+pub fn capture_setting(root: &Path) -> Option<CaptureSetting> {
+    Some(setting_in(&load().ok()?, root))
+}
+
+fn setting_in(bindings: &[CaptureBinding], root: &Path) -> CaptureSetting {
+    let binding = bindings.iter().find(|binding| binding.root == root);
+    CaptureSetting {
+        configured: binding.is_some(),
+        enabled: binding.is_some_and(|binding| binding.enabled),
+        mode: binding
+            .filter(|binding| binding.enabled)
+            .map(|binding| binding.capture_mode),
+    }
+}
+
+/// Capture mode of the enabled binding for `root`, or `None` when it has none.
+pub fn enabled_capture_mode(root: &Path) -> Option<CaptureModeV1> {
+    capture_setting(root)?.mode
+}
+
+/// Hash of a fixed label and the canonical root, so a default is stable for a checkout and
+/// differs between checkouts.
+fn root_digest(label: &str, root: &Path) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut digest = Sha256::new();
+    digest.update(label.as_bytes());
+    digest.update([0]);
+    digest.update(root.as_os_str().as_encoded_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+/// Makes capture available for a connected checkout in one step and sets its mode.
+///
+/// - Enabled binding: only the mode changes, exactly like [`set_capture_mode`].
+/// - Disabled binding: re-enabled through [`configure_with`] with everything it saved (spool,
+///   worktree, base ref, setup digest, rules, recipes, limits); hooks are reinstalled at the
+///   default `ROOT/.claude/settings.local.json`.
+/// - No binding: created through [`configure_with`], the same path as `change-capture configure`,
+///   with these defaults. The private spool is `<config>/agentscm/capture-spools/<id>`, mode 0700,
+///   where `<id>` is derived from the canonical root. The worktree id is `checkout_<id>` from the
+///   same root, not a host path and stable across token changes. The base ref is `origin/main`.
+///   The setup digest is the SHA-256 of a fixed label and the root: a caller assertion that
+///   identifies this default, not a measurement of the agent setup. The only action rule is
+///   `Bash=execution:partial:process_exit_code`. Hooks go to the configure default.
+///
+/// The checkout needs a current client connection. Any mode other than the one asked for is never
+/// chosen here, so `shared-conversation` is enabled only by an explicit request.
+pub fn enable_capture(root: &Path, mode: CaptureModeV1) -> Result<Value> {
+    let root = client_config::canonical_root(root)?;
+    connection_for(&root)?;
+    let saved = load()?.into_iter().find(|binding| binding.root == root);
+    let spec = match saved {
+        Some(binding) if binding.enabled => return set_capture_mode(&root, mode),
+        Some(binding) => BindingSpec {
+            settings: settings_path(&root, None)?,
+            root,
+            spool: binding.spool,
+            worktree_id: binding.worktree_id,
+            base_ref: binding.base_ref,
+            setup_digest: binding.setup_digest,
+            capture_mode: mode,
+            action_rules: binding.action_rules,
+            configured_recipes: binding.configured_recipes,
+            claude_history_root: binding.claude_history_root,
+            spool_limits: binding.spool_limits,
+        },
+        None => {
+            let spools = hub_cli::config_dir()?
+                .join("agentscm")
+                .join("capture-spools");
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&spools)?;
+            BindingSpec {
+                spool: spools.join(&root_digest("agentscm-capture-spool-v1", &root)[..32]),
+                worktree_id: format!(
+                    "checkout_{}",
+                    &root_digest("agentscm-capture-worktree-v1", &root)[..32]
+                ),
+                base_ref: "origin/main".into(),
+                setup_digest: root_digest("agentscm-one-click-setup-v1", &root),
+                capture_mode: mode,
+                action_rules: vec![parse_rule("Bash=execution:partial:process_exit_code")?],
+                configured_recipes: Vec::new(),
+                settings: settings_path(&root, None)?,
+                claude_history_root: None,
+                spool_limits: SpoolLimits::default(),
+                root,
+            }
+        }
+    };
+    let root = spec.root.clone();
+    let mut result = configure_with(spec)?;
+    result["capture_mode"] = json!(mode);
+    result["root"] = json!(root);
+    Ok(result)
+}
+
+/// Everything a binding is built from. `configure` fills it from flags; [`enable_capture`] fills
+/// it from documented defaults or from the saved binding; both go through [`configure_with`].
+struct BindingSpec {
+    root: PathBuf,
+    spool: PathBuf,
+    worktree_id: String,
+    base_ref: String,
+    setup_digest: String,
+    capture_mode: CaptureModeV1,
+    action_rules: Vec<ActionRuleV1>,
+    configured_recipes: Vec<ConfiguredRecipeV1>,
+    settings: PathBuf,
+    claude_history_root: Option<PathBuf>,
+    spool_limits: SpoolLimits,
 }
 
 pub fn configure(args: ConfigureArgs) -> Result<Value> {
     let root = client_config::canonical_root(&args.root)?;
-    let requested_spool = absolute_without_parent_components(&args.spool)?;
     let spool_limits = SpoolLimits {
         max_records: args.max_spool_records as usize,
         max_total_bytes: args.max_spool_bytes,
         max_artifact_bytes: args.max_artifact_bytes,
     };
-    spool_limits
-        .validate_action_capture()
-        .map_err(|error| invalid(format!("local capture: {error}")))?;
     let action_rules = args
         .action_rules
         .iter()
@@ -604,20 +716,51 @@ pub fn configure(args: ConfigureArgs) -> Result<Value> {
         .iter()
         .map(|path| load_recipe_file(path))
         .collect::<Result<Vec<_>>>()?;
-    let connection = connection_for(&root)?;
-    let settings = settings_path(&root, args.claude_settings)?;
     let claude_history_root = args
         .claude_history_root
         .as_deref()
         .map(canonical_history_root)
         .transpose()?;
+    configure_with(BindingSpec {
+        spool: absolute_without_parent_components(&args.spool)?,
+        settings: settings_path(&root, args.claude_settings)?,
+        root,
+        worktree_id: args.worktree_id,
+        base_ref: args.base_ref,
+        setup_digest: args.setup_digest,
+        capture_mode: args.capture_mode.into(),
+        action_rules,
+        configured_recipes,
+        claude_history_root,
+        spool_limits,
+    })
+}
+
+fn configure_with(spec: BindingSpec) -> Result<Value> {
+    let BindingSpec {
+        root,
+        spool: requested_spool,
+        worktree_id,
+        base_ref,
+        setup_digest,
+        capture_mode,
+        action_rules,
+        configured_recipes,
+        settings,
+        claude_history_root,
+        spool_limits,
+    } = spec;
+    spool_limits
+        .validate_action_capture()
+        .map_err(|error| invalid(format!("local capture: {error}")))?;
+    let connection = connection_for(&root)?;
     let _lock = acquire_lock()?;
     let old_bindings = load()?;
     let saved = old_bindings.iter().find(|binding| binding.root == root);
     if let Some(saved) = saved {
         if saved.repository != connection.repo
             || saved.hub != connection.hub
-            || saved.worktree_id != args.worktree_id
+            || saved.worktree_id != worktree_id
         {
             return Err(invalid(
                 "capture binding cannot switch namespace safety lineage for an existing checkout",
@@ -677,10 +820,10 @@ pub fn configure(args: ConfigureArgs) -> Result<Value> {
         spool_identity: Some(spool_identity),
         repository: connection.repo.clone(),
         hub: connection.hub.clone(),
-        worktree_id: args.worktree_id,
-        base_ref: args.base_ref,
-        setup_digest: args.setup_digest,
-        capture_mode: args.capture_mode.into(),
+        worktree_id,
+        base_ref,
+        setup_digest,
+        capture_mode,
         claude_history_root,
         action_rules,
         configured_recipes,
@@ -1519,9 +1662,10 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CaptureBinding, HOOK_MARKER, disable_binding, enabled_mode, install_hooks,
+        CaptureBinding, CaptureSetting, HOOK_MARKER, disable_binding, install_hooks,
         load_recipe_file, load_recipe_from_file, managed_recipe_invocations, parse_rule,
-        remove_owned_hooks, session_start_context, validate_binding, validate_binding_update,
+        remove_owned_hooks, session_start_context, setting_in, validate_binding,
+        validate_binding_update,
     };
     use agentscm::change_capture::claude_code::{ActionRuleV1, NativeResultSourceV1};
     use agentscm::change_capture::{
@@ -1702,24 +1846,41 @@ mod tests {
     }
 
     #[test]
-    fn mode_is_offered_only_for_an_enabled_binding_of_that_root() {
+    fn setting_reports_configured_enabled_and_mode_for_that_root_only() {
         let root = std::path::Path::new("/tmp/agentscm-recipe-root");
+        let other = std::path::Path::new("/tmp/other");
         let mut bindings = vec![recipe_binding(vec![])];
+        let setting = |bindings: &[CaptureBinding], root| setting_in(bindings, root);
         assert_eq!(
-            enabled_mode(&bindings, root),
-            Some(CaptureModeV1::MetadataOnly)
+            setting(&bindings, root),
+            CaptureSetting {
+                configured: true,
+                enabled: true,
+                mode: Some(CaptureModeV1::MetadataOnly)
+            }
         );
         bindings[0].capture_mode = CaptureModeV1::SharedConversation;
         assert_eq!(
-            enabled_mode(&bindings, root),
+            setting(&bindings, root).mode,
             Some(CaptureModeV1::SharedConversation)
         );
         assert_eq!(
-            enabled_mode(&bindings, std::path::Path::new("/tmp/other")),
-            None
+            setting(&bindings, other),
+            CaptureSetting {
+                configured: false,
+                enabled: false,
+                mode: None
+            }
         );
         bindings[0].enabled = false;
-        assert_eq!(enabled_mode(&bindings, root), None);
+        assert_eq!(
+            setting(&bindings, root),
+            CaptureSetting {
+                configured: true,
+                enabled: false,
+                mode: None
+            }
+        );
     }
 
     #[test]
