@@ -48,6 +48,9 @@ const MAX_HUB_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_HUB_READS: usize = 8;
 /// How long the list of current connections is reused before Git is asked again.
 const CONNECTIONS_TTL: Duration = Duration::from_secs(5);
+/// How long a Hub's reported retention is reused, and how long the page waits to learn it.
+const RETENTION_TTL: Duration = Duration::from_secs(60);
+const RETENTION_TIMEOUT: Duration = Duration::from_secs(3);
 const SHUTDOWN_REVOKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The most one mint (session check, forge check, mint and confirmation) may take, so a slow
 /// Hub cannot hold a repository's token for longer.
@@ -85,6 +88,8 @@ pub(super) struct FrontDoor {
     retired: Arc<Mutex<Vec<CachedToken>>>,
     hub_reads: tokio::sync::Semaphore,
     client: reqwest::Client,
+    /// Days each Hub said it keeps a shared conversation (`None`: it did not say), by Hub URL.
+    retention: Mutex<HashMap<String, (Instant, Option<i64>)>>,
 }
 
 #[derive(Default)]
@@ -226,9 +231,55 @@ impl FrontDoor {
             tokens: Mutex::new(HashMap::new()),
             retired: Arc::new(Mutex::new(Vec::new())),
             hub_reads: tokio::sync::Semaphore::new(MAX_HUB_READS),
+            retention: Mutex::new(HashMap::new()),
             client: agentscm::hub::forge_http::client()
                 .map_err(|_| agentscm::Error::Invalid("HTTP client unavailable".into()))?,
         })
+    }
+
+    fn cached_retention(&self, hub: &str) -> Option<(Instant, Option<i64>)> {
+        self.retention
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(hub)
+            .copied()
+    }
+
+    /// Days the connection's Hub says it keeps a shared conversation, from its `whoami` with the
+    /// checkout's own agent token. `None` when the Hub is unreachable, slow, older or says
+    /// nothing usable; the answer (or its absence) is reused for [`RETENTION_TTL`].
+    async fn retention_days(&self, connection: &Connection) -> Option<i64> {
+        if let Some((at, days)) = self.cached_retention(&connection.hub)
+            && at.elapsed() < RETENTION_TTL
+        {
+            return days;
+        }
+        let token_file = connection.token_file.clone();
+        let token = tokio::task::spawn_blocking(move || crate::client_cli::read_token(&token_file))
+            .await
+            .ok()
+            .and_then(Result::ok);
+        let days = match token {
+            Some(token) => tokio::time::timeout(
+                RETENTION_TIMEOUT,
+                crate::client_status::check_hub(connection, &token, None),
+            )
+            .await
+            .ok()
+            .and_then(|(check, _)| match check {
+                crate::client_status::HubCheck::Valid {
+                    shared_conversation_retention_days,
+                    ..
+                } => shared_conversation_retention_days,
+                _ => None,
+            }),
+            None => None,
+        };
+        self.retention
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(connection.hub.clone(), (Instant::now(), days));
+        days
     }
 
     pub(super) fn admin_secret(&self) -> &str {
@@ -806,7 +857,11 @@ fn checkout_id(instance: &str, connection: &Connection) -> String {
 }
 
 /// One checkout's sharing state, with the repository and Hub the page shows the person.
-fn capture_row(instance: &str, connection: &Connection) -> serde_json::Value {
+fn capture_row(
+    instance: &str,
+    connection: &Connection,
+    retention_days: Option<i64>,
+) -> serde_json::Value {
     let setting = crate::change_capture_client::capture_setting(connection);
     let mismatch = setting
         .as_ref()
@@ -823,19 +878,45 @@ fn capture_row(instance: &str, connection: &Connection) -> serde_json::Value {
         "lineage_mismatch": mismatch.is_some(),
         "saved_repository": mismatch.map(|saved| saved.repository.as_str()),
         "saved_hub": mismatch.map(|saved| saved.hub.as_str()),
+        // What this Hub said, or null when it did not; the page never states a number it lacks.
+        "shared_conversation_retention_days": retention_days,
     })
 }
 
 async fn capture_settings(State(front_door): State<Arc<FrontDoor>>) -> Response {
     let instance = front_door.instance.clone();
-    let rows = tokio::task::spawn_blocking(move || {
-        all_connections()
+    let (connections, mut rows) = tokio::task::spawn_blocking(move || {
+        let connections = all_connections();
+        let rows = connections
             .iter()
-            .map(|connection| capture_row(&instance, connection))
-            .collect::<Vec<_>>()
+            .map(|connection| capture_row(&instance, connection, None))
+            .collect::<Vec<_>>();
+        (connections, rows)
     })
     .await
     .unwrap_or_default();
+    // One lookup per Hub, all at once, so a slow Hub delays the list by one timeout at most.
+    let mut lookups = tokio::task::JoinSet::new();
+    let mut hubs = std::collections::BTreeSet::new();
+    for connection in &connections {
+        if hubs.insert(connection.hub.clone()) {
+            let (door, connection) = (front_door.clone(), connection.clone());
+            lookups.spawn(async move {
+                (
+                    connection.hub.clone(),
+                    door.retention_days(&connection).await,
+                )
+            });
+        }
+    }
+    let mut days: HashMap<String, Option<i64>> = HashMap::new();
+    while let Some(Ok((hub, found))) = lookups.join_next().await {
+        days.insert(hub, found);
+    }
+    for (row, connection) in rows.iter_mut().zip(&connections) {
+        row["shared_conversation_retention_days"] =
+            json!(days.get(&connection.hub).copied().flatten());
+    }
     Json(json!({"version": 1, "checkouts": rows})).into_response()
 }
 
@@ -904,11 +985,17 @@ async fn capture_change(
                 Some(expected),
             )
         };
-        Some(result.map(|_| capture_row(&instance, &connection)))
+        Some(result.map(|_| connection))
     })
     .await;
     match outcome {
-        Ok(Some(Ok(row))) => Json(json!({"version": 1, "checkout": row})).into_response(),
+        Ok(Some(Ok(connection))) => {
+            let days = front_door
+                .cached_retention(&connection.hub)
+                .and_then(|(_, days)| days);
+            let row = capture_row(&front_door.instance, &connection, days);
+            Json(json!({"version": 1, "checkout": row})).into_response()
+        }
         Ok(Some(Err(error))) => {
             // The detail can name local paths, so it stays in this process's log.
             eprintln!("local capture change refused: {error}");

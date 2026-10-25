@@ -109,6 +109,10 @@ pub(crate) enum HubCheck {
         host: String,
         login: String,
         expires_at: i64,
+        /// Days the Hub keeps an uploaded shared conversation, as the Hub reported. Absent from an
+        /// older Hub, so callers must not assume a number.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        shared_conversation_retention_days: Option<i64>,
     },
     Rejected {
         checked_at: i64,
@@ -482,7 +486,18 @@ pub(crate) async fn check_hub(
         Some(client_id) => onboarding(&client, connection, token, client_id).await,
         None => Vec::new(),
     };
-    finalize_hub_check(expires_at, unix_now(), provider, host, login, participation)
+    let retention_days = reply["shared_conversation_retention_days"]
+        .as_i64()
+        .filter(|days| (1..=3650).contains(days));
+    finalize_hub_check(
+        expires_at,
+        unix_now(),
+        provider,
+        host,
+        login,
+        retention_days,
+        participation,
+    )
 }
 
 fn finalize_hub_check(
@@ -491,6 +506,7 @@ fn finalize_hub_check(
     provider: &str,
     host: &str,
     login: &str,
+    shared_conversation_retention_days: Option<i64>,
     mut participation: Vec<Participation>,
 ) -> (HubCheck, Vec<Participation>) {
     if expires_at <= checked_at {
@@ -504,6 +520,7 @@ fn finalize_hub_check(
             host: crate::hub_cli::clean(host),
             login: crate::hub_cli::clean(login),
             expires_at,
+            shared_conversation_retention_days,
         },
         participation,
     )
@@ -599,6 +616,7 @@ mod tests {
                 host: "github.com".into(),
                 login: "synthetic".into(),
                 expires_at: 2,
+                shared_conversation_retention_days: None,
             };
             (root, status)
         });
@@ -674,6 +692,7 @@ mod tests {
             "github",
             "github.com",
             "synthetic",
+            None,
             vec![participation(11)],
         );
         assert!(matches!(expired, HubCheck::Rejected { checked_at: 10 }));
@@ -685,6 +704,7 @@ mod tests {
             "github",
             "github.com",
             "synthetic",
+            Some(14),
             vec![participation(10), participation(11)],
         );
         assert!(matches!(
@@ -692,6 +712,7 @@ mod tests {
             HubCheck::Valid {
                 checked_at: 10,
                 expires_at: 20,
+                shared_conversation_retention_days: Some(14),
                 ..
             }
         ));

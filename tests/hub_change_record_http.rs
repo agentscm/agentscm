@@ -1999,6 +1999,37 @@ mod shared_bodies {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn whoami_reports_the_configured_retention_to_authenticated_clients() {
+        for days in [30, 7, 3650] {
+            let f = Fixture::start_for(days).await;
+            let whoami = |secret: Option<&str>| {
+                let request = f.client.get(format!("{}/v1/hub/whoami", f.base));
+                match secret {
+                    Some(secret) => request.bearer_auth(secret),
+                    None => request,
+                }
+                .send()
+            };
+            for secret in [&f.owner_secret, &f.read_only_secret] {
+                let reply = whoami(Some(secret)).await.unwrap();
+                assert_eq!(reply.status(), StatusCode::OK);
+                let body = json_of(reply).await;
+                assert_eq!(body["shared_conversation_retention_days"], days);
+            }
+            // Only an authenticated client is told.
+            let anonymous = whoami(None).await.unwrap();
+            assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+            assert!(
+                !anonymous
+                    .text()
+                    .await
+                    .unwrap()
+                    .contains("shared_conversation_retention_days")
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn upload_stores_the_exact_body_and_replays_idempotently() {
         let f = Fixture::start().await;
         assert_eq!(f.row().state, SharedBodyState::Declared);

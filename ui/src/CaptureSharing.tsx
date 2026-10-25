@@ -4,12 +4,12 @@ import { Box, Icon, Pill, Skeleton } from './ui.tsx'
 import { usePoll } from './usePoll.ts'
 
 /** What turning sharing on does, in the words the menu bar app uses. */
-export function SharingConsequences({ hub }: { hub: string }) {
+export function SharingConsequences({ hub, retentionDays }: { hub: string; retentionDays: number | null }) {
   return (
     <ul className="small">
       <li>Prompts, replies and tool output are redacted for secrets on this computer first. Redaction is best effort, so avoid putting secrets in conversations.</li>
       <li>The redacted conversation is uploaded to <code>{hub}</code>.</li>
-      <li>It is kept 30 days by default.</li>
+      <li>{retentionDays === null ? 'It is kept for as long as the Hub operator sets (30 days unless changed).' : <>It is kept {retentionDays === 1 ? '1 day' : `${retentionDays} days`} on <code>{hub}</code>.</>}</li>
       <li>You and Hub admins can read it.</li>
       <li>Turning sharing off stops future uploads. Copies already uploaded stay until they expire or you delete them.</li>
     </ul>
@@ -90,7 +90,7 @@ export function CaptureSharingBox({ token }: { token: string }) {
                   {open && (
                     <div className="mt-2" role="group" aria-label={`Confirm sharing for ${checkout.repository} in ${checkout.folder}`}>
                       <div className="settings-label">Share conversations from this checkout?</div>
-                      <SharingConsequences hub={checkout.hub} />
+                      <SharingConsequences hub={checkout.hub} retentionDays={checkout.shared_conversation_retention_days} />
                       <button ref={confirmButton} type="button" className="btn btn-sm btn-primary me-2" disabled={busy !== null} onClick={() => void change(checkout, true)}>Share conversations</button>
                       <button type="button" className="btn btn-sm btn-outline-secondary" disabled={busy !== null} onClick={() => cancel(checkout)}>Cancel</button>
                     </div>

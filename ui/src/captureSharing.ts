@@ -20,6 +20,8 @@ export interface SharingCheckout {
   lineage_mismatch: boolean
   saved_repository: string | null
   saved_hub: string | null
+  /** Days the Hub said it keeps a shared conversation; null when it did not say (older or unreachable Hub). */
+  shared_conversation_retention_days: number | null
 }
 
 const MODES = ['metadata_only', 'local_conversation', 'shared_conversation'] as const
@@ -39,6 +41,9 @@ const flag = (value: unknown, path: string): boolean => {
   return value
 }
 
+/** A retention the Hub could have configured (1 to 3650 days), else unknown. */
+const retentionDays = (value: unknown): number | null => (typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= 3650 ? value : null)
+
 export function decodeCheckout(value: unknown, path = 'checkout'): SharingCheckout {
   const raw = object(value, path)
   const mode = raw['mode']
@@ -57,6 +62,7 @@ export function decodeCheckout(value: unknown, path = 'checkout'): SharingChecko
     lineage_mismatch: flag(raw['lineage_mismatch'], `${path}.lineage_mismatch`),
     saved_repository: optionalText(raw['saved_repository'], `${path}.saved_repository`),
     saved_hub: optionalText(raw['saved_hub'], `${path}.saved_hub`),
+    shared_conversation_retention_days: retentionDays(raw['shared_conversation_retention_days']),
   }
 }
 

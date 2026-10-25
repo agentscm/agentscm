@@ -886,12 +886,25 @@ struct ShareRequest {
     hub: String,
     label: String,
     desired: CaptureModeV1,
+    /// Days the Hub said it keeps a shared conversation; `None` until a Hub check reports it.
+    retention_days: Option<i64>,
+}
+
+/// How long the Hub keeps a shared conversation, in the words every surface uses. Only a number
+/// the Hub reported is stated as fact.
+fn retention_phrase(hub: &str, days: Option<i64>) -> String {
+    match days {
+        Some(1) => format!("kept 1 day on {hub}"),
+        Some(days) => format!("kept {days} days on {hub}"),
+        None => "kept for as long as the Hub operator sets (30 days unless changed)".into(),
+    }
 }
 
 /// What turning sharing on does, in the words every surface uses.
-fn share_consequences(hub: &str) -> String {
+fn share_consequences(hub: &str, retention_days: Option<i64>) -> String {
     format!(
-        "Conversations are redacted on this computer, uploaded to {hub}, kept 30 days by default, and readable by you and Hub admins. Redaction is best effort. Turning sharing off stops future uploads."
+        "Conversations are redacted on this computer, uploaded to {hub}, {}, and readable by you and Hub admins. Redaction is best effort. Turning sharing off stops future uploads.",
+        retention_phrase(hub, retention_days)
     )
 }
 
@@ -900,7 +913,7 @@ fn share_progress(request: &ShareRequest) -> String {
         format!(
             "Setting up capture for {} if needed, then turning sharing on. {}",
             request.label,
-            share_consequences(&request.hub)
+            share_consequences(&request.hub, request.retention_days)
         )
     } else {
         "Switching this checkout to metadata only. Local data is not touched.".into()
@@ -981,7 +994,7 @@ fn share_confirmation(request: &ShareRequest) -> (String, String) {
         format!("Share conversations from {}?", request.label),
         format!(
             "{} Nothing is shared yet. Open this checkout's menu and choose \"{}\" to turn sharing on.",
-            share_consequences(&request.hub),
+            share_consequences(&request.hub, request.retention_days),
             share_confirm_label(&request.hub)
         ),
     )
@@ -1019,6 +1032,13 @@ fn share_request(id: &str, snapshot: &Snapshot) -> Option<ShareRequest> {
             .and_then(|name| name.to_str())
             .map_or_else(|| connection.repository.clone(), super::clean_label),
         desired,
+        retention_days: match &connection.hub_check {
+            HubCheck::Valid {
+                shared_conversation_retention_days,
+                ..
+            } => *shared_conversation_retention_days,
+            _ => None,
+        },
     })
 }
 
@@ -1042,7 +1062,7 @@ fn share_outcome(
             format!(
                 "Sharing on for {}. {}",
                 request.label,
-                share_consequences(&request.hub)
+                share_consequences(&request.hub, request.retention_days)
             ),
         ),
         (Ok(()), _) => (
@@ -2260,6 +2280,46 @@ mod tests {
     }
 
     #[test]
+    fn a_share_request_carries_only_the_retention_the_hub_check_reported() {
+        let mut connection = share_connection("/synthetic/reported", None);
+        connection.hub_check = HubCheck::Valid {
+            checked_at: 1,
+            provider: "github".into(),
+            host: "github.com".into(),
+            login: "member".into(),
+            expires_at: 100,
+            shared_conversation_retention_days: Some(45),
+        };
+        let identity = connection_identity(&connection);
+        let mut snapshot = Snapshot {
+            version: 1,
+            snapshot_at: 0,
+            connections: vec![connection],
+        };
+        let id = share_menu_id(&identity);
+        assert_eq!(
+            share_request(&id, &snapshot).unwrap().retention_days,
+            Some(45)
+        );
+        // An unchecked, unreachable or older Hub leaves it unknown.
+        for check in [
+            HubCheck::Skipped,
+            HubCheck::Unavailable { checked_at: 1 },
+            HubCheck::Valid {
+                checked_at: 1,
+                provider: "github".into(),
+                host: "github.com".into(),
+                login: "member".into(),
+                expires_at: 100,
+                shared_conversation_retention_days: None,
+            },
+        ] {
+            snapshot.connections[0].hub_check = check;
+            assert_eq!(share_request(&id, &snapshot).unwrap().retention_days, None);
+        }
+    }
+
+    #[test]
     fn share_toggle_flips_the_mode_and_a_click_without_a_binding_turns_sharing_on() {
         let snapshot = Snapshot {
             version: 1,
@@ -2316,7 +2376,9 @@ mod tests {
         };
         let (title, body) = share_confirmation(&asked);
         assert_eq!(title, "Share conversations from unbound?");
-        assert!(body.contains(&share_consequences("https://hub.example")));
+        assert!(body.contains(&share_consequences("https://hub.example", None)));
+        assert!(body.contains("as long as the Hub operator sets (30 days unless changed)"));
+        assert!(!body.contains("days on"));
         assert!(body.contains(&share_confirm_label("https://hub.example")));
         assert!(body.contains("Nothing is shared yet"));
         assert_eq!(
@@ -2447,13 +2509,23 @@ mod tests {
             hub: "https://hub.example.test".into(),
             label: "project".into(),
             desired: CaptureModeV1::SharedConversation,
+            retention_days: Some(7),
         };
         let (_, body) = share_outcome(&request, &Ok(()));
         assert!(body.starts_with("Sharing on for project."));
         assert!(body.contains("redacted on this computer"));
         assert!(body.contains("uploaded to https://hub.example.test"));
-        assert!(body.contains("30 days") && body.contains("Hub admins"));
-        assert!(share_progress(&request).contains("30 days"));
+        assert!(body.contains("kept 7 days on https://hub.example.test"));
+        assert!(body.contains("Hub admins"));
+        assert!(share_progress(&request).contains("kept 7 days on"));
+        request.retention_days = Some(1);
+        assert!(share_progress(&request).contains("kept 1 day on"));
+        // A Hub that did not say how long is never given a number.
+        request.retention_days = None;
+        let unknown = share_progress(&request);
+        assert!(unknown.contains("as long as the Hub operator sets (30 days unless changed)"));
+        assert!(!unknown.contains("days on"));
+        request.retention_days = Some(7);
         request.desired = CaptureModeV1::MetadataOnly;
         let (_, body) = share_outcome(&request, &Ok(()));
         assert!(body.starts_with("Sharing off for project:"));
@@ -2892,6 +2964,7 @@ mod tests {
             host: "github.com".into(),
             login: "member".into(),
             expires_at,
+            shared_conversation_retention_days: None,
         };
         assert!(hub_recently_verified(&check(40, 200), 100));
         assert!(!hub_recently_verified(&check(39, 200), 100));
@@ -2999,6 +3072,7 @@ mod tests {
             host: "github.com".into(),
             login: "member".into(),
             expires_at: 101,
+            shared_conversation_retention_days: None,
         };
         assert!(hub_label(&check, 100).starts_with("authenticated as member"));
         assert_eq!(

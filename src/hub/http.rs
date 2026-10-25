@@ -411,9 +411,13 @@ async fn view_settings(
     Ok(Json(report))
 }
 
-async fn whoami(Reader(principal): Reader) -> Json<serde_json::Value> {
+async fn whoami(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+) -> Json<serde_json::Value> {
     let owner = principal.owner;
     Json(json!({
+        "shared_conversation_retention_days": state.shared_conversation_retention_days,
         "token": {
             "id": principal.token_id,
             "name": principal.name,

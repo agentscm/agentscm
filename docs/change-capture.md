@@ -251,7 +251,14 @@ status codes are in [shared conversation reads](hub.md#shared-conversation-reads
 ### Retention and deletion
 
 The Hub keeps an uploaded body for 30 days by default; the operator changes this with
-`hub serve --shared-conversation-retention-days N` (1 to 3650). The deadline is set when the body
+`hub serve --shared-conversation-retention-days N` (1 to 3650). The Hub reports the configured
+number to authenticated clients as `shared_conversation_retention_days` in `GET /v1/hub/whoami`.
+`client status --check` carries it in the connection's `hub_check` (when the check is valid), the
+menu bar app reads it from there, and the local page's `GET /v1/local/capture` lists it per
+checkout (looked up with the checkout's own agent token and reused for a minute). Both surfaces
+then say "kept N days on <hub>". When the number is unknown (an older Hub, an unreachable or slow
+Hub, or no Hub check yet) they say "kept for as long as the Hub operator sets (30 days unless
+changed)" and never name a number they were not given. The deadline is set when the body
 is uploaded. A sweep every ten minutes expires due bodies and deletes their objects, in batches of
 100 until none are due or 30 seconds are spent (the rest waits for the next pass); an object whose
 removal fails is retried after 1 hour, doubling to at most a day, without holding up others. The author

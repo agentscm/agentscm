@@ -42,8 +42,8 @@ There is no token to paste and no address to enter.
 Turning a switch on sets capture up for that checkout if it never was (same defaults as the menu
 bar app; see [sharing conversations](change-capture.md#one-step-setup-from-the-menu-bar-and-the-local-page))
 and switches it to `shared-conversation`. The page first shows what that does: conversations are
-redacted on this computer (best effort), uploaded to that checkout's Hub, kept 30 days by default
-and readable by you and Hub admins. Only after you confirm does it send the request, with an
+redacted on this computer (best effort), uploaded to that checkout's Hub, kept for the number of days that Hub reports (or, if it did not
+say, for as long as its operator sets, 30 days unless changed) and readable by you and Hub admins. Only after you confirm does it send the request, with an
 explicit `confirm_sharing`; the service refuses a request without it and changes nothing. Turning
 it off needs no confirmation, switches the checkout to `metadata-only` and stops future uploads.
 The request is a `POST` to `/v1/local/capture`, which needs the same live browser connection, loopback

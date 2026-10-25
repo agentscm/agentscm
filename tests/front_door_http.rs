@@ -80,6 +80,17 @@ fn fake_hub_for(
     host: &'static str,
     minted_provider: &'static str,
 ) -> (String, Arc<Mutex<Vec<String>>>) {
+    fake_hub_reporting(provider, host, minted_provider, None)
+}
+
+/// Like [`fake_hub_for`]; `retention_days` is what the Hub's `whoami` says it keeps a shared
+/// conversation (`None` models an older Hub that does not say).
+fn fake_hub_reporting(
+    provider: &'static str,
+    host: &'static str,
+    minted_provider: &'static str,
+    retention_days: Option<i64>,
+) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -100,10 +111,11 @@ fn fake_hub_for(
                 && request.contains("authorization: Bearer synthetic-agent-token")
             {
                 // The checkout's own agent token, as the tray's Hub check reads it.
-                (
-                    200,
-                    json!({"token": {"id": "tok_agent", "name": "agent", "repository": REPO, "repository_id": 7, "expires_at": expiry, "read_only": false}, "owner": {"provider": provider, "host": host, "user_id": 1, "login": "synthetic"}}),
-                )
+                let mut body = json!({"token": {"id": "tok_agent", "name": "agent", "repository": REPO, "repository_id": 7, "expires_at": expiry, "read_only": false}, "owner": {"provider": provider, "host": host, "user_id": 1, "login": "synthetic"}});
+                if let Some(days) = retention_days {
+                    body["shared_conversation_retention_days"] = json!(days);
+                }
+                (200, body)
             } else if line.starts_with("GET /v1/hub/whoami ") {
                 (
                     200,
@@ -1824,4 +1836,38 @@ fn refused_capture_changes_tell_the_page_a_fixed_message_and_never_a_local_path(
         refused(&reply).contains("refresh and confirm again"),
         "{reply}"
     );
+}
+
+#[test]
+fn the_listing_carries_the_retention_the_hub_reported_and_null_when_it_did_not() {
+    for (reported, expected) in [(Some(21), json!(21)), (None, Value::Null)] {
+        let temp = TempDir::new().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap().join("widgets");
+        checkout(&root);
+        let (hub, _) = fake_hub_reporting("github", "github.com", "github", reported);
+        let door = FrontDoor::start(&temp, &hub, &root);
+        let page = Page::new(&door);
+        assert_eq!(
+            page.list()[0]["shared_conversation_retention_days"],
+            expected
+        );
+        // A change reply says the same, from what the listing learned.
+        let id = page.id_of("widgets");
+        let (status, reply) = page.post(&id, &hub, "shared_conversation");
+        assert_eq!(status, 200, "{reply}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&reply).unwrap()["checkout"]["shared_conversation_retention_days"],
+            expected
+        );
+    }
+
+    // A Hub that cannot be reached is unknown too, never a guessed number.
+    let temp = TempDir::new().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap().join("widgets");
+    checkout(&root);
+    let (hub, _) = fake_hub_reporting("github", "github.com", "github", Some(21));
+    let door = FrontDoor::start(&temp, &hub, &root);
+    let page = Page::new(&door);
+    set_hub(&door, "http://127.0.0.1:9");
+    assert!(page.list()[0]["shared_conversation_retention_days"].is_null());
 }

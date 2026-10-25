@@ -103,7 +103,7 @@ one. Turning it on for a connected
 checkout sets capture up first if it never was (one step, documented defaults; see
 [change capture](change-capture.md#one-step-setup-from-the-menu-bar-and-the-local-page)) and
 switches that checkout to `shared-conversation` mode: new conversations are redacted on this
-machine on a best-effort basis and uploaded to the Hub, kept 30 days by default, where only you (the person who shared them) and Hub
+machine on a best-effort basis and uploaded to the Hub, kept for the number of days the Hub reports (30 unless its operator changed it), where only you (the person who shared them) and Hub
 admins can read them. The status window says this before it turns on. The same switch is under
 **Settings → Conversation sharing** on the Hub page opened from this computer. Turning it off sets `metadata-only` (not a previous `local-conversation`); conversations stay on this machine,
 and copies already uploaded remain until they expire or you delete them. Nothing local is deleted.

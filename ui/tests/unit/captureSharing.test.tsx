@@ -7,7 +7,7 @@ import { decodeCheckouts, setSharing, sharingState } from '../../src/captureShar
 const TOKEN = `local:${'a'.repeat(64)}:acme/widgets`
 const HUB = 'https://hub.example.test'
 const ID = 'a1b2c3d4e5f60718293a4b5c'
-const row = (over: Record<string, unknown> = {}) => ({ id: ID, repository: 'acme/widgets', hub: HUB, folder: 'widgets', configured: false, enabled: false, mode: null, readable: true, lineage_mismatch: false, saved_repository: null, saved_hub: null, ...over })
+const row = (over: Record<string, unknown> = {}) => ({ id: ID, repository: 'acme/widgets', hub: HUB, folder: 'widgets', configured: false, enabled: false, mode: null, readable: true, lineage_mismatch: false, saved_repository: null, saved_hub: null, shared_conversation_retention_days: null, ...over })
 const reply = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
 
 afterEach(() => vi.unstubAllGlobals())
@@ -19,6 +19,13 @@ describe('conversation sharing decoding', () => {
     expect(() => decodeCheckouts({ version: 1, checkouts: [row({ mode: 'everything' })] })).toThrow(/mode/)
     expect(() => decodeCheckouts({ version: 1, checkouts: [row({ enabled: 'yes' })] })).toThrow(/enabled/)
     expect(() => decodeCheckouts({ version: 1, checkouts: [{ ...row(), path: '/x' }, 7] })).toThrow()
+  })
+
+  it('reads the Hub retention only as a whole number of days it could have configured', () => {
+    const days = (value: unknown) => decodeCheckouts({ version: 1, checkouts: [row({ shared_conversation_retention_days: value })] })[0]!.shared_conversation_retention_days
+    expect(days(14)).toBe(14)
+    expect(days(3650)).toBe(3650)
+    for (const bad of [null, undefined, 0, 3651, 1.5, '30', {}]) expect(days(bad)).toBeNull()
   })
 
   it('requires an opaque id, so a path or a missing id is never accepted as a name', () => {
@@ -60,13 +67,25 @@ describe('Conversation sharing in Settings', () => {
     expect((toggle as HTMLInputElement).checked).toBe(false)
     await userEvent.click(toggle)
     expect(posts).toEqual([])
-    expect(screen.getByText(/kept 30 days by default/)).toBeTruthy()
+    expect(screen.getByText(/as long as the Hub operator sets \(30 days unless changed\)/)).toBeTruthy()
+    expect(screen.queryByText(/days on/)).toBeNull()
     expect(screen.getByText(/redacted for secrets on this computer/)).toBeTruthy()
     expect(screen.getByText(HUB)).toBeTruthy()
     await userEvent.click(screen.getByRole('button', { name: 'Share conversations' }))
     await waitFor(() => expect((screen.getByRole('switch') as HTMLInputElement).checked).toBe(true))
     expect(posts).toHaveLength(1)
     expect(screen.getByText('Shared with Hub')).toBeTruthy()
+  })
+
+  it('states the retention the Hub reported, and no number when it did not', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => reply(200, { version: 1, checkouts: [row({ shared_conversation_retention_days: 7 }), row({ id: 'ffffffffffffffffffffffff', folder: 'widgets-two', shared_conversation_retention_days: 1 })] })))
+    render(<CaptureSharingBox token={TOKEN} />)
+    const switches = await screen.findAllByRole('switch')
+    await userEvent.click(switches[0]!)
+    expect(screen.getByText(/It is kept 7 days on/).textContent).toContain(HUB)
+    expect(screen.queryByText(/30 days/)).toBeNull()
+    await userEvent.click(switches[1]!)
+    expect(screen.getByText(/It is kept 1 day on/)).toBeTruthy()
   })
 
   it('moves focus into the confirmation, announces the result and gives focus back to the switch', async () => {
