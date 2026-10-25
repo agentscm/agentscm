@@ -1,5 +1,7 @@
 //! Multi-user coordination hub: storage and authenticated HTTP.
 pub mod advice;
+pub mod catchup;
+mod catchup_sync;
 pub mod change_record;
 pub mod change_record_http;
 pub mod connection;
@@ -19,6 +21,7 @@ pub mod insights;
 pub mod intent;
 pub mod login;
 pub mod mcp;
+pub mod merge_recap;
 pub mod onboarding;
 #[cfg(unix)]
 pub mod pipeline_rules;
@@ -36,6 +39,7 @@ pub mod ui;
 pub mod view_settings;
 pub mod work;
 pub mod work_http;
+pub mod work_preflight;
 pub mod workspace;
 #[cfg(unix)]
 pub mod workspace_agent_tasks;
@@ -81,6 +85,9 @@ pub enum HubError {
     },
     /// The bounded overlap scan could not prove that the requested scope is free.
     WorkOverlapIncomplete,
+    /// Atomic admission found that an explicitly supplied source/merge preflight is not clear.
+    /// The structured evidence is returned to the caller and no new Work is claimed.
+    WorkPreflight(Box<work_preflight::WorkPreflightResult>),
     /// Internal detail for the operator's stderr only; never sent to a client.
     Unavailable(String),
 }
@@ -104,6 +111,7 @@ impl fmt::Display for HubError {
             Self::WorkOverlapIncomplete => {
                 write!(f, "work overlap scan is incomplete; claim refused")
             }
+            Self::WorkPreflight(_) => write!(f, "work preflight requires review; claim refused"),
             Self::Unavailable(message) => write!(f, "unavailable: {message}"),
         }
     }

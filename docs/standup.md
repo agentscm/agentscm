@@ -56,13 +56,156 @@ The response contains two independent sections:
 
 The Work dashboard separates **Working now**, **Recently finished** and **Needs coordination**. Working now preserves the progress lanes and identifies the lead, participants and next action. Recently finished uses a server-reported time window, independent of acknowledgement, and includes actual reported completion and decision checkpoints. Needs coordination shows durable directed requests, per-lead receipt and reply state, and recorded resolutions. Detected scope overlaps are listed separately: detection alone is not delivery or resolution.
 
-The dashboard uses authenticated read-only GETs. It never acknowledges a request or briefing and never changes an assignment. Each bounded section states its completeness; request pages retain their fixed upper watermark, and Change history retains the briefing cursor tuple. Stale and unknown claims remain assigned. Finished work carries no assignment claim and does not imply tests, review or merge.
+The dashboard reads current Work without changing assignments or acknowledging coordination requests or agent briefings. Its separate personal catch-up panel advances only the signed-in person’s review position after an explicit action. Each bounded section states its completeness; request pages retain their fixed upper watermark, and Change history retains the briefing cursor tuple. Stale and unknown claims remain assigned. Finished work carries no assignment claim and does not imply tests, review or merge.
+
+### Since you last checked
+
+Hub Work and the inline MCP Work app show a personal return-to-work delivery above
+current assignments. It combines retained Work/checkpoint and coordination events
+with immutable merge observations. Human review state belongs to the authenticated
+person and repository, so it survives token rotation and is shared across that
+person’s devices. A verified repository ID keeps that history and readership position
+through a repository rename; unbound repositories retain name-based isolation.
+Agent subscribers retain separate token/session positions.
+Opening a page, login, polling, dismissal and startup never mark records reviewed.
+The personal position is an authenticated owner’s readership assertion. An owner’s
+bearer credentials, including read-only tokens, can advance it; the protocol does
+not attest human presence, understanding or approval. Agents use their separate
+namespaced subscribers and must not select or acknowledge `human` without the
+owner’s explicit review action. Acknowledged delivery receipts retain the acting
+token and delivery client within the bounded receipt lifetime; they do not
+establish human presence.
+
+`GET /v1/hub/standup/catchup` freezes a delivery with separate Work-event and
+merge-observation high-waters. Continue with the exact delivery and both returned
+cursor pairs; pages never chase new events beyond that fixed window. Load all
+pages before explicitly posting the delivery and expected starting cursors to
+`POST /v1/hub/standup/catchup/ack`. A concurrent acknowledgement cannot move either
+position backwards. Retrying the same completed acknowledgement is idempotent;
+a stale position reports a conflict and the client reloads current state.
+Read-only tokens can maintain their own readership state and trigger bounded,
+idempotent projection of trusted stored publications into the shared merge feed.
+They cannot supply merge observations or mutate Work, publications or the forge. Agent Work briefing acknowledgements remain separate.
+
+The CLI exposes `work catchup` (optional `--request` query JSON) and
+`work catchup-ack --request` (exact acknowledgement JSON). MCP exposes
+`agentscm_work_catchup` and `agentscm_work_catchup_ack`. The HTTP/CLI default subscriber is `human`; MCP and supported agent startup paths
+select namespaced independent agent subscribers. Browser/MCP App instances supply
+an opaque `delivery_client` so two devices or tabs page independently while sharing
+the person’s review position. With browser Web Locks, Hub tabs retain a bounded set
+of client slots across reloads and acquire exclusive ownership before using a stored
+client; a copied busy client is replaced. Browsers without that facility use a
+volatile client. MCP App instances also keep independent volatile clients. Reuse
+one client identity throughout a delivery. Idle
+deliveries expire after 24 hours without moving the review position; an expired
+continuation must reload. Recent acknowledgement receipts are retained for retry.
+Delivery storage is bounded per person and repository: at most 128 active windows
+and 128 MiB of retained page payload. One agent token is limited to 16 windows
+and 32 MiB; agents together are limited to 96 windows and 96 MiB, preserving
+capacity for human review. Human windows are capped at 32. Byte limits apply to
+continuation pages as well as new windows; capacity errors leave review positions
+unchanged.
+
+Merge observations retain an exact repository, PR/MR number, head/merge commits,
+typed original source, changed paths and ingestion sequence. The sequence records
+when AgentSCM first retained the observation; an optional provider occurrence time
+is displayed separately. Publication observations and ordinary forge observations
+deduplicate on repository, proposal number and merge commit. Display titles are bounded and
+strip control and invisible characters consistently with the clients; exact source
+identities are never rewritten. Unsupported identity characters leave source
+coverage unavailable rather than inserting an unreadable delivery. A provider record is
+read through the configured authenticated GitHub/GitLab transport, never accepted
+from an unverified webhook payload. The sync also reads a bounded recent closed
+proposal page and re-reads new merge candidates. Source status records unread
+pages, deferred observations and failures. Source-quality metadata refreshes on
+each page without changing the delivery’s event watermarks. This is observed coverage, not a claim
+of complete forge history. No model call generates the recap.
+
+Retention gaps, unavailable sources and partial pages remain visible. An empty
+retained delivery does not establish that nothing happened outside that coverage.
+Current Work and existing coordination warnings stay visible alongside it. No
+catch-up acknowledgement closes Work, changes a claim or authorizes an edit.
+
+### Source and scope preflight
+
+`POST /v1/hub/standup/preflight`, CLI `work preflight --request`, and MCP
+`agentscm_work_preflight` inspect a proposed Work start without claiming it.
+The request uses the same exact Work resolver and normalized scope as start, plus
+an optional immutable source revision, fixed merge window and deliberately checked
+merge identities. Admission repeats the relevant check in the same transaction as
+the Work claim, so a changed merge watermark cannot silently use an old check.
+Titles and similar branch names never prove that two tasks are equivalent. An exact
+retained source head is checked independently of the caller’s chosen merge window;
+an empty window cannot hide that duplicate signal.
+
+The result distinguishes `review_required`, `unknown` and
+`clear_within_checked_window`. The last status is limited to the declared comparisons
+and caller-reported source relationship; it is not authenticated Git ancestry. It reports existing subject Work, scope overlaps and
+exact merge identities; it is not a general conflict-free or semantic-duplication
+guarantee. Git ancestry is a caller-reported local source fact: report `source_relation_checked` only
+after inspecting it, and `in_source` for each exact checked merge. For Git,
+`git merge-base --is-ancestor MERGE_COMMIT SOURCE_REVISION` distinguishes ancestry
+from a definite non-ancestor; missing objects or command errors are unknown.
+A different SHA alone is not proof of staleness. Missing objects, missing scope, unavailable
+coverage or an unverified source relationship remain unknown. Current claim,
+generation and deliberate handover rules continue to apply. An explicit stale or
+incomplete preflight refuses a new lead claim with `work_preflight_required` and
+its typed evidence. A new-subject start with an active scope overlap instead records the existing
+durable coordination request and returns the nonclear preflight without acquiring
+a competing claim. Repeating that start reuses the request; inspecting preflight
+alone does not notify or mutate other Work. An explicit retry/resume of already-owned Work still passes
+through the existing identity and generation checks. Applicable Work retained under
+a former repository name requires explicit review rather than a false clear result.
+Legacy starts without
+preflight evidence retain compatibility admission and return unknown readiness. Native startup hooks
+and MCP start show a bounded catch-up preview without creating a delivery or
+acknowledgement. A preview cannot be continued or acknowledged: call the explicit
+catch-up tool to begin a fixed-window delivery, read every page and deliberately
+acknowledge that agent subscriber. Opening new agent sessions therefore does not
+consume delivery quotas or pin retained history. MCP is advisory and cannot
+intercept arbitrary edits outside a supported hook.
+
+### Legacy time-window merge projection
+
+The HTTP and MCP Work overview also include `merge_recap`, a read-only summary of stored
+AgentSCM publications with recorded merge commits. This compatibility projection is separate from the durable catch-up delivery above.
+MCP work start and native startup hooks use the delivery-free catch-up preview for return-to-work context.
+
+The recap uses the overview's recent time window, with `time_basis: last_recorded_update`:
+an item's `updated_at` is its last stored publication update, not the time the forge
+merged it. Each item names the publication, pull request, head and merge commits, branch
+and base. Reading does not query the forge, acknowledge a briefing or alter a claim.
+
+Coverage is limited to retained AgentSCM publications in the authenticated provider,
+host, repository name and repository ID when available. Bound tokens see publications
+created by tokens for the same repository ID; unbound legacy tokens see publications
+created by unbound tokens. These are separate partitions within provider/host/name,
+matching Work's existing scope. Completeness applies only to that partition.
+Pull requests created outside that publication
+path may be absent. A narrow query inspects at most 21 matching publication records,
+returns at most 20 merges and reports `complete: false` when another match exists.
+`scanned_count` is the number of matching records inspected, not a count of all repository
+activity. Full publication manifests and conversation bodies are not returned by this read.
+The result limit does not bound database rows examined or query latency.
+A null or absent `merge_recap` means unavailable, not an empty merge history. Work and
+publication reads are separate observations, not an atomic joined snapshot.
+
+This is a recent-activity window, not a personal unread marker. Signing in or opening
+the overview does not establish what a person has read. A merge recap does not prove
+that an active Work item is finished or duplicated: there is no inferred association
+from matching titles or branches. Inspect current assignments and source before editing;
+the existing scope-admission and coordination rules still apply.
+
+The overview JSON adds the optional `merge_recap` field. Clients using a closed response
+schema must accept that extension; the existing Work fields retain their meaning.
+This projection requires PostgreSQL 16 or newer and was exercised on PostgreSQL 17.
+The bundled SQLite supports the query. A query failure leaves the recap unavailable.
 
 ## Before work and after an overlap
 
 1. Read `agentscm_work_overview` (or `agentscm work overview`) before planning. It shows unfinished assignments, declared overlaps, and reported outcomes in the last 24 hours by default. `recent_since` selects another starting time. A compacted history is explicitly incomplete.
-2. Read the session's briefing and coordination inbox. Retrieve every page before relying on coverage. Reconnect with the same subscriber/session; acknowledge only deliberately received data.
-3. Start with a stable work identity, explicit session and intended paths. HTTP/CLI and MCP starts return a pre-claim overview in `context`. The database serializes scope admission with the claim, so simultaneous different work identities cannot both claim the same declared scope unnoticed. Empty scope is unknown coverage; declare scope before editing.
+2. Read the personal/agent catch-up delivery, session briefing and coordination inbox. Retrieve every page before relying on coverage. Reconnect with the same subscriber/session; acknowledge only deliberately received data.
+3. Inspect the proposed source and scope with preflight, then start with a stable work identity, explicit session, intended paths and the same checked merge watermark. HTTP/CLI and MCP starts return a pre-claim overview in `context`. The database serializes scope admission with the claim, so simultaneous different work identities cannot both claim the same declared scope unnoticed. Empty scope is unknown coverage; declare scope before editing.
 4. A conflicting lead start creates an idempotent durable coordination request, addressed to the affected current leads, without creating a competing assignment or announcing paths. A conflicting scope checkpoint also records a request while leaving the work unchanged. Exact files and `directory/**` scopes use component-aware overlap matching; related meaning in task titles is not automatically inferred.
 5. The affected lead acknowledges the request version and reports a proposed split, join, handover or decline. Responses go back to the requester. Make the agreed scope or participation change, then resolve the request. The engine rejects resolution while an uncoordinated overlap remains. The requester can explicitly withdraw its proposal.
 6. Report meaningful checkpoints and an explicit finish. Session end alone preserves unfinished work for resumption or handover.
@@ -83,7 +226,43 @@ agentscm work compact --database sqlite:///absolute/path/hub.sqlite \
 
 For a password-bearing PostgreSQL URL, select an existing environment variable instead of placing its value in command arguments or shell history: use `--database-env AGENTSCM_DATABASE_URL` in place of `--database`. The variable must already contain the intended database URL.
 
-The default is a dry run. Inspect its result before repeating the command with `--apply`. The cutoff is a Unix timestamp and must be at least 24 hours old. Compaction refuses while an unexpired, unacknowledged briefing depends on the repository's history. It preserves current work, recent operation receipts and the historical baseline needed for retained snapshots. Later briefings explicitly report a retention gap when their acknowledgement boundary predates removed history.
+The default is a dry run. Inspect its result before repeating the command with `--apply`. The cutoff is a Unix timestamp and must be at least 24 hours old. Compaction refuses while an unexpired, unacknowledged briefing or catch-up delivery
+depends on the repository’s history. It preserves current work, recent operation receipts and the historical baseline needed for retained snapshots. Later briefings explicitly report a retention gap when their acknowledgement boundary predates removed history.
+
+Merge observations have a separate retained limit of 100,000 rows and 512 MiB of
+accounted payload per repository. Ingestion that exceeds either limit fails with
+incomplete or unavailable coverage. The same maintenance command previews and
+removes an eligible oldest sequence prefix of merge observations, reports
+`deleted_merge_observations` and `merge_retention_floor`, and preserves newer rows.
+Merge updates remain prohibited. Later catch-up deliveries explicitly report a
+merge retention gap; maintenance does not promise complete forge history.
+
+A failed tracked-publication projection retains that exact publication identity and
+reports incomplete coverage with a deferred count. Successful retries remove the
+failure and recompute coverage. Optional projection SQL failures are isolated from
+the authoritative publication update. If a legacy publication recorded an invalid
+merge commit, a trusted local operator can preview a repair:
+
+```sh
+agentscm work repair-merge --database-env AGENTSCM_DATABASE_URL \
+  --repository acme/widgets \
+  --publication pub_00000000000000000000000000000000 \
+  --merge-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+```
+
+Use the verified canonical merge commit for the exact repository and proposal;
+this command does not query the forge. Inspect the proposal, then repeat with
+`--apply`. Repair requires an exact retained projection failure and an invalid
+current publication projection, or a retry of the same valid commit after a
+transient projection failure. The dry run checks the same eligibility without
+changing data. Apply rechecks eligibility atomically and reports success only
+after recording the observation and clearing the exact failure. Correcting an
+invalid stored merge fact records the publication identity and prior fact fingerprint and proposed commit in
+an audit event in the same transaction. Only this guarded local repair can replace
+an invalid retained merge commit; ordinary merge updates can retry the projection
+of the same commit. Valid immutable merge facts remain protected. The output contains bounded
+identity and merge fields, never the publication manifest or database URL.
+
 
 Compaction also removes coordination requests that were resolved or withdrawn before the cutoff, along with their retained receipts, replies and operation history. Open requests remain intact, even when older than the cutoff. The result reports `deleted_coordination_requests` and `coordination_retention_floor`; older inbox/list cursors report a retention gap rather than claiming complete history. Removed coordination receipts can no longer be replayed, so inspect current work before retrying an old operation. Reclaimed payload quota becomes available for new work, while physical database file size may remain unchanged.
 
@@ -144,8 +323,8 @@ and usage remain explicit rather than being counted as zero.
 | Surface | Current behavior |
 | --- | --- |
 | Hub storage | Durable SQLite and PostgreSQL work and directed-request records, repository-scoped authorization, atomic claims, generation fencing and bounded pages. Required schema migrations run when the store opens; a migration failure prevents the store and API from starting with partial coordination support. |
-| Hub dashboard | Read-only current-work, recent-outcome, directed-request, detected-overlap, catch-up and work-detail inspection. It cannot mutate or acknowledge. |
-| CLI | Agent-authenticated overview, inbox, request acknowledgement/reply/resolution/withdrawal, start, checkpoint, briefing and briefing acknowledgement against the Hub. Work drill-down is available through the HTTP API and dashboard. |
+| Hub dashboard | Current Work, outcomes, coordination, overlaps and source detail; personal catch-up with explicit review acknowledgement. It cannot mutate assignments or acknowledge agent briefings. |
+| CLI | Agent-authenticated overview, inbox, request acknowledgement/reply/resolution/withdrawal, preflight, start, checkpoint, personal catch-up and agent briefing with separate explicit acknowledgements against the Hub. Work drill-down is available through the HTTP API and dashboard. |
 | MCP | Agent-authenticated stand-up tools expose the same bounded records. Calls depend on the model following instructions; MCP cannot intercept arbitrary work. |
 | Native hooks | A supported session-start event can read and render a bounded briefing. A safely linked end event can pause active work if its observed checkpoint is still current. Hooks do not create a goal, acknowledge a briefing, infer decisions or meaningful progress, or claim accepted/landed completion. Existing edit events continue to announce file intent and warn about overlaps. |
 | Forge links | A work item can refer to an issue in its configured GitHub or GitLab repository. No automatic issue creation, update, comment or two-way mirror is performed. |

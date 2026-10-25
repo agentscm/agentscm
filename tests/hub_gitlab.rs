@@ -768,10 +768,23 @@ async fn polling_converges_without_webhooks_and_does_not_rewrite_what_is_unchang
     let lists = env.fake.with(|s| {
         s.requests
             .iter()
-            .filter(|r| r.path_and_query.contains("/merge_requests?"))
+            .filter(|r| r.path_and_query.contains("/merge_requests?state=opened"))
             .count()
     });
     assert_eq!(lists, 2);
+    assert_eq!(
+        env.fake.with(|state| state
+            .requests
+            .iter()
+            .filter(|request| {
+                request
+                    .path_and_query
+                    .contains("/merge_requests?state=merged")
+            })
+            .count()),
+        2,
+        "catch-up independently checks bounded merged proposals"
+    );
 
     // Changes while no webhook arrives: a new head, a merge, a new MR, a deleted and a new branch.
     env.mr(1, |m| {
@@ -1403,4 +1416,49 @@ fn gitlab_configuration_is_vetted() {
     ])
     .unwrap();
     assert!(error.contains("different hosts"), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catchup_discovers_ordinary_gitlab_merges_and_keeps_rename_paths() {
+    use agentscm::hub::catchup::CatchupQuery;
+    use agentscm::hub::store::mint_bound_agent_token;
+    let env = Env::start().await;
+    add_mr(&env, 71, &["src/current.rs"]);
+    env.mr(71, |mr| {
+        mr.state = "merged".into();
+        mr.merge_commit_sha = Some("a".repeat(40));
+        mr.renamed.push(("src/old.rs".into(), "src/new.rs".into()));
+    });
+    let owner = env
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "gitlab".into(),
+                host: env.host.clone(),
+                user_id: 71,
+            },
+            "reader",
+        )
+        .unwrap();
+    let (token, _, _) =
+        mint_bound_agent_token(&*env.store, &owner.id, "reader", REPO, REPO_ID, 3600, true)
+            .unwrap();
+    env.poll().await;
+    let page = env
+        .store
+        .work_catchup(&token, &CatchupQuery::default(), unix_now())
+        .unwrap();
+    assert_eq!(page.merges.len(), 1);
+    assert_eq!(page.merges[0].pull_number, 71);
+    assert_eq!(
+        page.merges[0].paths,
+        ["src/current.rs", "src/new.rs", "src/old.rs"]
+    );
+    assert!(page.merges[0].paths_complete);
+    env.poll().await;
+    let again = env
+        .store
+        .work_catchup(&token, &CatchupQuery::default(), unix_now())
+        .unwrap();
+    assert_eq!(again.merges, page.merges);
 }

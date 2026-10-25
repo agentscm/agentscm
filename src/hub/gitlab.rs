@@ -696,7 +696,8 @@ fn pull_json(mr: &Value) -> Value {
     json!({"number": mr["iid"], "node_id": format!("gid://gitlab/MergeRequest/{}", mr["id"]),
         "title": mr["title"], "state": if open { "open" } else { "closed" },
         "draft": mr["draft"].as_bool().or(mr["work_in_progress"].as_bool()).unwrap_or(false),
-        "merged": merged, "body": mr["description"], "labels": mr["labels"],
+        "merged": merged, "merged_at": mr["merged_at"],
+        "body": mr["description"], "labels": mr["labels"],
         "squash_commit_sha": mr["squash_commit_sha"],
         "source_project_id": mr["source_project_id"], "target_project_id": mr["target_project_id"],
         "merge_commit_sha": if mr["merge_commit_sha"].is_null() { &mr["squash_commit_sha"] } else { &mr["merge_commit_sha"] },
@@ -777,7 +778,7 @@ fn branch_of(item: &Value) -> Option<Branch> {
 }
 
 /// Unix seconds of an ISO 8601 time; GitLab writes the committer's own UTC offset.
-fn time(text: &str) -> Option<i64> {
+pub(super) fn time(text: &str) -> Option<i64> {
     // Slicing below is by byte; ASCII keeps it on character boundaries.
     if !text.is_ascii() {
         return None;

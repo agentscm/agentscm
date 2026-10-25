@@ -9,6 +9,11 @@ use crate::change_record::{
     ActionFinishV1, ActionMutationReceiptV1, ActionStartV1, CaptureBatchV1, ChangeRecordSummaryV1,
     ConversationEntryV1, IngestReceiptV1,
 };
+use crate::hub::catchup::{
+    CatchupAck, CatchupAckResult, CatchupMergeObservation, CatchupPage, CatchupPreview,
+    CatchupPreviewQuery, CatchupPublicationRepair, CatchupPublicationRepairResult, CatchupQuery,
+    CatchupRepositoryScope, CatchupSourceStatus, NewCatchupMerge,
+};
 
 use super::change_record::{SharedBodyAccess, SharedBodyRow, SharedBodyState};
 use super::connection::{
@@ -23,6 +28,7 @@ use super::external_runs::{ExternalKind, ExternalObserved, ExternalRun};
 use super::handoff::{Answered, Asked};
 use super::insights::{InsightPage, InsightQuery, UsageReceipt, UsageRecord, WorkInsight};
 use super::intent::{Announced, Intent, NewIntent};
+use super::merge_recap::MergeRecap;
 use super::publish::{Create, NewPublication, Publication, PublicationSearch, Update};
 use super::session::{SessionCall, Touched};
 use super::skills::{EvidenceRow, RunHead, SkillAdoption};
@@ -33,6 +39,7 @@ use super::work::{
     WorkItem, WorkOverview, WorkOverviewQuery, WorkRepositoryScope, WorkScopeCheck, WorkSearchPage,
     WorkStart, WorkStartResult,
 };
+use super::work_preflight::WorkPreflightResult;
 use super::{HubError, Result};
 use crate::team::auth::{Secret, generate_secret, lower_hex, token_digest};
 
@@ -478,6 +485,19 @@ pub trait Store: Send + Sync {
         before: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Publication>>;
+    /// Recent tracked merges in the authenticated Work repository identity. Reads at most 21
+    /// narrow matching rows; `scanned_count` includes the possible truncation marker.
+    fn work_merge_recap(
+        &self,
+        _token: &str,
+        _since: i64,
+        _until: i64,
+        _now: i64,
+    ) -> Result<MergeRecap> {
+        Err(HubError::Unavailable(
+            "merge recap projection unavailable".into(),
+        ))
+    }
     /// Like [`Store::publications`] but only matches of `search` (already [`search_text`]-cleaned)
     /// among the newest `SEARCH_SCAN_ROWS` publications below `before`: branch, base, title,
     /// id, owner login or token name containing it, or the pull request number it names. Never
@@ -500,6 +520,39 @@ pub trait Store: Send + Sync {
     ) -> Result<Vec<Publication>>;
     /// Applies one forge fact (see [`Update`]); an event only when the state changes. Unknown id is `Invalid`.
     fn update_publication(&self, id: &str, update: &Update, now: i64) -> Result<Publication>;
+    /// Propose or atomically apply a repair for one exact retained publication-projection failure.
+    fn repair_catchup_publication_merge(
+        &self,
+        repair: &CatchupPublicationRepair,
+        now: i64,
+    ) -> Result<CatchupPublicationRepairResult>;
+    /// Record one immutable provider-confirmed merge observation. Exact repository, PR and merge
+    /// commit duplicates return the retained observation without changing its ingestion time.
+    fn record_catchup_merge(
+        &self,
+        scope: &CatchupRepositoryScope,
+        merge: &NewCatchupMerge,
+        observed_at: i64,
+    ) -> Result<CatchupMergeObservation>;
+    fn catchup_merge_known(
+        &self,
+        scope: &CatchupRepositoryScope,
+        pull_number: i64,
+        merge_commit: Option<&str>,
+    ) -> Result<bool>;
+    fn catchup_merge_highwater(&self, scope: &CatchupRepositoryScope) -> Result<i64>;
+    fn catchup_merges_through(
+        &self,
+        scope: &CatchupRepositoryScope,
+        after: i64,
+        through: i64,
+        limit: usize,
+    ) -> Result<Vec<CatchupMergeObservation>>;
+    fn record_catchup_source_status(
+        &self,
+        scope: &CatchupRepositoryScope,
+        status: &CatchupSourceStatus,
+    ) -> Result<()>;
     /// Events with `seq` greater than the argument, oldest first, at most 1000.
     /// Retained events in sequence order; operator-compacted work events can leave gaps.
     fn events_after(&self, seq: i64, limit: usize) -> Result<Vec<HubEvent>>;
@@ -747,6 +800,21 @@ pub trait Store: Send + Sync {
         now: i64,
     ) -> Result<CoordinationRequest>;
     fn work_ack(&self, token: &str, ack: &BriefingAck, now: i64) -> Result<()>;
+    fn work_catchup(&self, token: &str, query: &CatchupQuery, now: i64) -> Result<CatchupPage>;
+    fn work_catchup_preview(
+        &self,
+        token: &str,
+        query: &CatchupPreviewQuery,
+        now: i64,
+    ) -> Result<CatchupPreview>;
+    fn work_catchup_ack(&self, token: &str, ack: &CatchupAck, now: i64)
+    -> Result<CatchupAckResult>;
+    fn work_preflight(
+        &self,
+        token: &str,
+        start: &WorkStart,
+        now: i64,
+    ) -> Result<WorkPreflightResult>;
     /// Local operator maintenance. `apply = false` is a side-effect-free preview.
     fn work_compact(
         &self,
@@ -932,7 +1000,7 @@ pub(super) struct Event {
     pub at: i64,
     pub kind: &'static str,
     pub subject: String,
-    /// Canonical JSON: serde_json orders object keys. Never holds secrets or digests.
+    /// Canonical JSON: serde_json orders object keys. Never holds secrets or credential digests.
     pub data: String,
 }
 
@@ -994,6 +1062,26 @@ impl Event {
     pub(super) fn token_revoked(token: &str, by: Option<&str>) -> Result<Self> {
         let data = by.map_or_else(|| json!({}), |by| json!({"by": by}));
         Self::new("agent_token_revoked", token, data)
+    }
+
+    pub(super) fn publication_merge_corrected(
+        repository: &str,
+        publication: &str,
+        previous_merge_commit: Option<&str>,
+        merge_commit: &str,
+    ) -> Result<Self> {
+        let previous_merge_commit_sha256 =
+            previous_merge_commit.map(|value| lower_hex_of(value.as_bytes()));
+        Self::new(
+            "publication_merge_corrected",
+            publication,
+            json!({
+                "repository": repository,
+                "publication": publication,
+                "previous_merge_commit_sha256": previous_merge_commit_sha256,
+                "merge_commit": merge_commit,
+            }),
+        )
     }
 }
 

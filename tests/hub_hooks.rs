@@ -317,6 +317,7 @@ async fn session_end_pauses_known_work_without_claiming_completion() {
                 depends_on: Vec::new(),
                 related_work: Vec::new(),
                 takeover_generation: None,
+                preflight: None,
             },
             unix_now(),
         )
@@ -378,6 +379,7 @@ async fn session_start_flags_records_omitted_from_a_complete_preview() {
                     depends_on: Vec::new(),
                     related_work: Vec::new(),
                     takeover_generation: None,
+                    preflight: None,
                 },
                 unix_now(),
             )

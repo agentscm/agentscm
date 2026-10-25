@@ -15,6 +15,19 @@ use crate::change_record::{
     SessionSetupV1, parse_conversation_cursor,
 };
 
+use super::catchup::{
+    CATCHUP_AGENT_DELIVERY_CAPACITY_BYTES, CATCHUP_AGENT_TOKEN_DELIVERY_CAPACITY_BYTES,
+    CATCHUP_DELIVERY_CAPACITY_BYTES, CATCHUP_PREVIEW_LIMIT, CatchupAck, CatchupAckResult,
+    CatchupAckStatus, CatchupCoordinationEvent, CatchupMergeObservation, CatchupMergeSource,
+    CatchupPage, CatchupPageWindow, CatchupPreview, CatchupPreviewQuery, CatchupPublicationRepair,
+    CatchupPublicationRepairResult, CatchupQuery, CatchupRepositoryScope, CatchupRetention,
+    CatchupSourceCoverage, CatchupSourceStatus, CatchupWorkEvent, HUMAN_SUBSCRIBER,
+    MAX_ACTIVE_AGENT_DELIVERIES, MAX_ACTIVE_AGENT_DELIVERIES_PER_TOKEN,
+    MAX_ACTIVE_CATCHUP_DELIVERIES, MAX_ACTIVE_HUMAN_DELIVERIES, MAX_CATCHUP_MERGE_BYTES,
+    MAX_CATCHUP_MERGE_ROWS, MAX_CATCHUP_PAGE, MAX_CATCHUP_PAGE_PAYLOAD_BYTES, NewCatchupMerge,
+    TrackedPublicationMergeInput, coverage_name, parse_coverage, parse_source,
+    repository_namespace, source_name, tracked_publication_merge,
+};
 use super::change_record::{
     SessionStatsV1, SharedBodyAccess, SharedBodyRow, SharedBodyState, StoredActionV1,
     StoredDecisionV1, project as project_change_record,
@@ -52,6 +65,7 @@ use super::intent::{
     Announced, Existing, INTENT_SELECT, Intent, NewIntent, Plan, Who, announced, display_all,
     finish, notice_events, plan, probe_set, validate_ttl,
 };
+use super::merge_recap::{MergeRecap, MergeRecapItem, QUERY_LIMIT, finish as finish_merge_recap};
 use super::publish::{
     Create, MAX_UNFINISHED, NewPublication, PUBLICATION_SELECT, Publication, PublicationSearch,
     SEARCH_SCAN_ROWS, Update,
@@ -78,7 +92,35 @@ use super::work::{
     normalized_scope, scope_overlap_reasons, uncovered_scope, work_overlap_pairs,
     work_payload_row_bytes,
 };
+use super::work_preflight::{WorkPreflightResult, WorkPreflightStatus};
 use super::{HubError, Result};
+
+mod preflight;
+
+fn require_clear_preflight(
+    who: &WorkWho,
+    start: &WorkStart,
+    result: &WorkPreflightResult,
+) -> Result<()> {
+    if start.preflight.is_none()
+        || (result.status == WorkPreflightStatus::ClearWithinCheckedWindow && result.complete)
+    {
+        return Ok(());
+    }
+    let own_explicit_resume = result.subject_match.as_ref().is_some_and(|item| {
+        start.role == WorkRole::Lead
+            && start.work_id.as_deref() == Some(item.id.as_str())
+            && item.lead_token == who.token
+            && ((item.lead_session == start.session && start.takeover_generation.is_none())
+                || (item.state == WorkState::Paused
+                    && start.takeover_generation == Some(item.generation)))
+    });
+    if own_explicit_resume {
+        Ok(())
+    } else {
+        Err(HubError::WorkPreflight(Box::new(result.clone())))
+    }
+}
 
 /// Held for the whole migration transaction so hubs starting together serialize.
 const MIGRATION_LOCK: i64 = 0x6167_656e_7473_636d;
@@ -478,6 +520,810 @@ fn json_value<T: serde::de::DeserializeOwned>(value: &str) -> Result<T> {
 
 fn enum_name<T: serde::Serialize>(value: &T) -> Result<String> {
     Ok(json_string(value)?.trim_matches('"').to_owned())
+}
+
+fn catchup_repository_key(repository_id: Option<i64>) -> i64 {
+    repository_id.unwrap_or(-1)
+}
+
+fn pg_check_catchup_delivery_capacity(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    repository: &str,
+    key: i64,
+    subscriber_token: Option<&str>,
+    previous_bytes: i64,
+    new_bytes: i64,
+) -> Result<()> {
+    let total: i64 = tx
+        .query_one(
+            "SELECT COALESCE(SUM(octet_length(page)),0)::bigint FROM hub_catchup_deliveries
+        WHERE owner=$1 AND provider=$2 AND host=$3 AND repository=$4 AND repository_key=$5",
+            &[
+                &who.owner.id,
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &repository,
+                &key,
+            ],
+        )?
+        .get(0);
+    if total
+        .saturating_sub(previous_bytes)
+        .saturating_add(new_bytes)
+        > CATCHUP_DELIVERY_CAPACITY_BYTES
+    {
+        return Err(HubError::WorkCapacity);
+    }
+    if let Some(token) = subscriber_token {
+        let agents: i64 = tx
+            .query_one(
+                "SELECT COALESCE(SUM(octet_length(page)),0)::bigint FROM hub_catchup_deliveries
+            WHERE owner=$1 AND provider=$2 AND host=$3 AND repository=$4 AND repository_key=$5
+              AND subscriber_token IS NOT NULL",
+                &[
+                    &who.owner.id,
+                    &who.owner.identity.provider,
+                    &who.owner.identity.host,
+                    &repository,
+                    &key,
+                ],
+            )?
+            .get(0);
+        let token_bytes: i64 = tx
+            .query_one(
+                "SELECT COALESCE(SUM(octet_length(page)),0)::bigint FROM hub_catchup_deliveries
+            WHERE owner=$1 AND provider=$2 AND host=$3 AND repository=$4 AND repository_key=$5
+              AND subscriber_token=$6",
+                &[
+                    &who.owner.id,
+                    &who.owner.identity.provider,
+                    &who.owner.identity.host,
+                    &repository,
+                    &key,
+                    &token,
+                ],
+            )?
+            .get(0);
+        if agents
+            .saturating_sub(previous_bytes)
+            .saturating_add(new_bytes)
+            > CATCHUP_AGENT_DELIVERY_CAPACITY_BYTES
+            || token_bytes
+                .saturating_sub(previous_bytes)
+                .saturating_add(new_bytes)
+                > CATCHUP_AGENT_TOKEN_DELIVERY_CAPACITY_BYTES
+        {
+            return Err(HubError::WorkCapacity);
+        }
+    }
+    Ok(())
+}
+
+fn catchup_merge_id(
+    scope: &CatchupRepositoryScope,
+    pull_number: i64,
+    merge_commit: &str,
+) -> String {
+    let input = format!(
+        "agentscm.hub.catchup-merge.v1\0{}\0{}\0{}\0{}\0{}\0{}",
+        scope.provider,
+        scope.host,
+        repository_namespace(&scope.repository, scope.repository_id),
+        catchup_repository_key(scope.repository_id),
+        pull_number,
+        merge_commit
+    );
+    format!("mrg_{}", &lower_hex_of(input.as_bytes())[..32])
+}
+
+fn pg_catchup_merge(row: &postgres::Row) -> Result<CatchupMergeObservation> {
+    Ok(CatchupMergeObservation {
+        id: row.get(0),
+        seq: row.get(1),
+        source: parse_source(row.get::<_, String>(2).as_str())?,
+        source_id: row.get(3),
+        occurred_at: row.get(4),
+        observed_at: row.get(5),
+        title: row.get(6),
+        branch: row.get(7),
+        base: row.get(8),
+        head_commit: row.get(9),
+        merge_commit: row.get(10),
+        pull_number: row.get(11),
+        paths: json_value(row.get::<_, String>(12).as_str())?,
+        paths_complete: row.get(13),
+    })
+}
+
+const CATCHUP_MERGE_COLUMNS: &str = "id,seq,source,source_id,occurred_at,observed_at,title,branch,base,head_commit,merge_commit,pull_number,paths,paths_complete";
+
+fn pg_record_catchup_merge(
+    tx: &mut postgres::Transaction<'_>,
+    scope: &CatchupRepositoryScope,
+    merge: &NewCatchupMerge,
+    observed_at: i64,
+) -> Result<CatchupMergeObservation> {
+    scope.validate()?;
+    merge.validate(observed_at)?;
+    lock_work_repository(
+        tx,
+        &scope.provider,
+        &scope.host,
+        &scope.repository,
+        scope.repository_id,
+    )?;
+    let key = catchup_repository_key(scope.repository_id);
+    let repository = repository_namespace(&scope.repository, scope.repository_id);
+    tx.execute("INSERT INTO hub_catchup_repositories
+        (provider,host,repository,repository_key,repository_id,next_merge_seq,merge_floor_seq,created_at,updated_at)
+        VALUES ($1,$2,$3,$4,$5,1,0,$6,$6) ON CONFLICT DO NOTHING",
+        &[&scope.provider,&scope.host,&repository,&key,&scope.repository_id,&observed_at])?;
+    if merge.source == CatchupMergeSource::TrackedPublication {
+        tx.execute(
+            "INSERT INTO hub_catchup_sources
+                (provider,host,repository,repository_key,repository_id,source,state,checked_at,unread_pages,deferred)
+             VALUES ($1,$2,$3,$4,$5,'tracked_publication','incomplete',$6,1,0)
+             ON CONFLICT(provider,host,repository,repository_key,source) DO UPDATE SET
+                checked_at=GREATEST(hub_catchup_sources.checked_at,EXCLUDED.checked_at)",
+            &[&scope.provider,&scope.host,&repository,&key,&scope.repository_id,&observed_at],
+        )?;
+    }
+    if let Some(row) = tx.query_opt(
+        &format!(
+            "SELECT {CATCHUP_MERGE_COLUMNS} FROM hub_catchup_merges
+        WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4
+          AND pull_number=$5 AND merge_commit=$6"
+        ),
+        &[
+            &scope.provider,
+            &scope.host,
+            &repository,
+            &key,
+            &merge.pull_number,
+            &merge.merge_commit,
+        ],
+    )? {
+        return pg_catchup_merge(&row);
+    }
+    let seq: i64 = tx
+        .query_one(
+            "SELECT next_merge_seq FROM hub_catchup_repositories
+        WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4 FOR UPDATE",
+            &[&scope.provider, &scope.host, &repository, &key],
+        )?
+        .get(0);
+    if let Some(row) = tx.query_opt(
+        &format!(
+            "SELECT {CATCHUP_MERGE_COLUMNS} FROM hub_catchup_merges
+        WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4
+          AND pull_number=$5 AND merge_commit=$6"
+        ),
+        &[
+            &scope.provider,
+            &scope.host,
+            &repository,
+            &key,
+            &merge.pull_number,
+            &merge.merge_commit,
+        ],
+    )? {
+        return pg_catchup_merge(&row);
+    }
+    let id = catchup_merge_id(scope, merge.pull_number, &merge.merge_commit);
+    let paths = json_string(&merge.paths)?;
+    let payload_bytes = [
+        merge.source_id.len(),
+        merge.title.as_ref().map_or(0, String::len),
+        merge.branch.len(),
+        merge.base.len(),
+        merge.head_commit.len(),
+        merge.merge_commit.len(),
+        paths.len(),
+        128,
+    ]
+    .into_iter()
+    .sum::<usize>() as i64;
+    let usage=tx.query_one("SELECT COUNT(*)::bigint,COALESCE(SUM(payload_bytes),0)::bigint
+        FROM hub_catchup_merges WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4",
+        &[&scope.provider,&scope.host,&repository,&key])?;
+    let retained_rows: i64 = usage.get(0);
+    let retained_bytes: i64 = usage.get(1);
+    if retained_rows >= MAX_CATCHUP_MERGE_ROWS
+        || retained_bytes.saturating_add(payload_bytes) > MAX_CATCHUP_MERGE_BYTES
+    {
+        return Err(HubError::WorkCapacity);
+    }
+    tx.execute(
+        "INSERT INTO hub_catchup_merges
+        (provider,host,repository,repository_key,repository_id,seq,id,source,source_id,occurred_at,
+         observed_at,title,branch,base,head_commit,merge_commit,pull_number,paths,paths_complete,payload_bytes)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)",
+        &[
+            &scope.provider,
+            &scope.host,
+            &repository,
+            &key,
+            &scope.repository_id,
+            &seq,
+            &id,
+            &source_name(merge.source),
+            &merge.source_id,
+            &merge.occurred_at,
+            &observed_at,
+            &merge.title,
+            &merge.branch,
+            &merge.base,
+            &merge.head_commit,
+            &merge.merge_commit,
+            &merge.pull_number,
+            &paths,
+            &merge.paths_complete,
+            &payload_bytes,
+        ],
+    )?;
+    tx.execute(
+        "UPDATE hub_catchup_repositories SET next_merge_seq=$5,updated_at=$6
+        WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4",
+        &[
+            &scope.provider,
+            &scope.host,
+            &repository,
+            &key,
+            &(seq + 1),
+            &observed_at,
+        ],
+    )?;
+    pg_catchup_merge(&tx.query_one(
+        &format!("SELECT {CATCHUP_MERGE_COLUMNS} FROM hub_catchup_merges WHERE id=$1"),
+        &[&id],
+    )?)
+}
+
+const CATCHUP_BACKFILL_BATCH: usize = 100;
+
+fn pg_publication_catchup_merge(publication: &Publication, now: i64) -> Result<NewCatchupMerge> {
+    let manifest = publication.manifest()?;
+    let paths = manifest
+        .changes
+        .iter()
+        .map(|change| change.path.clone())
+        .collect::<Vec<_>>();
+    tracked_publication_merge(TrackedPublicationMergeInput {
+        source_id: publication.id.clone(),
+        title: manifest.title.clone(),
+        branch: publication.branch.clone(),
+        base: publication.base.clone(),
+        head_commit: publication.commit.clone(),
+        merge_commit: publication.merge_commit.clone(),
+        pull_number: publication.pr_number,
+        paths,
+        observed_at: now,
+    })
+}
+
+fn pg_record_publication_failure(
+    tx: &mut postgres::Transaction<'_>,
+    scope: &CatchupRepositoryScope,
+    publication: &str,
+    now: i64,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO hub_catchup_publication_failures
+            (provider,host,repository,repository_key,repository_id,publication,attempts,created_at,updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,1,$7,$7)
+         ON CONFLICT(provider,host,repository,repository_key,publication) DO UPDATE SET
+            attempts=LEAST(1000000,hub_catchup_publication_failures.attempts+1),
+            updated_at=EXCLUDED.updated_at",
+        &[&scope.provider,&scope.host,&repository_namespace(&scope.repository,scope.repository_id),
+          &catchup_repository_key(scope.repository_id),&scope.repository_id,&publication,&now],
+    )?;
+    Ok(())
+}
+
+fn pg_clear_publication_failure(
+    tx: &mut postgres::Transaction<'_>,
+    scope: &CatchupRepositoryScope,
+    publication: &str,
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM hub_catchup_publication_failures WHERE provider=$1 AND host=$2
+           AND repository=$3 AND repository_key=$4 AND publication=$5",
+        &[
+            &scope.provider,
+            &scope.host,
+            &repository_namespace(&scope.repository, scope.repository_id),
+            &catchup_repository_key(scope.repository_id),
+            &publication,
+        ],
+    )?;
+    Ok(())
+}
+
+fn pg_refresh_publication_coverage(
+    tx: &mut postgres::Transaction<'_>,
+    scope: &CatchupRepositoryScope,
+    now: i64,
+) -> Result<()> {
+    let repository = repository_namespace(&scope.repository, scope.repository_id);
+    let key = catchup_repository_key(scope.repository_id);
+    let complete = tx
+        .query_opt(
+            "SELECT complete FROM hub_catchup_backfills WHERE provider=$1 AND host=$2
+             AND repository=$3 AND repository_key=$4",
+            &[&scope.provider, &scope.host, &repository, &key],
+        )?
+        .is_some_and(|row| row.get(0));
+    let deferred: i64 = tx
+        .query_one(
+            "SELECT COUNT(*)::bigint FROM hub_catchup_publication_failures
+             WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4",
+            &[&scope.provider, &scope.host, &repository, &key],
+        )?
+        .get(0);
+    let state = if complete && deferred == 0 {
+        "observed_only"
+    } else {
+        "incomplete"
+    };
+    tx.execute(
+        "INSERT INTO hub_catchup_sources
+            (provider,host,repository,repository_key,repository_id,source,state,checked_at,unread_pages,deferred)
+         VALUES ($1,$2,$3,$4,$5,'tracked_publication',$6,$7,$8,$9)
+         ON CONFLICT(provider,host,repository,repository_key,source) DO UPDATE SET
+            state=EXCLUDED.state,checked_at=GREATEST(hub_catchup_sources.checked_at,EXCLUDED.checked_at),
+            unread_pages=EXCLUDED.unread_pages,deferred=EXCLUDED.deferred",
+        &[&scope.provider,&scope.host,&repository,&key,&scope.repository_id,&state,&now,
+          &i64::from(!complete),&deferred],
+    )?;
+    Ok(())
+}
+
+fn pg_retain_publication_projection(
+    tx: &mut postgres::Transaction<'_>,
+    scope: &CatchupRepositoryScope,
+    publication: &Publication,
+    now: i64,
+) -> Result<()> {
+    let merge = match pg_publication_catchup_merge(publication, now) {
+        Ok(merge) => merge,
+        Err(_) => {
+            pg_record_publication_failure(tx, scope, &publication.id, now)?;
+            return Ok(());
+        }
+    };
+    tx.batch_execute("SAVEPOINT catchup_publication_projection")?;
+    match pg_record_catchup_merge(tx, scope, &merge, now) {
+        Ok(_) => {
+            tx.batch_execute("RELEASE catchup_publication_projection")?;
+            pg_clear_publication_failure(tx, scope, &publication.id)?;
+        }
+        Err(_) => {
+            tx.batch_execute(
+                "ROLLBACK TO catchup_publication_projection; RELEASE catchup_publication_projection",
+            )?;
+            pg_record_publication_failure(tx, scope, &publication.id, now)?;
+        }
+    }
+    Ok(())
+}
+
+fn pg_mark_backfill_unavailable(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    now: i64,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO hub_catchup_sources
+            (provider,host,repository,repository_key,repository_id,source,state,checked_at,unread_pages,deferred)
+         VALUES ($1,$2,$3,$4,$5,'tracked_publication','unavailable',$6,1,0)
+         ON CONFLICT(provider,host,repository,repository_key,source) DO UPDATE SET
+            state='unavailable',checked_at=GREATEST(hub_catchup_sources.checked_at,EXCLUDED.checked_at),
+            unread_pages=1",
+        &[&who.owner.identity.provider,&who.owner.identity.host,
+          &repository_namespace(&who.repository,who.repository_id),&catchup_repository_key(who.repository_id),
+          &who.repository_id,&now],
+    )?;
+    Ok(())
+}
+
+fn pg_try_backfill_catchup_publications(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    now: i64,
+) -> Result<()> {
+    tx.batch_execute("SAVEPOINT catchup_backfill")?;
+    match pg_backfill_catchup_publications(tx, who, now) {
+        Ok(()) => {
+            tx.batch_execute("RELEASE catchup_backfill")?;
+            Ok(())
+        }
+        Err(_) => {
+            tx.batch_execute("ROLLBACK TO catchup_backfill; RELEASE catchup_backfill")?;
+            pg_mark_backfill_unavailable(tx, who, now)
+        }
+    }
+}
+
+fn pg_backfill_catchup_publications(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    now: i64,
+) -> Result<()> {
+    lock_work_repository(
+        tx,
+        &who.owner.identity.provider,
+        &who.owner.identity.host,
+        &who.repository,
+        who.repository_id,
+    )?;
+    let key = catchup_repository_key(who.repository_id);
+    let repository = repository_namespace(&who.repository, who.repository_id);
+    tx.execute(
+        "INSERT INTO hub_catchup_backfills
+            (provider,host,repository,repository_key,repository_id,after_publication,complete,deferred,updated_at)
+         VALUES ($1,$2,$3,$4,$5,'',FALSE,0,$6) ON CONFLICT DO NOTHING",
+        &[&who.owner.identity.provider,&who.owner.identity.host,&repository,&key,
+            &who.repository_id,&now],
+    )?;
+    let row = tx.query_one(
+        "SELECT after_publication,complete FROM hub_catchup_backfills
+         WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4 FOR UPDATE",
+        &[
+            &who.owner.identity.provider,
+            &who.owner.identity.host,
+            &repository,
+            &key,
+        ],
+    )?;
+    let after: String = row.get(0);
+    let complete: bool = row.get(1);
+    if complete {
+        return Ok(());
+    }
+    let limit = (CATCHUP_BACKFILL_BATCH + 1) as i64;
+    let mut rows = tx.query(
+        "SELECT p.id,p.branch,p.base,p.commit_sha,p.merge_commit,p.pr_number
+         FROM hub_publications p JOIN hub_agent_tokens t ON t.id=p.token
+         JOIN hub_users u ON u.id=t.owner
+         WHERE u.provider=$1 AND u.host=$2
+           AND (($4::bigint IS NOT NULL AND t.repository_id=$4)
+             OR ($4::bigint IS NULL AND t.repository_id IS NULL AND p.repository=$3))
+           AND p.merge_commit IS NOT NULL
+           AND p.pr_number IS NOT NULL AND p.id>$5 ORDER BY p.id LIMIT $6",
+        &[
+            &who.owner.identity.provider,
+            &who.owner.identity.host,
+            &who.repository,
+            &who.repository_id,
+            &after,
+            &limit,
+        ],
+    )?;
+    let has_more = rows.len() > CATCHUP_BACKFILL_BATCH;
+    rows.truncate(CATCHUP_BACKFILL_BATCH);
+    let mut last = after;
+    let scope = CatchupRepositoryScope {
+        provider: who.owner.identity.provider.clone(),
+        host: who.owner.identity.host.clone(),
+        repository: who.repository.clone(),
+        repository_id: who.repository_id,
+    };
+    for row in rows {
+        let id: String = row.get(0);
+        last = id.clone();
+        match tracked_publication_merge(TrackedPublicationMergeInput {
+            source_id: id,
+            title: String::new(),
+            branch: row.get(1),
+            base: row.get(2),
+            head_commit: row.get(3),
+            merge_commit: row.get(4),
+            pull_number: row.get(5),
+            paths: Vec::new(),
+            observed_at: now,
+        }) {
+            Ok(mut merge) => {
+                merge.title = None;
+                merge.paths_complete = false;
+                tx.batch_execute("SAVEPOINT catchup_backfill_publication")?;
+                match pg_record_catchup_merge(tx, &scope, &merge, now) {
+                    Ok(_) => {
+                        tx.batch_execute("RELEASE catchup_backfill_publication")?;
+                        pg_clear_publication_failure(tx, &scope, &merge.source_id)?;
+                    }
+                    Err(_) => {
+                        tx.batch_execute("ROLLBACK TO catchup_backfill_publication; RELEASE catchup_backfill_publication")?;
+                        pg_record_publication_failure(tx, &scope, &merge.source_id, now)?;
+                    }
+                }
+            }
+            Err(_) => pg_record_publication_failure(tx, &scope, &last, now)?,
+        }
+    }
+    let deferred: i64 = tx
+        .query_one(
+            "SELECT COUNT(*)::bigint FROM hub_catchup_publication_failures
+         WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4",
+            &[
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &repository,
+                &key,
+            ],
+        )?
+        .get(0);
+    tx.execute(
+        "UPDATE hub_catchup_backfills SET after_publication=$5,complete=$6,deferred=$7,updated_at=$8
+         WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4",
+        &[&who.owner.identity.provider,&who.owner.identity.host,&repository,&key,
+            &last,&(!has_more),&deferred,&now],
+    )?;
+    pg_refresh_publication_coverage(tx, &scope, now)
+}
+
+fn pg_catchup_page(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    window: &CatchupPageWindow<'_>,
+) -> Result<CatchupPage> {
+    let CatchupPageWindow {
+        subscriber,
+        delivery_client,
+        delivery,
+        event_from,
+        event_through,
+        event_after,
+        merge_from,
+        merge_through,
+        merge_after,
+        limit,
+    } = *window;
+    if event_after < event_from
+        || event_after > event_through
+        || merge_after < merge_from
+        || merge_after > merge_through
+    {
+        return Err(HubError::Invalid(
+            "catch-up cursor is outside its delivery".into(),
+        ));
+    }
+    let rows=tx.query("SELECT seq,at,kind,subject,stream,snapshot,title,status FROM (
+        SELECT e.seq,e.at,e.kind,e.subject,'work'::text stream,v.snapshot,NULL::text title,NULL::text status
+          FROM hub_events e JOIN hub_work_versions v ON v.event_seq=e.seq JOIN hub_work_items w ON w.id=v.work
+         WHERE e.seq>$1 AND e.seq<=$2 AND w.provider=$3 AND w.host=$4
+           AND (($6::bigint IS NOT NULL AND w.repository_id=$6)
+             OR ($6::bigint IS NULL AND w.repository=$5 AND w.repository_id IS NULL))
+        UNION ALL
+        SELECT e.seq,e.at,e.kind,e.subject,'coordination'::text,NULL::text,r.proposed_title,v.status
+          FROM hub_events e JOIN hub_coordination_versions v ON v.event_seq=e.seq
+          JOIN hub_coordination_requests r ON r.id=v.request
+         WHERE e.seq>$1 AND e.seq<=$2 AND r.provider=$3 AND r.host=$4
+           AND (($6::bigint IS NOT NULL AND r.repository_id=$6)
+             OR ($6::bigint IS NULL AND r.repository=$5 AND r.repository_id IS NULL))) events ORDER BY seq LIMIT $7",
+        &[&event_after,&event_through,&who.owner.identity.provider,&who.owner.identity.host,
+          &who.repository,&who.repository_id,&((limit+1) as i64)])?;
+    let mut more_events = rows.len() > limit;
+    let mut work_events = Vec::new();
+    let mut coordination_events = Vec::new();
+    let mut last_event = event_after;
+    let mut page_payload_bytes = 0usize;
+    for row in &rows {
+        if work_events.len() + coordination_events.len() >= limit {
+            more_events = true;
+            break;
+        }
+        let seq: i64 = row.get(0);
+        let at = row.get(1);
+        let kind: String = row.get(2);
+        let subject: String = row.get(3);
+        let stream: String = row.get(4);
+        let snapshot: Option<String> = row.get(5);
+        let title: Option<String> = row.get(6);
+        let row_status: Option<String> = row.get(7);
+        let row_bytes = kind.len()
+            + subject.len()
+            + snapshot.as_ref().map_or(0, String::len)
+            + title.as_ref().map_or(0, String::len)
+            + row_status.as_ref().map_or(0, String::len)
+            + 128;
+        if page_payload_bytes.saturating_add(row_bytes) > MAX_CATCHUP_PAGE_PAYLOAD_BYTES {
+            if work_events.is_empty() && coordination_events.is_empty() {
+                return Err(HubError::Unavailable(
+                    "a retained catch-up work event exceeds the page byte limit".into(),
+                ));
+            }
+            more_events = true;
+            break;
+        }
+        page_payload_bytes += row_bytes;
+        last_event = seq;
+        if stream == "work" {
+            work_events.push(CatchupWorkEvent {
+                seq,
+                at,
+                kind,
+                work_id: subject,
+                item: json_value(snapshot.as_deref().ok_or_else(|| {
+                    HubError::Unavailable("missing retained work snapshot".into())
+                })?)?,
+            });
+        } else {
+            coordination_events.push(CatchupCoordinationEvent {
+                seq,
+                at,
+                kind,
+                request_id: subject,
+                title: title.ok_or_else(|| {
+                    HubError::Unavailable("missing retained coordination title".into())
+                })?,
+                status: row_status.ok_or_else(|| {
+                    HubError::Unavailable("missing retained coordination status".into())
+                })?,
+            });
+        }
+    }
+    let next_event_after = if more_events {
+        last_event
+    } else {
+        event_through
+    };
+    let key = catchup_repository_key(who.repository_id);
+    let repository = repository_namespace(&who.repository, who.repository_id);
+    let rows = tx.query(
+        &format!(
+            "SELECT {CATCHUP_MERGE_COLUMNS} FROM hub_catchup_merges
+        WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4 AND seq>$5 AND seq<=$6
+        ORDER BY seq LIMIT $7"
+        ),
+        &[
+            &who.owner.identity.provider,
+            &who.owner.identity.host,
+            &repository,
+            &key,
+            &merge_after,
+            &merge_through,
+            &((limit + 1) as i64),
+        ],
+    )?;
+    let mut more_merges = rows.len() > limit;
+    let mut merges = Vec::new();
+    for row in &rows {
+        if merges.len() >= limit {
+            more_merges = true;
+            break;
+        }
+        let row_bytes = row.get::<_, String>(0).len()
+            + row.get::<_, String>(2).len()
+            + row.get::<_, String>(3).len()
+            + row
+                .get::<_, Option<String>>(6)
+                .as_ref()
+                .map_or(0, String::len)
+            + row.get::<_, String>(7).len()
+            + row.get::<_, String>(8).len()
+            + row.get::<_, String>(9).len()
+            + row.get::<_, String>(10).len()
+            + row.get::<_, String>(12).len()
+            + 128;
+        if page_payload_bytes.saturating_add(row_bytes) > MAX_CATCHUP_PAGE_PAYLOAD_BYTES {
+            if work_events.is_empty() && coordination_events.is_empty() && merges.is_empty() {
+                return Err(HubError::Unavailable(
+                    "a retained catch-up merge exceeds the page byte limit".into(),
+                ));
+            }
+            more_merges = true;
+            break;
+        }
+        page_payload_bytes += row_bytes;
+        merges.push(pg_catchup_merge(row)?);
+    }
+    let next_merge_after = if more_merges {
+        merges.last().map_or(merge_after, |m| m.seq)
+    } else {
+        merge_through
+    };
+    let work_floor: i64 = tx
+        .query_one(
+            "SELECT COALESCE(MAX(event_floor_seq),0)::bigint
+        FROM hub_work_retention WHERE provider=$1 AND host=$2
+          AND (($4::bigint IS NOT NULL AND repository_id=$4)
+            OR ($4::bigint IS NULL AND repository=$3 AND repository_id IS NULL))",
+            &[
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                &who.repository_id,
+            ],
+        )?
+        .get(0);
+    let coordination_floor = tx
+        .query_one(
+            "SELECT COALESCE(MAX(event_floor_seq),0)::bigint FROM hub_coordination_retention
+        WHERE provider=$1 AND host=$2 AND (($4::bigint IS NOT NULL AND repository_id=$4)
+          OR ($4::bigint IS NULL AND repository=$3 AND repository_id IS NULL))",
+            &[
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                &who.repository_id,
+            ],
+        )?
+        .get(0);
+    let merge_floor = tx
+        .query_opt(
+            "SELECT merge_floor_seq FROM hub_catchup_repositories
+        WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4",
+            &[
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &repository,
+                &key,
+            ],
+        )?
+        .map_or(0, |r| r.get(0));
+    let mut source_coverage = vec![
+        CatchupSourceCoverage {
+            source: CatchupMergeSource::TrackedPublication,
+            state: super::catchup::CatchupCoverageState::Incomplete,
+            checked_at: None,
+            unread_pages: 0,
+            deferred: 0,
+        },
+        CatchupSourceCoverage {
+            source: CatchupMergeSource::ForgePull,
+            state: super::catchup::CatchupCoverageState::Unavailable,
+            checked_at: None,
+            unread_pages: 0,
+            deferred: 0,
+        },
+    ];
+    for row in tx.query(
+        "SELECT source,state,checked_at,unread_pages,deferred FROM hub_catchup_sources
+        WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4 ORDER BY source",
+        &[
+            &who.owner.identity.provider,
+            &who.owner.identity.host,
+            &repository,
+            &key,
+        ],
+    )? {
+        let source = parse_source(row.get::<_, String>(0).as_str())?;
+        source_coverage.retain(|entry| entry.source != source);
+        source_coverage.push(CatchupSourceCoverage {
+            source,
+            state: parse_coverage(row.get::<_, String>(1).as_str())?,
+            checked_at: Some(row.get(2)),
+            unread_pages: row.get::<_, i64>(3) as u64,
+            deferred: row.get::<_, i64>(4) as u64,
+        });
+    }
+    source_coverage.sort_by_key(|entry| source_name(entry.source));
+    Ok(CatchupPage {
+        subscriber: subscriber.to_owned(),
+        delivery_client: delivery_client.to_owned(),
+        delivery: delivery.to_owned(),
+        event_from,
+        event_through,
+        event_after,
+        next_event_after,
+        merge_from,
+        merge_through,
+        merge_after,
+        next_merge_after,
+        work_events,
+        coordination_events,
+        merges,
+        retention: CatchupRetention {
+            work_gap: event_from < work_floor,
+            coordination_gap: event_from < coordination_floor,
+            merge_gap: merge_from < merge_floor,
+            event_available_from: work_floor.max(coordination_floor),
+            merge_available_from: merge_floor,
+        },
+        source_coverage,
+        complete: next_event_after == event_through && next_merge_after == merge_through,
+    })
 }
 
 fn pg_usage_summary(
@@ -928,6 +1774,35 @@ fn work_event_high_water(
                  UNION ALL SELECT event_floor_seq FROM hub_coordination_retention
                    WHERE provider=$1 AND host=$2 AND repository=$3
                      AND repository_id IS NOT DISTINCT FROM $4) watermarks",
+            &[
+                &who.owner.identity.provider,
+                &who.owner.identity.host,
+                &who.repository,
+                &who.repository_id,
+                &minimum,
+            ],
+        )?
+        .get(0))
+}
+
+fn catchup_event_high_water(
+    tx: &mut postgres::Transaction<'_>,
+    who: &WorkWho,
+    minimum: i64,
+) -> Result<i64> {
+    Ok(tx
+        .query_one(
+            "SELECT MAX(value) FROM (
+        SELECT COALESCE(MAX(seq),0)::bigint value FROM hub_events UNION ALL SELECT $5::bigint
+        UNION ALL SELECT COALESCE(MAX(event_floor_seq),0) FROM hub_work_retention
+          WHERE provider=$1 AND host=$2 AND (($4::bigint IS NOT NULL AND repository_id=$4)
+            OR ($4::bigint IS NULL AND repository=$3 AND repository_id IS NULL))
+        UNION ALL SELECT COALESCE(MAX(snapshot_floor_seq),0) FROM hub_work_retention
+          WHERE provider=$1 AND host=$2 AND (($4::bigint IS NOT NULL AND repository_id=$4)
+            OR ($4::bigint IS NULL AND repository=$3 AND repository_id IS NULL))
+        UNION ALL SELECT COALESCE(MAX(event_floor_seq),0) FROM hub_coordination_retention
+          WHERE provider=$1 AND host=$2 AND (($4::bigint IS NOT NULL AND repository_id=$4)
+            OR ($4::bigint IS NULL AND repository=$3 AND repository_id IS NULL))) watermarks",
             &[
                 &who.owner.identity.provider,
                 &who.owner.identity.host,
@@ -2008,6 +2883,7 @@ fn start_in(
                         conflict: None,
                         context: None,
                         coordination_request: None,
+                        preflight: None,
                     });
                 }
                 item.participants
@@ -2064,6 +2940,7 @@ fn start_in(
                 conflict: None,
                 context: None,
                 coordination_request: None,
+                preflight: None,
             });
         }
         if item.lead_token == who.token
@@ -2090,6 +2967,7 @@ fn start_in(
                     took_over: false,
                     context: None,
                     coordination_request: None,
+                    preflight: None,
                 });
             }
             let overlaps = work_scope_overlaps(tx, who, &item.scope, Some(&item.id), now)?;
@@ -2119,6 +2997,7 @@ fn start_in(
                 conflict: None,
                 context: None,
                 coordination_request,
+                preflight: None,
             });
         }
         if start.takeover_generation != Some(item.generation) {
@@ -2141,6 +3020,7 @@ fn start_in(
                 took_over: false,
                 context: None,
                 coordination_request: None,
+                preflight: None,
             });
         }
         let resuming_own_paused = item.lead_token == who.token
@@ -2162,6 +3042,7 @@ fn start_in(
                 took_over: false,
                 context: None,
                 coordination_request: None,
+                preflight: None,
             });
         }
         let previous_item_bytes = stored_work_item_bytes(tx, &item.id)?;
@@ -2240,6 +3121,7 @@ fn start_in(
             conflict: None,
             context: None,
             coordination_request: None,
+            preflight: None,
         });
     }
     if start.work_id.is_some() {
@@ -2258,6 +3140,7 @@ fn start_in(
             took_over: false,
             context: None,
             coordination_request: None,
+            preflight: None,
         });
     }
     let overlaps = work_scope_overlaps(tx, who, &scope, None, now)?;
@@ -2288,6 +3171,7 @@ fn start_in(
             }),
             context: None,
             coordination_request: Some(coordination_request),
+            preflight: None,
         });
     }
     relation_targets(tx, who, &start.depends_on)?;
@@ -2429,6 +3313,7 @@ fn start_in(
         conflict: None,
         context: None,
         coordination_request: None,
+        preflight: None,
     })
 }
 
@@ -2812,11 +3697,12 @@ fn lock_repository(tx: &mut postgres::Transaction<'_>, repository: &str) -> Resu
 }
 
 fn lock_work_delivery(tx: &mut postgres::Transaction<'_>, who: &WorkWho) -> Result<()> {
+    let repository = repository_namespace(&who.repository, who.repository_id);
     let scope = json_string(&(
         &who.owner.id,
         &who.owner.identity.provider,
         &who.owner.identity.host,
-        &who.repository,
+        &repository,
         who.repository_id,
     ))?;
     tx.execute(
@@ -2833,6 +3719,7 @@ fn lock_work_repository(
     repository: &str,
     repository_id: Option<i64>,
 ) -> Result<()> {
+    let repository = repository_namespace(repository, repository_id);
     let scope = json_string(&(provider, host, repository, repository_id))?;
     tx.execute(
         "SELECT pg_advisory_xact_lock($1, hashtext($2))",
@@ -2848,6 +3735,7 @@ fn lock_work_repository_shared(
     repository: &str,
     repository_id: Option<i64>,
 ) -> Result<()> {
+    let repository = repository_namespace(repository, repository_id);
     let scope = json_string(&(provider, host, repository, repository_id))?;
     tx.execute(
         "SELECT pg_advisory_xact_lock_shared($1, hashtext($2))",
@@ -5258,6 +6146,67 @@ impl Store for PgStore {
         })
     }
 
+    fn work_merge_recap(
+        &self,
+        token: &str,
+        since: i64,
+        until: i64,
+        now: i64,
+    ) -> Result<MergeRecap> {
+        self.run(true, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            let rows = tx.query(
+                "WITH recent AS MATERIALIZED (
+                    SELECT p.id, p.updated_at
+                    FROM hub_publications p
+                    JOIN hub_agent_tokens t ON t.id = p.token
+                    JOIN hub_users u ON u.id = t.owner
+                    WHERE p.repository = $1 AND t.repository = $1
+                      AND t.repository_id IS NOT DISTINCT FROM $2
+                      AND u.provider = $3 AND u.host = $4
+                      AND p.pr_number IS NOT NULL AND p.merge_commit IS NOT NULL
+                      AND p.updated_at >= $5 AND p.updated_at <= $6
+                    ORDER BY p.updated_at DESC, p.id DESC LIMIT $7
+                 )
+                 SELECT left(p.id, 37),
+                        CASE WHEN octet_length(p.manifest) <= 2097152
+                                       AND p.manifest IS JSON OBJECT
+                             THEN CASE WHEN jsonb_typeof(p.manifest::jsonb -> 'title') = 'string'
+                                             AND octet_length(p.manifest::jsonb ->> 'title') <= 256
+                                        THEN p.manifest::jsonb ->> 'title' END END,
+                        left(p.branch, 256), left(p.base, 256), left(p.commit_sha, 65),
+                        left(p.merge_commit, 65), p.pr_number, p.updated_at
+                 FROM recent r JOIN hub_publications p ON p.id = r.id
+                 ORDER BY p.updated_at DESC, p.id DESC",
+                &[
+                    &who.repository,
+                    &who.repository_id,
+                    &who.owner.identity.provider,
+                    &who.owner.identity.host,
+                    &since,
+                    &until,
+                    &QUERY_LIMIT,
+                ],
+            )?;
+            let merges = rows
+                .iter()
+                .map(|row| MergeRecapItem {
+                    id: row.get(0),
+                    title: row.get(1),
+                    branch: row.get(2),
+                    base: row.get(3),
+                    head_commit: row.get(4),
+                    merge_commit: row.get(5),
+                    pull_number: row.get(6),
+                    updated_at: row.get(7),
+                })
+                .collect();
+            tx.commit()?;
+            finish_merge_recap(since, until, merges)
+        })
+    }
+
     fn publication_search(
         &self,
         repository: &str,
@@ -5369,6 +6318,18 @@ impl Store for PgStore {
             }
             let mut p = publication_by_id(&mut tx, id, true)?
                 .ok_or_else(|| HubError::Invalid("unknown publication".into()))?;
+            let retry_catchup = if let Update::Merged { merge_commit } = update {
+                p.merge_commit.as_deref() == Some(merge_commit.as_str())
+                    && pg_publication_catchup_merge(&p, now).is_ok()
+                    && tx
+                        .query_one(
+                            "SELECT EXISTS(SELECT 1 FROM hub_catchup_publication_failures WHERE publication=$1)",
+                            &[&id],
+                        )?
+                        .get::<_, bool>(0)
+            } else {
+                false
+            };
             let (changed, event) = p.apply(update, now)?;
             if changed {
                 tx.execute(
@@ -5392,9 +6353,261 @@ impl Store for PgStore {
             if let Some(event) = event {
                 append(&mut tx, &event)?;
             }
+            if (changed && matches!(update, Update::Merged { .. })) || retry_catchup {
+                let row = tx.query_one(
+                    "SELECT u.provider,u.host,t.repository,t.repository_id
+                     FROM hub_agent_tokens t JOIN hub_users u ON u.id=t.owner WHERE t.id=$1",
+                    &[&p.token],
+                )?;
+                let scope = CatchupRepositoryScope {
+                    provider: row.get(0),
+                    host: row.get(1),
+                    repository: row.get(2),
+                    repository_id: row.get(3),
+                };
+                pg_retain_publication_projection(&mut tx, &scope, &p, now)?;
+                pg_refresh_publication_coverage(&mut tx, &scope, now)?;
+            }
             tx.commit()?;
             Ok(p)
         })
+    }
+
+    fn repair_catchup_publication_merge(
+        &self,
+        repair: &CatchupPublicationRepair,
+        now: i64,
+    ) -> Result<CatchupPublicationRepairResult> {
+        repair.validate()?;
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let mut publication = publication_by_id(&mut tx, &repair.publication, true)?
+                .filter(|publication| publication.repository == repair.repository)
+                .ok_or_else(|| HubError::Invalid("unknown publication in repository".into()))?;
+            let current_merge_commit = publication.merge_commit.clone();
+            let row = tx.query_one(
+                "SELECT u.provider,u.host,t.repository,t.repository_id
+                 FROM hub_agent_tokens t JOIN hub_users u ON u.id=t.owner WHERE t.id=$1",
+                &[&publication.token],
+            )?;
+            let scope = CatchupRepositoryScope {
+                provider: row.get(0),
+                host: row.get(1),
+                repository: row.get(2),
+                repository_id: row.get(3),
+            };
+            lock_work_repository(
+                &mut tx,
+                &scope.provider,
+                &scope.host,
+                &scope.repository,
+                scope.repository_id,
+            )?;
+            let retained_failure = tx.query_opt(
+                "SELECT 1 FROM hub_catchup_publication_failures
+                 WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4
+                   AND publication=$5 FOR UPDATE",
+                &[
+                    &scope.provider,
+                    &scope.host,
+                    &repository_namespace(&scope.repository, scope.repository_id),
+                    &catchup_repository_key(scope.repository_id),
+                    &repair.publication,
+                ],
+            )?;
+            if retained_failure.is_none() {
+                return Err(HubError::Invalid(
+                    "no retained catch-up projection failure for publication".into(),
+                ));
+            }
+
+            let (merge, replace_invalid) = match pg_publication_catchup_merge(&publication, now) {
+                Ok(merge) => {
+                    if publication.merge_commit.as_deref() != Some(repair.merge_commit.as_str()) {
+                        return Err(HubError::Invalid(
+                            "publication merge fact is immutable and cannot be repaired".into(),
+                        ));
+                    }
+                    (merge, false)
+                }
+                Err(_) => {
+                    publication.merge_commit = Some(repair.merge_commit.clone());
+                    publication.updated_at = now;
+                    let merge = pg_publication_catchup_merge(&publication, now).map_err(|_| {
+                        HubError::Invalid(
+                            "proposed merge commit does not repair the retained projection failure"
+                                .into(),
+                        )
+                    })?;
+                    (merge, true)
+                }
+            };
+            let result = CatchupPublicationRepairResult {
+                publication: publication.id.clone(),
+                repository: publication.repository.clone(),
+                previous_merge_commit_sha256: current_merge_commit
+                    .as_deref()
+                    .map(|value| lower_hex_of(value.as_bytes())),
+                proposed_merge_commit: repair.merge_commit.clone(),
+                applied: repair.apply,
+            };
+            if !repair.apply {
+                tx.commit()?;
+                return Ok(result);
+            }
+            if replace_invalid {
+                tx.execute(
+                    "UPDATE hub_publications SET merge_commit=$2,updated_at=$3 WHERE id=$1",
+                    &[
+                        &publication.id,
+                        &publication.merge_commit,
+                        &publication.updated_at,
+                    ],
+                )?;
+            }
+            let observation = pg_record_catchup_merge(&mut tx, &scope, &merge, now)?;
+            if observation.pull_number != merge.pull_number
+                || observation.merge_commit != repair.merge_commit
+            {
+                return Err(HubError::Unavailable(
+                    "catch-up publication repair did not retain the exact projection".into(),
+                ));
+            }
+            let deleted = tx.execute(
+                "DELETE FROM hub_catchup_publication_failures WHERE provider=$1 AND host=$2
+                 AND repository=$3 AND repository_key=$4 AND publication=$5",
+                &[
+                    &scope.provider,
+                    &scope.host,
+                    &repository_namespace(&scope.repository, scope.repository_id),
+                    &catchup_repository_key(scope.repository_id),
+                    &publication.id,
+                ],
+            )?;
+            if deleted != 1 {
+                return Err(HubError::Unavailable(
+                    "retained catch-up projection failure changed during repair".into(),
+                ));
+            }
+            pg_refresh_publication_coverage(&mut tx, &scope, now)?;
+            if replace_invalid {
+                append(
+                    &mut tx,
+                    &Event::publication_merge_corrected(
+                        &publication.repository,
+                        &publication.id,
+                        current_merge_commit.as_deref(),
+                        &repair.merge_commit,
+                    )?,
+                )?;
+            }
+            tx.commit()?;
+            Ok(result)
+        })
+    }
+
+    fn record_catchup_merge(
+        &self,
+        scope: &CatchupRepositoryScope,
+        merge: &NewCatchupMerge,
+        observed_at: i64,
+    ) -> Result<CatchupMergeObservation> {
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let value = pg_record_catchup_merge(&mut tx, scope, merge, observed_at)?;
+            tx.commit()?;
+            Ok(value)
+        })
+    }
+
+    fn catchup_merge_known(
+        &self,
+        scope: &CatchupRepositoryScope,
+        pull_number: i64,
+        merge_commit: Option<&str>,
+    ) -> Result<bool> {
+        scope.validate()?;
+        if pull_number < 1 {
+            return Err(HubError::Invalid("pull number must be positive".into()));
+        }
+        self.run(true, |client| {
+            let repository = repository_namespace(&scope.repository, scope.repository_id);
+            Ok(client
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM hub_catchup_merges
+            WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4 AND pull_number=$5
+              AND ($6::text IS NULL OR merge_commit=$6))",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &repository,
+                        &catchup_repository_key(scope.repository_id),
+                        &pull_number,
+                        &merge_commit,
+                    ],
+                )?
+                .get(0))
+        })
+    }
+
+    fn catchup_merge_highwater(&self, scope: &CatchupRepositoryScope) -> Result<i64> {
+        scope.validate()?;
+        self.run(true, |client| {
+            let repository = repository_namespace(&scope.repository, scope.repository_id);
+            Ok(client
+                .query_opt(
+                    "SELECT next_merge_seq-1 FROM hub_catchup_repositories WHERE provider=$1
+            AND host=$2 AND repository=$3 AND repository_key=$4",
+                    &[
+                        &scope.provider,
+                        &scope.host,
+                        &repository,
+                        &catchup_repository_key(scope.repository_id),
+                    ],
+                )?
+                .map_or(0, |r| r.get(0)))
+        })
+    }
+
+    fn catchup_merges_through(
+        &self,
+        scope: &CatchupRepositoryScope,
+        after: i64,
+        through: i64,
+        limit: usize,
+    ) -> Result<Vec<CatchupMergeObservation>> {
+        scope.validate()?;
+        if after < 0 || through < after || !(1..=MAX_CATCHUP_PAGE).contains(&limit) {
+            return Err(HubError::Invalid("invalid catch-up merge page".into()));
+        }
+        let repository = repository_namespace(&scope.repository, scope.repository_id);
+        self.run(true,|client|client.query(&format!("SELECT {CATCHUP_MERGE_COLUMNS} FROM hub_catchup_merges
+            WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4 AND seq>$5 AND seq<=$6
+            ORDER BY seq LIMIT $7"),&[&scope.provider,&scope.host,&repository,
+            &catchup_repository_key(scope.repository_id),&after,&through,&(limit as i64)])?.iter().map(pg_catchup_merge).collect())
+    }
+
+    fn record_catchup_source_status(
+        &self,
+        scope: &CatchupRepositoryScope,
+        status: &CatchupSourceStatus,
+    ) -> Result<()> {
+        scope.validate()?;
+        status.validate()?;
+        let repository = repository_namespace(&scope.repository, scope.repository_id);
+        self.run(false,|client|{client.execute("INSERT INTO hub_catchup_sources
+            (provider,host,repository,repository_key,repository_id,source,state,checked_at,unread_pages,deferred)
+            VALUES ($1,$2,$3,$4,$5,'tracked_publication','incomplete',$6,1,0)
+            ON CONFLICT DO NOTHING",&[&scope.provider,&scope.host,&repository,
+            &catchup_repository_key(scope.repository_id),&scope.repository_id,&status.checked_at])?;
+            client.execute("INSERT INTO hub_catchup_sources
+            (provider,host,repository,repository_key,repository_id,source,state,checked_at,unread_pages,deferred)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            ON CONFLICT(provider,host,repository,repository_key,source) DO UPDATE SET state=EXCLUDED.state,
+              checked_at=EXCLUDED.checked_at,unread_pages=EXCLUDED.unread_pages,deferred=EXCLUDED.deferred
+            WHERE EXCLUDED.checked_at>=hub_catchup_sources.checked_at",&[&scope.provider,&scope.host,&repository,
+            &catchup_repository_key(scope.repository_id),&scope.repository_id,&source_name(status.source),
+            &coverage_name(status.state),&status.checked_at,&(status.unread_pages as i64),&(status.deferred as i64)])?;Ok(())})
     }
 
     fn work_start(&self, token: &str, start: &WorkStart, now: i64) -> Result<WorkStartResult> {
@@ -5402,6 +6615,9 @@ impl Store for PgStore {
             let mut tx = client.transaction()?;
             let who = work_who(&mut tx, token, now)?;
             lock_work_capacity(&mut tx, &who)?;
+            if start.preflight.is_some() {
+                pg_try_backfill_catchup_publications(&mut tx, &who, now)?;
+            }
             let resolver = match (&start.work_id, &start.source, &start.request_key) {
                 (Some(id), None, None) => vec!["work", id],
                 (None, Some(source), None) => vec![
@@ -5426,7 +6642,36 @@ impl Store for PgStore {
                 &[&0x6167_6577_i32, &lock],
             )?;
             lock_repository(&mut tx, &who.repository)?;
-            let result = start_in(&mut tx, &who, start, now)?;
+            let scope = start.validate(&who)?;
+            let preflight = preflight::evaluate(&mut tx, &who, start, &scope, now)?;
+            if super::work_preflight::coordinates_active_scope_overlap(start, &preflight) {
+                let mut result = start_in(&mut tx, &who, start, now)?;
+                super::work_preflight::require_overlap_coordination(&result, &preflight)?;
+                result.preflight = Some(preflight);
+                tx.commit()?;
+                return Ok(result);
+            }
+            require_clear_preflight(&who, start, &preflight)?;
+            let mut result = start_in(&mut tx, &who, start, now)?;
+            result.preflight = Some(preflight);
+            tx.commit()?;
+            Ok(result)
+        })
+    }
+
+    fn work_preflight(
+        &self,
+        token: &str,
+        start: &WorkStart,
+        now: i64,
+    ) -> Result<super::work_preflight::WorkPreflightResult> {
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            lock_work_capacity(&mut tx, &who)?;
+            pg_try_backfill_catchup_publications(&mut tx, &who, now)?;
+            let scope = start.validate(&who)?;
+            let result = preflight::evaluate(&mut tx, &who, start, &scope, now)?;
             tx.commit()?;
             Ok(result)
         })
@@ -5450,6 +6695,9 @@ impl Store for PgStore {
                 return Err(HubError::Unauthorized);
             }
             lock_work_capacity(&mut tx, &who)?;
+            if start.preflight.is_some() {
+                pg_try_backfill_catchup_publications(&mut tx, &who, now)?;
+            }
             let mut planned = start.clone();
             planned.request_key = Some("automatic-session-start".into());
             let planned_scope = planned.validate(&who)?;
@@ -5460,6 +6708,12 @@ impl Store for PgStore {
             )?;
             lock_repository(&mut tx, &who.repository)?;
             if let Some(item) = unfinished_for_session(&mut tx, &who, &start.session, now)? {
+                let mut inspected = planned.clone();
+                inspected.work_id = Some(item.id.clone());
+                inspected.request_key = None;
+                let preflight =
+                    preflight::evaluate(&mut tx, &who, &inspected, &planned_scope, now)?;
+                require_clear_preflight(&who, start, &preflight)?;
                 let changed = item.title != start.title
                     || item.scope != planned_scope
                     || item.branch != start.branch
@@ -5472,8 +6726,7 @@ impl Store for PgStore {
                     current_generation: item.generation,
                     overlaps: Vec::new(),
                 });
-                tx.commit()?;
-                return Ok(WorkStartResult {
+                let result = WorkStartResult {
                     item,
                     created: false,
                     joined: false,
@@ -5481,11 +6734,17 @@ impl Store for PgStore {
                     conflict,
                     context: None,
                     coordination_request: None,
-                });
+                    preflight: Some(preflight),
+                };
+                tx.commit()?;
+                return Ok(result);
             }
             let mut created = start.clone();
             created.request_key = Some(new_id("req")?);
-            let result = start_in(&mut tx, &who, &created, now)?;
+            let preflight = preflight::evaluate(&mut tx, &who, &created, &planned_scope, now)?;
+            require_clear_preflight(&who, start, &preflight)?;
+            let mut result = start_in(&mut tx, &who, &created, now)?;
+            result.preflight = Some(preflight);
             tx.commit()?;
             Ok(result)
         })
@@ -6858,6 +8117,228 @@ impl Store for PgStore {
         })
     }
 
+    fn work_catchup_preview(
+        &self,
+        token: &str,
+        query: &CatchupPreviewQuery,
+        now: i64,
+    ) -> Result<CatchupPreview> {
+        query.validate()?;
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            let who = work_who(&mut tx, token, now)?;
+            lock_work_delivery(&mut tx, &who)?;
+            pg_try_backfill_catchup_publications(&mut tx, &who, now)?;
+            let key = catchup_repository_key(who.repository_id);
+            let repository = repository_namespace(&who.repository, who.repository_id);
+            let subscriber_token =
+                (query.subscriber != HUMAN_SUBSCRIBER).then(|| who.token.clone());
+            let (event_ack, merge_ack) = tx
+                .query_opt(
+                    "SELECT event_cursor,merge_cursor FROM hub_catchup_acks WHERE owner=$1
+                     AND subscriber_token IS NOT DISTINCT FROM $2 AND subscriber=$3
+                     AND provider=$4 AND host=$5 AND repository=$6 AND repository_key=$7",
+                    &[
+                        &who.owner.id,
+                        &subscriber_token,
+                        &query.subscriber,
+                        &who.owner.identity.provider,
+                        &who.owner.identity.host,
+                        &repository,
+                        &key,
+                    ],
+                )?
+                .map_or((0, 0), |row| (row.get(0), row.get(1)));
+            let event_through = catchup_event_high_water(&mut tx, &who, event_ack)?;
+            let merge_through = tx
+                .query_opt(
+                    "SELECT next_merge_seq-1 FROM hub_catchup_repositories WHERE provider=$1
+                     AND host=$2 AND repository=$3 AND repository_key=$4",
+                    &[
+                        &who.owner.identity.provider,
+                        &who.owner.identity.host,
+                        &repository,
+                        &key,
+                    ],
+                )?
+                .map_or(merge_ack, |row| row.get::<_, i64>(0))
+                .max(merge_ack);
+            let page = pg_catchup_page(
+                &mut tx,
+                &who,
+                &CatchupPageWindow {
+                    subscriber: &query.subscriber,
+                    delivery_client: "",
+                    delivery: "",
+                    event_from: event_ack,
+                    event_through,
+                    event_after: event_ack,
+                    merge_from: merge_ack,
+                    merge_through,
+                    merge_after: merge_ack,
+                    limit: CATCHUP_PREVIEW_LIMIT,
+                },
+            )?;
+            tx.commit()?;
+            Ok(CatchupPreview::from_page(page))
+        })
+    }
+
+    fn work_catchup(&self, token: &str, query: &CatchupQuery, now: i64) -> Result<CatchupPage> {
+        query.validate()?;
+        self.run(false,|client|{let mut tx=client.transaction()?;let who=work_who(&mut tx,token,now)?;
+        lock_work_delivery(&mut tx,&who)?;let key=catchup_repository_key(who.repository_id);
+        let repository=repository_namespace(&who.repository,who.repository_id);
+        let subscriber_token=(query.subscriber!=HUMAN_SUBSCRIBER).then(||who.token.clone());
+        if let Some(delivery)=&query.delivery{
+            let row=tx.query_opt("SELECT event_from,event_through,merge_from,merge_through,page_event_after,
+                page_merge_after,next_event_after,next_merge_after,page FROM hub_catchup_deliveries
+                WHERE id=$1 AND owner=$2 AND subscriber_token IS NOT DISTINCT FROM $3 AND subscriber=$4
+                  AND provider=$5 AND host=$6 AND repository=$7 AND repository_key=$8
+                  AND delivery_client=$9 AND updated_at>=$10 FOR UPDATE",
+                &[delivery,&who.owner.id,&subscriber_token,&query.subscriber,&who.owner.identity.provider,
+                  &who.owner.identity.host,&repository,&key,&query.delivery_client,&now.saturating_sub(86_400)])?.ok_or_else(||HubError::Invalid("unknown catch-up delivery".into()))?;
+            let values=(row.get::<_,i64>(0),row.get::<_,i64>(1),row.get::<_,i64>(2),row.get::<_,i64>(3),
+                row.get::<_,i64>(4),row.get::<_,i64>(5),row.get::<_,i64>(6),row.get::<_,i64>(7),row.get::<_,String>(8));
+            let ea=query.event_after.unwrap();let et=query.event_through.unwrap();let ma=query.merge_after.unwrap();let mt=query.merge_through.unwrap();
+            if et!=values.1||mt!=values.3{return Err(HubError::Invalid("catch-up watermark changed".into()));}
+            if ea==values.4&&ma==values.5{return json_value(&values.8);}
+            if ea!=values.6||ma!=values.7{return Err(HubError::Invalid("catch-up continuation skipped a page".into()));}
+            let page=pg_catchup_page(&mut tx,&who,&CatchupPageWindow{
+                subscriber:&query.subscriber,delivery_client:&query.delivery_client,delivery,
+                event_from:values.0,event_through:values.1,event_after:ea,merge_from:values.2,
+                merge_through:values.3,merge_after:ma,limit:query.limit,
+            })?;
+            let serialized=json_string(&page)?;check_work_delivery_page(&serialized)?;
+            pg_check_catchup_delivery_capacity(&mut tx,&who,&repository,key,subscriber_token.as_deref(),
+                values.8.len() as i64,serialized.len() as i64)?;
+            tx.execute("UPDATE hub_catchup_deliveries SET page_event_after=$2,page_merge_after=$3,
+                next_event_after=$4,next_merge_after=$5,page=$6,complete=$7,updated_at=$8 WHERE id=$1",
+                &[delivery,&ea,&ma,&page.next_event_after,&page.next_merge_after,&serialized,&page.complete,&now])?;
+            tx.commit()?;return Ok(page);
+        }
+        pg_try_backfill_catchup_publications(&mut tx,&who,now)?;
+        tx.execute("DELETE FROM hub_catchup_deliveries WHERE owner=$1 AND provider=$2 AND host=$3
+            AND repository=$4 AND repository_key=$5 AND updated_at<$6",
+            &[&who.owner.id,&who.owner.identity.provider,&who.owner.identity.host,
+              &repository,&key,&now.saturating_sub(86_400)])?;
+        let cursors=tx.query_opt("SELECT event_cursor,merge_cursor FROM hub_catchup_acks WHERE owner=$1
+            AND subscriber_token IS NOT DISTINCT FROM $2 AND subscriber=$3 AND provider=$4 AND host=$5
+            AND repository=$6 AND repository_key=$7 FOR UPDATE",&[&who.owner.id,&subscriber_token,
+            &query.subscriber,&who.owner.identity.provider,&who.owner.identity.host,&repository,&key])?
+            .map_or((0,0),|r|(r.get::<_,i64>(0),r.get::<_,i64>(1)));
+        tx.execute("UPDATE hub_catchup_deliveries SET superseded=TRUE,updated_at=$8
+            WHERE owner=$1 AND subscriber_token IS NOT DISTINCT FROM $2 AND subscriber=$3
+              AND provider=$4 AND host=$5 AND repository=$6 AND repository_key=$7
+              AND NOT acknowledged AND NOT superseded AND (event_from<>$9 OR merge_from<>$10)",
+            &[&who.owner.id,&subscriber_token,&query.subscriber,&who.owner.identity.provider,
+              &who.owner.identity.host,&repository,&key,&now,&cursors.0,&cursors.1])?;
+        let existing=tx.query_opt("SELECT id,event_from,event_through,merge_from,merge_through
+            FROM hub_catchup_deliveries WHERE owner=$1 AND subscriber_token IS NOT DISTINCT FROM $2
+              AND subscriber=$3 AND provider=$4 AND host=$5 AND repository=$6 AND repository_key=$7
+              AND delivery_client=$8 AND NOT acknowledged AND NOT superseded
+              ORDER BY created_at DESC,id DESC LIMIT 1 FOR UPDATE",
+            &[&who.owner.id,&subscriber_token,&query.subscriber,&who.owner.identity.provider,
+              &who.owner.identity.host,&repository,&key,&query.delivery_client])?;
+        let(delivery,event_from,event_through,merge_from,merge_through,is_new)=if let Some(row)=existing{
+            (row.get(0),row.get(1),row.get(2),row.get(3),row.get(4),false)
+        }else{
+            let active_total:i64=tx.query_one("SELECT COUNT(*) FROM hub_catchup_deliveries WHERE owner=$1 AND provider=$2
+                AND host=$3 AND repository=$4 AND repository_key=$5 AND NOT acknowledged AND NOT superseded",
+                &[&who.owner.id,&who.owner.identity.provider,&who.owner.identity.host,&repository,&key])?.get(0);
+            let(active_class,class_limit,active_group,group_limit)=if subscriber_token.is_none(){
+                let count:i64=tx.query_one("SELECT COUNT(*) FROM hub_catchup_deliveries WHERE owner=$1
+                    AND provider=$2 AND host=$3 AND repository=$4 AND repository_key=$5
+                    AND subscriber_token IS NULL AND NOT acknowledged AND NOT superseded",
+                    &[&who.owner.id,&who.owner.identity.provider,&who.owner.identity.host,&repository,&key])?.get(0);
+                (count,MAX_ACTIVE_HUMAN_DELIVERIES,active_total,MAX_ACTIVE_CATCHUP_DELIVERIES)
+            }else{
+                let token_count:i64=tx.query_one("SELECT COUNT(*) FROM hub_catchup_deliveries WHERE owner=$1
+                    AND provider=$2 AND host=$3 AND repository=$4 AND repository_key=$5
+                    AND subscriber_token=$6 AND NOT acknowledged AND NOT superseded",
+                    &[&who.owner.id,&who.owner.identity.provider,&who.owner.identity.host,&repository,&key,&who.token])?.get(0);
+                let agent_count:i64=tx.query_one("SELECT COUNT(*) FROM hub_catchup_deliveries WHERE owner=$1
+                    AND provider=$2 AND host=$3 AND repository=$4 AND repository_key=$5
+                    AND subscriber_token IS NOT NULL AND NOT acknowledged AND NOT superseded",
+                    &[&who.owner.id,&who.owner.identity.provider,&who.owner.identity.host,&repository,&key])?.get(0);
+                (token_count,MAX_ACTIVE_AGENT_DELIVERIES_PER_TOKEN,agent_count,MAX_ACTIVE_AGENT_DELIVERIES)
+            };
+            if active_class>=class_limit||active_group>=group_limit||active_total>=MAX_ACTIVE_CATCHUP_DELIVERIES{return Err(HubError::WorkCapacity);}
+            let et=catchup_event_high_water(&mut tx,&who,cursors.0)?;
+            let mt=tx.query_opt("SELECT next_merge_seq-1 FROM hub_catchup_repositories WHERE provider=$1
+                AND host=$2 AND repository=$3 AND repository_key=$4",
+                &[&who.owner.identity.provider,&who.owner.identity.host,&repository,&key])?.map_or(cursors.1,|r|r.get::<_,i64>(0)).max(cursors.1);
+            (new_id("cup")?,cursors.0,et,cursors.1,mt,true)
+        };
+        let page=pg_catchup_page(&mut tx,&who,&CatchupPageWindow{
+            subscriber:&query.subscriber,delivery_client:&query.delivery_client,delivery:&delivery,
+            event_from,event_through,event_after:event_from,merge_from,merge_through,
+            merge_after:merge_from,limit:query.limit,
+        })?;let serialized=json_string(&page)?;check_work_delivery_page(&serialized)?;
+        let previous_bytes=if is_new{0}else{tx.query_one("SELECT octet_length(page)::bigint FROM hub_catchup_deliveries WHERE id=$1",
+            &[&delivery])?.get(0)};
+        pg_check_catchup_delivery_capacity(&mut tx,&who,&repository,key,subscriber_token.as_deref(),previous_bytes,serialized.len() as i64)?;
+        if is_new{
+            tx.execute("INSERT INTO hub_catchup_deliveries
+            (id,owner,subscriber_token,subscriber,provider,host,repository,repository_key,repository_id,
+             event_from,event_through,merge_from,merge_through,page_event_after,page_merge_after,
+             next_event_after,next_merge_after,page,complete,created_at,updated_at,delivery_client)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$10,$12,$14,$15,$16,$17,$18,$18,$19)",
+            &[&delivery,&who.owner.id,&subscriber_token,&query.subscriber,&who.owner.identity.provider,
+              &who.owner.identity.host,&repository,&key,&who.repository_id,&event_from,&event_through,
+              &merge_from,&merge_through,&page.next_event_after,&page.next_merge_after,&serialized,&page.complete,&now,
+              &query.delivery_client])?;
+        }else{tx.execute("UPDATE hub_catchup_deliveries SET page_event_after=$2,page_merge_after=$3,
+            next_event_after=$4,next_merge_after=$5,page=$6,complete=$7,updated_at=$8 WHERE id=$1",
+            &[&delivery,&event_from,&merge_from,&page.next_event_after,&page.next_merge_after,&serialized,&page.complete,&now])?;}
+        tx.execute("DELETE FROM hub_catchup_deliveries WHERE owner=$1 AND subscriber_token IS NOT DISTINCT FROM $2
+            AND subscriber=$3 AND delivery_client=$4 AND provider=$5 AND host=$6 AND repository=$7
+            AND repository_key=$8 AND (acknowledged OR superseded) AND id NOT IN
+              (SELECT id FROM hub_catchup_deliveries WHERE owner=$1 AND subscriber_token IS NOT DISTINCT FROM $2
+               AND subscriber=$3 AND delivery_client=$4 AND provider=$5 AND host=$6 AND repository=$7
+               AND repository_key=$8 AND (acknowledged OR superseded)
+               ORDER BY updated_at DESC,id DESC LIMIT 8)",
+            &[&who.owner.id,&subscriber_token,&query.subscriber,&query.delivery_client,
+              &who.owner.identity.provider,&who.owner.identity.host,&repository,&key])?;
+        tx.commit()?;Ok(page)})
+    }
+
+    fn work_catchup_ack(
+        &self,
+        token: &str,
+        ack: &CatchupAck,
+        now: i64,
+    ) -> Result<CatchupAckResult> {
+        ack.validate()?;
+        self.run(false,|client|{let mut tx=client.transaction()?;let who=work_who(&mut tx,token,now)?;
+        lock_work_delivery(&mut tx,&who)?;let key=catchup_repository_key(who.repository_id);
+        let repository=repository_namespace(&who.repository,who.repository_id);
+        let row=tx.query_opt("SELECT subscriber_token,subscriber,event_from,event_through,merge_from,merge_through,acknowledged
+            FROM hub_catchup_deliveries WHERE id=$1 AND owner=$2 AND provider=$3 AND host=$4 AND repository=$5
+              AND repository_key=$6 AND complete AND (subscriber_token IS NULL OR subscriber_token=$7)
+              AND updated_at>=$8 FOR UPDATE",
+            &[&ack.delivery,&who.owner.id,&who.owner.identity.provider,&who.owner.identity.host,&repository,&key,&who.token,&now.saturating_sub(86_400)])?
+            .ok_or_else(||HubError::Invalid("catch-up delivery is unknown or incomplete".into()))?;
+        let subscriber_token:Option<String>=row.get(0);let subscriber:String=row.get(1);let event_from:i64=row.get(2);
+        let event_through:i64=row.get(3);let merge_from:i64=row.get(4);let merge_through:i64=row.get(5);let acknowledged:bool=row.get(6);
+        if ack.expected_event_from!=event_from||ack.expected_merge_from!=merge_from{return Err(HubError::Invalid("catch-up acknowledgement does not match delivery".into()));}
+        let current=tx.query_opt("SELECT event_cursor,merge_cursor FROM hub_catchup_acks WHERE owner=$1
+            AND subscriber_token IS NOT DISTINCT FROM $2 AND subscriber=$3 AND provider=$4 AND host=$5
+            AND repository=$6 AND repository_key=$7 FOR UPDATE",&[&who.owner.id,&subscriber_token,&subscriber,
+            &who.owner.identity.provider,&who.owner.identity.host,&repository,&key])?.map_or((0,0),|r|(r.get(0),r.get(1)));
+        let status=if acknowledged{CatchupAckStatus::AlreadyAcknowledged}else if current!=(event_from,merge_from){CatchupAckStatus::Conflict}else{
+            tx.execute("INSERT INTO hub_catchup_acks(owner,subscriber_token,subscriber,provider,host,repository,
+                repository_key,repository_id,event_cursor,merge_cursor,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                ON CONFLICT(owner,subscriber_token,subscriber,provider,host,repository,repository_key)
+                DO UPDATE SET event_cursor=EXCLUDED.event_cursor,merge_cursor=EXCLUDED.merge_cursor,updated_at=EXCLUDED.updated_at",
+                &[&who.owner.id,&subscriber_token,&subscriber,&who.owner.identity.provider,&who.owner.identity.host,
+                  &repository,&key,&who.repository_id,&event_through,&merge_through,&now])?;
+            tx.execute("UPDATE hub_catchup_deliveries SET acknowledged=TRUE,ack_actor=$2,updated_at=$3 WHERE id=$1",&[&ack.delivery,&who.token,&now])?;
+            CatchupAckStatus::Advanced};
+        let current=if status==CatchupAckStatus::Advanced{(event_through,merge_through)}else{current};tx.commit()?;
+        Ok(CatchupAckResult{status,event_through,merge_through,current_event_ack:current.0,current_merge_ack:current.1})})
+    }
+
     fn work_compact(
         &self,
         scope: &WorkRepositoryScope,
@@ -6880,6 +8361,7 @@ impl Store for PgStore {
                 &scope.repository,
                 scope.repository_id,
             )?;
+            let catchup_repository=repository_namespace(&scope.repository,scope.repository_id);
             let active_deliveries: i64 = tx
                 .query_one(
                     "SELECT COUNT(*) FROM hub_work_deliveries
@@ -6900,6 +8382,36 @@ impl Store for PgStore {
                     "work compaction is blocked by an unacknowledged briefing delivery".into(),
                 ));
             }
+            let active_catchup_deliveries: i64 = tx
+                .query_one(
+                    "SELECT COUNT(*) FROM hub_catchup_deliveries
+                     WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=COALESCE($4::bigint,-1)
+                       AND NOT acknowledged AND NOT superseded AND updated_at>=$5",
+                    &[&scope.provider,&scope.host,&catchup_repository,&scope.repository_id,
+                        &now.saturating_sub(86_400)],
+                )?
+                .get(0);
+            if active_catchup_deliveries > 0 {
+                return Err(HubError::Invalid(
+                    "work compaction is blocked by an unacknowledged catch-up delivery".into(),
+                ));
+            }
+            let(current_merge_floor,merge_highwater)=tx.query_opt(
+                "SELECT merge_floor_seq,next_merge_seq-1 FROM hub_catchup_repositories
+                 WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=COALESCE($4::bigint,-1)",
+                &[&scope.provider,&scope.host,&catchup_repository,&scope.repository_id])?
+                .map_or((0,0),|r|(r.get::<_,i64>(0),r.get::<_,i64>(1)));
+            let first_retained:i64=tx.query_one(
+                "SELECT COALESCE(MIN(seq),$5::bigint+1)::bigint FROM hub_catchup_merges
+                 WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=COALESCE($4::bigint,-1)
+                   AND observed_at>=$6",
+                &[&scope.provider,&scope.host,&catchup_repository,&scope.repository_id,&merge_highwater,&before])?.get(0);
+            let merge_retention_floor=(first_retained-1).max(current_merge_floor).min(merge_highwater);
+            let merge_observations:i64=tx.query_one(
+                "SELECT COUNT(*)::bigint FROM hub_catchup_merges WHERE provider=$1 AND host=$2
+                 AND repository=$3 AND repository_key=COALESCE($4::bigint,-1) AND seq>$5 AND seq<=$6",
+                &[&scope.provider,&scope.host,&catchup_repository,&scope.repository_id,
+                  &current_merge_floor,&merge_retention_floor])?.get(0);
             let operations: i64 = tx
                 .query_one(
                     "SELECT COUNT(*) FROM hub_work_checkpoint_ops o
@@ -7022,6 +8534,15 @@ impl Store for PgStore {
                 .unwrap_or(0)
                 .max(current_coordination_floor);
             if apply {
+                if merge_retention_floor>current_merge_floor {
+                    tx.execute("UPDATE hub_catchup_repositories SET merge_floor_seq=$5,updated_at=$6
+                        WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=COALESCE($4::bigint,-1)",
+                        &[&scope.provider,&scope.host,&catchup_repository,&scope.repository_id,
+                          &merge_retention_floor,&now])?;
+                    tx.execute("DELETE FROM hub_catchup_merges WHERE provider=$1 AND host=$2
+                        AND repository=$3 AND repository_key=COALESCE($4::bigint,-1) AND seq<=$5",
+                        &[&scope.provider,&scope.host,&catchup_repository,&scope.repository_id,&merge_retention_floor])?;
+                }
                 tx.execute(
                     "DELETE FROM hub_work_deliveries
                      WHERE provider = $1 AND host = $2 AND repository = $3
@@ -7246,6 +8767,8 @@ impl Store for PgStore {
                 retention_floor,
                 deleted_coordination_requests: compacted_coordination.len() as u64,
                 coordination_retention_floor: coordination_floor,
+                deleted_merge_observations: merge_observations as u64,
+                merge_retention_floor,
             })
         })
     }

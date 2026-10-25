@@ -946,6 +946,82 @@ async fn webhooks_are_verified_deduplicated_and_re_read() {
 // ---- 4. polling when every webhook is lost ----
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catchup_discovers_ordinary_merges_without_an_open_observation() {
+    use agentscm::hub::catchup::{CatchupCoverageState, CatchupQuery};
+
+    let env = Env::start().await;
+    env.connect_app().await;
+    env.install_widgets();
+    add_pull(&env, 7, &["src/new.rs", "src/old.rs"]);
+    env.pull(7, |pull| {
+        pull.state = "closed".into();
+        pull.merged = true;
+        pull.merge_commit_sha = Some("a".repeat(40));
+    });
+    let owner = env
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: env.host(),
+                user_id: 77,
+            },
+            "reader",
+        )
+        .unwrap();
+    let (token, _, _) =
+        mint_bound_agent_token(&*env.store, &owner.id, "reader", REPO, REPO_ID, 3600, true)
+            .unwrap();
+    env.poll().await;
+    assert!(env.observed("pull_request").is_empty());
+    let page = env
+        .store
+        .work_catchup(&token, &CatchupQuery::default(), unix_now())
+        .unwrap();
+    assert_eq!(page.merges.len(), 1);
+    let merge = &page.merges[0];
+    assert_eq!(merge.pull_number, 7);
+    assert_eq!(merge.merge_commit, "a".repeat(40));
+    assert_eq!(merge.paths, ["src/new.rs", "src/old.rs"]);
+    assert!(merge.paths_complete);
+    assert_eq!(merge.occurred_at, None);
+    assert!(page.complete);
+    assert!(
+        page.source_coverage
+            .iter()
+            .any(|coverage| { coverage.state == CatchupCoverageState::ObservedOnly })
+    );
+    let writes = env.fake_writes();
+    let detail_reads = env.fake.with(|state| {
+        state
+            .requests
+            .iter()
+            .filter(|request| {
+                request.path_and_query.split('?').next() == Some("/repos/acme/widgets/pulls/7")
+            })
+            .count()
+    });
+    env.poll().await;
+    let repeated = env
+        .store
+        .work_catchup(&token, &CatchupQuery::default(), unix_now())
+        .unwrap();
+    assert_eq!(repeated.merges, page.merges);
+    assert_eq!(env.fake_writes(), writes);
+    assert_eq!(
+        env.fake.with(|state| state
+            .requests
+            .iter()
+            .filter(|request| {
+                request.path_and_query.split('?').next() == Some("/repos/acme/widgets/pulls/7")
+            })
+            .count()),
+        detail_reads,
+        "known merges do not repeat detail or file requests"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn polling_converges_without_webhooks_and_does_not_rewrite_what_is_unchanged() {
     let env = Env::start().await;
     env.connect_app().await;
@@ -984,10 +1060,18 @@ async fn polling_converges_without_webhooks_and_does_not_rewrite_what_is_unchang
         let pulls: Vec<_> = s
             .requests
             .iter()
-            .filter(|r| r.path_and_query.contains("/pulls?"))
+            .filter(|r| r.path_and_query.contains("/pulls?state=open"))
             .collect();
         assert!(pulls.last().unwrap().if_none_match.is_some());
         assert!(pulls.first().unwrap().if_none_match.is_none());
+        assert_eq!(
+            s.requests
+                .iter()
+                .filter(|request| { request.path_and_query.contains("/pulls?state=closed") })
+                .count(),
+            2,
+            "catch-up independently checks bounded closed proposals"
+        );
     });
 
     // Changes while no webhook arrives: a new head, a merge, a new pull request, a deleted
@@ -1076,6 +1160,66 @@ async fn more_than_300_open_pull_requests_are_cut_short_and_said_so() {
     assert_eq!(
         env.work(&agent).await["truncated"],
         json!({"pull_requests": 1})
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_discovery_invalidates_previously_observed_catchup_coverage() {
+    use agentscm::hub::work::WorkStart;
+    use agentscm::hub::work_preflight::WorkPreflightStatus;
+
+    let env = Env::start().await;
+    env.connect_app().await;
+    env.install_widgets();
+    env.poll().await;
+    let owner = env
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: env.host(),
+                user_id: 77,
+            },
+            "reader",
+        )
+        .unwrap();
+    let (token, _, _) =
+        mint_bound_agent_token(&*env.store, &owner.id, "reader", REPO, REPO_ID, 3600, true)
+            .unwrap();
+    let start: WorkStart = serde_json::from_value(json!({
+        "request_key":"coverage-failure", "title":"Inspect the source", "session":"coverage-failure",
+        "scope":["src/check.rs"],
+        "preflight":{
+            "source_revision":"ffffffffffffffffffffffffffffffffffffffff",
+            "merge_after":0,"merge_through":0,"source_relation_checked":true,"checked_merges":[]
+        }
+    })).unwrap();
+    assert_eq!(
+        env.store
+            .work_preflight(&token, &start, unix_now())
+            .unwrap()
+            .status,
+        WorkPreflightStatus::ClearWithinCheckedWindow
+    );
+    env.fake.with(|state| {
+        state.fail.push_back(Failure {
+            path_contains: "/app/installations".into(),
+            status: 401,
+            headers: vec![],
+        })
+    });
+    assert!(env.poll().await.is_empty());
+    let after = env
+        .store
+        .work_preflight(&token, &start, unix_now())
+        .unwrap();
+    assert_eq!(after.status, WorkPreflightStatus::Unknown);
+    assert!(
+        serde_json::to_value(&after.reasons)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .contains(&json!("merge_coverage_unknown"))
     );
 }
 

@@ -86,6 +86,7 @@ fn setup(db: &Db) -> (Arc<dyn Store>, String, String, i64) {
                 depends_on: vec![],
                 related_work: vec![],
                 takeover_generation: None,
+                preflight: None,
             },
             now,
         )
@@ -310,6 +311,7 @@ fn action_capture_receipt(db: &Db) {
                 depends_on: vec![],
                 related_work: vec![],
                 takeover_generation: None,
+                preflight: None,
             },
             311,
         )
@@ -435,6 +437,7 @@ fn lifecycle_resume_and_replay(db: &Db) {
                 depends_on: vec![],
                 related_work: vec![],
                 takeover_generation: None,
+                preflight: None,
             },
             399,
         )
@@ -594,6 +597,7 @@ fn lifecycle_resume_and_replay(db: &Db) {
                 depends_on: vec![],
                 related_work: vec![],
                 takeover_generation: Some(generation),
+                preflight: None,
             },
             412,
         )
@@ -805,6 +809,7 @@ fn capture_survives_pause_and_stops_at_end_of_claim(fresh: &dyn Fn() -> Db) {
                 depends_on: vec![],
                 related_work: vec![],
                 takeover_generation: Some(generation),
+                preflight: None,
             },
             500,
         )
@@ -930,6 +935,7 @@ fn join_session(store: &dyn Store, token: &str, work_id: &str, session: &str) {
                 depends_on: vec![],
                 related_work: vec![],
                 takeover_generation: None,
+                preflight: None,
             },
             unix_now(),
         )
@@ -1114,6 +1120,7 @@ fn capture_target_prefers_active_then_lead(fresh: &dyn Fn() -> Db) {
                     depends_on: vec![],
                     related_work: vec![],
                     takeover_generation: None,
+                    preflight: None,
                 },
                 unix_now(),
             )

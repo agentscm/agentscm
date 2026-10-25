@@ -286,6 +286,9 @@ pub(crate) fn map_hub_error(error: HubError) -> Error {
         HubError::WorkOverlapIncomplete => {
             Error::Invalid("work overlap coverage is incomplete; no scope was claimed".into())
         }
+        HubError::WorkPreflight(_) => {
+            Error::Invalid("work preflight requires review; no scope was claimed".into())
+        }
         HubError::Unavailable(message) => Error::Invalid(format!("hub unavailable: {message}")),
     }
 }

@@ -692,6 +692,14 @@ pub async fn refresh(state: &HubState, connection: &str) -> Result<Vec<PollRepor
 async fn poll(state: &HubState, only: Option<&str>) -> Result<Vec<PollReport>> {
     let mut reports = Vec::new();
     if state.sync.config.is_none() {
+        for conn in db(state, |store| store.connections()).await? {
+            catchup_connection_status(
+                state,
+                &conn,
+                super::catchup::CatchupCoverageState::Unavailable,
+            )
+            .await?;
+        }
         return Ok(reports);
     }
     for conn in db(state, |store| store.connections()).await? {
@@ -748,7 +756,30 @@ async fn mark_enabled(state: &HubState, conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+// Discovery can fail before a repository token/read is attempted. Its last successful
+// observation must not continue to advertise a healthy forge source after that failure.
+async fn catchup_connection_status(
+    state: &HubState,
+    conn: &Connection,
+    coverage: super::catchup::CatchupCoverageState,
+) -> Result<()> {
+    let id = conn.id.clone();
+    for repo in db(state, move |store| store.repositories(&id)).await? {
+        let _guard = state.sync.lock_repo(&repo.id).await;
+        super::catchup_sync::source_status(state, conn, &repo, coverage, unix_now(), 0, 0)
+            .await
+            .map_err(|_| HubError::Unavailable("could not record catch-up source status".into()))?;
+    }
+    Ok(())
+}
+
 async fn poll_connection(state: &HubState, conn: &Connection) -> Result<Vec<PollReport>> {
+    catchup_connection_status(
+        state,
+        conn,
+        super::catchup::CatchupCoverageState::Incomplete,
+    )
+    .await?;
     let mut reports = Vec::new();
     let mut marked = false;
     if conn.kind == "app" {
@@ -758,6 +789,12 @@ async fn poll_connection(state: &HubState, conn: &Connection) -> Result<Vec<Poll
                 marked = true;
             }
             Err(error) => {
+                catchup_connection_status(
+                    state,
+                    conn,
+                    super::catchup::CatchupCoverageState::Unavailable,
+                )
+                .await?;
                 failed(state, conn, "installations", error).await?;
                 return Ok(reports);
             }
@@ -857,11 +894,20 @@ async fn sync_repo(
         .await
         .map_err(|_| GhError::Failed("shutting down".into()))?;
     let _guard = sync.lock_repo(&repo.id).await;
-    // A failure to get a token is the connection's credential failing.
-    let token = sync.token(conn, repo.installation_id).await?;
-    read_repo(state, conn, repo, &token)
-        .await
-        .map_err(|error| repo_level(state, conn, repo, error))
+    // Token acquisition and API setup are part of the attempted source read.
+    super::catchup_sync::begin(state, conn, repo).await?;
+    let result = async {
+        // A failure to get a token is the connection's credential failing.
+        let token = sync.token(conn, repo.installation_id).await?;
+        read_repo(state, conn, repo, &token)
+            .await
+            .map_err(|error| repo_level(state, conn, repo, error))
+    }
+    .await;
+    if result.is_err() {
+        super::catchup_sync::unavailable(state, conn, repo).await?;
+    }
+    result
 }
 
 async fn read_repo(
@@ -879,6 +925,10 @@ async fn read_repo(
         ..PollReport::default()
     };
     let mut cut = serde_json::Map::new();
+
+    // Rereading disappeared open proposals may ingest merges before the recent
+    // closed-proposal pass. Publish uncertainty before either batch begins.
+    super::catchup_sync::begin(state, conn, repo).await?;
 
     // Pull requests.
     let started = now_ms();
@@ -953,6 +1003,15 @@ async fn read_repo(
         Value::Object(cut)
     };
     lock(&sync.truncated).insert(repo.id.clone(), report.truncated.clone());
+
+    // Catch-up reads cannot turn a failed source into an empty successful recap.
+    // Keep the existing coordination poll useful when this optional read fails.
+    if let Err(error) = super::catchup_sync::reconcile(state, conn, repo, token).await {
+        if matches!(error, GhError::Auth(_) | GhError::Limited(_)) {
+            return Err(error);
+        }
+        eprintln!("hub: merge catch-up observation failed: {error:?}");
+    }
 
     if conn.outbound {
         outbound_repo(state, conn, repo, token).await?;
@@ -1034,6 +1093,13 @@ async fn reread_pull(
     let pull = state.sync.forge(conn)?.pull(token, repo, number).await?;
     if let Some(pull) = pull.as_ref().filter(|pull| pull["state"] == "open") {
         return observe_pull(state, conn, repo, token, pull, stored.get(&number), started).await;
+    }
+    if let Some(pull) = pull.as_ref().filter(|pull| pull["merged"] == true)
+        && let Err(error) =
+            super::catchup_sync::observe(state, conn, repo, token, number, pull).await
+    {
+        super::catchup_sync::unavailable(state, conn, repo).await?;
+        eprintln!("hub: merge catch-up observation failed: {error:?}");
     }
     let data = match &pull {
         None => json!({"number": number, "state": "gone", "merged": false}),
@@ -1739,7 +1805,19 @@ async fn webhook_work(
         .await
         .map_err(|_| HubError::Unavailable("shutting down".into()))?;
     if matches!(event, "installation" | "installation_repositories") {
+        catchup_connection_status(
+            state,
+            conn,
+            super::catchup::CatchupCoverageState::Incomplete,
+        )
+        .await?;
         if let Err(error) = discover(state, conn).await {
+            catchup_connection_status(
+                state,
+                conn,
+                super::catchup::CatchupCoverageState::Unavailable,
+            )
+            .await?;
             failed(state, conn, "installations", error).await?;
         }
         return Ok(());
@@ -1759,6 +1837,11 @@ async fn webhook_work(
         return Ok(());
     };
     let _guard = sync.lock_repo(&repo.id).await;
+    if event == "pull_request" {
+        super::catchup_sync::begin(state, conn, &repo)
+            .await
+            .map_err(|_| HubError::Unavailable("could not start catch-up source read".into()))?;
+    }
     let result = async {
         let token = sync.token(conn, repo.installation_id).await?;
         let reads = async {
@@ -1778,6 +1861,7 @@ async fn webhook_work(
                         .as_i64()
                         .filter(|n| *n > 0);
                     if let Some(number) = number {
+                        super::catchup_sync::begin(state, conn, &repo).await?;
                         let stored = stored_pulls(state, &repo).await?;
                         reread_pull(state, conn, &repo, &token, number, &stored).await?;
                     }
@@ -1814,7 +1898,14 @@ async fn webhook_work(
     }
     .await;
     match result {
-        Err(error) => failed(state, conn, &repo.full_name, error).await.map(drop),
+        Err(error) => {
+            super::catchup_sync::unavailable(state, conn, &repo)
+                .await
+                .map_err(|_| {
+                    HubError::Unavailable("could not record catch-up source failure".into())
+                })?;
+            failed(state, conn, &repo.full_name, error).await.map(drop)
+        }
         Ok(()) => Ok(()),
     }
 }

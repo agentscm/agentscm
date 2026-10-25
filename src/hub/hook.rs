@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 use tokio::time::{Instant, timeout_at};
 
 use super::advice::unknown;
+use super::catchup::{CatchupPreview, CatchupPreviewQuery};
 use super::coordination::{CoordinationInboxQuery, CoordinationStatus};
 use super::http::{ApiError, blocking};
 use super::intent::spec_key;
@@ -336,6 +337,7 @@ fn reason(error: HubError) -> &'static str {
         HubError::WorkOverlapIncomplete => {
             "work overlap coverage is incomplete; no scope was claimed"
         }
+        HubError::WorkPreflight(_) => "work preflight requires review; no scope was claimed",
         HubError::Unauthorized => DENIED,
         HubError::Invalid(_) => "invalid hook payload",
         HubError::Unavailable(detail) => {
@@ -531,10 +533,23 @@ impl Call {
                 let briefing = blocking(state, move || {
                     let now = unix_now();
                     let subscriber = store.session_name_for(&token, requested.as_deref(), now)?;
-                    Ok((
-                        store.work_briefing_preview_for(&token, Some(&subscriber), 20, now)?,
-                        store.work_overview(&token, &WorkOverviewQuery::default(), now)?,
-                    ))
+                    let briefing =
+                        store.work_briefing_preview_for(&token, Some(&subscriber), 20, now)?;
+                    let overview =
+                        store.work_overview(&token, &WorkOverviewQuery::default(), now)?;
+                    let subscriber = super::catchup::agent_subscriber(&subscriber)?;
+                    let catchup = match store.work_catchup_preview(
+                        &token,
+                        &CatchupPreviewQuery { subscriber },
+                        now,
+                    ) {
+                        Ok(page) => Some(page),
+                        Err(error) => {
+                            eprintln!("hub: durable catch-up for session start: {error}");
+                            None
+                        }
+                    };
+                    Ok((briefing, overview, catchup))
                 })
                 .await;
                 let advice = announce_for(state, &principal, call(Vec::new()))
@@ -553,7 +568,12 @@ impl Call {
                 };
                 text.push('\n');
                 text.push_str(&match briefing {
-                    Ok((briefing, overview)) => format!("{}\n{}", render_briefing(&briefing), render_overview(&overview)),
+                    Ok((briefing, overview, catchup)) => format!(
+                        "{}\n{}\n{}",
+                        render_briefing(&briefing),
+                        render_overview(&overview),
+                        render_catchup(catchup.as_ref())
+                    ),
                     Err(_) => format!(
                         "{} Call agentscm_work_briefing before planning meaningful work. Once the user intent is known, call agentscm_start with a stable work_id, canonical forge source or request_key before taking coordinated paths.",
                         unknown("shared work could not be listed")
@@ -720,6 +740,57 @@ fn render_overview(overview: &WorkOverview) -> String {
         lines.push("This startup recap is partial. Inspect agentscm_work_overview and page agentscm_work_briefing before relying on coverage.".into());
     }
     lines.push("Only declared work is visible; empty scope is unknown coverage. Give each agent a separate token for independent catch-up. Reported finish does not prove tests, review or merge.".into());
+    lines.join("\n")
+}
+
+fn render_catchup(page: Option<&CatchupPreview>) -> String {
+    let Some(page) = page else {
+        return "AgentSCM durable catch-up is unavailable. Merge and Work-event coverage are unknown; do not infer that nothing changed."
+            .to_owned();
+    };
+    let mut lines = vec![format!(
+        "AgentSCM catch-up preview: {} Work event(s), {} coordination event(s), and {} provider-confirmed merge observation(s) in this page; complete through fixed event {} and merge {} high-waters: {}.",
+        page.work_events.len(),
+        page.coordination_events.len(),
+        page.merges.len(),
+        page.event_through,
+        page.merge_through,
+        page.complete,
+    )];
+    for merge in page.merges.iter().take(5) {
+        lines.push(format!(
+            "- {:?} {} PR #{}: {} -> {} (observed {})",
+            merge.source,
+            bounded_hook_text(&merge.source_id, 80),
+            merge.pull_number,
+            merge.head_commit,
+            merge.merge_commit,
+            merge.observed_at,
+        ));
+    }
+    lines.push(format!(
+        "This automatic preview creates no delivery or acknowledgement. Call agentscm_work_catchup with this exact JSON to begin an explicit delivery and read every page: {}",
+        json!({"subscriber": page.subscriber, "delivery_client": page.subscriber, "limit": 20})
+    ));
+    if page.retention.work_gap || page.retention.coordination_gap || page.retention.merge_gap {
+        lines.push("Retained catch-up has a history gap. Treat affected coverage as unknown and inspect the current source and Work state.".to_owned());
+    }
+    lines.push(format!(
+        "Source coverage: {}.",
+        page.source_coverage
+            .iter()
+            .map(|source| format!("{:?}={:?}", source.source, source.state))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    if page
+        .source_coverage
+        .iter()
+        .any(|source| source.state != super::catchup::CatchupCoverageState::ObservedOnly)
+    {
+        lines.push("Some catch-up sources are incomplete or unavailable; affected coverage is unknown. Do not infer that no recent merges were recorded.".to_owned());
+    }
+    lines.push("Merge observations are exact typed records, not proof of arbitrary Git ancestry. For Git, check `git merge-base --is-ancestor <merge_commit> <source_revision>`; missing objects or an unavailable check leave the relation unknown. Inspect exact source and declared scope before claiming or editing.".to_owned());
     lines.join("\n")
 }
 

@@ -281,6 +281,10 @@ impl From<HubError> for ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 code: "work_overlap_incomplete",
             },
+            HubError::WorkPreflight(_) => Self {
+                status: StatusCode::CONFLICT,
+                code: "work_preflight_required",
+            },
             HubError::Unavailable(detail) => {
                 eprintln!("hub error: {detail}");
                 Self {
@@ -345,7 +349,9 @@ impl FromRequestParts<HubState> for Authenticated {
     }
 }
 
-/// Like [`Authenticated`] but also accepts a read-only token: use it only on pure reads.
+/// Like [`Authenticated`] but also accepts a read-only token. It permits reads
+/// and that person's catch-up delivery/acknowledgement state, never Work claims,
+/// source changes or forge mutations.
 pub struct Reader(pub Principal);
 
 impl FromRequestParts<HubState> for Reader {
