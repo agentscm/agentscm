@@ -14,7 +14,13 @@ use sha2::{Digest, Sha256};
 use crate::client_config::Connection;
 
 const VERSION: u8 = 1;
-const DATAGRAM_BYTES: usize = 1024;
+/// Room for the longest valid unconnected report: a JSON-escaped root of [`MAX_ROOT_BYTES`].
+const DATAGRAM_BYTES: usize = 16 * 1024;
+const MAX_ROOT_BYTES: usize = 4096;
+/// Unix datagram sockets cap one message at their buffer size: 2 KiB to send and 4 KiB to
+/// receive by default on macOS. Both ends raise it so every valid report fits.
+#[cfg(unix)]
+const SOCKET_BUFFER_BYTES: libc::c_int = 64 * 1024;
 #[cfg(any(target_os = "macos", test))]
 const MAX_ROWS: usize = 256;
 #[cfg(any(target_os = "macos", test))]
@@ -222,6 +228,7 @@ fn decode(bytes: &[u8], observed_at: std::time::Instant) -> Option<ActivityObser
 fn valid_unconnected(root: &str, host: &str, repo: &str, agent: &str) -> bool {
     let printable = |text: &str| !text.is_empty() && !text.chars().any(char::is_control);
     printable(root)
+        && root.len() <= MAX_ROOT_BYTES
         && Path::new(root).is_absolute()
         && printable(host)
         && host.len() <= 253
@@ -353,10 +360,27 @@ fn send_at(pathname: &Path, wire: &impl Serialize) {
     let Ok(socket) = UnixDatagram::unbound() else {
         return;
     };
-    if socket.set_nonblocking(true).is_err() {
+    if socket.set_nonblocking(true).is_err() || !set_buffer(&socket, libc::SO_SNDBUF) {
         return;
     }
     let _ = socket.send_to(&bytes, pathname);
+}
+
+#[cfg(unix)]
+fn set_buffer(socket: &std::os::unix::net::UnixDatagram, option: libc::c_int) -> bool {
+    use std::os::fd::AsRawFd;
+    let size = SOCKET_BUFFER_BYTES;
+    // SAFETY: the descriptor stays open for the call, and the value pointer and length describe
+    // `size`, which outlives it.
+    unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            option,
+            (&raw const size).cast(),
+            size_of::<libc::c_int>() as libc::socklen_t,
+        ) == 0
+    }
 }
 
 /// Tray-owned socket lifecycle. The tray is responsible for singleton coordination before bind.
@@ -423,6 +447,9 @@ impl ActivityReceiver {
         }
         let identity = (metadata.dev(), metadata.ino());
         socket.set_nonblocking(true)?;
+        if !set_buffer(&socket, libc::SO_RCVBUF) {
+            return Err(std::io::Error::last_os_error());
+        }
         Ok(Self {
             socket,
             path,
@@ -436,7 +463,7 @@ impl ActivityReceiver {
     }
 
     fn drain_with_limit(&self, store: &mut ActivityStore, limit: usize) {
-        let mut bytes = [0_u8; DATAGRAM_BYTES + 1];
+        let mut bytes = vec![0_u8; DATAGRAM_BYTES + 1];
         for _ in 0..limit {
             match self.socket.recv(&mut bytes) {
                 Ok(size) if size <= DATAGRAM_BYTES => {
@@ -761,6 +788,32 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn the_longest_valid_root_is_delivered_and_longer_roots_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private").join("activity.sock");
+        let receiver = ActivityReceiver::bind_at(path.clone()).unwrap();
+        // Quotes and backslashes double in JSON, so this is the largest possible report.
+        let longest = format!("/{}", "\"\\".repeat((MAX_ROOT_BYTES - 1) / 2));
+        assert!(longest.len() <= MAX_ROOT_BYTES && longest.len() > MAX_ROOT_BYTES - 2);
+        let too_long = format!("/{}", "a".repeat(MAX_ROOT_BYTES));
+        for root in [&too_long, &longest] {
+            observe_unconnected_at(
+                &path,
+                Path::new(root),
+                &"h".repeat(253),
+                "acme/widgets",
+                "copilot",
+            );
+        }
+        let mut store = ActivityStore::default();
+        receiver.drain(&mut store);
+        let rows = store.unconnected(std::time::Instant::now());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].root, Path::new(&longest));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn missing_receiver_is_silent_and_receiver_drains_valid_only() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing.sock");
@@ -775,6 +828,7 @@ mod tests {
         let path = dir.path().join("private").join("activity.sock");
         let receiver = ActivityReceiver::bind_at(path.clone()).unwrap();
         let sender = std::os::unix::net::UnixDatagram::unbound().unwrap();
+        assert!(set_buffer(&sender, libc::SO_SNDBUF));
         sender.send_to(b"bad", &path).unwrap();
         sender
             .send_to(&vec![b'x'; DATAGRAM_BYTES * 2], &path)
