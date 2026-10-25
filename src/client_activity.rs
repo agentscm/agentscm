@@ -641,11 +641,17 @@ mod tests {
         }
     }
 
+    /// An absolute root on every platform: `/synthetic/x` has no drive and is relative on Windows.
+    fn absolute(name: &str) -> String {
+        std::env::temp_dir().join(name).to_str().unwrap().to_owned()
+    }
+
     #[test]
     fn unconnected_wire_format_round_trips_and_is_distinct_from_activity() {
+        let root = absolute("acme widgets");
         let bytes = serde_json::to_vec(&WireUnconnected {
             version: VERSION,
-            root: "/synthetic/acme widgets".into(),
+            root: root.clone(),
             host: "github.com".into(),
             repo: "acme/widgets".into(),
             agent: "claude".into(),
@@ -666,7 +672,7 @@ mod tests {
         );
         let now = std::time::Instant::now();
         let decoded = decode_unconnected(&bytes, now).unwrap();
-        assert_eq!(decoded.root, PathBuf::from("/synthetic/acme widgets"));
+        assert_eq!(decoded.root, PathBuf::from(root));
         assert_eq!(decoded.agents, ["claude"]);
         assert!(decode(&bytes, now).is_none());
 
@@ -684,13 +690,22 @@ mod tests {
     #[test]
     fn invalid_unconnected_input_is_ignored() {
         let now = std::time::Instant::now();
+        let valid = absolute("root");
+        // Each case breaks one rule of an otherwise valid observation.
+        assert!(valid_unconnected(
+            &valid,
+            "github.com",
+            "acme/widgets",
+            "claude"
+        ));
+        let broken = absolute("\nroot");
         for (root, host, repo, agent) in [
             ("relative/root", "github.com", "acme/widgets", "claude"),
-            ("/synthetic/\nroot", "github.com", "acme/widgets", "claude"),
-            ("/synthetic/root", "", "acme/widgets", "claude"),
-            ("/synthetic/root", "git hub.com", "acme/widgets", "claude"),
-            ("/synthetic/root", "github.com", "not-a-repo", "claude"),
-            ("/synthetic/root", "github.com", "acme/widgets", "unknown"),
+            (broken.as_str(), "github.com", "acme/widgets", "claude"),
+            (valid.as_str(), "", "acme/widgets", "claude"),
+            (valid.as_str(), "git hub.com", "acme/widgets", "claude"),
+            (valid.as_str(), "github.com", "not-a-repo", "claude"),
+            (valid.as_str(), "github.com", "acme/widgets", "unknown"),
         ] {
             assert!(
                 !valid_unconnected(root, host, repo, agent),
@@ -706,20 +721,19 @@ mod tests {
             .unwrap();
             assert!(decode_unconnected(&bytes, now).is_none());
         }
-        assert!(
-            decode_unconnected(
-                br#"{"version":2,"root":"/r","host":"github.com","repo":"a/b","agent":"codex"}"#,
-                now
-            )
-            .is_none()
-        );
-        assert!(
-            decode_unconnected(
-                br#"{"version":1,"root":"/r","host":"github.com","repo":"a/b","agent":"codex","token":"x"}"#,
-                now
-            )
-            .is_none()
-        );
+        let wire = serde_json::json!({"version":1, "root":valid, "host":"github.com", "repo":"a/b", "agent":"codex"});
+        assert!(decode_unconnected(&serde_json::to_vec(&wire).unwrap(), now).is_some());
+        for (key, value) in [
+            ("version", serde_json::json!(2)),
+            ("token", serde_json::json!("x")),
+        ] {
+            let mut changed = wire.clone();
+            changed[key] = value;
+            assert!(
+                decode_unconnected(&serde_json::to_vec(&changed).unwrap(), now).is_none(),
+                "{key}"
+            );
+        }
     }
 
     #[test]
