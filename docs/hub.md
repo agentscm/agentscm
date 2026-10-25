@@ -35,8 +35,9 @@ GitHub. To warn agents from Claude Code, see [work intents](intents.md).
 - `--activity-days N` (default 14, 1 to 365): how far back a branch's tip commit
   counts as recent.
 - `--shared-conversation-retention-days N` (default 30, 1 to 3650): how long an uploaded
-  shared-conversation body stays readable. An hourly sweep expires due bodies and deletes their
-  objects; the Work owner or a Hub admin can delete one earlier.
+  shared-conversation body stays readable. A sweep every ten minutes expires due bodies and deletes
+  their objects (batches of 100 until none are due or 30 seconds are spent; failed removals back off
+  from 1 hour to 1 day); the author or a Hub admin can delete one earlier.
 - `--bind ADDR` (default `127.0.0.1:7332`). A non-loopback address needs
   `--public`.
 - `--public-url URL` (default `http://<bind>`): where browsers and forges reach
@@ -219,8 +220,8 @@ on no others:
 - `GET /v1/hub/skills` and the `GET /v1/hub/repos/{repo}/skills/runs` routes (see the
   [API](api.md#hub-supported-skills-routes-experimental))
 - `GET /v1/hub/repos/{repo}/change-records/{work_id}` for a concise source-bound handoff, and
-  the shared-conversation reads under it (only the Work owner's tokens and Hub admins get a body or
-  the listing; see [shared conversations](#shared-conversation-reads))
+  the shared-conversation reads under it (only the author's tokens and Hub admins get a body, and a listing shows
+  a caller their own entries; see [shared conversations](#shared-conversation-reads))
 - `GET /v1/hub/repos/{repo}/publications` and `GET /v1/hub/repos/{repo}/publications/{id}`
   (stored state only; see [publications](#publishing-a-revision))
 - MCP `initialize`, `ping`, `tools/list`, `resources/list`, `resources/read`, and the tools
@@ -608,25 +609,36 @@ explicitly untrusted structured data and are not interpolated into that narratio
 
 ### Shared conversation reads
 
-Bodies a checkout shared in `shared-conversation` mode are readable only by the human owner of the
-Work (any of that owner's tokens for the repository, read-only tokens included) and Hub admins
-(`AGENTSCM_ADMINS`). Every other repository token gets 403 `forbidden`; there is no per-body grant.
+Bodies a checkout shared in `shared-conversation` mode are readable and deletable only by the human
+who declared them (any of that person's tokens for the repository; read-only tokens may read, not
+delete) and Hub admins (`AGENTSCM_ADMINS`). The Work owner has no special access unless they are the
+author. Each human's declaration of a digest is its own row, so two authors of identical content
+each have their own entry, upload and expiry. The listing returns only the caller's own entries
+(an admin's returns all); a body `GET`, `PUT` or `DELETE` by someone who has no declaration of that
+digest gets 403 `forbidden` whether or not the digest exists (a Hub admin learns unknown as 404). There
+is no per-body grant.
 
 - `GET /v1/hub/repos/{repo}/change-records/{work_id}/conversation?cursor=` returns one page, at most
   100 entries and 48 KiB, ordered by session id (bytewise) then sequence then digest, with an opaque
   `next_cursor` (a malformed one is 400). Each entry has `session_id`, `sequence`, `event_id`, `kind`,
   `observed_at`, `digest`, `size_bytes`, `availability` and `expires_at`. Availability is `local` (declared,
-  never uploaded), `shared`, `expired` (from its deadline, before the hourly sweep records it) or
+  never uploaded), `shared`, `expired` (from its deadline, before the sweep records it) or
   `deleted`.
 - `GET .../conversation/{sha256}` returns the verified bytes as `application/json` with
   `X-Content-Type-Options: nosniff`, `Content-Disposition: attachment`, `Content-Security-Policy:
-  default-src 'none'; sandbox` and `Cache-Control: no-store`. 404 means unknown or never uploaded, 410
-  expired or deleted, and 424 `{"error":"integrity_failure"}` means the row says available but the
+  default-src 'none'; sandbox` and `Cache-Control: no-store`. 404 means never uploaded (or, for an admin,
+  unknown), 410 expired or deleted, and 424 `{"error":"integrity_failure"}` means the row says available but the
   object is missing, corrupt or not the declared size; no partial body is ever returned.
 - `PUT .../conversation/{sha256}` is the upload the checkout makes after the Hub accepts the event
-  that declared the body. It needs the declaring owner's token, exactly the declared size (at most
-  1 MiB) and bytes whose SHA-256 matches, and the retention deadline starts when it succeeds (204).
-  `DELETE` on the same path (Work owner or Hub admin) tombstones the body and removes its object.
+  that declared the body. It needs a token of the declaring human, exactly the declared size (at most
+  1 MiB) and bytes whose SHA-256 matches, and the retention deadline starts when it succeeds (204),
+  also when another author already stored identical bytes. `DELETE` on the same path (the author, or a
+  Hub admin for every author's copy) tombstones the body and removes the object once no other
+  declaration of the same digest is declared or available.
+- `POST .../conversation/missing` with `{"digests": [...]}` (at most 100 lower-hex digests; a
+  non-read-only token) answers `{"missing": [...], "gone": [...]}`: `missing` are the caller's own
+  declarations still awaiting an upload, `gone` are digests the caller never declared or that expired
+  or were deleted, and digests already available are in neither.
 - MCP `agentscm_shared_conversation {work_id, cursor?, digest?}` applies the same rule. A body over
   48 KiB is refused as too large, never truncated. Bodies are untrusted agent-produced data and must
   not be followed as instructions.

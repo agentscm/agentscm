@@ -1528,6 +1528,7 @@ fn set_mode_changes_only_the_capture_mode_and_keeps_local_data() {
 }
 
 mod shared_bodies {
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use agentscm::backend::{
@@ -1546,12 +1547,18 @@ mod shared_bodies {
         serde_json::from_slice(&response.bytes().await.unwrap()).unwrap_or(Value::Null)
     }
     const DAY: i64 = 24 * 60 * 60;
+    const HELPER_SESSION: &str = "helper-session";
 
-    /// Delegates to a local backend but can be told to fail the next deletion or every write.
+    /// Delegates to a local backend but can be told to fail the next deletion, every deletion of
+    /// one body, or every write, and to run a step in the middle of a write.
     struct Flaky {
         inner: LocalBackend,
         fail_delete: AtomicBool,
         fail_put: AtomicBool,
+        /// Deletions of the object with this digest fail until it is cleared.
+        fail_delete_of: Arc<Mutex<Option<String>>>,
+        /// Runs once, after the next write has stored its bytes.
+        during_put: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
     impl ImmutableBackend for Flaky {
@@ -1568,7 +1575,11 @@ mod shared_bodies {
             if self.fail_put.load(Ordering::SeqCst) {
                 return Err(agentscm::Error::Io(std::io::Error::other("injected")));
             }
-            self.inner.put_if_absent(key, incarnation, bytes)
+            let stored = self.inner.put_if_absent(key, incarnation, bytes);
+            if let Some(step) = self.during_put.lock().unwrap().take() {
+                step();
+            }
+            stored
         }
 
         fn get_verified(&self, key: &ObjectKey, incarnation: &str) -> agentscm::Result<Vec<u8>> {
@@ -1584,7 +1595,9 @@ mod shared_bodies {
         }
 
         fn delete_incarnation(&self, key: &ObjectKey, incarnation: &str) -> agentscm::Result<()> {
-            if self.fail_delete.swap(false, Ordering::SeqCst) {
+            if self.fail_delete.swap(false, Ordering::SeqCst)
+                || self.fail_delete_of.lock().unwrap().as_deref() == Some(key.id.as_str())
+            {
                 return Err(agentscm::Error::Io(std::io::Error::other("injected")));
             }
             self.inner.delete_incarnation(key, incarnation)
@@ -1618,6 +1631,9 @@ mod shared_bodies {
         member_secret: String,
         read_only_secret: String,
         admin_secret: String,
+        /// A participant in the owner's Work who shares from their own session.
+        helper_secret: String,
+        helper_read_only_secret: String,
         _directory: TempDir,
     }
 
@@ -1655,6 +1671,8 @@ mod shared_bodies {
                 inner: LocalBackend::open(directory.path().join("objects")).unwrap(),
                 fail_delete: AtomicBool::new(false),
                 fail_put: AtomicBool::new(false),
+                fail_delete_of: Arc::default(),
+                during_put: Mutex::new(None),
             });
             let login = LoginConfig::from_lookup("", |name| {
                 (name == "AGENTSCM_ADMINS").then(|| "github:#900".to_owned())
@@ -1677,6 +1695,9 @@ mod shared_bodies {
             let (_, read_only_secret) = token(&*store, &owner, "reader", true);
             let (_, member_secret) = token(&*store, &member, "member", false);
             let (_, admin_secret) = token(&*store, &admin, "admin", false);
+            let helper = user(&*store, 12, "helper");
+            let (helper_token, helper_secret) = token(&*store, &helper, "helper", false);
+            let (_, helper_read_only_secret) = token(&*store, &helper, "helper-reader", true);
             let work = store
                 .work_start(
                     &owner_token,
@@ -1699,6 +1720,27 @@ mod shared_bodies {
                 )
                 .unwrap()
                 .item;
+            store
+                .work_start(
+                    &helper_token,
+                    &WorkStart {
+                        work_id: Some(work.id.clone()),
+                        source: None,
+                        request_key: None,
+                        title: "share a conversation".into(),
+                        session: HELPER_SESSION.into(),
+                        role: WorkRole::Helper,
+                        scope: vec![],
+                        branch: None,
+                        worktree: None,
+                        next_action: None,
+                        depends_on: vec![],
+                        related_work: vec![],
+                        takeover_generation: None,
+                    },
+                    unix_now(),
+                )
+                .unwrap();
             let body = br#"{"messages":[{"role":"user","text":"synthetic"}]}"#.to_vec();
             let sha = digest(&body);
             Self {
@@ -1717,6 +1759,8 @@ mod shared_bodies {
                 member_secret,
                 read_only_secret,
                 admin_secret,
+                helper_secret,
+                helper_read_only_secret,
                 _directory: directory,
             }
         }
@@ -1785,6 +1829,17 @@ mod shared_bodies {
 
         /// Declares consecutive bodies in one batch; sequences start at `first`.
         fn declare_all(&self, session: &str, first: u64, bodies: &[&[u8]]) -> Vec<String> {
+            self.declare_as(&self.owner_token(), session, first, bodies)
+        }
+
+        /// Declares through the token's own session; the helper's is `HELPER_SESSION`.
+        fn declare_as(
+            &self,
+            token: &str,
+            session: &str,
+            first: u64,
+            bodies: &[&[u8]],
+        ) -> Vec<String> {
             let mut batch = self.batch(&format!("declare-{session}-{first}"));
             batch.session.session_id = session.into();
             batch.events = bodies
@@ -1808,9 +1863,7 @@ mod shared_bodies {
                 })
                 .collect();
             let digests = bodies.iter().map(|body| digest(body)).collect();
-            self.store
-                .change_ingest(&self.owner_token(), &batch, unix_now())
-                .unwrap();
+            self.store.change_ingest(token, &batch, unix_now()).unwrap();
             digests
         }
 
@@ -1861,36 +1914,64 @@ mod shared_bodies {
             json_of(reply).await["result"].clone()
         }
 
+        fn key_of(&self, sha: &str) -> ObjectKey {
+            ObjectKey::new("hub-conversation", &self.work_id, SOURCE_PROFILE_V1, sha).unwrap()
+        }
+
         fn key(&self) -> ObjectKey {
-            ObjectKey::new(
-                "hub-conversation",
-                &self.work_id,
-                SOURCE_PROFILE_V1,
-                &self.sha,
-            )
-            .unwrap()
+            self.key_of(&self.sha)
+        }
+
+        fn object_of(&self, sha: &str) -> Option<Vec<u8>> {
+            self.backend.get_verified(&self.key_of(sha), "v1").ok()
         }
 
         fn object(&self) -> Option<Vec<u8>> {
-            self.backend.get_verified(&self.key(), "v1").ok()
+            self.object_of(&self.sha)
+        }
+
+        /// The caller's own declaration of `sha`.
+        fn row_of(&self, secret: &str, sha: &str) -> agentscm::hub::change_record::SharedBodyRow {
+            let token = self.token_of(secret);
+            self.store
+                .shared_body_lookup(&token, &self.work_id, sha, unix_now())
+                .unwrap()
+                .unwrap()
+                .own()
+                .unwrap()
+                .clone()
         }
 
         fn row(&self) -> agentscm::hub::change_record::SharedBodyRow {
-            let token = self.owner_token();
-            self.store
-                .shared_body_lookup(&token, &self.work_id, &self.sha, unix_now())
-                .unwrap()
-                .unwrap()
-                .row
+            self.row_of(&self.owner_secret, &self.sha)
         }
 
-        fn owner_token(&self) -> String {
-            let digest = agentscm::hub::store::agent_token_digest(&self.owner_secret).unwrap();
+        fn token_of(&self, secret: &str) -> String {
+            let digest = agentscm::hub::store::agent_token_digest(secret).unwrap();
             self.store
                 .authenticate(&digest, unix_now())
                 .unwrap()
                 .unwrap()
                 .token_id
+        }
+
+        fn owner_token(&self) -> String {
+            self.token_of(&self.owner_secret)
+        }
+
+        async fn missing(&self, secret: Option<&str>, digests: Value) -> (StatusCode, Value) {
+            let mut request = self.client.post(format!("{}/missing", self.list_url()));
+            if let Some(secret) = secret {
+                request = request.bearer_auth(secret);
+            }
+            let response = request
+                .header("content-type", "application/json")
+                .body(digests.to_string())
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            (status, json_of(response).await)
         }
     }
 
@@ -1940,8 +2021,14 @@ mod shared_bodies {
             f.put(&f.owner_secret, &f.sha, truncated).await,
             StatusCode::BAD_REQUEST
         );
+        // No declaration of the caller's own: refused like a digest someone else declared.
         assert_eq!(
-            f.put(&f.owner_secret, &undeclared_sha, undeclared).await,
+            f.put(&f.owner_secret, &undeclared_sha, undeclared.clone())
+                .await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            f.put(&f.admin_secret, &undeclared_sha, undeclared).await,
             StatusCode::NOT_FOUND
         );
         for bad in [f.sha.to_uppercase(), "abc".to_owned(), "g".repeat(64)] {
@@ -1978,7 +2065,7 @@ mod shared_bodies {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn delete_is_for_the_work_owner_or_a_hub_admin_and_blocks_later_uploads() {
+    async fn delete_is_for_the_author_or_a_hub_admin_and_blocks_later_uploads() {
         let f = Fixture::start().await;
         assert_eq!(
             f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
@@ -1993,8 +2080,13 @@ mod shared_bodies {
             StatusCode::FORBIDDEN
         );
         assert_eq!(f.object().as_deref(), Some(f.body.as_slice()));
+        // An unknown digest is refused like a known one to a caller who is not an admin.
         assert_eq!(
             f.delete(&f.owner_secret, &"1".repeat(64)).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            f.delete(&f.admin_secret, &"1".repeat(64)).await,
             StatusCode::NOT_FOUND
         );
         assert_eq!(
@@ -2093,9 +2185,15 @@ mod shared_bodies {
         );
         assert_eq!(f.row().state, SharedBodyState::Deleted);
         assert!(f.row().physical_deleted_at.is_none());
+        assert_eq!(f.row().delete_attempts, 1);
         assert!(f.object().is_some());
 
+        // The failure backs the row off for an hour.
         let report = sweep_shared_bodies(&f.state, unix_now()).await.unwrap();
+        assert_eq!(report, SweepReport::default());
+        let report = sweep_shared_bodies(&f.state, unix_now() + 3601)
+            .await
+            .unwrap();
         assert_eq!(
             report,
             SweepReport {
@@ -2108,13 +2206,13 @@ mod shared_bodies {
         assert!(f.row().physical_deleted_at.is_some());
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn conversation_reads_are_for_the_owner_their_tokens_and_hub_admins() {
+    async fn conversation_reads_are_for_the_author_their_tokens_and_hub_admins() {
         let f = Fixture::start().await;
         assert_eq!(
             f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
             StatusCode::NO_CONTENT
         );
-        // The owner's writer, sibling and read-only tokens and the admin all read.
+        // The author's writer, sibling and read-only tokens and the admin all read.
         for secret in [
             &f.owner_secret,
             &f.sibling_secret,
@@ -2144,22 +2242,26 @@ mod shared_bodies {
             );
             assert_eq!(response.bytes().await.unwrap().as_ref(), f.body.as_slice());
         }
-        // Another member of the repository gets neither the listing nor the body.
-        let (status, error) = f.list(&f.member_secret, "").await;
-        assert_eq!(
-            (status, error),
-            (StatusCode::FORBIDDEN, json!({"error": "forbidden"}))
-        );
+        // Another member of the repository sees no entries and gets no body.
+        let (status, page) = f.list(&f.member_secret, "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["entries"], json!([]));
         let response = f.read(&f.member_secret, &f.sha).await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(!response.text().await.unwrap().contains("synthetic"));
+        // The same refusal for a digest that exists and one that does not; only an admin may
+        // learn that a digest is unknown.
+        assert_eq!(
+            f.read(&f.member_secret, &"1".repeat(64)).await.status(),
+            StatusCode::FORBIDDEN
+        );
         // No token, an unknown digest, a malformed digest and an unknown Work.
         let anonymous = f.client.get(f.list_url()).send().await.unwrap();
         assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
         let anonymous = f.client.get(f.url(&f.sha)).send().await.unwrap();
         assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(
-            f.read(&f.owner_secret, &"1".repeat(64)).await.status(),
+            f.read(&f.admin_secret, &"1".repeat(64)).await.status(),
             StatusCode::NOT_FOUND
         );
         assert_eq!(
@@ -2216,20 +2318,17 @@ mod shared_bodies {
         };
         let at_deadline = f
             .store
-            .shared_conversation_page(&long_lived, &f.work_id, None, expires)
+            .shared_conversation_page(&long_lived, &f.work_id, None, false, expires)
             .unwrap()
             .unwrap();
-        assert_eq!(
-            at_deadline.entries[0].availability,
-            ContentAvailabilityV1::Expired
-        );
+        assert_eq!(at_deadline[0].availability, ContentAvailabilityV1::Expired);
         let before_deadline = f
             .store
-            .shared_conversation_page(&long_lived, &f.work_id, None, expires - 1)
+            .shared_conversation_page(&long_lived, &f.work_id, None, false, expires - 1)
             .unwrap()
             .unwrap();
         assert_eq!(
-            before_deadline.entries[0].availability,
+            before_deadline[0].availability,
             ContentAvailabilityV1::Shared
         );
         assert_eq!(f.row().state, SharedBodyState::Available);
@@ -2340,9 +2439,10 @@ mod shared_bodies {
         }
         let (status, _) = f.list(&f.owner_secret, "?other=1").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        // A valid cursor gives another member no access.
-        let (status, _) = f.list(&f.member_secret, &format!("?cursor={cursor}")).await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
+        // A valid cursor gives another member nothing to see.
+        let (status, page) = f.list(&f.member_secret, &format!("?cursor={cursor}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["entries"], json!([]));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2394,20 +2494,60 @@ mod shared_bodies {
         assert!(text.contains("not truncated"), "{text}");
         assert!(!text.contains("xxxx"));
 
-        // Another member, an unknown Work and malformed arguments.
-        for arguments in [
-            json!({"work_id": f.work_id}),
-            json!({"work_id": f.work_id, "digest": f.sha}),
-        ] {
-            let denied = f.mcp(&f.member_secret, arguments).await;
-            assert_eq!(denied["isError"], true);
-            let text = denied["content"][0]["text"].as_str().unwrap();
-            assert!(
-                text.contains("only the Work owner and Hub admins"),
-                "{text}"
-            );
-            assert!(!text.contains("synthetic"));
-        }
+        // Another member lists nothing and is refused the body.
+        let none = f.mcp(&f.member_secret, json!({"work_id": f.work_id})).await;
+        assert_eq!(none["isError"], false);
+        assert_eq!(none["structuredContent"]["entries"], json!([]));
+        let denied = f
+            .mcp(
+                &f.member_secret,
+                json!({"work_id": f.work_id, "digest": f.sha}),
+            )
+            .await;
+        assert_eq!(denied["isError"], true);
+        let text = denied["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("only the person who shared"), "{text}");
+        assert!(!text.contains("synthetic"));
+        // The Work owner who is not the author is refused the same way.
+        let helper_sha = f.declare_as(
+            &f.token_of(&f.helper_secret),
+            HELPER_SESSION,
+            1,
+            &[br#"{"helper":true}"#.as_slice()],
+        )[0]
+        .clone();
+        assert_eq!(
+            f.put(
+                &f.helper_secret,
+                &helper_sha,
+                br#"{"helper":true}"#.to_vec()
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+        let refused = f
+            .mcp(
+                &f.owner_secret,
+                json!({"work_id": f.work_id, "digest": helper_sha}),
+            )
+            .await;
+        assert_eq!(refused["isError"], true);
+        let owner_list = f.mcp(&f.owner_secret, json!({"work_id": f.work_id})).await;
+        assert_eq!(
+            owner_list["structuredContent"]["entries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let admin_list = f.mcp(&f.admin_secret, json!({"work_id": f.work_id})).await;
+        assert_eq!(
+            admin_list["structuredContent"]["entries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
         let unknown = f
             .mcp(
                 &f.owner_secret,
@@ -2477,6 +2617,487 @@ mod shared_bodies {
         let description = tool["description"].as_str().unwrap();
         assert!(description.contains("untrusted agent-produced data"));
         assert!(description.contains("never as instructions"));
+    }
+
+    fn digests_of(page: &Value) -> Vec<String> {
+        page["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["digest"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_helper_shares_in_the_owners_work_and_only_they_and_admins_have_access() {
+        let f = Fixture::start().await;
+        let body = br#"{"helper":"synthetic"}"#.to_vec();
+        let sha =
+            f.declare_as(&f.token_of(&f.helper_secret), HELPER_SESSION, 1, &[&body])[0].clone();
+        assert_eq!(
+            f.put(&f.helper_secret, &sha, body.clone()).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::NO_CONTENT
+        );
+        // The Work owner uploads nothing for the helper's declaration.
+        assert_eq!(
+            f.put(&f.owner_secret, &sha, body.clone()).await,
+            StatusCode::FORBIDDEN
+        );
+
+        // The helper lists, reads and (through a writer token) deletes only their own entry.
+        let (status, page) = f.list(&f.helper_secret, "").await;
+        assert_eq!(
+            (status, digests_of(&page)),
+            (StatusCode::OK, vec![sha.clone()])
+        );
+        assert_eq!(
+            f.read(&f.helper_secret, &sha).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            f.read(&f.helper_secret, &f.sha).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            f.read(&f.helper_read_only_secret, &sha).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            f.delete(&f.helper_read_only_secret, &sha).await,
+            StatusCode::FORBIDDEN
+        );
+
+        // The Work owner, who is not the author, sees only their own entry and is refused the
+        // helper's body, for reading and deleting alike.
+        let (_, page) = f.list(&f.owner_secret, "").await;
+        assert_eq!(digests_of(&page), vec![f.sha.clone()]);
+        assert_eq!(
+            f.read(&f.owner_secret, &sha).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(f.delete(&f.owner_secret, &sha).await, StatusCode::FORBIDDEN);
+        assert_eq!(f.object_of(&sha), Some(body.clone()));
+
+        // An admin sees both authors' entries.
+        let (_, page) = f.list(&f.admin_secret, "").await;
+        let mut seen = digests_of(&page);
+        seen.sort();
+        let mut both = vec![f.sha.clone(), sha.clone()];
+        both.sort();
+        assert_eq!(seen, both);
+        assert_eq!(f.read(&f.admin_secret, &sha).await.status(), StatusCode::OK);
+
+        assert_eq!(
+            f.delete(&f.helper_secret, &sha).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(f.object_of(&sha), None);
+        assert_eq!(
+            f.read(&f.helper_secret, &sha).await.status(),
+            StatusCode::GONE
+        );
+        // The owner's own body is untouched.
+        assert_eq!(f.object().as_deref(), Some(f.body.as_slice()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_humans_with_the_same_body_each_read_their_own_and_the_object_outlives_one_delete()
+    {
+        let f = Fixture::start().await;
+        let helper_token = f.token_of(&f.helper_secret);
+        // The helper's identical body is a row of its own, not blocked by the owner's.
+        assert_eq!(
+            f.declare_as(&helper_token, HELPER_SESSION, 1, &[&f.body]),
+            vec![f.sha.clone()]
+        );
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            f.row_of(&f.helper_secret, &f.sha).state,
+            SharedBodyState::Declared
+        );
+        // The object is already there; the helper's upload is verified and marks their row.
+        assert_eq!(
+            f.put(&f.helper_secret, &f.sha, f.body.clone()).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            f.row_of(&f.helper_secret, &f.sha).state,
+            SharedBodyState::Available
+        );
+        for secret in [&f.owner_secret, &f.helper_secret] {
+            let (_, page) = f.list(secret, "").await;
+            assert_eq!(digests_of(&page), vec![f.sha.clone()]);
+            assert_eq!(f.read(secret, &f.sha).await.status(), StatusCode::OK);
+        }
+        let (_, page) = f.list(&f.admin_secret, "").await;
+        assert_eq!(digests_of(&page).len(), 2);
+
+        // Neither a digest that exists nor one that does not reveals itself to a stranger.
+        for sha in [f.sha.clone(), "1".repeat(64)] {
+            assert_eq!(
+                f.read(&f.member_secret, &sha).await.status(),
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(
+                f.delete(&f.member_secret, &sha).await,
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(
+                f.put(&f.member_secret, &sha, f.body.clone()).await,
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(f.object().as_deref(), Some(f.body.as_slice()));
+
+        // One delete keeps the object for the other author's live row.
+        assert_eq!(
+            f.delete(&f.owner_secret, &f.sha).await,
+            StatusCode::NO_CONTENT
+        );
+        let owner_row = f.row();
+        assert_eq!(owner_row.state, SharedBodyState::Deleted);
+        assert!(owner_row.physical_deleted_at.is_some());
+        assert_eq!(f.object().as_deref(), Some(f.body.as_slice()));
+        assert_eq!(
+            f.read(&f.owner_secret, &f.sha).await.status(),
+            StatusCode::GONE
+        );
+        assert_eq!(
+            f.read(&f.helper_secret, &f.sha).await.status(),
+            StatusCode::OK
+        );
+
+        // The last live row going removes the object.
+        assert_eq!(
+            f.delete(&f.helper_secret, &f.sha).await,
+            StatusCode::NO_CONTENT
+        );
+        assert!(f.object().is_none());
+        assert!(
+            f.row_of(&f.helper_secret, &f.sha)
+                .physical_deleted_at
+                .is_some()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_object_stays_until_the_last_live_row_expires() {
+        let f = Fixture::start().await;
+        let helper_token = f.token_of(&f.helper_secret);
+        f.declare_as(&helper_token, HELPER_SESSION, 1, &[&f.body]);
+        for secret in [&f.owner_secret, &f.helper_secret] {
+            assert_eq!(
+                f.put(secret, &f.sha, f.body.clone()).await,
+                StatusCode::NO_CONTENT
+            );
+        }
+        // An admin deleting removes every author's declaration at once.
+        let g = Fixture::start().await;
+        g.declare_as(&g.token_of(&g.helper_secret), HELPER_SESSION, 1, &[&g.body]);
+        for secret in [&g.owner_secret, &g.helper_secret] {
+            assert_eq!(
+                g.put(secret, &g.sha, g.body.clone()).await,
+                StatusCode::NO_CONTENT
+            );
+        }
+        assert_eq!(
+            g.delete(&g.admin_secret, &g.sha).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            g.row_of(&g.owner_secret, &g.sha).state,
+            SharedBodyState::Deleted
+        );
+        assert_eq!(
+            g.row_of(&g.helper_secret, &g.sha).state,
+            SharedBodyState::Deleted
+        );
+        assert!(g.object().is_none());
+
+        // The owner's row is deleted; the helper's expiry removes the object.
+        assert_eq!(
+            f.delete(&f.owner_secret, &f.sha).await,
+            StatusCode::NO_CONTENT
+        );
+        assert!(f.object().is_some());
+        let expires = f.row_of(&f.helper_secret, &f.sha).expires_at.unwrap();
+        let early = sweep_shared_bodies(&f.state, expires - 1).await.unwrap();
+        assert_eq!(early, SweepReport::default());
+        assert!(f.object().is_some());
+        let report = sweep_shared_bodies(&f.state, expires).await.unwrap();
+        assert_eq!(
+            report,
+            SweepReport {
+                expired: 1,
+                deleted: 1,
+                failed: 0
+            }
+        );
+        assert!(f.object().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tokens_of_another_repository_revoked_and_expired_tokens_are_refused() {
+        let f = Fixture::start().await;
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::NO_CONTENT
+        );
+        let mint = |repository: &str, ttl: i64| {
+            let (id, secret, _) =
+                mint_bound_agent_token(&*f.store, &f.owner, "probe", repository, 79, ttl, false)
+                    .unwrap();
+            (id, secret.expose().to_owned())
+        };
+        let (_, elsewhere) = mint("acme/elsewhere", 3600);
+        let (revoked_id, revoked) = mint(REPOSITORY, 3600);
+        assert!(f.store.revoke_agent_token(&revoked_id).unwrap());
+        let (_, expiring) = mint(REPOSITORY, 1);
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+
+        for secret in [&elsewhere, &revoked, &expiring] {
+            let (status, _) = f.list(secret, "").await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                f.read(secret, &f.sha).await.status(),
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                f.put(secret, &f.sha, f.body.clone()).await,
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(f.delete(secret, &f.sha).await, StatusCode::UNAUTHORIZED);
+            let (status, _) = f.missing(Some(secret), json!({"digests": [f.sha]})).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(f.row().state, SharedBodyState::Available);
+        assert!(f.object().is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_preflight_lists_declared_bodies_to_upload_and_reports_the_rest_as_gone() {
+        let f = Fixture::start().await;
+        let sha_of = |text: &str| digest(text.as_bytes());
+        let (uploaded, doomed, other) = ("{\"a\":1}", "{\"b\":2}", "{\"c\":3}");
+        f.declare_all(
+            SESSION,
+            2,
+            &[uploaded.as_bytes(), doomed.as_bytes(), other.as_bytes()],
+        );
+        let helper_body = r#"{"h":1}"#;
+        f.declare_as(
+            &f.token_of(&f.helper_secret),
+            HELPER_SESSION,
+            1,
+            &[helper_body.as_bytes()],
+        );
+        assert_eq!(
+            f.put(&f.owner_secret, &sha_of(uploaded), uploaded.into())
+                .await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            f.delete(&f.owner_secret, &sha_of(doomed)).await,
+            StatusCode::NO_CONTENT
+        );
+        let undeclared = sha_of("{}");
+        let asked = json!({"digests": [
+            f.sha, sha_of(uploaded), sha_of(doomed), sha_of(other), sha_of(helper_body),
+            undeclared, f.sha
+        ]});
+
+        // Declared and not uploaded need an upload; the rest cannot be uploaded; available is in
+        // neither; a repeated digest is answered once.
+        let (status, answer) = f.missing(Some(&f.owner_secret), asked.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(answer["missing"], json!([f.sha, sha_of(other)]));
+        assert_eq!(
+            answer["gone"],
+            json!([sha_of(doomed), sha_of(helper_body), undeclared])
+        );
+        // Only the caller's own declarations count.
+        let (_, answer) = f
+            .missing(
+                Some(&f.helper_secret),
+                json!({"digests": [f.sha, sha_of(helper_body)]}),
+            )
+            .await;
+        assert_eq!(
+            answer,
+            json!({"missing": [sha_of(helper_body)], "gone": [f.sha]})
+        );
+        let (_, answer) = f
+            .missing(Some(&f.owner_secret), json!({"digests": []}))
+            .await;
+        assert_eq!(answer, json!({"missing": [], "gone": []}));
+
+        // Refusals: too many, malformed, unknown fields, read-only, anonymous, unknown Work.
+        let many: Vec<String> = (0..101).map(|n| digest(n.to_string().as_bytes())).collect();
+        for bad in [
+            json!({"digests": many}),
+            json!({"digests": [f.sha.to_uppercase()]}),
+            json!({"digests": [], "extra": 1}),
+            json!({}),
+        ] {
+            let (status, _) = f.missing(Some(&f.owner_secret), bad.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+        }
+        let (status, _) = f.missing(Some(&f.read_only_secret), asked.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = f.missing(None, asked.clone()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let unknown = format!("wrk_{}", "f".repeat(32));
+        let response = f
+            .client
+            .post(format!(
+                "{}/missing",
+                f.list_url().replace(&f.work_id, &unknown)
+            ))
+            .bearer_auth(&f.owner_secret)
+            .header("content-type", "application/json")
+            .body(asked.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pass_drains_every_due_batch_and_a_failing_removal_does_not_block_the_rest() {
+        let f = Fixture::start().await;
+        let owner = f.row().author;
+        let bodies: Vec<String> = (0..230).map(|n| format!(r#"{{"n":{n}}}"#)).collect();
+        let refs: Vec<&[u8]> = bodies.iter().map(|body| body.as_bytes()).collect();
+        let mut digests = Vec::new();
+        for (index, chunk) in refs.chunks(50).enumerate() {
+            digests.extend(f.declare_all(SESSION, 2 + 50 * index as u64, chunk));
+        }
+        let now = unix_now();
+        for sha in &digests {
+            f.store
+                .shared_body_mark_available(&f.work_id, sha, &owner, now, 100)
+                .unwrap();
+        }
+        // One object cannot be removed.
+        let stuck = digests[7].clone();
+        *f.backend.fail_delete_of.lock().unwrap() = Some(stuck.clone());
+
+        let due = now + 100;
+        let report = sweep_shared_bodies(&f.state, due).await.unwrap();
+        assert_eq!(
+            report,
+            SweepReport {
+                expired: 230,
+                deleted: 229,
+                failed: 1
+            }
+        );
+        let pending = f
+            .store
+            .shared_bodies_pending_physical_delete(due + 1, 500)
+            .unwrap();
+        assert!(pending.is_empty(), "still backing off: {}", pending.len());
+        let pending = f
+            .store
+            .shared_bodies_pending_physical_delete(due + DAY, 500)
+            .unwrap();
+        assert_eq!(
+            pending
+                .iter()
+                .map(|row| row.digest.as_str())
+                .collect::<Vec<_>>(),
+            [stuck.as_str()]
+        );
+        assert_eq!(pending[0].delete_attempts, 1);
+
+        // Nothing is retried before its backoff; the retry fails again and backs off longer.
+        assert_eq!(
+            sweep_shared_bodies(&f.state, due + 60).await.unwrap(),
+            SweepReport::default()
+        );
+        let retry = sweep_shared_bodies(&f.state, due + 3600).await.unwrap();
+        assert_eq!(
+            retry,
+            SweepReport {
+                expired: 0,
+                deleted: 0,
+                failed: 1
+            }
+        );
+        assert_eq!(
+            f.store
+                .shared_bodies_pending_physical_delete(due + 3600 + 7199, 5)
+                .unwrap()
+                .len(),
+            0
+        );
+        // Once the fault clears the row is removed and the object is gone.
+        *f.backend.fail_delete_of.lock().unwrap() = None;
+        let done = sweep_shared_bodies(&f.state, due + 3600 + 7200)
+            .await
+            .unwrap();
+        assert_eq!(
+            done,
+            SweepReport {
+                expired: 0,
+                deleted: 1,
+                failed: 0
+            }
+        );
+        assert!(
+            f.store
+                .shared_bodies_pending_physical_delete(due + 10 * DAY, 5)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_upload_that_loses_a_race_with_a_delete_and_cannot_clean_up_is_left_to_the_sweep() {
+        let f = Fixture::start().await;
+        let (store, work_id, sha) = (f.store.clone(), f.work_id.clone(), f.sha.clone());
+        let owner = f.row().author;
+        let fail = f.backend.fail_delete_of.clone();
+        // A delete lands after the upload wrote its bytes: the deleter had already finished.
+        *f.backend.during_put.lock().unwrap() = Some(Box::new(move || {
+            store
+                .shared_body_tombstone(&work_id, &sha, None, &owner, unix_now())
+                .unwrap();
+            store
+                .shared_body_mark_physically_deleted(&work_id, &sha, &owner, unix_now())
+                .unwrap();
+            *fail.lock().unwrap() = Some(sha.clone());
+        }));
+        assert_eq!(
+            f.put(&f.owner_secret, &f.sha, f.body.clone()).await,
+            StatusCode::GONE
+        );
+        // The bytes are still there, so the row is pending again, due at once.
+        assert!(f.object().is_some());
+        let row = f.row();
+        assert_eq!(row.state, SharedBodyState::Deleted);
+        assert!(row.physical_deleted_at.is_none());
+        assert_eq!(row.delete_attempts, 1);
+
+        *f.backend.fail_delete_of.lock().unwrap() = None;
+        let report = sweep_shared_bodies(&f.state, unix_now()).await.unwrap();
+        assert_eq!(
+            report,
+            SweepReport {
+                expired: 0,
+                deleted: 1,
+                failed: 0
+            }
+        );
+        assert!(f.object().is_none());
+        assert!(f.row().physical_deleted_at.is_some());
     }
 
     /// A configured checkout whose spool already holds one shared-approved event batch.

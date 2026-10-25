@@ -91,7 +91,7 @@ selected visible bodies only in the spool; they are not placed in shared envelop
 the event. Change an enabled binding's mode with `change-capture set-mode --root PATH --mode
 metadata-only|local-conversation|shared-conversation`, which never touches the spool. `change-capture
 conversation --work-id ID [--cursor C | --digest D | --delete D]` lists, prints or deletes shared
-bodies (Work owner and Hub admins only). See
+bodies (the author and Hub admins only). See
 [sharing conversations](../change-capture.md#sharing-conversations-with-the-hub).
 
 Execution success is not a passing verification. An exact verification rule has the form

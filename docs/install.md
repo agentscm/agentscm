@@ -98,8 +98,8 @@ connection values.
 The **Share agent conversations with Hub** item is off by default and is disabled until the
 checkout has an enabled capture binding (run `agentscm change-capture configure` first). Turning it
 on switches that checkout to `shared-conversation` mode: new conversations are redacted on this
-machine on a best-effort basis and uploaded to the Hub, where the Work owner and Hub admins can read
-them. Turning it off sets `metadata-only` (not a previous `local-conversation`); conversations stay on this machine,
+machine on a best-effort basis and uploaded to the Hub, where only you (the person who shared them) and Hub
+admins can read them. Turning it off sets `metadata-only` (not a previous `local-conversation`); conversations stay on this machine,
 and copies already uploaded remain until they expire or you delete them. Nothing local is deleted.
 It is the same change as `agentscm change-capture set-mode`; see
 [sharing conversations](change-capture.md#sharing-conversations-with-the-hub).

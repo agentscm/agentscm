@@ -1,6 +1,6 @@
 //! Authenticated HTTP transport for the shared change-record service.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::Bytes;
@@ -12,12 +12,13 @@ use axum::routing::{get, post, put};
 use crate::backend::{ImmutableBackend, ObjectKey, SOURCE_PROFILE_V1};
 use crate::change_record::{
     ActionFinishV1, ActionMutationReceiptV1, ActionStartV1, CaptureBatchV1, CaptureTargetV1,
-    ChangeRecordResponseV1, ConversationPageV1, IngestReceiptV1, MAX_BATCH_BYTES,
+    ChangeRecordResponseV1, ConversationMissingRequestV1, ConversationMissingV1,
+    ConversationPageV1, IngestReceiptV1, MAX_BATCH_BYTES, MAX_CONVERSATION_MISSING_DIGESTS,
     MAX_SHARED_BODY_BYTES,
 };
 use crate::store::digest;
 
-use super::change_record::{SharedBodyState, conversation_readable};
+use super::change_record::{SharedBodyRow, SharedBodyState};
 use super::http::{ApiError, Authenticated, JsonBody, Reader, blocking};
 use super::store::{Store, unix_now};
 use super::{HubError, HubState, Principal};
@@ -25,9 +26,18 @@ use serde::Deserialize;
 
 const SHARED_BODY_DOMAIN: &str = "hub-conversation";
 const SHARED_BODY_INCARNATION: &str = "v1";
-/// Rows handled per sweep pass; the rest wait for the next one.
+/// Rows handled per sweep batch; a pass repeats batches until one comes back short.
 const SWEEP_BATCH: usize = 100;
-const SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// A pass stops starting new batches after this long; the rest waits for the next pass.
+const SWEEP_BUDGET: Duration = Duration::from_secs(30);
+const SWEEP_INTERVAL: Duration = Duration::from_secs(10 * 60);
+/// A pass refused with `Busy` is retried this often, this many times, before waiting for the
+/// next interval.
+const SWEEP_BUSY_RETRY: Duration = Duration::from_secs(5);
+const SWEEP_BUSY_ATTEMPTS: usize = 12;
+/// A failed object removal is retried after one hour, doubling to at most a day.
+const DELETE_BACKOFF_FIRST: i64 = 60 * 60;
+const DELETE_BACKOFF_MAX: i64 = 24 * 60 * 60;
 
 pub fn routes() -> Router<HubState> {
     Router::new()
@@ -51,6 +61,10 @@ pub fn routes() -> Router<HubState> {
         .route(
             "/v1/hub/repos/{repo}/change-records/{work_id}/conversation",
             get(list_conversation),
+        )
+        .route(
+            "/v1/hub/repos/{repo}/change-records/{work_id}/conversation/missing",
+            post(missing_bodies),
         )
         .route(
             "/v1/hub/repos/{repo}/change-records/{work_id}/conversation/{sha256}",
@@ -179,7 +193,7 @@ async fn list_conversation(
     ))
 }
 
-/// The listing for the Work owner and Hub admins, shared by the HTTP and MCP reads.
+/// The caller's own entries, or every author's for a Hub admin, shared by the HTTP and MCP reads.
 pub(super) async fn conversation_page(
     state: &HubState,
     principal: &Principal,
@@ -188,25 +202,30 @@ pub(super) async fn conversation_page(
 ) -> Result<ConversationPageV1, ApiError> {
     let store = state.store.clone();
     let token = principal.token_id.clone();
-    let read = blocking(state, move || {
-        store.shared_conversation_page(&token, &work_id, cursor.as_deref(), unix_now())
+    let admin = state.login.is_admin_user(&principal.owner);
+    let entries = blocking(state, move || {
+        store.shared_conversation_page(&token, &work_id, cursor.as_deref(), admin, unix_now())
     })
     .await?
     .ok_or_else(ApiError::not_found)?;
-    if !conversation_readable(
-        read.caller_owns_work,
-        state.login.is_admin_user(&principal.owner),
-    ) {
-        return Err(ApiError::forbidden());
-    }
-    let page = ConversationPageV1::bounded(read.entries)?;
+    let page = ConversationPageV1::bounded(entries)?;
     page.validate_encoded_size()?;
     Ok(page)
 }
 
-/// A shared body's verified bytes for the Work owner and Hub admins, shared by the HTTP and MCP
-/// reads. Unknown or never uploaded is `not_found`, expired or deleted is `gone`, and an
-/// object that is missing, corrupt or not the declared size is `integrity_failure` (424).
+/// What a caller with no access to a digest is told. A caller who is not an admin gets the same
+/// refusal for a digest that exists and one that does not, so the route is no existence oracle.
+fn no_access(admin: bool) -> ApiError {
+    if admin {
+        ApiError::not_found()
+    } else {
+        ApiError::forbidden()
+    }
+}
+
+/// A shared body's verified bytes for its author and Hub admins, shared by the HTTP and MCP
+/// reads. Never uploaded is `not_found`, expired or deleted is `gone`, and an object that is
+/// missing, corrupt or not the declared size is `integrity_failure` (424).
 pub(super) async fn conversation_body(
     state: &HubState,
     principal: &Principal,
@@ -227,10 +246,10 @@ pub(super) async fn conversation_body(
             let Some(access) = store.shared_body_lookup(&token, &work_id, &sha256, now)? else {
                 return Ok(Err(ApiError::not_found()));
             };
-            if !access.readable(admin) {
-                return Ok(Err(ApiError::forbidden()));
-            }
-            match access.row.state_at(now) {
+            let Some(row) = access.accessible(admin, now) else {
+                return Ok(Err(no_access(admin)));
+            };
+            match row.state_at(now) {
                 SharedBodyState::Declared => return Ok(Err(ApiError::not_found())),
                 SharedBodyState::Expired | SharedBodyState::Deleted => {
                     return Ok(Err(ApiError::gone()));
@@ -241,7 +260,7 @@ pub(super) async fn conversation_body(
                 &shared_body_key(&work_id, &sha256)?,
                 SHARED_BODY_INCARNATION,
             ) {
-                Ok(bytes) if bytes.len() as u64 == access.row.size_bytes => Ok(Ok(bytes)),
+                Ok(bytes) if bytes.len() as u64 == row.size_bytes => Ok(Ok(bytes)),
                 Ok(_)
                 | Err(
                     crate::Error::NotFound(_)
@@ -311,17 +330,41 @@ fn lower_hex_digest(value: &str) -> bool {
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// Removes the object and records it. A failure leaves the row pending for the sweep.
+/// Retry delay after the `attempts`-th failed removal of an object.
+fn delete_backoff(attempts: i64) -> i64 {
+    (DELETE_BACKOFF_FIRST << attempts.clamp(0, 10)).min(DELETE_BACKOFF_MAX)
+}
+
+/// Removes the object unless another declaration of the digest may still need it, and records
+/// `row` as removed. A failure leaves the row pending for the sweep, after the backoff or at
+/// once with `retry_now`.
 fn physically_delete(
     store: &dyn Store,
     objects: &dyn ImmutableBackend,
-    work_id: &str,
-    sha256: &str,
+    row: &SharedBodyRow,
     now: i64,
+    retry_now: bool,
 ) -> Result<(), HubError> {
-    let key = shared_body_key(work_id, sha256)?;
-    objects.delete_incarnation(&key, SHARED_BODY_INCARNATION)?;
-    store.shared_body_mark_physically_deleted(work_id, sha256, now)
+    let removed = (|| {
+        if !store.shared_body_object_in_use(&row.work, &row.digest)? {
+            let key = shared_body_key(&row.work, &row.digest)?;
+            objects.delete_incarnation(&key, SHARED_BODY_INCARNATION)?;
+        }
+        store.shared_body_mark_physically_deleted(&row.work, &row.digest, &row.author, now)
+    })();
+    if removed.is_err() {
+        let retry_at = if retry_now {
+            now
+        } else {
+            now.saturating_add(delete_backoff(row.delete_attempts))
+        };
+        if let Err(error) =
+            store.shared_body_delete_failed(&row.work, &row.digest, &row.author, retry_at)
+        {
+            eprintln!("hub: shared body retry not recorded: {error}");
+        }
+    }
+    removed
 }
 
 /// A refusal the caller should see as a status, as opposed to a store failure.
@@ -341,15 +384,17 @@ async fn upload_body(
     let objects = state.objects.clone();
     let retention = state.shared_conversation_retention_days * 24 * 60 * 60;
     let token = principal.token_id;
+    let admin = state.login.is_admin_user(&principal.owner);
     blocking(&state, move || -> Result<Refusal, HubError> {
         let now = unix_now();
         let Some(access) = store.shared_body_lookup(&token, &work_id, &sha256, now)? else {
             return Ok(Err(ApiError::not_found()));
         };
-        if !access.declared_by_caller_owner {
-            return Ok(Err(ApiError::forbidden()));
-        }
-        match access.row.state_at(now) {
+        // Only the author uploads, and only against their own declaration.
+        let Some(row) = access.own() else {
+            return Ok(Err(no_access(admin)));
+        };
+        match row.state_at(now) {
             SharedBodyState::Expired | SharedBodyState::Deleted => {
                 return Ok(Err(ApiError::gone()));
             }
@@ -357,17 +402,18 @@ async fn upload_body(
             SharedBodyState::Declared => {}
         }
         // Refused, never truncated: the bytes must be exactly the body the event declared.
-        if body.len() as u64 != access.row.size_bytes || digest(&body) != sha256 {
+        if body.len() as u64 != row.size_bytes || digest(&body) != sha256 {
             return Ok(Err(ApiError::invalid()));
         }
         let key = shared_body_key(&work_id, &sha256)?;
         objects.prepare_publication(&key, SHARED_BODY_INCARNATION)?;
+        // Another author's upload of the same body may already be there; the bytes are the same.
         objects.put_if_absent(&key, SHARED_BODY_INCARNATION, &body)?;
-        match store.shared_body_mark_available(&work_id, &sha256, now, retention)? {
+        match store.shared_body_mark_available(&work_id, &sha256, &row.author, now, retention)? {
             Some(SharedBodyState::Available) => Ok(Ok(())),
             _ => {
                 // Deleted or expired while uploading: do not leave the bytes behind.
-                if let Err(error) = objects.delete_incarnation(&key, SHARED_BODY_INCARNATION) {
+                if let Err(error) = physically_delete(&*store, &*objects, row, now, true) {
                     eprintln!("hub: shared body cleanup deferred to the sweep: {error}");
                 }
                 Ok(Err(ApiError::gone()))
@@ -397,18 +443,74 @@ async fn delete_body(
         let Some(access) = store.shared_body_lookup(&token, &work_id, &sha256, now)? else {
             return Ok(Err(ApiError::not_found()));
         };
-        if !access.caller_owns_work && !admin {
-            return Ok(Err(ApiError::forbidden()));
-        }
+        let Some(row) = access.accessible(admin, now) else {
+            return Ok(Err(no_access(admin)));
+        };
+        // An author deletes their own declaration; an admin deletes every author's.
+        let author = (!admin).then_some(row.author.as_str());
         // The tombstone is the decision; the object removal may fail and be retried by the sweep.
-        store.shared_body_tombstone(&work_id, &sha256, &actor, now)?;
-        if let Err(error) = physically_delete(&*store, &*objects, &work_id, &sha256, now) {
-            eprintln!("hub: shared body removal deferred to the sweep: {error}");
+        for row in store.shared_body_tombstone(&work_id, &sha256, author, &actor, now)? {
+            if row.physical_deleted_at.is_some() {
+                continue;
+            }
+            if let Err(error) = physically_delete(&*store, &*objects, &row, now, false) {
+                eprintln!("hub: shared body removal deferred to the sweep: {error}");
+            }
         }
         Ok(Ok(()))
     })
     .await??;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Which of the caller's declared bodies still need their bytes. `missing` are declared and not
+/// uploaded; `gone` are not declared by the caller, expired or deleted, so the client can stop
+/// offering them. Bodies already available are in neither list.
+async fn missing_bodies(
+    State(state): State<HubState>,
+    Authenticated(principal): Authenticated,
+    Path((repo, work_id)): Path<(String, String)>,
+    JsonBody(request): JsonBody<ConversationMissingRequestV1>,
+) -> Result<Json<ConversationMissingV1>, ApiError> {
+    scope(&principal, &repo)?;
+    if request.digests.len() > MAX_CONVERSATION_MISSING_DIGESTS
+        || !request
+            .digests
+            .iter()
+            .all(|digest| lower_hex_digest(digest))
+    {
+        return Err(ApiError::invalid());
+    }
+    let store = state.store.clone();
+    let token = principal.token_id;
+    let digests = request.digests;
+    let rows = {
+        let digests = digests.clone();
+        blocking(&state, move || {
+            store.shared_bodies_own(&token, &work_id, &digests, unix_now())
+        })
+        .await?
+        .ok_or_else(ApiError::not_found)?
+    };
+    let now = unix_now();
+    let mut answer = ConversationMissingV1::default();
+    for digest in digests {
+        if answer.missing.contains(&digest) || answer.gone.contains(&digest) {
+            continue;
+        }
+        match rows
+            .iter()
+            .find(|row| row.digest == digest)
+            .map(|row| row.state_at(now))
+        {
+            Some(SharedBodyState::Declared) => answer.missing.push(digest),
+            Some(SharedBodyState::Available) => {}
+            Some(SharedBodyState::Expired | SharedBodyState::Deleted) | None => {
+                answer.gone.push(digest)
+            }
+        }
+    }
+    Ok(Json(answer))
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -418,39 +520,64 @@ pub struct SweepReport {
     pub failed: usize,
 }
 
-/// One bounded retention pass at `now`: expires due bodies, then removes the objects of every
-/// expired or deleted body not yet confirmed gone. A failed removal stays pending for the next
-/// pass.
+/// One retention pass at `now`: expires due bodies, then removes the objects of every expired or
+/// deleted body not yet confirmed gone, oldest first, in batches until one comes back short or
+/// `SWEEP_BUDGET` is spent. A failed removal waits out its backoff, so it cannot starve the rest.
 pub async fn sweep_shared_bodies(state: &HubState, now: i64) -> Result<SweepReport, HubError> {
-    let store = state.store.clone();
-    let objects = state.objects.clone();
-    blocking(state, move || {
-        let mut report = SweepReport {
-            expired: store.shared_bodies_expire(now, SWEEP_BATCH)?.len(),
-            ..SweepReport::default()
-        };
-        for row in store.shared_bodies_pending_physical_delete(SWEEP_BATCH)? {
-            match physically_delete(&*store, &*objects, &row.work, &row.digest, now) {
-                Ok(()) => report.deleted += 1,
-                Err(error) => {
-                    report.failed += 1;
-                    eprintln!("hub: shared body removal failed, will retry: {error}");
+    let deadline = Instant::now() + SWEEP_BUDGET;
+    let mut report = SweepReport::default();
+    loop {
+        let store = state.store.clone();
+        let expired = blocking(state, move || store.shared_bodies_expire(now, SWEEP_BATCH))
+            .await?
+            .len();
+        report.expired += expired;
+        if expired < SWEEP_BATCH || Instant::now() >= deadline {
+            break;
+        }
+    }
+    loop {
+        let store = state.store.clone();
+        let objects = state.objects.clone();
+        let (batch, pending) = blocking(state, move || {
+            let rows = store.shared_bodies_pending_physical_delete(now, SWEEP_BATCH)?;
+            let mut batch = SweepReport::default();
+            for row in &rows {
+                match physically_delete(&*store, &*objects, row, now, false) {
+                    Ok(()) => batch.deleted += 1,
+                    Err(error) => {
+                        batch.failed += 1;
+                        eprintln!("hub: shared body removal failed, will retry: {error}");
+                    }
                 }
             }
+            Ok((batch, rows.len()))
+        })
+        .await?;
+        report.deleted += batch.deleted;
+        report.failed += batch.failed;
+        if pending < SWEEP_BATCH || Instant::now() >= deadline {
+            break;
         }
-        Ok(report)
-    })
-    .await
+    }
+    Ok(report)
 }
 
-/// Runs a sweep at startup and then hourly until the process exits.
+/// Runs a sweep at startup and then every ten minutes until the process exits.
 pub async fn sweep_loop(state: HubState) {
     let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
-        if let Err(error) = sweep_shared_bodies(&state, unix_now()).await {
-            eprintln!("hub: shared body sweep failed: {error}");
+        for _ in 0..SWEEP_BUSY_ATTEMPTS {
+            match sweep_shared_bodies(&state, unix_now()).await {
+                Err(HubError::Busy) => tokio::time::sleep(SWEEP_BUSY_RETRY).await,
+                Err(error) => {
+                    eprintln!("hub: shared body sweep failed: {error}");
+                    break;
+                }
+                Ok(_) => break,
+            }
         }
     }
 }

@@ -10,14 +10,14 @@ use serde_json::json;
 
 use crate::change_record::{
     ActionFinishV1, ActionMutationReceiptV1, ActionStartV1, ArtifactRefV1, CaptureBatchV1,
-    CapturedEventKindV1, CapturedEventV1, ChangeRecordSummaryV1, IngestReceiptV1,
-    MAX_CONVERSATION_PAGE_ENTRIES, MAX_PROJECTED_SESSION_SETUPS, RetentionClassV1, SessionSetupV1,
-    parse_conversation_cursor,
+    CapturedEventKindV1, CapturedEventV1, ChangeRecordSummaryV1, ConversationEntryV1,
+    IngestReceiptV1, MAX_CONVERSATION_PAGE_ENTRIES, MAX_PROJECTED_SESSION_SETUPS, RetentionClassV1,
+    SessionSetupV1, parse_conversation_cursor,
 };
 
 use super::change_record::{
-    SessionStatsV1, SharedBodyAccess, SharedBodyRow, SharedBodyState, SharedConversationRead,
-    StoredActionV1, StoredDecisionV1, project as project_change_record,
+    SessionStatsV1, SharedBodyAccess, SharedBodyRow, SharedBodyState, StoredActionV1,
+    StoredDecisionV1, project as project_change_record,
 };
 use super::connection::{
     CONNECTION_SELECT, ConnectedRepository, Connection as ForgeConnection, DELIVERY_KEEP_SECONDS,
@@ -378,7 +378,10 @@ fn work_who(tx: &mut postgres::Transaction<'_>, token: &str, now: i64) -> Result
 }
 
 const SHARED_BODY_COLUMNS: &str = "work,digest,size_bytes,session_id,generation,event_id,sequence,
-    declared_token,declared_at,state,uploaded_at,expires_at,deleted_at,deleted_by,physical_deleted_at";
+    declared_token,declared_at,state,uploaded_at,expires_at,deleted_at,deleted_by,physical_deleted_at,
+    author,delete_attempts";
+/// Where a query that appends columns after `SHARED_BODY_COLUMNS` finds them.
+const SHARED_BODY_COLUMN_COUNT: usize = 17;
 
 fn shared_body_row(row: &postgres::Row) -> Result<SharedBodyRow> {
     Ok(SharedBodyRow {
@@ -397,11 +400,13 @@ fn shared_body_row(row: &postgres::Row) -> Result<SharedBodyRow> {
         deleted_at: row.get(12),
         deleted_by: row.get(13),
         physical_deleted_at: row.get(14),
+        author: row.get(15),
+        delete_attempts: row.get(16),
     })
 }
 
-/// Records that an accepted event named a shared body. The first declaration of (work, digest)
-/// wins; a later one must agree on size.
+/// Records that an accepted event named a shared body for the human owning `token`. Each human's
+/// declaration of a digest is its own row, and a later one must agree on size with any earlier.
 fn declare_shared_body(
     tx: &mut postgres::Transaction<'_>,
     batch: &CaptureBatchV1,
@@ -412,12 +417,22 @@ fn declare_shared_body(
 ) -> Result<()> {
     let size = artifact.size_bytes as i64;
     let sequence = event.sequence as i64;
-    let inserted = tx.execute(
+    let declared = tx.query_opt(
+        "SELECT size_bytes FROM hub_change_shared_bodies WHERE work=$1 AND digest=$2 LIMIT 1",
+        &[&batch.work_id, &artifact.digest],
+    )?;
+    if declared.is_some_and(|declared| declared.get::<_, i64>(0) != size) {
+        return Err(HubError::Invalid(
+            "shared body digest was already declared with a different size".into(),
+        ));
+    }
+    tx.execute(
         "INSERT INTO hub_change_shared_bodies
-         (work,digest,size_bytes,media,session_id,generation,event_id,sequence,
+         (work,digest,author,size_bytes,media,session_id,generation,event_id,sequence,
           declared_token,declared_at,state)
-         VALUES ($1,$2,$3,'json',$4,$5,$6,$7,$8,$9,'declared')
-         ON CONFLICT (work,digest) DO NOTHING",
+         VALUES ($1,$2,(SELECT owner FROM hub_agent_tokens WHERE id=$8),$3,'json',$4,$5,$6,$7,
+                 $8,$9,'declared')
+         ON CONFLICT (work,digest,author) DO NOTHING",
         &[
             &batch.work_id,
             &artifact.digest,
@@ -430,19 +445,6 @@ fn declare_shared_body(
             &now,
         ],
     )?;
-    if inserted == 0 {
-        let declared: i64 = tx
-            .query_one(
-                "SELECT size_bytes FROM hub_change_shared_bodies WHERE work=$1 AND digest=$2",
-                &[&batch.work_id, &artifact.digest],
-            )?
-            .get(0);
-        if declared != size {
-            return Err(HubError::Invalid(
-                "shared body digest was already declared with a different size".into(),
-            ));
-        }
-    }
     Ok(())
 }
 
@@ -5849,31 +5851,55 @@ impl Store for PgStore {
                 .isolation_level(IsolationLevel::RepeatableRead)
                 .start()?;
             let who = work_who(&mut tx, token, now)?;
-            let Some(item) = scoped_work(&mut tx, &who, work_id, now, false)? else {
+            if scoped_work(&mut tx, &who, work_id, now, false)?.is_none() {
                 return Ok(None);
-            };
-            let Some(row) = tx.query_opt(
-                &format!(
-                    "SELECT {SHARED_BODY_COLUMNS} FROM hub_change_shared_bodies
-                     WHERE work=$1 AND digest=$2"
-                ),
-                &[&work_id, &digest],
-            )?
-            else {
-                return Ok(None);
-            };
-            let row = shared_body_row(&row)?;
-            let declarer = tx
-                .query_opt(
-                    "SELECT owner FROM hub_agent_tokens WHERE id=$1",
-                    &[&row.declared_token],
+            }
+            let rows = tx
+                .query(
+                    &format!(
+                        "SELECT {SHARED_BODY_COLUMNS} FROM hub_change_shared_bodies
+                         WHERE work=$1 AND digest=$2 ORDER BY declared_at,author"
+                    ),
+                    &[&work_id, &digest],
                 )?
-                .map(|declarer| declarer.get::<_, String>(0));
+                .iter()
+                .map(shared_body_row)
+                .collect::<Result<Vec<_>>>()?;
             Ok(Some(SharedBodyAccess {
-                declared_by_caller_owner: declarer.as_deref() == Some(who.owner.id.as_str()),
-                caller_owns_work: item.owner == who.owner.id,
-                row,
+                rows,
+                caller: who.owner.id,
             }))
+        })
+    }
+
+    fn shared_bodies_own(
+        &self,
+        token: &str,
+        work_id: &str,
+        digests: &[String],
+        now: i64,
+    ) -> Result<Option<Vec<SharedBodyRow>>> {
+        self.run(true, |client| {
+            let mut tx = client
+                .build_transaction()
+                .isolation_level(IsolationLevel::RepeatableRead)
+                .start()?;
+            let who = work_who(&mut tx, token, now)?;
+            if scoped_work(&mut tx, &who, work_id, now, false)?.is_none() {
+                return Ok(None);
+            }
+            let rows = tx
+                .query(
+                    &format!(
+                        "SELECT {SHARED_BODY_COLUMNS} FROM hub_change_shared_bodies
+                         WHERE work=$1 AND author=$2 AND digest = ANY($3)"
+                    ),
+                    &[&work_id, &who.owner.id, &digests],
+                )?
+                .iter()
+                .map(shared_body_row)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Some(rows))
         })
     }
 
@@ -5882,8 +5908,9 @@ impl Store for PgStore {
         token: &str,
         work_id: &str,
         cursor: Option<&str>,
+        all_authors: bool,
         now: i64,
-    ) -> Result<Option<SharedConversationRead>> {
+    ) -> Result<Option<Vec<ConversationEntryV1>>> {
         let after = cursor.map(parse_conversation_cursor).transpose()?;
         self.run(true, |client| {
             let mut tx = client
@@ -5891,9 +5918,9 @@ impl Store for PgStore {
                 .isolation_level(IsolationLevel::RepeatableRead)
                 .start()?;
             let who = work_who(&mut tx, token, now)?;
-            let Some(item) = scoped_work(&mut tx, &who, work_id, now, false)? else {
+            if scoped_work(&mut tx, &who, work_id, now, false)?.is_none() {
                 return Ok(None);
-            };
+            }
             let rows = tx.query(
                 &format!(
                     "WITH page AS (
@@ -5901,6 +5928,7 @@ impl Store for PgStore {
                          WHERE work=$1 AND ($2::text IS NULL
                            OR (session_id COLLATE \"C\",sequence,digest COLLATE \"C\")
                               > ($2::text COLLATE \"C\",$3::bigint,$4::text COLLATE \"C\"))
+                           AND ($6::boolean OR author=$7)
                          ORDER BY session_id COLLATE \"C\",sequence,digest COLLATE \"C\" LIMIT $5)
                      SELECT page.*, e.event, e.observed_at FROM page
                      JOIN hub_change_events e ON e.work=page.work AND e.generation=page.generation
@@ -5913,22 +5941,21 @@ impl Store for PgStore {
                     &after.as_ref().map(|after| after.1 as i64),
                     &after.as_ref().map(|after| after.2.as_str()),
                     &(MAX_CONVERSATION_PAGE_ENTRIES as i64 + 1),
+                    &all_authors,
+                    &who.owner.id,
                 ],
             )?;
             let entries = rows
                 .iter()
                 .map(|row| {
                     shared_body_row(row)?.conversation_entry(
-                        &row.get::<_, String>(15),
-                        row.get::<_, i64>(16),
+                        &row.get::<_, String>(SHARED_BODY_COLUMN_COUNT),
+                        row.get::<_, i64>(SHARED_BODY_COLUMN_COUNT + 1),
                         now,
                     )
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok(Some(SharedConversationRead {
-                caller_owns_work: item.owner == who.owner.id,
-                entries,
-            }))
+            Ok(Some(entries))
         })
     }
 
@@ -5936,6 +5963,7 @@ impl Store for PgStore {
         &self,
         work_id: &str,
         digest: &str,
+        author: &str,
         now: i64,
         retention_seconds: i64,
     ) -> Result<Option<SharedBodyState>> {
@@ -5944,14 +5972,15 @@ impl Store for PgStore {
             let expires = now.saturating_add(retention_seconds);
             tx.execute(
                 "UPDATE hub_change_shared_bodies
-                 SET state='available', uploaded_at=$3, expires_at=$4
-                 WHERE work=$1 AND digest=$2 AND state='declared'",
-                &[&work_id, &digest, &now, &expires],
+                 SET state='available', uploaded_at=$4, expires_at=$5
+                 WHERE work=$1 AND digest=$2 AND author=$3 AND state='declared'",
+                &[&work_id, &digest, &author, &now, &expires],
             )?;
             let state = tx
                 .query_opt(
-                    "SELECT state FROM hub_change_shared_bodies WHERE work=$1 AND digest=$2",
-                    &[&work_id, &digest],
+                    "SELECT state FROM hub_change_shared_bodies
+                     WHERE work=$1 AND digest=$2 AND author=$3",
+                    &[&work_id, &digest, &author],
                 )?
                 .map(|row| SharedBodyState::parse(&row.get::<_, String>(0)))
                 .transpose()?;
@@ -5964,29 +5993,33 @@ impl Store for PgStore {
         &self,
         work_id: &str,
         digest: &str,
+        author: Option<&str>,
         actor: &str,
         now: i64,
-    ) -> Result<Option<SharedBodyState>> {
+    ) -> Result<Vec<SharedBodyRow>> {
         self.run(false, |client| {
             let mut tx = client.transaction()?;
-            let before = tx
-                .query_opt(
-                    "SELECT state FROM hub_change_shared_bodies
-                     WHERE work=$1 AND digest=$2 FOR UPDATE",
-                    &[&work_id, &digest],
+            tx.execute(
+                "UPDATE hub_change_shared_bodies
+                 SET state='deleted', deleted_at=$4, deleted_by=$5
+                 WHERE work=$1 AND digest=$2 AND ($3::text IS NULL OR author=$3)
+                   AND state<>'deleted'",
+                &[&work_id, &digest, &author, &now, &actor],
+            )?;
+            let rows = tx
+                .query(
+                    &format!(
+                        "SELECT {SHARED_BODY_COLUMNS} FROM hub_change_shared_bodies
+                         WHERE work=$1 AND digest=$2 AND ($3::text IS NULL OR author=$3)
+                         ORDER BY author"
+                    ),
+                    &[&work_id, &digest, &author],
                 )?
-                .map(|row| SharedBodyState::parse(&row.get::<_, String>(0)))
-                .transpose()?;
-            if before.is_some_and(|state| state != SharedBodyState::Deleted) {
-                tx.execute(
-                    "UPDATE hub_change_shared_bodies
-                     SET state='deleted', deleted_at=$3, deleted_by=$4
-                     WHERE work=$1 AND digest=$2",
-                    &[&work_id, &digest, &now, &actor],
-                )?;
-            }
+                .iter()
+                .map(shared_body_row)
+                .collect::<Result<Vec<_>>>()?;
             tx.commit()?;
-            Ok(before)
+            Ok(rows)
         })
     }
 
@@ -5998,11 +6031,12 @@ impl Store for PgStore {
                     &format!(
                         // MATERIALIZED: a semi-join over the subquery could ignore its LIMIT.
                         "WITH due AS MATERIALIZED (
-                             SELECT work AS w,digest AS d FROM hub_change_shared_bodies
+                             SELECT work AS w,digest AS d,author AS a FROM hub_change_shared_bodies
                              WHERE state='available' AND expires_at<=$1
-                             ORDER BY expires_at,work,digest LIMIT $2 FOR UPDATE SKIP LOCKED)
+                             ORDER BY expires_at,work,digest,author LIMIT $2
+                             FOR UPDATE SKIP LOCKED)
                          UPDATE hub_change_shared_bodies b SET state='expired'
-                         FROM due WHERE b.work=due.w AND b.digest=due.d
+                         FROM due WHERE b.work=due.w AND b.digest=due.d AND b.author=due.a
                          RETURNING {SHARED_BODY_COLUMNS}"
                     ),
                     &[&now, &limit],
@@ -6013,7 +6047,11 @@ impl Store for PgStore {
         })
     }
 
-    fn shared_bodies_pending_physical_delete(&self, limit: usize) -> Result<Vec<SharedBodyRow>> {
+    fn shared_bodies_pending_physical_delete(
+        &self,
+        now: i64,
+        limit: usize,
+    ) -> Result<Vec<SharedBodyRow>> {
         self.run(true, |client| {
             let limit = limit as i64;
             client
@@ -6021,9 +6059,10 @@ impl Store for PgStore {
                     &format!(
                         "SELECT {SHARED_BODY_COLUMNS} FROM hub_change_shared_bodies
                          WHERE state IN ('expired','deleted') AND physical_deleted_at IS NULL
-                         ORDER BY work,digest LIMIT $1"
+                           AND (next_delete_at IS NULL OR next_delete_at<=$1)
+                         ORDER BY COALESCE(deleted_at,expires_at),work,digest,author LIMIT $2"
                     ),
-                    &[&limit],
+                    &[&now, &limit],
                 )?
                 .iter()
                 .map(shared_body_row)
@@ -6031,18 +6070,49 @@ impl Store for PgStore {
         })
     }
 
+    fn shared_body_object_in_use(&self, work_id: &str, digest: &str) -> Result<bool> {
+        self.run(true, |client| {
+            Ok(client
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM hub_change_shared_bodies
+                     WHERE work=$1 AND digest=$2 AND state IN ('declared','available'))",
+                    &[&work_id, &digest],
+                )?
+                .get(0))
+        })
+    }
+
     fn shared_body_mark_physically_deleted(
         &self,
         work_id: &str,
         digest: &str,
+        author: &str,
         now: i64,
     ) -> Result<()> {
         self.run(false, |client| {
             client.execute(
-                "UPDATE hub_change_shared_bodies SET physical_deleted_at=$3
-                 WHERE work=$1 AND digest=$2 AND state IN ('expired','deleted')
+                "UPDATE hub_change_shared_bodies SET physical_deleted_at=$4, next_delete_at=NULL
+                 WHERE work=$1 AND digest=$2 AND author=$3 AND state IN ('expired','deleted')
                    AND physical_deleted_at IS NULL",
-                &[&work_id, &digest, &now],
+                &[&work_id, &digest, &author, &now],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn shared_body_delete_failed(
+        &self,
+        work_id: &str,
+        digest: &str,
+        author: &str,
+        retry_at: i64,
+    ) -> Result<()> {
+        self.run(false, |client| {
+            client.execute(
+                "UPDATE hub_change_shared_bodies
+                 SET physical_deleted_at=NULL, delete_attempts=delete_attempts+1, next_delete_at=$4
+                 WHERE work=$1 AND digest=$2 AND author=$3 AND state IN ('expired','deleted')",
+                &[&work_id, &digest, &author, &retry_at],
             )?;
             Ok(())
         })

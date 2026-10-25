@@ -547,7 +547,7 @@ export function fetchConversationPage(repo: string, workId: string, token: strin
 
 /**
  * One body, pretty-printed for display as text. It is untrusted agent content: never render it as markup.
- * Errors carry the HTTP status: 403 not the owner or an admin, 404 unknown, 410 expired or deleted,
+ * Errors carry the HTTP status: 403 not the author or an admin, 404 unknown, 410 expired or deleted,
  * 424 the stored body is missing or failed verification.
  */
 export async function fetchConversationBody(repo: string, workId: string, digestValue: string, token: string, signal: AbortSignal): Promise<string> {

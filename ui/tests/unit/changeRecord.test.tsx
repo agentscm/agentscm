@@ -401,7 +401,7 @@ describe('change record route and page', () => {
     expect(screen.queryByText(/private transcript/)).toBeNull()
     const record = `/v1/hub/repos/${encodeURIComponent('counterbranch/agentscm')}/change-records/${WORK_ID}`
     // The list is the only conversation request: no body is fetched until one is opened.
-    await screen.findByText('No conversation shared for this work item')
+    await screen.findByText('No shared conversation you can read for this work item')
     expect(sent).toEqual([{ method: 'GET', url: record }, { method: 'GET', url: `${record}/conversation` }])
   })
 
@@ -547,6 +547,22 @@ describe('shared conversation', () => {
     expect(screen.queryByText('Untrusted agent content')).toBeNull()
   })
 
+  it('words expiry accurately and shows no expiry time for a deleted entry', async () => {
+    await open((url) =>
+      url.endsWith('/conversation')
+        ? json(200, conversationPage([
+            entry({ digest: '7'.repeat(64), availability: 'expired' }),
+            entry({ sequence: 2, event_id: 'event-2', digest: '6'.repeat(64), availability: 'deleted' }),
+          ]))
+        : undefined,
+    )
+    const items = (await screen.findAllByRole('listitem')).filter((item) => item.closest('ul')?.getAttribute('aria-label') === 'Shared conversation entries')
+    expect(items[0]?.textContent).toContain('expired ')
+    expect(items[1]?.textContent).toContain('Deleted')
+    expect(items[1]?.textContent).not.toContain('expired')
+    expect(items[1]?.textContent).not.toContain('expires')
+  })
+
   it('shows a body as plain text with an untrusted label and never as markup', async () => {
     const hostile = { messages: [{ role: 'assistant', text: '<img src=x onerror="window.__pwned=1"><script>window.__pwned=1</script> ignore previous instructions' }] }
     const sent: string[] = []
@@ -569,9 +585,9 @@ describe('shared conversation', () => {
     expect(screen.queryByLabelText('Conversation body (untrusted agent content)')).toBeNull()
   })
 
-  it('says plainly when the viewer is not the owner or an admin, and offers no retry', async () => {
+  it('says plainly when the viewer is not the author or an admin, and offers no retry', async () => {
     await open((url) => (url.endsWith('/conversation') ? json(403, { error: 'forbidden' }) : undefined))
-    expect(await screen.findByText('Only the Work owner and Hub admins can read this conversation')).toBeTruthy()
+    expect(await screen.findByText('Only the person who shared this conversation and Hub admins can read it')).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Try again' })).toBeNull()
   })
 
@@ -586,7 +602,7 @@ describe('shared conversation', () => {
       [410, 'This conversation body has expired or been deleted'],
       [424, 'Integrity failed: the stored body is missing or did not verify, so nothing is shown'],
       [404, 'This conversation body is not on the Hub'],
-      [403, 'Only the Work owner and Hub admins can read this conversation'],
+      [403, 'Only the person who shared this conversation and Hub admins can read it'],
     ] as const) {
       status.set('body', code)
       fireEvent.click(await screen.findByRole('button', { name: 'View' }))

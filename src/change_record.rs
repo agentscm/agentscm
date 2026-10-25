@@ -20,6 +20,8 @@ pub const MAX_PROJECTED_SESSION_SETUPS: usize = 16;
 /// Largest redacted conversation body that may be retained as `SharedApproved`.
 pub const MAX_SHARED_BODY_BYTES: u64 = 1024 * 1024;
 pub const MAX_CONVERSATION_PAGE_ENTRIES: usize = 100;
+/// Digests one `conversation/missing` preflight may ask about.
+pub const MAX_CONVERSATION_MISSING_DIGESTS: usize = 100;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -33,7 +35,7 @@ pub enum AgentHarnessV1 {
 pub enum CaptureModeV1 {
     MetadataOnly,
     LocalConversation,
-    /// Redacted conversation bodies may be uploaded to the Hub for the Work owner.
+    /// Redacted conversation bodies may be uploaded to the Hub for the person who shares them and Hub admins.
     SharedConversation,
 }
 
@@ -726,6 +728,23 @@ pub fn parse_conversation_cursor(cursor: &str) -> Result<(String, u64, String)> 
         }
         _ => Err(invalid("malformed cursor")),
     }
+}
+
+/// Body of `POST .../conversation/missing`: lower-hex digests the caller declared.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConversationMissingRequestV1 {
+    pub digests: Vec<String>,
+}
+
+/// Which asked digests need an upload (`missing`, declared by the caller and not yet uploaded)
+/// and which can no longer be uploaded (`gone`: undeclared by the caller, expired or deleted).
+/// Digests already available are in neither.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConversationMissingV1 {
+    pub missing: Vec<String>,
+    pub gone: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

@@ -12,8 +12,9 @@ use crate::change_record::{
 use super::work::{Checkpoint, SourceRef, WorkItem};
 use super::{HubError, Result};
 
-/// Lifecycle of one shared-conversation body, keyed by (work, digest). `Declared` means an
-/// accepted event named the body but no bytes were uploaded; only `Available` rows have an object.
+/// Lifecycle of one shared-conversation body declaration, keyed by (work, digest, author).
+/// `Declared` means an accepted event named the body but its author uploaded no bytes. The object
+/// is shared by every author's row for the same digest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SharedBodyState {
     Declared,
@@ -49,6 +50,8 @@ impl SharedBodyState {
 pub struct SharedBodyRow {
     pub work: String,
     pub digest: String,
+    /// The human user whose token declared the body; only they and Hub admins may read or delete it.
+    pub author: String,
     pub size_bytes: u64,
     pub session_id: String,
     pub generation: i64,
@@ -62,6 +65,8 @@ pub struct SharedBodyRow {
     pub deleted_at: Option<i64>,
     pub deleted_by: Option<String>,
     pub physical_deleted_at: Option<i64>,
+    /// Failed object removals so far; drives the sweep's retry backoff.
+    pub delete_attempts: i64,
 }
 
 impl SharedBodyRow {
@@ -110,34 +115,42 @@ impl SharedBodyRow {
     }
 }
 
-/// The one read rule for shared conversation bodies and their listing: the Work's human owner
-/// (through any of that owner's tokens for the repository) and Hub admins. Every HTTP and MCP
-/// read goes through this.
-pub fn conversation_readable(caller_owns_work: bool, admin: bool) -> bool {
-    caller_owns_work || admin
+/// The one access rule for shared conversation bodies and their listing, for reading and
+/// deleting alike: the human who declared the body (through any of their tokens) and Hub admins.
+/// The Work owner has no access of their own. Every HTTP and MCP path goes through this; the
+/// listing applies it in the store query.
+pub fn conversation_readable(author: &str, caller: &str, admin: bool) -> bool {
+    admin || author == caller
 }
 
-/// One page of a Work's shared-conversation listing, read with one row beyond the page limit.
+/// Every declaration of one digest in a Work, with who is asking.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SharedConversationRead {
-    pub caller_owns_work: bool,
-    pub entries: Vec<ConversationEntryV1>,
+pub struct SharedBodyAccess {
+    pub rows: Vec<SharedBodyRow>,
+    /// The caller's human owner.
+    pub caller: String,
 }
 
 impl SharedBodyAccess {
-    pub fn readable(&self, admin: bool) -> bool {
-        conversation_readable(self.caller_owns_work, admin)
+    /// The caller's own declaration, whatever its state.
+    pub fn own(&self) -> Option<&SharedBodyRow> {
+        self.rows.iter().find(|row| row.author == self.caller)
     }
-}
 
-/// A body row with what the calling token's human owner may do to it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SharedBodyAccess {
-    pub row: SharedBodyRow,
-    /// The caller's token, or a token of the same human owner, declared the body.
-    pub declared_by_caller_owner: bool,
-    /// The caller's human owner owns the Work.
-    pub caller_owns_work: bool,
+    /// The declaration a read or delete acts on: the caller's own, else for an admin the first
+    /// that is still available. `None` means the caller may not act, whether or not the digest
+    /// exists.
+    pub fn accessible(&self, admin: bool, now: i64) -> Option<&SharedBodyRow> {
+        self.rows
+            .iter()
+            .filter(|row| conversation_readable(&row.author, &self.caller, admin))
+            .min_by_key(|row| {
+                (
+                    row.author != self.caller,
+                    row.state_at(now) != SharedBodyState::Available,
+                )
+            })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -432,11 +445,11 @@ fn aggregate_availability(
 mod tests {
     use super::*;
 
-    #[test]
-    fn available_bodies_expire_at_their_deadline_before_any_sweep() {
-        let mut row = SharedBodyRow {
+    fn row(author: &str, state: SharedBodyState) -> SharedBodyRow {
+        SharedBodyRow {
             work: "w".into(),
             digest: "0".repeat(64),
+            author: author.into(),
             size_bytes: 1,
             session_id: "s".into(),
             generation: 1,
@@ -444,13 +457,51 @@ mod tests {
             sequence: 1,
             declared_token: "t".into(),
             declared_at: 1,
-            state: SharedBodyState::Available,
+            state,
             uploaded_at: Some(1),
             expires_at: Some(10),
             deleted_at: None,
             deleted_by: None,
             physical_deleted_at: None,
+            delete_attempts: 0,
+        }
+    }
+
+    #[test]
+    fn only_the_author_and_admins_may_act_and_an_admin_prefers_a_live_copy() {
+        assert!(conversation_readable("a", "a", false));
+        assert!(!conversation_readable("a", "b", false));
+        assert!(conversation_readable("a", "b", true));
+        let access = SharedBodyAccess {
+            rows: vec![
+                row("a", SharedBodyState::Deleted),
+                row("b", SharedBodyState::Available),
+            ],
+            caller: "c".into(),
         };
+        assert!(access.own().is_none() && access.accessible(false, 0).is_none());
+        assert_eq!(access.accessible(true, 0).unwrap().author, "b");
+        // Past its deadline the available copy is no better than the deleted one.
+        assert_eq!(access.accessible(true, 10).unwrap().author, "a");
+        let access = SharedBodyAccess {
+            caller: "a".into(),
+            ..access
+        };
+        assert_eq!(access.accessible(false, 0).unwrap().author, "a");
+        assert_eq!(access.accessible(true, 0).unwrap().author, "a");
+        assert!(
+            SharedBodyAccess {
+                rows: vec![],
+                caller: "a".into()
+            }
+            .accessible(true, 0)
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn available_bodies_expire_at_their_deadline_before_any_sweep() {
+        let mut row = row("a", SharedBodyState::Available);
         assert_eq!(row.state_at(9), SharedBodyState::Available);
         assert_eq!(row.state_at(10), SharedBodyState::Expired);
         row.state = SharedBodyState::Deleted;

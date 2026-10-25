@@ -985,20 +985,30 @@ fn shared_body_lifecycle(db: &Db) {
         .shared_body_lookup(&token, &work_id, &digest, now)
         .unwrap()
         .unwrap();
-    assert_eq!(access.row.state, SharedBodyState::Declared);
-    assert_eq!((access.row.size_bytes, access.row.sequence), (7, 1));
-    assert_eq!(access.row.declared_at, now);
-    assert!(access.declared_by_caller_owner && access.caller_owns_work);
+    let owner = access.caller.clone();
+    let row = access.own().unwrap();
+    assert_eq!(row.state, SharedBodyState::Declared);
+    assert_eq!((row.size_bytes, row.sequence), (7, 1));
+    assert_eq!(
+        (row.declared_at, row.author.as_str()),
+        (now, owner.as_str())
+    );
+    // Another human sees the declaration exists but has none of their own.
     let other = store
         .shared_body_lookup(&stranger_token, &work_id, &digest, now)
         .unwrap()
         .unwrap();
-    assert!(!other.declared_by_caller_owner && !other.caller_owns_work);
+    assert_eq!(other.caller, stranger.id);
+    assert!(other.own().is_none() && other.accessible(false, now).is_none());
+    assert_eq!(other.rows.len(), 1);
+    // An undeclared digest has no rows, which is not the same as an unknown Work.
     assert!(
         store
             .shared_body_lookup(&token, &work_id, &sha256_hex(b"nothing"), now)
             .unwrap()
-            .is_none()
+            .unwrap()
+            .rows
+            .is_empty()
     );
     assert!(
         store
@@ -1027,7 +1037,9 @@ fn shared_body_lifecycle(db: &Db) {
         .shared_body_lookup(&token, &work_id, &digest, now)
         .unwrap()
         .unwrap()
-        .row;
+        .own()
+        .unwrap()
+        .clone();
     assert_eq!(
         (unchanged.event_id.as_str(), unchanged.declared_at),
         ("shared-event-one", now)
@@ -1052,25 +1064,27 @@ fn shared_body_lifecycle(db: &Db) {
 
     assert_eq!(
         store
-            .shared_body_mark_available("work_unknown", &digest, now, 100)
+            .shared_body_mark_available("work_unknown", &digest, &owner, now, 100)
             .unwrap(),
         None
     );
     assert_eq!(
         store
-            .shared_body_mark_available(&work_id, &digest, now + 10, 100)
+            .shared_body_mark_available(&work_id, &digest, &owner, now + 10, 100)
             .unwrap(),
         Some(SharedBodyState::Available)
     );
     // A second upload does not extend the retention.
     store
-        .shared_body_mark_available(&work_id, &digest, now + 50, 100)
+        .shared_body_mark_available(&work_id, &digest, &owner, now + 50, 100)
         .unwrap();
     let row = store
         .shared_body_lookup(&token, &work_id, &digest, now)
         .unwrap()
         .unwrap()
-        .row;
+        .own()
+        .unwrap()
+        .clone();
     assert_eq!(
         (row.uploaded_at, row.expires_at),
         (Some(now + 10), Some(now + 110))
@@ -1086,7 +1100,7 @@ fn shared_body_lifecycle(db: &Db) {
     );
     assert!(
         store
-            .shared_bodies_pending_physical_delete(10)
+            .shared_bodies_pending_physical_delete(now + 999, 10)
             .unwrap()
             .is_empty()
     );
@@ -1104,51 +1118,52 @@ fn shared_body_lifecycle(db: &Db) {
     );
     assert_eq!(
         store
-            .shared_body_mark_available(&work_id, &digest, now + 120, 100)
+            .shared_body_mark_available(&work_id, &digest, &owner, now + 120, 100)
             .unwrap(),
         Some(SharedBodyState::Expired)
     );
     assert_eq!(
         store
-            .shared_bodies_pending_physical_delete(10)
+            .shared_bodies_pending_physical_delete(now + 999, 10)
             .unwrap()
             .len(),
         1
     );
     store
-        .shared_body_mark_physically_deleted(&work_id, &digest, now + 130)
+        .shared_body_mark_physically_deleted(&work_id, &digest, &owner, now + 130)
         .unwrap();
     assert!(
         store
-            .shared_bodies_pending_physical_delete(10)
+            .shared_bodies_pending_physical_delete(now + 999, 10)
             .unwrap()
             .is_empty()
     );
 
     // A tombstone replaces expiry, keeps the first physical-removal time, and is final.
+    let tombstoned = store
+        .shared_body_tombstone(&work_id, &digest, Some(&owner), &stranger.id, now + 140)
+        .unwrap();
     assert_eq!(
-        store
-            .shared_body_tombstone(&work_id, &digest, &stranger.id, now + 140)
-            .unwrap(),
-        Some(SharedBodyState::Expired)
+        tombstoned.iter().map(|row| row.state).collect::<Vec<_>>(),
+        [SharedBodyState::Deleted]
     );
-    assert_eq!(
+    let again = store
+        .shared_body_tombstone(&work_id, &digest, None, "usr_later", now + 150)
+        .unwrap();
+    assert_eq!(again[0].deleted_by.as_deref(), Some(stranger.id.as_str()));
+    assert!(
         store
-            .shared_body_tombstone(&work_id, &digest, "usr_later", now + 150)
-            .unwrap(),
-        Some(SharedBodyState::Deleted)
-    );
-    assert_eq!(
-        store
-            .shared_body_tombstone(&work_id, &sha256_hex(b"x"), "usr_x", now)
-            .unwrap(),
-        None
+            .shared_body_tombstone(&work_id, &sha256_hex(b"x"), None, "usr_x", now)
+            .unwrap()
+            .is_empty()
     );
     let row = store
         .shared_body_lookup(&token, &work_id, &digest, now)
         .unwrap()
         .unwrap()
-        .row;
+        .own()
+        .unwrap()
+        .clone();
     assert_eq!(row.state, SharedBodyState::Deleted);
     assert_eq!(
         (row.deleted_at, row.deleted_by.as_deref()),
@@ -1157,7 +1172,7 @@ fn shared_body_lifecycle(db: &Db) {
     assert_eq!(row.physical_deleted_at, Some(now + 130));
     assert_eq!(
         store
-            .shared_body_mark_available(&work_id, &digest, now + 160, 100)
+            .shared_body_mark_available(&work_id, &digest, &owner, now + 160, 100)
             .unwrap(),
         Some(SharedBodyState::Deleted)
     );
@@ -1173,21 +1188,21 @@ fn shared_body_lifecycle(db: &Db) {
             )
             .unwrap();
         store
-            .shared_body_mark_available(&work_id, &sha256_hex(body), now + 200, 10)
+            .shared_body_mark_available(&work_id, &sha256_hex(body), &owner, now + 200, 10)
             .unwrap();
     }
     assert_eq!(store.shared_bodies_expire(now + 300, 1).unwrap().len(), 1);
     assert_eq!(store.shared_bodies_expire(now + 300, 5).unwrap().len(), 1);
     assert_eq!(
         store
-            .shared_bodies_pending_physical_delete(1)
+            .shared_bodies_pending_physical_delete(now + 999, 1)
             .unwrap()
             .len(),
         1
     );
     assert_eq!(
         store
-            .shared_bodies_pending_physical_delete(5)
+            .shared_bodies_pending_physical_delete(now + 999, 5)
             .unwrap()
             .len(),
         2
@@ -1252,12 +1267,10 @@ fn shared_conversation_listing(db: &Db) {
     }
 
     let page = store
-        .shared_conversation_page(&token, &work_id, None, now)
+        .shared_conversation_page(&token, &work_id, None, false, now)
         .unwrap()
         .unwrap();
-    assert!(page.caller_owns_work);
     let order: Vec<(&str, u64)> = page
-        .entries
         .iter()
         .map(|entry| (entry.session_id.as_str(), entry.sequence))
         .collect();
@@ -1270,7 +1283,7 @@ fn shared_conversation_listing(db: &Db) {
             ("session-1", 1)
         ]
     );
-    let first = &page.entries[0];
+    let first = &page[0];
     assert_eq!(first.digest, sha256_hex(&bodies[2]));
     assert_eq!(first.event_id, "B-session-1");
     assert_eq!(
@@ -1283,34 +1296,37 @@ fn shared_conversation_listing(db: &Db) {
         (CapturedEventKindV1::AssistantMessage, 502, 7, None)
     );
     assert!(
-        page.entries
-            .iter()
+        page.iter()
             .all(|entry| entry.availability == ContentAvailabilityV1::Local)
     );
 
     // A cursor continues strictly after its entry, for a position that no longer needs to exist.
-    for (index, entry) in page.entries.iter().enumerate() {
+    for (index, entry) in page.iter().enumerate() {
         let rest = store
-            .shared_conversation_page(&token, &work_id, Some(&entry.cursor()), now)
+            .shared_conversation_page(&token, &work_id, Some(&entry.cursor()), false, now)
             .unwrap()
             .unwrap();
-        assert_eq!(rest.entries, page.entries[index + 1..], "{index}");
+        assert_eq!(rest, page[index + 1..], "{index}");
     }
 
     // Availability follows the row, and an available body is expired from its deadline.
     let digest = sha256_hex(&bodies[2]);
+    let owner = store
+        .shared_body_lookup(&token, &work_id, &digest, now)
+        .unwrap()
+        .unwrap()
+        .caller;
     store
-        .shared_body_mark_available(&work_id, &digest, now, 100)
+        .shared_body_mark_available(&work_id, &digest, &owner, now, 100)
         .unwrap();
     store
-        .shared_body_tombstone(&work_id, &sha256_hex(&bodies[1]), &stranger.id, now)
+        .shared_body_tombstone(&work_id, &sha256_hex(&bodies[1]), None, &stranger.id, now)
         .unwrap();
     let states = |at: i64| -> Vec<ContentAvailabilityV1> {
         store
-            .shared_conversation_page(&token, &work_id, None, at)
+            .shared_conversation_page(&token, &work_id, None, false, at)
             .unwrap()
             .unwrap()
-            .entries
             .iter()
             .map(|entry| entry.availability)
             .collect()
@@ -1320,29 +1336,38 @@ fn shared_conversation_listing(db: &Db) {
     assert_eq!(states(now + 100), [Expired, Local, Deleted, Local]);
     assert_eq!(
         store
-            .shared_conversation_page(&token, &work_id, None, now)
+            .shared_conversation_page(&token, &work_id, None, false, now)
             .unwrap()
-            .unwrap()
-            .entries[0]
+            .unwrap()[0]
             .expires_at,
         Some(now + 100)
     );
 
-    // Who asks is reported, not enforced here; an unknown Work is absent; bad cursors fail.
-    let other = store
-        .shared_conversation_page(&stranger_token, &work_id, None, now)
-        .unwrap()
-        .unwrap();
-    assert!(!other.caller_owns_work);
+    // Another human sees none of these unless the caller is an admin; an unknown Work is
+    // absent; bad cursors fail.
+    let other = |all_authors: bool| {
+        store
+            .shared_conversation_page(&stranger_token, &work_id, None, all_authors, now)
+            .unwrap()
+            .unwrap()
+    };
+    assert!(other(false).is_empty());
+    assert_eq!(
+        other(true)
+            .iter()
+            .map(|entry| entry.cursor())
+            .collect::<Vec<_>>(),
+        page.iter().map(|entry| entry.cursor()).collect::<Vec<_>>()
+    );
     assert!(
         store
-            .shared_conversation_page(&token, "work_unknown", None, now)
+            .shared_conversation_page(&token, "work_unknown", None, false, now)
             .unwrap()
             .is_none()
     );
     assert!(
         store
-            .shared_conversation_page(&token, &work_id, Some("garbage"), now)
+            .shared_conversation_page(&token, &work_id, Some("garbage"), false, now)
             .is_err()
     );
 }
@@ -1356,5 +1381,138 @@ fn sqlite_shared_conversation_listing() {
 fn postgres_shared_conversation_listing() {
     if let Some(db) = Db::postgres() {
         shared_conversation_listing(&db);
+    }
+}
+
+fn shared_bodies_are_rows_per_author(db: &Db) {
+    let (store, token, work_id, generation) = setup(db);
+    let helper = store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: "github.com".into(),
+                user_id: 44,
+            },
+            "helper",
+        )
+        .unwrap();
+    let (helper_token, _) = mint_agent_token(&*store, &helper.id, "other", REPO, 3600).unwrap();
+    join_session(&*store, &helper_token, &work_id, "helper-session");
+    let now = unix_now();
+    let body = b"{\"same\":1}".as_slice();
+    let digest = sha256_hex(body);
+    store
+        .change_ingest(
+            &token,
+            &shared_batch(&work_id, generation, "own", 1, body, 10),
+            now,
+        )
+        .unwrap();
+    // The helper declares the identical body from their own session without colliding.
+    let mut theirs = shared_batch(&work_id, generation, "theirs", 1, body, 10);
+    theirs.session.session_id = "helper-session".into();
+    store.change_ingest(&helper_token, &theirs, now).unwrap();
+    // A different size for the same digest is refused whoever declares it.
+    let mut wrong = shared_batch(&work_id, generation, "wrong", 2, body, 11);
+    wrong.session.session_id = "helper-session".into();
+    assert!(matches!(
+        store.change_ingest(&helper_token, &wrong, now),
+        Err(agentscm::hub::HubError::Invalid(_))
+    ));
+
+    let access = store
+        .shared_body_lookup(&helper_token, &work_id, &digest, now)
+        .unwrap()
+        .unwrap();
+    assert_eq!(access.rows.len(), 2);
+    assert_eq!(access.own().unwrap().author, helper.id);
+    let owner = access
+        .rows
+        .iter()
+        .find(|row| row.author != helper.id)
+        .unwrap()
+        .author
+        .clone();
+    let own = |who: &str, at: &[String]| {
+        store
+            .shared_bodies_own(who, &work_id, at, now)
+            .unwrap()
+            .unwrap()
+    };
+    let asked = [digest.clone(), sha256_hex(b"nothing")];
+    assert_eq!(own(&helper_token, &asked).len(), 1);
+    assert_eq!(own(&helper_token, &asked)[0].author, helper.id);
+    assert_eq!(own(&token, &asked)[0].author, owner);
+    assert!(
+        store
+            .shared_bodies_own(&token, "work_unknown", &asked, now)
+            .unwrap()
+            .is_none()
+    );
+
+    // The listing is the caller's own entries, or every author's for an admin.
+    let listed = |who: &str, all: bool| {
+        store
+            .shared_conversation_page(who, &work_id, None, all, now)
+            .unwrap()
+            .unwrap()
+            .len()
+    };
+    assert_eq!(
+        (listed(&token, false), listed(&helper_token, false)),
+        (1, 1)
+    );
+    assert_eq!(listed(&token, true), 2);
+
+    // The object is needed while any declaration is declared or available.
+    assert!(store.shared_body_object_in_use(&work_id, &digest).unwrap());
+    store
+        .shared_body_mark_available(&work_id, &digest, &owner, now, 100)
+        .unwrap();
+    let deleted = store
+        .shared_body_tombstone(&work_id, &digest, Some(&helper.id), &helper.id, now)
+        .unwrap();
+    assert_eq!(deleted.len(), 1);
+    assert!(store.shared_body_object_in_use(&work_id, &digest).unwrap());
+    store
+        .shared_body_tombstone(&work_id, &digest, Some(&owner), &owner, now)
+        .unwrap();
+    assert!(!store.shared_body_object_in_use(&work_id, &digest).unwrap());
+
+    // A failed removal backs off, is visible again at its retry time, and bookkeeping is per row.
+    let pending = |at: i64| store.shared_bodies_pending_physical_delete(at, 10).unwrap();
+    assert_eq!(pending(now).len(), 2);
+    store
+        .shared_body_delete_failed(&work_id, &digest, &owner, now + 50)
+        .unwrap();
+    assert_eq!(pending(now + 49).len(), 1);
+    assert_eq!(pending(now + 50).len(), 2);
+    assert_eq!(
+        pending(now + 50)
+            .iter()
+            .map(|row| row.delete_attempts)
+            .max(),
+        Some(1)
+    );
+    store
+        .shared_body_mark_physically_deleted(&work_id, &digest, &owner, now + 60)
+        .unwrap();
+    assert_eq!(pending(now + 99).len(), 1);
+    // A failure after a recorded removal makes the row pending again.
+    store
+        .shared_body_delete_failed(&work_id, &digest, &owner, now + 70)
+        .unwrap();
+    assert_eq!(pending(now + 70).len(), 2);
+}
+
+#[test]
+fn sqlite_shared_bodies_are_rows_per_author() {
+    shared_bodies_are_rows_per_author(&Db::sqlite());
+}
+
+#[test]
+fn postgres_shared_bodies_are_rows_per_author() {
+    if let Some(db) = Db::postgres() {
+        shared_bodies_are_rows_per_author(&db);
     }
 }

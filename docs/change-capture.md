@@ -130,9 +130,13 @@ What leaves the machine, and when:
   uploaded. A transient failure leaves the envelope pending for the next hook, and a body that
   never uploads stays declared on the Hub as `local`. Hooks stay fail-open.
 
-Who can read a shared body: the human owner of the Work (any of that owner's tokens for the
-repository, read-only tokens included) and Hub admins. Every other repository token gets 403.
-There is no per-body grant, and bodies are never included in the change-record projection or handoff.
+Who can read or delete a shared body: the human who shared it (any of that person's tokens for the
+repository; read-only tokens may read but not delete) and Hub admins. The owner of the Work has no
+access to a helper's or reviewer's shared bodies unless they shared them. Each human's declaration of
+a body is its own row, so two people sharing identical content each read and delete their own. A
+listing shows a caller only their own entries (an admin sees all); a body request from anyone else
+gets 403, whether or not that digest exists. There is no per-body grant, and bodies are never included
+in the change-record projection or handoff.
 Read them with `agentscm change-capture conversation`:
 
 ```text
@@ -148,9 +152,14 @@ status codes are in [shared conversation reads](hub.md#shared-conversation-reads
 
 The Hub keeps an uploaded body for 30 days by default; the operator changes this with
 `hub serve --shared-conversation-retention-days N` (1 to 3650). The deadline is set when the body
-is uploaded. An hourly sweep expires due bodies and deletes their objects. The Work owner or a Hub
-admin can delete a body earlier with `--delete` or the HTTP `DELETE` route; deletion records a
-tombstone and then removes the object, so a deleted or expired body answers 410.
+is uploaded. A sweep every ten minutes expires due bodies and deletes their objects, in batches of
+100 until none are due or 30 seconds are spent (the rest waits for the next pass); an object whose
+removal fails is retried after 1 hour, doubling to at most a day, without holding up others. The author
+or a Hub admin can delete a body earlier with `--delete` or the HTTP `DELETE` route (an admin deletes
+every author's copy); deletion records a tombstone and then removes the object, so a deleted or
+expired body answers 410. When two people shared identical content the stored object is removed
+only once no other copy of it is declared or available, so an author who declared but never uploaded
+keeps it from being removed.
 
 Turning sharing off does not recall anything: copies already uploaded stay until they expire or
 are deleted. AgentSCM never deletes the local spool copy. Backups, exports or copies a reader

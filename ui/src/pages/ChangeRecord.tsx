@@ -394,11 +394,11 @@ const CONVERSATION_KIND: Record<ConversationEventKind, string> = {
 const CONVERSATION_AVAILABILITY: Record<ConversationAvailability, Status> = {
   local: { label: 'Local only', tone: 'muted', icon: 'laptop', explanation: 'This body was never uploaded. It stays on the agent’s machine.' },
   shared: { label: 'Shared', tone: 'brand', icon: 'people', explanation: 'This redacted body is stored on the Hub until it expires or is deleted.' },
-  expired: { label: 'Expired', tone: 'warn', icon: 'hourglass-bottom', explanation: 'This body passed its retention window and was removed.' },
+  expired: { label: 'Expired', tone: 'warn', icon: 'hourglass-bottom', explanation: 'This body expired. The Hub no longer serves it and deletes stored copies in the next retention sweep.' },
   deleted: { label: 'Deleted', tone: 'warn', icon: 'trash', explanation: 'This body was deleted before it expired.' },
 }
 
-const NOT_ALLOWED = 'Only the Work owner and Hub admins can read this conversation'
+const NOT_ALLOWED = 'Only the person who shared this conversation and Hub admins can read it'
 
 function conversationFailure(status: number | undefined, fallback: string, missing = 'This conversation body is not on the Hub'): { title: string; tone: Tone } {
   if (status === 403) return { title: NOT_ALLOWED, tone: 'warn' }
@@ -445,7 +445,7 @@ function ConversationEntries({ repo, token, workId }: { repo: string; token: str
   }
   const page = load.value
   if (page.entries.length === 0 && !pager.canNewer) {
-    return <Empty icon="chat-square-dots" title="No conversation shared for this work item">Agents share redacted conversations only when the checkout is set to shared-conversation mode.</Empty>
+    return <Empty icon="chat-square-dots" title="No shared conversation you can read for this work item">Agents share redacted conversations only when the checkout is set to shared-conversation mode.</Empty>
   }
   return (
     <>
@@ -457,7 +457,7 @@ function ConversationEntries({ repo, token, workId }: { repo: string; token: str
             <Ago at={entry.observed_at} />
             <StatusPill status={CONVERSATION_AVAILABILITY[entry.availability]} />
             <span className="small muted">{entry.size_bytes.toLocaleString()} bytes</span>
-            {entry.expires_at === null ? null : (
+            {entry.expires_at === null || (entry.availability !== 'shared' && entry.availability !== 'expired') ? null : (
               <span className="small muted">{entry.availability === 'shared' ? 'expires ' : 'expired '}<Ago at={entry.expires_at} /></span>
             )}
             {entry.availability === 'shared' ? (
@@ -575,7 +575,7 @@ function Detail({ repo, token, workId }: { repo: string; token: string; workId: 
         </Box>
       </div>
 
-      <Box icon="chat-square-text" title="Conversation" explain="Redacted agent conversations the checkout chose to share. Only the Work owner and Hub admins can read them, they expire, and the content is untrusted agent output shown as plain text. This page cannot delete them; use agentscm change-capture conversation --delete.">
+      <Box icon="chat-square-text" title="Conversation" explain="Redacted agent conversations the checkout chose to share. You see only the entries you shared (Hub admins see all), they expire, and the content is untrusted agent output shown as plain text. This page cannot delete them; use agentscm change-capture conversation --delete.">
         <ConversationEntries repo={repo} token={token} workId={workId} />
       </Box>
 

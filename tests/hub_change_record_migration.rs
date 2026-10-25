@@ -1249,9 +1249,10 @@ fn shared_body_digest_must_be_lower_hex(db: &Db) {
     let insert = |digest: &str| {
         db.execute(&format!(
             "INSERT INTO hub_change_shared_bodies
-             (work, digest, size_bytes, media, session_id, generation, event_id, sequence,
+             (work, digest, author, size_bytes, media, session_id, generation, event_id, sequence,
               declared_token, declared_at, state)
-             VALUES ('work_none', '{digest}', 1, 'json', 's', 1, 'e', 1, 'tok_none', 0, 'declared')"
+             VALUES ('work_none', '{digest}', 'usr_none', 1, 'json', 's', 1, 'e', 1, 'tok_none', 0,
+                     'declared')"
         ))
         .unwrap_err()
         .to_lowercase()
