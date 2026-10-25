@@ -37,17 +37,13 @@ fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 fn checkout(root: &Path) -> String {
+    checkout_from(root, "https://github.com/acme/widgets.git")
+}
+
+fn checkout_from(root: &Path, origin: &str) -> String {
     fs::create_dir_all(root).unwrap();
     git(root, &["init", "-q", "-b", "main"]);
-    git(
-        root,
-        &[
-            "remote",
-            "add",
-            "origin",
-            "https://github.com/acme/widgets.git",
-        ],
-    );
+    git(root, &["remote", "add", "origin", origin]);
     fs::write(root.join("README.md"), "synthetic\n").unwrap();
     git(root, &["add", "README.md"]);
     git(
@@ -74,6 +70,16 @@ fn now() -> i64 {
 
 /// A fake Hub: mints and confirms one read-only token, answers one repository read, records requests.
 fn fake_hub() -> (String, Arc<Mutex<Vec<String>>>) {
+    fake_hub_for("github", "github.com", "github")
+}
+
+/// A fake Hub whose owner is `provider` on `host`; `minted_provider` is what it reports for the
+/// minted token (a different value models a token for another forge).
+fn fake_hub_for(
+    provider: &'static str,
+    host: &'static str,
+    minted_provider: &'static str,
+) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -90,10 +96,18 @@ fn fake_hub() -> (String, Arc<Mutex<Vec<String>>>) {
                     201,
                     json!({"id": MINTED_ID, "token": MINTED, "name": "agentscm-tray", "repository": REPO, "repository_id": 7, "expires_at": expiry, "read_only": true}),
                 )
+            } else if line.starts_with("GET /v1/hub/whoami ")
+                && request.contains("authorization: Bearer synthetic-agent-token")
+            {
+                // The checkout's own agent token, as the tray's Hub check reads it.
+                (
+                    200,
+                    json!({"token": {"id": "tok_agent", "name": "agent", "repository": REPO, "repository_id": 7, "expires_at": expiry, "read_only": false}, "owner": {"provider": provider, "host": host, "user_id": 1, "login": "synthetic"}}),
+                )
             } else if line.starts_with("GET /v1/hub/whoami ") {
                 (
                     200,
-                    json!({"token": {"id": MINTED_ID, "name": "agentscm-tray", "repository": REPO, "repository_id": 7, "expires_at": expiry, "read_only": true}, "owner": {"provider": "github", "host": "github.com", "user_id": 1, "login": "synthetic"}}),
+                    json!({"token": {"id": MINTED_ID, "name": "agentscm-tray", "repository": REPO, "repository_id": 7, "expires_at": expiry, "read_only": true}, "owner": {"provider": minted_provider, "host": host, "user_id": 1, "login": "synthetic"}}),
                 )
             } else if line.starts_with("GET /v1/hub/repos/acme%2Fwidgets/refused") {
                 (401, json!({"error": "unauthorized"}))
@@ -162,13 +176,17 @@ struct FrontDoor {
 
 impl FrontDoor {
     fn start(temp: &TempDir, hub: &str, root: &Path) -> Self {
+        Self::start_on(temp, hub, root, "github.com")
+    }
+
+    fn start_on(temp: &TempDir, hub: &str, root: &Path, origin_host: &str) -> Self {
         let config = temp.path().join("config");
         let token_file = config.join("agentscm/tokens/widgets");
         private_file(&token_file, "synthetic-agent-token\n");
         private_file(
             &config.join("agentscm/connections.json"),
             &json!({"version": 1, "connections": [{
-                "root": root, "origin_host": "github.com", "hub": hub, "repo": REPO, "token_file": token_file
+                "root": root, "origin_host": origin_host, "hub": hub, "repo": REPO, "token_file": token_file
             }]})
             .to_string(),
         );
@@ -839,4 +857,104 @@ fn open_starts_the_page_hands_the_code_over_a_private_file_and_stops_it() {
     let stopped = run(&["open", "--stop"]);
     assert!(stopped.contains("Stopped"), "{stopped}");
     assert!(!record_path.exists(), "the record outlived the page");
+}
+
+/// Pair a browser with `door` and return its grant.
+fn connect(door: &FrontDoor) -> String {
+    let record: Value = serde_json::from_str(
+        &fs::read_to_string(door.config.join("agentscm/front-door/service.json")).unwrap(),
+    )
+    .unwrap();
+    let admin = format!("Bearer {}", record["admin"].as_str().unwrap());
+    let (_, _, minted) = door.request("POST", "/v1/local/pairings", &[("Authorization", &admin)]);
+    let code = serde_json::from_str::<Value>(&minted).unwrap()["code"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (_, _, redeemed) = door.request(
+        "POST",
+        "/v1/local/pairings/redeem",
+        &[
+            ("Authorization", &format!("Bearer {code}")),
+            ("Origin", &door.origin()),
+        ],
+    );
+    serde_json::from_str::<Value>(&redeemed).unwrap()["grant"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[test]
+fn a_self_hosted_forge_gets_a_token_only_for_the_provider_its_hub_vouches_for() {
+    for (minted_provider, expected) in [("gitea", 200), ("github", 502)] {
+        let temp = TempDir::new().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap().join("widgets");
+        checkout_from(&root, "https://git.example.com/acme/widgets.git");
+        let (hub, _) = fake_hub_for("gitea", "git.example.com", minted_provider);
+        let door = FrontDoor::start_on(&temp, &hub, &root, "git.example.com");
+        let grant = connect(&door);
+        let (status, _, body) = door.request(
+            "GET",
+            "/v1/hub/repos/acme%2Fwidgets/work",
+            &[("Authorization", &format!("Bearer local:{grant}:{REPO}"))],
+        );
+        assert_eq!(status, expected, "minted for {minted_provider}: {body}");
+    }
+}
+
+#[test]
+fn signing_this_computer_out_of_its_hub_revokes_the_page_token_on_next_use() {
+    let temp = TempDir::new().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap().join("widgets");
+    checkout(&root);
+    let (hub, seen) = fake_hub();
+    let door = FrontDoor::start(&temp, &hub, &root);
+    let grant = connect(&door);
+    let auth = format!("Bearer local:{grant}:{REPO}");
+    assert_eq!(
+        door.request(
+            "GET",
+            "/v1/hub/repos/acme%2Fwidgets/work",
+            &[("Authorization", &auth)]
+        )
+        .0,
+        200
+    );
+
+    fs::remove_file(door.config.join("agentscm/hub-sessions.json")).unwrap();
+    let (status, _, body) = door.request(
+        "GET",
+        "/v1/hub/repos/acme%2Fwidgets/work",
+        &[("Authorization", &auth)],
+    );
+    assert_eq!(status, 503, "{body}");
+    assert!(body.contains("hub_sign_in_required"), "{body}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !seen
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r.starts_with("DELETE /v1/hub/token ") && r.contains(MINTED))
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        seen.lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.starts_with("DELETE /v1/hub/token ") && r.contains(MINTED)),
+        "the token from the removed sign-in is revoked"
+    );
+    // The browser's connection to this computer is not what ended.
+    assert_eq!(
+        door.request(
+            "GET",
+            "/v1/local/explorer/summary",
+            &[("Authorization", &auth)]
+        )
+        .0,
+        200
+    );
 }

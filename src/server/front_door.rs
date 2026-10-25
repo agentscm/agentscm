@@ -48,6 +48,9 @@ const MAX_HUB_READS: usize = 8;
 /// How long the list of current connections is reused before Git is asked again.
 const CONNECTIONS_TTL: Duration = Duration::from_secs(5);
 const SHUTDOWN_REVOKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The most one mint (session check, forge check, mint and confirmation) may take, so a slow
+/// Hub cannot hold a repository's token for longer.
+const MINT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Names the tokens this service mints in the Hub's token list.
 const TOKEN_NAME: &str = "agentscm-local-page";
 /// The browser credential: `local:<grant>:<owner/name>[@<hub>]`.
@@ -123,6 +126,7 @@ pub(super) struct Selected {
     pub hub: String,
     pub root: PathBuf,
     origin_host: String,
+    connection: Connection,
 }
 
 fn now() -> i64 {
@@ -341,6 +345,7 @@ impl FrontDoor {
                     hub: connection.hub.clone(),
                     root: connection.root.clone(),
                     origin_host: connection.origin_host.clone(),
+                    connection: connection.clone(),
                 })
             });
             if found.is_some() {
@@ -411,30 +416,41 @@ impl FrontDoor {
             selected.origin_host.clone(),
         ));
         let mut cached = slot.lock().await;
+        let session = hub_read_token::load_exact_session(&selected.hub);
+        // A token minted from a sign-in that was since removed or replaced is revoked now, on
+        // its next use, rather than living until it expires.
+        if cached.as_ref().is_some_and(
+            |token| !matches!(&session, Ok((_, current)) if *current == token.human_session),
+        ) && let Some(stale) = cached.take()
+        {
+            let client = self.client.clone();
+            tokio::spawn(async move { revoke(&client, &stale).await });
+        }
         if let Some(token) = cached.as_ref()
             && failed.is_none_or(|failed| failed != token.secret)
             && token.expires_at > now() + TOKEN_RENEW_SECONDS
         {
             return Ok(token.secret.clone());
         }
-        let (hub, human_session) = hub_read_token::load_exact_session(&selected.hub)?;
-        let provider = hub_read_token::expected_provider(
-            &selected.origin_host,
-            &crate::client_status::HubCheck::Skipped,
-        );
-        let minted = hub_read_token::mint_and_confirm(
-            &self.client,
-            &hub,
-            &human_session,
-            &hub_read_token::TokenRequest {
-                repository: &selected.repository,
-                origin_host: &selected.origin_host,
-                provider: provider.as_deref(),
-                name: TOKEN_NAME,
-            },
-            now(),
-        )
-        .await?;
+        let (hub, human_session) = session?;
+        let minted = tokio::time::timeout(MINT_TIMEOUT, async {
+            let provider = self.forge_provider(selected).await?;
+            hub_read_token::mint_and_confirm(
+                &self.client,
+                &hub,
+                &human_session,
+                &hub_read_token::TokenRequest {
+                    repository: &selected.repository,
+                    origin_host: &selected.origin_host,
+                    provider: Some(&provider),
+                    name: TOKEN_NAME,
+                },
+                now(),
+            )
+            .await
+        })
+        .await
+        .map_err(|_| OpenError::Unavailable)??;
         let retired = cached.replace(CachedToken {
             hub,
             id: minted.id.clone(),
@@ -462,6 +478,24 @@ impl FrontDoor {
             });
         }
         Ok(minted.secret)
+    }
+
+    /// The forge a token for this checkout must belong to: known for github.com and gitlab.com,
+    /// otherwise what the Hub reports for the checkout's own agent token, as the tray checks it. A
+    /// self-hosted forge the Hub cannot vouch for gets no token.
+    async fn forge_provider(&self, selected: &Selected) -> std::result::Result<String, OpenError> {
+        let check = match selected.origin_host.as_str() {
+            "github.com" | "gitlab.com" => crate::client_status::HubCheck::Skipped,
+            _ => {
+                let agent_token = crate::client_cli::read_token(&selected.connection.token_file)
+                    .map_err(|_| OpenError::InvalidConnection)?;
+                crate::client_status::check_hub(&selected.connection, &agent_token, None)
+                    .await
+                    .0
+            }
+        };
+        hub_read_token::expected_provider(&selected.origin_host, &check)
+            .ok_or(OpenError::Unavailable)
     }
 
     fn lock_retired(&self) -> std::sync::MutexGuard<'_, Vec<CachedToken>> {
@@ -759,18 +793,19 @@ async fn proxy(
     let target = uri
         .path_and_query()
         .map_or(uri.path(), axum::http::uri::PathAndQuery::as_str);
-    let Ok(_permit) = front_door.hub_reads.acquire().await else {
-        return refuse(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "unavailable",
-            "this computer's Hub page is stopping",
-        );
-    };
     let mut refused: Option<String> = None;
     for _ in 0..2 {
         let token = match front_door.hub_token(&selected, refused.as_deref()).await {
             Ok(token) => token,
             Err(error) => return hub_refusal(error, &selected.hub),
+        };
+        // Held only for the read itself, never while a mint for this repository is waited on.
+        let Ok(_permit) = front_door.hub_reads.acquire().await else {
+            return refuse(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                "this computer's Hub page is stopping",
+            );
         };
         let reply = front_door
             .client

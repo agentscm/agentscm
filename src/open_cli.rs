@@ -162,8 +162,15 @@ fn handoff(target: &str) -> Result<PathBuf> {
 /// keeps two concurrent `open`s from starting two services.
 async fn running_or_start(client: &reqwest::Client) -> Result<ServiceRecord> {
     let dir = local_service::ensure_dir()?;
-    let lock = private_file(&dir.join("open.lock"), false)?;
-    lock.lock()?;
+    // Waiting for another `open` to finish starting blocks, so it waits off the async runtime.
+    let lock_path = dir.join("open.lock");
+    let _lock = tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
+        let lock = private_file(&lock_path, false)?;
+        lock.lock()?;
+        Ok(lock)
+    })
+    .await
+    .map_err(|_| Error::Invalid("could not wait for another `agentscm open`".into()))??;
     if let Some(record) = local_service::load()?
         && confirmed(client, &record).await
     {

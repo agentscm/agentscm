@@ -49,7 +49,13 @@ There is no token to paste and no address to enter.
 - The service answers only on loopback, refuses requests that name another host (DNS
   rebinding) and refuses pages from any other origin. It forwards only the Hub reads the page
   makes, in their plain form, never Hub sign-in, workspace or token areas. Requests to the service
-  itself bypass any configured HTTP proxy. It revokes the tokens it minted when it stops.
+  itself bypass any configured HTTP proxy.
+- Hub tokens the service mints last 30 minutes at most. It revokes them when it is stopped
+  normally (`agentscm open --stop`, quitting, or Ctrl-C); if it is killed or crashes, they simply
+  expire. After you sign this computer out of a Hub (`agentscm hub logout`), the token minted
+  from that sign-in is revoked the next time the page reads that Hub, and otherwise expires.
+- For a self-hosted forge, the service mints a token only for the forge the Hub reports for the
+  checkout's own connection, as the menu bar app checks it.
 
 ## Lifetime and disconnecting
 
