@@ -325,12 +325,17 @@ impl LocalPage {
         {
             return;
         }
-        if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            let _ = runtime.block_on(stop());
-        }
+        // The owner may be running inside an async runtime (the tray is), where a second one
+        // cannot block; stop from a thread of its own and wait for it.
+        let stopping = std::thread::spawn(|| {
+            if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                let _ = runtime.block_on(stop());
+            }
+        });
+        let _ = stopping.join();
     }
 }
 
