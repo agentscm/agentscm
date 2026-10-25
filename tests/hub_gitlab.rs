@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agentscm::backend::LocalBackend;
-use agentscm::hub::connection::ConnectedRepository;
+use agentscm::hub::connection::{ConnectedRepository, Observed};
 use agentscm::hub::login::{Login, LoginConfig};
 use agentscm::hub::store::{self, ForgeIdentity, Store, mint_agent_token, unix_now};
 use agentscm::hub::sync::{self, PollReport, Sync, SyncConfig};
@@ -305,6 +305,30 @@ impl Env {
 
     async fn poll(&self) -> Vec<PollReport> {
         sync::poll_once(&self.state).await.unwrap()
+    }
+
+    fn restarted_sync(&self) -> HubState {
+        let base = self.fake.base.clone();
+        let sync_config = SyncConfig::from_lookup(
+            &self.url,
+            self._dir.path().join("restart-secrets"),
+            14,
+            |name| match name {
+                "AGENTSCM_GITLAB_URL" => Some(base.clone()),
+                "AGENTSCM_GITLAB_TOKEN" => Some(TOKEN.into()),
+                "AGENTSCM_GITLAB_WEBHOOK_SECRET" => Some(HOOK.into()),
+                _ => None,
+            },
+        )
+        .unwrap();
+        HubState::new(
+            self.store.clone(),
+            Arc::new(
+                LocalBackend::open(self._dir.path().join("restart-objects"))
+                    .expect("restart object store"),
+            ),
+        )
+        .with_sync(Sync::new(sync_config).unwrap())
     }
 
     /// An agent token for `REPO` owned by a new GitLab user on the fake's host.
@@ -838,6 +862,92 @@ async fn polling_converges_without_webhooks_and_does_not_rewrite_what_is_unchang
             .count()
     });
     assert_eq!(file_reads, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn polling_advances_persisted_future_observations_after_restart() {
+    let env = Env::start().await;
+    add_mr(&env, 1, &["src/one.rs"]);
+    add_mr(&env, 2, &["src/two.rs"]);
+    add_branch(&env, "feat/a", 1);
+    add_branch(&env, "feat/b", 1);
+    env.poll().await;
+
+    let repository = env.repo();
+    let future = (unix_now() + 60) * 1_000;
+    let mr1 = env.pr_data(1).to_string();
+    assert_eq!(
+        env.store
+            .observe(&repository.id, "pull_request", "1", &mr1, future)
+            .unwrap(),
+        Observed::Unchanged
+    );
+    assert!(
+        env.store
+            .forget(
+                &repository.id,
+                "pull_request",
+                "2",
+                future + 1,
+                &json!({"number": 2, "state": "closed"}).to_string(),
+                "pull_request_closed",
+            )
+            .unwrap()
+    );
+    let branches = env.store.observations(&repository.id, "branch").unwrap();
+    let branch_a = &branches
+        .iter()
+        .find(|row| row.key == "feat/a")
+        .unwrap()
+        .data;
+    assert_eq!(
+        env.store
+            .observe(&repository.id, "branch", "feat/a", branch_a, future + 2)
+            .unwrap(),
+        Observed::Unchanged
+    );
+    assert!(
+        env.store
+            .forget(
+                &repository.id,
+                "branch",
+                "feat/b",
+                future + 3,
+                &json!({"name": "feat/b", "deleted": true}).to_string(),
+                "branch_deleted",
+            )
+            .unwrap()
+    );
+
+    // The new Sync seeds its logical clock from active rows and tombstones. It can therefore
+    // close future-stamped active state and recreate future-stamped tombstones after wall-clock
+    // rollback, while subsequent reads keep advancing in this process.
+    env.mr(1, |mr| {
+        mr.state = "merged".into();
+        mr.merge_commit_sha = Some("c".repeat(40));
+    });
+    env.fake.with(|state| {
+        state
+            .projects
+            .get_mut(&REPO_ID)
+            .unwrap()
+            .branches
+            .retain(|branch| branch.name != "feat/a")
+    });
+    let restarted = env.restarted_sync();
+    let reports = sync::refresh(&restarted, &env.connection()).await.unwrap();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(env.observed("pull_request"), BTreeSet::from(["2".into()]));
+    assert_eq!(env.observed("branch"), BTreeSet::from(["feat/b".into()]));
+    for row in env
+        .store
+        .observations(&repository.id, "pull_request")
+        .unwrap()
+        .into_iter()
+        .chain(env.store.observations(&repository.id, "branch").unwrap())
+    {
+        assert!(row.observed_at > future + 3, "{row:?}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -11,12 +11,11 @@ use serde_json::json;
 use super::catchup::{CatchupAck, CatchupAckResult, CatchupPage, CatchupQuery};
 use super::http::{ApiError, Authenticated, JsonBody, Reader, blocking};
 use super::insights::{InsightPage, InsightQuery, UsageReceipt, UsageRecord, WorkInsight};
-use super::merge_recap::WorkOverviewWithMergeRecap;
 use super::store::{search_text, unix_now};
 use super::work::{
     Briefing, BriefingAck, BriefingQuery, CheckpointKind, DEFAULT_WORK_SEARCH, MAX_WORK_SEARCH,
-    WorkCheckpoint, WorkCheckpointResult, WorkItem, WorkOverviewQuery, WorkSearchPage, WorkStart,
-    WorkState,
+    WorkCheckpoint, WorkCheckpointResult, WorkItem, WorkOverview, WorkOverviewQuery,
+    WorkSearchPage, WorkStart, WorkState,
 };
 use super::work_preflight::WorkPreflightResult;
 use super::{HubError, HubState};
@@ -166,26 +165,13 @@ async fn overview(
     State(state): State<HubState>,
     Reader(principal): Reader,
     query: std::result::Result<Query<WorkOverviewQuery>, QueryRejection>,
-) -> Result<Json<WorkOverviewWithMergeRecap>, ApiError> {
+) -> Result<Json<WorkOverview>, ApiError> {
     let Query(query) = query.map_err(|_| ApiError::invalid())?;
     let store = state.store.clone();
     let token = principal.token_id.clone();
     Ok(Json(
         blocking(&state, move || {
-            let now = unix_now();
-            let overview = store.work_overview(&token, &query, now)?;
-            let merge_recap =
-                match store.work_merge_recap(&token, overview.recent_since, overview.until, now) {
-                    Ok(recap) => Some(recap),
-                    Err(error) => {
-                        eprintln!("hub: merge recap for work overview: {error}");
-                        None
-                    }
-                };
-            Ok(WorkOverviewWithMergeRecap {
-                overview,
-                merge_recap,
-            })
+            store.work_overview(&token, &query, unix_now())
         })
         .await?,
     ))

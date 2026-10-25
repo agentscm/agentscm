@@ -28,7 +28,6 @@ use super::external_runs::{ExternalKind, ExternalObserved, ExternalRun};
 use super::handoff::{Answered, Asked};
 use super::insights::{InsightPage, InsightQuery, UsageReceipt, UsageRecord, WorkInsight};
 use super::intent::{Announced, Intent, NewIntent};
-use super::merge_recap::MergeRecap;
 use super::publish::{Create, NewPublication, Publication, PublicationSearch, Update};
 use super::session::{SessionCall, Touched};
 use super::skills::{EvidenceRow, RunHead, SkillAdoption};
@@ -303,6 +302,9 @@ pub trait Store: Send + Sync {
     fn set_pulls_etag(&self, repo: &str, etag: Option<&str>) -> Result<()>;
     /// True when the delivery id is new for the connection. Ids older than a week are pruned.
     fn record_delivery(&self, connection: &str, delivery: &str, now: i64) -> Result<bool>;
+    /// Greatest forge observation timestamp retained for this repository, including tombstones.
+    /// Sync reads this once per repository and process to seed its monotonic read clock.
+    fn observation_floor(&self, repo: &str) -> Result<i64>;
     /// Record what a read of the forge (started at `observed_at`, unix ms) showed.
     fn observe(
         &self,
@@ -485,19 +487,6 @@ pub trait Store: Send + Sync {
         before: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Publication>>;
-    /// Recent tracked merges in the authenticated Work repository identity. Reads at most 21
-    /// narrow matching rows; `scanned_count` includes the possible truncation marker.
-    fn work_merge_recap(
-        &self,
-        _token: &str,
-        _since: i64,
-        _until: i64,
-        _now: i64,
-    ) -> Result<MergeRecap> {
-        Err(HubError::Unavailable(
-            "merge recap projection unavailable".into(),
-        ))
-    }
     /// Like [`Store::publications`] but only matches of `search` (already [`search_text`]-cleaned)
     /// among the newest `SEARCH_SCAN_ROWS` publications below `before`: branch, base, title,
     /// id, owner login or token name containing it, or the pull request number it names. Never

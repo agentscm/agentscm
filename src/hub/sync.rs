@@ -247,6 +247,9 @@ pub struct Sync {
     setups: Mutex<Table<Setup>>,
     jobs: Semaphore,
     repo_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Last forge-read stamp per repository. The first read is seeded from durable observations;
+    /// later reads advance locally while the repository lock is held.
+    observation_stamps: Mutex<HashMap<String, i64>>,
     /// Caps that cut the last poll's view of a repository short.
     truncated: Mutex<HashMap<String, Value>>,
     pending: AtomicUsize,
@@ -272,6 +275,33 @@ fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis() as i64)
+}
+
+fn advance_observation_stamp(last: &mut i64, wall: i64) -> Result<i64> {
+    let after_last = last
+        .checked_add(1)
+        .ok_or_else(|| HubError::Unavailable("forge observation clock exhausted".into()))?;
+    let next = wall.max(after_last);
+    *last = next;
+    Ok(next)
+}
+
+/// Allocates a read stamp while the caller holds this Sync's repository lock. The initial
+/// durable floor includes tombstones, so a restarted hub can close or recreate an observation
+/// even after the wall clock moved backwards. Subsequent reads do not rescan the repository.
+async fn observation_stamp(state: &HubState, repository: &str) -> Gh<i64> {
+    let known = lock(&state.sync.observation_stamps)
+        .get(repository)
+        .copied();
+    let floor = if known.is_none() {
+        let id = repository.to_owned();
+        db(state, move |store| store.observation_floor(&id)).await?
+    } else {
+        0
+    };
+    let mut stamps = lock(&state.sync.observation_stamps);
+    let last = stamps.entry(repository.to_owned()).or_insert(floor);
+    Ok(advance_observation_stamp(last, now_ms())?)
 }
 
 impl Sync {
@@ -348,6 +378,7 @@ impl Sync {
             setups: Mutex::default(),
             jobs: Semaphore::new(MAX_JOBS),
             repo_locks: Mutex::default(),
+            observation_stamps: Mutex::default(),
             truncated: Mutex::default(),
             pending: AtomicUsize::new(0),
             round: AtomicUsize::new(0),
@@ -931,7 +962,7 @@ async fn read_repo(
     super::catchup_sync::begin(state, conn, repo).await?;
 
     // Pull requests.
-    let started = now_ms();
+    let started = observation_stamp(state, &repo.id).await?;
     let stored = stored_pulls(state, repo).await?;
     match api
         .open_pulls(token, repo, repo.pulls_etag.as_deref())
@@ -1089,7 +1120,7 @@ async fn reread_pull(
     number: i64,
     stored: &BTreeMap<i64, Value>,
 ) -> Gh<bool> {
-    let started = now_ms();
+    let started = observation_stamp(state, &repo.id).await?;
     let pull = state.sync.forge(conn)?.pull(token, repo, number).await?;
     if let Some(pull) = pull.as_ref().filter(|pull| pull["state"] == "open") {
         return observe_pull(state, conn, repo, token, pull, stored.get(&number), started).await;
@@ -1140,7 +1171,7 @@ async fn reread_branch(
     token: &str,
     name: &str,
 ) -> Gh<Option<bool>> {
-    let started = now_ms();
+    let started = observation_stamp(state, &repo.id).await?;
     let branch = state.sync.forge(conn)?.branch(token, repo, name).await?;
     let (id, name) = (repo.id.clone(), name.to_owned());
     Ok(db(state, move |store| match branch {
@@ -1167,7 +1198,7 @@ async fn sync_branches(
     token: &str,
     activity_days: i64,
 ) -> Gh<(usize, bool)> {
-    let started = now_ms();
+    let started = observation_stamp(state, &repo.id).await?;
     let (recent, capped) = state
         .sync
         .forge(conn)?
@@ -2447,6 +2478,23 @@ async fn work(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observation_stamps_advance_when_the_wall_clock_moves_backwards() {
+        let mut last = 10_000;
+        assert_eq!(advance_observation_stamp(&mut last, 9_000).unwrap(), 10_001);
+        assert_eq!(advance_observation_stamp(&mut last, 8_000).unwrap(), 10_002);
+        assert_eq!(
+            advance_observation_stamp(&mut last, 20_000).unwrap(),
+            20_000
+        );
+        assert_eq!(
+            advance_observation_stamp(&mut last, 19_000).unwrap(),
+            20_001
+        );
+        last = i64::MAX;
+        assert!(advance_observation_stamp(&mut last, 0).is_err());
+    }
 
     #[test]
     fn manifest_declares_a_webhook_only_for_a_public_https_host() {

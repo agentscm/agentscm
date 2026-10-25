@@ -55,7 +55,7 @@ async function stubHub(page: Page) {
     if (url.pathname === '/v1/hub/health') return json({ status: 'ok', storage: 'sqlite', coordination: { denied: 0, repeated: 0, rate_limited: 0, fail_open: 0, hook_p95_ms: 2 } })
     if (url.pathname === '/v1/hub/repos/counterbranch%2Fagentscm/work') return json({ intents: [], intents_truncated: false, pull_requests: [], connected: true })
     if (url.pathname === '/v1/hub/repos/counterbranch%2Fagentscm/activity') return json({ sessions: [], events: [], next_before: null })
-    if (url.pathname === '/v1/hub/standup/overview') return json({ recent_since: 1_792_854_000, until: 1_792_944_000, current: [], recent: [], overlaps: [], current_complete: true, recent_complete: true, overlaps_complete: true, history_retention_gap: false, merge_recap: null })
+    if (url.pathname === '/v1/hub/standup/overview') return json({ recent_since: 1_792_854_000, until: 1_792_944_000, current: [], recent: [], overlaps: [], current_complete: true, recent_complete: true, overlaps_complete: true, history_retention_gap: false })
     if (url.pathname === '/v1/hub/standup/catchup' && request.method() === 'GET') {
       const client = url.searchParams.get('delivery_client')
       if (!client) return json({ error: 'missing_delivery_client' }, 400)

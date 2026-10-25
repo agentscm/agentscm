@@ -6,8 +6,7 @@
 :root[data-theme=dark]{--bg:#15141a;--card:#1d1b25;--fg:#ececf3;--mut:#a9a6b8;--bd:#34314a;--acc:#a28cff;--accbg:#2c2550;--ok:#6fd49a;--okbg:#17301f;--warn:#f1c36a;--warnbg:#38290a;--bad:#ff8f87;--badbg:#3d1916;color-scheme:dark}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
 .card{margin:8px;padding:14px;background:var(--card);border:.5px solid var(--bd);border-radius:12px}
-.recap,.catchup{margin:10px 0 14px;padding:10px 12px;border:.5px solid var(--bd);border-radius:10px;background:var(--bg)}
-.recap h2{margin:0 0 6px;color:var(--fg);text-transform:none;letter-spacing:0}.merge{padding:6px 0;border-bottom:.5px solid var(--bd)}.merge:last-of-type{border-bottom:0}
+.catchup{margin:10px 0 14px;padding:10px 12px;border:.5px solid var(--bd);border-radius:10px;background:var(--bg)}
 .catchup h2{margin:0;color:var(--fg);text-transform:none;letter-spacing:0}.catchup-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.catchup-head button{margin-left:auto}.group{border-top:.5px solid var(--bd);padding-top:6px}.catchup .att{overflow-wrap:anywhere}
 .source dl{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:3px 10px;margin:6px 0}.source dt{color:var(--mut);font-weight:600}.source dd{margin:0;min-width:0;overflow-wrap:anywhere}.source code{overflow-wrap:anywhere;word-break:break-all}
 header{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}
@@ -60,32 +59,8 @@ var dt=h('details');add(dt,h('summary',null,'Recently finished ('+rec.length+')'
 rec.forEach(function(o){var i=o.item||{},r=h('div','row'),m=h('div','main');add(m,h('div','t',clip(i.title)),h('div','s',clip(who(i))+' · '+(o.kind==='decision'?'Decision':'Completed')));add(r,m,h('div','s',ago(o.at)));dt.appendChild(r)});
 if(d.recent_complete===false)add(dt,h('p','note','This list may be partial.'));add(root,dt);
 add(root,h('footer',null,'Read-only. Stale claims stay claimed. '+(d.overlaps_complete===false?'⚠ Overlap check incomplete':'✓ Overlap check complete')),h('div','quiet',manage))}
-function recapRow(v,since,until){if(!v||typeof v!=='object'||Array.isArray(v))return null;
-var id=typeof v.id==='string'&&/^pub_[0-9a-f]{32}$/.test(v.id)?v.id:null;
-var head=typeof v.head_commit==='string'&&/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(v.head_commit)?v.head_commit:null;
-var merge=typeof v.merge_commit==='string'&&/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(v.merge_commit)?v.merge_commit:null;
-var branch=typeof v.branch==='string'&&v.branch.length>0&&v.branch.length<=255?clip(v.branch):null;
-var base=typeof v.base==='string'&&v.base.length>0&&v.base.length<=255?clip(v.base):null;
-var title=v.title===null?null:typeof v.title==='string'&&v.title.length>0&&v.title.length<=500?clip(v.title):null;
-var num=Number.isSafeInteger(v.pull_number)&&v.pull_number>0?v.pull_number:null;
-var updated=Number.isSafeInteger(v.updated_at)&&v.updated_at>=since&&v.updated_at<=until?v.updated_at:null;
-if(!id||!head||!merge||!branch||!base||v.title!==null&&title===null||!num||updated===null)return null;
-return{id:id,title:title,branch:branch,base:base,head_commit:head,merge_commit:merge,pull_number:num,updated_at:updated}}
-function recapValue(v){if(!v||typeof v!=='object'||Array.isArray(v))return null;
-var maxTime=8640000000000;
-if(v.time_basis!=='last_recorded_update'||v.scope!=='tracked_publications'||!Number.isSafeInteger(v.since)||v.since<0||v.since>maxTime||!Number.isSafeInteger(v.until)||v.until<0||v.until>maxTime||v.since>v.until||!Array.isArray(v.merges)||v.merges.length>20||typeof v.complete!=='boolean'||!Number.isSafeInteger(v.scanned_count)||v.scanned_count<0||v.scanned_count>21||v.scanned_count!==(v.complete?v.merges.length:21))return null;
-var ids={},rows=[];for(var i=0;i<v.merges.length;i++){var rawId=v.merges[i]&&v.merges[i].id;if(typeof rawId!=='string'||ids[rawId])return null;ids[rawId]=true;var row=recapRow(v.merges[i],v.since,v.until);if(!row)return null;rows.push(row)}
-return{since:v.since,until:v.until,merges:rows,complete:v.complete,scanned_count:v.scanned_count}}
 function when(at){return new Date(at*1000).toLocaleString()}
 function pair(dl,label,value){var dd=h('dd');add(dd,h('code',null,value));add(dl,h('dt',null,label),dd)}
-function mergeRow(m){var x=h('div','merge'),label=m.title||'Pull request #'+m.pull_number,source=h('details','source'),summary=h('summary',null,'Source details'),dl=h('dl');add(x,h('div','t',label),h('div','s','PR #'+m.pull_number+' · merge '+m.merge_commit.slice(0,12)+' · record updated '+ago(m.updated_at)));pair(dl,'Publication',m.id);pair(dl,'Branch → base',m.branch+' → '+m.base);pair(dl,'Head commit',m.head_commit);pair(dl,'Merge commit',m.merge_commit);add(source,summary,dl);add(x,source);return x}
-function renderRecap(root,value){var r=recapValue(value),box=h('section','recap');add(box,h('h2',null,'Recent stored merge activity'+(r?' ('+r.merges.length+')':'')));
-if(!r){add(box,h('p','note','This Hub did not return the optional stored publication recap. No merge coverage is implied.'));root.appendChild(box);return}
-if(!r.merges.length)add(box,h('p',null,r.complete?'No merged publications were found in this stored update window.':'This partial result includes no merge rows; more matching merges are omitted.'));
-r.merges.slice(0,3).forEach(function(m){box.appendChild(mergeRow(m))});
-if(r.merges.length>3){var all=h('details'),sum=h('summary',null,'Show all '+r.merges.length);add(all,sum);r.merges.slice(3).forEach(function(m){all.appendChild(mergeRow(m))});box.appendChild(all)}
-add(box,h('p','note',(r.complete?'':'Partial stored result; more matching merges are omitted. ')+'Only changes published through AgentSCM are included; other forge merges may be missing.'));
-var detail=h('details'),summary=h('summary',null,'Coverage and timing'),count=r.scanned_count+' matching publication record'+(r.scanned_count===1?'':'s')+' inspected',coverage=r.complete?count+'; all matching merge rows are shown.':count+'; more matching merges are omitted.';add(detail,summary,h('p','note','Stored publication updates from '+when(r.since)+' through '+when(r.until)+'. The time is each publication’s last stored update, not its merge time. '+coverage));add(box,detail);root.appendChild(box)}
 function catchClient(){var c=window.crypto;if(c&&typeof c.randomUUID==='function')return'mcp_'+c.randomUUID();if(c&&typeof c.getRandomValues==='function'){var b=c.getRandomValues(new Uint8Array(16)),s='';for(var i=0;i<b.length;i++)s+=b[i].toString(16).padStart(2,'0');return'mcp_'+s}return'mcp_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2)+'_'+Math.random().toString(36).slice(2)}
 var CATCH_CLIENT=catchClient(),CATCH={page:null,busy:false,err:null,note:null};
 function safeText(v,max){if(typeof v!=='string'||!v.length||v.length>max||/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2064\u2066-\u206f\ufeff]/.test(v))return null;return v}

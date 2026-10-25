@@ -1,5 +1,4 @@
 import { ApiError } from './api.ts'
-import { decodeOptionalMergeRecap, type MergeRecap } from './mergeRecap.ts'
 import { withTimeout } from './timeout.ts'
 
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024
@@ -146,7 +145,6 @@ export interface WorkOverview {
   recent_complete: boolean
   overlaps_complete: boolean
   history_retention_gap: boolean
-  merge_recap: MergeRecap | null
 }
 
 export interface CoordinationAgent {
@@ -565,7 +563,6 @@ export function decodeOverview(value: unknown): WorkOverview {
     recent_complete: recentComplete,
     overlaps_complete: overlapsComplete,
     history_retention_gap: historyRetentionGap,
-    merge_recap: decodeOptionalMergeRecap(item['merge_recap'], recentSince, until),
   }
 }
 

@@ -1176,8 +1176,10 @@ fn observations(db: &Db) {
     assert_eq!(seen(70), Observed::Changed { previous: None });
     assert_eq!(store.events_after(0, 1000).unwrap().len(), before + 1);
     // Markers are pruned by age; live observations stay.
-    assert!(gone("never", 80, "branch_deleted").unwrap());
-    assert_eq!(store.prune_tombstones(81).unwrap(), 3);
+    assert!(gone("never", 800, "branch_deleted").unwrap());
+    assert_eq!(store.observation_floor(&repo.id).unwrap(), 800);
+    assert_eq!(store.prune_tombstones(801).unwrap(), 4);
+    assert_eq!(store.observation_floor(&repo.id).unwrap(), 600);
     assert_eq!(prs(&*store, &repo.id).len(), 1);
 
     for bad in [

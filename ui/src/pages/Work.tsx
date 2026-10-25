@@ -1,6 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { CatchupPanel } from '../Catchup.tsx'
-import { mergeRecapHref, shortCommit, type MergeRecap } from '../mergeRecap.ts'
 import {
   currentLeadParticipant,
   fetchBriefing,
@@ -539,83 +538,6 @@ function Finished({ overview, search }: { overview: WorkOverview; search: string
         </div>
       )}
     </div>
-  )
-}
-
-/* ---------- Recent stored merge activity ---------- */
-
-function MergeRecapRow({ merge }: { merge: MergeRecap['merges'][number] }) {
-  const href = mergeRecapHref(merge.id)
-  const label = merge.title ?? `Pull request #${merge.pull_number}`
-  return (
-    <li>
-      <div>{href ? <a href={href}><strong>{label}</strong></a> : <strong>{label}</strong>}</div>
-      <div className="small muted">
-        PR #{merge.pull_number} · <code>{shortCommit(merge.merge_commit)}</code> · record updated <Ago at={merge.updated_at} />
-      </div>
-      <details className="disclosure">
-        <summary>Source details</summary>
-        <dl className="tech">
-          <dt>Publication</dt>
-          <dd><code className="text-break">{merge.id}</code></dd>
-          <dt>Branch → base</dt>
-          <dd><code className="text-break">{merge.branch}</code> → <code className="text-break">{merge.base}</code></dd>
-          <dt>Head commit</dt>
-          <dd><code className="text-break">{merge.head_commit}</code></dd>
-          <dt>Merge commit</dt>
-          <dd><code className="text-break">{merge.merge_commit}</code></dd>
-        </dl>
-      </details>
-    </li>
-  )
-}
-
-export function RecentMergeActivity({ recap }: { recap: MergeRecap | null }) {
-  if (recap === null) {
-    return (
-      <Notice tone="muted" icon="git" title="Recent merge activity unavailable">
-        This Hub did not return the optional stored publication recap. No merge coverage is implied.
-      </Notice>
-    )
-  }
-
-  return (
-    <Box
-      id="recent-merge-activity"
-      icon="git"
-      title="Recent stored merge activity"
-      count={recap.merges.length}
-      tone={recap.complete ? 'muted' : 'warn'}
-      explain="A bounded read of retained AgentSCM publication records. Publication updates are not merge timestamps, and this is separate from the Work snapshot."
-    >
-      {recap.merges.length === 0 ? (
-        <p>{recap.complete
-          ? 'No merged publications were found in this stored update window.'
-          : 'This partial result includes no merge rows; more matching merges are omitted.'}</p>
-      ) : (
-        <>
-          <ul className="plain-list">{recap.merges.slice(0, 3).map((merge) => <MergeRecapRow key={merge.id} merge={merge} />)}</ul>
-          {recap.merges.length > 3 && (
-            <details className="disclosure">
-              <summary>Show all {recap.merges.length}</summary>
-              <ul className="plain-list">{recap.merges.slice(3).map((merge) => <MergeRecapRow key={merge.id} merge={merge} />)}</ul>
-            </details>
-          )}
-        </>
-      )}
-      <p className="small muted">
-        {!recap.complete && <><strong>Partial stored result; more matching merges are omitted.</strong>{' '}</>}
-        Only changes published through AgentSCM are included; other forge merges may be missing.
-      </p>
-      <details className="disclosure">
-        <summary>Coverage and timing</summary>
-        <p className="small muted">
-          Stored publication updates from <strong>{localDate(recap.since)}</strong> through <strong>{localDate(recap.until)}</strong>. The time is each publication's last stored update, not its merge time. {recap.complete
-            ? `${plural(recap.scanned_count, 'matching publication record')} inspected; all matching merge rows are shown.`
-            : `${plural(recap.scanned_count, 'matching publication record')} inspected; more matching merges are omitted.`}
-        </p>
-      </details>
-    </Box>
   )
 }
 

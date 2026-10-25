@@ -826,6 +826,12 @@ branch, `installation` and `installation_repositories` refresh the repository
 list, `ping` and anything else do nothing. The payload is trusted for ids and
 names only; state is read from GitHub again. Delivery ids are kept a week.
 
+Within one Hub process, pull request and branch sync allocate increasing read stamps
+before contacting the forge, even if the host clock moves backwards. The first read for a
+repository seeds this order from retained observations, including deleted rows,
+so it survives a restart. This uses one database scan per repository on its first
+read in that process; subsequent reads advance the cached stamp.
+
 Overlap. When a pull request is first seen or changes, every live intent in the same
 repository (matched by the token's repository name, and its owner's host) whose
 paths overlap files that intent was not yet told about gets a `pr_notice`; told

@@ -24,7 +24,6 @@ use super::coordination::{
 };
 use super::http::{ApiError, Reader, blocking};
 use super::insights::{InsightQuery, UsageRecord};
-use super::merge_recap::WorkOverviewWithMergeRecap;
 use super::session::{SessionCall, announce_for, done_for, duplicates_for, others_for, status_for};
 use super::skill_workflow::ReadError as SkillWorkflowReadError;
 use super::store::{Principal, unix_now};
@@ -1164,24 +1163,7 @@ async fn call_inner(
         let token = principal.token_id.clone();
         return Ok(
             match blocking(state, move || {
-                let now = unix_now();
-                let overview = store.work_overview(&token, &query, now)?;
-                let merge_recap = match store.work_merge_recap(
-                    &token,
-                    overview.recent_since,
-                    overview.until,
-                    now,
-                ) {
-                    Ok(recap) => Some(recap),
-                    Err(error) => {
-                        eprintln!("hub: merge recap for MCP work overview: {error}");
-                        None
-                    }
-                };
-                Ok(WorkOverviewWithMergeRecap {
-                    overview,
-                    merge_recap,
-                })
+                store.work_overview(&token, &query, unix_now())
             })
             .await
             {

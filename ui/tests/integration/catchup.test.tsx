@@ -2,6 +2,8 @@ import { StrictMode } from 'react'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CatchupPanel } from '../../src/Catchup.tsx'
+import { WorkPage } from '../../src/pages/Work.tsx'
+import type { WorkOverview } from '../../src/standup.ts'
 
 const delivery = (digit = 'a') => `cup_${digit.repeat(32)}`
 const page = (over: Record<string, unknown> = {}) => ({
@@ -58,6 +60,34 @@ afterEach(() => {
 })
 
 describe('Since you last checked', () => {
+  it('keeps the last Work snapshot visible and labels a failed refresh while catch-up loads independently', () => {
+    const overview: WorkOverview = {
+      recent_since: 100,
+      until: 200,
+      current: [],
+      recent: [],
+      overlaps: [],
+      current_complete: true,
+      recent_complete: true,
+      overlaps_complete: true,
+      history_retention_gap: false,
+    }
+    vi.spyOn(globalThis, 'fetch').mockImplementation(() => new Promise(() => {}))
+    window.location.hash = '#work'
+    render(<WorkPage token="read-only" overview={{
+      kind: 'ready',
+      value: overview,
+      fetchedAt: 1_000_000,
+      refreshError: 'connection refused',
+      retry: vi.fn(),
+    }} />)
+
+    expect(screen.getByText('Could not refresh')).toBeTruthy()
+    expect(screen.getByText('Since you last checked')).toBeTruthy()
+    expect(screen.getByText('No unfinished work is assigned right now.')).toBeTruthy()
+    expect(screen.getByText(/connection refused/)).toBeTruthy()
+  })
+
   it('renders the exact server-sanitized merge title as text', async () => {
     const sanitizedTitle = 'Family 👨👩👧👦'
     vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(response(page({
