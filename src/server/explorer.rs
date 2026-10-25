@@ -45,6 +45,19 @@ pub(super) fn open(
     }
 }
 
+/// An explorer for one connected checkout, with its capture spool when one is bound to it.
+pub(super) fn open_checkout(
+    root: &std::path::Path,
+    repository: &str,
+    spool: Option<PathBuf>,
+) -> Result<Arc<Explorer>> {
+    let git = GitExplorer::open(root, repository)?;
+    let evidence = spool
+        .map(|path| EvidenceExplorer::open(path, repository.to_owned()))
+        .transpose()?;
+    Ok(Arc::new(Explorer { git, evidence }))
+}
+
 pub(super) fn routes() -> Router<AppState> {
     Router::new().route("/v1/local/explorer/{operation}", get(read))
 }
@@ -58,6 +71,7 @@ enum Operation {
     Diff,
     Search,
     Evidence,
+    Sessions,
     Conversation,
 }
 
@@ -71,6 +85,7 @@ impl Operation {
             "diff" => Self::Diff,
             "search" => Self::Search,
             "evidence" => Self::Evidence,
+            "sessions" => Self::Sessions,
             "conversation" => Self::Conversation,
             _ => return None,
         })
@@ -85,6 +100,7 @@ impl Operation {
             Self::Diff => &["left", "right", "path", "cursor", "limit"],
             Self::Search => &["commit", "q", "cursor", "limit"],
             Self::Evidence => &["commit", "path", "work_id", "cursor", "limit"],
+            Self::Sessions => &["cursor", "limit"],
             Self::Conversation => &["work_id", "session_id", "cursor", "limit"],
         }
     }
@@ -110,11 +126,28 @@ async fn read(
     State(state): State<AppState>,
     Path(operation): Path<String>,
     RawQuery(raw): RawQuery,
+    selected: Option<axum::Extension<super::front_door::Selected>>,
 ) -> Response {
     let Some(operation) = Operation::parse(&operation) else {
         return failure(StatusCode::NOT_FOUND, "Unknown repository explorer read.");
     };
-    let Some(explorer) = state.explorer.clone() else {
+    // The front door picks the checkout per request; `serve --explorer-repo` has exactly one.
+    let explorer = match (&selected, &state.front_door) {
+        (Some(axum::Extension(selected)), Some(front_door)) => {
+            match front_door.explorer(selected) {
+                Ok(explorer) => Some(explorer),
+                Err(error) => {
+                    eprintln!("repository explorer open failed: {error:?}");
+                    return failure(
+                        StatusCode::NOT_FOUND,
+                        "This checkout could not be opened for browsing. Check that it still exists, then reload.",
+                    );
+                }
+            }
+        }
+        _ => state.explorer.clone(),
+    };
+    let Some(explorer) = explorer else {
         return failure(
             StatusCode::NOT_FOUND,
             "Repository explorer is off. Configure --explorer-repo and --explorer-repository on this computer.",
@@ -128,14 +161,17 @@ async fn read(
         Ok(value) => value.unwrap_or(operation.default_limit()),
         Err(error) => return read_error(error, "repository explorer"),
     };
-    if matches!(operation, Operation::Evidence | Operation::Conversation)
-        && explorer.evidence.is_none()
+    if matches!(
+        operation,
+        Operation::Evidence | Operation::Sessions | Operation::Conversation
+    ) && explorer.evidence.is_none()
     {
         return failure(
             StatusCode::NOT_FOUND,
             "Private capture is not connected. Configure --explorer-spool to read retained evidence on this computer.",
         );
     }
+    let front_door = state.front_door.clone();
     let result = blocking(state, move |_| {
         let value = project(&explorer, operation, &fields, limit)?;
         let body = serde_json::to_string(&value)?;
@@ -153,6 +189,13 @@ async fn read(
             permit,
         ),
         Err(error) => {
+            // A rejected query says nothing about the checkout; other failures may mean it moved.
+            if error.status != StatusCode::BAD_REQUEST
+                && let (Some(axum::Extension(selected)), Some(front_door)) =
+                    (&selected, &front_door)
+            {
+                front_door.forget_explorer(selected);
+            }
             // Git and filesystem diagnostics can contain local paths or private
             // data. Their detailed text stays in the local service diagnostics.
             eprintln!("repository explorer read failed: {:?}", error.message);
@@ -231,6 +274,10 @@ fn project(
                 optional("cursor"),
                 limit,
             )?)?
+        }
+        Operation::Sessions => {
+            let evidence = explorer.evidence.as_ref().ok_or(Error::SourceDenied)?;
+            serde_json::to_value(evidence.sessions(optional("cursor"), limit)?)?
         }
         Operation::Conversation => {
             let evidence = explorer.evidence.as_ref().ok_or(Error::SourceDenied)?;

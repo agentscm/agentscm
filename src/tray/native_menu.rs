@@ -420,6 +420,8 @@ fn status_symbol_name(status: &str) -> &'static str {
         "checkmark.circle"
     } else if status == "Connection: attention needed" {
         "exclamationmark.triangle"
+    } else if status == "Not connected" {
+        "link.badge.plus"
     } else {
         "questionmark.circle"
     }
@@ -454,6 +456,7 @@ fn symbol_for_title(title: &str) -> Option<&'static str> {
         "Check Now" => Some("arrow.clockwise"),
         "Quit AgentSCM Tray" => Some("power"),
         _ if title.starts_with("Set Up ") => Some("plus.app"),
+        _ if title.starts_with("Connect with ") => Some("link"),
         _ if title.starts_with("Reapply ") => Some("arrow.clockwise"),
         _ => None,
     }
@@ -552,6 +555,8 @@ mod tests {
             status_symbol_name("Connection: unknown"),
             "questionmark.circle"
         );
+        assert_eq!(status_symbol_name("Not connected"), "link.badge.plus");
+        assert_eq!(symbol_for_title("Connect with Codex"), Some("link"));
         assert_eq!(
             text_item("__AGENTSCM_TEXT_details__Path  /tmp/repo", true, true),
             None,

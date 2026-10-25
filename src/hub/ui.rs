@@ -1,10 +1,9 @@
-//! The Hub UI at `/ui/`: read-only status tokens and opt-in workspace sessions.
+//! The Hub UI at `/ui/`: read-only status tokens and opt-in workspace sessions. The local service
+//! (`agentscm serve --front-door`) serves the same page for this computer's repositories.
 use axum::Router;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Redirect};
 use axum::routing::get;
-
-use super::HubState;
 
 // `'unsafe-inline'` for styles only: React sets inline `style` attributes, which `style-src` governs.
 // Fonts and images are inlined into app.css as `data:` URIs, hence `font-src` and `img-src` allow `data:`.
@@ -25,7 +24,8 @@ const INDEX: &[u8] = b"<!doctype html><html lang=\"en\"><head><meta charset=\"ut
     Release binaries and the container image include it. From source, run `npm ci &amp;&amp; npm run build` \
     in ui/, then `cargo build --features ui`.</p></body></html>";
 
-pub fn routes() -> Router<HubState> {
+/// The page's routes. They hold no state, so the local service mounts the same page.
+pub fn routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
     let router = Router::new()
         .route(
             "/",

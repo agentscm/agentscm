@@ -42,7 +42,14 @@ enum UserEvent {
     MenuTrackingEnded,
     Snapshot(std::result::Result<Snapshot, String>, ConfigStamp),
     Integration(crate::client_setup::Agent, std::result::Result<(), String>),
+    Connected(
+        crate::client_setup::Agent,
+        String,
+        std::result::Result<String, String>,
+    ),
     HubOpen(std::result::Result<Box<hub_open::PreparedOpen>, hub_open::OpenError>),
+    /// Open Hub opened this computer's own Hub page (`agentscm open`).
+    HubOpenedLocally,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -176,9 +183,13 @@ fn run_foreground(initial: Snapshot) -> Result<()> {
         menu_dirty: false,
         notice: None,
     };
-    event_loop
+    // This computer's Hub page runs while the tray does, so Open Hub opens at once.
+    let local_page = crate::open_cli::LocalPage::start_in_background();
+    let result = event_loop
         .run_app(&mut app)
-        .map_err(|error| Error::Invalid(format!("tray event loop failed: {error}")))
+        .map_err(|error| Error::Invalid(format!("tray event loop failed: {error}")));
+    local_page.stop_if_started();
+    result
 }
 
 struct TrayApp {
@@ -331,6 +342,7 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                 self.tray = Some(icon);
                 println!("{READY}");
                 let _ = std::io::stdout().flush();
+                discard_stdout();
             }
             Err(error) => {
                 println!("AGENTSCM_TRAY_ERROR:{error}");
@@ -429,6 +441,65 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                     self.replace_menu(None);
                 }
             }
+            UserEvent::Menu(id) if id.starts_with("connect:") => {
+                self.notice = None;
+                let request = connect_request(
+                    &id,
+                    &self.snapshot,
+                    &self.activity,
+                    std::time::Instant::now(),
+                );
+                let hub = request
+                    .as_ref()
+                    .and_then(|request| target_hub(&request.host, &request.repo));
+                if self.opening_hub || self.installing.load(Ordering::Acquire) {
+                    self.notice = Some(Notice::Action(
+                        "An action is still running; wait for its result".into(),
+                    ));
+                } else if let (Some(request), Some(hub)) = (&request, &hub) {
+                    self.installing.store(true, Ordering::Release);
+                    self.feedback.show(
+                        &format!("Connecting {}…", request.repo),
+                        &format!(
+                            "Connecting this checkout to {hub} with your saved sign-in, then configuring {}. Your coding client will ask for its own approvals when you open it.",
+                            request.label
+                        ),
+                        true,
+                    );
+                    spawn_connect(
+                        self.refresh_proxy.clone(),
+                        request.clone(),
+                        hub.clone(),
+                        self.executable.clone(),
+                    );
+                    self.notice = Some(Notice::Action("Connecting checkout…".into()));
+                } else if request.is_some() {
+                    self.feedback.show(
+                        "No saved Hub sign-in",
+                        "Copy Terminal Setup and run it in a terminal to choose a Hub and sign in.",
+                        false,
+                    );
+                    self.notice = Some(Notice::Action("No saved Hub sign-in".into()));
+                } else {
+                    self.feedback.show(
+                        "Connect could not start",
+                        "This checkout is no longer listed as not connected. Check Now and try again.",
+                        false,
+                    );
+                }
+                self.replace_menu(None);
+            }
+            UserEvent::Menu(id) if id.starts_with("copy-quickstart:") => {
+                self.notice = None;
+                if let Some(row) =
+                    unconnected_rows(&self.snapshot, &self.activity, std::time::Instant::now())
+                        .into_iter()
+                        .find(|row| id == format!("copy-quickstart:{}", unconnected_identity(row)))
+                {
+                    copy_text(&quickstart_command_for(&self.executable, &row));
+                }
+                self.replace_menu(None);
+            }
             UserEvent::Menu(id) if id.starts_with("hub:") => {
                 if self.opening_hub || self.installing.load(Ordering::Acquire) {
                     self.notice = Some(Notice::Action(
@@ -471,6 +542,9 @@ impl ApplicationHandler<UserEvent> for TrayApp {
             UserEvent::Snapshot(Ok(updated), dispatched) => {
                 self.refreshing.store(false, Ordering::Release);
                 if dispatched == config_stamp() {
+                    for connection in &updated.connections {
+                        self.activity.forget_unconnected(&connection.root);
+                    }
                     self.snapshot = updated;
                     clear_refresh_notice(&mut self.notice);
                 }
@@ -505,6 +579,33 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                         self.feedback
                             .update("Integration setup failed", &error, false);
                         format!("Integration setup failed: {error}")
+                    }
+                }));
+                self.replace_menu(None);
+                if !self.refreshing.swap(true, Ordering::AcqRel) {
+                    spawn_refresh(self.refresh_proxy.clone(), false);
+                }
+            }
+            UserEvent::HubOpenedLocally => {
+                self.opening_hub = false;
+                self.feedback.update("Hub opened", "Your browser opened this computer's Hub page, connected to your files, saved conversations and your team's work.", false);
+                self.notice = Some(Notice::Action("Hub opened in your browser".into()));
+                self.replace_menu(None);
+            }
+            UserEvent::Connected(agent, repo, result) => {
+                self.installing.store(false, Ordering::Release);
+                self.notice = Some(Notice::Action(match result {
+                    Ok(hub) => {
+                        self.feedback.update(
+                            &format!("{repo} connected"),
+                            &format!("Connected to {hub}. {}", setup_next_step(agent)),
+                            false,
+                        );
+                        format!("{repo} connected; open a fresh client session")
+                    }
+                    Err(error) => {
+                        self.feedback.update("Connect failed", &error, false);
+                        format!("Connect failed: {error}")
                     }
                 }));
                 self.replace_menu(None);
@@ -685,6 +786,178 @@ fn spawn_integration(
     });
 }
 
+#[derive(Clone)]
+struct ConnectRequest {
+    agent: crate::client_setup::Agent,
+    label: &'static str,
+    root: std::path::PathBuf,
+    host: String,
+    repo: String,
+}
+
+fn connect_request(
+    id: &str,
+    snapshot: &Snapshot,
+    activity: &crate::client_activity::ActivityStore,
+    now: std::time::Instant,
+) -> Option<ConnectRequest> {
+    let mut parts = id.split(':');
+    (parts.next()? == "connect").then_some(())?;
+    let identity = parts.next()?;
+    let agent_name = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let row = unconnected_rows(snapshot, activity, now)
+        .into_iter()
+        .find(|row| unconnected_identity(row) == identity)?;
+    row.agents
+        .iter()
+        .any(|agent| agent == agent_name)
+        .then_some(())?;
+    let (agent, label) = agent_choices()
+        .into_iter()
+        .find(|(agent, _)| agent.name() == agent_name)?;
+    Some(ConnectRequest {
+        agent,
+        label,
+        root: row.root,
+        host: row.host,
+        repo: row.repo,
+    })
+}
+
+/// The Hub a tray Connect uses for `host`/`repo`, with the saved sign-in it needs.
+fn target_hub(host: &str, repo: &str) -> Option<String> {
+    let connections = crate::client_config::load().unwrap_or_default();
+    connect_hub(host, repo, &connections, |hub| {
+        crate::hub_cli::load_session(hub).ok().map(|(hub, _)| hub)
+    })
+}
+
+/// A Hub another checkout of the same forge repository is connected to and still signed in to,
+/// so its agents meet the others; else the default saved sign-in.
+fn connect_hub(
+    host: &str,
+    repo: &str,
+    connections: &[crate::client_config::Connection],
+    signed_in: impl Fn(Option<&str>) -> Option<String>,
+) -> Option<String> {
+    connections
+        .iter()
+        .filter(|connection| {
+            connection.origin_host.eq_ignore_ascii_case(host)
+                && connection.repo.eq_ignore_ascii_case(repo)
+        })
+        .find_map(|connection| signed_in(Some(&connection.hub)))
+        .or_else(|| signed_in(None))
+}
+
+fn spawn_connect(
+    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    request: ConnectRequest,
+    hub: String,
+    program: std::path::PathBuf,
+) {
+    std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())?;
+            runtime
+                .block_on(crate::client_cli::setup_unconnected(
+                    request.agent,
+                    &request.root,
+                    &hub,
+                    &program,
+                ))
+                .map_err(|error| error.to_string())
+        }))
+        .map_err(|_| "connect stopped unexpectedly".to_owned())
+        .and_then(|result| result.map_err(|error| bounded_error(&error)))
+        .map(|()| hub);
+        let _ = proxy.send_event(UserEvent::Connected(request.agent, request.repo, result));
+    });
+}
+
+/// Unconnected checkouts still worth offering: fresh, and not connected since they were seen.
+fn unconnected_rows(
+    snapshot: &Snapshot,
+    activity: &crate::client_activity::ActivityStore,
+    now: std::time::Instant,
+) -> Vec<crate::client_activity::UnconnectedCheckout> {
+    let mut rows = activity.unconnected(now);
+    rows.retain(|row| {
+        !snapshot
+            .connections
+            .iter()
+            .any(|connection| connection.root == row.root)
+    });
+    rows
+}
+
+fn unconnected_identity(row: &crate::client_activity::UnconnectedCheckout) -> String {
+    let digest = Sha256::digest(row.root.as_os_str().as_encoded_bytes());
+    format!("{digest:x}")[..24].to_owned()
+}
+
+fn unconnected_details(
+    row: &crate::client_activity::UnconnectedCheckout,
+    now: std::time::Instant,
+    hub: Option<&str>,
+) -> String {
+    let elapsed = now.saturating_duration_since(row.seen_at);
+    let age = if elapsed < Duration::from_secs(60) {
+        "less than 1m ago".to_owned()
+    } else {
+        format!("{}m ago", elapsed.as_secs() / 60)
+    };
+    let agents = row
+        .agents
+        .iter()
+        .rev()
+        .map(|agent| agent_label(agent))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Agent  {agents}\nLast seen  {age}\nForge  {}\nPath  {}\nConnects to  {}",
+        full_menu_value(&row.host),
+        full_menu_value(&row.root.to_string_lossy()),
+        hub.map_or_else(|| "no saved Hub sign-in".to_owned(), full_menu_value),
+    )
+}
+
+fn agent_label(agent: &str) -> &'static str {
+    agent_choices()
+        .into_iter()
+        .find(|(choice, _)| choice.name() == agent)
+        .map_or("Agent", |(_, label)| label)
+}
+
+fn quickstart_command_for(
+    executable: &Path,
+    row: &crate::client_activity::UnconnectedCheckout,
+) -> String {
+    let agent = row.agents.last().map_or("claude", String::as_str);
+    format!(
+        "cd {} && {} quickstart --agent {}",
+        shell_quote(&row.root.to_string_lossy()),
+        shell_quote(&executable.to_string_lossy()),
+        shell_quote(agent)
+    )
+}
+
+/// `client setup` prints progress, and once the launcher has read the ready line, stdout is a
+/// closed pipe on which `println!` would panic.
+fn discard_stdout() {
+    use std::os::fd::AsRawFd;
+    if let Ok(null) = OpenOptions::new().write(true).open("/dev/null") {
+        // SAFETY: both descriptors are open for the call; dup2 only replaces descriptor 1.
+        unsafe { libc::dup2(null.as_raw_fd(), libc::STDOUT_FILENO) };
+    }
+}
+
 fn setup_next_step(agent: crate::client_setup::Agent) -> &'static str {
     use crate::client_setup::Agent;
     match agent {
@@ -714,6 +987,15 @@ fn spawn_hub_open(
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build();
+        // This computer's own page first; the hosted Hub's read-only link only if it cannot start.
+        if let Ok(runtime) = &runtime
+            && runtime
+                .block_on(crate::open_cli::open_checkout(request.root()))
+                .is_ok()
+        {
+            let _ = proxy.send_event(UserEvent::HubOpenedLocally);
+            return;
+        }
         let result = match &runtime {
             Ok(runtime) => runtime.block_on(hub_open::prepare_open(request)),
             Err(_) => Err(hub_open::OpenError::Unavailable),
@@ -783,7 +1065,9 @@ fn build_menu(
     let menu = Menu::new();
     menu.append(&PredefinedMenuItem::section_header("AgentSCM"))
         .map_err(menu_error)?;
-    if snapshot.connections.is_empty() && notice.is_none() {
+    let monotonic_now = std::time::Instant::now();
+    let unconnected = unconnected_rows(snapshot, activity, monotonic_now);
+    if snapshot.connections.is_empty() && unconnected.is_empty() && notice.is_none() {
         menu.append(&native_text_item(
             "empty",
             "No connected checkouts\nRun npx agentscm in a checkout to begin.",
@@ -959,6 +1243,57 @@ fn build_menu(
         submenu.append(&troubleshooting).map_err(menu_error)?;
         menu.append(&submenu).map_err(menu_error)?;
     }
+    if !unconnected.is_empty() {
+        menu.append(&PredefinedMenuItem::section_header("Not connected"))
+            .map_err(menu_error)?;
+    }
+    for row in &unconnected {
+        let identity = unconnected_identity(row);
+        let name = row
+            .root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&row.repo);
+        let submenu = Submenu::new(super::clean_label(name), true);
+        submenu
+            .append(&native_text_item(
+                "summary",
+                &format!("{}\nNot connected", full_menu_value(&row.repo)),
+            ))
+            .map_err(menu_error)?;
+        submenu
+            .append(&native_text_item(
+                "details",
+                &unconnected_details(
+                    row,
+                    monotonic_now,
+                    target_hub(&row.host, &row.repo).as_deref(),
+                ),
+            ))
+            .map_err(menu_error)?;
+        submenu
+            .append(&PredefinedMenuItem::separator())
+            .map_err(menu_error)?;
+        for agent in row.agents.iter().rev() {
+            submenu
+                .append(&MenuItem::with_id(
+                    format!("connect:{identity}:{agent}"),
+                    format!("Connect with {}", agent_label(agent)),
+                    true,
+                    None,
+                ))
+                .map_err(menu_error)?;
+        }
+        submenu
+            .append(&MenuItem::with_id(
+                format!("copy-quickstart:{identity}"),
+                "Copy Terminal Setup",
+                true,
+                None,
+            ))
+            .map_err(menu_error)?;
+        menu.append(&submenu).map_err(menu_error)?;
+    }
     menu.append(&PredefinedMenuItem::separator())
         .map_err(menu_error)?;
     if let Some(notice) = notice {
@@ -1038,6 +1373,15 @@ fn menu_projection_key(
                 key.push_str(&activity_label_at(&row, monotonic_now));
             }
         }
+    }
+    for row in unconnected_rows(snapshot, activity, monotonic_now) {
+        key.push_str("\nunconnected:");
+        key.push_str(&row.repo);
+        key.push_str(&unconnected_details(
+            &row,
+            monotonic_now,
+            target_hub(&row.host, &row.repo).as_deref(),
+        ));
     }
     key
 }
@@ -1568,6 +1912,153 @@ mod tests {
                 Path::new("/tmp/a b;$(touch nope)"),
             ),
             "'/Applications/AgentSCM versions/agentscm'\\''current' client setup --agent 'codex' --hub 'https://hub.example.test/a'\\''b' --root '/tmp/a b;$(touch nope)'"
+        );
+    }
+
+    #[test]
+    fn connect_prefers_the_hub_the_repository_already_uses() {
+        let saved =
+            |root: &str, host: &str, repo: &str, hub: &str| crate::client_config::Connection {
+                root: root.into(),
+                origin_host: host.into(),
+                hub: hub.into(),
+                repo: repo.into(),
+                token_file: "/synthetic/token".into(),
+                report_completion: false,
+                owned_token_id: None,
+                owned_token_expires_at: None,
+                agents: Vec::new(),
+            };
+        let connections = [
+            saved(
+                "/synthetic/a",
+                "gitlab.com",
+                "acme/widgets",
+                "https://other.example.test",
+            ),
+            saved(
+                "/synthetic/b",
+                "github.com",
+                "Acme/Widgets",
+                "https://team.example.test",
+            ),
+            saved(
+                "/synthetic/c",
+                "github.com",
+                "acme/widgets",
+                "https://stale.example.test",
+            ),
+        ];
+        let signed_in = |hubs: &'static [&'static str]| {
+            move |hub: Option<&str>| match hub {
+                Some(hub) => hubs.contains(&hub).then(|| hub.to_owned()),
+                None => Some("https://default.example.test".to_owned()),
+            }
+        };
+        assert_eq!(
+            connect_hub(
+                "github.com",
+                "acme/widgets",
+                &connections,
+                signed_in(&["https://team.example.test"])
+            ),
+            Some("https://team.example.test".to_owned()),
+            "same forge repository, case-insensitive"
+        );
+        assert_eq!(
+            connect_hub("github.com", "acme/widgets", &connections, signed_in(&[])),
+            Some("https://default.example.test".to_owned()),
+            "no sign-in for that Hub any more"
+        );
+        assert_eq!(
+            connect_hub(
+                "github.com",
+                "acme/other",
+                &connections,
+                signed_in(&["https://team.example.test"])
+            ),
+            Some("https://default.example.test".to_owned()),
+            "another repository"
+        );
+        assert_eq!(connect_hub("github.com", "acme/other", &[], |_| None), None);
+    }
+
+    #[test]
+    fn unconnected_rows_offer_seen_agents_until_the_checkout_is_connected() {
+        let now = std::time::Instant::now();
+        let mut activity = crate::client_activity::ActivityStore::default();
+        for agent in ["claude", "codex"] {
+            activity.push_unconnected(crate::client_activity::UnconnectedCheckout {
+                root: "/synthetic/widgets".into(),
+                host: "github.com".into(),
+                repo: "acme/widgets".into(),
+                agents: vec![agent.into()],
+                seen_at: now,
+            });
+        }
+        let mut snapshot = Snapshot {
+            version: 1,
+            snapshot_at: 0,
+            connections: Vec::new(),
+        };
+        let rows = unconnected_rows(&snapshot, &activity, now);
+        assert_eq!(rows.len(), 1);
+        let identity = unconnected_identity(&rows[0]);
+        let request = connect_request(
+            &format!("connect:{identity}:codex"),
+            &snapshot,
+            &activity,
+            now,
+        )
+        .unwrap();
+        assert_eq!(request.agent, crate::client_setup::Agent::Codex);
+        assert_eq!(request.root, Path::new("/synthetic/widgets"));
+        for id in [
+            format!("connect:{identity}:gemini"),
+            format!("connect:{identity}:codex:extra"),
+            "connect:unknown:codex".to_owned(),
+        ] {
+            assert!(
+                connect_request(&id, &snapshot, &activity, now).is_none(),
+                "{id}"
+            );
+        }
+        assert_eq!(
+            quickstart_command_for(Path::new("/opt/agent scm"), &rows[0]),
+            "cd '/synthetic/widgets' && '/opt/agent scm' quickstart --agent 'codex'"
+        );
+        let projected = menu_projection_key(&snapshot, &activity, None, false, 100, now);
+        assert!(projected.contains("unconnected:acme/widgets"));
+
+        snapshot
+            .connections
+            .push(crate::client_status::ConnectionStatus {
+                root: "/synthetic/widgets".into(),
+                repository: "acme/widgets".into(),
+                hub: "https://hub.example.test".into(),
+                agents: vec!["codex".into()],
+                binding: crate::client_status::BindingStatus {
+                    state: BindingState::Current,
+                    generation: None,
+                    activity_generation: None,
+                },
+                credential: crate::client_status::CredentialStatus {
+                    kind: crate::client_status::CredentialKind::Managed,
+                    state: CredentialState::Available,
+                    expires_at: None,
+                },
+                hub_check: HubCheck::Skipped,
+                recent_participation: vec![],
+            });
+        assert!(unconnected_rows(&snapshot, &activity, now).is_empty());
+        assert!(
+            connect_request(
+                &format!("connect:{identity}:codex"),
+                &snapshot,
+                &activity,
+                now
+            )
+            .is_none()
         );
     }
 

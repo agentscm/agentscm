@@ -512,10 +512,20 @@ pub(crate) fn is_current(connection: &Connection) -> bool {
         .canonicalize()
         .is_ok_and(|root| root == connection.root)
         && repo_root(&connection.root).as_deref() == Some(connection.root.as_path())
-        && origin_identity(&connection.root).is_ok_and(|(host, repo)| {
-            host.eq_ignore_ascii_case(&connection.origin_host)
-                && repo.eq_ignore_ascii_case(&connection.repo)
-        })
+        && same_origin(connection, &connection.root)
+}
+
+/// [`is_current`], and a linked worktree `checkout` still has the bound origin identity, which
+/// worktree-specific Git configuration could otherwise change.
+pub(crate) fn is_current_in(connection: &Connection, checkout: &Path) -> bool {
+    is_current(connection) && (checkout == connection.root || same_origin(connection, checkout))
+}
+
+fn same_origin(connection: &Connection, checkout: &Path) -> bool {
+    origin_identity(checkout).is_ok_and(|(host, repo)| {
+        host.eq_ignore_ascii_case(&connection.origin_host)
+            && repo.eq_ignore_ascii_case(&connection.repo)
+    })
 }
 
 /// Resolve an existing prefix, then normalize a possibly-not-yet-created tail.
@@ -552,6 +562,70 @@ pub(crate) fn connection_for_path<'a>(
         .iter()
         .filter(|connection| path.starts_with(&connection.root))
         .max_by_key(|connection| connection.root.components().count())
+}
+
+/// The connection for the Git checkout containing `path`, and that checkout's root. A linked
+/// worktree of a registered checkout shares its Git directory and routes to it, so a session an
+/// editor starts in a new worktree needs no setup. A nested or separate clone never matches.
+pub(crate) fn connection_for_checkout<'a>(
+    connections: &'a [Connection],
+    path: &Path,
+) -> Option<(&'a Connection, PathBuf)> {
+    let resolved = resolved(path)?;
+    let checkout = resolved
+        .ancestors()
+        .find(|path| path.exists())
+        .and_then(repo_root)?;
+    if let Some(connection) = connections.iter().find(|c| c.root == checkout) {
+        return Some((connection, checkout));
+    }
+    let common = common_dir(&checkout)?;
+    connections
+        .iter()
+        .filter(|connection| common_dir(&connection.root).as_deref() == Some(common.as_path()))
+        // Several checkouts of one repository may be registered; prefer the main worktree.
+        .min_by_key(|connection| connection.root.join(".git") != common)
+        .map(|connection| (connection, checkout))
+}
+
+/// The main worktree of the checkout at `root`: its own root unless it is a verified linked
+/// worktree of a non-bare repository, whose shared Git directory is `<main>/.git`.
+pub(crate) fn main_checkout(root: &Path) -> PathBuf {
+    common_dir(root)
+        .filter(|common| common.file_name().is_some_and(|name| name == ".git"))
+        .and_then(|common| common.parent().map(Path::to_owned))
+        .filter(|main| repo_root(main).as_deref() == Some(main.as_path()))
+        .unwrap_or_else(|| root.to_owned())
+}
+
+/// The Git directory every worktree of the checkout at `root` shares. A linked worktree's `.git`
+/// file names its own directory under the shared `worktrees/`, which Git points back at the
+/// checkout; a copied, forged or submodule pointer fails these checks.
+fn common_dir(root: &Path) -> Option<PathBuf> {
+    let dot_git = root.join(".git");
+    let kind = std::fs::symlink_metadata(&dot_git).ok()?.file_type();
+    // A symlinked `.git` would borrow another checkout's Git directory without being its worktree.
+    if kind.is_symlink() {
+        return None;
+    }
+    if kind.is_dir() {
+        return dot_git.canonicalize().ok();
+    }
+    let read = |path: &Path| std::fs::read_to_string(path).ok();
+    let own = root
+        .join(read(&dot_git)?.strip_prefix("gitdir:")?.trim())
+        .canonicalize()
+        .ok()?;
+    let back = own
+        .join(read(&own.join("gitdir"))?.trim())
+        .canonicalize()
+        .ok()?;
+    let common = own
+        .join(read(&own.join("commondir"))?.trim())
+        .canonicalize()
+        .ok()?;
+    (back == dot_git.canonicalize().ok()? && own.parent()? == common.join("worktrees"))
+        .then_some(common)
 }
 
 /// A safe repo-relative path under `root`, resolving symlinked existing prefixes.
@@ -932,6 +1006,88 @@ mod tests {
         assert_eq!(
             origin_identity(&linked).unwrap(),
             ("github.com".into(), "acme/widgets".into())
+        );
+    }
+
+    #[test]
+    fn linked_worktrees_route_to_their_registered_checkout_and_other_clones_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        git(&main, &["init", "--quiet"]);
+        git(&main, &["config", "user.name", "AgentSCM Test"]);
+        git(&main, &["config", "user.email", "test@example.invalid"]);
+        git(&main, &["commit", "--quiet", "--allow-empty", "-m", "test"]);
+        // Git gets plain paths: Windows canonical `\\?\` paths are not accepted by `worktree add`.
+        let checkout = main;
+        let main = checkout.canonicalize().unwrap();
+        // Editors create session worktrees both inside the checkout and beside it.
+        let nested = checkout.join(".claude/worktrees/task");
+        let beside = dir.path().join("beside");
+        let third = dir.path().join("third");
+        for linked in [&nested, &beside, &third] {
+            let linked = linked.to_str().unwrap();
+            git(
+                &checkout,
+                &["worktree", "add", "--quiet", "--detach", linked],
+            );
+        }
+        let foreign = checkout.join("vendor/other");
+        std::fs::create_dir_all(&foreign).unwrap();
+        git(&foreign, &["init", "--quiet"]);
+        let connections = [connection(main.clone(), "acme/widgets")];
+
+        assert_eq!(
+            connection_for_checkout(&connections, &main.join("src/new.rs")),
+            Some((&connections[0], main.clone()))
+        );
+        for linked in [&nested, &beside] {
+            let linked = linked.canonicalize().unwrap();
+            assert_eq!(
+                connection_for_checkout(&connections, &linked.join("src/new.rs")),
+                Some((&connections[0], linked))
+            );
+        }
+        assert_eq!(
+            connection_for_checkout(&connections, &foreign.join("a.rs")),
+            None
+        );
+
+        // A copied `.git` pointer is not a worktree Git created for this checkout.
+        let copied = dir.path().join("copied");
+        std::fs::create_dir(&copied).unwrap();
+        std::fs::copy(beside.join(".git"), copied.join(".git")).unwrap();
+        assert_eq!(connection_for_checkout(&connections, &copied), None);
+        for checkout in [
+            &main,
+            &nested.canonicalize().unwrap(),
+            &beside.canonicalize().unwrap(),
+        ] {
+            assert_eq!(main_checkout(checkout), main);
+        }
+        assert_eq!(main_checkout(&copied), copied);
+        let foreign = foreign.canonicalize().unwrap();
+        assert_eq!(main_checkout(&foreign), foreign);
+
+        // A symlinked `.git`, to the shared directory or to a worktree's file, is refused too.
+        #[cfg(unix)]
+        for (name, target) in [
+            ("linked-dir", main.join(".git")),
+            ("linked-file", beside.join(".git")),
+        ] {
+            let fake = dir.path().join(name);
+            std::fs::create_dir(&fake).unwrap();
+            std::os::unix::fs::symlink(target, fake.join(".git")).unwrap();
+            assert_eq!(connection_for_checkout(&connections, &fake), None, "{name}");
+        }
+
+        let both = [
+            connection(beside.canonicalize().unwrap(), "acme/widgets"),
+            connection(main.clone(), "acme/widgets"),
+        ];
+        assert_eq!(
+            connection_for_checkout(&both, &third).map(|(connection, _)| &connection.root),
+            Some(&main)
         );
     }
 }

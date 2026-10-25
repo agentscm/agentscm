@@ -1,4 +1,4 @@
-import { loadLocalBase, loadLocalToken, validLocalBase } from './localApi.ts'
+import { loadLocalBase, loadLocalToken, localCredential, validLocalBase } from './localApi.ts'
 import { withTimeout } from './timeout.ts'
 
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024
@@ -571,6 +571,36 @@ function decodeSessionEvidence(value: unknown, path: string): ExplorerSessionEvi
   }
 }
 
+/** Saved sessions for the repository: each belongs to its Work, none is tied to a commit. */
+export interface ExplorerSessionPage {
+  version: 1
+  repository: string
+  sessions: ExplorerSessionEvidence[]
+  projection_coverage: ExplorerProjectionCoverage
+  next_cursor: string | null
+  complete: boolean
+}
+
+export function decodeExplorerSessions(value: unknown): ExplorerSessionPage {
+  const path = 'sessions'
+  const raw = object(value, path, ['version', 'repository', 'sessions', 'projection_coverage', 'next_cursor', 'complete'])
+  if (raw['version'] !== 1) fail(`${path}.version`)
+  const page: ExplorerSessionPage = {
+    version: 1,
+    repository: nonempty(raw['repository'], `${path}.repository`, 256),
+    sessions: array(raw['sessions'], `${path}.sessions`, 200).map((item, index) => {
+      // The listing sends bare session facts; the `entry` tag belongs to evidence pages only.
+      if (item === null || typeof item !== 'object' || Array.isArray(item) || 'entry' in item) fail(`${path}.sessions[${index}]`)
+      return decodeSessionEvidence({ entry: 'session', ...(item as Record<string, unknown>) }, `${path}.sessions[${index}]`)
+    }),
+    projection_coverage: decodeProjectionCoverage(raw['projection_coverage'], `${path}.projection_coverage`),
+    next_cursor: nullableCursor(raw['next_cursor'], `${path}.next_cursor`),
+    complete: bool(raw['complete'], `${path}.complete`),
+  }
+  if (page.complete !== (page.next_cursor === null)) fail(`${path}.complete`)
+  return page
+}
+
 export function decodeExplorerEvidence(value: unknown): ExplorerEvidencePage {
   const path = 'evidence'
   const raw = object(value, path, ['version', 'repository', 'commit', 'path', 'requested_work_id', 'entries', 'projection_coverage', 'next_cursor', 'complete'])
@@ -712,7 +742,7 @@ async function explorerRead<T>(endpoint: string, params: Record<string, string |
   const crossOrigin = configured !== ''
   const query = new URLSearchParams()
   for (const [key, value] of Object.entries(params)) if (value !== undefined) query.set(key, String(value))
-  const token = loadLocalToken()
+  const token = crossOrigin ? loadLocalToken() : localCredential() || loadLocalToken()
   const url = `${crossOrigin ? configured : ''}/v1/local/explorer/${endpoint}?${query}`
   const busyDelays = [150, 400, 900, 1800]
   let response: Response
@@ -735,8 +765,10 @@ async function explorerRead<T>(endpoint: string, params: Record<string, string |
     if (signal.aborted) throw signal.reason
   }
   if (!response.ok) {
-    await response.body?.cancel()
-    throw new ExplorerResponseError(adviceFor(response.status), response.status)
+    // On this computer's own Hub page, a repository that is no longer connected is its own case.
+    const code = response.status === 409 ? ((await response.json().catch(() => null)) as { error?: unknown } | null)?.error : undefined
+    if (code === undefined) await response.body?.cancel()
+    throw new ExplorerResponseError(code === 'repository_unavailable' ? 'That repository is no longer connected on this computer. Choose another one at the top of the page, or run agentscm open in its checkout.' : adviceFor(response.status), response.status)
   }
   return decode(await boundedJson(response))
 }
@@ -789,6 +821,12 @@ export async function fetchExplorerSearch(commit: string, query: string, signal:
 export async function fetchExplorerEvidence(commit: string, path: string | null, signal: AbortSignal, workId?: string, cursor?: string, repositoryId?: string): Promise<ExplorerEvidencePage> {
   const value = await explorerRead('evidence', { commit, path: path || undefined, work_id: workId, cursor, limit: 25 }, decodeExplorerEvidence, signal)
   if (value.commit !== commit || value.path !== path || value.requested_work_id !== (workId ?? null)) throw new ExplorerResponseError('The local explorer returned evidence for a different source selection.')
+  if (repositoryId !== undefined && value.repository !== repositoryId) throw new ExplorerResponseError('The local explorer returned data for a different repository.')
+  return value
+}
+
+export async function fetchExplorerSessions(signal: AbortSignal, cursor?: string, repositoryId?: string): Promise<ExplorerSessionPage> {
+  const value = await explorerRead('sessions', { cursor, limit: 25 }, decodeExplorerSessions, signal)
   if (repositoryId !== undefined && value.repository !== repositoryId) throw new ExplorerResponseError('The local explorer returned data for a different repository.')
   return value
 }

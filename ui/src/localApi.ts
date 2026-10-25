@@ -6,7 +6,9 @@
 // shortcut: the routes below are provisional until the local read API ships; when a route does not
 // answer, the adapter returns the fixtures and marks them `preview`, and every screen says so.
 import examples from './localExamples.json'
+import { isLocalCredential } from './frontDoor.ts'
 import { clean } from './publications.ts'
+import { loadToken } from './storage.ts'
 import { decodeSkillWorkflowListEnvelope } from './skillWorkflow.ts'
 import type { SkillWorkflowListEnvelope } from './types.ts'
 
@@ -244,6 +246,11 @@ export function saveLocalToken(v: string): void {
     /* not kept */
   }
 }
+/** On this computer's own Hub page, the connection credential; same-origin reads carry it. */
+export function localCredential(): string {
+  const token = loadToken()
+  return isLocalCredential(token) ? token : ''
+}
 /** Only loopback http(s) addresses are accepted: this must be a server on this computer. */
 export const validLocalBase = (v: string) => v === '' || /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d{1,5})?$/.test(v)
 
@@ -264,7 +271,7 @@ export class LocalError extends Error {
   status: number
   code: string
   constructor(status: number, code: string) {
-    super(adviceFor(status))
+    super(code === 'repository_unavailable' ? 'That repository is no longer connected on this computer. Choose another one at the top of the page, or run agentscm open in its checkout.' : adviceFor(status))
     this.status = status
     this.code = code
   }
@@ -275,7 +282,7 @@ const BUSY_RETRIES = [150, 400, 900, 1800]
 async function read<T>(path: string, decode: (v: unknown) => T, fixture: () => T, signal: AbortSignal): Promise<Read<T>> {
   const base = loadLocalBase()
   const cross = base !== '' && validLocalBase(base)
-  const token = cross ? loadLocalToken() : ''
+  const token = cross ? loadLocalToken() : localCredential()
   let res: Response
   // serve handles one read at a time by default and answers 503 when busy; that is a retry, not an error.
   for (let attempt = 0; ; attempt++) {

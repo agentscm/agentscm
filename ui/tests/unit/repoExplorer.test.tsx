@@ -7,6 +7,7 @@ import {
 } from '../../src/pages/Explorer.tsx'
 import {
   decodeExplorerConversation,
+  decodeExplorerSessions,
   decodeExplorerDiff,
   decodeExplorerEvidence,
   decodeExplorerFile,
@@ -192,6 +193,32 @@ describe('repository explorer journey', () => {
     expect(calls.some((call) => call.includes('/v1/local/explorer/diff?'))).toBe(true)
   })
 
+  it('reaches a saved conversation that has no evidence at the viewed commit', async () => {
+    vi.stubGlobal('fetch', async (input: string | URL | Request) => {
+      const url = new URL(String(input), 'http://localhost')
+      if (url.pathname.endsWith('/summary')) return json(summary())
+      if (url.pathname.endsWith('/tree')) return json({ version: 1, repository_id: REPO, commit: COMMIT, tree: TREE, path: '', entries: [], next: null, complete: true, limit_state: 'complete' })
+      if (url.pathname.endsWith('/evidence')) return json({ ...evidence(), path: null, entries: [] })
+      if (url.pathname.endsWith('/sessions')) return json({ version: 1, repository: REPO, sessions: [Object.fromEntries(Object.entries(sessionEntry()).filter(([key]) => key !== 'entry'))], projection_coverage: coverage(), next_cursor: null, complete: true })
+      if (url.pathname.endsWith('/conversation')) return json(conversation())
+      throw new Error(`unexpected URL ${url}`)
+    })
+    const user = userEvent.setup()
+    render(<ExplorerPage hubRepository={REPO} />)
+    await user.click(await screen.findByRole('tab', { name: /Evidence/ }))
+    expect(await screen.findByText('No retained evidence for this selection')).toBeTruthy()
+    await user.click(screen.getByRole('button', { name: 'Browse all saved conversations' }))
+    expect(screen.getByRole('tab', { name: /Conversations/ }).getAttribute('aria-selected')).toBe('true')
+    expect(await screen.findByText(/not tied to the commit you are viewing/)).toBeTruthy()
+    expect(screen.getByText('Some saved capture is missing')).toBeTruthy()
+    expect(screen.getByText('Saved text is checked when you open a conversation.')).toBeTruthy()
+    const open = screen.getByRole('button', { name: 'Open conversation' })
+    await user.click(open)
+    expect(await screen.findByText('<script>alert("quoted")</script>')).toBeTruthy()
+    await user.click(screen.getByRole('button', { name: 'Close conversation' }))
+    await waitFor(() => expect(document.activeElement).toBe(open))
+  })
+
   it('supports list and tab arrow keys', async () => {
     vi.stubGlobal('fetch', async (input: string | URL | Request) => {
       const url = new URL(String(input), 'http://localhost')
@@ -300,5 +327,23 @@ describe('bounded context packet', () => {
     expect(packet.untrusted_data.sections.conversation.pagination).toEqual({ page_complete: false, next_cursor_present: true, remaining_count: 'unknown' })
     expect(packet.untrusted_data.sections.conversation.omitted_loaded_count).toBeGreaterThan(0)
     expect(packet.untrusted_data.sections.evidence.details.projection_coverage.unverified_bodies).toBe(1)
+  })
+})
+
+describe('saved conversation listing', () => {
+  const session = { relation: 'same_work_session', work_id: 'wrk_synthetic', generation: 1, session_id: 'session-synthetic', harness: 'claude_code', capture_mode: 'local_conversation', first_observed_at: 1, last_observed_at: 2, event_count: 3, unavailable_body_count: 0, capture_gap_count: 1 }
+  const page = { version: 1, repository: 'acme/widgets', sessions: [session], projection_coverage: { retained_envelopes: 1, compacted_event_batches_unattributed: 0, unavailable_bodies: 0, unverified_bodies: 0, capture_gaps: 1, complete: false }, next_cursor: null, complete: true }
+
+  it('keeps sessions as same-Work entries with their capture gaps', () => {
+    const decoded = decodeExplorerSessions(page)
+    expect(decoded.sessions[0]).toMatchObject({ entry: 'session', relation: 'same_work_session', work_id: 'wrk_synthetic', capture_gap_count: 1 })
+    expect(decoded.projection_coverage.complete).toBe(false)
+  })
+
+  it('rejects any other relation or an inconsistent page', () => {
+    expect(() => decodeExplorerSessions({ ...page, sessions: [{ ...session, relation: 'exact_source_binding' }] })).toThrow()
+    expect(() => decodeExplorerSessions({ ...page, next_cursor: 'more', complete: true })).toThrow()
+    expect(() => decodeExplorerSessions({ ...page, extra: 1 })).toThrow()
+    expect(() => decodeExplorerSessions({ ...page, sessions: [{ ...session, entry: 'session' }] })).toThrow()
   })
 })

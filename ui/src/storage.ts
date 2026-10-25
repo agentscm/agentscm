@@ -48,6 +48,14 @@ export function fragmentTokenAllowed(stored: string | null, demo: boolean): bool
   return demo || stored === null
 }
 
+/**
+ * After the Hub refuses `refused`: the sign-in another tab saved since, if any, so a stale tab
+ * adopts it instead of erasing it; `null` means sign out.
+ */
+export function signInAfterRefusal(refused: string | null, stored: string | null): string | null {
+  return stored && stored !== refused ? stored : null
+}
+
 /** Unchecked "keep me signed in" uses sessionStorage, checked uses localStorage. */
 export function saveToken(token: string, keep: boolean): void {
   clearToken()

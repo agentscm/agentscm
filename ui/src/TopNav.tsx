@@ -1,3 +1,5 @@
+import { hostOf, selectorOf, useLocalComputer } from './ComputerBar.tsx'
+import { disconnectComputer, isLocalCredential, localSelection, switchRepository, type ConnectedRepository } from './frontDoor.ts'
 import { skillRunHref, skillRunsHref, skillsRoute } from './skills.ts'
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { Derived } from './derive.ts'
@@ -120,6 +122,81 @@ function RepoSwitcher({ repo, onForget }: { repo: string; onForget: () => void }
           <button type="button" role="menuitem" className="pop-item" onClick={onForget}>
             <Icon name="arrow-left-right" />
             <span className="pop-main">Use a different token<span className="pop-sub">Forgets this one in this browser</span></span>
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * The repository menu on this computer's own Hub page: the connected computer, every repository
+ * connected on it (the same repository on two Hubs is told apart by Hub), and Disconnect. It shares
+ * `useDismiss` with the Hub's other menus.
+ */
+export function LocalRepoSwitcher({ token, repo }: { token: string; repo: string }) {
+  const [open, setOpen] = useState(false)
+  const ref = useDismiss(open, () => setOpen(false))
+  const local = useLocalComputer()
+  const identity = local?.identity.kind === 'ready' ? local.identity.value : null
+  const repositories = local?.repositories ?? []
+  const computer = identity?.computer ?? 'This computer'
+  const repository = identity ? identity.repository : repo
+  const selection = localSelection(token) ?? repository ?? ''
+  const current = repositories.find((r) => selectorOf(r) === selection) ?? repositories.find((r) => r.repository.toLowerCase() === repository?.toLowerCase() && r.hub === identity?.hub?.url)
+  const repeated = (r: ConnectedRepository) => repositories.filter((o) => o.repository.toLowerCase() === r.repository.toLowerCase()).length > 1
+  return (
+    <div className="pop" ref={ref}>
+      <button type="button" data-tour="repo" className={`repo-btn${open ? ' is-open' : ''}`} aria-haspopup="menu" aria-expanded={open} aria-label={`${repository ?? 'No repository'} on ${computer}`} onClick={() => setOpen((o) => !o)}>
+        <span className="repo-mark is-computer" aria-hidden="true"><Icon name="laptop" /></span>
+        <span className="repo-name">{repository ?? 'Choose a repository'}</span>
+        <Icon name="chevron-expand" className="repo-chevron" />
+      </button>
+      {open && (
+        <div className="pop-menu pop-left" role="menu">
+          <div className="pop-head">
+            <Icon name="laptop" /> On {computer}
+          </div>
+          {repositories.map((r) => {
+            const isCurrent = current !== undefined && selectorOf(r) === selectorOf(current)
+            return (
+              <button
+                key={selectorOf(r)}
+                type="button"
+                role="menuitemradio"
+                aria-checked={isCurrent}
+                className={`pop-item${isCurrent ? ' is-current' : ''}`}
+                onClick={() => {
+                  setOpen(false)
+                  if (!isCurrent && switchRepository(token, selectorOf(r))) window.location.reload()
+                }}
+              >
+                <span className="repo-mark" aria-hidden="true"><Icon name="git" /></span>
+                <span className="pop-main">
+                  <code>{r.repository}</code>
+                  <span className="pop-sub">{repeated(r) ? hostOf(r.hub) : r.folder && r.folder !== r.repository.split('/')[1] ? r.folder : 'Read-only team view'}</span>
+                </span>
+                {isCurrent && <Icon name="check2" className="pop-check" />}
+              </button>
+            )
+          })}
+          <p className="pop-note">
+            <Icon name="info-circle" /> Files and saved conversations come from this computer. Team work comes from each repository’s Hub, read-only.
+          </p>
+          <div className="pop-sep" />
+          <button
+            type="button"
+            role="menuitem"
+            className="pop-item"
+            onClick={() => {
+              setOpen(false)
+              void disconnectComputer().then(() => window.location.reload())
+            }}
+          >
+            <Icon name="box-arrow-right" />
+            <span className="pop-main">
+              Disconnect this browser<span className="pop-sub">Connect again with Open Hub or <code>agentscm open</code></span>
+            </span>
           </button>
         </div>
       )}
@@ -464,8 +541,10 @@ function Breadcrumbs({ repo, section, overview, data }: { repo: string; section:
   )
 }
 
-export function AppChrome({ logo, repo, sections, section, badges, data, d, overview, pref, onPref, onForget, collapsed, onCollapsed, children }: {
+export function AppChrome({ logo, token, repo, sections, section, badges, data, d, overview, pref, onPref, onForget, collapsed, onCollapsed, children }: {
   logo: ReactNode
+  /** The Hub sign-in; on this computer's own page, its connection credential. */
+  token: string
   repo: string
   sections: SectionDef[]
   section: Section
@@ -546,7 +625,7 @@ export function AppChrome({ logo, repo, sections, section, badges, data, d, over
           {logo}
         </a>
         <span className="topbar-div" aria-hidden="true" />
-        <RepoSwitcher repo={repo} onForget={onForget} />
+        {isLocalCredential(token) ? <LocalRepoSwitcher token={token} repo={repo} /> : <RepoSwitcher repo={repo} onForget={onForget} />}
 
         <button type="button" data-tour="search" className="search-pill" onClick={() => setPalette(true)} aria-label="Search the hub">
           <Icon name="search" />

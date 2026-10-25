@@ -109,7 +109,21 @@ login command for that exact Hub and run it in Terminal; then retry Open Hub.
 For a connected checkout, choose **Agent Integrations** in its menu to configure Claude
 Code, Codex, Cursor, Copilot or Gemini. This installs AgentSCM's existing hooks, MCP connection
 and coordination skill; the native client's own trust prompts still apply. **Reapply** reruns
-that setup without signing in again. Connect a new checkout or Hub through quickstart.
+that setup without signing in again.
+When the user-scope Claude Code or Codex plugin (or another client-connection hook) runs in a Git
+checkout that has no connection, the hook tells a running tray, and the checkout appears under
+**Not connected** with its repository, agent and last-seen time. A linked worktree is listed as its
+main checkout. Only checkouts whose `origin` is one GitHub or GitLab repository are listed; the
+report stays on this machine and is sent only while a tray is running. Once a tray has received
+it, the hook repeats it at most every five minutes per agent and checkout, so a tray opened during
+a session lists the checkout at the agent's next hook. The tray forgets it after an hour, after
+sleep, or on quit, keeping at most eight. **Connect with**
+an agent runs the same steps as `agentscm client setup --agent AGENT --hub HUB` for the main
+checkout, with the Hub of your most recent saved sign-in and without starting a new sign-in; the
+result window names the Hub. The row then becomes a normal connected checkout; if that connection
+is removed later, the checkout is listed again only once an agent runs there again. When there is no
+saved sign-in, or it has expired, **Copy Terminal Setup** copies `agentscm quickstart` for that
+checkout. Connect a checkout to a different Hub through quickstart.
 Setup opens a status window with progress, the result and the client's next steps. It does not
 install the coding client itself. Open the configured checkout in that client, review its own
 approvals, and start a fresh session before checking activity in the tray.

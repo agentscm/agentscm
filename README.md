@@ -84,6 +84,9 @@ Quickstart sets up each coding agent through `agentscm client setup`, so it appe
 hub's Connect agents page, defaults to a native managed hub on Apple Silicon macOS with an explicit Docker fallback, and prints the executable path and PATH guidance for later commands.
 See [guided setup](docs/setup-guide.md) for details.
 
+Run `agentscm open` in a connected checkout to see your files, saved agent conversations and your
+team's work in one browser page ([details](docs/connect-this-computer.md)).
+
 On macOS, `npx agentscm tray` opens the optional status-bar companion from the same installation;
 `npx agentscm --local --tray` opens it after successful setup. Start at Login is off by default.
 The current alpha binary is unsigned and unnotarized, and the tray has no independent updater.

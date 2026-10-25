@@ -2572,3 +2572,6 @@ a.run-row:hover {
 }
 .lane-title { margin: 0; font: inherit; color: inherit; }
 .ws-grid .combo { min-width: min(100%, 18rem); }
+
+/* This computer's own Hub page: the repository menu marks the computer. */
+.repo-mark.is-computer { color: var(--hub-ok); }

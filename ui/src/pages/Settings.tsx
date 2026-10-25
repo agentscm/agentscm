@@ -1,3 +1,5 @@
+import { ComputerSettings } from '../ComputerBar.tsx'
+import { isLocalCredential } from '../frontDoor.ts'
 import { useState } from 'react'
 import { loadLocalBase, loadLocalToken, localStatus, saveLocalBase, saveLocalToken, validLocalBase } from '../localApi.ts'
 import { usePoll } from '../usePoll.ts'
@@ -99,8 +101,15 @@ export function SettingsPage({ token, whoami, pref, onPref, density, onDensity, 
 
         <Walkthrough />
 
-        <LocalServer />
+        {isLocalCredential(token) ? (
+          <Box tour="settings-local" icon="laptop" title="This computer" explain="This page comes from AgentSCM on your computer. It reads your files and saved conversations here, and your team’s Hub with a read-only connection.">
+            <ComputerSettings />
+          </Box>
+        ) : (
+          <LocalServer />
+        )}
 
+        {!isLocalCredential(token) && (
         <Box tour="settings-token" icon="key" title="Your token" explain="The token decides which repository you see. A read-only token can look but never change coordination.">
           {!whoami ? (
             <Skeleton rows={2} />
@@ -123,6 +132,7 @@ export function SettingsPage({ token, whoami, pref, onPref, density, onDensity, 
             </button>
           </div>
         </Box>
+        )}
 
         <ViewSettingsBox token={token} />
 
@@ -174,7 +184,8 @@ function LocalServer() {
       >
         <div>
           <label className="settings-label" htmlFor="local-base">Local read API</label>
-          <div className="muted small">Leave the address empty to use this page’s own address. Only addresses on this computer are allowed, such as http://127.0.0.1:7331. The repository explorer always requires the local service’s read token. Other local features also require it when configured. Use the local read token here; it is kept for this tab only.</div>
+          <div className="small mb-2">To browse your files and saved conversations, run <code>agentscm open</code> in your repository, or choose Open Hub in the AgentSCM menu bar app. Nothing below is needed then.</div>
+          <div className="muted small">Advanced: leave the address empty to use this page’s own address. Only addresses on this computer are allowed, such as http://127.0.0.1:7331. The repository explorer always requires the local service’s read token. Other local features also require it when configured. Use the local read token here; it is kept for this tab only.</div>
           <div className="mt-2">
             <span className="small muted me-2">Timeline connection:</span>
             {status.kind === 'ready' ? <Pill tone={STATUS[status.value].tone} icon={STATUS[status.value].icon}>{STATUS[status.value].word}</Pill> : status.kind === 'loading' ? <span className="small muted">Checking…</span> : <Pill tone="bad">Could not check</Pill>}

@@ -155,7 +155,11 @@ async fn call_hub(
     let plugin_route = client_connection;
     let (url, token, repo, root, endpoint_agent, outbound, client_connection, report_completion) =
         if plugin_route {
-            let routed = route_client(&agent, &payload)?;
+            let routed = route_client(&agent, &payload).inspect_err(|reason| {
+                if [NO_CONNECTION, NO_EDIT_CONNECTION].contains(&reason.as_str()) {
+                    report_unconnected(&agent, &payload);
+                }
+            })?;
             (
                 routed.connection.hub.clone(),
                 Token::PrivateFile(routed.connection.token_file.clone()),
@@ -401,6 +405,14 @@ fn with_root_header(
 }
 
 const MAX_WORKSPACE_ROOTS: usize = 16;
+/// Every new worktree of a connected checkout is covered, so this means the repository itself.
+const NO_CONNECTION: &str =
+    "no client connection for this repository; run `agentscm quickstart` in it once";
+const NO_EDIT_CONNECTION: &str = "no client connection for an edit path";
+/// How often one agent re-reports the same unconnected checkout to the tray, and how long that
+/// report may hold the hook.
+const UNCONNECTED_EVERY: Duration = Duration::from_secs(5 * 60);
+const UNCONNECTED_WAIT: Duration = Duration::from_millis(500);
 const MAX_EDIT_PATHS: usize = 256;
 const PATCH_HEADERS: [&str; 4] = [
     "*** Update File: ",
@@ -418,6 +430,8 @@ struct EditPath {
 #[derive(Debug)]
 struct RoutedClient {
     connection: Connection,
+    /// The registered root, or a linked worktree of it.
+    checkout: PathBuf,
     endpoint_agent: String,
     payload: Value,
 }
@@ -521,17 +535,16 @@ fn unique_connection(
 ) -> Result<Option<(&Connection, PathBuf)>, String> {
     let mut found: Vec<(&Connection, PathBuf)> = Vec::new();
     for candidate in candidates {
-        if let Some(connection) = client_config::connection_for_path(connections, &candidate) {
-            let resolved = client_config::resolved(&candidate);
-            let existing = resolved
-                .as_deref()
-                .and_then(|path| path.ancestors().find(|path| path.exists()));
-            if existing.and_then(repo_root).as_deref() != Some(connection.root.as_path()) {
+        let connection = match client_config::connection_for_checkout(connections, &candidate) {
+            Some((connection, _)) => connection,
+            // An unregistered nested Git checkout must never inherit the parent's credential.
+            None if client_config::connection_for_path(connections, &candidate).is_some() => {
                 return Err("path belongs to another Git checkout".into());
             }
-            if !found.iter().any(|(saved, _)| saved.root == connection.root) {
-                found.push((connection, candidate));
-            }
+            None => continue,
+        };
+        if !found.iter().any(|(saved, _)| saved.root == connection.root) {
+            found.push((connection, candidate));
         }
     }
     match found.len() {
@@ -552,14 +565,19 @@ fn match_edit<'a>(
     {
         return Err("too many workspace roots".into());
     }
+    // A containing root without a checkout match is kept so the caller refuses a nested checkout.
+    let route = |candidate: &Path| {
+        client_config::connection_for_checkout(connections, candidate)
+            .map(|(connection, _)| connection)
+            .or_else(|| client_config::connection_for_path(connections, candidate))
+    };
     let path = Path::new(path);
     if path.is_absolute() {
-        return Ok(client_config::connection_for_path(connections, path)
-            .map(|connection| (connection, path.to_owned())));
+        return Ok(route(path).map(|connection| (connection, path.to_owned())));
     }
     if let Some(cwd) = payload["cwd"].as_str() {
         let candidate = Path::new(cwd).join(path);
-        if let Some(connection) = client_config::connection_for_path(connections, &candidate) {
+        if let Some(connection) = route(&candidate) {
             return Ok(Some((connection, candidate)));
         }
     }
@@ -600,7 +618,7 @@ fn match_session<'a>(
 fn route_client(agent: &str, payload: &Value) -> Result<RoutedClient, String> {
     let connections = client_config::load().map_err(|_| "client connections unavailable")?;
     let routed = route_client_with(agent, payload, &connections)?;
-    if !client_config::is_current(&routed.connection) {
+    if !client_config::is_current_in(&routed.connection, &routed.checkout) {
         return Err("client connection no longer matches this checkout".into());
     }
     Ok(routed)
@@ -612,50 +630,125 @@ fn route_client_with(
     connections: &[Connection],
 ) -> Result<RoutedClient, String> {
     if connections.is_empty() {
-        return Err("no client connection for this checkout".into());
+        return Err(NO_CONNECTION.into());
     }
     let edits = edit_paths(agent, payload)?;
-    let mut selected: Option<Connection> = None;
+    let mut selected: Option<(Connection, PathBuf)> = None;
     let mut normalized = Vec::with_capacity(edits.len());
     for edit in &edits {
         let Some((connection, candidate)) = match_edit(payload, connections, &edit.path)? else {
-            return Err("no client connection for an edit path".into());
+            return Err(NO_EDIT_CONNECTION.into());
         };
-        let connection = connection.clone();
-        if selected
-            .as_ref()
-            .is_some_and(|selected| selected.root != connection.root)
+        if let Some((selected, _)) = &selected
+            && selected.root != connection.root
         {
             return Err("edit crosses configured repositories".into());
         }
-        let relative = client_config::relative(&connection.root, &candidate)
-            .ok_or_else(|| "edit path is outside the configured repository".to_owned())?;
         // An unregistered nested Git checkout must never inherit the parent's credential.
-        let resolved = client_config::resolved(&candidate);
-        let existing = resolved
-            .as_deref()
-            .and_then(|path| path.ancestors().find(|path| path.exists()));
-        if existing.and_then(repo_root).as_deref() != Some(connection.root.as_path()) {
+        let Some((_, checkout)) = client_config::connection_for_checkout(connections, &candidate)
+            .filter(|(routed, _)| routed.root == connection.root)
+        else {
             return Err("edit path belongs to another Git checkout".into());
+        };
+        if selected
+            .as_ref()
+            .is_some_and(|(_, selected)| *selected != checkout)
+        {
+            return Err("edit crosses Git worktrees".into());
         }
-        selected = Some(connection);
+        let relative = client_config::relative(&checkout, &candidate)
+            .ok_or_else(|| "edit path is outside the configured repository".to_owned())?;
+        selected = Some((connection.clone(), checkout));
         normalized.push(EditPath {
             header: edit.header,
             path: relative,
         });
     }
-    let connection = match selected {
-        Some(connection) => connection,
+    let (connection, checkout) = match selected {
+        Some(selected) => selected,
         None => match_session(payload, connections)?
-            .map(|(connection, _)| connection.clone())
-            .ok_or_else(|| "no client connection for this checkout".to_owned())?,
+            .and_then(|(_, candidate)| {
+                client_config::connection_for_checkout(connections, &candidate)
+            })
+            .map(|(connection, checkout)| (connection.clone(), checkout))
+            .ok_or_else(|| NO_CONNECTION.to_owned())?,
     };
     let endpoint_agent = if agent == "gemini" { "generic" } else { agent };
     Ok(RoutedClient {
         payload: sanitized_client(agent, payload, &normalized)?,
         connection,
+        checkout,
         endpoint_agent: endpoint_agent.to_owned(),
     })
+}
+
+/// Tell a running tray that this agent works in a Git checkout with no client connection, so it
+/// can offer to connect it. Throttled per agent and checkout, bounded in time, and local only.
+fn report_unconnected(agent: &str, payload: &Value) {
+    #[cfg(unix)]
+    if let (Ok(config), Some(socket)) = (config_dir(), crate::client_activity::socket_path()) {
+        report_unconnected_at(
+            &config,
+            &socket,
+            agent,
+            cwd_of(payload),
+            client_config::load,
+        );
+    }
+    #[cfg(not(unix))]
+    let _ = (agent, payload);
+}
+
+#[cfg(unix)]
+fn report_unconnected_at(
+    config: &Path,
+    socket: &Path,
+    agent: &str,
+    cwd: PathBuf,
+    load: fn() -> agentscm::Result<Vec<Connection>>,
+) {
+    let Some(checkout) = repo_root(&cwd) else {
+        return;
+    };
+    let main = client_config::main_checkout(&checkout);
+    let key = format!("unconnected\0{agent}\0{}", main.display());
+    // A report no tray received must not start the interval, so a tray opened later hears the
+    // next hook.
+    if marked_within(config, &key, UNCONNECTED_EVERY)
+        || !crate::client_activity::listening_at(socket)
+    {
+        return;
+    }
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let connections = load().unwrap_or_default();
+        let _ = sender.send(unconnected_checkout(&cwd, &connections));
+    });
+    let settled = match receiver.recv_timeout(UNCONNECTED_WAIT) {
+        Ok(Some((root, host, repo))) => {
+            crate::client_activity::observe_unconnected_at(socket, &root, &host, &repo, agent)
+        }
+        // Nothing to report, or Git is too slow: neither changes before the interval ends.
+        Ok(None) | Err(_) => true,
+    };
+    if settled {
+        mark(config, &key);
+    }
+}
+
+/// The main worktree, forge host and repository of the checkout containing `cwd`, when it has
+/// a supported `origin` and no client connection covers it.
+fn unconnected_checkout(
+    cwd: &Path,
+    connections: &[Connection],
+) -> Option<(PathBuf, String, String)> {
+    let checkout = repo_root(cwd)?;
+    if client_config::connection_for_checkout(connections, &checkout).is_some() {
+        return None;
+    }
+    let main = client_config::main_checkout(&checkout);
+    let (host, repo) = client_config::origin_identity(&main).ok()?;
+    Some((main, host, repo))
 }
 
 #[cfg(test)]
@@ -1027,6 +1120,25 @@ fn first_marker(config: &Path, key: &str) -> bool {
         }
     }
     true
+}
+
+fn marker_path(config: &Path, key: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    (config.join("agentscm").join("hook-notes")).join(format!("{:x}", Sha256::digest(key)))
+}
+
+/// Whether `key` was marked less than `every` ago.
+fn marked_within(config: &Path, key: &str, every: Duration) -> bool {
+    (std::fs::metadata(marker_path(config, key)).and_then(|m| m.modified()))
+        .ok()
+        .and_then(|time| time.elapsed().ok())
+        .is_some_and(|age| age < every)
+}
+
+/// Mark `key` now, replacing an older mark.
+fn mark(config: &Path, key: &str) {
+    let _ = std::fs::remove_file(marker_path(config, key));
+    first_marker(config, key);
 }
 
 /// The reply for an unreachable hub; `note` is the reason to show, or `None` for the silent form.
@@ -1696,6 +1808,194 @@ mod tests {
         );
     }
 
+    /// The layout `git worktree add` leaves: a `.git` file and a back-pointing private directory.
+    fn linked_worktree(main: &Path, path: &Path) -> PathBuf {
+        let own = main.join(".git/worktrees").join(path.file_name().unwrap());
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::write(path.join(".git"), format!("gitdir: {}\n", own.display())).unwrap();
+        std::fs::write(
+            own.join("gitdir"),
+            format!("{}\n", path.join(".git").display()),
+        )
+        .unwrap();
+        std::fs::write(own.join("commondir"), "../..\n").unwrap();
+        path.canonicalize().unwrap()
+    }
+
+    /// Runs Git for a synthetic repository. Callers pass the plain temporary path: Windows
+    /// canonical `\\?\` paths are not accepted by every Git command.
+    fn git(root: &Path, arguments: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(arguments)
+            .current_dir(root)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {arguments:?}");
+    }
+
+    #[test]
+    fn only_unconnected_checkouts_with_a_supported_origin_are_reported() {
+        let parent = tempfile::tempdir().unwrap();
+        let plain = parent.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        assert_eq!(unconnected_checkout(&plain, &[]), None);
+
+        let checkout = parent.path().join("main");
+        std::fs::create_dir_all(checkout.join("src")).unwrap();
+        git(&checkout, &["init", "--quiet"]);
+        let main = checkout.canonicalize().unwrap();
+        assert_eq!(unconnected_checkout(&main, &[]), None, "no origin");
+        git(
+            &checkout,
+            &["remote", "add", "origin", "file:///synthetic/widgets.git"],
+        );
+        assert_eq!(unconnected_checkout(&main, &[]), None, "unsupported origin");
+
+        git(
+            &checkout,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/acme/widgets.git",
+            ],
+        );
+        let linked = linked_worktree(&main, &main.join(".claude/worktrees/task"));
+        let expected = Some((main.clone(), "github.com".into(), "acme/widgets".into()));
+        for cwd in [main.join("src"), linked.clone()] {
+            assert_eq!(unconnected_checkout(&cwd, &[]), expected);
+        }
+        let connections = [connection(&main, "acme/widgets")];
+        for cwd in [main.join("src"), linked] {
+            assert_eq!(unconnected_checkout(&cwd, &connections), None);
+        }
+    }
+
+    #[test]
+    fn markers_record_when_a_key_was_last_marked() {
+        let config = tempfile::tempdir().unwrap();
+        let (config, every, key) = (
+            config.path(),
+            Duration::from_secs(60),
+            "unconnected\0claude\0/a",
+        );
+        assert!(!marked_within(config, key, every));
+        mark(config, key);
+        assert!(marked_within(config, key, every));
+        assert!(!marked_within(config, "unconnected\0codex\0/a", every));
+        assert!(!marked_within(config, key, Duration::ZERO));
+        mark(config, key);
+        assert!(marked_within(config, key, every));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_delivered_report_starts_the_throttle_interval() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixDatagram;
+
+        fn no_connections() -> agentscm::Result<Vec<Connection>> {
+            Ok(Vec::new())
+        }
+        let parent = tempfile::tempdir().unwrap();
+        let repo = parent.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "--quiet"]);
+        git(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/widgets.git",
+            ],
+        );
+        let repo = repo.canonicalize().unwrap();
+        let config = parent.path().join("config");
+        let tray = parent.path().join("tray");
+        std::fs::create_dir(&tray).unwrap();
+        std::fs::set_permissions(&tray, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = tray.join("activity.sock");
+        let key = format!("unconnected\0claude\0{}", repo.display());
+        let report = || {
+            report_unconnected_at(&config, &socket, "claude", repo.clone(), no_connections);
+        };
+
+        report();
+        assert!(!marked_within(&config, &key, UNCONNECTED_EVERY), "no tray");
+        drop(UnixDatagram::bind(&socket).unwrap());
+        report();
+        assert!(
+            !marked_within(&config, &key, UNCONNECTED_EVERY),
+            "stale socket"
+        );
+        std::fs::remove_file(&socket).unwrap();
+
+        let receiver = UnixDatagram::bind(&socket).unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        report();
+        assert!(marked_within(&config, &key, UNCONNECTED_EVERY));
+        let mut bytes = [0_u8; 4096];
+        let size = receiver.recv(&mut bytes).unwrap();
+        let sent: Value = serde_json::from_slice(&bytes[..size]).unwrap();
+        assert_eq!(sent["root"], json!(repo));
+        assert_eq!(sent["repo"], "acme/widgets");
+        report();
+        assert!(receiver.recv(&mut bytes).is_err(), "throttled while marked");
+
+        // A checkout with nothing to report is not checked again on every hook.
+        let plain = parent.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        git(&plain, &["init", "--quiet"]);
+        let plain = plain.canonicalize().unwrap();
+        report_unconnected_at(&config, &socket, "claude", plain.clone(), no_connections);
+        assert!(marked_within(
+            &config,
+            &format!("unconnected\0claude\0{}", plain.display()),
+            UNCONNECTED_EVERY
+        ));
+        assert!(receiver.recv(&mut bytes).is_err(), "nothing to report");
+    }
+
+    #[test]
+    fn linked_worktree_sessions_and_edits_use_the_registered_connection() {
+        let parent = tempfile::tempdir().unwrap();
+        let main = git_repo(parent.path(), "main");
+        let nested = linked_worktree(&main, &main.join(".claude/worktrees/task"));
+        let beside = linked_worktree(&main, &parent.path().join("beside"));
+        let connections = [connection(&main, "acme/widgets")];
+        for checkout in [&nested, &beside] {
+            let session =
+                json!({"hook_event_name":"SessionStart", "session_id":"s", "cwd":checkout});
+            let routed = route_client_with("claude", &session, &connections).unwrap();
+            assert_eq!(routed.connection, connections[0]);
+            assert_eq!(&routed.checkout, checkout);
+            let edit = json!({"hook_event_name":"PreToolUse", "session_id":"s", "cwd":checkout,
+                "tool_name":"Write", "tool_input":{"file_path":checkout.join("src/a.rs")}});
+            let routed = route_client_with("claude", &edit, &connections).unwrap();
+            assert_eq!(&routed.checkout, checkout);
+            let sent = routed.payload.to_string();
+            assert!(
+                sent.contains("src/a.rs") && !sent.contains("worktrees"),
+                "{sent}"
+            );
+        }
+        let crossing = json!({"hook_event_name":"PreToolUse", "session_id":"s", "cwd":main,
+            "tool_name":"apply_patch", "tool_input":format!(
+                "*** Begin Patch\n*** Update File: {}/a.rs\n*** Move to: {}/a.rs\n*** End Patch",
+                main.display(), beside.display())});
+        assert_eq!(
+            route_codex_with(&crossing, &connections).unwrap_err(),
+            "edit crosses Git worktrees"
+        );
+    }
+
     #[test]
     fn codex_session_route_rejects_multiple_registered_workspace_roots() {
         let parent = tempfile::tempdir().unwrap();
@@ -1726,7 +2026,7 @@ mod tests {
         );
         assert_eq!(
             route_codex_with(&json!({"hook_event_name":"SessionEnd"}), &connections).unwrap_err(),
-            "no client connection for this checkout"
+            NO_CONNECTION
         );
     }
 

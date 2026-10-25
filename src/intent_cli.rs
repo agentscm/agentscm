@@ -351,9 +351,11 @@ impl Hub {
         let saved = (env_url.is_none() || env_file.is_none())
             .then(|| {
                 let connections = crate::client_config::load().ok()?;
-                crate::client_config::connection_for_path(&connections, cwd)
-                    .filter(|connection| crate::client_config::is_current(connection))
-                    .map(|connection| (connection.hub.clone(), connection.token_file.clone()))
+                crate::client_config::connection_for_checkout(&connections, cwd)
+                    .filter(|(connection, checkout)| {
+                        crate::client_config::is_current_in(connection, checkout)
+                    })
+                    .map(|(connection, _)| (connection.hub.clone(), connection.token_file.clone()))
             })
             .flatten();
         let (url, token_file) = match saved {
