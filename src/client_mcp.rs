@@ -1,7 +1,7 @@
 //! Checkout-bound stdio MCP transport for the stateless Hub endpoint.
 
 use std::io::{BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use reqwest::header::CONTENT_TYPE;
 use serde_json::{Value, json};
@@ -11,7 +11,7 @@ use agentscm::{Error, Result};
 
 use crate::client_cli::read_token;
 use crate::client_config::{
-    Connection, canonical_root, connection_for_checkout, is_current, is_current_in, load,
+    Connection, canonical_root, connection_for_checkout, is_current_in, load,
 };
 use crate::hub_cli::map_hub_error;
 
@@ -30,7 +30,7 @@ fn selected(root: &Path, connections: &[Connection]) -> Result<Connection> {
         .ok_or_else(|| invalid("this checkout has no saved client connection"))
 }
 
-fn connection(root: Option<&Path>) -> Result<(Connection, String)> {
+fn connection(root: Option<&Path>) -> Result<(Connection, PathBuf, String)> {
     let cwd = std::env::current_dir()?;
     let checkout = canonical_root(root.unwrap_or(&cwd))?;
     let connections = load()?;
@@ -43,13 +43,13 @@ fn connection(root: Option<&Path>) -> Result<(Connection, String)> {
         ));
     }
     let token = read_token(&connection.token_file)?;
-    Ok((connection, token))
+    Ok((connection, checkout, token))
 }
 
-fn unchanged(connection: &Connection, token: &str) -> Result<()> {
+fn unchanged(connection: &Connection, checkout: &Path, token: &str) -> Result<()> {
     let saved = selected(&connection.root, &load()?)?;
     if saved != *connection
-        || !is_current(connection)
+        || !is_current_in(connection, checkout)
         || read_token(&connection.token_file)? != token
     {
         return Err(invalid(
@@ -288,7 +288,7 @@ fn report_activity(binding: &str, outcome: crate::client_activity::ActivityOutco
 }
 
 pub(crate) async fn run(root: Option<&Path>) -> Result<()> {
-    let (connection, token) = connection(root)?;
+    let (connection, checkout, token) = connection(root)?;
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     serve(
@@ -296,7 +296,7 @@ pub(crate) async fn run(root: Option<&Path>) -> Result<()> {
         &token,
         &mut stdin.lock(),
         &mut stdout.lock(),
-        || unchanged(&connection, &token),
+        || unchanged(&connection, &checkout, &token),
     )
     .await
 }
@@ -306,7 +306,6 @@ mod tests {
     use super::*;
     use std::io::{Cursor, Read};
     use std::net::TcpListener;
-    use std::path::PathBuf;
     use std::sync::mpsc;
 
     fn saved(hub: String, root: &str, repo: &str) -> Connection {

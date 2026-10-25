@@ -344,9 +344,17 @@ agentscm hook <claude|codex|cursor|copilot|generic> [--hub-url URL]   # called b
 
 ```sh
 agentscm --data-dir ./agentscm-data serve [--bind ADDR] [--max-concurrency N] [--collisions-repo PATH] [--timeline-workspace ROOT] [--browser-origin ORIGIN]... [--public]
+agentscm --data-dir ./agentscm-data serve --explorer-repo ABS_PATH --explorer-repository ID [--explorer-spool ABS_PATH] [--browser-origin ORIGIN]...
 ```
 
 `serve` serves collision warnings (`GET /v1/collisions`) for the trusted Git checkout named by `--collisions-repo`, and the experimental read-only native API for the data directory. `--bind` defaults to `127.0.0.1:7331`. A non-loopback `--bind` is refused unless `--public` is passed. The container image passes `--public` itself; publish the port on loopback only, or put authentication in front of it. `--timeline-workspace` serves one native workspace's timeline read-only under `/v1/local`. `--browser-origin` lets that exact origin read `/v1/local` cross-origin, and it requires `AGENTSCM_SERVE_READ_TOKEN`. See [local template and timeline reads](../api.md#local-template-and-timeline-reads).
+
+`--explorer-repo` and `--explorer-repository` enable the [repository explorer](../repository-explorer.md)
+for one absolute Git checkout path and logical repository ID. It always requires
+`AGENTSCM_SERVE_READ_TOKEN` and a loopback bind, including when `--public` is present.
+`--explorer-spool` opts in to private capture from an existing absolute spool directory whose
+namespace matches that ID. The explorer is Unix-only, reads immutable commits and performs no
+fetch, checkout or execution.
 
 ## Trusted-local task workflow
 

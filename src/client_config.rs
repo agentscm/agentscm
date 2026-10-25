@@ -603,7 +603,12 @@ pub(crate) fn main_checkout(root: &Path) -> PathBuf {
 /// checkout; a copied, forged or submodule pointer fails these checks.
 fn common_dir(root: &Path) -> Option<PathBuf> {
     let dot_git = root.join(".git");
-    if dot_git.is_dir() {
+    let kind = std::fs::symlink_metadata(&dot_git).ok()?.file_type();
+    // A symlinked `.git` would borrow another checkout's Git directory without being its worktree.
+    if kind.is_symlink() {
+        return None;
+    }
+    if kind.is_dir() {
         return dot_git.canonicalize().ok();
     }
     let read = |path: &Path| std::fs::read_to_string(path).ok();
@@ -1013,16 +1018,21 @@ mod tests {
         git(&main, &["config", "user.name", "AgentSCM Test"]);
         git(&main, &["config", "user.email", "test@example.invalid"]);
         git(&main, &["commit", "--quiet", "--allow-empty", "-m", "test"]);
-        let main = main.canonicalize().unwrap();
+        // Git gets plain paths: Windows canonical `\\?\` paths are not accepted by `worktree add`.
+        let checkout = main;
+        let main = checkout.canonicalize().unwrap();
         // Editors create session worktrees both inside the checkout and beside it.
-        let nested = main.join(".claude/worktrees/task");
+        let nested = checkout.join(".claude/worktrees/task");
         let beside = dir.path().join("beside");
         let third = dir.path().join("third");
         for linked in [&nested, &beside, &third] {
             let linked = linked.to_str().unwrap();
-            git(&main, &["worktree", "add", "--quiet", "--detach", linked]);
+            git(
+                &checkout,
+                &["worktree", "add", "--quiet", "--detach", linked],
+            );
         }
-        let foreign = main.join("vendor/other");
+        let foreign = checkout.join("vendor/other");
         std::fs::create_dir_all(&foreign).unwrap();
         git(&foreign, &["init", "--quiet"]);
         let connections = [connection(main.clone(), "acme/widgets")];
@@ -1057,6 +1067,18 @@ mod tests {
         }
         assert_eq!(main_checkout(&copied), copied);
         assert_eq!(main_checkout(&foreign), foreign);
+
+        // A symlinked `.git`, to the shared directory or to a worktree's file, is refused too.
+        #[cfg(unix)]
+        for (name, target) in [
+            ("linked-dir", main.join(".git")),
+            ("linked-file", beside.join(".git")),
+        ] {
+            let fake = dir.path().join(name);
+            std::fs::create_dir(&fake).unwrap();
+            std::os::unix::fs::symlink(target, fake.join(".git")).unwrap();
+            assert_eq!(connection_for_checkout(&connections, &fake), None, "{name}");
+        }
 
         let both = [
             connection(beside.canonicalize().unwrap(), "acme/widgets"),

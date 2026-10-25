@@ -22,6 +22,7 @@
 - [Local workspace snapshot timeline](workspace-timeline.md): capture and inspect bounded native-workspace observations, or fork an earlier observation into another Change
 - [Asynchronous agent stand-up](standup.md): durable work claims, checkpoint handovers and bounded catch-up
 - [Local change capture](change-capture.md): configure-once Claude hooks, source-bound action receipts and concise transcript-free handoff
+- [Repository explorer](repository-explorer.md): browse committed Git files, history and diffs alongside private local conversation and source-bound evidence
 - [Work insights](work-insights.md): bounded timing, coordination, usage reports and stored publication observations
 - [Supported coding agents](agents.md): Claude Code, Codex, Cursor, Copilot and others; `agentscm init-repo` and `agentscm hook`
 - [Slack adapter](slack.md) and [capability map](slack-capabilities.md): optional direct messages for coordination moments that need a person, with handoff buttons.
@@ -43,6 +44,10 @@ The immutable ledger, Git bridges, isolated command checks and
 [source-bound skill workflows](advanced/skill-workflows.md): see the [advanced index](advanced/README.md).
 The [reusable workflow library](advanced/reusable-workflows.md) binds one explicit, versioned
 native manifest to existing Changes without adding a mutable catalog or remote executor.
+Experimental [productive workflow actions](advanced/productive-workflow-actions.md) compose
+bounded prompt-generated text and deterministic artifact commands in that same graph,
+separately from verification and native admission. [Operator-local repository rules](advanced/pipeline-rules.md)
+can enqueue those workflows after a provider-confirmed merge.
 The [Claude Code workflow loop](advanced/claude-code-workflows.md) adds an opt-in local trigger,
 isolated tests, bounded model review and exact-revision native requirements. The opt-in
 [Community workspace pilot](advanced/community-workspace.md) adds persistent membership,

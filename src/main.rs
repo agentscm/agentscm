@@ -76,6 +76,8 @@ mod local_recovery_cli;
 mod local_validation_cli;
 #[cfg(unix)]
 mod merge_cli;
+#[cfg(unix)]
+mod pipeline_cli;
 mod prompt;
 #[cfg(unix)]
 mod publish_cli;
@@ -163,6 +165,12 @@ enum Command {
     SkillWorkflow {
         #[command(subcommand)]
         command: skill_workflow_cli::SkillWorkflowCommand,
+    },
+    /// [experimental] Install repository rules and run local productive pipelines.
+    #[cfg(unix)]
+    Pipeline {
+        #[command(subcommand)]
+        command: pipeline_cli::PipelineCommand,
     },
     /// Inspect or change pseudonymous product telemetry.
     Telemetry {
@@ -528,6 +536,16 @@ enum Command {
         /// omitted.
         #[arg(long)]
         timeline_workspace: Option<PathBuf>,
+        /// Browse this Git checkout read-only under /v1/local/explorer. Requires a local read
+        /// token and a loopback bind address.
+        #[arg(long, requires = "explorer_repository")]
+        explorer_repo: Option<PathBuf>,
+        /// Logical repository ID used to match locally captured evidence.
+        #[arg(long, requires = "explorer_repo")]
+        explorer_repository: Option<String>,
+        /// Opt in to reading visible conversation and action evidence from this private spool.
+        #[arg(long, requires = "explorer_repo")]
+        explorer_spool: Option<PathBuf>,
         /// Allow this exact browser origin to read /v1/local cross-origin (repeatable). Requires
         /// AGENTSCM_SERVE_READ_TOKEN.
         #[arg(long)]
@@ -728,6 +746,10 @@ async fn run(cli: Cli) -> Result<RunExit> {
         }
         Command::SkillWorkflow { command } => {
             skill_workflow_cli::run(&cli.data_dir, command).await?;
+        }
+        #[cfg(unix)]
+        Command::Pipeline { command } => {
+            print_json(&pipeline_cli::run(&cli.data_dir, command).await?);
         }
         Command::Telemetry { command } => {
             match telemetry_cli::run(command, cli.no_telemetry).await? {
@@ -1193,18 +1215,24 @@ async fn run(cli: Cli) -> Result<RunExit> {
             max_concurrency,
             collisions_repo,
             timeline_workspace,
+            explorer_repo,
+            explorer_repository,
+            explorer_spool,
             browser_origin,
             public,
         } => {
-            server::serve(
-                cli.data_dir,
+            server::serve(server::ServeOptions {
+                data_dir: cli.data_dir,
                 bind,
                 public,
                 max_concurrency,
-                collisions_repo,
-                timeline_workspace,
-                browser_origin,
-            )
+                collisions: collisions_repo,
+                timeline: timeline_workspace,
+                browser_origins: browser_origin,
+                explorer_repo,
+                explorer_repository,
+                explorer_spool,
+            })
             .await?;
         }
     }

@@ -34,9 +34,13 @@ pub use review::{ClaudeReviewFinding, ClaudeReviewView};
 mod agent_tasks;
 pub use agent_tasks::*;
 
+#[path = "runtime_actions.rs"]
+mod productive;
+pub use productive::{artifact, bind_inputs, recover_action};
+
 const VIEW_VERSION: u32 = 1;
 const APPLICATION_ID: i64 = 0x4153_5746;
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const MAX_RUN_ID_BYTES: usize = 64;
 const MAX_DEFINITION_BYTES: usize = 256 * 1024;
 const MAX_DETAIL_BYTES: usize = 4 * 1024;
@@ -84,6 +88,8 @@ pub struct StepView {
     pub execution: Option<CommandStepView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<ClaudeReviewView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<super::action::ActionView>,
 }
 
 /// A projection of the retained authority attempt, never worker-supplied evidence.
@@ -473,6 +479,8 @@ pub fn advance(data_dir: &Path, run_id: &str, max_steps: usize) -> Result<RunVie
         #[cfg(unix)]
         None,
         None,
+        #[cfg(unix)]
+        None,
     )
 }
 
@@ -483,7 +491,15 @@ pub fn advance_with_executor(
     max_steps: usize,
     executor: &CommandExecutor<'_>,
 ) -> Result<RunView> {
-    advance_inner(data_dir, run_id, max_steps, Some(executor), None, None)
+    advance_inner(
+        data_dir,
+        run_id,
+        max_steps,
+        Some(executor),
+        None,
+        None,
+        None,
+    )
 }
 
 #[cfg(unix)]
@@ -494,7 +510,7 @@ pub fn advance_with_backends(
     command: Option<&CommandExecutor<'_>>,
     claude: Option<&ClaudeExecutor<'_>>,
 ) -> Result<RunView> {
-    advance_inner(data_dir, run_id, max_steps, command, claude, None)
+    advance_inner(data_dir, run_id, max_steps, command, claude, None, None)
 }
 
 /// A server's current authorization check. Called before each external step and
@@ -510,7 +526,56 @@ pub fn advance_guarded(
     claude: Option<&ClaudeExecutor<'_>>,
     guard: &DispatchGuard<'_>,
 ) -> Result<RunView> {
-    advance_inner(data_dir, run_id, max_steps, command, claude, Some(guard))
+    advance_inner(
+        data_dir,
+        run_id,
+        max_steps,
+        command,
+        claude,
+        Some(guard),
+        None,
+    )
+}
+
+/// Advance productive actions using the same ordered graph and journal. These runs
+/// are observations and cannot finalize native admission receipts.
+#[cfg(unix)]
+pub fn advance_with_actions(
+    data_dir: &Path,
+    run_id: &str,
+    max_steps: usize,
+    executor: &super::action::ActionExecutor<'_>,
+) -> Result<RunView> {
+    advance_inner(
+        data_dir,
+        run_id,
+        max_steps,
+        None,
+        None,
+        None,
+        Some(executor),
+    )
+}
+
+/// Recheck caller authority before every productive dispatch and while its child
+/// is active. The guard cannot alter prompts, inputs or selected executables.
+#[cfg(unix)]
+pub fn advance_actions_guarded(
+    data_dir: &Path,
+    run_id: &str,
+    max_steps: usize,
+    executor: &super::action::ActionExecutor<'_>,
+    guard: &DispatchGuard<'_>,
+) -> Result<RunView> {
+    advance_inner(
+        data_dir,
+        run_id,
+        max_steps,
+        None,
+        None,
+        Some(guard),
+        Some(executor),
+    )
 }
 
 fn advance_inner(
@@ -520,6 +585,7 @@ fn advance_inner(
     #[cfg(unix)] executor: Option<&CommandExecutor<'_>>,
     #[cfg(unix)] claude: Option<&ClaudeExecutor<'_>>,
     guard: Option<&DispatchGuard<'_>>,
+    #[cfg(unix)] actions: Option<&super::action::ActionExecutor<'_>>,
 ) -> Result<RunView> {
     validate_run_id(run_id)?;
     if max_steps > MAX_ADVANCE_STEPS {
@@ -603,6 +669,16 @@ fn advance_inner(
 
         if let Some(guard) = guard {
             guard()?;
+        }
+
+        #[cfg(unix)]
+        if matches!(step.action, StepAction::AgentAction { .. }) {
+            let action = plan
+                .actions
+                .get(&step.id)
+                .ok_or_else(|| Error::Invalid("compiled action missing".into()))?;
+            journal = productive::execute(journal, run_id, &plan, step, action, actions, guard)?;
+            continue;
         }
 
         #[cfg(unix)]
@@ -1112,6 +1188,7 @@ impl Journal {
                 detail,
                 execution: command_projection(&self.data_dir, run_id, &run, declared, state)?,
                 review: review_projection(&self.connection, run_id, &run, declared, state)?,
+                action: productive::projection(&self.connection, run_id, declared, state)?,
             });
         }
         if steps.len() != run.ordered_steps.len() {
@@ -1281,16 +1358,23 @@ fn initialize_schema(connection: &mut Connection, create: bool) -> Result<()> {
         tx.pragma_update(None, "application_id", APPLICATION_ID)?;
         review::create_schema(&tx)?;
         agent_tasks::create_schema(&tx)?;
+        productive::create_schema(&tx)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     } else if application == APPLICATION_ID && version == 1 {
         review::create_schema(&tx)?;
         agent_tasks::create_schema(&tx)?;
+        productive::create_schema(&tx)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     } else if application == APPLICATION_ID && version == 2 {
         agent_tasks::create_schema(&tx)?;
+        productive::create_schema(&tx)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     } else if application == APPLICATION_ID && version == 3 {
         agent_tasks::migrate_v3_to_v4(&tx)?;
+        productive::create_schema(&tx)?;
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    } else if application == APPLICATION_ID && version == 4 {
+        productive::create_schema(&tx)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     } else if application != APPLICATION_ID || version != SCHEMA_VERSION {
         return Err(Error::Invalid(
@@ -1305,7 +1389,7 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version == 3 {
         return Err(Error::Invalid(
-            "workflow journal schema version 3 requires a writable migration to version 4".into(),
+            "workflow journal schema version 3 requires a writable migration to version 5".into(),
         ));
     }
     validate_recovery_schema(connection)
@@ -1332,6 +1416,11 @@ pub(crate) fn validate_recovery_schema(connection: &Connection) -> Result<()> {
         connection.prepare(
             "SELECT run_id,step_id,record_digest,record_json FROM workflow_reviews LIMIT 0",
         )?;
+    }
+    if version >= 5 {
+        connection.prepare("SELECT run_id,step_id,profile_digest,record_json,artifact FROM workflow_action_attempts LIMIT 0")?;
+        connection
+            .prepare("SELECT run_id,digest,canonical_json FROM workflow_action_inputs LIMIT 0")?;
     }
     if version == 3 {
         agent_tasks::validate_v3_schema(connection)?;
@@ -1425,7 +1514,9 @@ fn validate_step_record(
         ));
     }
     match &definition.action {
-        StepAction::Command { .. } | StepAction::ClaudeCodeReview { .. } => {
+        StepAction::Command { .. }
+        | StepAction::ClaudeCodeReview { .. }
+        | StepAction::AgentAction { .. } => {
             if !observations.is_empty() {
                 return Err(Error::Invalid(
                     "command step contains source-path observations".into(),
@@ -1605,6 +1696,11 @@ fn validate_dependency_results(definitions: &[StepDefinition], steps: &[StepView
 
 fn execute_step(engine: &Engine, source: &WorkflowSource, step: &StepDefinition) -> StepResult {
     match &step.action {
+        StepAction::AgentAction { .. } => StepResult {
+            state: StepState::Blocked,
+            observations: Vec::new(),
+            detail: "productive actions require a supported Unix executor".into(),
+        },
         StepAction::Command { .. } | StepAction::ClaudeCodeReview { .. } => StepResult {
             state: StepState::Blocked,
             observations: Vec::new(),
@@ -2032,6 +2128,7 @@ mod tests {
             detail: None,
             execution: None,
             review: None,
+            action: None,
         }
     }
 

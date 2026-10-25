@@ -2084,6 +2084,9 @@ mod tests {
             stdout: String::new(),
             stderr: stderr.into(),
             timed_out,
+            truncated: false,
+            incomplete: false,
+            stdout_valid_utf8: true,
         };
         let label = "com.counterbranch.agentscm.test";
         assert!(service_absent(

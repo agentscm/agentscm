@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "name": "release-notes",
+  "workflow_version": 1,
+  "skill": {
+    "entrypoint": "examples/productive-workflows/release-notes/v1/SKILL.md",
+    "resources": [
+      "examples/productive-workflows/release-notes/v1/explain.md",
+      "examples/productive-workflows/release-notes/v1/draft.md",
+      "examples/productive-workflows/release-notes/v1/explain.json",
+      "examples/productive-workflows/release-notes/v1/draft.json",
+      "examples/productive-workflows/release-notes/v1/package.json"
+    ]
+  },
+  "steps": [
+    {
+      "id": "explain",
+      "needs": [],
+      "required": true,
+      "action": {
+        "kind": "agent_action",
+        "resource": "explain.json"
+      }
+    },
+    {
+      "id": "draft",
+      "needs": [
+        "explain"
+      ],
+      "required": true,
+      "action": {
+        "kind": "agent_action",
+        "resource": "draft.json"
+      }
+    },
+    {
+      "id": "package",
+      "needs": [
+        "draft"
+      ],
+      "required": true,
+      "action": {
+        "kind": "agent_action",
+        "resource": "package.json"
+      }
+    }
+  ]
+}

@@ -26,6 +26,249 @@ const SOURCE: &str = "src/lib.rs";
 const SOURCE_BYTES: &[u8] = b"pub fn answer() -> u8 { 42 }\n";
 const RUN_ID: &str = "local-read-run";
 
+fn explorer_checkout(path: &Path) -> String {
+    fs::create_dir(path).unwrap();
+    for args in [
+        vec!["init", "-q", "--initial-branch=main"],
+        vec!["config", "user.name", "Example Developer"],
+        vec!["config", "user.email", "developer@example.invalid"],
+        vec!["config", "commit.gpgsign", "false"],
+    ] {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    fs::write(path.join("source.txt"), "first source\n").unwrap();
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["add", "source.txt"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "-qm",
+                "Initial source"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .into()
+}
+
+#[test]
+fn explorer_requires_explicit_credentials_and_loopback_even_with_public() {
+    let root = TempDir::new().unwrap();
+    for (bind, token, public) in [
+        ("127.0.0.1:0", None, false),
+        ("0.0.0.0:0", Some(TOKEN), true),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agentscm"));
+        command
+            .args(["--no-telemetry", "--data-dir"])
+            .arg(root.path().join("data"))
+            .args(["serve", "--bind", bind, "--explorer-repo"])
+            .arg(root.path())
+            .args(["--explorer-repository", "owner/example"])
+            .env_remove("AGENTSCM_SERVE_READ_TOKEN");
+        if let Some(token) = token {
+            command.env("AGENTSCM_SERVE_READ_TOKEN", token);
+        }
+        if public {
+            command.arg("--public");
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("requires a loopback bind address"),
+            "{error}"
+        );
+        assert!(!root.path().join("data").exists());
+    }
+}
+
+#[test]
+fn explorer_http_pins_source_and_enforces_private_read_boundary() {
+    let root = TempDir::new().unwrap();
+    let repo = root.path().join("repo");
+    let head = explorer_checkout(&repo);
+    let server = Server::start(
+        &root.path().join("data"),
+        Some(TOKEN),
+        &[
+            "--explorer-repo",
+            repo.to_str().unwrap(),
+            "--explorer-repository",
+            "owner/example",
+            "--browser-origin",
+            ORIGIN,
+        ],
+    );
+    let summary = "/v1/local/explorer/summary";
+    assert_eq!(server.request("GET", summary, &[]).0, 401);
+    let auth = format!("Bearer {TOKEN}");
+    let headers = [("Authorization", auth.as_str())];
+    assert_eq!(
+        server
+            .request_to("untrusted.invalid", "GET", summary, &headers)
+            .0,
+        421
+    );
+    assert_eq!(
+        server
+            .request(
+                "GET",
+                summary,
+                &[
+                    ("Authorization", &auth),
+                    ("Origin", "https://untrusted.invalid")
+                ]
+            )
+            .0,
+        403
+    );
+    assert_eq!(
+        server.request("OPTIONS", summary, &[("Origin", ORIGIN)]).0,
+        204
+    );
+    assert_eq!(server.request("POST", summary, &headers).0, 405);
+    let (status, response) = server.get(summary);
+    assert_eq!(status, 200, "{response}");
+    assert_eq!(response["commit"], head);
+    assert_eq!(response["repository_id"], "owner/example");
+    assert!(response["dirty"].is_null());
+    fs::write(repo.join("source.txt"), "uncommitted replacement\n").unwrap();
+    let (status, response) = server.get(&format!(
+        "/v1/local/explorer/file?commit={head}&path=source.txt"
+    ));
+    assert_eq!(status, 200, "{response}");
+    assert_eq!(response["content"], "first source\n");
+    assert!(server.get(summary).1["dirty"].is_null());
+    fs::write(repo.join("untracked.txt"), "local-only source\n").unwrap();
+    assert_eq!(server.get(summary).1["dirty"], true);
+    assert_eq!(
+        server.get("/v1/local/explorer/summary?ref=HEAD&ref=main").0,
+        400
+    );
+    assert_eq!(server.get("/v1/local/explorer/summary?root=/etc").0, 400);
+    assert_eq!(
+        server
+            .get("/v1/local/explorer/file?commit=HEAD&path=source.txt")
+            .0,
+        400
+    );
+    assert_eq!(
+        server
+            .get(&format!(
+                "/v1/local/explorer/file?commit={head}&path=..%2Foutside"
+            ))
+            .0,
+        400
+    );
+    let (status, response) = server.get(&format!("/v1/local/explorer/evidence?commit={head}"));
+    assert_eq!(status, 404);
+    assert!(
+        response["error"]
+            .as_str()
+            .unwrap()
+            .contains("--explorer-spool")
+    );
+    assert!(!response.to_string().contains(root.path().to_str().unwrap()));
+    assert_eq!(
+        fs::read_to_string(repo.join("source.txt")).unwrap(),
+        "uncommitted replacement\n"
+    );
+}
+
+#[test]
+fn explorer_conversation_reads_only_retained_visible_capture_after_authorization() {
+    use agentscm::change_capture::claude_code::{CaptureRequest, import_jsonl};
+    use agentscm::change_capture::{LocalSpool, SpoolNamespaceV1};
+    use agentscm::change_record::CaptureModeV1;
+
+    let root = TempDir::new().unwrap();
+    let repo = root.path().join("repo");
+    explorer_checkout(&repo);
+    let spool_path = root.path().join("private-spool");
+    let spool = LocalSpool::open(&spool_path).unwrap();
+    spool
+        .bind_namespace(SpoolNamespaceV1 {
+            version: 1,
+            hub: "https://hub.example.invalid".into(),
+            repository: "owner/example".into(),
+            worktree_id: "synthetic-checkout".into(),
+        })
+        .unwrap();
+    let request = CaptureRequest {
+        operation_prefix: "http-visible-capture".into(),
+        work_id: "wrk_example".into(),
+        generation: 1,
+        observed_session_id: "session_example".into(),
+        canonical_session_id: "session_example".into(),
+        parent_session_id: None,
+        capture_mode: CaptureModeV1::LocalConversation,
+    };
+    let transcript = concat!(
+        "{\"type\":\"user\",\"uuid\":\"u1\",\"sessionId\":\"session_example\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"message\":{\"content\":\"Review the fixture source\"}}\n",
+        "{\"type\":\"assistant\",\"uuid\":\"a1\",\"sessionId\":\"session_example\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"message\":{\"content\":[{\"type\":\"thinking\",\"thinking\":\"hidden-fixture-marker\"},{\"type\":\"text\",\"text\":\"Visible fixture response\"}]}}\n"
+    );
+    import_jsonl(std::io::Cursor::new(transcript), &request, &spool).unwrap();
+    let server = Server::start(
+        &root.path().join("data"),
+        Some(TOKEN),
+        &[
+            "--explorer-repo",
+            repo.to_str().unwrap(),
+            "--explorer-repository",
+            "owner/example",
+            "--explorer-spool",
+            spool_path.to_str().unwrap(),
+        ],
+    );
+    let path = "/v1/local/explorer/conversation?work_id=wrk_example&session_id=session_example";
+    let (status, _, denied) = server.request("GET", path, &[]);
+    assert_eq!(status, 401);
+    assert!(!denied.contains("Visible fixture response"));
+    let (status, response) = server.get(path);
+    assert_eq!(status, 200, "{response}");
+    let response = response.to_string();
+    assert!(response.contains("Review the fixture source"));
+    assert!(response.contains("Visible fixture response"));
+    assert!(!response.contains("hidden-fixture-marker"));
+    assert!(!response.contains(spool_path.to_str().unwrap()));
+    let (status, response) = server.get(&format!("{path}&artifact=other"));
+    assert_eq!(status, 400);
+    assert!(!response.to_string().contains("Visible fixture response"));
+}
+
 struct Server {
     child: Child,
     address: SocketAddr,

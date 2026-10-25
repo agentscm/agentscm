@@ -1,4 +1,6 @@
 import type {
+  SkillWorkflowAction,
+  SkillWorkflowActionOutcome,
   SkillWorkflowApplicabilityState,
   SkillWorkflowEnvelope,
   SkillWorkflowListEnvelope,
@@ -28,6 +30,8 @@ const STEP_STATES = new Set<SkillWorkflowStepState>(['pending', 'running', 'succ
 const APPLICABILITY_STATES = new Set<SkillWorkflowApplicabilityState>(['current', 'stale', 'unavailable'])
 const REVIEW_STATUSES = new Set<SkillWorkflowReviewStatus>(['succeeded', 'failed', 'blocked', 'cancelled'])
 const REVIEW_SEVERITIES = new Set<SkillWorkflowReviewSeverity>(['note', 'warning', 'error'])
+const ACTION_OUTCOMES = new Set<SkillWorkflowActionOutcome>(['succeeded', 'failed', 'blocked', 'cancelled', 'uncertain', 'timed_out', 'output_limit', 'invalid_output'])
+const ARTIFACT_MEDIA = new Set<NonNullable<SkillWorkflowAction['artifact']>['media_type']>(['text/plain', 'text/markdown', 'application/json'])
 
 export class InvalidSkillWorkflowResponse extends Error {}
 
@@ -132,6 +136,36 @@ function review(value: unknown): SkillWorkflowReview | null {
   }
 }
 
+function productiveAction(value: unknown): SkillWorkflowAction | null {
+  if (value === undefined || value === null) return null
+  const item = record(value, 'step.action')
+  if (item['verification'] !== 'not_independently_verified') fail('step.action.verification')
+  const outcome = item['outcome'] === null ? null : enumValue(item['outcome'], ACTION_OUTCOMES, 'step.action.outcome')
+  let artifact: SkillWorkflowAction['artifact'] = null
+  if (item['artifact'] !== null) {
+    const a = record(item['artifact'], 'step.action.artifact')
+    const bytes = integer(a['bytes'], 'step.action.artifact.bytes')
+    if (bytes === 0 || bytes > 256 * 1024 || outcome !== 'succeeded') fail('step.action.artifact')
+    artifact = {
+      name: stepId(a['name'], 'step.action.artifact.name'),
+      media_type: enumValue(a['media_type'], ARTIFACT_MEDIA, 'step.action.artifact.media_type'),
+      sha256: lowerHex(a['sha256'], 64, 'step.action.artifact.sha256'),
+      bytes,
+      run_id: canonicalId(a['run_id'], 'step.action.artifact.run_id'),
+      step_id: stepId(a['step_id'], 'step.action.artifact.step_id'),
+      revision: lowerHex(a['revision'], 64, 'step.action.artifact.revision'),
+    }
+  }
+  if (outcome === 'succeeded' && artifact === null) fail('step.action.artifact')
+  return {
+    profile_digest: lowerHex(item['profile_digest'], 64, 'step.action.profile_digest'),
+    outcome,
+    artifact,
+    observed_model: optionalText(item['observed_model'], 'step.action.observed_model', 256),
+    verification: 'not_independently_verified',
+  }
+}
+
 function step(value: unknown): SkillWorkflowStep {
   const item = record(value, 'step')
   const required = item['required']
@@ -145,6 +179,7 @@ function step(value: unknown): SkillWorkflowStep {
     detail: nullableText(item['detail'], 'step.detail'),
     execution: commandExecution(item['execution']),
     review: review(item['review']),
+    action: productiveAction(item['action']),
   }
 }
 
@@ -177,6 +212,11 @@ export function decodeSkillWorkflowEnvelope(value: unknown, expectedRunId?: stri
     if (dependencies.size !== item.needs.length || dependencies.has(item.id) || item.needs.some((dependency) => !stepIds.has(dependency))) {
       fail('projection.run.steps.needs')
     }
+    const artifact = item.action?.artifact
+    if (artifact && (artifact.run_id !== runId || artifact.step_id !== item.id || artifact.revision !== source['revision'])) {
+      fail('projection.run.steps.action.artifact.binding')
+    }
+    if (item.action && item.state === 'succeeded' && item.action.outcome !== 'succeeded') fail('projection.run.steps.action.outcome')
   }
   return {
     version,

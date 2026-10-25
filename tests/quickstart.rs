@@ -687,9 +687,9 @@ fn a_busy_hub_port_prints_a_rerun_command_with_a_free_port() {
 }
 
 fn fake_docker(machine: &Machine) {
-    let docker = machine.bin.path().join("docker");
+    let body = machine.home.path().join(".quickstart-fake-docker.sh");
     std::fs::write(
-        &docker,
+        &body,
         r#"#!/bin/sh
 printf '%s\n' "$*" >> "$HOME/docker.log"
 case "$1 $2" in
@@ -716,7 +716,15 @@ exit 1
 "#,
     )
     .unwrap();
-    std::fs::set_permissions(docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(body, std::fs::Permissions::from_mode(0o600)).unwrap();
+    symlink(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/quickstart_fake_docker.sh"
+        ),
+        machine.bin.path().join("docker"),
+    )
+    .unwrap();
 }
 
 fn slack_install_fixture(machine: &Machine) -> PathBuf {
@@ -750,9 +758,9 @@ fn slack_install_fixture(machine: &Machine) -> PathBuf {
 }
 
 fn recovery_fake_docker(machine: &Machine) {
-    let docker = machine.bin.path().join("docker");
+    let body = machine.home.path().join(".quickstart-fake-docker.sh");
     std::fs::write(
-        &docker,
+        &body,
         r#"#!/bin/sh
 printf '%s\n' "$*" >> "$HOME/docker.log"
 case "$1 $2" in
@@ -859,7 +867,15 @@ exit 1
 "#,
     )
     .unwrap();
-    std::fs::set_permissions(docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(body, std::fs::Permissions::from_mode(0o600)).unwrap();
+    symlink(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/quickstart_fake_docker.sh"
+        ),
+        machine.bin.path().join("docker"),
+    )
+    .unwrap();
 }
 
 fn seed_docker_slack_receipt(setup: &Path) {
@@ -3244,6 +3260,7 @@ fn app_install_wait_case(client_command: &str, independent_copy: bool) {
                 }
                 Err(error) => panic!("fake Hub accept failed: {error}"),
             };
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();

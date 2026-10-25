@@ -20,6 +20,8 @@ pub mod intent;
 pub mod login;
 pub mod mcp;
 pub mod onboarding;
+#[cfg(unix)]
+pub mod pipeline_rules;
 pub mod publish;
 pub mod session;
 pub mod skill_workflow;

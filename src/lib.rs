@@ -39,6 +39,8 @@ pub mod local_validation;
 pub mod merge;
 pub mod model;
 pub mod policy;
+#[cfg(unix)]
+pub mod repo_explorer;
 pub mod reviewer;
 pub mod store;
 pub mod sync;

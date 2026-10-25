@@ -16,6 +16,47 @@ use clap::Subcommand;
 
 const MAX_DEFINITION_BYTES: u64 = 256 * 1024;
 
+/// Keep the existing Unix signal-to-cancellation bridge alive for a complete
+/// productive CLI operation, including an idle watch interval.
+#[cfg(unix)]
+pub(crate) struct ProductiveSignals {
+    pub cancellation: Cancellation,
+    stopped: tokio::sync::watch::Receiver<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+#[cfg(unix)]
+impl ProductiveSignals {
+    pub fn new() -> Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        let cancellation = Cancellation::default();
+        let token = cancellation.clone();
+        let (sender, stopped) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move {
+            tokio::select! {_=interrupt.recv()=>{},_=terminate.recv()=>{}}
+            token.cancel();
+            let _ = sender.send(true);
+        });
+        Ok(Self {
+            cancellation,
+            stopped,
+            task,
+        })
+    }
+    pub async fn stopped(&mut self) {
+        if !*self.stopped.borrow() {
+            let _ = self.stopped.changed().await;
+        }
+    }
+}
+#[cfg(unix)]
+impl Drop for ProductiveSignals {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum SkillWorkflowCommand {
     /// Serve local workflow tools to any stdio MCP client using fixed operator settings.
@@ -112,6 +153,15 @@ pub enum SkillWorkflowCommand {
         /// Existing local Unix socket of the trusted Docker daemon.
         #[arg(long, requires = "docker")]
         docker_socket: Option<PathBuf>,
+        /// Explicit trusted-local productive action profile (not candidate source).
+        #[arg(long)]
+        action_profile: Option<PathBuf>,
+    },
+    /// Read a validated named productive artifact as JSON text.
+    Artifact {
+        run_id: String,
+        step_id: String,
+        name: String,
     },
     /// Inspect a retained run without advancing it.
     Status { run_id: String },
@@ -126,6 +176,9 @@ pub enum SkillWorkflowCommand {
         /// Existing local Unix socket of the trusted Docker daemon.
         #[arg(long, requires = "docker")]
         docker_socket: Option<PathBuf>,
+        /// Explicit trusted-local productive action profile (not candidate source).
+        #[arg(long)]
+        action_profile: Option<PathBuf>,
     },
     /// Cancel unfinished work while preserving completed observations.
     Cancel {
@@ -137,6 +190,8 @@ pub enum SkillWorkflowCommand {
         #[arg(long, requires = "docker")]
         docker_socket: Option<PathBuf>,
     },
+    /// Explicitly fence an interrupted productive action without replaying it.
+    RecoverAction { run_id: String, step_id: String },
     /// Recover one interrupted command step after reconciling its container.
     Recover {
         run_id: String,
@@ -169,7 +224,8 @@ pub enum LibraryCommand {
 
 pub(crate) fn telemetry_action(command: &SkillWorkflowCommand) -> bool {
     match command {
-        SkillWorkflowCommand::Status { .. }
+        SkillWorkflowCommand::Artifact { .. }
+        | SkillWorkflowCommand::Status { .. }
         | SkillWorkflowCommand::Handoff { .. }
         | SkillWorkflowCommand::Library {
             command: LibraryCommand::Inspect { .. },
@@ -305,11 +361,30 @@ pub async fn run(data_dir: &Path, command: SkillWorkflowCommand) -> Result<()> {
             input,
             docker,
             docker_socket,
+            action_profile,
         } => {
             let definition = read_definition(&input)?;
             let plan = skill_workflow::compile(data_dir, &definition)?;
             skill_workflow::start(data_dir, &run_id, &plan)?;
-            print_execution(&advance(data_dir, &run_id, 32, docker, docker_socket)?)
+            print_execution(&advance(
+                data_dir,
+                &run_id,
+                32,
+                docker,
+                docker_socket,
+                action_profile,
+            )?)
+        }
+        SkillWorkflowCommand::Artifact {
+            run_id,
+            step_id,
+            name,
+        } => {
+            let bytes = skill_workflow::runtime::artifact(data_dir, &run_id, &step_id, &name)?;
+            crate::print_json(
+                &serde_json::json!({"run_id":run_id,"step_id":step_id,"name":name,"content":String::from_utf8(bytes).map_err(|_| Error::Invalid("artifact is not UTF-8".into()))?}),
+            );
+            Ok(())
         }
         SkillWorkflowCommand::Status { run_id } => {
             crate::print_json(&serde_json::to_value(skill_workflow::status(
@@ -322,12 +397,14 @@ pub async fn run(data_dir: &Path, command: SkillWorkflowCommand) -> Result<()> {
             max_steps,
             docker,
             docker_socket,
+            action_profile,
         } => print_execution(&advance(
             data_dir,
             &run_id,
             max_steps as usize,
             docker,
             docker_socket,
+            action_profile,
         )?),
         SkillWorkflowCommand::Cancel {
             run_id,
@@ -342,6 +419,9 @@ pub async fn run(data_dir: &Path, command: SkillWorkflowCommand) -> Result<()> {
             )?)?);
             Ok(())
         }
+        SkillWorkflowCommand::RecoverAction { run_id, step_id } => print_execution(
+            &skill_workflow::runtime::recover_action(data_dir, &run_id, &step_id)?,
+        ),
         SkillWorkflowCommand::Recover {
             run_id,
             step_id,
@@ -524,6 +604,7 @@ fn configure_definition(
     use agentscm::execution::{COMMAND_CAPABILITY, COMMAND_EVIDENCE};
     use agentscm::skill_workflow::StepAction;
 
+    WorkflowRequirement::validate_admission_actions(&definition)?;
     let mut authority = Authority::open(data_dir)?;
     let state = authority.change(&expected_context.change)?;
     if state.context_digest != expected_context.digest()?
@@ -700,7 +781,66 @@ fn advance(
     max_steps: usize,
     docker: Option<PathBuf>,
     docker_socket: Option<PathBuf>,
+    action_profile: Option<PathBuf>,
 ) -> Result<RunView> {
+    #[cfg(unix)]
+    if let Some(path) = action_profile {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        if docker.is_some() || docker_socket.is_some() {
+            return Err(Error::Invalid(
+                "select productive profile separately from native check backends".into(),
+            ));
+        }
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if !path.is_absolute() || !metadata.is_file() || metadata.len() > 64 * 1024 {
+            return Err(Error::Invalid(
+                "action profile must be a bounded regular operator file at an absolute path".into(),
+            ));
+        }
+        let canonical = std::fs::canonicalize(&path)?;
+        // geteuid reads process metadata; no pointer or memory ownership crosses FFI.
+        let owner = unsafe { libc::geteuid() };
+        if metadata.uid() != owner
+            || metadata.permissions().mode() & 0o022 != 0
+            || canonical
+                .ancestors()
+                .any(|parent| std::fs::symlink_metadata(parent.join(".git")).is_ok())
+        {
+            return Err(Error::Invalid("action profile must be operator-owned, not writable by others, and outside Git checkouts".into()));
+        }
+        let profile: skill_workflow::action::ActionProfile =
+            serde_json::from_slice(&std::fs::read(canonical)?)?;
+        profile.validate()?;
+        let mut random = [0; 16];
+        getrandom::fill(&mut random)
+            .map_err(|_| Error::Invalid("cannot create action parent".into()))?;
+        let parent = std::env::temp_dir().join(format!(
+            "agentscm-actions-{}",
+            agentscm::store::digest(&random)
+        ));
+        std::fs::DirBuilder::new().mode(0o700).create(&parent)?;
+        let signals = ProductiveSignals::new()?;
+        let result = tokio::task::block_in_place(|| {
+            skill_workflow::runtime::advance_with_actions(
+                data_dir,
+                run_id,
+                max_steps,
+                &skill_workflow::action::ActionExecutor {
+                    profile: &profile,
+                    work_dir: &parent,
+                    cancellation: &signals.cancellation,
+                },
+            )
+        });
+        let _ = std::fs::remove_dir_all(parent);
+        return result;
+    }
+    #[cfg(not(unix))]
+    if action_profile.is_some() {
+        return Err(Error::Invalid(
+            "productive action execution requires Unix".into(),
+        ));
+    }
     #[cfg(unix)]
     if let (Some(docker), Some(docker_socket)) = (docker.as_ref(), docker_socket.as_ref()) {
         return with_executor(data_dir, docker, docker_socket, |executor| {

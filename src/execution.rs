@@ -6,6 +6,8 @@ mod backend;
 mod candidates;
 mod contracts;
 #[cfg(unix)]
+pub mod executable;
+#[cfg(unix)]
 pub(crate) mod process;
 #[cfg(unix)]
 mod snapshot;
