@@ -21,6 +21,7 @@ import {
   type ExplorerSummary,
 } from '../repoExplorer.ts'
 import { Ago, CopyButton, Empty, Icon, Notice, Pill, Skeleton, type Tone } from '../ui.tsx'
+import { onFrontDoor } from '../frontDoor.ts'
 import '../explorer.css'
 
 type Load<T> = { kind: 'idle' } | { kind: 'loading' } | { kind: 'error'; message: string } | { kind: 'ready'; value: T }
@@ -494,7 +495,7 @@ export function ExplorerPage({ hubRepository }: { hubRepository?: string | null 
         <p className="answer-fact"><Icon name="laptop" /> Read-only from your local checkout. Refresh observes the selected ref without changing your files.</p>
       </div>
       {summary.kind === 'loading' && <Skeleton rows={6} />}
-      {summary.kind === 'error' && <Notice tone="bad" icon="plug" title="Could not open the local repository" action={<a className="btn btn-outline-secondary" href="#settings">Open Settings</a>}>{summary.message}</Notice>}
+      {summary.kind === 'error' && (onFrontDoor() ? <Notice tone="bad" icon="plug" title="Could not open this repository">{summary.message}</Notice> : <Notice tone="brand" icon="laptop" title="Your files and conversations open from your computer">Run <code>agentscm open</code> in your repository, or choose Open Hub in the AgentSCM menu bar app. This page then opens on your computer, already connected.<details className="mt-2 small"><summary>Details</summary>{summary.message}</details></Notice>)}
       {summary.kind === 'ready' && <><SummaryIdentity summary={summary.value} selectedRef={selectedRef} onRef={setSelectedRef} onRefresh={() => setRefresh((value) => value + 1)} /><ExplorerBody key={`${summary.value.repository_id}|${summary.value.commit}`} summary={summary.value} hubRepository={hubRepository} onOpenRevision={setSelectedRef} /></>}
     </div>
   )

@@ -1,4 +1,4 @@
-import { loadLocalBase, loadLocalToken, validLocalBase } from './localApi.ts'
+import { loadLocalBase, loadLocalToken, localCredential, validLocalBase } from './localApi.ts'
 import { withTimeout } from './timeout.ts'
 
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024
@@ -712,7 +712,7 @@ async function explorerRead<T>(endpoint: string, params: Record<string, string |
   const crossOrigin = configured !== ''
   const query = new URLSearchParams()
   for (const [key, value] of Object.entries(params)) if (value !== undefined) query.set(key, String(value))
-  const token = loadLocalToken()
+  const token = crossOrigin ? loadLocalToken() : localCredential() || loadLocalToken()
   const url = `${crossOrigin ? configured : ''}/v1/local/explorer/${endpoint}?${query}`
   const busyDelays = [150, 400, 900, 1800]
   let response: Response
