@@ -6288,18 +6288,24 @@ fn validate_private_authority_layout(directory: &File, scan_files: bool) -> Resu
                     "capture spool privacy validation contains too many physical records".into(),
                 ));
             }
-            let file = openat_file(
+            let file = match openat_file(
                 &child,
                 &entry_name,
                 libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 0,
-            )
-            .map_err(|_| {
-                CaptureError::Conflict(format!(
-                    "spool_private_permissions: retained entry {} is unavailable",
-                    entry_name.to_string_lossy()
-                ))
-            })?;
+            ) {
+                Ok(file) => file,
+                // A concurrent writer renamed or removed it after the listing; nothing is exposed.
+                Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    continue;
+                }
+                Err(_) => {
+                    return Err(CaptureError::Conflict(format!(
+                        "spool_private_permissions: retained entry {} is unavailable",
+                        entry_name.to_string_lossy()
+                    )));
+                }
+            };
             let metadata = file.metadata()?;
             if !metadata.file_type().is_file() {
                 return Err(CaptureError::Conflict(format!(
@@ -6327,18 +6333,24 @@ fn validate_private_authority_layout(directory: &File, scan_files: bool) -> Resu
                     "capture spool privacy validation contains too many physical records".into(),
                 ));
             }
-            let file = openat_file(
+            let file = match openat_file(
                 directory,
                 &entry_name,
                 libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 0,
-            )
-            .map_err(|_| {
-                CaptureError::Conflict(format!(
-                    "spool_private_permissions: retained metadata {} is unavailable",
-                    entry_name.to_string_lossy()
-                ))
-            })?;
+            ) {
+                Ok(file) => file,
+                // A concurrent writer renamed or removed it after the listing; nothing is exposed.
+                Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    continue;
+                }
+                Err(_) => {
+                    return Err(CaptureError::Conflict(format!(
+                        "spool_private_permissions: retained metadata {} is unavailable",
+                        entry_name.to_string_lossy()
+                    )));
+                }
+            };
             let metadata = file.metadata()?;
             if !metadata.file_type().is_file() {
                 return Err(CaptureError::Conflict(format!(
