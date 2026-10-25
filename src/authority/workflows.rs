@@ -42,6 +42,21 @@ pub struct WorkflowRequirement {
 }
 
 impl WorkflowRequirement {
+    /// Preflight action purpose before a configuring caller mutates a Change.
+    /// Full compilation and exact-subject validation remain separate requirements.
+    pub fn validate_admission_actions(definition: &WorkflowDefinition) -> Result<()> {
+        if definition
+            .steps
+            .iter()
+            .any(|step| matches!(step.action, StepAction::AgentAction { .. }))
+        {
+            return Err(Error::Invalid(
+                "productive actions cannot be native admission requirements".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn from_plan(target: &str, plan: &CompiledPlan) -> Result<Self> {
         validate_identifier("target name", target)?;
         let requirement = Self {
@@ -88,6 +103,7 @@ impl WorkflowRequirement {
     }
 
     fn validate(&self) -> Result<()> {
+        Self::validate_admission_actions(&self.definition)?;
         if self.version != REQUIREMENT_VERSION {
             return Err(Error::Invalid(format!(
                 "unsupported workflow requirement version {}",
@@ -822,7 +838,7 @@ fn validate_imported_graph(
                 })
             }
             StepAction::SourcePaths { .. } => native.contains(&step.id),
-            StepAction::RequireCapability { .. } => false,
+            StepAction::RequireCapability { .. } | StepAction::AgentAction { .. } => false,
         };
         if step.required && !satisfied {
             return Err(Error::Conflict(format!(
@@ -1012,6 +1028,15 @@ fn normalized_definition(definition: &WorkflowDefinition) -> WorkflowDefinition 
 }
 
 fn validate_successful_graph(plan: &CompiledPlan, view: &RunView) -> Result<()> {
+    if plan
+        .ordered_steps()
+        .iter()
+        .any(|step| matches!(step.action, StepAction::AgentAction { .. }))
+    {
+        return Err(Error::Invalid(
+            "productive actions cannot finalize native evidence".into(),
+        ));
+    }
     if !matches!(
         view.state,
         RunState::Succeeded | RunState::CompletedWithOmissions

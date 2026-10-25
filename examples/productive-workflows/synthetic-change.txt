@@ -1,0 +1,1 @@
+The synthetic issue list gains a status filter with values all, open and closed. The filter defaults to all. Changing the filter preserves the current search query. An empty filtered result displays an empty-state message.

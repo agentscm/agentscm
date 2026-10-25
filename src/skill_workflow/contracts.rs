@@ -47,6 +47,10 @@ pub struct StepDefinition {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StepAction {
+    /// Productive output, never native admission evidence.
+    AgentAction {
+        resource: String,
+    },
     SourcePaths {
         expectations: Vec<SourcePathExpectation>,
     },

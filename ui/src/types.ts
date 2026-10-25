@@ -131,6 +131,24 @@ export interface SkillWorkflowReview {
   covered_paths: string[]
 }
 
+export type SkillWorkflowActionOutcome = 'succeeded' | 'failed' | 'blocked' | 'cancelled' | 'uncertain' | 'timed_out' | 'output_limit' | 'invalid_output'
+
+export interface SkillWorkflowAction {
+  profile_digest: string
+  outcome: SkillWorkflowActionOutcome | null
+  artifact: {
+    name: string
+    media_type: 'text/plain' | 'text/markdown' | 'application/json'
+    sha256: string
+    bytes: number
+    run_id: string
+    step_id: string
+    revision: string
+  } | null
+  observed_model: string | null
+  verification: 'not_independently_verified'
+}
+
 export interface SkillWorkflowStep {
   id: string
   needs: string[]
@@ -140,6 +158,7 @@ export interface SkillWorkflowStep {
   detail: string | null
   execution: SkillWorkflowCommandExecution | null
   review: SkillWorkflowReview | null
+  action?: SkillWorkflowAction | null
 }
 
 export interface SkillWorkflowProjection {

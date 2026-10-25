@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "inputs": {
+    "explanation": {
+      "kind": "artifact",
+      "step": "explain",
+      "name": "explanation"
+    }
+  },
+  "output": {
+    "name": "draft",
+    "media_type": "text/markdown",
+    "max_bytes": 32768
+  },
+  "action": {
+    "kind": "prompt",
+    "prompt": "draft.md",
+    "required_tools": []
+  }
+}

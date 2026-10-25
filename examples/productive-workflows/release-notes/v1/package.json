@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "inputs": {
+    "draft": {
+      "kind": "artifact",
+      "step": "draft",
+      "name": "draft"
+    },
+    "title": {
+      "kind": "parameter",
+      "value": "Release notes"
+    }
+  },
+  "output": {
+    "name": "bundle",
+    "media_type": "application/json",
+    "max_bytes": 65536
+  },
+  "action": {
+    "kind": "command",
+    "profile": "package-json"
+  }
+}

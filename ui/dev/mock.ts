@@ -160,6 +160,30 @@ const WORKFLOW_RUNS = Array.from({ length: 60 }, (_, index) => {
 })
 
 function workflow(runId: string): Record<string, unknown> | null {
+  if (runId === 'productive-artifacts') {
+    const revision = 'a'.repeat(64)
+    return {
+      version: 1, availability: 'available',
+      projection: {
+        version: 1,
+        run: {
+          version: 1, run_id: runId, plan_digest: `sha256:${'b'.repeat(64)}`, skill_digest: `sha256:${'c'.repeat(64)}`,
+          source: { repository: 'd'.repeat(32), revision, policy_epoch: 1 }, state: 'succeeded', admission: 'not_assessed',
+          steps: ['explain', 'draft', 'package'].map((id, index, ids) => ({
+            id, needs: index ? [ids[index - 1]] : [], required: true, state: 'succeeded', observations: [],
+            detail: 'Synthetic artifact metadata for interface development; no agent was executed.',
+            action: {
+              profile_digest: 'e'.repeat(64), outcome: 'succeeded', verification: 'not_independently_verified',
+              observed_model: index < 2 ? 'synthetic-model' : null,
+              artifact: { name: id, media_type: index < 2 ? 'text/markdown' : 'application/json', sha256: 'f'.repeat(64), bytes: 1240, run_id: runId, step_id: id, revision },
+            },
+          })),
+        },
+        present_applicability: { basis: 'current_authority_repository_policy_epoch_and_immutable_revision', state: 'current', reason: null },
+        present_landing_binding: null,
+      },
+    }
+  }
   const summary = WORKFLOW_RUNS.find((run) => run.run_id === runId)
   if (!summary) return null
   const failedReview = runId === 'claude-review-failed'

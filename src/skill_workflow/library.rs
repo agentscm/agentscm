@@ -37,6 +37,9 @@ pub struct TemplateStepDefinition {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TemplateStepAction {
+    AgentAction {
+        resource: String,
+    },
     SourcePaths {
         expectations: Vec<SourcePathExpectation>,
     },
@@ -110,6 +113,9 @@ impl WorkflowTemplateSnapshot {
                     needs: step.needs.clone(),
                     required: step.required,
                     action: match &step.action {
+                        TemplateStepAction::AgentAction { resource } => StepAction::AgentAction {
+                            resource: resource.clone(),
+                        },
                         TemplateStepAction::SourcePaths { expectations } => {
                             StepAction::SourcePaths {
                                 expectations: expectations.clone(),

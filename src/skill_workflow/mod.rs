@@ -1,4 +1,5 @@
 //! Source-bound trusted-local skill workflow plans and durable execution.
+pub mod action;
 pub mod collector_transfer;
 pub mod compiler;
 pub mod contracts;

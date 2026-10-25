@@ -1487,3 +1487,72 @@ fn handoff_preserves_pending_failed_and_omitted_results_without_advancing() {
         assert_eq!(status(root.path(), run_id).unwrap(), before);
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn productive_library_configure_preserves_change_and_context() {
+    let root = TempDir::new().unwrap();
+    let engine = Engine::open(root.path()).unwrap();
+    let manifest = template(
+        "productive",
+        1,
+        SKILL,
+        vec![step(
+            "draft",
+            &[],
+            true,
+            json!({"kind":"agent_action","resource":"draft.json"}),
+        )],
+    );
+    let mut manifest = manifest;
+    manifest["skill"]["resources"] = json!([
+        "skills/reusable/v1/draft.json",
+        "skills/reusable/v1/draft.md"
+    ]);
+    let action = json!({"version":1,"inputs":{},"output":{"name":"draft","media_type":"text/markdown","max_bytes":1024},"action":{"kind":"prompt","prompt":"draft.md","required_tools":[]}});
+    let revision = engine
+        .checkpoint(
+            None,
+            &[
+                put(SKILL, b"# Productive\n".to_vec()),
+                put(LIBRARY_V1, serde_json::to_vec(&manifest).unwrap()),
+                put(
+                    "skills/reusable/v1/draft.json",
+                    serde_json::to_vec(&action).unwrap(),
+                ),
+                put(
+                    "skills/reusable/v1/draft.md",
+                    b"Draft synthetic release notes.\n".to_vec(),
+                ),
+            ],
+        )
+        .unwrap();
+    let mut authority = Authority::open(root.path()).unwrap();
+    let repository = authority.repository_id().unwrap();
+    let before_context = context(&repository, "productive", &revision);
+    let before = authority.start_change(&before_context).unwrap();
+    drop(authority);
+    let output = invoke(
+        root.path(),
+        &[
+            "skill-workflow",
+            "library",
+            "configure",
+            "productive",
+            "--library",
+            LIBRARY_V1,
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("productive actions cannot be native admission")
+    );
+    let authority = Authority::open(root.path()).unwrap();
+    assert_eq!(authority.change(&before.id).unwrap(), before);
+    assert_eq!(
+        authority.review_context(&before.context_digest).unwrap(),
+        before_context
+    );
+    assert!(authority.workflow_requirement("main").unwrap().is_none());
+}

@@ -1,8 +1,7 @@
 //! What the machine and the checkout already have, found without changing anything.
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 use crate::intent_cli::valid_repo;
 
@@ -143,31 +142,13 @@ pub(crate) fn capture(
     limit: Duration,
 ) -> Option<String> {
     let mut command = Command::new(program);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+    command.args(args);
     if let Some(dir) = dir {
         command.current_dir(dir);
     }
-    let mut child = command.spawn().ok()?;
-    let deadline = Instant::now() + limit;
-    loop {
-        match child.try_wait().ok()? {
-            Some(status) => {
-                let mut out = String::new();
-                child.stdout.take()?.read_to_string(&mut out).ok()?;
-                return status.success().then(|| out.trim().to_owned());
-            }
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            None => std::thread::sleep(Duration::from_millis(50)),
-        }
-    }
+    let output = super::process::run(&mut command, limit).ok()?;
+    (output.success && !output.truncated && !output.incomplete && output.stdout_valid_utf8)
+        .then_some(output.stdout)
 }
 
 const QUICK: Duration = Duration::from_secs(10);
@@ -284,5 +265,71 @@ mod tests {
         assert_eq!(docker_arch("x86_64"), Some("amd64"));
         assert_eq!(docker_arch("amd64"), Some("amd64"));
         assert_eq!(docker_arch("armv7"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_drains_output_larger_than_a_pipe_while_the_command_runs() {
+        let output = capture(
+            Path::new("/bin/sh"),
+            &["-c", "head -c 131072 /dev/zero | tr '\\000' x"],
+            None,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(output.len(), 131072);
+        assert!(output.bytes().all(|byte| byte == b'x'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_cleans_up_an_inherited_pipe_after_leader_exit() {
+        let started = std::time::Instant::now();
+        let output = capture(
+            Path::new("/bin/sh"),
+            &["-c", "sleep 60 & printf complete; exit 0"],
+            None,
+            Duration::from_secs(1),
+        );
+        assert_eq!(output.as_deref(), Some("complete"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_rejects_truncation_without_using_a_text_marker() {
+        assert_eq!(
+            capture(
+                Path::new("/bin/sh"),
+                &["-c", "head -c 524288 /dev/zero"],
+                None,
+                Duration::from_secs(5),
+            ),
+            None
+        );
+        assert_eq!(
+            capture(
+                Path::new("/bin/sh"),
+                &["-c", "printf '[output truncated]'"],
+                None,
+                Duration::from_secs(5),
+            )
+            .as_deref(),
+            Some("[output truncated]")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_preserves_rejection_of_invalid_utf8() {
+        assert_eq!(
+            capture(
+                Path::new("/bin/sh"),
+                &["-c", "printf '\\377'"],
+                None,
+                Duration::from_secs(5),
+            ),
+            None
+        );
     }
 }

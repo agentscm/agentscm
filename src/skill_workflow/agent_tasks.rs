@@ -1181,6 +1181,10 @@ impl<'a> AgentTaskService<'a> {
                         ),
                     }
                 }
+                StepAction::AgentAction { .. } => (
+                    QualificationTaskState::Blocked,
+                    Some("productive_action_not_qualification"),
+                ),
                 StepAction::RequireCapability { .. } => (
                     QualificationTaskState::Blocked,
                     Some("capability_unavailable"),
@@ -1344,6 +1348,7 @@ impl<'a> AgentTaskService<'a> {
         let mut omitted = false;
         for (step, task) in current.plan.ordered_steps().iter().zip(&current.tasks) {
             match &step.action {
+                StepAction::AgentAction { .. } => return Ok(None),
                 StepAction::SourcePaths { .. } => {
                     let result =
                         super::execute_step(&engine, &current.plan.definition().source, step);
@@ -2444,6 +2449,7 @@ fn derive_tasks(
 
 fn criteria(step: &StepDefinition) -> Vec<RequiredCriterion> {
     let (description, kind, evidence_rule) = match &step.action {
+        StepAction::AgentAction { .. } => return Vec::new(),
         StepAction::ClaudeCodeReview { .. } => (
             "Complete the installed independent controller review",
             CriterionKind::IndependentReview,
@@ -4271,7 +4277,7 @@ mod tests {
         let plan = fixture.service().current(&fixture.context).unwrap().plan;
         let before = super::super::start(fixture.root.path(), "prior-run", &plan).unwrap();
         let journal = Journal::open(fixture.root.path(), OpenMode::Create).unwrap();
-        journal.connection.execute_batch("DROP TABLE agent_workflow_operations; DROP TABLE agent_workflow_collector_transfers; DROP TABLE agent_workflow_collector_claims; DROP TABLE agent_workflow_assertions; DROP TABLE agent_workflow_attempts; DROP TABLE agent_workflow_tasks; PRAGMA user_version=2;").unwrap();
+        journal.connection.execute_batch("DROP TABLE workflow_action_inputs; DROP TABLE workflow_action_attempts; DROP TABLE agent_workflow_operations; DROP TABLE agent_workflow_collector_transfers; DROP TABLE agent_workflow_collector_claims; DROP TABLE agent_workflow_assertions; DROP TABLE agent_workflow_attempts; DROP TABLE agent_workflow_tasks; PRAGMA user_version=2;").unwrap();
         drop(journal);
         let journal = Journal::open(fixture.root.path(), OpenMode::Create).unwrap();
         assert_eq!(
@@ -4279,7 +4285,7 @@ mod tests {
                 .connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            4
+            5
         );
         assert_eq!(journal.view("prior-run").unwrap(), before);
         drop(journal);
@@ -4452,6 +4458,8 @@ mod tests {
             )
             .unwrap();
         }
+        tx.execute_batch("DROP TABLE workflow_action_inputs; DROP TABLE workflow_action_attempts;")
+            .unwrap();
         tx.pragma_update(None, "user_version", 3).unwrap();
         tx.commit().unwrap();
         connection
@@ -4621,7 +4629,7 @@ mod tests {
                 .connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            4
+            5
         );
         assert!(
             !migrated

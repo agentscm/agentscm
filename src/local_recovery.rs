@@ -911,6 +911,16 @@ fn validate_journal(
                 "Git reconciliation recovery is unsupported on non-Unix platforms".into(),
             ));
         }
+    } else if kind == DbKind::Pipeline {
+        #[cfg(unix)]
+        {
+            crate::hub::pipeline_rules::validate_recovery(db, repository)?;
+            None
+        }
+        #[cfg(not(unix))]
+        {
+            return Err(Error::Invalid("pipeline recovery requires Unix".into()));
+        }
     } else if kind == DbKind::Issue {
         let config = issue_config.ok_or_else(|| {
             Error::Invalid(
@@ -958,6 +968,7 @@ enum DbKind {
     Export,
     GitReconcile,
     Issue,
+    Pipeline,
 }
 fn validate_database(db: &Connection, kind: DbKind) -> Result<()> {
     let integrity: String = db.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
@@ -976,10 +987,11 @@ fn validate_database(db: &Connection, kind: DbKind) -> Result<()> {
         DbKind::Workspace => app == 0x4153_574b && matches!(version, 2..=5),
         DbKind::Merge => (app, version) == (0x4147_4d47, 1),
         DbKind::Workflow => (app, version) == (0x4153_4746, 1),
-        DbKind::SkillWorkflow => app == 0x4153_5746 && matches!(version, 1..=4),
+        DbKind::SkillWorkflow => app == 0x4153_5746 && matches!(version, 1..=5),
         DbKind::Export => app == 1095190616 && matches!(version, 1 | 2),
         DbKind::GitReconcile => (app, version) == (0x4153_4752, 1),
         DbKind::Issue => return Ok(()),
+        DbKind::Pipeline => (app, version) == (0x4153_5052, 1),
     };
     if !supported {
         return Err(Error::Invalid(format!(
@@ -1275,6 +1287,7 @@ fn database_paths(
             ("merges/state.sqlite", DbKind::Merge),
             ("workflow.sqlite", DbKind::Workflow),
             ("skill-workflows/state.sqlite", DbKind::SkillWorkflow),
+            ("pipeline-rules/state.sqlite", DbKind::Pipeline),
             ("git-reconcile.sqlite", DbKind::GitReconcile),
         ]
     } else if destination.starts_with("workspaces/") {
@@ -1301,6 +1314,7 @@ fn database_paths(
                             | DbKind::Workflow
                             | DbKind::SkillWorkflow
                             | DbKind::GitReconcile
+                            | DbKind::Pipeline
                     ) => {}
             Err(e) => return Err(e.into()),
         }

@@ -40,6 +40,7 @@ pub struct CompiledPlan {
     pub(crate) digest: String,
     pub(crate) skill_digest: String,
     pub(crate) ordered_steps: Vec<StepDefinition>,
+    pub actions: BTreeMap<String, super::action::CompiledAction>,
     /// Exact resource hashes from the already bounded, verified compilation read.
     #[serde(skip)]
     pub(crate) instruction_sha256: BTreeMap<String, String>,
@@ -85,11 +86,12 @@ pub fn compile(data_dir: &Path, definition: &WorkflowDefinition) -> Result<Compi
     validate_authority(&authority, definition)?;
     let engine = Engine::open(data_dir)?;
     let (source, budget) = engine.with_read_budget(MAX_SKILL_COMPILATION_READ_BYTES);
-    let bundle = budget.finish((|| {
+    let (bundle, actions) = budget.finish((|| {
         source.load_revision(&definition.source.revision)?;
         let bundle = resolve_skill(&source, definition)?;
         validate_claude_review_sources(&source, definition)?;
-        Ok(bundle)
+        let actions = super::action::compile(&source, definition, &bundle)?;
+        Ok((bundle, actions))
     })())?;
     validate_claude_review_skill(definition, &bundle)?;
     let command_recipes = compile_command_recipes(&authority, definition, &bundle)?;
@@ -114,6 +116,7 @@ pub fn compile(data_dir: &Path, definition: &WorkflowDefinition) -> Result<Compi
         digest,
         skill_digest,
         ordered_steps,
+        actions,
         command_recipes,
     })
 }
@@ -140,6 +143,7 @@ pub fn validate_sources(data_dir: &Path, definition: &WorkflowDefinition) -> Res
         source.load_revision(&definition.source.revision)?;
         let bundle = resolve_skill(&source, definition)?;
         validate_claude_review_sources(&source, definition)?;
+        super::action::compile(&source, definition, &bundle)?;
         Ok(bundle)
     })())?;
     validate_claude_review_skill(definition, &bundle)?;
@@ -291,6 +295,9 @@ fn validate_step(step: &StepDefinition) -> Result<()> {
     }
 
     match &step.action {
+        StepAction::AgentAction { resource } => {
+            validate_path(resource)?;
+        }
         StepAction::SourcePaths { expectations } => {
             if expectations.is_empty() || expectations.len() > MAX_EXPECTATIONS {
                 return Err(Error::Limit(format!(
