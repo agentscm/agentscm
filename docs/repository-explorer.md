@@ -7,11 +7,19 @@ file, open its history or a comparison, then inspect recorded actions and visibl
 This is a read-only alpha feature for Unix hosts. It reads one checkout selected by the local
 operator. It does not fetch, check out a branch, run an agent or execute a check.
 
-## Connect the local service
+## Open it
 
-Choose a local read secret with at least 32 bytes and set `AGENTSCM_SERVE_READ_TOKEN` in the service
-environment. Use a separate secret from your Hub credential. Start the service with absolute
-paths and the logical repository ID used by your AgentSCM connection:
+Run `agentscm open` in a connected checkout, or choose **Open Hub** in the AgentSCM menu bar app.
+The browser opens this computer's Hub page on Repository explorer, already connected to every
+checkout connected on this computer, with capture included where change capture is set up for that
+checkout. See [Open the Hub from this computer](connect-this-computer.md).
+
+### Advanced: connect without `agentscm open`
+
+For a Hub page served elsewhere, start a local service yourself. Choose a local read secret with
+at least 32 bytes and set `AGENTSCM_SERVE_READ_TOKEN` in the service environment. Use a separate
+secret from your Hub credential. Start the service with absolute paths and the logical repository
+ID used by your AgentSCM connection:
 
 ```text
 agentscm --data-dir /absolute/local-data serve \
@@ -26,8 +34,8 @@ save `http://127.0.0.1:7331` and the local read token. The token stays in this b
 storage. Opening the explorer requires a token even when the local service shares the page's
 origin. A non-loopback bind is refused for the explorer, including with `--public`.
 
-To include existing local capture, add `--explorer-spool /absolute/private/spool` when starting the
-service. Its configured repository namespace must match `--explorer-repository`. This is an
+With a manually started service, include existing local capture by adding
+`--explorer-spool /absolute/private/spool`. Its configured repository namespace must match `--explorer-repository`. This is an
 explicit opt-in to reading private bodies through the local service. Configure capture separately
 using [Local change capture](change-capture.md). Browsing does not initialize, recover, acknowledge
 or compact a spool.

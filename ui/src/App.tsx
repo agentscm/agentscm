@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useState, useSyncExternalStore } from 'react'
+import { ComputerBar } from './ComputerBar.tsx'
 import { derive } from './derive.ts'
+import { isLocalCredential, onFrontDoor } from './frontDoor.ts'
 import { fetchOverview } from './standup.ts'
-import { clearToken, loadDensity, loadTheme, loadToken, saveDensity, saveTheme, saveToken, type Density, type ThemePref } from './storage.ts'
+import { clearToken, loadDensity, loadTheme, loadToken, saveDensity, saveTheme, saveToken, signInAfterRefusal, type Density, type ThemePref } from './storage.ts'
 import { useHub } from './useHub.ts'
 import logoDark from './logo-dark.png'
 import logoLight from './logo-light.png'
@@ -125,6 +127,7 @@ function Shell({ token, dark, pref, onPref, density, onDensity, onUnauthorized, 
         collapsed={rail}
         onCollapsed={changeRail}
       >
+        {isLocalCredential(token) && section !== 'settings' && <ComputerBar token={token} />}
         {data.health?.demo && (
           <Notice tone="brand" icon="play-circle" title="Demo hub">
             Simulated agents working on your repository’s file names. Nothing is written to your repository; this page stops when <code>agentscm demo</code> does. To set it up for real, stop the demo and run <code>agentscm quickstart</code> (or <code>npx agentscm</code>).
@@ -179,7 +182,15 @@ export default function App() {
     setToken(null)
     setNotice(message)
   }, [])
-  const onUnauthorized = useCallback((m?: string) => signedOut(m ?? 'Your token was rejected or has expired. Paste a current one to continue.'), [signedOut])
+  const onUnauthorized = useCallback(
+    (m?: string) => {
+      // Another tab may already have signed in or reconnected: use that rather than erasing it.
+      const other = signInAfterRefusal(token, loadToken())
+      if (other) return setToken(other)
+      signedOut(m ?? (onFrontDoor() ? 'This connection ended, for example because AgentSCM restarted on this computer.' : 'Your token was rejected or has expired. Paste a current one to continue.'))
+    },
+    [signedOut, token],
+  )
   const onForget = useCallback(() => signedOut('Token forgotten on this browser. The hub still accepts it until it expires or is revoked.'), [signedOut])
 
   if (token) return <Shell key={token} token={token} dark={dark} pref={pref} onPref={changePref} density={density} onDensity={changeDensity} onUnauthorized={onUnauthorized} onForget={onForget} />

@@ -69,13 +69,19 @@ mod hook_cli;
 #[cfg(unix)]
 mod hosted_workflow_client;
 mod hub_cli;
+#[cfg(unix)]
+mod hub_read_token;
 mod init_cli;
 mod intent_cli;
 mod local_recovery_cli;
 #[cfg(unix)]
+mod local_service;
+#[cfg(unix)]
 mod local_validation_cli;
 #[cfg(unix)]
 mod merge_cli;
+#[cfg(unix)]
+mod open_cli;
 #[cfg(unix)]
 mod pipeline_cli;
 mod prompt;
@@ -131,6 +137,10 @@ struct Cli {
 enum Command {
     /// Open the optional native status-bar companion (macOS).
     Tray(tray::TrayArgs),
+    /// Open this checkout's Hub page in your browser, connected to this computer's files and
+    /// saved conversations. Starts the local page when needed; `--stop` stops it.
+    #[cfg(unix)]
+    Open(open_cli::OpenArgs),
     /// [experimental] Capture local agent events and observed command receipts.
     #[cfg(unix)]
     ChangeCapture {
@@ -553,6 +563,10 @@ enum Command {
         /// Allow a non-loopback bind address.
         #[arg(long)]
         public: bool,
+        /// Serve the Hub page and every checkout connected on this computer, for
+        /// `agentscm open`. Takes no source flags.
+        #[arg(long, hide = true)]
+        front_door: bool,
     },
 }
 
@@ -722,6 +736,8 @@ enum RunExit {
 async fn run(cli: Cli) -> Result<RunExit> {
     match cli.command {
         Command::Tray(args) => tray::run(args).await?,
+        #[cfg(unix)]
+        Command::Open(args) => open_cli::run(args).await?,
         #[cfg(unix)]
         Command::ChangeCapture { command } => {
             let code = change_capture_cli::run(command).await?;
@@ -1220,6 +1236,7 @@ async fn run(cli: Cli) -> Result<RunExit> {
             explorer_spool,
             browser_origin,
             public,
+            front_door,
         } => {
             server::serve(server::ServeOptions {
                 data_dir: cli.data_dir,
@@ -1232,6 +1249,7 @@ async fn run(cli: Cli) -> Result<RunExit> {
                 explorer_repo,
                 explorer_repository,
                 explorer_spool,
+                front_door,
             })
             .await?;
         }

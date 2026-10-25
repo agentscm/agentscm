@@ -22,6 +22,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 #[cfg(unix)]
 mod explorer;
+#[cfg(unix)]
+mod front_door;
 
 const MAX_CONCURRENCY: usize = 256;
 const MAX_QUERY_BYTES: usize = 4 * 1024;
@@ -41,6 +43,9 @@ struct AppState {
     timeline: Option<Arc<PathBuf>>,
     #[cfg(unix)]
     explorer: Option<Arc<agentscm::repo_explorer::Explorer>>,
+    /// Set by `--front-door`: every connected checkout, chosen per request.
+    #[cfg(unix)]
+    front_door: Option<Arc<front_door::FrontDoor>>,
 }
 
 /// Token and browser origins guarding `/v1/local`, fixed at startup.
@@ -96,6 +101,8 @@ pub struct ServeOptions {
     pub explorer_repo: Option<PathBuf>,
     pub explorer_repository: Option<String>,
     pub explorer_spool: Option<PathBuf>,
+    /// Serve the Hub page and every connected checkout on loopback (`agentscm open`).
+    pub front_door: bool,
 }
 
 pub async fn serve(options: ServeOptions) -> Result<()> {
@@ -110,7 +117,25 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         explorer_repo,
         explorer_repository,
         explorer_spool,
+        front_door,
     } = options;
+    if front_door
+        && (public
+            || collisions.is_some()
+            || timeline.is_some()
+            || !browser_origins.is_empty()
+            || explorer_repo.is_some()
+            || explorer_spool.is_some()
+            || !bind.ip().is_loopback())
+    {
+        return Err(Error::Invalid(
+            "--front-door serves this computer's connected checkouts on loopback and takes no other source flags".into(),
+        ));
+    }
+    #[cfg(not(unix))]
+    if front_door {
+        return Err(Error::Invalid("the front door needs a Unix host".into()));
+    }
     if !bind.ip().is_loopback() && !public {
         return Err(Error::Invalid(
             "binding a non-loopback address requires --public".into(),
@@ -122,7 +147,11 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         )));
     }
 
-    let access = local_access(std::env::var(READ_TOKEN_ENV).ok(), browser_origins)?;
+    // The front door authorizes browsers itself; a read token in the environment is not its concern.
+    let token = (!front_door)
+        .then(|| std::env::var(READ_TOKEN_ENV).ok())
+        .flatten();
+    let access = local_access(token, browser_origins)?;
     if explorer_repo.is_some() && (!bind.ip().is_loopback() || access.token.is_none()) {
         return Err(Error::Invalid(format!(
             "the repository explorer requires a loopback bind address and {READ_TOKEN_ENV}"
@@ -165,6 +194,11 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         None => None,
     };
 
+    #[cfg(unix)]
+    let door = front_door
+        .then(front_door::FrontDoor::new)
+        .transpose()?
+        .map(Arc::new);
     let state = AppState {
         data_dir,
         engine,
@@ -173,11 +207,50 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         timeline,
         #[cfg(unix)]
         explorer,
+        #[cfg(unix)]
+        front_door: door.clone(),
     };
+    #[cfg(unix)]
+    if let Some(door) = door {
+        return serve_front_door(state, door, bind).await;
+    }
     let app = router(state, access);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     eprintln!("listening on {}", listener.local_addr()?);
     agentscm::http_listener::serve(listener, app, shutdown_signal()).await;
+    Ok(())
+}
+
+/// Bind the front door (the requested port, else any free one), publish its discovery record,
+/// serve until stopped, then revoke the Hub tokens it minted.
+#[cfg(unix)]
+async fn serve_front_door(
+    state: AppState,
+    door: Arc<front_door::FrontDoor>,
+    bind: SocketAddr,
+) -> Result<()> {
+    let listener = match tokio::net::TcpListener::bind(bind).await {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            tokio::net::TcpListener::bind(SocketAddr::new(bind.ip(), 0)).await?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let address = listener.local_addr()?;
+    let base = format!("http://{address}");
+    door.set_origin(base.clone());
+    let _record = crate::local_service::publish(&crate::local_service::ServiceRecord {
+        version: 1,
+        instance: door.instance.clone(),
+        pid: std::process::id(),
+        base,
+        admin: door.admin_secret().to_owned(),
+        started_at: agentscm::hub::store::unix_now(),
+    })?;
+    eprintln!("listening on {address}");
+    let app = front_door::router(state, door.clone());
+    agentscm::http_listener::serve(listener, app, shutdown_signal()).await;
+    door.revoke_all().await;
     Ok(())
 }
 
@@ -323,7 +396,7 @@ async fn local_guard(
     response
 }
 
-fn loopback_host(headers: &HeaderMap) -> bool {
+pub(super) fn loopback_host(headers: &HeaderMap) -> bool {
     let Some(host) = headers
         .get(header::HOST)
         .and_then(|host| host.to_str().ok())
@@ -860,7 +933,7 @@ fn api_response(status: StatusCode, body: String, content_type: &'static str) ->
     response
 }
 
-async fn health() -> Json<serde_json::Value> {
+pub(super) async fn health() -> Json<serde_json::Value> {
     Json(json!({"status": "ok"}))
 }
 
@@ -1200,6 +1273,8 @@ mod tests {
             timeline: None,
             #[cfg(unix)]
             explorer: None,
+            #[cfg(unix)]
+            front_door: None,
         };
         let permit = reserve_work(&state).unwrap();
         let response = workflow_status(State(state.clone()), RawQuery(None)).await;
@@ -1222,6 +1297,8 @@ mod tests {
             timeline: None,
             #[cfg(unix)]
             explorer: None,
+            #[cfg(unix)]
+            front_door: None,
         };
         let permit = reserve_work(&state).unwrap();
         let response = skill_workflow(
@@ -1250,6 +1327,8 @@ mod tests {
             timeline: None,
             #[cfg(unix)]
             explorer: None,
+            #[cfg(unix)]
+            front_door: None,
         };
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();

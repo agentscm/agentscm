@@ -1,3 +1,4 @@
+import { onFrontDoor } from '../frontDoor.ts'
 import { useState, type FormEvent } from 'react'
 import { AGENT_TOKEN_MESSAGE, ApiError, fetchWhoami } from '../api.ts'
 import { Logo } from '../App.tsx'
@@ -55,6 +56,23 @@ export function SignIn({ dark, notice, onSignedIn }: { dark: boolean; notice: st
         </ul>
       </div>
       <div className="signin-panel">
+        {onFrontDoor() ? (
+          <section className="box" aria-labelledby="connect-title">
+            <header className="box-head">
+              <span className="box-badge tone-brand">
+                <Icon name="laptop" />
+              </span>
+              <h2 id="connect-title" className="box-title">Connect this computer</h2>
+            </header>
+            <div className="box-body">
+              {notice && <Notice tone="brand" icon="info-circle" title={notice} />}
+              <p>
+                In a terminal, run <code>agentscm open</code> in your repository, or choose <strong>Open Hub</strong> in the AgentSCM menu bar app. This page opens connected to your files, saved conversations and your team’s Hub.
+              </p>
+              <p className="small muted mb-0">Each connection lasts while AgentSCM keeps running on this computer, for up to a week.</p>
+            </div>
+          </section>
+        ) : (
         <form className="box" onSubmit={submit} noValidate>
           <header className="box-head">
             <span className="box-badge tone-brand">
@@ -107,6 +125,8 @@ export function SignIn({ dark, notice, onSignedIn }: { dark: boolean; notice: st
             </div>
           </div>
         </form>
+        )}
+        {!onFrontDoor() && (
         <div className="signin-alt">
           <button type="button" className="btn btn-outline-secondary" onClick={() => setConnect((c) => !c)} aria-expanded={connect}>
             <Icon name="plug" /> Connect an agent
@@ -115,6 +135,7 @@ export function SignIn({ dark, notice, onSignedIn }: { dark: boolean; notice: st
             <Icon name="people" /> Sign in to workspace
           </a>
         </div>
+        )}
         {connect && (
           <section className="box mt-3" aria-label="Connect an agent">
             <div className="box-body">

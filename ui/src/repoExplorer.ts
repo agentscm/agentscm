@@ -1,4 +1,4 @@
-import { loadLocalBase, loadLocalToken, validLocalBase } from './localApi.ts'
+import { loadLocalBase, loadLocalToken, localCredential, validLocalBase } from './localApi.ts'
 import { withTimeout } from './timeout.ts'
 
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024
@@ -742,7 +742,7 @@ async function explorerRead<T>(endpoint: string, params: Record<string, string |
   const crossOrigin = configured !== ''
   const query = new URLSearchParams()
   for (const [key, value] of Object.entries(params)) if (value !== undefined) query.set(key, String(value))
-  const token = loadLocalToken()
+  const token = crossOrigin ? loadLocalToken() : localCredential() || loadLocalToken()
   const url = `${crossOrigin ? configured : ''}/v1/local/explorer/${endpoint}?${query}`
   const busyDelays = [150, 400, 900, 1800]
   let response: Response
@@ -765,8 +765,10 @@ async function explorerRead<T>(endpoint: string, params: Record<string, string |
     if (signal.aborted) throw signal.reason
   }
   if (!response.ok) {
-    await response.body?.cancel()
-    throw new ExplorerResponseError(adviceFor(response.status), response.status)
+    // On this computer's own Hub page, a repository that is no longer connected is its own case.
+    const code = response.status === 409 ? ((await response.json().catch(() => null)) as { error?: unknown } | null)?.error : undefined
+    if (code === undefined) await response.body?.cancel()
+    throw new ExplorerResponseError(code === 'repository_unavailable' ? 'That repository is no longer connected on this computer. Choose another one at the top of the page, or run agentscm open in its checkout.' : adviceFor(response.status), response.status)
   }
   return decode(await boundedJson(response))
 }
