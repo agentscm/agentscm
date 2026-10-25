@@ -2671,9 +2671,17 @@ impl LocalSpool {
             .entries
             .get(&key)
         {
-            // Compaction keeps only a digest, so a receipt-timed re-delivery cannot be compared
-            // beyond its operation id, which already fixes the hook's identity.
-            return if receipt_timed || compacted.digest == sha256(&bytes) {
+            // Digest-only compaction keeps no bytes to compare, so a receipt-timed re-delivery
+            // falls back to its operation id; only acknowledged envelopes are compacted.
+            let matches = match (&compacted.envelope, receipt_timed) {
+                (Some(retained), true) => {
+                    without_observation_time(&serde_json::to_vec(retained)?)?
+                        == without_observation_time(&bytes)?
+                }
+                (None, true) => true,
+                (_, false) => compacted.digest == sha256(&bytes),
+            };
+            return if matches {
                 Ok(AppendOutcome::Duplicate)
             } else {
                 Err(CaptureError::Conflict(
@@ -7085,6 +7093,7 @@ fn usage(root: &Path, _configured_max: usize) -> Result<(usize, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::change_record::GapReasonV1;
 
     fn export_anchors(parent: &Path) -> Vec<PathBuf> {
         let mut anchors = fs::read_dir(parent)
@@ -8121,6 +8130,106 @@ mod tests {
         assert!(!root.join("capture-spool-v4.json").exists());
         assert!(!root.join("spool.lock").exists());
         assert!(!root.join("managed-capture.lock").exists());
+    }
+
+    fn gap_envelope(
+        operation_id: &str,
+        observed_at: i64,
+        reason: GapReasonV1,
+    ) -> CaptureEnvelopeV1 {
+        use crate::change_record::{
+            AgentHarnessV1, CaptureBatchV1, CapturedEventKindV1, CapturedEventV1, GapFactV1,
+            SessionIdentityV1,
+        };
+        CaptureEnvelopeV1::EventBatch(CaptureBatchV1 {
+            schema_version: crate::change_record::SCHEMA_VERSION_V1,
+            operation_id: operation_id.into(),
+            work_id: "wrk_receipt".into(),
+            generation: 1,
+            session: SessionIdentityV1 {
+                harness: AgentHarnessV1::ClaudeCode,
+                adapter_version: "test".into(),
+                session_id: "session_receipt".into(),
+                parent_session_id: None,
+                capture_mode: CaptureModeV1::MetadataOnly,
+            },
+            events: vec![CapturedEventV1 {
+                event_id: "gap:receipt".into(),
+                sequence: 1,
+                observed_at,
+                kind: CapturedEventKindV1::Gap,
+                tool: None,
+                artifact: None,
+                setup: None,
+                gap: Some(GapFactV1 {
+                    first_missing: 1,
+                    last_missing: 1,
+                    reason,
+                }),
+                boundary: None,
+                subagent: None,
+            }],
+        })
+    }
+
+    #[test]
+    fn receipt_timed_priority_redelivery_in_outbox_ignores_only_observation_time() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+        let operation = format!("cap:{}", "a".repeat(64));
+        let original = gap_envelope(&operation, 100, GapReasonV1::AdapterStartedLate);
+        assert_eq!(
+            spool.append_priority_at_receipt(&original).unwrap(),
+            AppendOutcome::Stored
+        );
+        let later = gap_envelope(&operation, 200, GapReasonV1::AdapterStartedLate);
+        assert_eq!(
+            spool.append_priority_at_receipt(&later).unwrap(),
+            AppendOutcome::Duplicate
+        );
+        let different = gap_envelope(&operation, 200, GapReasonV1::CaptureInterrupted);
+        assert!(matches!(
+            spool.append_priority_at_receipt(&different),
+            Err(CaptureError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn receipt_timed_redelivery_after_compaction_compares_retained_envelopes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+        let digest_only = format!("cap:{}", "b".repeat(64));
+        let replayable = format!("provider:history:{}:gap", "c".repeat(64));
+        for operation in [&digest_only, &replayable] {
+            let original = gap_envelope(operation, 100, GapReasonV1::AdapterStartedLate);
+            spool.append_priority_at_receipt(&original).unwrap();
+            spool.acknowledge(&original).unwrap();
+        }
+        spool.compact_acknowledged(10).unwrap();
+
+        // Digest-only history keeps no bytes, so the operation id alone decides.
+        let later = gap_envelope(&digest_only, 200, GapReasonV1::CaptureInterrupted);
+        assert_eq!(
+            spool.append_priority_at_receipt(&later).unwrap(),
+            AppendOutcome::Duplicate
+        );
+        // Replayable history keeps the envelope, so only the observation time may differ.
+        let later = gap_envelope(&replayable, 200, GapReasonV1::AdapterStartedLate);
+        assert_eq!(
+            spool.append_priority_at_receipt(&later).unwrap(),
+            AppendOutcome::Duplicate
+        );
+        let different = gap_envelope(&replayable, 200, GapReasonV1::CaptureInterrupted);
+        assert!(matches!(
+            spool.append_priority_at_receipt(&different),
+            Err(CaptureError::Conflict(_))
+        ));
+        // An untimed append still requires exact bytes.
+        let retimed = gap_envelope(&replayable, 200, GapReasonV1::AdapterStartedLate);
+        assert!(matches!(
+            spool.append_priority(&retimed),
+            Err(CaptureError::Conflict(_))
+        ));
     }
 
     #[test]

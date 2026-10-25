@@ -178,7 +178,20 @@ pub fn capture_hook(
     request: &CaptureRequest,
     spool: &LocalSpool,
 ) -> Result<HookCaptureOutcome> {
-    capture_hook_with_identity(input, request, spool, None)
+    let outcome = capture_hook_with_identity(input, request, spool, None);
+    for warning in take_hook_warnings() {
+        eprintln!("agentscm: {warning}");
+    }
+    outcome
+}
+
+thread_local! {
+    // Non-fatal capture notes from the shared hook path, surfaced through `NativeHookReport`.
+    static HOOK_WARNINGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn take_hook_warnings() -> Vec<String> {
+    HOOK_WARNINGS.with(|warnings| std::mem::take(&mut *warnings.borrow_mut()))
 }
 
 fn capture_hook_with_identity(
@@ -315,7 +328,11 @@ fn capture_hook_with_identity_mode(
         // The marker is retried on every hook until the origin is seen, so a failure here must
         // not cost the hook's own event.
         if let Err(error) = ensure_adapter_started_late_gap(request, spool) {
-            eprintln!("agentscm: adapter-started-late marker not retained: {error}");
+            HOOK_WARNINGS.with(|warnings| {
+                warnings
+                    .borrow_mut()
+                    .push(format!("adapter-started-late marker not retained: {error}"));
+            });
         }
     }
     let identity_input = serde_json::to_vec(&json!({
@@ -752,6 +769,18 @@ pub fn capture_native_hook(
     actions: &ActionCaptureConfig,
     spool: &LocalSpool,
 ) -> Result<NativeHookReport> {
+    take_hook_warnings();
+    let mut report = capture_native_hook_inner(input, request, actions, spool)?;
+    report.warnings.extend(take_hook_warnings());
+    Ok(report)
+}
+
+fn capture_native_hook_inner(
+    input: &[u8],
+    request: &CaptureRequest,
+    actions: &ActionCaptureConfig,
+    spool: &LocalSpool,
+) -> Result<NativeHookReport> {
     validate_action_config(actions)?;
     let payload: Value = serde_json::from_slice(input)?;
     let payload = payload
@@ -765,7 +794,7 @@ pub fn capture_native_hook(
         event_name,
         "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
     ) {
-        let event = capture_hook(input, request, spool)?;
+        let event = capture_hook_with_identity(input, request, spool, None)?;
         return Ok(NativeHookReport {
             event,
             action: NativeActionOutcome::NotApplicable,

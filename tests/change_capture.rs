@@ -1153,6 +1153,47 @@ fn resumed_session_hooks_survive_spool_compaction_and_receipt_time_changes() {
 }
 
 #[test]
+fn adapter_started_late_marker_failure_is_reported_and_keeps_the_hook_event() {
+    let repo = git_fixture();
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let request = capture_request(CaptureModeV1::MetadataOnly);
+    let actions = ActionCaptureConfig {
+        source: git_request(&repo.path().canonicalize().unwrap()),
+        setup_digest: "1".repeat(64),
+        managed_invocations: Vec::new(),
+        rules: Vec::new(),
+    };
+    let hook = |id: &str| {
+        format!(
+            r#"{{"hook_event_name":"PreToolUse","session_id":"session_fixture","tool_name":"Read","tool_use_id":"{id}","tool_input":{{}}}}"#
+        )
+    };
+    let first = capture_native_hook(hook("read_1").as_bytes(), &request, &actions, &spool).unwrap();
+    assert!(first.warnings.is_empty());
+    // Corrupt the retained marker so the next attempt to re-evaluate it conflicts.
+    let mut changed = 0;
+    for entry in fs::read_dir(spool.root().join("outbox")).unwrap() {
+        let path = entry.unwrap().path();
+        let text = fs::read_to_string(&path).unwrap();
+        if text.contains("adapter_started_late") {
+            fs::write(
+                &path,
+                text.replace("adapter_started_late", "capture_interrupted"),
+            )
+            .unwrap();
+            changed += 1;
+        }
+    }
+    assert_eq!(changed, 1);
+    let second =
+        capture_native_hook(hook("read_2").as_bytes(), &request, &actions, &spool).unwrap();
+    assert_eq!(second.event, HookCaptureOutcome::Stored);
+    assert_eq!(second.warnings.len(), 1);
+    assert!(second.warnings[0].contains("adapter-started-late marker not retained"));
+}
+
+#[test]
 fn receipt_timed_redelivery_differing_only_in_time_is_a_duplicate() {
     let temp = TempDir::new().unwrap();
     let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
