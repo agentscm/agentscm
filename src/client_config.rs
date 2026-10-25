@@ -216,6 +216,9 @@ fn save_to(path: &Path, connections: &[Connection]) -> Result<()> {
     write_private(path, &text)
 }
 
+/// The refusal when the connections lock stays held past its wait.
+pub(crate) const BUSY: &str = "client connections are busy; retry";
+
 pub(crate) fn acquire_lock(path: &Path) -> Result<File> {
     let dir = path
         .parent()
@@ -260,7 +263,7 @@ pub(crate) fn acquire_lock(path: &Path) -> Result<File> {
                 std::thread::sleep(Duration::from_millis(25));
             }
             Err(TryLockError::WouldBlock) => {
-                return Err(invalid("client connections are busy; retry"));
+                return Err(invalid(BUSY));
             }
             Err(TryLockError::Error(error)) => return Err(error.into()),
         }

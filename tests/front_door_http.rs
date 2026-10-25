@@ -1387,7 +1387,7 @@ fn sharing_is_refused_for_a_hub_other_than_the_one_the_person_saw_and_changes_no
     let (status, reply) = page.post(&id, &hub, "shared_conversation");
     assert_eq!(status, 409, "{reply}");
     assert!(
-        reply.contains("now connected to") && reply.contains("127.0.0.1:9"),
+        reply.contains("now connected to another repository or Hub"),
         "{reply}"
     );
     assert!(reply.contains("refresh and confirm again"));
@@ -1766,4 +1766,62 @@ fn off_works_without_a_connection_and_a_reconnect_does_not_resume_sharing() {
     let listed = page.list().remove(0);
     assert_eq!(listed["mode"], "metadata_only");
     assert_eq!(listed["lineage_mismatch"], false);
+}
+
+#[test]
+fn refused_capture_changes_tell_the_page_a_fixed_message_and_never_a_local_path() {
+    let temp = TempDir::new().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap().join("widgets");
+    checkout(&root);
+    let (hub, _) = fake_hub();
+    let door = FrontDoor::start(&temp, &hub, &root);
+    let page = Page::new(&door);
+    let id = page.id_of("widgets");
+    // No path, URL or other slash-bearing detail can reach the page in a refusal.
+    let refused = |reply: &str| {
+        assert!(!reply.contains('/'), "{reply}");
+        assert!(!reply.contains(temp.path().to_str().unwrap()), "{reply}");
+        serde_json::from_str::<Value>(reply).unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+
+    // A spool that cannot be opened is reported without the spool's path.
+    assert_eq!(page.post(&id, &hub, "shared_conversation").0, 200);
+    let spool = std::path::PathBuf::from(bindings(&door)[0]["spool"].as_str().unwrap());
+    assert_eq!(page.post(&id, &hub, "metadata_only").0, 200);
+    let moved = spool.with_extension("moved");
+    fs::rename(&spool, &moved).unwrap();
+    let (status, reply) = page.post(&id, &hub, "shared_conversation");
+    assert_eq!(status, 409, "{reply}");
+    assert!(refused(&reply).contains("needs attention"), "{reply}");
+    fs::rename(&moved, &spool).unwrap();
+
+    // A saved capture for another Hub is explained without paths either.
+    let (ok, text) = agentscm(
+        &door,
+        temp.path(),
+        &[
+            "change-capture",
+            "unconfigure",
+            "--root",
+            root.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "{text}");
+    let other = "http://127.0.0.1:9";
+    set_hub(&door, other);
+    let (status, reply) = page.post(&id, other, "shared_conversation");
+    assert_eq!(status, 409, "{reply}");
+    assert!(refused(&reply).contains("change-capture forget"), "{reply}");
+
+    // So is a checkout that was reconnected after the page listed it.
+    set_hub(&door, &hub);
+    let (status, reply) = page.post(&id, other, "shared_conversation");
+    assert_eq!(status, 409, "{reply}");
+    assert!(
+        refused(&reply).contains("refresh and confirm again"),
+        "{reply}"
+    );
 }

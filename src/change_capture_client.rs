@@ -596,7 +596,7 @@ fn lock_checkout(root: &Path, expected: Option<ExpectedTarget<'_>>) -> Result<Lo
             || connection.hub != expected.hub)
     {
         return Err(invalid(format!(
-            "this checkout is now connected to {} on {}; refresh and confirm again",
+            "{RECONNECTED} {} on {}; refresh and confirm again",
             connection.repo, connection.hub
         )));
     }
@@ -608,11 +608,50 @@ fn lock_checkout(root: &Path, expected: Option<ExpectedTarget<'_>>) -> Result<Lo
     })
 }
 
+const RECONNECTED: &str = "this checkout is now connected to";
+const LINEAGE: &str = "this checkout's saved capture belongs to";
+
+/// Why a change made from the local page was refused, in terms safe to show a browser. Error
+/// text can carry local paths (spool, config), so the page gets only these fixed messages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PageRefusal {
+    Busy,
+    Reconnected,
+    Lineage,
+    NeedsAttention,
+}
+
+impl PageRefusal {
+    pub(crate) fn of(error: &Error) -> Self {
+        match error {
+            Error::Invalid(message) if message == client_config::BUSY => Self::Busy,
+            Error::Invalid(message) if message.starts_with(RECONNECTED) => Self::Reconnected,
+            Error::Invalid(message) if message.starts_with(LINEAGE) => Self::Lineage,
+            _ => Self::NeedsAttention,
+        }
+    }
+
+    pub(crate) const fn message(self) -> &'static str {
+        match self {
+            Self::Busy => "capture is busy; try again",
+            Self::Reconnected => {
+                "this checkout is now connected to another repository or Hub; refresh and confirm again"
+            }
+            Self::Lineage => {
+                "this checkout's saved capture belongs to another repository or Hub, and its private spool keeps that history apart; to start fresh, run `agentscm change-capture unconfigure --root <checkout>` if capture is still on, then `agentscm change-capture forget --root <checkout>`, then try again"
+            }
+            Self::NeedsAttention => {
+                "this checkout's capture setup needs attention; run `agentscm change-capture status`"
+            }
+        }
+    }
+}
+
 /// The error for a saved capture whose repository or Hub is not the checkout's current one, with
 /// the supported way out.
 fn lineage_error(saved: &CaptureBinding, connection: &client_config::Connection) -> Error {
     invalid(format!(
-        "this checkout's saved capture belongs to {} on {}, and its private spool keeps that history apart, so it cannot be reused for {} on {}. To start fresh, run `agentscm change-capture unconfigure --root <checkout>` if capture is still on, then `agentscm change-capture forget --root <checkout>` (the old spool stays on disk), then try again",
+        "{LINEAGE} {} on {}, and its private spool keeps that history apart, so it cannot be reused for {} on {}. To start fresh, run `agentscm change-capture unconfigure --root <checkout>` if capture is still on, then `agentscm change-capture forget --root <checkout>` (the old spool stays on disk), then try again",
         saved.repository, saved.hub, connection.repo, connection.hub
     ))
 }

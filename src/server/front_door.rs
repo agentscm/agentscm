@@ -909,11 +909,15 @@ async fn capture_change(
     .await;
     match outcome {
         Ok(Some(Ok(row))) => Json(json!({"version": 1, "checkout": row})).into_response(),
-        Ok(Some(Err(error))) => refuse(
-            StatusCode::CONFLICT,
-            "capture_unavailable",
-            &error.to_string(),
-        ),
+        Ok(Some(Err(error))) => {
+            // The detail can name local paths, so it stays in this process's log.
+            eprintln!("local capture change refused: {error}");
+            refuse(
+                StatusCode::CONFLICT,
+                "capture_unavailable",
+                crate::change_capture_client::PageRefusal::of(&error).message(),
+            )
+        }
         Ok(None) => refuse(StatusCode::NOT_FOUND, "unknown_checkout", REPOSITORY_GONE),
         Err(_) => refuse(
             StatusCode::INTERNAL_SERVER_ERROR,
