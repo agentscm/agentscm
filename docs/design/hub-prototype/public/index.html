@@ -6,8 +6,13 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AgentSCM Hub</title>
 <script>
-  // Set the theme before first paint so there is no light flash in dark mode.
-  (function () { var q = new URLSearchParams(location.search), t = q.get('mode'); if (!t) { try { t = localStorage.getItem('hubstory.theme'); } catch (e) {} } if (!t) t = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'; document.documentElement.setAttribute('data-bs-theme', t); var d = q.get('density'); if (d === null) { try { d = localStorage.getItem('agentscm.hub.density'); } catch (e) {} } if (d && d !== 'spacious') document.documentElement.setAttribute('data-density', d); var s = new URLSearchParams(location.search).get('skin'); if (s === null) { try { s = localStorage.getItem('agentscm.hub.skin'); } catch (e) {} } if (s) document.documentElement.setAttribute('data-skin', s); })();
+  // Set the theme before first paint so there is no light flash in dark mode. Only known values are applied:
+  // these come from the URL or storage and end up in attributes the page reads back.
+  (function () { var q = new URLSearchParams(location.search), get = function (k, key) { var v = q.get(k); if (v === null) { try { v = localStorage.getItem(key); } catch (e) {} } return v; };
+    var t = get('mode', 'hubstory.theme'); if (t !== 'light' && t !== 'dark') t = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    document.documentElement.setAttribute('data-bs-theme', t);
+    if (get('density', 'agentscm.hub.density') === 'condensed') document.documentElement.setAttribute('data-density', 'condensed');
+    var s = get('skin', 'agentscm.hub.skin'); if (['dusk', 'mist', 'twilight', 'graphite', 'glance'].indexOf(s) >= 0) document.documentElement.setAttribute('data-skin', s); })();
 </script>
 <link rel="stylesheet" href="vendor/bootstrap.min.css">
 <link rel="stylesheet" href="vendor/bootstrap-icons.min.css">

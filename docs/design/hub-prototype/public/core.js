@@ -1329,8 +1329,9 @@ export function startApp(option) {
     if (location.hash === taskHref(id)) { document.getElementById(ui.anchor || 'top')?.scrollIntoView({ block: 'start' }); ui.anchor = null; return; }
     location.hash = taskHref(id);
   }
-  const qs = () => (embed ? `?embed${skin() ? `&skin=${skin()}` : ''}` : '');
-  const skin = () => document.documentElement.getAttribute('data-skin') || '';
+  const qs = () => (embed ? `?embed${skin() ? `&skin=${encodeURIComponent(skin())}` : ''}` : '');
+  // Only a known skin key ever leaves this function; the attribute itself can come from the URL.
+  const skin = () => { const k = document.documentElement.getAttribute('data-skin') || ''; return SKINS.some(x => x.k === k) ? k : ''; };
   const density = () => document.documentElement.getAttribute('data-density') || 'spacious';
 
   // ----- alerts: unread is per user (per browser here) and per story
