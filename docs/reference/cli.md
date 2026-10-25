@@ -87,6 +87,12 @@ The command preserves unrelated hooks. Each installed hook resolves the current 
 and generation for its native session, appends to the private spool, then attempts bounded ordered
 delivery through the saved connection. `metadata-only` is the default. `local-conversation` retains
 selected visible bodies only in the spool; they are not placed in shared envelopes.
+`shared-conversation` also redacts them (best effort) and uploads them to the Hub after it accepts
+the event. Change an enabled binding's mode with `change-capture set-mode --root PATH --mode
+metadata-only|local-conversation|shared-conversation`, which never touches the spool. `change-capture
+conversation --work-id ID [--cursor C | --digest D | --delete D]` lists, prints or deletes shared
+bodies (Work owner and Hub admins only). See
+[sharing conversations](../change-capture.md#sharing-conversations-with-the-hub).
 
 Execution success is not a passing verification. An exact verification rule has the form
 `Bash=verification:complete:process_exit_code:<lowercase-sha256>`. The local client reports

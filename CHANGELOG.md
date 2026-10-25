@@ -6,6 +6,18 @@ All notable changes are listed here, newest first. AgentSCM is alpha: any releas
 
 - Fixed: hooks, the client MCP server and Hub-backed CLI commands started in a linked Git worktree of a connected checkout now use that checkout's connection, so sessions that Claude Code or Codex start in a new worktree coordinate without running setup again. Edit paths are reported relative to the worktree. Separate or nested clones, submodules and copied `.git` files still never inherit a connection. With no connection, the hook note now names `agentscm quickstart`.
 
+- Experimental, Unix/Claude Code: opt-in shared agent conversations. A checkout in the new `shared-conversation` capture mode (default stays `metadata-only`) scrubs selected prompt, assistant and tool bodies of well-known credential shapes and secret-named fields on the client (best effort, not a guarantee; a `redacted` gap marks altered bodies, and bodies over 1 MiB stay local), then uploads them to the Hub after it accepts the event. Only the Work's owner and Hub admins can list and read them (HTTP `.../change-records/{work_id}/conversation[/{sha256}]`, MCP `agentscm_shared_conversation`, `agentscm change-capture conversation`, and a read-only list in the Hub UI); other tokens get 403. Bodies expire after 30 days and the owner or an admin can delete one earlier through the CLI or HTTP (the Hub UI has no delete control). Change a checkout's mode with `agentscm change-capture set-mode` or `configure --capture-mode`, or with the new per-checkout **Share agent conversations with Hub** switch in the macOS tray (native UI not yet accepted by a human). A named Hub migration adds the shared-body table. See [sharing conversations](docs/change-capture.md#sharing-conversations-with-the-hub).
+
+- New `agentscm hub serve --shared-conversation-retention-days N` (default 30, 1 to 3650) sets how long an uploaded shared body stays readable; an hourly sweep removes expired bodies. It is one global setting, not a per-team policy.
+
+- The local capture config is written as version 6 only while some checkout is in `shared-conversation` mode; an older binary refuses a version 6 file. Without an opt-in the config stays at version 5.
+
+- Change-record capture records more: the host tool name and whether a finished tool call `returned` or `failed`, session start and end boundaries, turn-ended (`Stop`), compaction (`PreCompact`) and subagent start and stop events, now installed as eleven hook groups. The new markers are informational and never raise coverage. These hooks are tested with synthetic fixtures, not live Claude Code payloads.
+
+- The change record lists per-session model, effort and permission mode (`session_setups`, up to 16 entries with a `parent_session_id`) when a session reported them.
+
+- Changed: the Hub no longer reads the start prompt of a `SessionStart` hook (including Copilot's `initialPrompt`) and so no longer stores it as a team-visible task.
+
 ## 0.1.0-alpha.6 (2026-10-25)
 
 - 0.1.0-alpha.5 was not released: its Linux musl binaries failed to link after its container image was pushed, so it has no GitHub release, npm package or attestations. Use 0.1.0-alpha.6, which contains everything listed below.

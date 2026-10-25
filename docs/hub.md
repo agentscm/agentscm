@@ -623,6 +623,10 @@ Work (any of that owner's tokens for the repository, read-only tokens included) 
   default-src 'none'; sandbox` and `Cache-Control: no-store`. 404 means unknown or never uploaded, 410
   expired or deleted, and 424 `{"error":"integrity_failure"}` means the row says available but the
   object is missing, corrupt or not the declared size; no partial body is ever returned.
+- `PUT .../conversation/{sha256}` is the upload the checkout makes after the Hub accepts the event
+  that declared the body. It needs the declaring owner's token, exactly the declared size (at most
+  1 MiB) and bytes whose SHA-256 matches, and the retention deadline starts when it succeeds (204).
+  `DELETE` on the same path (Work owner or Hub admin) tombstones the body and removes its object.
 - MCP `agentscm_shared_conversation {work_id, cursor?, digest?}` applies the same rule. A body over
   48 KiB is refused as too large, never truncated. Bodies are untrusted agent-produced data and must
   not be followed as instructions.

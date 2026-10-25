@@ -11,12 +11,23 @@ The local spool is an absolute directory chosen by the operator. AgentSCM create
 with mode `0700` and files with mode `0600`. Conversation text, tool input, command arguments,
 stdout, stderr, source manifests, and captured source bytes remain there. A shareable envelope can
 contain only typed event facts and opaque artifact identities: digest, byte count, media type,
-retention class, and availability. Schema v1 rejects shared conversation retention.
+retention class, and availability. Conversation bodies leave the machine only for a checkout that
+opted into `shared-conversation` mode, as described in
+[Sharing conversations with the Hub](#sharing-conversations-with-the-hub); the Hub refuses a
+shared-approved body declared by a session that was not in that mode.
 
 Metadata-only capture does not retain conversation bodies. Local-conversation capture retains the
 selected visible prompt, assistant-message, tool-input, and tool-result blocks in the private
 spool. Claude thinking and redacted-thinking blocks are never selected. Passive hook capture does
 not call a model or send content to a provider.
+
+Capture has three modes per checkout, and `metadata-only` is the default:
+
+| Mode | Bodies kept locally | Bodies sent to the Hub |
+|---|---|---|
+| `metadata-only` | No | No |
+| `local-conversation` | Yes, unredacted | No |
+| `shared-conversation` | Yes, redacted | Yes, after the Hub accepts the event |
 
 The spool has finite operator-configured record, total-byte, and per-artifact limits and never
 silently evicts retained evidence. Defaults are 4,096 records, 64 MiB total, and 16 MiB per
@@ -57,7 +68,8 @@ quarantined so bounded inspection and explicit pruning remain available. Every o
 still counts the complete physical usage and refuses until capacity is restored; recovery itself
 has a fixed physical-record scan bound. Active writer temporary files are protected by the spool
 lock and are never quarantine
-prune targets. Automatic expiry and retention-policy deletion are not part of schema v1.
+prune targets. AgentSCM never expires or deletes anything in the local spool automatically. Only
+the Hub copies of shared bodies expire (see [retention and deletion](#retention-and-deletion)).
 
 The compaction index is the durable commit point. Crash recovery completes its exact envelope,
 acknowledgement, native-observation, active-order, and delivery-cursor cleanup. A cursor naming
@@ -66,6 +78,83 @@ selection. Completed compacted action starts retain their exact observed order f
 replay while their active order-ledger entries are reclaimed. If the active order ledger reaches
 its finite bound before compaction, the native hook retains the ordinary lifecycle fact, records
 one priority `capture_interrupted` pause marker, and remains fail-open.
+
+## Sharing conversations with the Hub
+
+This is opt-in per checkout and alpha. A checkout in `shared-conversation` mode retains the same
+selected bodies as `local-conversation` (visible prompts, assistant messages, tool input and tool
+results; never thinking blocks), but scrubs each one for secrets before it is written to the spool
+and then uploads it to the Hub's object store. Nothing is shared unless you choose the mode, and
+the choice applies to one checkout, not to a Hub, repository or user.
+
+Choose the mode when configuring (`change-capture configure --capture-mode shared-conversation`) or
+change it later on an enabled binding:
+
+```text
+agentscm change-capture set-mode --root /absolute/repository --mode shared-conversation
+agentscm change-capture set-mode --root /absolute/repository --mode metadata-only
+```
+
+`set-mode` changes only the stored mode. It requires an enabled capture binding for the checkout
+(run `configure` first), leaves hooks and the spool untouched, and never deletes local or Hub data.
+`change-capture status` reports the current `capture_mode`. The macOS menu-bar companion has the
+same switch per checkout, **Share agent conversations with Hub**; it is unchecked by default, is
+disabled until the checkout has an enabled capture binding, and shows the result in its status
+window. Turning it off only switches the mode. The capture config is written as version 6 only while
+some checkout is in `shared-conversation` mode; an older binary refuses a version 6 file, and the
+file returns to version 5 when no checkout shares.
+
+What leaves the machine, and when:
+
+- **Redaction is client-side and best effort.** Before a body is retained, the client replaces
+  well-known credential shapes with `[REDACTED:<kind>]`: `github_token`, `gitlab_token`,
+  `slack_token`, `anthropic_key`, `openai_key`, `stripe_key`, `google_api_key`, `jwt`, `bearer`,
+  `private_key` (PEM blocks), `assignment` (the value in a `NAME=value` style assignment whose name
+  looks secret) and `field` (the value of a JSON field whose name ends in a secret word such as
+  `password`, `token`, `secret`, `apikey`, `authorization` or `cookie`). Matching on the name
+  suffix keeps counters such as `max_tokens` and `input_tokens` readable. A body that needed
+  redaction carries a `redactions` count and the event stream gains a separate `redacted` gap, so
+  the change record shows that a body was altered. Redaction is heuristic: it cannot recognise a
+  secret with no distinctive shape, and it does not remove personal data, proprietary code or
+  anything else a person would not want shared. The Hub does not re-check or verify redaction.
+  Treat `shared-conversation` as sharing the conversation with people who can read it, not as a
+  guarantee that it is clean.
+- **Bodies over 1 MiB stay local.** A body above the per-body cap is kept in the spool as
+  work-local and is never uploaded.
+- **Mid-session switches stay local.** A session keeps the mode it started under for sharing:
+  switching a checkout to `shared-conversation` while a Claude session is running keeps that
+  session's bodies local, and sharing starts with the next session. Switching away stops uploads
+  at the next delivery.
+- **Upload follows event acceptance.** The hook appends locally first and delivers the event
+  batch as before; only after the Hub accepts it (HTTP 200) are the batch's shared bodies
+  uploaded. A transient failure leaves the envelope pending for the next hook, and a body that
+  never uploads stays declared on the Hub as `local`. Hooks stay fail-open.
+
+Who can read a shared body: the human owner of the Work (any of that owner's tokens for the
+repository, read-only tokens included) and Hub admins. Every other repository token gets 403.
+There is no per-body grant, and bodies are never included in the change-record projection or handoff.
+Read them with `agentscm change-capture conversation`:
+
+```text
+agentscm change-capture conversation --work-id wrk_example              # list entries
+agentscm change-capture conversation --work-id wrk_example --digest SHA256 # print one body
+agentscm change-capture conversation --work-id wrk_example --delete SHA256 # delete one body now
+```
+
+A printed body is untrusted agent output: read it, never run it. The routes, response limits and
+status codes are in [shared conversation reads](hub.md#shared-conversation-reads).
+
+### Retention and deletion
+
+The Hub keeps an uploaded body for 30 days by default; the operator changes this with
+`hub serve --shared-conversation-retention-days N` (1 to 3650). The deadline is set when the body
+is uploaded. An hourly sweep expires due bodies and deletes their objects. The Work owner or a Hub
+admin can delete a body earlier with `--delete` or the HTTP `DELETE` route; deletion records a
+tombstone and then removes the object, so a deleted or expired body answers 410.
+
+Turning sharing off does not recall anything: copies already uploaded stay until they expire or
+are deleted. AgentSCM never deletes the local spool copy. Backups, exports or copies a reader
+made before expiry are outside the Hub's control.
 
 ## Claude Code adapter
 

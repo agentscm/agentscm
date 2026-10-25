@@ -91,9 +91,18 @@ The optional macOS tray is part of this same binary; no separate app install is 
 `npx agentscm tray`, or add `--tray` to quickstart to open it after successful setup. Start at
 Login is off until enabled in the tray menu. The alpha binary is not signed or notarized, and the
 tray does not update independently; install a newer AgentSCM release through the same installer.
-Each checkout menu groups its status, opening actions, **Agent Integrations**, **Connection Details**,
-**Recent Activity** and **Troubleshooting**. Connection Details shows the full checkout path and
+Each checkout menu groups its status, opening actions, a **Share agent conversations with Hub**
+switch, **Agent Integrations**, **Connection Details**, **Recent Activity** and **Troubleshooting**. Connection Details shows the full checkout path and
 connection values.
+
+The **Share agent conversations with Hub** item is off by default and is disabled until the
+checkout has an enabled capture binding (run `agentscm change-capture configure` first). Turning it
+on switches that checkout to `shared-conversation` mode: new conversations are redacted on this
+machine on a best-effort basis and uploaded to the Hub, where the Work owner and Hub admins can read
+them. Turning it off sets `metadata-only` (not a previous `local-conversation`); conversations stay on this machine,
+and copies already uploaded remain until they expire or you delete them. Nothing local is deleted.
+It is the same change as `agentscm change-capture set-mode`; see
+[sharing conversations](change-capture.md#sharing-conversations-with-the-hub).
 
 Copied reconnect, repository-guidance and Terminal setup commands use the running executable's
 full path, so they work before `agentscm` is on your shell's `PATH`.
