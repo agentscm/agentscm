@@ -660,16 +660,6 @@ fn one_connection_switches_between_connected_repositories() {
     let gadgets_commit = git(&gadgets, &["rev-parse", "HEAD"]);
     let (hub, _) = fake_hub();
     let door = FrontDoor::start(&temp, &hub, &widgets);
-    // Add the second checkout to the same computer's connections.
-    let token_file = door.config.join("agentscm/tokens/gadgets");
-    private_file(&token_file, "synthetic-agent-token\n");
-    let connections = door.config.join("agentscm/connections.json");
-    let mut file: Value = serde_json::from_str(&fs::read_to_string(&connections).unwrap()).unwrap();
-    file["connections"].as_array_mut().unwrap().push(json!({
-        "root": gadgets, "origin_host": "github.com", "hub": hub, "repo": "acme/gadgets", "token_file": token_file
-    }));
-    private_file(&connections, &file.to_string());
-
     let record: Value = serde_json::from_str(
         &fs::read_to_string(door.config.join("agentscm/front-door/service.json")).unwrap(),
     )
@@ -693,6 +683,38 @@ fn one_connection_switches_between_connected_repositories() {
         .unwrap()
         .to_owned();
 
+    // Read once so the service holds the list of connections from before the next checkout.
+    assert_eq!(
+        door.request(
+            "GET",
+            "/v1/local/explorer/summary",
+            &[("Authorization", &format!("Bearer local:{grant}:{REPO}"))]
+        )
+        .0,
+        200
+    );
+    // Connect a second checkout now; it is found at once, not after the list's refresh.
+    let token_file = door.config.join("agentscm/tokens/gadgets");
+    private_file(&token_file, "synthetic-agent-token\n");
+    let connections = door.config.join("agentscm/connections.json");
+    let mut file: Value = serde_json::from_str(&fs::read_to_string(&connections).unwrap()).unwrap();
+    file["connections"].as_array_mut().unwrap().push(json!({
+        "root": gadgets, "origin_host": "github.com", "hub": hub, "repo": "acme/gadgets", "token_file": token_file
+    }));
+    private_file(&connections, &file.to_string());
+
+    let (status, _, fresh) = door.request(
+        "GET",
+        "/v1/local/explorer/summary",
+        &[(
+            "Authorization",
+            &format!("Bearer local:{grant}:acme/gadgets"),
+        )],
+    );
+    assert_eq!(
+        status, 200,
+        "a just-connected checkout is found at once: {fresh}"
+    );
     let (_, _, listed) = door.request(
         "GET",
         "/v1/local/repositories",

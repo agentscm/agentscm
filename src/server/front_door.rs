@@ -77,6 +77,8 @@ pub(super) struct FrontDoor {
     connections: tokio::sync::Mutex<Option<(Instant, Arc<Vec<Connection>>)>>,
     explorers: Mutex<HashMap<ExplorerKey, Arc<Explorer>>>,
     tokens: Mutex<HashMap<TokenKey, TokenSlot>>,
+    /// Replaced tokens awaiting their delayed revocation; shutdown revokes whatever is left.
+    retired: Arc<Mutex<Vec<CachedToken>>>,
     hub_reads: tokio::sync::Semaphore,
     client: reqwest::Client,
 }
@@ -155,8 +157,9 @@ fn credential(headers: &HeaderMap) -> Option<(&str, &str)> {
         .split_once(':')
 }
 
-/// Every current connection on this computer, one per repository, Hub and forge (the first
-/// checkout wins). The same repository can be connected to different Hubs in different checkouts.
+/// Every current connection on this computer, one per repository and Hub (the first checkout
+/// wins), which is what a selector can name. The same repository can be connected to different
+/// Hubs in different checkouts.
 fn current_connections() -> Vec<Connection> {
     let mut seen = std::collections::BTreeSet::new();
     client_config::load()
@@ -164,11 +167,7 @@ fn current_connections() -> Vec<Connection> {
         .into_iter()
         .filter(client_config::is_current)
         .filter(|connection| {
-            seen.insert((
-                connection.repo.to_ascii_lowercase(),
-                connection.hub.clone(),
-                connection.origin_host.clone(),
-            ))
+            seen.insert((connection.repo.to_ascii_lowercase(), connection.hub.clone()))
         })
         .collect()
 }
@@ -202,6 +201,7 @@ impl FrontDoor {
             connections: tokio::sync::Mutex::new(None),
             explorers: Mutex::new(HashMap::new()),
             tokens: Mutex::new(HashMap::new()),
+            retired: Arc::new(Mutex::new(Vec::new())),
             hub_reads: tokio::sync::Semaphore::new(MAX_HUB_READS),
             client: agentscm::hub::forge_http::client()
                 .map_err(|_| agentscm::Error::Invalid("HTTP client unavailable".into()))?,
@@ -297,10 +297,12 @@ impl FrontDoor {
         })
     }
 
-    /// This computer's current connections, rechecked with Git at most every few seconds.
-    async fn connected(&self) -> Arc<Vec<Connection>> {
+    /// This computer's current connections, rechecked with Git at most every few seconds unless
+    /// `fresh` asks for a recheck now.
+    async fn connected(&self, fresh: bool) -> Arc<Vec<Connection>> {
         let mut cached = self.connections.lock().await;
-        if let Some((at, connections)) = cached.as_ref()
+        if !fresh
+            && let Some((at, connections)) = cached.as_ref()
             && at.elapsed() < CONNECTIONS_TTL
         {
             return connections.clone();
@@ -314,26 +316,30 @@ impl FrontDoor {
         connections
     }
 
-    /// The connected checkout a credential's `<owner/name>[@<hub>]` selector names.
+    /// The connected checkout a credential's `<owner/name>[@<hub>]` selector names. A miss is
+    /// rechecked once, so a checkout connected moments ago is found at once.
     async fn select(&self, headers: &HeaderMap) -> Option<Selected> {
         let (_, selector) = credential(headers)?;
         let (repository, hub) = match selector.split_once('@') {
             Some((repository, hub)) => (repository, Some(hub)),
             None => (selector, None),
         };
-        self.connected()
-            .await
-            .iter()
-            .find(|connection| {
-                connection.repo.eq_ignore_ascii_case(repository)
-                    && hub.is_none_or(|hub| hub == connection.hub)
-            })
-            .map(|connection| Selected {
-                repository: connection.repo.clone(),
-                hub: connection.hub.clone(),
-                root: connection.root.clone(),
-                origin_host: connection.origin_host.clone(),
-            })
+        for fresh in [false, true] {
+            let found = self.connected(fresh).await.iter().find_map(|connection| {
+                (connection.repo.eq_ignore_ascii_case(repository)
+                    && hub.is_none_or(|hub| hub == connection.hub))
+                .then(|| Selected {
+                    repository: connection.repo.clone(),
+                    hub: connection.hub.clone(),
+                    root: connection.root.clone(),
+                    origin_host: connection.origin_host.clone(),
+                })
+            });
+            if found.is_some() {
+                return found;
+            }
+        }
+        None
     }
 
     /// The explorer for a connected checkout. Capture is included only when change capture is
@@ -429,16 +435,35 @@ impl FrontDoor {
             human_session,
         });
         if let Some(retired) = retired {
-            let client = self.client.clone();
+            let id = retired.id.clone();
+            self.lock_retired().push(retired);
+            let (client, list) = (self.client.clone(), self.retired.clone());
             tokio::spawn(async move {
                 tokio::time::sleep(RETIRED_TOKEN_GRACE).await;
-                revoke(&client, &retired).await;
+                let token = {
+                    let mut list = list
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    list.iter()
+                        .position(|token| token.id == id)
+                        .map(|at| list.remove(at))
+                };
+                if let Some(token) = token {
+                    revoke(&client, &token).await;
+                }
             });
         }
         Ok(minted.secret)
     }
 
-    /// Revoke every Hub token this process holds, together and within a bound.
+    fn lock_retired(&self) -> std::sync::MutexGuard<'_, Vec<CachedToken>> {
+        self.retired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Revoke every Hub token this process holds, current and retired, together and within one
+    /// bound that also covers waiting for a mint in progress.
     pub(super) async fn revoke_all(&self) {
         let slots: Vec<TokenSlot> = self
             .tokens
@@ -447,14 +472,21 @@ impl FrontDoor {
             .drain()
             .map(|(_, slot)| slot)
             .collect();
-        let mut revocations = tokio::task::JoinSet::new();
-        for slot in slots {
-            if let Some(token) = slot.lock().await.take() {
-                let client = self.client.clone();
+        let retired: Vec<CachedToken> = self.lock_retired().drain(..).collect();
+        let client = self.client.clone();
+        let revoke_everything = async move {
+            let mut revocations = tokio::task::JoinSet::new();
+            let mut tokens = retired;
+            for slot in slots {
+                tokens.extend(slot.lock().await.take());
+            }
+            for token in tokens {
+                let client = client.clone();
                 revocations.spawn(async move { revoke(&client, &token).await });
             }
-        }
-        let _ = tokio::time::timeout(SHUTDOWN_REVOKE_TIMEOUT, revocations.join_all()).await;
+            revocations.join_all().await;
+        };
+        let _ = tokio::time::timeout(SHUTDOWN_REVOKE_TIMEOUT, revoke_everything).await;
     }
 }
 
@@ -676,8 +708,9 @@ async fn identity(State(front_door): State<Arc<FrontDoor>>, headers: HeaderMap) 
 }
 
 async fn repositories(State(front_door): State<Arc<FrontDoor>>) -> Response {
+    // The switcher is read once per page load, so it always rechecks.
     let repositories: Vec<_> = front_door
-        .connected()
+        .connected(true)
         .await
         .iter()
         .map(|connection| {

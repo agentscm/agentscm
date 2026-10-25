@@ -32,10 +32,12 @@ pub(crate) struct OpenArgs {
     stop: bool,
 }
 
-/// What `open` connected: the repository and the page address (without the code).
+/// What `open` connected: the repository, the page address (without the code), and the
+/// owner-only file that carries the code to the browser.
 pub(crate) struct Opened {
     pub repository: String,
     pub page: String,
+    pub handoff: PathBuf,
 }
 
 pub(crate) async fn run(args: OpenArgs) -> Result<()> {
@@ -54,6 +56,10 @@ pub(crate) async fn run(args: OpenArgs) -> Result<()> {
     println!(
         "Opened {} from this computer at {}",
         opened.repository, opened.page
+    );
+    println!(
+        "If your browser did not open it, open {} in your browser within two minutes, or run `agentscm open` again.",
+        opened.handoff.display()
     );
     Ok(())
 }
@@ -96,10 +102,12 @@ pub(crate) async fn open_checkout(path: &Path) -> Result<Opened> {
     let page = format!("{}/ui/", record.base);
     let selector = format!("{}@{}", connection.repo, connection.hub);
     let target = format!("{page}#pair={code}&repo={}", fragment_value(&selector));
-    crate::hub_cli::open_url(&handoff(&target)?.display().to_string());
+    let handoff = handoff(&target)?;
+    crate::hub_cli::open_url(&handoff.display().to_string());
     Ok(Opened {
         repository: connection.repo.clone(),
         page,
+        handoff,
     })
 }
 
@@ -142,8 +150,9 @@ fn handoff(target: &str) -> Result<PathBuf> {
         &path,
         &format!(
             "<!doctype html><meta charset=\"utf-8\"><meta name=\"referrer\" content=\"no-referrer\">\
-             <meta http-equiv=\"refresh\" content=\"0;url={attribute}\"><title>Opening AgentSCM</title>\
-             <script>location.replace({quoted})</script><p>Opening AgentSCM…</p>\n"
+             <title>Opening AgentSCM</title><script>location.replace({quoted})</script>\
+             <noscript><meta http-equiv=\"refresh\" content=\"0;url={attribute}\"></noscript>\
+             <p>Opening AgentSCM…</p>\n"
         ),
     )?;
     Ok(path)
@@ -190,6 +199,11 @@ async fn running_or_start(client: &reqwest::Client) -> Result<ServiceRecord> {
             && record.pid == child.id()
             && confirmed(client, &record).await
         {
+            // Reap the service when it exits, so a long-lived caller such as the tray keeps no
+            // zombie process.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
             return Ok(record);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;

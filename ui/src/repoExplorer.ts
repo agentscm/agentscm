@@ -735,8 +735,10 @@ async function explorerRead<T>(endpoint: string, params: Record<string, string |
     if (signal.aborted) throw signal.reason
   }
   if (!response.ok) {
-    await response.body?.cancel()
-    throw new ExplorerResponseError(adviceFor(response.status), response.status)
+    // On this computer's own Hub page, a repository that is no longer connected is its own case.
+    const code = response.status === 409 ? ((await response.json().catch(() => null)) as { error?: unknown } | null)?.error : undefined
+    if (code === undefined) await response.body?.cancel()
+    throw new ExplorerResponseError(code === 'repository_unavailable' ? 'That repository is no longer connected on this computer. Choose another one at the top of the page, or run agentscm open in its checkout.' : adviceFor(response.status), response.status)
   }
   return decode(await boundedJson(response))
 }

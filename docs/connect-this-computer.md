@@ -72,6 +72,10 @@ remains for a Hub page served elsewhere.
 
 ## Limits
 
+- `agentscm open` gives the browser an owner-only local file that forwards it to the page. A
+  browser that cannot read files in your config directory (for example some sandboxed Linux
+  browser packages), or a computer where `.html` files open in an editor, does not open the page;
+  `agentscm open` prints the file to open by hand.
 - The page runs on this computer only. Over SSH, `agentscm open` has no local browser to hand the
   connection to; use the team's Hub there, with the manual setup for files.
 - Templates and Timeline read a native workspace chosen with `agentscm serve --timeline-workspace`;

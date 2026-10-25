@@ -271,7 +271,7 @@ export class LocalError extends Error {
   status: number
   code: string
   constructor(status: number, code: string) {
-    super(adviceFor(status))
+    super(code === 'repository_unavailable' ? 'That repository is no longer connected on this computer. Choose another one at the top of the page, or run agentscm open in its checkout.' : adviceFor(status))
     this.status = status
     this.code = code
   }
