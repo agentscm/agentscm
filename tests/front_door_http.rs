@@ -749,3 +749,94 @@ fn one_connection_switches_between_connected_repositories() {
         );
     }
 }
+
+#[test]
+fn open_starts_the_page_hands_the_code_over_a_private_file_and_stops_it() {
+    let temp = TempDir::new().unwrap();
+    let config = temp.path().join("config");
+    let root = fs::canonicalize(temp.path()).unwrap().join("widgets");
+    checkout(&root);
+    let (hub, _) = fake_hub();
+    let token_file = config.join("agentscm/tokens/widgets");
+    private_file(&token_file, "synthetic-agent-token\n");
+    private_file(
+        &config.join("agentscm/connections.json"),
+        &json!({"version": 1, "connections": [{
+            "root": root, "origin_host": "github.com", "hub": hub, "repo": REPO, "token_file": token_file
+        }]})
+        .to_string(),
+    );
+    private_file(
+        &config.join("agentscm/hub-sessions.json"),
+        &json!({"version": 2, "default_hub": hub, "sessions": [{"hub": hub, "session": HUMAN_SESSION}]}).to_string(),
+    );
+    // Stand-ins for the browser launchers record their arguments instead of opening anything.
+    let bin = temp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let seen = temp.path().join("launched");
+    for name in ["open", "xdg-open"] {
+        let script = bin.join(name);
+        fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n", seen.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let run = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_agentscm"))
+            .arg("--no-telemetry")
+            .args(args)
+            .current_dir(&root)
+            .env("XDG_CONFIG_HOME", &config)
+            .env("PATH", &path)
+            .env("AGENTSCM_SERVE_READ_TOKEN", "short")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    let printed = run(&["open"]);
+    assert!(printed.contains("Opened acme/widgets"), "{printed}");
+    // The launcher runs in the background; give it a moment to record its arguments.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !seen.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    let launched = fs::read_to_string(&seen).unwrap();
+    let handoff = launched.lines().next().unwrap_or_default().trim();
+    assert!(
+        handoff.ends_with(".html") && !handoff.contains("pair="),
+        "only a file path is passed: {launched}"
+    );
+    assert_eq!(
+        fs::metadata(handoff).unwrap().permissions().mode() & 0o077,
+        0
+    );
+    let page = fs::read_to_string(handoff).unwrap();
+    let record_path = config.join("agentscm/front-door/service.json");
+    let record: Value = serde_json::from_str(&fs::read_to_string(&record_path).unwrap()).unwrap();
+    let base = record["base"].as_str().unwrap();
+    assert!(page.contains(&format!("{base}/ui/#pair=")), "{page}");
+    assert!(page.contains(&format!("repo=acme/widgets@{hub}")), "{page}");
+
+    // A second `open` reuses the running page.
+    run(&["open"]);
+    let again: Value = serde_json::from_str(&fs::read_to_string(&record_path).unwrap()).unwrap();
+    assert_eq!(again["instance"], record["instance"]);
+
+    let stopped = run(&["open", "--stop"]);
+    assert!(stopped.contains("Stopped"), "{stopped}");
+    assert!(!record_path.exists(), "the record outlived the page");
+}
