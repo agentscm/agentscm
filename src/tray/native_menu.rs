@@ -95,7 +95,7 @@ pub(super) struct NativeMenuBridge {
     item: Retained<NSMenuItem>,
     target: Retained<Target>,
     switch: Option<Retained<NSSwitch>>,
-    login_state: Option<Retained<NSTextField>>,
+    login_title: Option<Retained<NSTextField>>,
     _view: Option<Retained<NSView>>,
     _text_views: Vec<Retained<NSView>>,
     tracking: Arc<AtomicBool>,
@@ -119,7 +119,7 @@ impl NativeMenuBridge {
         // NSSwitch was introduced in macOS 10.15, while AgentSCM still supports older macOS.
         // Looking up the class first avoids messaging an unavailable class; the existing Muda
         // CheckMenuItem remains the accessible legacy control when the lookup fails.
-        let (switch, login_state, view) = if AnyClass::get(c"NSSwitch").is_some() {
+        let (switch, login_title, view) = if AnyClass::get(c"NSSwitch").is_some() {
             let (view, title, switch) = login_row(mtm);
             apply_login_state(&switch, &title, NativeLoginState::Confirmed(enabled));
             // SAFETY: Target implements loginSwitchChanged: with the NSSwitch sender signature and
@@ -163,7 +163,7 @@ impl NativeMenuBridge {
             item,
             target,
             switch,
-            login_state,
+            login_title,
             _view: view,
             _text_views: text_views,
             tracking,
@@ -179,8 +179,8 @@ impl NativeMenuBridge {
     }
 
     pub(super) fn set_login_state(&self, state: NativeLoginState) {
-        if let (Some(switch), Some(label)) = (&self.switch, &self.login_state) {
-            apply_login_state(switch, label, state);
+        if let (Some(switch), Some(title)) = (&self.switch, &self.login_title) {
+            apply_login_state(switch, title, state);
         }
     }
 
@@ -243,7 +243,7 @@ fn login_row(
     title.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
     view.addSubview(&title);
     view.addSubview(&switch);
-    if let Some(image) = system_symbol(LOGIN_SYMBOL) {
+    if let Some(image) = system_symbol("sunrise") {
         let icon = NSImageView::initWithFrame(
             NSImageView::alloc(mtm),
             NSRect::new(
@@ -256,8 +256,6 @@ fn login_row(
     }
     (view, title, switch)
 }
-
-const LOGIN_SYMBOL: &str = "sunrise";
 
 fn login_title(state: NativeLoginState) -> &'static str {
     match state {
@@ -492,7 +490,7 @@ fn system_symbol(symbol: &str) -> Option<Retained<NSImage>> {
         None,
     )?;
     image.setTemplate(true);
-    image.setSize(NSSize::new(16.0, 16.0));
+    image.setSize(NSSize::new(MENU_ICON, MENU_ICON));
     Some(image)
 }
 
