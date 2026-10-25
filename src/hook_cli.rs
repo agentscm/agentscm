@@ -685,22 +685,54 @@ fn route_client_with(
 /// Tell a running tray that this agent works in a Git checkout with no client connection, so it
 /// can offer to connect it. Throttled per agent and checkout, bounded in time, and local only.
 fn report_unconnected(agent: &str, payload: &Value) {
-    let cwd = cwd_of(payload);
+    #[cfg(unix)]
+    if let (Ok(config), Some(socket)) = (config_dir(), crate::client_activity::socket_path()) {
+        report_unconnected_at(
+            &config,
+            &socket,
+            agent,
+            cwd_of(payload),
+            client_config::load,
+        );
+    }
+    #[cfg(not(unix))]
+    let _ = (agent, payload);
+}
+
+#[cfg(unix)]
+fn report_unconnected_at(
+    config: &Path,
+    socket: &Path,
+    agent: &str,
+    cwd: PathBuf,
+    load: fn() -> agentscm::Result<Vec<Connection>>,
+) {
     let Some(checkout) = repo_root(&cwd) else {
         return;
     };
     let main = client_config::main_checkout(&checkout);
     let key = format!("unconnected\0{agent}\0{}", main.display());
-    if !config_dir().is_ok_and(|config| due_marker(&config, &key, UNCONNECTED_EVERY)) {
+    // A report no tray received must not start the interval, so a tray opened later hears the
+    // next hook.
+    if marked_within(config, &key, UNCONNECTED_EVERY)
+        || !crate::client_activity::listening_at(socket)
+    {
         return;
     }
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
-        let connections = client_config::load().unwrap_or_default();
+        let connections = load().unwrap_or_default();
         let _ = sender.send(unconnected_checkout(&cwd, &connections));
     });
-    if let Ok(Some((root, host, repo))) = receiver.recv_timeout(UNCONNECTED_WAIT) {
-        crate::client_activity::observe_unconnected(&root, &host, &repo, agent);
+    let settled = match receiver.recv_timeout(UNCONNECTED_WAIT) {
+        Ok(Some((root, host, repo))) => {
+            crate::client_activity::observe_unconnected_at(socket, &root, &host, &repo, agent)
+        }
+        // Nothing to report, or Git is too slow: neither changes before the interval ends.
+        Ok(None) | Err(_) => true,
+    };
+    if settled {
+        mark(config, &key);
     }
 }
 
@@ -1090,20 +1122,23 @@ fn first_marker(config: &Path, key: &str) -> bool {
     true
 }
 
-/// True when `key` was not marked within `every`, and marks it now.
-fn due_marker(config: &Path, key: &str, every: Duration) -> bool {
+fn marker_path(config: &Path, key: &str) -> PathBuf {
     use sha2::{Digest, Sha256};
-    let marker =
-        (config.join("agentscm").join("hook-notes")).join(format!("{:x}", Sha256::digest(key)));
-    let recent = (std::fs::metadata(&marker).and_then(|m| m.modified()))
+    (config.join("agentscm").join("hook-notes")).join(format!("{:x}", Sha256::digest(key)))
+}
+
+/// Whether `key` was marked less than `every` ago.
+fn marked_within(config: &Path, key: &str, every: Duration) -> bool {
+    (std::fs::metadata(marker_path(config, key)).and_then(|m| m.modified()))
         .ok()
         .and_then(|time| time.elapsed().ok())
-        .is_some_and(|age| age < every);
-    if recent {
-        return false;
-    }
-    let _ = std::fs::remove_file(&marker);
-    first_marker(config, key)
+        .is_some_and(|age| age < every)
+}
+
+/// Mark `key` now, replacing an older mark.
+fn mark(config: &Path, key: &str) {
+    let _ = std::fs::remove_file(marker_path(config, key));
+    first_marker(config, key);
 }
 
 /// The reply for an unreachable hub; `note` is the reason to show, or `None` for the silent form.
@@ -1840,17 +1875,123 @@ mod tests {
     }
 
     #[test]
-    fn due_markers_repeat_only_after_their_interval() {
+    fn markers_record_when_a_key_was_last_marked() {
         let config = tempfile::tempdir().unwrap();
         let every = Duration::from_secs(60);
-        assert!(due_marker(config.path(), "unconnected\0claude\0/a", every));
-        assert!(!due_marker(config.path(), "unconnected\0claude\0/a", every));
-        assert!(due_marker(config.path(), "unconnected\0codex\0/a", every));
-        assert!(due_marker(
+        assert!(!marked_within(
+            config.path(),
+            "unconnected\0claude\0/a",
+            every
+        ));
+        mark(config.path(), "unconnected\0claude\0/a");
+        assert!(marked_within(
+            config.path(),
+            "unconnected\0claude\0/a",
+            every
+        ));
+        assert!(!marked_within(
+            config.path(),
+            "unconnected\0codex\0/a",
+            every
+        ));
+        assert!(!marked_within(
             config.path(),
             "unconnected\0claude\0/a",
             Duration::ZERO
         ));
+        mark(config.path(), "unconnected\0claude\0/a");
+        assert!(marked_within(
+            config.path(),
+            "unconnected\0claude\0/a",
+            every
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_delivered_report_starts_the_throttle_interval() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixDatagram;
+
+        fn no_connections() -> agentscm::Result<Vec<Connection>> {
+            Ok(Vec::new())
+        }
+        let parent = tempfile::tempdir().unwrap();
+        let repo = parent.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        for arguments in [
+            &["init", "--quiet"][..],
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/widgets.git",
+            ],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(arguments)
+                .current_dir(&repo)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {arguments:?}");
+        }
+        let repo = repo.canonicalize().unwrap();
+        let config = parent.path().join("config");
+        let tray = parent.path().join("tray");
+        std::fs::create_dir(&tray).unwrap();
+        std::fs::set_permissions(&tray, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = tray.join("activity.sock");
+        let key = format!("unconnected\0claude\0{}", repo.display());
+        let report = || {
+            report_unconnected_at(&config, &socket, "claude", repo.clone(), no_connections);
+        };
+
+        report();
+        assert!(!marked_within(&config, &key, UNCONNECTED_EVERY), "no tray");
+        drop(UnixDatagram::bind(&socket).unwrap());
+        report();
+        assert!(
+            !marked_within(&config, &key, UNCONNECTED_EVERY),
+            "stale socket"
+        );
+        std::fs::remove_file(&socket).unwrap();
+
+        let receiver = UnixDatagram::bind(&socket).unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        report();
+        assert!(marked_within(&config, &key, UNCONNECTED_EVERY));
+        let mut bytes = [0_u8; 4096];
+        let size = receiver.recv(&mut bytes).unwrap();
+        let sent: Value = serde_json::from_slice(&bytes[..size]).unwrap();
+        assert_eq!(sent["root"], json!(repo));
+        assert_eq!(sent["repo"], "acme/widgets");
+        report();
+        assert!(receiver.recv(&mut bytes).is_err(), "throttled while marked");
+
+        // A checkout with nothing to report is not checked again on every hook.
+        let plain = parent.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&plain)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let plain = plain.canonicalize().unwrap();
+        report_unconnected_at(&config, &socket, "claude", plain.clone(), no_connections);
+        assert!(marked_within(
+            &config,
+            &format!("unconnected\0claude\0{}", plain.display()),
+            UNCONNECTED_EVERY
+        ));
+        assert!(receiver.recv(&mut bytes).is_err(), "nothing to report");
     }
 
     #[test]

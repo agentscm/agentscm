@@ -114,8 +114,10 @@ When the user-scope Claude Code or Codex plugin (or another client-connection ho
 checkout that has no connection, the hook tells a running tray, and the checkout appears under
 **Not connected** with its repository, agent and last-seen time. A linked worktree is listed as its
 main checkout. Only checkouts whose `origin` is one GitHub or GitLab repository are listed; the
-report stays on this machine, is repeated at most every five minutes per agent and checkout, and
-the tray forgets it after an hour, after sleep, or on quit, keeping at most eight. **Connect with**
+report stays on this machine and is sent only while a tray is running. Once a tray has received
+it, the hook repeats it at most every five minutes per agent and checkout, so a tray opened during
+a session lists the checkout at the agent's next hook. The tray forgets it after an hour, after
+sleep, or on quit, keeping at most eight. **Connect with**
 an agent runs the same steps as `agentscm client setup --agent AGENT --hub HUB` for the main
 checkout, with the Hub of your most recent saved sign-in and without starting a new sign-in; the
 result window names the Hub. The row then becomes a normal connected checkout. When there is no

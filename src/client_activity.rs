@@ -258,7 +258,7 @@ fn decode_unconnected(bytes: &[u8], seen_at: std::time::Instant) -> Option<Uncon
 }
 
 #[cfg(unix)]
-fn socket_path() -> Option<PathBuf> {
+pub(crate) fn socket_path() -> Option<PathBuf> {
     crate::hub_cli::config_dir()
         .ok()
         .map(|dir| dir.join("agentscm").join("tray").join("activity.sock"))
@@ -302,24 +302,30 @@ fn observe_at(
     );
 }
 
-/// Report a coding agent working in a checkout that has no client connection. Like [`observe`],
-/// this never waits for the tray, and nothing leaves the machine.
-pub(crate) fn observe_unconnected(root: &Path, host: &str, repo: &str, agent: &str) {
-    #[cfg(unix)]
-    if let Some(pathname) = socket_path() {
-        observe_unconnected_at(&pathname, root, host, repo, agent);
-    }
-    #[cfg(not(unix))]
-    let _ = (root, host, repo, agent);
+/// Whether a tray is bound to the socket at `pathname`. A stale socket left by a tray that
+/// crashed refuses the connection.
+#[cfg(unix)]
+pub(crate) fn listening_at(pathname: &Path) -> bool {
+    std::os::unix::net::UnixDatagram::unbound()
+        .and_then(|socket| socket.connect(pathname))
+        .is_ok()
 }
 
+/// Report a coding agent working in a checkout that has no client connection. Like [`observe`],
+/// this never waits for the tray, and nothing leaves the machine. True when a tray accepted it.
 #[cfg(unix)]
-fn observe_unconnected_at(pathname: &Path, root: &Path, host: &str, repo: &str, agent: &str) {
+pub(crate) fn observe_unconnected_at(
+    pathname: &Path,
+    root: &Path,
+    host: &str,
+    repo: &str,
+    agent: &str,
+) -> bool {
     let Some(root) = root.to_str() else {
-        return;
+        return false;
     };
     if !valid_unconnected(root, host, repo, agent) {
-        return;
+        return false;
     }
     send_at(
         pathname,
@@ -330,40 +336,40 @@ fn observe_unconnected_at(pathname: &Path, root: &Path, host: &str, repo: &str, 
             repo: repo.to_owned(),
             agent: agent.to_owned(),
         },
-    );
+    )
 }
 
+/// True when the datagram was queued at a listening, owner-controlled socket.
 #[cfg(unix)]
-fn send_at(pathname: &Path, wire: &impl Serialize) {
+fn send_at(pathname: &Path, wire: &impl Serialize) -> bool {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::os::unix::net::UnixDatagram;
 
     let Some(parent) = pathname.parent() else {
-        return;
+        return false;
     };
     let Ok(metadata) = std::fs::symlink_metadata(parent) else {
-        return;
+        return false;
     };
     // SAFETY: geteuid has no arguments or memory access preconditions.
     if !metadata.file_type().is_dir()
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.permissions().mode() & 0o077 != 0
     {
-        return;
+        return false;
     }
     let Ok(bytes) = serde_json::to_vec(wire) else {
-        return;
+        return false;
     };
     if bytes.len() > DATAGRAM_BYTES {
-        return;
+        return false;
     }
     let Ok(socket) = UnixDatagram::unbound() else {
-        return;
+        return false;
     };
-    if socket.set_nonblocking(true).is_err() || !set_buffer(&socket, libc::SO_SNDBUF) {
-        return;
-    }
-    let _ = socket.send_to(&bytes, pathname);
+    socket.set_nonblocking(true).is_ok()
+        && set_buffer(&socket, libc::SO_SNDBUF)
+        && socket.send_to(&bytes, pathname).is_ok()
 }
 
 #[cfg(unix)]
