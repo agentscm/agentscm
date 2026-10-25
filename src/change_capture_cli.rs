@@ -25,6 +25,8 @@ use crate::change_capture_client;
 pub enum ChangeCaptureCommand {
     /// Configure one checkout and add marked Claude hooks without replacing foreign entries.
     Configure(change_capture_client::ConfigureArgs),
+    /// Change only the capture mode of an enabled checkout binding; retained local data is kept.
+    SetMode(change_capture_client::SetModeArgs),
     /// Disable one checkout, retain its spool lineage, and remove only AgentSCM's marked hooks.
     Unconfigure(change_capture_client::UnconfigureArgs),
     /// Inspect, restore, or prune bounded private Claude settings recovery entries.
@@ -57,21 +59,6 @@ pub enum ChangeCaptureCommand {
     PruneQuarantine(PruneQuarantineArgs),
     /// Reclaim acknowledged envelope bytes while retaining replay/idempotency facts.
     Compact(CompactArgs),
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum CaptureModeArg {
-    MetadataOnly,
-    LocalConversation,
-}
-
-impl From<CaptureModeArg> for CaptureModeV1 {
-    fn from(value: CaptureModeArg) -> Self {
-        match value {
-            CaptureModeArg::MetadataOnly => Self::MetadataOnly,
-            CaptureModeArg::LocalConversation => Self::LocalConversation,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -157,7 +144,7 @@ pub struct ImportClaudeArgs {
     #[arg(long)]
     operation_prefix: String,
     #[arg(long, value_enum, default_value = "metadata-only")]
-    capture_mode: CaptureModeArg,
+    capture_mode: change_capture_client::CaptureModeArg,
 }
 
 #[derive(Debug, Args)]
@@ -230,6 +217,13 @@ pub async fn run(command: ChangeCaptureCommand) -> Result<i32> {
     match command {
         ChangeCaptureCommand::Configure(args) => {
             println!("{}", change_capture_client::configure(args)?);
+            Ok(0)
+        }
+        ChangeCaptureCommand::SetMode(args) => {
+            println!(
+                "{}",
+                change_capture_client::set_capture_mode(&args.root, args.mode.into())?
+            );
             Ok(0)
         }
         ChangeCaptureCommand::Unconfigure(args) => {
@@ -694,6 +688,7 @@ fn import_claude(args: ImportClaudeArgs) -> Result<i32> {
             "conversation_content": match request.capture_mode {
                 CaptureModeV1::MetadataOnly => "not_retained",
                 CaptureModeV1::LocalConversation => "local_only",
+                CaptureModeV1::SharedConversation => "shared_after_redaction",
             },
         }))?
     );

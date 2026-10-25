@@ -4867,3 +4867,170 @@ fn session_identity_is_pinned_while_the_live_mode_gates_retention() {
     );
     assert!(!artifact_for(1), "live metadata-only mode retains nothing");
 }
+
+fn synthetic_secrets() -> (String, String) {
+    (
+        ["gh", "p_"].concat() + &"a1B2".repeat(9),
+        ["hunter", "2-synthetic"].concat(),
+    )
+}
+
+fn shared_prompt_and_tool_hooks(token: &str, password: &str) -> [String; 3] {
+    [
+        format!(
+            r#"{{"hook_event_name":"UserPromptSubmit","session_id":"session_fixture","prompt_id":"p1","prompt":"please deploy with {token} today"}}"#
+        ),
+        format!(
+            r#"{{"hook_event_name":"PreToolUse","session_id":"session_fixture","tool_name":"Bash","tool_use_id":"t1","tool_input":{{"command":"deploy","password":"{password}","env":"DB_PASSWORD={password}"}}}}"#
+        ),
+        format!(
+            r#"{{"hook_event_name":"PostToolUse","session_id":"session_fixture","tool_name":"Read","tool_use_id":"t2","tool_response":{{"content":"Authorization: Bearer {token}"}}}}"#
+        ),
+    ]
+}
+
+#[test]
+fn shared_conversation_redacts_before_retention_and_marks_bodies_shared_approved() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let request = capture_request(CaptureModeV1::SharedConversation);
+    let (token, password) = synthetic_secrets();
+    for hook in shared_prompt_and_tool_hooks(&token, &password) {
+        assert_eq!(
+            capture_hook(hook.as_bytes(), &request, &spool).unwrap(),
+            HookCaptureOutcome::Stored
+        );
+    }
+
+    let retained = retained_bytes(spool.root());
+    assert!(!contains_bytes(&retained, token.as_bytes()));
+    assert!(!contains_bytes(&retained, password.as_bytes()));
+    assert!(contains_bytes(&retained, b"[REDACTED:github_token]"));
+    assert!(contains_bytes(&retained, b"[REDACTED:field]"));
+
+    let captured = captured_events(&spool);
+    let bodies: Vec<_> = captured
+        .iter()
+        .filter_map(|(_, event)| event.artifact.as_ref().map(|artifact| (event, artifact)))
+        .collect();
+    assert_eq!(bodies.len(), 3);
+    for (_, artifact) in &bodies {
+        assert_eq!(artifact.retention, RetentionClassV1::SharedApproved);
+        assert_eq!(artifact.media, ArtifactMediaV1::Json);
+        assert_eq!(artifact.availability, ContentAvailabilityV1::Local);
+        let bytes = spool.read_artifact(artifact).unwrap();
+        assert_eq!(format!("{:x}", Sha256::digest(&bytes)), artifact.digest);
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body["redactions"].as_u64().unwrap() >= 1);
+    }
+    let redacted_gaps = captured
+        .iter()
+        .filter(|(_, event)| {
+            event
+                .gap
+                .as_ref()
+                .is_some_and(|gap| gap.reason == GapReasonV1::Redacted)
+        })
+        .count();
+    assert_eq!(redacted_gaps, 3);
+    assert!(
+        captured
+            .iter()
+            .all(|(session, _)| session.capture_mode == CaptureModeV1::SharedConversation)
+    );
+
+    // Redaction is deterministic, so a replay is a duplicate rather than a second record.
+    let replay = shared_prompt_and_tool_hooks(&token, &password);
+    assert_eq!(
+        capture_hook(replay[0].as_bytes(), &request, &spool).unwrap(),
+        HookCaptureOutcome::Duplicate
+    );
+}
+
+#[test]
+fn local_conversation_keeps_unredacted_work_local_bodies() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let request = capture_request(CaptureModeV1::LocalConversation);
+    let (token, password) = synthetic_secrets();
+    for hook in shared_prompt_and_tool_hooks(&token, &password) {
+        capture_hook(hook.as_bytes(), &request, &spool).unwrap();
+    }
+    let retained = retained_bytes(spool.root());
+    assert!(contains_bytes(&retained, token.as_bytes()));
+    assert!(contains_bytes(&retained, password.as_bytes()));
+    let captured = captured_events(&spool);
+    assert!(captured.iter().all(|(_, event)| {
+        event
+            .artifact
+            .as_ref()
+            .is_none_or(|artifact| artifact.retention == RetentionClassV1::WorkLocal)
+            && event
+                .gap
+                .as_ref()
+                .is_none_or(|gap| gap.reason != GapReasonV1::Redacted)
+    }));
+}
+
+#[test]
+fn shared_mode_switch_mid_session_keeps_bodies_local_but_redacted() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    // The session was pinned while metadata-only; the binding now says shared.
+    let mut request = capture_request(CaptureModeV1::MetadataOnly);
+    request.live_capture_mode = CaptureModeV1::SharedConversation;
+    let (token, password) = synthetic_secrets();
+    for hook in shared_prompt_and_tool_hooks(&token, &password) {
+        capture_hook(hook.as_bytes(), &request, &spool).unwrap();
+    }
+    assert!(!contains_bytes(
+        &retained_bytes(spool.root()),
+        token.as_bytes()
+    ));
+    let captured = captured_events(&spool);
+    assert!(captured.iter().all(|(session, event)| {
+        session.capture_mode == CaptureModeV1::MetadataOnly
+            && event
+                .artifact
+                .as_ref()
+                .is_none_or(|artifact| artifact.retention == RetentionClassV1::WorkLocal)
+    }));
+    assert!(captured.iter().any(|(_, event)| event.artifact.is_some()));
+
+    // The reverse switch (pinned shared, live local) also never produces a shared artifact.
+    let reverse_spool = LocalSpool::open(temp.path().join("reverse")).unwrap();
+    let mut reverse = capture_request(CaptureModeV1::SharedConversation);
+    reverse.live_capture_mode = CaptureModeV1::LocalConversation;
+    capture_hook(
+        shared_prompt_and_tool_hooks(&token, &password)[0].as_bytes(),
+        &reverse,
+        &reverse_spool,
+    )
+    .unwrap();
+    assert!(captured_events(&reverse_spool).iter().all(|(_, event)| {
+        event
+            .artifact
+            .as_ref()
+            .is_none_or(|artifact| artifact.retention == RetentionClassV1::WorkLocal)
+    }));
+}
+
+#[test]
+fn oversized_shared_bodies_stay_work_local() {
+    let temp = TempDir::new().unwrap();
+    let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+    let request = capture_request(CaptureModeV1::SharedConversation);
+    let big = "a".repeat(agentscm::change_record::MAX_SHARED_BODY_BYTES as usize + 1024);
+    let transcript = format!(
+        "{{\"type\":\"user\",\"sessionId\":\"session_fixture\",\"timestamp\":\"2026-10-23T10:00:00Z\",\"uuid\":\"u1\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{big}\"}}]}}}}\n"
+    );
+    let report = import_jsonl(Cursor::new(transcript), &request, &spool).unwrap();
+    assert_eq!(report.events, 2);
+    let artifacts: Vec<_> = captured_events(&spool)
+        .into_iter()
+        .filter_map(|(_, event)| event.artifact)
+        .collect();
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(artifacts[0].retention, RetentionClassV1::WorkLocal);
+    assert_eq!(artifacts[0].availability, ContentAvailabilityV1::Local);
+}

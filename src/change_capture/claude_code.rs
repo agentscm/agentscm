@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::change_capture::redact::redact_json;
 use crate::change_capture::spool::{
     LocalSpool, ManagedInvocationV1, NativeOccurrenceReceiptV1, NativeOccurrenceRouteV1,
     ProviderHistoryCursorV1,
@@ -24,9 +25,9 @@ use crate::change_capture::{
 use crate::change_record::{
     ActionFinishV1, ActionKindV1, ActionOutcomeV1, ActionStartV1, AgentHarnessV1, ArtifactMediaV1,
     CaptureBatchV1, CaptureEnvelopeV1, CaptureModeV1, CapturedEventKindV1, CapturedEventV1,
-    CheckResultV1, CoverageV1, DriftV1, GapFactV1, GapReasonV1, RecipeProvenanceV1,
-    RetentionClassV1, SCHEMA_VERSION_V1, SessionIdentityV1, SetupComponentV1, SetupObservationV1,
-    SubagentFactV1, ToolCompletionV1, ToolFactV1, ToolKindV1,
+    CheckResultV1, CoverageV1, DriftV1, GapFactV1, GapReasonV1, MAX_SHARED_BODY_BYTES,
+    RecipeProvenanceV1, RetentionClassV1, SCHEMA_VERSION_V1, SessionIdentityV1, SetupComponentV1,
+    SetupObservationV1, SubagentFactV1, ToolCompletionV1, ToolFactV1, ToolKindV1,
 };
 use crate::hub::github::parse_rfc3339;
 use crate::hub::insights::{
@@ -356,8 +357,13 @@ fn capture_hook_with_identity_mode(
         boundary,
         subagent,
     };
-    let (event, retention_missing) = retain_selected(selected, request, spool)?;
+    let Retained {
+        event,
+        retention_missing,
+        redacted_gap,
+    } = retain_selected(selected, request, spool)?;
     let mut events = vec![event];
+    events.extend(redacted_gap);
     if identity_uncertain {
         let gap_id = format!("gap:{}", sha256(format!("{event_id}\0identity").as_bytes()));
         let sequence = spool.sequence_for(&request.canonical_session_id, &gap_id)?;
@@ -1282,12 +1288,17 @@ fn capture_ordinary_claimed_action(
     let event = capture_claimed_event(input, request, claim, "post", false, spool)?;
     let mut warnings = Vec::new();
     let mut output_artifacts = Vec::new();
-    if request.live_capture_mode == CaptureModeV1::LocalConversation {
-        let output = serde_json::to_vec(&json!({
+    if request.live_capture_mode != CaptureModeV1::MetadataOnly {
+        let mut body = json!({
             "tool_name": native_tool,
             "tool_response": payload.get("tool_response"),
             "error": payload.get("error"),
-        }))?;
+        });
+        // Action outputs are never shared, but a shared-conversation checkout still scrubs them.
+        if request.live_capture_mode == CaptureModeV1::SharedConversation {
+            redact_json(&mut body);
+        }
+        let output = serde_json::to_vec(&body)?;
         match spool.retain_artifact(&output, ArtifactMediaV1::Json, RetentionClassV1::WorkLocal) {
             Ok(reference) => output_artifacts.push(reference),
             Err(error) => {
@@ -2304,9 +2315,10 @@ pub fn import_jsonl(
         let (events, ignored) = select_line(parsed, request, lines)?;
         report.private_blocks_ignored = report.private_blocks_ignored.saturating_add(ignored);
         for event in events {
-            let (event, retention_missing) = retain_selected(event, request, spool)?;
-            selected.push(event);
-            missing = missing.saturating_add(u64::from(retention_missing));
+            let retained = retain_selected(event, request, spool)?;
+            selected.push(retained.event);
+            selected.extend(retained.redacted_gap);
+            missing = missing.saturating_add(u64::from(retained.retention_missing));
         }
     }
     let history_anchor = selected
@@ -2476,17 +2488,47 @@ fn select_line(
     Ok((selected, private))
 }
 
+struct Retained {
+    event: CapturedEventV1,
+    retention_missing: bool,
+    /// Present when redaction changed the retained body.
+    redacted_gap: Option<CapturedEventV1>,
+}
+
 fn retain_selected(
     event: SelectedEvent,
     request: &CaptureRequest,
     spool: &LocalSpool,
-) -> Result<(CapturedEventV1, bool)> {
+) -> Result<Retained> {
     let sequence = spool.sequence_for(&request.canonical_session_id, &event.event_id)?;
-    let (artifact, retention_missing) = match (request.live_capture_mode, event.local_body) {
-        (CaptureModeV1::LocalConversation, Some(body)) => {
-            let bytes = serde_json::to_vec(&body)?;
-            match spool.retain_artifact(&bytes, ArtifactMediaV1::Json, RetentionClassV1::WorkLocal)
+    let mut redactions = 0;
+    let body = match (request.live_capture_mode, event.local_body) {
+        (CaptureModeV1::LocalConversation, body) => body,
+        (CaptureModeV1::SharedConversation, Some(mut body)) => {
+            redactions = redact_json(&mut body);
+            if redactions > 0
+                && let Value::Object(map) = &mut body
             {
+                map.insert("redactions".to_owned(), json!(redactions));
+            }
+            Some(body)
+        }
+        _ => None,
+    };
+    let (artifact, retention_missing) = match body {
+        Some(body) => {
+            let bytes = serde_json::to_vec(&body)?;
+            // Validation uses the session's pinned mode, so a mid-session switch to sharing
+            // keeps bodies local until the next session. Oversized bodies also stay local.
+            let shared = request.live_capture_mode == CaptureModeV1::SharedConversation
+                && request.capture_mode == CaptureModeV1::SharedConversation
+                && u64::try_from(bytes.len()).is_ok_and(|size| size <= MAX_SHARED_BODY_BYTES);
+            let retention = if shared {
+                RetentionClassV1::SharedApproved
+            } else {
+                RetentionClassV1::WorkLocal
+            };
+            match spool.retain_artifact(&bytes, ArtifactMediaV1::Json, retention) {
                 Ok(reference) => (Some(reference), false),
                 Err(_) => (
                     Some(spool.missing_artifact_reference(
@@ -2498,10 +2540,35 @@ fn retain_selected(
                 ),
             }
         }
-        _ => (None, false),
+        None => (None, false),
     };
-    Ok((
-        CapturedEventV1 {
+    let redacted_gap = if redactions > 0 {
+        let gap_id = format!(
+            "gap:{}",
+            sha256(format!("{}\0redacted", event.event_id).as_bytes())
+        );
+        let gap_sequence = spool.sequence_for(&request.canonical_session_id, &gap_id)?;
+        Some(CapturedEventV1 {
+            event_id: gap_id,
+            sequence: gap_sequence,
+            observed_at: event.observed_at,
+            kind: CapturedEventKindV1::Gap,
+            tool: None,
+            artifact: None,
+            setup: None,
+            gap: Some(GapFactV1 {
+                first_missing: gap_sequence,
+                last_missing: gap_sequence,
+                reason: GapReasonV1::Redacted,
+            }),
+            boundary: None,
+            subagent: None,
+        })
+    } else {
+        None
+    };
+    Ok(Retained {
+        event: CapturedEventV1 {
             event_id: event.event_id,
             sequence,
             observed_at: event.observed_at,
@@ -2514,7 +2581,8 @@ fn retain_selected(
             subagent: event.subagent,
         },
         retention_missing,
-    ))
+        redacted_gap,
+    })
 }
 
 fn native_setup_observation(

@@ -1,8 +1,8 @@
 //! Versioned, bounded contracts for local capture and source-bound action receipts.
 //!
 //! These types deliberately contain no conversation text, commands, source paths or process
-//! output. Conversation bodies remain in the local capture store until the shared-retention
-//! privacy lifecycle is implemented and qualified.
+//! output. Conversation bodies remain in the local capture store; only redacted bodies of
+//! `shared_conversation` sessions may carry `SharedApproved` retention.
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +17,8 @@ pub const MAX_CHANGE_RECORD_RESPONSE_BYTES: usize = 48 * 1024;
 pub const MAX_PROJECTED_SCOPE: usize = 16;
 pub const MAX_PROJECTED_DECISION_REFS: usize = 16;
 pub const MAX_PROJECTED_SESSION_SETUPS: usize = 16;
+/// Largest redacted conversation body that may be retained as `SharedApproved`.
+pub const MAX_SHARED_BODY_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -30,6 +32,8 @@ pub enum AgentHarnessV1 {
 pub enum CaptureModeV1 {
     MetadataOnly,
     LocalConversation,
+    /// Redacted conversation bodies may be uploaded to the Hub for the Work owner.
+    SharedConversation,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -716,7 +720,7 @@ impl CaptureBatchV1 {
         let mut previous = None;
         let mut gaps = 0;
         for event in &self.events {
-            event.validate()?;
+            event.validate(self.session.capture_mode)?;
             if previous.is_some_and(|sequence| event.sequence <= sequence) {
                 return Err(invalid(
                     "capture events must have increasing sequence numbers",
@@ -754,7 +758,7 @@ impl SessionIdentityV1 {
 }
 
 impl CapturedEventV1 {
-    fn validate(&self) -> Result<()> {
+    fn validate(&self, session_mode: CaptureModeV1) -> Result<()> {
         identifier("event_id", &self.event_id, 255)?;
         if self.sequence == 0 || self.observed_at < 0 {
             return Err(invalid(
@@ -823,9 +827,14 @@ impl CapturedEventV1 {
         }
         if let Some(artifact) = &self.artifact {
             artifact.validate()?;
-            if artifact.retention == RetentionClassV1::SharedApproved {
+            if artifact.retention == RetentionClassV1::SharedApproved
+                && !(session_mode == CaptureModeV1::SharedConversation
+                    && artifact.media == ArtifactMediaV1::Json
+                    && artifact.availability == ContentAvailabilityV1::Local
+                    && artifact.size_bytes <= MAX_SHARED_BODY_BYTES)
+            {
                 return Err(invalid(
-                    "shared artifact retention is unavailable in schema v1",
+                    "shared artifact retention requires a shared-conversation session and a bounded local JSON body",
                 ));
             }
         }
@@ -1228,6 +1237,33 @@ mod tests {
         batch.events[0].artifact = None;
         batch.events[0].event_id = "/private/tmp/transcript.jsonl".into();
         assert!(batch.validate().is_err());
+    }
+
+    #[test]
+    fn shared_approved_requires_a_shared_session_and_a_bounded_local_json_body() {
+        let shared = |mode, media, availability, size_bytes| {
+            let mut batch = batch_of(json!({
+                "event_id": "event-1", "sequence": 1, "observed_at": 1,
+                "kind": "assistant_message", "tool": null, "gap": null,
+                "artifact": {
+                    "digest": "a".repeat(64), "size_bytes": size_bytes, "media": media,
+                    "retention": "shared_approved", "availability": availability,
+                },
+            }));
+            batch.session.capture_mode = mode;
+            batch.validate().is_ok()
+        };
+        let mode = CaptureModeV1::SharedConversation;
+        assert!(shared(mode, "json", "local", MAX_SHARED_BODY_BYTES));
+        assert!(!shared(mode, "json", "local", MAX_SHARED_BODY_BYTES + 1));
+        assert!(!shared(mode, "text", "local", 10));
+        assert!(!shared(mode, "json", "missing", 10));
+        for other in [
+            CaptureModeV1::MetadataOnly,
+            CaptureModeV1::LocalConversation,
+        ] {
+            assert!(!shared(other, "json", "local", 10));
+        }
     }
 
     fn batch_of(event: serde_json::Value) -> CaptureBatchV1 {

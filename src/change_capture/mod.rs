@@ -7,6 +7,7 @@
 
 pub mod claude_code;
 pub mod codex;
+pub mod redact;
 pub mod spool;
 
 use std::ffi::{CString, OsStr};

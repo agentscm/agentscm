@@ -1382,3 +1382,147 @@ async fn hook_cli_accepts_canonical_alias_and_records_outage_as_a_gap() {
     assert!(after_outage.sessions.gaps > 0);
     assert_eq!(after_outage.sessions.coverage, CoverageV1::Partial);
 }
+
+#[test]
+fn set_mode_changes_only_the_capture_mode_and_keeps_local_data() {
+    let private = TempDir::new().unwrap();
+    let root = private.path().join("repo");
+    std::fs::create_dir(&root).unwrap();
+    run_git(&root, &["init", "--quiet", "--initial-branch=main"]);
+    run_git(&root, &["config", "user.email", "fixture@example.invalid"]);
+    run_git(&root, &["config", "user.name", "Synthetic Fixture"]);
+    std::fs::write(root.join("tracked.txt"), "fixture\n").unwrap();
+    run_git(&root, &["add", "tracked.txt"]);
+    run_git(&root, &["commit", "--quiet", "-m", "fixture"]);
+    run_git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/widgets.git",
+        ],
+    );
+    run_git(&root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    let root = root.canonicalize().unwrap();
+    let config = private.path().join("config");
+    std::fs::create_dir_all(config.join("agentscm")).unwrap();
+    let token_file = private.path().join("token");
+    std::fs::write(&token_file, "synthetic-token\n").unwrap();
+    std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::write(
+        config.join("agentscm/connections.json"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "connections": [{
+                "root": root,
+                "origin_host": "github.com",
+                "hub": "http://127.0.0.1:9",
+                "repo": REPOSITORY,
+                "token_file": token_file,
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let spool = private.path().join("spool");
+    let cli = |args: &[&str]| {
+        let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+        run_capture_cli(&config, private.path(), &args, None)
+    };
+    let root_arg = root.display().to_string();
+    let configured = cli(&[
+        "change-capture",
+        "configure",
+        "--root",
+        &root_arg,
+        "--spool",
+        &spool.display().to_string(),
+        "--worktree-id",
+        "set-mode-worktree",
+        "--setup-digest",
+        &"5".repeat(64),
+        "--action-rule",
+        "Bash=execution:partial:process_exit_code",
+    ]);
+    assert!(
+        configured.status.success(),
+        "{}",
+        String::from_utf8_lossy(&configured.stderr)
+    );
+    let config_file = config.join("agentscm/change-capture.json");
+    let read_config =
+        || -> Value { serde_json::from_slice(&std::fs::read(&config_file).unwrap()).unwrap() };
+    let original = read_config();
+    let spool_files = |dir: &std::path::Path| {
+        let mut names: Vec<_> = walk(dir);
+        names.sort();
+        names
+    };
+    fn walk(dir: &std::path::Path) -> Vec<String> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                names.extend(walk(&entry.path()));
+            } else {
+                names.push(entry.path().display().to_string());
+            }
+        }
+        names
+    }
+    let files_before = spool_files(&spool);
+    let status = |expected: &str| {
+        let output = cli(&["change-capture", "status", "--root", &root_arg]);
+        let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(status["capture_mode"], expected);
+    };
+    status("metadata_only");
+
+    let set = cli(&[
+        "change-capture",
+        "set-mode",
+        "--root",
+        &root_arg,
+        "--mode",
+        "shared-conversation",
+    ]);
+    assert!(
+        set.status.success(),
+        "{}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    status("shared_conversation");
+    let shared = read_config();
+    assert_eq!(shared["version"], 6);
+    let mut expected = original.clone();
+    expected["version"] = json!(6);
+    expected["bindings"][0]["capture_mode"] = json!("shared_conversation");
+    assert_eq!(shared, expected);
+
+    let back = cli(&[
+        "change-capture",
+        "set-mode",
+        "--root",
+        &root_arg,
+        "--mode",
+        "metadata-only",
+    ]);
+    assert!(
+        back.status.success(),
+        "{}",
+        String::from_utf8_lossy(&back.stderr)
+    );
+    assert_eq!(read_config(), original);
+    assert_eq!(spool_files(&spool), files_before);
+
+    let unknown = cli(&[
+        "change-capture",
+        "set-mode",
+        "--root",
+        &private.path().display().to_string(),
+        "--mode",
+        "local-conversation",
+    ]);
+    assert!(!unknown.status.success());
+}

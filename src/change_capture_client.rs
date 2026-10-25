@@ -31,6 +31,9 @@ use crate::{client_config, hub_cli};
 mod settings_transaction;
 
 const CONFIG_VERSION: u8 = 5;
+/// Written only while a binding uses a mode older binaries cannot parse, so users who never opt
+/// in keep a config those binaries still read.
+const SHARED_CONFIG_VERSION: u8 = 6;
 const CONFIG_BYTES: u64 = 256 * 1024;
 const RECIPE_BYTES: u64 = 64 * 1024;
 const MAX_BINDINGS: usize = 128;
@@ -61,9 +64,10 @@ fn invalid(message: impl Into<String>) -> Error {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
-enum CaptureModeArg {
+pub enum CaptureModeArg {
     MetadataOnly,
     LocalConversation,
+    SharedConversation,
 }
 
 impl From<CaptureModeArg> for CaptureModeV1 {
@@ -71,6 +75,7 @@ impl From<CaptureModeArg> for CaptureModeV1 {
         match value {
             CaptureModeArg::MetadataOnly => Self::MetadataOnly,
             CaptureModeArg::LocalConversation => Self::LocalConversation,
+            CaptureModeArg::SharedConversation => Self::SharedConversation,
         }
     }
 }
@@ -116,6 +121,15 @@ pub struct ConfigureArgs {
     /// Maximum bytes for one locally retained artifact.
     #[arg(long, default_value_t = 16 * 1024 * 1024, value_parser = clap::value_parser!(u64).range(1..=1024 * 1024 * 1024))]
     max_artifact_bytes: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct SetModeArgs {
+    /// Canonical Git checkout with an enabled capture binding.
+    #[arg(long)]
+    pub root: PathBuf,
+    #[arg(long, value_enum)]
+    pub mode: CaptureModeArg,
 }
 
 #[derive(Debug, Args)]
@@ -246,7 +260,7 @@ fn load() -> Result<Vec<CaptureBinding>> {
     };
     let config: CaptureConfig =
         serde_json::from_str(&text).map_err(|_| invalid("change capture config is not valid"))?;
-    if !matches!(config.version, 2 | 3 | 4 | CONFIG_VERSION) || config.bindings.len() > MAX_BINDINGS
+    if !matches!(config.version, 2..=SHARED_CONFIG_VERSION) || config.bindings.len() > MAX_BINDINGS
     {
         return Err(invalid("change capture config is not valid"));
     }
@@ -257,8 +271,15 @@ fn load() -> Result<Vec<CaptureBinding>> {
 }
 
 fn save(bindings: &[CaptureBinding]) -> Result<()> {
+    let shared = bindings
+        .iter()
+        .any(|binding| binding.capture_mode == CaptureModeV1::SharedConversation);
     let text = serde_json::to_string(&CaptureConfig {
-        version: CONFIG_VERSION,
+        version: if shared {
+            SHARED_CONFIG_VERSION
+        } else {
+            CONFIG_VERSION
+        },
         bindings: bindings.to_vec(),
     })
     .map_err(|_| invalid("cannot encode change capture config"))?;
@@ -489,6 +510,64 @@ fn parse_rule(value: &str) -> Result<ActionRuleV1> {
     })
 }
 
+/// Validates one binding against the saved binding for its checkout, saves it and, when
+/// `settings` is given, reinstalls the marked hooks, restoring the previous config on failure.
+/// The caller holds the config lock and has loaded `old_bindings` under it.
+fn commit_binding(
+    old_bindings: &[CaptureBinding],
+    binding: CaptureBinding,
+    settings: Option<&Path>,
+) -> Result<()> {
+    validate_binding(&binding)?;
+    let saved = old_bindings.iter().find(|saved| saved.root == binding.root);
+    if let Some(saved) = saved {
+        validate_binding_update(saved, &binding)?;
+    }
+    ensure_spool_namespace(&binding)?;
+    let root = binding.root.clone();
+    let mut bindings = old_bindings.to_vec();
+    bindings.retain(|saved| saved.root != root);
+    if saved.is_none() && bindings.len() == MAX_BINDINGS {
+        return Err(invalid("too many change capture bindings"));
+    }
+    bindings.push(binding);
+    bindings.sort_by(|left, right| left.root.cmp(&right.root));
+    save(&bindings)?;
+    if let Some(settings) = settings
+        && let Err(error) = install_hooks(&root, settings, true)
+    {
+        if let Err(rollback) = save(old_bindings) {
+            return Err(invalid(format!(
+                "Claude hook installation failed ({error}); capture binding rollback also failed ({rollback})"
+            )));
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Changes only the capture mode of an existing enabled binding. Retained local data is never
+/// touched, and hooks are left alone because they read the mode from the binding when they run.
+pub fn set_capture_mode(root: &Path, mode: CaptureModeV1) -> Result<Value> {
+    let root = client_config::canonical_root(root)?;
+    let connection = connection_for(&root)?;
+    let _lock = acquire_lock()?;
+    let old_bindings = load()?;
+    let mut binding = old_bindings
+        .iter()
+        .find(|binding| binding.root == root && binding.enabled)
+        .cloned()
+        .ok_or_else(|| invalid("no enabled capture binding for this checkout"))?;
+    if connection.repo != binding.repository || connection.hub != binding.hub {
+        return Err(invalid(
+            "capture binding namespace differs from client connection",
+        ));
+    }
+    binding.capture_mode = mode;
+    commit_binding(&old_bindings, binding, None)?;
+    Ok(json!({"root": root, "capture_mode": mode}))
+}
+
 pub fn configure(args: ConfigureArgs) -> Result<Value> {
     let root = client_config::canonical_root(&args.root)?;
     let requested_spool = absolute_without_parent_components(&args.spool)?;
@@ -592,27 +671,7 @@ pub fn configure(args: ConfigureArgs) -> Result<Value> {
         configured_recipes,
         spool_limits,
     };
-    validate_binding(&binding)?;
-    if let Some(saved) = saved {
-        validate_binding_update(saved, &binding)?;
-    }
-    ensure_spool_namespace(&binding)?;
-    let mut bindings = old_bindings.clone();
-    bindings.retain(|saved| saved.root != root);
-    if saved.is_none() && bindings.len() == MAX_BINDINGS {
-        return Err(invalid("too many change capture bindings"));
-    }
-    bindings.push(binding);
-    bindings.sort_by(|left, right| left.root.cmp(&right.root));
-    save(&bindings)?;
-    if let Err(error) = install_hooks(&root, &settings, true) {
-        if let Err(rollback) = save(&old_bindings) {
-            return Err(invalid(format!(
-                "Claude hook installation failed ({error}); capture binding rollback also failed ({rollback})"
-            )));
-        }
-        return Err(error);
-    }
+    commit_binding(&old_bindings, binding, Some(&settings))?;
     Ok(json!({"configured": true, "root": root, "settings": settings}))
 }
 
@@ -753,6 +812,7 @@ pub fn capture_status(root: &Path) -> Result<Value> {
         "version": 1,
         "state": state,
         "enabled": binding.enabled,
+        "capture_mode": binding.capture_mode,
         "current_connection": current_connection,
         "root": binding.root,
         "spool": binding.spool,

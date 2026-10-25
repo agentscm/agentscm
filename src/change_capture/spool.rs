@@ -2381,19 +2381,14 @@ impl LocalSpool {
         }
     }
 
-    /// Retains bytes before returning their reference. Shared retention is intentionally absent
-    /// from this M1 store.
+    /// Retains bytes before returning their reference. The caller decides the retention class;
+    /// envelope validation rejects `SharedApproved` outside shared-conversation event bodies.
     pub fn retain_artifact(
         &self,
         bytes: &[u8],
         media: ArtifactMediaV1,
         retention: RetentionClassV1,
     ) -> Result<ArtifactRefV1> {
-        if retention == RetentionClassV1::SharedApproved {
-            return Err(CaptureError::Invalid(
-                "shared conversation retention is unavailable in capture schema v1".into(),
-            ));
-        }
         let size_bytes = u64::try_from(bytes.len())
             .map_err(|_| CaptureError::Limit("artifact size is out of range".into()))?;
         if size_bytes > self.limits.max_artifact_bytes {
