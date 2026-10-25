@@ -1728,3 +1728,42 @@ fn sharing_can_be_turned_off_after_a_reconnect_and_the_list_says_which_hub_it_wa
         "unknown_checkout"
     );
 }
+
+#[test]
+fn off_works_without_a_connection_and_a_reconnect_does_not_resume_sharing() {
+    let temp = TempDir::new().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap().join("widgets");
+    checkout(&root);
+    let (hub, _) = fake_hub();
+    let door = FrontDoor::start(&temp, &hub, &root);
+    let page = Page::new(&door);
+    let id = page.id_of("widgets");
+    assert_eq!(page.post(&id, &hub, "shared_conversation").0, 200);
+
+    // The connection disappears (removed by hand), so nothing lists or reaches the Hub.
+    private_file(
+        &door.config.join("agentscm/connections.json"),
+        &json!({"version": 1, "connections": []}).to_string(),
+    );
+    let root_arg = root.to_str().unwrap();
+    let (ok, text) = agentscm(
+        &door,
+        temp.path(),
+        &[
+            "change-capture",
+            "set-mode",
+            "--root",
+            root_arg,
+            "--mode",
+            "metadata-only",
+        ],
+    );
+    assert!(ok, "{text}");
+    assert_eq!(bindings(&door)[0]["capture_mode"], "metadata_only");
+
+    // Reconnecting the same repository and Hub shows sharing off until it is confirmed again.
+    connect_checkout(&door, &root, &hub, "again");
+    let listed = page.list().remove(0);
+    assert_eq!(listed["mode"], "metadata_only");
+    assert_eq!(listed["lineage_mismatch"], false);
+}

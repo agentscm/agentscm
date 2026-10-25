@@ -178,8 +178,14 @@ Both work on a checkout that has been deleted: pass its absolute path as it was 
 the parent directories that still exist are resolved, the deleted part is matched as given, and
 nothing is touched in the missing tree (its hooks went with it). `unconfigure` fails with `no
 capture binding for this checkout` when nothing matches.
-Turning sharing off is always allowed, even after the checkout was reconnected to another Hub: it
-only switches the binding to `metadata-only`, never uploads and never changes the saved lineage.
+Turning sharing down (to `metadata-only`, or from `shared-conversation` to `local-conversation`)
+needs only the capture config lock, not a current client connection: it works after the connection
+was removed or the checkout was reconnected to another Hub, never opens the spool, never uploads and
+never changes the saved lineage. Raising the mode still needs a current connection and matching
+lineage. Removing or replacing a checkout's client connection (`client remove`, `client setup` for
+another repository or Hub) also lowers a `shared-conversation` binding for that checkout to
+`metadata-only`, so reconnecting the same repository and Hub never resumes sharing without a new
+confirmation. Capture hooks and delivery do nothing for a binding whose connection is absent.
 The tray and the page then say "Sharing was set for <hub>; this checkout is now connected to
 <other>" and offer only Off. It never deletes the spool: it prints the spool path (and `spool_retained: true`) so you can
 `export` or delete it yourself. The next enable creates a new spool and new random ids.
@@ -197,7 +203,11 @@ What leaves the machine, and when:
   JSON field whose name ends in a secret word such as `password`, `token`, `secret`, `apikey`,
   `secretkey`, `signingkey`, `dsn`, `databaseurl`, `authorization` or `cookie`; when that value is
   an object or array the whole subtree is replaced). Matching on the name
-  suffix keeps counters such as `max_tokens` and `input_tokens` readable. A body that needed
+  suffix keeps counters such as `max_tokens` and `input_tokens` readable. `pass`, `pwd` and `auth`
+  count only as a separate name part (`pass`, `DB_PASS`, `dbPwd`, `auth`), so `bypass`, `compass`
+  and `oauth_state` stay readable. Values inside JSON that was escaped into a string
+  (`\"password\":\"x\"`) and token shapes glued to an identifier after `_` or `-`
+  (`X_ghp_...`) are recognised too. A body that needed
   redaction carries a `redactions` count and the event stream gains a separate `redacted` gap, so
   the change record shows that a body was altered. Redaction is heuristic: it cannot recognise a
   secret with no distinctive shape, and it does not remove personal data, proprietary code or

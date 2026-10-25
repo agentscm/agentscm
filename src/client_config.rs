@@ -280,9 +280,17 @@ pub(crate) fn update(
     expected: Option<&Connection>,
     replacement: Option<Connection>,
 ) -> Result<()> {
-    update_at(&path()?, &lock_path()?, root, expected, replacement)
+    update_with(
+        &path()?,
+        &lock_path()?,
+        root,
+        expected,
+        replacement,
+        crate::change_capture_client::lower_sharing_for_connection_change,
+    )
 }
 
+#[cfg(test)]
 fn update_at(
     config_path: &Path,
     lock_path: &Path,
@@ -290,9 +298,35 @@ fn update_at(
     expected: Option<&Connection>,
     replacement: Option<Connection>,
 ) -> Result<()> {
+    update_with(
+        config_path,
+        lock_path,
+        root,
+        expected,
+        replacement,
+        |_, _| Ok(()),
+    )
+}
+
+/// `before_save` runs under the connections lock, once the change is known to apply and before it
+/// is written, so a failure leaves the connection unchanged.
+fn update_with(
+    config_path: &Path,
+    lock_path: &Path,
+    root: &Path,
+    expected: Option<&Connection>,
+    replacement: Option<Connection>,
+    before_save: impl FnOnce(&Path, Option<&Connection>) -> Result<()>,
+) -> Result<()> {
     let _lock = acquire_lock(lock_path)?;
     let mut connections = load_from(config_path)?;
     replace(&mut connections, root, expected, replacement)?;
+    before_save(
+        root,
+        connections
+            .iter()
+            .find(|connection| connection.root == root),
+    )?;
     save_to(config_path, &connections)
 }
 

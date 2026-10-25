@@ -617,8 +617,13 @@ fn lineage_error(saved: &CaptureBinding, connection: &client_config::Connection)
     ))
 }
 
-/// Changes only the capture mode of an existing enabled binding. Retained local data is never
-/// touched, and hooks are left alone because they read the mode from the binding when they run.
+/// Changes only the capture mode of an existing binding. Retained local data is never touched,
+/// and hooks are left alone because they read the mode from the binding when they run.
+///
+/// Reducing capture (to `metadata-only`, or from `shared-conversation` to `local-conversation`)
+/// needs only the capture config lock: it works after the client connection was removed, replaced
+/// or reconnected elsewhere, and never opens the spool. Any other change needs the checkout's
+/// current connection and lineage.
 ///
 /// `expected` is what the person was shown; it is checked under the config lock when the mode is
 /// shared. Only the command line, where the person typed the command, passes `None`.
@@ -627,12 +632,58 @@ pub fn set_capture_mode(
     mode: CaptureModeV1,
     expected: Option<ExpectedTarget<'_>>,
 ) -> Result<Value> {
-    let root = client_config::canonical_root(root)?;
+    let (root, _) = binding_root(root)?;
+    if mode != CaptureModeV1::SharedConversation
+        && let Some(result) = lower_mode(&root, mode)?
+    {
+        return Ok(result);
+    }
     let locked = lock_checkout(
         &root,
         expected.filter(|_| mode == CaptureModeV1::SharedConversation),
     )?;
     set_mode_in(&locked, &root, mode)
+}
+
+/// Reduces the mode of `root`'s binding, or returns `None` when `mode` would not reduce it (or
+/// there is no binding), which leaves the decision to the connection-checked path.
+fn lower_mode(root: &Path, mode: CaptureModeV1) -> Result<Option<Value>> {
+    let _lock = acquire_lock()?;
+    let mut bindings = load()?;
+    let Some(binding) = bindings.iter_mut().find(|binding| binding.root == root) else {
+        return Ok(None);
+    };
+    if mode != CaptureModeV1::MetadataOnly
+        && binding.capture_mode != CaptureModeV1::SharedConversation
+    {
+        return Ok(None);
+    }
+    binding.capture_mode = mode;
+    save(&bindings)?;
+    Ok(Some(json!({"root": root, "capture_mode": mode})))
+}
+
+/// Called with the connections lock held when `root`'s connection is removed or replaced:
+/// sharing agreed for the previous connection is lowered to `metadata-only` unless the
+/// replacement is still the repository and Hub the binding was saved for, so a later reconnect
+/// never resumes sharing without a new confirmation.
+pub(crate) fn lower_sharing_for_connection_change(
+    root: &Path,
+    replacement: Option<&client_config::Connection>,
+) -> Result<()> {
+    let _lock = acquire_lock()?;
+    let mut bindings = load()?;
+    let Some(binding) = bindings.iter_mut().find(|binding| {
+        binding.root == root
+            && binding.capture_mode == CaptureModeV1::SharedConversation
+            && replacement.is_none_or(|connection| {
+                connection.repo != binding.repository || connection.hub != binding.hub
+            })
+    }) else {
+        return Ok(());
+    };
+    binding.capture_mode = CaptureModeV1::MetadataOnly;
+    save(&bindings)
 }
 
 fn set_mode_in(locked: &Locked, root: &Path, mode: CaptureModeV1) -> Result<Value> {
@@ -642,11 +693,8 @@ fn set_mode_in(locked: &Locked, root: &Path, mode: CaptureModeV1) -> Result<Valu
         .find(|binding| binding.root == root && binding.enabled)
         .cloned()
         .ok_or_else(|| invalid("no enabled capture binding for this checkout"))?;
-    // Turning sharing off only reduces capture and never uploads, so it is allowed even after the
-    // checkout was reconnected elsewhere; any other mode needs the saved lineage to match.
-    if mode != CaptureModeV1::MetadataOnly
-        && (locked.connection.repo != binding.repository || locked.connection.hub != binding.hub)
-    {
+    // Reducing capture is handled by `lower_mode`; any other change needs the saved lineage.
+    if locked.connection.repo != binding.repository || locked.connection.hub != binding.hub {
         return Err(lineage_error(&binding, &locked.connection));
     }
     binding.capture_mode = mode;
@@ -2582,14 +2630,18 @@ mod tests {
                     hub: "http://127.0.0.1:9".into(),
                 })
             );
-            // Anything but off still needs the saved lineage to match.
-            for mode in [
-                CaptureModeV1::SharedConversation,
-                CaptureModeV1::LocalConversation,
-            ] {
-                let error = set_capture_mode(&root, mode, None).unwrap_err().to_string();
-                assert!(error.contains("change-capture forget"), "{error}");
-            }
+            // Raising or keeping sharing still needs the saved lineage to match.
+            let error = set_capture_mode(&root, CaptureModeV1::SharedConversation, None)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("change-capture forget"), "{error}");
+            // Reducing sharing to local only does not, and stops uploads.
+            let result = set_capture_mode(&root, CaptureModeV1::LocalConversation, None).unwrap();
+            assert_eq!(result["capture_mode"], "local_conversation");
+            let error = set_capture_mode(&root, CaptureModeV1::SharedConversation, None)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("change-capture forget"), "{error}");
             let result = set_capture_mode(&root, CaptureModeV1::MetadataOnly, None).unwrap();
             assert_eq!(result["capture_mode"], "metadata_only");
             let saved = load().unwrap();
@@ -2598,6 +2650,78 @@ mod tests {
                 (saved[0].repository.as_str(), saved[0].hub.as_str()),
                 ("acme/widgets", "http://127.0.0.1:9")
             );
+        });
+    }
+
+    fn shared_binding(config: &Path, root: &Path) {
+        let mut binding = recipe_binding(vec![]);
+        let spool =
+            LocalSpool::open_with_limits(config.join("spool"), SpoolLimits::default()).unwrap();
+        binding.root = root.to_owned();
+        binding.spool = spool.root().to_owned();
+        binding.spool_identity = Some(spool.identity());
+        binding.repository = "acme/widgets".into();
+        binding.hub = "http://127.0.0.1:9".into();
+        binding.capture_mode = CaptureModeV1::SharedConversation;
+        save(&[binding]).unwrap();
+    }
+
+    fn saved_mode() -> CaptureModeV1 {
+        load().unwrap()[0].capture_mode
+    }
+
+    #[test]
+    fn off_works_without_a_connection_and_a_removed_connection_never_resumes_sharing() {
+        client_config::in_isolated_config_home(|config| {
+            let (root, agentscm) = connected_checkout(config);
+            shared_binding(config, &root);
+            let token = agentscm.join("token");
+            std::fs::write(&token, "agentscm_test_token\n").unwrap();
+            std::fs::set_permissions(&token, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+                .unwrap();
+            let connection = client_config::load().unwrap().remove(0);
+
+            // Replacing the connection with the same repository and Hub keeps the agreement.
+            client_config::update(&root, Some(&connection), Some(connection.clone())).unwrap();
+            assert_eq!(saved_mode(), CaptureModeV1::SharedConversation);
+            // Removing it lowers sharing, so a reconnect to the same repository and Hub does not
+            // resume it.
+            client_config::update(&root, Some(&connection), None).unwrap();
+            assert_eq!(saved_mode(), CaptureModeV1::MetadataOnly);
+            connect(&agentscm, &root, "http://127.0.0.1:9");
+            assert_eq!(saved_mode(), CaptureModeV1::MetadataOnly);
+            let setting = capture_setting(&connection).unwrap();
+            assert_eq!(setting.mode, Some(CaptureModeV1::MetadataOnly));
+
+            // A replacement for another Hub also lowers it.
+            shared_binding(config, &root);
+            let mut elsewhere = connection.clone();
+            elsewhere.hub = "https://hub.example".into();
+            client_config::update(&root, Some(&connection), Some(elsewhere)).unwrap();
+            assert_eq!(saved_mode(), CaptureModeV1::MetadataOnly);
+
+            // Off needs no connection at all, even when the file was removed behind our back.
+            for target in [
+                CaptureModeV1::MetadataOnly,
+                CaptureModeV1::LocalConversation,
+            ] {
+                shared_binding(config, &root);
+                let _ = std::fs::remove_file(agentscm.join("connections.json"));
+                let result = set_capture_mode(&root, target, None).unwrap();
+                assert_eq!(result["capture_mode"], json!(target));
+                assert_eq!(saved_mode(), target);
+            }
+            // Turning sharing back on still needs a current connection.
+            assert!(set_capture_mode(&root, CaptureModeV1::SharedConversation, None).is_err());
+            // Nothing is delivered for a binding whose connection is absent.
+            let spool =
+                LocalSpool::open_with_limits(config.join("spool"), SpoolLimits::default()).unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            assert!(runtime.block_on(deliver_pending(&root, &spool)).is_err());
+            assert!(super::binding_for_root(&root).is_err());
         });
     }
 

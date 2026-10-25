@@ -12,8 +12,9 @@ use serde_json::Value;
 
 /// Normalized (lowercase, no `_`/`-`) name suffixes that mark a field or variable as secret.
 /// Suffix matching keeps counters such as `max_tokens` and `input_tokens` readable.
-const SECRET_WORDS: [&str; 25] = [
+const SECRET_WORDS: [&str; 26] = [
     "password",
+    "passphrase",
     "passwords",
     "passwd",
     "secret",
@@ -39,6 +40,10 @@ const SECRET_WORDS: [&str; 25] = [
     "databaseurl",
     "connectionstring",
 ];
+
+/// Short words that mark a secret only as a separate name part (`DB_PASS`, `dbPwd`, `auth`), so
+/// `bypass`, `compass` and `oauth_state` stay readable.
+const SECRET_NAME_PARTS: [&str; 3] = ["pass", "pwd", "auth"];
 
 const FIELD_REPLACEMENT: &str = "[REDACTED:field]";
 const REDACTED_PREFIX: &str = "[REDACTED:";
@@ -102,7 +107,7 @@ fn redact_text(text: &str) -> Option<(String, usize)> {
         }
         if is_ident(bytes[i]) && (i == 0 || !is_ident(bytes[i - 1])) {
             let name_end = run_end(bytes, i, is_ident);
-            if let Some((from, end, kind)) = token_at(bytes, i) {
+            if let Some((from, end, kind)) = token_at(bytes, i, false) {
                 replace(&mut out, &mut copied, from, end, kind);
                 i = end;
             } else if let Some((from, end, kind)) = context_value(bytes, i, name_end) {
@@ -110,6 +115,9 @@ fn redact_text(text: &str) -> Option<(String, usize)> {
                 i = end;
             } else if let Some((from, end)) = assignment_value(bytes, i, name_end) {
                 replace(&mut out, &mut copied, from, end, "assignment");
+                i = end;
+            } else if let Some((from, end, kind)) = glued_token(bytes, i, name_end) {
+                replace(&mut out, &mut copied, from, end, kind);
                 i = end;
             } else {
                 i = name_end;
@@ -161,8 +169,22 @@ fn is_slack(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'-'
 }
 
+/// A token shape that starts after a `_` or `-` inside the identifier run `[start, name_end)`,
+/// such as `X_ghp_...` or `foo-sk-ant-...`.
+fn glued_token(
+    bytes: &[u8],
+    start: usize,
+    name_end: usize,
+) -> Option<(usize, usize, &'static str)> {
+    (start + 1..name_end)
+        .filter(|at| matches!(bytes[at - 1], b'_' | b'-') && bytes[*at].is_ascii_alphanumeric())
+        .find_map(|at| token_at(bytes, at, true))
+}
+
 /// Matches a known token shape that starts at `i`. Returns the replaced range and its kind.
-fn token_at(bytes: &[u8], i: usize) -> Option<(usize, usize, &'static str)> {
+/// `inner` is set for a start inside an identifier run, where the JWT check (whose first segment
+/// spans the whole run) is skipped to keep the scan linear.
+fn token_at(bytes: &[u8], i: usize, inner: bool) -> Option<(usize, usize, &'static str)> {
     let rest = &bytes[i..];
     let prefixed = |prefix: &[u8], class: fn(u8) -> bool, min: usize| {
         if !rest.starts_with(prefix) {
@@ -226,7 +248,8 @@ fn token_at(bytes: &[u8], i: usize) -> Option<(usize, usize, &'static str)> {
     if let Some(end) = prefixed(b"AIza", is_ident, 35) {
         return Some((i, end, "google_api_key"));
     }
-    if rest.starts_with(b"eyJ")
+    if !inner
+        && rest.starts_with(b"eyJ")
         && let Some(end) = jwt_end(bytes, i)
     {
         return Some((i, end, "jwt"));
@@ -298,7 +321,9 @@ fn assignment_value(bytes: &[u8], start: usize, name_end: usize) -> Option<(usiz
         return None;
     }
     let mut pos = name_end;
-    if matches!(bytes.get(pos), Some(b'"' | b'\'')) {
+    if bytes.get(pos) == Some(&b'\\') && matches!(bytes.get(pos + 1), Some(b'"' | b'\'')) {
+        pos += 2;
+    } else if matches!(bytes.get(pos), Some(b'"' | b'\'')) {
         pos += 1;
     }
     while is_blank(bytes.get(pos)) {
@@ -316,7 +341,28 @@ fn assignment_value(bytes: &[u8], start: usize, name_end: usize) -> Option<(usiz
 }
 
 /// The (optionally quoted) value starting at `pos`, or `None` when empty or already redacted.
+/// A backslash-escaped quote (`\"x\"`, from JSON embedded in a JSON string) delimits the value
+/// like a plain quote does.
 fn value_at(bytes: &[u8], pos: usize) -> Option<(usize, usize)> {
+    if bytes.get(pos) == Some(&b'\\')
+        && let Some(quote) = bytes
+            .get(pos + 1)
+            .copied()
+            .filter(|byte| matches!(byte, b'"' | b'\''))
+    {
+        let value_start = pos + 2;
+        let mut end = value_start;
+        while end < bytes.len() && bytes[end] != b'\n' {
+            match (bytes[end], bytes.get(end + 1)) {
+                (b'\\', Some(next)) if *next == quote => break,
+                (b'\\', Some(_)) => end += 2,
+                _ => end += 1,
+            }
+        }
+        return (end > value_start
+            && !bytes[value_start..end].starts_with(REDACTED_PREFIX.as_bytes()))
+        .then_some((value_start, end));
+    }
     let quote = bytes
         .get(pos)
         .copied()
@@ -431,6 +477,28 @@ fn is_secret_name(name: &[u8]) -> bool {
     SECRET_WORDS
         .iter()
         .any(|word| normalized.ends_with(word.as_bytes()))
+        || SECRET_NAME_PARTS
+            .iter()
+            .any(|word| ends_with_name_part(name, word.as_bytes()))
+}
+
+/// True when `name` ends with `word` as its own part: the whole name, after `_`/`-`, or as a
+/// capitalized camelCase part after a lowercase letter or digit (`dbPass`).
+fn ends_with_name_part(name: &[u8], word: &[u8]) -> bool {
+    let Some(start) = name.len().checked_sub(word.len()) else {
+        return false;
+    };
+    if !name[start..].eq_ignore_ascii_case(word) {
+        return false;
+    }
+    match start.checked_sub(1).map(|prev| name[prev]) {
+        None | Some(b'_' | b'-') => true,
+        Some(prev) => {
+            (prev.is_ascii_lowercase() || prev.is_ascii_digit())
+                && name[start].is_ascii_uppercase()
+                && name[start + 1..].iter().all(u8::is_ascii_lowercase)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -702,6 +770,91 @@ mod tests {
         ] {
             assert_eq!(redact(input), (input.to_owned(), 0), "{input}");
         }
+    }
+
+    #[test]
+    fn redacts_pass_pwd_and_auth_names_only_as_name_parts() {
+        for (input, want) in [
+            ("DB_PASS=abc", "DB_PASS=[REDACTED:assignment]"),
+            ("dbPass: abc", "dbPass: [REDACTED:assignment]"),
+            ("PWD=abc", "PWD=[REDACTED:assignment]"),
+            ("db-pwd=abc", "db-pwd=[REDACTED:assignment]"),
+            ("auth=abc", "auth=[REDACTED:assignment]"),
+            (r#"{"auth":"abc"}"#, r#"{"auth":"[REDACTED:assignment]"}"#),
+            ("GIT_AUTH=abc", "GIT_AUTH=[REDACTED:assignment]"),
+            ("passphrase=abc", "passphrase=[REDACTED:assignment]"),
+            ("--pass abc", "--pass [REDACTED:flag_value]"),
+        ] {
+            assert_eq!(redact(input), (want.to_owned(), 1), "{input}");
+        }
+        for input in [
+            "bypass=abc compass: north oauth_state=abc author=me",
+            "OAuth: yes authority=x passenger=y",
+            "max_tokens=4096 input_tokens: 12 token_count=3 tokenizer=bpe",
+        ] {
+            assert_eq!(redact(input), (input.to_owned(), 0), "{input}");
+        }
+        let mut value = json!({"db_pass": "a", "pwd": 1, "auth": {"k": "v"}, "bypass": "kept"});
+        assert_eq!(redact_json(&mut value), 3);
+        assert_eq!(value["bypass"], "kept");
+    }
+
+    #[test]
+    fn redacts_escaped_quote_values() {
+        for (input, want) in [
+            (
+                r#"{\"password\":\"hunter2\"}"#,
+                r#"{\"password\":\"[REDACTED:assignment]\"}"#,
+            ),
+            (
+                r#"{\"password\": \"a b\", \"x\": 1}"#,
+                r#"{\"password\": \"[REDACTED:assignment]\", \"x\": 1}"#,
+            ),
+            (
+                r#"{\"api_key\":\"a\\nb\"}"#,
+                r#"{\"api_key\":\"[REDACTED:assignment]\"}"#,
+            ),
+        ] {
+            assert_eq!(redact(input), (want.to_owned(), 1), "{input}");
+        }
+        for input in [
+            r#"{\"password\":\"\"}"#,
+            r#"\"password\":\"[REDACTED:assignment]\""#,
+        ] {
+            assert_eq!(redact(input), (input.to_owned(), 0), "{input}");
+        }
+    }
+
+    #[test]
+    fn redacts_tokens_glued_to_identifiers() {
+        for (secret, kind) in [
+            (["gh", "p_"].concat() + &repeat('a', 36), "github_token"),
+            (
+                ["sk", "-ant-api03-"].concat() + &repeat('e', 30),
+                "anthropic_key",
+            ),
+            (
+                ["AK", "IA"].concat() + &repeat('A', 16),
+                "aws_access_key_id",
+            ),
+        ] {
+            for glue in ["X_", "foo-", "key=", "a.b/", "k:"] {
+                assert_eq!(
+                    redact(&format!("{glue}{secret} z")),
+                    (format!("{glue}[REDACTED:{kind}] z"), 1),
+                    "{glue}{kind}"
+                );
+            }
+        }
+        for input in [
+            "task-description-of-something-quite-long-here desk-with-a-long-name-here-ok",
+            "my_ghp_short and foo-sk-short and the-AKIA1234",
+            "a-b-c-d-e-f-g-h-i-j-k-l-m-n-o-p-q-r-s-t-u-v-w-x-y-z",
+        ] {
+            assert_eq!(redact(input), (input.to_owned(), 0), "{input}");
+        }
+        let adversarial = "-eyJ".repeat(5000);
+        assert_eq!(redact(&adversarial).1, 0);
     }
 
     #[test]
