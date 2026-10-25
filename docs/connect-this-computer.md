@@ -31,6 +31,23 @@ There is no token to paste and no address to enter.
   and its own read-only access.
 - Saved conversations appear only for repositories where change capture was already set up.
   Opening the page never starts capture and never uploads conversations.
+- **Settings → Conversation sharing** lists the checkouts on this computer with a switch for
+  sharing agent conversations with the Hub. It is the only thing the page can change on this
+  computer; see below.
+
+## Conversation sharing from the page
+
+Turning a switch on sets capture up for that checkout if it never was (same defaults as the menu
+bar app; see [sharing conversations](change-capture.md#one-step-setup-from-the-menu-bar-and-the-local-page))
+and switches it to `shared-conversation`. The page first shows what that does: conversations are
+redacted on this computer (best effort), uploaded to that checkout's Hub, kept 30 days by default
+and readable by you and Hub admins. Only after you confirm does it send the request, with an
+explicit `confirm_sharing`; the service refuses a request without it and changes nothing. Turning
+it off needs no confirmation, switches the checkout to `metadata-only` and stops future uploads.
+The request is a `POST` to `/v1/local/capture`, which needs the same live browser connection, loopback
+Host and own-origin check as every other route here, sets no cross-origin headers, accepts at most
+1 KiB, and names the checkout by the repository and Hub the page already lists, never by a path.
+A page opened from a Hub elsewhere has no such control and points to the menu bar app and `agentscm open`.
 
 ## How the connection is protected
 

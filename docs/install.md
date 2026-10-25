@@ -95,11 +95,13 @@ Each checkout menu groups its status, opening actions, a **Share agent conversat
 switch, **Agent Integrations**, **Connection Details**, **Recent Activity** and **Troubleshooting**. Connection Details shows the full checkout path and
 connection values.
 
-The **Share agent conversations with Hub** item is off by default and is disabled until the
-checkout has an enabled capture binding (run `agentscm change-capture configure` first). Turning it
-on switches that checkout to `shared-conversation` mode: new conversations are redacted on this
-machine on a best-effort basis and uploaded to the Hub, where only you (the person who shared them) and Hub
-admins can read them. Turning it off sets `metadata-only` (not a previous `local-conversation`); conversations stay on this machine,
+The **Share agent conversations with Hub** item is off by default. Turning it on for a connected
+checkout sets capture up first if it never was (one step, documented defaults; see
+[change capture](change-capture.md#one-step-setup-from-the-menu-bar-and-the-local-page)) and
+switches that checkout to `shared-conversation` mode: new conversations are redacted on this
+machine on a best-effort basis and uploaded to the Hub, kept 30 days by default, where only you (the person who shared them) and Hub
+admins can read them. The status window says this when you turn it on. The same switch is under
+**Settings → Conversation sharing** on the Hub page opened from this computer. Turning it off sets `metadata-only` (not a previous `local-conversation`); conversations stay on this machine,
 and copies already uploaded remain until they expire or you delete them. Nothing local is deleted.
 It is the same change as `agentscm change-capture set-mode`; see
 [sharing conversations](change-capture.md#sharing-conversations-with-the-hub).
