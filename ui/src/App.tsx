@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useState, useSyncExternalStore } from 'react'
-import { ComputerBar } from './ComputerBar.tsx'
+import { ComputerNotices } from './ComputerBar.tsx'
 import { derive } from './derive.ts'
 import { isLocalCredential, onFrontDoor } from './frontDoor.ts'
 import { fetchOverview } from './standup.ts'
@@ -114,6 +114,7 @@ function Shell({ token, dark, pref, onPref, density, onDensity, onUnauthorized, 
     <TourProvider section={section} data={data} d={d} overview={overview.kind === 'ready' ? overview.value : null}>
       <AppChrome
         logo={<Logo dark={dark} height={26} />}
+        token={token}
         repo={repo}
         sections={SECTIONS}
         section={section}
@@ -127,7 +128,7 @@ function Shell({ token, dark, pref, onPref, density, onDensity, onUnauthorized, 
         collapsed={rail}
         onCollapsed={changeRail}
       >
-        {isLocalCredential(token) && section !== 'settings' && <ComputerBar token={token} />}
+        {isLocalCredential(token) && <ComputerNotices token={token} />}
         {data.health?.demo && (
           <Notice tone="brand" icon="play-circle" title="Demo hub">
             Simulated agents working on your repository’s file names. Nothing is written to your repository; this page stops when <code>agentscm demo</code> does. To set it up for real, stop the demo and run <code>agentscm quickstart</code> (or <code>npx agentscm</code>).
