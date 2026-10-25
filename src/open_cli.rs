@@ -274,12 +274,14 @@ async fn mint_code(client: &reqwest::Client, record: &ServiceRecord) -> Result<S
     }
 }
 
+#[cfg(target_os = "macos")]
 /// The local page as started by a long-lived owner such as the tray: started in the background
 /// when this computer has any connected checkout, and stopped again only if this owner started it.
 pub(crate) struct LocalPage {
     started: std::sync::Arc<std::sync::Mutex<Option<u32>>>,
 }
 
+#[cfg(target_os = "macos")]
 impl LocalPage {
     pub(crate) fn start_in_background() -> Self {
         let started = std::sync::Arc::new(std::sync::Mutex::new(None));
