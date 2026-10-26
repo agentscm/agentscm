@@ -13,6 +13,7 @@ pub mod candidate;
 pub mod change_capture;
 pub mod change_record;
 pub mod checks;
+pub mod civil;
 pub mod context;
 pub mod error;
 pub mod evidence;

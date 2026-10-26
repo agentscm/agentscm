@@ -406,17 +406,7 @@ fn now() -> i64 {
 }
 
 fn utc_day(timestamp: i64) -> String {
-    // Howard Hinnant's civil_from_days algorithm, with Unix epoch as day zero.
-    let z = timestamp.div_euclid(86_400) + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let mut year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = mp + if mp < 10 { 3 } else { -9 };
-    year += i64::from(month <= 2);
+    let (year, month, day, ..) = agentscm::civil::utc_civil(timestamp);
     format!("{year:04}-{month:02}-{day:02}")
 }
 
@@ -1171,7 +1161,7 @@ mod tests {
     }
 
     #[test]
-    fn utc_dates_cover_epoch_and_leap_days() {
+    fn utc_days_are_zero_padded_dates() {
         assert_eq!(utc_day(0), "1970-01-01");
         assert_eq!(utc_day(1_709_164_800), "2024-02-29");
     }
