@@ -1,7 +1,17 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { decodeDevice, decodeRefusal, deviceAuth, fetchDevices, revokeDevice, type DeviceAuth } from '../../src/devices.ts'
-import { AdminPage, ComputersPage } from '../../src/pages/Computers.tsx'
+import { AdminPage, ComputersPage, useDeviceAuth } from '../../src/pages/Computers.tsx'
+
+// As the Shell wires them: one auth read shared by both pages.
+function Computers({ token }: { token: string }) {
+  const { auth, reload } = useDeviceAuth(token)
+  return <ComputersPage auth={auth} provider="github" onSignedOut={reload} />
+}
+function Admin({ token }: { token: string }) {
+  const { auth } = useDeviceAuth(token)
+  return <AdminPage auth={auth} provider="github" />
+}
 
 const ID = `dev_${'a'.repeat(32)}`
 const DEVICE = { id: ID, name: 'jonny-mbp', created_at: 1_790_000_000, last_used_at: 1_790_100_000, revoked_at: null, current: false, repositories: ['counterbranch/agentscm', 'not a repo'] }
@@ -75,22 +85,45 @@ describe('ComputersPage', () => {
         return { status: 204 }
       },
     })
-    render(<ComputersPage token="read-only-token" />)
+    render(<Computers token="read-only-token" />)
     fireEvent.click(await screen.findByRole('button', { name: 'Revoke' }))
     fireEvent.click(screen.getByRole('button', { name: 'Revoke jonny-mbp' }))
     expect(await screen.findByText(/jonny-mbp was revoked/)).toBeTruthy()
     await waitFor(() => expect(screen.getByText('No computers are signed in')).toBeTruthy())
   })
 
-  it('explains the way in when the page can’t see computers', async () => {
-    stubFetch({ 'GET /v1/hub/session': () => ({ status: 404 }) })
-    render(<ComputersPage token="read-only-token" />)
-    expect(await screen.findByText(/Your computers show up here once this page knows who you are/)).toBeTruthy()
+  it('offers a forge sign-in when this browser has no Hub session', async () => {
+    stubFetch({ 'GET /v1/hub/session': () => ({ status: 401, body: { error: 'sign_in_required' } }) })
+    render(<Computers token="read-only-token" />)
+    expect((await screen.findByRole('link', { name: /Sign in with GitHub/ })).getAttribute('href')).toBe('/v1/hub/login/github')
+  })
+
+  it('signs the browser out with CSRF, then offers sign-in again', async () => {
+    let signedIn = true
+    const calls = stubFetch({
+      'GET /v1/hub/session': () => (signedIn ? { status: 200, body: SESSION } : { status: 401 }),
+      'GET /v1/hub/devices': () => ({ status: 200, body: { devices: [DEVICE] } }),
+      'DELETE /v1/hub/session': () => {
+        signedIn = false
+        return { status: 204 }
+      },
+    })
+    render(<Computers token="read-only-token" />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Sign out of this browser' }))
+    expect(await screen.findByRole('link', { name: /Sign in with GitHub/ })).toBeTruthy()
+    const del = calls.find((c) => c.init.method === 'DELETE')!
+    expect((del.init.headers as Record<string, string>)['x-csrf-token']).toBe(SESSION.csrf_token)
+  })
+
+  it('names the Hub the local page read from', async () => {
+    stubFetch({ 'GET /v1/hub/devices': () => ({ status: 200, body: { hub: 'https://dogfood.agentscm.dev', devices: [DEVICE] } }) })
+    render(<Computers token="local:abc:o/r" />)
+    expect((await screen.findByText(/can start agents as you on/)).textContent).toContain('dogfood.agentscm.dev')
   })
 
   it('does not offer to revoke the computer the page runs on', async () => {
     stubFetch({ 'GET /v1/hub/devices': () => ({ status: 200, body: { devices: [{ ...DEVICE, current: true }] } }) })
-    render(<ComputersPage token="local:abc:o/r" />)
+    render(<Computers token="local:abc:o/r" />)
     expect(await screen.findByText('This computer')).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Revoke' })).toBeNull()
   })
@@ -101,12 +134,12 @@ describe('AdminPage', () => {
     stubFetch({
       'GET /v1/hub/session': () => ({ status: 200, body: SESSION }),
       'GET /v1/hub/admin/repositories': () => ({ status: 200, body: { repositories: [{ full_name: 'counterbranch/agentscm', provider: 'github', host: 'github.com', connection: 'con_1', devices: 2, agent_tokens: 3 }] } }),
-      'GET /v1/hub/admin/sign-in-refusals': () => ({ status: 200, body: { refusals: [{ at: 1_790_000_000, count: 3, provider: 'github', login: 'brandonfla', forge_user_id: 1, reason: 'no_repository_role', via: 'device_mint' }] } }),
+      'GET /v1/hub/admin/sign-in-refusals': () => ({ status: 200, body: { refusals: [{ at: 1_790_000_000, count: 3, provider: 'github', login: 'brandonfla', forge_user_id: 1, reason: 'insufficient_role', via: 'device_mint' }] } }),
       'GET /v1/hub/admin/devices': () => ({ status: 200, body: { devices: [{ ...DEVICE, owner: { id: 'usr_2', login: 'maria', provider: 'github' } }] } }),
     })
-    render(<AdminPage token="read-only-token" />)
+    render(<Admin token="read-only-token" />)
     expect(await screen.findByText('brandonfla')).toBeTruthy()
-    expect(screen.getByText(/ask a repository owner to add you/)).toBeTruthy()
+    expect(screen.getByText(/role on the repositories connected to this Hub is too low/)).toBeTruthy()
     expect(screen.getByText('3×')).toBeTruthy()
     expect(screen.getByText('counterbranch/agentscm', { selector: 'td code' })).toBeTruthy()
     expect(screen.getByText('maria')).toBeTruthy()
@@ -114,7 +147,7 @@ describe('AdminPage', () => {
 
   it('stays closed to people who aren’t Hub admins', async () => {
     const calls = stubFetch({ 'GET /v1/hub/session': () => ({ status: 200, body: { ...SESSION, admin: false } }) })
-    render(<AdminPage token="read-only-token" />)
+    render(<Admin token="read-only-token" />)
     expect(await screen.findByText('Only Hub admins see this page')).toBeTruthy()
     expect(calls.some((c) => c.url.includes('/admin/'))).toBe(false)
   })

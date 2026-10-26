@@ -5,6 +5,7 @@
 // Admin routes take only the browser session; a computer credential is never accepted there.
 // A read-only repository token can read none of this.
 import { ApiError } from './api.ts'
+import { safeHubOrigin } from './connectAgent.ts'
 import { isLocalCredential } from './frontDoor.ts'
 import { clean } from './publications.ts'
 import { refusalFrom } from './refusal.ts'
@@ -126,8 +127,21 @@ const list = <T>(raw: unknown, key: string, decode: (v: unknown) => T | null, ma
     .map(decode)
     .filter((v): v is T => v !== null)
 
-export async function fetchDevices(auth: DeviceAuth, signal?: AbortSignal): Promise<Device[]> {
-  return list(await (await request('/v1/hub/devices', auth, signal)).json(), 'devices', decodeDevice, 100)
+/** Your computers, and on the local page the Hub they were read from (one Hub per call). */
+export async function fetchDevices(auth: DeviceAuth, signal?: AbortSignal): Promise<{ devices: Device[]; hub: string | null }> {
+  const raw: unknown = await (await request('/v1/hub/devices', auth, signal)).json()
+  const hub = rec(raw)['hub']
+  return { devices: list(raw, 'devices', decodeDevice, 100), hub: typeof hub === 'string' ? safeHubOrigin(hub) : null }
+}
+
+/** Signs this browser out of the Hub; its computers stay signed in. */
+export async function signOutBrowser(session: BrowserSession): Promise<void> {
+  try {
+    await request('/v1/hub/session', { kind: 'browser', session }, undefined, 'DELETE')
+  } catch (e) {
+    // Already signed out is the outcome we wanted.
+    if (!(e instanceof ApiError && e.status === 401)) throw e
+  }
 }
 
 /** `revoked`, or `gone` when the Hub no longer knows it (already removed, or not yours). */

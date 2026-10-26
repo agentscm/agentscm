@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useState } from 'react'
 import { ApiError } from '../api.ts'
-import { deviceAuth, fetchAdmin, fetchDevices, revokeDevice, type AdminRepository, type Device, type DeviceAuth, type SignInRefusal } from '../devices.ts'
+import { deviceAuth, fetchAdmin, fetchDevices, revokeDevice, signOutBrowser, type AdminRepository, type Device, type DeviceAuth, type SignInRefusal } from '../devices.ts'
 import { reasonSentence } from '../refusal.ts'
 import { RefusalNotice } from '../Refusal.tsx'
 import { SectionTabs } from '../TopNav.tsx'
 import { Ago, Box, Empty, Icon, Notice, Pill, Skeleton } from '../ui.tsx'
 
-type Load<T> = { kind: 'loading' } | { kind: 'ready'; value: T } | { kind: 'error'; error: unknown }
+export type Load<T> = { kind: 'loading' } | { kind: 'ready'; value: T } | { kind: 'error'; error: unknown }
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`
 
 function Failure({ error, what }: { error: unknown; what: string }) {
@@ -16,8 +16,10 @@ function Failure({ error, what }: { error: unknown; what: string }) {
   return <Notice tone="bad" icon="wifi-off" title={`Could not load ${what}`}>The Hub didn’t answer. This page tries again when you reload it.</Notice>
 }
 
-function useAuth(token: string) {
+/** How this page reaches the computer and admin routes. Read once per signed-in page; `reload` after signing out. */
+export function useDeviceAuth(token: string) {
   const [auth, setAuth] = useState<Load<DeviceAuth | null>>({ kind: 'loading' })
+  const [tick, setTick] = useState(0)
   useEffect(() => {
     const ctl = new AbortController()
     deviceAuth(token, ctl.signal).then(
@@ -25,16 +27,21 @@ function useAuth(token: string) {
       (error) => !ctl.signal.aborted && setAuth({ kind: 'error', error }),
     )
     return () => ctl.abort()
-  }, [token])
-  return auth
+  }, [token, tick])
+  return { auth, reload: useCallback(() => setTick((t) => t + 1), []) }
 }
 
-/** When there is no way to reach the computer routes from here. */
-function NoAccess() {
+const FORGE = { github: 'GitHub', gitlab: 'GitLab' } as const
+
+/** Signed out in this browser: one way in, through the forge. */
+function SignInHere({ provider, what }: { provider: 'github' | 'gitlab'; what: string }) {
   return (
-    <Notice tone="muted" icon="laptop" title="Your computers show up here once this page knows who you are">
-      Open the Hub from the AgentSCM menu bar app (Open Hub), or sign in to this Hub in your browser. A read-only repository token can’t see or remove computers.
-    </Notice>
+    <div className="computer-signin">
+      <p>Sign in to this Hub in your browser to see {what}. A read-only repository token can’t.</p>
+      <a className="btn btn-primary" href={`/v1/hub/login/${provider}`}>
+        <Icon name={provider} /> Sign in with {FORGE[provider]}
+      </a>
+    </div>
   )
 }
 
@@ -74,7 +81,13 @@ function RevokeButton({ device, auth, onDone }: { device: Device; auth: DeviceAu
       </button>
       {error !== null && (
         <span className="computer-error" role="alert">
-          {error instanceof ApiError && error.refusal ? error.refusal.message : error instanceof ApiError && error.status === 400 ? 'This computer can’t remove itself here; use Sign Out in its menu bar app.' : 'The Hub didn’t confirm the revoke. Nothing changed; try again.'}
+          {error instanceof ApiError && error.refusal
+            ? error.refusal.message
+            : error instanceof ApiError && error.status === 400
+              ? 'This computer can’t remove itself here; use Sign Out in its menu bar app.'
+              : error instanceof ApiError && error.status === 403
+                ? 'Your browser sign-in needs a refresh; reload the page and try again.'
+                : 'The Hub didn’t confirm the revoke. Nothing changed; try again.'}
         </span>
       )}
     </div>
@@ -148,9 +161,10 @@ function ComputerList({ devices, auth, showOwner = false, onChange }: { devices:
   )
 }
 
-export function ComputersPage({ token }: { token: string }) {
-  const auth = useAuth(token)
-  const [devices, setDevices] = useState<Load<Device[]>>({ kind: 'loading' })
+export function ComputersPage({ auth, provider, onSignedOut }: { auth: Load<DeviceAuth | null>; provider: 'github' | 'gitlab'; onSignedOut: () => void }) {
+  const [devices, setDevices] = useState<Load<{ devices: Device[]; hub: string | null }>>({ kind: 'loading' })
+  const [signingOut, setSigningOut] = useState(false)
+  const [signOutError, setSignOutError] = useState(false)
   const [tick, setTick] = useState(0)
   const reload = useCallback(() => setTick((t) => t + 1), [])
   const ready = auth.kind === 'ready' ? auth.value : null
@@ -163,25 +177,57 @@ export function ComputersPage({ token }: { token: string }) {
     )
     return () => ctl.abort()
   }, [ready, tick])
-  const active = devices.kind === 'ready' ? devices.value.filter((d) => !d.revokedAt).length : null
+  const active = devices.kind === 'ready' ? devices.value.devices.filter((d) => !d.revokedAt).length : null
+  // The local page reads one Hub at a time (the current repository's); say which.
+  const hub = devices.kind === 'ready' && devices.value.hub ? new URL(devices.value.hub).host : 'this Hub'
+  const session = ready?.kind === 'browser' ? ready.session : null
   return (
     <div className="page">
       <div className="answer">
         <h1 className="page-question">Which computers can act for me?</h1>
-        <p className="answer-text">{active === null ? 'Your computers signed in to this Hub.' : active === 0 ? 'No computer is signed in as you.' : <><b>{plural(active, 'computer')}</b> can start agents as you on this Hub.</>}</p>
+        <p className="answer-text">{active === null ? `Your computers signed in to ${hub}.` : active === 0 ? `No computer is signed in as you on ${hub}.` : <><b>{plural(active, 'computer')}</b> can start agents as you on {hub}.</>}</p>
       </div>
       <SectionTabs />
-      <Box icon="laptop" title="Your computers" count={active ?? undefined} explain="Each computer signs in once and renews its own agent tokens. Revoking one stops its agents at once.">
+      <Box
+        icon="laptop"
+        title="Your computers"
+        count={active ?? undefined}
+        explain="Each computer signs in once and renews its own agent tokens. Revoking one stops its agents at once."
+        actions={
+          session && (
+            <button
+              type="button"
+              className="btn btn-sm btn-outline-secondary"
+              disabled={signingOut}
+              onClick={async () => {
+                setSigningOut(true)
+                setSignOutError(false)
+                try {
+                  await signOutBrowser(session)
+                  onSignedOut()
+                } catch {
+                  setSignOutError(true)
+                } finally {
+                  setSigningOut(false)
+                }
+              }}
+            >
+              Sign out of this browser
+            </button>
+          )
+        }
+      >
+        {signOutError && <Notice tone="bad" icon="box-arrow-right" title="This browser is still signed in">The Hub didn’t confirm the sign-out. Reload the page and try again.</Notice>}
         {auth.kind === 'loading' || (ready && devices.kind === 'loading') ? (
           <Skeleton rows={2} />
         ) : auth.kind === 'error' ? (
           <Failure error={auth.error} what="your computers" />
         ) : !ready ? (
-          <NoAccess />
+          <SignInHere provider={provider} what="your computers" />
         ) : devices.kind === 'error' ? (
           <Failure error={devices.error} what="your computers" />
         ) : devices.kind === 'ready' ? (
-          <ComputerList devices={devices.value} auth={ready} onChange={reload} />
+          <ComputerList devices={devices.value.devices} auth={ready} onChange={reload} />
         ) : null}
       </Box>
     </div>
@@ -238,8 +284,7 @@ function Repositories({ rows }: { rows: AdminRepository[] }) {
   )
 }
 
-export function AdminPage({ token }: { token: string }) {
-  const auth = useAuth(token)
+export function AdminPage({ auth, provider }: { auth: Load<DeviceAuth | null>; provider: 'github' | 'gitlab' }) {
   const [data, setData] = useState<Load<Awaited<ReturnType<typeof fetchAdmin>>>>({ kind: 'loading' })
   const [tick, setTick] = useState(0)
   const browser = auth.kind === 'ready' && auth.value?.kind === 'browser' && auth.value.session.admin ? auth.value : null
@@ -263,16 +308,22 @@ export function AdminPage({ token }: { token: string }) {
               <b>{plural(v.repositories.length, 'repository', 'repositories')}</b> connected · {v.refusals.length === 0 ? 'nobody turned away' : <b className="tone-warn">{plural(v.refusals.reduce((n, r) => n + r.count, 0), 'refusal')}</b>} in the last 30 days.
             </>
           ) : (
-            'Connected repositories, refused sign-ins and every signed-in computer.'
+            'Connected repositories, refusals and every signed-in computer.'
           )}
         </p>
       </div>
       <SectionTabs />
       {auth.kind === 'loading' || (browser && data.kind === 'loading') ? (
         <Skeleton rows={4} />
+      ) : auth.kind === 'error' ? (
+        <Failure error={auth.error} what="the admin lists" />
+      ) : auth.kind === 'ready' && !auth.value ? (
+        <Box icon="shield-lock" title="Hub admins only">
+          <SignInHere provider={provider} what="who was turned away and which repositories are connected" />
+        </Box>
       ) : !browser ? (
         <Notice tone="muted" icon="shield-lock" title="Only Hub admins see this page">
-          Sign in to this Hub in your browser as a Hub admin. A computer’s own sign-in and read-only repository tokens never open it.
+          {auth.kind === 'ready' && auth.value?.kind === 'local' ? 'Open the Hub’s own page and sign in there as a Hub admin. This computer’s sign-in never opens it.' : 'Your account isn’t a Hub admin on this Hub.'}
         </Notice>
       ) : data.kind === 'error' ? (
         <Failure error={data.error} what="the admin lists" />

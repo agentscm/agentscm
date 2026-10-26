@@ -10,7 +10,7 @@ import logoDark from './logo-dark.png'
 import logoLight from './logo-light.png'
 import { DashboardPage, dashboardStatus } from './pages/Dashboard.tsx'
 import { HealthPage } from './pages/Health.tsx'
-import { AdminPage, ComputersPage } from './pages/Computers.tsx'
+import { AdminPage, ComputersPage, useDeviceAuth } from './pages/Computers.tsx'
 import { SetupPage } from './pages/Setup.tsx'
 import { SignIn } from './pages/SignIn.tsx'
 import { isSignedInHash, SignedInPage } from './pages/SignedIn.tsx'
@@ -138,6 +138,11 @@ function Shell({ token, pref, onPref, density, onDensity, onUnauthorized, onForg
   const d = useMemo(() => (data.work && data.activity ? derive(data.work, data.activity) : null), [data.work, data.activity])
   const overview = usePoll((signal) => fetchOverview(token, signal), 15_000, token)
   const repo = data.whoami?.token.repository ?? 'this repository'
+  const device = useDeviceAuth(token)
+  const provider = data.whoami?.owner.provider === 'gitlab' ? 'gitlab' : 'github'
+  // The Admin tab is only for a browser signed in as a Hub admin; someone who opens #admin anyway keeps the tabs and is told why.
+  const showAdmin = section === 'admin' || (device.auth.kind === 'ready' && device.auth.value?.kind === 'browser' && device.auth.value.session.admin)
+  const sections = useMemo(() => (showAdmin ? SECTIONS : SECTIONS.filter((s) => s.key !== 'admin')), [showAdmin])
   const ov = overview.kind === 'ready' ? overview.value : null
   // Measured against the last successful poll, not the 1-second clock, so the whole shell re-renders only when data arrives.
   const dash = dashboardStatus(ov, d, data.activity?.events ?? null, data.lastOk, useHidden())
@@ -178,7 +183,7 @@ function Shell({ token, pref, onPref, density, onDensity, onUnauthorized, onForg
         token={token}
         repo={repo}
         nav={NAV}
-        sections={SECTIONS}
+        sections={sections}
         section={section}
         badges={badges}
         statuses={statuses}
@@ -213,8 +218,8 @@ function Shell({ token, pref, onPref, density, onDensity, onUnauthorized, onForg
         {section === 'setup' && <SetupPage token={token} />}
         {section === 'workspace' && <WorkspacePage />}
         {section === 'health' && <HealthPage health={data.health} />}
-        {section === 'computers' && <ComputersPage token={token} />}
-        {section === 'admin' && <AdminPage token={token} />}
+        {section === 'computers' && <ComputersPage auth={device.auth} provider={provider} onSignedOut={device.reload} />}
+        {section === 'admin' && <AdminPage auth={device.auth} provider={provider} />}
         {section === 'settings' && <SettingsPage token={token} whoami={data.whoami} pref={pref} onPref={onPref} density={density} onDensity={onDensity} railCollapsed={rail} onRail={changeRail} onForget={onForget} />}
       </AppChrome>
     </TourProvider>

@@ -35,7 +35,7 @@ type Fields = { repo: string | null; provider: unknown }
 const KNOWN: Record<string, (f: Fields) => string> = {
   not_connected: () => 'This repository isn’t connected to this Hub yet; ask a Hub admin to connect it.',
   forbidden: () => 'Your forge account can’t see that repository, or it was renamed or moved; check the name and your access.',
-  no_repository_role: () => 'Your account has no role on a repository connected to this Hub; ask a repository owner to add you, then sign in again.',
+  insufficient_role: () => 'Your account’s role on the repositories connected to this Hub is too low; ask a repository owner to raise it, then sign in again.',
   not_allowed: () => 'This Hub only lets in people its admins have allowed; ask a Hub admin to add you.',
   user_disabled: () => 'Your account is turned off on this Hub; ask a Hub admin to turn it back on.',
   login_failed: () => 'Sign-in didn’t finish; choose Sign In in the AgentSCM menu bar app to try again.',

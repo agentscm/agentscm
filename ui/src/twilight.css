@@ -2313,6 +2313,20 @@ textarea.form-control {
 }
 
 /* ---------- your computers and the admin lists ---------- */
+.computer-signin {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 20px;
+}
+.computer-signin p {
+  margin: 0;
+  max-width: 52ch;
+  font-size: 14.5px;
+  line-height: 1.5;
+  color: var(--hub-text-2);
+}
 .computer {
   display: grid;
   grid-template-columns: 22px minmax(0, 1fr) auto;

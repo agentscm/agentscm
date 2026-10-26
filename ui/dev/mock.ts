@@ -51,6 +51,8 @@ function work() {
 let catchupAcked = false
 // Computer sign-in fixtures. Revoke only changes this dev server's memory.
 const revokedDevices = new Map<string, number>()
+// The synthetic browser session: GET /v1/hub/login/github signs in, DELETE /v1/hub/session signs out.
+let browserSignedIn = true
 function devices() {
   const mk = (n: string, name: string, owner: { login: string }, created: number, used: number | null, repositories: string[]) => ({ id: `dev_${n.repeat(32).slice(0, 32)}`, name, created_at: ago(created), last_used_at: used === null ? null : ago(used), revoked_at: revokedDevices.get(`dev_${n.repeat(32).slice(0, 32)}`) ?? null, current: false, repositories, owner: { id: `usr_${owner.login}`, login: owner.login, provider: 'github' } })
   return [
@@ -430,6 +432,7 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
       server.middlewares.use('/__mock', (req, res) => {
         if (req.url?.startsWith('/reset')) {
           revokedDevices.clear()
+          browserSignedIn = true
           return res.end('computers reset\n')
         }
         down = req.url?.startsWith('/down') ?? false
@@ -471,7 +474,19 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
           return send(404, { error: 'synthetic_workspace_route_not_found' })
         }
         // Synthetic browser session (an HttpOnly cookie in production) and the computer routes.
-        if (url.pathname === '/session') return scenario === 'empty' ? send(401, { error: 'sign_in_required' }) : send(200, { user: { id: 'usr_maria', login: 'maria', provider: 'github' }, admin: true, csrf_token: 'synthetic-csrf-no-authority', expires_at: ago(-86400) })
+        if (url.pathname.startsWith('/login/') && req.method === 'GET' && !url.searchParams.has('workspace') && !url.searchParams.has('cli_port')) {
+          browserSignedIn = true
+          res.statusCode = 302
+          res.setHeader('location', '/#home')
+          return res.end()
+        }
+        if (url.pathname === '/session' && req.method === 'DELETE') {
+          if (req.headers['x-csrf-token'] !== 'synthetic-csrf-no-authority') return send(403, { error: 'csrf', message: 'Reload the page and try again.' })
+          browserSignedIn = false
+          res.statusCode = 204
+          return res.end()
+        }
+        if (url.pathname === '/session') return scenario === 'empty' || !browserSignedIn ? send(401, { error: 'sign_in_required' }) : send(200, { user: { id: 'usr_maria', login: 'maria', provider: 'github', host: 'github.com', user_id: 1001 }, admin: true, csrf_token: 'synthetic-csrf-no-authority', expires_at: ago(-86400 / 3) })
         if (url.pathname === '/devices') return send(200, { devices: scenario === 'empty' ? [] : devices().filter((d) => d.owner.login === maria.login).map((d) => ({ ...d, owner: undefined })) })
         if (url.pathname.startsWith('/devices/') && req.method === 'DELETE') {
           const id = url.pathname.slice('/devices/'.length)
@@ -484,7 +499,7 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
         if (url.pathname === '/admin/devices') return send(200, { devices: scenario === 'empty' ? [] : devices() })
         if (url.pathname === '/admin/repositories') return send(200, { repositories: scenario === 'empty' ? [] : [{ full_name: REPO, provider: 'github', host: 'github.com', connection: 'con_synthetic', devices: 3, agent_tokens: 5 }, { full_name: 'acme/billing-docs', provider: 'github', host: 'github.com', connection: 'con_synthetic2', devices: 1, agent_tokens: 1 }] })
         if (url.pathname === '/admin/sign-in-refusals') return send(200, { refusals: scenario === 'empty' ? [] : [
-          { at: ago(900), count: 3, provider: 'github', login: 'brandonfla', forge_user_id: 3001, reason: 'no_repository_role', via: 'device_mint' },
+          { at: ago(900), count: 3, provider: 'github', login: 'brandonfla', forge_user_id: 3001, reason: 'insufficient_role', via: 'device_mint' },
           { at: ago(86400 * 2), count: 1, provider: 'github', login: 'drive-by', forge_user_id: 3002, reason: 'not_allowed', via: 'sign_in' },
         ] })
         const token = /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1]
