@@ -1,8 +1,11 @@
 # Design: sign in once per computer
 
-> **Status: design.** This page describes a change under review. Until [the roadmap](../roadmap.md)
-> lists it, none of it is implemented. Today's behavior is in [hub](../hub.md) and
-> [connect this computer](../connect-this-computer.md).
+> **Status: experimental.** Built as described below except where marked not built; see
+> [the roadmap](../roadmap.md) for what is qualified. User-facing behavior is in
+> [hub](../hub.md#computer-credentials) and
+> [connect this computer](../connect-this-computer.md#sign-in-once-per-computer).
+> Not built: the `--no-auto-connect` flag, the fork hint, the Gemini note, and asking at the
+> next interactive command (a terminal sign-in and the menu bar app ask).
 
 ## Problem
 
@@ -140,8 +143,7 @@ Manual `hub token create` keeps its 30-day maximum; only the device path is shor
   No without a prompt. The help says that the checkout's origin (forge host and owner/name) is sent
   to every Hub with auto-connect on. It can be changed later
   (`agentscm hub auto-connect on|off [--hub URL]`).
-- Only at session start (Claude Code `SessionStart`, and the first hook call of a session for agents
-  without one), never on every tool call. When an agent starts in a Git checkout with no client
+- Only at session start (each supported agent's session start hook), never on every tool call. When an agent starts in a Git checkout with no client
   connection, the hook re-derives the origin from the checkout (`origin_identity`), and for each
   saved Hub with `auto_connect` (at most 4, the default Hub first) asks `POST /v1/hub/device/tokens`
   with `auto: true`. `not_connected` moves on to the next Hub; any other refusal stops.
