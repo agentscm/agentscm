@@ -1956,9 +1956,16 @@ async fn cli_falls_back_to_the_loopback_flow_when_device_flow_is_unavailable() {
     assert_eq!(status, 302);
     let loopback = headers[header::LOCATION].to_str().unwrap();
     assert!(loopback.starts_with("http://127.0.0.1:"));
+    // The CLI trades the code first, then sends the browser to the Hub's signed-in page.
     let response = env.http.get(loopback).send().await.unwrap();
-    assert_eq!(response.status(), 200);
-    assert!(response.text().await.unwrap().contains("Signed in"));
+    assert_eq!(response.status(), 302);
+    let page = response.headers()[header::LOCATION].to_str().unwrap();
+    assert!(
+        page.starts_with(&format!(
+            "{hub}/ui/#/signed-in?status=signed_in&login=bob&provider=gitlab&computer="
+        )),
+        "{page}"
+    );
     let mut rest = String::new();
     std::io::Read::read_to_string(&mut stderr, &mut rest).unwrap();
     assert!(child.wait().unwrap().success(), "{rest}");
@@ -1977,4 +1984,28 @@ async fn cli_falls_back_to_the_loopback_flow_when_device_flow_is_unavailable() {
         })
         .count();
     assert_eq!(leftovers, 0);
+
+    // The sign-in also signed this computer in; without a terminal nobody was asked about
+    // auto-connect.
+    let saved: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let device = &saved["sessions"][0]["device"];
+    assert!(
+        device["id"].as_str().unwrap().starts_with("dev_"),
+        "{saved}"
+    );
+    assert!(
+        saved["sessions"][0].get("auto_connect").is_none(),
+        "{saved}"
+    );
+    let (ok, stdout, stderr) = cli.run(&["devices", "list"]);
+    assert!(ok && stdout.contains("(this computer)"), "{stdout}{stderr}");
+    assert!(!stdout.contains(device["secret"].as_str().unwrap()));
+    let (ok, _, stderr) = cli.run(&["auto-connect", "on"]);
+    assert!(ok && stderr.contains("Auto-connect is on"), "{stderr}");
+    let saved: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(saved["sessions"][0]["auto_connect"], json!(true));
+    // Signing out signs the computer out on the Hub too.
+    let (ok, _, stderr) = cli.run(&["logout"]);
+    assert!(ok, "{stderr}");
+    assert!(env.kinds().contains(&"device_revoked".to_owned()));
 }

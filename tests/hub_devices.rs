@@ -289,6 +289,19 @@ impl Env {
         url
     }
 
+    /// Connects another repository on the Hub and gives `user` read on it.
+    fn connect_repo(&self, name: &str, id: i64, user: i64) {
+        let host = self.base.trim_start_matches("http://");
+        let connection = self.store.pat_connection(host).unwrap().unwrap().id;
+        self.store
+            .upsert_repository(&connection, host, id, name, None, None)
+            .unwrap();
+        self.set_repo(name, id, "private");
+        let mut fake = self.fake.lock().unwrap();
+        fake.roles.insert((name.into(), user), ("read", "read"));
+        fake.levels.insert((id, user), 20);
+    }
+
     fn set_repo(&self, name: &str, id: i64, visibility: &'static str) {
         self.fake
             .lock()
@@ -671,9 +684,12 @@ async fn signing_in_again_replaces_only_the_presented_computer() {
         .await;
     assert_eq!(status, 200, "{signed}");
     assert_eq!(env.get("/v1/hub/device", new).await.0, 200);
-    // A sign-in without a device request returns no credential.
+    // A sign-in without a device request returns no credential; one without a name gets a
+    // default that is no host name.
     let (_, signed) = env.sign_in_at(&env.hub, ALICE, None).await;
     assert!(signed.get("device").is_none(), "{signed}");
+    let (_, signed) = env.sign_in_at(&env.hub, ALICE, Some(json!({}))).await;
+    assert_eq!(signed["device"]["name"], "alice's computer");
 }
 
 #[tokio::test]
@@ -800,4 +816,252 @@ async fn a_refused_sign_in_is_recorded_once_per_person_and_reason() {
             .iter()
             .all(|u| u.login != "bob")
     );
+}
+
+// ---- the client: sign in once, agents connect and renew ----
+
+/// One computer: its own config and home directories and a checkout of `repo` whose origin is
+/// on the fake forge's host.
+struct Machine {
+    config: TempDir,
+    home: TempDir,
+    checkout: TempDir,
+}
+
+impl Machine {
+    fn new(repo: &str) -> Self {
+        let checkout = TempDir::new().unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                &format!("http://127.0.0.1/{repo}.git"),
+            ],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(checkout.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        Self {
+            config: TempDir::new().unwrap(),
+            home: TempDir::new().unwrap(),
+            checkout,
+        }
+    }
+
+    fn root(&self) -> std::path::PathBuf {
+        self.checkout.path().canonicalize().unwrap()
+    }
+
+    fn command(&self, args: &[&str]) -> std::process::Command {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_agentscm"));
+        command
+            .args(args)
+            .env("XDG_CONFIG_HOME", self.config.path())
+            .env("HOME", self.home.path())
+            .env("NO_PROXY", "127.0.0.1")
+            .env_remove("AGENTSCM_HUB_URL")
+            .env_remove("AGENTSCM_HUB_TOKEN")
+            .stdin(std::process::Stdio::null());
+        command
+    }
+
+    fn run(&self, args: &[&str]) -> (bool, String, String) {
+        let output = self.command(args).output().unwrap();
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    /// One SessionStart hook in the checkout; returns the hook's JSON reply.
+    fn session_start(&self, session: &str) -> Value {
+        use std::io::Write;
+        let mut child = self
+            .command(&["--no-telemetry", "hook", "claude", "--client-connection"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let payload = json!({"hook_event_name": "SessionStart", "session_id": session,
+            "cwd": self.root(), "source": "startup"});
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+
+    fn file(&self, name: &str) -> Value {
+        let path = self.config.path().join("agentscm").join(name);
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn connection(&self) -> Value {
+        self.file("connections.json")["connections"][0].clone()
+    }
+
+    /// Makes the saved token look about to expire, so the next renewal is due.
+    fn age_token(&self) {
+        let path = self.config.path().join("agentscm/connections.json");
+        let mut saved: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        saved["connections"][0]["owned_token_expires_at"] = json!(unix_now() + 60);
+        std::fs::write(path, saved.to_string()).unwrap();
+    }
+
+    fn token(&self) -> String {
+        let path = self.connection()["token_file"].as_str().unwrap().to_owned();
+        std::fs::read_to_string(path).unwrap().trim().to_owned()
+    }
+
+    fn renew(&self) -> Value {
+        let root = self.root();
+        let (ok, stdout, stderr) = self.run(&[
+            "--no-telemetry",
+            "client",
+            "renew",
+            "--root",
+            root.to_str().unwrap(),
+        ]);
+        assert!(ok, "{stderr}");
+        serde_json::from_str(stdout.lines().last().unwrap()).unwrap()
+    }
+}
+
+fn context(reply: &Value) -> String {
+    reply["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
+    let env = Env::start("github").await;
+    env.fake.lock().unwrap().approve = ALICE;
+    let machine = Machine::new(REPO);
+    let hub = env.hub.clone();
+    let (ok, _, stderr) = machine.run(&["hub", "login", "--hub", &hub, "--provider", "github"]);
+    assert!(ok, "{stderr}");
+    // Before auto-connect is on, an agent in the checkout is only told how to connect.
+    let reply = machine.session_start("s0");
+    assert!(context(&reply).contains("no client connection"), "{reply}");
+    let (ok, _, stderr) = machine.run(&["hub", "auto-connect", "on"]);
+    assert!(ok, "{stderr}");
+
+    // The next session connects the checkout and says so in one line, writing no file in it.
+    let reply = machine.session_start("s1");
+    assert!(
+        context(&reply).starts_with(&format!("AgentSCM: coordinating on {REPO}.")),
+        "{reply}"
+    );
+    let connection = machine.connection();
+    assert_eq!(connection["repo"], REPO);
+    let entries: Vec<_> = std::fs::read_dir(machine.root())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(entries, [std::ffi::OsString::from(".git")]);
+    let exclude = machine.root().join(".git/info/exclude");
+    assert!(
+        !std::fs::read_to_string(exclude)
+            .unwrap_or_default()
+            .contains("agentscm")
+    );
+    assert!(env.kinds().contains(&"auto_connected".to_owned()));
+    let first = machine.token();
+    assert_eq!(env.whoami(&first).await, 200);
+
+    // Renewal swaps the token before it ends and revokes the old one.
+    assert_eq!(machine.renew()["result"], "not_due");
+    machine.age_token();
+    assert_eq!(machine.renew()["result"], "renewed");
+    let second = machine.token();
+    assert_ne!(first, second);
+    assert_eq!(env.whoami(&first).await, 401);
+    assert_eq!(env.whoami(&second).await, 200);
+
+    // Losing the role refuses the next renewal; the agent is told why and what to do.
+    env.drop_role(ALICE);
+    machine.age_token();
+    let refused = machine.renew();
+    assert_eq!(refused["result"], "refused", "{refused}");
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap()
+            .contains("isn't enough")
+    );
+    let reply = machine.session_start("s2");
+    assert!(
+        context(&reply).starts_with("AgentSCM: your forge role"),
+        "{reply}"
+    );
+
+    // Revoking the computer signs it out: renewal says so, and nothing re-enrolls it.
+    env.role(ALICE, "write", "write", 30);
+    let device = machine.file("hub-sessions.json")["sessions"][0]["device"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        env.store
+            .revoke_device(&device, None, "usr_admin", unix_now())
+            .unwrap()
+    );
+    let refused = machine.renew();
+    assert_eq!(refused["result"], "refused", "{refused}");
+    assert!(refused["message"].as_str().unwrap().contains("signed out"));
+    assert!(
+        machine.file("hub-sessions.json")["sessions"][0]
+            .get("device")
+            .is_none()
+    );
+    assert_eq!(machine.renew()["result"], "refused");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_connect_is_refused_without_the_role_and_skips_unconnected_repositories() {
+    let env = Env::start("github").await;
+    env.fake.lock().unwrap().approve = BOB;
+    env.set_repo(REPO, REPO_ID, "public");
+    // bob can sign in through another repository he reads.
+    env.connect_repo("acme/docs", 4343, BOB);
+    let machine = Machine::new(REPO);
+    let hub = env.hub.clone();
+    let (ok, _, stderr) = machine.run(&["hub", "login", "--hub", &hub, "--provider", "github"]);
+    assert!(ok, "{stderr}");
+    machine.run(&["hub", "auto-connect", "on"]);
+    // bob only reads a public repository: refused, with the reason, and nothing saved.
+    let reply = machine.session_start("s1");
+    assert!(context(&reply).contains("isn't enough"), "{reply}");
+    assert!(
+        !machine
+            .config
+            .path()
+            .join("agentscm/connections.json")
+            .exists()
+    );
+
+    // A repository the Hub does not have is not reported as a refusal.
+    let other = Machine::new("acme/elsewhere");
+    let config = machine.config.path().to_owned();
+    let mut command = other.command(&["--no-telemetry", "client", "auto-connect", "--root"]);
+    let output = command
+        .arg(other.root())
+        .env("XDG_CONFIG_HOME", &config)
+        .output()
+        .unwrap();
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["result"], "not_connected", "{result}");
 }

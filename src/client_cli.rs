@@ -16,13 +16,16 @@ use crate::client_config::{
     Connection, RetiredFile, canonical_root, is_current, load, origin_identity, owned_token_path,
     remove_unreferenced_owned_file, update,
 };
-use crate::hub_cli::{Provider, call, has_session, load_session, map_hub_error, sign_in};
+use crate::hub_cli::{HubAuth, Provider, call, has_session, load_session, map_hub_error, sign_in};
+
+mod computer;
 use crate::intent_cli::valid_repo;
 use crate::prompt::Ui;
+pub(crate) use computer::{attention, auto_connect_command, due, renew_command};
 
 const TOKEN_BYTES: u64 = 16 * 1024;
-/// Hub maximum. Nothing renews agent tokens, so a shorter life stops every agent each day
-/// until someone signs in again; the token stays per repository and revocable.
+/// Hub maximum, for a token minted with a session (no computer credential, or an older Hub).
+/// Nothing renews those; a computer's tokens last 24 hours and are renewed before they end.
 const AGENT_TOKEN_TTL: i64 = agentscm::hub::store::MAX_AGENT_TOKEN_TTL_SECONDS;
 const REPLY_BYTES: usize = 64 * 1024;
 
@@ -54,6 +57,12 @@ pub(crate) enum ClientCommand {
         #[command(subcommand)]
         command: ReportingCommand,
     },
+    /// Renew this checkout's agent token with this computer's credential when it is due.
+    #[command(hide = true)]
+    Renew(RootArgs),
+    /// Connect this checkout through a Hub with auto-connect on; prints one JSON result.
+    #[command(hide = true)]
+    AutoConnect(RootArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -89,6 +98,9 @@ pub(crate) struct ConnectArgs {
     /// Refuse instead of starting a browser or device sign-in (quickstart with `--yes` or no terminal).
     #[arg(skip)]
     pub(crate) no_sign_in: bool,
+    /// Auto-connect from a hook: only this computer's credential, no sign-in, nothing printed.
+    #[arg(skip)]
+    pub(crate) auto: bool,
 }
 
 #[cfg(unix)]
@@ -181,6 +193,10 @@ pub(crate) async fn run(command: ClientCommand) -> Result<()> {
         ClientCommand::Doctor(args) => doctor(args).await,
         ClientCommand::Mcp(args) => crate::client_mcp::run(args.root.as_deref()).await,
         ClientCommand::Reporting { command } => reporting(command),
+        ClientCommand::Renew(args) => renew_command(&selected_root(args.root.as_deref())?).await,
+        ClientCommand::AutoConnect(args) => {
+            auto_connect_command(&selected_root(args.root.as_deref())?).await
+        }
     }
 }
 
@@ -805,7 +821,8 @@ async fn hub_identity_matches(
 struct Minted {
     id: String,
     token: String,
-    session: String,
+    /// What minted it, which can also revoke it.
+    auth: HubAuth,
 }
 
 /// How `connect` reports, and at a terminal waits out, a repository the hub's GitHub App is not
@@ -851,10 +868,21 @@ async fn refresh_connections(hub: &str, session: &str) {
 
 async fn mint_agent_token(
     connection: &Connection,
-    provider: Provider,
+    provider: Option<Provider>,
     wait: Option<&AppWait<'_>>,
     no_sign_in: bool,
+    auto: bool,
 ) -> Result<Minted> {
+    // This computer's credential needs no session and survives Hub restarts.
+    if let Some(minted) = computer::mint(connection, provider, auto).await? {
+        return Ok(minted);
+    }
+    if auto {
+        return Err(invalid(computer::NO_CREDENTIAL));
+    }
+    let provider = provider.ok_or_else(|| {
+        invalid("cannot infer the forge sign-in provider for this origin; pass --provider github or --provider gitlab")
+    })?;
     let mut session = session_for(
         &connection.hub,
         provider,
@@ -911,28 +939,31 @@ async fn mint_agent_token(
             }),
         )),
         (401, _) => Err(invalid("Hub sign-in expired or was rejected")),
-        (201, _) => {
-            let id = reply["id"]
-                .as_str()
-                .filter(|id| {
-                    id.starts_with("tok_")
-                        && id
-                            .bytes()
-                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-                })
-                .ok_or_else(|| invalid("Hub returned an invalid token id"))?;
-            let token = reply["token"]
-                .as_str()
-                .filter(|token| !token.is_empty() && token.len() <= TOKEN_BYTES as usize)
-                .ok_or_else(|| invalid("Hub returned an invalid agent token"))?;
-            Ok(Minted {
-                id: id.to_owned(),
-                token: token.to_owned(),
-                session,
-            })
-        }
+        (201, _) => minted_from(&reply, HubAuth::Session(session)),
         _ => Err(invalid("Hub could not create an agent token")),
     }
+}
+
+/// The token in a 201 mint reply.
+fn minted_from(reply: &Value, auth: HubAuth) -> Result<Minted> {
+    let id = reply["id"]
+        .as_str()
+        .filter(|id| {
+            id.starts_with("tok_")
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
+        .ok_or_else(|| invalid("Hub returned an invalid token id"))?;
+    let token = reply["token"]
+        .as_str()
+        .filter(|token| !token.is_empty() && token.len() <= TOKEN_BYTES as usize)
+        .ok_or_else(|| invalid("Hub returned an invalid agent token"))?;
+    Ok(Minted {
+        id: id.to_owned(),
+        token: token.to_owned(),
+        auth,
+    })
 }
 
 async fn revoke_minted(connection: &Connection, minted: &Minted) {
@@ -942,8 +973,8 @@ async fn revoke_minted(connection: &Connection, minted: &Minted) {
     let _ = call(
         &client,
         Method::DELETE,
-        &format!("{}/v1/hub/tokens/{}", connection.hub, minted.id),
-        Some(&minted.session),
+        &minted.auth.revoke_url(&connection.hub, &minted.id),
+        Some(minted.auth.secret()),
         None,
     )
     .await;
@@ -1160,6 +1191,7 @@ async fn connect_inner(
     wait: Option<&AppWait<'_>>,
     setup: Option<SetupInstallation<'_>>,
 ) -> Result<()> {
+    let quiet = args.auto;
     let initial_lifecycle = lifecycle_lock()?;
     let invocation_program = invocation_program_fence()?;
     if let Some(setup) = setup.as_ref() {
@@ -1235,15 +1267,17 @@ async fn connect_inner(
             if let Some(setup) = setup.as_ref() {
                 install_setup(setup, &root)?;
             }
-            println!(
-                "Connection is already valid for {} at {} as {}:{}@{}; token expires at {} and permits coordination.",
-                saved.repo,
-                saved.hub,
-                verified.provider,
-                verified.login,
-                verified.host,
-                verified.expires_at
-            );
+            if !quiet {
+                println!(
+                    "Connection is already valid for {} at {} as {}:{}@{}; token expires at {} and permits coordination.",
+                    saved.repo,
+                    saved.hub,
+                    verified.provider,
+                    verified.login,
+                    verified.host,
+                    verified.expires_at
+                );
+            }
             return Ok(());
         }
         // A supplied token file is independent of the managed-token path hash, so its saved
@@ -1255,15 +1289,17 @@ async fn connect_inner(
             if let Some(setup) = setup.as_ref() {
                 install_setup(setup, &root)?;
             }
-            println!(
-                "Connection is already valid for {} at {} as {}:{}@{}; token expires at {} and permits coordination.",
-                corrected.repo,
-                corrected.hub,
-                verified.provider,
-                verified.login,
-                verified.host,
-                verified.expires_at
-            );
+            if !quiet {
+                println!(
+                    "Connection is already valid for {} at {} as {}:{}@{}; token expires at {} and permits coordination.",
+                    corrected.repo,
+                    corrected.hub,
+                    verified.provider,
+                    verified.login,
+                    verified.host,
+                    verified.expires_at
+                );
+            }
             return Ok(());
         }
         drop(final_lifecycle);
@@ -1305,10 +1341,10 @@ async fn connect_inner(
                 "--provider does not match the checkout origin host",
             ));
         }
-        let provider = args.provider.or(inferred).ok_or_else(|| {
-            invalid("cannot infer the forge sign-in provider for this origin; pass --provider github or --provider gitlab")
-        })?;
-        let minted = mint_agent_token(&connection, provider, wait, args.no_sign_in).await?;
+        // Without one, a computer credential's owner decides; a session sign-in needs it.
+        let provider = args.provider.or(inferred);
+        let minted =
+            mint_agent_token(&connection, provider, wait, args.no_sign_in, args.auto).await?;
         let verified = match verify_token(&connection, &minted.token).await {
             Ok(verified) => verified,
             Err(error) => {
@@ -1401,6 +1437,9 @@ async fn connect_inner(
         retire_owned(saved).await;
     }
     install_result?;
+    if quiet {
+        return Ok(());
+    }
     println!(
         "Connected {} to {} for {} as {}:{}@{}; token expires at {} and permits coordination.",
         connection.root.display(),

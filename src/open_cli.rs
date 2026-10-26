@@ -90,7 +90,7 @@ pub(crate) async fn open_checkout(path: &Path) -> Result<Opened> {
                 .into(),
         ));
     }
-    if !crate::hub_cli::has_session(Some(&connection.hub))? {
+    if !crate::hub_cli::is_signed_in(Some(&connection.hub))? {
         return Err(Error::Invalid(format!(
             "this computer is not signed in to {hub}; run `agentscm hub login --hub {hub}` first",
             hub = connection.hub

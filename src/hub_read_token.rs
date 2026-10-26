@@ -1,12 +1,14 @@
-//! Mint short-lived, read-only Hub tokens from this computer's saved human session, and revoke
-//! them: for the tray's fallback browser link and for the local front door's Hub proxy.
+//! Mint short-lived, read-only Hub tokens with this computer's Hub credential (or its saved
+//! human session, before it has one), and revoke them: for the tray's fallback browser link and
+//! for the local front door's Hub proxy.
 
 use std::fmt;
 
 use reqwest::Method;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::client_status::HubCheck;
+use crate::hub_cli::HubAuth;
 
 pub(crate) const TOKEN_TTL_SECONDS: i64 = 30 * 60;
 const EXPIRY_SLOP_SECONDS: i64 = 60;
@@ -56,8 +58,8 @@ impl fmt::Display for OpenError {
 
 impl std::error::Error for OpenError {}
 
-pub(crate) fn load_exact_session(expected_hub: &str) -> Result<(String, String), OpenError> {
-    match crate::hub_cli::load_session(Some(expected_hub)) {
+pub(crate) fn load_exact_session(expected_hub: &str) -> Result<(String, HubAuth), OpenError> {
+    match crate::hub_cli::load_auth(Some(expected_hub)) {
         Ok((hub, session)) if hub == expected_hub => Ok((hub, session)),
         Ok(_) => Err(OpenError::InvalidConnection),
         Err(agentscm::Error::Invalid(message))
@@ -111,7 +113,7 @@ pub(crate) struct TokenRequest<'a> {
 pub(crate) async fn mint_and_confirm(
     client: &reqwest::Client,
     hub: &str,
-    human_session: &str,
+    human_session: &HubAuth,
     request: &TokenRequest<'_>,
     now: i64,
 ) -> Result<MintedToken, OpenError> {
@@ -121,23 +123,23 @@ pub(crate) async fn mint_and_confirm(
         provider,
         name,
     } = *request;
-    let body = json!({
-        "name": name,
-        "repository": repository,
-        "ttl_seconds": TOKEN_TTL_SECONDS,
-        "read_only": true,
-    });
+    let (url, body) = human_session.mint(hub, name, repository, TOKEN_TTL_SECONDS, true);
     let (status, reply) = crate::hub_cli::call(
         client,
         Method::POST,
-        &format!("{hub}/v1/hub/tokens"),
-        Some(human_session),
+        &url,
+        Some(human_session.secret()),
         Some(body),
     )
     .await
     .map_err(|_| OpenError::Unavailable)?;
     match status {
-        401 => return Err(OpenError::RejectedSignIn),
+        401 => {
+            if let HubAuth::Device(secret) = human_session {
+                let _ = crate::hub_cli::forget_device_if(hub, secret);
+            }
+            return Err(OpenError::RejectedSignIn);
+        }
         403 if reply["error"] == "not_connected" => {
             return Err(OpenError::RepositoryNotConnected);
         }
@@ -279,7 +281,7 @@ pub(crate) async fn revoke_token(
     hub: &str,
     token_secret: Option<&str>,
     token_id: Option<&str>,
-    human_session: &str,
+    human_session: &HubAuth,
 ) {
     if let Some(token) = token_secret.filter(|token| valid_token_secret(token)) {
         let target = format!("{hub}/v1/hub/token");
@@ -295,8 +297,8 @@ pub(crate) async fn revoke_token(
     let _ = crate::hub_cli::call(
         client,
         Method::DELETE,
-        &format!("{hub}/v1/hub/tokens/{token_id}"),
-        Some(human_session),
+        &human_session.revoke_url(hub, token_id),
+        Some(human_session.secret()),
         None,
     )
     .await;
@@ -313,6 +315,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use serde_json::json;
 
     const ID: &str = "tok_0123456789abcdef0123456789abcdef";
     const SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -414,7 +417,7 @@ mod tests {
         mint_and_confirm(
             client,
             hub,
-            "human-session",
+            &HubAuth::Session("human-session".into()),
             &TokenRequest {
                 repository: "acme/widgets",
                 origin_host: "github.com",
@@ -538,7 +541,7 @@ mod tests {
             &hub,
             Some(SECRET),
             Some(ID),
-            "rejected-human-session",
+            &HubAuth::Session("rejected-human-session".into()),
         )
         .await;
         let requests = receive_requests(&requests, 1);

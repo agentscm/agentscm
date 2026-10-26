@@ -115,7 +115,9 @@ impl FromRequestParts<HubState> for Owner {
 #[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct DeviceRequest {
-    pub(super) name: String,
+    /// Default: "<login>'s computer".
+    #[serde(default)]
+    pub(super) name: Option<String>,
     /// The secret of this computer's previous credential; only that computer is replaced.
     #[serde(default)]
     pub(super) replaces: Option<String>,
@@ -127,24 +129,32 @@ pub(super) async fn issue(
     user: &User,
     request: DeviceRequest,
 ) -> ApiResult<Value> {
-    validate_device_name(&request.name).map_err(|_| ApiError::invalid())?;
+    let name = match request.name {
+        Some(name) => name,
+        None => format!("{}'s computer", user.login)
+            .chars()
+            .take(64)
+            .collect(),
+    };
+    validate_device_name(&name).map_err(|_| ApiError::invalid())?;
     let secret = random_hex()?;
     let digest = device_digest(&secret)?;
-    let (store, owner, name) = (state.store.clone(), user.id.clone(), request.name.clone());
+    let (store, owner, stored) = (state.store.clone(), user.id.clone(), name.clone());
+    let replaces = request.replaces;
     let id = blocking(state, move || {
         let now = unix_now();
         // A credential that is not this person's live computer replaces nothing.
-        let replaces = match request.replaces.as_deref().map(device_digest) {
+        let replaces = match replaces.as_deref().map(device_digest) {
             Some(Ok(old)) => store
                 .authenticate_device(&old, now)?
                 .filter(|device| device.owner.id == owner)
                 .map(|device| device.device_id),
             _ => None,
         };
-        store.insert_device(&owner, &name, &digest, replaces.as_deref(), now)
+        store.insert_device(&owner, &stored, &digest, replaces.as_deref(), now)
     })
     .await?;
-    Ok(json!({"id": id, "secret": secret, "name": request.name}))
+    Ok(json!({"id": id, "secret": secret, "name": name}))
 }
 
 /// Records a refusal for administrators. Best effort: a refusal is never turned into success.

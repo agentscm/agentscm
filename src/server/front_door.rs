@@ -110,7 +110,7 @@ struct CachedToken {
     id: String,
     secret: String,
     expires_at: i64,
-    human_session: String,
+    human_session: crate::hub_cli::HubAuth,
 }
 
 /// A cached explorer is reused only while the checkout, its connection and its capture binding
@@ -806,7 +806,7 @@ async fn identity(State(front_door): State<Arc<FrontDoor>>, headers: HeaderMap) 
         Some(selected) => {
             let url = selected.hub.clone();
             let signed_in =
-                tokio::task::spawn_blocking(move || crate::hub_cli::has_session(Some(&url)))
+                tokio::task::spawn_blocking(move || crate::hub_cli::is_signed_in(Some(&url)))
                     .await
                     .ok()
                     .and_then(Result::ok)
