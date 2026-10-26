@@ -3,7 +3,7 @@ import { agentSetupPrompt, CLIENT_AGENTS, clientSetupCommand, installCommand, sa
 import { CopyButton, Icon, Notice } from '../ui.tsx'
 
 /** Set up this computer: one command, then agents connect on their own. Copies text; never runs anything. */
-export function InstallCommand({ lead = 'Set up a computer once and every agent you start there connects by itself.' }: { lead?: string }) {
+export function InstallCommand({ lead = 'Run this in a checkout of a repository on this Hub to connect its agents.' }: { lead?: string }) {
   const command = installCommand(window.location.origin)
   if (!command) return null
   return (
@@ -14,7 +14,7 @@ export function InstallCommand({ lead = 'Set up a computer once and every agent 
         <code>{command}</code>
         <CopyButton text={command} />
       </div>
-      <p className="install-after">It installs AgentSCM, adds it to the menu bar and opens your browser once to sign in. macOS and Linux.</p>
+      <p className="install-after">It asks before it changes anything, then signs you in with a one-time code from GitHub or GitLab. macOS and Linux.</p>
     </div>
   )
 }

@@ -74,7 +74,7 @@ export function SignIn({ notice, onSignedIn }: { notice: string | null; onSigned
               <h2 id="install-title" className="box-title">Set up this computer</h2>
             </header>
             <div className="box-body">
-              <InstallCommand lead="Run this once. After that, every agent you start on this computer connects to this Hub by itself." />
+              <InstallCommand lead="Run this in a checkout of a repository on this Hub. It connects your agents there and signs you in." />
             </div>
           </section>
         )}

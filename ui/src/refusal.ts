@@ -34,7 +34,7 @@ type Fields = { repo: string | null; provider: unknown }
 /** The shared sentence for each code that arrives without the Hub's own message. */
 const KNOWN: Record<string, (f: Fields) => string> = {
   not_connected: () => 'This repository isn’t connected to this Hub yet; ask a Hub admin to connect it.',
-  forbidden: () => 'This Hub won’t open that repository; it may have been renamed or moved, so check the name.',
+  forbidden: () => 'Your forge account can’t see that repository, or it was renamed or moved; check the name and your access.',
   no_repository_role: () => 'Your account has no role on a repository connected to this Hub; ask a repository owner to add you, then sign in again.',
   not_allowed: () => 'This Hub only lets in people its admins have allowed; ask a Hub admin to add you.',
   user_disabled: () => 'Your account is turned off on this Hub; ask a Hub admin to turn it back on.',
