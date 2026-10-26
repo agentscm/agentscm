@@ -1,7 +1,8 @@
 import type { Refusal } from './refusal.ts'
 import { CopyButton, Notice } from './ui.tsx'
 
-const COMMAND = /^(npx )?agentscm [a-z]/
+// Copyable only when the whole fix is one plain agentscm command: no quotes, pipes, chaining or substitution.
+export const COMMAND = /^(npx )?agentscm [a-z][a-z0-9 ._:/=-]*$/
 
 /** A Hub refusal: the Hub's sentence as the title, then the one fix (copyable when it is a command). */
 export function RefusalNotice({ refusal }: { refusal: Refusal }) {

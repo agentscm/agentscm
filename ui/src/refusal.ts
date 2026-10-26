@@ -57,6 +57,5 @@ export function refusalFrom(body: unknown): Refusal | null {
   const visibility = line(fields['visibility'], 20)
   if (login && NAME.test(login) && repo && REPO.test(repo) && have && needs)
     return { code, message: roleSentence({ login, role: have, visibility: visibility && /^[a-z]+$/.test(visibility) ? visibility : null, repo, needs }), fix }
-  const known = KNOWN[code]
-  return known ? { code, message: known, fix } : null
+  return Object.hasOwn(KNOWN, code) ? { code, message: KNOWN[code]!, fix } : null
 }

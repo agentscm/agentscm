@@ -1,6 +1,9 @@
 // Where the browser lands after "sign in once per computer". It only reads its own fragment:
-// `#signed-in?login=…&computer=…[&hub=…]`, or `#signed-in?error=<code>[&message=…&fix=…]` when the
-// Hub said no. Nothing here is a secret, and nothing is stored or sent.
+// `#signed-in?login=…&computer=…`, or `#signed-in?error=<code>[&login&repo&role&needs&visibility]`
+// when the Hub said no. Nothing here is a secret, and nothing is stored or sent.
+// Anyone can craft this link, so it never shows free text or a command from it: the Hub is always
+// this page's own origin, a refusal is composed from validated fields, and its fix is a fixed local
+// sentence. A forged "signed in" state is possible but only changes what this tab displays.
 import { useState } from 'react'
 import { Logo } from '../App.tsx'
 import { safeHubOrigin } from '../connectAgent.ts'
@@ -23,13 +26,16 @@ const printable = (v: string | null, max: number): string | null => {
 
 export const isSignedInHash = (hash = window.location.hash) => hashPath(hash) === '#signed-in'
 
+const AFTER_REFUSAL = 'When that’s sorted, choose Sign In in the AgentSCM menu bar app.'
+
 export function signedInFromHash(hash = window.location.hash, origin = window.location.origin): SignedInState {
   const q = hashQuery(hash)
-  const hub = safeHubOrigin(q.get('hub') ?? origin) ?? safeHubOrigin(origin) ?? origin
+  const hub = safeHubOrigin(origin) ?? origin
   const error = q.get('error')
   if (error !== null) {
-    const refusal = refusalFrom({ error, message: q.get('message'), fix: q.get('fix'), login: q.get('login'), repo: q.get('repo'), role: q.get('role'), needs: q.get('needs'), visibility: q.get('visibility') })
-    return refusal ? { kind: 'refused', hub, refusal } : { kind: 'invalid', hub }
+    // Never `message` or `fix` from the link: only the code and fields the sentence is built from.
+    const refusal = refusalFrom({ error, login: q.get('login'), repo: q.get('repo'), role: q.get('role'), needs: q.get('needs'), visibility: q.get('visibility') })
+    return refusal ? { kind: 'refused', hub, refusal: { ...refusal, fix: AFTER_REFUSAL } } : { kind: 'invalid', hub }
   }
   const login = q.get('login')
   if (!login || !LOGIN.test(login)) return { kind: 'invalid', hub }
