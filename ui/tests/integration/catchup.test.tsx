@@ -2,7 +2,7 @@ import { StrictMode } from 'react'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CatchupPanel } from '../../src/Catchup.tsx'
-import { WorkPage } from '../../src/pages/Work.tsx'
+import { DashboardPage } from '../../src/pages/Dashboard.tsx'
 import type { WorkOverview } from '../../src/standup.ts'
 
 const delivery = (digit = 'a') => `cup_${digit.repeat(32)}`
@@ -73,8 +73,9 @@ describe('Since you last checked', () => {
       history_retention_gap: false,
     }
     vi.spyOn(globalThis, 'fetch').mockImplementation(() => new Promise(() => {}))
-    window.location.hash = '#work'
-    render(<WorkPage token="read-only" overview={{
+    window.location.hash = '#activity'
+    const data = { whoami: null, work: null, activity: null, health: null, fresh: new Set<string>(), lastOk: null, failing: false }
+    render(<DashboardPage section="activity" question="What happened since I last looked?" token="read-only" repo="acme/widgets" data={data} d={null} overview={{
       kind: 'ready',
       value: overview,
       fetchedAt: 1_000_000,
@@ -82,9 +83,8 @@ describe('Since you last checked', () => {
       retry: vi.fn(),
     }} />)
 
-    expect(screen.getByText('Could not refresh')).toBeTruthy()
+    expect(screen.getByText('Showing the last overview that loaded')).toBeTruthy()
     expect(screen.getByText('Since you last checked')).toBeTruthy()
-    expect(screen.getByText('No unfinished work is assigned right now.')).toBeTruthy()
     expect(screen.getByText(/connection refused/)).toBeTruthy()
   })
 

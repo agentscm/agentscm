@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { SectionTabs } from '../TopNav.tsx'
 import { fetchPublication, headline, listPublications, listTrack, loadRecent, rememberRecent, track, validPublicationId, type ExternalRun, type ExternalState, type Outcome, type Publication, type Step } from '../publications.ts'
 import { Ago, Box, Empty, Explain, Icon, Notice, Pill, Skeleton, Tip, relative, type Tone } from '../ui.tsx'
 import { Combobox, type ComboResult } from '../Combobox.tsx'
@@ -319,6 +320,7 @@ function List({ repo, token }: { repo: string; token: string }) {
                 : <>{landed.length} of {ready.publications.length} recent change{ready.publications.length === 1 ? '' : 's'} landed{failing.length ? <>, and <span className="text-danger-emphasis">{failing.length} had a failure after landing</span></> : null}.</>}
         </p>
       </div>
+      <SectionTabs />
       <Lookup repo={repo} token={token} recent={recent} onOpen={(id) => { window.location.hash = landedHref(id).slice(1) }} />
       <Box tour="landed-list" icon="rocket-takeoff" tone={failing.length ? 'bad' : 'brand'} title="Recent changes" count={ready ? ready.publications.length : undefined} explain="Changes agents published to this repository through the hub, newest first. Each row shows how far it got.">
         {load.kind === 'loading' ? (

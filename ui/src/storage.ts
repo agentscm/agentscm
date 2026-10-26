@@ -86,12 +86,13 @@ export function saveTheme(t: ThemePref): void {
   }
 }
 
-export type Density = 'spacious' | 'compact'
+export type Density = 'spacious' | 'condensed'
 
 export function loadDensity(): Density {
   try {
     const v = window.localStorage.getItem(DENSITY_KEY)
-    if (v === 'spacious' || v === 'compact') return v
+    if (v === 'spacious' || v === 'condensed') return v
+    if (v === 'compact') return 'condensed' // the earlier name
   } catch {
     /* ignore */
   }

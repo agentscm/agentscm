@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { SectionTabs } from '../TopNav.tsx'
 import { decodeSkillWorkflowEnvelope, validSkillWorkflowStepId } from '../skillWorkflow.ts'
 import {
   identityKey,
@@ -879,6 +880,7 @@ export function WorkspacePage() {
         <h1 className="page-question">Who can run what?</h1>
         <p className="answer-text">{s ? <>You’re signed in to <strong>{s.workspace.name}</strong> as {s.actor.user.login}.</> : 'The workspace holds shared repositories, members and workflow execution.'}</p>
       </div>
+      <SectionTabs />
       {s?.synthetic_fixture && <Notice tone="brand" icon="flask" title="Synthetic workspace fixture">These records are examples, not live coding sessions.</Notice>}
       {signOutError && <Notice title={signOutError} />}
       {session.kind === 'loading' && <Skeleton rows={4} />}

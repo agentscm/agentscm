@@ -1,4 +1,5 @@
 import { ComputerSettings } from '../ComputerBar.tsx'
+import { SectionTabs } from '../TopNav.tsx'
 import { CaptureSharingBox, CaptureSharingElsewhere } from '../CaptureSharing.tsx'
 import { isLocalCredential, onFrontDoor } from '../frontDoor.ts'
 import { useState } from 'react'
@@ -53,15 +54,17 @@ export function SettingsPage({ token, whoami, pref, onPref, density, onDensity, 
   ]
   const densities: { v: Density; icon: string; label: string; hint: string }[] = [
     { v: 'spacious', icon: 'arrows-expand', label: 'Spacious', hint: 'More room between rows and sections.' },
-    { v: 'compact', icon: 'arrows-collapse', label: 'Compact', hint: 'Fits more on screen.' },
+    { v: 'condensed', icon: 'arrows-collapse', label: 'Condensed', hint: 'Same layout, tighter measurements: fits more on screen.' },
   ]
   const [singleKeys, setSingleKeys] = useState(loadSingleKeys)
   return (
     <div className="page">
       <div className="answer" data-tour="answer">
         <h1 className="page-question">How is this page set up for me?</h1>
-        <p className="answer-text">Appearance and token settings live in this browser only and never change the hub. Inline agent views are a hub setting shared by everyone.</p>
+        <p className="answer-text">How the Hub looks for you, kept in this browser.</p>
+        <p className="answer-fact">Nothing here changes the hub, except inline agent views, which are shared by everyone.</p>
       </div>
+      <SectionTabs />
       <div className="stack">
         <Box icon="palette" title="Appearance" explain="Saved in this browser. Other people see their own choice.">
           <div className="settings-row">

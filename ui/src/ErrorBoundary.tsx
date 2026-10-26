@@ -24,16 +24,16 @@ export class ErrorBoundary extends Component<{ children: ReactNode }, { error: E
           <code>{this.state.error.message}</code>
         </p>
         <a
-          href="#now"
+          href="#home"
           className="btn btn-primary"
           onClick={(e) => {
             e.preventDefault()
             // Reset the address first: the hash that caused the error would otherwise reproduce it.
-            window.location.hash = 'now'
+            window.location.hash = 'home'
             this.setState({ error: null })
           }}
         >
-          Go to Right now
+          Go to the dashboard
         </a>
       </div>
     )

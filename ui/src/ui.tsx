@@ -43,8 +43,8 @@ export function Box({ id, tour, icon, title, explain, count, tone = 'brand', act
           {title}
         </h2>
         {count !== undefined && <span className="box-count">{count}</span>}
-        {explain && <Explain text={explain} />}
         {actions && <div className="box-actions">{actions}</div>}
+        {explain && <p className="box-explain">{explain}</p>}
       </header>
       <div className={flush ? 'box-body flush' : 'box-body'}>{children}</div>
     </section>

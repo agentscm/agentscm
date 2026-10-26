@@ -24,9 +24,9 @@ describe('skills routes', () => {
     ['#skills/runs/a/b', 'runs'],
     ['#skills/other', 'library'],
   ])('%s → %s', (hash, kind) => expect(skillsRoute(hash).kind).toBe(kind))
-  it('belongs to the Verify group and has crumbs', () => {
+  it('belongs to the Skills nav item and has crumbs', () => {
     const s = SECTIONS.find((x) => x.key === 'skills')!
-    expect(s.group).toBe('Verify')
+    expect(s.nav).toBe('skills')
     expect(sectionFromHash('#skills/runs/run_41')).toBe('skills')
     expect(crumbsFor('#skills/runs/run_41', s, null).map((c) => c.label)).toEqual(['Skills', 'Runs', 'Run run_41'])
     expect(crumbsFor('#skills', s, null)).toHaveLength(1)

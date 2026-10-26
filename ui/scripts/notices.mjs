@@ -1,4 +1,4 @@
-// Lists the npm packages bundled into dist/app.js with their licenses.
+// Lists the npm packages bundled into dist/app.js and dist/app.css with their licenses.
 //   node scripts/notices.mjs                 print the Markdown section
 //   node scripts/notices.mjs --write FILE    replace (or append) the section in FILE
 //   node scripts/notices.mjs --check FILE    exit 1 if FILE's section differs
@@ -75,7 +75,7 @@ function fence(text) {
 
 export function section() {
   const { rows, texts } = collect()
-  const out = [HEADING, '', 'Production dependencies of the status page that are compiled into `app.js`. Build tools and type packages are not shipped.', '']
+  const out = [HEADING, '', 'Production dependencies of the status page that are compiled into `app.js`, or whose stylesheets and fonts are inlined into `app.css`. Build tools and type packages are not shipped.', '']
   out.push('| Package | Version | License | Notice |', '|---|---|---|---|')
   for (const r of rows) out.push(`| ${r.name} | ${r.version} | ${r.license.replaceAll('|', '/')} | ${r.ids.join(', ') || 'none shipped'} |`)
   for (const [text, applies] of [...texts].sort((a, b) => a[1][0].localeCompare(b[1][0]))) {

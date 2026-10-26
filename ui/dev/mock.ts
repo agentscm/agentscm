@@ -48,6 +48,8 @@ function work() {
 }
 
 /** Synthetic work overview: one item per progress lane, two recent outcomes and one declared-scope overlap. */
+let catchupAcked = false
+
 function overview() {
   const wid = (c: string) => `wrk_${c.repeat(32)}`
   const cp = (kind: string, summary: string, next: string | null, secs: number, agent: string) => ({ kind, summary, next_action: next, source_refs: [], at: ago(secs), token: `tok_${agent}`, agent, session: `${agent}-session`, generation: 1 })
@@ -461,6 +463,46 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
         if (down) return send(503, { error: 'unavailable' })
         const empty = scenario === 'empty'
         if (url.pathname === '/standup/overview') return send(200, empty ? { ...overview(), current: [], recent: [], overlaps: [] } : overview())
+        // A fixed personal delivery over the overview's work, two coordination events and two merges. Ack empties it once.
+        if (url.pathname === '/standup/briefing') {
+          const ov = overview()
+          const items = empty ? [] : [...new Map([...ov.current, ...ov.recent.map((o) => o.item)].map((w) => [w.id, w])).values()]
+          const events = items.map((item, i) => ({ seq: 10 + i, at: item.updated_at, kind: i % 3 === 0 ? 'work_started' : 'work_checkpoint', work_id: item.id, item }))
+          return send(200, { delivery: null, from: 0, through: 40, after: 0, work_after: null, next_after: 40, next_work_after: null, next_work_done: true, items, events, retention_gap: false, complete: true })
+        }
+        if (url.pathname === '/standup/coordination') return send(200, { from: 0, through: 40, next_after: 0, requests: [], complete: true, retention_gap: false })
+        if (url.pathname.startsWith('/standup/work/')) {
+          const id = decodeURIComponent(url.pathname.slice('/standup/work/'.length))
+          const ov = overview()
+          const item = ov.current.find((w) => w.id === id) ?? ov.recent.find((o) => o.item.id === id)?.item
+          return item && !empty ? send(200, item) : send(404, { error: 'not found' })
+        }
+        if (url.pathname === '/standup/catchup/ack' && req.method === 'POST') {
+          catchupAcked = true
+          return send(200, { status: 'advanced', event_through: 40, merge_through: 2, current_event_ack: 40, current_merge_ack: 2 })
+        }
+        if (url.pathname === '/standup/catchup') {
+          const ov = overview()
+          const quiet = empty || catchupAcked
+          const work_events = quiet ? [] : ov.current.map((item, i) => ({ seq: 30 + i, at: item.updated_at, kind: i === 0 ? 'work_started' : 'work_checkpoint', work_id: item.id, item }))
+          const coordination_events = quiet ? [] : [
+            { seq: 28, at: ago(5400), kind: 'coordination_requested', request_id: 'crq_synthetic_1', title: 'Split the invoice scope', status: 'pending' },
+            { seq: 29, at: ago(3000), kind: 'coordination_responded', request_id: 'crq_synthetic_1', title: 'Split the invoice scope', status: 'responded' },
+          ]
+          const merge = (n: number, title: string, secs: number, failed = false) => ({ id: `mob_synthetic_${n}`, seq: n, source: 'forge_pull', source_id: `pull_${n}`, occurred_at: ago(secs + 60), observed_at: ago(secs), title: failed ? `${title} (checks failed after merge)` : title, branch: `feat/${n}`, base: 'main', head_commit: String(n).repeat(40).slice(0, 40), merge_commit: `${n}f`.repeat(20).slice(0, 40), pull_number: 200 + n, paths: ['src/billing.rs'], paths_complete: true })
+          const merges = quiet ? [] : [merge(1, 'Round invoice totals per currency', 6000), merge(2, 'Move tax rules into their own module', 1800)]
+          return send(200, {
+            subscriber: 'human', delivery_client: url.searchParams.get('delivery_client') ?? 'hub_synthetic-client-0001', delivery: `cup_${'a'.repeat(32)}`,
+            event_from: 27, event_through: 40, event_after: 27, next_event_after: 40, merge_from: 0, merge_through: 2, merge_after: 0, next_merge_after: 2,
+            work_events, coordination_events, merges,
+            retention: { work_gap: false, coordination_gap: false, merge_gap: false, event_available_from: 0, merge_available_from: 0 },
+            source_coverage: [
+              { source: 'tracked_publication', state: 'observed_only', checked_at: ago(120), unread_pages: 0, deferred: 0 },
+              { source: 'forge_pull', state: 'observed_only', checked_at: ago(120), unread_pages: 0, deferred: 0 },
+            ],
+            complete: true,
+          })
+        }
         if (url.pathname === '/onboarding') {
           const base = { owner: 'maria', expires_at: ago(-600), mcp_verified: true, native_verified: true, blocker: null, next_action: 'MCP and a native edit-hook check were observed for this connection and session. Continue work; this is coordination evidence, not a guarantee of future quota or complete tool coverage.' }
           return send(200, empty ? [] : [

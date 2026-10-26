@@ -1,6 +1,7 @@
-import type { ReactNode } from 'react'
-import { notable, type Contested, type Derived, type LiveAgent } from '../derive.ts'
-import type { WorkOverview } from '../standup.ts'
+import { useMemo, useState } from 'react'
+import { type Contested, type Derived, type LiveAgent } from '../derive.ts'
+import { areas } from '../needs.ts'
+import { workHref, type WorkOverview } from '../standup.ts'
 import type { PullRequest } from '../types.ts'
 import type { HubData } from '../useHub.ts'
 import { Ago, Avatar, Box, Empty, Explain, Icon, Notice, Path, Pill, Skeleton, Tip, Via } from '../ui.tsx'
@@ -8,122 +9,9 @@ import type { Poll } from '../usePoll.ts'
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`
 
-/** The signature move: counts in the answer are links that bring their evidence box into view and ring it. */
-function Jump({ to, children, tone = 'brand' }: { to: string; children: ReactNode; tone?: string }) {
+export function AgentRow({ a, awake }: { a: LiveAgent; awake?: boolean }) {
   return (
-    <a
-      href={`#${to}`}
-      className={`jump tone-${tone}`}
-      onClick={(e) => {
-        const el = document.getElementById(to)
-        if (!el) return
-        e.preventDefault()
-        el.scrollIntoView({ behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start' })
-        el.classList.remove('ring')
-        void el.offsetWidth
-        el.classList.add('ring')
-      }}
-    >
-      {children}
-    </a>
-  )
-}
-
-function KeyFact({ d }: { d: Derived }) {
-  const n = notable(d.contested)
-  if (n?.kind === 'handoff' && n.c.handoff) {
-    const h = n.c.handoff
-    const state = h.answer ? (h.answer.kind === 'granted' ? 'handed it over' : 'kept it') : h.lapsed ? 'the request lapsed' : 'waiting for an answer'
-    return (
-      <>
-        <Icon name="arrow-left-right" /> {h.from.owner}’s {h.from.name} asked {h.to.owner}’s {h.to.name} for <Path>{n.c.path}</Path> · {state}.
-      </>
-    )
-  }
-  if (n?.c.refused) {
-    const r = n.c.refused
-    return (
-      <>
-        <Icon name="slash-circle" /> {r.owner}’s {r.name} was refused an edit to <Path>{n.c.path}</Path>
-        {n.c.repeated ? ', then repeated it and was let through.' : '.'}
-      </>
-    )
-  }
-  const c = d.contested[0]
-  if (c)
-    return (
-      <>
-        <Icon name="exclamation-diamond" /> {c.holders.map((h) => `${h.owner}’s ${h.name}`).join(' and ')} both hold <Path>{c.path}</Path>.
-      </>
-    )
-  const p = d.prOverlaps[0]
-  const w = p?.with[0]
-  if (p && w)
-    return (
-      <>
-        <Icon name="git" /> PR #{p.pr.number} touches files {w.agent.owner}’s {w.agent.name} is working on.
-      </>
-    )
-  if (d.agents.length > 0) return <><Icon name="check2-circle" /> Agents are working on separate files.</>
-  return <>Live activity appears here within seconds of an agent starting.</>
-}
-
-function Answer({ repo, d, overview, failing }: { repo: string; d: Derived | null; overview: Poll<WorkOverview>; failing: boolean }) {
-  if (!d) {
-    return (
-      <div className="answer">
-        <h1 className="page-question">Who is editing which files right now?</h1>
-        {failing ? <p className="answer-text">Waiting for the hub. This page keeps trying and fills in as soon as it answers.</p> : <Skeleton rows={2} />}
-      </div>
-    )
-  }
-  const overlaps = overview.kind === 'ready' ? overview.value.overlaps.length : null
-  const c = d.contested.length
-  return (
-    <div className="answer" data-tour="answer">
-      <h1 className="page-question">Who is editing which files right now?</h1>
-      <p className="answer-text">
-        {d.agents.length === 0 ? (
-          <>No agent is holding files in {repo} right now.</>
-        ) : (
-          <>
-            <Jump to="box-agents">{plural(d.agents.length, 'agent')}</Jump> {d.agents.length === 1 ? 'is' : 'are'} holding <Jump to="box-agents">{plural(d.filesHeld, 'file')}</Jump> in <span className="repo-name">{repo}</span>.{' '}
-            {c === 0 ? (
-              <>No file is contested.</>
-            ) : (
-              <>
-                <Jump to="box-contested" tone="bad">
-                  {plural(c, 'file')} {c === 1 ? 'is' : 'are'} contested
-                </Jump>
-                .
-              </>
-            )}{' '}
-            {d.prOverlaps.length > 0 && (
-              <>
-                <Jump to="box-prs" tone="warn">
-                  {plural(d.prOverlaps.length, 'pull request')}
-                </Jump>{' '}
-                {d.prOverlaps.length === 1 ? 'touches' : 'touch'} held files.
-              </>
-            )}
-          </>
-        )}
-      </p>
-      <p className="answer-fact">
-        <KeyFact d={d} />
-      </p>
-      {overlaps !== null && overlaps > 0 && (
-        <a href="#work" className="answer-next">
-          <Icon name="sign-intersection-y" /> {plural(overlaps, 'task')} declare overlapping scope — review on Work
-        </a>
-      )}
-    </div>
-  )
-}
-
-function AgentRow({ a }: { a: LiveAgent }) {
-  return (
-    <li className="agent">
+    <li className={`agent${awake === undefined ? '' : awake ? ' is-awake' : ' is-quiet'}`}>
       <Avatar name={a.name} size={36} />
       <div className="agent-main">
         <div className="agent-line">
@@ -226,47 +114,18 @@ function PrTitle({ pr }: { pr: PullRequest }) {
   )
 }
 
-export function NowPage({ repo, data, d, overview }: { repo: string; data: HubData; d: Derived | null; overview: Poll<WorkOverview> }) {
+/** Where: the repository as a map of areas, then the two kinds of crossing in full. */
+export function NowPage({ data, d, overview }: { data: HubData; d: Derived | null; overview: Poll<WorkOverview> }) {
   const work = data.work
+  const ov = overview.kind === 'ready' ? overview.value : null
   return (
-    <div className="page">
-      <Answer repo={repo} d={d} overview={overview} failing={data.failing} />
+    <>
       {data.failing && d && (
         <Notice title="The hub is not answering">Showing the last data that loaded. This page keeps retrying.</Notice>
       )}
-      <div className="grid-now">
-        <Box
-          id="box-agents"
-          tour="now-agents"
-          icon="people"
-          title="Live agents"
-          count={d ? d.agents.length : undefined}
-          explain="Agents that announced work or edited files recently, grouped by the person who owns them. Each chip is a file or folder the agent holds."
-          className="area-agents"
-        >
-          {!d ? (
-            <Skeleton rows={4} />
-          ) : d.groups.length === 0 ? (
-            <Empty icon="moon-stars" title="No agents active">
-              When an agent connected through a hook or MCP starts editing, it appears here with the files it holds.
-            </Empty>
-          ) : (
-            d.groups.map((g) => (
-              <div key={g.owner} className="owner-group">
-                <h3 className="owner-name">
-                  <Icon name="person" /> {g.owner} <span className="muted small">· {plural(g.agents.length, 'agent')}</span>
-                </h3>
-                <ul className="agent-list">
-                  {g.agents.map((a) => (
-                    <AgentRow key={a.id} a={a} />
-                  ))}
-                </ul>
-              </div>
-            ))
-          )}
-          {work?.intents_truncated && <Notice title="Some agents are not shown">The hub returned its maximum number of intents. More agents may be active.</Notice>}
-        </Box>
-
+      <AreaMap d={d} ov={ov} />
+      {work?.intents_truncated && <Notice title="Some agents are not shown">The hub returned its maximum number of intents. More agents may be active.</Notice>}
+      <div className="grid-2">
         <Box
           id="box-contested"
           tour="now-contested"
@@ -274,8 +133,7 @@ export function NowPage({ repo, data, d, overview }: { repo: string; data: HubDa
           tone={d && d.contested.length > 0 ? 'bad' : 'ok'}
           title="Contested files"
           count={d ? d.contested.length : undefined}
-          explain="A file is contested when two agents hold overlapping paths. The hub refuses the second agent’s first edit and lets a repeated edit through."
-          className="area-contested"
+          explain="Two agents hold overlapping paths. The hub refuses the second agent’s first edit and lets a repeated edit through."
         >
           {!d ? (
             <Skeleton rows={3} />
@@ -300,7 +158,6 @@ export function NowPage({ repo, data, d, overview }: { repo: string; data: HubDa
           title="Pull requests touching held files"
           count={d ? d.prOverlaps.length : undefined}
           explain="Open pull or merge requests mirrored from your forge whose changed files overlap paths a live agent holds."
-          className="area-prs"
         >
           {!d || !work ? (
             <Skeleton rows={2} />
@@ -342,6 +199,146 @@ export function NowPage({ repo, data, d, overview }: { repo: string; data: HubDa
           )}
         </Box>
       </div>
-    </div>
+    </>
+  )
+}
+
+const MAX_TILES = 12
+
+/**
+ * The repository as tiles, one per top-level folder someone holds or plans to touch. Faces are the
+ * agents there; a coral ring and pill mark a crossing. Picking a tile opens what is happening in it.
+ */
+function AreaMap({ d, ov }: { d: Derived | null; ov: WorkOverview | null }) {
+  const all = useMemo(() => areas(ov, d), [ov, d])
+  const [picked, setPicked] = useState<string | null>(null)
+  const shown = all.slice(0, MAX_TILES)
+  const area = shown.find((a) => a.name === picked) ?? null
+  const most = Math.max(1, ...shown.map((a) => a.holders.length + a.planned.length))
+  return (
+    <Box
+      id="box-map"
+      tour="now-map"
+      icon="grid-1x2"
+      title="The repository"
+      count={d ? `${plural(all.length, 'area')}` : undefined}
+      tone={shown.some((a) => a.crossings > 0) ? 'bad' : 'brand'}
+      explain="One tile per top-level folder an agent holds files in or a task declared it will touch. Deeper colour means more people there. Pick a tile to see who and why."
+    >
+      {!d ? (
+        <Skeleton rows={4} />
+      ) : all.length === 0 ? (
+        <Empty icon="grid-1x2" title="Nobody is holding or planning files">
+          When an agent starts editing or a task declares its scope, its folder appears here.
+        </Empty>
+      ) : (
+        <>
+          <div className="map" role="list">
+            {shown.map((a) => {
+              const people = [...new Map([...a.holders.map((h) => [h.name, h.name] as const), ...a.planned.map((p) => [p.item.lead_agent, p.item.lead_agent] as const)]).values()]
+              const heat = (a.holders.length + a.planned.length) / most
+              return (
+                <div role="listitem" key={a.name || '(root)'} className="map-cell">
+                  <button
+                    type="button"
+                    className={`tile${a.crossings > 0 ? ' is-crossing' : ''}${picked === a.name ? ' is-selected' : ''}`}
+                    style={{ ['--heat' as string]: heat.toFixed(2) }}
+                    aria-expanded={picked === a.name}
+                    aria-controls="area-drawer"
+                    onClick={() => setPicked((p) => (p === a.name ? null : a.name))}
+                  >
+                    <span className="tile-head">
+                      <b>{a.name || 'Repository root'}</b>
+                      <code>{a.name ? `${a.name}/` : 'files at the top level'}</code>
+                    </span>
+                    {a.crossings > 0 && <span className="crossing">{plural(a.crossings, 'crossing')}</span>}
+                    <span className="tile-people" aria-label={`${people.length} ${people.length === 1 ? 'agent' : 'agents'}: ${people.join(', ')}`}>
+                      {people.slice(0, 5).map((n) => (
+                        <Avatar key={n} name={n} size={26} />
+                      ))}
+                      {people.length > 5 && <span className="tile-more">+{people.length - 5}</span>}
+                    </span>
+                    <span className="tile-lens">
+                      {a.holders.length > 0 ? `${a.holders.length} editing` : 'Nobody editing'}
+                      {a.planned.length > 0 && ` · ${plural(a.planned.length, 'task')} planned`}
+                    </span>
+                  </button>
+                </div>
+              )
+            })}
+          </div>
+          {all.length > shown.length && <p className="map-hint">{plural(all.length - shown.length, 'quieter area')} not shown.</p>}
+          {area ? (
+            <div className="area-drawer" id="area-drawer">
+              <div className="area-drawer-head">
+                <h3>
+                  {area.name || 'Repository root'} <code>{area.name ? `${area.name}/` : ''}</code>
+                </h3>
+                <button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => setPicked(null)}>
+                  Close
+                </button>
+              </div>
+              <div className="area-cols">
+                <section>
+                  <h4>Editing now</h4>
+                  {area.holders.length === 0 ? (
+                    <p className="muted small">No live agent holds files here.</p>
+                  ) : (
+                    <ul className="ad-list">
+                      {area.holders.map((h) => (
+                        <li key={h.id} className="ad-item">
+                          <Avatar name={h.name} size={26} />
+                          <div>
+                            <div className="ad-main">
+                              {h.name} <span className="muted small">{h.owner}</span>
+                            </div>
+                            <div className="ad-meta">{h.files.slice(0, 4).map((f) => <Path key={f}>{f}</Path>)}{h.files.length > 4 && <span>+{h.files.length - 4} more</span>}</div>
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </section>
+                <section>
+                  <h4>Tasks planned here</h4>
+                  {area.planned.length === 0 ? (
+                    <p className="muted small">No unfinished task declared scope here.</p>
+                  ) : (
+                    <ul className="ad-list">
+                      {area.planned.map(({ item, paths }) => (
+                        <li key={item.id} className="ad-item">
+                          <Avatar name={item.lead_agent} size={26} />
+                          <div>
+                            <a className="ad-main work-link" href={workHref(item.id)}>{item.title}</a>
+                            <div className="ad-meta">
+                              {item.lead_agent} · {paths.slice(0, 3).map((f) => <Path key={f}>{f}</Path>)}
+                              {paths.length > 3 && <span>+{paths.length - 3} more</span>}
+                            </div>
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </section>
+                <section>
+                  <h4>Crossings</h4>
+                  {area.crossings === 0 ? (
+                    <p className="muted small">None here.</p>
+                  ) : (
+                    <p className="small">
+                      {plural(area.crossings, 'crossing')}. <a href="#box-contested">Contested files</a> are two agents holding one path; <a href="#inbox">overlaps in the Inbox</a> are two tasks planning the same one.
+                    </p>
+                  )}
+                </section>
+              </div>
+            </div>
+          ) : (
+            <p className="map-hint">
+              <Icon name="hand-index" /> Pick an area to see who is editing there, which tasks plan to, and any crossings.
+            </p>
+          )}
+        </>
+      )}
+    </Box>
   )
 }

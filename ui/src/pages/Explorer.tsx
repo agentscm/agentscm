@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
+import { SectionTabs } from '../TopNav.tsx'
 import {
   fetchExplorerConversation,
   fetchExplorerDiff,
@@ -521,9 +522,10 @@ export function ExplorerPage({ hubRepository }: { hubRepository?: string | null 
     <div className="page explorer-page">
       <div className="answer">
         <h1 className="page-question">What happened around this code?</h1>
-        <p className="answer-text">Explore committed files, history, evidence and saved agent conversations.</p>
+        <p className="answer-text">Files, history and the evidence behind them.</p>
         <p className="answer-fact"><Icon name="laptop" /> Read-only from your local checkout. Refresh observes the selected ref without changing your files.</p>
       </div>
+      <SectionTabs />
       {summary.kind === 'loading' && <Skeleton rows={6} />}
       {summary.kind === 'error' && (onFrontDoor() ? <Notice tone="bad" icon="plug" title="Could not open this repository">{summary.message}</Notice> : <Notice tone="brand" icon="laptop" title="Your files and conversations open from your computer">Run <code>agentscm open</code> in your repository, or choose Open Hub in the AgentSCM menu bar app. This page then opens on your computer, already connected.<details className="mt-2 small"><summary>Details</summary>{summary.message}</details></Notice>)}
       {summary.kind === 'ready' && <><SummaryIdentity summary={summary.value} selectedRef={selectedRef} onRef={setSelectedRef} onRefresh={() => setRefresh((value) => value + 1)} /><ExplorerBody key={`${summary.value.repository_id}|${summary.value.commit}`} summary={summary.value} hubRepository={hubRepository} onOpenRevision={setSelectedRef} /></>}

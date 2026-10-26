@@ -133,16 +133,13 @@ export function ActivityPage({ d, events: live, fresh, repo, token }: { d: Deriv
   const rows = d && events ? events.filter((e) => match(e.kind)).map((e) => ({ e, row: describe(e, d) })).filter((x): x is { e: HubEvent; row: Row } => x.row !== null).slice(0, older.length ? undefined : 30) : null
   const shown = rows ? (expanded || older.length ? rows : rows.slice(0, 12)) : null
   return (
-    <div className="page">
-      <div className="answer" data-tour="answer">
-        <h1 className="page-question">What just happened?</h1>
-        <p className="answer-text">The latest things agents did on this repository, newest first. New events slide in as they arrive.</p>
-      </div>
+    <>
       <Box
+        id="box-log"
         icon="clock-history"
-        title="Activity"
+        title="The full log"
         count={rows?.length}
-        explain="Up to 30 recent hub events: sessions, announced work, refused and repeated edits, and handoffs between agents."
+        explain="What agents did on this repository, newest first: sessions, announced work, refused and repeated edits, and handoffs. New events slide in as they arrive."
         actions={
           <div className="btn-group btn-group-sm" data-tour="activity-filter" role="group" aria-label="Filter events">
             {KINDS.map((k) => (
@@ -196,6 +193,6 @@ export function ActivityPage({ d, events: live, fresh, repo, token }: { d: Deriv
           </button>
         )}
       </Box>
-    </div>
+    </>
   )
 }

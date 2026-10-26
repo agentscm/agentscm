@@ -44,7 +44,7 @@ export const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n ==
 // Targets are stable data-tour anchors, never classes or DOM shape, so restyling a page keeps its tour.
 const T = (...anchors: string[]) => anchors.map((a) => `[data-tour="${a}"]`)
 // On phones the rail lives in a drawer, so nav steps fall back to the menu button.
-const NAV = (group: string) => T(`nav-${group}`, 'menu')
+const NAV = (item: string) => T(`nav-${item}`, 'menu')
 
 export const WELCOME: TourDef = {
   title: 'Welcome to the AgentSCM Hub',
@@ -53,7 +53,7 @@ export const WELCOME: TourDef = {
       title: 'This page shows what your agents are doing',
       what: 'The hub watches every coding agent connected to this repository: which files each one holds, which task it owns, and what checks said about its work.',
       why: 'Two agents editing the same file is how work gets lost. The hub spots it first and tells you who to talk to.',
-      how: 'Most pages only read, so look around freely. Two places can change things, and both say so: Workspace, after you sign in with GitHub or GitLab, and the inline agent views in Settings.',
+      how: 'Most pages only read, so look around freely. Two places can change things, and both say so: Setup › Access, after you sign in with GitHub or GitLab, and the inline agent views in Setup › Preferences.',
       tip: (c) => (c.d ? `Right now ${plural(c.d.agents.length, 'agent')} ${c.d.agents.length === 1 ? 'is' : 'are'} connected to this repository.` : null),
       empty: 'Once an agent connects, the count of live agents shows here.',
     },
@@ -77,89 +77,158 @@ export const WELCOME: TourDef = {
       title: 'Live means the numbers are fresh',
       what: 'A green dot says the hub answered the last refresh. Pages refresh every few seconds while this tab is open.',
       why: 'If the hub stops answering, the page keeps the last data it had and says so. You will never act on stale numbers without a warning.',
-      how: 'When it turns amber or says Reconnecting, open it to see Hub health.',
-      tip: (c) => (!c.data?.health ? null : c.data.failing ? 'The hub did not answer the last refresh, so you are seeing older data.' : c.data.health.status === 'ok' ? 'The hub is answering right now.' : 'The hub reports a problem. Open Hub health for details.'),
+      how: 'When it turns coral or says Reconnecting, open it to see the hub’s health.',
+      tip: (c) => (!c.data?.health ? null : c.data.failing ? 'The hub did not answer the last refresh, so you are seeing older data.' : c.data.health.status === 'ok' ? 'The hub is answering right now.' : 'The hub reports a problem. Open it for details.'),
     },
     {
-      target: NAV('coordinate'),
-      title: 'Coordinate: who is doing what',
-      what: 'Right now shows who holds which files. Work is the task board. Activity is the live feed of refusals and handoffs.',
+      target: NAV('home'),
+      title: 'Dashboard: what is happening',
+      what: 'One sentence on top, then four tabs. Now lists what needs you and every task as a lane. Where maps the repository. Catch up shows what happened while you were away. Team shows who is working.',
       why: 'This is where you catch two agents about to collide, before either one wastes an afternoon.',
-      how: 'Start your day on Right now. A red number next to it counts files two agents hold at once.',
-      tip: (c) => (!c.d ? null : c.d.contested.length > 0 ? `${plural(c.d.contested.length, 'file is', 'files are')} contested right now. Open Right now to see who holds each one.` : 'No contested files right now: every held path has exactly one agent.'),
+      how: 'Start your day here. A coral number in the sentence or on the rail counts the things that need a person.',
+      tip: (c) => (!c.d ? null : c.d.contested.length > 0 ? `${plural(c.d.contested.length, 'file is', 'files are')} contested right now. Open Where to see who holds each one.` : 'No contested files right now: every held path has exactly one agent.'),
     },
     {
-      target: NAV('verify'),
-      title: 'Verify: did it actually work',
-      what: 'Workflows holds recorded tests and reviews. Change records say what is ready to hand off. Landed changes say whether merges went in and what CI did after. Skills says which workflows agents here must follow.',
-      why: 'An agent saying “done” is not proof. These pages show the checks that ran on the exact change.',
-      how: 'Before you trust a finished task, look for its workflow run or its landed change.',
+      target: NAV('inbox'),
+      title: 'Inbox: the conversations to have',
+      what: 'Tasks that declared overlapping files, and the requests agents sent each other to split, join or hand over.',
+      why: 'An overlap is a signal to talk, not proof of a conflict. Reading the Inbox never answers a request for anyone.',
+      how: 'Open a request to see who asked whom, and whether they received and replied.',
+      tip: (c) => (c.overview ? (c.overview.overlaps.length > 0 ? `${plural(c.overview.overlaps.length, 'overlap')} waiting in the Inbox.` : 'No declared scopes overlap right now.') : null),
+    },
+    {
+      target: NAV('history'),
+      title: 'History: what happened before',
+      what: 'What agents reported finished, every change to Work page by page, change records ready to hand off, and the files behind them.',
+      why: 'An agent saying “done” is not proof. History keeps the record so you can check before you trust it.',
+      how: 'Open a finished task, then its change record, before you build on it.',
+    },
+    {
+      target: NAV('skills'),
+      title: 'Skills: did the agreed steps run',
+      what: 'The workflows agents here must follow, the checks that ran on each exact revision, what CI and deploys did after a merge, and reusable recipes.',
+      why: 'A passing check only proves those exact files passed. These pages keep that honest.',
+      how: 'Before you trust a finished task, look for its check run or its landed change.',
       tip: (c) => {
         const done = c.overview?.recent.length ?? 0
-        return c.overview ? (done > 0 ? `${plural(done, 'task was', 'tasks were')} reported finished recently. Verify tells you whether checks agree.` : 'No tasks were reported finished in the recent window yet.') : null
+        return c.overview ? (done > 0 ? `${plural(done, 'task was', 'tasks were')} reported finished recently. Skills tells you whether checks agree.` : 'No tasks were reported finished in the recent window yet.') : null
       },
     },
     {
-      target: NAV('this-computer'),
-      title: 'This computer: your own machine',
-      what: 'Templates and Timeline read from agentscm serve running on this computer, not from the hub.',
-      why: 'They show workflow recipes and saved moments of your own workspace, which never leave your machine.',
-      how: 'If these pages show preview data, start agentscm serve and set its address in Settings.',
-    },
-    {
-      target: NAV('manage'),
-      title: 'Manage: set up and settings',
-      what: 'Workspace access, connecting agents, hub health and your own settings.',
-      why: 'An agent only shows up in the hub once it is connected. Connect agents tells you which ones are ready.',
+      target: NAV('setup'),
+      title: 'Setup: connect and configure',
+      what: 'Connect agents, check the hub, manage workspace access and set your own preferences.',
+      why: 'An agent only shows up once it is connected. Agents tells you which ones are ready.',
       how: 'New here? Connect one agent first. It is Ready once it proves it can reach the hub and its edit hook fires.',
+      tip: (c) => (c.d ? (c.d.agents.length > 0 ? `${plural(c.d.agents.length, 'agent is', 'agents are')} already reporting here.` : 'No agents are reporting yet, so Setup is the place to start.') : null),
     },
     {
-      target: T('connect', 'menu'),
-      title: 'Connect your first agent',
-      what: 'This button opens the setup for Claude Code, Codex, Cursor and other agents.',
-      why: 'Every page fills in from connected agents. With none, the hub has nothing to coordinate.',
-      how: 'Follow the steps there, then make one small edit with the agent to prove the hook fires.',
-      tip: (c) => (c.d ? (c.d.agents.length > 0 ? `${plural(c.d.agents.length, 'agent is', 'agents are')} already reporting here.` : 'No agents are reporting yet, so this is the place to start.') : null),
+      target: T('view', 'menu'),
+      title: 'Light or dark, spacious or condensed',
+      what: 'This menu switches the sheet between light and dark, or follows your device, and between Spacious and Condensed.',
+      why: 'Condensed fits more on screen without moving anything: every page keeps the same parts in the same places.',
+      how: 'Both choices stay in this browser only. Setup › Preferences has them too.',
     },
     {
       target: T('tour-trigger'),
       title: 'Lost? Each page has its own tour',
-      what: 'This button walks you through the page you are on, pointing at the real numbers on screen.',
+      what: 'The question mark walks you through the page you are on, pointing at the real numbers on screen.',
       why: 'Each page answers one question. A short tour shows how to read the answer.',
-      how: 'Use it whenever a page is unclear, or press ⌘K and choose “Walk me through this page”. Settings, under Feature walkthrough, turns tours on or off.',
+      how: 'Use it whenever a page is unclear, or press ⌘K and choose “Walk me through this page”. Setup › Preferences turns tours on or off.',
     },
   ],
 }
 
 export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
-  now: {
-    title: 'Right now',
+  home: {
+    title: 'Dashboard › Now',
     steps: [
       {
         target: T('answer'),
         title: 'The answer comes first',
-        what: 'One sentence: how many agents are holding how many files, and whether any collide.',
+        what: 'One sentence: how many agents are working on how many tasks, how many things need you, and how many crossings there are.',
         why: 'You should know in two seconds whether anything needs you.',
-        how: 'Click a number in the sentence to jump to the list behind it.',
-        tip: (c) => (c.d ? `${plural(c.d.agents.length, 'agent')} holding ${plural(c.d.filesHeld, 'file')} right now.` : null),
+        how: 'Click a coral count to jump to the list behind it. The sentence stays on top of every dashboard tab.',
+        tip: (c) => (c.d && c.overview ? `${plural(c.d.agents.length, 'agent')} on ${plural(c.overview.current.length, 'task')} right now.` : null),
+      },
+      {
+        target: T('tabs'),
+        title: 'Four tabs, one question each',
+        what: 'Now, Where, Catch up and Team. Under each name is its live status: a coral dot means something there needs you.',
+        why: 'Each fact lives in exactly one tab, so you never read the same thing twice.',
+        how: 'Each tab has its own address, so you can bookmark or share the one you need.',
+      },
+      {
+        target: T('needs'),
+        title: 'Needs you',
+        what: 'Only things a person should decide: a blocker, a task whose agent went quiet but still holds it, a handover, two agents holding one file, two tasks planning the same files, or a pull request under an agent’s feet.',
+        why: 'Each one stays stuck until someone decides. Reading this page answers none of them.',
+        how: 'Each row ends with what to do next. Follow its link to the task, the file or the Inbox.',
+        empty: 'When nothing needs you, this box says so in green.',
+      },
+      {
+        target: T('work-lanes'),
+        title: 'The track',
+        what: 'Every unfinished task as one lane: claimed, where it is now with the face of the agent holding it, its next step, then finished.',
+        why: 'A coral segment is blocked and an amber one went quiet. A quiet task is still assigned, so ask its lead before taking it over.',
+        how: 'Click any segment to open the task. When a task moves, its new segment sweeps in with the agent riding it.',
+        tip: (c) => {
+          const cur = c.overview?.current
+          if (!cur) return null
+          const blocked = cur.filter((i) => i.state === 'blocked').length
+          return blocked > 0 ? `${plural(blocked, 'task is', 'tasks are')} blocked right now. Open one to read the blocker the agent wrote.` : cur.length > 0 ? `${plural(cur.length, 'task')} assigned and none blocked.` : null
+        },
+        empty: 'When agents announce tasks, each appears here as a lane.',
+      },
+    ],
+  },
+  team: {
+    title: 'Dashboard › Team',
+    steps: [
+      {
+        target: T('now-agents'),
+        title: 'Who is working',
+        what: 'Live agents grouped by the person who owns them. A green dot means the agent reported in the last five minutes; amber means it is quieter but still holds its files.',
+        why: 'Before you start something, check nobody already holds those files.',
+        how: 'Each chip is a file or folder the agent holds. A coral chip is contested.',
+        tip: (c) => (c.d && c.d.agents.length > 0 ? `${c.d.agents[0]!.name} (${c.d.agents[0]!.owner}) holds ${plural(c.d.agents[0]!.holdings.length, 'path')}.` : null),
+        empty: 'No agents are active. When a connected agent starts editing, it appears here with the files it holds.',
+      },
+    ],
+  },
+  inbox: {
+    title: 'Inbox',
+    steps: [
+      {
+        target: T('answer'),
+        title: 'What needs a conversation',
+        what: 'How many declared-scope overlaps and open requests there are, with a bar showing where each one stands.',
+        why: 'Overlaps are a signal to talk before two agents write the same code. Detecting one sends nothing.',
+        how: 'Coral is an overlap nobody has raised yet, amber a request waiting for an answer, violet one that settled.',
+        tip: (c) => (c.overview ? (c.overview.overlaps.length > 0 ? `${plural(c.overview.overlaps.length, 'overlap')} right now.` : 'No overlaps right now.') : null),
+      },
+    ],
+  },
+  now: {
+    title: 'Dashboard › Where',
+    steps: [
+      {
+        target: T('now-map'),
+        title: 'The repository as a map',
+        what: 'One tile per top-level folder an agent holds files in or a task plans to touch. Faces are the agents there; a deeper colour means more people.',
+        why: 'A coral ring and pill mark a crossing: two agents holding one file, or two tasks planning the same one.',
+        how: 'Pick a tile to see who is editing there, which tasks plan to, and why it crosses.',
+        tip: (c) => (c.d ? (c.d.contested.length > 0 ? `${plural(c.d.contested.length, 'file')} contested. Look for the coral tile.` : 'No contested files right now.') : null),
+        empty: 'Tiles appear when an agent starts editing or a task declares its scope.',
       },
       {
         target: T('now-contested'),
         title: 'Contested files',
         what: 'Files that two agents hold at the same time.',
         why: 'The hub refuses the second agent’s first edit to one of these. If nobody steps in, one agent’s work gets thrown away.',
-        how: 'Open a row to see who holds it and whether a handoff was asked for. Then tell one agent to wait or hand it over.',
-        tip: (c) => (!c.d ? null : c.d.contested.length > 0 ? `This red number is ${plural(c.d.contested.length, 'file')} two agents are editing at once. Open one to see who holds it.` : null),
-        empty: 'Nothing is contested now. When two agents claim the same path, the file appears here in red with both holders.',
-      },
-      {
-        target: T('now-agents'),
-        title: 'Live agents',
-        what: 'Every agent that announced work or edited recently, grouped by the person who owns it. Each chip is a file or folder it holds.',
-        why: 'Before you start something, check nobody already holds those files.',
-        how: 'A red chip is a contested file. Search with ⌘K for a file name to find its holder fast.',
-        tip: (c) => (c.d && c.d.agents.length > 0 ? `${c.d.agents[0]!.name} (${c.d.agents[0]!.owner}) holds ${plural(c.d.agents[0]!.holdings.length, 'path')}.` : null),
-        empty: 'No agents are active. When a connected agent starts editing, it appears here with the files it holds.',
+        how: 'Each row says who holds it and whether a handoff was asked for. Then tell one agent to wait or hand it over.',
+        tip: (c) => (!c.d ? null : c.d.contested.length > 0 ? `${plural(c.d.contested.length, 'file')} two agents are editing at once.` : null),
+        empty: 'Nothing is contested now. When two agents claim the same path, the file appears here with both holders.',
       },
       {
         target: T('now-prs'),
@@ -174,94 +243,65 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
   },
 
   work: {
-    title: 'Work',
+    title: 'History',
     steps: [
       {
         target: T('answer'),
-        title: 'The answer comes first',
-        what: 'One sentence: how many tasks are in progress, blocked, waiting for handover or paused.',
-        why: 'A blocked task means an agent is stuck and nothing will move until someone helps.',
-        how: 'Read the red “blocked” count first. Then open the lanes below.',
+        title: 'What was reported finished',
+        what: 'Tasks agents reported finished in the recent window, with who finished them and when.',
+        why: 'Finished is the agent’s own report. It does not prove review, verification or a merge.',
+        how: 'Open a task, then its change record, before you build on it. Changes lists every start, join, takeover and checkpoint.',
         tip: (c) => {
-          const cur = c.overview?.current
-          if (!cur) return null
-          const blocked = cur.filter((i) => i.state === 'blocked').length
-          return blocked > 0 ? `${plural(blocked, 'task is', 'tasks are')} blocked right now. Open one to read the blocker the agent wrote.` : cur.length > 0 ? `${plural(cur.length, 'task')} assigned and none blocked.` : null
+          const done = c.overview?.recent.filter((o) => o.kind === 'completion').length
+          return done === undefined ? null : done > 0 ? `${plural(done, 'task')} reported finished recently.` : 'Nothing was reported finished recently.'
         },
-        empty: 'When agents announce tasks, this sentence counts how many are in progress, blocked or paused.',
       },
       {
-        target: T('work-tabs'),
-        title: 'Four views of the same work',
-        what: 'Working now is the board. Recently finished lists tasks agents reported done. Needs coordination lists tasks whose declared files overlap. Change history is the log of every change to a task.',
-        why: 'Each view answers a different question, so you do not have to hunt through one long list.',
-        how: 'A yellow number on Needs coordination means two tasks say they will touch the same files. Open it before they start.',
-        tip: (c) => (c.overview && c.overview.overlaps.length > 0 ? `${plural(c.overview.overlaps.length, 'pair of tasks')} declared overlapping files. Open Needs coordination.` : null),
-        empty: 'A yellow number appears on Needs coordination when two tasks declare overlapping files.',
-      },
-      {
-        target: T('work-lanes'),
-        title: 'The task board',
-        what: 'One lane per state: In progress, Blocked, Handover and Paused. Each card shows the owner, a title, the next step the agent reported and when it last checked in.',
-        why: 'A card marked “No recent check-in” is still assigned. Taking it over without asking the lead causes duplicate work.',
-        how: 'Open a card for the agent’s reports, its declared files and its helpers. Use the search box to find an agent, task or path.',
-        tip: (c) => {
-          const stale = c.count('[data-tour="work-lanes"] .pill.tone-warn')
-          const n = c.count('[data-tour="work-lanes"] article')
-          return n === 0 ? null : stale > 0 ? `${plural(stale, 'card')} on screen ${stale === 1 ? 'has' : 'have'} a yellow check-in warning. Ask that lead before you reuse the task.` : `${plural(n, 'card')} on screen, all with a recent check-in.`
-        },
-        empty: 'This step looks at the Working now tab. When agents announce tasks, each appears here as a card in its lane.',
+        target: T('tabs'),
+        title: 'Four views of what happened',
+        what: 'Finished, Changes, Change records and Files.',
+        why: 'Each answers a different question, so you do not have to hunt through one long list.',
+        how: 'Files reads from your own checkout on this computer; the rest come from the hub.',
       },
     ],
   },
 
   activity: {
-    title: 'Activity',
+    title: 'Dashboard › Catch up',
     steps: [
       {
-        target: T('answer'),
-        title: 'The newest events first',
-        what: 'A live feed of what agents just did: sessions, announced work, refused edits and handoffs.',
-        why: 'It is the story behind the numbers on Right now. You can see how a conflict started.',
-        how: 'Leave the tab open. New events slide in by themselves.',
+        target: ['#since-last-checked'],
+        title: 'Since you last checked',
+        what: 'A sentence about the time you were away, then three lanes of dots: merges, work updates and messages between agents. A coral dot needs a look.',
+        why: 'You can see at a glance whether anything happened, and when.',
+        how: 'Pick a lane name to narrow the list below. Mark reviewed moves your own review position; opening or paging never does.',
+        empty: 'When records arrive after your last review, they appear here as dots.',
       },
       {
         target: T('activity-filter'),
-        title: 'Filter the feed',
-        what: 'Four buttons: Everything, Refusals & handoffs, Announcements and Sessions.',
+        title: 'The full log',
+        what: 'Every hub event, newest first. Four buttons filter it: Everything, Refusals & handoffs, Announcements and Sessions.',
         why: 'On a busy repository the signal is easy to lose. Refusals are the events that need a person.',
         how: 'Pick Refusals & handoffs to see only collisions and who gave a file to whom.',
         tip: (c) => {
           const n = c.count('[data-tour="activity-feed"] .event.tone-bad')
-          return n > 0 ? `${plural(n, 'event')} below ${n === 1 ? 'is a' : 'are'} red refusal${n === 1 ? '' : 's'}: an agent tried to edit a file another agent holds.` : null
+          return n > 0 ? `${plural(n, 'event')} below ${n === 1 ? 'is a' : 'are'} refusal${n === 1 ? '' : 's'}: an agent tried to edit a file another agent holds.` : null
         },
-        empty: 'Red events appear when an agent is refused an edit because another agent holds the file.',
-      },
-      {
-        target: T('activity-feed'),
-        title: 'The event list',
-        what: 'One line per event: who did it, what they did and how long ago. Red is a refusal, yellow is a warning, green is a success.',
-        why: 'A repeated edit (yellow) means an agent ignored a refusal and was let through. That is where work gets overwritten.',
-        how: 'Show all lists every event loaded so far. Red rows are the ones that need a person.',
-        tip: (c) => {
-          const n = c.count('[data-tour="activity-feed"] li')
-          return n > 0 ? `${plural(n, 'event')} on screen, newest at the top.` : null
-        },
-        empty: 'Events appear here as agents start sessions, announce work and edit files.',
+        empty: 'Refusals appear when an agent is refused an edit because another agent holds the file.',
       },
       {
         target: T('activity-load-older'),
         title: 'Go further back',
         what: 'Load older fetches the events before the oldest one on screen. When there are none left it says That’s everything.',
-        why: 'A conflict that matters now may have started earlier than the latest 30 events.',
+        why: 'A conflict that matters now may have started earlier than the latest events.',
         how: 'Press Load older until you reach the refusal or handoff you are looking for.',
-        empty: 'Load older appears under the feed once events have loaded.',
+        empty: 'Load older appears under the log once events have loaded.',
       },
     ],
   },
 
   workflows: {
-    title: 'Workflows',
+    title: 'Skills › Checks',
     steps: [
       {
         target: T('answer'),
@@ -345,7 +385,7 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
   },
 
   landed: {
-    title: 'Landed changes',
+    title: 'Skills › After merge',
     steps: [
       {
         target: T('answer'),
@@ -480,7 +520,7 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
         title: 'Preview data or your own computer',
         what: 'A banner says when the page shows sample data. This page reads from agentscm serve on your computer, not from the hub.',
         why: 'Sample data looks real. The banner is how you tell the two apart.',
-        how: 'To see your own data, start agentscm serve and set its address in Settings.',
+        how: 'To see your own data, start agentscm serve and set its address in Setup › Preferences.',
         tip: (c) => (c.count('.notice.tone-brand') > 0 ? 'You are looking at sample data right now.' : null),
         empty: 'No preview banner is showing, so this page is reading from your computer.',
       },
@@ -573,7 +613,7 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
   },
 
   setup: {
-    title: 'Connect agents',
+    title: 'Setup › Agents',
     steps: [
       {
         target: T('answer'),
@@ -615,7 +655,7 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
   },
 
   health: {
-    title: 'Hub health',
+    title: 'Setup › Hub',
     steps: [
       {
         target: T('answer'),
@@ -654,7 +694,7 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
   },
 
   settings: {
-    title: 'Settings',
+    title: 'Setup › Preferences',
     steps: [
       {
         target: T('answer'),

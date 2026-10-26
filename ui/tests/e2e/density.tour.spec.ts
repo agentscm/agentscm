@@ -62,7 +62,7 @@ async function walk(page: Page) {
   await expect(dialog(page)).toBeHidden()
 }
 
-for (const density of ['spacious', 'compact'] as const) {
+for (const density of ['spacious', 'condensed'] as const) {
   test.describe(`${density} density`, () => {
     test.beforeEach(async ({ page }) => {
       await page.addInitScript(
@@ -126,7 +126,7 @@ for (const density of ['spacious', 'compact'] as const) {
     })
 
     test('after switching density in Settings, the page tour spotlight still matches its target', async ({ page }) => {
-      const other = density === 'spacious' ? 'Compact' : 'Spacious'
+      const other = density === 'spacious' ? 'Condensed' : 'Spacious'
       await signIn(page, '#settings')
       await page.getByRole('radio', { name: new RegExp(`^${other}`) }).click()
       await expect(page.locator('html')).toHaveAttribute('data-density', other.toLowerCase())

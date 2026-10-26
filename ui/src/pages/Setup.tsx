@@ -1,4 +1,5 @@
 import { fetchSetup } from '../api.ts'
+import { SectionTabs } from '../TopNav.tsx'
 import { blockerLabel, setupState, type SetupStatus } from '../onboarding.ts'
 import { useNow } from '../useHub.ts'
 import { Avatar, Box, Empty, Icon, Notice, Pill, Skeleton } from '../ui.tsx'
@@ -25,8 +26,10 @@ export function SetupPage({ token }: { token: string }) {
     <div className="page">
       <div className="answer" data-tour="answer">
         <h1 className="page-question">Is my agent set up?</h1>
-        <p className="answer-text">An agent is ready when it has proved, in one session, that it can reach the hub over MCP and that its edit hook fires on a real edit.</p>
+        <p className="answer-text">Connect an agent, then let it prove itself once.</p>
+        <p className="answer-fact">An agent is ready when, in one session, it reached the hub over MCP and its edit hook fired on a real edit.</p>
       </div>
+      <SectionTabs />
       <div className="grid-2 align-start">
         <Box tour="setup-sessions" icon="patch-check" title="Verified sessions" count={rows.length} explain="Proof lasts up to 15 minutes after the agent’s last check, and never outlasts the agent’s own token (30 days for client setup). Ready does not guarantee future quota or that every edit tool is covered.">
           {load.kind === 'loading' && <Skeleton rows={3} />}

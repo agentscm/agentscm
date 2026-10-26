@@ -6,7 +6,7 @@ import { derive } from '../../src/derive.ts'
 import type { WorkOverview } from '../../src/standup.ts'
 import type { Activity, Work } from '../../src/types.ts'
 import { useNow, type HubData } from '../../src/useHub.ts'
-import { SECTIONS } from '../../src/App.tsx'
+import { NAV, SECTIONS } from '../../src/App.tsx'
 import { ErrorBoundary } from '../../src/ErrorBoundary.tsx'
 import { AppChrome, crumbsFor, useDismiss } from '../../src/TopNav.tsx'
 import { NowPage, httpsUrl } from '../../src/pages/Now.tsx'
@@ -30,14 +30,18 @@ function Chrome({ overview = null, data = hubData() }: { overview?: WorkOverview
     <AppChrome
       token="read-only-hub-token" logo={<span>logo</span>}
       repo="acme/widgets"
+      nav={NAV}
       sections={SECTIONS}
       section="now"
       badges={{}}
+      statuses={{}}
       data={data}
       d={null}
       overview={overview}
       pref="system"
       onPref={() => {}}
+      density="spacious"
+      onDensity={() => {}}
       onForget={() => {}}
       collapsed={false}
       onCollapsed={() => {}}
@@ -109,7 +113,7 @@ describe('2. pull request links accept only https', () => {
       pull_requests: [pr(1, 'javascript:alert(document.cookie)'), pr(2, 'https://github.com/acme/widgets/pull/2')],
     }
     const activity: Activity = { sessions: [], events: [] }
-    render(<NowPage repo="acme/widgets" data={hubData({ work, activity })} d={derive(work, activity)} overview={{ kind: 'loading' }} />)
+    render(<NowPage data={hubData({ work, activity })} d={derive(work, activity)} overview={{ kind: 'loading' }} />)
     expect(screen.getByRole('link', { name: /#2 PR 2/ }).getAttribute('href')).toBe('https://github.com/acme/widgets/pull/2')
     expect(screen.queryByRole('link', { name: /#1 PR 1/ })).toBeNull()
     const hrefs = [...document.querySelectorAll('.pr-list a')].map((a) => a.getAttribute('href'))
@@ -122,16 +126,16 @@ describe('3. malformed workflow hashes never crash the page', () => {
   const workflows = SECTIONS.find((s) => s.key === 'workflows')!
   it('crumbsFor tolerates a broken percent-escape and invalid ids', () => {
     expect(() => crumbsFor('#workflows/runs/%E0%A4%A', workflows, null)).not.toThrow()
-    expect(crumbsFor('#workflows/runs/%E0%A4%A', workflows, null).map((c) => c.label)).toEqual(['Workflows'])
-    expect(crumbsFor('#workflows/runs/..%2F..%2Fetc', workflows, null).map((c) => c.label)).toEqual(['Workflows'])
-    expect(crumbsFor('#workflows/runs/run_1/steps/%E0%A4%A', workflows, null).map((c) => c.label)).toEqual(['Workflows', 'Run run_1'])
-    expect(crumbsFor('#workflows/runs/run_1/steps/lint%2Fdocs', workflows, null).map((c) => c.label)).toEqual(['Workflows', 'Run run_1', 'Step lint/docs'])
+    expect(crumbsFor('#workflows/runs/%E0%A4%A', workflows, null).map((c) => c.label)).toEqual(['Checks'])
+    expect(crumbsFor('#workflows/runs/..%2F..%2Fetc', workflows, null).map((c) => c.label)).toEqual(['Checks'])
+    expect(crumbsFor('#workflows/runs/run_1/steps/%E0%A4%A', workflows, null).map((c) => c.label)).toEqual(['Checks', 'Run run_1'])
+    expect(crumbsFor('#workflows/runs/run_1/steps/lint%2Fdocs', workflows, null).map((c) => c.label)).toEqual(['Checks', 'Run run_1', 'Step lint/docs'])
   })
 
   it('the error boundary shows a recovery message and "Go to Right now" resets the hash', async () => {
     window.location.hash = '#broken'
     function Boom() {
-      if (window.location.hash !== '#now') throw new Error('kaboom')
+      if (window.location.hash !== '#home') throw new Error('kaboom')
       return <p>recovered</p>
     }
     vi.spyOn(console, 'error').mockImplementation(() => {})
@@ -146,8 +150,8 @@ describe('3. malformed workflow hashes never crash the page', () => {
     const alert = screen.getByRole('alert')
     expect(within(alert).getByText('This page hit a problem')).toBeTruthy()
     expect(within(alert).getByText('kaboom')).toBeTruthy()
-    fireEvent.click(within(alert).getByRole('link', { name: 'Go to Right now' }))
-    expect(window.location.hash).toBe('#now')
+    fireEvent.click(within(alert).getByRole('link', { name: 'Go to the dashboard' }))
+    expect(window.location.hash).toBe('#home')
     expect(screen.getByText('recovered')).toBeTruthy()
     window.removeEventListener('error', quiet)
   })
@@ -191,16 +195,18 @@ describe('5 + 8. search palette is an accessible combobox with a valid selection
 })
 
 describe('6. menu roles match what the keyboard reaches', () => {
-  it('account menu theme choices are menuitemradio with aria-checked, and arrows reach them', async () => {
+  it('view menu theme and density choices are menuitemradio with aria-checked, and arrows reach them', async () => {
     render(<Chrome />)
-    fireEvent.click(screen.getByRole('button', { name: /Account and settings/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Theme and density' }))
     await flush()
     const menu = screen.getByRole('menu')
     const radios = within(menu).getAllByRole('menuitemradio')
     expect(radios.map((r) => [r.textContent!.trim(), r.getAttribute('aria-checked')])).toEqual([
-      ['Light', 'false'],
-      ['System', 'true'],
-      ['Dark', 'false'],
+      [expect.stringMatching(/^Light/), 'false'],
+      [expect.stringMatching(/^Dark/), 'false'],
+      [expect.stringMatching(/^Match this device/), 'true'],
+      ['Spacious', 'true'],
+      ['Condensed', 'false'],
     ])
     expect(document.activeElement).toBe(radios[0])
     key('ArrowDown')

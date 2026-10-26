@@ -33,7 +33,7 @@ describe('paletteHits', () => {
     expect(hits.find((h) => h.group === 'Recently finished')).toMatchObject({ href: `#work/${W2}`, hint: 'claude-juno · reported completion' })
   })
   it('works before data loads', () => {
-    expect(paletteHits(SECTIONS, null, null)).toHaveLength(SECTIONS.length)
+    expect(paletteHits(SECTIONS, null, null)).toHaveLength(SECTIONS.length + 1) // every page, plus History › Changes
   })
 })
 
@@ -41,7 +41,7 @@ describe('filterHits', () => {
   const hits = paletteHits(SECTIONS, d, overview)
   it('empty or blank query shows only pages', () => {
     expect(filterHits(hits, '').every((h) => h.group === 'Pages')).toBe(true)
-    expect(filterHits(hits, '   ')).toHaveLength(SECTIONS.length)
+    expect(filterHits(hits, '   ')).toHaveLength(SECTIONS.length + 1)
   })
   it('matches label and hint case-insensitively', () => {
     expect(filterHits(hits, 'COORD').map((h) => h.label)).toContain('Bound coordination history')

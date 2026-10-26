@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react'
+import { SectionTabs } from '../TopNav.tsx'
 import {
   fetchChangeRecord,
   fetchConversationBody,
@@ -164,8 +165,10 @@ function Lookup({ token }: { token: string }) {
     <div className="page">
       <div className="answer" data-tour="answer">
         <h1 className="page-question">What is ready to hand off?</h1>
-        <p className="answer-text">Open a work item to see its source, recorded checks, decision, gaps and next action.</p>
+        <p className="answer-text">Pick a task to see what is ready to hand off.</p>
+        <p className="answer-fact">Each record shows the source, recorded checks, decision, known gaps and next action.</p>
       </div>
+      <SectionTabs />
       <Box icon="search" title="Open a change record" explain="Search by title, agent, branch or issue number, or paste the durable work ID shown on the Work page or returned by an agent.">
         <div className="lookup">
           <Combobox

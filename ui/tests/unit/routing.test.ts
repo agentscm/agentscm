@@ -10,24 +10,31 @@ const section = (key: string) => SECTIONS.find((s) => s.key === key)!
 
 describe('sectionFromHash', () => {
   it.each([
-    ['', 'now'],
-    ['#', 'now'],
+    ['', 'home'],
+    ['#', 'home'],
+    ['#home', 'home'],
     ['#now', 'now'],
-    ['#work', 'work'],
+    ['#team', 'team'],
+    ['#inbox', 'inbox'],
+    // The Work board became the dashboard's track and its coordination tab became the Inbox.
+    ['#work', 'home'],
+    ['#work/working', 'home'],
     [`#work/${ID}`, 'work'],
-    ['#work/coordination', 'work'],
+    ['#work/finished', 'work'],
+    ['#work/history', 'work'],
+    ['#work/coordination', 'inbox'],
     ['#activity', 'activity'],
     ['#workflows/runs/run_1/steps/s1', 'workflows'],
     [`#change-record/${ID}`, 'change-record'],
     ['#settings', 'settings'],
     ['#health', 'health'],
     // The current status page's links keep working.
-    ['#coordination', 'now'],
+    ['#coordination', 'home'],
     [`#coordination/work/${ID}`, 'work'],
-    // Unknown or hostile hashes fall back to the first page.
-    ['#nope', 'now'],
-    ['#__proto__', 'now'],
-    ['#token=abc', 'now'],
+    // Unknown or hostile hashes fall back to the dashboard.
+    ['#nope', 'home'],
+    ['#__proto__', 'home'],
+    ['#token=abc', 'home'],
   ])('%s → %s', (hash, want) => {
     expect(sectionFromHash(hash)).toBe(want)
   })
@@ -53,11 +60,12 @@ describe('crumbsFor', () => {
     recent: [{ item: { id: `wrk_${'b'.repeat(32)}`, title: 'Finished thing' } }],
   } as unknown as WorkOverview
 
-  it('work tab crumbs link to the tab', () => {
-    expect(crumbsFor('#work/coordination', section('work'), null)).toEqual([
-      { label: 'Work', href: '#work', icon: 'kanban' },
-      { label: 'Needs coordination', href: '#work/coordination' },
-    ])
+  it('history tabs are a single crumb, so no trail is drawn', () => {
+    expect(crumbsFor('#work/finished', section('work'), null)).toEqual([{ label: 'Finished', href: '#work/finished', icon: 'flag' }])
+    expect(crumbsFor('#work/history', section('work'), null)).toEqual([{ label: 'Changes', href: '#work/history', icon: 'list-ul' }])
+  })
+  it('a task page leads back to the dashboard', () => {
+    expect(crumbsFor(`#work/${ID}`, section('work'), overview)[0]).toEqual({ label: 'Dashboard', href: '#home', icon: 'activity' })
   })
   it('work detail shows the item title from the overview', () => {
     expect(crumbsFor(`#work/${ID}`, section('work'), overview).at(-1)).toEqual({ label: 'Rebuild the hub shell' })
@@ -68,7 +76,7 @@ describe('crumbsFor', () => {
   })
   it('workflow run and step crumbs', () => {
     const c = crumbsFor('#workflows/runs/run_0123456789abcdef/steps/lint', section('workflows'), null)
-    expect(c.map((x) => x.label)).toEqual(['Workflows', 'Run run_0123456789…', 'Step lint'])
+    expect(c.map((x) => x.label)).toEqual(['Checks', 'Run run_0123456789…', 'Step lint'])
     expect(c[1]!.href).toBe('#workflows/runs/run_0123456789abcdef')
   })
   it('change record detail keeps the durable work id in its breadcrumb', () => {
@@ -78,7 +86,7 @@ describe('crumbsFor', () => {
     ])
   })
   it('other sections are a single crumb', () => {
-    expect(crumbsFor('#health', section('health'), null)).toEqual([{ label: 'Hub health', href: '#health', icon: 'heart-pulse' }])
+    expect(crumbsFor('#health', section('health'), null)).toEqual([{ label: 'Hub', href: '#health', icon: 'heart-pulse' }])
   })
 })
 
@@ -101,11 +109,11 @@ describe('workspace routes and crumbs', () => {
     const ws = section('workspace')
     expect(crumbsFor('#workspace/members', ws, null).at(-1)).toEqual({ label: 'Members', href: '#workspace/members' })
     expect(crumbsFor(`#workspace/workflow/${R}/synthetic-workspace-run/steps/lint`, ws, null)).toEqual([
-      { label: 'Workspace', href: '#workspace', icon: 'people' },
+      { label: 'Access', href: '#workspace', icon: 'people' },
       { label: 'Repositories & runs', href: '#workspace' },
       { label: 'Run synthetic-work…', href: workspaceRunHref('acme/widgets', 'synthetic-workspace-run'), mono: true },
       { label: 'Step lint', mono: true },
     ])
-    expect(crumbsFor('#workspace/workflow/%E0%A4%A/x', ws, null).map((c) => c.label)).toEqual(['Workspace', 'Repositories & runs'])
+    expect(crumbsFor('#workspace/workflow/%E0%A4%A/x', ws, null).map((c) => c.label)).toEqual(['Access', 'Repositories & runs'])
   })
 })

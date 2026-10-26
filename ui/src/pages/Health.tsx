@@ -1,4 +1,5 @@
 import type { Health } from '../types.ts'
+import { SectionTabs } from '../TopNav.tsx'
 import { Box, Explain, Icon, Notice, Pill, Skeleton } from '../ui.tsx'
 
 const BUDGET_MS = 250
@@ -22,6 +23,7 @@ export function HealthPage({ health }: { health: Health | null }) {
         <h1 className="page-question">Is the hub OK?</h1>
         <p className="answer-text">{!health ? 'Checking…' : ok ? <>Yes. The hub is answering{health.storage ? <> and storing data in {STORAGE[health.storage] ?? health.storage}</> : null}.</> : 'No. The hub reports it is unavailable. This page keeps trying.'}</p>
       </div>
+      <SectionTabs />
       {!health ? (
         <Skeleton rows={4} />
       ) : !ok ? (

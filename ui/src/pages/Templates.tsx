@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { SectionTabs } from '../TopNav.tsx'
 import { Combobox } from '../Combobox.tsx'
 import { fetchHandoff, fetchLocalChanges, fetchLocalRuns, inspectTemplate, type Handoff, type RunState, type TemplateAction, type TemplateInspect } from '../localApi.ts'
 import { Box, Empty, Explain, Icon, Notice, Pill, PreviewBanner, Skeleton, type Tone } from '../ui.tsx'
@@ -250,8 +251,10 @@ export function TemplatesPage() {
     <div className="page">
       <div className="answer" data-tour="answer">
         <h1 className="page-question">Which workflow recipes can agents reuse?</h1>
-        <p className="answer-text">A <strong>template</strong> is a saved recipe of checks (like “check these files, run the tests, then ask Claude to review”) that any change can reuse instead of writing its own.</p>
+        <p className="answer-text">Recipes of checks that any change can reuse.</p>
+        <p className="answer-fact">A <strong>template</strong> is a saved recipe, like “check these files, run the tests, then ask Claude to review”.</p>
       </div>
+      <SectionTabs />
       {preview && preview.kind === 'ready' && <PreviewBanner reason={preview.value?.reason} />}
       <div className="grid-2 align-start">
         <Box icon="journal-code" title="See a change’s recipe" explain="Shows the template this computer uses, as it applies to one change: its steps, what each waits for, and which must pass. Same as skill-workflow library inspect.">

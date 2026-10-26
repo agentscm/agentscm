@@ -4,15 +4,14 @@ import { derive } from './derive.ts'
 import { isLocalCredential, onFrontDoor } from './frontDoor.ts'
 import { fetchOverview } from './standup.ts'
 import { clearToken, loadDensity, loadTheme, loadToken, saveDensity, saveTheme, saveToken, signInAfterRefusal, type Density, type ThemePref } from './storage.ts'
-import { useHub } from './useHub.ts'
+import { useHub, useNow } from './useHub.ts'
 import logoDark from './logo-dark.png'
 import logoLight from './logo-light.png'
-import { ActivityPage } from './pages/Activity.tsx'
+import { DashboardPage, dashboardStatus } from './pages/Dashboard.tsx'
 import { HealthPage } from './pages/Health.tsx'
-import { NowPage } from './pages/Now.tsx'
 import { SetupPage } from './pages/Setup.tsx'
 import { SignIn } from './pages/SignIn.tsx'
-import { WorkPage } from './pages/Work.tsx'
+import { InboxPage, WorkPage } from './pages/Work.tsx'
 import { WorkflowsPage } from './pages/Workflows.tsx'
 import { ChangeRecordPage } from './pages/ChangeRecord.tsx'
 import { WorkspacePage } from './pages/Workspace.tsx'
@@ -22,7 +21,7 @@ import { TemplatesPage } from './pages/Templates.tsx'
 import { TimelinePage } from './pages/Timeline.tsx'
 import { ExplorerPage } from './pages/Explorer.tsx'
 import { SettingsPage } from './pages/Settings.tsx'
-import { AppChrome, type Badges, type SectionDef } from './TopNav.tsx'
+import { AppChrome, type Badges, type NavDef, type SectionDef, type TabStatuses } from './TopNav.tsx'
 import { Icon, Notice } from './ui.tsx'
 import { usePoll } from './usePoll.ts'
 import { TourProvider } from './tour/Tour.tsx'
@@ -36,23 +35,37 @@ const subscribeDark = (cb: () => void) => {
 }
 const systemDark = () => window.matchMedia(darkQuery).matches
 
-export type Section = 'now' | 'work' | 'activity' | 'workflows' | 'change-record' | 'landed' | 'skills' | 'templates' | 'timeline' | 'explorer' | 'setup' | 'workspace' | 'health' | 'settings'
+export type Section = 'home' | 'now' | 'activity' | 'team' | 'inbox' | 'work' | 'workflows' | 'change-record' | 'landed' | 'skills' | 'templates' | 'timeline' | 'explorer' | 'setup' | 'workspace' | 'health' | 'settings'
 
+/** Every routed page. `label` names its tab inside its nav item; `question` is the page's hidden h1. */
 export const SECTIONS: SectionDef[] = [
-  { key: 'now', icon: 'broadcast', label: 'Right now', question: 'Who is editing which files?', group: 'Coordinate' },
-  { key: 'work', icon: 'kanban', label: 'Work', question: 'Who owns which task?', group: 'Coordinate' },
-  { key: 'activity', icon: 'clock-history', label: 'Activity', question: 'What just happened?', group: 'Coordinate' },
-  { key: 'workflows', icon: 'diagram-3', label: 'Workflows', question: 'Did the checks pass?', group: 'Verify' },
-  { key: 'change-record', icon: 'clipboard2-check', label: 'Change records', question: 'What is ready to hand off?', group: 'Verify' },
-  { key: 'landed', icon: 'rocket-takeoff', label: 'Landed changes', question: 'Did our changes land, and did checks pass after?', group: 'Verify' },
-  { key: 'skills', icon: 'journal-check', label: 'Skills', question: 'Which workflows do agents in this repository have to follow?', group: 'Verify' },
-  { key: 'templates', icon: 'journal-code', label: 'Templates', question: 'Which workflow recipes can agents reuse?', group: 'This computer' },
-  { key: 'timeline', icon: 'camera', label: 'Timeline', question: 'What did this workspace look like earlier?', group: 'This computer' },
-  { key: 'explorer', icon: 'folder2-open', label: 'Repository explorer', question: 'How did this code and its evidence come together?', group: 'This computer' },
-  { key: 'workspace', icon: 'people', label: 'Workspace', question: 'Who can run what?', group: 'Manage' },
-  { key: 'setup', icon: 'plug', label: 'Connect agents', question: 'Is my agent set up?', group: 'Manage' },
-  { key: 'health', icon: 'heart-pulse', label: 'Hub health', question: 'Is the hub OK?', group: 'Manage' },
-  { key: 'settings', icon: 'sliders', label: 'Settings', question: 'How is this page set up?', group: 'Manage' },
+  { key: 'home', nav: 'home', icon: 'activity', label: 'Now', question: 'What needs me, and where is every task?' },
+  { key: 'now', nav: 'home', icon: 'grid-1x2', label: 'Where', question: 'Who is editing which files?' },
+  { key: 'activity', nav: 'home', icon: 'clock-history', label: 'Catch up', question: 'What happened since I last looked?' },
+  { key: 'team', nav: 'home', icon: 'people', label: 'Team', question: 'Who is working right now?' },
+  { key: 'inbox', nav: 'inbox', icon: 'inbox', label: 'Inbox', question: 'Which overlaps need a conversation?' },
+  { key: 'work', nav: 'history', icon: 'flag', label: 'Finished', question: 'What did agents report finished?' },
+  { key: 'change-record', nav: 'history', icon: 'clipboard2-check', label: 'Change records', question: 'What is ready to hand off?' },
+  { key: 'explorer', nav: 'history', icon: 'folder2-open', label: 'Files', question: 'How did this code and its evidence come together?' },
+  { key: 'timeline', nav: 'timeline', icon: 'camera', label: 'Timeline', question: 'What did this workspace look like earlier?' },
+  { key: 'skills', nav: 'skills', icon: 'journal-check', label: 'Skills', question: 'Which workflows do agents in this repository have to follow?' },
+  { key: 'workflows', nav: 'skills', icon: 'diagram-3', label: 'Checks', question: 'Did the checks pass?' },
+  { key: 'landed', nav: 'skills', icon: 'rocket-takeoff', label: 'After merge', question: 'Did our changes land, and did checks pass after?' },
+  { key: 'templates', nav: 'skills', icon: 'journal-code', label: 'Recipes', question: 'Which workflow recipes can agents reuse?' },
+  { key: 'setup', nav: 'setup', icon: 'plug', label: 'Agents', question: 'Is my agent set up?' },
+  { key: 'health', nav: 'setup', icon: 'heart-pulse', label: 'Hub', question: 'Is the hub OK?' },
+  { key: 'workspace', nav: 'setup', icon: 'people', label: 'Access', question: 'Who can run what?' },
+  { key: 'settings', nav: 'setup', icon: 'sliders', label: 'Preferences', question: 'How is this page set up?' },
+]
+
+/** The rail: one item per question; items with more than one page show them as tabs. */
+export const NAV: NavDef[] = [
+  { key: 'home', icon: 'activity', label: 'Dashboard', question: 'What’s happening?' },
+  { key: 'inbox', icon: 'inbox', label: 'Inbox', question: 'What needs a conversation?' },
+  { key: 'history', icon: 'clock-history', label: 'History', question: 'What happened before?' },
+  { key: 'timeline', icon: 'camera', label: 'Timeline', question: 'What did it look like earlier?' },
+  { key: 'skills', icon: 'lightning-charge', label: 'Skills', question: 'Did the agreed steps run?' },
+  { key: 'setup', icon: 'plug', label: 'Setup', question: 'Is everything connected?' },
 ]
 
 const RAIL_KEY = 'agentscm.hub.railCompact'
@@ -75,9 +88,11 @@ export const saveRail = (v: boolean) => {
 export function sectionFromHash(raw = window.location.hash): Section {
   const h = hashPath(raw)
   if (h.startsWith('#coordination/work/')) return 'work'
-  const first = h.slice(1).split('/')[0]
-  if (first === 'coordination') return 'now'
-  return SECTIONS.some((s) => s.key === first) ? (first as Section) : 'now'
+  const [first, second] = h.slice(1).split('/')
+  // The Work board became the dashboard's track and its coordination tab became the Inbox; their links keep working.
+  if (first === 'work') return second === 'coordination' ? 'inbox' : !second || second === 'working' ? 'home' : 'work'
+  if (first === 'coordination' || first === '') return 'home'
+  return SECTIONS.some((s) => s.key === first) ? (first as Section) : 'home'
 }
 
 export function useSection(): Section {
@@ -94,15 +109,37 @@ export function Logo({ dark, height = 32 }: { dark: boolean; height?: number }) 
   return <img src={dark ? logoDark : logoLight} alt="AgentSCM" height={height} className="logo" />
 }
 
-function Shell({ token, dark, pref, onPref, density, onDensity, onUnauthorized, onForget }: { token: string; dark: boolean; pref: ThemePref; onPref: (p: ThemePref) => void; density: Density; onDensity: (d: Density) => void; onUnauthorized: (m?: string) => void; onForget: () => void }) {
+function Shell({ token, pref, onPref, density, onDensity, onUnauthorized, onForget }: { token: string; pref: ThemePref; onPref: (p: ThemePref) => void; density: Density; onDensity: (d: Density) => void; onUnauthorized: (m?: string) => void; onForget: () => void }) {
   const data = useHub(token, onUnauthorized)
   const section = useSection()
   const d = useMemo(() => (data.work && data.activity ? derive(data.work, data.activity) : null), [data.work, data.activity])
   const overview = usePoll((signal) => fetchOverview(token, signal), 15_000, token)
   const repo = data.whoami?.token.repository ?? 'this repository'
+  const ov = overview.kind === 'ready' ? overview.value : null
+  const now = useNow()
+  const dash = dashboardStatus(ov, d, data.activity?.events ?? null, now)
   const badges: Badges = {}
-  if (d && d.contested.length > 0) badges.now = { n: d.contested.length, tone: 'bad', tip: `${d.contested.length} contested file${d.contested.length === 1 ? '' : 's'}` }
-  if (overview.kind === 'ready' && overview.value.overlaps.length > 0) badges.work = { n: overview.value.overlaps.length, tone: 'warn', tip: `${overview.value.overlaps.length} declared-scope overlap${overview.value.overlaps.length === 1 ? '' : 's'} to coordinate` }
+  if (dash.needs.length > 0) badges.home = { n: dash.needs.length, tone: dash.needs.some((n) => n.tone === 'bad') ? 'bad' : 'warn', tip: `${dash.needs.length} thing${dash.needs.length === 1 ? ' needs' : 's need'} you` }
+  if (ov && ov.overlaps.length > 0) badges.inbox = { n: ov.overlaps.length, tone: 'warn', tip: `${ov.overlaps.length} declared-scope overlap${ov.overlaps.length === 1 ? '' : 's'} to coordinate` }
+  const finished = ov?.recent.filter((o) => o.kind === 'completion').length
+  const statuses: TabStatuses = {
+    home: dash.home,
+    now: dash.now,
+    activity: dash.activity,
+    team: dash.team,
+    work: finished === undefined ? undefined : { text: finished ? `${finished} recently` : 'None recently', tone: finished ? 'ok' : 'muted' },
+    'work-history': { text: 'Every change, paged', tone: 'muted' },
+    'change-record': { text: 'Per task', tone: 'muted' },
+    explorer: { text: 'From this computer', tone: 'muted' },
+    skills: { text: 'Required steps', tone: 'muted' },
+    workflows: { text: 'Recorded runs', tone: 'muted' },
+    landed: { text: 'CI and deploys', tone: 'muted' },
+    templates: { text: 'From this computer', tone: 'muted' },
+    setup: { text: 'Hooks and tokens', tone: 'muted' },
+    health: data.failing ? { text: 'Not answering', tone: 'bad' } : data.health ? { text: data.health.status === 'ok' ? 'Answering' : 'Degraded', tone: data.health.status === 'ok' ? 'ok' : 'warn' } : undefined,
+    workspace: { text: 'Members and runs', tone: 'muted' },
+    settings: { text: 'This browser', tone: 'muted' },
+  }
 
   const [rail, setRail] = useState(loadRail)
   const changeRail = useCallback((v: boolean) => {
@@ -113,17 +150,22 @@ function Shell({ token, dark, pref, onPref, density, onDensity, onUnauthorized, 
   const shell = (
     <TourProvider section={section} data={data} d={d} overview={overview.kind === 'ready' ? overview.value : null}>
       <AppChrome
-        logo={<Logo dark={dark} height={26} />}
+        // The frame is deep violet in both themes, so the top bar always carries the light-on-dark logo.
+        logo={<Logo dark height={26} />}
         token={token}
         repo={repo}
+        nav={NAV}
         sections={SECTIONS}
         section={section}
         badges={badges}
+        statuses={statuses}
         data={data}
         d={d}
         overview={overview.kind === 'ready' ? overview.value : null}
         pref={pref}
         onPref={onPref}
+        density={density}
+        onDensity={onDensity}
         onForget={onForget}
         collapsed={rail}
         onCollapsed={changeRail}
@@ -134,9 +176,9 @@ function Shell({ token, dark, pref, onPref, density, onDensity, onUnauthorized, 
             Simulated agents working on your repository’s file names. Nothing is written to your repository; this page stops when <code>agentscm demo</code> does. To set it up for real, stop the demo and run <code>agentscm quickstart</code> (or <code>npx agentscm</code>).
           </Notice>
         )}
-        {section === 'now' && <NowPage repo={repo} data={data} d={d} overview={overview} />}
+        {(section === 'home' || section === 'now' || section === 'activity' || section === 'team') && <DashboardPage section={section} question={SECTIONS.find((s) => s.key === section)!.question} token={token} repo={repo} data={data} d={d} overview={overview} />}
+        {section === 'inbox' && <InboxPage token={token} overview={overview} />}
         {section === 'work' && <WorkPage token={token} overview={overview} />}
-        {section === 'activity' && <ActivityPage d={d} events={data.activity?.events ?? null} fresh={data.fresh} repo={data.whoami?.token.repository ?? null} token={token} />}
         {section === 'workflows' && <WorkflowsPage token={token} repository={data.whoami?.token.repository ?? null} />}
         {section === 'change-record' && <ChangeRecordPage repo={data.whoami?.token.repository ?? null} token={token} />}
         {section === 'landed' && <LandedPage repo={data.whoami?.token.repository ?? null} token={token} />}
@@ -196,11 +238,11 @@ export default function App() {
   )
   const onForget = useCallback(() => signedOut('Token forgotten on this browser. The hub still accepts it until it expires or is revoked.'), [signedOut])
 
-  if (token) return <Shell key={token} token={token} dark={dark} pref={pref} onPref={changePref} density={density} onDensity={changeDensity} onUnauthorized={onUnauthorized} onForget={onForget} />
+  if (token) return <Shell key={token} token={token} pref={pref} onPref={changePref} density={density} onDensity={changeDensity} onUnauthorized={onUnauthorized} onForget={onForget} />
   if (section === 'workspace')
     return (
       <div className="signed-out-workspace">
-        <a href="#now" className="btn btn-link">
+        <a href="#home" className="btn btn-link">
           <Icon name="arrow-left" /> Back to sign-in
         </a>
         <WorkspacePage />

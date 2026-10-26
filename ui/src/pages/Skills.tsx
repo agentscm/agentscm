@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react'
+import { SectionTabs } from '../TopNav.tsx'
 import { Track } from './Landed.tsx'
 import {
   GATE_STATE_VIEW, addCommand, adoptionLabel, assuranceView, enforcement, fetchLibrary, fetchRun, fetchRuns, gateChain, gateLabel, gateSteps, lastEvidence, paramText, removeCommand,
@@ -103,8 +104,10 @@ function LibraryView({ repo, token }: { repo: string; token: string }) {
     <div className="page">
       <div className="answer" data-tour="answer">
         <h1 className="page-question">Which workflows do agents in this repository have to follow?</h1>
-        <p className="answer-text"><code>{repo}</code>{poll.kind === 'ready' && <> · <span>{adoptionLabel(poll.value.adoption.source, poll.value.adoption.default_branch)}</span></>}</p>
+        <p className="answer-text">{poll.kind === 'ready' ? (() => { const n = poll.value.adoption.pins.filter((p) => p.status === 'adopted').length; return n === 0 ? 'This repository requires no skills yet.' : <><b>{n} {n === 1 ? 'skill' : 'skills'}</b> agents here have to follow.</> })() : 'Checking which skills this repository requires…'}</p>
+        {poll.kind === 'ready' && <p className="answer-fact"><code>{repo}</code> · <span>{adoptionLabel(poll.value.adoption.source, poll.value.adoption.default_branch)}</span></p>}
       </div>
+      <SectionTabs />
       <Loaded poll={poll} what="skills">{(lib) => <Library lib={lib} />}</Loaded>
       <p className="small muted"><Icon name="info-circle" /> Read-only. Adoption is the lock file in the repository; it takes effect when <code>agentscm-skills.lock.json</code> is committed.</p>
     </div>
@@ -196,8 +199,10 @@ function RunsList({ repo, token }: { repo: string; token: string }) {
     <div className="page">
       <div className="answer" data-tour="answer">
         <h1 className="page-question">Where is each pull request in its workflow?</h1>
-        <p className="answer-text"><a href={skillsHref}><Icon name="arrow-left" /> Skills library</a> · <code>{repo}</code></p>
+        <p className="answer-text">Every pull request, at the step its workflow reached.</p>
+        <p className="answer-fact"><a href={skillsHref}><Icon name="arrow-left" /> Skills library</a> · <code>{repo}</code></p>
       </div>
+      <SectionTabs />
       <Loaded poll={poll} what="skill runs">
         {({ runs, truncated }) => {
           const inTab = (r: RunView) => (tab === 'open') === (r.state === 'open')
