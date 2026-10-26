@@ -17,6 +17,7 @@ use crate::execution::process::{Stop, capture_with_input};
 use crate::{Error, Result};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(60);
+const FETCH_TIMEOUT: Duration = Duration::from_secs(300);
 const GIT_OUTPUT: u64 = 16 * 1024 * 1024;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const PROBE_OUTPUT: u64 = 64 * 1024;
@@ -54,6 +55,16 @@ fn allowlisted(command: &mut Command) {
 }
 
 fn git(repo: &Path, args: &[&str], limit: u64) -> Result<Vec<u8>> {
+    git_timeout(repo, args, limit, GIT_TIMEOUT, false)
+}
+
+fn git_timeout(
+    repo: &Path,
+    args: &[&str],
+    limit: u64,
+    timeout: Duration,
+    network: bool,
+) -> Result<Vec<u8>> {
     let mut command = Command::new("git");
     command
         .env_clear()
@@ -61,16 +72,15 @@ fn git(repo: &Path, args: &[&str], limit: u64) -> Result<Vec<u8>> {
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .arg("-C")
         .arg(repo)
-        .args(["--no-optional-locks", "-c", "core.fsmonitor=false"])
-        .args(args)
-        .process_group(0);
-    let out = capture_with_input(
-        &mut command,
-        None,
-        GIT_TIMEOUT,
-        limit,
-        &Cancellation::default(),
-    )?;
+        .args(["--no-optional-locks", "-c", "core.fsmonitor=false"]);
+    if network {
+        // No credentials, prompts or environment configuration reach the transport.
+        command
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(["-c", "credential.helper="]);
+    }
+    command.args(args).process_group(0);
+    let out = capture_with_input(&mut command, None, timeout, limit, &Cancellation::default())?;
     if out.stop.is_some() || out.code != Some(0) {
         return Err(Error::Invalid(format!(
             "git {} failed",
@@ -109,6 +119,28 @@ pub fn observe(repo: &Path, head: &str, base_rev: &str) -> Result<GitState> {
         commit,
         base_tip,
     })
+}
+
+/// Fetches the base branch and `refs/pull/{number}/head` from `origin` (Git data only, nothing is
+/// checked out) and requires the pull ref to name exactly `head`.
+pub fn fetch_pull(repo: &Path, base: &str, number: i64, head: &str) -> Result<()> {
+    let base_spec = format!("+refs/heads/{base}:refs/remotes/origin/{base}");
+    let pull_ref = format!("refs/pull/{number}/head");
+    for spec in [base_spec.as_str(), pull_ref.as_str()] {
+        git_timeout(
+            repo,
+            &["fetch", "--no-tags", "--quiet", "origin", spec],
+            GIT_OUTPUT,
+            FETCH_TIMEOUT,
+            true,
+        )?;
+    }
+    if rev(repo, "FETCH_HEAD", "^{commit}")? != head {
+        return Err(Error::Invalid(
+            "pull request head moved while fetching".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn is_clean(repo: &Path) -> Result<bool> {

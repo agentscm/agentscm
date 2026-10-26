@@ -664,6 +664,7 @@ async fn legacy_flat_comment_is_upgraded_in_place_without_changing_signed_bytes(
                 id: 50,
                 body: legacy.clone(),
                 author: "maintainer-login".into(),
+                ..Default::default()
             }],
         );
     });
@@ -710,6 +711,7 @@ async fn another_authors_marker_comment_is_not_adopted() {
                 id: 50,
                 body,
                 author: "mallory".into(),
+                ..Default::default()
             }],
         );
     });

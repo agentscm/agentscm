@@ -10,6 +10,8 @@ use std::collections::HashSet;
 
 pub mod comment;
 #[cfg(unix)]
+pub mod reconcile;
+#[cfg(unix)]
 pub mod run;
 
 use serde::{Deserialize, Serialize};
