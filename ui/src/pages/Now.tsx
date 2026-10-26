@@ -4,7 +4,7 @@ import { areas } from '../needs.ts'
 import { workHref, type WorkOverview } from '../standup.ts'
 import type { PullRequest } from '../types.ts'
 import type { HubData } from '../useHub.ts'
-import { Ago, Avatar, Box, Empty, Explain, Icon, Notice, Path, Pill, Skeleton, Tip, Via } from '../ui.tsx'
+import { agentLabel, Ago, Avatar, Box, Empty, Explain, Icon, Notice, Path, Pill, Skeleton, Tip, Via } from '../ui.tsx'
 import type { Poll } from '../usePoll.ts'
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`
@@ -15,7 +15,7 @@ export function AgentRow({ a, awake }: { a: LiveAgent; awake?: boolean }) {
       <Avatar name={a.name} size={36} />
       <div className="agent-main">
         <div className="agent-line">
-          <strong>{a.name}</strong>
+          <strong title={a.name}>{agentLabel(a.name)}</strong>
           <span className="muted">{a.owner}</span>
           {a.via.map((v) => (
             <Via key={v} via={v} />
@@ -66,14 +66,14 @@ function ContestedRow({ c }: { c: Contested }) {
       <div className="contested-holders">
         {c.holders.map((x, i) => (
           <span key={x.id}>
-            {i > 0 && <Icon name="arrow-left-right" className="muted" />} <strong>{x.name}</strong> <span className="muted">{x.owner}</span>
+            {i > 0 && <Icon name="arrow-left-right" className="muted" />} <strong title={x.name}>{agentLabel(x.name)}</strong> <span className="muted">{x.owner}</span>
           </span>
         ))}
       </div>
       <div className="contested-state">
         {c.refused && (
           <Pill tone="bad" icon="slash-circle" tip="The hub refused this agent’s first edit because another agent holds the file.">
-            {c.refused.owner}’s {c.refused.name} refused <Ago at={c.refused.at} />
+            {c.refused.owner}’s {agentLabel(c.refused.name)} refused <Ago at={c.refused.at} />
           </Pill>
         )}
         {c.repeated && (
@@ -87,7 +87,7 @@ function ContestedRow({ c }: { c: Contested }) {
             icon={h.answer ? (h.answer.kind === 'granted' ? 'check2-circle' : 'lock') : h.lapsed ? 'hourglass-bottom' : 'hourglass-split'}
             tip="Experimental handoff: one agent asked the holder to hand the file over. Unanswered requests lapse after 30 minutes."
           >
-            {h.from.name} asked {h.to.name} · {h.answer ? (h.answer.kind === 'granted' ? 'handed over' : 'kept') : h.lapsed ? 'lapsed' : 'waiting'}
+            {agentLabel(h.from.name)} asked {agentLabel(h.to.name)} · {h.answer ? (h.answer.kind === 'granted' ? 'handed over' : 'kept') : h.lapsed ? 'lapsed' : 'waiting'}
           </Pill>
         )}
       </div>
@@ -252,16 +252,18 @@ function AreaMap({ d, ov }: { d: Derived | null; ov: WorkOverview | null }) {
                       <b>{a.name || 'Repository root'}</b>
                       <code>{a.name ? `${a.name}/` : 'files at the top level'}</code>
                     </span>
-                    {a.crossings > 0 && <span className="crossing">{plural(a.crossings, 'crossing')}</span>}
                     <span className="tile-people" aria-label={`${people.length} ${people.length === 1 ? 'agent' : 'agents'}: ${people.map(([k]) => k.replace('/', '’s ')).join(', ')}`}>
                       {people.slice(0, 5).map(([k, n]) => (
                         <Avatar key={k} name={n} size={26} />
                       ))}
                       {people.length > 5 && <span className="tile-more">+{people.length - 5}</span>}
                     </span>
-                    <span className="tile-lens">
-                      {a.holders.length > 0 ? `${a.holders.length} editing` : 'Nobody editing'}
-                      {a.planned.length > 0 && ` · ${plural(a.planned.length, 'task')} planned`}
+                    <span className="tile-foot">
+                      <span className="tile-lens">
+                        {a.holders.length > 0 ? `${a.holders.length} editing` : 'Nobody editing'}
+                        {a.planned.length > 0 && ` · ${plural(a.planned.length, 'task')} planned`}
+                      </span>
+                      {a.crossings > 0 && <span className="crossing">{plural(a.crossings, 'crossing')}</span>}
                     </span>
                   </button>
                 </div>
@@ -291,7 +293,7 @@ function AreaMap({ d, ov }: { d: Derived | null; ov: WorkOverview | null }) {
                           <Avatar name={h.name} size={26} />
                           <div>
                             <div className="ad-main">
-                              {h.name} <span className="muted small">{h.owner}</span>
+                              <span title={h.name}>{agentLabel(h.name)}</span> <span className="muted small">{h.owner}</span>
                             </div>
                             <div className="ad-meta">{h.files.slice(0, 4).map((f) => <Path key={f}>{f}</Path>)}{h.files.length > 4 && <span>+{h.files.length - 4} more</span>}</div>
                           </div>

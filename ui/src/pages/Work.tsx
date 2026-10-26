@@ -25,7 +25,7 @@ import {
   type WorkSourceRef,
   type WorkState,
 } from '../standup.ts'
-import { Ago, Avatar, Box, Empty, Explain, Icon, Notice, Path, Paths, Pill, Skeleton, Tip, localDate, type Tone } from '../ui.tsx'
+import { agentLabel, Ago, Avatar, Box, Empty, Explain, Icon, Notice, Path, Paths, Pill, Skeleton, Tip, localDate, type Tone } from '../ui.tsx'
 import { usePoll, type Poll } from '../usePoll.ts'
 import { hashPath, Pager } from '../Pager.tsx'
 
@@ -39,9 +39,11 @@ export const STATE: Record<WorkState, { label: string; tone: Tone; icon: string;
 const LANES: WorkState[] = ['active', 'blocked', 'handover', 'paused']
 
 const EVENT_LABEL: Record<string, string> = { work_started: 'Started work', work_joined: 'Joined work', work_takeover: 'Took over the claim', work_checkpoint: 'Reported a checkpoint' }
+const EVENT_ICON: Record<string, string> = { work_started: 'play-fill', work_joined: 'person-plus', work_takeover: 'arrow-left-right', work_checkpoint: 'flag' }
 const RESPONSE_LABEL: Record<CoordinationResponseKind, string> = { propose_split: 'Proposed a scope split', join: 'Offered to join', handover: 'Offered a handover', decline: 'Declined' }
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`
+const spanText = (seconds: number) => (seconds <= 48 * 3600 ? plural(Math.max(1, Math.round(seconds / 3600)), 'hour') : plural(Math.round(seconds / 86400), 'day'))
 
 export function lead(item: WorkItem): { agent: string; login: string } {
   try {
@@ -100,7 +102,7 @@ export function LaneBar({ item, fresh }: { item: WorkItem; fresh: boolean }) {
   const l = lead(item)
   const href = workHref(item.id)
   const s = STATE[item.state]
-  const claimTip = `Claimed by ${l.agent} (${l.login}) ${localDate(item.created_at)}`
+  const claimTip = `Claimed by ${agentLabel(l.agent)} (${l.login}) ${localDate(item.created_at)}`
   return (
     <div className="lb-wrap">
       <ol className="lb lb-fit" aria-label={`${item.title}: ${s.label}`}>
@@ -183,7 +185,7 @@ function WorkCard({ item, outcomeAt }: { item: WorkItem; outcomeAt?: number }) {
       <div className="work-owner">
         <Avatar name={l.agent} size={28} />
         <span>
-          <strong>{l.agent}</strong> <span className="muted small">{l.login}</span>
+          <strong title={l.agent}>{agentLabel(l.agent)}</strong> <span className="muted small">{l.login}</span>
         </span>
       </div>
       <h3 className="work-title">
@@ -197,7 +199,7 @@ function WorkCard({ item, outcomeAt }: { item: WorkItem; outcomeAt?: number }) {
       <Action item={item} />
       {helpers.length > 0 && (
         <div className="small muted">
-          <Icon name="people" /> {helpers.slice(0, 2).map((p) => `${p.agent} (${p.role})`).join(', ')}
+          <Icon name="people" /> {helpers.slice(0, 2).map((p) => `${agentLabel(p.agent)} (${p.role})`).join(', ')}
           {helpers.length > 2 && <> · <WorkLink id={item.id}>+{helpers.length - 2} more</WorkLink></>}
         </div>
       )}
@@ -295,7 +297,7 @@ function Request({ r }: { r: CoordinationRequest }) {
         <span className="request-main">
           <strong>{r.proposal.title}</strong>
           <span className="muted small">
-            <Icon name="person" /> {r.requester.agent} <Icon name="arrow-right" /> {r.targets.map((t) => t.lead.agent).join(', ')}
+            <Icon name="person" /> {agentLabel(r.requester.agent)} <Icon name="arrow-right" /> {r.targets.map((t) => agentLabel(t.lead.agent)).join(', ')}
           </span>
         </span>
         {first && (
@@ -311,7 +313,7 @@ function Request({ r }: { r: CoordinationRequest }) {
       <div className="request-body">
         <div className="request-proposal">
           <div className="small muted">
-            Requested by {r.requester.agent} · {r.requester.login} · <code>{r.id}</code>
+            Requested by {agentLabel(r.requester.agent)} · {r.requester.login} · <code>{r.id}</code>
           </div>
           <div>
             <span className="label">Proposed scope</span> {r.proposal.scope.length ? <Paths items={r.proposal.scope} max={12} /> : <em className="muted">Scope not declared</em>}
@@ -336,7 +338,7 @@ function Request({ r }: { r: CoordinationRequest }) {
                   <Avatar name={t.lead.agent} size={28} />
                   <span>
                     <span className="label">Target lead</span>
-                    <strong>{t.lead.agent}</strong> <span className="muted small">{t.lead.login}</span>
+                    <strong title={t.lead.agent}>{agentLabel(t.lead.agent)}</strong> <span className="muted small">{t.lead.login}</span>
                   </span>
                   <WorkLink id={t.work_id}>Open work</WorkLink>
                 </div>
@@ -359,7 +361,7 @@ function Request({ r }: { r: CoordinationRequest }) {
                 {resp && (
                   <blockquote className="response">
                     <strong>
-                      {resp.responder.agent} · {resp.responder.login}
+                      {agentLabel(resp.responder.agent)} · {resp.responder.login}
                     </strong>
                     <p>{resp.note ?? 'No note provided.'}</p>
                     <Ago at={resp.created_at} />
@@ -463,7 +465,7 @@ function OverlapRow({ o }: { o: WorkOverlapPair }) {
     return (
       <div className="overlap-side">
         <div>
-          <Avatar name={l.agent} size={24} /> <strong>{l.agent}</strong> <span className="muted small">{l.login}</span>
+          <Avatar name={l.agent} size={24} /> <strong title={l.agent}>{agentLabel(l.agent)}</strong> <span className="muted small">{l.login}</span>
         </div>
         <WorkLink id={item.id}>{item.title}</WorkLink>
         <div className="small">
@@ -526,7 +528,7 @@ export function Coordination({ token, overview, search }: { token: string; overv
               {attention.map((i) => (
                 <li key={i.id}>
                   <WorkLink id={i.id}>{i.title}</WorkLink>
-                  <span className="muted small"> · {lead(i).agent}</span>
+                  <span className="muted small"> · {agentLabel(lead(i).agent)}</span>
                   <div className="pills">
                     {i.claim_status !== 'active' && <ClaimPill item={i} />}
                     {i.scope.length === 0 && <Pill tone="muted" icon="question-circle">Scope unknown</Pill>}
@@ -568,7 +570,10 @@ function Finished({ overview, search }: { overview: WorkOverview; search: string
       <div className="window">
         <Icon name="calendar-range" />
         <span>
-          Showing completions from <strong>{localDate(overview.recent_since)}</strong> to <strong>{localDate(overview.until)}</strong>
+          Completions reported in the{' '}
+          <Tip text={`${localDate(overview.recent_since)} to ${localDate(overview.until)}`} focusable>
+            <strong>last {spanText(overview.until - overview.recent_since)}</strong>
+          </Tip>
         </span>
         <Explain text="Finished means the agent reported it finished. It does not confirm verification, review, or merge." />
       </div>
@@ -644,37 +649,26 @@ function History({ token }: { token: string }) {
       ) : events.length === 0 ? (
         <Empty icon="list" title="No changes on this page" />
       ) : (
-        <div className="table-responsive box">
-          <table className="table table-hover align-middle mb-0 history">
-            <thead>
-              <tr>
-                <th scope="col">Work</th>
-                <th scope="col">Change</th>
-                <th scope="col">Lead</th>
-                <th scope="col">Status</th>
-                <th scope="col">When</th>
-              </tr>
-            </thead>
-            <tbody>
-              {events.map((e) => (
-                <tr key={e.seq}>
-                  <td>
-                    <WorkLink id={e.work_id}>{e.item.title}</WorkLink>
-                  </td>
-                  <td>
-                    {EVENT_LABEL[e.kind] ?? e.kind}
-                    {e.item.current && e.kind === 'work_checkpoint' && <div className="small muted text-truncate history-sub">{e.item.current.summary}</div>}
-                  </td>
-                  <td>{lead(e.item).agent}</td>
-                  <td>
+        <ol className="change-feed box">
+          {events.map((e) => {
+            const l = lead(e.item)
+            return (
+              <li key={e.seq} className="change-row">
+                <span className={`change-mark is-${e.kind}`} aria-hidden="true"><Icon name={EVENT_ICON[e.kind] ?? 'dot'} /></span>
+                <div className="change-main">
+                  <WorkLink id={e.work_id}>{e.item.title}</WorkLink>
+                  <div className="change-meta">
+                    <span>{EVENT_LABEL[e.kind] ?? e.kind}</span>
+                    <span className="change-who"><Avatar name={l.agent} size={18} /> <span title={l.agent}>{agentLabel(l.agent)}</span> <span className="muted">{l.login}</span></span>
                     <StatePill state={e.item.state} />
-                  </td>
-                  <td className="text-nowrap">{localDate(e.at)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+                  </div>
+                  {e.item.current && e.kind === 'work_checkpoint' && <p className="change-quote">“{e.item.current.summary}”</p>}
+                </div>
+                <span className="change-when"><Ago at={e.at} /></span>
+              </li>
+            )
+          })}
+        </ol>
       )}
       <Pager
         newerLabel="Previous"
@@ -728,7 +722,7 @@ function Report({ c, item, title }: { c: WorkCheckpoint; item: WorkItem; title: 
         </div>
       )}
       <div className="small muted">
-        Reported by {c.agent} · {localDate(c.at)}
+        Reported by {agentLabel(c.agent)} · {localDate(c.at)}
       </div>
     </div>
   )
@@ -792,7 +786,7 @@ function Detail({ id, token }: { id: string; token: string }) {
                       <li key={`${p.token}-${p.session}`} className="d-flex align-items-center gap-2">
                         <Avatar name={p.agent} size={28} />
                         <span>
-                          <strong>{p.agent}</strong> <span className="muted small">{p.login}</span>
+                          <strong title={p.agent}>{agentLabel(p.agent)}</strong> <span className="muted small">{p.login}</span>
                         </span>
                         <Pill tone={p.role === 'lead' ? 'brand' : 'muted'} icon={p.role === 'lead' ? 'star' : p.role === 'reviewer' ? 'eye' : 'person'}>
                           {p.role}

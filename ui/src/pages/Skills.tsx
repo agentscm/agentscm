@@ -2,10 +2,11 @@ import { useEffect, useState, type ReactNode } from 'react'
 import { SectionTabs } from '../TopNav.tsx'
 import { Track } from './Landed.tsx'
 import {
-  GATE_STATE_VIEW, addCommand, adoptionLabel, assuranceView, enforcement, fetchLibrary, fetchRun, fetchRuns, gateChain, gateLabel, gateSteps, lastEvidence, paramText, removeCommand,
-  runMatches, runStateLabel, stepText, runStateTone, selfReportedCount, shortSha, skillRunHref, skillRunsHref, skillsHref, skillsRoute, type CatalogEntry, type Evidence, type Library, type Pin, type RunView,
+  GATE_STATE_VIEW, addCommand, adoptionLabel, assuranceView, enforcement, fetchLibrary, fetchRun, fetchRuns, gateLabel, gateSteps, lastEvidence, paramText, parseStep, removeCommand,
+  runMatches, runStateLabel, stepText, runStateTone, selfReportedCount, shortSha, skillRunHref, skillRunsHref, skillsHref, skillsRoute, type CatalogEntry, type Evidence, type Library, type Pin, type RunView, type StepEnforce,
 } from '../skills.ts'
-import { Ago, Box, CopyButton, Empty, Icon, Notice, Pill, Skeleton } from '../ui.tsx'
+import { Markdown } from '../Markdown.tsx'
+import { Ago, Box, CopyButton, Empty, Icon, Notice, Pill, Skeleton, type Tone } from '../ui.tsx'
 import { usePoll, type Poll } from '../usePoll.ts'
 
 function Loaded<T>({ poll, what, children }: { poll: Poll<T>; what: string; children: (v: T) => ReactNode }) {
@@ -35,16 +36,43 @@ export function SkillsPage({ repo, token }: { repo: string | null; token: string
 }
 
 function Applicability({ c }: { c: CatalogEntry }) {
-  const rows: [string, string[]][] = [['When to use', c.applicability.triggers], ['Prerequisites', c.applicability.prerequisites], ['Not for', c.applicability.not_for]]
+  const rows: [string, string, string[]][] = [['When to use', 'check2', c.applicability.triggers], ['Prerequisites', 'box-seam', c.applicability.prerequisites], ['Not for', 'slash-circle', c.applicability.not_for]]
   return (
     <dl className="skill-facts">
-      {rows.map(([label, items]) => (
+      {rows.map(([label, icon, items]) => (
         <div key={label}>
-          <dt>{label}</dt>
+          <dt><Icon name={icon} /> {label}</dt>
           <dd>{items.length ? <ul>{items.map((t) => <li key={t}>{t}</li>)}</ul> : <span className="muted">None stated</span>}</dd>
         </div>
       ))}
     </dl>
+  )
+}
+
+const ENFORCE_VIEW: Record<StepEnforce, { label: string; tone: Tone; icon: string }> = {
+  block: { label: 'Blocks finish', tone: 'brand', icon: 'sign-stop' },
+  warn: { label: 'Warns', tone: 'muted', icon: 'bell' },
+  record: { label: 'Recorded', tone: 'muted', icon: 'journal-text' },
+}
+const whoIcon = (who: string) => (/^maintainer/i.test(who) ? 'person' : /session/i.test(who) ? 'people' : 'robot')
+
+// Every hub line ends its needs with the lowest bar; said once under the track instead of on every step.
+const LOWEST_BAR = ' (self-reported or stronger)'
+
+function Step({ line }: { line: string }) {
+  const s = parseStep(line)
+  if (!s) return <li className="gate-step"><p className="gate-plain">{stepText(line)}</p></li>
+  const e = ENFORCE_VIEW[s.enforce]
+  return (
+    <li className={`gate-step is-${s.enforce}`}>
+      <div className="gate-step-head">
+        <strong>{s.name}</strong>
+        <span className="gate-who"><Icon name={whoIcon(s.who)} /> {s.who}</span>
+        <Pill tone={e.tone} icon={e.icon} tip={s.detail.toLowerCase() === e.label.toLowerCase() ? undefined : s.detail}>{e.label}</Pill>
+      </div>
+      <p className="gate-plain">{s.plain}</p>
+      <p className="gate-needs">{`Needs: ${s.needs.endsWith(LOWEST_BAR) ? s.needs.slice(0, -LOWEST_BAR.length) : s.needs}`}</p>
+    </li>
   )
 }
 
@@ -53,15 +81,29 @@ function HowItWorks({ c, pin }: { c: CatalogEntry; pin: Pin | null }) {
   if (lines.length === 0) return null
   return (
     <div className="skill-walkthrough" data-tour="skills-how">
-      <h3 className="small fw-semibold mb-1">How it works</h3>
-      <ol className="small">{lines.map((l, i) => <li key={i}>{stepText(l)}</li>)}</ol>
+      <h3 className="skill-sub">How it works</h3>
+      <ol className="gate-track">{lines.map((l, i) => <Step key={i} line={l} />)}</ol>
+      {lines.every((l) => parseStep(l)?.needs.endsWith(LOWEST_BAR)) && <p className="gate-note"><Icon name="person-check" /> Every step accepts evidence the agent reports itself. The hub records it; it does not check it.</p>}
       {c.procedure && (
-        <details className="small">
-          <summary>Full procedure</summary>
-          <pre className="small">{c.procedure}</pre>
+        <details className="skill-proc">
+          <summary><Icon name="file-earmark-text" /> Full procedure <span className="muted">· the text agents follow</span></summary>
+          <Markdown source={c.procedure} />
         </details>
       )}
     </div>
+  )
+}
+
+function SkillItem({ c, pin, children }: { c: CatalogEntry; pin: Pin | null; children: ReactNode }) {
+  return (
+    <li className="skill-item" data-tour="skills-item">
+      <SkillHead c={c} />
+      <p className="skill-summary">{c.summary}</p>
+      <Applicability c={c} />
+      <HowItWorks c={c} pin={pin} />
+      <Params c={c} pin={pin} />
+      <div className="skill-act">{children}</div>
+    </li>
   )
 }
 
@@ -130,17 +172,11 @@ function Library({ lib }: { lib: Library }) {
             {adopted.map(({ p, c }) => {
               const n = lib.counts[c.name] ?? { open: 0, at_stop_gate: 0, completed: 0 }
               return (
-                <li key={c.name} className="skill-item" data-tour="skills-item">
-                  <SkillHead c={c} />
-                  <p className="mb-1">{c.summary}</p>
-                  <p className="small muted mb-1">{gateChain(c.gates)}</p>
-                  <Applicability c={c} />
-                  <HowItWorks c={c} pin={p} />
-                  <Params c={c} pin={p} />
+                <SkillItem key={c.name} c={c} pin={p}>
                   <p className="small mb-2">{n.open} open run{n.open === 1 ? '' : 's'} · {n.at_stop_gate} at a stop gate · {n.completed} completed <a className="ms-2" href={skillRunsHref}>View runs</a></p>
                   <p className="small muted mb-1">To remove it, run this in the repository, then commit the lock file:</p>
                   <Cmd command={removeCommand(c.name)} label={`Remove ${c.name}`} />
-                </li>
+                </SkillItem>
               )
             })}
           </ul>
@@ -152,16 +188,10 @@ function Library({ lib }: { lib: Library }) {
         ) : (
           <ul className="skill-list">
             {available.map((c) => (
-              <li key={c.name} className="skill-item" data-tour="skills-item">
-                <SkillHead c={c} />
-                <p className="mb-1">{c.summary}</p>
-                <p className="small muted mb-1">{gateChain(c.gates)}</p>
-                <Applicability c={c} />
-                <HowItWorks c={c} pin={null} />
-                <Params c={c} pin={null} />
+              <SkillItem key={c.name} c={c} pin={null}>
                 <p className="small muted mb-1">To adopt it, run this in the repository, then commit <code>agentscm-skills.lock.json</code>:</p>
                 <Cmd command={addCommand(c.name)} label={`Adopt ${c.name}`} />
-              </li>
+              </SkillItem>
             ))}
           </ul>
         )}

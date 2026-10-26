@@ -1,4 +1,6 @@
 // Browser storage can throw (private windows, blocked site data): never rely on it.
+import { clearPollCache } from './usePoll.ts'
+
 const TOKEN_KEY = 'agentscm.token'
 const THEME_KEY = 'agentscm.theme'
 const DENSITY_KEY = 'agentscm.density'
@@ -31,6 +33,7 @@ export function loadToken(): string | null {
 }
 
 export function clearToken(): void {
+  clearPollCache()
   for (const s of stores()) {
     try {
       s.removeItem(TOKEN_KEY)

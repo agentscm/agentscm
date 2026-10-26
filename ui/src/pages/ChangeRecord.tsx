@@ -25,7 +25,7 @@ import {
 } from '../changeRecord.ts'
 import { searchStandupWork, validWorkId, type WorkState } from '../standup.ts'
 import { StatePill } from './Work.tsx'
-import { Ago, Box, Empty, Explain, Icon, Notice, Path, Paths, Pill, Reported, Skeleton, relative, type Tone } from '../ui.tsx'
+import { agentLabel, Ago, Box, Empty, Explain, Icon, Notice, Path, Paths, Pill, Reported, Skeleton, relative, type Tone } from '../ui.tsx'
 import { Combobox, type ComboResult } from '../Combobox.tsx'
 import { hashPath, Pager, useHashCursor } from '../Pager.tsx'
 import { usePoll } from '../usePoll.ts'
@@ -192,7 +192,7 @@ function Lookup({ token }: { token: string }) {
                   label: (
                     <>
                       {w.title}
-                      {w.lead_agent ? <span className="small muted"> · {w.lead_agent}</span> : null}
+                      {w.lead_agent ? <span className="small muted"> · {agentLabel(w.lead_agent)}</span> : null}
                       {w.branch ? <> <code className="branch-name small">{w.branch}</code></> : null}
                     </>
                   ),

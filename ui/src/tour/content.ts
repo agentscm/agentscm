@@ -461,11 +461,11 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
       {
         target: T('skills-how'),
         title: 'How it works, in plain English',
-        what: 'One line per step of the skill, written by the hub. Full procedure opens the exact text agents follow.',
+        what: 'One step per gate, written by the hub: who does it, what it needs, and whether the Stop hook blocks on it. Full procedure opens the exact text agents follow.',
         why: 'You can check what an agent is supposed to do before you adopt it, without reading the workflow file.',
         how: 'Read the steps top to bottom. They match the gates you will see on each run.',
         tip: (c) => {
-          const t = c.text('[data-tour="skills-how"] li')
+          const t = c.text('[data-tour="skills-how"] .gate-plain')
           return t ? `Step 1 says: “${t}”` : null
         },
         empty: 'The plain-English steps appear here for each skill the hub ships.',

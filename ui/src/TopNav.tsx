@@ -13,7 +13,7 @@ import { routeFromHash as workflowRouteFromHash, runHref as workflowRunHref } fr
 import { workspaceRoute, workspaceRunHref } from './pages/Workspace.tsx'
 import { landedIdFromHash, landedHref } from './pages/Landed.tsx'
 import { compareHref, entryHref, timelineRoute } from './pages/Timeline.tsx'
-import { Icon, Tip, relative } from './ui.tsx'
+import { Icon, Tip, agentLabel, relative } from './ui.tsx'
 import { TourTrigger, useTour } from './tour/Tour.tsx'
 import { tourFor } from './tour/content.ts'
 
@@ -345,7 +345,7 @@ export function paletteHits(sections: SectionDef[], d: Derived | null, overview:
   for (const a of d?.agents ?? []) hits.push({ group: 'Agents', icon: 'robot', label: a.name, hint: `${a.owner}${a.task ? ` · ${a.task}` : ''}`, href: '#team' })
   const files = new Set((d?.agents ?? []).flatMap((a) => a.holdings.map((h) => h.spec)))
   for (const f of files) hits.push({ group: 'Held files', icon: 'file-earmark-code', label: f, hint: 'Claimed by a live agent', href: '#now' })
-  for (const w of overview?.current ?? []) hits.push({ group: 'Work', icon: 'kanban', label: w.title, hint: `${w.lead_agent} · ${w.state}`, href: workHref(w.id) })
+  for (const w of overview?.current ?? []) hits.push({ group: 'Work', icon: 'kanban', label: w.title, hint: `${agentLabel(w.lead_agent)} · ${w.state}`, href: workHref(w.id) })
   for (const o of overview?.recent ?? []) hits.push({ group: 'Recently finished', icon: 'check2-circle', label: o.item.title, hint: `${o.item.lead_agent} · reported ${o.kind}`, href: workHref(o.item.id) })
   return hits
 }
@@ -681,12 +681,15 @@ export function AppChrome({ logo, token, repo, nav, sections, section, badges, s
   }, [drawer])
   // A new section starts at the top, with focus on the page so keyboard and screen-reader users land in it.
   const firstSection = useRef(true)
+  // Scroll before paint, so the new page never shows for a frame at the old position; focus after, so a tour opened by the same change keeps its own focus order.
+  useLayoutEffect(() => {
+    if (!firstSection.current) window.scrollTo(0, 0)
+  }, [section])
   useEffect(() => {
     if (firstSection.current) {
       firstSection.current = false
       return
     }
-    window.scrollTo(0, 0)
     document.getElementById('main')?.focus({ preventScroll: true })
   }, [section])
   useEffect(() => {

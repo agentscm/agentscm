@@ -371,7 +371,7 @@ function Composer({ session, repository, onStarted }: { session: WorkspaceSessio
   const firstSubjects = usePoll(
     (signal) => (profileId ? workspaceRequest<{ subjects: WorkspaceSubject[]; next_cursor: string | null }>(`${base}/subjects?limit=20`, { signal }) : Promise.resolve({ subjects: [], next_cursor: null })),
     0,
-    profileId,
+    base,
   )
   const [more, setMore] = useState<Page<WorkspaceSubject> | null>(null)
   const extra = more?.key === profileId ? more : null

@@ -371,6 +371,25 @@ textarea.form-control {
   background: var(--hub-sunken);
 }
 
+/* ---------- loading: row-shaped skeletons that wait a beat, content that settles in ---------- */
+.skeleton { display: grid; gap: 4px; }
+.skeleton-row { display: flex; align-items: center; gap: 12px; min-height: 52px; }
+.skeleton-row + .skeleton-row { border-top: 1px solid var(--hub-rule); }
+.placeholder.skeleton-dot { flex: none; width: 30px; height: 30px; border-radius: 50%; background: var(--hub-sunken); opacity: 1; }
+.skeleton-text { flex: 1; min-width: 0; display: grid; gap: 7px; }
+.skeleton-text .placeholder.skeleton-line { height: 11px; margin: 0; }
+.skeleton-text .placeholder.skeleton-line.is-sub { height: 9px; opacity: 0.7; }
+@media (prefers-reduced-motion: no-preference) {
+  .skeleton { animation: skeleton-wait 1ms 180ms backwards; }
+  .skeleton .placeholder { animation: skeleton-sheen 1.6s ease-in-out infinite; background-image: linear-gradient(90deg, transparent 0%, color-mix(in srgb, var(--hub-surface) 70%, transparent) 50%, transparent 100%); background-size: 200% 100%; background-repeat: no-repeat; }
+  /* Content mounts settle in once; polling re-renders keep their nodes, so they do not replay this. */
+  .page > *, .box-body > * { animation: settle-in 260ms cubic-bezier(0.25, 1, 0.5, 1) backwards; }
+  .box-body > .skeleton, .page > .skeleton { animation: skeleton-wait 1ms 180ms backwards; }
+}
+@keyframes skeleton-wait { from { opacity: 0; } }
+@keyframes skeleton-sheen { from { background-position: 150% 0; } to { background-position: -50% 0; } }
+@keyframes settle-in { from { opacity: 0; transform: translateY(4px); } }
+
 /* ---------- the frame: top bar and rail ---------- */
 .app-shell {
   --side-w: 236px;
@@ -1492,14 +1511,14 @@ textarea.form-control {
 /* ---------- where: the repository as tiles ---------- */
 .map {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
-  grid-auto-rows: 116px;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  grid-auto-rows: minmax(116px, auto);
   gap: 10px;
 }
 :root[data-density='condensed'] .map {
-  grid-auto-rows: 88px;
+  grid-auto-rows: minmax(88px, auto);
   gap: 6px;
-  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
 }
 .map-cell {
   min-width: 0;
@@ -1537,7 +1556,6 @@ textarea.form-control {
   display: grid;
   line-height: 1.2;
   min-width: 0;
-  padding-right: 84px;
 }
 .tile-head b {
   font-size: 14.5px;
@@ -1583,10 +1601,17 @@ textarea.form-control {
 :root[data-density='condensed'] .tile-lens {
   display: none;
 }
+.tile-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px 8px;
+  min-width: 0;
+}
 .crossing {
-  position: absolute;
-  top: 12px;
-  right: 12px;
+  flex: none;
+  margin-left: auto;
   padding: 2px 8px;
   border-radius: 999px;
   background: var(--coral);
@@ -1678,13 +1703,6 @@ textarea.form-control {
   .area-cols {
     grid-template-columns: minmax(0, 1fr);
     gap: 18px;
-  }
-  .tile-head {
-    padding-right: 0;
-  }
-  .crossing {
-    position: static;
-    justify-self: start;
   }
 }
 

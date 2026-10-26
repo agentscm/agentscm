@@ -2,7 +2,7 @@ import { fetchSetup } from '../api.ts'
 import { SectionTabs } from '../TopNav.tsx'
 import { blockerLabel, setupState, type SetupStatus } from '../onboarding.ts'
 import { useNow } from '../useHub.ts'
-import { Avatar, Box, Empty, Icon, Notice, Pill, Skeleton } from '../ui.tsx'
+import { agentLabel, Avatar, Box, Empty, Icon, Notice, Pill, Skeleton } from '../ui.tsx'
 import { usePoll } from '../usePoll.ts'
 import { ConnectAgent } from './Connect.tsx'
 
@@ -47,7 +47,7 @@ export function SetupPage({ token }: { token: string }) {
                 <li key={row.key} className="setup-row">
                   <div className="d-flex align-items-center gap-2 flex-wrap">
                     <Avatar name={row.name} size={28} />
-                    <strong>{row.name}</strong>
+                    <strong title={row.name}>{agentLabel(row.name)}</strong>
                     <span className="muted small">
                       {row.owner} · {row.agent}
                     </span>

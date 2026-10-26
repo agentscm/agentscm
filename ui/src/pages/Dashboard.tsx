@@ -6,7 +6,7 @@ import { crossings, needsYou, type Need } from '../needs.ts'
 import { workHref, type WorkItem, type WorkOverview } from '../standup.ts'
 import { SectionTabs } from '../TopNav.tsx'
 import type { HubEvent } from '../types.ts'
-import { Ago, Box, Empty, Icon, Notice, Path, Skeleton, relative } from '../ui.tsx'
+import { agentLabel, Ago, Box, Empty, Icon, Notice, Path, Skeleton, relative } from '../ui.tsx'
 import { useNow, type HubData } from '../useHub.ts'
 import type { Poll } from '../usePoll.ts'
 import { ActivityPage } from './Activity.tsx'
@@ -81,7 +81,7 @@ function Answer({ question, repo, d, ov, failing, needs }: { question: string; r
 
 function who(i: WorkItem) {
   const l = lead(i)
-  return `${l.login}’s ${l.agent}`
+  return `${l.login}’s ${agentLabel(l.agent)}`
 }
 
 function NeedRow({ n, ov, d }: { n: Need; ov: WorkOverview; d: Derived }) {
@@ -108,10 +108,10 @@ function NeedRow({ n, ov, d }: { n: Need; ov: WorkOverview; d: Derived }) {
   } else if (n.kind === 'contested') {
     const c = d.contested.find((x) => x.path === n.path)
     icon = 'exclamation-diamond'
-    const names = [...new Set(c?.holders.map((h) => `${h.owner}’s ${h.name}`) ?? [])]
-    const wants = c?.refused ? `${c.refused.owner}’s ${c.refused.name}` : 'another agent'
+    const names = [...new Set(c?.holders.map((h) => `${h.owner}’s ${agentLabel(h.name)}`) ?? [])]
+    const wants = c?.refused ? `${c.refused.owner}’s ${agentLabel(c.refused.name)}` : 'another agent'
     title = names.length >= 2 ? <>{names.join(' and ')} both hold <Path>{n.path ?? ''}</Path></> : <>{names[0] ?? 'An agent'} holds <Path>{n.path ?? ''}</Path>, and {wants} wants it</>
-    body = c?.refused ? <>The hub refused {c.refused.owner}’s {c.refused.name} {c.repeated ? 'once, then let a repeated edit through' : 'its first edit'}.</> : <>Both agents can still edit it after one refusal.</>
+    body = c?.refused ? <>The hub refused {c.refused.owner}’s {agentLabel(c.refused.name)} {c.repeated ? 'once, then let a repeated edit through' : 'its first edit'}.</> : <>Both agents can still edit it after one refusal.</>
     then = <>Agree who keeps it · <a href="#box-contested">see the contested file</a></>
   } else if (n.kind === 'overlap') {
     const o = ov.overlaps.find((x) => `overlap:${x.left.id}:${x.right.id}` === n.key)
@@ -123,7 +123,7 @@ function NeedRow({ n, ov, d }: { n: Need; ov: WorkOverview; d: Derived }) {
     const p = d.prOverlaps.find((x) => `pr:${x.pr.number}` === n.key)
     icon = 'git'
     title = <>PR #{p?.pr.number} touches files an agent holds</>
-    body = p ? <>“{p.pr.title}” overlaps {p.with.map((w) => `${w.agent.owner}’s ${w.agent.name}`).join(', ')}.</> : null
+    body = p ? <>“{p.pr.title}” overlaps {p.with.map((w) => `${w.agent.owner}’s ${agentLabel(w.agent.name)}`).join(', ')}.</> : null
     then = <>Check before merging · <a href="#box-prs">see the pull request</a></>
   }
   return (
@@ -228,7 +228,7 @@ function Track({ ov }: { ov: WorkOverview }) {
                     <p className="rl-said">
                       <Icon name="chat-left-quote" />
                       <span>
-                        {l.agent}: “{i.current.summary}”
+                        {agentLabel(l.agent)}: “{i.current.summary}”
                       </span>
                       <small>
                         <Ago at={i.current.at} />
