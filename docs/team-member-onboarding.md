@@ -9,8 +9,18 @@ workspace. Those are separate [operator deployment](deployment.md) and
 [Community workspace](advanced/community-workspace.md) tasks.
 
 Ask the team for the Hub's exact HTTPS URL and clone the repository before starting. The Hub
-operator must already have connected the forge repository. Use a forge identity that can read the
-repository.
+operator must already have connected the forge repository. Your forge identity needs:
+
+- on a private repository: read access;
+- on a public GitHub repository: Triage or higher (read is not enough, since anyone can read it);
+- on GitLab: Reporter or higher on a private project, Developer or higher on a public or internal
+  one.
+
+If you are signed in but your role on this repository is too low, setup stops with the Hub's own
+reason, for example
+`alice has Read on public repository acme/widgets; ask a repository owner for Triage or higher`.
+Ask a repository owner for that role and run setup again. When no repository connected to the Hub
+gives you enough of a role, sign-in itself is refused (`not_allowed`) with the same fix.
 
 This candidate setup runs on macOS and Linux with local coding-agent clients. It does not configure
 Windows, hosted cloud agents or general browser and desktop chats.
@@ -178,7 +188,8 @@ agentscm hub logout --hub 'https://hub.example.com'
 
 Human sessions are keyed by Hub. Before minting a token, setup verifies that the selected session's
 forge provider and host match the checkout origin; otherwise it starts the required sign-in. The
-most recently saved Hub is the default for commands without `--hub`.
+most recently saved Hub is the default for `hub token` and `hub logout` without `--hub`;
+`hub login`, `client connect` and `client setup` leave out `--hub` only when exactly one Hub is saved.
 
 `sessions remove` only forgets the local human sign-in. `logout` also attempts to end that session
 on the selected Hub before removing that exact local generation. A concurrently replaced sign-in

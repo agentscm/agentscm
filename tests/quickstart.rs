@@ -3934,13 +3934,20 @@ fn a_failed_agent_step_ends_non_zero_and_the_last_line_says_so() {
         body.replacen("\n", "\ncase \"$*\" in *install*) exit 1;; esac\n", 1),
     )
     .unwrap();
-    let output = machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"]));
+    let output = machine.run(
+        repo.path(),
+        &quick(&hub.url, &token, &["--no-collisions", "--init"]),
+    );
     let line = last_line(&output);
     assert!(!output.status.success(), "{output:?}");
     assert!(
         line.starts_with("Live warnings: off — coding agent setup failed"),
         "{line}"
     );
+    // Nothing committable is written for a connection that failed.
+    let said = String::from_utf8_lossy(&output.stdout);
+    assert!(said.contains("didn't add the agent instructions"), "{said}");
+    assert!(!repo.path().join("AGENTS.md").exists());
 }
 
 #[test]

@@ -88,8 +88,12 @@ You can also keep using `npx agentscm <subcommand>`.
 Remove them with `agentscm uninstall`.
 
 The optional macOS tray is part of this same binary; no separate app install is needed. Run
-`npx agentscm tray`, or add `--tray` to quickstart to open it after successful setup. Start at
-Login is off until enabled in the tray menu. The alpha binary is not signed or notarized, and the
+`npx agentscm tray` to open it. On macOS, once an interactive quickstart has connected your
+agents, it asks once: "Keep AgentSCM in the menu bar, and start it when you log in?" Yes (the
+default) opens the tray and turns on Start at Login; No leaves both off and quickstart does not ask
+again. With `--yes` or without a terminal it does not ask, and the tray stays off unless you add
+`--tray`, which opens it without changing Start at Login. You can switch Start at Login in the tray
+menu at any time. The alpha binary is not signed or notarized, and the
 tray does not update independently; install a newer AgentSCM release through the same installer.
 Each checkout menu groups its status, opening actions, a **Share agent conversations with Hub**
 switch, **Agent Integrations**, **Connection Details**, **Recent Activity** and **Troubleshooting**. Connection Details shows the full checkout path and

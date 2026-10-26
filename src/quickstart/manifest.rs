@@ -44,6 +44,8 @@ pub(crate) struct Manifest {
     pub(crate) bin_dir: Option<PathBuf>,
     /// Quickstart created `~/.agentscm` itself, not only `bin` inside it.
     pub(crate) bin_parent_created: bool,
+    /// The person said no to keeping the menu bar app, so quickstart does not ask again.
+    pub(crate) tray_declined: bool,
 }
 
 pub(crate) fn path() -> Result<PathBuf> {
@@ -182,6 +184,21 @@ impl Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_declined_tray_is_remembered_and_older_records_still_load() {
+        let older: Manifest = serde_json::from_str(r#"{"created_at":1,"clients":[]}"#).unwrap();
+        assert!(!older.tray_declined);
+        let declined = Manifest {
+            tray_declined: true,
+            ..Manifest::default()
+        };
+        let reloaded: Manifest =
+            serde_json::from_str(&serde_json::to_string(&declined).unwrap()).unwrap();
+        assert!(reloaded.tray_declined);
+        // The answer alone is not something uninstall has to undo.
+        assert!(reloaded.is_empty());
+    }
 
     #[test]
     fn quickstart_lease_is_exclusive_and_reusable() {
