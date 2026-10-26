@@ -2281,6 +2281,158 @@ textarea.form-control {
   padding: 32px max(16px, calc((100vw - 980px) / 2));
 }
 
+/* ---------- set up this computer: one command, copied ---------- */
+.install {
+  margin-top: 4px;
+}
+.install-lead {
+  margin: 0 0 4px;
+  max-width: 60ch;
+  font-size: 14.5px;
+  line-height: 1.5;
+  color: var(--hub-text-2);
+}
+.install .command {
+  margin-top: 10px;
+}
+.install .command code {
+  font-size: 12.5px;
+}
+.install-prompt {
+  color: var(--hub-text-3);
+}
+.install-after {
+  margin: 8px 0 0;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--hub-text-3);
+}
+.empty + .install {
+  margin-top: 0;
+  padding: 0 4px 4px;
+}
+
+/* ---------- signed in: the one browser moment of setup, told on the frame ---------- */
+.done {
+  min-height: 100dvh;
+  display: grid;
+  grid-template-rows: auto 1fr;
+  padding: clamp(20px, 5vw, 56px) 16px;
+  background: var(--frame);
+  color: var(--frame-ink);
+}
+.done-top,
+.done-body {
+  width: 100%;
+  max-width: 600px;
+  margin: 0 auto;
+}
+.done-body {
+  align-self: center;
+  padding: 40px 0 64px;
+}
+.done-mark {
+  display: inline-grid;
+  place-items: center;
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  font-size: 26px;
+  color: var(--frame);
+  background: var(--hub-ok-fill);
+}
+.done-mark.tone-bad {
+  background: var(--frame-coral);
+  color: var(--frame-on-coral);
+}
+@media (prefers-reduced-motion: no-preference) {
+  /* One moment: the mark is already there; a ring leaves it once. */
+  .done-mark.tone-ok {
+    animation: done-ring 1.1s cubic-bezier(0.16, 1, 0.3, 1) 0.15s 1 both;
+  }
+}
+@keyframes done-ring {
+  from {
+    box-shadow: 0 0 0 0 rgba(47, 182, 124, 0.55);
+  }
+  to {
+    box-shadow: 0 0 0 22px rgba(47, 182, 124, 0);
+  }
+}
+.done-title {
+  margin: 28px 0 14px;
+  font-size: clamp(30px, 4.2vw, 44px);
+  font-weight: 300;
+  line-height: 1.12;
+  letter-spacing: -0.035em;
+  color: #fff;
+  text-wrap: balance;
+}
+.done-lead {
+  max-width: 56ch;
+  margin: 0;
+  font-size: 17px;
+  line-height: 1.55;
+  color: var(--frame-dim);
+}
+.done-lead strong {
+  font-weight: 600;
+  color: var(--frame-ink);
+  overflow-wrap: anywhere;
+}
+.done-next {
+  list-style: none;
+  margin: 36px 0 0;
+  padding: 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+.done-next li {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  gap: 14px;
+  padding: 16px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  font-size: 14.5px;
+  line-height: 1.5;
+  color: var(--frame-dim);
+}
+.done-next li i {
+  color: var(--frame-active-icon);
+  font-size: 17px;
+  line-height: 1.35;
+}
+.done-next strong {
+  font-weight: 600;
+  color: var(--frame-ink);
+}
+.done-sheet {
+  margin-top: 8px;
+  padding: 6px;
+  border-radius: 20px;
+  background: var(--hub-surface);
+  color: var(--hub-text);
+}
+.done-sheet .notice {
+  margin: 0;
+}
+.done-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px 20px;
+  margin-top: 32px;
+}
+.done-actions .btn-primary {
+  --bs-btn-bg: var(--frame-brand);
+  --bs-btn-border-color: var(--frame-brand);
+  border-radius: 999px;
+  padding-inline: 24px;
+}
+.done-close {
+  font-size: 14px;
+  color: var(--frame-dim);
+}
+
 /* ---------- agent briefing: the catch-up told as a sentence, every claim footnoted ---------- */
 .brief {
   position: relative;

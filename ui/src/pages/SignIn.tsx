@@ -3,7 +3,9 @@ import { useState, type FormEvent } from 'react'
 import { AGENT_TOKEN_MESSAGE, ApiError, fetchWhoami } from '../api.ts'
 import { Logo } from '../App.tsx'
 import { CopyButton, Explain, Icon, Notice } from '../ui.tsx'
-import { ConnectAgent } from './Connect.tsx'
+import { ConnectAgent, InstallCommand } from './Connect.tsx'
+import type { Refusal } from '../refusal.ts'
+import { RefusalNotice } from '../Refusal.tsx'
 
 const CREATE = 'agentscm hub token create --read-only --ttl 30d --name status-page --repo owner/name'
 
@@ -13,6 +15,7 @@ export function SignIn({ notice, onSignedIn }: { notice: string | null; onSigned
   const [busy, setBusy] = useState(false)
   const [reveal, setReveal] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [refusal, setRefusal] = useState<Refusal | null>(null)
   const [connect, setConnect] = useState(false)
 
   const submit = async (ev: FormEvent) => {
@@ -21,6 +24,7 @@ export function SignIn({ notice, onSignedIn }: { notice: string | null; onSigned
     if (!token) return setError('Paste a read-only token to continue.')
     setBusy(true)
     setError(null)
+    setRefusal(null)
     try {
       const whoami = await fetchWhoami(token, new AbortController().signal)
       if (!whoami.token.read_only) {
@@ -32,7 +36,12 @@ export function SignIn({ notice, onSignedIn }: { notice: string | null; onSigned
       }
       onSignedIn(token, keep)
     } catch (e) {
-      setError(e instanceof ApiError && e.status === 401 ? 'That token was not accepted. Check that it is current and for this hub.' : 'Could not reach the hub. Try again in a moment.')
+      // Say why the Hub said no; "could not reach" only when it didn't answer.
+      if (e instanceof ApiError && e.refusal) setRefusal(e.refusal)
+      else if (e instanceof ApiError && e.status === 401) setError('That token was not accepted. Check that it is current and for this hub.')
+      else if (e instanceof ApiError && e.status === 403) setError('This Hub answered but won’t open that repository with this token.')
+      else if (e instanceof ApiError) setError(`The Hub answered with an error (HTTP ${e.status}). Try again in a moment.`)
+      else setError('Could not reach the hub. Try again in a moment.')
       setBusy(false)
     }
   }
@@ -56,6 +65,19 @@ export function SignIn({ notice, onSignedIn }: { notice: string | null; onSigned
         </ul>
       </div>
       <div className="signin-panel">
+        {!onFrontDoor() && (
+          <section className="box mb-3" aria-labelledby="install-title">
+            <header className="box-head">
+              <span className="box-badge tone-brand">
+                <Icon name="laptop" />
+              </span>
+              <h2 id="install-title" className="box-title">Set up this computer</h2>
+            </header>
+            <div className="box-body">
+              <InstallCommand lead="Run this once. After that, every agent you start on this computer connects to this Hub by itself." />
+            </div>
+          </section>
+        )}
         {onFrontDoor() ? (
           <section className="box" aria-labelledby="connect-title">
             <header className="box-head">
@@ -85,6 +107,7 @@ export function SignIn({ notice, onSignedIn }: { notice: string | null; onSigned
             {notice && (
               <Notice tone="brand" icon="info-circle" title={notice} />
             )}
+            {refusal && <RefusalNotice refusal={refusal} />}
             <label htmlFor="token" className="form-label">
               Read-only token
             </label>

@@ -4,7 +4,7 @@ import { blockerLabel, setupState, type SetupStatus } from '../onboarding.ts'
 import { useNow } from '../useHub.ts'
 import { agentLabel, Avatar, Box, Empty, Icon, Notice, Pill, Skeleton } from '../ui.tsx'
 import { usePoll } from '../usePoll.ts'
-import { ConnectAgent } from './Connect.tsx'
+import { ConnectAgent, InstallCommand } from './Connect.tsx'
 
 const STATE_TONE = { Ready: 'ok', Blocked: 'warn', Unverified: 'muted' } as const
 const STATE_ICON = { Ready: 'patch-check', Blocked: 'exclamation-octagon', Unverified: 'question-circle' } as const
@@ -35,9 +35,12 @@ export function SetupPage({ token }: { token: string }) {
           {load.kind === 'loading' && <Skeleton rows={3} />}
           {!available && load.kind !== 'loading' && <Notice tone="muted" icon="info-circle" title="Setup verification unavailable">No agent is marked ready until the hub answers again.</Notice>}
           {load.kind === 'ready' && rows.length === 0 && (
-            <Empty icon="plug" title="No verified setup yet">
-              Copy the instructions to your agent, resolve any sign-in or approval blockers, then verify a native edit. Agents set up with <code>agentscm client setup</code> or <code>agentscm quickstart</code> report here.
-            </Empty>
+            <>
+              <Empty icon="plug" title="No agent has checked in yet">
+                Agents report here the first time they connect from a set-up computer.
+              </Empty>
+              <InstallCommand />
+            </>
           )}
           <ul className="plain-list">
             {rows.slice(0, 30).map((row) => {

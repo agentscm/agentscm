@@ -1,6 +1,23 @@
 import { useState } from 'react'
-import { agentSetupPrompt, CLIENT_AGENTS, clientSetupCommand, safeHubOrigin, type ClientAgent } from '../connectAgent.ts'
+import { agentSetupPrompt, CLIENT_AGENTS, clientSetupCommand, installCommand, safeHubOrigin, type ClientAgent } from '../connectAgent.ts'
 import { CopyButton, Icon, Notice } from '../ui.tsx'
+
+/** Set up this computer: one command, then agents connect on their own. Copies text; never runs anything. */
+export function InstallCommand({ lead = 'Set up a computer once and every agent you start there connects by itself.' }: { lead?: string }) {
+  const command = installCommand(window.location.origin)
+  if (!command) return null
+  return (
+    <div className="install">
+      <p className="install-lead">{lead}</p>
+      <div className="command">
+        <Icon name="terminal" className="install-prompt" />
+        <code>{command}</code>
+        <CopyButton text={command} />
+      </div>
+      <p className="install-after">It installs AgentSCM, adds it to the menu bar and opens your browser once to sign in. macOS and Linux.</p>
+    </div>
+  )
+}
 
 const AGENT_NAMES: Record<ClientAgent, string> = { claude: 'Claude Code', codex: 'Codex', cursor: 'Cursor', copilot: 'Copilot', gemini: 'Gemini' }
 

@@ -12,6 +12,7 @@ import { DashboardPage, dashboardStatus } from './pages/Dashboard.tsx'
 import { HealthPage } from './pages/Health.tsx'
 import { SetupPage } from './pages/Setup.tsx'
 import { SignIn } from './pages/SignIn.tsx'
+import { isSignedInHash, SignedInPage } from './pages/SignedIn.tsx'
 import { InboxPage, WorkPage } from './pages/Work.tsx'
 import { WorkflowsPage } from './pages/Workflows.tsx'
 import { ChangeRecordPage } from './pages/ChangeRecord.tsx'
@@ -222,6 +223,8 @@ export default function App() {
   const [notice, setNotice] = useState<string | null>(null)
   const [pref, setPref] = useState<ThemePref>(loadTheme)
   const [density, setDensity] = useState<Density>(loadDensity)
+  // The browser's landing page after signing this computer in; shown with or without a token.
+  const [signedInLanding] = useState(isSignedInHash)
   const prefersDark = useSyncExternalStore(subscribeDark, systemDark)
   const dark = pref === 'dark' || (pref === 'system' && prefersDark)
   const section = useSection()
@@ -258,6 +261,7 @@ export default function App() {
   )
   const onForget = useCallback(() => signedOut('Token forgotten on this browser. The hub still accepts it until it expires or is revoked.'), [signedOut])
 
+  if (signedInLanding) return <SignedInPage />
   if (token) return <Shell key={token} token={token} pref={pref} onPref={changePref} density={density} onDensity={changeDensity} onUnauthorized={onUnauthorized} onForget={onForget} />
   if (section === 'workspace')
     return (
