@@ -55,17 +55,20 @@ a current binding for the same root and Hub. The token is stored in a unique own
 never put in the repository, generated agent configuration, URL or command.
 
 Setup installs the selected host's native hooks or plugin, coordination skill where supported and a
-checkout-scoped local MCP server. The MCP command uses the private root binding to proxy to the
-existing Hub. Generated client configuration contains the installed AgentSCM binary and checkout
+local MCP server, by default in the host's user configuration so they run in every project (see
+[coding agents in every project](install.md#coding-agents-in-every-project));
+`client setup --checkout-only` writes them into the checkout instead. The MCP command uses the
+private root binding of the checkout it starts in to proxy to the existing Hub. Generated client configuration contains the installed AgentSCM binary and checkout
 paths, but no Hub token. Different checkouts can therefore remain connected to different Hubs.
 
 A linked worktree created from a connected checkout (`git worktree add`, which Claude Code and
 Codex use for new sessions, inside the checkout or beside it) uses that checkout's connection with
 no further setup. The worktree must share the checkout's Git directory and keep its `origin`; a
 separate or nested clone, a submodule, a copied `.git` file or a symlinked `.git` is never covered. The user-scope
-Claude Code and Codex plugins therefore coordinate in new worktrees at once. A Git-excluded
-`.mcp.json` or `.codex/config.toml` entry is not copied into a new worktree, so the MCP tools are
-available there only where such an entry exists.
+Claude Code and Codex plugins, and the other agents' user-scope hooks and MCP server, therefore
+coordinate in new worktrees at once. Claude Code's Git-excluded `.mcp.json`, and any
+`--checkout-only` entry, is not copied into a new worktree, so those MCP tools are available there
+only where such an entry exists.
 
 On macOS, `npx agentscm tray` can show these connections in the optional status-bar companion;
 there is no separate app install. Start at Login is off until the member enables it in the menu.
@@ -73,6 +76,9 @@ If the user-scope plugin runs in a checkout that was never connected, the tray l
 under **Not connected** and offers **Connect**, which runs `client setup` with the member's saved
 Hub sign-in. On every platform, `agentscm client status --check` provides the CLI view. Activity is based on
 recent observed MCP and native hook participation, so missing or idle activity remains unknown.
+
+The table lists the checkout files a `--checkout-only` setup writes; by default the same entries go
+into the user configuration listed in [install](install.md#coding-agents-in-every-project).
 
 | Coding agent | Native components written or installed | Review and refresh in the host |
 | --- | --- | --- |

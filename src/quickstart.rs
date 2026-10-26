@@ -289,7 +289,8 @@ struct Live {
     agents: Vec<String>,
     /// This run tried to set up at least one agent.
     wanted_agents: bool,
-    /// The user answered no to "Go ahead?", or no to the Claude Code plugin with no other agent.
+    /// The user answered no to "Go ahead?", or no to installing for all projects when every
+    /// chosen agent needs that.
     declined: bool,
     /// Why setting up the coding agents failed.
     agent_error: Option<String>,
@@ -1115,23 +1116,50 @@ fn chosen_agents(cx: &Cx<'_>) -> Vec<crate::client_setup::Agent> {
     }
 }
 
-/// Claude Code's plugin is installed for the whole user account, so say so and ask first (once:
-/// an installed plugin is not asked about again). `--yes` answers yes, after the notice.
+/// Where each agent is set up. For all projects is the default, so agents connect in any repo,
+/// but it reaches beyond this checkout, so say so and ask first, once: agents already set up
+/// that way are not asked about again. `--yes` answers yes, after the notice. A No sets up
+/// Cursor, Copilot and Gemini in this checkout only, and drops Claude Code and Codex, whose
+/// hooks come only from a user-scope plugin.
 #[cfg(unix)]
-fn claude_plugin_wanted(cx: &Cx<'_>, root: &Path, agents: &[crate::client_setup::Agent]) -> bool {
-    if !agents.contains(&crate::client_setup::Agent::Claude)
-        || crate::client_plugin::claude_plugin_installed(root)
-    {
-        return true;
+fn agent_scopes(
+    cx: &Cx<'_>,
+    root: &Path,
+    agents: &[crate::client_setup::Agent],
+) -> Vec<(crate::client_setup::Agent, crate::client_setup::Scope)> {
+    use crate::client_setup::{Agent, Scope, user_scope_installed};
+    let (installed, new): (Vec<Agent>, Vec<Agent>) = agents
+        .iter()
+        .partition(|agent| user_scope_installed(**agent, root));
+    let user = |agents: &[Agent]| agents.iter().map(|agent| (*agent, Scope::User)).collect();
+    if new.is_empty() {
+        return user(&installed);
     }
+    let names = new
+        .iter()
+        .map(|agent| agent.label())
+        .collect::<Vec<_>>()
+        .join(", ");
     println!(
-        "The AgentSCM plugin for Claude Code is installed for your user account, so it is in all your projects; `{} uninstall` removes it when no other connected checkout uses it.",
+        "AgentSCM for {names} is installed for your user account, so it is in all your projects; `{} uninstall` removes it when no other connected checkout uses it.",
         cli_command(cx)
     );
-    cx.ui.confirm(CLAUDE_PLUGIN_QUESTION, true)
+    if cx.ui.confirm(
+        &format!(
+            "Install AgentSCM for {names} in all your projects? It runs a quick check whenever an agent starts and only contacts a Hub in repos connected to it."
+        ),
+        true,
+    ) {
+        return user(agents);
+    }
+    let mut scopes: Vec<(Agent, Scope)> = user(&installed);
+    scopes.extend(
+        new.into_iter()
+            .filter(|agent| !matches!(agent, Agent::Claude | Agent::Codex))
+            .map(|agent| (agent, Scope::Checkout)),
+    );
+    scopes
 }
-
-const CLAUDE_PLUGIN_QUESTION: &str = "Install the AgentSCM plugin for Claude Code in all your projects? It runs a quick check whenever an agent starts and only contacts a Hub in repos connected to it.";
 
 /// The `client setup` line for every supported agent, for setting one up later.
 #[cfg(unix)]
@@ -1156,7 +1184,7 @@ async fn agents_stage(_cx: &mut Cx<'_>) {
 /// writes agent hooks and MCP configuration and gives the hub's Connect agents page its proof.
 #[cfg(unix)]
 async fn agents_stage(cx: &mut Cx<'_>) {
-    let mut agents = chosen_agents(cx);
+    let agents = chosen_agents(cx);
     if agents.is_empty() {
         if let (false, Some(hub), true) = (cx.args.no_agents, &cx.live.hub, cx.live.hub_up) {
             print_agent_setup_hints(cx, hub);
@@ -1198,16 +1226,14 @@ async fn agents_stage(cx: &mut Cx<'_>) {
         return;
     };
     // Asked only once nothing else stops the setup, so a No is a real choice.
-    if !claude_plugin_wanted(cx, &root, &agents) {
-        agents.retain(|agent| *agent != crate::client_setup::Agent::Claude);
-        if agents.is_empty() {
-            cx.live.declined = true;
-            return;
-        }
+    let agents = agent_scopes(cx, &root, &agents);
+    if agents.is_empty() {
+        cx.live.declined = true;
+        return;
     }
     let names = agents
         .iter()
-        .map(|agent| agent.name())
+        .map(|(agent, _)| agent.name())
         .collect::<Vec<_>>()
         .join(", ");
     // Quickstart owns this checkout's connection: an unchanged, valid one is kept as it is,
