@@ -7,7 +7,7 @@
 //! Pull request code is never checked out, built or run; heads are fetched as Git data only.
 //!
 //! ponytail: invalidate-first writes two statuses per opted-in head per run, and GitHub keeps
-//! at most 1000 statuses per sha and context; a head re-verified daily lasts years.
+//! at most 1000 statuses per sha and context; `--pr` limits comment events to one pull request.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
@@ -98,6 +98,8 @@ pub struct Context<'a> {
     /// OWNER/NAME.
     pub github_repo: &'a str,
     pub base: &'a str,
+    /// When set, only this pull request is invalidated and verified.
+    pub only_pr: Option<i64>,
     /// Local checkout whose `origin` is the repository.
     pub git_repo: &'a Path,
     /// The policy's repository identity.
@@ -210,7 +212,7 @@ impl Context<'_> {
         });
         let status = match status {
             Ok(status) => status,
-            Err(error) => return self.refused(tally, &error.to_string()),
+            Err(error) => return self.refused(tally, head, &error.to_string()),
         };
         match self
             .api
@@ -218,17 +220,20 @@ impl Context<'_> {
             .await
         {
             Ok(Ok(())) => true,
-            Ok(Err(code)) => self.refused(tally, &format!("status refused with {code}")),
+            Ok(Err(code)) => self.refused(tally, head, &format!("status refused with {code}")),
             Err(error) => {
-                tally.fail("status write uncertain or failed", &error);
+                tally.fail(
+                    &format!("head {head}: status write uncertain or failed"),
+                    &error,
+                );
                 false
             }
         }
     }
 
-    fn refused(&self, tally: &mut Tally, why: &str) -> bool {
+    fn refused(&self, tally: &mut Tally, head: &str, why: &str) -> bool {
         tally.errors += 1;
-        eprintln!("{why}");
+        eprintln!("head {head}: {why}");
         false
     }
 
@@ -252,14 +257,16 @@ impl Context<'_> {
         })
     }
 
-    fn verdict(&self, c: &Candidate) -> (StatusState, String) {
+    /// Err when the head could not be fetched or observed: nothing is written for it.
+    fn verdict(&self, c: &Candidate) -> Result<(StatusState, String), String> {
         let git = tokio::task::block_in_place(|| {
             fetch_pull(self.git_repo, self.base, c.number, &c.head)?;
             observe(self.git_repo, &c.head, &format!("origin/{}", self.base))
         });
         let git = match git {
             Ok(git) if git.commit == c.head => git,
-            _ => return (StatusState::Error, "head could not be fetched".into()),
+            Ok(_) => return Err("fetched commit differs from the head".into()),
+            Err(error) => return Err(format!("{error:?}")),
         };
         let clock = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -289,7 +296,7 @@ impl Context<'_> {
             VerdictState::Error => StatusState::Error,
             VerdictState::Pending => StatusState::Pending,
         };
-        (state, verdict.reason.to_owned())
+        Ok((state, verdict.reason.to_owned()))
     }
 
     /// Exit code: 0 when every pull request was handled, 1 on any error or unread input.
@@ -300,7 +307,16 @@ impl Context<'_> {
         };
         let mut tally = Tally::default();
         let mut work = Vec::new();
-        for pull in pulls.iter().filter(|p| p.base == self.base) {
+        if let Some(n) = self.only_pr
+            && !pulls.iter().any(|p| p.number == n && p.base == self.base)
+        {
+            println!("PR #{n}: not open on {}; nothing written", self.base);
+            return 0;
+        }
+        for pull in pulls
+            .iter()
+            .filter(|p| p.base == self.base && self.only_pr.is_none_or(|n| n == p.number))
+        {
             if !is_sha(&pull.head) {
                 println!("PR #{}: unexpected head; skipped", pull.number);
                 tally.errors += 1;
@@ -367,7 +383,18 @@ impl Context<'_> {
             let decided = if multiple {
                 None
             } else {
-                Some(self.verdict(c))
+                match self.verdict(c) {
+                    Ok(decided) => Some(decided),
+                    Err(why) => {
+                        // Stays pending from the invalidate step; the run fails.
+                        tally.errors += 1;
+                        eprintln!(
+                            "PR #{} {}: head could not be fetched ({why}); stays pending",
+                            c.number, c.head
+                        );
+                        continue;
+                    }
+                }
             };
             let outcome = match self.recheck(c).await {
                 Err(error) => {

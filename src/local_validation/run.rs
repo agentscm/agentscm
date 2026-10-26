@@ -154,9 +154,13 @@ fn is_clean(repo: &Path) -> Result<bool> {
 
 /// Digest of `path` at `commit`; a file the commit does not contain is an error.
 fn file_digest(repo: &Path, commit: &str, path: &str) -> Result<String> {
-    git(repo, &["show", &format!("{commit}:{path}")], GIT_OUTPUT)
-        .map(|bytes| sha256(&bytes))
-        .map_err(|_| Error::Invalid(format!("{path} cannot be read at the commit")))
+    git(
+        repo,
+        &["cat-file", "blob", &format!("{commit}:{path}")],
+        GIT_OUTPUT,
+    )
+    .map(|bytes| sha256(&bytes))
+    .map_err(|_| Error::Invalid(format!("{path} cannot be read at the commit")))
 }
 
 /// Captured bytes of one command, exactly those the record's digests cover.

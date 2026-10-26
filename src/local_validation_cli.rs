@@ -45,7 +45,7 @@ pub enum LocalValidationCommand {
     /// Post a retained attestation as a PR comment (GitHub). Posts no status.
     Post(PostArgs),
     /// Set the `agentscm/local-validation` status of every open pull request on `--base` from its
-    /// signed attestation comments. Exit 0 when all were handled, 1 on any error or unread input,
+    /// signed attestation comments (or only `--pr`). Exit 0 when all were handled, 1 on any error or unread input,
     /// 2 when the policy is for another repository.
     Reconcile(ReconcileArgs),
 }
@@ -58,6 +58,9 @@ pub struct ReconcileArgs {
     /// The only pull request base reconciled.
     #[arg(long, default_value = "main")]
     base: String,
+    /// Reconcile only this pull request (a comment event); shared heads are still detected.
+    #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
+    pr: Option<i64>,
     /// Directory with policy.json, recipe.json and registry.json from the default branch.
     #[arg(long, default_value = ".github/local-validation")]
     config_dir: PathBuf,
@@ -482,6 +485,7 @@ async fn reconcile(args: ReconcileArgs) -> Result<i32> {
         token: &token,
         github_repo: &args.github_repo,
         base: &args.base,
+        only_pr: args.pr,
         git_repo: &args.repo,
         repository: &policy.repository,
         policy: &policy,

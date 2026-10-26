@@ -583,3 +583,64 @@ async fn a_bun_shaped_recipe_without_services_produces_posts_and_reconciles() {
     assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(env.states(&env.head), ["pending", "success"]);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_head_that_cannot_be_fetched_stays_pending_and_fails_the_run() {
+    let env = Env::new().await;
+    let body = env.attest();
+    env.attest_comment(10, "OWNER", body);
+    git(
+        &env.root().join("checkout"),
+        &["remote", "set-url", "origin", "/nonexistent/origin.git"],
+    );
+    let out = env.reconcile();
+    assert_eq!(code(&out), 1, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(env.states(&env.head), ["pending"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("PR #1") && stderr.contains(&env.head));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pr_limits_writes_to_that_pull_requests_head() {
+    let env = Env::new().await;
+    let body = env.attest();
+    env.attest_comment(10, "OWNER", body.clone());
+    let other = "d".repeat(40);
+    env.fake.with(|s| {
+        let repo = s.repos.get_mut(&1).unwrap();
+        repo.pulls.insert(
+            2,
+            Pull {
+                head_sha: other.clone(),
+                ..Pull::new(2, "other", &[])
+            },
+        );
+        repo.comments.insert(
+            2,
+            vec![Comment {
+                id: 11,
+                body,
+                author: "maintainer-login".into(),
+                author_association: "OWNER".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+            }],
+        );
+    });
+    let mut args = env.reconcile_args();
+    args.extend(["--pr".into(), "2".into()]);
+    let out = env.cli(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(env.states(&env.head).is_empty());
+    assert!(
+        !env.states(&other).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A pull request that is not open writes nothing and exits 0.
+    let before = env.posts();
+    let mut args = env.reconcile_args();
+    args.extend(["--pr".into(), "9".into()]);
+    let out = env.cli(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(code(&out), 0);
+    assert_eq!(env.posts(), before);
+}

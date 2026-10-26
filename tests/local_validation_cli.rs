@@ -336,6 +336,23 @@ fn missing_lockfile_is_an_error_not_an_empty_digest() {
     assert!(!f.state().exists() || fs::read_dir(f.state()).unwrap().next().is_none());
 }
 
+#[test]
+fn a_dependency_path_naming_a_directory_fails_before_any_command() {
+    let f = Fixture::with_recipe(
+        vec![command("gate", "true", 30)],
+        Some(vec!["Cargo.lock".into(), "sub".into()]),
+        None,
+    );
+    fs::create_dir(f.repo().join("sub")).unwrap();
+    fs::write(f.repo().join("sub/x.txt"), "x").unwrap();
+    git(&f.repo(), &["add", "."]);
+    git(&f.repo(), &["commit", "-q", "-m", "dir"]);
+    let out = f.run();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("sub"));
+    assert!(!f.state().exists() || fs::read_dir(f.state()).unwrap().next().is_none());
+}
+
 fn bun_fixture(command: RecipeCommand, probes: Vec<Vec<String>>) -> Fixture {
     let f = Fixture::with_recipe(
         vec![command],
