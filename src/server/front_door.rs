@@ -631,6 +631,7 @@ pub(super) fn router(state: AppState, front_door: Arc<FrontDoor>) -> Router {
         .route("/v1/hub/{*path}", get(proxy))
         .with_state(front_door.clone())
         .merge(super::explorer::routes().with_state(state.clone()))
+        .merge(super::workflow_library::routes().with_state(state.clone()))
         .layer(middleware::from_fn_with_state(
             front_door.clone(),
             require_repository,
@@ -1158,6 +1159,453 @@ async fn relay(mut reply: reqwest::Response) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn granted_json(
+        app: &mut Router,
+        credential: &str,
+        method: &str,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        use axum::body::to_bytes;
+        use tower_service::Service;
+
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::HOST, "127.0.0.1:3210")
+            .header(header::ORIGIN, "http://127.0.0.1:3210")
+            .header(header::AUTHORIZATION, format!("Bearer {credential}"));
+        let request = if body.is_null() {
+            request.body(Body::empty()).unwrap()
+        } else {
+            request = request.header(header::CONTENT_TYPE, "application/json");
+            request.body(Body::from(body.to_string())).unwrap()
+        };
+        let response = app.call(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 8 * 1024 * 1024)
+            .await
+            .unwrap();
+        let value = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, value)
+    }
+
+    fn sanitize_workflow_wire(
+        value: &mut serde_json::Value,
+        replacements: &HashMap<String, String>,
+    ) {
+        match value {
+            serde_json::Value::Object(object) => {
+                for (key, value) in object {
+                    if matches!(key.as_str(), "created_at" | "updated_at" | "expires_at") {
+                        *value = json!(1);
+                    } else if key == "content" {
+                        *value = json!("<captured text>");
+                    } else if matches!(key.as_str(), "digest" | "sha256")
+                        && value.as_str().is_some_and(|value| value.len() == 64)
+                    {
+                        *value = json!(
+                            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                        );
+                    } else {
+                        sanitize_workflow_wire(value, replacements);
+                    }
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    sanitize_workflow_wire(value, replacements);
+                }
+            }
+            serde_json::Value::String(value) => {
+                for (original, replacement) in replacements {
+                    if value.contains(original) {
+                        *value = value.replace(original, replacement);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn canonicalize_captured_workflow_list(value: &mut serde_json::Value) {
+        let Some(workflows) = value
+            .get_mut("workflows")
+            .and_then(|value| value.get_mut("workflows"))
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            return;
+        };
+        // Draft timestamps have one-second resolution, so tied rows are ordered by random IDs.
+        workflows.sort_by(|left, right| {
+            left.pointer("/draft/id")
+                .and_then(serde_json::Value::as_str)
+                .cmp(
+                    &right
+                        .pointer("/draft/id")
+                        .and_then(serde_json::Value::as_str),
+                )
+        });
+    }
+
+    fn required_string(value: &serde_json::Value, key: &str) -> String {
+        value[key].as_str().unwrap().to_owned()
+    }
+
+    #[tokio::test]
+    async fn workflow_library_writes_need_a_browser_grant_and_selected_checkout() {
+        use tower_service::Service;
+
+        let directory = tempfile::tempdir().unwrap();
+        let front_door = Arc::new(FrontDoor::new().unwrap());
+        front_door.set_origin("http://127.0.0.1:3210".into());
+        let state = AppState {
+            data_dir: directory.path().to_path_buf(),
+            engine: agentscm::store::Engine::open(directory.path()).unwrap(),
+            work: Arc::new(tokio::sync::Semaphore::new(2)),
+            collisions: None,
+            timeline: None,
+            explorer: None,
+            front_door: Some(front_door.clone()),
+        };
+        let request = |authorization: Option<String>| {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/v1/local/workflow-library")
+                .header(header::HOST, "127.0.0.1:3210")
+                .header(header::ORIGIN, "http://127.0.0.1:3210")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"name":"release","summary":"release","idempotency_key":"one"}"#,
+                ))
+                .unwrap();
+            if let Some(authorization) = authorization {
+                request.headers_mut().insert(
+                    header::AUTHORIZATION,
+                    HeaderValue::from_str(&authorization).unwrap(),
+                );
+            }
+            request
+        };
+        let mut app = router(state, front_door.clone());
+        let response = app
+            .call(request(Some(format!("Bearer {}", "a".repeat(64)))))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(!directory.path().join("workflow-library").exists());
+
+        let (code, _) = front_door.mint_code().unwrap();
+        let (grant, _) = front_door.redeem(&code).unwrap().unwrap();
+        let response = app
+            .call(request(Some(format!("Bearer local:{grant}:owner/name"))))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(!directory.path().join("workflow-library").exists());
+    }
+
+    #[tokio::test]
+    async fn workflow_library_granted_router_round_trip_matches_the_ui_wire_fixture() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        let checkout = directory.path().join("checkout");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&checkout).unwrap();
+        let front_door = Arc::new(FrontDoor::new().unwrap());
+        front_door.set_origin("http://127.0.0.1:3210".into());
+        *front_door.connections.lock().await = Some((
+            Instant::now(),
+            Arc::new(vec![Connection {
+                root: checkout,
+                origin_host: "github.com".into(),
+                hub: "https://hub.example.test".into(),
+                repo: "acme/widgets".into(),
+                token_file: directory.path().join("unused-token"),
+                report_completion: false,
+                owned_token_id: None,
+                owned_token_expires_at: None,
+                agents: Vec::new(),
+            }]),
+        ));
+        let state = AppState {
+            data_dir: data.clone(),
+            engine: agentscm::store::Engine::open(&data).unwrap(),
+            work: Arc::new(tokio::sync::Semaphore::new(2)),
+            collisions: None,
+            timeline: None,
+            explorer: None,
+            front_door: Some(front_door.clone()),
+        };
+        let (code, _) = front_door.mint_code().unwrap();
+        let (grant, _) = front_door.redeem(&code).unwrap().unwrap();
+        let credential = format!("local:{grant}:acme/widgets");
+        let mut app = router(state, front_door);
+        let mut captured = serde_json::Map::new();
+        let mut replacements = HashMap::new();
+
+        let (status, preview) = granted_json(
+            &mut app,
+            &credential,
+            "POST",
+            "/v1/local/skill-imports/preview",
+            json!({"source":{"kind":"markdown","name":"Release helper","markdown":"# Release helper\n","resources":[
+                {"path":"draft.json","content":"{\"version\":1,\"inputs\":{},\"output\":{\"name\":\"draft\",\"media_type\":\"text/markdown\",\"max_bytes\":16384},\"action\":{\"kind\":\"prompt\",\"prompt\":\"draft.md\",\"required_tools\":[]}}"},
+                {"path":"draft.md","content":"Write release notes."}
+            ]}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        replacements.insert(
+            required_string(&preview, "preview_id"),
+            "imp_fixture".into(),
+        );
+        captured.insert("preview".into(), preview.clone());
+
+        let (status, accepted) = granted_json(
+            &mut app,
+            &credential,
+            "POST",
+            "/v1/local/skill-imports/accept",
+            json!({"preview_id":preview["preview_id"],"digest":preview["digest"],"idempotency_key":"accept-release-helper"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let skill_id = required_string(&accepted, "id");
+        replacements.insert(skill_id.clone(), "skl_fixture".into());
+        captured.insert("accepted_skill".into(), accepted.clone());
+
+        let (status, skills) = granted_json(
+            &mut app,
+            &credential,
+            "GET",
+            "/v1/local/skill-library",
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        captured.insert("skills".into(), skills);
+
+        let (status, child) = granted_json(
+            &mut app,
+            &credential,
+            "POST",
+            "/v1/local/workflow-library",
+            json!({"name":"Release action","summary":"Create release notes.","idempotency_key":"create-release-action"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let child_id = required_string(&child, "id");
+        replacements.insert(child_id.clone(), "wfl_child".into());
+        captured.insert("child_created".into(), child.clone());
+        let action_step = json!({"id":"draft-release","label":"Draft release notes","needs":[],"required":true,"kind":"action","skill_version_id":skill_id,"resource":"draft.json"});
+        let (status, child_updated) = granted_json(
+            &mut app,
+            &credential,
+            "PATCH",
+            &format!("/v1/local/workflow-library/{child_id}"),
+            json!({"expected_generation":child["generation"],"steps":[action_step],"trigger":null,"follow_on":null}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        captured.insert("child_updated".into(), child_updated.clone());
+        let (status, child_publish) = granted_json(
+            &mut app,
+            &credential,
+            "POST",
+            &format!("/v1/local/workflow-library/{child_id}/versions"),
+            json!({"expected_generation":child_updated["generation"],"idempotency_key":"publish-release-action"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "child publish: {child_publish}");
+        let child_version_id = required_string(&child_publish["version"], "id");
+        replacements.insert(child_version_id.clone(), "wfv_child".into());
+        captured.insert("child_published".into(), child_publish);
+
+        let (status, parent) = granted_json(
+            &mut app,
+            &credential,
+            "POST",
+            "/v1/local/workflow-library",
+            json!({"name":"Major feature follow-up","summary":"Prepare release evidence after merge.","idempotency_key":"create-major-follow-up"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let parent_id = required_string(&parent, "id");
+        replacements.insert(parent_id.clone(), "wfl_parent".into());
+        captured.insert("parent_created".into(), parent.clone());
+        let parent_steps = json!([
+            {"id":"prepare","label":"Prepare notes","needs":[],"required":true,"kind":"action","skill_version_id":skill_id,"resource":"draft.json"},
+            {"id":"reuse","label":"Reuse release action","needs":["prepare"],"required":true,"kind":"workflow","workflow_version_id":child_version_id,"inputs":{}}
+        ]);
+        let trigger =
+            json!({"kind":"confirmed_merge","target":"main","labels_all":["major-feature"]});
+        let follow_on =
+            json!({"workflow_version_id":child_version_id,"when":"success","inputs":{}});
+        let (status, parent_updated) = granted_json(
+            &mut app,
+            &credential,
+            "PATCH",
+            &format!("/v1/local/workflow-library/{parent_id}"),
+            json!({"expected_generation":parent["generation"],"steps":parent_steps,"trigger":trigger,"follow_on":follow_on}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        captured.insert("parent_updated".into(), parent_updated.clone());
+        let (status, parent_cleared) = granted_json(
+            &mut app,
+            &credential,
+            "PATCH",
+            &format!("/v1/local/workflow-library/{parent_id}"),
+            json!({"expected_generation":parent_updated["generation"],"trigger":null,"follow_on":null}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(parent_cleared["trigger"].is_null());
+        assert!(parent_cleared["follow_on"].is_null());
+        captured.insert("parent_cleared".into(), parent_cleared.clone());
+        let (status, parent_restored) = granted_json(
+            &mut app,
+            &credential,
+            "PATCH",
+            &format!("/v1/local/workflow-library/{parent_id}"),
+            json!({"expected_generation":parent_cleared["generation"],"trigger":trigger,"follow_on":follow_on}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        captured.insert("parent_restored".into(), parent_restored.clone());
+        let (status, parent_publish) = granted_json(
+            &mut app,
+            &credential,
+            "POST",
+            &format!("/v1/local/workflow-library/{parent_id}/versions"),
+            json!({"expected_generation":parent_restored["generation"],"idempotency_key":"publish-major-follow-up"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let parent_version_id = required_string(&parent_publish["version"], "id");
+        replacements.insert(parent_version_id.clone(), "wfv_parent".into());
+        captured.insert("parent_published".into(), parent_publish);
+
+        let (status, workflows) = granted_json(
+            &mut app,
+            &credential,
+            "GET",
+            "/v1/local/workflow-library",
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        captured.insert("workflows".into(), workflows);
+        let (status, simulation) = granted_json(
+            &mut app,
+            &credential,
+            "POST",
+            "/v1/local/workflow-simulations",
+            json!({"workflow_version_id":parent_version_id,"repository":"acme/widgets","source_revision":"1111111111111111111111111111111111111111"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        captured.insert("simulation".into(), simulation);
+
+        let attachment_path =
+            "/v1/local/repositories/acme%2Fwidgets/workflow-attachments/major-feature";
+        let (status, attachment) = granted_json(
+            &mut app,
+            &credential,
+            "PUT",
+            attachment_path,
+            json!({"workflow_version_id":parent_version_id,"params":{},"idempotency_key":"attach-major-feature"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        captured.insert("attachment_put".into(), attachment.clone());
+        let (status, attachments) = granted_json(
+            &mut app,
+            &credential,
+            "GET",
+            "/v1/local/repositories/acme%2Fwidgets/workflow-attachments",
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        captured.insert("attachments_reloaded".into(), attachments);
+        let (status, validation) = granted_json(
+            &mut app,
+            &credential,
+            "POST",
+            &format!("{attachment_path}/validate"),
+            json!({"expected_generation":attachment["generation"],"source_revision":"1111111111111111111111111111111111111111"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        captured.insert("attachment_validated".into(), validation);
+
+        let (status, invalid) = granted_json(
+            &mut app,
+            &credential,
+            "POST",
+            "/v1/local/workflow-library",
+            json!({"name":"Invalid publication","summary":"Exercise structured lint diagnostics.","idempotency_key":"create-invalid-publication"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let invalid_id = required_string(&invalid, "id");
+        replacements.insert(invalid_id.clone(), "wfl_invalid".into());
+        let invalid_step = json!({"id":"missing-action","label":"Missing action","needs":[],"required":true,"kind":"action","skill_version_id":skill_id,"resource":"missing.json"});
+        let (status, invalid_updated) = granted_json(
+            &mut app,
+            &credential,
+            "PATCH",
+            &format!("/v1/local/workflow-library/{invalid_id}"),
+            json!({"expected_generation":invalid["generation"],"steps":[invalid_step],"trigger":null,"follow_on":null}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, publication_rejected) = granted_json(
+            &mut app,
+            &credential,
+            "POST",
+            &format!("/v1/local/workflow-library/{invalid_id}/versions"),
+            json!({"expected_generation":invalid_updated["generation"],"idempotency_key":"publish-invalid-publication"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(publication_rejected["error"], "invalid_workflow");
+        assert!(
+            publication_rejected["diagnostics"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        );
+        captured.insert("publication_rejected".into(), publication_rejected);
+
+        let (status, conflict) = granted_json(
+            &mut app,
+            &credential,
+            "PATCH",
+            &format!("/v1/local/workflow-library/{parent_id}"),
+            json!({"expected_generation":1,"name":"stale edit"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(conflict["error"].as_str().is_some());
+        captured.insert("conflict".into(), conflict);
+
+        let mut captured = serde_json::Value::Object(captured);
+        sanitize_workflow_wire(&mut captured, &replacements);
+        canonicalize_captured_workflow_list(&mut captured);
+        let mut expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../../ui/tests/fixtures/workflow-library-router.json"
+        ))
+        .unwrap();
+        canonicalize_captured_workflow_list(&mut expected);
+        assert_eq!(captured, expected);
+    }
 
     #[test]
     fn a_code_redeems_once_and_grants_live_only_in_this_process() {

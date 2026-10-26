@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useState, useSyncExternalStore } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { ComputerNotices, LocalComputerProvider } from './ComputerBar.tsx'
 import { derive } from './derive.ts'
 import { isLocalCredential, onFrontDoor } from './frontDoor.ts'
@@ -51,7 +51,7 @@ export const SECTIONS: SectionDef[] = [
   { key: 'skills', nav: 'skills', icon: 'journal-check', label: 'Skills', question: 'Which workflows do agents in this repository have to follow?' },
   { key: 'workflows', nav: 'skills', icon: 'diagram-3', label: 'Checks', question: 'Did the checks pass?' },
   { key: 'landed', nav: 'skills', icon: 'rocket-takeoff', label: 'After merge', question: 'Did our changes land, and did checks pass after?' },
-  { key: 'templates', nav: 'skills', icon: 'journal-code', label: 'Recipes', question: 'Which workflow recipes can agents reuse?' },
+  { key: 'templates', nav: 'skills', icon: 'journal-code', label: 'Library', question: 'Which reusable workflows can agents configure here?' },
   { key: 'setup', nav: 'setup', icon: 'plug', label: 'Agents', question: 'Is my agent set up?' },
   { key: 'health', nav: 'setup', icon: 'heart-pulse', label: 'Hub', question: 'Is the hub OK?' },
   { key: 'workspace', nav: 'setup', icon: 'people', label: 'Access', question: 'Who can run what?' },
@@ -95,13 +95,26 @@ export function sectionFromHash(raw = window.location.hash): Section {
   return SECTIONS.some((s) => s.key === first) ? (first as Section) : 'home'
 }
 
-export function useSection(): Section {
+export function useSection(blocked = false): Section {
   const [section, setSection] = useState(() => sectionFromHash())
+  const protectedHash = useRef(window.location.hash)
   useEffect(() => {
-    const on = () => setSection(sectionFromHash())
+    const on = () => {
+      const next = sectionFromHash()
+      if (next === section) {
+        if (!blocked) protectedHash.current = window.location.hash
+        return
+      }
+      if (blocked && !window.confirm('Discard unsaved workflow edits?')) {
+        history.replaceState(null, '', `${window.location.pathname}${window.location.search}${protectedHash.current}`)
+        return
+      }
+      protectedHash.current = window.location.hash
+      setSection(next)
+    }
     window.addEventListener('hashchange', on)
     return () => window.removeEventListener('hashchange', on)
-  }, [])
+  }, [blocked, section])
   return section
 }
 
@@ -111,7 +124,8 @@ export function Logo({ dark, height = 32 }: { dark: boolean; height?: number }) 
 
 function Shell({ token, pref, onPref, density, onDensity, onUnauthorized, onForget }: { token: string; pref: ThemePref; onPref: (p: ThemePref) => void; density: Density; onDensity: (d: Density) => void; onUnauthorized: (m?: string) => void; onForget: () => void }) {
   const data = useHub(token, onUnauthorized)
-  const section = useSection()
+  const [workflowDirty, setWorkflowDirty] = useState(false)
+  const section = useSection(workflowDirty)
   const d = useMemo(() => (data.work && data.activity ? derive(data.work, data.activity) : null), [data.work, data.activity])
   const overview = usePoll((signal) => fetchOverview(token, signal), 15_000, token)
   const repo = data.whoami?.token.repository ?? 'this repository'
@@ -167,6 +181,7 @@ function Shell({ token, pref, onPref, density, onDensity, onUnauthorized, onForg
         density={density}
         onDensity={onDensity}
         onForget={onForget}
+        navigationBlocked={workflowDirty}
         collapsed={rail}
         onCollapsed={changeRail}
       >
@@ -183,7 +198,7 @@ function Shell({ token, pref, onPref, density, onDensity, onUnauthorized, onForg
         {section === 'change-record' && <ChangeRecordPage repo={data.whoami?.token.repository ?? null} token={token} />}
         {section === 'landed' && <LandedPage repo={data.whoami?.token.repository ?? null} token={token} />}
         {section === 'skills' && <SkillsPage repo={data.whoami?.token.repository ?? null} token={token} />}
-        {section === 'templates' && <TemplatesPage />}
+        {section === 'templates' && <TemplatesPage repository={data.whoami?.token.repository ?? null} onDirtyChange={setWorkflowDirty} />}
         {section === 'timeline' && <TimelinePage />}
         {section === 'explorer' && <ExplorerPage hubRepository={data.whoami?.token.repository ?? null} />}
         {section === 'setup' && <SetupPage token={token} />}

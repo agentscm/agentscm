@@ -211,7 +211,7 @@ function RepoSwitcher({ repo, onForget }: { repo: string; onForget: () => void }
  * connected on it (the same repository on two Hubs is told apart by Hub), and Disconnect. It shares
  * `useDismiss` with the Hub's other menus.
  */
-export function LocalRepoSwitcher({ token, repo }: { token: string; repo: string }) {
+export function LocalRepoSwitcher({ token, repo, navigationBlocked = false }: { token: string; repo: string; navigationBlocked?: boolean }) {
   const [open, setOpen] = useState(false)
   const ref = useDismiss(open, () => setOpen(false))
   const local = useLocalComputer()
@@ -245,6 +245,7 @@ export function LocalRepoSwitcher({ token, repo }: { token: string; repo: string
                 className={`pop-item${isCurrent ? ' is-current' : ''}`}
                 onClick={() => {
                   setOpen(false)
+                  if (!isCurrent && navigationBlocked && !window.confirm('Discard unsaved workflow edits?')) return
                   if (!isCurrent && switchRepository(token, selectorOf(r))) window.location.reload()
                 }}
               >
@@ -267,6 +268,7 @@ export function LocalRepoSwitcher({ token, repo }: { token: string; repo: string
             className="pop-item"
             onClick={() => {
               setOpen(false)
+              if (navigationBlocked && !window.confirm('Discard unsaved workflow edits?')) return
               void disconnectComputer().then(() => window.location.reload())
             }}
           >
@@ -641,7 +643,7 @@ function Breadcrumbs({ section, overview }: { section: SectionDef; overview: Wor
   )
 }
 
-export function AppChrome({ logo, token, repo, nav, sections, section, badges, statuses, data, d, overview, pref, onPref, density, onDensity, onForget, collapsed, onCollapsed, children }: {
+export function AppChrome({ logo, token, repo, nav, sections, section, badges, statuses, data, d, overview, pref, onPref, density, onDensity, onForget, navigationBlocked = false, collapsed, onCollapsed, children }: {
   logo: ReactNode
   /** The Hub sign-in; on this computer's own page, its connection credential. */
   token: string
@@ -659,6 +661,7 @@ export function AppChrome({ logo, token, repo, nav, sections, section, badges, s
   density: Density
   onDensity: (d: Density) => void
   onForget: () => void
+  navigationBlocked?: boolean
   collapsed: boolean
   onCollapsed: (c: boolean) => void
   children: ReactNode
@@ -733,7 +736,7 @@ export function AppChrome({ logo, token, repo, nav, sections, section, badges, s
           <a href="#home" className="topbar-logo" aria-label="AgentSCM Hub home">
             {logo}
           </a>
-          {isLocalCredential(token) ? <LocalRepoSwitcher token={token} repo={repo} /> : <RepoSwitcher repo={repo} onForget={onForget} />}
+          {isLocalCredential(token) ? <LocalRepoSwitcher token={token} repo={repo} navigationBlocked={navigationBlocked} /> : <RepoSwitcher repo={repo} onForget={onForget} />}
 
           <button type="button" data-tour="search" className="search-pill" onClick={() => setPalette(true)} aria-label="Search the hub">
             <Icon name="search" />

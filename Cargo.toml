@@ -54,7 +54,7 @@ lto = "thin"
 [profile.dev]
 debug = "line-tables-only"
 
-# Packaging integration tests copy the actual CLI. Omit embedded DWARF from test
-# executables so debug metadata does not consume the native bundle's 128 MiB limit.
+# Packaging integration tests copy the actual CLI. Omit DWARF and symbol metadata
+# from test executables so metadata does not consume the native bundle's 128 MiB limit.
 [profile.test]
-strip = "debuginfo"
+strip = true

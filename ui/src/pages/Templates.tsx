@@ -1,9 +1,9 @@
-import { useEffect, useState } from 'react'
-import { SectionTabs } from '../TopNav.tsx'
+import { useEffect, useRef, useState } from 'react'
 import { Combobox } from '../Combobox.tsx'
 import { fetchHandoff, fetchLocalChanges, fetchLocalRuns, inspectTemplate, type Handoff, type RunState, type TemplateAction, type TemplateInspect } from '../localApi.ts'
 import { Box, Empty, Explain, Icon, Notice, Pill, PreviewBanner, Skeleton, type Tone } from '../ui.tsx'
 import { usePoll } from '../usePoll.ts'
+import { SkillLibraryPanel, WorkflowLibraryPanel } from '../WorkflowLibraryPanel.tsx'
 
 /** One plain sentence per step, so the recipe reads like instructions rather than configuration. */
 export function describeAction(a: TemplateAction): { icon: string; text: string } {
@@ -239,7 +239,7 @@ function RecipeLookup({ recent, onOpen }: { recent: string[]; onOpen: (change: s
   )
 }
 
-export function TemplatesPage() {
+function InspectorPanel() {
   const [recipe, setRecipe] = useState<{ change: string; library: string } | null>(null)
   const [runId, setRunId] = useState<string | null>(null)
   const [recentRecipes, setRecentRecipes] = useState(() => loadIds(RECENT.recipe))
@@ -248,13 +248,8 @@ export function TemplatesPage() {
   const handoff = usePoll((signal) => (runId ? fetchHandoff(runId, signal) : Promise.resolve(null)), 0, runId ?? '')
   const preview = [inspect, handoff].find((p) => p.kind === 'ready' && p.value?.source === 'preview')
   return (
-    <div className="page">
-      <div className="answer" data-tour="answer">
-        <h1 className="page-question">Which workflow recipes can agents reuse?</h1>
-        <p className="answer-text">Recipes of checks that any change can reuse.</p>
-        <p className="answer-fact">A <strong>template</strong> is a saved recipe, like “check these files, run the tests, then ask Claude to review”.</p>
-      </div>
-      <SectionTabs />
+    <div className="stack">
+      <p className="small muted mb-0">Inspect a source-bound template or retained run. This view never changes or starts either one.</p>
       {preview && preview.kind === 'ready' && <PreviewBanner reason={preview.value?.reason} />}
       <div className="grid-2 align-start">
         <Box icon="journal-code" title="See a change’s recipe" explain="Shows the template this computer uses, as it applies to one change: its steps, what each waits for, and which must pass. Same as skill-workflow library inspect.">
@@ -281,6 +276,57 @@ export function TemplatesPage() {
         <Empty icon="journal-code" title="Open a change or a run to begin">Paste an ID above. This page reads from this computer only and never starts or approves anything.</Empty>
       )}
       <p className="small muted" data-tour="templates-source"><Icon name="laptop" /> Read from <code>agentscm serve</code> on this computer, not from the hub.</p>
+    </div>
+  )
+}
+
+type LibraryTab = 'workflows' | 'skills' | 'inspect'
+export function templatesTab(hash = window.location.hash): LibraryTab {
+  const query = hash.includes('?') ? hash.slice(hash.indexOf('?') + 1) : ''
+  const view = new URLSearchParams(query).get('view')
+  return view === 'skills' || view === 'workflows' ? view : 'inspect'
+}
+const tabHref = (tab: LibraryTab) => `#templates?view=${tab}`
+
+export function TemplatesPage({ repository = null, onDirtyChange }: { repository?: string | null; onDirtyChange?: (dirty: boolean) => void }) {
+  const [tab, setTab] = useState<LibraryTab>(() => templatesTab())
+  const [workflowDirty, setWorkflowDirty] = useState(false)
+  const protectedHash = useRef(window.location.hash)
+  useEffect(() => {
+    const onHash = () => {
+      if (window.location.hash.split('?')[0] !== '#templates') return
+      if (window.location.hash === protectedHash.current) return
+      if (workflowDirty && !window.confirm('Discard unsaved workflow edits?')) {
+        history.replaceState(null, '', `${window.location.pathname}${window.location.search}${protectedHash.current}`)
+        return
+      }
+      protectedHash.current = window.location.hash
+      setTab(templatesTab())
+    }
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [workflowDirty])
+  useEffect(() => {
+    onDirtyChange?.(workflowDirty)
+    return () => onDirtyChange?.(false)
+  }, [onDirtyChange, workflowDirty])
+  return (
+    <div className="page">
+      <div className="answer" data-tour="answer">
+        <h1 className="page-question">Which reusable workflows can agents configure here?</h1>
+        <p className="answer-text">Create versioned workflow drafts, save exact skill sources, and simulate what a published version would do before attaching it to <code>{repository ?? 'a repository'}</code>.</p>
+      </div>
+      <div className="tabbar" role="tablist" aria-label="Workflow library views">
+        {([
+          ['workflows', 'diagram-3', 'Workflows'],
+          ['skills', 'journal-check', 'Skills'],
+          ['inspect', 'search', 'Inspect source & runs'],
+        ] as const).map(([key, icon, label]) => <a key={key} role="tab" aria-selected={tab === key} className={`tab${tab === key ? ' active' : ''}`} href={tabHref(key)}><Icon name={icon} /> {label}</a>)}
+      </div>
+      {tab === 'workflows' && <WorkflowLibraryPanel repository={repository} onDirtyChange={setWorkflowDirty} />}
+      {tab === 'skills' && <SkillLibraryPanel />}
+      {tab === 'inspect' && <InspectorPanel />}
+      <p className="small muted" data-tour="templates-source"><Icon name="laptop" /> Workflow authoring is available through the loopback page opened by <code>agentscm open</code>. The shared Hub remains read-only.</p>
     </div>
   )
 }
