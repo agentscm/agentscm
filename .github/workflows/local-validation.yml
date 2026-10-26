@@ -1,23 +1,16 @@
 name: Local validation verifier
 
-# Verifies maintainer-signed local validation attestations posted as PR comments and
-# publishes the verdict as the `agentscm/local-validation` commit status on the exact
-# verified head. It builds only the default branch and treats the PR head purely as Git
-# data (`git fetch`, then `verify`); it never checks out, builds or runs pull request code.
-# Policy, recipe and registry come from the default branch.
+# Reconciles the `agentscm/local-validation` commit status of every open pull request on the
+# default branch from maintainer-signed attestation comments. It builds only the default
+# branch; pull request heads are fetched as Git data by `agentscm local-validation reconcile`
+# and are never checked out, built or run. Policy, recipe and registry come from the default
+# branch checkout.
 
 on:
   issue_comment: # zizmor: ignore[dangerous-triggers] default-branch build only; the PR head is fetched as Git data, never built or run
     types: [created, edited, deleted]
-  workflow_dispatch:
-    inputs:
-      pr:
-        description: Pull request number to verify
-        required: true
-        type: number
   push:
     branches: [main]
-    # Keep this list identical to `verifier_inputs` in the verify step below.
     paths:
       - "src/**"
       - "Cargo.toml"
@@ -30,15 +23,16 @@ on:
 
 permissions: {}
 
+# Every run reconciles all open pull requests, so a queued run supersedes intermediate ones.
 concurrency:
-  group: local-validation-${{ github.event.issue.number || inputs.pr || github.ref }}
+  group: local-validation
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  verify:
+  reconcile:
     # For comments: only pull request comments from trusted associations that start with the
     # attestation marker, or that did before an edit removed it so the old success is replaced
     # (the signature still decides; this limits compute abuse and replay).
@@ -58,161 +52,10 @@ jobs:
       - run: rustup toolchain install # reads rust-toolchain.toml
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build --locked --bin agentscm
-      - name: Verify and publish status
+      - name: Reconcile statuses
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch || github.ref_name }}
-          EVENT_NAME: ${{ github.event_name }}
-          COMMENT_PR: ${{ github.event.issue.number }}
-          DISPATCH_PR: ${{ inputs.pr }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          shopt -s inherit_errexit # a failing $(...) helper must fail the PR, not be skipped
-          marker='<!-- agentscm-local-validation:v1 '
-          cfg=.github/local-validation
-          repository=$(jq -r .repository "$cfg/policy.json")
-          if [[ $repository != "github.com/$REPO" ]]; then
-            echo "policy repository $repository does not match github.com/$REPO; not verifying"; exit 1
-          fi
-          work=$(mktemp -d)
-          CHECKOUT_SHA=$(git rev-parse HEAD)
-          trusted='["OWNER","MEMBER","COLLABORATOR"]'
-
-          # Inputs that decide a verdict. Must match the push `paths:` list above.
-          verifier_inputs=(
-            'src/**' Cargo.toml Cargo.lock rust-toolchain.toml '.github/local-validation/**'
-            .github/workflows/local-validation.yml
-          )
-
-          post_status() { # sha state description
-            # A run that checked out older verifier inputs must not overwrite the verdict
-            # of the run that re-verifies after they changed.
-            git fetch --no-tags origin "$DEFAULT_BRANCH"
-            if ! git diff --quiet "$CHECKOUT_SHA" FETCH_HEAD -- "${verifier_inputs[@]}"; then
-              echo "not posting $2 on $1: default-branch verifier inputs changed since checkout; a newer run owns the verdict"
-              return 0
-            fi
-            gh api -X POST "repos/$REPO/statuses/$1" \
-              -f state="$2" -f context=agentscm/local-validation \
-              -f description="${3:0:140}" -f target_url="$RUN_URL" > /dev/null
-          }
-
-          # Select the trusted attestation comments; shared by reading and re-checking.
-          # shellcheck disable=SC2016 # jq variables, not shell expansions
-          sel='.[] | select((.body | startswith($m)) and (.author_association as $a | $t | index($a)))'
-          fp_filter="$sel | \"\(.id):\(.updated_at)\""
-
-          fingerprint() { # pr: sorted id:updated_at of the trusted marker comments
-            local pr=$1 page len
-            : > "$work/fp-out.txt"
-            for page in $(seq 10); do
-              gh api "repos/$REPO/issues/$pr/comments?per_page=100&page=$page" > "$work/fp-page.json" || return 1
-              jq -r --arg m "$marker" --argjson t "$trusted" "$fp_filter" "$work/fp-page.json" >> "$work/fp-out.txt" || return 1
-              len=$(jq length "$work/fp-page.json") || return 1
-              if [[ $len -lt 100 ]]; then break; fi
-            done
-            sort "$work/fp-out.txt"
-          }
-
-          verify_pr() {
-            local pr=$1 dir="$work/$1" head base page len n=0 args=() out code state want desc fp_before fp_after
-            mkdir -p "$dir"
-            gh api "repos/$REPO/pulls/$pr" > "$dir/pull.json"
-            head=$(jq -r .head.sha "$dir/pull.json")
-            base=$(jq -r .base.ref "$dir/pull.json")
-            if [[ ! $head =~ ^[0-9a-f]{40}$ || ! $base =~ ^[A-Za-z0-9._/-]+$ ]]; then
-              echo "PR $pr: unexpected head or base; skipped"; return 0
-            fi
-            echo "$head" > "$work/$pr.head"
-            git fetch --no-tags origin "+refs/heads/$base:refs/remotes/origin/$base"
-            git fetch --no-tags origin "refs/pull/$pr/head"
-            if ! git cat-file -e "$head^{commit}" 2>/dev/null; then
-              post_status "$head" error "head moved while fetching; re-run"; return 0
-            fi
-            : > "$dir/fp.txt"
-            for page in $(seq 10); do
-              gh api "repos/$REPO/issues/$pr/comments?per_page=100&page=$page" > "$dir/page.json"
-              len=$(jq length "$dir/page.json")
-              jq -c --arg m "$marker" --argjson t "$trusted" "$sel | .body" "$dir/page.json" > "$dir/bodies.txt"
-              jq -r --arg m "$marker" --argjson t "$trusted" "$fp_filter" "$dir/page.json" >> "$dir/fp.txt"
-              while IFS= read -r body; do
-                n=$((n + 1))
-                printf '%s' "$body" | jq -r . > "$dir/comment-$n.txt"
-                args+=(--comment-body "$dir/comment-$n.txt")
-              done < "$dir/bodies.txt"
-              [[ $len -lt 100 ]] && break
-              if [[ $page -eq 10 ]]; then
-                post_status "$head" error "too many comments to read the newest attestation"; return 0
-              fi
-            done
-            fp_before=$(sort "$dir/fp.txt")
-            if [[ $n -eq 0 && ( $EVENT_NAME == push || $EVENT_NAME == schedule ) ]]; then
-              # Skip PRs that never opted in; but if this head already has our status (for
-              # example the attestation comment was deleted), replace it with pending.
-              gh api --paginate "repos/$REPO/commits/$head/statuses?per_page=100" \
-                --jq '.[] | select(.context == "agentscm/local-validation") | .id' > "$dir/statuses.txt"
-              if [[ ! -s $dir/statuses.txt ]]; then
-                echo "PR $pr: no trusted attestation comment and no existing status; not opted in, no status written"; return 0
-              fi
-            fi
-            if [[ $n -eq 0 ]]; then
-              post_status "$head" pending "no local validation attestation for this head"; return 0
-            fi
-            code=0
-            out=$(target/debug/agentscm local-validation verify "${args[@]}" \
-              --policy "$cfg/policy.json" --recipe "$cfg/recipe.json" --registry "$cfg/registry.json" --repo . \
-              --head "$head" --base-ref "$base" --base-rev "origin/$base" \
-              --repository "$repository") || code=$?
-            echo "PR $pr head $head exit $code: $out"
-            # Trust the exit code only when stdout is a verdict that agrees with it.
-            state=error
-            case $code in
-              0) want=success ;; 1) want=failure ;; 2) want=error ;; 3) want=pending ;; *) want= ;;
-            esac
-            if [[ -n $want && $(printf '%s' "$out" | jq -r .state 2>/dev/null) == "$want" ]]; then
-              state=$want
-            fi
-            desc=$(printf '%s' "$out" | jq -r '.reason // empty' 2>/dev/null || true)
-            # A comment run and a push/schedule run can overlap; if a trusted attestation
-            # comment changed since it was read, the run that saw the change owns the verdict.
-            fp_after=$(fingerprint "$pr")
-            if [[ $fp_after != "$fp_before" ]]; then
-              echo "PR $pr: attestation comments changed during verification; not posting $state on $head; a newer run owns the verdict"
-              return 0
-            fi
-            post_status "$head" "$state" "${desc:-verifier error (exit $code)}"
-            if [[ $(gh api "repos/$REPO/pulls/$pr" --jq .head.sha || true) != "$head" ]]; then
-              echo "PR $pr head moved during verification; the status is bound to $head and the new head has none"
-            fi
-          }
-
-          case $EVENT_NAME in
-            issue_comment) prs=$COMMENT_PR ;;
-            workflow_dispatch) prs=$DISPATCH_PR ;;
-            push | schedule)
-              gh pr list --repo "$REPO" --state open --limit 1000 --json number > "$work/open.json"
-              if [[ $(jq length "$work/open.json") -ge 1000 ]]; then
-                echo "1000 or more open PRs; the list may be truncated"; exit 1
-              fi
-              prs=$(jq -r '.[].number' "$work/open.json") ;;
-            *) echo "unexpected event"; exit 1 ;;
-          esac
-          errored=0
-          for pr in $prs; do
-            [[ $pr =~ ^[0-9]+$ ]] || { echo "bad PR number"; exit 1; }
-            # set -e is ignored inside an `if` or `||` context, so run the subshell bare.
-            set +e
-            (set -euo pipefail; verify_pr "$pr")
-            rc=$?
-            set -e
-            if [[ $rc -ne 0 ]]; then
-              errored=1
-              echo "PR $pr: verifier failed with exit $rc"
-              if [[ -s $work/$pr.head ]]; then
-                post_status "$(cat "$work/$pr.head")" error "verifier error; re-run" || true
-              fi
-            fi
-          done
-          exit $errored
+        run: target/debug/agentscm local-validation reconcile --github-repo "$REPO" --base "$DEFAULT_BRANCH" --target-url "$RUN_URL"
