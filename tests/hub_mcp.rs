@@ -494,6 +494,20 @@ async fn protocol_basics() {
         )
         .await
         .json();
+    let submit = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "agentscm_briefing_submit")
+        .unwrap();
+    assert_eq!(
+        submit["inputSchema"]["properties"]["output"]["properties"]["headline_references"]["minItems"],
+        1
+    );
+    assert_eq!(
+        submit["inputSchema"]["properties"]["output"]["properties"]["facts"]["minItems"],
+        1
+    );
     let names: Vec<&str> = listed["result"]["tools"]
         .as_array()
         .unwrap()
@@ -514,6 +528,10 @@ async fn protocol_basics() {
             "agentscm_work_briefing",
             "agentscm_work_catchup",
             "agentscm_work_catchup_ack",
+            "agentscm_briefing_read",
+            "agentscm_briefing_pending",
+            "agentscm_briefing_prepare",
+            "agentscm_briefing_submit",
             "agentscm_work_preflight",
             "agentscm_coordination_inbox",
             "agentscm_change_record",

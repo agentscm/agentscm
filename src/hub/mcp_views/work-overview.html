@@ -36,6 +36,7 @@ function render(root,d,at){
 var cur=Array.isArray(d.current)?d.current:[],ov=Array.isArray(d.overlaps)?d.overlaps:[],rec=Array.isArray(d.recent)?d.recent:[];
 var n=function(s){return cur.filter(function(i){return i.state===s}).length};
 var hd=h('header');add(hd,h('h1',null,'Work overview'),h('span','sp'),h('span','mut','Updated '+pad(at.getHours())+':'+pad(at.getMinutes())),refreshBtn());add(root,hd,failNote());
+renderNarrative(root);
 renderCatchup(root);
 if(d.current_complete===false)add(root,h('div','warn','⚠ Showing a partial list.'));
 var tl=h('div','tiles');
@@ -61,6 +62,23 @@ if(d.recent_complete===false)add(dt,h('p','note','This list may be partial.'));a
 add(root,h('footer',null,'Read-only. Stale claims stay claimed. '+(d.overlaps_complete===false?'⚠ Overlap check incomplete':'✓ Overlap check complete')),h('div','quiet',manage))}
 function when(at){return new Date(at*1000).toLocaleString()}
 function pair(dl,label,value){var dd=h('dd');add(dd,h('code',null,value));add(dl,h('dt',null,label),dd)}
+var NARRATIVE={value:null,busy:false,error:false,timer:null};
+function narrativeReferences(v,ids,allowEmpty){if(!Array.isArray(v)||v.length>4||!allowEmpty&&!v.length)return false;var seen={};return !v.some(function(r){if(typeof r!=='string'||seen[r]||!Object.prototype.hasOwnProperty.call(ids,r))return true;seen[r]=true;return false})}
+function narrativeValue(v){
+if(!v||typeof v!=='object'||!safeText(v.id,100)||!safeText(v.digest,64)||['pending','generating','ready','failed'].indexOf(v.status)<0||!v.window||typeof v.window.complete!=='boolean'||!Array.isArray(v.sources)||v.sources.length>100||!Array.isArray(v.warnings)||v.warnings.length>20||v.warnings.some(function(w){return !safeText(w,1000)}))return null;
+var w=v.window;if(w.subscriber!=='human'||nat(w.event_from)===null||nat(w.event_through)===null||w.event_from>w.event_through||nat(w.merge_from)===null||nat(w.merge_through)===null||w.merge_from>w.merge_through)return null;
+if(v.generated_at!==null&&nat(v.generated_at)===null||v.generated_by!==null&&!safeText(v.generated_by,255))return null;
+var ids={};for(var i=0;i<v.sources.length;i++){var x=v.sources[i];if(!x||!safeText(x.id,200)||ids[x.id]||!safeText(x.label,600)||x.work_id!==null&&!/^wrk_[0-9a-f]{32}$/.test(x.work_id)||x.commit!==null&&!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(x.commit)||x.pull_number!==null&&(nat(x.pull_number)===null||x.pull_number<1))return null;ids[x.id]=true}
+if(v.status==='ready'){var o=v.output,sourceFree=v.sources.length===0;if(!o||!safeText(o.headline,240)||!Array.isArray(o.facts)||!Array.isArray(o.implications)||!narrativeReferences(o.headline_references,ids,sourceFree)||sourceFree&&(o.facts.length||o.implications.length)||o.facts.length<1&&!sourceFree||o.facts.length>6||o.implications.length>4||o.facts.concat(o.implications).some(function(t){return !t||!safeText(t.text,600)||!narrativeReferences(t.references,ids,false)}))return null}else if(v.output!==null)return null;
+return v}
+function narrativeSource(v,id){var source=v.sources.find(function(x){return x.id===id}),d=h('details','source');add(d,h('summary',null,source.label),h('p','id',id+(source.work_id?' · Work '+source.work_id:'')+(source.commit?' · Commit '+source.commit:'')+(source.pull_number?' · PR #'+source.pull_number:'')));return d}
+function renderNarrative(root){var box=h('section','catchup'),v=NARRATIVE.value;add(box,h('h2',null,'Agent briefing'));if(NARRATIVE.error)add(box,h('p','warn','Agent briefing unavailable. Refresh to retry; source records remain below.'));
+if(!v){if(!NARRATIVE.error)add(box,h('p','note','Loading agent briefing…'));add(root,box);return}
+v.warnings.forEach(function(w){add(box,h('p','warn',w))});if(!v.window.complete)add(box,h('p','warn','This briefing covers a bounded portion of the catch-up window; more records may exist.'));
+if(v.status==='ready'){add(box,h('p','t',v.output.headline));v.output.headline_references.forEach(function(id){add(box,narrativeSource(v,id))});[['Reported facts',v.output.facts],['What this may mean for your work',v.output.implications]].forEach(function(group){if(!group[1].length)return;add(box,h('h3',null,group[0]));var list=h('ul');group[1].forEach(function(t){var row=h('li','att',t.text);t.references.forEach(function(id){add(row,narrativeSource(v,id))});add(list,row)});add(box,list)});add(box,h('p','note','Reported by '+(v.generated_by||'connected agent')+(v.generated_at===null?'':' · '+when(v.generated_at))))}
+else add(box,h('p','note',v.status==='failed'?'No generated briefing is available for this window. Check the reported warning; this page keeps checking for recovery.':v.status==='generating'?'A connected agent is writing this briefing.':'Waiting for a connected agent to write this briefing. The Hub does not launch a model.'));
+add(box,h('p','note','Work events '+v.window.event_from+' → '+v.window.event_through+' · Merge observations '+v.window.merge_from+' → '+v.window.merge_through+'. Agent reporting is not independent verification or edit authority. Reading never marks review complete.'));add(root,box)}
+function narrativeCall(){if(NARRATIVE.busy)return;clearTimeout(NARRATIVE.timer);NARRATIVE.busy=true;rpc('tools/call',{name:'agentscm_briefing_read',arguments:{subscriber:'human'}}).then(function(r){NARRATIVE.value=narrativeValue(parse(r));NARRATIVE.error=!NARRATIVE.value},function(){NARRATIVE.value=null;NARRATIVE.error=true}).finally(function(){NARRATIVE.busy=false;paint();NARRATIVE.timer=setTimeout(function(){if(!document.hidden)narrativeCall()},30000)})}
 function catchClient(){var c=window.crypto;if(c&&typeof c.randomUUID==='function')return'mcp_'+c.randomUUID();if(c&&typeof c.getRandomValues==='function'){var b=c.getRandomValues(new Uint8Array(16)),s='';for(var i=0;i<b.length;i++)s+=b[i].toString(16).padStart(2,'0');return'mcp_'+s}return'mcp_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2)+'_'+Math.random().toString(36).slice(2)}
 var CATCH_CLIENT=catchClient(),CATCH={page:null,busy:false,err:null,note:null};
 function safeText(v,max){if(typeof v!=='string'||!v.length||v.length>max||/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2064\u2066-\u206f\ufeff]/.test(v))return null;return v}
@@ -98,7 +116,7 @@ function take(r,silent){var d=parse(r);if(d){last=d;lastAt=new Date();failedAt=n
 var failedAt=null;
 function fail(){failedAt=lastAt;paint()}
 function call(args,keep){return rpc('tools/call',{name:TOOL,arguments:args}).then(function(r){var d=parse(r);if(d){last=d;lastAt=new Date();failedAt=null;paint()}else fail()},fail)}
-function refreshBtn(){var b=h('button',null,'Refresh');b.type='button';b.addEventListener('click',function(){call({})});return b}
+function refreshBtn(){var b=h('button',null,'Refresh');b.type='button';b.addEventListener('click',function(){call({});narrativeCall()});return b}
 function failNote(){return failedAt?h('div','warn','Could not refresh. Showing data from '+hms(failedAt)):null}
 window.addEventListener('message',function(e){if(e.source!==window.parent)return;var m=e.data;if(!m||m.jsonrpc!=='2.0')return;
 if(m.id!=null&&pending[m.id]&&!m.method){var p=pending[m.id];delete pending[m.id];if(m.error)p.no(m.error);else p.ok(m.result);return}
@@ -107,7 +125,7 @@ else if(m.method==='ui/notifications/host-context-changed')theme(m.params&&(m.pa
 var manage='Manage these views: ask your agent to run agentscm_view_settings, or open Settings in the hub.';
 function start(){if(typeof ResizeObserver==='function')new ResizeObserver(size).observe(document.body);
 rpc('ui/initialize',{appInfo:{name:TOOL+'-view',version:'1.0.0'},appCapabilities:{},protocolVersion:'2026-01-26'}).then(function(r){theme(r&&r.hostContext);send({jsonrpc:'2.0',method:'ui/notifications/initialized',params:{}})},function(){});
-paint();catchCall({subscriber:'human',delivery_client:CATCH_CLIENT},false)}
+paint();narrativeCall();catchCall({subscriber:'human',delivery_client:CATCH_CLIENT},false)}
 var FIND={q:'',items:[],cursor:null,more:false,busy:false,err:false,seq:0,timer:0,box:null,list:null,note:null,btn:null};
 function findBuild(){var root=document.getElementById('find');root.textContent='';
 var i=h('input');i.type='search';i.maxLength=200;i.placeholder='Title, branch, agent, issue number';i.setAttribute('aria-label','Find work');

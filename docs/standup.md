@@ -126,6 +126,48 @@ retained delivery does not establish that nothing happened outside that coverage
 Current Work and existing coordination warnings stay visible alongside it. No
 catch-up acknowledgement closes Work, changes a claim or authorizes an edit.
 
+### Agent-generated catch-up narrative
+
+The Work dashboard can show an optional agent-generated narrative above the retained
+catch-up feed. Reading it requests or reuses an ephemeral synthesis for the same
+bounded human subscriber window. Each idle cached variant is retained for up to
+30 minutes. A visible ready view polls every 30 seconds and keeps reusing the same
+variant while its source facts remain unchanged. Variant capacity is bounded,
+reserves room for the general human briefing and protects active generation leases.
+Reading, refreshing or generating the narrative never acknowledges the catch-up
+delivery, moves an agent briefing cursor, changes Work or authorizes an edit.
+
+The Hub does not launch a model provider. An eligible connected agent claims a
+pending window with `agentscm_briefing_prepare`, retrieves the bounded source facts,
+generates the structured narrative and submits it through
+`agentscm_briefing_submit`.
+The dashboard can request task-specific implications through its optional task
+field; it sends the task only when the person submits the form. Connected agents
+discover and prepare those pending requests through the same bounded workflow.
+Concurrent snapshot requests for the same owner and repository fail fast while
+one capture is running; other owners use separate capture gates. Temporary
+unavailability is retried while the dashboard is visible. A claim lasts five minutes. Two expired attempts pause the job for ten minutes,
+then make it eligible again; polling does not extend that cooldown. Failed views
+keep checking for recovery. New source facts supersede the old job, including any
+active lease, so the agent must prepare again rather than submit stale prose.
+Frequent coverage changes can therefore cause repeated supersession. Agents retry
+a temporarily busy prepare or unchanged submission at most twice; a busy response
+does not consume their existing lease.
+Agent-facing results frame the narrative as untrusted JSON data.
+The ephemeral cache has 64 slots across the Hub. If every slot holds a general
+briefing or active lease, another request can be temporarily unavailable even in
+a different owner namespace. This is a bounded availability limit, not shared
+access to another owner’s facts.
+There is no unattended provider worker; generation happens only when an eligible
+connected agent follows that workflow.
+Startup and MCP instructions tell eligible agents how to prepare, generate and
+submit that result. A successful finish checkpoint also offers a fresh general
+briefing while its agent is still present, even if nobody has opened the dashboard.
+Progress checkpoints deliver existing requests without starting repeated synthesis. If no eligible agent is connected, the narrative remains
+pending and the retained catch-up feed stays available. Generation failures,
+incomplete source windows and warnings remain visible and cannot be read as an
+empty result, authorization or a conflict all-clear.
+
 ### Source and scope preflight
 
 `POST /v1/hub/standup/preflight`, CLI `work preflight --request`, and MCP
