@@ -4,6 +4,7 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 
 use super::{MAX_RECORD_BYTES, ValidationRecord};
 use crate::evidence::validate_lower_hex;
@@ -13,6 +14,7 @@ pub const MAX_COMMENT_BYTES: usize = 60 * 1024;
 const MARKER_PREFIX: &str = "<!-- agentscm-local-validation:v1 ";
 const ENVELOPE_FENCE: &str = "```agentscm-envelope-v1";
 const RECORD_FENCE: &str = "```agentscm-record-v1";
+const LOGO_URL: &str = "https://raw.githubusercontent.com/counterbranch/agentscm/24b70c0796e8288d1560adda36a1590e613d0ffc/docs/assets/agentscm-icon.png";
 
 pub fn envelope_sha256(envelope: &[u8]) -> String {
     format!("{:x}", Sha256::digest(envelope))
@@ -28,40 +30,100 @@ fn block(fence: &str, bytes: &[u8]) -> String {
     format!("{fence}\n{}\n```\n", lines.join("\n"))
 }
 
+/// Escapes display-only text before placing it in Markdown or HTML. Encoding every
+/// non-alphanumeric character also prevents Markdown delimiters and newlines from
+/// changing the surrounding disclosure structure.
+fn display_text(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() || character == ' ' {
+            escaped.push(character);
+        } else {
+            write!(escaped, "&#x{:x};", character as u32).expect("writing to a string cannot fail");
+        }
+    }
+    escaped
+}
+
+fn code(value: &str) -> String {
+    format!("<code>{}</code>", display_text(value))
+}
+
 /// Deterministic comment body for the exact envelope and record bytes.
 pub fn render(envelope: &[u8], record: &[u8]) -> Result<String> {
     let parsed = ValidationRecord::from_slice(record)?;
     let envelope_json: serde_json::Value = serde_json::from_slice(envelope)?;
-    let outcome = envelope_json["payload"]["outcome"]
-        .as_str()
-        .unwrap_or("unknown");
+    let outcome = match envelope_json["payload"]["outcome"].as_str() {
+        Some("pass") => "pass",
+        Some("fail") => "fail",
+        _ => "unknown",
+    };
     let omissions: Vec<&str> = envelope_json["payload"]["coverage"]["omissions"]
         .as_array()
         .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
         .unwrap_or_default();
+    let observed = envelope_json["payload"]["coverage"]["observed_count"]
+        .as_u64()
+        .map_or_else(|| "unknown".to_owned(), |value| value.to_string());
+    let expected = envelope_json["payload"]["coverage"]["expected_count"]
+        .as_u64()
+        .map_or_else(|| "unknown".to_owned(), |value| value.to_string());
+    let omissions = if omissions.is_empty() {
+        "none reported".to_owned()
+    } else {
+        omissions
+            .iter()
+            .map(|value| code(value))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let missing_services = [
+        (!parsed.services.postgres).then_some("PostgreSQL"),
+        (!parsed.services.s3).then_some("S3"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let missing_services = if missing_services.is_empty() {
+        "none reported".to_owned()
+    } else {
+        missing_services.join(", ")
+    };
     let mut body = format!(
-        "{MARKER_PREFIX}{} -->\n\n**Local validation: {outcome}**\n\n- commit: `{}`\n- tree: `{}`\n- base: `{}` at `{}` (merge-base `{}`)\n- services: postgres={}, s3={}\n- omissions: {}\n",
+        "{MARKER_PREFIX}{} -->\n\n<img src=\"{LOGO_URL}\" alt=\"AgentSCM icon\" width=\"28\"> **Local validation: reported {outcome}**\n\nSigned evidence reports **{outcome}** for commit {} in {}. Rendering this comment does not verify its signature or prove that commands ran.\n\nCoverage is limited to the recorded evidence: {observed}/{expected} expected checks reported; omissions: {omissions}; missing services: {missing_services}.\n\n<details>\n<summary>Source and environment</summary>\n\n- Repository: {}\n- Commit: {}\n- Tree: {}\n- Base ref: {}\n- Base tip: {}\n- Merge base: {}\n- Services: PostgreSQL={}, S3={}\n- Platform: {}\n- Toolchain: {}\n\n</details>\n\n<details>\n<summary>Command results</summary>\n\n",
         envelope_sha256(envelope),
-        parsed.subject.commit,
-        parsed.subject.tree,
-        parsed.context.base_ref,
-        parsed.base_tip,
-        parsed.context.merge_base,
+        code(&parsed.subject.commit),
+        code(&parsed.subject.repository),
+        code(&parsed.subject.repository),
+        code(&parsed.subject.commit),
+        code(&parsed.subject.tree),
+        code(&parsed.context.base_ref),
+        code(&parsed.base_tip),
+        code(&parsed.context.merge_base),
         parsed.services.postgres,
         parsed.services.s3,
-        omissions.join(", "),
+        code(&parsed.platform),
+        parsed
+            .toolchain
+            .iter()
+            .map(|value| code(value))
+            .collect::<Vec<_>>()
+            .join(", "),
     );
     for r in &parsed.results {
         let exit = r.exit_code.map_or("none".to_owned(), |c| c.to_string());
         body.push_str(&format!(
-            "- `{}`: {:?}, exit {exit}, {} ms\n",
-            r.id, r.stop, r.duration_ms
+            "- {}: {:?}, exit {exit}, {} ms\n",
+            code(&r.id),
+            r.stop,
+            r.duration_ms
         ));
     }
-    body.push_str("\nThis summary is display only; the signed blocks below decide.\n\n");
+    body.push_str("\n</details>\n\n<details>\n<summary>Signed machine-readable evidence</summary>\n\nThe exact signed bytes are preserved below for verification and audit tooling.\n\n");
     body.push_str(&block(ENVELOPE_FENCE, envelope));
     body.push('\n');
     body.push_str(&block(RECORD_FENCE, record));
+    body.push_str("\n</details>\n");
     if body.len() > MAX_COMMENT_BYTES {
         return Err(Error::Limit(format!(
             "comment body exceeds {MAX_COMMENT_BYTES} bytes"
