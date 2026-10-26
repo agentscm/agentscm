@@ -893,8 +893,12 @@ async fn only_listed_users_and_admins_sign_in() {
     env.fake.lock().unwrap().current_user = 8;
     let (location, cookie, _) = env.browser_start("github").await;
     let callback = env.authorize_at_forge(&location).await;
-    let (status, _, body) = env.callback(&callback, Some(&cookie)).await;
-    assert_eq!((status, body), (403, json!({"error": "not_allowed"})));
+    // The browser lands on the Hub page that says why, with no code for the CLI.
+    let (status, headers, _) = env.callback(&callback, Some(&cookie)).await;
+    assert_eq!(
+        (status, headers[header::LOCATION].to_str().unwrap()),
+        (302, "/ui/#/signed-in?status=refused&reason=not_allowed")
+    );
     for (provider, user) in [("github", 8), ("gitlab", 7)] {
         env.fake
             .lock()
@@ -1529,8 +1533,12 @@ async fn admins_disable_and_enable_users() {
     env.fake.lock().unwrap().current_user = 7;
     let (location, cookie, _) = env.browser_start("github").await;
     let callback = env.authorize_at_forge(&location).await;
-    let (status, _, body) = env.callback(&callback, Some(&cookie)).await;
-    assert_eq!((status, body), (403, json!({"error": "user_disabled"})));
+    // The browser lands on the Hub page that says why, with no code for the CLI.
+    let (status, headers, _) = env.callback(&callback, Some(&cookie)).await;
+    assert_eq!(
+        (status, headers[header::LOCATION].to_str().unwrap()),
+        (302, "/ui/#/signed-in?status=refused&reason=user_disabled")
+    );
     assert_eq!(signed_in(), before);
     env.fake.lock().unwrap().script.push_back(Step::Approve(7));
     let (_, started) = env

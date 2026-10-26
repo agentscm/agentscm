@@ -29,6 +29,8 @@ use super::store::{
 use super::{HubError, HubState, Result};
 use crate::team::auth::{generate_secret, token_digest};
 
+mod devices;
+
 const SESSION_DIGEST_DOMAIN: &[u8] = b"agentscm.hub.session.v1\0";
 const COOKIE: &str = "__Host-agentscm_login";
 const SESSION_SECONDS: i64 = 8 * 60 * 60;
@@ -567,6 +569,7 @@ pub fn routes() -> Router<HubState> {
         .route("/v1/hub/users", get(list_users))
         .route("/v1/hub/users/{id}/disable", post(disable))
         .route("/v1/hub/users/{id}/enable", post(enable))
+        .merge(devices::routes())
 }
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
@@ -782,7 +785,17 @@ async fn callback_inner(
     } else {
         "browser"
     };
-    let signed = sign_in(state, provider, forge, method, &body).await?;
+    let signed = match sign_in(state, provider, forge, method, &body).await {
+        Ok(signed) => signed,
+        // The person reads why in the Hub page, not as a JSON error.
+        Err(error)
+            if !pending.workspace && matches!(error.code(), "not_allowed" | "user_disabled") =>
+        {
+            let location = format!("/ui/#/signed-in?status=refused&reason={}", error.code());
+            return found(&location, cookie_attributes("", 0));
+        }
+        Err(error) => return Err(error),
+    };
     if pending.workspace {
         // The browser receives a separate short-lived HttpOnly cookie, never the
         // CLI human bearer or an agent token. Forge credentials stay server-side.
@@ -945,17 +958,30 @@ async fn sign_in(
         user_id: id,
     };
     let admin = state.login.is_admin(provider.name, id, &login);
-    // Nothing is stored for anyone refused.
+    // No user, event or session is stored for anyone refused; administrators see a bounded,
+    // deduplicated refusal row.
+    let candidate = User {
+        id: String::new(),
+        identity: identity.clone(),
+        login: login.clone(),
+        disabled: false,
+    };
+    let refuse =
+        |reason: &'static str| devices::record_refusal(state, &candidate, reason, "sign_in");
     if method == "workspace" {
         let workspace = state.workspace.clone().ok_or_else(not_found)?;
         let candidate = identity.clone();
         if !blocking(state, move || workspace.allows_sign_in(&candidate)).await? {
+            refuse("not_allowed").await;
             return Err(ApiError::new(StatusCode::FORBIDDEN, "not_allowed"));
         }
     } else if !admin {
-        let listed_ok =
-            !state.login.has_allow_list() || state.login.is_allowed(provider.name, id, &login);
-        if !listed_ok || !reads_connected(state, provider, forge, token).await? {
+        if state.login.has_allow_list() && !state.login.is_allowed(provider.name, id, &login) {
+            refuse("not_allowed").await;
+            return Err(ApiError::new(StatusCode::FORBIDDEN, "not_allowed"));
+        }
+        if !reads_connected(state, provider, forge, token).await? {
+            refuse("no_repository_role").await;
             return Err(ApiError::new(StatusCode::FORBIDDEN, "not_allowed"));
         }
     }
@@ -977,6 +1003,7 @@ async fn sign_in(
     })
     .await?;
     if user.disabled {
+        refuse("user_disabled").await;
         return Err(ApiError::new(StatusCode::FORBIDDEN, "user_disabled"));
     }
     let now = unix_now();
@@ -1011,6 +1038,9 @@ async fn sign_in(
 struct ExchangeBody {
     code: String,
     verifier: String,
+    /// Also sign this computer in, returning its credential once.
+    #[serde(default)]
+    device: Option<devices::DeviceRequest>,
 }
 
 async fn exchange(
@@ -1018,10 +1048,24 @@ async fn exchange(
     JsonBody(body): JsonBody<ExchangeBody>,
 ) -> ApiResult<Json<Value>> {
     let handoff = state.login.pending().handoffs.take(&body.code, unix_now());
-    handoff
+    let signed = handoff
         .filter(|h| body.verifier.len() <= 128 && pkce_challenge(&body.verifier) == h.challenge)
-        .map(|h| Json(h.signed.json()))
-        .ok_or_else(failed)
+        .map(|h| h.signed)
+        .ok_or_else(failed)?;
+    Ok(Json(signed_reply(&state, &signed, body.device).await?))
+}
+
+/// The sign-in reply, with a new computer credential when the client asked for one.
+async fn signed_reply(
+    state: &HubState,
+    signed: &Signed,
+    device: Option<devices::DeviceRequest>,
+) -> ApiResult<Value> {
+    let mut out = signed.json();
+    if let Some(device) = device {
+        out["device"] = devices::issue(state, &signed.user, device).await?;
+    }
+    Ok(out)
 }
 
 async fn device_start(
@@ -1095,6 +1139,9 @@ async fn device_start(
 #[serde(deny_unknown_fields)]
 struct PollBody {
     handle: String,
+    /// Also sign this computer in once the forge approves.
+    #[serde(default)]
+    device: Option<devices::DeviceRequest>,
 }
 
 async fn device_poll(
@@ -1124,7 +1171,7 @@ async fn device_poll(
     if reply["access_token"].is_string() {
         remove();
         let signed = sign_in(&state, provider, forge, "device", &reply).await?;
-        let mut out = signed.json();
+        let mut out = signed_reply(&state, &signed, body.device).await?;
         out["status"] = json!("signed_in");
         return Ok(Json(out));
     }
