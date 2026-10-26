@@ -1423,6 +1423,11 @@ pub(crate) fn is_signed_in(hub: Option<&str>) -> Result<bool> {
     Ok(load_auth(hub).is_ok())
 }
 
+/// The saved Hub for `hub` (or the default Hub), signed in or not: where a sign-in goes.
+pub(crate) fn saved_hub(hub: Option<&str>) -> Option<String> {
+    load_saved_session(hub).ok().map(|(hub, _)| hub)
+}
+
 /// The computer credential saved for exactly `hub`, if any.
 pub(crate) fn saved_device(hub: &str) -> Result<Option<SavedDevice>> {
     if !session_files_present()? {
