@@ -259,8 +259,8 @@ impl Context<'_> {
         })
     }
 
-    /// False when the verifier inputs on the default branch moved since the checkout.
-    fn config_current(&self) -> bool {
+    /// Whether the verifier inputs on the default branch are unchanged since the checkout.
+    fn config_current(&self) -> crate::Result<bool> {
         tokio::task::block_in_place(|| {
             config_dir_unchanged(self.git_repo, self.base, self.config_dir)
         })
@@ -388,18 +388,29 @@ impl Context<'_> {
                     Err(why) => {
                         // Stays pending from the invalidate step. A head that moved mid-run is
                         // not an error; anything else fails the run.
-                        if let Ok(Recheck::Changed(moved)) = self.recheck(c).await {
-                            println!(
+                        match self.recheck(c).await {
+                            Ok(Recheck::Changed(moved)) => println!(
                                 "PR #{} {}: {moved}; left pending (a newer event owns the verdict)",
                                 c.number, c.head
-                            );
-                            continue;
+                            ),
+                            Ok(_) => {
+                                tally.errors += 1;
+                                eprintln!(
+                                    "PR #{} {}: head could not be fetched ({why}); stays pending",
+                                    c.number, c.head
+                                );
+                            }
+                            Err(error) => tally.fail(
+                                &format!(
+                                    "PR #{} {}: head could not be fetched ({why}) and re-check failed; stays pending",
+                                    c.number, c.head
+                                ),
+                                &error,
+                            ),
                         }
-                        tally.errors += 1;
-                        eprintln!(
-                            "PR #{} {}: head could not be fetched ({why}); stays pending",
-                            c.number, c.head
-                        );
+                        if tally.stop {
+                            return 1;
+                        }
                         continue;
                     }
                 }
@@ -428,12 +439,24 @@ impl Context<'_> {
                 Ok(Recheck::Shared) => None,
                 Ok(Recheck::Current) => decided,
             };
-            if !self.config_current() {
-                println!(
-                    "PR #{} {}: default-branch verifier configuration changed since checkout; a newer run owns the verdict",
-                    c.number, c.head
-                );
-                continue;
+            match self.config_current() {
+                Ok(true) => {}
+                Ok(false) => {
+                    println!(
+                        "PR #{} {}: default-branch verifier configuration changed since checkout; a newer run owns the verdict",
+                        c.number, c.head
+                    );
+                    // Remaining heads stay pending; the newer run owns them.
+                    break;
+                }
+                Err(error) => {
+                    tally.errors += 1;
+                    eprintln!(
+                        "PR #{} {}: verifier configuration could not be checked ({error:?}); stays pending",
+                        c.number, c.head
+                    );
+                    continue;
+                }
             }
             let (state, reason) = outcome.unwrap_or((
                 StatusState::Pending,

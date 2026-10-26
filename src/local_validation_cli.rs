@@ -463,20 +463,17 @@ async fn reconcile(args: ReconcileArgs) -> Result<i32> {
         .ok()
         .filter(|t| !t.is_empty())
         .ok_or_else(|| Error::Invalid("the token environment variable is unset or empty".into()))?;
-    let config_dir = args
-        .config_dir
-        .to_str()
-        .filter(|d| {
-            !d.is_empty()
-                && !d.starts_with('-')
-                && args
-                    .config_dir
-                    .components()
-                    .all(|c| matches!(c, std::path::Component::Normal(_)))
-        })
-        .ok_or_else(|| {
-            Error::Invalid("--config-dir must be a relative path inside --repo".into())
-        })?;
+    let Some(config_dir) = args.config_dir.to_str().filter(|d| {
+        !d.is_empty()
+            && !d.starts_with('-')
+            && args
+                .config_dir
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+    }) else {
+        eprintln!("--config-dir must be a relative path inside --repo; nothing written");
+        return Ok(2);
+    };
     let target_ok = args.target_url.as_deref().is_none_or(|url| {
         CommitStatus::new(&"0".repeat(40), StatusState::Pending, "x", "x")
             .and_then(|status| status.with_target_url(url))
@@ -487,6 +484,21 @@ async fn reconcile(args: ReconcileArgs) -> Result<i32> {
             "--target-url must be a short http(s) URL without control characters; nothing written"
         );
         return Ok(2);
+    }
+    // The guard compares `HEAD`, so the files read must be the committed ones.
+    let committed = agentscm::local_validation::run::config_dir_tree(&args.repo, config_dir)
+        .map(|_| ())
+        .and_then(|()| agentscm::local_validation::run::config_dir_dirty(&args.repo, config_dir))
+        .map_err(|e| {
+            eprintln!("--config-dir cannot be read at HEAD of --repo ({e:?}); nothing written");
+        });
+    match committed {
+        Ok(false) => {}
+        Ok(true) => {
+            eprintln!("--config-dir has uncommitted changes; nothing written");
+            return Ok(2);
+        }
+        Err(()) => return Ok(2),
     }
     let read = |name: &str| {
         read_bounded(

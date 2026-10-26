@@ -153,15 +153,37 @@ pub fn fetch_pull(repo: &Path, base: &str, number: i64, head: &str) -> Result<()
     Ok(())
 }
 
-/// Re-fetches `origin/{base}` and tells whether the repository-relative `dir` has the same tree
-/// there as at the checkout's `HEAD`. Any failure to read either side counts as changed.
-pub fn config_dir_unchanged(repo: &Path, base: &str, dir: &str) -> bool {
-    let tree = |name: &str| rev(repo, name, &format!(":{dir}"));
-    fetch_base(repo, base).is_ok()
-        && match (tree("HEAD"), tree(&format!("refs/remotes/origin/{base}"))) {
-            (Ok(ours), Ok(theirs)) => ours == theirs,
-            _ => false,
-        }
+/// Tree id of `dir` at the checkout's `HEAD`, resolved from `repo` (not the repository root).
+pub fn config_dir_tree(repo: &Path, dir: &str) -> Result<String> {
+    rev(repo, "HEAD", &format!(":./{dir}"))
+}
+
+/// True when `dir` has uncommitted changes, untracked files included.
+pub fn config_dir_dirty(repo: &Path, dir: &str) -> Result<bool> {
+    Ok(!git(
+        repo,
+        &[
+            "status",
+            "--porcelain",
+            "--untracked-files=normal",
+            "--",
+            dir,
+        ],
+        GIT_OUTPUT,
+    )?
+    .is_empty())
+}
+
+/// Re-fetches `origin/{base}` and tells whether `dir` (relative to `repo`) has the same tree
+/// there as at the checkout's `HEAD`. Err when the fetch or either read fails.
+pub fn config_dir_unchanged(repo: &Path, base: &str, dir: &str) -> Result<bool> {
+    fetch_base(repo, base)?;
+    let theirs = rev(
+        repo,
+        &format!("refs/remotes/origin/{base}"),
+        &format!(":./{dir}"),
+    )?;
+    Ok(config_dir_tree(repo, dir)? == theirs)
 }
 
 fn is_clean(repo: &Path) -> Result<bool> {

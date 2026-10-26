@@ -566,6 +566,10 @@ async fn a_policy_for_another_repository_is_refused_before_any_request() {
         .join("checkout/.github/local-validation/policy.json");
     let text = fs::read_to_string(&policy).unwrap();
     fs::write(&policy, text.replace(REPOSITORY, "github.com/o/other")).unwrap();
+    git(
+        &env.root().join("checkout"),
+        &["commit", "-q", "-am", "other repo"],
+    );
     let out = tokio::task::block_in_place(|| env.reconcile());
     assert_eq!(code(&out), 2);
     assert!(env.fake.with(|s| s.requests.is_empty()));
@@ -642,4 +646,112 @@ async fn an_invalid_target_url_is_refused_before_any_request() {
     });
     assert_eq!(code(&out), 2);
     assert!(env.fake.with(|s| s.requests.is_empty()));
+}
+
+fn assert_refused_before_any_request(env: &Env, out: &Output) {
+    assert_eq!(code(out), 2, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(env.fake.with(|s| s.requests.is_empty()));
+    assert_eq!(env.posts(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unsafe_config_dirs_are_refused_before_any_request() {
+    let env = Env::new().await;
+    for dir in ["/abs/dir", "../up", "a/../b", "./x", "-x", ""] {
+        let mut args = env.reconcile_args();
+        args.push(format!("--config-dir={dir}"));
+        let out = tokio::task::block_in_place(|| {
+            env.cli(&args.iter().map(String::as_str).collect::<Vec<_>>())
+        });
+        assert_refused_before_any_request(&env, &out);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_config_dir_with_uncommitted_changes_is_refused_before_any_request() {
+    let env = Env::new().await;
+    let body = env.attest();
+    env.attest_comment(10, "OWNER", body);
+    let dir = env.root().join("checkout/.github/local-validation");
+    let registry = dir.join("registry.json");
+    fs::write(&registry, "{}\n").unwrap();
+    let out = tokio::task::block_in_place(|| env.reconcile());
+    assert_refused_before_any_request(&env, &out);
+    git(&env.root().join("checkout"), &["checkout", "--", "."]);
+    fs::write(dir.join("untracked.json"), "{}").unwrap();
+    let out = tokio::task::block_in_place(|| env.reconcile());
+    assert_refused_before_any_request(&env, &out);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_config_dir_that_is_not_committed_at_head_is_refused_before_any_request() {
+    let env = Env::new().await;
+    let mut args = env.reconcile_args();
+    args.push("--config-dir=missing".into());
+    let out = tokio::task::block_in_place(|| {
+        env.cli(&args.iter().map(String::as_str).collect::<Vec<_>>())
+    });
+    assert_refused_before_any_request(&env, &out);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_base_that_advanced_outside_the_config_dir_still_gets_its_verdict() {
+    let env = Env::new().await;
+    let body = env.attest();
+    env.attest_comment(10, "OWNER", body);
+    let root = env.root();
+    let newer = root.join("newer");
+    git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            root.join("origin.git").to_str().unwrap(),
+            "newer",
+        ],
+    );
+    fs::write(newer.join("unrelated.txt"), "later").unwrap();
+    git(&newer, &["add", "."]);
+    git(&newer, &["commit", "-q", "-m", "unrelated"]);
+    git(&newer, &["push", "-q", "origin", "HEAD:main"]);
+    let out = tokio::task::block_in_place(|| env.reconcile());
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(env.states(&env.head), ["pending", "success"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_head_that_moves_during_a_failed_fetch_is_left_pending_without_error() {
+    let env = Env::new().await;
+    let body = env.attest();
+    env.attest_comment(10, "OWNER", body);
+    let root = env.root();
+    let out = env
+        .reconcile_stalled(&format!("/statuses/{}", env.head), |fake| {
+            let work = root.join("work");
+            git(&work, &["commit", "-q", "--allow-empty", "-m", "moved"]);
+            let moved = git(&work, &["rev-parse", "HEAD"]);
+            git(
+                &work,
+                &[
+                    "push",
+                    "-q",
+                    "-f",
+                    root.join("origin.git").to_str().unwrap(),
+                    &format!("{moved}:refs/pull/1/head"),
+                ],
+            );
+            fake.with(|s| {
+                s.repos
+                    .get_mut(&1)
+                    .unwrap()
+                    .pulls
+                    .get_mut(&1)
+                    .unwrap()
+                    .head_sha = moved
+            })
+        })
+        .await;
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(env.states(&env.head), ["pending"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("left pending"));
 }
