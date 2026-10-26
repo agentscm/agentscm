@@ -2168,3 +2168,49 @@ textarea.form-control {
     box-shadow: 24px 0 48px -24px rgba(0, 0, 0, 0.6);
   }
 }
+
+/* ---------- signed out: the frame holds the promise, one sheet holds the sign-in ---------- */
+.signin {
+  color: var(--frame-ink);
+}
+.signin-intro h1 {
+  font-weight: 300;
+  letter-spacing: -0.035em;
+  line-height: 1.12;
+  color: #fff;
+}
+.signin-intro .lead {
+  color: var(--frame-dim);
+  font-size: 16px;
+}
+.signin-points li {
+  font-weight: 500;
+  color: var(--frame-ink);
+}
+.signin-points i {
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--frame-active-icon);
+}
+.signin-panel .box,
+.signin-panel form.box {
+  background: var(--hub-surface);
+  color: var(--hub-text);
+  border-radius: 26px;
+}
+.signin-alt .btn-outline-secondary {
+  --bs-btn-color: var(--frame-ink);
+  --bs-btn-border-color: rgba(255, 255, 255, 0.18);
+  --bs-btn-hover-color: #fff;
+  --bs-btn-hover-bg: #6d5ce0;
+  --bs-btn-hover-border-color: #6d5ce0;
+}
+.signin-alt .btn-outline-secondary:hover {
+  background: #6d5ce0;
+}
+.signed-out-workspace {
+  background: var(--hub-canvas);
+  min-height: 100dvh;
+  max-width: none;
+  padding: 32px max(16px, calc((100vw - 980px) / 2));
+}

@@ -60,10 +60,9 @@ test('the drawer opens from the menu button, navigates, and closes', async ({ pa
   await expect(rail(page)).toBeHidden()
   await page.getByRole('button', { name: 'Open navigation' }).tap()
   await expect(rail(page)).toBeVisible()
-  await rail(page).getByRole('link', { name: /^Work(?= )/ }).tap()
+  await rail(page).getByRole('link', { name: /^Inbox(?= )/ }).tap()
   await expect(rail(page)).toBeHidden()
-  await expect(crumbs(page).locator('[aria-current="page"]')).toContainText('Working now')
-  await expect(page.locator('#main')).toContainText('Rebuild the hub status page shell')
+  await expect(page.locator('#main').getByRole('heading', { level: 1 })).toHaveText('Which overlaps need a conversation?')
   expect(await noSideScroll(page)).toBe(true)
 })
 
@@ -78,7 +77,7 @@ test('tapping the dimmed page closes the drawer', async ({ page }) => {
 
 test('every page fits the phone width', async ({ page }) => {
   await signIn(page)
-  for (const hash of ['#now', '#work', '#work/coordination', '#activity', '#workflows', '#change-record', '#landed', '#templates', '#timeline', '#workspace', '#setup', '#health', '#settings']) {
+  for (const hash of ['#home', '#now', '#team', '#inbox', '#work/finished', '#work/history', '#activity', '#workflows', '#change-record', '#landed', '#templates', '#timeline', '#workspace', '#setup', '#health', '#settings']) {
     await page.evaluate((h) => (window.location.hash = h), hash)
     await expect(page.locator('#main')).not.toBeEmpty()
     expect(await noSideScroll(page), hash).toBe(true)

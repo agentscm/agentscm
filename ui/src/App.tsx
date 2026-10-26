@@ -250,7 +250,6 @@ export default function App() {
     )
   return (
     <SignIn
-      dark={dark}
       notice={notice}
       onSignedIn={(t, keep) => {
         saveToken(t, keep)

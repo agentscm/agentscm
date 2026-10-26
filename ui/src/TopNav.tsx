@@ -526,7 +526,7 @@ function SideNav({ nav, sections, section, badges, collapsed, onCollapse, drawer
               const first = sections.find((s) => s.nav === n.key)!
               return (
                 <RailTip key={n.key} on={collapsed && !drawer} text={`${n.label}: ${n.question}`}>
-                  <a href={`#${first.key}`} data-tour={`nav-${n.key}`} className={`side-link${active ? ' active' : ''}`} aria-current={active ? 'page' : undefined} aria-label={collapsed && !drawer ? n.label : undefined} onClick={onClose}>
+                  <a href={first.key === 'work' ? workTabHref('finished') : `#${first.key}`} data-tour={`nav-${n.key}`} className={`side-link${active ? ' active' : ''}`} aria-current={active ? 'page' : undefined} aria-label={collapsed && !drawer ? n.label : undefined} onClick={onClose}>
                     <span className="side-icon"><Icon name={n.icon} /></span>
                     <span className="side-text">
                       <span className="side-label">{n.label}</span>

@@ -239,22 +239,22 @@ function Walkthrough() {
         </div>
       </div>
       <div className="settings-label mt-3">Page tours</div>
-      <div className="muted small">Switch one on to play it by itself the next time you open that page. Every page also has a Tour this page button beside the breadcrumbs.</div>
+      <div className="muted small">Switch one on to play it by itself the next time you open that page. Every page also has a question-mark button in the top bar that tours it.</div>
       <ul className="tour-list">
         {pages.map((s) => (
           <li key={s.key}>
             <Icon name={s.icon} />
             <span>
-              {s.label}
+              {tourFor(s.key)!.title}
               <span className="muted small"> · {s.question}</span>
             </span>
             <button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => {
               window.location.hash = s.key
               tour.start(s.key)
-            }} aria-label={`Run the ${s.label} tour now`}>Run now</button>
+            }} aria-label={`Run the ${tourFor(s.key)!.title} tour now`}>Run now</button>
             <div className="form-check form-switch m-0">
               <input id={`tour-${s.key}`} className="form-check-input" type="checkbox" role="switch" checked={tour.prefs.autoplay.includes(s.key)} disabled={!tour.remember} onChange={(e) => tour.update((p) => setAutoplay(p, s.key, e.target.checked))} />
-              <label className="visually-hidden" htmlFor={`tour-${s.key}`}>Play the {s.label} tour on my next visit</label>
+              <label className="visually-hidden" htmlFor={`tour-${s.key}`}>Play the {tourFor(s.key)!.title} tour on my next visit</label>
             </div>
           </li>
         ))}

@@ -75,7 +75,7 @@ async function stubHub(page: Page) {
 async function exercise(page: Page, screenshotName: string) {
   const { acknowledgements, deliveryClients } = await stubHub(page)
   await page.goto(`/#token=${TOKEN}`)
-  await page.evaluate(() => { window.location.hash = '#work' })
+  await page.evaluate(() => { window.location.hash = '#activity' })
   const main = page.locator('#main')
   await expect(main.getByRole('heading', { name: 'Since you last checked' })).toBeVisible()
   await expect.poll(() => deliveryClients.length).toBe(1)
@@ -89,7 +89,6 @@ async function exercise(page: Page, screenshotName: string) {
   await expect(main).toContainText('Forge pull request source incomplete')
   await expect(main).toContainText('<img src=x onerror=alert(1)>')
   await expect(main.locator('img')).toHaveCount(0)
-  await expect(main.getByText('No unfinished work is assigned right now.')).toBeVisible()
   await expect(main.getByRole('button', { name: /Mark (?:available records )?reviewed/ })).toHaveCount(0)
   await expect(main.evaluate((element) => element.scrollWidth <= element.clientWidth)).resolves.toBe(true)
 
@@ -114,7 +113,7 @@ test('complete fixed delivery is required before a stale acknowledgement conflic
 test('a cloned tab gets an independent fixed delivery client while the original remains active', async ({ page }) => {
   const { deliveryClients } = await stubHub(page)
   await page.goto(`/#token=${TOKEN}`)
-  await page.evaluate(() => { window.location.hash = '#work' })
+  await page.evaluate(() => { window.location.hash = '#activity' })
   const main = page.locator('#main')
   await expect(main.getByRole('heading', { name: 'Since you last checked' })).toBeVisible()
   await expect.poll(() => deliveryClients.length).toBe(1)

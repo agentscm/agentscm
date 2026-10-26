@@ -106,7 +106,7 @@ test('the Settings switch brings the welcome tour back after a reload', async ({
   await expect(dialog(page)).toBeVisible()
 })
 
-test('the Tour this page trigger runs the Right now tour', async ({ page }) => {
+test('the Tour this page trigger runs the Dashboard › Now tour', async ({ page }) => {
   await signIn(page)
   await page.keyboard.press('Escape')
   await trigger(page).click()
@@ -116,7 +116,7 @@ test('the Tour this page trigger runs the Right now tour', async ({ page }) => {
   await expect(dialog(page).getByRole('checkbox', { name: 'Don’t show again' })).toHaveCount(0)
   await withinViewport(page)
   await dialog(page).getByRole('button', { name: /Next/ }).click()
-  await expect(title(page)).toHaveText('Contested files')
+  await expect(title(page)).toHaveText('Four tabs, one question each')
   await page.keyboard.press('Escape')
   await expect(dialog(page)).toHaveCount(0)
 })
@@ -158,7 +158,7 @@ test('a Settings "Run now" starts that page’s tour', async ({ page }) => {
   await signIn(page)
   await page.keyboard.press('Escape')
   await page.evaluate(() => (window.location.hash = 'settings'))
-  await page.getByRole('button', { name: 'Run the Right now tour now' }).click()
+  await page.getByRole('button', { name: 'Run the Dashboard › Now tour now' }).click()
   await expect(title(page)).toHaveText('The answer comes first')
   await expect(page.locator('[data-tour="answer"]')).toBeVisible() // it took us to the page
 })
@@ -168,8 +168,8 @@ test('a page tour switched on in Settings plays until finished or turned off', a
   await dialog(page).getByRole('checkbox', { name: 'Don’t show again' }).check()
   await page.keyboard.press('Escape')
   await page.evaluate(() => (window.location.hash = 'settings'))
-  await page.getByRole('switch', { name: 'Play the Right now tour on my next visit' }).check()
-  await page.evaluate(() => (window.location.hash = 'now'))
+  await page.getByRole('switch', { name: 'Play the Dashboard › Now tour on my next visit' }).check()
+  await page.evaluate(() => (window.location.hash = 'home'))
   await expect(title(page)).toHaveText('The answer comes first')
   await page.keyboard.press('Escape') // closed without the box: it plays again next visit
   await reload(page)
@@ -179,7 +179,7 @@ test('a page tour switched on in Settings plays until finished or turned off', a
   await reload(page)
   await expect(dialog(page)).toHaveCount(0)
   await page.evaluate(() => (window.location.hash = 'settings'))
-  await expect(page.getByRole('switch', { name: 'Play the Right now tour on my next visit' })).not.toBeChecked()
+  await expect(page.getByRole('switch', { name: 'Play the Dashboard › Now tour on my next visit' })).not.toBeChecked()
 })
 
 test('leaving the page closes its tour, so old copy never spotlights a new page', async ({ page }) => {
@@ -190,7 +190,7 @@ test('leaving the page closes its tour, so old copy never spotlights a new page'
   await page.evaluate(() => (window.location.hash = 'health'))
   await expect(dialog(page)).toHaveCount(0)
   await page.goBack()
-  await expect(page.locator('[data-tour="now-contested"]')).toBeVisible()
+  await expect(page.locator('[data-tour="needs"]')).toBeVisible()
   await expect(dialog(page)).toHaveCount(0)
 })
 
@@ -198,7 +198,7 @@ test('after Settings “Run now” and closing, focus lands on the page', async 
   await signIn(page)
   await page.keyboard.press('Escape')
   await page.evaluate(() => (window.location.hash = 'settings'))
-  await page.getByRole('button', { name: 'Run the Hub health tour now' }).click()
+  await page.getByRole('button', { name: 'Run the Setup › Hub tour now' }).click()
   await expect(dialog(page)).toBeVisible()
   await page.keyboard.press('Escape')
   await expect(dialog(page)).toHaveCount(0)

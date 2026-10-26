@@ -7,7 +7,7 @@ import { ConnectAgent } from './Connect.tsx'
 
 const CREATE = 'agentscm hub token create --read-only --ttl 30d --name status-page --repo owner/name'
 
-export function SignIn({ dark, notice, onSignedIn }: { dark: boolean; notice: string | null; onSignedIn: (token: string, keep: boolean) => void }) {
+export function SignIn({ notice, onSignedIn }: { notice: string | null; onSignedIn: (token: string, keep: boolean) => void }) {
   const [value, setValue] = useState('')
   const [keep, setKeep] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -40,7 +40,7 @@ export function SignIn({ dark, notice, onSignedIn }: { dark: boolean; notice: st
   return (
     <div className="signin">
       <div className="signin-intro">
-        <Logo dark={dark} height={40} />
+        <Logo dark height={40} />
         <h1>See what every agent is working on.</h1>
         <p className="lead">The Hub shows which agent holds which files, who owns each task, and where two agents need to coordinate. It only reads; it never changes your work.</p>
         <ul className="signin-points">

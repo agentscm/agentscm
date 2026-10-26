@@ -83,7 +83,7 @@ for (const density of ['spacious', 'condensed'] as const) {
       await walk(page)
     })
 
-    for (const [hash, name] of [['#now', 'Right now'], ['#work', 'Work']] as const) {
+    for (const [hash, name] of [['#home', 'Dashboard › Now'], ['#now', 'Dashboard › Where'], ['#work/finished', 'History']] as const) {
       test(`the ${name} page tour stays on screen with its spotlight on target`, async ({ page }) => {
         await signIn(page, hash)
         await page.getByRole('button', { name: 'Tour this page' }).click()
@@ -118,10 +118,10 @@ for (const density of ['spacious', 'condensed'] as const) {
       }
     })
 
-    test('Work lanes show without sideways scroll', async ({ page }) => {
-      await signIn(page, '#work')
+    test('the track shows without sideways scroll', async ({ page }) => {
+      await signIn(page, '#home')
       await expect(page.locator('[data-tour="work-lanes"]')).toBeVisible()
-      await expect(page.locator('.lane:visible').first()).toBeVisible()
+      await expect(page.locator('.lb:visible').first()).toBeVisible()
       expect(await noSideScroll(page)).toBe(true)
     })
 
