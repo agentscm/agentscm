@@ -893,7 +893,12 @@ fn repository_policy_and_recipe_keep_their_canonical_bytes() {
 #[test]
 fn paths_and_exempt_paths_round_trip() {
     let mut r = recipe();
-    r.commands[0].paths = Some(vec!["src".into(), ":(glob)docs/**".into()]);
+    r.commands[0].paths = Some(vec![
+        "src".into(),
+        ":(glob)docs/**".into(),
+        "a..b".into(),
+        ":(glob)a..b/**".into(),
+    ]);
     let bytes = serde_json::to_vec(&r).unwrap();
     assert_eq!(ValidationRecipe::from_slice(&bytes).unwrap(), r);
     assert_ne!(r.sha256().unwrap(), recipe_hash());
