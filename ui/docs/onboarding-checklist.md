@@ -33,6 +33,8 @@ Start the stopwatch at step 1. Write down anything that makes you stop and think
 | 9 | As the teammate, open the account menu → **Your computers**. Revoke the computer from step 4. | It's listed with the repository. After Revoke: "<computer> was revoked." Within a minute the menu bar app shows the computer is signed out, and the agent's next edit says so in one line. | ☐ |
 | 10 | Restart the Mac (if you answered Yes in step 2). | The menu bar app comes back on its own and shows Connected or what needs attention. | ☐ |
 
+Step 3's single click holds once the Hub's browser-first computer sign-in ships. Until then quickstart asks for a one-time device code from GitHub or GitLab instead; note the extra steps and time them anyway.
+
 **Time (steps 1–6):** ____ s  (pass under 120 s)
 
 ## Record

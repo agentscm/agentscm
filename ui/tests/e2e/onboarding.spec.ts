@@ -14,7 +14,7 @@ test('1. the Hub’s sign-in page offers one command to set up this computer', a
   await page.goto('/#home')
   const setup = page.getByRole('region', { name: 'Set up this computer' })
   await expect(setup).toBeVisible()
-  await expect(setup.locator('code')).toHaveText(`npx agentscm quickstart --hub existing --hub-url '${baseURL}'`)
+  await expect(setup.locator('code')).toHaveText(`npx agentscm --hub-url '${baseURL}'`)
   await expect(setup.getByRole('button', { name: /copy/i })).toBeVisible()
 })
 

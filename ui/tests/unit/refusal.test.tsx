@@ -101,7 +101,7 @@ describe('signedInFromHash', () => {
 
 describe('installCommand', () => {
   it('quotes the hub and only offers https or loopback', () => {
-    expect(installCommand(HUB)).toBe(`npx agentscm quickstart --hub existing --hub-url '${HUB}'`)
+    expect(installCommand(HUB)).toBe(`npx agentscm --hub-url '${HUB}'`)
     expect(installCommand('http://example.com')).toBeNull()
   })
 })
