@@ -1903,7 +1903,8 @@ case "$1" in
   case "$FAKE_PRINT_MODE" in
    unavailable) echo "fixture: GUI domain unavailable" >&2; exit 5 ;;
    wrong-label) echo 'Could not find service "com.counterbranch.agentscm.other" in domain for user gui' >&2; exit 113 ;;
-   timeout) exec /bin/sleep 30 ;;
+   # Stay well past the 30-second control deadline so load cannot turn this into a successful exit.
+   timeout) exec /bin/sleep 120 ;;
    absent) printf 'Could not find service "%s" in domain for user gui\n' "${2##*/}" >&2; exit 113 ;;
   esac
   if [ -e "$HOME/launchctl-stopped" ]; then
