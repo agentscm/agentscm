@@ -16,7 +16,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::comment::MARKER_PREFIX;
-use super::run::{config_dir_unchanged, fetch_pull, observe};
+use super::run::{config_dir_unchanged, fetch_pull, observe, required_commands, trust_paths};
 use super::{Observed, ValidationPolicy, ValidationRecipe, VerdictState, select};
 use crate::evidence::EvaluationClock;
 use crate::hub::github::{Api, CommitStatus, Gh, GhError, StatusState};
@@ -102,6 +102,8 @@ pub struct Context<'a> {
     /// Repository-relative directory of the policy, recipe and registry; its tree at the checkout
     /// `HEAD` must equal `origin/<base>`'s before a verdict is written.
     pub config_dir: &'a str,
+    /// Verifier workflow path relative to the checkout; with `config_dir` it is a trust input.
+    pub verifier_workflow: &'a str,
     /// Local checkout whose `origin` is the repository.
     pub git_repo: &'a Path,
     /// The policy's repository identity.
@@ -284,6 +286,19 @@ impl Context<'_> {
             .map_or(EvaluationClock::Uncertain, |unix_ms| {
                 EvaluationClock::Known { unix_ms }
             });
+        let trust = trust_paths(self.config_dir, self.verifier_workflow);
+        let required = match tokio::task::block_in_place(|| {
+            required_commands(
+                self.git_repo,
+                &git.merge_base,
+                &git.commit,
+                self.recipe,
+                &trust,
+            )
+        }) {
+            Ok(required) => required,
+            Err(error) => return Err(format!("{error:?}")),
+        };
         let bodies: Vec<&str> = c.bodies.iter().map(String::as_str).collect();
         let verdict = select(
             &bodies,
@@ -296,6 +311,7 @@ impl Context<'_> {
                 tree: &git.tree,
                 base_ref: self.base,
                 merge_base: &git.merge_base,
+                required: &required,
             },
             clock,
         );

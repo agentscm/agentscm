@@ -139,6 +139,9 @@ pub struct ValidationRecord {
     pub base_tip: String,
     pub recipe_sha256: String,
     pub results: Vec<CommandResult>,
+    /// Recipe commands not run because the changed paths did not require them, in recipe order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_required: Vec<String>,
     pub services: Services,
     pub platform: String,
     pub toolchain: Vec<String>,
@@ -315,10 +318,15 @@ impl ValidationRecipe {
         Ok(recipe)
     }
 
-    /// The first position where `results` departs from this recipe's commands (ids and argv, in
-    /// order), as `(reason, detail)`. A missing command is reported by id.
-    fn first_departure(&self, results: &[CommandResult]) -> Option<String> {
-        for (index, command) in self.commands.iter().enumerate() {
+    /// The first position where `results` departs from this recipe's `required` commands (ids and
+    /// argv, in order), as a detail. A missing command is reported by id.
+    fn first_departure(&self, results: &[CommandResult], required: &[String]) -> Option<String> {
+        let commands: Vec<&RecipeCommand> = self
+            .commands
+            .iter()
+            .filter(|c| required.contains(&c.id))
+            .collect();
+        for (index, command) in commands.iter().enumerate() {
             match results.get(index) {
                 None => return Some(format!("{} did not run", command.id)),
                 Some(r) if r.id != command.id || r.argv != command.argv => {
@@ -328,7 +336,7 @@ impl ValidationRecipe {
             }
         }
         results
-            .get(self.commands.len())
+            .get(commands.len())
             .map(|r| format!("{} is not in the recipe", r.id))
     }
 
@@ -366,10 +374,21 @@ impl ValidationRecord {
         self.context.validate()?;
         oid("base tip", &self.base_tip)?;
         validate_lower_hex("recipe digest", &self.recipe_sha256, 32)?;
-        if self.results.is_empty() || self.results.len() > MAX_COMMANDS {
+        if self.results.len() > MAX_COMMANDS
+            || (self.results.is_empty() && self.not_required.is_empty())
+        {
             return Err(Error::Limit(format!(
                 "record must have 1 to {MAX_COMMANDS} results"
             )));
+        }
+        let mut skipped = HashSet::new();
+        for id in &self.not_required {
+            validate_identifier("command ID", id)?;
+            if self.not_required.len() > MAX_COMMANDS || !skipped.insert(id.as_str()) {
+                return Err(Error::Invalid(
+                    "duplicate or excess not-required command".into(),
+                ));
+            }
         }
         let mut ids = HashSet::new();
         for result in &self.results {
@@ -523,15 +542,26 @@ pub fn evidence_payload(
 ) -> Result<(EvidencePayload, Vec<u8>)> {
     let record_bytes = record.to_bytes()?;
     let record_sha256 = format!("{:x}", Sha256::digest(&record_bytes));
+    let required: Vec<String> = recipe
+        .commands
+        .iter()
+        .filter(|c| !record.not_required.contains(&c.id))
+        .map(|c| c.id.clone())
+        .collect();
     let pass = record.shortfall(policy.required_services).is_none()
-        && recipe.first_departure(&record.results).is_none();
+        && recipe.first_departure(&record.results, &required).is_none();
     let mut omissions: Vec<String> = FIXED_OMISSIONS.iter().map(|s| (*s).to_owned()).collect();
     omissions.extend(
-        recipe
-            .commands
+        required
             .iter()
-            .filter(|c| !record.results.iter().any(|r| r.id == c.id))
-            .map(|c| format!("skipped: {}", c.id)),
+            .filter(|id| !record.results.iter().any(|r| &r.id == *id))
+            .map(|id| format!("skipped: {id}")),
+    );
+    omissions.extend(
+        record
+            .not_required
+            .iter()
+            .map(|id| format!("not required: {id}")),
     );
     if !record.services.postgres {
         omissions.push("postgres tests".into());
@@ -592,7 +622,7 @@ pub fn evidence_payload(
         qualification_claim: None,
         coverage: CoverageClaim {
             scope: record.results.iter().map(|r| r.id.clone()).collect(),
-            expected_count: recipe.commands.len() as u32,
+            expected_count: required.len() as u32,
             observed_count: record.results.len() as u32,
             inventory_complete: false,
             omissions,
@@ -672,6 +702,8 @@ pub struct Observed<'a> {
     pub tree: &'a str,
     pub base_ref: &'a str,
     pub merge_base: &'a str,
+    /// Recipe command ids the changed paths require, in recipe order, computed from Git.
+    pub required: &'a [String],
 }
 
 /// Decides whether an attestation satisfies the observed head. Anything other
@@ -870,11 +902,35 @@ fn assess_envelope(
     if record.recipe_sha256 != policy.recipe_sha256 {
         return Verdict::failure("recipe mismatch", "recipe differs from policy").applied();
     }
+    let not_required: Vec<&String> = recipe
+        .commands
+        .iter()
+        .map(|c| &c.id)
+        .filter(|id| !observed.required.contains(id))
+        .collect();
+    if let Some(id) = record
+        .not_required
+        .iter()
+        .find(|id| observed.required.contains(id))
+    {
+        return Verdict::failure(
+            "incomplete run",
+            format!("{id} is required by the changed paths"),
+        )
+        .applied();
+    }
+    if !record.not_required.iter().eq(not_required.iter().copied()) {
+        return Verdict::failure(
+            "incomplete run",
+            "not-required commands differ from the changed paths",
+        )
+        .applied();
+    }
     // Departures inside the recipe order come first; a stopped run is a prefix, reported below.
-    let departure = recipe.first_departure(&record.results);
+    let departure = recipe.first_departure(&record.results, observed.required);
     if let Some(detail) = departure
         .as_ref()
-        .filter(|_| record.results.len() >= recipe.commands.len())
+        .filter(|_| record.results.len() >= recipe.commands.len() - not_required.len())
     {
         return Verdict::failure("incomplete run", detail.clone()).applied();
     }

@@ -99,6 +99,7 @@ fn record() -> ValidationRecord {
             stderr_sha256: hex(5),
             truncated: false,
         }],
+        not_required: vec![],
         services: Services {
             postgres: true,
             s3: true,
@@ -134,6 +135,8 @@ struct Case {
     /// Policy used at verification time when it differs from the signed one.
     assess_policy: Option<ValidationPolicy>,
     observed: [String; 5],
+    /// Ids the changed paths require; every recipe command when unset.
+    required: Option<Vec<String>>,
     clock: EvaluationClock,
     tamper_payload: Option<Tamper>,
     tamper_record: bool,
@@ -150,6 +153,7 @@ impl Case {
             policy: policy(),
             assess_policy: None,
             observed: ["repo-1", COMMIT, TREE, "refs/heads/main", BASE].map(String::from),
+            required: None,
             clock: EvaluationClock::Known { unix_ms: NOW },
             tamper_payload: None,
             tamper_record: false,
@@ -202,6 +206,9 @@ impl Case {
         }
         let body = comment::render(&envelope_bytes, &record_bytes).unwrap_or_default();
         let [repository, commit, tree, base_ref, merge_base] = &self.observed;
+        let required = self
+            .required
+            .unwrap_or_else(|| self.recipe.commands.iter().map(|c| c.id.clone()).collect());
         let verdict = assess(
             &envelope_bytes,
             &record_bytes,
@@ -214,6 +221,7 @@ impl Case {
                 tree,
                 base_ref,
                 merge_base,
+                required: &required,
             },
             self.clock,
         );
@@ -601,6 +609,7 @@ fn select_all(bodies: &[&str], clock: EvaluationClock) -> Verdict {
             tree: TREE,
             base_ref: "refs/heads/main",
             merge_base: BASE,
+            required: &["test".to_owned()],
         },
         clock,
     )
@@ -1067,4 +1076,94 @@ mod scoped {
         assert!(exempt(d.path(), &b, &h, &["*.md"]));
         assert!(!exempt(d.path(), &b, &h, &[":(glob)*.md"]));
     }
+}
+
+/// A two-command recipe whose `lint` is path-scoped; `required` says what the diff needs.
+fn scoped(required: &[&str], not_required: &[&str]) -> Case {
+    let mut c = Case::new();
+    c.recipe.commands.push(RecipeCommand {
+        id: "lint".into(),
+        argv: vec!["cargo".into(), "clippy".into()],
+        timeout_secs: 60,
+        paths: Some(vec!["src".into()]),
+    });
+    c.policy.recipe_sha256 = c.recipe.sha256().unwrap();
+    c.record.recipe_sha256 = c.policy.recipe_sha256.clone();
+    c.required = Some(required.iter().map(|s| (*s).to_owned()).collect());
+    c.record.not_required = not_required.iter().map(|s| (*s).to_owned()).collect();
+    c
+}
+
+#[test]
+fn not_required_command_is_reported_apart_from_skipped_and_passes() {
+    let mut c = scoped(&["test"], &["lint"]);
+    c.tamper_payload = Some(Box::new(|p| {
+        assert!(
+            p.coverage
+                .omissions
+                .contains(&"not required: lint".to_owned())
+        );
+        assert!(!p.coverage.omissions.contains(&"skipped: lint".to_owned()));
+        assert_eq!(p.coverage.expected_count, 1);
+        assert_eq!(p.coverage.observed_count, 1);
+    }));
+    let body = Case {
+        tamper_payload: None,
+        ..scoped(&["test"], &["lint"])
+    }
+    .body();
+    assert!(body.contains("Not required by the changed paths: <code>lint</code>"));
+    expect(c.run(), VerdictState::Success, "validated");
+}
+
+#[test]
+fn records_without_not_required_keep_their_bytes() {
+    let bytes = record().to_bytes().unwrap();
+    assert!(!String::from_utf8(bytes).unwrap().contains("not_required"));
+}
+
+#[test]
+fn forged_not_required_claim_for_a_required_command_fails() {
+    let verdict = scoped(&["test", "lint"], &["lint"]).run();
+    assert_eq!(verdict.reason, "incomplete run", "{verdict:?}");
+    assert_eq!(verdict.state, VerdictState::Failure);
+    assert!(
+        verdict
+            .detail
+            .contains("lint is required by the changed paths")
+    );
+}
+
+#[test]
+fn missing_required_result_fails() {
+    let verdict = scoped(&["test", "lint"], &[]).run();
+    expect(verdict.clone(), VerdictState::Failure, "incomplete run");
+    assert!(verdict.detail.contains("lint did not run"));
+}
+
+#[test]
+fn unclaimed_or_wrong_not_required_list_fails() {
+    // The diff does not require lint, but the record neither ran it nor listed it.
+    expect(
+        scoped(&["test"], &[]).run(),
+        VerdictState::Failure,
+        "incomplete run",
+    );
+    // The record ran lint although the diff does not require it.
+    let mut c = scoped(&["test"], &[]);
+    let mut lint = c.record.results[0].clone();
+    lint.id = "lint".into();
+    lint.argv = vec!["cargo".into(), "clippy".into()];
+    c.record.results.push(lint);
+    expect(c.run(), VerdictState::Failure, "incomplete run");
+}
+
+#[test]
+fn conditional_command_that_ran_passes_when_required() {
+    let mut c = scoped(&["test", "lint"], &[]);
+    let mut lint = c.record.results[0].clone();
+    lint.id = "lint".into();
+    lint.argv = vec!["cargo".into(), "clippy".into()];
+    c.record.results.push(lint);
+    expect(c.run(), VerdictState::Success, "validated");
 }

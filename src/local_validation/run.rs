@@ -360,14 +360,16 @@ fn run_command(
     (result, CommandOutput { stdout, stderr })
 }
 
-/// Runs the recipe in `repo` (which must be clean) until the first failure.
-/// Only commands that actually ran are recorded. `cancel` stops the running command and the run.
+/// Runs the recipe commands the change requires in `repo` (which must be clean) until the first
+/// failure. Only commands that actually ran are recorded; the rest are listed as not required.
+/// `trust` is from [`trust_paths`]. `cancel` stops the running command and the run.
 pub fn produce(
     repo: &Path,
     recipe: &ValidationRecipe,
     policy: &ValidationPolicy,
     base_ref: &str,
     base_rev: &str,
+    trust: &[String],
     cancel: &Cancellation,
 ) -> Result<Produced> {
     let recipe_sha256 = recipe.sha256()?;
@@ -383,8 +385,9 @@ pub fn produce(
         .into_iter()
         .map(|path| file_digest(repo, &state.commit, &path).map(|digest| (path, digest)))
         .collect::<Result<Vec<_>>>()?;
+    let required = required_commands(repo, &state.merge_base, &state.commit, recipe, trust)?;
     let (mut results, mut outputs) = (Vec::new(), Vec::new());
-    for c in &recipe.commands {
+    for c in recipe.commands.iter().filter(|c| required.contains(&c.id)) {
         let (result, output) = run_command(repo, &c.id, &c.argv, c.timeout_secs, cancel);
         let ok = result.stop == StopReason::Exited && result.exit_code == Some(0);
         results.push(result);
@@ -421,6 +424,12 @@ pub fn produce(
             base_tip: state.base_tip,
             recipe_sha256,
             results,
+            not_required: recipe
+                .commands
+                .iter()
+                .filter(|c| !required.contains(&c.id))
+                .map(|c| c.id.clone())
+                .collect(),
             services: Services {
                 postgres: var_set("AGENTSCM_TEST_DATABASE_URL"),
                 s3: S3_VARS.iter().all(|v| var_set(v)),
