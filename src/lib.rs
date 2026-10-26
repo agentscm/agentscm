@@ -57,3 +57,4 @@ pub mod issue_workflow;
 pub mod skill_bundle;
 pub mod skill_workflow;
 pub mod skill_workflow_service;
+pub mod workflow_library;

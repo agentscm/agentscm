@@ -13,6 +13,7 @@ AgentSCM also contains an immutable ledger for exact revisions, their review con
 - [Native installation helper](native-installation.md): `agentscm setup`, for contributors working from a source build
 - [Source-bound skill workflows](skill-workflows.md): run exact-file checks and explicit packaged container commands against an immutable revision; inspect, resume, cancel or recover the run.
 - [Reusable workflow templates](reusable-workflows.md): bind one named, versioned manifest from immutable native source to an existing Change, install its first target requirement and retain a read-only handoff.
+- [Local workflow and skill library](workflow-library.md): author immutable skill packages and reusable workflow versions in the Hub, simulate declarations, and export action recipes to the existing operator-local pipeline.
 - [Agent-owned workflow task contract](agent-workflow-tasks.md): strict task, attempt, instruction, assertion, enrolled-collector and recovery schemas with authenticated HTTP/MCP and Unix CLI routes.
 - [Claude Code workflow loop](claude-code-workflows.md): an opt-in local Stop trigger, tests/review, failure feedback and exact-current native landing requirements. Existing edit hooks remain contention-only.
 - [Community workspace pilot](community-workspace.md): persistent members/settings, independent roles, shared execution and explicit approval/native landing on one server. The legacy token dashboard and MCP remain inspection-only.

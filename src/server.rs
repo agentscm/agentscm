@@ -24,6 +24,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 mod explorer;
 #[cfg(unix)]
 mod front_door;
+#[cfg(unix)]
+mod workflow_library;
 
 const MAX_CONCURRENCY: usize = 256;
 const MAX_QUERY_BYTES: usize = 4 * 1024;

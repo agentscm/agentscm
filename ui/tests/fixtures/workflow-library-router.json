@@ -1,0 +1,778 @@
+{
+  "accepted_skill": {
+    "archived": false,
+    "created_at": 1,
+    "digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "entrypoint": "SKILL.md",
+    "files": [
+      {
+        "path": "SKILL.md",
+        "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "size": 17
+      },
+      {
+        "path": "draft.json",
+        "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "size": 165
+      },
+      {
+        "path": "draft.md",
+        "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "size": 20
+      }
+    ],
+    "generation": 1,
+    "id": "skl_fixture",
+    "name": "Release helper",
+    "provenance": {
+      "kind": "markdown",
+      "locator": "pasted_markdown"
+    },
+    "version": 1
+  },
+  "attachment_put": {
+    "diagnostics": [],
+    "generation": 1,
+    "id": "major-feature",
+    "params": {},
+    "pipeline_rule": null,
+    "repository": "acme/widgets",
+    "source_binding": null,
+    "state": "draft",
+    "workflow_version_id": "wfv_parent"
+  },
+  "attachment_validated": {
+    "attachment": {
+      "diagnostics": [
+        {
+          "code": "commit_required",
+          "level": "guidance",
+          "message": "Review and commit the exported immutable skill resources, then fill the operator-owned manifest bindings and run the existing pipeline install command.",
+          "path": null
+        }
+      ],
+      "generation": 2,
+      "id": "major-feature",
+      "params": {},
+      "pipeline_rule": null,
+      "repository": "acme/widgets",
+      "source_binding": {
+        "asserted_source_revision": "1111111111111111111111111111111111111111",
+        "verified": false
+      },
+      "state": "export_required",
+      "workflow_version_id": "wfv_parent"
+    },
+    "next_actions": [
+      "Write every exported file at its exact relative path and commit it.",
+      "Replace the manifest operator bindings with reviewed local values.",
+      "Set source_commit to the resulting full commit and run `agentscm pipeline install <manifest.json>`.",
+      "Inspect with `agentscm pipeline status`, preview a synthetic event, then enable with the returned generation."
+    ],
+    "setup": {
+      "activation": "operator_local_cli",
+      "files": [
+        {
+          "content": "<captured text>",
+          "path": ".agentscm/workflows/wfl_parent/v1/SKILL.md"
+        },
+        {
+          "content": "<captured text>",
+          "path": ".agentscm/workflows/wfl_parent/v1/skills/skl_fixture/SKILL.md"
+        },
+        {
+          "content": "<captured text>",
+          "path": ".agentscm/workflows/wfl_parent/v1/skills/skl_fixture/draft.json"
+        },
+        {
+          "content": "<captured text>",
+          "path": ".agentscm/workflows/wfl_parent/v1/skills/skl_fixture/draft.md"
+        },
+        {
+          "content": "<captured text>",
+          "path": ".agentscm/workflows/wfl_parent/v1/steps/prepare.json"
+        },
+        {
+          "content": "<captured text>",
+          "path": ".agentscm/workflows/wfl_parent/v1/steps/reuse__draft-release.json"
+        },
+        {
+          "content": "<captured text>",
+          "path": ".agentscm/workflows/wfl_parent/v1/steps/follow__draft-release.json"
+        },
+        {
+          "content": "<captured text>",
+          "path": ".agentscm/workflows/wfl_parent/v1/workflow.json"
+        }
+      ],
+      "library_follow_on": {
+        "inputs": {},
+        "when": "success",
+        "workflow_version_id": "wfv_child"
+      },
+      "pipeline_install_template": {
+        "enabled": false,
+        "git": "/usr/bin/git",
+        "git_repository": "/absolute/repository/checkout",
+        "host": "REPLACE_WITH_FORGE_HOST",
+        "profile_path": "/absolute/operator/action-profile.json",
+        "provider": "REPLACE_WITH_github_OR_gitlab",
+        "provider_repository_id": 1,
+        "recipe": {
+          "name": "wfl_parent",
+          "skill": {
+            "entrypoint": ".agentscm/workflows/wfl_parent/v1/SKILL.md",
+            "resources": [
+              ".agentscm/workflows/wfl_parent/v1/skills/skl_fixture/SKILL.md",
+              ".agentscm/workflows/wfl_parent/v1/skills/skl_fixture/draft.json",
+              ".agentscm/workflows/wfl_parent/v1/skills/skl_fixture/draft.md",
+              ".agentscm/workflows/wfl_parent/v1/steps/follow__draft-release.json",
+              ".agentscm/workflows/wfl_parent/v1/steps/prepare.json",
+              ".agentscm/workflows/wfl_parent/v1/steps/reuse__draft-release.json"
+            ]
+          },
+          "steps": [
+            {
+              "action": {
+                "kind": "agent_action",
+                "resource": "steps/prepare.json"
+              },
+              "id": "prepare",
+              "needs": [],
+              "required": true
+            },
+            {
+              "action": {
+                "kind": "agent_action",
+                "resource": "steps/reuse__draft-release.json"
+              },
+              "id": "reuse__draft-release",
+              "needs": [
+                "prepare"
+              ],
+              "required": true
+            },
+            {
+              "action": {
+                "kind": "agent_action",
+                "resource": "steps/follow__draft-release.json"
+              },
+              "id": "follow__draft-release",
+              "needs": [
+                "reuse__draft-release"
+              ],
+              "required": true
+            }
+          ],
+          "version": 1
+        },
+        "repository": "acme/widgets",
+        "rule_id": "major-feature",
+        "source_commit": "REPLACE_WITH_POST_EXPORT_COMMIT",
+        "trigger": {
+          "labels_all": [
+            "major-feature"
+          ],
+          "target": "main"
+        }
+      },
+      "pipeline_recipe": {
+        "name": "wfl_parent",
+        "skill": {
+          "entrypoint": ".agentscm/workflows/wfl_parent/v1/SKILL.md",
+          "resources": [
+            ".agentscm/workflows/wfl_parent/v1/skills/skl_fixture/SKILL.md",
+            ".agentscm/workflows/wfl_parent/v1/skills/skl_fixture/draft.json",
+            ".agentscm/workflows/wfl_parent/v1/skills/skl_fixture/draft.md",
+            ".agentscm/workflows/wfl_parent/v1/steps/follow__draft-release.json",
+            ".agentscm/workflows/wfl_parent/v1/steps/prepare.json",
+            ".agentscm/workflows/wfl_parent/v1/steps/reuse__draft-release.json"
+          ]
+        },
+        "steps": [
+          {
+            "action": {
+              "kind": "agent_action",
+              "resource": "steps/prepare.json"
+            },
+            "id": "prepare",
+            "needs": [],
+            "required": true
+          },
+          {
+            "action": {
+              "kind": "agent_action",
+              "resource": "steps/reuse__draft-release.json"
+            },
+            "id": "reuse__draft-release",
+            "needs": [
+              "prepare"
+            ],
+            "required": true
+          },
+          {
+            "action": {
+              "kind": "agent_action",
+              "resource": "steps/follow__draft-release.json"
+            },
+            "id": "follow__draft-release",
+            "needs": [
+              "reuse__draft-release"
+            ],
+            "required": true
+          }
+        ],
+        "version": 1
+      },
+      "runnable": true,
+      "source_binding": {
+        "asserted": true,
+        "verified": false
+      },
+      "unmet_bindings": [],
+      "warnings": []
+    },
+    "state": "export_required"
+  },
+  "attachments_reloaded": [
+    {
+      "diagnostics": [],
+      "generation": 1,
+      "id": "major-feature",
+      "params": {},
+      "pipeline_rule": null,
+      "repository": "acme/widgets",
+      "source_binding": null,
+      "state": "draft",
+      "workflow_version_id": "wfv_parent"
+    }
+  ],
+  "child_created": {
+    "archived": false,
+    "follow_on": null,
+    "generation": 1,
+    "id": "wfl_child",
+    "name": "Release action",
+    "steps": [],
+    "summary": "Create release notes.",
+    "trigger": null,
+    "updated_at": 1
+  },
+  "child_published": {
+    "diagnostics": [],
+    "version": {
+      "archived": false,
+      "created_at": 1,
+      "definition": {
+        "archived": false,
+        "follow_on": null,
+        "generation": 2,
+        "id": "wfl_child",
+        "name": "Release action",
+        "steps": [
+          {
+            "id": "draft-release",
+            "kind": "action",
+            "label": "Draft release notes",
+            "needs": [],
+            "required": true,
+            "resource": "draft.json",
+            "skill_version_id": "skl_fixture"
+          }
+        ],
+        "summary": "Create release notes.",
+        "trigger": null,
+        "updated_at": 1
+      },
+      "digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "id": "wfv_child",
+      "skill_versions": [
+        "skl_fixture"
+      ],
+      "version": 1,
+      "workflow_id": "wfl_child"
+    }
+  },
+  "child_updated": {
+    "archived": false,
+    "follow_on": null,
+    "generation": 2,
+    "id": "wfl_child",
+    "name": "Release action",
+    "steps": [
+      {
+        "id": "draft-release",
+        "kind": "action",
+        "label": "Draft release notes",
+        "needs": [],
+        "required": true,
+        "resource": "draft.json",
+        "skill_version_id": "skl_fixture"
+      }
+    ],
+    "summary": "Create release notes.",
+    "trigger": null,
+    "updated_at": 1
+  },
+  "conflict": {
+    "error": "conflict: workflow generation conflict"
+  },
+  "parent_cleared": {
+    "archived": false,
+    "follow_on": null,
+    "generation": 3,
+    "id": "wfl_parent",
+    "name": "Major feature follow-up",
+    "steps": [
+      {
+        "id": "prepare",
+        "kind": "action",
+        "label": "Prepare notes",
+        "needs": [],
+        "required": true,
+        "resource": "draft.json",
+        "skill_version_id": "skl_fixture"
+      },
+      {
+        "id": "reuse",
+        "inputs": {},
+        "kind": "workflow",
+        "label": "Reuse release action",
+        "needs": [
+          "prepare"
+        ],
+        "required": true,
+        "workflow_version_id": "wfv_child"
+      }
+    ],
+    "summary": "Prepare release evidence after merge.",
+    "trigger": null,
+    "updated_at": 1
+  },
+  "parent_created": {
+    "archived": false,
+    "follow_on": null,
+    "generation": 1,
+    "id": "wfl_parent",
+    "name": "Major feature follow-up",
+    "steps": [],
+    "summary": "Prepare release evidence after merge.",
+    "trigger": null,
+    "updated_at": 1
+  },
+  "parent_published": {
+    "diagnostics": [],
+    "version": {
+      "archived": false,
+      "created_at": 1,
+      "definition": {
+        "archived": false,
+        "follow_on": {
+          "inputs": {},
+          "when": "success",
+          "workflow_version_id": "wfv_child"
+        },
+        "generation": 4,
+        "id": "wfl_parent",
+        "name": "Major feature follow-up",
+        "steps": [
+          {
+            "id": "prepare",
+            "kind": "action",
+            "label": "Prepare notes",
+            "needs": [],
+            "required": true,
+            "resource": "draft.json",
+            "skill_version_id": "skl_fixture"
+          },
+          {
+            "id": "reuse",
+            "inputs": {},
+            "kind": "workflow",
+            "label": "Reuse release action",
+            "needs": [
+              "prepare"
+            ],
+            "required": true,
+            "workflow_version_id": "wfv_child"
+          }
+        ],
+        "summary": "Prepare release evidence after merge.",
+        "trigger": {
+          "kind": "confirmed_merge",
+          "labels_all": [
+            "major-feature"
+          ],
+          "target": "main"
+        },
+        "updated_at": 1
+      },
+      "digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "id": "wfv_parent",
+      "skill_versions": [
+        "skl_fixture"
+      ],
+      "version": 1,
+      "workflow_id": "wfl_parent"
+    }
+  },
+  "parent_restored": {
+    "archived": false,
+    "follow_on": {
+      "inputs": {},
+      "when": "success",
+      "workflow_version_id": "wfv_child"
+    },
+    "generation": 4,
+    "id": "wfl_parent",
+    "name": "Major feature follow-up",
+    "steps": [
+      {
+        "id": "prepare",
+        "kind": "action",
+        "label": "Prepare notes",
+        "needs": [],
+        "required": true,
+        "resource": "draft.json",
+        "skill_version_id": "skl_fixture"
+      },
+      {
+        "id": "reuse",
+        "inputs": {},
+        "kind": "workflow",
+        "label": "Reuse release action",
+        "needs": [
+          "prepare"
+        ],
+        "required": true,
+        "workflow_version_id": "wfv_child"
+      }
+    ],
+    "summary": "Prepare release evidence after merge.",
+    "trigger": {
+      "kind": "confirmed_merge",
+      "labels_all": [
+        "major-feature"
+      ],
+      "target": "main"
+    },
+    "updated_at": 1
+  },
+  "parent_updated": {
+    "archived": false,
+    "follow_on": {
+      "inputs": {},
+      "when": "success",
+      "workflow_version_id": "wfv_child"
+    },
+    "generation": 2,
+    "id": "wfl_parent",
+    "name": "Major feature follow-up",
+    "steps": [
+      {
+        "id": "prepare",
+        "kind": "action",
+        "label": "Prepare notes",
+        "needs": [],
+        "required": true,
+        "resource": "draft.json",
+        "skill_version_id": "skl_fixture"
+      },
+      {
+        "id": "reuse",
+        "inputs": {},
+        "kind": "workflow",
+        "label": "Reuse release action",
+        "needs": [
+          "prepare"
+        ],
+        "required": true,
+        "workflow_version_id": "wfv_child"
+      }
+    ],
+    "summary": "Prepare release evidence after merge.",
+    "trigger": {
+      "kind": "confirmed_merge",
+      "labels_all": [
+        "major-feature"
+      ],
+      "target": "main"
+    },
+    "updated_at": 1
+  },
+  "preview": {
+    "blocked": false,
+    "digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "expires_at": 1,
+    "files": [
+      {
+        "path": "SKILL.md",
+        "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "size": 17
+      },
+      {
+        "path": "draft.json",
+        "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "size": 165
+      },
+      {
+        "path": "draft.md",
+        "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "size": 20
+      }
+    ],
+    "preview_id": "imp_fixture",
+    "skill": {
+      "entrypoint": "SKILL.md",
+      "name": "Release helper",
+      "provenance": {
+        "kind": "markdown",
+        "locator": "pasted_markdown"
+      }
+    },
+    "warnings": []
+  },
+  "publication_rejected": {
+    "diagnostics": [
+      {
+        "code": "invalid_composition",
+        "level": "error",
+        "message": "not found: skill resource missing.json",
+        "path": null
+      }
+    ],
+    "error": "invalid_workflow",
+    "message": "workflow has blocking diagnostics"
+  },
+  "simulation": {
+    "admission": "not_assessed",
+    "deployment": "not_attempted",
+    "diagnostics": [],
+    "outcome": "passed",
+    "side_effects": "none",
+    "steps": [
+      {
+        "detail": "Simulation compiled the immutable action declaration; no process or external action ran.",
+        "id": "prepare",
+        "requires": [
+          "committed resources and productive action profile"
+        ],
+        "status": "would_run"
+      },
+      {
+        "detail": "Simulation compiled the immutable action declaration; no process or external action ran.",
+        "id": "reuse__draft-release",
+        "requires": [
+          "committed resources and productive action profile"
+        ],
+        "status": "would_run"
+      },
+      {
+        "detail": "Simulation compiled the immutable action declaration; no process or external action ran.",
+        "id": "follow__draft-release",
+        "requires": [
+          "committed resources and productive action profile"
+        ],
+        "status": "would_run"
+      }
+    ],
+    "trigger_match": null
+  },
+  "skills": {
+    "skills": [
+      {
+        "archived": false,
+        "created_at": 1,
+        "digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "entrypoint": "SKILL.md",
+        "files": [
+          {
+            "path": "SKILL.md",
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size": 17
+          },
+          {
+            "path": "draft.json",
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size": 165
+          },
+          {
+            "path": "draft.md",
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "size": 20
+          }
+        ],
+        "generation": 1,
+        "id": "skl_fixture",
+        "name": "Release helper",
+        "provenance": {
+          "kind": "markdown",
+          "locator": "pasted_markdown"
+        },
+        "version": 1
+      }
+    ],
+    "version": 1
+  },
+  "workflows": {
+    "version": 1,
+    "workflows": [
+      {
+        "draft": {
+          "archived": false,
+          "follow_on": {
+            "inputs": {},
+            "when": "success",
+            "workflow_version_id": "wfv_child"
+          },
+          "generation": 4,
+          "id": "wfl_parent",
+          "name": "Major feature follow-up",
+          "steps": [
+            {
+              "id": "prepare",
+              "kind": "action",
+              "label": "Prepare notes",
+              "needs": [],
+              "required": true,
+              "resource": "draft.json",
+              "skill_version_id": "skl_fixture"
+            },
+            {
+              "id": "reuse",
+              "inputs": {},
+              "kind": "workflow",
+              "label": "Reuse release action",
+              "needs": [
+                "prepare"
+              ],
+              "required": true,
+              "workflow_version_id": "wfv_child"
+            }
+          ],
+          "summary": "Prepare release evidence after merge.",
+          "trigger": {
+            "kind": "confirmed_merge",
+            "labels_all": [
+              "major-feature"
+            ],
+            "target": "main"
+          },
+          "updated_at": 1
+        },
+        "versions": [
+          {
+            "archived": false,
+            "created_at": 1,
+            "definition": {
+              "archived": false,
+              "follow_on": {
+                "inputs": {},
+                "when": "success",
+                "workflow_version_id": "wfv_child"
+              },
+              "generation": 4,
+              "id": "wfl_parent",
+              "name": "Major feature follow-up",
+              "steps": [
+                {
+                  "id": "prepare",
+                  "kind": "action",
+                  "label": "Prepare notes",
+                  "needs": [],
+                  "required": true,
+                  "resource": "draft.json",
+                  "skill_version_id": "skl_fixture"
+                },
+                {
+                  "id": "reuse",
+                  "inputs": {},
+                  "kind": "workflow",
+                  "label": "Reuse release action",
+                  "needs": [
+                    "prepare"
+                  ],
+                  "required": true,
+                  "workflow_version_id": "wfv_child"
+                }
+              ],
+              "summary": "Prepare release evidence after merge.",
+              "trigger": {
+                "kind": "confirmed_merge",
+                "labels_all": [
+                  "major-feature"
+                ],
+                "target": "main"
+              },
+              "updated_at": 1
+            },
+            "digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "id": "wfv_parent",
+            "skill_versions": [
+              "skl_fixture"
+            ],
+            "version": 1,
+            "workflow_id": "wfl_parent"
+          }
+        ]
+      },
+      {
+        "draft": {
+          "archived": false,
+          "follow_on": null,
+          "generation": 2,
+          "id": "wfl_child",
+          "name": "Release action",
+          "steps": [
+            {
+              "id": "draft-release",
+              "kind": "action",
+              "label": "Draft release notes",
+              "needs": [],
+              "required": true,
+              "resource": "draft.json",
+              "skill_version_id": "skl_fixture"
+            }
+          ],
+          "summary": "Create release notes.",
+          "trigger": null,
+          "updated_at": 1
+        },
+        "versions": [
+          {
+            "archived": false,
+            "created_at": 1,
+            "definition": {
+              "archived": false,
+              "follow_on": null,
+              "generation": 2,
+              "id": "wfl_child",
+              "name": "Release action",
+              "steps": [
+                {
+                  "id": "draft-release",
+                  "kind": "action",
+                  "label": "Draft release notes",
+                  "needs": [],
+                  "required": true,
+                  "resource": "draft.json",
+                  "skill_version_id": "skl_fixture"
+                }
+              ],
+              "summary": "Create release notes.",
+              "trigger": null,
+              "updated_at": 1
+            },
+            "digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "id": "wfv_child",
+            "skill_versions": [
+              "skl_fixture"
+            ],
+            "version": 1,
+            "workflow_id": "wfl_child"
+          }
+        ]
+      }
+    ]
+  }
+}

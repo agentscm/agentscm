@@ -275,7 +275,7 @@ function List({ token }: { token: string }) {
     <div className="page">
       <div className="answer" data-tour="answer">
         <h1 className="page-question">Did the checks pass?</h1>
-        <p className="answer-text">Checks, structured reviews and productive actions retained for this repository. Each run belongs to one exact revision; producing an artifact does not verify its content or permit landing.</p>
+        <p className="answer-text">Checks, structured reviews and productive actions retained for this repository. Each run belongs to one exact revision; producing an artifact does not verify its content or permit landing. <a href="#templates?view=workflows">Build a reusable workflow</a>.</p>
       </div>
       <Box
         tour="workflows-runs"
