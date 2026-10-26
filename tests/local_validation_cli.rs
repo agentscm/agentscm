@@ -47,6 +47,14 @@ fn command(id: &str, script: &str, timeout_secs: u64) -> RecipeCommand {
 
 impl Fixture {
     fn new(commands: Vec<RecipeCommand>) -> Self {
+        Self::with_recipe(commands, None, None)
+    }
+
+    fn with_recipe(
+        commands: Vec<RecipeCommand>,
+        dependency_files: Option<Vec<String>>,
+        toolchain_probes: Option<Vec<Vec<String>>>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
@@ -93,6 +101,8 @@ impl Fixture {
         let recipe = ValidationRecipe {
             recipe_id: "gate".into(),
             commands,
+            dependency_files,
+            toolchain_probes,
         };
         let policy = ValidationPolicy {
             repository: "repo-1".into(),
@@ -142,14 +152,6 @@ impl Fixture {
             .arg("local-validation")
             .args(args)
             .env("GH_TOKEN", "synthetic-secret")
-            .env(
-                "AGENTSCM_TEST_DATABASE_URL",
-                "postgres://synthetic.invalid/x",
-            )
-            .env("AGENTSCM_TEST_S3_ENDPOINT", "http://synthetic.invalid")
-            .env("AGENTSCM_TEST_S3_BUCKET", "b")
-            .env("AGENTSCM_TEST_S3_ACCESS_KEY_ID", "k")
-            .env("AGENTSCM_TEST_S3_SECRET_ACCESS_KEY", "s")
             .output()
             .unwrap()
     }
@@ -257,11 +259,7 @@ fn flat_comment(sha: &str, envelope: &[u8], record: &[u8]) -> String {
 }
 
 fn ok_fixture() -> Fixture {
-    Fixture::new(vec![command(
-        "gate",
-        r#"test -z "$GH_TOKEN" && test -n "$AGENTSCM_TEST_DATABASE_URL""#,
-        30,
-    )])
+    Fixture::new(vec![command("gate", r#"test -z "$GH_TOKEN""#, 30)])
 }
 
 #[test]
@@ -335,6 +333,98 @@ fn missing_lockfile_is_an_error_not_an_empty_digest() {
     let out = f.run();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("Cargo.lock"));
+    assert!(!f.state().exists() || fs::read_dir(f.state()).unwrap().next().is_none());
+}
+
+#[test]
+fn a_dependency_path_naming_a_directory_fails_before_any_command() {
+    let f = Fixture::with_recipe(
+        vec![command("gate", "true", 30)],
+        Some(vec!["Cargo.lock".into(), "sub".into()]),
+        None,
+    );
+    fs::create_dir(f.repo().join("sub")).unwrap();
+    fs::write(f.repo().join("sub/x.txt"), "x").unwrap();
+    git(&f.repo(), &["add", "."]);
+    git(&f.repo(), &["commit", "-q", "-m", "dir"]);
+    let out = f.run();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("sub"));
+    assert!(!f.state().exists() || fs::read_dir(f.state()).unwrap().next().is_none());
+}
+
+fn bun_fixture(command: RecipeCommand, probes: Vec<Vec<String>>) -> Fixture {
+    let f = Fixture::with_recipe(
+        vec![command],
+        Some(vec!["bun.lock".into(), "package.json".into()]),
+        Some(probes),
+    );
+    // No Cargo.lock in the repository: only the declared files are required.
+    git(
+        &f.repo(),
+        &["rm", "-q", "Cargo.lock", "rust-toolchain.toml"],
+    );
+    fs::write(f.repo().join("bun.lock"), "synthetic\n").unwrap();
+    fs::write(f.repo().join("package.json"), "{}\n").unwrap();
+    git(&f.repo(), &["add", "."]);
+    git(&f.repo(), &["commit", "-q", "-m", "bun"]);
+    f
+}
+
+fn record_of(f: &Fixture, sha: &str) -> (Value, Value) {
+    let text = fs::read_to_string(f.show_to_file(sha, "shown.md")).unwrap();
+    let (envelope, record) = comment::parse(&text).unwrap();
+    (
+        serde_json::from_slice(&envelope).unwrap(),
+        serde_json::from_slice(&record).unwrap(),
+    )
+}
+
+#[test]
+fn declared_dependencies_and_probes_are_recorded_in_order() {
+    let probes = vec![
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "echo synthetic-tool 1".into(),
+        ],
+        vec!["/nonexistent-synthetic-tool".into(), "-V".into()],
+    ];
+    let f = bun_fixture(command("gate", "true", 30), probes);
+    let (sha, code) = f.attest();
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&f.run().stderr));
+    let (envelope, record) = record_of(&f, &sha);
+    let deps: Vec<_> = envelope["payload"]["dependencies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["identity"].as_str().unwrap())
+        .collect();
+    assert_eq!(deps, ["bun.lock", "package.json"]);
+    let toolchain: Vec<_> = record["toolchain"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l.as_str().unwrap())
+        .collect();
+    assert_eq!(toolchain.len(), 3);
+    assert_eq!(toolchain[0], "synthetic-tool 1");
+    assert_eq!(toolchain[1], "/nonexistent-synthetic-tool -V: unavailable");
+    assert!(toolchain[2].starts_with("git version"));
+}
+
+#[test]
+fn missing_declared_dependency_fails_before_any_command_runs() {
+    let f = bun_fixture(
+        command("gate", "touch ran-marker", 30),
+        vec![vec!["git".into(), "--version".into()]],
+    );
+    git(&f.repo(), &["rm", "-q", "bun.lock"]);
+    git(&f.repo(), &["commit", "-q", "-m", "drop bun lock"]);
+    let out = f.run();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("bun.lock"));
+    assert!(!f.repo().join("ran-marker").exists());
     assert!(!f.state().exists() || fs::read_dir(f.state()).unwrap().next().is_none());
 }
 
@@ -591,6 +681,7 @@ async fn legacy_flat_comment_is_upgraded_in_place_without_changing_signed_bytes(
                 id: 50,
                 body: legacy.clone(),
                 author: "maintainer-login".into(),
+                ..Default::default()
             }],
         );
     });
@@ -637,6 +728,7 @@ async fn another_authors_marker_comment_is_not_adopted() {
                 id: 50,
                 body,
                 author: "mallory".into(),
+                ..Default::default()
             }],
         );
     });

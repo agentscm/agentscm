@@ -20,6 +20,13 @@ fn hex(byte: u8) -> String {
     format!("{byte:02x}").repeat(32)
 }
 
+fn deps() -> Vec<(String, String)> {
+    vec![
+        ("Cargo.lock".into(), hex(8)),
+        ("rust-toolchain.toml".into(), hex(9)),
+    ]
+}
+
 fn signing_key() -> SigningKey {
     SigningKey::from_bytes(&[7; 32])
 }
@@ -59,6 +66,8 @@ fn recipe() -> ValidationRecipe {
             argv: vec!["cargo".into(), "test".into()],
             timeout_secs: 60,
         }],
+        dependency_files: None,
+        toolchain_probes: None,
     }
 }
 
@@ -166,8 +175,7 @@ impl Case {
             issued_at_ms: self.issued_at_ms,
             expires_at_ms: ISSUED + 86_400_000,
             issuer_registry_sha256: &self.registry.digest().unwrap(),
-            cargo_lock_sha256: &hex(8),
-            toolchain_file_sha256: &hex(9),
+            dependencies: &deps(),
         };
         let (mut payload, mut record_bytes) =
             evidence_payload(&self.record, &self.recipe, &self.policy, &issuance).unwrap();
@@ -230,8 +238,7 @@ fn comment_bytes() -> (Vec<u8>, Vec<u8>) {
         issued_at_ms: ISSUED,
         expires_at_ms: ISSUED + 86_400_000,
         issuer_registry_sha256: &registry.digest().unwrap(),
-        cargo_lock_sha256: &hex(8),
-        toolchain_file_sha256: &hex(9),
+        dependencies: &deps(),
     };
     let (payload, record) = evidence_payload(&record(), &recipe(), &policy(), &issuance).unwrap();
     let envelope = serde_json::to_vec(&sign_evidence(payload, &signing_key()).unwrap()).unwrap();
@@ -546,13 +553,21 @@ fn signed_pass_for_failed_record_is_rejected() {
 }
 
 #[test]
-fn producer_marks_missing_service_run_as_not_pass() {
+fn producer_passes_when_policy_does_not_require_the_missing_service() {
     let mut c = Case::new();
     c.record.services.s3 = false;
     c.policy.required_services.s3 = false;
-    // The producer marks the run failed without all services, so the signed
-    // outcome is not pass even though the policy tolerates the absence.
-    fails(c, "outcome not pass");
+    let (verdict, body) = c.execute();
+    assert_eq!(verdict.state, VerdictState::Success);
+    assert!(body.contains("- <code>s3 tests</code>\n"));
+}
+
+#[test]
+fn missing_required_service_fails_verification() {
+    let mut c = Case::new();
+    c.record.services.s3 = false;
+    c.policy.required_services.s3 = true;
+    fails(c, "required service missing");
 }
 
 const OLD: &str = "5555555555555555555555555555555555555555";
@@ -737,4 +752,107 @@ fn repository_configuration_is_consistent() {
     assert_eq!(policy.recipe_sha256, recipe.sha256().unwrap());
     assert_eq!(policy.repository, registry.repository);
     assert_eq!(policy.epoch, registry.epoch);
+}
+
+#[test]
+fn recipe_without_new_fields_keeps_its_canonical_bytes() {
+    let legacy = r#"{"recipe_id":"gate","commands":[{"id":"test","argv":["cargo","test"],"timeout_secs":60}]}"#;
+    assert_eq!(serde_json::to_string(&recipe()).unwrap(), legacy);
+    assert_eq!(
+        ValidationRecipe::from_slice(legacy.as_bytes()).unwrap(),
+        recipe()
+    );
+    let mut declared = recipe();
+    declared.dependency_files = Some(vec!["bun.lock".into()]);
+    assert_ne!(declared.sha256().unwrap(), recipe_hash());
+}
+
+#[test]
+fn recipe_defaults_and_declared_lists() {
+    let r = recipe();
+    assert_eq!(
+        r.dependency_file_list(),
+        ["Cargo.lock", "rust-toolchain.toml"]
+    );
+    let probes = r.toolchain_probe_list();
+    assert_eq!(probes.len(), 4);
+    assert_eq!(probes[3], ["git", "--version"]);
+    let mut r = recipe();
+    r.dependency_files = Some(vec!["bun.lock".into(), "package.json".into()]);
+    r.toolchain_probes = Some(vec![vec!["bun".into(), "--version".into()]]);
+    r.validate().unwrap();
+    assert_eq!(r.dependency_file_list(), ["bun.lock", "package.json"]);
+    assert_eq!(
+        r.toolchain_probe_list(),
+        [vec!["bun", "--version"], vec!["git", "--version"]]
+    );
+}
+
+#[test]
+fn invalid_recipe_dependency_and_probe_declarations_are_rejected() {
+    let bad_files: Vec<Vec<&str>> = vec![
+        vec![],
+        vec!["../x"],
+        vec!["/abs"],
+        vec!["-x"],
+        vec!["a//b"],
+        vec!["a/./b"],
+        vec!["a/"],
+        vec!["a\\b"],
+        vec!["a b"],
+        vec!["x", "x"],
+    ];
+    for files in bad_files {
+        let mut r = recipe();
+        r.dependency_files = Some(files.iter().map(|f| (*f).to_owned()).collect());
+        assert!(r.validate().is_err(), "{files:?}");
+    }
+    let mut r = recipe();
+    r.dependency_files = Some((0..17).map(|i| format!("f{i}")).collect());
+    assert!(r.validate().is_err());
+    for probes in [
+        vec![],
+        vec![vec![]],
+        vec![vec!["a".to_owned(), String::new()]],
+    ] {
+        let mut r = recipe();
+        r.toolchain_probes = Some(probes);
+        assert!(r.validate().is_err());
+    }
+    let mut r = recipe();
+    r.toolchain_probes = Some(vec![vec!["a".into()]; 16]);
+    assert!(r.validate().is_err());
+    r.toolchain_probes = Some(vec![vec!["a".into()]; 15]);
+    r.validate().unwrap();
+    let unknown =
+        r#"{"recipe_id":"gate","commands":[{"id":"t","argv":["a"],"timeout_secs":1}],"extra":1}"#;
+    assert!(ValidationRecipe::from_slice(unknown.as_bytes()).is_err());
+}
+
+#[test]
+fn payload_dependencies_follow_the_issuance_order() {
+    let registry = registry();
+    let key_id = registry.issuers[0].keys[0].key_id.clone();
+    let dependencies = vec![
+        ("bun.lock".to_owned(), hex(1)),
+        ("package.json".to_owned(), hex(2)),
+    ];
+    let (payload, _) = evidence_payload(
+        &record(),
+        &recipe(),
+        &policy(),
+        &Issuance {
+            issuer_id: "maintainer",
+            key_id: &key_id,
+            attempt_id: "attempt-1",
+            run_generation: 1,
+            issued_at_ms: ISSUED,
+            expires_at_ms: ISSUED + 86_400_000,
+            issuer_registry_sha256: &registry.digest().unwrap(),
+            dependencies: &dependencies,
+        },
+    )
+    .unwrap();
+    let identities: Vec<_> = payload.dependencies.iter().map(|d| &*d.identity).collect();
+    assert_eq!(identities, ["bun.lock", "package.json"]);
 }
