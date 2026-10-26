@@ -10,6 +10,14 @@ A maintainer can run the repository's gate on their own machine and attach a sig
 - Repository configuration in `.github/local-validation/`: `recipe.json` (the commands from `AGENTS.md`), `policy.json` (repository ID, recipe digest, required PostgreSQL and S3 services, 30-day maximum age, epoch) and `registry.json` (issuer keys). A test fails when `policy.json` drifts from `recipe.json`.
 - `.github/workflows/local-validation.yml`: runs on a PR comment that starts with the attestation marker from an `OWNER`, `MEMBER` or `COLLABORATOR` (created, edited or deleted; an edit that removes the marker re-verifies; other commenters are ignored and the signature still decides), on manual dispatch, on pushes to `main` that touch the verifier inputs (`src/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.github/local-validation/**` and the workflow itself) and daily. The push and daily runs re-verify every open PR (and fail the job if 1000 or more are open); they skip a PR that has no trusted attestation comment and no existing `agentscm/local-validation` status on its head, and post `pending` where a status exists but the comment is gone. The workflow builds `agentscm` from the default branch, fetches the PR head only as Git data, runs `verify` and posts `success`, `failure`, `error` or `pending` on exactly the verified head SHA. It never checks out, builds or runs PR code.
 
+## Compact comment display and compatibility
+
+`local-validation show` renders a compact comment with the AgentSCM icon, reported outcome, abbreviated source and coverage summary visible at first. Coverage omissions, source and environment fields, command results and the signed machine-readable evidence are four closed disclosure sections, so supporting Markdown renderers show them collapsed by default. Missing PostgreSQL or S3 coverage remains visible in the summary.
+
+The summary and disclosure markup are display only. The exact signed envelope and record bytes remain in their named fences, and the first-line marker still commits to the envelope digest. `verify` extracts those exact bytes while ignoring surrounding Markdown, so the compact layout does not change signatures, verification or adoption of legacy flat comments.
+
+To replace an older flat presentation, rerun `local-validation post` for the same retained attestation. On GitHub it edits the posting user's existing comment with the same marker in place instead of creating another comment. Posting and the hosted verifier workflow are GitHub-only. The Markdown carrier and standalone verifier are forge-neutral, but no GitLab posting or verifier integration exists, and GitLab rendering or sanitization of this presentation has not been qualified.
+
 ## Trust boundary
 
 - A valid signature proves only that the holder of a registered key signed bytes bound to that commit, tree and base. The execution basis is `worker_asserted`: nothing proves the commands ran as recorded.

@@ -6,6 +6,8 @@ use agentscm::local_validation::*;
 use agentscm::policy::issuers::{
     CommonControl, IssuerKeyRecord, IssuerRecord, IssuerRegistrySnapshot, issuer_key_id,
 };
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use ed25519_dalek::SigningKey;
 
 const COMMIT: &str = "1111111111111111111111111111111111111111";
@@ -214,6 +216,168 @@ fn expect(verdict: Verdict, state: VerdictState, reason: &str) {
         (verdict.state, verdict.reason),
         (state, reason),
         "{verdict:?}"
+    );
+}
+
+fn comment_bytes() -> (Vec<u8>, Vec<u8>) {
+    let registry = registry();
+    let key_id = registry.issuers[0].keys[0].key_id.clone();
+    let issuance = Issuance {
+        issuer_id: "maintainer",
+        key_id: &key_id,
+        attempt_id: "attempt-1",
+        run_generation: 1,
+        issued_at_ms: ISSUED,
+        expires_at_ms: ISSUED + 86_400_000,
+        issuer_registry_sha256: &registry.digest().unwrap(),
+        cargo_lock_sha256: &hex(8),
+        toolchain_file_sha256: &hex(9),
+    };
+    let (payload, record) = evidence_payload(&record(), &recipe(), &policy(), &issuance).unwrap();
+    let envelope = serde_json::to_vec(&sign_evidence(payload, &signing_key()).unwrap()).unwrap();
+    (envelope, record)
+}
+
+fn flat_comment(envelope: &[u8], record: &[u8]) -> String {
+    format!(
+        "<!-- agentscm-local-validation:v1 {} -->\n\nlegacy summary\n\n```agentscm-envelope-v1\n{}\n```\n\n```agentscm-record-v1\n{}\n```\n",
+        comment::envelope_sha256(envelope),
+        STANDARD.encode(envelope),
+        STANDARD.encode(record),
+    )
+}
+
+#[test]
+fn rendered_comment_is_stable_collapsed_and_round_trips_exact_bytes() {
+    let (envelope, record) = comment_bytes();
+    let body = comment::render(&envelope, &record).unwrap();
+    assert_eq!(body, comment::render(&envelope, &record).unwrap());
+    assert!(body.starts_with("<!-- agentscm-local-validation:v1 "));
+    assert!(body.contains("alt=\"AgentSCM icon\" width=\"28\""));
+    assert!(body.contains("**Local validation: reported pass**"));
+    assert!(body.contains("Source: <code>repo&#x2d;1</code> at <code>111111111111</code>"));
+    assert!(body.contains("the verifier checks the signature and source bindings"));
+    assert!(body.contains("Coverage: 1/1 checks reported; 5 omissions."));
+    assert!(body.contains("<summary>Coverage omissions (5)</summary>"));
+    for omission in [
+        "<code>ignored tests</code>",
+        "<code>windows</code>",
+        "<code>container smoke</code>",
+        "<code>hub end&#x2d;to&#x2d;end</code>",
+        "<code>live execution</code>",
+    ] {
+        assert!(body.contains(&format!("- {omission}\n")));
+    }
+    let visible = body.split("<details>").next().unwrap();
+    assert_eq!(visible.matches("pass").count(), 1);
+    assert!(!visible.contains(COMMIT));
+    assert_eq!(body.matches("<details>").count(), 4);
+    assert_eq!(body.matches("</details>").count(), 4);
+    assert!(!body.contains("<details open"));
+
+    let signed_details = body
+        .find("<summary>Signed machine-readable evidence</summary>")
+        .unwrap();
+    let envelope_fence = body.find("```agentscm-envelope-v1\n").unwrap();
+    let record_fence = body.find("```agentscm-record-v1\n").unwrap();
+    let signed_close = body[record_fence..].find("\n</details>").unwrap() + record_fence;
+    assert!(signed_details < envelope_fence && envelope_fence < record_fence);
+    assert!(record_fence < signed_close);
+    assert_eq!(comment::parse(&body).unwrap(), (envelope, record));
+}
+
+#[test]
+fn rendered_comment_warns_when_services_are_missing() {
+    let (envelope, _) = comment_bytes();
+    let mut missing_service_record = record();
+    missing_service_record.services.s3 = false;
+    let record_bytes = serde_json::to_vec(&missing_service_record).unwrap();
+    let body = comment::render(&envelope, &record_bytes).unwrap();
+
+    assert!(body.contains("Missing services: S3. Coverage is incomplete."));
+}
+
+#[test]
+fn parser_accepts_legacy_flat_carrier() {
+    let (envelope, record) = comment_bytes();
+    assert_eq!(
+        comment::parse(&flat_comment(&envelope, &record)).unwrap(),
+        (envelope, record)
+    );
+}
+
+#[test]
+fn parser_strictly_rejects_malformed_carriers() {
+    let (envelope, record) = comment_bytes();
+    let valid = flat_comment(&envelope, &record);
+
+    let duplicate = format!(
+        "{valid}\n```agentscm-envelope-v1\n{}\n```\n",
+        STANDARD.encode(&envelope)
+    );
+    assert!(comment::parse(&duplicate).is_err());
+
+    let missing = valid
+        .split("```agentscm-record-v1")
+        .next()
+        .unwrap()
+        .to_owned();
+    assert!(comment::parse(&missing).is_err());
+
+    let bad_base64 = valid.replacen(&STANDARD.encode(&envelope), "not-base64!", 1);
+    assert!(comment::parse(&bad_base64).is_err());
+
+    let mut bad_digest = valid.clone();
+    let digest_start = "<!-- agentscm-local-validation:v1 ".len();
+    bad_digest.replace_range(digest_start..=digest_start, "0");
+    if bad_digest == valid {
+        bad_digest.replace_range(digest_start..=digest_start, "1");
+    }
+    assert!(comment::parse(&bad_digest).is_err());
+    assert!(comment::parse(&"x".repeat(comment::MAX_COMMENT_BYTES + 1)).is_err());
+}
+
+#[test]
+fn renderer_preserves_the_comment_size_bound() {
+    let (envelope, _) = comment_bytes();
+    let mut large_record = record();
+    large_record.toolchain = vec!["x".repeat(2048); 16];
+    large_record.results[0].argv = vec!["x".repeat(256); 64];
+    let record_bytes = serde_json::to_vec(&large_record).unwrap();
+    assert!(record_bytes.len() <= MAX_RECORD_BYTES);
+    assert!(matches!(
+        comment::render(&envelope, &record_bytes),
+        Err(agentscm::Error::Limit(_))
+    ));
+}
+
+#[test]
+fn hostile_display_strings_cannot_escape_collapsed_sections() {
+    let (envelope, mut record_bytes) = comment_bytes();
+    let mut envelope_json: serde_json::Value = serde_json::from_slice(&envelope).unwrap();
+    envelope_json["payload"]["outcome"] = "</details>\n```spoof".into();
+    envelope_json["payload"]["coverage"]["omissions"] =
+        serde_json::json!(["</details>\n<details open>spoof"]);
+    let hostile_envelope = serde_json::to_vec(&envelope_json).unwrap();
+
+    let mut hostile_record: serde_json::Value = serde_json::from_slice(&record_bytes).unwrap();
+    hostile_record["context"]["base_ref"] = "refs/heads/_spoof_".into();
+    hostile_record["results"][0]["id"] = "test:_spoof_".into();
+    hostile_record["platform"] = "</details>\n<details open>spoof".into();
+    hostile_record["toolchain"][0] = "```agentscm-record-v1\nspoof".into();
+    record_bytes = serde_json::to_vec(&hostile_record).unwrap();
+
+    let body = comment::render(&hostile_envelope, &record_bytes).unwrap();
+    assert!(body.contains("**Local validation: reported unknown**"));
+    assert_eq!(body.matches("<details>").count(), 4);
+    assert_eq!(body.matches("</details>").count(), 4);
+    assert!(!body.contains("<details open>"));
+    assert!(!body.contains("```spoof"));
+    assert!(!body.contains("refs/heads/_spoof_"));
+    assert!(!body.contains("test:_spoof_"));
+    assert_eq!(
+        comment::parse(&body).unwrap(),
+        (hostile_envelope, record_bytes)
     );
 }
 
