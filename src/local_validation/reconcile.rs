@@ -7,7 +7,8 @@
 //! Pull request code is never checked out, built or run; heads are fetched as Git data only.
 //!
 //! ponytail: invalidate-first writes two statuses per opted-in head per run, and GitHub keeps
-//! at most 1000 statuses per sha and context; `--pr` limits comment events to one pull request.
+//! at most 1000 statuses per sha and context, so a head hits the cap after about 500 runs. Upgrade
+//! path: skip both writes when the head's latest status already equals the verdict and nothing changed.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
@@ -98,8 +99,6 @@ pub struct Context<'a> {
     /// OWNER/NAME.
     pub github_repo: &'a str,
     pub base: &'a str,
-    /// When set, only this pull request is invalidated and verified.
-    pub only_pr: Option<i64>,
     /// Local checkout whose `origin` is the repository.
     pub git_repo: &'a Path,
     /// The policy's repository identity.
@@ -307,16 +306,7 @@ impl Context<'_> {
         };
         let mut tally = Tally::default();
         let mut work = Vec::new();
-        if let Some(n) = self.only_pr
-            && !pulls.iter().any(|p| p.number == n && p.base == self.base)
-        {
-            println!("PR #{n}: not open on {}; nothing written", self.base);
-            return 0;
-        }
-        for pull in pulls
-            .iter()
-            .filter(|p| p.base == self.base && self.only_pr.is_none_or(|n| n == p.number))
-        {
+        for pull in pulls.iter().filter(|p| p.base == self.base) {
             if !is_sha(&pull.head) {
                 println!("PR #{}: unexpected head; skipped", pull.number);
                 tally.errors += 1;

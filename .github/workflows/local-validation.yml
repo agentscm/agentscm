@@ -58,10 +58,6 @@ jobs:
           REPO: ${{ github.repository }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch || github.ref_name }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          EVENT_NAME: ${{ github.event_name }}
-          COMMENT_PR: ${{ github.event.issue.number }}
         run: |
-          set -euo pipefail
-          args=()
-          if [[ $EVENT_NAME == issue_comment ]]; then args+=(--pr "$COMMENT_PR"); fi
-          target/debug/agentscm local-validation reconcile --github-repo "$REPO" --base "$DEFAULT_BRANCH" --target-url "$RUN_URL" "${args[@]}"
+          # Every run sweeps all open PRs: the single concurrency group keeps only the latest queued run.
+          target/debug/agentscm local-validation reconcile --github-repo "$REPO" --base "$DEFAULT_BRANCH" --target-url "$RUN_URL"
