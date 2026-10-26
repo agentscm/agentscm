@@ -917,6 +917,11 @@ fn invalid_pathspecs_are_rejected() {
         vec![":(icase)x".into()],
         vec![":(glob,icase)x".into()],
         vec![":(glob".into()],
+        vec![":(glob,literal)x".into()],
+        vec![":(top)".into()],
+        vec![":(literal)".into()],
+        vec!["/x".into()],
+        vec![":(top,literal)/x".into()],
         vec!["a\0b".into()],
         vec!["x".to_owned(); 65],
     ];
@@ -1069,6 +1074,27 @@ mod scoped {
         assert_eq!(required(d.path(), &b, &h), ["always", "rust", "docs"]);
     }
 
+    #[test]
+    fn the_verifier_workflow_is_a_trust_input_from_a_subdirectory_repo() {
+        let (d, b, h) = repo(|p| write(p, DEFAULT_VERIFIER_WORKFLOW));
+        let sub = d.path().join("src");
+        // A root-level workflow change is outside the subdirectory but still a trust change.
+        assert_eq!(
+            required_commands(
+                &sub,
+                &b,
+                &h,
+                &scoped_recipe(),
+                &trust_paths("x", DEFAULT_VERIFIER_WORKFLOW)
+            )
+            .unwrap(),
+            ["always", "rust", "docs"]
+        );
+        let specs = vec!["docs/**".to_owned()];
+        let trust = trust_paths("x", DEFAULT_VERIFIER_WORKFLOW);
+        assert!(!only_exempt(&sub, &b, &h, &specs, &trust).unwrap());
+    }
+
     /// Without magic, `*` matches across `/`, so `*.md` also matches `docs/x.md`.
     #[test]
     fn default_wildcard_pathspec_matches_at_depth() {
@@ -1114,6 +1140,13 @@ fn not_required_command_is_reported_apart_from_skipped_and_passes() {
     .body();
     assert!(body.contains("Not required by the changed paths: <code>lint</code>"));
     expect(c.run(), VerdictState::Success, "validated");
+}
+
+#[test]
+fn a_command_cannot_be_both_a_result_and_not_required() {
+    let mut r = record();
+    r.not_required = vec![r.results[0].id.clone()];
+    assert!(r.validate().is_err());
 }
 
 #[test]

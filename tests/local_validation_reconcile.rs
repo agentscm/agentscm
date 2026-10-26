@@ -1056,7 +1056,52 @@ async fn an_exempt_change_beats_an_unusable_attestation_and_a_prior_status() {
         env.statuses(&env.head).last().unwrap(),
         &("success".to_owned(), EXEMPT_DESCRIPTION.to_owned())
     );
-    assert!(!env.states(&env.head).contains(&"pending".to_owned()));
+    // Invalidated first, then replaced by the exemption.
+    assert_eq!(env.states(&env.head), ["success", "pending", "success"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_exempt_head_shared_by_two_pull_requests_ends_pending() {
+    let env = Env::exempting(vec![("README.md", "x")]).await;
+    env.prior_success();
+    env.fake.with(|s| {
+        s.repos.get_mut(&1).unwrap().pulls.insert(
+            2,
+            Pull {
+                head_sha: env.head.clone(),
+                ..Pull::new(2, "other", &[])
+            },
+        );
+    });
+    let out = tokio::task::block_in_place(|| env.reconcile());
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let statuses = env.statuses(&env.head);
+    assert_eq!(statuses.last().unwrap().0, "pending");
+    assert!(statuses.iter().all(|(_, d)| d != EXEMPT_DESCRIPTION));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attestation_listing_a_path_scoped_command_as_not_required_passes() {
+    let command = |id: &str, paths: Option<Vec<String>>| RecipeCommand {
+        id: id.into(),
+        argv: vec!["/bin/sh".into(), "-c".into(), "true".into()],
+        timeout_secs: 30,
+        paths,
+    };
+    let env = Env::with_recipe(
+        vec![("a.txt", "a"), ("bun.lock", "# synthetic lock\n")],
+        vec![
+            command("gate", None),
+            command("lint", Some(vec!["src".into()])),
+        ],
+        Some(vec!["bun.lock".into()]),
+    )
+    .await;
+    let body = tokio::task::block_in_place(|| env.attest());
+    env.attest_comment(10, "OWNER", body);
+    let out = tokio::task::block_in_place(|| env.reconcile());
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(env.states(&env.head), ["pending", "success"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

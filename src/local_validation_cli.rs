@@ -63,7 +63,7 @@ pub struct ReconcileArgs {
     /// relative to `--repo`, without `..`.
     #[arg(long, default_value = ".github/local-validation")]
     config_dir: PathBuf,
-    /// Verifier workflow path relative to `--repo`; a change to it or to `--config-dir` requires
+    /// Verifier workflow path relative to the repository root; a change to it or to `--config-dir` requires
     /// every recipe command.
     #[arg(long, default_value = DEFAULT_VERIFIER_WORKFLOW)]
     verifier_workflow: String,
@@ -107,7 +107,7 @@ pub struct RunArgs {
     /// every recipe command.
     #[arg(long, default_value = ".github/local-validation")]
     config_dir: PathBuf,
-    /// Verifier workflow path relative to `--repo`; a change to it or to `--config-dir` requires
+    /// Verifier workflow path relative to the repository root; a change to it or to `--config-dir` requires
     /// every recipe command.
     #[arg(long, default_value = DEFAULT_VERIFIER_WORKFLOW)]
     verifier_workflow: String,
@@ -159,7 +159,7 @@ pub struct VerifyArgs {
     /// every recipe command.
     #[arg(long, default_value = ".github/local-validation")]
     config_dir: PathBuf,
-    /// Verifier workflow path relative to `--repo`; a change to it or to `--config-dir` requires
+    /// Verifier workflow path relative to the repository root; a change to it or to `--config-dir` requires
     /// every recipe command.
     #[arg(long, default_value = DEFAULT_VERIFIER_WORKFLOW)]
     verifier_workflow: String,

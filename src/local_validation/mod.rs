@@ -218,20 +218,34 @@ fn pathspec(spec: &str) -> Result<()> {
         return Err(Error::Invalid("pathspec must not start with '-'".into()));
     }
     if let Some(magic) = spec.strip_prefix(':') {
-        let words = magic
+        let parsed = magic
             .strip_prefix('(')
             .and_then(|rest| rest.split_once(')'))
-            .map(|(words, _)| words)
-            .filter(|words| {
+            .filter(|(words, _)| {
                 words
                     .split(',')
                     .all(|w| matches!(w, "glob" | "literal" | "exclude" | "top"))
             });
-        if words.is_none() {
+        let Some((words, path)) = parsed else {
             return Err(Error::Invalid(format!(
                 "pathspec magic must be :(glob|literal|exclude|top,...): {spec}"
             )));
+        };
+        let has = |word| words.split(',').any(|w| w == word);
+        if (has("glob") && has("literal")) || path.is_empty() {
+            return Err(Error::Invalid(format!(
+                "pathspec must not combine glob and literal or have an empty path: {spec}"
+            )));
         }
+        if path.starts_with('/') {
+            return Err(Error::Invalid(format!(
+                "pathspec must not start with '/': {spec}"
+            )));
+        }
+    } else if spec.starts_with('/') {
+        return Err(Error::Invalid(format!(
+            "pathspec must not start with '/': {spec}"
+        )));
     }
     Ok(())
 }
@@ -378,7 +392,7 @@ impl ValidationRecord {
             || (self.results.is_empty() && self.not_required.is_empty())
         {
             return Err(Error::Limit(format!(
-                "record must have 1 to {MAX_COMMANDS} results"
+                "record must have at most {MAX_COMMANDS} results and at least one result or not-required command"
             )));
         }
         let mut skipped = HashSet::new();
@@ -392,6 +406,11 @@ impl ValidationRecord {
         }
         let mut ids = HashSet::new();
         for result in &self.results {
+            if skipped.contains(result.id.as_str()) {
+                return Err(Error::Invalid(
+                    "command is both a result and not required".into(),
+                ));
+            }
             validate_identifier("command ID", &result.id)?;
             validate_argv(&result.argv)?;
             validate_lower_hex("stdout digest", &result.stdout_sha256, 32)?;
@@ -930,7 +949,7 @@ fn assess_envelope(
     let departure = recipe.first_departure(&record.results, observed.required);
     if let Some(detail) = departure
         .as_ref()
-        .filter(|_| record.results.len() >= recipe.commands.len() - not_required.len())
+        .filter(|_| record.results.len() >= observed.required.len())
     {
         return Verdict::failure("incomplete run", detail.clone()).applied();
     }

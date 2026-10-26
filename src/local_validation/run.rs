@@ -138,11 +138,14 @@ fn changed(repo: &Path, from: &str, to: &str, pathspecs: &[String]) -> Result<us
         .count())
 }
 
-/// Built-in pathspecs for the files that define the gate itself, relative to `repo`.
+/// Built-in pathspecs for the files that define the gate itself: the config directory relative
+/// to `repo`, and the verifier workflow relative to the repository root (GitHub reads workflows
+/// only there).
 pub fn trust_paths(config_dir: &str, verifier_workflow: &str) -> Vec<String> {
-    [config_dir, verifier_workflow]
-        .map(|path| format!(":(literal){path}"))
-        .into()
+    vec![
+        format!(":(literal){config_dir}"),
+        format!(":(top,literal){verifier_workflow}"),
+    ]
 }
 
 /// Recipe command ids the change requires, in recipe order. A change to any trust input
