@@ -451,6 +451,7 @@ fn symbol_for_title(title: &str) -> Option<&'static str> {
         "Copy Diagnostics" => Some("doc.on.doc"),
         "Copy Reconnect" => Some("arrow.triangle.2.circlepath"),
         "Copy Guidance Preview" => Some("text.book.closed"),
+        "Forget This Checkout" | "Forget This Checkout…" => Some("trash"),
         "Check Now" => Some("arrow.clockwise"),
         "Quit AgentSCM Tray" => Some("power"),
         _ if title.starts_with("Set Up ") => Some("plus.app"),

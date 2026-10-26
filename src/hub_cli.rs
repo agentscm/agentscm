@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use agentscm::hub::HubError;
 use agentscm::hub::forge_http::{self, check_base_url, send};
 use agentscm::hub::http::{self, HubConfig};
+use agentscm::hub::store::unix_now;
 use agentscm::{Error, Result};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -384,7 +385,7 @@ pub(crate) fn clean(text: &str) -> String {
 /// Ends the saved session when it belongs to `hub`: the hub is told (best effort) and only
 /// that exact local session is removed. A concurrently replaced session is preserved.
 pub(crate) async fn end_session(hub: &str) -> Result<bool> {
-    let Ok((saved, session)) = load_session(Some(hub)) else {
+    let Ok((saved, session)) = load_saved_session(Some(hub)) else {
         return Ok(false);
     };
     if let Ok(client) = forge_http::client() {
@@ -399,7 +400,7 @@ async fn logout(hub: Option<&str>) -> Result<()> {
         eprintln!("not signed in");
         return Ok(());
     }
-    let selected = load_session(hub)?;
+    let selected = load_saved_session(hub)?;
     // The hub may be unreachable; the local entry goes either way.
     if let Ok(client) = forge_http::client() {
         let url = format!("{}/v1/hub/session", selected.0);
@@ -421,11 +422,7 @@ fn sessions(command: SessionCommand) -> Result<()> {
                 return Ok(());
             }
             let store = load_sessions()?;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
-            for line in session_lines(&store, now) {
+            for line in session_lines(&store, unix_now()) {
                 println!("{line}");
             }
             Ok(())
@@ -859,27 +856,41 @@ fn upsert_saved_session(store: Option<SavedSessions>, new: SavedSession) -> Resu
     Ok(store)
 }
 
+pub(crate) const SESSION_EXPIRED: &str = "hub session expired; run agentscm hub login";
+
+/// The saved session for `hub` (or the default Hub), refusing one past its recorded expiry.
 pub(crate) fn load_session(hub: Option<&str>) -> Result<(String, String)> {
     let store = load_sessions()?;
-    let saved = selected_session(&store, hub)?;
+    let saved = selected_session(&store, hub, unix_now())?;
     Ok((saved.hub.clone(), saved.session.clone()))
 }
 
+/// Whether a saved, unexpired session exists for `hub` (or the default Hub).
 pub(crate) fn has_session(hub: Option<&str>) -> Result<bool> {
     if !session_files_present()? {
         return Ok(false);
     }
     let store = load_sessions()?;
-    match hub {
-        Some(hub) => {
-            let hub = check_base_url(hub).map_err(map_hub_error)?;
-            Ok(store.sessions.iter().any(|saved| saved.hub == hub))
-        }
-        None => Ok(true),
+    if let Some(hub) = hub {
+        check_base_url(hub).map_err(map_hub_error)?;
     }
+    Ok(selected_session(&store, hub, unix_now()).is_ok())
 }
 
-fn selected_session<'a>(store: &'a SavedSessions, hub: Option<&str>) -> Result<&'a SavedSession> {
+fn selected_session<'a>(
+    store: &'a SavedSessions,
+    hub: Option<&str>,
+    now: i64,
+) -> Result<&'a SavedSession> {
+    let saved = saved_session(store, hub)?;
+    if saved.expires_at.is_some_and(|expires| expires <= now) {
+        return Err(invalid(SESSION_EXPIRED));
+    }
+    Ok(saved)
+}
+
+/// The saved entry whether or not it has expired; only sign-out uses it, to clear stale entries.
+fn saved_session<'a>(store: &'a SavedSessions, hub: Option<&str>) -> Result<&'a SavedSession> {
     let selected = match hub {
         Some(hub) => check_base_url(hub).map_err(map_hub_error)?,
         None => store.default_hub.clone(),
@@ -889,6 +900,12 @@ fn selected_session<'a>(store: &'a SavedSessions, hub: Option<&str>) -> Result<&
         .iter()
         .find(|saved| saved.hub == selected)
         .ok_or_else(|| invalid("no saved session for this hub; run agentscm hub login"))
+}
+
+fn load_saved_session(hub: Option<&str>) -> Result<(String, String)> {
+    let store = load_sessions()?;
+    let saved = saved_session(&store, hub)?;
+    Ok((saved.hub.clone(), saved.session.clone()))
 }
 
 fn remove_file_if_present(path: &std::path::Path) -> Result<()> {
@@ -1019,7 +1036,7 @@ async fn token(command: TokenCommand) -> Result<()> {
     )
     .await?;
     match (status, &command) {
-        (401, _) => Err(invalid("hub session expired; run agentscm hub login")),
+        (401, _) => Err(invalid(SESSION_EXPIRED)),
         (403, _) if reply["error"] == "not_connected" => Err(invalid(
             "connect the repository first: install the GitHub App on it, then run \
              `agentscm hub connections refresh <id>` (for a PAT or GitLab token connection: \
@@ -1084,7 +1101,7 @@ async fn admin_call(
     )
     .await?;
     match status {
-        401 => Err(invalid("hub session expired; run agentscm hub login")),
+        401 => Err(invalid(SESSION_EXPIRED)),
         403 => Err(invalid(
             "refused: administrators only, or the connection cannot read that repository",
         )),
@@ -1307,16 +1324,37 @@ mod tests {
             upsert_saved_session(Some(upsert_saved_session(None, first).unwrap()), second).unwrap();
 
         assert_eq!(
-            selected_session(&store, None).unwrap().session,
+            selected_session(&store, None, 100).unwrap().session,
             "secret-two"
         );
         assert_eq!(
-            selected_session(&store, Some("https://one.example/"))
+            selected_session(&store, Some("https://one.example/"), 100)
                 .unwrap()
                 .session,
             "secret-one"
         );
-        assert!(selected_session(&store, Some("https://missing.example")).is_err());
+        assert!(selected_session(&store, Some("https://missing.example"), 100).is_err());
+    }
+
+    #[test]
+    fn expired_sessions_are_not_selected_but_stay_removable() {
+        let first = checked_session("https://one.example", "secret-one", Some(200)).unwrap();
+        let second = checked_session("https://two.example", "secret-two", None).unwrap();
+        let store =
+            upsert_saved_session(Some(upsert_saved_session(None, second).unwrap()), first).unwrap();
+
+        let Err(Error::Invalid(message)) = selected_session(&store, None, 200) else {
+            panic!("an expired default session was selected");
+        };
+        assert_eq!(message, SESSION_EXPIRED);
+        assert!(selected_session(&store, Some("https://one.example"), 199).is_ok());
+        assert_eq!(
+            selected_session(&store, Some("https://two.example"), i64::MAX)
+                .unwrap()
+                .session,
+            "secret-two"
+        );
+        assert_eq!(saved_session(&store, None).unwrap().session, "secret-one");
     }
 
     #[test]

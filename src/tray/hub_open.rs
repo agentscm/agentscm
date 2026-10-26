@@ -207,7 +207,8 @@ fn validate_session(hub: &str, expected_session: &str) -> Result<(), OpenError> 
         Ok(_) => Err(OpenError::SignInChanged),
         Err(agentscm::Error::Invalid(message))
             if message == "not signed in; run agentscm hub login"
-                || message == "no saved session for this hub; run agentscm hub login" =>
+                || message == "no saved session for this hub; run agentscm hub login"
+                || message == crate::hub_cli::SESSION_EXPIRED =>
         {
             Err(OpenError::SignInChanged)
         }
