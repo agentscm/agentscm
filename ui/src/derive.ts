@@ -73,6 +73,9 @@ export interface Derived {
   intentById: Map<string, Intent>
 }
 
+/** The hub fills `task unknown` when an agent announced none: that is an absence, not a task to show. */
+export const announced = (task: string | null | undefined): string | null => (task && task !== 'task unknown' ? task : null)
+
 const mcpOnly = (via: string[]): boolean => via.length === 1 && via[0] === 'mcp'
 
 /**
@@ -98,7 +101,7 @@ export function liveAgents(work: Work, activity: Activity): LiveAgent[] {
       token: s.agent.token,
       name: s.agent.name,
       via: [...new Set([...s.via, ...(i?.via ?? [])])],
-      task: s.task ?? i?.task ?? null,
+      task: announced(s.task) ?? announced(i?.task) ?? null,
       machine: i?.machine ?? null,
       branch: i?.branch ?? null,
       holdings: i ? holdings(i) : [],
@@ -114,7 +117,7 @@ export function liveAgents(work: Work, activity: Activity): LiveAgent[] {
       token: i.agent.token,
       name: i.agent.name,
       via: i.via,
-      task: i.task,
+      task: announced(i.task),
       machine: i.machine,
       branch: i.branch,
       holdings: holdings(i),

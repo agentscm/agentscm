@@ -50,6 +50,10 @@ function Answer({ question, repo, d, ov, failing, needs }: { question: string; r
         <p className="answer-text" aria-live="polite">
           {d.agents.length === 0 && ov.current.length === 0 ? (
             <>Nobody is working in <span className="repo-name">{repo}</span> right now. </>
+          ) : ov.current.length === 0 ? (
+            <>
+              <b>{plural(d.agents.length, 'agent')}</b> {d.agents.length === 1 ? 'is' : 'are'} connected, and no task is claimed yet.{' '}
+            </>
           ) : (
             <>
               <b>{plural(d.agents.length, 'agent')}</b> {d.agents.length === 1 ? 'is' : 'are'} working on <b>{plural(ov.current.length, 'task')}</b>.{' '}

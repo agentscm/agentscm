@@ -1,6 +1,6 @@
 // Zero-dependency self-check for src/derive.ts (Node strips the types).
 import assert from 'node:assert/strict'
-import { derive, notable, overlaps, specKey } from '../src/derive.ts'
+import { announced, derive, notable, overlaps, specKey } from '../src/derive.ts'
 import { InvalidSkillWorkflowResponse, decodeSkillWorkflowEnvelope, decodeSkillWorkflowListEnvelope, validSkillWorkflowRunId, validSkillWorkflowStepId } from '../src/skillWorkflow.ts'
 import { fragmentTokenAllowed } from '../src/storage.ts'
 
@@ -248,4 +248,6 @@ const C = agent('tc', 'cursor')
   assert.equal(notable(run([], [], [], [denied(100), R]).contested).c.path, 'a.rs')
   assert.equal(notable(run([], [], [], [denied(400), D, R]).contested).kind, 'handoff', 'a handoff in the same second as a refusal wins')
 }
+assert.equal(announced('task unknown'), null, "the hub's placeholder is no task")
+assert.equal(announced('Fix invoice rounding'), 'Fix invoice rounding')
 console.log('derive checks passed')

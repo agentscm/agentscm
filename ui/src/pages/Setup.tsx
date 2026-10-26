@@ -64,13 +64,18 @@ export function SetupPage({ token }: { token: string }) {
                       <Icon name="hash" /> {row.key.slice(0, 8)}
                     </span>
                   </div>
-                  <p className="small mt-2 mb-0">
+                  {state !== 'Ready' && <p className="small mt-2 mb-0">
                     <Icon name="arrow-right-circle" /> {!available ? 'Verification unavailable. Reconnect to the hub before relying on setup status.' : row.expires_at <= now / 1000 ? 'Evidence expired. Ask your agent to verify MCP and a native edit again.' : row.blocker ? `${blockerLabel(row.blocker)}. ${row.next_action}` : state === 'Unverified' ? `Ask your agent to: ${row.next_action}` : row.next_action}
-                  </p>
+                  </p>}
                 </li>
               )
             })}
           </ul>
+          {/* Ready rows share one next step; it is said once rather than under every agent. */}
+          {(() => {
+            const ready = rows.find((row) => setupState(row, now, available) === 'Ready')
+            return ready ? <p className="small muted mt-2 mb-0"><Icon name="check2-circle" /> Ready: {ready.next_action}</p> : null
+          })()}
           {rows.length > 30 && <p className="small muted">Showing 30 setup sessions.</p>}
         </Box>
         <Box tour="setup-connect" icon="plug" title="Connect an agent" explain="Copies instructions your coding agent follows to install AgentSCM. Nothing runs from this page.">
