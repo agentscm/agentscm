@@ -289,7 +289,7 @@ struct Live {
     agents: Vec<String>,
     /// This run tried to set up at least one agent.
     wanted_agents: bool,
-    /// The user answered no to "Go ahead?" for the agent setup.
+    /// The user answered no to "Go ahead?", or no to the Claude Code plugin with no other agent.
     declined: bool,
     /// Why setting up the coding agents failed.
     agent_error: Option<String>,
@@ -331,7 +331,7 @@ impl Live {
             (None, _) => off(
                 "no hub chosen",
                 &format!(
-                    "run `{cli} quickstart --local` for a hub on this machine, or `--hosted --hub-url URL` for your team's hub"
+                    "run `{cli} quickstart --local` for a hub on this machine, or `{cli} quickstart --hub-url URL` for your team's hub"
                 ),
             ),
             (Some(url), _) if !self.hub_up => off(
@@ -766,7 +766,7 @@ async fn choose_hub(cx: &mut Cx<'_>) -> Option<String> {
                 };
                 if url.is_empty() {
                     println!(
-                        "Skipping live warnings. Run quickstart again with --hosted --hub-url URL once the hub runs.\n"
+                        "Skipping live warnings. Run quickstart again with --hub-url URL once the hub runs.\n"
                     );
                     return None;
                 }
@@ -1115,6 +1115,24 @@ fn chosen_agents(cx: &Cx<'_>) -> Vec<crate::client_setup::Agent> {
     }
 }
 
+/// Claude Code's plugin is installed for the whole user account, so say so and ask first (once:
+/// an installed plugin is not asked about again). `--yes` answers yes, after the notice.
+#[cfg(unix)]
+fn claude_plugin_wanted(cx: &Cx<'_>, root: &Path, agents: &[crate::client_setup::Agent]) -> bool {
+    if !agents.contains(&crate::client_setup::Agent::Claude)
+        || crate::client_plugin::claude_plugin_installed(root)
+    {
+        return true;
+    }
+    println!(
+        "The AgentSCM plugin for Claude Code is installed for your user account, so it is in all your projects; `{} uninstall` removes it when no other connected checkout uses it.",
+        cli_command(cx)
+    );
+    cx.ui.confirm(CLAUDE_PLUGIN_QUESTION, true)
+}
+
+const CLAUDE_PLUGIN_QUESTION: &str = "Install the AgentSCM plugin for Claude Code in all your projects? It runs a quick check whenever an agent starts and only contacts a Hub in repos connected to it.";
+
 /// The `client setup` line for every supported agent, for setting one up later.
 #[cfg(unix)]
 fn print_agent_setup_hints(cx: &Cx<'_>, hub: &str) {
@@ -1138,7 +1156,7 @@ async fn agents_stage(_cx: &mut Cx<'_>) {
 /// writes agent hooks and MCP configuration and gives the hub's Connect agents page its proof.
 #[cfg(unix)]
 async fn agents_stage(cx: &mut Cx<'_>) {
-    let agents = chosen_agents(cx);
+    let mut agents = chosen_agents(cx);
     if agents.is_empty() {
         if let (false, Some(hub), true) = (cx.args.no_agents, &cx.live.hub, cx.live.hub_up) {
             print_agent_setup_hints(cx, hub);
@@ -1179,6 +1197,19 @@ async fn agents_stage(cx: &mut Cx<'_>) {
         println!("I can't tell where this program is, so I didn't set up {names}.");
         return;
     };
+    // Asked only once nothing else stops the setup, so a No is a real choice.
+    if !claude_plugin_wanted(cx, &root, &agents) {
+        agents.retain(|agent| *agent != crate::client_setup::Agent::Claude);
+        if agents.is_empty() {
+            cx.live.declined = true;
+            return;
+        }
+    }
+    let names = agents
+        .iter()
+        .map(|agent| agent.name())
+        .collect::<Vec<_>>()
+        .join(", ");
     // Quickstart owns this checkout's connection: an unchanged, valid one is kept as it is,
     // and anything else (another hub, another token file) is replaced after this notice.
     let existing = checkout_connection(&cx.found);

@@ -3087,7 +3087,12 @@ fn uninstall_removes_everything_quickstart_set_up() {
     let (hub, machine) = (Hub::start(), Machine::new().with_claude());
     let repo = machine.repo();
     let token = hub.token_file(machine.home.path());
-    ok(&machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"])));
+    let said = ok(&machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"])));
+    // The user-wide plugin is named as such before it is installed.
+    assert!(
+        said.contains("installed for your user account, so it is in all your projects"),
+        "{said}"
+    );
     assert_eq!(machine.connections().len(), 1);
     assert!(repo.path().join(".mcp.json").exists());
 
