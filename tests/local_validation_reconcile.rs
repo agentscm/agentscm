@@ -755,3 +755,166 @@ async fn a_head_that_moves_during_a_failed_fetch_is_left_pending_without_error()
     assert_eq!(env.states(&env.head), ["pending"]);
     assert!(String::from_utf8_lossy(&out.stdout).contains("left pending"));
 }
+
+/// Commits a copy of the verifier configuration at `sub/cfg` in the checkout and publishes it, so
+/// `--repo` can be the subdirectory `sub` with `--config-dir=cfg`.
+fn config_in_subdirectory(env: &Env) -> Vec<String> {
+    let checkout = env.root().join("checkout");
+    let cfg = checkout.join("sub/cfg");
+    fs::create_dir_all(&cfg).unwrap();
+    for name in ["policy.json", "recipe.json", "registry.json"] {
+        fs::copy(
+            checkout.join(".github/local-validation").join(name),
+            cfg.join(name),
+        )
+        .unwrap();
+    }
+    git(&checkout, &["add", "."]);
+    git(&checkout, &["commit", "-q", "-m", "sub config"]);
+    git(&checkout, &["push", "-q", "origin", "HEAD:main"]);
+    let mut args = env.reconcile_args();
+    let at = args.iter().position(|a| a == "--repo").unwrap() + 1;
+    args[at] = checkout.join("sub").to_str().unwrap().to_owned();
+    args.push("--config-dir=cfg".into());
+    args
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repo_that_is_a_subdirectory_resolves_a_relative_config_dir_there() {
+    let env = Env::new().await;
+    let body = env.attest();
+    env.attest_comment(10, "OWNER", body);
+    let args = config_in_subdirectory(&env);
+    let out = tokio::task::block_in_place(|| {
+        env.cli(&args.iter().map(String::as_str).collect::<Vec<_>>())
+    });
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(env.states(&env.head), ["pending", "success"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dirty_config_dir_in_a_subdirectory_repo_is_refused_before_any_request() {
+    let env = Env::new().await;
+    let body = env.attest();
+    env.attest_comment(10, "OWNER", body);
+    let args = config_in_subdirectory(&env);
+    fs::write(env.root().join("checkout/sub/cfg/registry.json"), "{}\n").unwrap();
+    let out = tokio::task::block_in_place(|| {
+        env.cli(&args.iter().map(String::as_str).collect::<Vec<_>>())
+    });
+    assert_refused_before_any_request(&env, &out);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ignored_file_in_the_config_dir_is_refused_before_any_request() {
+    let env = Env::new().await;
+    let body = env.attest();
+    env.attest_comment(10, "OWNER", body);
+    let checkout = env.root().join("checkout");
+    fs::write(checkout.join(".git/info/exclude"), "ignored.json\n").unwrap();
+    fs::write(checkout.join(".github/local-validation/ignored.json"), "{}").unwrap();
+    let out = tokio::task::block_in_place(|| env.reconcile());
+    assert_refused_before_any_request(&env, &out);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_head_fetch_followed_by_an_auth_failure_on_the_recheck_stops_the_run() {
+    for status in [401, 429] {
+        let env = Env::new().await;
+        let body = env.attest();
+        env.attest_comment(10, "OWNER", body.clone());
+        env.fake.with(|s| {
+            let repo = s.repos.get_mut(&1).unwrap();
+            repo.pulls.insert(2, Pull::new(2, "second", &[]));
+            repo.comments.insert(
+                2,
+                vec![Comment {
+                    id: 20,
+                    body,
+                    author: "maintainer-login".into(),
+                    author_association: "OWNER".into(),
+                    updated_at: "2026-01-01T00:00:00Z".into(),
+                }],
+            );
+        });
+        git(
+            &env.root().join("checkout"),
+            &["remote", "set-url", "origin", "/nonexistent/origin.git"],
+        );
+        let out = env
+            .reconcile_stalled(&format!("/statuses/{}", env.head), |fake| {
+                fake.with(|s| {
+                    s.fail.push_back(Failure {
+                        path_contains: "/pulls?state=open".into(),
+                        status,
+                        headers: vec![],
+                    })
+                })
+            })
+            .await;
+        assert_eq!(code(&out), 1, "{status}");
+        // The initial listing and the one failed recheck; the second pull request is never tried.
+        let listings = env.fake.with(|s| {
+            s.requests
+                .iter()
+                .filter(|r| r.path_and_query.contains("/pulls?state=open"))
+                .count()
+        });
+        assert_eq!(listings, 2, "{status}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_configuration_change_stops_the_loop_so_every_head_stays_pending() {
+    let env = Env::new().await;
+    let body = env.attest();
+    env.attest_comment(10, "OWNER", body.clone());
+    let root = env.root();
+    let work = root.join("work");
+    git(&work, &["commit", "-q", "--allow-empty", "-m", "second"]);
+    let second = git(&work, &["rev-parse", "HEAD"]);
+    git(
+        &work,
+        &[
+            "push",
+            "-q",
+            root.join("origin.git").to_str().unwrap(),
+            &format!("{second}:refs/pull/2/head"),
+        ],
+    );
+    env.fake.with(|s| {
+        let repo = s.repos.get_mut(&1).unwrap();
+        let pull = Pull {
+            head_sha: second.clone(),
+            ..Pull::new(2, "second", &[])
+        };
+        repo.pulls.insert(2, pull);
+        repo.comments.insert(
+            2,
+            vec![Comment {
+                id: 20,
+                body,
+                author: "maintainer-login".into(),
+                author_association: "OWNER".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+            }],
+        );
+    });
+    let newer = root.join("newer");
+    git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            root.join("origin.git").to_str().unwrap(),
+            "newer",
+        ],
+    );
+    fs::write(newer.join(".github/local-validation/registry.json"), "{}\n").unwrap();
+    git(&newer, &["commit", "-q", "-am", "change registry"]);
+    git(&newer, &["push", "-q", "origin", "HEAD:main"]);
+    let out = tokio::task::block_in_place(|| env.reconcile());
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(env.states(&env.head), ["pending"]);
+    assert_eq!(env.states(&second), ["pending"]);
+}

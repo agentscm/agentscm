@@ -486,19 +486,20 @@ async fn reconcile(args: ReconcileArgs) -> Result<i32> {
         return Ok(2);
     }
     // The guard compares `HEAD`, so the files read must be the committed ones.
-    let committed = agentscm::local_validation::run::config_dir_tree(&args.repo, config_dir)
-        .map(|_| ())
-        .and_then(|()| agentscm::local_validation::run::config_dir_dirty(&args.repo, config_dir))
-        .map_err(|e| {
-            eprintln!("--config-dir cannot be read at HEAD of --repo ({e:?}); nothing written");
-        });
-    match committed {
+    if let Err(e) = agentscm::local_validation::run::config_dir_tree(&args.repo, config_dir) {
+        eprintln!("--config-dir cannot be read at HEAD of --repo ({e:?}); nothing written");
+        return Ok(2);
+    }
+    match agentscm::local_validation::run::config_dir_dirty(&args.repo, config_dir) {
         Ok(false) => {}
         Ok(true) => {
-            eprintln!("--config-dir has uncommitted changes; nothing written");
+            eprintln!("--config-dir has uncommitted, untracked or ignored files; nothing written");
             return Ok(2);
         }
-        Err(()) => return Ok(2),
+        Err(e) => {
+            eprintln!("--config-dir cleanliness could not be checked ({e:?}); nothing written");
+            return Ok(2);
+        }
     }
     let read = |name: &str| {
         read_bounded(

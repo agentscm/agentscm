@@ -158,7 +158,7 @@ pub fn config_dir_tree(repo: &Path, dir: &str) -> Result<String> {
     rev(repo, "HEAD", &format!(":./{dir}"))
 }
 
-/// True when `dir` has uncommitted changes, untracked files included.
+/// True when `dir` has uncommitted changes, untracked and ignored files included.
 pub fn config_dir_dirty(repo: &Path, dir: &str) -> Result<bool> {
     Ok(!git(
         repo,
@@ -166,6 +166,7 @@ pub fn config_dir_dirty(repo: &Path, dir: &str) -> Result<bool> {
             "status",
             "--porcelain",
             "--untracked-files=normal",
+            "--ignored=matching",
             "--",
             dir,
         ],
@@ -175,14 +176,15 @@ pub fn config_dir_dirty(repo: &Path, dir: &str) -> Result<bool> {
 }
 
 /// Re-fetches `origin/{base}` and tells whether `dir` (relative to `repo`) has the same tree
-/// there as at the checkout's `HEAD`. Err when the fetch or either read fails.
+/// there as at the checkout's `HEAD`. A directory missing at `origin/{base}` has changed. Err when
+/// the fetch fails or either side cannot be read otherwise.
 pub fn config_dir_unchanged(repo: &Path, base: &str, dir: &str) -> Result<bool> {
     fetch_base(repo, base)?;
-    let theirs = rev(
-        repo,
-        &format!("refs/remotes/origin/{base}"),
-        &format!(":./{dir}"),
-    )?;
+    let tip = format!("refs/remotes/origin/{base}");
+    rev(repo, &tip, "^{commit}")?;
+    let Ok(theirs) = rev(repo, &tip, &format!(":./{dir}")) else {
+        return Ok(false);
+    };
     Ok(config_dir_tree(repo, dir)? == theirs)
 }
 
