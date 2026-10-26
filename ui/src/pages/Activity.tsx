@@ -2,7 +2,7 @@ import { useState, type ReactNode } from 'react'
 import { overlaps, pathsOf, type Derived } from '../derive.ts'
 import { fetchActivityPage } from '../api.ts'
 import type { HubEvent } from '../types.ts'
-import { Ago, Avatar, Box, Empty, Icon, Path, Pill, Skeleton, viaLabel, type Tone } from '../ui.tsx'
+import { agentLabel, Ago, Avatar, Box, Empty, Icon, Path, Pill, Skeleton, viaLabel, type Tone } from '../ui.tsx'
 
 const strs = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [])
 const rec = (v: unknown): Record<string, unknown> => (v && typeof v === 'object' ? (v as Record<string, unknown>) : {})
@@ -41,7 +41,7 @@ function describe(e: HubEvent, d: Derived): Row | null {
     case 'edit_denied': {
       const holders = [...new Set(strs(data['holders']).map((id) => {
         const i = d.intentById.get(id)
-        return i ? `${i.owner.login}’s ${i.agent.name}` : 'another agent'
+        return i ? `${i.owner.login}’s ${agentLabel(i.agent.name)}` : 'another agent'
       }))]
       return { icon: 'slash-circle', tone: 'bad', text: <>was refused an edit to <Files paths={pathsOf(e)} /> (held by {holders.length ? holders.join(', ') : 'another agent'})</> }
     }
@@ -133,16 +133,13 @@ export function ActivityPage({ d, events: live, fresh, repo, token }: { d: Deriv
   const rows = d && events ? events.filter((e) => match(e.kind)).map((e) => ({ e, row: describe(e, d) })).filter((x): x is { e: HubEvent; row: Row } => x.row !== null).slice(0, older.length ? undefined : 30) : null
   const shown = rows ? (expanded || older.length ? rows : rows.slice(0, 12)) : null
   return (
-    <div className="page">
-      <div className="answer" data-tour="answer">
-        <h1 className="page-question">What just happened?</h1>
-        <p className="answer-text">The latest things agents did on this repository, newest first. New events slide in as they arrive.</p>
-      </div>
+    <>
       <Box
+        id="box-log"
         icon="clock-history"
-        title="Activity"
+        title="The full log"
         count={rows?.length}
-        explain="Up to 30 recent hub events: sessions, announced work, refused and repeated edits, and handoffs between agents."
+        explain="What agents did on this repository, newest first: sessions, announced work, refused and repeated edits, and handoffs. New events slide in as they arrive."
         actions={
           <div className="btn-group btn-group-sm" data-tour="activity-filter" role="group" aria-label="Filter events">
             {KINDS.map((k) => (
@@ -168,7 +165,7 @@ export function ActivityPage({ d, events: live, fresh, repo, token }: { d: Deriv
                 </span>
                 <div className="event-body">
                   <div>
-                    <Avatar name={e.agent.name} size={20} /> <strong>{e.agent.name}</strong> <span className="muted">({e.owner.login})</span> {row.text}{' '}
+                    <Avatar name={e.agent.name} size={20} /> <strong title={e.agent.name}>{agentLabel(e.agent.name)}</strong> <span className="muted">({e.owner.login})</span> {row.text}{' '}
                     {row.experimental && (
                       <Pill tone="muted" icon="flask" tip="Handoff is experimental: the API and behaviour may change.">
                         Experimental
@@ -196,6 +193,6 @@ export function ActivityPage({ d, events: live, fresh, repo, token }: { d: Deriv
           </button>
         )}
       </Box>
-    </div>
+    </>
   )
 }

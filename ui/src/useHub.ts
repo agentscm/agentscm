@@ -113,7 +113,7 @@ export function useHub(token: string, onUnauthorized: (message?: string) => void
 
   useLoop(
     async (signal) => {
-      const health = await fetchHealth(signal)
+      const health = await fetchHealth(signal, token)
       setData((d) => ({ ...d, health }))
     },
     15_000,

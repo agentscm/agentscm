@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react'
-import { CatchupPanel } from '../Catchup.tsx'
+import { SectionTabs } from '../TopNav.tsx'
 import {
   currentLeadParticipant,
   fetchBriefing,
@@ -25,11 +25,11 @@ import {
   type WorkSourceRef,
   type WorkState,
 } from '../standup.ts'
-import { Ago, Avatar, Box, Empty, Explain, Icon, Notice, Path, Paths, Pill, Skeleton, Tip, localDate, type Tone } from '../ui.tsx'
+import { agentLabel, Ago, Avatar, Box, Empty, Explain, Icon, Notice, Path, Paths, Pill, Skeleton, Tip, localDate, type Tone } from '../ui.tsx'
 import { usePoll, type Poll } from '../usePoll.ts'
 import { hashPath, Pager } from '../Pager.tsx'
 
-const STATE: Record<WorkState, { label: string; tone: Tone; icon: string; tip: string }> = {
+export const STATE: Record<WorkState, { label: string; tone: Tone; icon: string; tip: string }> = {
   active: { label: 'In progress', tone: 'brand', icon: 'play-circle', tip: 'The lead agent reports it is actively working on this.' },
   blocked: { label: 'Blocked', tone: 'bad', icon: 'sign-stop', tip: 'The lead agent reported a blocker and is waiting on it.' },
   handover: { label: 'Handover', tone: 'brand', icon: 'arrow-left-right', tip: 'The lead reported this is ready for another agent to take over.' },
@@ -39,11 +39,13 @@ const STATE: Record<WorkState, { label: string; tone: Tone; icon: string; tip: s
 const LANES: WorkState[] = ['active', 'blocked', 'handover', 'paused']
 
 const EVENT_LABEL: Record<string, string> = { work_started: 'Started work', work_joined: 'Joined work', work_takeover: 'Took over the claim', work_checkpoint: 'Reported a checkpoint' }
+const EVENT_ICON: Record<string, string> = { work_started: 'play-fill', work_joined: 'person-plus', work_takeover: 'arrow-left-right', work_checkpoint: 'flag' }
 const RESPONSE_LABEL: Record<CoordinationResponseKind, string> = { propose_split: 'Proposed a scope split', join: 'Offered to join', handover: 'Offered a handover', decline: 'Declined' }
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`
+const spanText = (seconds: number) => (seconds <= 48 * 3600 ? plural(Math.max(1, Math.round(seconds / 3600)), 'hour') : plural(Math.round(seconds / 86400), 'day'))
 
-function lead(item: WorkItem): { agent: string; login: string } {
+export function lead(item: WorkItem): { agent: string; login: string } {
   try {
     const p = currentLeadParticipant(item)
     return { agent: p.agent, login: p.login }
@@ -61,7 +63,7 @@ export function StatePill({ state }: { state: WorkState }) {
   )
 }
 
-function ClaimPill({ item }: { item: WorkItem }) {
+export function ClaimPill({ item }: { item: WorkItem }) {
   if (item.state === 'finished') return null
   if (item.claim_status === 'active')
     return (
@@ -73,6 +75,72 @@ function ClaimPill({ item }: { item: WorkItem }) {
     <Pill tone="warn" icon="exclamation-triangle" tip="An old or unknown check-in does not release the assignment. Coordinate with the lead before taking it over.">
       {item.claim_status === 'stale' ? 'No recent check-in' : 'Check-in unknown'} · still assigned
     </Pill>
+  )
+}
+
+/** The current segment's look follows the reported state; a stale claim is amber whatever the state says. */
+function nowClass(i: WorkItem): string {
+  if (i.state === 'blocked') return 'lb-fail'
+  if (i.claim_status !== 'active' || i.state === 'paused') return 'lb-stale'
+  if (i.state === 'handover') return 'lb-ready'
+  return ''
+}
+
+const NOW_NOTE: Record<WorkState, (i: WorkItem) => string> = {
+  active: (i) => i.current?.summary ?? 'Working, no report yet',
+  blocked: (i) => i.blocker?.summary ?? 'Blocked',
+  handover: (i) => i.next_action ?? 'Ready to hand over',
+  paused: (i) => i.current?.summary ?? 'Paused',
+  finished: (i) => i.current?.summary ?? 'Reported finished',
+}
+
+/**
+ * One task as a segmented capsule, read left to right: claimed, where it is now (wide, with the
+ * holder's face), its next step, then finished. Every segment opens the task.
+ */
+export function LaneBar({ item, fresh }: { item: WorkItem; fresh: boolean }) {
+  const l = lead(item)
+  const href = workHref(item.id)
+  const s = STATE[item.state]
+  const claimTip = `Claimed by ${agentLabel(l.agent)} (${l.login}) ${localDate(item.created_at)}`
+  return (
+    <div className="lb-wrap">
+      <ol className="lb lb-fit" aria-label={`${item.title}: ${s.label}`}>
+        <li className="lb-seg lb-done">
+          <Tip text={claimTip} className="lb-tip">
+            <a className="lb-hit" href={href}>
+              <Icon name="check2" />
+              <span className="lb-label">Claimed</span>
+            </a>
+          </Tip>
+        </li>
+        <li className={`lb-seg is-here ${nowClass(item)}${fresh ? ' is-new' : ''}`}>
+          <a className="lb-hit" href={href}>
+            <span className="baton">
+              <Avatar name={l.agent} size={24} />
+            </span>
+            <span className="lb-label">{item.claim_status === 'active' ? s.label : item.claim_status === 'stale' ? 'Quiet' : 'Unknown'}</span>
+            <span className="lb-note">{NOW_NOTE[item.state](item)}</span>
+          </a>
+        </li>
+        <li className={`lb-seg ${item.next_action ? 'lb-none' : 'lb-unknown'}`}>
+          <Tip text={item.next_action ? `Next: ${item.next_action}` : 'No next step reported'} className="lb-tip">
+            <a className="lb-hit" href={href}>
+              <Icon name="arrow-right" />
+              <span className="lb-label">Next</span>
+            </a>
+          </Tip>
+        </li>
+        <li className="lb-seg">
+          <Tip text="Not reported finished yet. A finished report still doesn’t prove review or landing." className="lb-tip">
+            <a className="lb-hit" href={href}>
+              <Icon name="flag" />
+              <span className="lb-label">Finished</span>
+            </a>
+          </Tip>
+        </li>
+      </ol>
+    </div>
   )
 }
 
@@ -117,7 +185,7 @@ function WorkCard({ item, outcomeAt }: { item: WorkItem; outcomeAt?: number }) {
       <div className="work-owner">
         <Avatar name={l.agent} size={28} />
         <span>
-          <strong>{l.agent}</strong> <span className="muted small">{l.login}</span>
+          <strong title={l.agent}>{agentLabel(l.agent)}</strong> <span className="muted small">{l.login}</span>
         </span>
       </div>
       <h3 className="work-title">
@@ -131,7 +199,7 @@ function WorkCard({ item, outcomeAt }: { item: WorkItem; outcomeAt?: number }) {
       <Action item={item} />
       {helpers.length > 0 && (
         <div className="small muted">
-          <Icon name="people" /> {helpers.slice(0, 2).map((p) => `${p.agent} (${p.role})`).join(', ')}
+          <Icon name="people" /> {helpers.slice(0, 2).map((p) => `${agentLabel(p.agent)} (${p.role})`).join(', ')}
           {helpers.length > 2 && <> · <WorkLink id={item.id}>+{helpers.length - 2} more</WorkLink></>}
         </div>
       )}
@@ -175,28 +243,6 @@ function Board({ items, showFinished = false }: { items: WorkItem[]; showFinishe
           )
         })}
       </div>
-    </>
-  )
-}
-
-function Updated({ fetchedAt, extra, error }: { fetchedAt: number; extra?: ReactNode; error: string | null }) {
-  const at = new Date(fetchedAt)
-  return (
-    <>
-      <div className="statusline">
-        <span>
-          <Icon name="eye" /> Read only
-        </span>
-        <span>
-          <Icon name="arrow-clockwise" /> Updated <time dateTime={at.toISOString()}>{at.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' })}</time>
-        </span>
-        {extra}
-      </div>
-      {error && (
-        <Notice title="Could not refresh">
-          Showing data loaded at {at.toLocaleTimeString()}. {error}
-        </Notice>
-      )}
     </>
   )
 }
@@ -251,7 +297,7 @@ function Request({ r }: { r: CoordinationRequest }) {
         <span className="request-main">
           <strong>{r.proposal.title}</strong>
           <span className="muted small">
-            <Icon name="person" /> {r.requester.agent} <Icon name="arrow-right" /> {r.targets.map((t) => t.lead.agent).join(', ')}
+            <Icon name="person" /> {agentLabel(r.requester.agent)} <Icon name="arrow-right" /> {r.targets.map((t) => agentLabel(t.lead.agent)).join(', ')}
           </span>
         </span>
         {first && (
@@ -267,7 +313,7 @@ function Request({ r }: { r: CoordinationRequest }) {
       <div className="request-body">
         <div className="request-proposal">
           <div className="small muted">
-            Requested by {r.requester.agent} · {r.requester.login} · <code>{r.id}</code>
+            Requested by {agentLabel(r.requester.agent)} · {r.requester.login} · <code>{r.id}</code>
           </div>
           <div>
             <span className="label">Proposed scope</span> {r.proposal.scope.length ? <Paths items={r.proposal.scope} max={12} /> : <em className="muted">Scope not declared</em>}
@@ -292,7 +338,7 @@ function Request({ r }: { r: CoordinationRequest }) {
                   <Avatar name={t.lead.agent} size={28} />
                   <span>
                     <span className="label">Target lead</span>
-                    <strong>{t.lead.agent}</strong> <span className="muted small">{t.lead.login}</span>
+                    <strong title={t.lead.agent}>{agentLabel(t.lead.agent)}</strong> <span className="muted small">{t.lead.login}</span>
                   </span>
                   <WorkLink id={t.work_id}>Open work</WorkLink>
                 </div>
@@ -315,7 +361,7 @@ function Request({ r }: { r: CoordinationRequest }) {
                 {resp && (
                   <blockquote className="response">
                     <strong>
-                      {resp.responder.agent} · {resp.responder.login}
+                      {agentLabel(resp.responder.agent)} · {resp.responder.login}
                     </strong>
                     <p>{resp.note ?? 'No note provided.'}</p>
                     <Ago at={resp.created_at} />
@@ -419,7 +465,7 @@ function OverlapRow({ o }: { o: WorkOverlapPair }) {
     return (
       <div className="overlap-side">
         <div>
-          <Avatar name={l.agent} size={24} /> <strong>{l.agent}</strong> <span className="muted small">{l.login}</span>
+          <Avatar name={l.agent} size={24} /> <strong title={l.agent}>{agentLabel(l.agent)}</strong> <span className="muted small">{l.login}</span>
         </div>
         <WorkLink id={item.id}>{item.title}</WorkLink>
         <div className="small">
@@ -447,7 +493,7 @@ function OverlapRow({ o }: { o: WorkOverlapPair }) {
   )
 }
 
-function Coordination({ token, overview, search }: { token: string; overview: WorkOverview; search: string }) {
+export function Coordination({ token, overview, search }: { token: string; overview: WorkOverview; search: string }) {
   const overlaps = overview.overlaps.filter((o) => workMatchesSearch(o.left, search) || workMatchesSearch(o.right, search) || o.reasons.some((r) => `${r.left_path} ${r.right_path}`.toLowerCase().includes(search.trim().toLowerCase())))
   const attention = overview.current.filter((i) => workMatchesSearch(i, search) && (i.claim_status !== 'active' || i.scope.length === 0))
   const decisions = overview.recent.filter((o) => o.kind === 'decision' && workMatchesSearch(o.item, search))
@@ -455,8 +501,9 @@ function Coordination({ token, overview, search }: { token: string; overview: Wo
     <div className="stack">
       <RequestQueue token={token} search={search} />
       <Box
+        id="box-overlaps"
         icon="sign-intersection-y"
-        tone={overlaps.length ? 'warn' : 'ok'}
+        tone={overlaps.length ? 'bad' : 'ok'}
         title="Detected scope overlaps"
         count={overlaps.length}
         explain="The hub compares the paths each task declared. An overlap is a signal to talk, not proof the code conflicts, and detecting it does not send a request."
@@ -481,7 +528,7 @@ function Coordination({ token, overview, search }: { token: string; overview: Wo
               {attention.map((i) => (
                 <li key={i.id}>
                   <WorkLink id={i.id}>{i.title}</WorkLink>
-                  <span className="muted small"> · {lead(i).agent}</span>
+                  <span className="muted small"> · {agentLabel(lead(i).agent)}</span>
                   <div className="pills">
                     {i.claim_status !== 'active' && <ClaimPill item={i} />}
                     {i.scope.length === 0 && <Pill tone="muted" icon="question-circle">Scope unknown</Pill>}
@@ -523,7 +570,10 @@ function Finished({ overview, search }: { overview: WorkOverview; search: string
       <div className="window">
         <Icon name="calendar-range" />
         <span>
-          Showing completions from <strong>{localDate(overview.recent_since)}</strong> to <strong>{localDate(overview.until)}</strong>
+          Completions reported in the{' '}
+          <Tip text={`${localDate(overview.recent_since)} to ${localDate(overview.until)}`} focusable>
+            <strong>last {spanText(overview.until - overview.recent_since)}</strong>
+          </Tip>
         </span>
         <Explain text="Finished means the agent reported it finished. It does not confirm verification, review, or merge." />
       </div>
@@ -599,37 +649,26 @@ function History({ token }: { token: string }) {
       ) : events.length === 0 ? (
         <Empty icon="list" title="No changes on this page" />
       ) : (
-        <div className="table-responsive box">
-          <table className="table table-hover align-middle mb-0 history">
-            <thead>
-              <tr>
-                <th scope="col">Work</th>
-                <th scope="col">Change</th>
-                <th scope="col">Lead</th>
-                <th scope="col">Status</th>
-                <th scope="col">When</th>
-              </tr>
-            </thead>
-            <tbody>
-              {events.map((e) => (
-                <tr key={e.seq}>
-                  <td>
-                    <WorkLink id={e.work_id}>{e.item.title}</WorkLink>
-                  </td>
-                  <td>
-                    {EVENT_LABEL[e.kind] ?? e.kind}
-                    {e.item.current && e.kind === 'work_checkpoint' && <div className="small muted text-truncate history-sub">{e.item.current.summary}</div>}
-                  </td>
-                  <td>{lead(e.item).agent}</td>
-                  <td>
+        <ol className="change-feed box">
+          {events.map((e) => {
+            const l = lead(e.item)
+            return (
+              <li key={e.seq} className="change-row">
+                <span className={`change-mark is-${e.kind}`} aria-hidden="true"><Icon name={EVENT_ICON[e.kind] ?? 'dot'} /></span>
+                <div className="change-main">
+                  <WorkLink id={e.work_id}>{e.item.title}</WorkLink>
+                  <div className="change-meta">
+                    <span>{EVENT_LABEL[e.kind] ?? e.kind}</span>
+                    <span className="change-who"><Avatar name={l.agent} size={18} /> <span title={l.agent}>{agentLabel(l.agent)}</span> <span className="muted">{l.login}</span></span>
                     <StatePill state={e.item.state} />
-                  </td>
-                  <td className="text-nowrap">{localDate(e.at)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+                  </div>
+                  {e.item.current && e.kind === 'work_checkpoint' && <p className="change-quote">“{e.item.current.summary}”</p>}
+                </div>
+                <span className="change-when"><Ago at={e.at} /></span>
+              </li>
+            )
+          })}
+        </ol>
       )}
       <Pager
         newerLabel="Previous"
@@ -683,7 +722,7 @@ function Report({ c, item, title }: { c: WorkCheckpoint; item: WorkItem; title: 
         </div>
       )}
       <div className="small muted">
-        Reported by {c.agent} · {localDate(c.at)}
+        Reported by {agentLabel(c.agent)} · {localDate(c.at)}
       </div>
     </div>
   )
@@ -693,9 +732,6 @@ function Detail({ id, token }: { id: string; token: string }) {
   const load = usePoll((signal) => fetchStandupWork(id, token, signal), 0, id)
   return (
     <div className="page">
-      <a href="#work" className="back">
-        <Icon name="arrow-left" /> All work
-      </a>
       {load.kind === 'loading' && <Skeleton rows={6} />}
       {load.kind === 'error' && (
         <Notice tone="bad" title={load.status === 404 ? 'This work item was not found' : 'Could not load this work item'} action={<button className="btn btn-sm btn-outline-secondary" onClick={load.retry}>Retry</button>}>
@@ -719,6 +755,7 @@ function Detail({ id, token }: { id: string; token: string }) {
                   <Icon name="clipboard2-check" /> Change record
                 </a>
               </header>
+              {item.state !== 'finished' && <LaneBar item={item} fresh={false} />}
               {item.state !== 'finished' && item.claim_status !== 'active' && (
                 <Notice title={item.claim_status === 'stale' ? 'No recent check-in' : 'Check-in unknown'}>This task is still assigned. Coordinate with the lead before taking it over.</Notice>
               )}
@@ -749,7 +786,7 @@ function Detail({ id, token }: { id: string; token: string }) {
                       <li key={`${p.token}-${p.session}`} className="d-flex align-items-center gap-2">
                         <Avatar name={p.agent} size={28} />
                         <span>
-                          <strong>{p.agent}</strong> <span className="muted small">{p.login}</span>
+                          <strong title={p.agent}>{agentLabel(p.agent)}</strong> <span className="muted small">{p.login}</span>
                         </span>
                         <Pill tone={p.role === 'lead' ? 'brand' : 'muted'} icon={p.role === 'lead' ? 'star' : p.role === 'reviewer' ? 'eye' : 'person'}>
                           {p.role}
@@ -799,54 +836,88 @@ function Detail({ id, token }: { id: string; token: string }) {
   )
 }
 
-/* ---------- Page ---------- */
+/* ---------- Pages ---------- */
 
 type Tab = 'working' | 'finished' | 'coordination' | 'history'
 const TABS: readonly Tab[] = ['working', 'finished', 'coordination', 'history']
-/** `#work/<tab>` (work ids are `wrk_…`, so the two never collide); breadcrumbs link to these. */
+/** `#work/<tab>` (work ids are `wrk_…`, so the two never collide). Working and coordination now live on the Dashboard and in the Inbox. */
 export function workTabFromHash(hash = window.location.hash): Tab {
   const t = hashPath(hash).slice(1).split('/')[1] as Tab
   return TABS.includes(t) ? t : 'working'
 }
 export const workTabHref = (t: Tab) => (t === 'working' ? '#work' : `#work/${t}`)
 
-export function WorkPage({ token, overview }: { token: string; overview: Poll<WorkOverview> }) {
-  const [workId, setWorkId] = useState(() => workIdFromHash(window.location.hash))
-  const [tab, setTab] = useState<Tab>(workTabFromHash)
-  const [search, setSearch] = useState('')
+function useWorkRoute() {
+  const [route, setRoute] = useState(() => ({ id: workIdFromHash(window.location.hash), tab: workTabFromHash() }))
   useEffect(() => {
-    const on = () => {
-      setWorkId(workIdFromHash(window.location.hash))
-      setTab(workTabFromHash())
-    }
+    const on = () => setRoute({ id: workIdFromHash(window.location.hash), tab: workTabFromHash() })
     window.addEventListener('hashchange', on)
     return () => window.removeEventListener('hashchange', on)
   }, [])
-  if (workId) return <Detail id={workId} token={token} />
+  return route
+}
 
+/** History › Finished and Changes, and the page of one task. */
+export function WorkPage({ token, overview }: { token: string; overview: Poll<WorkOverview> }) {
+  const { id, tab } = useWorkRoute()
+  const [search, setSearch] = useState('')
+  if (id) return <Detail id={id} token={token} />
   const ov = overview.kind === 'ready' ? overview.value : null
-  const count = (s: WorkState) => ov?.current.filter((i) => i.state === s).length ?? 0
   const finished = ov?.recent.filter((o) => o.kind === 'completion').length ?? 0
-  const tabs: { key: Tab; icon: string; label: string; n?: number; tone?: string }[] = [
-    { key: 'working', icon: 'kanban', label: 'Working now', ...(ov ? { n: ov.current.length } : {}) },
-    { key: 'finished', icon: 'flag', label: 'Recently finished', ...(ov ? { n: finished } : {}) },
-    { key: 'coordination', icon: 'sign-intersection-y', label: 'Needs coordination', ...(ov && ov.overlaps.length > 0 ? { n: ov.overlaps.length, tone: 'warn' } : {}) },
-    { key: 'history', icon: 'clock-history', label: 'Change history' },
-  ]
+  const history = tab === 'history'
   return (
     <div className="page">
       <div className="answer" data-tour="answer">
-        <h1 className="page-question">Who owns which task?</h1>
+        <h1 className="page-question">{history ? 'What changed in Work, and when?' : 'What did agents report finished?'}</h1>
+        {history ? (
+          <p className="answer-text">Every start, join, takeover and checkpoint, newest first. Reading never marks anything as seen.</p>
+        ) : ov ? (
+          <p className="answer-text">
+            {finished === 0 ? 'Nothing was reported finished recently.' : <><b>{plural(finished, 'task')}</b> reported finished since {new Date(ov.recent_since * 1000).toLocaleDateString([], { weekday: 'long' })}.</>}
+          </p>
+        ) : overview.kind === 'error' ? null : (
+          <Skeleton rows={1} />
+        )}
+      </div>
+      <SectionTabs />
+      {!history && overview.kind === 'error' && (
+        <Notice tone="bad" title="Could not load the work overview" action={<button className="btn btn-sm btn-outline-secondary" onClick={overview.retry}>Retry</button>}>
+          {overview.message}
+        </Notice>
+      )}
+      {!history && !ov && overview.kind === 'loading' && <Skeleton rows={6} />}
+      {!history && ov && (
+        <>
+          <Search value={search} onChange={setSearch} placeholder="Search agents, tasks, or paths" />
+          <Finished overview={ov} search={search} />
+        </>
+      )}
+      {history && <History token={token} />}
+    </div>
+  )
+}
+
+const pending = (r: CoordinationRequest) => r.status !== 'resolved' && r.status !== 'withdrawn'
+
+/** Inbox: every declared-scope overlap and directed request, the conversations agents have to have. */
+export function InboxPage({ token, overview }: { token: string; overview: Poll<WorkOverview> }) {
+  const [search, setSearch] = useState('')
+  const ov = overview.kind === 'ready' ? overview.value : null
+  const requests = usePoll((signal) => fetchCoordination(token, signal, { limit: 10, activeOnly: true }), 15_000, `inbox|${token}`)
+  const open = requests.kind === 'ready' ? requests.value.requests.filter(pending) : []
+  const quiet = ov?.current.filter((i) => i.claim_status !== 'active' || i.scope.length === 0).length ?? 0
+  return (
+    <div className="page">
+      <div className="answer" data-tour="answer">
+        <h1 className="page-question">Which overlaps need a conversation?</h1>
         {ov ? (
           <p className="answer-text">
-            {ov.current.length === 0 ? (
-              'No unfinished work is assigned right now.'
+            {ov.overlaps.length === 0 && open.length === 0 ? (
+              ov.overlaps_complete ? 'No two tasks plan to touch the same files, and no request is waiting.' : 'No overlap in this partial snapshot. An empty list is not an all-clear.'
             ) : (
               <>
-                {plural(count('active'), 'task')} in progress
-                {count('blocked') > 0 && <>, <span className="tone-text-bad">{count('blocked')} blocked</span></>}
-                {count('handover') > 0 && <>, {count('handover')} waiting for handover</>}
-                {count('paused') > 0 && <>, {count('paused')} paused</>}. {finished > 0 && <>{plural(finished, 'task')} reported finished recently.</>}
+                {ov.overlaps.length > 0 && <><a className="jump tone-bad" href="#box-overlaps">{plural(ov.overlaps.length, 'overlap')}</a> {ov.overlaps.length === 1 ? 'needs' : 'need'} a conversation. </>}
+                {open.length > 0 && <><b>{plural(open.length, 'request')}</b> {open.length === 1 ? 'is' : 'are'} waiting on another lead.</>}
               </>
             )}
           </p>
@@ -854,42 +925,31 @@ export function WorkPage({ token, overview }: { token: string; overview: Poll<Wo
           <Skeleton rows={1} />
         )}
       </div>
+      {ov && (requests.kind === 'ready' || quiet > 0) && (
+        <div className="ib-progress" aria-label="Where the conversations stand">
+          <ul className="ib-bar" aria-hidden="true">
+            {ov.overlaps.map((o) => <li key={`${o.left.id}-${o.right.id}`} className="ib-seg ib-bad" />)}
+            {open.map((r) => <li key={r.id} className="ib-seg ib-wait" />)}
+            {Array.from({ length: quiet }, (_, i) => <li key={`q${i}`} className="ib-seg ib-team" />)}
+            {requests.kind === 'ready' && requests.value.requests.filter((r) => !pending(r)).map((r) => <li key={r.id} className="ib-seg ib-done" />)}
+          </ul>
+          <p>
+            {plural(ov.overlaps.length, 'overlap')} · {plural(open.length, 'open request')} · {plural(quiet, 'other signal')}
+          </p>
+        </div>
+      )}
       {overview.kind === 'error' && (
         <Notice tone="bad" title="Could not load the work overview" action={<button className="btn btn-sm btn-outline-secondary" onClick={overview.retry}>Retry</button>}>
           {overview.message}
         </Notice>
       )}
-      {overview.kind === 'ready' && (
-        <Updated
-          fetchedAt={overview.fetchedAt}
-          error={overview.refreshError}
-          extra={
-            <Tip text="The overview is a bounded, repository-wide snapshot. It refreshes every 15 seconds while visible." focusable>
-              <Icon name="camera" /> Snapshot through {localDate(overview.value.until)}
-            </Tip>
-          }
-        />
-      )}
-      <CatchupPanel token={token} />
-      <div className="tabbar" data-tour="work-tabs" role="tablist" aria-label="Work views">
-        {tabs.map((t) => (
-          <button key={t.key} type="button" role="tab" aria-selected={tab === t.key} className={`tab${tab === t.key ? ' active' : ''}`} onClick={() => { window.location.hash = workTabHref(t.key).slice(1) }}>
-            <Icon name={t.icon} /> {t.label}
-            {t.n !== undefined && <span className={`tab-count ${t.tone ? `tone-${t.tone}` : ''}`}>{t.n}</span>}
-          </button>
-        ))}
-      </div>
-      {tab !== 'history' && <Search value={search} onChange={setSearch} placeholder="Search agents, tasks, or paths" />}
-      {tab !== 'history' && !ov && overview.kind === 'loading' && <Skeleton rows={6} />}
-      {ov && tab === 'working' && (
+      {!ov && overview.kind === 'loading' && <Skeleton rows={6} />}
+      {ov && (
         <>
-          {!ov.current_complete && <Notice title="This snapshot is incomplete">The overview limit was reached. More work exists outside it.</Notice>}
-          <Board items={ov.current.filter((i) => workMatchesSearch(i, search))} />
+          <Search value={search} onChange={setSearch} placeholder="Search agents, tasks, or paths" />
+          <Coordination token={token} overview={ov} search={search} />
         </>
       )}
-      {ov && tab === 'finished' && <Finished overview={ov} search={search} />}
-      {ov && tab === 'coordination' && <Coordination token={token} overview={ov} search={search} />}
-      {tab === 'history' && <History token={token} />}
     </div>
   )
 }

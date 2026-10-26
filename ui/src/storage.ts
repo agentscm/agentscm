@@ -1,4 +1,6 @@
 // Browser storage can throw (private windows, blocked site data): never rely on it.
+import { clearPollCache } from './usePoll.ts'
+
 const TOKEN_KEY = 'agentscm.token'
 const THEME_KEY = 'agentscm.theme'
 const DENSITY_KEY = 'agentscm.density'
@@ -31,6 +33,7 @@ export function loadToken(): string | null {
 }
 
 export function clearToken(): void {
+  clearPollCache()
   for (const s of stores()) {
     try {
       s.removeItem(TOKEN_KEY)
@@ -86,12 +89,13 @@ export function saveTheme(t: ThemePref): void {
   }
 }
 
-export type Density = 'spacious' | 'compact'
+export type Density = 'spacious' | 'condensed'
 
 export function loadDensity(): Density {
   try {
     const v = window.localStorage.getItem(DENSITY_KEY)
-    if (v === 'spacious' || v === 'compact') return v
+    if (v === 'spacious' || v === 'condensed') return v
+    if (v === 'compact') return 'condensed' // the earlier name
   } catch {
     /* ignore */
   }

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { SectionTabs } from '../TopNav.tsx'
 import { fetchSkillWorkflow, fetchSkillWorkflows } from '../api.ts'
 import { validSkillWorkflowRunId, validSkillWorkflowStepId } from '../skillWorkflow.ts'
 import type { SkillWorkflowProjection, SkillWorkflowRunState, SkillWorkflowStep, SkillWorkflowStepState } from '../types.ts'
@@ -275,8 +276,10 @@ function List({ token }: { token: string }) {
     <div className="page">
       <div className="answer" data-tour="answer">
         <h1 className="page-question">Did the checks pass?</h1>
-        <p className="answer-text">Checks, structured reviews and productive actions retained for this repository. Each run belongs to one exact revision; producing an artifact does not verify its content or permit landing. <a href="#templates?view=workflows">Build a reusable workflow</a>.</p>
+        <p className="answer-text">Every check, review and action, each tied to one exact revision.</p>
+        <p className="answer-fact">Producing an artifact does not verify its content or permit landing. <a href="#templates?view=workflows">Build a reusable workflow</a>.</p>
       </div>
+      <SectionTabs />
       <Box
         tour="workflows-runs"
         tone={load.kind === 'ready' && load.value.availability === 'available' && load.value.runs.some((r) => r.state === 'failed' || r.state === 'blocked') ? 'bad' : 'brand'}

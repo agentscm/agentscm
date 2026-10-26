@@ -89,7 +89,7 @@ export function TourTrigger({ section }: { section: Section }) {
   if (!tour || !tourFor(section)) return null
   return (
     <button type="button" data-tour="tour-trigger" className="tour-trigger" onClick={() => tour.start(section)} aria-label="Tour this page" title="Tour this page">
-      <Icon name="signpost-split" />
+      <Icon name="question-lg" />
       <span className="tour-trigger-text">Tour this page</span>
     </button>
   )
@@ -247,7 +247,7 @@ function TourOverlay({ tourKey, data, d, overview, onClose, autoplayOn }: { tour
   const [moreAt, setMoreAt] = useState<number | null>(null) // the step whose "More" is open
   const more = moreAt === i
   const hero = isWelcome && i === 0
-  const place = placeCard(rect, { fullH, h: cardH, hero }, { w: window.innerWidth, h: window.innerHeight }, document.documentElement.dataset['density'] !== 'compact')
+  const place = placeCard(rect, { fullH, h: cardH, hero }, { w: window.innerWidth, h: window.innerHeight }, document.documentElement.dataset['density'] !== 'condensed')
   const compact = place.compact
   // Measure the card as it renders: its full height (with the illustration) feeds the compact decision.
   useLayoutEffect(() => {

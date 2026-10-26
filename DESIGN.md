@@ -1,283 +1,490 @@
 ---
-name: AgentSCM Hub
-description: A calm, read-only coordination Hub for seeing who owns each piece of agent work.
+name: AgentSCM Hub (Twilight)
+description: A calm workroom for agent teams. A deep-violet frame holds a quiet sheet; each page answers its question in one sentence, then shows one picture of the answer.
 colors:
-  primary-light: "#4F5BD5"
-  primary-dark: "#7C86FF"
-  chrome-light: "#DDE0EC"
-  chrome-dark: "#05060B"
-  canvas-light: "#F6F7FB"
-  canvas-dark: "#181C30"
-  surface-light: "#FFFFFF"
-  surface-dark: "#1F2438"
-  surface-head-light: "#EEF1F7"
-  surface-head-dark: "#282E46"
-  elevated-dark: "#1A1E30"
-  nav-active-light: "#D3D7F5"
-  success: "#12B76A"
-  warning: "#F79009"
-  error: "#F04438"
-  success-ink-light: "#05663D"
-  warning-ink-light: "#9C3D06"
-  error-ink-light: "#B42318"
-  success-ink-dark: "#6CE9A6"
-  warning-ink-dark: "#FEC84B"
-  error-ink-dark: "#FDA29B"
+  frame-light: "#17142e"
+  frame-dark: "#0b0a17"
+  frame-ink: "#ece9ff"
+  frame-dim-light: "#aaa5d2"
+  frame-dim-dark: "#9e99c6"
+  frame-active-icon: "#b3abff"
+  canvas-light: "#fafafc"
+  canvas-dark: "#111119"
+  surface-light: "#ffffff"
+  surface-dark: "#17171f"
+  sunken-light: "#f4f3f9"
+  sunken-dark: "#1e1e29"
+  text-light: "#1d1c28"
+  text-2-light: "#4f4e63"
+  text-3-light: "#6c6b80"
+  text-dark: "#ededf4"
+  text-2-dark: "#babacb"
+  text-3-dark: "#9090a6"
+  rule-light: "#efeef4"
+  rule-strong-light: "#dddce6"
+  rule-dark: "rgba(255, 255, 255, 0.06)"
+  rule-strong-dark: "rgba(255, 255, 255, 0.13)"
+  brand-light: "#6d5ce0"
+  brand-ink-light: "#5947cc"
+  brand-soft-light: "#f1eefd"
+  on-brand-light: "#ffffff"
+  brand-dark: "#a796ff"
+  brand-ink-dark: "#c6bbff"
+  brand-soft-dark: "rgba(167, 150, 255, 0.13)"
+  on-brand-dark: "#16132a"
+  coral-light: "#c8432a"
+  on-coral-light: "#ffffff"
+  coral-dark: "#ff7a5c"
+  on-coral-dark: "#1c0f0b"
+  ok-light: "#127a52"
+  ok-soft-light: "#e7f6ef"
+  ok-fill-light: "#2fb67c"
+  warn-light: "#9a5a06"
+  warn-soft-light: "#fdf2e2"
+  warn-fill-light: "#eea341"
+  bad-light: "#c0391f"
+  bad-soft-light: "#fdeee9"
+  ok-dark: "#6fdba6"
+  ok-soft-dark: "rgba(80, 200, 140, 0.12)"
+  ok-fill-dark: "#52c98f"
+  warn-dark: "#f6bd7a"
+  warn-soft-dark: "rgba(246, 170, 90, 0.12)"
+  warn-fill-dark: "#f5aa5a"
+  bad-dark: "#ff9c84"
+  bad-soft-dark: "rgba(255, 122, 92, 0.13)"
 typography:
-  display:
-    fontFamily: "-apple-system, BlinkMacSystemFont, SF Pro Text, Inter, Segoe UI, Roboto, Helvetica Neue, Arial, sans-serif"
-    fontSize: "clamp(24px, 2.5vw, 28px)"
-    fontWeight: 700
-    lineHeight: 1.12
+  answer:
+    fontFamily: "Onest, system-ui, -apple-system, Segoe UI, Roboto, sans-serif"
+    fontSize: "clamp(26px, 2.8vw, 34px)"
+    fontWeight: 300
+    lineHeight: 1.25
     letterSpacing: "-0.025em"
+  answer-condensed:
+    fontFamily: "Onest, system-ui, -apple-system, Segoe UI, Roboto, sans-serif"
+    fontSize: "21px"
+    fontWeight: 300
+    lineHeight: 1.3
+    letterSpacing: "-0.025em"
+  headline:
+    fontFamily: "Onest, system-ui, -apple-system, Segoe UI, Roboto, sans-serif"
+    fontSize: "22px"
+    fontWeight: 300
+    lineHeight: 1.4
+    letterSpacing: "-0.02em"
   title:
-    fontFamily: "-apple-system, BlinkMacSystemFont, SF Pro Text, Inter, Segoe UI, Roboto, Helvetica Neue, Arial, sans-serif"
-    fontSize: "24px"
-    fontWeight: 700
-    lineHeight: 1.12
-    letterSpacing: "-0.025em"
+    fontFamily: "Onest, system-ui, -apple-system, Segoe UI, Roboto, sans-serif"
+    fontSize: "16px"
+    fontWeight: 600
+    letterSpacing: "-0.01em"
+  tab:
+    fontFamily: "Onest, system-ui, -apple-system, Segoe UI, Roboto, sans-serif"
+    fontSize: "15px"
+    fontWeight: 600
+    letterSpacing: "-0.01em"
   body:
-    fontFamily: "-apple-system, BlinkMacSystemFont, SF Pro Text, Inter, Segoe UI, Roboto, Helvetica Neue, Arial, sans-serif"
-    fontSize: "14px"
+    fontFamily: "Onest, system-ui, -apple-system, Segoe UI, Roboto, sans-serif"
+    fontSize: "14.5px"
     fontWeight: 400
     lineHeight: 1.5
+    fontFeature: "'tnum' 1"
+  body-condensed:
+    fontFamily: "Onest, system-ui, -apple-system, Segoe UI, Roboto, sans-serif"
+    fontSize: "13.5px"
+    fontWeight: 400
+    lineHeight: 1.5
+    fontFeature: "'tnum' 1"
   label:
-    fontFamily: "-apple-system, BlinkMacSystemFont, SF Pro Text, Inter, Segoe UI, Roboto, Helvetica Neue, Arial, sans-serif"
-    fontSize: "12px"
-    fontWeight: 650
-    lineHeight: 1.4
-    letterSpacing: "0.03em"
+    fontFamily: "Onest, system-ui, -apple-system, Segoe UI, Roboto, sans-serif"
+    fontSize: "12.5px"
+    fontWeight: 500
+  explain:
+    fontFamily: "Onest, system-ui, -apple-system, Segoe UI, Roboto, sans-serif"
+    fontSize: "13px"
+    fontWeight: 400
+    lineHeight: 1.45
+  numeral:
+    fontFamily: "Onest, system-ui, sans-serif"
+    fontSize: "20px"
+    fontWeight: 300
+    lineHeight: 1.1
+    letterSpacing: "-0.02em"
+  numeral-dark:
+    fontFamily: "Unbounded, Onest, sans-serif"
+    fontSize: "17px"
+    fontWeight: 300
+    lineHeight: 1.1
+    letterSpacing: "-0.02em"
+  mono:
+    fontFamily: "JetBrains Mono, ui-monospace, SF Mono, Menlo, Consolas, monospace"
+    fontSize: "12.5px"
+    fontWeight: 400
 rounded:
-  sm: "8px"
-  md: "12px"
-  lg: "14px"
-  xl: "20px"
+  sheet-corner: "26px"
+  card: "20px"
+  card-condensed: "14px"
+  menu: "18px"
+  tile: "16px"
+  tile-condensed: "12px"
+  notice: "14px"
+  nav: "12px"
+  nav-condensed: "8px"
+  tag: "6px"
+  segment: "5px"
+  pill: "999px"
+  round: "50%"
 spacing:
-  xs: "4px"
-  sm: "8px"
-  md: "12px"
-  lg: "16px"
-  xl: "20px"
-  section: "24px"
-  section-spacious: "32px"
+  gap: "32px"
+  gap-condensed: "16px"
+  gap-mobile: "20px"
+  top-bar: "62px"
+  rail: "236px"
+  rail-compact: "72px"
+  sheet-top: "44px"
+  sheet-top-condensed: "22px"
+  sheet-top-mobile: "26px"
+  sheet-side: "clamp(20px, 4vw, 60px)"
+  sheet-side-condensed: "clamp(14px, 2vw, 28px)"
+  sheet-side-mobile: "16px"
+  answer-gap: "40px"
+  answer-gap-condensed: "18px"
+  answer-gap-mobile: "24px"
+  card-inset: "26px"
+  card-inset-condensed: "16px"
+  card-inset-mobile: "18px"
+  row-y: "16px"
+  row-y-condensed: "9px"
+  nav-row: "40px"
+  nav-row-condensed: "32px"
+  lane-bar: "34px"
+  lane-bar-condensed: "28px"
+  page-max: "1160px"
+  page-max-condensed: "1440px"
 components:
-  navigation:
-    backgroundColor: "{colors.chrome-light}"
-    activeColor: "{colors.nav-active-light}"
-    typography: "{typography.body}"
-    rounded: "{rounded.sm}"
-    height: "40px"
-    width: "248px"
-  filter-field:
+  answer:
+    textColor: "{colors.text-light}"
+    typography: "{typography.answer}"
+    width: "28ch"
+  answer-condensed:
+    typography: "{typography.answer-condensed}"
+    width: "60ch"
+  answer-link:
+    textColor: "{colors.brand-ink-light}"
+  answer-link-trouble:
+    textColor: "{colors.coral-light}"
+  box:
     backgroundColor: "{colors.surface-light}"
-    textColor: "{colors.primary-light}"
-    rounded: "{rounded.md}"
-    height: "44px"
-    padding: "0 12px"
-  work-row:
+    rounded: "{rounded.card}"
+    padding: "22px 26px 26px"
+  box-condensed:
+    rounded: "{rounded.card-condensed}"
+    padding: "12px 16px 14px"
+  since-card:
     backgroundColor: "{colors.surface-light}"
-    textColor: "{colors.primary-light}"
-    rounded: "{rounded.sm}"
-    padding: "12px 14px"
-  primary-action:
-    backgroundColor: "{colors.primary-light}"
+    rounded: "{rounded.card}"
+    padding: "24px 28px 18px"
+  since-card-condensed:
+    rounded: "{rounded.card-condensed}"
+    padding: "12px 16px 10px"
+  lane-claimed:
+    backgroundColor: "{colors.brand-soft-light}"
+    textColor: "{colors.brand-ink-light}"
+    rounded: "{rounded.segment}"
+    height: "34px"
+  lane-now:
+    backgroundColor: "{colors.brand-light}"
+    textColor: "{colors.on-brand-light}"
+    rounded: "{rounded.segment}"
+    height: "34px"
+  lane-now-handover:
+    backgroundColor: "{colors.brand-soft-light}"
+    textColor: "{colors.brand-ink-light}"
+  lane-now-quiet:
+    backgroundColor: "{colors.warn-soft-light}"
+    textColor: "{colors.warn-light}"
+  lane-now-blocked:
+    backgroundColor: "{colors.coral-light}"
+    textColor: "{colors.on-coral-light}"
+  lane-later:
+    backgroundColor: "{colors.sunken-light}"
+    textColor: "{colors.text-3-light}"
+    rounded: "{rounded.segment}"
+    height: "34px"
+  map-tile:
+    backgroundColor: "{colors.sunken-light}"
+    textColor: "{colors.text-light}"
+    rounded: "{rounded.tile}"
+    padding: "16px 18px 14px"
+    height: "116px"
+  map-tile-condensed:
+    rounded: "{rounded.tile-condensed}"
+    padding: "10px 12px"
+    height: "88px"
+  crossing-pill:
+    backgroundColor: "{colors.coral-light}"
+    textColor: "{colors.on-coral-light}"
+    rounded: "{rounded.pill}"
+    padding: "2px 8px"
+  area-drawer:
+    backgroundColor: "{colors.sunken-light}"
+    rounded: "{rounded.tile}"
+    padding: "20px 22px 18px"
+  notice:
+    backgroundColor: "{colors.sunken-light}"
+    rounded: "{rounded.notice}"
+    padding: "12px 16px"
+  status-dot:
+    textColor: "{colors.text-2-light}"
+    typography: "{typography.label}"
+    size: "7px"
+  tag-muted:
+    textColor: "{colors.text-2-light}"
+    rounded: "{rounded.tag}"
+    padding: "0 7px"
+  section-tab:
+    textColor: "{colors.text-2-light}"
+    typography: "{typography.tab}"
+    padding: "10px 4px 14px"
+  section-tab-open:
+    textColor: "{colors.text-light}"
+  inbox-segment:
+    backgroundColor: "{colors.sunken-light}"
+    rounded: "{rounded.segment}"
+    height: "10px"
+  button-primary:
+    backgroundColor: "{colors.brand-light}"
+    textColor: "{colors.on-brand-light}"
+    rounded: "{rounded.pill}"
+    padding: "0 14px"
+  button-primary-hover:
+    backgroundColor: "{colors.brand-ink-light}"
+  button-outline:
+    textColor: "{colors.text-light}"
+    rounded: "{rounded.pill}"
+    padding: "0 14px"
+  button-outline-hover:
+    backgroundColor: "{colors.brand-light}"
+    textColor: "{colors.on-brand-light}"
+  chip-active:
+    backgroundColor: "{colors.text-light}"
     textColor: "{colors.surface-light}"
-    rounded: "{rounded.md}"
-    height: "44px"
+    rounded: "{rounded.pill}"
+  field:
+    backgroundColor: "{colors.surface-light}"
+    textColor: "{colors.text-light}"
+    rounded: "{rounded.pill}"
+    padding: "0 14px"
+  nav-item:
+    backgroundColor: "{colors.frame-light}"
+    textColor: "{colors.frame-dim-light}"
+    rounded: "{rounded.nav}"
+    height: "40px"
+  nav-item-active:
+    backgroundColor: "rgba(255, 255, 255, 0.13)"
+    textColor: "{colors.surface-light}"
 ---
 
-# Design System: AgentSCM Hub
+# Design System: AgentSCM Hub (Twilight)
 
 ## Overview
 
-**Creative North Star: "The Calm Work Register"**
+**Creative North Star: "The Calm Workroom"**
 
-AgentSCM Hub is a quiet coordination surface for teams running coding agents. Ownership and the reported next step receive the strongest visual weight, while status and history remain easy to inspect without turning the page into a long feed. The visual language inherits the Hub: neutral surfaces, a violet navigation accent, system sans typography, restrained rules, and semantic labels that accompany color.
+A deep-violet frame (the top bar and the nav rail) holds one quiet content sheet. The sheet's only shaped corner is a large 26px curve at its top left, where it meets the frame. Every page opens with one sentence that answers the page's question, then shows one picture of that answer: on the Dashboard, the track of lane bars (Now) or the tiled map of the repository (Where). The question itself sits under the active rail item and in a visually hidden h1.
 
-The Work section is a focused expression of that world. Three plain primary tabs answer the stand-up jobs directly: Working now, Recently finished, and Needs coordination. Current work keeps the four progress lanes. Recent completions come from a server-bounded time window. Needs coordination leads with durable directed requests and their receipt, reply and resolution state; server-computed detected overlaps remain visibly separate. The fixed-watermark briefing remains available as a secondary Change history view.
+The frame stays violet in both themes; only its depth changes. Inside the sheet, light mode is a near-white sheet with soft violet and light font weights, and dark mode is a violet-grey dusk sheet with lavender. Theme is `data-bs-theme="light|dark"` on `<html>`, chosen as Light, Dark or Match this device (which follows `prefers-color-scheme`). Density is `data-density="spacious|condensed"`, set on `<html>` from the saved preference before first render; Spacious is the default and only Condensed overrides anything. The world sits on Bootstrap 5.3 and the Hub's `--hub-*` custom properties. `ui/src/twilight.css` loads after `ui/src/styles.css`, re-points the shared tokens and restyles the shared components; this file describes the result.
+
+The world rejects the KPI-card grid and the dense ruled table. Boxes are soft, frameless cards with plenty of air, lists use hairline separators, and colour is held back for state. The Hub is read-only, and the design says so plainly: the rail footer reads "Read-only. Opening a page never changes anything for your agents."
 
 **Key Characteristics:**
-- Ownership, task, and reported action lead each work card.
-- Neutral surfaces and fine borders carry hierarchy.
-- Violet, rose, amber, and green fields communicate labelled work state.
-- Four desktop progress lanes collapse into a mobile lane selector and one visible queue.
-- Recently finished and coordination are first-class overview sections, with visible time and completeness boundaries.
-- No new imagery or decorative assets are part of the Work surface.
+- Deep-violet frame, a light or dusk sheet, and one 26px corner where they meet.
+- A sentence answer leads each page. Nothing visible sits above it.
+- Brand violet marks progress, the current selection and focus. Coral marks trouble and nothing else.
+- Onest for every word, Unbounded only for dark-mode tally numerals, JetBrains Mono only for paths, branches and identifiers.
+- Two densities share every component. Condensed changes measurements, never structure.
+- One authored motion: a task's current stage sweeps in on its lane bar, carrying the holder's face.
 
 ## Colors
 
-The palette is a neutral light/dark canvas with white or deep blue-black content surfaces, a restrained violet accent, and labelled green, amber, and rose state colors.
+Violet carries the structure, near-neutral violet-greys carry the reading, and one warm coral is kept for trouble.
 
 ### Primary
-- **Hub violet, light** (`#4F5BD5`): Navigation, links, focus outlines, lane emphasis, and active controls in the light theme.
-- **Hub violet, dark** (`#7C86FF`): The same accent role in the dark theme.
+- **Twilight Frame** (frame-light / frame-dark): the top bar and nav rail, and the page background behind the sheet. It goes a step deeper in dark mode so the dusk sheet still lifts off it. Names on the frame use **Frame Ink**; resting nav, secondary text and frame icons use **Frame Dim**; the active nav icon and frame focus outlines use **Frame Active Icon**.
+- **Twilight Violet / Dusk Lavender** (brand-light / brand-dark): the "Now" segment of a lane bar, the selected map tile ring, the open tab's underline, merge dots on the catch-up strip, focus outlines, primary buttons, checked boxes, and the hover fill of outline buttons. **Brand Ink** is the text-weight violet (links, the Claimed segment's text, primary-button hover). **Brand Soft** is the tint behind the Claimed segment, a handover, brand notices and the halo of a brand status dot. **On Brand** is the text that sits on a violet fill.
+
+### Secondary
+- **Coral** (coral-light / coral-dark): trouble. A blocked task's Now segment, the crossing pill and crossing tile ring, a failure dot on the catch-up strip, the count of a box whose tone is bad, a bad status dot, the "needs you" and crossing links in the answer, and the rail and bell badges. **On Coral** is the text on a coral fill: white in light mode, near-black (#1c0f0b) in dark mode, where coral is bright. On the always-dark frame, badges use the bright coral in both themes.
+
+### Tertiary
+- **Status** (ok / warn / bad, each with soft and, for ok and warn, fill versions): the fill is the status dot (green for active or observed, amber for paused, quiet or waiting); the soft tint is the dot's 3px halo and the background of a toned notice; the plain token is status text. A paused or quiet task's Now segment is warn-soft with a warn-fill ring.
+- **Avatar hues**: each avatar's fill is derived from a hash of the agent's name (`hsl(h 52% 56%)` with white initials in light mode, `hsl(h 60% 70%)` with #16132a initials in dark). Hues tell agents apart; they never carry state.
 
 ### Neutral
-- **Chrome, light / dark** (`#DDE0EC` / `#05060B`): The top bar and the side rail, one shared surface.
-- **Sheet canvas, light / dark** (`#F6F7FB` / `#181C30`): The page itself, inset in the chrome.
-- **White surface** (`#FFFFFF`): Light content, card, and control surfaces.
-- **Deep surface** (`#1F2438`): Dark content surfaces, with a 1px top highlight (`inset 0 1px 0 rgba(255,255,255,.04)`).
-- **Box head band** (`--hub-surface-head`, `#EEF1F7` / `#282E46`): The tinted head of every evidence box.
-- **Rules** (`--hub-rule` / `--hub-rule-strong`): 10% / 18% ink in light, 8% / 15% white in dark.
-- **Elevated dark surface** (`#1A1E30`): Dark elevated controls and overlays.
-- **Theme text and border:** Use `--hub-text`, `--hub-text-2`, `--hub-text-3`, and `--hub-rule` / `--hub-rule-strong` so contrast follows the active theme.
+- **Canvas** (canvas-light / canvas-dark): the sheet's own ground.
+- **Surface** (surface-light / surface-dark): boxes, the Since card, fields, the active segment of a segmented control, and the ring that separates overlapping avatars and dots.
+- **Sunken** (sunken-light / sunken-dark): map tiles at rest, the area drawer, notices, segmented-control tracks, inline path chips, skeleton lines and lane segments not reached yet.
+- **Ink ramp** (text / text-2 / text-3, both modes): primary reading; secondary reading and status words; counts, times, explanations and column headings.
+- **Rules** (rule / rule-strong): hairlines between list rows; then the tab-strip baseline, outline-button borders, field borders, the catch-up rails and the outline of a lane segment with nothing reported.
 
 ### Named Rules
-**The Semantic Field Rule.** State fields use violet for active or handover, rose for blocked, amber for paused or stale, and green for finished or active assignment; every field includes text.
+**The Coral Is Trouble Rule.** Coral means "a person should look here". It is used for blocked work, crossings, failures and bad counts, and for the answer's links when they point at one of those. Every other link, including a non-trouble link in the answer, is Brand Ink. Never use coral for brand, decoration or neutral time markers.
 
-**The Colour For Meaning Rule.** State is carried by tone, never by grey: a change waiting to merge is violet, one still getting ready is muted, a fully passed landing is green, and failed or blocked is rose. A box takes the tone its data implies (contested files rose when any exist, otherwise green; pull requests touching held files amber when any; workflow runs and recent changes rose when one failed). Counts stay plain and every tone carries text.
+**The Frame Never Changes Hue Rule.** Light and dark swap the sheet, not the world. The frame is deep violet in both modes and only changes depth.
 
-**The Ownership First Rule.** Keep the lead agent and task legible before source identities, bookkeeping, and technical identifiers.
+**The Readable Coral Rule.** Light-mode coral is the deeper #c8432a: 4.69:1 as text on the canvas and 4.89:1 under white text, so it passes AA at every size the build uses. Dark-mode coral is bright, so text on a coral fill goes dark instead of white.
+
+**The Dot Plus Word Rule.** Status is never colour alone. Every dot sits beside a word, and every toned segment or tile carries its label or an accessible name.
 
 ## Typography
 
-**Display Font:** System sans (`-apple-system`, BlinkMacSystemFont, SF Pro Text, Inter, Segoe UI, Roboto, Helvetica Neue, Arial, sans-serif)
-**Body Font:** The same system sans stack
-**Label/Mono Font:** `ui-monospace`, SF Mono, JetBrains Mono, Menlo, Consolas, monospace for identifiers and paths only.
+**Body Font:** Onest variable (with system-ui, -apple-system, Segoe UI, Roboto, sans-serif)
+**Numeral Font:** Unbounded 300 (with Onest), for dark-mode tally numerals only
+**Mono Font:** JetBrains Mono 400 (with ui-monospace, SF Mono, Menlo, Consolas), for paths, branches and identifiers only
 
-**Character:** Compact, direct, and highly legible. Weight and line-height establish hierarchy; the Work surface avoids display faces and ornamental type.
+All three are self-hosted from the `@fontsource-variable/onest`, `@fontsource/unbounded` and `@fontsource/jetbrains-mono` packages, Latin subset only, and inlined into the built CSS as data URIs, because the Hub's Content Security Policy is `font-src 'self' data:`.
+
+**Character:** Onest is a soft, plain grotesque. Light mode sets the big text at light weights, so the sheet reads like a calm note rather than a dashboard. Tabular figures are on everywhere (`font-feature-settings: 'tnum' 1`).
 
 ### Hierarchy
-- **Answer** (550, 22px, 1.38, `-0.015em`, 68ch measure): The one-sentence answer under each page's question. Facts inside it are 700-weight links with a thin offset underline, coloured by tone; the question above it is a 14px 600 `--hub-text-3` heading.
-- **Display** (700, `clamp(24px, 2.5vw, 28px)`, 1.12): Work detail titles.
-- **Title** (700, 24px on narrow screens, 1.12): Mobile title treatment and detail headings.
-- **Body** (400, 14px, 1.5): Card content, descriptions, action text, and history rows.
-- **Label** (650, 12px, 1.4, `0.03em`): Lane counts, table headings, state labels, and compact metadata.
-- **Supporting text** (400, 13px): Timestamps, source hints, and secondary ownership context.
+- **Answer** (300 in light mode, 400 in dark; clamp(26px, 2.8vw, 34px); 1.25; −0.025em; at most 28ch): the sentence that leads each page. Bold counts step up to 500 in light and 600 in dark. Links in it are weight 500 with a 1.5px underline offset 6px. Condensed sets it at 21px, 1.3, up to 60ch. A record's own page shows its title at the same size in place of the hidden question.
+- **Headline** (300 light / 400 dark, 22px, 1.4; 17px on phones, 15.5px in Condensed): the summary sentence of the "Since you last checked" card.
+- **Title** (600, 16px, −0.01em; 14px in Condensed): box titles, the Since card title and the area-drawer heading.
+- **Tab** (600, 15px; 14px in Condensed and on phones): Dashboard tab labels. Need-you row titles use 600 at 15px too.
+- **Body** (400, 14.5px; 13.5px in Condensed): all running text, task titles and tile names.
+- **Label** (500, 12.5px): status words, lane-bar segment text (600 labels), tab status lines, column headings (600, text-3, sentence case) and meta lines.
+- **Explain** (400, 13px, 1.45, text-3, up to 80ch; 12px in Condensed): the explanation under every box title.
+- **Numeral** (Onest 300, 20px in light; Unbounded 300, 17px in dark): the counts in the Team tallies.
+- **Mono** (12.5px; 11.5px on tiles and branches): file paths, branches, the folder under a tile name and technical identifiers. Nothing else.
 
 ### Named Rules
-**The System Sans Rule.** Use the system sans for product copy and reserve monospace for identifiers, source paths, branches, and work IDs.
+**The Plain Voice Rule.** Every word on screen is Onest. Unbounded appears only as a dark-mode tally numeral and JetBrains Mono only as a path, branch or identifier.
+
+**The Answer Has No Eyebrow Rule.** Nothing visible sits above the answer sentence. The question lives under the active rail item and in a visually hidden h1.
+
+**The Sentence Case Rule.** Headings, tab labels and column heads are sentence case. No tracked uppercase labels.
 
 ## Layout
 
-The Work surface begins with section navigation, a direct heading, read-only load status, and plain Working now / Recently finished / Needs coordination tabs. Search and counts apply only to the returned overview slice. The overview identifies its request-time upper bound and exposes incomplete current, recent, or overlap slices rather than implying a global all-clear. While the page is visible, the overview refreshes every 15 seconds without resetting the selected tab or search. A failed refresh keeps the last readable snapshot and labels its load time and error.
+The shell is a 236px frame rail (72px when collapsed to icons) beside the sheet, under a 62px frame top bar. At 960px and below the rail becomes a drawer over a scrim and the sheet loses its corner. Inside the sheet the page is one centred column with sections `--hub-gap` apart.
 
-Current work uses four desktop progress lanes: In progress, Blocked, Handover, and Paused. The board is a four-column grid with 14px gaps, 12px lane corners, 14px lane-heading and 10px card insets, and an internally scrolling height of `clamp(240px, calc(100dvh - 570px), 460px)`. Recently finished uses a two-column task grid with the exact overview window above it. Needs coordination starts with a fixed-watermark page of compact directed-request summaries. Each summary exposes the stage, proposal, requester-to-target relationship and first concrete path reason; its native disclosure reveals all returned paths, receipts, responses and notes. Detected overlaps, other attention signals and recent decisions remain separate, count-labelled disclosures that are collapsed by default.
+- **Spacious (default):** the page column is capped at 1160px. The sheet is padded 44px at the top and clamp(20px, 4vw, 60px) at the sides. Sections are 32px apart, the answer sits 40px above what follows, card insets are 26px, list rows have 16px of vertical padding, nav rows are 40px and lane bars 34px.
+- **Condensed:** the column widens to 1440px. The sheet drops to 22px and clamp(14px, 2vw, 28px), the gap to 16px, the answer gap to 18px, card insets to 16px, rows to 9px, nav rows to 32px and lane bars to 28px. Body text steps down 1px. The track hides each task's "Next:" line and map tiles hide their activity line. Structure, order and components stay the same.
+- **Mobile (760px and below, either density):** sections are 20px apart, the sheet is padded 26px at the top and 16px at the sides, the answer gap is 24px and card insets 18px. The track drops its column header and stacks each task over its lane bar. The map becomes two columns, the area drawer one, and the Dashboard tabs scroll sideways at their natural width.
+- **Phones (640px and below):** the top bar keeps only what a person acts on (menu, repository, search, health, inbox, account) with 44px icon targets. Theme and density move to Setup › Preferences.
 
-At 860px and below, the board becomes two columns, directed-request targets become a single queue, and detected-overlap rows stack the reason above the involved work. Change history keeps its date column in the stacked record. At 640px and below, the Work surface uses 16px horizontal padding with an 8px side bleed, controls keep 44px targets, lane buttons wrap at a 110px basis, only the selected lane is visible as one scrollable queue, recently finished becomes one column, and each involved work item receives its own separated row. The search input remains visually present while its redundant label is visually hidden and remains available to screen readers.
+Two-column pages use a 1fr main column with a 280–340px side column (Team) or two equal columns (Where's contested files and pull requests); both stack to one column at 1100px.
 
-## Density
-
-**The Two Densities Rule.** The Hub has two density modes, chosen in Settings and stored per browser (`agentscm.density`, set on `<html data-density>` before first render). **Spacious** is the default; **Compact** is the dense register for big screens and is exactly the layout the sections above describe. Spacious overrides tokens only, all in `ui/src/density.css` (tour card values at the end of `ui/src/tour/tour.css`); the rules in `styles.css` carry the compact value as the `var()` fallback, so Compact sets nothing.
-
-| Token | Compact | Spacious (phone) |
-| --- | --- | --- |
-| Body size (`--bs-body-font-size`) | 14px | 15px |
-| Section and page gap (`--hub-gap`) | 24px | 32px (26px) |
-| Masthead space below (`--hub-answer-pad`) | 28px | 36px (28px) |
-| Space above the page (`--hub-main-top`) | 28px (22px) | 36px (26px) |
-| Question to answer gap (`--hub-answer-gap`) | 8px | 12px (10px) |
-| Top bar (`--hub-top-h`) | 56px | 62px (56px) |
-| Box head (`--hub-head-h`, `--hub-head-x`) | 52px, 18px | 58px, 22px (54px, 18px) |
-| Box body (`--hub-pad-box`) | 16 18 18 | 20 22 22 (18 18 20) |
-| List row (`--hub-row-y`) | 12px | 16px (14px) |
-| Activity row (`--hub-event-y`) | 8px | 11px (10px) |
-| Nav row, group gap (`--hub-nav-h`, `--hub-nav-group`) | 40px, 18px | 44px, 24px |
-| Lane and work-card padding | 11 14 10 / 12 14 | 14 16 12 / 16 18 (12 14 11 / 14 16) |
-| Tour card width (welcome) | 400 (480) | 500 (580) |
-| Tour card type | as built | title 1.45rem, lead 1.0625rem, rows 0.97rem (phone: title 1.25rem, lead 1rem) |
-| Tour card band, hero, padding | as built | 116px, 188px, 24/30 (phone band 96px) |
-| Tour buttons, trail nodes, ring | as built | 44px buttons, 10px nodes, 20px ring |
-
-Touch targets stay at 44px in both modes and phones get the lighter increase.
+**The Same Room, Fewer Steps Rule.** Density is a measurement switch, not a different layout. A component that exists in Spacious exists in Condensed in the same place. The view menu says so: "Condensed changes measurements only. Every page keeps the same parts in the same places."
 
 ## Elevation & Depth
 
-**The Three Planes Rule.** The Hub has three planes, each one tonal step apart, so navigation never reads as content: **chrome** (`#DDE0EC` / `#05060B`; the top bar and rail share one tinted surface with no dividing rules), the **sheet** (`#F6F7FB` / `#181C30`; the content column, inset with a 14px top-left radius and a clearly visible edge, carrying the breadcrumbs as its own header line), and **surfaces** (`#FFFFFF` / `#1F2438`; boxes and cards on the sheet). Tiles inside a box are tonal (`--hub-sunken`), never bordered, so a box never holds more boxes. On screens up to 960px wide the rail becomes a drawer and the sheet loses its corner. `main` takes focus on navigation for assistive technology but shows no ring, because it isn't a control.
+Depth is mostly tone: the frame is darkest, then the canvas, then surface cards, with sunken wells inside cards. Cards add one very soft lift. In light mode that is a 1px ambient shadow plus a long, faint violet-tinted drop; in dark mode it is a hairline ring, an inset top highlight and a deep drop. The sheet has no shadow; tone and its corner separate it from the frame. Map tiles and lane segments are flat and change state with inset rings.
 
-The Work register is flat and structural. Depth comes from tonal lane fields, a one-pixel `--hub-rule` rule, white or deep content surfaces, and a small violet hover tint. The feature adds no shadow vocabulary or decorative gradient. Focus-visible targets use a 2px violet outline with a 3px offset, and reduced-motion users receive no row hover transition.
+### Shadow Vocabulary
+- **Card lift** (light: `0 1px 2px rgba(29,28,40,.03), 0 20px 40px -30px rgba(70,55,160,.22)`; dark: `inset 0 1px 0 rgba(255,255,255,.03), 0 0 0 1px rgba(255,255,255,.055), 0 24px 48px -32px rgba(0,0,0,.9)`): every box, the Since card and a record page's action grid.
+- **Menu pop** (light: `0 24px 48px -20px rgba(23,20,46,.4), 0 2px 6px rgba(23,20,46,.06)`; dark: `0 30px 60px -24px rgba(0,0,0,.85), 0 0 0 1px rgba(255,255,255,.08)`): popover menus from the top bar, which float over both frame and sheet.
+- **Thumb** (light: `0 1px 2px rgba(20,16,50,.08), 0 4px 10px -4px rgba(20,16,50,.18)`): the active segment of a segmented control only.
+- **Drawer edge** (`24px 0 48px -24px rgba(0,0,0,.6)`): the rail when it opens as a drawer at 960px and below.
 
 ### Named Rules
-**The Visible Step Rule.** Each plane is at least one visible tonal step from its neighbour in both themes; if nav, header and sections read as one grey field, raise the step, not the borders.
+**The Inset State Rule.** Tiles and lane segments change state with inset rings: 1px rule-strong on tile hover, 2px brand when a tile is selected, 2px coral on a tile with a crossing, 1.5px current colour on lane-segment hover. They never lift.
 
-**The Masthead Rule.** The question, its one-sentence answer and any facts row form a masthead: the question carries its page icon in brand ink, the answer stays at reading size, and a full-width hairline with 28px of space below separates it from the content.
-
-**The Head Band and Cap Rule.** Every box head is a `--hub-surface-head` band under a 2px top cap, the same vocabulary as the Work lanes. Ok, warn and bad boxes cap in their tone; brand boxes cap quietly (brand at low strength) and muted boxes in `--hub-rule-strong`.
-
-**The Section Rhythm Rule.** Stacked boxes sit 24px apart (`--hub-gap`); the masthead hairline adds 8px before the first section.
-
-**The Sentence Case Rule.** No tracked uppercase eyebrows: nav group heads, owner group heads, work-card Next and Blocker labels and table headings are 12px, weight 650, `--hub-text-3`, in sentence case. Inline links carry no appended arrow; arrows stay on real Next, Back and relationship glyphs.
-
-**The Bounded Register Rule.** Keep the active page compact, keep pagination in the reading path, and let the fixed watermark define the briefing boundary.
-
-**The Flat Work Rule.** Use tonal fields and restrained borders before adding elevation to a coordination row or detail section.
+**The Flat Sheet Rule.** The sheet never casts a shadow and a box never sits inside another box. Inside a card, depth is a sunken well or a hairline rule.
 
 ## Shapes
 
-The Hub uses gently rounded controls and surfaces: 12px is the primary control and box radius, lanes use 12px, cards 10px, info bars 10px and nav rows 8px, the sheet's inset corner is 14px, and 20px remains the large theme radius. Lane headings follow the containing lane's corner. Focusable controls keep a minimum 44px height. The history table uses separators and stacked records rather than card decoration.
+Soft and round throughout. Boxes and the Since card use 20px corners (14px in Condensed). Map tiles, the area drawer and textareas use 16px (12px for tiles in Condensed). Notices use 14px, popover menus 18px with 12px items, and nav rows 12px (8px in Condensed). Every interactive control (buttons, fields, search, segmented controls, catch-up lane names, breadcrumbs) is a full pill. Status dots, avatars, icon buttons and need-you icons are circles. Lane-bar and inbox-bar segments have 5px and 3px inner corners with pill-rounded ends. The only square-shouldered marker is the 6px outlined muted tag (for example "Draft"), and inline paths sit on a 6px sunken chip. The sheet has a single 26px curve at its top left; its other corners are square against the frame.
 
 ## Components
 
-### Navigation rail
-- **Shape:** A 248px rail (68px compact) on the chrome surface with no dividing rule. Group heads are sentence-case 12px 650 `--hub-text-3` labels; on desktop their explainers appear on hover or focus, and in the mobile drawer they are always visible. Rows are 40px, with a plain 20px icon in `--hub-text-3` and a 550-weight label.
-- **Behavior:** The active row takes the `--hub-nav-active` tint, a violet icon and a 650 label, and shows the page's question beneath it, wrapped rather than truncated. Other rows keep their question in the accessible name only, since each page opens with its question as its heading. The mobile drawer has room for the questions and no hover, so it shows every one. Badges stay compact counts beside the label, or a corner dot in the compact rail.
+### Answer
+A sentence, not a header. There is no rule under it and nothing visible above it. The h1 holds the page's question and is clipped from view; the answer paragraph is `aria-live="polite"`. On the Dashboard it reads, for example, "2 agents are working on 3 tasks. 1 thing needs you. 1 crossing." The "needs you" and crossing counts are coral links: following one scrolls to its box and rings it once with a soft violet pulse. When nothing needs you, the sentence says "Nothing needs you." in plain text. An optional fact line under it is 14.5px text-2, up to 70ch.
 
-### Top bar
-- **Shape:** It sits on the chrome surface, with the search field and the header "Connect agent" action as white controls with hairline borders. The header action is deliberately secondary (an outline button with violet text) so each page's filled primary action stays the only filled violet on screen.
+### Box with frameless head
+- **Corner Style:** 20px (14px in Condensed), card lift, no border.
+- **Head:** transparent, with no divider, no icon and no tinted band. The title is 16px 600; the count sits plain on the right in 13px 500 text-3, or coral 700 when the box's tone is bad; the explanation spans the full width beneath.
+- **Internal Padding:** head 22px 26px 6px and body 14px 26px 26px; Condensed 12px 16px 2px and 8px 16px 14px; mobile 18px 18px 4px and 10px 18px 20px.
 
-### Evidence boxes
-- **Shape:** 12px-corner surfaces under a 2px tone cap, with a 52px head band (`--hub-surface-head`) of a plain 20px icon (tinted only for ok, warn or bad tones), a 16px 650 title, a plain count and an explainer at 0.8 rest opacity (at least 3:1 against the surface in both themes) that reaches full opacity when the box is hovered or the explainer focused, then a hairline rule over the body.
-- **Behavior:** The head labels the data; it doesn't compete with it. Rows inside a box are separated by rules or proximity, not nested cards.
+### Section tabs
+The Dashboard (and any rail item with more than one page) shows its pages as equal columns over a 1px rule-strong baseline. Each tab is a label over its live status: "1 needs you" with a coral dot, "No crossings" with no dot, "Last event 4 min ago" with a violet dot, "2 of 3 awake" with a green dot. The open tab is text colour with a 2px brand underline; hover shows a rule-strong underline. Tabs are links (`#home`, `#now`, `#activity`, `#team`) with `aria-current="page"`.
 
-### Info bars
-- **Shape:** One `Notice` pattern: a 10px-corner surface bar with a hairline in the tone and the tone on the icon. Warnings and errors add a soft tinted fill so problems still stand out. Retry and similar actions sit vertically centred at the end.
+### Status dot and muted tag
+A 7px dot with a 3px soft halo in its tone, then a 12.5px 500 word in text-2. A bad dot is coral. Muted metadata (a client, a draft) is instead a 6px-cornered outlined tag with no dot.
 
-### Tabs and pills
-- **Tabs:** One vocabulary across pages: an underline strip with a 2px violet indicator under the active tab, used for both button tabs and link tabs. Counts are small neutral or warning pills.
-- **Pills:** State pills keep a soft tonal fill, an icon and text. Muted pills are metadata and use a hairline outline instead of a fill. Inside agent rows, the connection (`Hook · Codex`) is plain secondary text. Pills may wrap inside narrow cards rather than overflow.
+### Buttons, fields and choices
+- **Shape:** full pill, 14px side padding (12px for small, at 13px).
+- **Primary:** brand fill with On Brand text; hover and press go to Brand Ink.
+- **Outline (secondary):** transparent with a rule-strong border and text-colour label; on hover it fills brand with On Brand text.
+- **Picked:** a picked choice in a group, a picked density, or a picked catch-up lane is the ink pill: text-colour fill with surface-colour text.
+- **Fields:** pill on surface with a rule-strong border; textareas use 16px corners.
+- **Focus:** a 2px brand outline offset 3px everywhere on the sheet; controls on the frame use a 2px Frame Active Icon outline offset 2px.
 
-### Progress lanes
-- **Shape:** Four 12px-corner lanes on desktop with a sticky 76px heading and a scrollable card list; a defensive fifth finished lane may span the board when returned data requires it.
-- **Content hierarchy:** Agent and login, task title, labelled state and claim, reported blocker or next action, participants, then last check-in.
-- **State fields:** Each lane is a quiet tonal column whose state colour sits in a 2px top cap and the heading icon: violet for active and handover, rose for blocked (its heading text is rose too), amber for paused, and green for finished. Old or unknown check-ins say “still assigned.” Finished work has no assignment claim or warning.
+### Navigation
+- **Rail:** frame background. Rows are `--hub-nav-h` tall (40px, 32px in Condensed) with 12px corners, Frame Dim icon and 500 label. Hover adds a 5% white wash. The active row takes a 13% white wash with a 1px inner ring, a white 600 label, a Frame Active Icon and the item's question beneath it in 12.5px Frame Dim; other rows keep their question for screen readers only, and the drawer shows every question. Badges are compact counts: bright coral with dark text for trouble, translucent amber for waiting. A collapse control reduces the rail to icons with tooltips.
+- **Items:** Dashboard (Now, Where, Catch up, Team), Inbox, History (Finished, Changes, Change records, Files), Timeline, Skills (Skills, Checks, After merge, Recipes) and Setup (Agents, Hub, Access, Preferences).
+- **Top bar:** frame background with a faint 6% white bottom rule. From left: the menu button (narrow screens only), the logo, the repository button (a pill that opens the repository menu), the search pill ("Search agents, files, work…" with its shortcut key), then on the right the health chip (a 7px green dot and "Hub live", or a coral dot with peach text for "Reconnecting" or "Degraded"), the page tour (a round question-mark button), the inbox bell with a coral or amber count, the view menu and the account avatar. Frame icon buttons are 38px circles that take an 8% white wash on hover.
+- **View menu:** Theme as Light ("A white sheet in the violet frame"), Dark ("A dusk sheet, the frame a step deeper") and Match this device; Density as Spacious or Condensed pills; then the density note.
+- **Breadcrumbs:** only deep pages (a run, a step, a saved moment) carry a quiet pill trail above the page.
 
-### Work cards
-- **Shape:** Neutral 10px-corner cards with 14px padding, a one-pixel border, and an 8px internal gap. The reported next action is text under a small label rather than a nested panel; only a blocker keeps a rose field. Check-in time and source share a ruled footer that wraps rather than splitting words.
-- **Behavior:** Source identity is compact and secondary. The title link, lead, state, and reported action form the primary scan path; participant details follow when present. Cards carry the state label. In the In progress lane a live claim is the normal case, so the claim chip appears only when it needs attention (no recent or unknown check-in, still assigned). In Blocked, Handover and Paused, the card always shows the claim, Assigned or still assigned, because that is where an idle-looking task could be mistaken for available work.
+### Needs you
+A box listing only decisions for a person: a blocker, a task whose agent went quiet, a handover, two agents holding one file, two tasks planning the same files, or a pull request touching held files. Each row is a 30px circle icon drawn as a 1.5px ring in its tone (Brand Ink, warn or coral), a 15px 600 title, a text-2 body and a 13px text-3 line saying what to do next. Rows are separated by hairlines. When empty it says "Nothing needs you" beside a green check. Its explanation states that reading the page answers none of them.
 
-### Recently finished
-- **Shape:** A two-column task grid on larger screens and a single queue on narrow screens, preceded by the exact server-provided start and end times.
-- **Behavior:** Completion is worded as agent-reported. The section explicitly says it does not confirm verification, review or merge. Clipped results and retained-history gaps are labelled incomplete, including when no completion remains visible.
+### The track and its lane bar
+Every unfinished task as one row: a task column (180–260px; 160–230px in Condensed) with the title link, its status dot and word, its branch in mono, and a check-in line, then the lane bar, then the agent's own last words in one ellipsised line with their time.
+- **Lane bar:** four segments in a pill-ended capsule with 3px gaps, sized 1fr : 3fr : 1fr : 1fr, under one column header: **Claimed · Now · Next · Finished**.
+- **Claimed:** Brand Soft with Brand Ink text and a check; its tooltip names who claimed it and when.
+- **Now:** the one wide segment. Brand fill with On Brand text, the holder's 24px avatar (20px in Condensed) ringed in On Brand, then "In progress · note" in words. A handover is Brand Soft with a 1.5px brand ring. Paused work, and any claim gone quiet or unknown (the label reads "Quiet" or "Unknown"), is warn-soft with a 1.5px warn-fill ring. Blocked fills coral with On Coral text.
+- **Next:** an outline in rule-strong; its tooltip gives the reported next step, or says none was reported and fades the icon.
+- **Finished:** sunken with a muted flag. The track holds only unfinished work, so it is never filled; its tooltip says a finished report still doesn't prove review or landing.
+- **Narrow** (the bar's container under 560px): the other segments become 34px icon chips and the Now segment takes the rest, stacking its label over its note so neither is cut off.
+- **Check-in line:** a 7px dot and words: green "Checked in 3 min ago", or amber "No check-in since … · still assigned" or "Check-in unknown · still assigned".
 
-### Coordination rows
-- **Shape:** A flat, ruled row with the concrete overlap reason on one side and two equal involved-work columns on the other.
-- **Behavior:** Reasons pair the server-returned paths directly. Each side identifies the agent, human owner, task link, and declared scope. The bounded path-witness list warns when additional overlaps were omitted and points to both full scopes. Missing scope and stale or unknown check-ins remain visible as separate attention signals. The interface never computes a global overlap from a displayed page or implies that detecting one sent a coordination request.
+### Repository map (Where)
+Up to 12 tiles, one per top-level folder that an agent holds files in or a task declared it will touch, in an auto-fill grid (190px minimum, 116px rows, 10px gaps; 160px, 88px and 6px in Condensed; two columns on mobile). A tile is a sunken button whose background mixes in up to 22% brand by how many people are there. It shows the folder name (14.5px 600), its path in mono, up to five overlapping 26px faces ringed in sunken (then "+N"), and "N editing · N tasks planned". A crossing adds a coral pill at the top right and a 2px coral inset ring. Picking a tile rings it in brand and opens the area drawer below: a sunken 16px panel with three columns, Editing now, Tasks planned here and Crossings. Quieter folders beyond 12 are counted, not hidden silently.
 
-### Directed request queue
-- **Shape:** A ruled, fixed-watermark request list. Each compact native disclosure summary carries the proposal, stage, requester-to-target route and a concrete overlap reason. Expanding it reveals current target leads in equal 12px-corner subregions with receipt state, response state, all returned path reasons, message and time. Pagination remains directly after the compact list.
-- **Behavior:** Overall stages read Awaiting receipt, Awaiting replies, Replied, Resolved or Withdrawn. Receipt and response are evaluated against each target's recorded generation. The dashboard initially requests active items only; a checkbox includes resolved and withdrawn requests. The fresh first page refreshes every 15 seconds while visible, so agent replies can appear while someone watches. Following Previous or Next freezes the first-page watermark and every subsequent page to the same bounded snapshot; Refresh requests returns to a new first-page snapshot. Reading never acknowledges, replies to, resolves or withdraws a request; agents perform those actions through authenticated MCP or HTTP flows. Target path reasons and request receipt/response projections are bounded. Explicit warnings identify omitted paths or history, and an incomplete projection never becomes an inferred receipt or reply; the server request status remains authoritative.
+### "Since you last checked" card (Catch up)
+A sentence, then a picture of the time away. The head holds the title, the range ("08:00 → now") and an outline "Mark reviewed" button. The headline sentence follows with bold counts, and a coral "Needs a look: N blocked tasks." when something is blocked.
+- **Lanes:** three rows, Merged, Work and Between agents, each a pill name with its count beside a 1px rule-strong rail, with one dot per retained record at its time. Work dots are 9px text-2 ink, merges 11px brand, agent messages amber, and a blocked task a 13px coral dot with a soft halo. Each dot is ringed in the card surface so clusters stay countable.
+- **Lane names are filters:** picking one turns it into the ink pill, dims the other rails to 30% and narrows the list; picking it again shows everything.
+- **List:** newest first, five items, then a link to show the rest. Each row has its toned icon and a collapsed technical disclosure.
+- **Foot:** each source's coverage as a 7px dot and word (green observed, amber partial, coral unavailable), and a technical disclosure.
+- **Honesty:** opening, refreshing or paging the card never marks anything reviewed, and the card says so. Marking is the explicit button. When retention has a gap, an amber note says the missing interval cannot be treated as quiet and the button reads "Mark available records reviewed". A partly loaded delivery must be loaded fully before it can be marked.
 
-### Search and history pagination
-- **Shape:** Search and selects use 44px controls and a 12px radius. Mobile lane buttons wrap with 44px minimum height and an `aria-pressed` selected state.
-- **Behavior:** Overview search and counts are scoped to the returned snapshot. Change-history search, filters, and counts are page-local. The dashboard remains read-only and uses GET overview, coordination-list, briefing, and work-detail boundaries only.
+### Team
+Who is working right now, grouped by person ("jonny · 2 agents · leads 1 task"), each agent with a 10px corner dot on its avatar: green if it reported activity in the last five minutes, amber if quieter but still holding files. Beside it, the **Lately** tallies: a ruled list of counts (sessions started, work announced, edits refused, edits repeated and let through, handoffs asked, warnings sent) with the numeral on the right; zero rows go text-3.
 
-### Recent changes table
-- **Shape:** A distinct five-column table with sticky headings, 12px vertical and 14px horizontal cells, and a separately bounded scroll region. At 860px it becomes stacked records while preserving title, owner, status, reported context, and date.
-- **Behavior:** Dates use the viewer's local format. The dashboard does not acknowledge the briefing.
+### Inbox bar
+Under the Inbox answer, one 10px-tall segmented bar (up to 260px wide) with one segment per item: coral for an overlap that needs a conversation, amber for a request waiting on another lead, rule-strong for another signal, and Brand Soft with a brand inset for a settled request. Beside it: "N overlaps · N open requests · N other signals".
 
-### Detail disclosure
-- **Shape:** Reported blocker, next action, and last check-in appear as a three-cell action grid with a one-pixel border; the grid stacks on narrow screens.
-- **Behavior:** Technical identifiers use a native “Technical details” disclosure and stay collapsed by default. Read-only detail inspection uses the authorized work ID path.
+### Notices and empty states
+- **Notices:** a quiet tinted note, never an alarm band: sunken (or the tone's soft tint) with 14px corners and no border; a bad notice draws its icon in coral. Retry actions sit at the end as small outline pills.
+- **Empty states:** left-aligned, with a 34px ring icon, a 600 title and a text-3 line saying what will make something appear.
+
+### Motion
+- **The baton ride:** when a task's state, claim or holder changes between refreshes, its Now segment sweeps in from the left (a clip-path reveal, 0.7s, `cubic-bezier(.16, 1, .3, 1)`) and the holder's avatar slides in from 38px to the left over 0.9s, sharpening from blurred and faint. This is the world's one authored moment.
+- **Feedback only:** a box rings once (1.4s) when an answer link jumps to it, the area drawer settles in over 0.4s, and tile tint and rings ease over 0.3–0.5s.
+- With `prefers-reduced-motion: reduce`, the ride, the ring and the drawer animation stop, smooth scrolling becomes instant, and tile, lane, tab, button and rail transitions are removed.
 
 ## Do's and Don'ts
 
 ### Do:
-- **Do** keep four progress lanes as the normal desktop current-work model, with finished rendered only defensively when page data includes it.
-- **Do** keep the three primary overview labels literal: Working now, Recently finished, and Needs coordination.
-- **Do** show the exact recent window and explicit completeness state returned by the server.
-- **Do** show overlap reasons, involved agents, declared scopes, and work links together.
-- **Do** show durable directed requests before raw detected overlaps, with per-target receipt and reply state.
-- **Do** lead with agent, task, and reported blocker or next action.
-- **Do** pair every state field with an explicit text label and retain “still assigned” for stale or unknown claims.
-- **Do** keep search, filters, and counts scoped to the fetched page and preserve fixed-watermark pagination.
-- **Do** keep the search input visible on mobile, hiding only its redundant visual label while preserving its accessible name.
-- **Do** preserve read-only GET boundaries, visible keyboard focus, and local history dates.
+- **Do** lead every page with its answer sentence at clamp(26px, 2.8vw, 34px), or 21px in Condensed, and keep the question in the rail and the hidden h1.
+- **Do** keep the frame deep violet in both themes and give the sheet its single 26px top-left corner.
+- **Do** draw unfinished work as the four-part lane bar, Claimed · Now · Next · Finished, with the wide Now segment naming the state in words and showing the holder's face.
+- **Do** show a quiet or unknown claim as amber and "still assigned", never as free work.
+- **Do** show status as a 7px dot with a soft halo plus a word.
+- **Do** make every control a full pill and every container a soft 20px card (14px in Condensed).
+- **Do** switch density by changing measurements only, keyed on `html[data-density='condensed']`.
+- **Do** self-host fonts from the @fontsource packages and inline them, so they load under `font-src 'self' data:`.
+- **Do** honour `prefers-reduced-motion` for every animation and transition you add.
 
 ### Don't:
-- **Don't** turn current work and recent changes into one chronological feed.
-- **Don't** derive repository-wide overlaps from a visible page or claim an all-clear when the overview is incomplete.
-- **Don't** imply that opening the dashboard acknowledged a request or that overlap detection alone delivered one.
-- **Don't** imply that stale or unknown claims are available work.
-- **Don't** show an assignment claim or warning on reported-finished work.
-- **Don't** use status color without its text label.
-- **Don't** introduce a large hero, new decorative imagery, or a second visual world inside this section.
+- **Don't** put an eyebrow, kicker or visible question above the answer.
+- **Don't** use coral for anything except trouble, including links in the answer that point at trouble.
+- **Don't** let a lane bar, tile or tally claim review, verification or landing. Finished means an agent reported it finished.
+- **Don't** mark anything reviewed, acknowledged or answered because someone opened, refreshed or paged a view. Only an explicit button does that, and it names what it covers.
+- **Don't** load fonts from Google Fonts or any other CDN.
+- **Don't** set any word in Unbounded except dark-mode tally numerals, or any non-path text in JetBrains Mono.
+- **Don't** add icons, dividers or tinted bands to box heads, or nest a box inside a box.
+- **Don't** build a grid of separate KPI cards or a dense ruled table for the dashboard.
+- **Don't** show tile or segment state by lifting with a shadow. Use inset rings.
+- **Don't** add a second authored motion. The baton ride is the moment.

@@ -24,9 +24,9 @@ describe('skills routes', () => {
     ['#skills/runs/a/b', 'runs'],
     ['#skills/other', 'library'],
   ])('%s → %s', (hash, kind) => expect(skillsRoute(hash).kind).toBe(kind))
-  it('belongs to the Verify group and has crumbs', () => {
+  it('belongs to the Skills nav item and has crumbs', () => {
     const s = SECTIONS.find((x) => x.key === 'skills')!
-    expect(s.group).toBe('Verify')
+    expect(s.nav).toBe('skills')
     expect(sectionFromHash('#skills/runs/run_41')).toBe('skills')
     expect(crumbsFor('#skills/runs/run_41', s, null).map((c) => c.label)).toEqual(['Skills', 'Runs', 'Run run_41'])
     expect(crumbsFor('#skills', s, null)).toHaveLength(1)
@@ -94,9 +94,11 @@ describe('Skills page against the mock hub', () => {
     expect(screen.getAllByText('How it works').length).toBe(2)
     expect(screen.getAllByText('Full procedure').length).toBe(2)
     expect(document.body.textContent).toContain('same agent token and session')
-    // Adopted pr-gate uses the pin's walkthrough (merge method squash); numbers come from <ol>, not the text.
-    const steps = screen.getAllByRole('listitem').filter((li) => li.textContent?.startsWith('Tests: The author runs the tests'))
-    expect(steps.length).toBeGreaterThan(0)
+    // Adopted pr-gate uses the pin's walkthrough (merge method squash); numbers come from the track, not the text.
+    expect(screen.getAllByText('The author runs the tests on the exact head commit.').length).toBe(1)
+    expect(screen.getAllByText('Blocks finish').length).toBe(3)
+    expect(screen.getAllByRole('heading', { name: 'pr-gate v1' }).length).toBe(1)
+    expect(document.body.textContent).not.toContain('name: pr-gate')
     expect(screen.getAllByText(/Needs: the merge \(squash\)/).length).toBe(1)
     expect(screen.queryByText(/^1\. /)).toBeNull()
     expect(screen.getByText(/Planned: merge check/)).toBeTruthy()

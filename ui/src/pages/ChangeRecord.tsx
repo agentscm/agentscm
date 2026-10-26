@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react'
+import { SectionTabs } from '../TopNav.tsx'
 import {
   fetchChangeRecord,
   fetchConversationBody,
@@ -24,7 +25,7 @@ import {
 } from '../changeRecord.ts'
 import { searchStandupWork, validWorkId, type WorkState } from '../standup.ts'
 import { StatePill } from './Work.tsx'
-import { Ago, Box, Empty, Explain, Icon, Notice, Path, Paths, Pill, Reported, Skeleton, relative, type Tone } from '../ui.tsx'
+import { agentLabel, Ago, Box, Empty, Explain, Icon, Notice, Path, Paths, Pill, Reported, Skeleton, relative, type Tone } from '../ui.tsx'
 import { Combobox, type ComboResult } from '../Combobox.tsx'
 import { hashPath, Pager, useHashCursor } from '../Pager.tsx'
 import { usePoll } from '../usePoll.ts'
@@ -164,8 +165,10 @@ function Lookup({ token }: { token: string }) {
     <div className="page">
       <div className="answer" data-tour="answer">
         <h1 className="page-question">What is ready to hand off?</h1>
-        <p className="answer-text">Open a work item to see its source, recorded checks, decision, gaps and next action.</p>
+        <p className="answer-text">Pick a task to see what is ready to hand off.</p>
+        <p className="answer-fact">Each record shows the source, recorded checks, decision, known gaps and next action.</p>
       </div>
+      <SectionTabs />
       <Box icon="search" title="Open a change record" explain="Search by title, agent, branch or issue number, or paste the durable work ID shown on the Work page or returned by an agent.">
         <div className="lookup">
           <Combobox
@@ -189,7 +192,7 @@ function Lookup({ token }: { token: string }) {
                   label: (
                     <>
                       {w.title}
-                      {w.lead_agent ? <span className="small muted"> · {w.lead_agent}</span> : null}
+                      {w.lead_agent ? <span className="small muted"> · {agentLabel(w.lead_agent)}</span> : null}
                       {w.branch ? <> <code className="branch-name small">{w.branch}</code></> : null}
                     </>
                   ),

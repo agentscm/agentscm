@@ -54,14 +54,14 @@ The response contains two independent sections:
 
 `retention_gap: true` means some requested history is no longer retained. Do not turn that gap into an empty or complete history claim. A writable agent briefing has a delivery identifier. Acknowledge it only after every page was delivered successfully; acknowledgement advances only that token and subscriber/session's boundary for the repository. Repeat `subscriber` on each continuation; the delivery records which subscriber an acknowledgement advances. Separate sessions cannot consume each other's recap when they use distinct subscriber identities. Omitting `subscriber` on the HTTP API keeps a token-level compatibility cursor. MCP and supported startup hooks resolve the current session automatically. A read-only token receives authorized inspection data without a delivery identifier and cannot acknowledge or mutate work.
 
-The Work dashboard separates **Working now**, **Recently finished** and **Needs coordination**. Working now preserves the progress lanes and identifies the lead, participants and next action. Recently finished uses a server-reported time window, independent of acknowledgement, and includes actual reported completion and decision checkpoints. Needs coordination shows durable directed requests, per-lead receipt and reply state, and recorded resolutions. Detected scope overlaps are listed separately: detection alone is not delivery or resolution.
+The Hub spreads this across three places. **Dashboard › Now** lists what needs a person, then every unfinished task as one lane (claimed, where it is now with its lead, its next step, finished) with the lead's latest report. **History › Finished** uses a server-reported time window, independent of acknowledgement, and includes actual reported completion and decision checkpoints. The **Inbox** shows durable directed requests, per-lead receipt and reply state, and recorded resolutions. Detected scope overlaps are listed separately there: detection alone is not delivery or resolution.
 
 The dashboard reads current Work without changing assignments or acknowledging coordination requests or agent briefings. Its separate personal catch-up panel advances only the signed-in person’s review position after an explicit action. Each bounded section states its completeness; request pages retain their fixed upper watermark, and Change history retains the briefing cursor tuple. Stale and unknown claims remain assigned. Finished work carries no assignment claim and does not imply tests, review or merge.
 
 ### Since you last checked
 
-Hub Work and the inline MCP Work app show a personal return-to-work delivery above
-current assignments. It combines retained Work/checkpoint and coordination events
+The Hub's Dashboard › Catch up tab and the inline MCP Work app show a personal return-to-work
+delivery. It combines retained Work/checkpoint and coordination events
 with immutable merge observations. Human review state belongs to the authenticated
 person and repository, so it survives token rotation and is shared across that
 person’s devices. A verified repository ID keeps that history and readership position

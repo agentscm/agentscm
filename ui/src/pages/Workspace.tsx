@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { SectionTabs } from '../TopNav.tsx'
 import { decodeSkillWorkflowEnvelope, validSkillWorkflowStepId } from '../skillWorkflow.ts'
 import {
   identityKey,
@@ -370,7 +371,7 @@ function Composer({ session, repository, onStarted }: { session: WorkspaceSessio
   const firstSubjects = usePoll(
     (signal) => (profileId ? workspaceRequest<{ subjects: WorkspaceSubject[]; next_cursor: string | null }>(`${base}/subjects?limit=20`, { signal }) : Promise.resolve({ subjects: [], next_cursor: null })),
     0,
-    profileId,
+    base,
   )
   const [more, setMore] = useState<Page<WorkspaceSubject> | null>(null)
   const extra = more?.key === profileId ? more : null
@@ -879,6 +880,7 @@ export function WorkspacePage() {
         <h1 className="page-question">Who can run what?</h1>
         <p className="answer-text">{s ? <>You’re signed in to <strong>{s.workspace.name}</strong> as {s.actor.user.login}.</> : 'The workspace holds shared repositories, members and workflow execution.'}</p>
       </div>
+      <SectionTabs />
       {s?.synthetic_fixture && <Notice tone="brand" icon="flask" title="Synthetic workspace fixture">These records are examples, not live coding sessions.</Notice>}
       {signOutError && <Notice title={signOutError} />}
       {session.kind === 'loading' && <Skeleton rows={4} />}

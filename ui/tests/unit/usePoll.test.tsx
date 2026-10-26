@@ -1,8 +1,26 @@
-import { describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it } from 'vitest'
 import { renderHook, waitFor } from '@testing-library/react'
-import { usePoll } from '../../src/usePoll.ts'
+import { clearPollCache, usePoll } from '../../src/usePoll.ts'
 
 describe('usePoll', () => {
+  beforeEach(clearPollCache)
+
+  it('shows the last value at once when a page comes back, then refreshes it', async () => {
+    let release: (v: string) => void = () => {}
+    const load = (): Promise<string> => new Promise((r) => { release = r })
+    const first = renderHook(() => usePoll(load, 0, 'page'))
+    release('A')
+    await waitFor(() => expect(first.result.current).toMatchObject({ kind: 'ready', value: 'A' }))
+    first.unmount()
+    const again = renderHook(() => usePoll(load, 0, 'page'))
+    expect(again.result.current).toMatchObject({ kind: 'ready', value: 'A' })
+    release('B')
+    await waitFor(() => expect(again.result.current).toMatchObject({ kind: 'ready', value: 'B' }))
+    clearPollCache()
+    again.unmount()
+    expect(renderHook(() => usePoll(load, 0, 'page')).result.current.kind).toBe('loading')
+  })
+
   it('reads as loading when the key changes, until the new key has loaded', async () => {
     let release: (v: string) => void = () => {}
     const load = (): Promise<string> => new Promise((r) => { release = r })

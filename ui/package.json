@@ -18,6 +18,9 @@
     "notices": "node scripts/notices.mjs"
   },
   "dependencies": {
+    "@fontsource-variable/onest": "5.3.1",
+    "@fontsource/jetbrains-mono": "5.3.0",
+    "@fontsource/unbounded": "5.3.0",
     "bootstrap": "5.3.8",
     "bootstrap-icons": "1.13.2",
     "react": "18.3.1",

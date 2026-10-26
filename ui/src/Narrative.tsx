@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { fetchNarrative, validateNarrativeTask, type NarrativeSource, type NarrativeStatement, type NarrativeView } from './narrative.ts'
-import { Box, Notice, Skeleton, localDate } from './ui.tsx'
+import { Ago, Icon, Notice, Skeleton, localDate } from './ui.tsx'
 
 type LoadState =
   | { kind: 'loading'; token: string; task: string | undefined }
@@ -10,41 +10,50 @@ type LoadState =
 const message = (error: unknown) => error instanceof Error ? error.message : 'Unknown error'
 const shortCommit = (commit: string) => commit.slice(0, 12)
 
-function SourceReference({ source }: { source: NarrativeSource }) {
-  const label: ReactNode = source.work_id === null
-    ? source.label
-    : <a href={`#work/${encodeURIComponent(source.work_id)}`}>{source.label}</a>
+/** Sources are numbered in the order the briefing first cites them, like footnotes. */
+function citationNumbers(view: NarrativeView) {
+  const order = new Map<string, number>()
+  const cite = (refs: string[]) => { for (const r of refs) if (!order.has(r)) order.set(r, order.size + 1) }
+  cite(view.output?.headline_references ?? [])
+  for (const s of [...(view.output?.facts ?? []), ...(view.output?.implications ?? [])]) cite(s.references)
+  return order
+}
+
+function SourceLabel({ source }: { source: NarrativeSource }) {
   return (
-    <span>
-      {label}
+    <>
+      {source.work_id === null ? source.label : <a href={`#work/${encodeURIComponent(source.work_id)}`}>{source.label}</a>}
       {source.pull_number !== null && <> · PR #{source.pull_number}</>}
-      {source.commit !== null && <> · commit <code>{shortCommit(source.commit)}</code></>}
+      {source.commit !== null && <> · <code>{shortCommit(source.commit)}</code></>}
+    </>
+  )
+}
+
+/** Footnote markers after a statement; each names its source for pointers and screen readers. */
+function Cites({ refs, numbers, sources }: { refs: string[]; numbers: Map<string, number>; sources: Map<string, NarrativeSource> }) {
+  if (refs.length === 0) return null
+  return (
+    <span className="brief-cites">
+      {refs.map((r) => (
+        <a key={r} href={`#brief-src-${numbers.get(r)}`} className="brief-cite" title={sources.get(r)?.label} aria-label={`Source ${numbers.get(r)}: ${sources.get(r)?.label ?? 'unknown'}`} onClick={(e) => {
+          e.preventDefault()
+          document.getElementById(`brief-src-${numbers.get(r)}`)?.scrollIntoView({ block: 'nearest' })
+        }}>
+          {numbers.get(r)}
+        </a>
+      ))}
     </span>
   )
 }
 
-function SourceReferences({ references, sources }: { references: string[]; sources: Map<string, NarrativeSource> }) {
-  if (references.length === 0) return null
+function Statements({ items, numbers, sources }: { items: NarrativeStatement[]; numbers: Map<string, number>; sources: Map<string, NarrativeSource> }) {
+  if (items.length === 0) return <p className="muted small mb-0">No cited statements were generated from this bounded source window.</p>
   return (
-    <div className="small muted">
-      Sources: {references.map((reference, index) => (
-        <span key={reference}>
-          {index > 0 && ' · '}
-          <SourceReference source={sources.get(reference)!} />
-        </span>
-      ))}
-    </div>
-  )
-}
-
-function Statements({ items, sources }: { items: NarrativeStatement[]; sources: Map<string, NarrativeSource> }) {
-  if (items.length === 0) return <p className="muted">No cited statements were generated from this bounded source window.</p>
-  return (
-    <ul className="plain-list">
+    <ul className="brief-list">
       {items.map((item, index) => (
         <li key={`${index}:${item.text}`}>
-          <div>{item.text}</div>
-          <SourceReferences references={item.references} sources={sources} />
+          {item.text}
+          <Cites refs={item.references} numbers={numbers} sources={sources} />
         </li>
       ))}
     </ul>
@@ -77,30 +86,31 @@ interface TaskControls {
   clear: () => void
 }
 
+/** Ask for the briefing through the lens of one task; nothing is sent until it is submitted. */
 function TaskRequest({ controls }: { controls: TaskControls }) {
   return (
-    <form className="mb-3" onSubmit={(event) => { event.preventDefault(); controls.submit() }}>
-      <label className="form-label" htmlFor="agent-briefing-task">Task to consider</label>
-      <div className="input-group">
+    <form className="brief-task" onSubmit={(event) => { event.preventDefault(); controls.submit() }}>
+      <label className="visually-hidden" htmlFor="agent-briefing-task">Task to consider</label>
+      <div className="brief-task-field">
+        <Icon name="crosshair" />
         <input
           id="agent-briefing-task"
-          className="form-control"
           type="text"
           value={controls.draftTask}
           maxLength={500}
           aria-describedby="agent-briefing-task-help"
-          placeholder="Optional task or change you are about to start"
+          placeholder="What are you about to start?"
           onChange={(event) => controls.setDraftTask(event.currentTarget.value)}
         />
-        <button className="btn btn-outline-secondary" type="submit">Brief this task</button>
+        <button className="btn btn-sm btn-primary" type="submit">Brief this task</button>
       </div>
-      <div id="agent-briefing-task-help" className="form-text">
+      <div id="agent-briefing-task-help" className="visually-hidden">
         Submitted text is used only for conditional implications. Typing does not make a request.
       </div>
       {controls.error !== null && <div className="small tone-text-bad" role="alert">{controls.error}</div>}
       {controls.task !== undefined && (
-        <div className="small muted mt-2">
-          Considering: {controls.task}{' '}
+        <div className="brief-considering">
+          For <b>{controls.task}</b>
           <button className="btn btn-sm btn-link" type="button" onClick={controls.clear}>Show general briefing</button>
         </div>
       )}
@@ -108,49 +118,67 @@ function TaskRequest({ controls }: { controls: TaskControls }) {
   )
 }
 
-function NarrativeBox({ tone, controls, children }: { tone: 'brand' | 'warn' | 'bad' | 'muted'; controls: TaskControls; children: ReactNode }) {
+function NarrativeBox({ state, by, controls, children }: { state: 'ready' | 'waiting' | 'writing' | 'bad'; by?: ReactNode; controls: TaskControls; children: ReactNode }) {
   return (
-    <Box
-      id="agent-briefing"
-      icon="stars"
-      title="Agent briefing"
-      tone={tone}
-      explain="Generated from a bounded AgentSCM source window. It is advisory and does not change Work or review positions."
-    >
-      <div className="text-break">
+    <section id="agent-briefing" className={`brief is-${state}`} aria-labelledby="agent-briefing-title">
+      <header className="brief-head">
+        <div className="brief-by">
+          <i aria-hidden="true" />
+          <h2 id="agent-briefing-title">Agent briefing</h2>
+          {by && <span>{by}</span>}
+        </div>
         <TaskRequest controls={controls} />
-        {children}
-      </div>
-    </Box>
+      </header>
+      <div className="text-break">{children}</div>
+    </section>
   )
 }
 
 function NarrativeReady({ view, controls }: { view: NarrativeView; controls: TaskControls }) {
   const sources = new Map(view.sources.map((source) => [source.id, source]))
+  const numbers = citationNumbers(view)
+  const cited = [...numbers].map(([id, n]) => ({ n, source: sources.get(id) })).filter((x): x is { n: number; source: NarrativeSource } => !!x.source)
+  const by = <>Written by {view.generated_by ?? 'a connected agent'} · {view.generated_at === null ? 'time not reported' : <Ago at={view.generated_at} />}</>
   return (
-    <NarrativeBox controls={controls} tone={view.window.complete && view.warnings.length === 0 ? 'brand' : 'warn'}>
+    <NarrativeBox controls={controls} state={view.window.complete && view.warnings.length === 0 ? 'ready' : 'bad'} by={by}>
       <WindowNotices view={view} />
-      <p><strong>{view.output!.headline}</strong></p>
-      <SourceReferences references={view.output!.headline_references} sources={sources} />
-      <p className="small muted">
-        Generated by {view.generated_by ?? 'connected agent'} · as of {view.generated_at === null ? 'time not reported' : localDate(view.generated_at)}
+      <p className="brief-headline">
+        {view.output!.headline}
+        <Cites refs={view.output!.headline_references} numbers={numbers} sources={sources} />
       </p>
-      <h3>Reported facts</h3>
-      <Statements items={view.output!.facts} sources={sources} />
-      <h3>What this may mean for your work</h3>
-      <Statements items={view.output!.implications} sources={sources} />
-      <p className="small muted">
-        This agent-generated narrative summarizes reported records. It does not authorize work, approve changes, or establish that conflicts are clear.
-      </p>
-      <details className="disclosure">
-        <summary>Briefing scope</summary>
-        <dl className="tech">
-          <dt>Subscriber</dt><dd><code>{view.window.subscriber}</code></dd>
-          <dt>Work events</dt><dd><code>{view.window.event_from}</code> → <code>{view.window.event_through}</code></dd>
-          <dt>Merge observations</dt><dd><code>{view.window.merge_from}</code> → <code>{view.window.merge_through}</code></dd>
-          <dt>Digest</dt><dd><code className="text-break">{view.digest}</code></dd>
-        </dl>
-      </details>
+      <div className="brief-cols">
+        <section>
+          <h3>Reported facts</h3>
+          <Statements items={view.output!.facts} numbers={numbers} sources={sources} />
+        </section>
+        <section>
+          <h3>What this may mean for your work</h3>
+          <Statements items={view.output!.implications} numbers={numbers} sources={sources} />
+        </section>
+      </div>
+      <footer className="brief-foot">
+        {cited.length > 0 && (
+          <ol className="brief-sources" aria-label="Sources">
+            {cited.map(({ n, source }) => (
+              <li key={n} id={`brief-src-${n}`}>
+                <span className="brief-cite" aria-hidden="true">{n}</span> <SourceLabel source={source} />
+              </li>
+            ))}
+          </ol>
+        )}
+        <p className="brief-caveat">
+          <Icon name="info-circle" /> This agent-generated narrative summarizes reported records. It does not authorize work, approve changes, or establish that conflicts are clear. Generated as of {view.generated_at === null ? 'an unreported time' : localDate(view.generated_at)}.
+        </p>
+        <details className="disclosure">
+          <summary>Briefing scope</summary>
+          <dl className="tech">
+            <dt>Subscriber</dt><dd><code>{view.window.subscriber}</code></dd>
+            <dt>Work events</dt><dd><code>{view.window.event_from}</code> → <code>{view.window.event_through}</code></dd>
+            <dt>Merge observations</dt><dd><code>{view.window.merge_from}</code> → <code>{view.window.merge_through}</code></dd>
+            <dt>Digest</dt><dd><code className="text-break">{view.digest}</code></dd>
+          </dl>
+        </details>
+      </footer>
     </NarrativeBox>
   )
 }
@@ -242,11 +270,11 @@ export function NarrativePanel({ token }: { token: string }) {
   }
   const current: LoadState = state.token === token && state.task === task ? state : { kind: 'loading', token, task }
   if (current.kind === 'loading') {
-    return <NarrativeBox controls={controls} tone="muted"><Skeleton rows={2} /></NarrativeBox>
+    return <NarrativeBox controls={controls} state="waiting"><Skeleton rows={2} /></NarrativeBox>
   }
   if (current.kind === 'error') {
     return (
-      <NarrativeBox controls={controls} tone="bad">
+      <NarrativeBox controls={controls} state="bad">
         <Notice tone="bad" title="Agent briefing unavailable" action={
           <button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => {
             setState({ kind: 'loading', token, task })
@@ -260,25 +288,25 @@ export function NarrativePanel({ token }: { token: string }) {
   }
   if (current.view.status === 'pending') {
     return (
-      <NarrativeBox controls={controls} tone="muted">
+      <NarrativeBox controls={controls} state="waiting">
         <WindowNotices view={current.view} />
-        <p>Waiting for a connected agent to generate this briefing.</p>
-        <p className="small muted mb-0">The dashboard cannot launch a model or provider. The reported catch-up remains available below.</p>
+        <p className="brief-headline is-quiet">Waiting for a connected agent to generate this briefing.</p>
+        <p className="brief-caveat mb-0">The dashboard cannot launch a model or provider. The reported catch-up is below.</p>
       </NarrativeBox>
     )
   }
   if (current.view.status === 'generating') {
     return (
-      <NarrativeBox controls={controls} tone="brand">
+      <NarrativeBox controls={controls} state="writing">
         <WindowNotices view={current.view} />
-        <p>An eligible connected agent is generating this briefing.</p>
-        <p className="small muted mb-0">This page checks for the submitted result while visible. The reported catch-up remains available below.</p>
+        <p className="brief-headline is-quiet">An eligible connected agent is generating this briefing.</p>
+        <p className="brief-caveat mb-0">This page checks for the submitted result while visible. The reported catch-up is below.</p>
       </NarrativeBox>
     )
   }
   if (current.view.status === 'failed') {
     return (
-      <NarrativeBox controls={controls} tone="bad">
+      <NarrativeBox controls={controls} state="bad">
         <WindowNotices view={current.view} />
         <Notice tone="bad" title="Agent briefing generation failed">
           No generated briefing is available for this window. This page keeps checking for recovery; an eligible connected agent is still required. This is not an empty result or an all-clear.

@@ -194,19 +194,19 @@ describe('bad workflow responses never render as data', () => {
 })
 
 describe('workflow breadcrumbs in the full app', () => {
-  it('Workflows › Run … › Step …, each crumb a working link', async () => {
+  it('Checks › Run … › Step …, each crumb a working link', async () => {
     stubHub()
     saveToken('fixture-token', false)
     at('#workflows/runs/claude-review-failed/steps/claude-review')
     render(<App />)
     const nav = await screen.findByRole('navigation', { name: 'Breadcrumb' }, LOAD)
-    await waitFor(() => expect(within(nav).getAllByRole('listitem').map((li) => li.textContent)).toEqual(['acme/widgets', 'Workflows', 'Run claude-review-…', 'Step claude-review']), LOAD)
+    await waitFor(() => expect(within(nav).getAllByRole('listitem').map((li) => li.textContent)).toEqual(['Checks', 'Run claude-review-…', 'Step claude-review']), LOAD)
     expect(within(nav).getByRole('link', { name: 'Run claude-review-…' }).getAttribute('href')).toBe('#workflows/runs/claude-review-failed')
-    expect(within(nav).getByRole('link', { name: 'Workflows' }).getAttribute('href')).toBe('#workflows')
+    expect(within(nav).getByRole('link', { name: 'Checks' }).getAttribute('href')).toBe('#workflows')
     await screen.findByText('Step: claude-review', {}, LOAD)
     fireEvent.click(within(nav).getByRole('link', { name: 'Run claude-review-…' }))
     at('#workflows/runs/claude-review-failed')
-    await waitFor(() => expect(within(nav).getAllByRole('listitem')).toHaveLength(3))
+    await waitFor(() => expect(within(nav).getAllByRole('listitem')).toHaveLength(2))
     expect(screen.queryByText('Step: claude-review')).toBeNull()
   })
 })

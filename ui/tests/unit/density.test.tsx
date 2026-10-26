@@ -13,8 +13,10 @@ afterEach(() => {
 describe('density storage', () => {
   it('defaults to spacious, round-trips, and ignores junk', () => {
     expect(loadDensity()).toBe('spacious')
-    saveDensity('compact')
-    expect(loadDensity()).toBe('compact')
+    saveDensity('condensed')
+    expect(loadDensity()).toBe('condensed')
+    localStorage.setItem('agentscm.density', 'compact')
+    expect(loadDensity()).toBe('condensed')
     localStorage.setItem('agentscm.density', 'tiny')
     expect(loadDensity()).toBe('spacious')
   })
@@ -25,7 +27,7 @@ describe('density storage', () => {
     vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
       throw new DOMException('blocked', 'SecurityError')
     })
-    expect(() => saveDensity('compact')).not.toThrow()
+    expect(() => saveDensity('condensed')).not.toThrow()
     expect(loadDensity()).toBe('spacious')
   })
 })
@@ -47,10 +49,10 @@ describe('Settings density choice', () => {
     const group = screen.getByRole('radiogroup', { name: 'Density' })
     expect(group.getAttribute('data-tour')).toBe('settings-density')
     expect(document.documentElement.dataset['density']).toBe('spacious')
-    fireEvent.click(screen.getByRole('radio', { name: /Compact/ }))
-    expect(document.documentElement.dataset['density']).toBe('compact')
-    expect(screen.getByRole('radio', { name: /Compact/ }).getAttribute('aria-checked')).toBe('true')
-    expect(loadDensity()).toBe('compact')
+    fireEvent.click(screen.getByRole('radio', { name: /Condensed/ }))
+    expect(document.documentElement.dataset['density']).toBe('condensed')
+    expect(screen.getByRole('radio', { name: /Condensed/ }).getAttribute('aria-checked')).toBe('true')
+    expect(loadDensity()).toBe('condensed')
   })
 
   it('roves with the arrow keys, Home and End: one tab stop, selection follows focus', () => {
@@ -59,7 +61,7 @@ describe('Settings density choice', () => {
     expect(radios().map((r) => r.tabIndex)).toEqual([0, -1])
     const group = screen.getByRole('radiogroup', { name: 'Density' })
     fireEvent.keyDown(radios()[0]!, { key: 'ArrowRight' })
-    expect(document.documentElement.dataset['density']).toBe('compact')
+    expect(document.documentElement.dataset['density']).toBe('condensed')
     expect(document.activeElement).toBe(radios()[1])
     expect(radios().map((r) => r.tabIndex)).toEqual([-1, 0])
     fireEvent.keyDown(group, { key: 'ArrowDown' })

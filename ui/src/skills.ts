@@ -110,9 +110,20 @@ export function enforcement(gates: { enforce: string[] }[]): { enforced: string[
   const all = new Set(gates.flatMap((g) => g.enforce))
   return { enforced: Object.keys(ENFORCED).filter((k) => all.has(k)).map((k) => ENFORCED[k]!), planned: Object.keys(PLANNED).filter((k) => all.has(k)).map((k) => PLANNED[k]!) }
 }
-export const gateChain = (gates: { id: string }[]) => gates.map((g) => gateLabel(g.id).toLowerCase()).join(' → ')
 /** The hub numbers its lines; the page numbers them with <ol>. */
 export const stepText = (line: string) => line.replace(/^\d+\.\s+/, '')
+
+export type StepEnforce = 'block' | 'warn' | 'record'
+export interface StepView { name: string; plain: string; who: string; needs: string; enforce: StepEnforce; detail: string }
+/** One hub walkthrough line ("N. Name: plain. Done by X. Needs: Y. Blocks…|Warns…|Recorded…") split into its parts; null when the hub wrote it another way. */
+export function parseStep(line: string): StepView | null {
+  const m = /^(?:\d+\.\s+)?([^:]+):\s+(.+?\.)\s+Done by (.+?)\.\s+Needs: (.+?)\.\s*((?:Blocks|Warns|Recorded).*)$/.exec(line)
+  if (!m) return null
+  const [, name, plain, by, needs, rest] = m as unknown as [string, string, string, string, string, string]
+  const enforce: StepEnforce = rest.startsWith('Blocks') ? 'block' : rest.startsWith('Warns') ? 'warn' : 'record'
+  const who = by.replace(/^(the|a)\s+/i, '')
+  return { name, plain, who: who.charAt(0).toUpperCase() + who.slice(1), needs, enforce, detail: rest.replace(/^[^:;]*[:;]\s*/, '').replace(/\.$/, '') }
+}
 export const shortSha = (s: string) => s.slice(0, 7)
 const SAFE_ARG = /^[A-Za-z0-9_.:/@+=-]+$/
 const shellArg = (v: string) => (SAFE_ARG.test(v) ? v : `'${v.replaceAll("'", `'\\''`)}'`)

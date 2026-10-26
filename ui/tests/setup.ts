@@ -1,5 +1,6 @@
 import { cleanup } from '@testing-library/react'
 import { afterEach, beforeEach } from 'vitest'
+import { clearPollCache } from '../src/usePoll.ts'
 
 // The welcome tour opens on first sign-in; app tests start as a viewer who has already dismissed it.
 export const TOUR_OFF = '{"welcomeSeen":true,"welcomeOff":true,"autoplay":[],"sectionsSeen":[]}'
@@ -13,6 +14,8 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
+  // Each test stubs its own hub; a value cached by the last test must not show in the next.
+  clearPollCache()
   window.location.hash = ''
 })
 

@@ -204,3 +204,29 @@
   :root[data-density='spacious'] .tour-band { height: 96px; }
   :root[data-density='spacious'] .tour-band.is-hero { height: 140px; }
 }
+
+/* ---------- Twilight: the card is a small sheet held by the deep-violet frame ---------- */
+.tour-layer { --tour-scrim: color-mix(in srgb, var(--frame) 64%, transparent); }
+.tour-card { border: 0; border-radius: var(--r); box-shadow: var(--card), 0 32px 64px -28px rgba(23, 20, 46, 0.6); }
+:root[data-density='spacious'] .tour-card { border-radius: var(--r); }
+[data-bs-theme='dark'] .tour-card { box-shadow: var(--card), 0 32px 64px -28px rgba(0, 0, 0, 0.85); }
+/* The band is a strip of the frame, so each drawing reads as part of the app's own chrome. Its tokens are re-pointed, not its rules. */
+.tour-band {
+  --hub-text-2: var(--frame-ink);
+  --hub-text-3: var(--frame-dim);
+  --hub-brand: var(--frame-active-icon);
+  --hub-surface: var(--frame);
+  background: radial-gradient(120% 140% at 50% 0%, color-mix(in srgb, var(--frame-brand) 34%, var(--frame)) 0%, var(--frame) 70%);
+  border-bottom: 0;
+  color: var(--frame-ink);
+}
+.tour-kicker { color: var(--hub-text-3); font-weight: 500; }
+.tour-title { font-weight: 500; font-size: 1.3rem; letter-spacing: -0.02em; }
+:root[data-density='spacious'] .tour-title { font-size: 1.55rem; letter-spacing: -0.025em; }
+.tour-what { color: var(--hub-text-2); }
+.tour-row dt { color: var(--hub-text); }
+.tour-tip { border: 0; border-radius: 12px; background: var(--hub-sunken); }
+.tour-tip.is-live { border: 0; background: var(--hub-brand-soft); }
+.tour-foot { border-top: 0; padding-top: 6px; }
+.tour-buttons .btn { border-radius: 999px; }
+.tour-keys kbd { border-radius: 6px; background: var(--hub-sunken); color: var(--hub-text-2); box-shadow: none; }

@@ -43,8 +43,8 @@ export function Box({ id, tour, icon, title, explain, count, tone = 'brand', act
           {title}
         </h2>
         {count !== undefined && <span className="box-count">{count}</span>}
-        {explain && <Explain text={explain} />}
         {actions && <div className="box-actions">{actions}</div>}
+        {explain && <p className="box-explain">{explain}</p>}
       </header>
       <div className={flush ? 'box-body flush' : 'box-body'}>{children}</div>
     </section>
@@ -87,11 +87,18 @@ export function Notice({ tone = 'warn', icon = 'exclamation-triangle', title, ch
   )
 }
 
+/** Row-shaped, like the lists it stands in for, so the content lands where the skeleton was. Shown only after a short delay (CSS), so a fast load never flashes it. */
 export function Skeleton({ rows = 3 }: { rows?: number }) {
   return (
-    <div className="placeholder-glow" aria-label="Loading" role="status">
+    <div className="placeholder-glow skeleton" aria-label="Loading" role="status">
       {Array.from({ length: rows }, (_, i) => (
-        <span key={i} className="placeholder skeleton-line" style={{ width: `${92 - i * 13}%` }} />
+        <span key={i} className="skeleton-row">
+          <span className="placeholder skeleton-dot" />
+          <span className="skeleton-text">
+            <span className="placeholder skeleton-line" style={{ width: `${78 - ((i * 17) % 34)}%` }} />
+            <span className="placeholder skeleton-line is-sub" style={{ width: `${46 - ((i * 11) % 20)}%` }} />
+          </span>
+        </span>
       ))}
     </div>
   )
@@ -178,11 +185,20 @@ export function Via({ via }: { via: string }) {
   )
 }
 
+// Client setup names tokens "client-<host>-<hex id>": every agent on one computer shares the host, so the id is what tells them apart.
+const CLIENT_TOKEN = /^client-(.+)-([0-9a-f]{6,})$/i
+/** The name people read: "Agent 6a36" for a generated client token (the full name stays in the title), anything else as given. */
+export const agentLabel = (name: string) => {
+  const m = CLIENT_TOKEN.exec(name)
+  return m ? `Agent ${m[2]!.slice(0, 4)}` : name
+}
+
 /** A simple agent mark: initials on a hue derived from the name, so the same agent reads the same everywhere. */
 export function Avatar({ name, size = 32 }: { name: string; size?: number }) {
   let h = 0
   for (const c of name) h = (h * 31 + c.charCodeAt(0)) % 360
-  const initials = name.replace(/[^a-z0-9]+/gi, ' ').trim().split(' ').map((w) => w[0]).join('').slice(0, 2).toUpperCase() || '?'
+  const id = CLIENT_TOKEN.exec(name)?.[2]
+  const initials = id ? id.slice(0, 2).toUpperCase() : name.replace(/[^a-z0-9]+/gi, ' ').trim().split(' ').map((w) => w[0]).join('').slice(0, 2).toUpperCase() || '?'
   return (
     <span className="avatar" style={{ width: size, height: size, ['--h' as string]: String(h) }} aria-hidden="true">
       {initials}

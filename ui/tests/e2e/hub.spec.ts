@@ -8,6 +8,8 @@ test.beforeAll(async () => {
 const rail = (page: Page) => page.getByRole('complementary', { name: 'Hub sections' })
 const crumbs = (page: Page) => page.getByRole('navigation', { name: 'Breadcrumb' })
 const main = (page: Page) => page.locator('#main')
+/** The open tab of the current nav item: a label over its live status. */
+const tab = (page: Page) => page.locator('.htabs [aria-current="page"]')
 
 async function signIn(page: Page, hash = '') {
   await page.goto(`/#token=${READ_TOKEN}`)
@@ -19,34 +21,36 @@ test('signs in from #token= and strips the token from the address bar', async ({
   await signIn(page)
   expect(page.url()).not.toContain('token=')
   await expect(page.getByRole('button', { name: 'counterbranch/agentscm' })).toBeVisible()
-  await expect(rail(page).getByText('Coordinate', { exact: true })).toBeVisible()
-  await expect(rail(page).getByText('Verify', { exact: true })).toBeVisible()
-  await expect(rail(page).getByText('Manage', { exact: true })).toBeVisible()
-  await expect(crumbs(page)).toContainText('counterbranch/agentscm')
-  await expect(crumbs(page)).toContainText('Right now')
-  await expect(main(page)).toContainText(/agents? (is|are) holding/)
+  for (const item of ['Dashboard', 'Inbox', 'History', 'Timeline', 'Skills', 'Setup']) await expect(rail(page).getByRole('link', { name: new RegExp(`^${item}`) })).toBeVisible()
+  await expect(tab(page)).toContainText('Now')
+  await expect(main(page)).toContainText(/agents? (is|are) working on/)
 })
 
-test('every section is reachable from the rail with a matching breadcrumb and page', async ({ page }) => {
+test('every page is reachable from the rail and its tabs, each with its question', async ({ page }) => {
   await signIn(page)
-  const pages: [string, RegExp][] = [
-    ['Work', /Who owns which task\?/],
-    ['Activity', /What just happened\?|happened in this repository/],
-    ['Workflows', /checks|workflow/i],
-    ['Change records', /What is ready to hand off\?/],
-    ['Workspace', /workspace/i],
-    ['Connect agents', /agent/i],
-    ['Hub health', /Is the hub OK\?/],
-    ['Settings', /How is this page set up for me\?/],
-    ['Right now', /Who is editing which files/],
+  const pages: [string, string, string][] = [
+    ['Dashboard', 'Where', 'Who is editing which files?'],
+    ['Dashboard', 'Catch up', 'What happened since I last looked?'],
+    ['Dashboard', 'Team', 'Who is working right now?'],
+    ['Inbox', '', 'Which overlaps need a conversation?'],
+    ['History', 'Finished', 'What did agents report finished?'],
+    ['History', 'Changes', 'What changed in Work, and when?'],
+    ['History', 'Change records', 'What is ready to hand off?'],
+    ['Skills', 'Checks', 'Did the checks pass?'],
+    ['Setup', 'Access', 'Who can run what?'],
+    ['Setup', 'Agents', 'Is my agent set up?'],
+    ['Setup', 'Hub', 'Is the hub OK?'],
+    ['Setup', 'Preferences', 'How is this page set up for me?'],
+    ['Dashboard', 'Now', 'What needs me, and where is every task?'],
   ]
-  for (const [label, heading] of pages) {
-    await rail(page).getByRole('link', { name: new RegExp(`^${label}(?= )`) }).click()
-    await expect(crumbs(page).locator('[aria-current="page"]')).toContainText(label === 'Work' ? 'Working now' : label === 'Workspace' ? 'Repositories & runs' : label)
-    await expect(main(page)).toContainText(heading)
-    await expect(rail(page).getByRole('link', { name: new RegExp(`^${label}(?= )`) })).toHaveAttribute('aria-current', 'page')
-    // A new section starts at the top with focus on the page.
-    expect(await page.evaluate(() => [window.scrollY, document.activeElement?.id])).toEqual([0, 'main'])
+  for (const [item, label, question] of pages) {
+    await rail(page).getByRole('link', { name: new RegExp(`^${item}`) }).click()
+    if (label) await page.locator('.htabs').getByRole('link', { name: new RegExp(`^${label}`) }).click()
+    if (label) await expect(tab(page)).toContainText(label)
+    await expect(main(page).getByRole('heading', { level: 1 }).first()).toHaveText(question)
+    await expect(rail(page).getByRole('link', { name: new RegExp(`^${item}`) })).toHaveAttribute('aria-current', 'page')
+    // A new page starts at the top with focus on it; a tab inside the same page keeps focus on the tab picked.
+    expect(await page.evaluate(() => [window.scrollY, document.activeElement?.id === 'main' || !!document.activeElement?.closest('.htabs')])).toEqual([0, true])
   }
 })
 
@@ -64,7 +68,7 @@ test('⌘K search opens a work item and the breadcrumb names it', async ({ page 
 })
 
 test('a work item opens its authenticated change-record projection', async ({ page }) => {
-  await signIn(page, '#work')
+  await signIn(page, '#home')
   await main(page).getByRole('link', { name: 'Rebuild the hub status page shell' }).first().click()
   await main(page).getByRole('link', { name: 'Change record' }).click()
   await expect(page).toHaveURL(/#change-record\/wrk_[0-9a-f]{32}$/)
@@ -76,7 +80,8 @@ test('a work item opens its authenticated change-record projection', async ({ pa
 
 test('a directed request expands to show targets, receipts and paths', async ({ page }) => {
   await signIn(page, '#work/coordination')
-  await expect(crumbs(page)).toContainText('Needs coordination')
+  await expect(page).toHaveURL(/#work\/coordination$/)
+  await expect(rail(page).getByRole('link', { name: /^Inbox/ })).toHaveAttribute('aria-current', 'page')
   const request = main(page).locator('details.request').first()
   await expect(request).toBeVisible()
   await request.locator('summary').click()
@@ -91,11 +96,23 @@ test('rail collapse persists across reload, with tooltips naming each icon', asy
   await expect(rail(page)).toHaveClass(/is-compact/)
   await page.reload()
   await expect(rail(page)).toHaveClass(/is-compact/)
-  await expect(rail(page).getByRole('link', { name: 'Work', exact: true })).toBeVisible()
+  await expect(rail(page).getByRole('link', { name: 'Inbox', exact: true })).toBeVisible()
   await page.keyboard.press('[')
   await expect(rail(page)).not.toHaveClass(/is-compact/)
   await page.reload()
   await expect(rail(page)).not.toHaveClass(/is-compact/)
+})
+
+test('the top bar view menu switches theme and density, and both persist', async ({ page }) => {
+  await signIn(page)
+  await page.getByRole('button', { name: 'Theme and density' }).click()
+  await page.getByRole('menuitemradio', { name: /^Dark/ }).click()
+  await page.getByRole('menuitemradio', { name: 'Condensed' }).click()
+  await expect(page.locator('html')).toHaveAttribute('data-bs-theme', 'dark')
+  await expect(page.locator('html')).toHaveAttribute('data-density', 'condensed')
+  await page.reload()
+  await expect(page.locator('html')).toHaveAttribute('data-bs-theme', 'dark')
+  await expect(page.locator('html')).toHaveAttribute('data-density', 'condensed')
 })
 
 test('theme choice in Settings applies and persists', async ({ page }) => {
@@ -116,7 +133,7 @@ test.describe('keyboard', () => {
     await expect(page.locator('.skip-link')).toBeInViewport()
     await page.keyboard.press('Enter')
     expect(await page.evaluate(() => document.activeElement?.id)).toBe('main')
-    await expect(crumbs(page)).toContainText('Right now') // the hash was not changed
+    await expect(tab(page)).toContainText('Now') // the hash was not changed
   })
 
   test('header menus: first item focused, arrows move, Escape returns focus', async ({ page }) => {
@@ -173,15 +190,15 @@ test.describe('tablet width', () => {
     await expect(rail(page)).toBeHidden()
     await expect(burger).toBeFocused()
     await burger.click()
-    await rail(page).getByRole('link', { name: /^Activity/ }).click()
+    await rail(page).getByRole('link', { name: /^History/ }).click()
     await expect(rail(page)).toBeHidden()
-    await expect(crumbs(page)).toContainText('Activity')
+    await expect(tab(page)).toContainText('Finished')
   })
 })
 
 test('live: a refusal and handoff made by agents appear in Activity without reload', async ({ page }) => {
   await signIn(page, '#activity')
-  await expect(main(page)).toContainText('What just happened?')
+  await expect(main(page)).toContainText('The full log')
   const handoff = await freshHandoff(marker())
   try {
     // Activity polls every 5 s.
@@ -195,19 +212,19 @@ test('live: a refusal and handoff made by agents appear in Activity without relo
 test('live: work started and checkpointed over MCP shows up in the UI, then moves to finished', async ({ page }) => {
   test.skip(!AGENT_TOKEN, 'No agent token in ui/dev-seed/.data/tokens.env')
   test.setTimeout(120_000)
-  await signIn(page, '#work')
+  await signIn(page, '#home')
   await expect(main(page)).toContainText('Rebuild the hub status page shell')
 
   const m = marker()
   const { item, session } = await startWork(m)
   try {
-    // The overview refreshes every 15 s; the new card appears in the In progress lane.
-    const card = main(page).locator('.lane').filter({ hasText: 'In progress' }).getByText(`E2E probe ${m}`)
-    await expect(card).toBeVisible({ timeout: 30_000 })
+    // The overview refreshes every 15 s; the new task appears on the track.
+    const lane = main(page).locator('#box-track .rl-row').filter({ hasText: `E2E probe ${m}` })
+    await expect(lane).toBeVisible({ timeout: 30_000 })
 
-    // Cards show the reported next action; the checkpoint summary is on the work detail page.
+    // Lanes show the reported next action; the checkpoint summary is on the task page too.
     expect((await checkpoint(item, session, 'progress', `Checkpoint ${m} via MCP`, `Next step ${m}`)).status).toBe(200)
-    await expect(main(page).locator('.lane').filter({ hasText: 'In progress' })).toContainText(`Next step ${m}`, { timeout: 30_000 })
+    await expect(lane).toContainText(`Next step ${m}`, { timeout: 30_000 })
     await page.evaluate((id) => (window.location.hash = `#work/${id}`), item.id)
     await expect(crumbs(page).locator('[aria-current="page"]')).toHaveText(`E2E probe ${m}`)
     await expect(main(page)).toContainText(`Checkpoint ${m} via MCP`)
@@ -265,8 +282,6 @@ test.describe('narrow header keeps problems in words', () => {
     const chip = page.locator('.health-chip')
     await expect(chip).toContainText('Reconnecting', { timeout: 20_000 })
     await expect(chip.locator('.health-text')).toBeVisible()
-    await expect(page.locator('.crumb-fresh')).toBeVisible()
-    await expect(page.locator('.crumb-fresh')).toContainText('Reconnecting')
   })
 })
 
@@ -275,26 +290,24 @@ test('a malformed workflow address shows the run list instead of a blank page, e
   const errors: string[] = []
   page.on('pageerror', (e) => errors.push(e.message))
   await page.evaluate(() => (window.location.hash = '#workflows/runs/%E0%A4%A'))
-  await expect(crumbs(page).locator('[aria-current="page"]')).toHaveText(/Workflows/)
+  await expect(tab(page)).toContainText('Checks')
   await expect(main(page)).toBeVisible()
   await page.reload()
-  await expect(crumbs(page).locator('[aria-current="page"]')).toHaveText(/Workflows/)
+  await expect(tab(page)).toContainText('Checks')
   await expect(page.getByRole('alert').filter({ hasText: 'This page hit a problem' })).toHaveCount(0)
   expect(errors).toEqual([])
 })
 
 // ---------- New features: Landed changes (#62), Templates (#64), Timeline (#67)
 
-test('the rail groups the local pages under "This computer", each with its question and breadcrumb', async ({ page }) => {
+test('the local pages and After merge each answer their question', async ({ page }) => {
   await signIn(page)
-  await expect(rail(page).getByText('This computer', { exact: true })).toBeVisible()
-  for (const [label, question] of [
-    ['Landed changes', 'Did our changes land, and did checks pass after?'],
-    ['Templates', 'Which workflow recipes can agents reuse?'],
-    ['Timeline', 'What did this workspace look like earlier?'],
+  for (const [hash, question] of [
+    ['#landed', 'Did our changes land, and did checks pass after?'],
+    ['#templates', 'Which reusable workflows can agents configure here?'],
+    ['#timeline', 'What did this workspace look like earlier?'],
   ] as const) {
-    await rail(page).getByRole('link', { name: new RegExp(`^${label}(?= )`) }).click()
-    await expect(crumbs(page).locator('[aria-current="page"]')).toContainText(label)
+    await page.evaluate((h) => (window.location.hash = h), hash)
     await expect(main(page).getByRole('heading', { level: 1 })).toHaveText(question)
   }
 })
@@ -348,7 +361,8 @@ test('Templates and Timeline read this computer through the dev proxy: live when
   await page.getByRole('link', { name: /Compare these two/ }).click()
   await expect(crumbs(page).locator('[aria-current="page"]')).toContainText('Compare #2 and #3')
   await expect(main(page).getByText(/What changed from #2 to #3/)).toBeVisible()
-  await page.evaluate(() => (window.location.hash = '#templates'))
+  // Inspecting one change's template is the Library's third view.
+  await page.evaluate(() => (window.location.hash = '#templates?view=inspect'))
   const changePicker = page.getByRole('combobox', { name: 'Change ID' })
   await changePicker.fill('other-change')
   await changePicker.press('Enter')

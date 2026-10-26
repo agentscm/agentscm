@@ -62,7 +62,7 @@ async function walk(page: Page) {
   await expect(dialog(page)).toBeHidden()
 }
 
-for (const density of ['spacious', 'compact'] as const) {
+for (const density of ['spacious', 'condensed'] as const) {
   test.describe(`${density} density`, () => {
     test.beforeEach(async ({ page }) => {
       await page.addInitScript(
@@ -83,7 +83,7 @@ for (const density of ['spacious', 'compact'] as const) {
       await walk(page)
     })
 
-    for (const [hash, name] of [['#now', 'Right now'], ['#work', 'Work']] as const) {
+    for (const [hash, name] of [['#home', 'Dashboard › Now'], ['#now', 'Dashboard › Where'], ['#work/finished', 'History']] as const) {
       test(`the ${name} page tour stays on screen with its spotlight on target`, async ({ page }) => {
         await signIn(page, hash)
         await page.getByRole('button', { name: 'Tour this page' }).click()
@@ -94,7 +94,7 @@ for (const density of ['spacious', 'compact'] as const) {
 
     test('picker popups stay within their combobox, clear of the nav', async ({ page }) => {
       await signIn(page)
-      for (const [hash, label] of [['#templates', 'Change ID'], ['#workflows', 'Find a run']] as const) {
+      for (const [hash, label] of [['#templates?view=inspect', 'Change ID'], ['#workflows', 'Find a run']] as const) {
         await page.evaluate((h) => (window.location.hash = h), hash)
         const picker = page.getByRole('combobox', { name: label })
         await picker.focus()
@@ -118,15 +118,15 @@ for (const density of ['spacious', 'compact'] as const) {
       }
     })
 
-    test('Work lanes show without sideways scroll', async ({ page }) => {
-      await signIn(page, '#work')
+    test('the track shows without sideways scroll', async ({ page }) => {
+      await signIn(page, '#home')
       await expect(page.locator('[data-tour="work-lanes"]')).toBeVisible()
-      await expect(page.locator('.lane:visible').first()).toBeVisible()
+      await expect(page.locator('.lb:visible').first()).toBeVisible()
       expect(await noSideScroll(page)).toBe(true)
     })
 
     test('after switching density in Settings, the page tour spotlight still matches its target', async ({ page }) => {
-      const other = density === 'spacious' ? 'Compact' : 'Spacious'
+      const other = density === 'spacious' ? 'Condensed' : 'Spacious'
       await signIn(page, '#settings')
       await page.getByRole('radio', { name: new RegExp(`^${other}`) }).click()
       await expect(page.locator('html')).toHaveAttribute('data-density', other.toLowerCase())

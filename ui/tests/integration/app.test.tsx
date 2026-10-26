@@ -15,27 +15,27 @@ const go = (hash: string) => act(() => {
 const main = () => within(document.getElementById('main')!)
 const LOAD = { timeout: 15_000 }
 
-describe.skipIf(!live)('the 1c app rendered against the live hub', () => {
+describe.skipIf(!live)('the Twilight app rendered against the live hub', () => {
   beforeEach(() => {
     localStorage.clear()
     sessionStorage.clear()
     saveToken(READ_TOKEN, false)
   })
 
-  it('shell: identity, repository, grouped rail and breadcrumbs', async () => {
+  it('shell: identity, repository, the six-item rail and the dashboard tabs', async () => {
     render(<App />)
     await screen.findByRole('button', { name: /Account and settings for/ }, LOAD)
     expect((await screen.findAllByText('counterbranch/agentscm', {}, LOAD)).length).toBeGreaterThan(0)
     const rail = within(screen.getByRole('complementary', { name: 'Hub sections' }))
-    expect(rail.getAllByText(/^(Coordinate|Verify|This computer|Manage)$/).map((e) => e.textContent)).toEqual(['Coordinate', 'Verify', 'This computer', 'Manage'])
-    expect(rail.getAllByRole('link').map((a) => a.querySelector('.side-label')!.textContent)).toEqual(['Right now', 'Work', 'Activity', 'Workflows', 'Change records', 'Landed changes', 'Skills', 'Templates', 'Timeline', 'Repository explorer', 'Workspace', 'Connect agents', 'Hub health', 'Settings'])
-    expect(screen.getByRole('navigation', { name: 'Breadcrumb' })).toBeTruthy()
+    expect(rail.getAllByRole('link').map((a) => a.querySelector('.side-label')!.textContent)).toEqual(['Dashboard', 'Inbox', 'History', 'Timeline', 'Skills', 'Setup'])
+    expect(within(screen.getByRole('navigation', { name: 'Dashboard views' })).getAllByRole('link').map((a) => a.querySelector('b')!.textContent)).toEqual(['Now', 'Where', 'Catch up', 'Team'])
   })
 
-  it('Right now answers who holds which files', async () => {
+  it('Where answers who holds which files', async () => {
+    go('#now')
     render(<App />)
-    await main().findByText(/are holding/, {}, LOAD)
-    expect(main().getByText('Live agents')).toBeTruthy()
+    await main().findByText(/are working on/, {}, LOAD)
+    expect(main().getByText('The repository')).toBeTruthy()
     expect(main().getByText('Contested files')).toBeTruthy()
   })
 

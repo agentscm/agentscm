@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { SectionTabs } from '../TopNav.tsx'
 import { fetchDiff, fetchEntry, fetchTimeline, type DiffEntry, type EvidenceState, type TimelineEntry, type Trigger } from '../localApi.ts'
 import { Ago, Box, CopyButton, Empty, Explain, Icon, Notice, Pill, PreviewBanner, Skeleton, type Tone } from '../ui.tsx'
 import { usePoll } from '../usePoll.ts'
@@ -218,8 +219,10 @@ export function TimelinePage() {
     <div className="page">
       <div className="answer" data-tour="answer">
         <h1 className="page-question">What did this workspace look like earlier?</h1>
-        <p className="answer-text">A <strong>snapshot</strong> is a saved picture of your files at one moment, so you can look back, compare two moments, or start again from one.</p>
+        <p className="answer-text">Saved moments of your files, to look back on or start again from.</p>
+        <p className="answer-fact">A <strong>snapshot</strong> is a picture of your files at one moment. Compare two, or fork a new change from one.</p>
       </div>
+      <SectionTabs />
       {route.kind !== 'list' && <a href="#timeline" className="back"><Icon name="arrow-left" /> All saved moments</a>}
       {route.kind === 'list' && <List />}
       {route.kind === 'entry' && <EntryDetail key={route.id} id={route.id} />}
