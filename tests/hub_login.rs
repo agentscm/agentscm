@@ -1324,6 +1324,7 @@ async fn gitlab_access_levels_come_from_the_project_or_its_group() {
     // (name, public, project level, group level, may mint)
     let cases = [
         ("grp/guest", false, Some(10), None, false),
+        ("grp/planner", false, Some(15), None, false),
         ("grp/minimal", false, Some(5), None, false),
         ("grp/reporter", false, Some(20), None, true),
         ("grp/group-reporter", false, None, Some(20), true),
@@ -1345,6 +1346,15 @@ async fn gitlab_access_levels_come_from_the_project_or_its_group() {
         assert_eq!(status, if allowed { 201 } else { 403 }, "{name}");
         assert_eq!(allowed, reply["error"] != "insufficient_role", "{name}");
     }
+    let (_, planner) = env.create_token(&session, "grp/planner").await;
+    assert_eq!(planner["has"], "planner");
+    assert!(
+        planner["message"]
+            .as_str()
+            .unwrap()
+            .contains("has Planner on private repository grp/planner"),
+        "{planner}"
+    );
     let (_, guest) = env.create_token(&session, "grp/guest").await;
     assert_eq!(
         (&guest["has"], &guest["needs"]),

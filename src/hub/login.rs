@@ -859,6 +859,7 @@ fn missing_role(
         }
         let has = match held {
             Some(GITLAB_REPORTER) => "reporter",
+            Some(15) => "planner",
             Some(10) => "guest",
             Some(5) => "minimal_access",
             _ => "none",
@@ -876,6 +877,7 @@ fn role_name(role: &str) -> &'static str {
         "read" => "Read",
         "triage" => "Triage",
         "guest" => "Guest",
+        "planner" => "Planner",
         "minimal_access" => "Minimal Access",
         "reporter" => "Reporter",
         "developer" => "Developer",

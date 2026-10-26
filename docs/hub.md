@@ -160,7 +160,7 @@ sign-in becomes the default hub. It is sent only to the hub that issued it.
   requires the repository to be connected on the person's host under the same
   forge repository id (403 `not_connected` otherwise); only then does it mint. A forge role
   below the rule above is refused with 403 `insufficient_role` and the fields `login`,
-  `repository`, `visibility` (`public`, `internal` or `private`), `has` (`read`, `guest`,
+  `repository`, `visibility` (`public`, `internal` or `private`), `has` (`read`, `guest`, `planner`,
   `minimal_access`, `reporter` or `none`), `needs` (`triage`, `reporter` or `developer`) and
   `message`, a sentence that names the fix, such as `alice has Read on public repository
   acme/widgets; ask a repository owner for Triage or higher`. Clients show `message` as given.

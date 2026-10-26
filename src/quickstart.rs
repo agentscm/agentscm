@@ -1341,6 +1341,15 @@ fn offers_tray(cx: &Cx<'_>) -> bool {
         && cx.live.repo.is_some()
         && cx.manifest.bin_dir.is_some()
         && !cx.manifest.tray_declined
+        && !tray_login_enabled()
+}
+
+/// A Yes is remembered by Start at Login itself.
+fn tray_login_enabled() -> bool {
+    #[cfg(target_os = "macos")]
+    return crate::tray::login_enabled();
+    #[cfg(not(target_os = "macos"))]
+    false
 }
 
 fn tray_offer(cx: &mut Cx<'_>, command: &str) -> Result<()> {
