@@ -58,7 +58,8 @@ pub struct ReconcileArgs {
     /// The only pull request base reconciled.
     #[arg(long, default_value = "main")]
     base: String,
-    /// Directory with policy.json, recipe.json and registry.json from the default branch.
+    /// Directory with policy.json, recipe.json and registry.json from the default branch;
+    /// relative to `--repo`, without `..`.
     #[arg(long, default_value = ".github/local-validation")]
     config_dir: PathBuf,
     /// Checkout of the default branch; its `origin` is fetched.
@@ -452,7 +453,7 @@ fn check_github_repo(repo: &str) -> Result<()> {
 
 async fn reconcile(args: ReconcileArgs) -> Result<i32> {
     use agentscm::hub::forge_http::check_base_url;
-    use agentscm::hub::github::{Api, valid_ref_name};
+    use agentscm::hub::github::{Api, CommitStatus, StatusState, valid_ref_name};
     use agentscm::local_validation::reconcile::Context;
     check_github_repo(&args.github_repo)?;
     if !valid_ref_name(&args.base) {
@@ -462,7 +463,37 @@ async fn reconcile(args: ReconcileArgs) -> Result<i32> {
         .ok()
         .filter(|t| !t.is_empty())
         .ok_or_else(|| Error::Invalid("the token environment variable is unset or empty".into()))?;
-    let read = |name: &str| read_bounded(&args.config_dir.join(name), MAX_INPUT_BYTES);
+    let config_dir = args
+        .config_dir
+        .to_str()
+        .filter(|d| {
+            !d.is_empty()
+                && !d.starts_with('-')
+                && args
+                    .config_dir
+                    .components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_)))
+        })
+        .ok_or_else(|| {
+            Error::Invalid("--config-dir must be a relative path inside --repo".into())
+        })?;
+    let target_ok = args.target_url.as_deref().is_none_or(|url| {
+        CommitStatus::new(&"0".repeat(40), StatusState::Pending, "x", "x")
+            .and_then(|status| status.with_target_url(url))
+            .is_ok()
+    });
+    if !target_ok {
+        eprintln!(
+            "--target-url must be a short http(s) URL without control characters; nothing written"
+        );
+        return Ok(2);
+    }
+    let read = |name: &str| {
+        read_bounded(
+            &args.repo.join(&args.config_dir).join(name),
+            MAX_INPUT_BYTES,
+        )
+    };
     let policy = ValidationPolicy::from_slice(&read("policy.json")?)?;
     let recipe = ValidationRecipe::from_slice(&read("recipe.json")?)?;
     let registry = IssuerRegistrySnapshot::from_slice(&read("registry.json")?)?;
@@ -482,6 +513,7 @@ async fn reconcile(args: ReconcileArgs) -> Result<i32> {
         token: &token,
         github_repo: &args.github_repo,
         base: &args.base,
+        config_dir,
         git_repo: &args.repo,
         repository: &policy.repository,
         policy: &policy,

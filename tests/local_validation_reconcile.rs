@@ -73,36 +73,6 @@ impl Env {
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         let work = root.join("work");
         fs::create_dir(&work).unwrap();
-        git(&work, &["init", "-q", "-b", "main"]);
-        fs::write(work.join("base.txt"), "base").unwrap();
-        git(&work, &["add", "."]);
-        git(&work, &["commit", "-q", "-m", "base"]);
-        let base = git(&work, &["rev-parse", "HEAD"]);
-        git(&work, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
-        for (name, text) in files {
-            fs::write(work.join(name), text).unwrap();
-        }
-        git(&work, &["add", "."]);
-        git(&work, &["commit", "-q", "-m", "work"]);
-        let head = git(&work, &["rev-parse", "HEAD"]);
-        // `origin` serves the default branch and the pull request head ref.
-        let bare = root.join("origin.git");
-        git(
-            &root,
-            &["init", "-q", "--bare", "-b", "main", bare.to_str().unwrap()],
-        );
-        git(
-            &work,
-            &[
-                "push",
-                "-q",
-                bare.to_str().unwrap(),
-                &format!("{base}:refs/heads/main"),
-                &format!("{head}:refs/pull/1/head"),
-            ],
-        );
-        git(&root, &["clone", "-q", bare.to_str().unwrap(), "checkout"]);
-
         let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
         fs::write(root.join("key"), [7; 32]).unwrap();
         fs::set_permissions(root.join("key"), fs::Permissions::from_mode(0o600)).unwrap();
@@ -163,6 +133,42 @@ impl Env {
             serde_json::to_vec(&policy).unwrap(),
         )
         .unwrap();
+
+        git(&work, &["init", "-q", "-b", "main"]);
+        fs::write(work.join("base.txt"), "base").unwrap();
+        // The verifier configuration lives in the default branch, as in a real repository.
+        let in_repo = work.join(".github/local-validation");
+        fs::create_dir_all(&in_repo).unwrap();
+        for name in ["policy.json", "recipe.json", "registry.json"] {
+            fs::copy(config.join(name), in_repo.join(name)).unwrap();
+        }
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "base"]);
+        let base = git(&work, &["rev-parse", "HEAD"]);
+        git(&work, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        for (name, text) in files {
+            fs::write(work.join(name), text).unwrap();
+        }
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "work"]);
+        let head = git(&work, &["rev-parse", "HEAD"]);
+        // `origin` serves the default branch and the pull request head ref.
+        let bare = root.join("origin.git");
+        git(
+            &root,
+            &["init", "-q", "--bare", "-b", "main", bare.to_str().unwrap()],
+        );
+        git(
+            &work,
+            &[
+                "push",
+                "-q",
+                bare.to_str().unwrap(),
+                &format!("{base}:refs/heads/main"),
+                &format!("{head}:refs/pull/1/head"),
+            ],
+        );
+        git(&root, &["clone", "-q", bare.to_str().unwrap(), "checkout"]);
 
         let fake = FakeGithub::start().await;
         fake.with(|s| {
@@ -233,8 +239,6 @@ impl Env {
             "reconcile",
             "--github-repo",
             "o/r",
-            "--config-dir",
-            root.join("config").to_str().unwrap(),
             "--repo",
             root.join("checkout").to_str().unwrap(),
             "--api-url",
@@ -557,7 +561,9 @@ async fn auth_and_rate_limit_failures_stop_the_run() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_policy_for_another_repository_is_refused_before_any_request() {
     let env = Env::new().await;
-    let policy = env.root().join("config/policy.json");
+    let policy = env
+        .root()
+        .join("checkout/.github/local-validation/policy.json");
     let text = fs::read_to_string(&policy).unwrap();
     fs::write(&policy, text.replace(REPOSITORY, "github.com/o/other")).unwrap();
     let out = tokio::task::block_in_place(|| env.reconcile());
@@ -598,4 +604,42 @@ async fn a_head_that_cannot_be_fetched_stays_pending_and_fails_the_run() {
     assert_eq!(env.states(&env.head), ["pending"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("PR #1") && stderr.contains(&env.head));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn verifier_configuration_that_changed_on_the_default_branch_gets_no_verdict() {
+    let env = Env::new().await;
+    let body = env.attest();
+    env.attest_comment(10, "OWNER", body);
+    // The default branch advances its verifier inputs after this checkout was made.
+    let root = env.root();
+    let newer = root.join("newer");
+    git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            root.join("origin.git").to_str().unwrap(),
+            "newer",
+        ],
+    );
+    fs::write(newer.join(".github/local-validation/registry.json"), "{}\n").unwrap();
+    git(&newer, &["commit", "-q", "-am", "change registry"]);
+    git(&newer, &["push", "-q", "origin", "HEAD:main"]);
+    let out = tokio::task::block_in_place(|| env.reconcile());
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(env.states(&env.head), ["pending"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("configuration changed since checkout"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invalid_target_url_is_refused_before_any_request() {
+    let env = Env::new().await;
+    let mut args = env.reconcile_args();
+    args.extend(["--target-url".into(), "javascript:alert(1)".into()]);
+    let out = tokio::task::block_in_place(|| {
+        env.cli(&args.iter().map(String::as_str).collect::<Vec<_>>())
+    });
+    assert_eq!(code(&out), 2);
+    assert!(env.fake.with(|s| s.requests.is_empty()));
 }

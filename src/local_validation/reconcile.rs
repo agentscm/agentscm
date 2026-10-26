@@ -16,7 +16,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::comment::MARKER_PREFIX;
-use super::run::{fetch_pull, observe};
+use super::run::{config_dir_unchanged, fetch_pull, observe};
 use super::{Observed, ValidationPolicy, ValidationRecipe, VerdictState, select};
 use crate::evidence::EvaluationClock;
 use crate::hub::github::{Api, CommitStatus, Gh, GhError, StatusState};
@@ -99,6 +99,9 @@ pub struct Context<'a> {
     /// OWNER/NAME.
     pub github_repo: &'a str,
     pub base: &'a str,
+    /// Repository-relative directory of the policy, recipe and registry; its tree at the checkout
+    /// `HEAD` must equal `origin/<base>`'s before a verdict is written.
+    pub config_dir: &'a str,
     /// Local checkout whose `origin` is the repository.
     pub git_repo: &'a Path,
     /// The policy's repository identity.
@@ -256,6 +259,13 @@ impl Context<'_> {
         })
     }
 
+    /// False when the verifier inputs on the default branch moved since the checkout.
+    fn config_current(&self) -> bool {
+        tokio::task::block_in_place(|| {
+            config_dir_unchanged(self.git_repo, self.base, self.config_dir)
+        })
+    }
+
     /// Err when the head could not be fetched or observed: nothing is written for it.
     fn verdict(&self, c: &Candidate) -> Result<(StatusState, String), String> {
         let git = tokio::task::block_in_place(|| {
@@ -376,7 +386,15 @@ impl Context<'_> {
                 match self.verdict(c) {
                     Ok(decided) => Some(decided),
                     Err(why) => {
-                        // Stays pending from the invalidate step; the run fails.
+                        // Stays pending from the invalidate step. A head that moved mid-run is
+                        // not an error; anything else fails the run.
+                        if let Ok(Recheck::Changed(moved)) = self.recheck(c).await {
+                            println!(
+                                "PR #{} {}: {moved}; left pending (a newer event owns the verdict)",
+                                c.number, c.head
+                            );
+                            continue;
+                        }
                         tally.errors += 1;
                         eprintln!(
                             "PR #{} {}: head could not be fetched ({why}); stays pending",
@@ -388,7 +406,13 @@ impl Context<'_> {
             };
             let outcome = match self.recheck(c).await {
                 Err(error) => {
-                    tally.fail("re-check failed; head stays pending", &error);
+                    tally.fail(
+                        &format!(
+                            "PR #{} {}: re-check failed; head stays pending",
+                            c.number, c.head
+                        ),
+                        &error,
+                    );
                     if tally.stop {
                         return 1;
                     }
@@ -396,7 +420,7 @@ impl Context<'_> {
                 }
                 Ok(Recheck::Changed(why)) => {
                     println!(
-                        "PR #{} {}: {why}; a newer event owns the verdict",
+                        "PR #{} {}: {why}; left pending (a newer event owns the verdict)",
                         c.number, c.head
                     );
                     continue;
@@ -404,6 +428,13 @@ impl Context<'_> {
                 Ok(Recheck::Shared) => None,
                 Ok(Recheck::Current) => decided,
             };
+            if !self.config_current() {
+                println!(
+                    "PR #{} {}: default-branch verifier configuration changed since checkout; a newer run owns the verdict",
+                    c.number, c.head
+                );
+                continue;
+            }
             let (state, reason) = outcome.unwrap_or((
                 StatusState::Pending,
                 "head shared by several open pull requests; unsupported".into(),

@@ -121,26 +121,47 @@ pub fn observe(repo: &Path, head: &str, base_rev: &str) -> Result<GitState> {
     })
 }
 
+fn fetch_base(repo: &Path, base: &str) -> Result<()> {
+    let base_spec = format!("+refs/heads/{base}:refs/remotes/origin/{base}");
+    git_timeout(
+        repo,
+        &["fetch", "--no-tags", "--quiet", "origin", &base_spec],
+        GIT_OUTPUT,
+        FETCH_TIMEOUT,
+        true,
+    )
+    .map(drop)
+}
+
 /// Fetches the base branch and `refs/pull/{number}/head` from `origin` (Git data only, nothing is
 /// checked out) and requires the pull ref to name exactly `head`.
 pub fn fetch_pull(repo: &Path, base: &str, number: i64, head: &str) -> Result<()> {
-    let base_spec = format!("+refs/heads/{base}:refs/remotes/origin/{base}");
+    fetch_base(repo, base)?;
     let pull_ref = format!("refs/pull/{number}/head");
-    for spec in [base_spec.as_str(), pull_ref.as_str()] {
-        git_timeout(
-            repo,
-            &["fetch", "--no-tags", "--quiet", "origin", spec],
-            GIT_OUTPUT,
-            FETCH_TIMEOUT,
-            true,
-        )?;
-    }
+    git_timeout(
+        repo,
+        &["fetch", "--no-tags", "--quiet", "origin", &pull_ref],
+        GIT_OUTPUT,
+        FETCH_TIMEOUT,
+        true,
+    )?;
     if rev(repo, "FETCH_HEAD", "^{commit}")? != head {
         return Err(Error::Invalid(
             "pull request head moved while fetching".into(),
         ));
     }
     Ok(())
+}
+
+/// Re-fetches `origin/{base}` and tells whether the repository-relative `dir` has the same tree
+/// there as at the checkout's `HEAD`. Any failure to read either side counts as changed.
+pub fn config_dir_unchanged(repo: &Path, base: &str, dir: &str) -> bool {
+    let tree = |name: &str| rev(repo, name, &format!(":{dir}"));
+    fetch_base(repo, base).is_ok()
+        && match (tree("HEAD"), tree(&format!("refs/remotes/origin/{base}"))) {
+            (Ok(ours), Ok(theirs)) => ours == theirs,
+            _ => false,
+        }
 }
 
 fn is_clean(repo: &Path) -> Result<bool> {
