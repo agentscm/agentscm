@@ -81,7 +81,7 @@ Git worktree. Rerun `init-repo` to review the updated instruction block; hooks s
 coordination, and selection does not narrow required checks or establish model-cost savings.
 
 Quickstart sets up each coding agent through `agentscm client setup`, so it appears on the
-hub's Connect agents page, defaults to a native managed hub on Apple Silicon macOS with an explicit Docker fallback, and prints the executable path and PATH guidance for later commands.
+hub's Setup › Agents page, defaults to a native managed hub on Apple Silicon macOS with an explicit Docker fallback, and prints the executable path and PATH guidance for later commands.
 See [guided setup](docs/setup-guide.md) for details.
 
 Run `agentscm open` in a connected checkout to see your files, saved agent conversations and your

@@ -51,7 +51,7 @@ agentscm init-repo --hub-url https://hub.example.com
 | Gemini CLI | `GEMINI.md` (one import line, `@./AGENTS.md`) |
 | All | `AGENTS.md` (a marked `<!-- agentscm:begin -->` block telling agents to start, to call `agentscm_check` before editing unless Claude Code, Codex or Copilot hooks already check their edits, to say so when coordination is unavailable, to do other work or ask when another agent holds a file, to answer handoff requests, and to finish) |
 
-It then prints, per agent, `agentscm client setup --agent <agent> --hub <hub>`. Each developer runs that once per checkout: it signs in to the hub and adds that machine's MCP server and hooks (git-excluded local files or user-level plugins), and the hub's Connect agents page verifies them. See [onboarding](team-member-onboarding.md).
+It then prints, per agent, `agentscm client setup --agent <agent> --hub <hub>`. Each developer runs that once per checkout: it signs in to the hub and adds that machine's MCP server and hooks (git-excluded local files or user-level plugins), and the hub's Setup › Agents page verifies them. See [onboarding](team-member-onboarding.md).
 
 `init-repo` replaces only its marked block in existing files and leaves the rest alone.
 

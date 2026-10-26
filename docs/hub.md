@@ -221,7 +221,7 @@ on no others:
   (search), `GET /v1/hub/standup/work/{id}`, `GET /v1/hub/standup/insights`,
   `GET /v1/hub/standup/work/{id}/insights`, `GET /v1/hub/standup/coordination` and
   `GET /v1/hub/standup/inbox` for the token's repository
-- `GET /v1/hub/view-settings` and `GET /v1/hub/onboarding` (the Connect agents page)
+- `GET /v1/hub/view-settings` and `GET /v1/hub/onboarding` (the Setup › Agents page)
 - `GET /v1/hub/skills` and the `GET /v1/hub/repos/{repo}/skills/runs` routes (see the
   [API](api.md#hub-supported-skills-routes-experimental))
 - `GET /v1/hub/repos/{repo}/change-records/{work_id}` for a concise source-bound handoff, and
@@ -667,12 +667,14 @@ are pending. See [local change capture](change-capture.md) for configuration and
 
 ## Status page
 
-`/ui/` is a read-only page of what the hub knows about one repository. Its rail groups the pages:
-Coordinate (Right now, Work, Activity: live sessions and recent events from
-`GET /v1/hub/repos/{repo}/activity`, and work from the stand-up routes), Verify (Workflows, Change
-records, Landed changes, Skills), This computer (Templates and Timeline, which read a local
-`agentscm serve`, not the hub: see [local template and timeline reads](api.md#local-template-and-timeline-reads))
-and Manage (Workspace, Connect agents, Hub health, Settings). The container image serves it (it is built
+`/ui/` is a read-only page of what the hub knows about one repository. Its rail has six items, each
+with tabs: Dashboard (Now, Where, Catch up and Team: live sessions and recent events from
+`GET /v1/hub/repos/{repo}/activity`, and work from the stand-up routes), Inbox (declared-scope
+overlaps and directed requests), History (Finished, Changes, Change records, and Files from this
+computer), Timeline, Skills (Skills, Checks, After merge, and Recipes) and Setup (Agents, Hub,
+Access and Preferences). Files, Timeline and Recipes read a local `agentscm serve`, not the hub: see
+[local template and timeline reads](api.md#local-template-and-timeline-reads). The page comes in
+light and dark, and in Spacious and Condensed densities, chosen in the top bar and kept in the browser. The container image serves it (it is built
 with `--features ui`, as are the release binaries); `/` and `/ui` redirect to it. A binary built
 from source without the feature answers `/ui/` with a short notice page and nothing else.
 
@@ -681,7 +683,7 @@ The page signs in with a [read-only token](#read-only-tokens) for the repository
 write. The token is kept in the browser's session storage, or in its local storage if "keep me
 signed in" is ticked. The token path uses no cookies. The workspace section is separate: it signs in through the hub's
 browser login and keeps a cookie session. The page polls every few seconds and reads `whoami`,
-`work`, `activity`, `health` and `/v1/hub/onboarding` (the Connect agents page); the workflow panel also reads the
+`work`, `activity`, `health` and `/v1/hub/onboarding` (the Setup › Agents page); the workflow panel also reads the
 bounded recent-run list once and an individual run when selected. Mint a token only for this, so it
 can be revoked on its own:
 
@@ -689,7 +691,7 @@ can be revoked on its own:
 agentscm hub token create --read-only --name status-page --repo owner/name
 ```
 
-The Verify rail and each Work detail can open `#change-record/{work_id}`. That page performs one
+History › Change records and each task page can open `#change-record/{work_id}`. That page performs one
 bounded read of the concise change-record projection and refreshes only on request. A missing record,
 authorization denial, unavailable service and incomplete evidence remain distinct states. The
 filled browser path still needs integrated qualification with a current captured record.
