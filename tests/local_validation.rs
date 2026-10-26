@@ -546,13 +546,21 @@ fn signed_pass_for_failed_record_is_rejected() {
 }
 
 #[test]
-fn producer_marks_missing_service_run_as_not_pass() {
+fn producer_passes_when_policy_does_not_require_the_missing_service() {
     let mut c = Case::new();
     c.record.services.s3 = false;
     c.policy.required_services.s3 = false;
-    // The producer marks the run failed without all services, so the signed
-    // outcome is not pass even though the policy tolerates the absence.
-    fails(c, "outcome not pass");
+    let (verdict, body) = c.execute();
+    assert_eq!(verdict.state, VerdictState::Success);
+    assert!(body.contains("- <code>s3 tests</code>\n"));
+}
+
+#[test]
+fn missing_required_service_fails_verification() {
+    let mut c = Case::new();
+    c.record.services.s3 = false;
+    c.policy.required_services.s3 = true;
+    fails(c, "required service missing");
 }
 
 const OLD: &str = "5555555555555555555555555555555555555555";

@@ -142,14 +142,6 @@ impl Fixture {
             .arg("local-validation")
             .args(args)
             .env("GH_TOKEN", "synthetic-secret")
-            .env(
-                "AGENTSCM_TEST_DATABASE_URL",
-                "postgres://synthetic.invalid/x",
-            )
-            .env("AGENTSCM_TEST_S3_ENDPOINT", "http://synthetic.invalid")
-            .env("AGENTSCM_TEST_S3_BUCKET", "b")
-            .env("AGENTSCM_TEST_S3_ACCESS_KEY_ID", "k")
-            .env("AGENTSCM_TEST_S3_SECRET_ACCESS_KEY", "s")
             .output()
             .unwrap()
     }
@@ -257,11 +249,7 @@ fn flat_comment(sha: &str, envelope: &[u8], record: &[u8]) -> String {
 }
 
 fn ok_fixture() -> Fixture {
-    Fixture::new(vec![command(
-        "gate",
-        r#"test -z "$GH_TOKEN" && test -n "$AGENTSCM_TEST_DATABASE_URL""#,
-        30,
-    )])
+    Fixture::new(vec![command("gate", r#"test -z "$GH_TOKEN""#, 30)])
 }
 
 #[test]

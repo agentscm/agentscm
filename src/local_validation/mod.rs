@@ -401,11 +401,7 @@ pub fn evidence_payload(
 ) -> Result<(EvidencePayload, Vec<u8>)> {
     let record_bytes = record.to_bytes()?;
     let record_sha256 = format!("{:x}", Sha256::digest(&record_bytes));
-    let all_services = Services {
-        postgres: true,
-        s3: true,
-    };
-    let pass = record.shortfall(all_services).is_none()
+    let pass = record.shortfall(policy.required_services).is_none()
         && recipe.first_departure(&record.results).is_none();
     let mut omissions: Vec<String> = FIXED_OMISSIONS.iter().map(|s| (*s).to_owned()).collect();
     omissions.extend(
