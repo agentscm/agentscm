@@ -37,6 +37,11 @@ export function needsYou(ov: WorkOverview | null, d: Derived | null): Need[] {
   return out.sort((a, b) => ORDER.indexOf(a.kind) - ORDER.indexOf(b.kind) || b.at - a.at)
 }
 
+/** When a need last changed: its own time or its task's last update, whichever is newer. */
+export const needUpdatedAt = (n: Need): number => Math.max(n.at, n.item?.updated_at ?? 0)
+/** The browser-only hide key: a need that changes gets a new key, so it shows again. */
+export const needHideKey = (n: Need): string => `${n.key}@${needUpdatedAt(n)}`
+
 /** Two agents holding one file, plus two tasks declaring overlapping scope: the map's crossings. */
 export function crossings(ov: WorkOverview | null, d: Derived | null): number {
   return (d?.contested.length ?? 0) + (ov?.overlaps.length ?? 0)
