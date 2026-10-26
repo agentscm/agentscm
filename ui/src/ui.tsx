@@ -206,6 +206,15 @@ export function Avatar({ name, size = 32 }: { name: string; size?: number }) {
   )
 }
 
+/** A page that reads this computer, opened on a Hub elsewhere: nothing is wrong, it just lives on the computer. */
+export function OnThisComputer({ what }: { what: string }) {
+  return (
+    <Empty icon="laptop" title={`${what} runs on this computer`}>
+      Open it from the AgentSCM menu bar app (Open Hub), or run <code>agentscm open</code> in your repository. It opens there already connected.
+    </Empty>
+  )
+}
+
 /** Shown whenever a local-feature page is rendering fixtures instead of a live local read API. */
 export function PreviewBanner({ reason }: { reason?: string }) {
   return (

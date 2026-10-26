@@ -543,7 +543,7 @@ function SideNav({ nav, sections, section, badges, collapsed, onCollapse, drawer
         </nav>
         <div className="side-foot">
           <p className="side-foot-note"><Icon name="eye" /> Read-only. Opening a page never changes anything for your agents.</p>
-          <Tip text={collapsed ? 'Expand the sidebar  [' : 'Show icons only  ['} placement="right">
+          <Tip text={collapsed ? 'Expand the sidebar' : 'Show icons only'} placement="right">
             <button type="button" className="side-collapse" onClick={onCollapse} aria-pressed={collapsed} aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}>
               <Icon name={collapsed ? 'layout-sidebar-inset' : 'layout-sidebar'} />
               <span className="side-label">Collapse</span>

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Combobox } from '../Combobox.tsx'
-import { fetchHandoff, fetchLocalChanges, fetchLocalRuns, inspectTemplate, type Handoff, type RunState, type TemplateAction, type TemplateInspect } from '../localApi.ts'
-import { Box, Empty, Explain, Icon, Notice, Pill, PreviewBanner, Skeleton, type Tone } from '../ui.tsx'
+import { fetchHandoff, fetchLocalChanges, fetchLocalRuns, inspectTemplate, localReachable, type Handoff, type RunState, type TemplateAction, type TemplateInspect } from '../localApi.ts'
+import { Box, Empty, Explain, Icon, Notice, OnThisComputer, Pill, PreviewBanner, Skeleton, type Tone } from '../ui.tsx'
 import { usePoll } from '../usePoll.ts'
 import { SectionTabs } from '../TopNav.tsx'
 import { SkillLibraryPanel, WorkflowLibraryPanel } from '../WorkflowLibraryPanel.tsx'
@@ -325,16 +325,22 @@ export function TemplatesPage({ repository = null, onDirtyChange }: { repository
         <p className="answer-fact">Draft the steps, publish an immutable version, simulate what it would do, then attach it to <code>{repository ?? 'a repository'}</code>. Nothing here runs a command.</p>
       </div>
       <SectionTabs />
-      <nav className="lens" aria-label="Library views">
-        {LENSES.map((l) => (
-          <a key={l.key} href={tabHref(l.key)} className={`lens-seg${tab === l.key ? ' on' : ''}`} aria-current={tab === l.key ? 'page' : undefined}>
-            <Icon name={l.icon} /> {l.label}
-          </a>
-        ))}
-      </nav>
-      {tab === 'workflows' && <WorkflowLibraryPanel repository={repository} onDirtyChange={setWorkflowDirty} />}
-      {tab === 'skills' && <SkillLibraryPanel />}
-      {tab === 'inspect' && <InspectorPanel />}
+      {!localReachable() ? (
+        <OnThisComputer what="The library" />
+      ) : (
+        <>
+          <nav className="lens" aria-label="Library views">
+            {LENSES.map((l) => (
+              <a key={l.key} href={tabHref(l.key)} className={`lens-seg${tab === l.key ? ' on' : ''}`} aria-current={tab === l.key ? 'page' : undefined}>
+                <Icon name={l.icon} /> {l.label}
+              </a>
+            ))}
+          </nav>
+          {tab === 'workflows' && <WorkflowLibraryPanel repository={repository} onDirtyChange={setWorkflowDirty} />}
+          {tab === 'skills' && <SkillLibraryPanel />}
+          {tab === 'inspect' && <InspectorPanel />}
+        </>
+      )}
       <p className="small muted" data-tour="templates-source"><Icon name="laptop" /> Workflow authoring is available through the loopback page opened by <code>agentscm open</code>. The shared Hub remains read-only.</p>
     </div>
   )

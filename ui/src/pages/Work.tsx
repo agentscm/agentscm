@@ -27,6 +27,8 @@ import {
 } from '../standup.ts'
 import { agentLabel, Ago, Avatar, Box, Empty, Explain, Icon, Notice, Path, Paths, Pill, Skeleton, Tip, localDate, type Tone } from '../ui.tsx'
 import { usePoll, type Poll } from '../usePoll.ts'
+import { useNow } from '../useHub.ts'
+import { HideButton, hideKey, isStale, ShowHidden, useHidden, useHideable } from '../dismiss.tsx'
 import { hashPath, Pager } from '../Pager.tsx'
 
 export const STATE: Record<WorkState, { label: string; tone: Tone; icon: string; tip: string }> = {
@@ -285,6 +287,16 @@ function requestMatches(r: CoordinationRequest, q: string) {
   return [r.id, r.requester.agent, r.requester.login, r.proposal.title, r.proposal.request_key, ...r.proposal.scope, ...r.targets.flatMap((t) => [t.work_id, t.lead.agent, t.lead.login, ...t.reasons.flatMap((x) => [x.your_path, x.their_path])]), ...r.responses.flatMap((x) => [x.responder.agent, x.responder.login, RESPONSE_LABEL[x.kind], x.note])].some((v) => v?.toLocaleLowerCase().includes(n))
 }
 
+/** Both sides of an overlap reason; a path both sides declared shows once. */
+function PathPair({ a, b, joiner = <Icon name="intersect" className="muted" /> }: { a: string; b: string; joiner?: ReactNode }) {
+  return a === b ? <Path>{a}</Path> : <><Path>{a}</Path> {joiner} <Path>{b}</Path></>
+}
+
+// Browser-only hide keys for the Inbox's lingering rows (see dismiss.tsx).
+const requestHideKey = (r: CoordinationRequest) => hideKey(`request:${r.id}`, r.updated_at)
+const signalUpdatedAt = (i: WorkItem) => Math.max(i.updated_at, i.last_checkin_at)
+const signalHideKey = (i: WorkItem) => hideKey(`signal:${i.id}`, signalUpdatedAt(i))
+
 function Request({ r }: { r: CoordinationRequest }) {
   const st = stage(r)
   const first = r.targets[0]?.reasons[0]
@@ -302,7 +314,7 @@ function Request({ r }: { r: CoordinationRequest }) {
         </span>
         {first && (
           <span className="request-reason small">
-            <Path>{first.your_path}</Path> <Icon name="intersect" className="muted" /> <Path>{first.their_path}</Path>
+            <PathPair a={first.your_path} b={first.their_path} />
           </span>
         )}
         <span className="muted small request-time">
@@ -353,7 +365,7 @@ function Request({ r }: { r: CoordinationRequest }) {
                 <ul className="reasons">
                   {t.reasons.map((x, i) => (
                     <li key={i}>
-                      <Path>{x.your_path}</Path> <span className="muted small">overlaps</span> <Path>{x.their_path}</Path>
+                      <PathPair a={x.your_path} b={x.their_path} joiner={<span className="muted small">overlaps</span>} />
                     </li>
                   ))}
                 </ul>
@@ -376,6 +388,30 @@ function Request({ r }: { r: CoordinationRequest }) {
   )
 }
 
+function RequestList({ requests, search, complete }: { requests: CoordinationRequest[]; search: string; complete: boolean }) {
+  const now = useNow() / 1000
+  const { rows, count, show, setShow, isHidden } = useHideable(requests, requestHideKey)
+  return (
+    <>
+      {rows.length === 0 ? (
+        <Empty icon="chat-left" title={search ? 'No request matches your search' : count > 0 ? 'Every request here is hidden' : complete ? 'No directed requests' : 'No request on this page'}>
+          {!search && count === 0 && (complete ? 'No agent has asked another lead to coordinate in this snapshot.' : 'More requests remain in this fixed snapshot.')}
+        </Empty>
+      ) : (
+        <div className="request-list">
+          {rows.map((r) => (
+            <div key={r.id} className={`hideable${isHidden(r) ? ' is-hidden' : ''}`}>
+              <Request r={r} />
+              {(isHidden(r) || isStale(r.updated_at, now)) && <HideButton k={requestHideKey(r)} hidden={isHidden(r)} what={`the request “${r.proposal.title}”`} />}
+            </div>
+          ))}
+        </div>
+      )}
+      <ShowHidden count={count} show={show} onShow={setShow} />
+    </>
+  )
+}
+
 function RequestQueue({ token, search }: { token: string; search: string }) {
   const [queries, setQueries] = useState<CoordinationQuery[]>([{ limit: 10, activeOnly: true }])
   const [page, setPage] = useState(0)
@@ -384,6 +420,7 @@ function RequestQueue({ token, search }: { token: string; search: string }) {
   const fresh = page === 0 && query.through === undefined
   const key = `${JSON.stringify(query)}|${nonce}`
   const load = usePoll((signal) => fetchCoordination(token, signal, query), fresh ? 15_000 : 0, key)
+  const hidden = useHidden()
   const restart = (activeOnly: boolean) => {
     setQueries([{ limit: 10, activeOnly }])
     setPage(0)
@@ -395,7 +432,7 @@ function RequestQueue({ token, search }: { token: string; search: string }) {
       icon="chat-left-dots"
       title="Directed requests"
       explain="When two tasks declare overlapping scope, an agent can send the other lead a request: split the scope, join, or hand over. Agents receive and answer these through MCP or HTTP; this page only reads them."
-      count={load.kind === 'ready' ? load.value.requests.length : undefined}
+      count={load.kind === 'ready' ? load.value.requests.filter((r) => !hidden.has(requestHideKey(r))).length : undefined}
       actions={
         <>
           <div className="form-check form-switch mb-0">
@@ -425,22 +462,7 @@ function RequestQueue({ token, search }: { token: string; search: string }) {
           </p>
           {load.refreshError && <Notice title="Could not refresh requests">{load.refreshError}</Notice>}
           {load.value.retention_gap && <Notice title="Some request history is no longer retained" />}
-          {(() => {
-            const visible = load.value.requests.filter((r) => requestMatches(r, search))
-            if (visible.length === 0)
-              return (
-                <Empty icon="chat-left" title={search ? 'No request matches your search' : load.value.complete ? 'No directed requests' : 'No request on this page'}>
-                  {!search && (load.value.complete ? 'No agent has asked another lead to coordinate in this snapshot.' : 'More requests remain in this fixed snapshot.')}
-                </Empty>
-              )
-            return (
-              <div className="request-list">
-                {visible.map((r) => (
-                  <Request key={r.id} r={r} />
-                ))}
-              </div>
-            )
-          })()}
+          <RequestList requests={load.value.requests.filter((r) => requestMatches(r, search))} search={search} complete={load.value.complete} />
           <Pager
             newerLabel="Previous"
             olderLabel="Next"
@@ -479,7 +501,7 @@ function OverlapRow({ o }: { o: WorkOverlapPair }) {
       <div className="overlap-why">
         {o.reasons.map((x, i) => (
           <div key={i}>
-            <Path>{x.left_path}</Path> <Icon name="intersect" className="muted" /> <Path>{x.right_path}</Path>
+            <PathPair a={x.left_path} b={x.right_path} />
           </div>
         ))}
         {!o.reasons_complete && <div className="small warn-text">More path pairs omitted — compare full scopes.</div>}
@@ -495,7 +517,9 @@ function OverlapRow({ o }: { o: WorkOverlapPair }) {
 
 export function Coordination({ token, overview, search }: { token: string; overview: WorkOverview; search: string }) {
   const overlaps = overview.overlaps.filter((o) => workMatchesSearch(o.left, search) || workMatchesSearch(o.right, search) || o.reasons.some((r) => `${r.left_path} ${r.right_path}`.toLowerCase().includes(search.trim().toLowerCase())))
-  const attention = overview.current.filter((i) => workMatchesSearch(i, search) && (i.claim_status !== 'active' || i.scope.length === 0))
+  const signals = useHideable(overview.current.filter((i) => workMatchesSearch(i, search) && (i.claim_status !== 'active' || i.scope.length === 0)), signalHideKey)
+  const attention = signals.rows
+  const now = useNow() / 1000
   const decisions = overview.recent.filter((o) => o.kind === 'decision' && workMatchesSearch(o.item, search))
   return (
     <div className="stack">
@@ -520,23 +544,25 @@ export function Coordination({ token, overview, search }: { token: string; overv
         )}
       </Box>
       <div className="grid-2">
-        <Box icon="exclamation-triangle" tone={attention.length ? 'warn' : 'muted'} title="Other attention signals" count={attention.length} explain="Tasks whose lead has not checked in recently, or that declared no scope. These limit how confident any overlap check can be.">
+        <Box icon="exclamation-triangle" tone={attention.some((i) => !signals.isHidden(i)) ? 'warn' : 'muted'} title="Other attention signals" count={attention.length - (signals.show ? signals.count : 0)} explain="Tasks whose lead has not checked in recently, or that declared no scope. These limit how confident any overlap check can be. Anything untouched for a day can be hidden in this browser.">
           {attention.length === 0 ? (
             <Empty icon="check2" title="Nothing else needs attention" />
           ) : (
             <ul className="plain-list">
               {attention.map((i) => (
-                <li key={i.id}>
+                <li key={i.id} className={signals.isHidden(i) ? 'is-hidden' : undefined}>
                   <WorkLink id={i.id}>{i.title}</WorkLink>
                   <span className="muted small"> · {agentLabel(lead(i).agent)}</span>
                   <div className="pills">
                     {i.claim_status !== 'active' && <ClaimPill item={i} />}
                     {i.scope.length === 0 && <Pill tone="muted" icon="question-circle">Scope unknown</Pill>}
+                    {(signals.isHidden(i) || isStale(signalUpdatedAt(i), now)) && <HideButton k={signalHideKey(i)} hidden={signals.isHidden(i)} what={`“${i.title}”`} />}
                   </div>
                 </li>
               ))}
             </ul>
           )}
+          <ShowHidden count={signals.count} show={signals.show} onShow={signals.setShow} />
         </Box>
         <Box icon="signpost-split" tone="muted" title="Recent decisions" count={decisions.length} explain="Decisions agents reported in the same window, for example agreeing a scope split.">
           {decisions.length === 0 ? (
@@ -870,11 +896,17 @@ export function WorkPage({ token, overview }: { token: string; overview: Poll<Wo
       <div className="answer" data-tour="answer">
         <h1 className="page-question">{history ? 'What changed in Work, and when?' : 'What did agents report finished?'}</h1>
         {history ? (
-          <p className="answer-text">Every start, join, takeover and checkpoint, newest first. Reading never marks anything as seen.</p>
+          <>
+            <p className="answer-text">Every change to Work, newest first.</p>
+            <p className="answer-fact">Starts, joins, takeovers and checkpoints. Reading never marks anything as seen.</p>
+          </>
         ) : ov ? (
-          <p className="answer-text">
-            {finished === 0 ? 'Nothing was reported finished recently.' : <><b>{plural(finished, 'task')}</b> reported finished since {new Date(ov.recent_since * 1000).toLocaleDateString([], { weekday: 'long' })}.</>}
-          </p>
+          <>
+            <p className="answer-text">
+              {finished === 0 ? 'Nothing was reported finished recently.' : <><b>{plural(finished, 'task')}</b> reported finished since {new Date(ov.recent_since * 1000).toLocaleDateString([], { weekday: 'long' })}.</>}
+            </p>
+            <p className="answer-fact">Newest first, in each agent’s own words.</p>
+          </>
         ) : overview.kind === 'error' ? null : (
           <Skeleton rows={1} />
         )}
@@ -904,8 +936,9 @@ export function InboxPage({ token, overview }: { token: string; overview: Poll<W
   const [search, setSearch] = useState('')
   const ov = overview.kind === 'ready' ? overview.value : null
   const requests = usePoll((signal) => fetchCoordination(token, signal, { limit: 10, activeOnly: true }), 15_000, `inbox|${token}`)
-  const open = requests.kind === 'ready' ? requests.value.requests.filter(pending) : []
-  const quiet = ov?.current.filter((i) => i.claim_status !== 'active' || i.scope.length === 0).length ?? 0
+  const hidden = useHidden()
+  const open = requests.kind === 'ready' ? requests.value.requests.filter((r) => pending(r) && !hidden.has(requestHideKey(r))) : []
+  const quiet = ov?.current.filter((i) => (i.claim_status !== 'active' || i.scope.length === 0) && !hidden.has(signalHideKey(i))).length ?? 0
   return (
     <div className="page">
       <div className="answer" data-tour="answer">
