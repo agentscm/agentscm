@@ -3,10 +3,12 @@ import { agentSetupPrompt, CLIENT_AGENTS, clientSetupCommand, installCommand, sa
 import { onFrontDoor } from '../frontDoor.ts'
 import { CopyButton, Icon, Notice } from '../ui.tsx'
 
+/** The set-up command for the Hub serving this page, or null: on the local page the origin is this computer, and an unsupported origin gets none. */
+export const installCommandHere = (): string | null => (onFrontDoor() ? null : installCommand(window.location.origin))
+
 /** Set up this computer: one command, then agents connect on their own. Copies text; never runs anything. */
 export function InstallCommand({ lead = 'Run this in a checkout of a repository on this Hub to connect its agents.' }: { lead?: string }) {
-  // The local page's origin is this computer, not the Hub: no command to copy there.
-  const command = onFrontDoor() ? null : installCommand(window.location.origin)
+  const command = installCommandHere()
   if (!command) return null
   return (
     <div className="install">

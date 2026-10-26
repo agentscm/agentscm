@@ -3,7 +3,7 @@ import { useState, type FormEvent } from 'react'
 import { AGENT_TOKEN_MESSAGE, ApiError, fetchWhoami } from '../api.ts'
 import { Logo } from '../App.tsx'
 import { CopyButton, Explain, Icon, Notice } from '../ui.tsx'
-import { ConnectAgent, InstallCommand } from './Connect.tsx'
+import { ConnectAgent, InstallCommand, installCommandHere } from './Connect.tsx'
 import type { Refusal } from '../refusal.ts'
 import { RefusalNotice } from '../Refusal.tsx'
 
@@ -65,7 +65,7 @@ export function SignIn({ notice, onSignedIn }: { notice: string | null; onSigned
         </ul>
       </div>
       <div className="signin-panel">
-        {!onFrontDoor() && (
+        {installCommandHere() && (
           <section className="box mb-3" aria-labelledby="install-title">
             <header className="box-head">
               <span className="box-badge tone-brand">

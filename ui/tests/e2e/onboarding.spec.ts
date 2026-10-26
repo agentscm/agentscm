@@ -18,6 +18,14 @@ test('1. the Hub’s sign-in page offers one command to set up this computer', a
   await expect(setup.getByRole('button', { name: /copy/i })).toBeVisible()
 })
 
+test('1b. no set-up card at all where there is no command to show', async ({ page, baseURL }) => {
+  // localhost isn't a Hub address the CLI accepts (only https or 127.0.0.1/[::1]), so no command renders; neither may its card.
+  await page.goto(`${baseURL!.replace('127.0.0.1', 'localhost')}/#home`)
+  await expect(page.getByRole('button', { name: /Open status/ })).toBeVisible()
+  await expect(page.getByRole('region', { name: 'Set up this computer' })).toHaveCount(0)
+  await expect(page.getByRole('heading', { name: 'Set up this computer' })).toHaveCount(0)
+})
+
 test('2. the browser lands on “This computer is signed in”, with no token and nothing stored', async ({ page, baseURL }) => {
   await page.goto('/#/signed-in?status=signed_in&login=maria&provider=github&computer=maria-mbp&auto_connect=on')
   await expect(page.getByRole('heading', { name: 'This computer is signed in.' })).toBeVisible()
