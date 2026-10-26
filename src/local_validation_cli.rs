@@ -248,8 +248,7 @@ fn run_recipe(args: RunArgs, cancel: &Cancellation) -> Result<i32> {
             issued_at_ms,
             expires_at_ms: issued_at_ms.saturating_add(lifetime.saturating_mul(1000)),
             issuer_registry_sha256: &registry.digest()?,
-            cargo_lock_sha256: &produced.cargo_lock_sha256,
-            toolchain_file_sha256: &produced.toolchain_file_sha256,
+            dependencies: &produced.dependencies,
         },
     )?;
     let pass = payload.outcome == EvidenceOutcome::Pass;
