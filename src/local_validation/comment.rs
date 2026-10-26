@@ -68,14 +68,14 @@ pub fn render(envelope: &[u8], record: &[u8]) -> Result<String> {
     let expected = envelope_json["payload"]["coverage"]["expected_count"]
         .as_u64()
         .map_or_else(|| "unknown".to_owned(), |value| value.to_string());
-    let omissions = if omissions.is_empty() {
-        "none reported".to_owned()
+    let omission_count = omissions.len();
+    let omission_details = if omissions.is_empty() {
+        "None reported.\n".to_owned()
     } else {
         omissions
             .iter()
-            .map(|value| code(value))
-            .collect::<Vec<_>>()
-            .join(", ")
+            .map(|value| format!("- {}\n", code(value)))
+            .collect()
     };
     let missing_services = [
         (!parsed.services.postgres).then_some("PostgreSQL"),
@@ -85,15 +85,19 @@ pub fn render(envelope: &[u8], record: &[u8]) -> Result<String> {
     .flatten()
     .collect::<Vec<_>>();
     let missing_services = if missing_services.is_empty() {
-        "none reported".to_owned()
+        String::new()
     } else {
-        missing_services.join(", ")
+        format!(
+            "\n\n&#x26a0;&#xfe0f; Missing services: {}. Coverage is incomplete.",
+            missing_services.join(", ")
+        )
     };
+    let short_commit: String = parsed.subject.commit.chars().take(12).collect();
     let mut body = format!(
-        "{MARKER_PREFIX}{} -->\n\n<img src=\"{LOGO_URL}\" alt=\"AgentSCM icon\" width=\"28\"> **Local validation: reported {outcome}**\n\nSigned evidence reports **{outcome}** for commit {} in {}. Rendering this comment does not verify its signature or prove that commands ran.\n\nCoverage is limited to the recorded evidence: {observed}/{expected} expected checks reported; omissions: {omissions}; missing services: {missing_services}.\n\n<details>\n<summary>Source and environment</summary>\n\n- Repository: {}\n- Commit: {}\n- Tree: {}\n- Base ref: {}\n- Base tip: {}\n- Merge base: {}\n- Services: PostgreSQL={}, S3={}\n- Platform: {}\n- Toolchain: {}\n\n</details>\n\n<details>\n<summary>Command results</summary>\n\n",
+        "{MARKER_PREFIX}{} -->\n\n<img src=\"{LOGO_URL}\" alt=\"AgentSCM icon\" width=\"28\"> **Local validation: reported {outcome}**\n\nSource: {} at {}\n\nWorker-reported; the verifier checks the signature and source bindings, not whether commands ran.\n\nCoverage: {observed}/{expected} checks reported; {omission_count} omissions.{missing_services}\n\n<details>\n<summary>Coverage omissions ({omission_count})</summary>\n\n{omission_details}\n</details>\n\n<details>\n<summary>Source and environment</summary>\n\n- Repository: {}\n- Commit: {}\n- Tree: {}\n- Base ref: {}\n- Base tip: {}\n- Merge base: {}\n- Services: PostgreSQL={}, S3={}\n- Platform: {}\n- Toolchain: {}\n\n</details>\n\n<details>\n<summary>Command results</summary>\n\n",
         envelope_sha256(envelope),
-        code(&parsed.subject.commit),
         code(&parsed.subject.repository),
+        code(&short_commit),
         code(&parsed.subject.repository),
         code(&parsed.subject.commit),
         code(&parsed.subject.tree),

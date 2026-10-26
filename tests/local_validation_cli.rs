@@ -7,11 +7,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use agentscm::local_validation::{
-    CHECK_KIND, RecipeCommand, Services, ValidationPolicy, ValidationRecipe,
+    CHECK_KIND, RecipeCommand, Services, ValidationPolicy, ValidationRecipe, comment,
 };
 use agentscm::policy::issuers::{
     CommonControl, IssuerKeyRecord, IssuerRecord, IssuerRegistrySnapshot, issuer_key_id,
 };
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use ed25519_dalek::SigningKey;
 use serde_json::Value;
 
@@ -237,6 +239,21 @@ impl Fixture {
         serde_json::from_slice(&fs::read(self.state().join(format!("{sha}.record.json"))).unwrap())
             .unwrap()
     }
+
+    fn retained_bytes(&self, sha: &str) -> (Vec<u8>, Vec<u8>) {
+        (
+            fs::read(self.state().join(format!("{sha}.envelope.json"))).unwrap(),
+            fs::read(self.state().join(format!("{sha}.record.json"))).unwrap(),
+        )
+    }
+}
+
+fn flat_comment(sha: &str, envelope: &[u8], record: &[u8]) -> String {
+    format!(
+        "<!-- agentscm-local-validation:v1 {sha} -->\n\nlegacy summary\n\n```agentscm-envelope-v1\n{}\n```\n\n```agentscm-record-v1\n{}\n```\n",
+        STANDARD.encode(envelope),
+        STANDARD.encode(record),
+    )
 }
 
 fn ok_fixture() -> Fixture {
@@ -255,6 +272,11 @@ fn success_flow_then_stale_after_new_commit() {
     let body = f.show_to_file(&sha, "body.md");
     let text = fs::read_to_string(&body).unwrap();
     assert!(text.starts_with(&format!("<!-- agentscm-local-validation:v1 {sha} -->\n")));
+    assert_eq!(text.matches("<details>").count(), 4);
+    assert_eq!(text.matches("</details>").count(), 4);
+    assert!(!text.contains("<details open"));
+    let (envelope, record) = f.retained_bytes(&sha);
+    assert_eq!(comment::parse(&text).unwrap(), (envelope, record));
     let again = f.show_to_file(&sha, "body2.md");
     assert_eq!(text, fs::read_to_string(again).unwrap());
     let (code, verdict) = f.verify(&body, "repo-1");
@@ -400,8 +422,8 @@ fn failures_are_signed_retained_and_never_verify() {
     assert!(
         std::fs::read_to_string(&body)
             .unwrap()
-            .contains("skipped: never"),
-        "the summary lists signed omissions"
+            .contains("<code>skipped&#x3a; never</code>"),
+        "the collapsed disclosure lists signed omissions"
     );
     assert_eq!(f.verify(&body, "repo-1").0, 1);
 }
@@ -553,6 +575,41 @@ async fn lost_create_reply_is_adopted_not_duplicated() {
     assert!(f.post(&fake.base, &sha).status.success());
     assert_eq!(comments(&fake).len(), 1);
     assert!(f.state().join(format!("{sha}.posted.json")).exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_flat_comment_is_upgraded_in_place_without_changing_signed_bytes() {
+    let f = ok_fixture();
+    let fake = fake(&f.head()).await;
+    let (sha, _) = tokio::task::block_in_place(|| f.attest());
+    let (envelope, record) = f.retained_bytes(&sha);
+    let legacy = flat_comment(&sha, &envelope, &record);
+    fake.with(|s| {
+        s.repos.get_mut(&1).unwrap().comments.insert(
+            7,
+            vec![Comment {
+                id: 50,
+                body: legacy.clone(),
+                author: "maintainer-login".into(),
+            }],
+        );
+    });
+
+    assert!(f.post(&fake.base, &sha).status.success());
+    let upgraded = comments(&fake);
+    assert_eq!(upgraded.len(), 1);
+    assert_eq!(upgraded[0].id, 50);
+    assert_ne!(upgraded[0].body, legacy);
+    assert_eq!(
+        comment::parse(&upgraded[0].body).unwrap(),
+        (envelope.clone(), record.clone())
+    );
+
+    assert!(f.post(&fake.base, &sha).status.success());
+    let rerun = comments(&fake);
+    assert_eq!(rerun.len(), 1);
+    assert_eq!(rerun[0].id, 50);
+    assert_eq!(comment::parse(&rerun[0].body).unwrap(), (envelope, record));
 }
 
 #[tokio::test(flavor = "multi_thread")]

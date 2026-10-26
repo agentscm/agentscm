@@ -255,10 +255,24 @@ fn rendered_comment_is_stable_collapsed_and_round_trips_exact_bytes() {
     assert!(body.starts_with("<!-- agentscm-local-validation:v1 "));
     assert!(body.contains("alt=\"AgentSCM icon\" width=\"28\""));
     assert!(body.contains("**Local validation: reported pass**"));
-    assert!(body.contains("Rendering this comment does not verify its signature"));
-    assert!(body.contains("Coverage is limited to the recorded evidence:"));
-    assert_eq!(body.matches("<details>").count(), 3);
-    assert_eq!(body.matches("</details>").count(), 3);
+    assert!(body.contains("Source: <code>repo&#x2d;1</code> at <code>111111111111</code>"));
+    assert!(body.contains("the verifier checks the signature and source bindings"));
+    assert!(body.contains("Coverage: 1/1 checks reported; 5 omissions."));
+    assert!(body.contains("<summary>Coverage omissions (5)</summary>"));
+    for omission in [
+        "<code>ignored tests</code>",
+        "<code>windows</code>",
+        "<code>container smoke</code>",
+        "<code>hub end&#x2d;to&#x2d;end</code>",
+        "<code>live execution</code>",
+    ] {
+        assert!(body.contains(&format!("- {omission}\n")));
+    }
+    let visible = body.split("<details>").next().unwrap();
+    assert_eq!(visible.matches("pass").count(), 1);
+    assert!(!visible.contains(COMMIT));
+    assert_eq!(body.matches("<details>").count(), 4);
+    assert_eq!(body.matches("</details>").count(), 4);
     assert!(!body.contains("<details open"));
 
     let signed_details = body
@@ -270,6 +284,17 @@ fn rendered_comment_is_stable_collapsed_and_round_trips_exact_bytes() {
     assert!(signed_details < envelope_fence && envelope_fence < record_fence);
     assert!(record_fence < signed_close);
     assert_eq!(comment::parse(&body).unwrap(), (envelope, record));
+}
+
+#[test]
+fn rendered_comment_warns_when_services_are_missing() {
+    let (envelope, _) = comment_bytes();
+    let mut missing_service_record = record();
+    missing_service_record.services.s3 = false;
+    let record_bytes = serde_json::to_vec(&missing_service_record).unwrap();
+    let body = comment::render(&envelope, &record_bytes).unwrap();
+
+    assert!(body.contains("Missing services: S3. Coverage is incomplete."));
 }
 
 #[test]
@@ -344,8 +369,8 @@ fn hostile_display_strings_cannot_escape_collapsed_sections() {
 
     let body = comment::render(&hostile_envelope, &record_bytes).unwrap();
     assert!(body.contains("**Local validation: reported unknown**"));
-    assert_eq!(body.matches("<details>").count(), 3);
-    assert_eq!(body.matches("</details>").count(), 3);
+    assert_eq!(body.matches("<details>").count(), 4);
+    assert_eq!(body.matches("</details>").count(), 4);
     assert!(!body.contains("<details open>"));
     assert!(!body.contains("```spoof"));
     assert!(!body.contains("refs/heads/_spoof_"));
