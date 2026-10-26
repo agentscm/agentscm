@@ -260,7 +260,7 @@ export function AdminPage({ token }: { token: string }) {
         <p className="answer-text">
           {v ? (
             <>
-              <b>{plural(v.repositories.length, 'repository', 'repositories')}</b> connected · {v.refusals.length === 0 ? 'nobody turned away' : <b className="tone-warn">{plural(v.refusals.reduce((n, r) => n + r.count, 0), 'refused sign-in')}</b>} in the last 30 days.
+              <b>{plural(v.repositories.length, 'repository', 'repositories')}</b> connected · {v.refusals.length === 0 ? 'nobody turned away' : <b className="tone-warn">{plural(v.refusals.reduce((n, r) => n + r.count, 0), 'refusal')}</b>} in the last 30 days.
             </>
           ) : (
             'Connected repositories, refused sign-ins and every signed-in computer.'

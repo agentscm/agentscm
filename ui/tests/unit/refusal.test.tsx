@@ -1,10 +1,10 @@
 import { render, screen } from '@testing-library/react'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { installCommand } from '../../src/connectAgent.ts'
 import { reasonSentence, refusalFrom, roleSentence } from '../../src/refusal.ts'
 import { isSignedInHash, signedInFromHash } from '../../src/pages/SignedIn.tsx'
 import { COMMAND, RefusalNotice } from '../../src/Refusal.tsx'
-import { WorkspaceError, workspaceError } from '../../src/workspace.ts'
+import { WorkspaceError, workspaceError, workspaceRequest } from '../../src/workspace.ts'
 
 const HUB = 'https://dogfood.agentscm.dev'
 // The Hub's 403 for a role that is too low, as POST /v1/hub/tokens sends it.
@@ -42,6 +42,17 @@ describe('refusalFrom', () => {
     const r = refusalFrom({ error: 'x', message: `line one\nline two ${'z'.repeat(400)}` })!
     expect(r.message).not.toContain('\n')
     expect(r.message.length).toBeLessThanOrEqual(300)
+  })
+
+  afterEach(() => vi.unstubAllGlobals())
+  const workspace403 = async (body: unknown) => {
+    vi.stubGlobal('fetch', async () => new Response(JSON.stringify(body), { status: 403 }))
+    return workspaceRequest('/members').then(() => 'resolved', workspaceError)
+  }
+  it('keeps the workspace’s own sentence for a bare code, and uses the Hub’s when it wrote one', async () => {
+    // Workspace routes answer a missing role with a bare "forbidden"; that is not a repository-access problem.
+    expect(await workspace403({ error: 'forbidden' })).toMatch(/^Your role in this workspace doesn’t allow this action/)
+    expect(await workspace403(INSUFFICIENT)).toBe(INSUFFICIENT.message)
   })
 
   it('never says membership in the workspace fallbacks, and prefers the Hub’s words', () => {

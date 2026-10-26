@@ -8,6 +8,7 @@ import { useState } from 'react'
 import { Logo } from '../App.tsx'
 import { safeHubOrigin } from '../connectAgent.ts'
 import { hashPath, hashQuery } from '../Pager.tsx'
+import { clean } from '../publications.ts'
 import { reasonSentence, type Refusal } from '../refusal.ts'
 import { RefusalNotice } from '../Refusal.tsx'
 import { Icon } from '../ui.tsx'
@@ -18,11 +19,6 @@ export type SignedInState =
   | { kind: 'invalid'; hub: string }
 
 const LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9])?$/
-const printable = (v: string | null, max: number): string | null => {
-  // eslint-disable-next-line no-control-regex
-  const t = v?.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim()
-  return t ? t.slice(0, max) : null
-}
 
 export const isSignedInHash = (hash = window.location.hash) => ['#/signed-in', '#signed-in'].includes(hashPath(hash))
 
@@ -37,7 +33,7 @@ export function signedInFromHash(hash = window.location.hash, origin = window.lo
   const login = q.get('login')
   if (q.get('status') !== 'signed_in' || !login || !LOGIN.test(login)) return { kind: 'invalid', hub }
   const provider = q.get('provider') === 'github' ? 'GitHub' : q.get('provider') === 'gitlab' ? 'GitLab' : null
-  return { kind: 'ok', hub, host: new URL(hub).host, login, provider, computer: printable(q.get('computer'), 80), autoConnect: q.get('auto_connect') !== 'off' }
+  return { kind: 'ok', hub, host: new URL(hub).host, login, provider, computer: clean(q.get('computer'), 80).trim() || null, autoConnect: q.get('auto_connect') !== 'off' }
 }
 
 function next(autoConnect: boolean) {

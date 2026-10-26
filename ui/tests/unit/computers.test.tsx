@@ -25,7 +25,7 @@ describe('decoders', () => {
   it('keeps only valid ids, repositories and owners', () => {
     expect(decodeDevice({ ...DEVICE, id: 'dev_short' })).toBeNull()
     expect(decodeDevice(DEVICE)).toMatchObject({ id: ID, repositories: ['counterbranch/agentscm'], owner: null })
-    expect(decodeDevice({ ...DEVICE, name: 'evil\u0000\nname', owner: { login: 'maria', provider: 'gitlab' } })).toMatchObject({ name: 'evil name', owner: { login: 'maria', provider: 'gitlab' } })
+    expect(decodeDevice({ ...DEVICE, name: 'evil\u0000\nname', owner: { login: 'maria', provider: 'gitlab' } })).toMatchObject({ name: 'evilname', owner: { login: 'maria', provider: 'gitlab' } })
     expect(decodeRefusal({ at: 1, count: 0, provider: 'github', login: 'b', reason: 'not_allowed', via: 'x' })).toEqual({ at: 1, count: 1, provider: 'github', login: 'b', reason: 'not_allowed', via: 'sign_in' })
   })
 })

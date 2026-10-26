@@ -2,8 +2,6 @@
 import { withTimeout } from './timeout.ts'
 import { refusalFrom, type Refusal } from './refusal.ts'
 
-const OWN_WORDS = new Set(['busy', 'last_administrator', 'idempotency_conflict', 'member_limit', 'csrf_required'])
-
 export interface WorkspaceIdentity { provider: string; host: string; user_id: number }
 export interface WorkspaceMember { identity: WorkspaceIdentity; roles: string[]; repository_ids: string[]; enabled: boolean; generation: number }
 export interface WorkspaceSettings { id: string; name: string; generation: number; max_concurrent_runs: number }
@@ -74,9 +72,13 @@ export async function workspaceRequest<T>(path: string, options: { signal?: Abor
     const message = `The hub rejected the request (HTTP ${response.status}). Refresh and check your inputs before retrying.`
     let code: string | undefined
     let refusal: Refusal | null = null
-    try { const detail: unknown = await response.json(); refusal = refusalFrom(detail); if (detail && typeof detail === 'object' && 'error' in detail && typeof detail.error === 'string') code = detail.error.slice(0, 100) } catch { /* A non-JSON error still has a useful HTTP status. */ }
-    // Codes the page words itself keep their own sentence; anything else the Hub explained is shown in its words.
-    throw new WorkspaceError(response.status, message, code, code && OWN_WORDS.has(code) ? null : refusal)
+    try {
+      const detail: unknown = await response.json()
+      if (detail && typeof detail === 'object' && 'error' in detail && typeof detail.error === 'string') code = detail.error.slice(0, 100)
+      // Only a sentence the Hub wrote: bare codes keep this page's workspace wording below.
+      if (detail && typeof detail === 'object' && 'message' in detail) refusal = refusalFrom(detail)
+    } catch { /* A non-JSON error still has a useful HTTP status. */ }
+    throw new WorkspaceError(response.status, message, code, refusal)
   }
   if (response.status === 204) return undefined as T
   return response.json() as Promise<T>

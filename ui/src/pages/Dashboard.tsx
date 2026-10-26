@@ -278,9 +278,9 @@ function Team({ d, ov, events }: { d: Derived; ov: WorkOverview | null; events: 
     <div className="today-grid">
       <Box id="box-agents" tour="now-agents" icon="people" title="The team right now" count={d.agents.length} explain="Live agents grouped by the person who owns them. A green dot means it reported activity in the last five minutes; amber means it is quieter but still holds its files.">
         {d.groups.length === 0 ? (
-          events && events.length > 0 ? (
+          events?.length !== 0 ? (
             <Empty icon="moon-stars" title="No agents active right now">
-              Last agent activity <Ago at={Math.max(...events.map((e) => e.at))} />. Agents appear here with the files they hold as soon as they start editing.
+              {events && <>Last agent activity <Ago at={Math.max(...events.map((e) => e.at))} />. </>}Agents appear here with the files they hold as soon as they start editing.
             </Empty>
           ) : (
             <>

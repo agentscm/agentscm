@@ -6,6 +6,7 @@
 // A read-only repository token can read none of this.
 import { ApiError } from './api.ts'
 import { isLocalCredential } from './frontDoor.ts'
+import { clean } from './publications.ts'
 import { refusalFrom } from './refusal.ts'
 import { withTimeout } from './timeout.ts'
 
@@ -29,8 +30,7 @@ export type DeviceAuth = { kind: 'local'; token: string } | { kind: 'browser'; s
 
 const rec = (v: unknown): Record<string, unknown> => (v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {})
 const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : [])
-// eslint-disable-next-line no-control-regex
-const text = (v: unknown, max = 100): string | null => (typeof v === 'string' && v.trim() ? v.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, max) : null)
+const text = (v: unknown, max = 100): string | null => clean(v, max).trim() || null
 const unix = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? Math.floor(v) : null)
 const count = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0)
 const DEVICE_ID = /^dev_[0-9a-f]{32}$/

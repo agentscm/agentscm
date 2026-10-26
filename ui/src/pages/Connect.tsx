@@ -1,10 +1,12 @@
 import { useState } from 'react'
 import { agentSetupPrompt, CLIENT_AGENTS, clientSetupCommand, installCommand, safeHubOrigin, type ClientAgent } from '../connectAgent.ts'
+import { onFrontDoor } from '../frontDoor.ts'
 import { CopyButton, Icon, Notice } from '../ui.tsx'
 
 /** Set up this computer: one command, then agents connect on their own. Copies text; never runs anything. */
 export function InstallCommand({ lead = 'Run this in a checkout of a repository on this Hub to connect its agents.' }: { lead?: string }) {
-  const command = installCommand(window.location.origin)
+  // The local page's origin is this computer, not the Hub: no command to copy there.
+  const command = onFrontDoor() ? null : installCommand(window.location.origin)
   if (!command) return null
   return (
     <div className="install">
@@ -31,6 +33,7 @@ const STEPS = [
 /** Instructions for connecting a coding agent to this hub. Copies text; never runs anything. */
 export function ConnectAgent() {
   const [agent, setAgent] = useState<ClientAgent | ''>('')
+  if (onFrontDoor()) return <Notice tone="muted" icon="laptop" title="This page runs on your computer">Open the Hub’s own page to copy setup instructions for it.</Notice>
   const origin = safeHubOrigin(window.location.origin)
   const prompt = agentSetupPrompt(window.location.origin)
   const command = agent ? clientSetupCommand(window.location.origin, agent) : null
