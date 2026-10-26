@@ -10,6 +10,7 @@ import logoDark from './logo-dark.png'
 import logoLight from './logo-light.png'
 import { DashboardPage, dashboardStatus } from './pages/Dashboard.tsx'
 import { HealthPage } from './pages/Health.tsx'
+import { AdminPage, ComputersPage } from './pages/Computers.tsx'
 import { SetupPage } from './pages/Setup.tsx'
 import { SignIn } from './pages/SignIn.tsx'
 import { isSignedInHash, SignedInPage } from './pages/SignedIn.tsx'
@@ -37,7 +38,7 @@ const subscribeDark = (cb: () => void) => {
 }
 const systemDark = () => window.matchMedia(darkQuery).matches
 
-export type Section = 'home' | 'now' | 'activity' | 'team' | 'inbox' | 'work' | 'workflows' | 'change-record' | 'landed' | 'skills' | 'templates' | 'timeline' | 'explorer' | 'setup' | 'workspace' | 'health' | 'settings'
+export type Section = 'home' | 'now' | 'activity' | 'team' | 'inbox' | 'work' | 'workflows' | 'change-record' | 'landed' | 'skills' | 'templates' | 'timeline' | 'explorer' | 'setup' | 'workspace' | 'computers' | 'admin' | 'health' | 'settings'
 
 /** Every routed page. `label` names its tab inside its nav item; `question` is the page's hidden h1. */
 export const SECTIONS: SectionDef[] = [
@@ -57,6 +58,8 @@ export const SECTIONS: SectionDef[] = [
   { key: 'setup', nav: 'setup', icon: 'plug', label: 'Agents', question: 'Is my agent set up?' },
   { key: 'health', nav: 'setup', icon: 'heart-pulse', label: 'Hub', question: 'Is the hub OK?' },
   { key: 'workspace', nav: 'setup', icon: 'people', label: 'Access', question: 'Who can run what?' },
+  { key: 'computers', nav: 'setup', icon: 'laptop', label: 'Computers', question: 'Which computers can act for me?' },
+  { key: 'admin', nav: 'setup', icon: 'shield-lock', label: 'Admin', question: 'Which repositories are connected, and who was turned away?' },
   { key: 'settings', nav: 'setup', icon: 'sliders', label: 'Preferences', question: 'How is this page set up?' },
 ]
 
@@ -210,6 +213,8 @@ function Shell({ token, pref, onPref, density, onDensity, onUnauthorized, onForg
         {section === 'setup' && <SetupPage token={token} />}
         {section === 'workspace' && <WorkspacePage />}
         {section === 'health' && <HealthPage health={data.health} />}
+        {section === 'computers' && <ComputersPage token={token} />}
+        {section === 'admin' && <AdminPage token={token} />}
         {section === 'settings' && <SettingsPage token={token} whoami={data.whoami} pref={pref} onPref={onPref} density={density} onDensity={onDensity} railCollapsed={rail} onRail={changeRail} onForget={onForget} />}
       </AppChrome>
     </TourProvider>

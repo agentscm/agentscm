@@ -2312,6 +2312,148 @@ textarea.form-control {
   padding: 0 4px 4px;
 }
 
+/* ---------- your computers and the admin lists ---------- */
+.computer {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  gap: 4px 14px;
+  align-items: start;
+  padding: 14px 0;
+  border-top: 1px solid var(--hub-rule);
+}
+.computer:first-child {
+  border-top: 0;
+}
+.computer-icon {
+  font-size: 18px;
+  line-height: 1.3;
+  color: var(--hub-text-3);
+}
+.computer-name {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+.computer-name strong {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.computer-owner {
+  font-size: 13px;
+  color: var(--hub-text-2);
+}
+.computer-meta {
+  margin-top: 3px;
+  font-size: 13px;
+  color: var(--hub-text-3);
+}
+.computer-repos {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  margin-top: 8px;
+  font-size: 12px;
+}
+.computer-repos code {
+  padding: 1px 7px;
+  border-radius: 6px;
+  background: var(--hub-sunken);
+}
+.computer-act {
+  justify-self: end;
+  max-width: 340px;
+}
+.computer-note {
+  display: block;
+  max-width: 220px;
+  font-size: 12.5px;
+  line-height: 1.4;
+  color: var(--hub-text-3);
+  text-align: right;
+}
+.computer-confirm {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 6px 8px;
+  font-size: 12.5px;
+  color: var(--hub-text-2);
+}
+.computer-confirm > span:first-child {
+  flex-basis: 100%;
+  text-align: right;
+}
+.computer-error {
+  flex-basis: 100%;
+  text-align: right;
+  color: var(--hub-bad);
+}
+.computer.is-revoked .computer-name strong,
+.computer.is-revoked .computer-icon {
+  color: var(--hub-text-3);
+}
+@media (max-width: 640px) {
+  .computer {
+    grid-template-columns: 22px minmax(0, 1fr);
+  }
+  .computer-act {
+    grid-column: 2;
+    justify-self: start;
+  }
+  .computer-note,
+  .computer-confirm > span:first-child,
+  .computer-error {
+    text-align: left;
+  }
+  .computer-confirm {
+    justify-content: flex-start;
+  }
+}
+.refusal-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 0;
+  border-top: 1px solid var(--hub-rule);
+}
+.refusal-row:first-child {
+  border-top: 0;
+}
+.refusal-why {
+  margin: 4px 0 0;
+  max-width: 68ch;
+  font-size: 13.5px;
+  line-height: 1.45;
+  color: var(--hub-text-2);
+}
+.refusal-when {
+  flex: none;
+  font-size: 13px;
+  color: var(--hub-text-3);
+  white-space: nowrap;
+}
+.admin-table {
+  --bs-table-bg: transparent;
+  margin: 0;
+  font-size: 14px;
+}
+.admin-table th {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--hub-text-3);
+  border-bottom-color: var(--hub-rule-strong);
+}
+.admin-table td {
+  border-bottom-color: var(--hub-rule);
+  vertical-align: middle;
+}
+.admin-table .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
 /* ---------- signed in: the one browser moment of setup, told on the frame ---------- */
 .done {
   min-height: 100dvh;

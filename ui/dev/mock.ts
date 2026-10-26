@@ -5,7 +5,7 @@
 //   MOCK=empty  a connected-nothing repository: no agents, events or PRs, no forge connection
 //   MOCK=down   the hub is failing: health 503, work and activity 503
 //   MOCK=demo   `agentscm demo` hub: health.demo true, simulated agents, no forge connection, no PRs
-// While running, GET /__mock/down and /__mock/up flip the failure on and off.
+// While running, GET /__mock/down and /__mock/up flip the failure on and off; /__mock/reset un-revokes computers.
 import type { Plugin } from 'vite'
 
 const START = Date.now()
@@ -49,6 +49,17 @@ function work() {
 
 /** Synthetic work overview: one item per progress lane, two recent outcomes and one declared-scope overlap. */
 let catchupAcked = false
+// Computer sign-in fixtures. Revoke only changes this dev server's memory.
+const revokedDevices = new Map<string, number>()
+function devices() {
+  const mk = (n: string, name: string, owner: { login: string }, created: number, used: number | null, repositories: string[]) => ({ id: `dev_${n.repeat(32).slice(0, 32)}`, name, created_at: ago(created), last_used_at: used === null ? null : ago(used), revoked_at: revokedDevices.get(`dev_${n.repeat(32).slice(0, 32)}`) ?? null, current: false, repositories, owner: { id: `usr_${owner.login}`, login: owner.login, provider: 'github' } })
+  return [
+    mk('a', 'maria-mbp', maria, 86400 * 12, 40, [REPO, 'acme/billing-docs']),
+    mk('b', 'maria-desktop', maria, 86400 * 40, 86400 * 9, [REPO]),
+    mk('c', 'ci-runner-old', maria, 86400 * 80, null, []),
+    mk('d', 'dev-thinkpad', dev, 86400 * 3, 300, [REPO]),
+  ]
+}
 
 function overview() {
   const wid = (c: string) => `wrk_${c.repeat(32)}`
@@ -417,6 +428,10 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
     apply: 'serve',
     configureServer(server) {
       server.middlewares.use('/__mock', (req, res) => {
+        if (req.url?.startsWith('/reset')) {
+          revokedDevices.clear()
+          return res.end('computers reset\n')
+        }
         down = req.url?.startsWith('/down') ?? false
         res.end(down ? 'hub is now failing\n' : 'hub is now healthy\n')
       })
@@ -455,6 +470,23 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
           if (url.pathname === `${base}/runs/synthetic-workspace-run/workflow`) return send(200, workflow(run.native_run_id))
           return send(404, { error: 'synthetic_workspace_route_not_found' })
         }
+        // Synthetic browser session (an HttpOnly cookie in production) and the computer routes.
+        if (url.pathname === '/session') return scenario === 'empty' ? send(401, { error: 'sign_in_required' }) : send(200, { user: { id: 'usr_maria', login: 'maria', provider: 'github' }, admin: true, csrf_token: 'synthetic-csrf-no-authority', expires_at: ago(-86400) })
+        if (url.pathname === '/devices') return send(200, { devices: scenario === 'empty' ? [] : devices().filter((d) => d.owner.login === maria.login).map((d) => ({ ...d, owner: undefined })) })
+        if (url.pathname.startsWith('/devices/') && req.method === 'DELETE') {
+          const id = url.pathname.slice('/devices/'.length)
+          const known = devices().find((d) => d.id === id)
+          if (!known || known.revoked_at) return send(404, { error: 'not_found' })
+          revokedDevices.set(id, ago(0))
+          res.statusCode = 204
+          return res.end()
+        }
+        if (url.pathname === '/admin/devices') return send(200, { devices: scenario === 'empty' ? [] : devices() })
+        if (url.pathname === '/admin/repositories') return send(200, { repositories: scenario === 'empty' ? [] : [{ full_name: REPO, provider: 'github', host: 'github.com', connection: 'con_synthetic', devices: 3, agent_tokens: 5 }, { full_name: 'acme/billing-docs', provider: 'github', host: 'github.com', connection: 'con_synthetic2', devices: 1, agent_tokens: 1 }] })
+        if (url.pathname === '/admin/sign-in-refusals') return send(200, { refusals: scenario === 'empty' ? [] : [
+          { at: ago(900), count: 3, provider: 'github', login: 'brandonfla', forge_user_id: 3001, reason: 'no_repository_role', via: 'device_mint' },
+          { at: ago(86400 * 2), count: 1, provider: 'github', login: 'drive-by', forge_user_id: 3002, reason: 'not_allowed', via: 'sign_in' },
+        ] })
         const token = /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1]
         if (!token || token === 'expired') return send(401, { error: 'unauthorized' })
         if (url.pathname === '/whoami') {
