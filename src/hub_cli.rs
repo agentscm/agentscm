@@ -66,10 +66,12 @@ pub enum HubCommand {
     },
     /// Sign in to a hub; the session is saved for the token commands.
     Login {
+        /// Hub URL, such as https://hub.example.com (default: the saved Hub, when there is one).
         #[arg(long)]
-        hub: String,
+        hub: Option<String>,
+        /// Forge to sign in with (default: the Hub's only sign-in provider).
         #[arg(long, value_enum)]
-        provider: Provider,
+        provider: Option<Provider>,
     },
     /// End one saved session on its hub and remove it locally.
     Logout {
@@ -253,11 +255,18 @@ pub async fn run(command: HubCommand, data_dir: &std::path::Path) -> Result<()> 
             .map_err(map_hub_error)
         }
         HubCommand::Login { hub, provider } => {
-            let hub = check_base_url(&hub).map_err(map_hub_error)?;
-            let name = provider
-                .to_possible_value()
-                .map(|v| v.get_name().to_owned());
-            login(&hub, &name.unwrap_or_default()).await
+            let hub = match hub {
+                Some(hub) => check_base_url(&hub).map_err(map_hub_error)?,
+                None => only_saved_hub()?,
+            };
+            let name = match provider {
+                Some(provider) => provider
+                    .to_possible_value()
+                    .map(|v| v.get_name().to_owned())
+                    .unwrap_or_default(),
+                None => only_provider(&hub).await?,
+            };
+            login(&hub, &name).await
         }
         HubCommand::Logout { hub } => logout(hub.as_deref()).await,
         HubCommand::Sessions { command } => sessions(command),
@@ -315,6 +324,54 @@ pub(crate) async fn call(
             .body(body.to_string());
     }
     send(request, HUB_BODY_BYTES).await.map_err(map_hub_error)
+}
+
+/// The Hub of the one saved sign-in; with none or several, `--hub` must say which.
+pub(crate) fn only_saved_hub() -> Result<String> {
+    let sessions = if session_files_present()? {
+        load_sessions()?.sessions
+    } else {
+        Vec::new()
+    };
+    match sessions.as_slice() {
+        [only] => Ok(only.hub.clone()),
+        [] => Err(invalid(
+            "pass --hub with the Hub's URL, such as --hub https://hub.example.com",
+        )),
+        _ => Err(invalid(
+            "several Hubs are saved; pass --hub to choose one (see agentscm hub sessions list)",
+        )),
+    }
+}
+
+/// The Hub's only sign-in provider; with several, `--provider` must say which.
+async fn only_provider(hub: &str) -> Result<String> {
+    let client = forge_http::client().map_err(map_hub_error)?;
+    let (status, reply) = call(
+        &client,
+        Method::GET,
+        &format!("{hub}/v1/hub/login"),
+        None,
+        None,
+    )
+    .await?;
+    let names: Vec<&str> = reply["providers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|name| matches!(*name, "github" | "gitlab"))
+        .collect();
+    match (status, names.as_slice()) {
+        (200, [only]) => Ok((*only).to_owned()),
+        (200, []) => Err(invalid("this Hub has no sign-in provider configured")),
+        (200, _) => Err(invalid(&format!(
+            "this Hub signs in with {}; pass --provider to choose one",
+            names.join(" or ")
+        ))),
+        // A Hub from before the provider list.
+        _ => Err(invalid("pass --provider github or --provider gitlab")),
+    }
 }
 
 async fn login(hub: &str, provider: &str) -> Result<()> {
@@ -379,6 +436,14 @@ pub(crate) fn open_url(url: &str) {
 /// Forge-supplied text must not carry terminal escapes.
 pub(crate) fn clean(text: &str) -> String {
     text.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// The Hub's own sentence for any refusal kind that carries one (the reason and its one fix,
+/// such as `insufficient_role`); `None` when the reply has none. Bounded, one terminal line.
+pub(crate) fn refusal_message(reply: &Value) -> Option<String> {
+    reply["error"].as_str()?;
+    let message = clean(reply["message"].as_str()?);
+    Some(message.chars().take(300).collect())
 }
 
 /// Ends the saved session when it belongs to `hub`: the hub is told (best effort) and only
@@ -1025,7 +1090,9 @@ async fn token(command: TokenCommand) -> Result<()> {
              `agentscm hub connections refresh <id>` (for a PAT or GitLab token connection: \
              `agentscm hub connections add-repo <id> <owner/name>`)",
         )),
-        (403, _) => Err(invalid("you cannot read that repository on the forge")),
+        (403, _) => Err(invalid(&refusal_message(&reply).unwrap_or_else(|| {
+            "your forge account can't see that repository, or it was renamed or moved; check the name and your access".to_owned()
+        }))),
         (404, TokenCommand::Revoke { .. }) => Err(invalid("no such token of yours")),
         (201, TokenCommand::Create { .. }) => {
             eprintln!(
@@ -1210,6 +1277,18 @@ async fn connections(command: ConnectionCommand) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refusal_shows_the_hub_sentence_without_control_characters() {
+        let refusal = json!({"error": "insufficient_role",
+            "message": "alice has Read on public repository acme/w;\u{1b}[2J ask for Triage"});
+        assert_eq!(
+            refusal_message(&refusal).as_deref(),
+            Some("alice has Read on public repository acme/w;[2J ask for Triage")
+        );
+        assert_eq!(refusal_message(&json!({"error": "forbidden"})), None);
+        assert_eq!(refusal_message(&json!({"message": "not a refusal"})), None);
+    }
 
     #[test]
     fn private_write_creates_and_replaces_a_file() {

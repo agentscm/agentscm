@@ -140,7 +140,7 @@ from a flag. A half-configured provider stops startup.
 
 ## Signing in and agent tokens
 
-`agentscm hub login --hub URL --provider github|gitlab` tries the forge's
+`agentscm hub login --hub URL [--provider github|gitlab]` tries the forge's
 device flow first: it prints a code and a verification URL to stderr and polls
 as the forge's `interval` and `slow_down` replies allow. If the forge or its
 app does not offer the device flow, it uses a browser flow through a loopback
@@ -152,11 +152,19 @@ forge's token) is saved to `$XDG_CONFIG_HOME/agentscm/hub-sessions.json`
 sign-in becomes the default hub. It is sent only to the hub that issued it.
 `agentscm hub sessions list` shows the saved sign-ins and their expiry, and
 `agentscm hub sessions remove --hub URL` forgets one locally without contacting its hub.
+`--provider` may be left out when the hub has exactly one sign-in provider
+(`GET /v1/hub/login` lists them), and `--hub` when exactly one session is saved.
 
 - `agentscm hub token create --name N --repo owner/name [--ttl 8h] [--read-only]` asks the
   forge, with the person's own token, whether they can read the repository, and
   requires the repository to be connected on the person's host under the same
-  forge repository id (403 `not_connected` otherwise); only then does it mint. The secret is the only line on stdout. `--ttl` takes
+  forge repository id (403 `not_connected` otherwise); only then does it mint. A forge role
+  below the rule above is refused with 403 `insufficient_role` and the fields `login`,
+  `repository`, `visibility` (`public`, `internal` or `private`), `has` (`read`, `guest`,
+  `minimal_access`, `reporter` or `none`), `needs` (`triage`, `reporter` or `developer`) and
+  `message`, a sentence that names the fix, such as `alice has Read on public repository
+  acme/widgets; ask a repository owner for Triage or higher`. Clients show `message` as given.
+  A redirect, an unreadable repository or a name now used by another id is 403 `forbidden`. The secret is the only line on stdout. `--ttl` takes
   `<n>s|m|h|d`, at most 30 days. `--read-only` makes a [read-only token](#read-only-tokens).
 - `agentscm hub token list` (read-only tokens are marked `read-only`) and `agentscm hub token revoke <tok_id>`.
 - `agentscm hub logout [--hub URL]` ends that hub's session on the hub (a failure is ignored)
@@ -171,7 +179,7 @@ sign-in there.
 
 ## Routes
 
-- `GET /v1/hub/health`: `{"status":"ok","storage":"sqlite"|"postgres","coordination":{...}}`
+- `GET /v1/hub/health` (also served at `/health` for load balancers): `{"status":"ok","storage":"sqlite"|"postgres","coordination":{...}}`
   (warn-once counters, see [Agent sessions](#agent-sessions-mcp-and-hook-endpoints)), plus
   `"demo":true` on the throwaway hub of `agentscm demo`, or 503 if the database does not answer.
 - `GET /v1/hub/whoami`: needs `Authorization: Bearer <token>`. Returns the
@@ -911,7 +919,7 @@ sign-in (and no PAT) makes a one-time setup link itself.
 4. The success page and the hub log print `AGENTSCM_GITHUB_CLIENT_ID=...` and
    `AGENTSCM_GITHUB_CLIENT_SECRET_FILE=...`. The second is a path inside the hub's own secrets
    directory, so it works as printed (with compose too); never loosen that file's mode. Set them
-   with `AGENTSCM_ADMINS=github:YOUR_LOGIN`, restart the hub, and run `agentscm hub login`.
+   with `AGENTSCM_ADMINS=github:YOUR_LOGIN`, restart the hub, and run `agentscm hub login --hub URL`.
    Sign-in is not reloaded without a restart. Lost the lines? The client id is the `client_id`
    in `<secrets>/<connection>.json`, and the secret file is `<secrets>/<connection>.client_secret`.
 5. Check: `agentscm hub connections list` shows the app, and `agentscm hub connections refresh

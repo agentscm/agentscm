@@ -1482,13 +1482,39 @@ fn print_error(error: &Error) {
     };
     eprintln!(
         "{}",
-        json!({"ok": false, "error": error.to_string(), "error_kind": kind})
+        render_error(error, kind, io::IsTerminal::is_terminal(&io::stderr()))
     );
+}
+
+/// A person at a terminal reads a sentence; scripts and agents get the JSON contract.
+fn render_error(error: &Error, kind: &str, terminal: bool) -> String {
+    if terminal {
+        match error {
+            Error::Invalid(message) => format!("error: {message}"),
+            _ => format!("error: {error}"),
+        }
+    } else {
+        json!({"ok": false, "error": error.to_string(), "error_kind": kind}).to_string()
+    }
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn errors_are_sentences_at_a_terminal_and_json_otherwise() {
+        let error = Error::Invalid("pass --hub".into());
+        assert_eq!(
+            render_error(&error, "invalid", true),
+            "error: invalid: pass --hub"
+        );
+        let piped: Value = serde_json::from_str(&render_error(&error, "invalid", false)).unwrap();
+        assert_eq!(
+            piped,
+            json!({"ok": false, "error": "invalid: pass --hub", "error_kind": "invalid"})
+        );
+    }
 
     #[test]
     fn quickstart_and_uninstall_help_describe_current_behaviour() {

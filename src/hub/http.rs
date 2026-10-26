@@ -40,6 +40,8 @@ pub struct HubConfig {
 pub fn routes() -> Router<HubState> {
     Router::new()
         .route("/v1/hub/health", get(health))
+        // The path load balancers and `agentscm serve` use.
+        .route("/health", get(health))
         .route("/v1/hub/whoami", get(whoami))
         .route("/v1/hub/view-settings", get(view_settings))
         .route("/v1/hub/skill-workflows", get(skill_workflows))

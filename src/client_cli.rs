@@ -68,10 +68,13 @@ pub(crate) enum ReportingCommand {
 
 #[derive(Debug, Default, Args)]
 pub(crate) struct ConnectArgs {
+    /// Hub URL, such as https://hub.example.com (default: the saved Hub, when there is one).
     #[arg(long)]
-    pub(crate) hub: String,
+    pub(crate) hub: Option<String>,
+    /// Forge repository as owner/name (default: read from the checkout's origin remote).
     #[arg(long)]
     pub(crate) repo: Option<String>,
+    /// File holding an agent token to use instead of creating one with your Hub sign-in.
     #[arg(long)]
     pub(crate) token_file: Option<PathBuf>,
     /// Forge sign-in provider (inferred for github.com and gitlab.com).
@@ -354,7 +357,7 @@ pub(crate) async fn setup_unconnected(
     let root = canonical_root(root)?;
     let stable = installed_program(running_program)?;
     let args = ConnectArgs {
-        hub: hub.to_owned(),
+        hub: Some(hub.to_owned()),
         no_sign_in: true,
         ..ConnectArgs::default()
     };
@@ -834,10 +837,12 @@ async fn mint_agent_token(
     }
     match (status, reply["error"].as_str()) {
         (403, Some("not_connected")) => Err(invalid(
-            "this repository is not connected to the Hub; ask its operator to connect it",
+            "this repository isn't connected to this Hub yet; ask a Hub admin to connect it",
         )),
         (403, _) => Err(invalid(
-            "your Hub membership cannot create an agent token for this repository",
+            &crate::hub_cli::refusal_message(&reply).unwrap_or_else(|| {
+                "your forge account can't see that repository, or it was renamed or moved; check the name and your access".to_owned()
+            }),
         )),
         (401, _) => Err(invalid("Hub sign-in expired or was rejected")),
         (201, _) => {
@@ -1103,7 +1108,10 @@ async fn connect_inner(
         Some(repo) => repo,
         None => inferred_repo.clone(),
     };
-    let hub = check_base_url(&args.hub).map_err(map_hub_error)?;
+    let hub = match args.hub.as_deref() {
+        Some(hub) => check_base_url(hub).map_err(map_hub_error)?,
+        None => crate::hub_cli::only_saved_hub()?,
+    };
     let supplied_token = match args.token_file {
         Some(path) => {
             let path = path

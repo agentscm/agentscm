@@ -6,7 +6,7 @@
 
 ## Commands
 
-Every command accepts `--data-dir`; its default is `.agentscm`. The global `--no-telemetry` flag disables product usage telemetry for that invocation. Most commands print one JSON value on standard output on success, and one JSON value (`{"ok":false,"error":...}`) on standard error with a nonzero exit on failure. The exceptions are:
+Every command accepts `--data-dir`; its default is `.agentscm`. The global `--no-telemetry` flag disables product usage telemetry for that invocation. Most commands print one JSON value on standard output on success, and one JSON value (`{"ok":false,"error":...,"error_kind":...}`) on standard error with a nonzero exit on failure. When standard error is a terminal, a failure is one plain `error: ...` line instead, without `error_kind`; scripts and agents that read standard error through a pipe keep the JSON. The exceptions are:
 
 - `--help` and `--version` print plain text.
 - `serve`, `hub serve` and `team serve` print nothing on standard output; they log to standard error.
@@ -205,7 +205,7 @@ agentscm --data-dir ./agentscm-data events --after 0 --limit 100
 
 Use `-` or omit the input filename for JSON on standard input. A checkpoint request contains an optional parent and changes. File content is an array of byte values; `null` deletes a path.
 
-`files` scans one immutable manifest page and returns entry metadata, `scanned`, `next` and `complete`. `--prefix PATH` and the literal, case-sensitive `--contains TEXT` filter that page after scanning it; search text must contain 1 to 1024 bytes. A filtered page can have no entries and still return `next`; save that JSON cursor string in a file and pass `--cursor FILE` until `next` is null. `stat` checks exact manifest membership without reading the file blob: `present` does not prove the blob is locally available, while `nonexistent` means the complete manifest has no such path. Missing source objects, denied/indeterminate reads and limits remain distinct failures with a typed top-level `error_kind`. `read` retrieves the entry kind and content as `text` (a string, when the bytes are valid UTF-8) or `base64` (standard alphabet, otherwise); exactly one is present. `workflow inspect` diff entries use the same rule per side as `before_text`/`before_base64` and `after_text`/`after_base64`, omitted for an absent side.
+`files` scans one immutable manifest page and returns entry metadata, `scanned`, `next` and `complete`. `--prefix PATH` and the literal, case-sensitive `--contains TEXT` filter that page after scanning it; search text must contain 1 to 1024 bytes. A filtered page can have no entries and still return `next`; save that JSON cursor string in a file and pass `--cursor FILE` until `next` is null. `stat` checks exact manifest membership without reading the file blob: `present` does not prove the blob is locally available, while `nonexistent` means the complete manifest has no such path. Missing source objects, denied/indeterminate reads and limits remain distinct failures with a typed top-level `error_kind` (in the JSON form). `read` retrieves the entry kind and content as `text` (a string, when the bytes are valid UTF-8) or `base64` (standard alphabet, otherwise); exactly one is present. `workflow inspect` diff entries use the same rule per side as `before_text`/`before_base64` and `after_text`/`after_base64`, omitted for an absent side.
 
 ```json
 {
@@ -283,7 +283,7 @@ agentscm quickstart --yes --hub existing --hub-url https://hub.example.com \
 agentscm uninstall                      # asks first; --yes, --remove-hub-data
 ```
 
-Flags: `--yes`, `--init` (also run `init-repo`; with `--yes` it is skipped unless passed), `--tray` (macOS only; open the companion after successful setup), `--local` (same as `--hub local`), `--hosted` (print the hosted guide; connects only with `--hub-url`), `--hub local|existing|skip`, `--hub-url URL`, `--hub-runtime native|docker`, `--hub-port PORT`, `--hub-project NAME`, `--slack-config-file PATH` (see [Slack](../slack.md)), `--provider github|gitlab`, `--agent-token-file PATH` (skip sign-in and minting), `--github-login LOGIN` (required with `--yes --hub local` unless `gh` is signed in), `--agent claude|codex|cursor|copilot|gemini` (repeatable; default Claude Code if the `claude` CLI is on `PATH`), `--no-agents`, `--no-collisions`.
+Flags: `--yes`, `--init` (also run `init-repo`; with `--yes` it is skipped unless passed), `--tray` (macOS only; open the companion after successful setup; without it, an interactive macOS run that connected agents asks once whether to keep the companion and start it at login), `--local` (same as `--hub local`), `--hosted` (print the hosted guide; connects only with `--hub-url`), `--hub local|existing|skip`, `--hub-url URL`, `--hub-runtime native|docker`, `--hub-port PORT`, `--hub-project NAME`, `--slack-config-file PATH` (see [Slack](../slack.md)), `--provider github|gitlab`, `--agent-token-file PATH` (skip sign-in and minting), `--github-login LOGIN` (required with `--yes --hub local` unless `gh` is signed in), `--agent claude|codex|cursor|copilot|gemini` (repeatable; default Claude Code if the `claude` CLI is on `PATH`), `--no-agents`, `--no-collisions`.
 
 ### Status-bar companion and client status
 
