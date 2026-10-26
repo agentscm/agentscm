@@ -175,10 +175,13 @@ export async function fetchActivityPage(repo: string, token: string, signal: Abo
   }
 }
 
-/** 503 `{status:"unavailable"}` is a real answer; transport errors are not. */
-export async function fetchHealth(signal: AbortSignal): Promise<Health> {
+/**
+ * 503 `{status:"unavailable"}` is a real answer; transport errors are not. The Hub answers without a
+ * token, but this computer's own page proxies only for its connected browser, so pass it when there is one.
+ */
+export async function fetchHealth(signal: AbortSignal, token?: string): Promise<Health> {
   try {
-    const j = rec(await getJson('/v1/hub/health', signal))
+    const j = rec(await getJson('/v1/hub/health', signal, token))
     const c = rec(j['coordination'])
     return {
       status: j['status'] === 'ok' ? 'ok' : 'unavailable',
