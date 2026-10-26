@@ -119,7 +119,15 @@ for 30 minutes. It opens the Hub UI with that token in the URL fragment; the UI 
 fragment immediately. An existing browser sign-in is preserved, so sign out there first when
 switching repositories. If the saved sign-in is missing or expired, the tray shows an error
 with a sign-in instruction. Under **Troubleshooting → Hub Sign-in**, copy the GitHub or GitLab
-login command for that exact Hub and run it in Terminal; then retry Open Hub.
+login command for that exact Hub and run it in Terminal; then retry Open Hub. A tray built from
+source without `--features ui` has no local Hub page, so Open Hub opens your default Hub's `/ui/`
+page instead and says so in the menu.
+
+**Forget This Checkout…** in a connected checkout's menu runs the same removal as
+`agentscm client remove --root ROOT` after you choose its confirm item: the agents' AgentSCM files,
+the connection and a Hub token setup made (which is revoked) are removed; the folder is not. If the
+Hub cannot revoke that token, the connection is kept and the result says so. Under **Not
+connected**, **Forget This Checkout** only hides the row until an agent runs there again.
 
 For a connected checkout, choose **Agent Integrations** in its menu to configure Claude
 Code, Codex, Cursor, Copilot or Gemini. This installs AgentSCM's existing hooks, MCP connection
@@ -134,8 +142,9 @@ it, the hook repeats it at most every five minutes per agent and checkout, so a 
 a session lists the checkout at the agent's next hook. The tray forgets it after an hour, after
 sleep, or on quit, keeping at most eight. **Connect with**
 an agent runs the same steps as `agentscm client setup --agent AGENT --hub HUB` for the main
-checkout, with the Hub of your most recent saved sign-in and without starting a new sign-in; the
-result window names the Hub. The row then becomes a normal connected checkout; if that connection
+checkout without starting a new sign-in. It uses the Hub another existing checkout of the same
+repository is connected to, when that checkout's folder still exists and its Hub sign-in has not
+expired; otherwise the Hub of your most recent saved sign-in. The result window names the Hub. The row then becomes a normal connected checkout; if that connection
 is removed later, the checkout is listed again only once an agent runs there again. When there is no
 saved sign-in, or it has expired, **Copy Terminal Setup** copies `agentscm quickstart` for that
 checkout. Connect a checkout to a different Hub through quickstart.
