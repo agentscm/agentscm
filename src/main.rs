@@ -622,8 +622,66 @@ enum ParsedCli {
     Exit(i32),
 }
 
+/// The commands `agentscm --help` shows, in groups; the rest are listed by `agentscm help --all`
+/// and keep working by name.
+const CORE_HELP: [(&str, &[&str]); 3] = [
+    ("Get started", &["quickstart", "uninstall"]),
+    (
+        "Connect this computer",
+        &[
+            "hub login",
+            "client setup",
+            "client remove",
+            "client doctor",
+        ],
+    ),
+    ("Every day", &["open", "tray"]),
+];
+
+/// The command line as people see it: the core commands in groups instead of every command.
+fn command_line() -> clap::Command {
+    use clap::CommandFactory;
+    let full = Cli::command();
+    let mut groups = String::new();
+    for (heading, names) in CORE_HELP {
+        groups.push_str(&format!("{heading}:\n"));
+        for name in names {
+            // `client setup` and `client doctor` exist only on Unix.
+            let Some(about) = name
+                .split(' ')
+                .try_fold(&full, |command, part| command.find_subcommand(part))
+                .and_then(clap::Command::get_about)
+                .map(|about| about.to_string())
+            else {
+                continue;
+            };
+            // The first sentence is enough in a list.
+            let short = about.split(". ").next().unwrap_or_default();
+            groups.push_str(&format!("  {name:<15}{short}\n"));
+        }
+        groups.push('\n');
+    }
+    full.help_template(format!(
+        "{{about-with-newline}}\n{{usage-heading}} {{usage}}\n\n{groups}\
+         Run `agentscm help --all` for every command, or `agentscm help COMMAND` for one.\n\n\
+         Options:\n{{options}}"
+    ))
+}
+
+/// `agentscm help --all`: every command, as clap lists them; internal helpers stay hidden.
+fn is_help_all(argv: &[OsString]) -> bool {
+    argv.get(1).is_some_and(|arg| arg == "help") && argv.iter().skip(2).any(|arg| arg == "--all")
+}
+
 fn parse_cli(argv: Vec<OsString>, terminal: bool) -> ParsedCli {
-    match Cli::try_parse_from(&argv) {
+    if is_help_all(&argv) {
+        let _ = <Cli as clap::CommandFactory>::command().print_help();
+        return ParsedCli::Return;
+    }
+    let parsed = command_line()
+        .try_get_matches_from(&argv)
+        .and_then(|matches| <Cli as clap::FromArgMatches>::from_arg_matches(&matches));
+    match parsed {
         Ok(cli) => ParsedCli::Run(Box::new(cli)),
         Err(error) if error.use_stderr() => {
             if is_capture_hook_invocation(&argv) {
@@ -1527,6 +1585,46 @@ mod tests {
         assert!(!about("quickstart").contains("Claude Code hooks"));
         let uninstall = about("uninstall");
         assert!(uninstall.contains("client connections") && !uninstall.contains("hooks, tokens"));
+    }
+
+    #[test]
+    fn help_shows_the_core_commands_and_help_all_shows_every_command() {
+        let (core, all) = std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                use clap::CommandFactory;
+                let all = Cli::command().render_help().to_string();
+                let listed: Vec<String> = Cli::command()
+                    .get_subcommands()
+                    .filter(|command| !command.is_hide_set())
+                    .map(|command| command.get_name().to_owned())
+                    .collect();
+                (command_line().render_help().to_string(), (all, listed))
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        let (all, listed) = all;
+        for (_, names) in CORE_HELP {
+            for name in names {
+                assert!(
+                    core.contains(&format!("  {name} ")),
+                    "{name} missing:\n{core}"
+                );
+            }
+        }
+        assert!(!core.contains("check-run-command") && core.contains("help --all"));
+        // Nothing moved out of the short list is hard to find.
+        assert!(listed.len() > 40);
+        for name in &listed {
+            assert!(
+                all.contains(&format!("  {name} ")),
+                "{name} missing from help --all"
+            );
+        }
+        let argv = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(is_help_all(&argv(&["agentscm", "help", "--all"])));
+        assert!(!is_help_all(&argv(&["agentscm", "hub", "--all"])));
     }
 
     #[test]
