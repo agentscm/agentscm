@@ -14,7 +14,7 @@ computer and repository, shows your files and saved conversations, and shows you
 There is no token to paste and no address to enter.
 
 `agentscm open` needs two things it will ask for if missing: the folder must be connected to a Hub
-(`agentscm client setup`), and this computer must be signed in to that Hub
+(`npx agentscm --hub-url <url>` connects it and signs you in), and this computer must be signed in to that Hub
 (`agentscm hub login --hub <url>`).
 
 ## What happens
