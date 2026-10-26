@@ -308,16 +308,17 @@ function Team({ d, ov, events }: { d: Derived; ov: WorkOverview | null; events: 
 export type DashTab = 'home' | 'now' | 'activity' | 'team'
 
 /** The live status under each dashboard tab and the rail badge, from the same joins as the page. */
-export function dashboardStatus(ov: WorkOverview | null, d: Derived | null, events: HubEvent[] | null, nowMs: number) {
+/** `asOfMs` is when the data was read (the last successful poll); null before the first one. */
+export function dashboardStatus(ov: WorkOverview | null, d: Derived | null, events: HubEvent[] | null, asOfMs: number | null) {
   const needs = needsYou(ov, d)
   const x = crossings(ov, d)
   const latest = events?.[0]
-  const up = d ? d.agents.filter((a) => nowMs / 1000 - a.lastActive < AWAKE_SECONDS).length : 0
+  const up = d && asOfMs ? d.agents.filter((a) => asOfMs / 1000 - a.lastActive < AWAKE_SECONDS).length : 0
   return {
     needs,
     home: d && ov ? (needs.length ? { text: `${needs.length} need${needs.length === 1 ? 's' : ''} you`, tone: 'bad' as const } : { text: 'Nothing needs you', tone: 'ok' as const }) : undefined,
     now: d ? (x ? { text: plural(x, 'crossing'), tone: 'bad' as const } : { text: 'No crossings', tone: 'muted' as const }) : undefined,
-    activity: latest ? { text: `Last event ${relative(latest.at, nowMs)}`, tone: 'brand' as const } : events ? { text: 'Quiet so far', tone: 'muted' as const } : undefined,
+    activity: latest && asOfMs ? { text: `Last event ${relative(latest.at, asOfMs)}`, tone: 'brand' as const } : events ? { text: 'Quiet so far', tone: 'muted' as const } : undefined,
     team: d ? (d.agents.length ? { text: `${up} of ${d.agents.length} awake`, tone: up ? ('ok' as const) : ('warn' as const) } : { text: 'Nobody connected', tone: 'muted' as const }) : undefined,
   }
 }

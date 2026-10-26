@@ -235,7 +235,8 @@ function AreaMap({ d, ov }: { d: Derived | null; ov: WorkOverview | null }) {
         <>
           <div className="map" role="list">
             {shown.map((a) => {
-              const people = [...new Map([...a.holders.map((h) => [h.name, h.name] as const), ...a.planned.map((p) => [p.item.lead_agent, p.item.lead_agent] as const)]).values()]
+              // One face per agent: two people's agents can share a client name, so the owner is part of the key.
+              const people = [...new Map([...a.holders.map((h) => [`${h.owner}/${h.name}`, h.name] as const), ...a.planned.map((p) => [`${p.item.owner_login}/${p.item.lead_agent}`, p.item.lead_agent] as const)])]
               const heat = (a.holders.length + a.planned.length) / most
               return (
                 <div role="listitem" key={a.name || '(root)'} className="map-cell">
@@ -252,9 +253,9 @@ function AreaMap({ d, ov }: { d: Derived | null; ov: WorkOverview | null }) {
                       <code>{a.name ? `${a.name}/` : 'files at the top level'}</code>
                     </span>
                     {a.crossings > 0 && <span className="crossing">{plural(a.crossings, 'crossing')}</span>}
-                    <span className="tile-people" aria-label={`${people.length} ${people.length === 1 ? 'agent' : 'agents'}: ${people.join(', ')}`}>
-                      {people.slice(0, 5).map((n) => (
-                        <Avatar key={n} name={n} size={26} />
+                    <span className="tile-people" aria-label={`${people.length} ${people.length === 1 ? 'agent' : 'agents'}: ${people.map(([k]) => k.replace('/', '’s ')).join(', ')}`}>
+                      {people.slice(0, 5).map(([k, n]) => (
+                        <Avatar key={k} name={n} size={26} />
                       ))}
                       {people.length > 5 && <span className="tile-more">+{people.length - 5}</span>}
                     </span>

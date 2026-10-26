@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { defineConfig, type Plugin } from 'vite'
 import { mockHub } from './dev/mock.ts'
 
@@ -38,7 +39,9 @@ function packagesManifest(): Plugin {
       // Stylesheets and the fonts they inline reach app.css, not app.js, so their packages are named here.
       for (const name of CSS_PACKAGES) {
         const dir = `node_modules/${name}`
-        found.set(dir, { name, version: (JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as { version: string }).version, dir })
+        // Resolved from this file, so a build started from another folder reads the same packages.
+        const manifest = fileURLToPath(new URL(`${dir}/package.json`, import.meta.url))
+        found.set(dir, { name, version: (JSON.parse(readFileSync(manifest, 'utf8')) as { version: string }).version, dir })
       }
       const list = [...found.values()].sort((a, b) => a.name.localeCompare(b.name) || a.version.localeCompare(b.version) || a.dir.localeCompare(b.dir))
       this.emitFile({ type: 'asset', fileName: 'packages.json', source: `${JSON.stringify(list, null, 2)}\n` })

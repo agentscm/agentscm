@@ -4,7 +4,7 @@ import { derive } from './derive.ts'
 import { isLocalCredential, onFrontDoor } from './frontDoor.ts'
 import { fetchOverview } from './standup.ts'
 import { clearToken, loadDensity, loadTheme, loadToken, saveDensity, saveTheme, saveToken, signInAfterRefusal, type Density, type ThemePref } from './storage.ts'
-import { useHub, useNow } from './useHub.ts'
+import { useHub } from './useHub.ts'
 import logoDark from './logo-dark.png'
 import logoLight from './logo-light.png'
 import { DashboardPage, dashboardStatus } from './pages/Dashboard.tsx'
@@ -116,8 +116,8 @@ function Shell({ token, pref, onPref, density, onDensity, onUnauthorized, onForg
   const overview = usePoll((signal) => fetchOverview(token, signal), 15_000, token)
   const repo = data.whoami?.token.repository ?? 'this repository'
   const ov = overview.kind === 'ready' ? overview.value : null
-  const now = useNow()
-  const dash = dashboardStatus(ov, d, data.activity?.events ?? null, now)
+  // Measured against the last successful poll, not the 1-second clock, so the whole shell re-renders only when data arrives.
+  const dash = dashboardStatus(ov, d, data.activity?.events ?? null, data.lastOk)
   const badges: Badges = {}
   if (dash.needs.length > 0) badges.home = { n: dash.needs.length, tone: dash.needs.some((n) => n.tone === 'bad') ? 'bad' : 'warn', tip: `${dash.needs.length} thing${dash.needs.length === 1 ? ' needs' : 's need'} you` }
   if (ov && ov.overlaps.length > 0) badges.inbox = { n: ov.overlaps.length, tone: 'warn', tip: `${ov.overlaps.length} declared-scope overlap${ov.overlaps.length === 1 ? '' : 's'} to coordinate` }

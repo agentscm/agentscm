@@ -371,24 +371,6 @@ kbd {
 }
 .health-chip.is-bad { color: var(--hub-warn); background: var(--hub-warn-soft); }
 .health-chip.is-bad .live-dot { background: var(--hub-warn); animation: none; }
-/* A persistent header action stays secondary: page actions own the filled violet. */
-.topbar-cta.btn-primary {
-  height: 32px;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  border-radius: 9px;
-  font-weight: 600;
-  white-space: nowrap;
-  --bs-btn-bg: var(--hub-surface);
-  --bs-btn-color: var(--hub-brand-ink);
-  --bs-btn-border-color: var(--hub-rule);
-  --bs-btn-hover-bg: var(--hub-brand-soft);
-  --bs-btn-hover-color: var(--hub-brand-ink);
-  --bs-btn-hover-border-color: color-mix(in srgb, var(--hub-brand) 40%, transparent);
-  --bs-btn-active-bg: var(--hub-brand-soft);
-  --bs-btn-active-color: var(--hub-brand-ink);
-}
 .live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--hub-ok); animation: pulse 2.4s ease-out infinite; }
 @keyframes pulse {
   0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--hub-ok) 45%, transparent); }
@@ -626,8 +608,6 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
 .crumbs .bi { font-size: 0.85rem; }
 .crumb-mono { font-family: var(--bs-font-monospace); font-size: 0.8rem; }
 .crumb-sep { color: var(--hub-text-3); font-size: 0.65rem; opacity: 0.7; }
-.crumb-fresh { display: inline-flex; align-items: center; gap: 6px; font-size: 0.78rem; color: var(--hub-text-3); white-space: nowrap; }
-.crumb-fresh.is-failing { color: var(--hub-warn); }
 
 /* Mobile drawer */
 .burger {
@@ -2127,7 +2107,7 @@ a.run-row:hover {
 
   .topbar { padding: 0 12px; gap: 8px; }
   .topbar-logo { min-width: 0; }
-  .topbar-div, .cta-text, .health-text, .search-pill kbd, .crumb-fresh { display: none; }
+  .topbar-div, .health-text, .search-pill kbd { display: none; }
   .burger { display: inline-grid; place-items: center; }
   .search-pill { width: 36px; padding: 0; justify-content: center; }
   .topbar-right { margin-left: 0; gap: 8px; }
@@ -2177,15 +2157,11 @@ a.run-row:hover {
   }
 }
 
-@media (max-width: 1100px) {
-  .cta-text { display: none; }
-}
 @media (max-width: 640px) {
   .repo-btn .repo-chevron { display: none; }
   .crumbs li.is-last > span > span { max-width: 22ch; }
 }
 @media (max-width: 640px) {
-  .topbar-right > span:has(> .topbar-cta) { display: none; }
   .repo-btn .repo-name { display: none; }
   .repo-btn { padding: 0 4px; gap: 4px; }
   .topbar { overflow: visible; }
@@ -2323,8 +2299,7 @@ a.run-row:hover {
 
 /* Narrow header: "Live" may collapse to the dot, but a problem always keeps its words (never colour alone). */
 @media (max-width: 960px) {
-  .health-chip.is-bad .health-text,
-  .crumb-fresh.is-failing { display: inline-flex; }
+  .health-chip.is-bad .health-text { display: inline-flex; }
 }
 
 .crash {
