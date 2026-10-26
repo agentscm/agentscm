@@ -42,6 +42,7 @@ fn command(id: &str, script: &str, timeout_secs: u64) -> RecipeCommand {
         id: id.into(),
         argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
         timeout_secs,
+        paths: None,
     }
 }
 
@@ -113,6 +114,7 @@ impl Fixture {
             },
             max_age_seconds: 3600,
             epoch: 1,
+            exempt_paths: None,
         };
         fs::write(
             root.join("registry.json"),

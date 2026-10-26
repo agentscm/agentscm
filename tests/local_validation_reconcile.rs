@@ -57,6 +57,7 @@ impl Env {
                 id: "gate".into(),
                 argv: vec!["/bin/sh".into(), "-c".into(), "true".into()],
                 timeout_secs: 30,
+                paths: None,
             }],
             None,
         )
@@ -115,6 +116,7 @@ impl Env {
             },
             max_age_seconds: 3600,
             epoch: 1,
+            exempt_paths: None,
         };
         let config = root.join("config");
         fs::create_dir(&config).unwrap();
@@ -583,6 +585,7 @@ async fn a_bun_shaped_recipe_without_services_produces_posts_and_reconciles() {
             id: "bun-test".into(),
             argv: vec!["/bin/sh".into(), "-c".into(), "test -f bun.lock".into()],
             timeout_secs: 30,
+            paths: None,
         }],
         Some(vec!["bun.lock".into()]),
     )

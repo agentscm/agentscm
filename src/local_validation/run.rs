@@ -121,6 +121,67 @@ pub fn observe(repo: &Path, head: &str, base_rev: &str) -> Result<GitState> {
     })
 }
 
+/// Number of paths that differ between two trees and match `pathspecs` (all paths when empty).
+/// Plumbing, so renames, external diff and `diff.relative` configuration cannot change the count.
+fn changed(repo: &Path, from: &str, to: &str, pathspecs: &[String]) -> Result<usize> {
+    for name in [from, to] {
+        if name.starts_with('-') || name.contains('\0') {
+            return Err(Error::Invalid("revision must not start with '-'".into()));
+        }
+    }
+    let mut args = vec!["diff-tree", "-r", "--name-only", "-z", "--no-renames"];
+    args.extend([from, to, "--"]);
+    args.extend(pathspecs.iter().map(String::as_str));
+    Ok(git(repo, &args, GIT_OUTPUT)?
+        .iter()
+        .filter(|b| **b == 0)
+        .count())
+}
+
+/// Built-in pathspecs for the files that define the gate itself, relative to `repo`.
+pub fn trust_paths(config_dir: &str, verifier_workflow: &str) -> Vec<String> {
+    [config_dir, verifier_workflow]
+        .map(|path| format!(":(literal){path}"))
+        .into()
+}
+
+/// Recipe command ids the change requires, in recipe order. A change to any trust input
+/// requires every command.
+pub fn required_commands(
+    repo: &Path,
+    merge_base: &str,
+    head: &str,
+    recipe: &ValidationRecipe,
+    trust: &[String],
+) -> Result<Vec<String>> {
+    let all = changed(repo, merge_base, head, trust)? > 0;
+    let mut ids = Vec::new();
+    for command in &recipe.commands {
+        let required = match &command.paths {
+            Some(paths) if !all => changed(repo, merge_base, head, paths)? > 0,
+            _ => true,
+        };
+        if required {
+            ids.push(command.id.clone());
+        }
+    }
+    Ok(ids)
+}
+
+/// True when the change is non-empty, touches no trust input and every path matches `exempt`.
+pub fn only_exempt(
+    repo: &Path,
+    merge_base: &str,
+    head: &str,
+    exempt: &[String],
+    trust: &[String],
+) -> Result<bool> {
+    let total = changed(repo, merge_base, head, &[])?;
+    Ok(total > 0
+        && changed(repo, merge_base, head, trust)? == 0
+        && changed(repo, merge_base, head, exempt)? == total)
+}
+
 fn fetch_base(repo: &Path, base: &str) -> Result<()> {
     let base_spec = format!("+refs/heads/{base}:refs/remotes/origin/{base}");
     git_timeout(

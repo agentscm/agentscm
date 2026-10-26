@@ -35,6 +35,7 @@ const MAX_ARGV: usize = 64;
 const MAX_TEXT: usize = 2048;
 const MAX_TOOLCHAIN_LINES: usize = 16;
 const MAX_DEPENDENCY_FILES: usize = 16;
+const MAX_PATHSPECS: usize = 64;
 const DEFAULT_DEPENDENCY_FILES: [&str; 2] = ["Cargo.lock", "rust-toolchain.toml"];
 const DEFAULT_TOOLCHAIN_PROBES: [&[&str]; 3] = [
     &["rustc", "-V"],
@@ -44,6 +45,7 @@ const DEFAULT_TOOLCHAIN_PROBES: [&[&str]; 3] = [
 const MAX_MAX_AGE_SECONDS: u64 = 366 * 24 * 3600;
 pub const CHECK_KIND: &str = "command/v1";
 pub const REQUIREMENT_ID: &str = "local-validation";
+pub const DEFAULT_VERIFIER_WORKFLOW: &str = ".github/workflows/local-validation.yml";
 /// Surfaces the local gate never covers, recorded as coverage omissions.
 const FIXED_OMISSIONS: [&str; 5] = [
     "ignored tests",
@@ -75,6 +77,10 @@ pub struct RecipeCommand {
     pub id: String,
     pub argv: Vec<String>,
     pub timeout_secs: u64,
+    /// Git pathspecs; the command is required only when the change touches one. Absent means
+    /// always required. Declaring them changes the recipe digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -147,6 +153,10 @@ pub struct ValidationPolicy {
     pub required_services: Services,
     pub max_age_seconds: u64,
     pub epoch: u64,
+    /// Git pathspecs. A change whose every path matches one, and that touches no trust input,
+    /// needs no attestation. Absent means nothing is exempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exempt_paths: Option<Vec<String>>,
 }
 
 fn text(kind: &str, value: &str) -> Result<()> {
@@ -197,6 +207,42 @@ fn validate_dependency_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// A Git pathspec that cannot be an option and uses only the long magic form with a fixed word
+/// set; short magic, `attr` and `icase` are rejected.
+fn pathspec(spec: &str) -> Result<()> {
+    text("pathspec", spec)?;
+    if spec.starts_with('-') {
+        return Err(Error::Invalid("pathspec must not start with '-'".into()));
+    }
+    if let Some(magic) = spec.strip_prefix(':') {
+        let words = magic
+            .strip_prefix('(')
+            .and_then(|rest| rest.split_once(')'))
+            .map(|(words, _)| words)
+            .filter(|words| {
+                words
+                    .split(',')
+                    .all(|w| matches!(w, "glob" | "literal" | "exclude" | "top"))
+            });
+        if words.is_none() {
+            return Err(Error::Invalid(format!(
+                "pathspec magic must be :(glob|literal|exclude|top,...): {spec}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn pathspecs(kind: &str, specs: &Option<Vec<String>>) -> Result<()> {
+    let Some(specs) = specs else { return Ok(()) };
+    if specs.is_empty() || specs.len() > MAX_PATHSPECS {
+        return Err(Error::Limit(format!(
+            "{kind} must have 1 to {MAX_PATHSPECS} pathspecs"
+        )));
+    }
+    specs.iter().try_for_each(|spec| pathspec(spec))
+}
+
 impl ValidationRecipe {
     pub fn validate(&self) -> Result<()> {
         validate_identifier("recipe ID", &self.recipe_id)?;
@@ -212,6 +258,7 @@ impl ValidationRecipe {
             if command.timeout_secs == 0 || !ids.insert(command.id.as_str()) {
                 return Err(Error::Invalid("invalid or duplicate recipe command".into()));
             }
+            pathspecs("command paths", &command.paths)?;
         }
         if let Some(files) = &self.dependency_files {
             if files.is_empty() || files.len() > MAX_DEPENDENCY_FILES {
@@ -398,6 +445,7 @@ impl ValidationPolicy {
         if self.max_age_seconds == 0 || self.max_age_seconds > MAX_MAX_AGE_SECONDS {
             return Err(Error::Limit("max age out of range".into()));
         }
+        pathspecs("exempt paths", &self.exempt_paths)?;
         Ok(())
     }
 
