@@ -103,7 +103,7 @@ function LibraryView({ repo, token }: { repo: string; token: string }) {
     <div className="page">
       <div className="answer" data-tour="answer">
         <h1 className="page-question">Which workflows do agents in this repository have to follow?</h1>
-        <p className="answer-text"><code>{repo}</code>{poll.kind === 'ready' && <> · <span>{adoptionLabel(poll.value.adoption.source, poll.value.adoption.default_branch)}</span></>}</p>
+        <p className="answer-text"><code>{repo}</code>{poll.kind === 'ready' && <> · <span>{adoptionLabel(poll.value.adoption.source, poll.value.adoption.default_branch)}</span></>} · <a href="#templates?view=skills">Create or import reusable skills</a></p>
       </div>
       <Loaded poll={poll} what="skills">{(lib) => <Library lib={lib} />}</Loaded>
       <p className="small muted"><Icon name="info-circle" /> Read-only. Adoption is the lock file in the repository; it takes effect when <code>agentscm-skills.lock.json</code> is committed.</p>

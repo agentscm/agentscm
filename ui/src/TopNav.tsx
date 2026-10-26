@@ -19,6 +19,7 @@ import { tourFor } from './tour/content.ts'
 
 export interface SectionDef {
   key: Section
+  href?: string
   icon: string
   label: string
   question: string
@@ -134,7 +135,7 @@ function RepoSwitcher({ repo, onForget }: { repo: string; onForget: () => void }
  * connected on it (the same repository on two Hubs is told apart by Hub), and Disconnect. It shares
  * `useDismiss` with the Hub's other menus.
  */
-export function LocalRepoSwitcher({ token, repo }: { token: string; repo: string }) {
+export function LocalRepoSwitcher({ token, repo, navigationBlocked = false }: { token: string; repo: string; navigationBlocked?: boolean }) {
   const [open, setOpen] = useState(false)
   const ref = useDismiss(open, () => setOpen(false))
   const local = useLocalComputer()
@@ -168,6 +169,7 @@ export function LocalRepoSwitcher({ token, repo }: { token: string; repo: string
                 className={`pop-item${isCurrent ? ' is-current' : ''}`}
                 onClick={() => {
                   setOpen(false)
+                  if (!isCurrent && navigationBlocked && !window.confirm('Discard unsaved workflow edits?')) return
                   if (!isCurrent && switchRepository(token, selectorOf(r))) window.location.reload()
                 }}
               >
@@ -190,6 +192,7 @@ export function LocalRepoSwitcher({ token, repo }: { token: string; repo: string
             className="pop-item"
             onClick={() => {
               setOpen(false)
+              if (navigationBlocked && !window.confirm('Discard unsaved workflow edits?')) return
               void disconnectComputer().then(() => window.location.reload())
             }}
           >
@@ -417,7 +420,7 @@ function SideNav({ sections, section, badges, collapsed, onCollapse, drawer, onC
                 const active = section === s.key
                 return (
                   <RailTip key={s.key} on={collapsed && !drawer} text={`${s.label}: ${s.question}`}>
-                    <a href={`#${s.key}`} className={`side-link${active ? ' active' : ''}`} aria-current={active ? 'page' : undefined} aria-label={collapsed && !drawer ? s.label : undefined} onClick={onClose}>
+                    <a href={s.href ?? `#${s.key}`} className={`side-link${active ? ' active' : ''}`} aria-current={active ? 'page' : undefined} aria-label={collapsed && !drawer ? s.label : undefined} onClick={onClose}>
                       <span className="side-icon"><Icon name={s.icon} /></span>
                       <span className="side-text">
                         <span className="side-label">{s.label}</span>
@@ -541,7 +544,7 @@ function Breadcrumbs({ repo, section, overview, data }: { repo: string; section:
   )
 }
 
-export function AppChrome({ logo, token, repo, sections, section, badges, data, d, overview, pref, onPref, onForget, collapsed, onCollapsed, children }: {
+export function AppChrome({ logo, token, repo, sections, section, badges, data, d, overview, pref, onPref, onForget, navigationBlocked = false, collapsed, onCollapsed, children }: {
   logo: ReactNode
   /** The Hub sign-in; on this computer's own page, its connection credential. */
   token: string
@@ -555,6 +558,7 @@ export function AppChrome({ logo, token, repo, sections, section, badges, data, 
   pref: ThemePref
   onPref: (p: ThemePref) => void
   onForget: () => void
+  navigationBlocked?: boolean
   collapsed: boolean
   onCollapsed: (c: boolean) => void
   children: ReactNode
@@ -625,7 +629,7 @@ export function AppChrome({ logo, token, repo, sections, section, badges, data, 
           {logo}
         </a>
         <span className="topbar-div" aria-hidden="true" />
-        {isLocalCredential(token) ? <LocalRepoSwitcher token={token} repo={repo} /> : <RepoSwitcher repo={repo} onForget={onForget} />}
+        {isLocalCredential(token) ? <LocalRepoSwitcher token={token} repo={repo} navigationBlocked={navigationBlocked} /> : <RepoSwitcher repo={repo} onForget={onForget} />}
 
         <button type="button" data-tour="search" className="search-pill" onClick={() => setPalette(true)} aria-label="Search the hub">
           <Icon name="search" />

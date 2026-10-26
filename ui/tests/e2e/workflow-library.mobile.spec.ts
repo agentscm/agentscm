@@ -1,0 +1,25 @@
+import { expect, test } from '@playwright/test'
+import { installWorkflowLibraryMock, LOCAL_TOKEN } from './workflowLibraryMock.ts'
+
+test('the workflow builder remains operable and readable on a phone', async ({ page }, testInfo) => {
+  const state = await installWorkflowLibraryMock(page)
+  state.skills.push({ id: 'skill-mobile', name: 'Mobile checks', version: 1, generation: 1, digest: 'c'.repeat(64), entrypoint: 'SKILL.md', files: [], provenance: { kind: 'markdown', locator: 'pasted' }, created_at: 1_798_000_000, archived: false })
+  await page.addInitScript((token) => localStorage.setItem('agentscm.token', token), LOCAL_TOKEN)
+  await page.goto('/#templates?view=workflows')
+  const main = page.locator('#main')
+  await main.getByRole('button', { name: 'New workflow' }).click()
+  await main.getByLabel('Name').fill('Phone release checks')
+  await main.getByLabel('Purpose').fill('Verify a compact workflow authoring path.')
+  await main.getByRole('button', { name: 'Create', exact: true }).click()
+  await main.getByRole('button', { name: 'Skill / rule' }).click()
+  await main.getByRole('button', { name: 'Build', exact: true }).click()
+  await main.getByLabel('Runner file').fill('runners/mobile-build.json')
+  await main.getByRole('button', { name: 'Save draft' }).click()
+  await main.getByRole('button', { name: 'Publish version' }).click()
+  await main.getByRole('button', { name: 'Simulate' }).click()
+  await expect(main.getByText('Simulation passed with warnings')).toBeVisible()
+  await expect(main.getByText('Admission was not assessed and deployment was not attempted.')).toBeVisible()
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true)
+  await page.evaluate(() => window.scrollTo(0, 0))
+  await page.screenshot({ path: testInfo.outputPath('workflow-library-mobile.png') })
+})

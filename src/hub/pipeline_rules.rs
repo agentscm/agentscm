@@ -45,6 +45,15 @@ impl PipelineRecipe {
             steps: self.steps.clone(),
         }
     }
+
+    pub(crate) fn validate_structure(&self, policy_epoch: u64) -> Result<()> {
+        skill_workflow::compiler::validate_definition(&self.definition(WorkflowSource {
+            repository: "00000000000000000000000000000000".into(),
+            revision: "0000000000000000000000000000000000000000000000000000000000000000".into(),
+            policy_epoch,
+        }))?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

@@ -193,7 +193,7 @@ fn validate_definition_size(definition: &WorkflowDefinition) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn validate_definition(definition: &WorkflowDefinition) -> Result<Vec<StepDefinition>> {
+pub(crate) fn validate_definition(definition: &WorkflowDefinition) -> Result<Vec<StepDefinition>> {
     if definition.version != WORKFLOW_VERSION {
         return Err(Error::Invalid(format!(
             "unsupported workflow definition version {}",
