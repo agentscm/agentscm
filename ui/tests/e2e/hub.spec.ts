@@ -304,7 +304,7 @@ test('the local pages and After merge each answer their question', async ({ page
   await signIn(page)
   for (const [hash, question] of [
     ['#landed', 'Did our changes land, and did checks pass after?'],
-    ['#templates', 'Which workflow recipes can agents reuse?'],
+    ['#templates', 'Which reusable workflows can agents configure here?'],
     ['#timeline', 'What did this workspace look like earlier?'],
   ] as const) {
     await page.evaluate((h) => (window.location.hash = h), hash)
@@ -361,7 +361,8 @@ test('Templates and Timeline read this computer through the dev proxy: live when
   await page.getByRole('link', { name: /Compare these two/ }).click()
   await expect(crumbs(page).locator('[aria-current="page"]')).toContainText('Compare #2 and #3')
   await expect(main(page).getByText(/What changed from #2 to #3/)).toBeVisible()
-  await page.evaluate(() => (window.location.hash = '#templates'))
+  // Inspecting one change's template is the Library's third view.
+  await page.evaluate(() => (window.location.hash = '#templates?view=inspect'))
   const changePicker = page.getByRole('combobox', { name: 'Change ID' })
   await changePicker.fill('other-change')
   await changePicker.press('Enter')

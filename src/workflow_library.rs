@@ -2238,9 +2238,9 @@ async fn resolve_github(
     let mut files = Vec::new();
     let mut total = 0usize;
     for remote in &paths {
-        let url = format!("https://raw.githubusercontent.com/{repository}/{commit}/{remote}");
+        let url = raw_github_url(&repository, &commit, remote)?;
         let mut response = client
-            .get(&url)
+            .get(url)
             .header("accept", "text/plain")
             .send()
             .await
@@ -2581,6 +2581,22 @@ fn validate_key(value: &str) -> Result<()> {
     }
     Ok(())
 }
+/// The one host GitHub imports read from. The validated owner, name, commit and path go in as
+/// separate path segments, so none of them can change the scheme, host or query.
+fn raw_github_url(repository: &str, commit: &str, path: &str) -> Result<reqwest::Url> {
+    validate_repository(repository)?;
+    validate_commit(commit)?;
+    validate_relative(path)?;
+    let mut url = reqwest::Url::parse("https://raw.githubusercontent.com/")
+        .map_err(|_| Error::Invalid("GitHub import URL unavailable".into()))?;
+    url.path_segments_mut()
+        .map_err(|()| Error::Invalid("GitHub import URL unavailable".into()))?
+        .extend(repository.split('/'))
+        .push(commit)
+        .extend(path.split('/'));
+    Ok(url)
+}
+
 fn validate_repository(value: &str) -> Result<()> {
     let parts: Vec<_> = value.split('/').collect();
     if parts.len() != 2
@@ -2644,6 +2660,28 @@ mod tests {
     use crate::authority::Authority;
     use crate::model::{EntryChange, EntryKind};
     use crate::skill_workflow::{WorkflowDefinition, WorkflowSource};
+
+    #[test]
+    fn raw_github_url_keeps_the_host_and_refuses_unsafe_parts() {
+        let commit = "a".repeat(40);
+        let url = raw_github_url("acme/widgets", &commit, "skills/x/SKILL.md").unwrap();
+        assert_eq!(
+            url.as_str(),
+            format!("https://raw.githubusercontent.com/acme/widgets/{commit}/skills/x/SKILL.md")
+        );
+        for (repository, path) in [
+            ("evil.example/x", "SKILL.md"),
+            ("acme/widgets", "../SKILL.md"),
+            ("acme/widgets", "a?b/SKILL.md"),
+            ("acme/widgets@evil.example", "SKILL.md"),
+        ] {
+            if let Ok(url) = raw_github_url(repository, &commit, path) {
+                assert_eq!(url.host_str(), Some("raw.githubusercontent.com"));
+                assert!(url.query().is_none() && url.fragment().is_none());
+            }
+        }
+        assert!(raw_github_url("acme/widgets", "main", "SKILL.md").is_err());
+    }
 
     fn accept_package(
         library: &mut Library,

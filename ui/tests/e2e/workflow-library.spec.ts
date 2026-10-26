@@ -24,7 +24,8 @@ test('creates an exact skill and a versioned workflow, then simulates and attach
   await main.getByRole('button', { name: 'Save this exact skill version' }).click()
   await expect(main.locator('.wl-row').filter({ hasText: 'Release helper' })).toHaveCount(1)
 
-  await main.getByRole('tab', { name: 'Workflows' }).click()
+  // The Library's views are links in its lens, so each view has its own address.
+  await main.getByRole('navigation', { name: 'Library views' }).getByRole('link', { name: 'Workflows' }).click()
   await main.getByRole('button', { name: 'New workflow' }).click()
   await main.getByLabel('Name').fill('Major feature follow-up')
   await main.getByLabel('Purpose').fill('Prepare build evidence and a release action after a confirmed merge.')
@@ -67,7 +68,8 @@ test('creates an exact skill and a versioned workflow, then simulates and attach
   await expect(main.locator('.wl-diagnostics').getByText('operator_profile', { exact: true })).toBeVisible()
   await expect(main.getByText(/pipeline install/)).toHaveCount(0)
   await main.getByRole('button', { name: 'Workflow library' }).click()
-  const seed = main.getByRole('listitem').filter({ hasText: 'Release evidence' })
+  // Match the row by its own title: another row's flow strip names Release evidence as its follow-on.
+  const seed = main.locator('.wl-row').filter({ has: page.locator('.wl-row-main > strong', { hasText: /^Release evidence$/ }) })
   await seed.getByRole('button', { name: 'Archive' }).click()
   await main.getByRole('button', { name: /Major feature follow-up/ }).first().click()
   const retainedReferences = main.getByRole('option', { name: /Release evidence v1 · archived reference \(retained\)/ })

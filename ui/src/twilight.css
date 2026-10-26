@@ -2148,15 +2148,15 @@ textarea.form-control {
   border-left: 1px solid var(--hub-rule);
 }
 
-/* Phones: the bar keeps what a person acts on (menu, repository, search, health, inbox, account).
-   Theme and density stay in Setup › Preferences; the page tour stays in search. */
+/* Phones: the bar keeps what a person acts on (menu, repository, search, health, page tour, inbox, account).
+   Theme and density stay in Setup › Preferences. */
 @media (max-width: 640px) {
   .topbar-logo,
-  .topbar [data-tour='view'],
-  .topbar .tour-trigger {
+  .topbar [data-tour='view'] {
     display: none;
   }
-  .topbar .top-icon {
+  .topbar .top-icon,
+  .topbar .tour-trigger {
     width: 44px;
     height: 44px;
   }

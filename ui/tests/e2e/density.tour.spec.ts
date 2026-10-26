@@ -94,7 +94,7 @@ for (const density of ['spacious', 'condensed'] as const) {
 
     test('picker popups stay within their combobox, clear of the nav', async ({ page }) => {
       await signIn(page)
-      for (const [hash, label] of [['#templates', 'Change ID'], ['#workflows', 'Find a run']] as const) {
+      for (const [hash, label] of [['#templates?view=inspect', 'Change ID'], ['#workflows', 'Find a run']] as const) {
         await page.evaluate((h) => (window.location.hash = h), hash)
         const picker = page.getByRole('combobox', { name: label })
         await picker.focus()
