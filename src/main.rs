@@ -1505,10 +1505,7 @@ mod tests {
     #[test]
     fn errors_are_sentences_at_a_terminal_and_json_otherwise() {
         let error = Error::Invalid("pass --hub".into());
-        assert_eq!(
-            render_error(&error, "invalid", true),
-            "error: invalid: pass --hub"
-        );
+        assert_eq!(render_error(&error, "invalid", true), "error: pass --hub");
         let piped: Value = serde_json::from_str(&render_error(&error, "invalid", false)).unwrap();
         assert_eq!(
             piped,
