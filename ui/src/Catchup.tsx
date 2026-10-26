@@ -11,6 +11,7 @@ import {
   type CatchupPage,
   type CatchupWorkEvent,
 } from './catchup.ts'
+import { NarrativePanel } from './Narrative.tsx'
 import { Ago, Box, Icon, Notice, Skeleton, localDate } from './ui.tsx'
 
 type LoadState =
@@ -263,7 +264,9 @@ export function CatchupPanel({ token }: { token: string }) {
   )
 
   return (
-    <Box
+    <>
+      <NarrativePanel token={token} />
+      <Box
       id="since-last-checked"
       icon="clock-history"
       title="Since you last checked"
@@ -310,6 +313,7 @@ export function CatchupPanel({ token }: { token: string }) {
           <dt>Retention floors</dt><dd>events <code>{page.retention.event_available_from}</code> · merges <code>{page.retention.merge_available_from}</code></dd>
         </dl>
       </details>
-    </Box>
+      </Box>
+    </>
   )
 }

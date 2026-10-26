@@ -579,6 +579,10 @@ impl Call {
                         unknown("shared work could not be listed")
                     ),
                 });
+                if !principal.read_only {
+                    text.push('\n');
+                    text.push_str(super::mcp::NARRATIVE_GUIDANCE);
+                }
                 Ok(Outcome {
                     text,
                     status,

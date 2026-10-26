@@ -21,6 +21,7 @@ pub mod insights;
 pub mod intent;
 pub mod login;
 pub mod mcp;
+pub mod narrative;
 pub mod onboarding;
 #[cfg(unix)]
 pub mod pipeline_rules;
@@ -154,6 +155,7 @@ pub struct HubState {
     login: Arc<login::Login>,
     sync: Arc<sync::Sync>,
     skill_workflows: Arc<skill_workflow::SkillWorkflowRegistry>,
+    narratives: Arc<narrative::Narratives>,
     onboarding: Arc<onboarding::Observations>,
     /// Set by `agentscm demo`; health says so, for the status page.
     demo: bool,
@@ -176,6 +178,7 @@ impl HubState {
             login: Arc::new(login::Login::unconfigured()),
             sync: Arc::new(sync::Sync::unconfigured()),
             skill_workflows: Arc::new(skill_workflow::SkillWorkflowRegistry::unconfigured()),
+            narratives: Arc::new(narrative::Narratives::default()),
             onboarding: Arc::new(onboarding::Observations::default()),
             demo: false,
             shared_conversation_retention_days: DEFAULT_SHARED_CONVERSATION_RETENTION_DAYS,

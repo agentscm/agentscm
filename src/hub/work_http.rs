@@ -23,6 +23,7 @@ use super::{HubError, HubState};
 pub fn routes() -> Router<HubState> {
     Router::new()
         .merge(super::coordination_http::routes())
+        .route("/v1/hub/standup/narrative", get(narrative))
         .route("/v1/hub/standup/catchup", get(catchup))
         .route("/v1/hub/standup/catchup/ack", post(catchup_ack))
         .route("/v1/hub/standup/briefing", get(briefing))
@@ -51,6 +52,18 @@ async fn preflight(
             store.work_preflight(&principal.token_id, &request, unix_now())
         })
         .await?,
+    ))
+}
+
+/// A cached agent synthesis of the bounded source window; never acknowledges review.
+async fn narrative(
+    State(state): State<HubState>,
+    Reader(principal): Reader,
+    query: std::result::Result<Query<super::narrative::NarrativeQuery>, QueryRejection>,
+) -> Result<Json<super::narrative::NarrativeView>, ApiError> {
+    let Query(query) = query.map_err(|_| ApiError::invalid())?;
+    Ok(Json(
+        super::narrative::read(&state, &principal, query).await?,
     ))
 }
 
