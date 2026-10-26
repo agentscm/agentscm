@@ -45,7 +45,8 @@ pub enum LocalValidationCommand {
     /// Post a retained attestation as a PR comment (GitHub). Posts no status.
     Post(PostArgs),
     /// Set the `agentscm/local-validation` status of every open pull request on `--base` from its
-    /// signed attestation comments. Exit 0 when all were handled, 1 on any error or unread input,
+    /// signed attestation comments; with policy `exempt_paths`, a pull request that changes only
+    /// exempt paths passes without one. Exit 0 when all were handled, 1 on any error or unread input,
     /// 2 when the policy is for another repository.
     Reconcile(ReconcileArgs),
 }

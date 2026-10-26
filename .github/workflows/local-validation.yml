@@ -4,11 +4,14 @@ name: Local validation verifier
 # default branch from maintainer-signed attestation comments. It builds only the default
 # branch; pull request heads are fetched as Git data by `agentscm local-validation reconcile`
 # and are never checked out, built or run. Policy, recipe and registry come from the default
-# branch checkout.
+# branch checkout. It also runs on pull request events so a head that changes only exempt paths
+# gets its status promptly.
 
 on:
   issue_comment: # zizmor: ignore[dangerous-triggers] default-branch build only; the PR head is fetched as Git data, never built or run
     types: [created, edited, deleted]
+  pull_request_target: # zizmor: ignore[dangerous-triggers] default-branch build only; the PR head is fetched as Git data, never built or run
+    types: [opened, synchronize, reopened, edited]
   push:
     branches: [main]
     paths:

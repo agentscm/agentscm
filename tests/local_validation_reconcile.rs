@@ -69,6 +69,35 @@ impl Env {
         commands: Vec<RecipeCommand>,
         dependency_files: Option<Vec<String>>,
     ) -> Self {
+        Self::with_exempt(files, commands, dependency_files, None).await
+    }
+
+    /// A docs-style exemption list whose `.github/**` must still not exempt the trust inputs.
+    async fn exempting(files: Vec<(&str, &str)>) -> Self {
+        Self::with_exempt(
+            files,
+            vec![RecipeCommand {
+                id: "gate".into(),
+                argv: vec!["/bin/sh".into(), "-c".into(), "true".into()],
+                timeout_secs: 30,
+                paths: None,
+            }],
+            None,
+            Some(
+                ["*.md", "docs/**", ".github/**"]
+                    .map(str::to_owned)
+                    .to_vec(),
+            ),
+        )
+        .await
+    }
+
+    async fn with_exempt(
+        files: Vec<(&str, &str)>,
+        commands: Vec<RecipeCommand>,
+        dependency_files: Option<Vec<String>>,
+        exempt_paths: Option<Vec<String>>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
@@ -116,7 +145,7 @@ impl Env {
             },
             max_age_seconds: 3600,
             epoch: 1,
-            exempt_paths: None,
+            exempt_paths,
         };
         let config = root.join("config");
         fs::create_dir(&config).unwrap();
@@ -149,10 +178,12 @@ impl Env {
         let base = git(&work, &["rev-parse", "HEAD"]);
         git(&work, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
         for (name, text) in files {
-            fs::write(work.join(name), text).unwrap();
+            let path = work.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
         }
         git(&work, &["add", "."]);
-        git(&work, &["commit", "-q", "-m", "work"]);
+        git(&work, &["commit", "-q", "--allow-empty", "-m", "work"]);
         let head = git(&work, &["rev-parse", "HEAD"]);
         // `origin` serves the default branch and the pull request head ref.
         let bare = root.join("origin.git");
@@ -317,6 +348,43 @@ impl Env {
     fn posts(&self) -> usize {
         self.fake
             .with(|s| s.requests.iter().filter(|r| r.method == "POST").count())
+    }
+
+    /// Commits `files` on top of the current head, publishes it as the pull request head and
+    /// returns the new sha.
+    fn push_head(&mut self, files: &[(&str, &str)]) -> String {
+        let root = self.root();
+        let work = root.join("work");
+        for (name, text) in files {
+            let path = work.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "more"]);
+        let head = git(&work, &["rev-parse", "HEAD"]);
+        let bare = root.join("origin.git");
+        git(
+            &work,
+            &[
+                "push",
+                "-q",
+                "-f",
+                bare.to_str().unwrap(),
+                &format!("{head}:refs/pull/1/head"),
+            ],
+        );
+        self.fake.with(|s| {
+            s.repos
+                .get_mut(&1)
+                .unwrap()
+                .pulls
+                .get_mut(&1)
+                .unwrap()
+                .head_sha = head.clone();
+        });
+        self.head = head.clone();
+        head
     }
 
     fn prior_success(&self) {
@@ -920,4 +988,85 @@ async fn a_configuration_change_stops_the_loop_so_every_head_stays_pending() {
     assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(env.states(&env.head), ["pending"]);
     assert_eq!(env.states(&second), ["pending"]);
+}
+
+const EXEMPT_DESCRIPTION: &str = "not required: only exempt paths changed";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unmarked_pull_request_changing_only_exempt_paths_passes_without_an_attestation() {
+    let env = Env::exempting(vec![("README.md", "x"), ("docs/a.txt", "y")]).await;
+    let out = tokio::task::block_in_place(|| env.reconcile());
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        env.statuses(&env.head),
+        [("success".to_owned(), EXEMPT_DESCRIPTION.to_owned())]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unmarked_pull_request_that_also_changes_a_required_path_gets_no_status() {
+    let env = Env::exempting(vec![("README.md", "x"), ("src/a.rs", "y")]).await;
+    let out = tokio::task::block_in_place(|| env.reconcile());
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(env.posts(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_change_to_the_config_dir_or_verifier_workflow_is_never_exempt() {
+    for path in [
+        ".github/local-validation/recipe.json",
+        ".github/workflows/local-validation.yml",
+    ] {
+        let env = Env::exempting(vec![(path, "changed")]).await;
+        let out = tokio::task::block_in_place(|| env.reconcile());
+        assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(env.posts(), 0, "{path}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_change_is_never_exempt() {
+    let env = Env::exempting(vec![]).await;
+    let out = tokio::task::block_in_place(|| env.reconcile());
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(env.posts(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_push_that_adds_a_required_path_loses_the_exempt_success() {
+    let mut env = Env::exempting(vec![("README.md", "x")]).await;
+    let first = env.head.clone();
+    let out = tokio::task::block_in_place(|| env.reconcile());
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(env.states(&first), ["success"]);
+    let second = env.push_head(&[("src/a.rs", "y")]);
+    let out = tokio::task::block_in_place(|| env.reconcile());
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(env.states(&second).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_exempt_change_beats_an_unusable_attestation_and_a_prior_status() {
+    let env = Env::exempting(vec![("README.md", "x")]).await;
+    env.attest_comment(10, "OWNER", format!("{MARKED}garbage -->"));
+    env.prior_success();
+    let out = tokio::task::block_in_place(|| env.reconcile());
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        env.statuses(&env.head).last().unwrap(),
+        &("success".to_owned(), EXEMPT_DESCRIPTION.to_owned())
+    );
+    assert!(!env.states(&env.head).contains(&"pending".to_owned()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unmarked_head_that_cannot_be_fetched_gets_no_status_and_fails_the_run() {
+    let env = Env::exempting(vec![("README.md", "x")]).await;
+    git(
+        &env.root().join("checkout"),
+        &["remote", "set-url", "origin", "/nonexistent/origin.git"],
+    );
+    let out = tokio::task::block_in_place(|| env.reconcile());
+    assert_eq!(code(&out), 1, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(env.posts(), 0);
 }

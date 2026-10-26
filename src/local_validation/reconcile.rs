@@ -4,6 +4,9 @@
 //! Safety order: every opted-in head is first set to `pending`, so a crash can leave `pending`
 //! but never a stale `success`; each later status write is preceded by a re-read of the pull
 //! requests and comments, and is skipped when anything changed (a newer run owns the verdict).
+//! When the policy has `exempt_paths`, every open pull request is also checked against Git: a head
+//! whose change is non-empty, touches no trust input and only exempt paths gets `success` without
+//! an attestation or an opt-in, ahead of any attestation verdict. Other unmarked heads get nothing.
 //! Pull request code is never checked out, built or run; heads are fetched as Git data only.
 //!
 //! ponytail: invalidate-first writes two statuses per opted-in head per run, and GitHub keeps
@@ -16,7 +19,9 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::comment::MARKER_PREFIX;
-use super::run::{config_dir_unchanged, fetch_pull, observe, required_commands, trust_paths};
+use super::run::{
+    config_dir_unchanged, fetch_pull, observe, only_exempt, required_commands, trust_paths,
+};
 use super::{Observed, ValidationPolicy, ValidationRecipe, VerdictState, select};
 use crate::evidence::EvaluationClock;
 use crate::hub::github::{Api, CommitStatus, Gh, GhError, StatusState};
@@ -268,6 +273,20 @@ impl Context<'_> {
         })
     }
 
+    /// Whether the head's change is only exempt paths; Err when it could not be fetched or read.
+    fn exempt(&self, c: &Candidate, exempt: &[String]) -> Result<bool, String> {
+        tokio::task::block_in_place(|| {
+            fetch_pull(self.git_repo, self.base, c.number, &c.head)?;
+            let git = observe(self.git_repo, &c.head, &format!("origin/{}", self.base))?;
+            if git.commit != c.head {
+                return Ok(Err("fetched commit differs from the head".to_owned()));
+            }
+            let trust = trust_paths(self.config_dir, self.verifier_workflow);
+            only_exempt(self.git_repo, &git.merge_base, &git.commit, exempt, &trust).map(Ok)
+        })
+        .map_err(|error| format!("{error:?}"))?
+    }
+
     /// Err when the head could not be fetched or observed: nothing is written for it.
     fn verdict(&self, c: &Candidate) -> Result<(StatusState, String), String> {
         let git = tokio::task::block_in_place(|| {
@@ -332,6 +351,7 @@ impl Context<'_> {
         };
         let mut tally = Tally::default();
         let mut work = Vec::new();
+        let mut exempted = Vec::new();
         for pull in pulls.iter().filter(|p| p.base == self.base) {
             if !is_sha(&pull.head) {
                 println!("PR #{}: unexpected head; skipped", pull.number);
@@ -351,16 +371,97 @@ impl Context<'_> {
             } else {
                 true
             };
-            if !opted_in {
-                println!("PR #{}: not opted in; nothing written", pull.number);
-                continue;
-            }
-            work.push(Candidate {
+            let candidate = Candidate {
                 number: pull.number,
                 head: pull.head.clone(),
                 fingerprint: fingerprint(&attestations),
                 bodies: attestations.iter().map(|c| c.body.clone()).collect(),
-            });
+            };
+            if let Some(paths) = &self.policy.exempt_paths {
+                match self.exempt(&candidate, paths) {
+                    Ok(true) => {
+                        exempted.push(candidate);
+                        continue;
+                    }
+                    Ok(false) => {}
+                    // An opted-in head goes on to its own verdict, which fails the same way.
+                    Err(why) if !opted_in => {
+                        tally.errors += 1;
+                        eprintln!(
+                            "PR #{} {}: head could not be checked for exempt paths ({why}); nothing written",
+                            pull.number, pull.head
+                        );
+                        continue;
+                    }
+                    Err(_) => {}
+                }
+            }
+            if !opted_in {
+                println!("PR #{}: not opted in; nothing written", pull.number);
+                continue;
+            }
+            work.push(candidate);
+        }
+
+        for c in &exempted {
+            match self.recheck(c).await {
+                Err(error) => {
+                    tally.fail(
+                        &format!(
+                            "PR #{} {}: re-check failed; nothing written",
+                            c.number, c.head
+                        ),
+                        &error,
+                    );
+                    if tally.stop {
+                        return 1;
+                    }
+                    continue;
+                }
+                Ok(Recheck::Changed(why)) => {
+                    println!(
+                        "PR #{} {}: {why}; nothing written (a newer event owns the verdict)",
+                        c.number, c.head
+                    );
+                    continue;
+                }
+                Ok(Recheck::Shared) => {
+                    println!(
+                        "PR #{} {}: shared head; exemption not applied",
+                        c.number, c.head
+                    );
+                    continue;
+                }
+                Ok(Recheck::Current) => {}
+            }
+            match self.config_current() {
+                Ok(true) => {}
+                Ok(false) => {
+                    println!(
+                        "PR #{} {}: default-branch verifier configuration changed since checkout; a newer run owns the verdict",
+                        c.number, c.head
+                    );
+                    break;
+                }
+                Err(error) => {
+                    tally.errors += 1;
+                    eprintln!(
+                        "PR #{} {}: verifier configuration could not be checked ({error:?}); nothing written",
+                        c.number, c.head
+                    );
+                    continue;
+                }
+            }
+            let reason = "not required: only exempt paths changed";
+            if self
+                .write(&c.head, StatusState::Success, reason, &mut tally)
+                .await
+            {
+                println!("PR #{} {}: success ({reason})", c.number, c.head);
+            }
+            if tally.stop {
+                return 1;
+            }
         }
 
         // Invalidate first.
