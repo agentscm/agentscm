@@ -1,5 +1,6 @@
 import { useState, type ReactNode } from 'react'
 import { CatchupPanel } from '../Catchup.tsx'
+import { NarrativePanel } from '../Narrative.tsx'
 import type { Derived, LiveAgent } from '../derive.ts'
 import { crossings, needsYou, type Need } from '../needs.ts'
 import { workHref, type WorkItem, type WorkOverview } from '../standup.ts'
@@ -345,6 +346,7 @@ export function DashboardPage({ section, question, token, repo, data, d, overvie
       {section === 'now' && <NowPage data={data} d={d} overview={overview} />}
       {section === 'activity' && (
         <>
+          <NarrativePanel token={token} />
           <CatchupPanel token={token} />
           <ActivityPage d={d} events={data.activity?.events ?? null} fresh={data.fresh} repo={data.whoami?.token.repository ?? null} token={token} />
         </>

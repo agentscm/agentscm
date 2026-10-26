@@ -105,7 +105,7 @@ function LibraryView({ repo, token }: { repo: string; token: string }) {
       <div className="answer" data-tour="answer">
         <h1 className="page-question">Which workflows do agents in this repository have to follow?</h1>
         <p className="answer-text">{poll.kind === 'ready' ? (() => { const n = poll.value.adoption.pins.filter((p) => p.status === 'adopted').length; return n === 0 ? 'This repository requires no skills yet.' : <><b>{n} {n === 1 ? 'skill' : 'skills'}</b> agents here have to follow.</> })() : 'Checking which skills this repository requires…'}</p>
-        {poll.kind === 'ready' && <p className="answer-fact"><code>{repo}</code> · <span>{adoptionLabel(poll.value.adoption.source, poll.value.adoption.default_branch)}</span></p>}
+        <p className="answer-fact"><code>{repo}</code>{poll.kind === 'ready' && <> · <span>{adoptionLabel(poll.value.adoption.source, poll.value.adoption.default_branch)}</span></>} · <a href="#templates?view=skills">Create or import reusable skills</a></p>
       </div>
       <SectionTabs />
       <Loaded poll={poll} what="skills">{(lib) => <Library lib={lib} />}</Loaded>

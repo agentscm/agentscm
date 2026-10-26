@@ -22,6 +22,40 @@ function Diagnostics({ items }: { items: Diagnostic[] }) {
   )
 }
 
+const KIND_ICON: Record<WorkflowStep['kind'], string> = { skill: 'journal-check', build: 'hammer', deploy: 'rocket-takeoff', action: 'play', workflow: 'diagram-3' }
+
+/**
+ * The workflow as one line, left to right: what starts it, every ordered step, and what it hands on to.
+ * It redraws as the draft changes, so editing shows the shape of what will be published.
+ */
+function FlowStrip({ steps, trigger, followOn, versions, size = 'full' }: { steps: WorkflowStep[]; trigger: WorkflowRecord['draft']['trigger']; followOn: WorkflowRecord['draft']['follow_on']; versions: WorkflowVersion[]; size?: 'full' | 'mini' }) {
+  const next = followOn ? versions.find((v) => v.id === followOn.workflow_version_id) : undefined
+  return (
+    <ol className={`flow flow-${size}`} aria-label={`${steps.length} step${steps.length === 1 ? '' : 's'}${trigger ? `, after a confirmed merge to ${trigger.target}` : ''}`}>
+      {trigger && (
+        <li className="flow-cap flow-start">
+          <Icon name="git" /> <span>After merge to <b>{trigger.target}</b></span>
+        </li>
+      )}
+      {steps.length === 0 ? (
+        <li className="flow-step is-empty"><span>No steps yet</span></li>
+      ) : (
+        steps.map((s, i) => (
+          <li key={s.id} className={`flow-step kind-${s.kind}${s.required ? '' : ' is-optional'}`} title={`${i + 1}. ${s.label} (${s.kind}${s.required ? '' : ', optional'})`}>
+            <Icon name={KIND_ICON[s.kind]} />
+            <span>{s.label || s.id}</span>
+          </li>
+        ))
+      )}
+      {followOn && (
+        <li className="flow-cap flow-end">
+          <Icon name="arrow-return-right" /> <span>Then <b>{next ? versionLabel(next) : 'a retained version'}</b></span>
+        </li>
+      )}
+    </ol>
+  )
+}
+
 function BusyButton({ busy, children, ...props }: { busy: boolean; children: ReactNode } & React.ButtonHTMLAttributes<HTMLButtonElement>) {
   return <button type="button" {...props} disabled={busy || props.disabled}>{busy && <span className="spinner-border spinner-border-sm" aria-hidden="true" />} {children}</button>
 }
@@ -138,7 +172,7 @@ export function WorkflowLibraryPanel({ repository, onDirtyChange }: { repository
               const attached = attachments.find((a) => a.id === w.draft.id)
               return <li key={w.draft.id} className="wl-row">
                 <button type="button" className="wl-open" onClick={() => setSelected(w.draft.id)}>
-                  <span className="wl-row-main"><strong>{w.draft.name}</strong><span>{w.draft.summary || 'No purpose recorded yet.'}</span><span className="small muted">{w.draft.steps.length} step{w.draft.steps.length === 1 ? '' : 's'} · {latest ? `version ${latest.version}` : 'draft only'} · updated <Ago at={w.draft.updated_at} /></span></span>
+                  <span className="wl-row-main"><strong>{w.draft.name}</strong><span>{w.draft.summary || 'No purpose recorded yet.'}</span><FlowStrip size="mini" steps={w.draft.steps} trigger={w.draft.trigger} followOn={w.draft.follow_on} versions={workflows.flatMap((x) => x.versions)} /><span className="small muted">{w.draft.steps.length} step{w.draft.steps.length === 1 ? '' : 's'} · {latest ? `version ${latest.version}` : 'draft only'} · updated <Ago at={w.draft.updated_at} /></span></span>
                   <span className="pills">{latest ? <Pill tone="ok" icon="lock">Versioned</Pill> : <Pill tone="muted" icon="pencil">Draft</Pill>}{attached && <Pill tone={attached.state === 'active' ? 'ok' : attached.state === 'blocked' ? 'bad' : attached.state === 'export_required' ? 'warn' : 'brand'}>{attached.state.replaceAll('_', ' ')}</Pill>}</span>
                   <Icon name="chevron-right" />
                 </button>
@@ -238,6 +272,10 @@ function WorkflowEditor({ record, workflows, skills, repository, requestedReposi
     {error && <Notice tone="bad" title="Could not update this workflow">{error}{canReload && <div className="mt-2"><BusyButton busy={busy === 'reload'} className="btn btn-sm btn-outline-light" onClick={() => void reload()}>Reload current draft</BusyButton></div>}</Notice>}
     <Diagnostics items={publishDiagnostics} />
     {notice && <Notice tone="brand" title="Workflow updated">{notice}</Notice>}
+    <section className="flow-live" aria-label="What this draft will do">
+      <div className="flow-live-head"><span className="flow-live-name">{draft.name || 'Untitled workflow'}</span><span className="small muted">{dirty ? 'Unsaved edits' : latest ? `Latest published: version ${latest.version}` : 'Saved draft, not yet published'}</span></div>
+      <FlowStrip steps={draft.steps} trigger={draft.trigger} followOn={draft.follow_on} versions={allVersions} />
+    </section>
     <Box icon="pencil-square" title="Details" tone="brand">
       <div className="wl-form-2"><label><span className="form-label">Name</span><input className="form-control" value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} maxLength={100} /></label><label><span className="form-label">Purpose</span><input className="form-control" value={draft.summary} onChange={(e) => setDraft({ ...draft, summary: e.target.value })} maxLength={500} /></label></div>
     </Box>

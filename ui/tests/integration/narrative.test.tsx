@@ -91,8 +91,9 @@ describe('Agent briefing', () => {
     expect(screen.getByText('The source window is incomplete')).toBeTruthy()
     expect(screen.getByText('Some source records were omitted.')).toBeTruthy()
     expect(screen.getByText('Reported progress <script>alert(1)</script>')).toBeTruthy()
+    // Each cited source is listed once, as a footnote; the citations themselves point at that footnote.
     const workLinks = screen.getAllByRole('link', { name: source.label })
-    expect(workLinks).toHaveLength(3)
+    expect(workLinks).toHaveLength(1)
     expect(workLinks.every((link) => link.getAttribute('href') === `#work/${source.work_id}`)).toBe(true)
     expect(screen.getAllByText(/PR #42/).length).toBeGreaterThan(0)
     expect(document.querySelector('img')).toBeNull()

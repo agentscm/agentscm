@@ -1,7 +1,7 @@
 // Landed changes (#62), Templates (#64) and Timeline (#67) rendered against stubbed replies.
 // Publications are the dev hub's real replies for its 7 seeded states; local reads use the CLI-shaped fixtures.
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { FIXTURE_ENTRY, FIXTURE_TIMELINE } from '../../src/localApi.ts'
 import { LandedPage } from '../../src/pages/Landed.tsx'
 import { TemplatesPage } from '../../src/pages/Templates.tsx'
@@ -160,6 +160,8 @@ describe('Landed changes', () => {
 })
 
 describe('Templates', () => {
+  // The Library opens on its workflows; these tests exercise its Inspect view.
+  beforeEach(() => { window.location.hash = '#templates?view=inspect' })
   const openRecipe = (change: string, library: string) => {
     const picker = screen.getByRole('combobox', { name: 'Change ID' })
     fireEvent.focus(picker)

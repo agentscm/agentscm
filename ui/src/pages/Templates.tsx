@@ -3,6 +3,7 @@ import { Combobox } from '../Combobox.tsx'
 import { fetchHandoff, fetchLocalChanges, fetchLocalRuns, inspectTemplate, type Handoff, type RunState, type TemplateAction, type TemplateInspect } from '../localApi.ts'
 import { Box, Empty, Explain, Icon, Notice, Pill, PreviewBanner, Skeleton, type Tone } from '../ui.tsx'
 import { usePoll } from '../usePoll.ts'
+import { SectionTabs } from '../TopNav.tsx'
 import { SkillLibraryPanel, WorkflowLibraryPanel } from '../WorkflowLibraryPanel.tsx'
 
 /** One plain sentence per step, so the recipe reads like instructions rather than configuration. */
@@ -281,12 +282,18 @@ function InspectorPanel() {
 }
 
 type LibraryTab = 'workflows' | 'skills' | 'inspect'
+/** `#templates?view=…`; the Library opens on its workflows. */
 export function templatesTab(hash = window.location.hash): LibraryTab {
   const query = hash.includes('?') ? hash.slice(hash.indexOf('?') + 1) : ''
   const view = new URLSearchParams(query).get('view')
-  return view === 'skills' || view === 'workflows' ? view : 'inspect'
+  return view === 'skills' || view === 'inspect' ? view : 'workflows'
 }
 const tabHref = (tab: LibraryTab) => `#templates?view=${tab}`
+const LENSES: { key: LibraryTab; icon: string; label: string }[] = [
+  { key: 'workflows', icon: 'diagram-3', label: 'Workflows' },
+  { key: 'skills', icon: 'journal-check', label: 'Skills' },
+  { key: 'inspect', icon: 'search', label: 'Inspect a change' },
+]
 
 export function TemplatesPage({ repository = null, onDirtyChange }: { repository?: string | null; onDirtyChange?: (dirty: boolean) => void }) {
   const [tab, setTab] = useState<LibraryTab>(() => templatesTab())
@@ -314,15 +321,17 @@ export function TemplatesPage({ repository = null, onDirtyChange }: { repository
     <div className="page">
       <div className="answer" data-tour="answer">
         <h1 className="page-question">Which reusable workflows can agents configure here?</h1>
-        <p className="answer-text">Create versioned workflow drafts, save exact skill sources, and simulate what a published version would do before attaching it to <code>{repository ?? 'a repository'}</code>.</p>
+        <p className="answer-text">Build a workflow once, freeze it, and reuse that exact version.</p>
+        <p className="answer-fact">Draft the steps, publish an immutable version, simulate what it would do, then attach it to <code>{repository ?? 'a repository'}</code>. Nothing here runs a command.</p>
       </div>
-      <div className="tabbar" role="tablist" aria-label="Workflow library views">
-        {([
-          ['workflows', 'diagram-3', 'Workflows'],
-          ['skills', 'journal-check', 'Skills'],
-          ['inspect', 'search', 'Inspect source & runs'],
-        ] as const).map(([key, icon, label]) => <a key={key} role="tab" aria-selected={tab === key} className={`tab${tab === key ? ' active' : ''}`} href={tabHref(key)}><Icon name={icon} /> {label}</a>)}
-      </div>
+      <SectionTabs />
+      <nav className="lens" aria-label="Library views">
+        {LENSES.map((l) => (
+          <a key={l.key} href={tabHref(l.key)} className={`lens-seg${tab === l.key ? ' on' : ''}`} aria-current={tab === l.key ? 'page' : undefined}>
+            <Icon name={l.icon} /> {l.label}
+          </a>
+        ))}
+      </nav>
       {tab === 'workflows' && <WorkflowLibraryPanel repository={repository} onDirtyChange={setWorkflowDirty} />}
       {tab === 'skills' && <SkillLibraryPanel />}
       {tab === 'inspect' && <InspectorPanel />}

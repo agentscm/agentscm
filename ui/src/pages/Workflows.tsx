@@ -277,7 +277,7 @@ function List({ token }: { token: string }) {
       <div className="answer" data-tour="answer">
         <h1 className="page-question">Did the checks pass?</h1>
         <p className="answer-text">Every check, review and action, each tied to one exact revision.</p>
-        <p className="answer-fact">Producing an artifact does not verify its content or permit landing.</p>
+        <p className="answer-fact">Producing an artifact does not verify its content or permit landing. <a href="#templates?view=workflows">Build a reusable workflow</a>.</p>
       </div>
       <SectionTabs />
       <Box

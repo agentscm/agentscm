@@ -2198,3 +2198,428 @@ textarea.form-control {
   max-width: none;
   padding: 32px max(16px, calc((100vw - 980px) / 2));
 }
+
+/* ---------- agent briefing: the catch-up told as a sentence, every claim footnoted ---------- */
+.brief {
+  position: relative;
+  background: var(--hub-surface);
+  border-radius: var(--r);
+  box-shadow: var(--card);
+  padding: 22px 28px 18px;
+  display: grid;
+  gap: 14px;
+  overflow: hidden;
+}
+/* A faint violet wash at the top marks agent-written text apart from reported records. */
+.brief::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto;
+  height: 96px;
+  background: linear-gradient(180deg, var(--hub-brand-soft), transparent);
+  pointer-events: none;
+}
+.brief > * {
+  position: relative;
+}
+:root[data-density='condensed'] .brief {
+  padding: 12px 16px 10px;
+  gap: 8px;
+}
+.brief-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 20px;
+}
+.brief-by {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--hub-text-3);
+}
+.brief-by h2 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--hub-brand-ink);
+}
+.brief-by > i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--hub-brand);
+  box-shadow: 0 0 0 3px var(--hub-brand-soft);
+}
+.brief.is-bad .brief-by > i {
+  background: var(--coral);
+  box-shadow: 0 0 0 3px var(--hub-bad-soft);
+}
+.brief.is-waiting .brief-by > i {
+  background: var(--hub-text-3);
+  box-shadow: none;
+}
+.brief.is-writing .brief-by > i {
+  animation: brief-breathe 1.8s ease-in-out infinite;
+}
+@keyframes brief-breathe {
+  50% { box-shadow: 0 0 0 6px transparent; opacity: 0.55; }
+}
+.brief-task {
+  flex: 0 1 420px;
+  min-width: min(100%, 280px);
+}
+.brief-task-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 3px 3px 14px;
+  border-radius: 999px;
+  background: var(--hub-surface);
+  box-shadow: inset 0 0 0 1px var(--hub-rule-strong);
+  transition: box-shadow 0.2s;
+}
+.brief-task-field:focus-within {
+  box-shadow: inset 0 0 0 1.5px var(--hub-brand), var(--hub-ring);
+}
+.brief-task-field > .bi {
+  color: var(--hub-text-3);
+}
+.brief-task-field input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--hub-text);
+  font-size: 13.5px;
+}
+.brief-task-field input::placeholder {
+  color: var(--hub-text-3);
+}
+.brief-considering {
+  margin-top: 6px;
+  font-size: 12.5px;
+  color: var(--hub-text-2);
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.brief-considering .btn-link {
+  padding: 0;
+  min-height: 0;
+  font-size: 12.5px;
+}
+.brief-headline {
+  margin: 0;
+  max-width: 46ch;
+  font-size: 24px;
+  line-height: 1.35;
+  font-weight: 300;
+  letter-spacing: -0.02em;
+  text-wrap: pretty;
+}
+[data-bs-theme='dark'] .brief-headline {
+  font-weight: 400;
+}
+:root[data-density='condensed'] .brief-headline {
+  font-size: 17px;
+  max-width: 70ch;
+}
+.brief-headline.is-quiet {
+  font-size: 17px;
+  color: var(--hub-text-2);
+}
+.brief-cols {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 32px;
+}
+.brief-cols h3 {
+  margin: 0 0 6px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--hub-text-3);
+}
+.brief-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.brief-list li {
+  position: relative;
+  padding: 7px 0 7px 16px;
+  border-top: 1px solid var(--hub-rule);
+  line-height: 1.5;
+}
+.brief-list li:first-child {
+  border-top: 0;
+}
+.brief-list li::before {
+  content: '';
+  position: absolute;
+  left: 2px;
+  top: 15px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--hub-rule-strong);
+}
+.brief-cols section + section .brief-list li::before {
+  background: var(--hub-brand);
+}
+:root[data-density='condensed'] .brief-list li {
+  padding: 4px 0 4px 16px;
+}
+.brief-cites {
+  display: inline-flex;
+  gap: 3px;
+  margin-left: 5px;
+  vertical-align: 2px;
+}
+.brief-cite {
+  display: inline-grid;
+  place-items: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--hub-brand-soft);
+  color: var(--hub-brand-ink);
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1;
+  text-decoration: none;
+  letter-spacing: 0;
+}
+a.brief-cite:hover {
+  background: var(--hub-brand);
+  color: var(--hub-on-brand);
+}
+.brief-headline .brief-cite {
+  vertical-align: 6px;
+}
+.brief-foot {
+  display: grid;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--hub-rule);
+}
+.brief-sources {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  font-size: 12.5px;
+  color: var(--hub-text-2);
+}
+.brief-sources li {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  scroll-margin: 80px;
+}
+.brief-sources li:target {
+  color: var(--hub-text);
+}
+.brief-caveat {
+  margin: 0;
+  font-size: 12px;
+  color: var(--hub-text-3);
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+}
+@media (max-width: 760px) {
+  .brief {
+    padding: 16px 18px 14px;
+  }
+  .brief-cols {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .brief-headline {
+    font-size: 19px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .brief.is-writing .brief-by > i {
+    animation: none;
+  }
+}
+
+/* ---------- library: one pill switch, and every workflow drawn as the line it runs ---------- */
+.lens {
+  display: inline-flex;
+  align-self: flex-start;
+  flex-wrap: wrap;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 999px;
+  background: var(--hub-sunken);
+  margin-top: calc(var(--hub-gap) * -0.4);
+}
+.lens-seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 32px;
+  padding: 0 16px;
+  border-radius: 999px;
+  color: var(--hub-text-2);
+  font-size: 13.5px;
+  font-weight: 500;
+  text-decoration: none;
+  transition: background-color 0.2s, color 0.2s;
+}
+.lens-seg:hover {
+  color: var(--hub-text);
+}
+.lens-seg.on {
+  background: var(--hub-surface);
+  color: var(--hub-text);
+  box-shadow: var(--thumb);
+}
+.lens-seg .bi {
+  font-size: 13px;
+  color: var(--hub-text-3);
+}
+.lens-seg.on .bi {
+  color: var(--hub-brand);
+}
+:root[data-density='condensed'] .lens-seg {
+  min-height: 28px;
+  padding: 0 12px;
+  font-size: 12.5px;
+}
+
+.flow {
+  list-style: none;
+  margin: 6px 0 2px;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  --flow-h: 30px;
+}
+.flow-mini {
+  --flow-h: 22px;
+}
+.flow > li {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: var(--flow-h);
+  padding: 0 12px;
+  border-radius: 5px;
+  font-size: 12.5px;
+  white-space: nowrap;
+  max-width: 100%;
+  min-width: 0;
+}
+.flow > li > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.flow > li:first-child {
+  border-top-left-radius: 999px;
+  border-bottom-left-radius: 999px;
+  padding-left: 14px;
+}
+.flow > li:last-child {
+  border-top-right-radius: 999px;
+  border-bottom-right-radius: 999px;
+  padding-right: 14px;
+}
+.flow-mini > li {
+  font-size: 11.5px;
+  padding: 0 9px;
+  gap: 5px;
+}
+.flow-step {
+  background: var(--hub-brand-soft);
+  color: var(--hub-brand-ink);
+  font-weight: 500;
+}
+.flow-step.is-optional {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--hub-brand) 45%, transparent);
+}
+.flow-step.is-empty {
+  background: transparent;
+  color: var(--hub-text-3);
+  box-shadow: inset 0 0 0 1px var(--hub-rule-strong);
+}
+.flow-cap {
+  background: var(--hub-sunken);
+  color: var(--hub-text-2);
+}
+.flow-cap b {
+  font-weight: 600;
+  color: var(--hub-text);
+}
+.flow-live {
+  display: grid;
+  gap: 4px;
+  padding: 18px 22px 16px;
+  border-radius: var(--r);
+  background: var(--hub-sunken);
+}
+.flow-live-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px 14px;
+}
+.flow-live-name {
+  font-size: 20px;
+  font-weight: 300;
+  letter-spacing: -0.02em;
+}
+[data-bs-theme='dark'] .flow-live-name {
+  font-weight: 400;
+}
+
+/* The library's own rows, steps and results take the sheet's language. */
+.wl-toolbar h2 {
+  font-size: 18px;
+  font-weight: 500;
+  letter-spacing: -0.015em;
+}
+.wl-open {
+  border-radius: 14px;
+  padding: 10px 12px;
+}
+.wl-open:hover {
+  background: var(--hub-sunken);
+}
+.wl-row-main > strong {
+  font-weight: 600;
+  font-size: 15px;
+}
+.wl-step-order > span {
+  border-radius: 50%;
+  background: var(--hub-brand-soft);
+  color: var(--hub-brand-ink);
+  font-weight: 600;
+}
+.wl-step-order button {
+  border-radius: 50%;
+}
+.wl-add {
+  gap: 6px;
+}
+.wl-result,
+.wl-preview,
+.wl-attachment {
+  border-top-color: var(--hub-rule);
+}
+.wl-sim-steps li,
+.wl-guidance li {
+  align-items: baseline;
+}

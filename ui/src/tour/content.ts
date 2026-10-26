@@ -485,7 +485,7 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
     ],
   },
   templates: {
-    title: 'Templates',
+    title: 'Skills › Library',
     steps: [
       {
         target: T('answer'),
