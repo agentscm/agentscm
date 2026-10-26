@@ -253,10 +253,15 @@ export function localCredential(): string {
 }
 /** Only loopback http(s) addresses are accepted: this must be a server on this computer. */
 export const validLocalBase = (v: string) => v === '' || /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d{1,5})?$/.test(v)
+/**
+ * Whether `agentscm serve` on this computer can answer this page: it is served from loopback, or Settings
+ * names a loopback address. On a hosted Hub neither holds, and `/v1/local` there is only the Hub's 404.
+ */
+export const localReachable = (hostname = window.location.hostname) => /^(127\.0\.0\.1|localhost|\[::1\])$/.test(hostname) || (loadLocalBase() !== '' && validLocalBase(loadLocalBase()))
 
 /** What a person should do about a local server error, in plain words. */
-function adviceFor(status: number): string {
-  if (status === 404) return 'Not found. For Templates, check the change ID and library path. If Timeline never loads, start agentscm serve with --timeline-workspace.'
+function adviceFor(status: number, path: string): string {
+  if (status === 404) return path.startsWith('/v1/local/workspace/') ? 'Not found. If the timeline never loads, start agentscm serve with --timeline-workspace.' : 'Not found. In the Library, check the change ID and library path, or the run ID.'
   if (status === 400) return 'The local server could not use that value. Check the ID and try again.'
   if (status === 401) return 'The local server needs its read token. Add it in Settings → This computer.'
   if (status === 421) return 'The local read API refused this page’s address; open the hub UI on localhost.'
@@ -270,8 +275,8 @@ function adviceFor(status: number): string {
 export class LocalError extends Error {
   status: number
   code: string
-  constructor(status: number, code: string) {
-    super(code === 'repository_unavailable' ? 'That repository is no longer connected on this computer. Choose another one at the top of the page, or run agentscm open in its checkout.' : adviceFor(status))
+  constructor(status: number, code: string, path = '') {
+    super(code === 'repository_unavailable' ? 'That repository is no longer connected on this computer. Choose another one at the top of the page, or run agentscm open in its checkout.' : adviceFor(status, path))
     this.status = status
     this.code = code
   }
@@ -301,7 +306,7 @@ async function read<T>(path: string, decode: (v: unknown) => T, fixture: () => T
   // older serve) means the read API isn't there yet.
   const body: unknown = await res.json().catch(() => null)
   const code = body && typeof body === 'object' && typeof (body as Record<string, unknown>)['error'] === 'string' ? clean((body as Record<string, unknown>)['error'], 100) : null
-  if (code !== null && res.status !== 405) throw new LocalError(res.status, code)
+  if (code !== null && res.status !== 405) throw new LocalError(res.status, code, path)
   return { source: 'preview', value: fixture(), reason: `The local read API isn’t at ${base || 'this page’s address'} yet.` }
 }
 

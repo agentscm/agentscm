@@ -23,6 +23,12 @@ describe('sectionFromHash', () => {
     ['#work/finished', 'work'],
     ['#work/history', 'work'],
     ['#work/coordination', 'inbox'],
+    // History's other tabs by name, not the Finished tab.
+    ['#work/files', 'explorer'],
+    ['#work/change-records', 'change-record'],
+    ['#history', 'work'],
+    ['#history/files', 'explorer'],
+    ['#work/__proto__', 'work'],
     ['#activity', 'activity'],
     ['#workflows/runs/run_1/steps/s1', 'workflows'],
     [`#change-record/${ID}`, 'change-record'],

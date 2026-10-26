@@ -62,7 +62,8 @@ pub(crate) fn load_exact_session(expected_hub: &str) -> Result<(String, String),
         Ok(_) => Err(OpenError::InvalidConnection),
         Err(agentscm::Error::Invalid(message))
             if message == "not signed in; run agentscm hub login"
-                || message == "no saved session for this hub; run agentscm hub login" =>
+                || message == "no saved session for this hub; run agentscm hub login"
+                || message == crate::hub_cli::SESSION_EXPIRED =>
         {
             Err(OpenError::MissingSignIn)
         }

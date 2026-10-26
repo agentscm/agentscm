@@ -520,6 +520,8 @@ textarea.form-control {
 .pop-menu {
   border-radius: 18px;
   border: 0;
+  /* The top bar's frame ink would otherwise leak in and vanish on the sheet. */
+  color: var(--hub-text);
   box-shadow: var(--pop);
   padding: 6px;
 }
@@ -714,6 +716,15 @@ textarea.form-control {
   font-size: 0.6em;
   font-weight: 400;
   vertical-align: 0.2em;
+}
+/* Tabs of one nav item stay put when switching: every tabbed answer reserves two lines. */
+.answer:has(+ .htabs) .answer-text {
+  min-height: 2lh;
+}
+@media (max-width: 576px) {
+  .answer:has(+ .htabs) .answer-fact {
+    min-height: 2lh;
+  }
 }
 .answer-fact {
   font-size: 14.5px;
@@ -1158,6 +1169,53 @@ textarea.form-control {
   font-size: 13px;
   color: var(--hub-text-3);
 }
+/* Browser-only Hide on rows nobody has touched in a day; hidden rows shown on request are dimmed. */
+.hide-btn,
+.show-hidden {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 0;
+  border-radius: 999px;
+  background: none;
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--hub-text-3);
+}
+.hide-btn {
+  margin-left: 8px;
+  padding: 2px 9px;
+}
+.show-hidden {
+  margin-top: 12px;
+  padding: 4px 10px 4px 0;
+}
+.hide-btn:hover,
+.show-hidden:hover {
+  color: var(--hub-brand-ink);
+}
+.hide-btn:hover {
+  background: var(--hub-sunken);
+}
+.attn-item.is-hidden :is(.attn-icon, .attn-title, .attn-main > p),
+.plain-list li.is-hidden > :not(.pills),
+.hideable.is-hidden > .request {
+  opacity: 0.55;
+}
+.hideable {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+}
+.hideable > .request {
+  flex: 1 1 320px;
+  min-width: 0;
+}
+.hideable > .hide-btn {
+  margin-left: auto;
+}
 .all-clear {
   display: flex;
   gap: 12px;
@@ -1221,12 +1279,15 @@ textarea.form-control {
   padding: 22px 0 18px;
   border-top: 1px solid var(--hub-rule);
   align-items: start;
+  /* The task cell spans both rows and the slack goes to the second, so the quote sits under its bar. */
+  grid-template-rows: auto 1fr;
 }
 :root[data-density='condensed'] .rl-row {
   padding: 10px 0 8px;
 }
 .rl-task {
   min-width: 0;
+  grid-row: span 2;
 }
 .lane-title {
   font-size: 14.5px;
@@ -1501,6 +1562,9 @@ textarea.form-control {
     grid-template-columns: minmax(0, 1fr);
     row-gap: 12px;
     padding: 16px 0 14px;
+  }
+  .rl-task {
+    grid-row: auto;
   }
   .rl-said {
     grid-column: 1;

@@ -1,6 +1,6 @@
 // #64/#67 adapter: decoders against the local server's real replies, the live-or-preview rule, and routing.
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { FIXTURE_DIFF, FIXTURE_ENTRY, FIXTURE_HANDOFF, FIXTURE_INSPECT, FIXTURE_TIMELINE, LocalError, decodeDiff, decodeEntryView, decodeHandoff, decodeInspect, decodeTimeline, fetchEntry, fetchTimeline, inspectTemplate, saveLocalBase, saveLocalToken, validLocalBase, type TemplateAction } from '../../src/localApi.ts'
+import { FIXTURE_DIFF, FIXTURE_ENTRY, FIXTURE_HANDOFF, FIXTURE_INSPECT, FIXTURE_TIMELINE, LocalError, decodeDiff, decodeEntryView, decodeHandoff, decodeInspect, decodeTimeline, fetchEntry, fetchTimeline, inspectTemplate, localReachable, saveLocalBase, saveLocalToken, validLocalBase, type TemplateAction } from '../../src/localApi.ts'
 import { describeAction } from '../../src/pages/Templates.tsx'
 import { compareHref, timelineRoute } from '../../src/pages/Timeline.tsx'
 
@@ -86,6 +86,20 @@ describe('live or preview', () => {
     await expect(fetchTimeline(signal)).rejects.toMatchObject({ message: 'The local read API refused this page’s address; open the hub UI on localhost.' })
     vi.stubGlobal('fetch', async () => json(401, { error: 'unauthorized' }))
     await expect(fetchTimeline(signal)).rejects.toBeInstanceOf(LocalError)
+  })
+
+  it('a not-found names the page it came from: the timeline never mentions Templates', async () => {
+    vi.stubGlobal('fetch', async () => json(404, { error: 'not_found' }))
+    await expect(fetchTimeline(signal)).rejects.toMatchObject({ message: 'Not found. If the timeline never loads, start agentscm serve with --timeline-workspace.' })
+    await expect(inspectTemplate('c', 'p', signal)).rejects.toMatchObject({ message: expect.stringContaining('change ID and library path') })
+  })
+
+  it('this computer is reachable from a loopback page, or a hosted page with a loopback address set', () => {
+    expect(localReachable('127.0.0.1')).toBe(true)
+    expect(localReachable('localhost')).toBe(true)
+    expect(localReachable('dogfood.agentscm.dev')).toBe(false)
+    saveLocalBase('http://127.0.0.1:7331')
+    expect(localReachable('dogfood.agentscm.dev')).toBe(true)
   })
 
   it('sends the local token only to a different local address, never same-origin', async () => {

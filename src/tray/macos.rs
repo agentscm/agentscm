@@ -52,6 +52,8 @@ enum UserEvent {
     HubOpen(std::result::Result<Box<hub_open::PreparedOpen>, hub_open::OpenError>),
     /// Open Hub opened this computer's own Hub page (`agentscm open`).
     HubOpenedLocally,
+    /// Forget This Checkout finished `client remove` for the named checkout.
+    Forgot(String, std::result::Result<(), String>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,6 +189,7 @@ fn run_foreground(initial: Snapshot) -> Result<()> {
         menu_dirty: false,
         notice: None,
         pending_share: None,
+        pending_forget: None,
     };
     // This computer's Hub page runs while the tray does, so Open Hub opens at once.
     let local_page = crate::open_cli::LocalPage::start_in_background();
@@ -223,6 +226,8 @@ struct TrayApp {
     /// The checkout whose sharing the person was asked to confirm. Sharing turns on only from the
     /// explicit confirm item this makes the menu show, never from the first click.
     pending_share: Option<PendingShare>,
+    /// The connected checkout the person was asked to confirm forgetting, and when.
+    pending_forget: Option<(String, std::time::Instant)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -257,10 +262,22 @@ impl TrayApp {
         self.pending_share = self.pending_share.take().filter(|pending| {
             pending_share_current(pending, &self.snapshot, std::time::Instant::now())
         });
+        let now = std::time::Instant::now();
+        self.pending_forget = self.pending_forget.take().filter(|(identity, asked_at)| {
+            now.saturating_duration_since(*asked_at) < SHARE_CONFIRM_TTL
+                && forget_target(identity, &self.snapshot).is_some()
+        });
+        // The menu id of the one item awaiting its confirm item, if any.
         let confirming = self
             .pending_share
             .as_ref()
-            .map(|pending| pending.request.identity.as_str());
+            .map(|pending| share_menu_id(&pending.request.identity))
+            .or_else(|| {
+                self.pending_forget
+                    .as_ref()
+                    .map(|(identity, _)| forget_id(identity))
+            });
+        let confirming = confirming.as_deref();
         let notice = projected_notice(
             None,
             self.notice.as_ref().map(Notice::as_str),
@@ -486,6 +503,7 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                                 request,
                                 asked_at: std::time::Instant::now(),
                             });
+                            self.pending_forget = None;
                         }
                         ShareStep::Change(request) => {
                             self.pending_share = None;
@@ -581,6 +599,89 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                 }
                 self.replace_menu(None);
             }
+            UserEvent::Menu(id)
+                if id.starts_with("forget:") || id.starts_with("forget-confirm:") =>
+            {
+                self.notice = None;
+                let identity = id.split_once(':').map_or("", |(_, identity)| identity);
+                let target = forget_target(identity, &self.snapshot);
+                let confirmed = id.starts_with("forget-confirm:")
+                    && self
+                        .pending_forget
+                        .as_ref()
+                        .is_some_and(|(pending, asked_at)| {
+                            pending == identity && asked_at.elapsed() < SHARE_CONFIRM_TTL
+                        });
+                if self.opening_hub || self.installing.load(Ordering::Acquire) {
+                    self.notice = Some(Notice::Action(
+                        "An action is still running; wait for its result".into(),
+                    ));
+                } else if let Some((root, name)) = target {
+                    if confirmed {
+                        self.pending_forget = None;
+                        self.installing.store(true, Ordering::Release);
+                        self.feedback.show(
+                            &format!("Forgetting {name}…"),
+                            "Removing this checkout's AgentSCM connection and agent setup.",
+                            true,
+                        );
+                        self.notice = Some(Notice::Action(format!("Forgetting {name}…")));
+                        spawn_forget(self.refresh_proxy.clone(), root, name);
+                    } else {
+                        self.pending_share = None;
+                        self.pending_forget =
+                            Some((identity.to_owned(), std::time::Instant::now()));
+                        let title = format!("Forget {name}?");
+                        self.feedback.show(
+                            &title,
+                            &format!(
+                                "This runs `agentscm client remove` for {}: it removes the AgentSCM hooks and MCP setup it added there, revokes the Hub token it made, and drops the connection. The folder and your own files stay. Open this checkout's menu and choose \"{FORGET_CONFIRM_LABEL}\" to continue.",
+                                root.display()
+                            ),
+                            false,
+                        );
+                        self.notice = Some(Notice::Action(title));
+                    }
+                } else {
+                    self.pending_forget = None;
+                    self.feedback.show(
+                        "Forget could not start",
+                        "The checkout connection changed. Check Now and try again.",
+                        false,
+                    );
+                }
+                self.replace_menu(None);
+            }
+            UserEvent::Forgot(name, result) => {
+                self.installing.store(false, Ordering::Release);
+                let (title, body) = match &result {
+                    Ok(()) => (
+                        format!("{name} forgotten"),
+                        "Its connection and agent setup were removed. Agents that start there again show it under Not connected.".to_owned(),
+                    ),
+                    Err(error) => (format!("Could not forget {name}"), error.clone()),
+                };
+                self.feedback.update(&title, &body, false);
+                self.notice = Some(Notice::Action(title));
+                self.replace_menu(None);
+                if !self.refreshing.swap(true, Ordering::AcqRel) {
+                    spawn_refresh(self.refresh_proxy.clone(), false);
+                }
+            }
+            UserEvent::Menu(id) if id.starts_with("forget-unconnected:") => {
+                self.notice = None;
+                if let Some(row) =
+                    unconnected_rows(&self.snapshot, &self.activity, std::time::Instant::now())
+                        .into_iter()
+                        .find(|row| {
+                            id == format!("forget-unconnected:{}", unconnected_identity(row))
+                        })
+                {
+                    // Nothing was set up there, so this only hides the row until an agent is seen again.
+                    self.activity.forget_unconnected(&row.root);
+                }
+                self.replace_menu(None);
+            }
             UserEvent::Menu(id) if id.starts_with("copy-quickstart:") => {
                 self.notice = None;
                 if let Some(row) =
@@ -605,8 +706,24 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                         .find(|connection| id == format!("hub:{}", connection_identity(connection)))
                         .ok_or(hub_open::OpenError::InvalidConnection)
                         .and_then(hub_open::OpenRequest::from_status);
-                    match request {
-                        Ok(request) => {
+                    match request.map(|request| (request, default_hub_page())) {
+                        Ok((_, Some(page))) => match native_feedback::open_url(&page) {
+                            Ok(()) => {
+                                let body = format!(
+                                    "This tray build has no local Hub page, so your browser opened {page} on your default Hub."
+                                );
+                                self.feedback.show("Hub opened", &body, false);
+                                self.notice = Some(Notice::Action(format!(
+                                    "This build has no local Hub page; opened {page}"
+                                )));
+                            }
+                            Err(error) => {
+                                self.feedback.show("Could not open Hub", error, false);
+                                self.notice =
+                                    Some(Notice::Action(format!("Could not open Hub: {error}")));
+                            }
+                        },
+                        Ok((request, None)) => {
                             self.opening_hub = true;
                             self.feedback.show(
                                 "Opening Hub…",
@@ -1150,8 +1267,9 @@ fn target_hub(host: &str, repo: &str) -> Option<String> {
     })
 }
 
-/// A Hub another checkout of the same forge repository is connected to and still signed in to,
-/// so its agents meet the others; else the default saved sign-in.
+/// A Hub another checkout of the same forge repository is connected to and still signed in to
+/// (an unexpired session), so its agents meet the others; else the default saved sign-in.
+/// Checkouts whose folder is gone, such as deleted walkthrough copies, do not count.
 fn connect_hub(
     host: &str,
     repo: &str,
@@ -1163,6 +1281,7 @@ fn connect_hub(
         .filter(|connection| {
             connection.origin_host.eq_ignore_ascii_case(host)
                 && connection.repo.eq_ignore_ascii_case(repo)
+                && connection.root.is_dir()
         })
         .find_map(|connection| signed_in(Some(&connection.hub)))
         .or_else(|| signed_in(None))
@@ -1193,6 +1312,48 @@ fn spawn_connect(
         .and_then(|result| result.map_err(|error| bounded_error(&error)))
         .map(|()| hub);
         let _ = proxy.send_event(UserEvent::Connected(request.agent, request.repo, result));
+    });
+}
+
+const FORGET_CONFIRM_LABEL: &str = "Confirm Forget (removes connection and agent setup)";
+
+fn forget_id(identity: &str) -> String {
+    format!("forget:{identity}")
+}
+
+/// The registered root and display name of the connected checkout `identity` names.
+fn forget_target(identity: &str, snapshot: &Snapshot) -> Option<(std::path::PathBuf, String)> {
+    let connection = snapshot
+        .connections
+        .iter()
+        .find(|connection| connection_identity(connection) == identity)?;
+    let name = connection
+        .root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&connection.repository);
+    Some((connection.root.clone(), super::clean_label(name)))
+}
+
+/// Runs the same removal as `agentscm client remove --root ROOT`.
+fn spawn_forget(
+    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    root: std::path::PathBuf,
+    name: String,
+) {
+    std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())?;
+            runtime
+                .block_on(crate::client_cli::remove_checkout(&root))
+                .map_err(|error| error.to_string())
+        }))
+        .map_err(|_| "forget stopped unexpectedly".to_owned())
+        .and_then(|result| result.map_err(|error| bounded_error(&error)));
+        let _ = proxy.send_event(UserEvent::Forgot(name, result));
     });
 }
 
@@ -1324,6 +1485,17 @@ fn spawn_hub_open(
     });
 }
 
+/// A build without the `ui` feature serves only a placeholder as this computer's Hub page, so
+/// Open Hub sends the browser to the default signed-in Hub's page instead.
+fn default_hub_page() -> Option<String> {
+    if cfg!(feature = "ui") {
+        return None;
+    }
+    crate::hub_cli::load_session(None)
+        .ok()
+        .map(|(hub, _)| format!("{hub}/ui/"))
+}
+
 fn revoke_hub_open(prepared: hub_open::PreparedOpen) {
     std::thread::spawn(move || {
         if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
@@ -1448,7 +1620,7 @@ fn build_menu(
                 None,
             ))
             .map_err(menu_error)?;
-        if confirming == Some(identity.as_str()) {
+        if confirming == Some(share_menu_id(&identity).as_str()) {
             submenu
                 .append(&MenuItem::with_id(
                     share_confirm_id(&identity),
@@ -1587,6 +1759,27 @@ fn build_menu(
             ))
             .map_err(menu_error)?;
         submenu.append(&troubleshooting).map_err(menu_error)?;
+        submenu
+            .append(&PredefinedMenuItem::separator())
+            .map_err(menu_error)?;
+        submenu
+            .append(&MenuItem::with_id(
+                forget_id(&identity),
+                "Forget This Checkout…",
+                true,
+                None,
+            ))
+            .map_err(menu_error)?;
+        if confirming == Some(forget_id(&identity).as_str()) {
+            submenu
+                .append(&MenuItem::with_id(
+                    format!("forget-confirm:{identity}"),
+                    FORGET_CONFIRM_LABEL,
+                    true,
+                    None,
+                ))
+                .map_err(menu_error)?;
+        }
         menu.append(&submenu).map_err(menu_error)?;
     }
     if !unconnected.is_empty() {
@@ -1634,6 +1827,14 @@ fn build_menu(
             .append(&MenuItem::with_id(
                 format!("copy-quickstart:{identity}"),
                 "Copy Terminal Setup",
+                true,
+                None,
+            ))
+            .map_err(menu_error)?;
+        submenu
+            .append(&MenuItem::with_id(
+                format!("forget-unconnected:{identity}"),
+                "Forget This Checkout",
                 true,
                 None,
             ))
@@ -2464,6 +2665,25 @@ mod tests {
     }
 
     #[test]
+    fn forget_targets_only_the_connected_checkout_its_item_names() {
+        let snapshot = Snapshot {
+            version: 1,
+            snapshot_at: 0,
+            connections: vec![
+                share_connection("/synthetic/claude-docs", None),
+                share_connection("/synthetic/widgets", None),
+            ],
+        };
+        let identity = connection_identity(&snapshot.connections[0]);
+        assert_eq!(
+            forget_target(&identity, &snapshot),
+            Some(("/synthetic/claude-docs".into(), "claude-docs".to_owned()))
+        );
+        assert_eq!(forget_target("unknown", &snapshot), None);
+        assert_ne!(forget_id(&identity), share_menu_id(&identity));
+    }
+
+    #[test]
     fn a_reconnected_checkout_explains_the_saved_hub_and_can_only_turn_sharing_off() {
         let mut connection =
             share_connection("/synthetic/moved", Some(CaptureModeV1::SharedConversation));
@@ -2555,9 +2775,10 @@ mod tests {
 
     #[test]
     fn connect_prefers_the_hub_the_repository_already_uses() {
+        let temp = tempfile::tempdir().unwrap();
         let saved =
             |root: &str, host: &str, repo: &str, hub: &str| crate::client_config::Connection {
-                root: root.into(),
+                root: temp.path().join(root),
                 origin_host: host.into(),
                 hub: hub.into(),
                 repo: repo.into(),
@@ -2569,24 +2790,33 @@ mod tests {
             };
         let connections = [
             saved(
-                "/synthetic/a",
+                "a",
                 "gitlab.com",
                 "acme/widgets",
                 "https://other.example.test",
             ),
             saved(
-                "/synthetic/b",
+                "b",
                 "github.com",
                 "Acme/Widgets",
                 "https://team.example.test",
             ),
             saved(
-                "/synthetic/c",
+                "c",
                 "github.com",
                 "acme/widgets",
                 "https://stale.example.test",
             ),
+            saved(
+                "deleted",
+                "github.com",
+                "acme/widgets",
+                "https://deleted.example.test",
+            ),
         ];
+        for root in ["a", "b", "c"] {
+            std::fs::create_dir(temp.path().join(root)).unwrap();
+        }
         let signed_in = |hubs: &'static [&'static str]| {
             move |hub: Option<&str>| match hub {
                 Some(hub) => hubs.contains(&hub).then(|| hub.to_owned()),
@@ -2606,7 +2836,17 @@ mod tests {
         assert_eq!(
             connect_hub("github.com", "acme/widgets", &connections, signed_in(&[])),
             Some("https://default.example.test".to_owned()),
-            "no sign-in for that Hub any more"
+            "the sibling's session expired or was signed out"
+        );
+        assert_eq!(
+            connect_hub(
+                "github.com",
+                "acme/widgets",
+                &connections,
+                signed_in(&["https://deleted.example.test"])
+            ),
+            Some("https://default.example.test".to_owned()),
+            "the sibling checkout's folder no longer exists"
         );
         assert_eq!(
             connect_hub(

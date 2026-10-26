@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { SectionTabs } from '../TopNav.tsx'
-import { fetchDiff, fetchEntry, fetchTimeline, type DiffEntry, type EvidenceState, type TimelineEntry, type Trigger } from '../localApi.ts'
-import { Ago, Box, CopyButton, Empty, Explain, Icon, Notice, Pill, PreviewBanner, Skeleton, type Tone } from '../ui.tsx'
+import { fetchDiff, fetchEntry, fetchTimeline, localReachable, type DiffEntry, type EvidenceState, type TimelineEntry, type Trigger } from '../localApi.ts'
+import { Ago, Box, CopyButton, Empty, Explain, Icon, Notice, OnThisComputer, Pill, PreviewBanner, Skeleton, type Tone } from '../ui.tsx'
 import { usePoll } from '../usePoll.ts'
 import { hashPath, Pager, useHashCursor } from '../Pager.tsx'
 
@@ -223,10 +223,16 @@ export function TimelinePage() {
         <p className="answer-fact">A <strong>snapshot</strong> is a picture of your files at one moment. Compare two, or fork a new change from one.</p>
       </div>
       <SectionTabs />
-      {route.kind !== 'list' && <a href="#timeline" className="back"><Icon name="arrow-left" /> All saved moments</a>}
-      {route.kind === 'list' && <List />}
-      {route.kind === 'entry' && <EntryDetail key={route.id} id={route.id} />}
-      {route.kind === 'compare' && <Compare key={`${route.left}|${route.right}`} left={route.left} right={route.right} />}
+      {!localReachable() ? (
+        <OnThisComputer what="The timeline" />
+      ) : (
+        <>
+          {route.kind !== 'list' && <a href="#timeline" className="back"><Icon name="arrow-left" /> All saved moments</a>}
+          {route.kind === 'list' && <List />}
+          {route.kind === 'entry' && <EntryDetail key={route.id} id={route.id} />}
+          {route.kind === 'compare' && <Compare key={`${route.left}|${route.right}`} left={route.left} right={route.right} />}
+        </>
+      )}
       <p className="small muted"><Icon name="laptop" /> Read from <code>agentscm serve</code> on this computer (the workspace it was started with), not the hub. Saving and forking happen in the CLI or your agent; this page only reads. <Explain text="Paging shows what was saved since the timeline was turned on. It isn't proof of everything that happened before." /></p>
     </div>
   )

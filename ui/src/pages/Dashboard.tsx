@@ -2,7 +2,8 @@ import { useState, type ReactNode } from 'react'
 import { CatchupPanel } from '../Catchup.tsx'
 import { NarrativePanel } from '../Narrative.tsx'
 import type { Derived, LiveAgent } from '../derive.ts'
-import { crossings, needsYou, type Need } from '../needs.ts'
+import { HideButton, isStale, ShowHidden, useHidden, useHideable } from '../dismiss.tsx'
+import { crossings, needHideKey, needsYou, needUpdatedAt, type Need } from '../needs.ts'
 import { workHref, type WorkItem, type WorkOverview } from '../standup.ts'
 import { SectionTabs } from '../TopNav.tsx'
 import type { HubEvent } from '../types.ts'
@@ -84,7 +85,8 @@ function who(i: WorkItem) {
   return `${l.login}’s ${agentLabel(l.agent)}`
 }
 
-function NeedRow({ n, ov, d }: { n: Need; ov: WorkOverview; d: Derived }) {
+function NeedRow({ n, ov, d, me, hidden }: { n: Need; ov: WorkOverview; d: Derived; me: string | null; hidden: boolean }) {
+  const now = useNow() / 1000
   const i = n.item
   let icon = 'exclamation-circle'
   let title: ReactNode = null
@@ -98,8 +100,8 @@ function NeedRow({ n, ov, d }: { n: Need; ov: WorkOverview; d: Derived }) {
   } else if (n.kind === 'quiet' && i) {
     icon = 'hourglass-split'
     title = <>{who(i)} has gone quiet</>
-    body = <>{i.claim_status === 'stale' ? <>No check-in since {new Date(i.last_checkin_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}.</> : <>Its last check-in is unknown.</>} <a className="work-link" href={workHref(i.id)}>{i.title}</a> is still assigned, so it isn’t free to take.</>
-    then = <>Ask {lead(i).login} before picking it up</>
+    body = <>{i.claim_status === 'stale' ? <>Last check-in <Ago at={i.last_checkin_at} />.</> : <>Its last check-in is unknown.</>} <a className="work-link" href={workHref(i.id)}>{i.title}</a> is still assigned, so it isn’t free to take.</>
+    then = lead(i).login === me ? <>Resume it or hand it over</> : <>Ask {lead(i).login} before picking it up</>
   } else if (n.kind === 'handover' && i) {
     icon = 'arrow-left-right'
     title = <><a className="work-link" href={workHref(i.id)}>{i.title}</a> is ready for another agent</>
@@ -127,14 +129,17 @@ function NeedRow({ n, ov, d }: { n: Need; ov: WorkOverview; d: Derived }) {
     then = <>Check before merging · <a href="#box-prs">see the pull request</a></>
   }
   return (
-    <li className={`attn-item tone-${n.tone}`}>
+    <li className={`attn-item tone-${n.tone}${hidden ? ' is-hidden' : ''}`}>
       <span className="attn-icon" aria-hidden="true">
         <Icon name={icon} />
       </span>
       <div className="attn-main">
         <div className="attn-title">{title}</div>
         {body && <p>{body}</p>}
-        <div className="attn-status">{then}</div>
+        <div className="attn-status">
+          {then}
+          {(hidden || isStale(needUpdatedAt(n), now)) && <HideButton k={needHideKey(n)} hidden={hidden} what="this item" />}
+        </div>
       </div>
     </li>
   )
@@ -142,9 +147,12 @@ function NeedRow({ n, ov, d }: { n: Need; ov: WorkOverview; d: Derived }) {
 
 const MAX_NEEDS = 6
 
-function NeedsYou({ needs, ov, d }: { needs: Need[]; ov: WorkOverview; d: Derived }) {
+/** `needs` includes the ones hidden in this browser; they stay out of the list until asked for. */
+function NeedsYou({ needs: all, ov, d, me }: { needs: Need[]; ov: WorkOverview; d: Derived; me: string | null }) {
+  const { rows: needs, count: hidden, show, setShow, isHidden } = useHideable(all, needHideKey)
+  const open = all.length - hidden
   return (
-    <Box id="box-needs" tour="needs" icon="bell" title="Needs you" count={needs.length} tone={needs.some((n) => n.tone === 'bad') ? 'bad' : 'brand'} explain="Only things a person should decide: a blocker, a task whose agent went quiet, a handover, or two agents or tasks crossing. Reading this page answers none of them.">
+    <Box id="box-needs" tour="needs" icon="bell" title="Needs you" count={open} tone={all.some((n) => n.tone === 'bad' && !isHidden(n)) ? 'bad' : 'brand'} explain="Only things a person should decide: a blocker, a task whose agent went quiet, a handover, or two agents or tasks crossing. Reading this page answers none of them. Anything untouched for a day can be hidden in this browser.">
       {needs.length === 0 ? (
         <div className="all-clear">
           <Icon name="check2-circle" />
@@ -157,16 +165,17 @@ function NeedsYou({ needs, ov, d }: { needs: Need[]; ov: WorkOverview; d: Derive
         <>
           <ul className="attn">
             {needs.slice(0, MAX_NEEDS).map((n) => (
-              <NeedRow key={n.key} n={n} ov={ov} d={d} />
+              <NeedRow key={n.key} n={n} ov={ov} d={d} me={me} hidden={isHidden(n)} />
             ))}
           </ul>
           {needs.length > MAX_NEEDS && (
             <p className="small muted mb-0">
-              {plural(needs.length - MAX_NEEDS, 'more')} in the <a href="#inbox">Inbox</a> and on <a href="#now">Where</a>.
+              {needs.length - MAX_NEEDS} more in the <a href="#inbox">Inbox</a> and on <a href="#now">Where</a>.
             </p>
           )}
         </>
       )}
+      <ShowHidden count={hidden} show={show} onShow={setShow} />
     </Box>
   )
 }
@@ -314,8 +323,9 @@ export type DashTab = 'home' | 'now' | 'activity' | 'team'
 
 /** The live status under each dashboard tab and the rail badge, from the same joins as the page. */
 /** `asOfMs` is when the data was read (the last successful poll); null before the first one. */
-export function dashboardStatus(ov: WorkOverview | null, d: Derived | null, events: HubEvent[] | null, asOfMs: number | null) {
-  const needs = needsYou(ov, d)
+/** `hidden` holds the needs hidden in this browser, which no count includes. */
+export function dashboardStatus(ov: WorkOverview | null, d: Derived | null, events: HubEvent[] | null, asOfMs: number | null, hidden: ReadonlySet<string> = new Set()) {
+  const needs = needsYou(ov, d).filter((n) => !hidden.has(needHideKey(n)))
   const x = crossings(ov, d)
   const latest = events?.[0]
   const up = d && asOfMs ? d.agents.filter((a) => asOfMs / 1000 - a.lastActive < AWAKE_SECONDS).length : 0
@@ -330,7 +340,9 @@ export function dashboardStatus(ov: WorkOverview | null, d: Derived | null, even
 
 export function DashboardPage({ section, question, token, repo, data, d, overview }: { section: DashTab; question: string; token: string; repo: string; data: HubData; d: Derived | null; overview: Poll<WorkOverview> }) {
   const ov = overview.kind === 'ready' ? overview.value : null
-  const needs = needsYou(ov, d)
+  const hidden = useHidden()
+  const all = needsYou(ov, d)
+  const needs = all.filter((n) => !hidden.has(needHideKey(n)))
   return (
     <div className="page">
       <Answer question={question} repo={repo} d={d} ov={ov} failing={data.failing} needs={needs} />
@@ -343,7 +355,7 @@ export function DashboardPage({ section, question, token, repo, data, d, overvie
       {ov && overview.kind === 'ready' && overview.refreshError && <Notice title="Showing the last overview that loaded">{overview.refreshError}</Notice>}
       {section === 'home' && (!ov || !d ? <Skeleton rows={6} /> : (
         <>
-          <NeedsYou needs={needs} ov={ov} d={d} />
+          <NeedsYou needs={all} ov={ov} d={d} me={data.whoami?.owner.login ?? null} />
           <Track ov={ov} />
         </>
       ))}
