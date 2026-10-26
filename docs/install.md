@@ -68,8 +68,10 @@ Use this as an explicit fallback on a supported Linux AMD64 or ARM64 Docker daem
 - Build provenance, only when the GitHub CLI (`gh`) is installed and signed in (`gh auth status` succeeds). The binary must be attested by this repository's `release.yml` for the matching tag, or it is deleted and not run. If `gh` is missing or not signed in, the installer says why and that it checked the checksum only.
 - To make a missing or signed-out `gh` an error, set `AGENTSCM_REQUIRE_PROVENANCE=1`.
 
-Successful installer verification prints one summary line. To include the verification
-command's details, set `AGENTSCM_INSTALL_VERBOSE=1`. Verification failures always show
+Successful installer verification prints one summary line. `npx agentscm` prints its notice and
+that line only when it first downloads a version, and never before `--help`; later runs start
+AgentSCM directly. To see them on every run, with the verification command's details, set
+`AGENTSCM_INSTALL_VERBOSE=1`. Verification failures always show
 diagnostics and stop installation.
 
 Checks run before anything is installed or linked.
