@@ -420,9 +420,9 @@ impl Context<'_> {
                     // An opted-in head goes on to its own verdict, which fails the same way.
                     Err(why) => {
                         if !opted_in {
-                            tally.errors += 1;
+                            // Not opted in: a warning, not an error an outside author can force.
                             eprintln!(
-                                "PR #{} {}: head could not be checked for exempt paths ({why}); nothing written",
+                                "warning: PR #{} {}: head could not be checked for exempt paths ({why}); nothing written",
                                 c.number, c.head
                             );
                         }

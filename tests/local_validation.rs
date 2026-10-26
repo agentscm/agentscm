@@ -923,6 +923,9 @@ fn invalid_pathspecs_are_rejected() {
         vec!["/x".into()],
         vec![":(top,literal)/x".into()],
         vec!["a\0b".into()],
+        vec!["../x".into()],
+        vec!["a/../x".into()],
+        vec![":(top)../x".into()],
         vec!["x".to_owned(); 65],
     ];
     for specs in bad {

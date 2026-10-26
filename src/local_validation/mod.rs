@@ -247,6 +247,14 @@ fn pathspec(spec: &str) -> Result<()> {
             "pathspec must not start with '/': {spec}"
         )));
     }
+    let path = spec
+        .strip_prefix(':')
+        .map_or(spec, |m| m.split_once(')').map_or("", |(_, p)| p));
+    if path.split('/').any(|part| part == "..") {
+        return Err(Error::Invalid(format!(
+            "pathspec must not contain a '..' component: {spec}"
+        )));
+    }
     Ok(())
 }
 

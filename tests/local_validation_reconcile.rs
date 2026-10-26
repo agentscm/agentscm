@@ -1105,13 +1105,37 @@ async fn an_attestation_listing_a_path_scoped_command_as_not_required_passes() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_unmarked_head_that_cannot_be_fetched_gets_no_status_and_fails_the_run() {
+async fn an_unmarked_head_that_cannot_be_fetched_gets_no_status_and_does_not_fail_the_run() {
     let env = Env::exempting(vec![("README.md", "x")]).await;
     git(
         &env.root().join("checkout"),
         &["remote", "set-url", "origin", "/nonexistent/origin.git"],
     );
     let out = tokio::task::block_in_place(|| env.reconcile());
-    assert_eq!(code(&out), 1, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(env.posts(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_opted_in_exempt_head_whose_comments_change_before_the_write_ends_pending() {
+    let env = Env::exempting(vec![("README.md", "x")]).await;
+    env.prior_success();
+    let out = env
+        .reconcile_stalled(&format!("/statuses/{}", env.head), |fake| {
+            fake.with(|s| {
+                s.repos.get_mut(&1).unwrap().comments.insert(
+                    1,
+                    vec![Comment {
+                        id: 10,
+                        body: MARKED.into(),
+                        author: "maintainer-login".into(),
+                        author_association: "OWNER".into(),
+                        updated_at: "2026-01-01T00:00:00Z".into(),
+                    }],
+                );
+            })
+        })
+        .await;
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(env.states(&env.head), ["success", "pending"]);
 }
