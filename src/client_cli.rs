@@ -97,6 +97,11 @@ pub(crate) struct SetupArgs {
     /// Coding agent whose native hooks should be installed.
     #[arg(long, value_enum)]
     agent: crate::client_setup::Agent,
+    /// Write the agent's hooks, MCP entry and skill into this checkout only, not your user
+    /// configuration, so they run only here. Claude Code and Codex hooks always come from a
+    /// user-scope plugin.
+    #[arg(long)]
+    checkout_only: bool,
     #[command(flatten)]
     connect: ConnectArgs,
 }
@@ -155,8 +160,13 @@ pub(crate) async fn run(command: ClientCommand) -> Result<()> {
             let root = selected_root(args.connect.root.as_deref())?;
             let ui = Ui { yes: false };
             let program = std::env::current_exe()?;
+            let scope = if args.checkout_only {
+                crate::client_setup::Scope::Checkout
+            } else {
+                crate::client_setup::Scope::User
+            };
             setup(
-                &[args.agent],
+                &[(args.agent, scope)],
                 args.connect,
                 root,
                 &program,
@@ -189,14 +199,26 @@ async fn status(args: StatusArgs) -> Result<()> {
         println!("No client connections configured.");
     }
     for connection in snapshot.connections {
+        let now = unix_now();
         println!(
-            "{}  {}  {}  binding={:?}  credential={:?}  hub={:?}",
+            "{}  {}  {}",
             connection.root.display(),
             connection.repository,
             connection.hub,
-            connection.binding.state,
-            connection.credential.state,
-            connection.hub_check,
+        );
+        println!(
+            "  binding: {}; token: {}; Hub: {}",
+            label(&connection.binding.state),
+            match connection.credential.expires_at {
+                Some(at) => format!(
+                    "{}, {} {}",
+                    label(&connection.credential.state),
+                    if at < now { "expired" } else { "expires" },
+                    crate::hub_cli::when(at, now)
+                ),
+                None => label(&connection.credential.state),
+            },
+            hub_check_text(&connection.hub_check, now),
         );
         if !connection.agents.is_empty() {
             println!("  configured agents: {}", connection.agents.join(", "));
@@ -215,6 +237,31 @@ async fn status(args: StatusArgs) -> Result<()> {
     Ok(())
 }
 
+/// A status enum's stable snake_case name, as the JSON form spells it.
+fn label(value: &impl serde::Serialize) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(|text| text.replace('_', " ")))
+        .unwrap_or_default()
+}
+
+fn hub_check_text(check: &crate::client_status::HubCheck, now: i64) -> String {
+    use crate::client_status::HubCheck;
+    match check {
+        HubCheck::Skipped => "not checked (pass --check)".to_owned(),
+        HubCheck::Valid {
+            login, expires_at, ..
+        } => format!(
+            "signed in as {}, sign-in expires {}",
+            crate::hub_cli::clean(login),
+            crate::hub_cli::when(*expires_at, now)
+        ),
+        HubCheck::Rejected { .. } => "rejected the saved sign-in or token".to_owned(),
+        HubCheck::Unavailable { .. } => "did not answer".to_owned(),
+        HubCheck::InvalidResponse { .. } => "gave an answer AgentSCM could not read".to_owned(),
+    }
+}
+
 /// Waiting for the GitHub App install needs someone at a terminal to press Enter.
 fn terminal_wait(ui: &Ui) -> Option<AppWait<'_>> {
     use std::io::IsTerminal;
@@ -229,7 +276,7 @@ fn terminal_wait(ui: &Ui) -> Option<AppWait<'_>> {
 /// `program` is the stable executable the hooks and MCP entries run.
 #[cfg(unix)]
 pub(crate) async fn setup(
-    agents: &[crate::client_setup::Agent],
+    agents: &[(crate::client_setup::Agent, crate::client_setup::Scope)],
     args: ConnectArgs,
     root: PathBuf,
     program: &Path,
@@ -246,7 +293,7 @@ pub(crate) async fn setup(
 
 #[cfg(unix)]
 struct SetupInstallation<'a> {
-    agents: &'a [crate::client_setup::Agent],
+    agents: &'a [(crate::client_setup::Agent, crate::client_setup::Scope)],
     program: &'a Path,
 }
 
@@ -256,8 +303,8 @@ type SetupInstallation<'a> = std::marker::PhantomData<&'a ()>;
 #[cfg(unix)]
 fn validate_setup_installation(setup: &SetupInstallation<'_>, root: &Path) -> Result<()> {
     validate_setup_program(setup.program)?;
-    for agent in setup.agents {
-        crate::client_setup::preflight(*agent, root, setup.program)?;
+    for (agent, scope) in setup.agents {
+        crate::client_setup::preflight(*agent, root, setup.program, *scope)?;
     }
     Ok(())
 }
@@ -271,9 +318,9 @@ fn validate_setup_installation(setup: &SetupInstallation<'_>, _root: &Path) -> R
 #[cfg(unix)]
 fn install_setup(setup: &SetupInstallation<'_>, root: &Path) -> Result<()> {
     // Recorded first, so `client remove` also takes out a plugin a failed install left behind.
-    for agent in setup.agents {
+    for (agent, scope) in setup.agents {
         record_agent(root, *agent)?;
-        crate::client_setup::install(*agent, root, setup.program)?;
+        crate::client_setup::install(*agent, root, setup.program, *scope)?;
     }
     Ok(())
 }
@@ -325,7 +372,9 @@ pub(crate) fn setup_existing_agent(
         agent,
     )?;
     let stable = installed_program(running_program)?;
-    crate::client_setup::preflight(agent, root, &stable)?;
+    // The tray asks nothing, so it keeps an agent's existing scope.
+    let scope = tray_scope(agent, root);
+    crate::client_setup::preflight(agent, root, &stable, scope)?;
     let latest = load()?
         .into_iter()
         .find(|connection| connection.root == root)
@@ -342,7 +391,17 @@ pub(crate) fn setup_existing_agent(
     // Record first so `client remove` can clean up a partially completed install.
     // The compare-and-swap also fences reapplication if the connection changed during preflight.
     update(root, Some(&latest), Some(replacement))?;
-    crate::client_setup::install_quiet(agent, root, &stable)
+    crate::client_setup::install_quiet(agent, root, &stable, scope)
+}
+
+/// The scope the tray sets an agent up in: for all projects only once that was chosen.
+#[cfg(target_os = "macos")]
+fn tray_scope(agent: crate::client_setup::Agent, root: &Path) -> crate::client_setup::Scope {
+    if crate::client_setup::user_scope_installed(agent, root) {
+        crate::client_setup::Scope::User
+    } else {
+        crate::client_setup::Scope::Checkout
+    }
 }
 
 /// `client setup` for a checkout the tray saw an agent use without a connection. The tray has
@@ -361,7 +420,14 @@ pub(crate) async fn setup_unconnected(
         no_sign_in: true,
         ..ConnectArgs::default()
     };
-    setup(&[agent], args, root, &stable, None).await
+    setup(
+        &[(agent, tray_scope(agent, &root))],
+        args,
+        root,
+        &stable,
+        None,
+    )
+    .await
 }
 
 /// The stable `~/.agentscm/bin/agentscm` link, which hooks must run, when it is this program.
@@ -885,8 +951,9 @@ async fn revoke_minted(connection: &Connection, minted: &Minted) {
 
 fn warn_unrevoked(connection: &Connection, id: &str, expiry: i64) {
     eprintln!(
-        "warning: the managed token {id} on {} could not be revoked; it remains valid until unix {expiry}. Revoke that token manually; no retry was queued.",
-        connection.hub
+        "warning: the managed token {id} on {} could not be revoked; it remains valid until {until}. Revoke that token manually; no retry was queued.",
+        connection.hub,
+        until = crate::hub_cli::when(expiry, unix_now()),
     );
 }
 
@@ -930,14 +997,16 @@ async fn retire_owned(connection: &Connection) {
     match remove_unreferenced_owned_file(connection) {
         Ok(RetiredFile::Referenced) => {
             eprintln!(
-                "warning: the managed token {id} was preserved because another client connection references its token file; it remains valid until unix {expiry}"
+                "warning: the managed token {id} was preserved because another client connection references its token file; it remains valid until {until}",
+                until = crate::hub_cli::when(expiry, unix_now()),
             );
             return;
         }
         Ok(RetiredFile::Removed) => {}
         Err(error) => {
             eprintln!(
-                "warning: the managed token {id} and its file were preserved because AgentSCM could not verify that the file is unreferenced ({error}); the token remains valid until unix {expiry}. No retry was queued."
+                "warning: the managed token {id} and its file were preserved because AgentSCM could not verify that the file is unreferenced ({error}); the token remains valid until {until}. No retry was queued.",
+                until = crate::hub_cli::when(expiry, unix_now()),
             );
             return;
         }
@@ -1459,9 +1528,10 @@ pub(crate) async fn remove_checkout(root: &Path) -> Result<()> {
             kept.agents.clear();
             update(root, Some(&connection), Some(kept))?;
             return Err(invalid(&format!(
-                "the agents' files were removed, but token {id} on {} could not be revoked (the hub did not answer or refused); it stays valid until unix {expiry}. Its connection and token file are kept: run `agentscm client remove --root {}` again when the hub answers (signing in with `agentscm hub login` first also lets it revoke)",
+                "the agents' files were removed, but token {id} on {} could not be revoked (the hub did not answer or refused); it stays valid until {until}. Its connection and token file are kept: run `agentscm client remove --root {}` again when the hub answers (signing in with `agentscm hub login` first also lets it revoke)",
                 connection.hub,
-                root.display()
+                root.display(),
+                until = crate::hub_cli::when(expiry, unix_now()),
             )));
         }
     }
@@ -1477,7 +1547,8 @@ pub(crate) async fn remove_checkout(root: &Path) -> Result<()> {
                 connection.hub
             ),
             Ok(RetiredFile::Referenced) => println!(
-                "Kept token {id} and its file: another client connection uses them (valid until unix {expiry})."
+                "Kept token {id} and its file: another client connection uses them (valid until {until}).",
+                until = crate::hub_cli::when(expiry, unix_now()),
             ),
             Err(error) => eprintln!(
                 "warning: token {id} was revoked, but its file {} could not be deleted ({error})",

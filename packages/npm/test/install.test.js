@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { NOTICE_TEXT, targetFor, assetNameFor, installNames, urlFor, launchArgs, verifiedInstallEnv, parseSums, matches, localSums, ghVerifyArgs, provenanceGap, checkProvenance, provenanceLine } = require('../lib/install.js');
+const { NOTICE_TEXT, announces, targetFor, assetNameFor, installNames, urlFor, launchArgs, verifiedInstallEnv, parseSums, matches, localSums, ghVerifyArgs, provenanceGap, checkProvenance, provenanceLine } = require('../lib/install.js');
 
 const fixtures = path.join(__dirname, 'fixtures');
 const sums = fs.readFileSync(path.join(fixtures, 'SHA256SUMS'), 'utf8');
@@ -189,4 +189,14 @@ test('--version answers from package.json without notice or download', async () 
 test('provenance line says exactly what was checked', () => {
   assert.equal(provenanceLine('the GitHub CLI (gh) is not installed'), 'Checked the SHA-256 checksum (provenance not checked: the GitHub CLI (gh) is not installed).');
   assert.match(provenanceLine(null), /^Verified provenance with GitHub attestations\./);
+});
+
+test('the notice and provenance line appear when installing, never before help, always when verbose', () => {
+  assert.equal(announces([], true, false), true);
+  assert.equal(announces(['--hub-url', 'https://hub.example.com'], true, false), true);
+  assert.equal(announces([], false, false), false);
+  assert.equal(announces(['hub', 'login'], false, false), false);
+  assert.equal(announces(['--help'], true, false), false);
+  assert.equal(announces(['-h'], true, false), false);
+  assert.equal(announces(['hub'], false, true), true);
 });

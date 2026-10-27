@@ -124,6 +124,13 @@ pub fn render(envelope: &[u8], record: &[u8]) -> Result<String> {
             r.duration_ms
         ));
     }
+    if !parsed.not_required.is_empty() {
+        let ids: Vec<String> = parsed.not_required.iter().map(|id| code(id)).collect();
+        body.push_str(&format!(
+            "- Not required by the changed paths: {}\n",
+            ids.join(", ")
+        ));
+    }
     body.push_str("\n</details>\n\n<details>\n<summary>Signed machine-readable evidence</summary>\n\nThe exact signed bytes are preserved below for verification and audit tooling.\n\n");
     body.push_str(&block(ENVELOPE_FENCE, envelope));
     body.push('\n');

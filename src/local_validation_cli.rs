@@ -10,10 +10,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use agentscm::evidence::{EvaluationClock, EvidenceOutcome, sign_evidence};
 use agentscm::execution::Cancellation;
 use agentscm::local_validation::comment::{self, envelope_sha256};
-use agentscm::local_validation::run::{observe, produce};
+use agentscm::local_validation::run::{observe, produce, required_commands, trust_paths};
 use agentscm::local_validation::{
-    Issuance, MAX_RECORD_BYTES, Observed, ValidationPolicy, ValidationRecipe, ValidationRecord,
-    Verdict, VerdictState, assess, evidence_payload, select,
+    DEFAULT_VERIFIER_WORKFLOW, Issuance, MAX_RECORD_BYTES, Observed, ValidationPolicy,
+    ValidationRecipe, ValidationRecord, Verdict, VerdictState, assess, evidence_payload, select,
 };
 use agentscm::policy::issuers::{IssuerRegistrySnapshot, issuer_key_id};
 use agentscm::{Error, Result};
@@ -45,8 +45,10 @@ pub enum LocalValidationCommand {
     /// Post a retained attestation as a PR comment (GitHub). Posts no status.
     Post(PostArgs),
     /// Set the `agentscm/local-validation` status of every open pull request on `--base` from its
-    /// signed attestation comments. Exit 0 when all were handled, 1 on any error or unread input,
-    /// 2 when the policy is for another repository.
+    /// signed attestation comments; with policy `exempt_paths`, a pull request that changes only
+    /// exempt paths passes without one. Exit 0 when all were handled, 1 on any error or unread input,
+    /// 2 when the policy is for another repository, `--config-dir` or `--verifier-workflow` is
+    /// unsafe, `--target-url` is invalid, or `--config-dir` is unreadable at HEAD or dirty.
     Reconcile(ReconcileArgs),
 }
 
@@ -62,6 +64,10 @@ pub struct ReconcileArgs {
     /// relative to `--repo`, without `..`.
     #[arg(long, default_value = ".github/local-validation")]
     config_dir: PathBuf,
+    /// Verifier workflow path relative to the repository root; a change to it or to `--config-dir` requires
+    /// every recipe command.
+    #[arg(long, default_value = DEFAULT_VERIFIER_WORKFLOW)]
+    verifier_workflow: String,
     /// Checkout of the default branch; its `origin` is fetched.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
@@ -98,6 +104,14 @@ pub struct PostArgs {
 pub struct RunArgs {
     #[arg(long, default_value = ".")]
     repo: PathBuf,
+    /// Trust directory relative to `--repo`; a change to it or to `--verifier-workflow` requires
+    /// every recipe command.
+    #[arg(long, default_value = ".github/local-validation")]
+    config_dir: PathBuf,
+    /// Verifier workflow path relative to the repository root; a change to it or to `--config-dir` requires
+    /// every recipe command.
+    #[arg(long, default_value = DEFAULT_VERIFIER_WORKFLOW)]
+    verifier_workflow: String,
     #[arg(long)]
     recipe: PathBuf,
     #[arg(long)]
@@ -142,6 +156,14 @@ pub struct VerifyArgs {
     registry: PathBuf,
     #[arg(long, default_value = ".")]
     repo: PathBuf,
+    /// Trust directory relative to `--repo`; a change to it or to `--verifier-workflow` requires
+    /// every recipe command.
+    #[arg(long, default_value = ".github/local-validation")]
+    config_dir: PathBuf,
+    /// Verifier workflow path relative to the repository root; a change to it or to `--config-dir` requires
+    /// every recipe command.
+    #[arg(long, default_value = DEFAULT_VERIFIER_WORKFLOW)]
+    verifier_workflow: String,
     #[arg(long, default_value = "HEAD")]
     head: String,
     #[arg(long, default_value = "main")]
@@ -185,6 +207,25 @@ pub async fn run(command: LocalValidationCommand) -> Result<i32> {
         LocalValidationCommand::Verify(args) => verify(args),
         LocalValidationCommand::Post(args) => post(args).await,
         LocalValidationCommand::Reconcile(args) => reconcile(args).await,
+    }
+}
+
+/// `--config-dir` and `--verifier-workflow` as the trust pathspecs: relative, normal components.
+fn trust_inputs(config_dir: &Path, verifier_workflow: &str) -> Result<Vec<String>> {
+    fn relative(path: &Path) -> Option<&str> {
+        path.to_str().filter(|p| {
+            !p.is_empty()
+                && !p.starts_with('-')
+                && path
+                    .components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_)))
+        })
+    }
+    match (relative(config_dir), relative(Path::new(verifier_workflow))) {
+        (Some(dir), Some(workflow)) => Ok(trust_paths(dir, workflow)),
+        _ => Err(Error::Invalid(
+            "--config-dir and --verifier-workflow must be relative paths inside --repo".into(),
+        )),
     }
 }
 
@@ -251,12 +292,14 @@ fn run_recipe(args: RunArgs, cancel: &Cancellation) -> Result<i32> {
     }
     let key = read_signing_key(&args.key_file)?;
     private_state_dir(&args.state_dir)?;
+    let trust = trust_inputs(&args.config_dir, &args.verifier_workflow)?;
     let produced = produce(
         &args.repo,
         &recipe,
         &policy,
         &args.base_ref,
         &args.base_rev,
+        &trust,
         cancel,
     )?;
     let mut attempt = [0_u8; 16];
@@ -394,8 +437,14 @@ fn verify_inputs(args: VerifyArgs) -> Result<i32> {
         }
         _ => None,
     };
-    let git = match observe(&args.repo, &args.head, &args.base_rev) {
-        Ok(git) => git,
+    let trust = trust_inputs(&args.config_dir, &args.verifier_workflow)?;
+    let git = observe(&args.repo, &args.head, &args.base_rev).and_then(|git| {
+        let required =
+            required_commands(&args.repo, &git.merge_base, &git.commit, &recipe, &trust)?;
+        Ok((git, required))
+    });
+    let (git, required) = match git {
+        Ok(found) => found,
         Err(error) => {
             let verdict = Verdict {
                 state: VerdictState::Error,
@@ -416,6 +465,7 @@ fn verify_inputs(args: VerifyArgs) -> Result<i32> {
         tree: &git.tree,
         base_ref: &args.base_ref,
         merge_base: &git.merge_base,
+        required: &required,
     };
     let verdict = match pair {
         Some((envelope, record)) => assess(
@@ -463,17 +513,16 @@ async fn reconcile(args: ReconcileArgs) -> Result<i32> {
         .ok()
         .filter(|t| !t.is_empty())
         .ok_or_else(|| Error::Invalid("the token environment variable is unset or empty".into()))?;
-    let Some(config_dir) = args.config_dir.to_str().filter(|d| {
-        !d.is_empty()
-            && !d.starts_with('-')
-            && args
-                .config_dir
-                .components()
-                .all(|c| matches!(c, std::path::Component::Normal(_)))
-    }) else {
+    let Some(config_dir) = args.config_dir.to_str() else {
         eprintln!("--config-dir must be a relative path inside --repo; nothing written");
         return Ok(2);
     };
+    if trust_inputs(&args.config_dir, &args.verifier_workflow).is_err() {
+        eprintln!(
+            "--config-dir and --verifier-workflow must be relative paths inside --repo; nothing written"
+        );
+        return Ok(2);
+    }
     let target_ok = args.target_url.as_deref().is_none_or(|url| {
         CommitStatus::new(&"0".repeat(40), StatusState::Pending, "x", "x")
             .and_then(|status| status.with_target_url(url))
@@ -527,6 +576,7 @@ async fn reconcile(args: ReconcileArgs) -> Result<i32> {
         github_repo: &args.github_repo,
         base: &args.base,
         config_dir,
+        verifier_workflow: &args.verifier_workflow,
         git_repo: &args.repo,
         repository: &policy.repository,
         policy: &policy,

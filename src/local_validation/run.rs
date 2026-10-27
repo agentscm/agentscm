@@ -121,6 +121,70 @@ pub fn observe(repo: &Path, head: &str, base_rev: &str) -> Result<GitState> {
     })
 }
 
+/// Number of paths that differ between two trees and match `pathspecs` (all paths when empty).
+/// Plumbing, so renames, external diff and `diff.relative` configuration cannot change the count.
+fn changed(repo: &Path, from: &str, to: &str, pathspecs: &[String]) -> Result<usize> {
+    for name in [from, to] {
+        if name.starts_with('-') || name.contains('\0') {
+            return Err(Error::Invalid("revision must not start with '-'".into()));
+        }
+    }
+    let mut args = vec!["diff-tree", "-r", "--name-only", "-z", "--no-renames"];
+    args.extend([from, to, "--"]);
+    args.extend(pathspecs.iter().map(String::as_str));
+    Ok(git(repo, &args, GIT_OUTPUT)?
+        .iter()
+        .filter(|b| **b == 0)
+        .count())
+}
+
+/// Built-in pathspecs for the files that define the gate itself: the config directory relative
+/// to `repo`, and the verifier workflow relative to the repository root (GitHub reads workflows
+/// only there).
+pub fn trust_paths(config_dir: &str, verifier_workflow: &str) -> Vec<String> {
+    vec![
+        format!(":(literal){config_dir}"),
+        format!(":(top,literal){verifier_workflow}"),
+    ]
+}
+
+/// Recipe command ids the change requires, in recipe order. A change to any trust input
+/// requires every command.
+pub fn required_commands(
+    repo: &Path,
+    merge_base: &str,
+    head: &str,
+    recipe: &ValidationRecipe,
+    trust: &[String],
+) -> Result<Vec<String>> {
+    let all = changed(repo, merge_base, head, trust)? > 0;
+    let mut ids = Vec::new();
+    for command in &recipe.commands {
+        let required = match &command.paths {
+            Some(paths) if !all => changed(repo, merge_base, head, paths)? > 0,
+            _ => true,
+        };
+        if required {
+            ids.push(command.id.clone());
+        }
+    }
+    Ok(ids)
+}
+
+/// True when the change is non-empty, touches no trust input and every path matches `exempt`.
+pub fn only_exempt(
+    repo: &Path,
+    merge_base: &str,
+    head: &str,
+    exempt: &[String],
+    trust: &[String],
+) -> Result<bool> {
+    let total = changed(repo, merge_base, head, &[])?;
+    Ok(total > 0
+        && changed(repo, merge_base, head, trust)? == 0
+        && changed(repo, merge_base, head, exempt)? == total)
+}
+
 fn fetch_base(repo: &Path, base: &str) -> Result<()> {
     let base_spec = format!("+refs/heads/{base}:refs/remotes/origin/{base}");
     git_timeout(
@@ -299,14 +363,16 @@ fn run_command(
     (result, CommandOutput { stdout, stderr })
 }
 
-/// Runs the recipe in `repo` (which must be clean) until the first failure.
-/// Only commands that actually ran are recorded. `cancel` stops the running command and the run.
+/// Runs the recipe commands the change requires in `repo` (which must be clean) until the first
+/// failure. Only commands that actually ran are recorded; the rest are listed as not required.
+/// `trust` is from [`trust_paths`]. `cancel` stops the running command and the run.
 pub fn produce(
     repo: &Path,
     recipe: &ValidationRecipe,
     policy: &ValidationPolicy,
     base_ref: &str,
     base_rev: &str,
+    trust: &[String],
     cancel: &Cancellation,
 ) -> Result<Produced> {
     let recipe_sha256 = recipe.sha256()?;
@@ -322,8 +388,9 @@ pub fn produce(
         .into_iter()
         .map(|path| file_digest(repo, &state.commit, &path).map(|digest| (path, digest)))
         .collect::<Result<Vec<_>>>()?;
+    let required = required_commands(repo, &state.merge_base, &state.commit, recipe, trust)?;
     let (mut results, mut outputs) = (Vec::new(), Vec::new());
-    for c in &recipe.commands {
+    for c in recipe.commands.iter().filter(|c| required.contains(&c.id)) {
         let (result, output) = run_command(repo, &c.id, &c.argv, c.timeout_secs, cancel);
         let ok = result.stop == StopReason::Exited && result.exit_code == Some(0);
         results.push(result);
@@ -360,6 +427,12 @@ pub fn produce(
             base_tip: state.base_tip,
             recipe_sha256,
             results,
+            not_required: recipe
+                .commands
+                .iter()
+                .filter(|c| !required.contains(&c.id))
+                .map(|c| c.id.clone())
+                .collect(),
             services: Services {
                 postgres: var_set("AGENTSCM_TEST_DATABASE_URL"),
                 s3: S3_VARS.iter().all(|v| var_set(v)),

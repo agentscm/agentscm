@@ -610,6 +610,11 @@ fn claude_plugin(plugins: &[Value]) -> Result<Option<&Value>> {
     Ok(installed)
 }
 
+/// Whether our user-scope Claude Code plugin is already installed; `false` when that is unknown.
+pub(crate) fn claude_plugin_installed(root: &Path) -> bool {
+    claude_plugins(root).is_ok_and(|plugins| matches!(claude_plugin(&plugins), Ok(Some(_))))
+}
+
 fn check_installed_claude_plugins(root: &Path) -> Result<()> {
     let plugins = claude_plugins(root)?;
     claude_plugin(&plugins).map(|_| ())

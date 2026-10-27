@@ -143,6 +143,11 @@ function checkProvenance(file, version, gap = provenanceGap(), run = spawnSync) 
   return true;
 }
 
+// The notice and the provenance line belong to installing: shown when this version is first
+// fetched (never before help text), and on every run only with AGENTSCM_INSTALL_VERBOSE=1.
+const announces = (args, installing, verbose) =>
+  verbose || (installing && !['--help', '-h'].includes(args[0]));
+
 // The one-line report of what was actually checked.
 const provenanceLine = (gap) => gap
   ? `Checked the SHA-256 checksum (provenance not checked: ${gap}).`
@@ -155,7 +160,6 @@ async function main(args) {
     console.log(`agentscm ${version}`);
     return 0;
   }
-  console.log(`${NOTICE_TEXT}\n`);
   const target = targetFor(process.platform, process.arch);
   if (!target) {
     console.error(`agentscm: ${unsupported(version)}`);
@@ -163,6 +167,10 @@ async function main(args) {
   }
   const asset = assetNameFor(target);
   const names = installNames(version, process.platform);
+  const dir = path.join(os.homedir(), '.agentscm', 'bin');
+  const binary = path.join(dir, names.versioned);
+  const announce = announces(args, !fs.existsSync(binary), verboseInstall());
+  if (announce) console.log(`${NOTICE_TEXT}\n`);
   const signal = AbortSignal.timeout(BUDGET_MS);
   const gap = provenanceGap(); // checked once: `gh auth status` goes over the network
   if (gap && process.env.AGENTSCM_REQUIRE_PROVENANCE === '1') throw new Error(`AGENTSCM_REQUIRE_PROVENANCE=1 but ${gap}`);
@@ -178,7 +186,6 @@ async function main(args) {
   }
   const expected = parseSums(sums, target);
 
-  const dir = path.join(os.homedir(), '.agentscm', 'bin');
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   fs.chmodSync(dir, 0o700);
   const link = path.join(dir, names.latest);
@@ -186,7 +193,6 @@ async function main(args) {
   if (names.symlink && lst && !lst.isSymbolicLink()) throw new Error(`${link} exists and is not a symlink; remove it`);
 
   // Order: checksum, provenance, chmod, rename, link, exec. Nothing is installed or linked before both checks pass.
-  const binary = path.join(dir, names.versioned);
   const rand = crypto.randomBytes(6).toString('hex');
   if (fs.existsSync(binary)) {
     if (!matches(binary, expected)) throw new Error(`${binary} does not match the release checksum; delete it and retry`);
@@ -227,7 +233,7 @@ async function main(args) {
     }
   }
 
-  console.log(provenanceLine(gap));
+  if (announce) console.log(provenanceLine(gap));
 
   // This process-only assertion comes from the verified installer. The binary records an
   // installation only after its disclosure/choice gates are effective; HTTP stays detached.
@@ -237,4 +243,4 @@ async function main(args) {
   return r.status ?? 128 + (os.constants.signals[r.signal] ?? 0);
 }
 
-module.exports = { NOTICE_TEXT, targetFor, assetNameFor, installNames, urlFor, launchArgs, verifiedInstallEnv, parseSums, sha256File, matches, localSums, ghVerifyArgs, provenanceGap, checkProvenance, provenanceLine, main };
+module.exports = { NOTICE_TEXT, announces, targetFor, assetNameFor, installNames, urlFor, launchArgs, verifiedInstallEnv, parseSums, sha256File, matches, localSums, ghVerifyArgs, provenanceGap, checkProvenance, provenanceLine, main };

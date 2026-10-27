@@ -23,6 +23,17 @@ pub(crate) enum Agent {
     Gemini,
 }
 
+/// Where `client setup` writes an agent's hooks, MCP entry and coordination skill. Claude Code
+/// and Codex hooks always come from a user-scope plugin, and Claude Code's MCP entry is always
+/// the checkout's `.mcp.json`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Scope {
+    /// The agent's user configuration, so the start-up check runs in every project.
+    User,
+    /// This checkout's files only.
+    Checkout,
+}
+
 impl Agent {
     pub(crate) fn name(self) -> &'static str {
         match self {
@@ -31,6 +42,17 @@ impl Agent {
             Self::Cursor => "cursor",
             Self::Copilot => "copilot",
             Self::Gemini => "gemini",
+        }
+    }
+
+    /// The product name people know the agent by.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude Code",
+            Self::Codex => "Codex",
+            Self::Cursor => "Cursor",
+            Self::Copilot => "GitHub Copilot",
+            Self::Gemini => "Gemini CLI",
         }
     }
 }
@@ -72,12 +94,20 @@ fn mcp_args(root: &Path) -> Result<Value> {
     Ok(json!(["--no-telemetry", "client", "mcp", "--root", root]))
 }
 
-fn mcp(root: &Path, program: &Path) -> Result<Value> {
+/// The user-scope entry starts in every project and finds the checkout from its working
+/// directory; Cursor documents no working directory for it, only `${workspaceFolder}`.
+fn user_mcp_args(agent: Agent) -> Value {
+    let mut args = vec!["--no-telemetry", "client", "mcp"];
+    if agent == Agent::Cursor {
+        args.extend(["--root", "${workspaceFolder}"]);
+    }
+    json!(args)
+}
+
+fn mcp(args: &Value, program: &Path) -> Result<Value> {
     // Gemini's strict schema selects stdio from `command` and rejects a `type` key.
-    Ok(
-        json!({"command":program_text(program)?, "args":mcp_args(root)?,
-        "env":{"XDG_CONFIG_HOME":mcp_config_home(&crate::hub_cli::config_dir()?)?}}),
-    )
+    Ok(json!({"command":program_text(program)?, "args":args,
+        "env":{"XDG_CONFIG_HOME":mcp_config_home(&crate::hub_cli::config_dir()?)?}}))
 }
 
 fn mcp_config_home(directory: &Path) -> Result<String> {
@@ -139,8 +169,8 @@ fn object<'a>(parent: &'a mut Map<String, Value>, key: &str) -> Result<&'a mut M
         .ok_or_else(|| invalid("native configuration has an unexpected object shape"))
 }
 
-fn check_mcp_entry(existing: &Value, root: &Path) -> Result<()> {
-    if existing["args"] != mcp_args(root)? || existing["url"].is_string() {
+fn check_mcp_entry(existing: &Value, args: &Value) -> Result<()> {
+    if existing["args"] != *args || existing["url"].is_string() {
         return Err(invalid(
             "this file already has an `agentscm` MCP entry that `client setup` did not write, so it was left unchanged; remove only that entry and rerun to let `client setup` manage it",
         ));
@@ -148,26 +178,26 @@ fn check_mcp_entry(existing: &Value, root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn add_mcp(value: &mut Value, key: &str, root: &Path, program: &Path) -> Result<()> {
+fn add_mcp(value: &mut Value, key: &str, args: &Value, program: &Path) -> Result<()> {
     let top = value
         .as_object_mut()
         .ok_or_else(|| invalid("native configuration must be an object"))?;
     let servers = object(top, key)?;
     if let Some(existing) = servers.get("agentscm") {
-        check_mcp_entry(existing, root)?;
+        check_mcp_entry(existing, args)?;
     }
-    servers.insert("agentscm".into(), mcp(root, program)?);
+    servers.insert("agentscm".into(), mcp(args, program)?);
     Ok(())
 }
 
 fn add_typed_mcp(
     value: &mut Value,
     key: &str,
-    root: &Path,
+    args: &Value,
     program: &Path,
     transport: &str,
 ) -> Result<()> {
-    add_mcp(value, key, root, program)?;
+    add_mcp(value, key, args, program)?;
     value[key]["agentscm"]["type"] = json!(transport);
     Ok(())
 }
@@ -330,19 +360,26 @@ struct Edit {
     after: String,
 }
 
+fn edited_json(
+    before: Option<&str>,
+    edit: impl FnOnce(&mut Value) -> Result<()>,
+) -> Result<String> {
+    let mut value = match before {
+        Some(text) => serde_json::from_str(text).map_err(|_| invalid("native configuration is not strict JSON; use the client's editor to migrate it first"))?,
+        None => json!({}),
+    };
+    edit(&mut value)?;
+    Ok(serde_json::to_string_pretty(&value)? + "\n")
+}
+
 fn json_edit(
     root: &Path,
     relative: &'static str,
     edit: impl FnOnce(&mut Value) -> Result<()>,
 ) -> Result<Edit> {
     let before = read(&local_path(root, relative)?)?;
-    let mut value = match &before {
-        Some(text) => serde_json::from_str(text).map_err(|_| invalid("native configuration is not strict JSON; use the client's editor to migrate it first"))?,
-        None => json!({}),
-    };
-    edit(&mut value)
+    let after = edited_json(before.as_deref(), edit)
         .map_err(|error| invalid(&format!("{relative}: {error}{}", team_note(root, relative))))?;
-    let after = serde_json::to_string_pretty(&value)? + "\n";
     Ok(Edit {
         relative,
         before,
@@ -353,7 +390,22 @@ fn json_edit(
 fn codex_mcp(root: &Path, program: &Path) -> Result<Edit> {
     let relative = ".codex/config.toml";
     let before = read(&local_path(root, relative)?)?;
-    let text = before.as_deref().unwrap_or_default();
+    let after = codex_block(
+        before.as_deref().unwrap_or_default(),
+        relative,
+        &mcp_args(root)?,
+        program,
+    )
+    .map_err(|error| invalid(&format!("{error}{}", team_note(root, relative))))?;
+    Ok(Edit {
+        relative,
+        before,
+        after,
+    })
+}
+
+/// `text` with AgentSCM's marked `[mcp_servers.agentscm]` block written or replaced.
+fn codex_block(text: &str, label: &str, args: &Value, program: &Path) -> Result<String> {
     let (head, tail) = match (text.find(BEGIN), text.find(END)) {
         (None, None) => (text, ""),
         (Some(start), Some(end))
@@ -369,52 +421,61 @@ fn codex_mcp(root: &Path, program: &Path) -> Result<Edit> {
             ));
         }
     };
-    // Refuse alternate quoted/table forms too, rather than overwrite an unmanaged server.
-    if head.contains("agentscm") || tail.contains("agentscm") {
+    // Parsed, so dotted, quoted and inline forms are found too, and a trusted project path
+    // that merely contains "agentscm" is not mistaken for a server.
+    let rest: toml_edit::DocumentMut = format!("{head}\n{tail}").parse().map_err(|_| {
+        invalid(&format!(
+            "{label} is not valid TOML; review it before setup"
+        ))
+    })?;
+    if rest
+        .get("mcp_servers")
+        .and_then(|servers| servers.get("agentscm"))
+        .is_some()
+    {
         return Err(invalid(&format!(
-            "{relative} already has an `agentscm` MCP server outside the `{BEGIN}` block, which `client setup` did not write; remove that `[mcp_servers.agentscm]` entry and rerun{}",
-            team_note(root, relative)
+            "{label} already has an `agentscm` MCP server outside the `{BEGIN}` block, which `client setup` did not write; remove that `[mcp_servers.agentscm]` entry and rerun"
         )));
     }
     let body = format!(
-        "{BEGIN}\n[mcp_servers.agentscm]\ncommand = {}\nargs = {}\nenv = {{ XDG_CONFIG_HOME = {} }}\nstartup_timeout_sec = 10\ntool_timeout_sec = 30\n{END}",
+        "{BEGIN}\n[mcp_servers.agentscm]\ncommand = {}\nargs = {args}\nenv = {{ XDG_CONFIG_HOME = {} }}\nstartup_timeout_sec = 10\ntool_timeout_sec = 30\n{END}",
         json!(program_text(program)?),
-        mcp_args(root)?,
         json!(mcp_config_home(&crate::hub_cli::config_dir()?)?)
     );
-    Ok(Edit {
-        relative,
-        before: before.clone(),
-        after: format!("{}\n\n{body}\n{}", head.trim_end(), tail.trim_start()),
-    })
+    Ok(format!(
+        "{}\n\n{body}\n{}",
+        head.trim_end(),
+        tail.trim_start()
+    ))
 }
 
 fn plan(agent: Agent, root: &Path, program: &Path) -> Result<Vec<Edit>> {
     program_text(program)?;
+    let args = &mcp_args(root)?;
     let mut edits = match agent {
         Agent::Claude => vec![json_edit(root, ".mcp.json", |v| {
-            add_typed_mcp(v, "mcpServers", root, program, "stdio")
+            add_typed_mcp(v, "mcpServers", args, program, "stdio")
         })?],
         Agent::Codex => vec![codex_mcp(root, program)?],
         Agent::Cursor => vec![
             json_edit(root, ".cursor/mcp.json", |v| {
-                add_typed_mcp(v, "mcpServers", root, program, "stdio")
+                add_typed_mcp(v, "mcpServers", args, program, "stdio")
             })?,
             json_edit(root, ".cursor/hooks.json", |v| add_hooks(v, agent, program))?,
         ],
         Agent::Copilot => vec![
             json_edit(root, ".github/mcp.json", |v| {
-                add_typed_mcp(v, "mcpServers", root, program, "local")
+                add_typed_mcp(v, "mcpServers", args, program, "local")
             })?,
             json_edit(root, ".vscode/mcp.json", |v| {
-                add_typed_mcp(v, "servers", root, program, "stdio")
+                add_typed_mcp(v, "servers", args, program, "stdio")
             })?,
             json_edit(root, ".github/hooks/agentscm-client.json", |v| {
                 add_hooks(v, agent, program)
             })?,
         ],
         Agent::Gemini => vec![json_edit(root, ".gemini/settings.json", |v| {
-            add_mcp(v, "mcpServers", root, program)?;
+            add_mcp(v, "mcpServers", args, program)?;
             add_hooks(v, agent, program)
         })?],
     };
@@ -427,7 +488,7 @@ fn plan(agent: Agent, root: &Path, program: &Path) -> Result<Vec<Edit>> {
             // Copilot prefers this shared file. Refresh our existing Claude-compatible entry
             // too, so it cannot shadow the native entry with an old executable or schema.
             edits.push(json_edit(root, ".mcp.json", |v| {
-                add_typed_mcp(v, "mcpServers", root, program, "stdio")
+                add_typed_mcp(v, "mcpServers", args, program, "stdio")
             })?);
         }
     }
@@ -440,14 +501,7 @@ fn plan(agent: Agent, root: &Path, program: &Path) -> Result<Vec<Edit>> {
     };
     if let Some(relative) = skill {
         let before = read(&local_path(root, relative)?)?;
-        if before
-            .as_deref()
-            .is_some_and(|old| old != SKILL && old != PREVIOUS_SKILL)
-        {
-            return Err(invalid(
-                "existing coordination skill differs; review it before setup",
-            ));
-        }
+        check_skill(before.as_deref())?;
         edits.push(Edit {
             relative,
             before,
@@ -462,6 +516,15 @@ fn plan(agent: Agent, root: &Path, program: &Path) -> Result<Vec<Edit>> {
         }
     }
     Ok(edits)
+}
+
+fn check_skill(before: Option<&str>) -> Result<()> {
+    if before.is_some_and(|old| old != SKILL && old != PREVIOUS_SKILL) {
+        return Err(invalid(
+            "existing coordination skill differs; review it before setup",
+        ));
+    }
+    Ok(())
 }
 
 /// A tracked file is the team's: a fix to it belongs in a commit, and setup would otherwise
@@ -490,7 +553,13 @@ fn tracked(root: &Path, relative: &str) -> Result<bool> {
     }
 }
 
-fn check_other_hooks(agent: Agent, root: &Path) -> Result<()> {
+fn check_other_hooks(agent: Agent, root: &Path, scope: Scope) -> Result<()> {
+    if scope == Scope::Checkout && agent != Agent::Claude && user_scope_installed(agent, root) {
+        return Err(invalid(&format!(
+            "AgentSCM is installed for {} in all your projects, so a checkout-only setup would run its hooks twice; rerun without --checkout-only",
+            agent.name()
+        )));
+    }
     if agent == Agent::Copilot
         && let Some(text) = read(&local_path(root, ".mcp.json")?)?
     {
@@ -499,7 +568,7 @@ fn check_other_hooks(agent: Agent, root: &Path) -> Result<()> {
         })?;
         if let Some(existing) = value["mcpServers"].get("agentscm") {
             // Copilot loads both this Claude-compatible file and .github/mcp.json.
-            check_mcp_entry(existing, root).map_err(|error| {
+            check_mcp_entry(existing, &mcp_args(root)?).map_err(|error| {
                 invalid(&format!(
                     ".mcp.json: {error}{}",
                     team_note(root, ".mcp.json")
@@ -507,17 +576,26 @@ fn check_other_hooks(agent: Agent, root: &Path) -> Result<()> {
             })?;
         }
     }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| invalid("HOME is not set"))?;
+    let home = home()?;
+    let user = scope == Scope::User;
+    // The other scope's file: ours there is a duplicate, unless a user-scope setup is about to
+    // take this checkout's copy out.
+    let other = |checkout: &str, user_file: PathBuf| {
+        if user {
+            (root.join(checkout), true)
+        } else {
+            (user_file, false)
+        }
+    };
     let paths = match agent {
         Agent::Claude => Vec::new(), // Inspected by the native plugin preflight.
-        Agent::Cursor => vec![home.join(".cursor/hooks.json")],
-        Agent::Gemini => vec![home.join(".gemini/settings.json")],
+        Agent::Cursor => vec![other(".cursor/hooks.json", home.join(".cursor/hooks.json"))],
+        Agent::Gemini => vec![other(
+            ".gemini/settings.json",
+            home.join(".gemini/settings.json"),
+        )],
         Agent::Copilot => {
-            let copilot_home = std::env::var_os("COPILOT_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".copilot"));
+            let copilot_home = copilot_home()?;
             let mut paths = vec![
                 root.join(".claude/settings.json"),
                 root.join(".claude/settings.local.json"),
@@ -525,6 +603,9 @@ fn check_other_hooks(agent: Agent, root: &Path) -> Result<()> {
                 root.join(".github/copilot/settings.local.json"),
                 copilot_home.join("settings.json"),
             ];
+            if user {
+                paths.push(root.join(".github/hooks/agentscm-client.json"));
+            }
             if root.join(".github/hooks").is_dir() {
                 for (index, entry) in std::fs::read_dir(root.join(".github/hooks"))?
                     .take(129)
@@ -552,23 +633,34 @@ fn check_other_hooks(agent: Agent, root: &Path) -> Result<()> {
                         return Err(invalid("too many Copilot hook files to inspect"));
                     }
                     let path = entry?.path();
-                    if path.extension().is_some_and(|ext| ext == "json") {
+                    if path.extension().is_some_and(|ext| ext == "json")
+                        && !(user
+                            && path
+                                .file_name()
+                                .is_some_and(|name| name == "agentscm-client.json"))
+                    {
                         paths.push(path);
                     }
                 }
             }
             paths
+                .into_iter()
+                .map(|path| {
+                    let ours = user && path.ends_with(".github/hooks/agentscm-client.json");
+                    (path, ours)
+                })
+                .collect()
         }
         Agent::Codex => Vec::new(),
     };
-    for path in paths {
+    for (path, allow_owned) in paths {
         if let Some(text) = read(&path)? {
             let value: Value = serde_json::from_str(&text).map_err(|_| {
                 invalid(
                     "another native hook configuration is not strict JSON; review it before setup",
                 )
             })?;
-            if has_foreign_hooks(&value["hooks"], false)
+            if has_foreign_hooks(&value["hooks"], allow_owned)
                 || value["enabledPlugins"].as_object().is_some_and(|plugins| {
                     plugins.iter().any(|(name, enabled)| {
                         name.starts_with("agentscm@") && *enabled == json!(true)
@@ -591,14 +683,121 @@ fn installation_lock() -> Result<std::fs::File> {
     )
 }
 
-pub(crate) fn preflight(agent: Agent, root: &Path, program: &Path) -> Result<()> {
-    let _lock = installation_lock()?;
-    preflight_locked(agent, root, program)
+fn home() -> Result<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| invalid("HOME is not set"))
 }
 
-fn preflight_locked(agent: Agent, root: &Path, program: &Path) -> Result<()> {
-    check_other_hooks(agent, root)?;
-    plan(agent, root, program)?;
+fn copilot_home() -> Result<PathBuf> {
+    match std::env::var_os("COPILOT_HOME") {
+        Some(path) => Ok(PathBuf::from(path)),
+        None => Ok(home()?.join(".copilot")),
+    }
+}
+
+fn codex_home() -> Result<PathBuf> {
+    match std::env::var_os("CODEX_HOME") {
+        Some(path) => Ok(PathBuf::from(path)),
+        None => Ok(home()?.join(".codex")),
+    }
+}
+
+/// The user configuration files a user-scope setup writes for `agent`, its MCP file first.
+fn user_files(agent: Agent) -> Result<Vec<PathBuf>> {
+    let home = home()?;
+    let skill = "skills/coordinate-edits/SKILL.md";
+    Ok(match agent {
+        Agent::Claude => Vec::new(), // Its user-scope plugin.
+        Agent::Codex => vec![codex_home()?.join("config.toml")], // Hooks and skill: its plugin.
+        Agent::Cursor => vec![
+            home.join(".cursor/mcp.json"),
+            home.join(".cursor/hooks.json"),
+            home.join(".cursor").join(skill),
+        ],
+        Agent::Gemini => vec![
+            home.join(".gemini/settings.json"),
+            home.join(".gemini").join(skill),
+        ],
+        Agent::Copilot => {
+            let copilot = copilot_home()?;
+            vec![
+                copilot.join("mcp-config.json"),
+                copilot.join("hooks/agentscm-client.json"),
+                copilot.join(skill),
+            ]
+        }
+    })
+}
+
+struct UserEdit {
+    path: PathBuf,
+    before: Option<String>,
+    after: String,
+}
+
+fn user_plan(agent: Agent, program: &Path) -> Result<Vec<UserEdit>> {
+    program_text(program)?;
+    let args = &user_mcp_args(agent);
+    let mut edits = Vec::new();
+    for path in user_files(agent)? {
+        let before = read(&path)?;
+        let name = path.display().to_string();
+        let old = before.as_deref();
+        let json =
+            |result: Result<String>| result.map_err(|error| invalid(&format!("{name}: {error}")));
+        let after = match path.file_name().and_then(|file| file.to_str()) {
+            Some("SKILL.md") => check_skill(old).map(|()| SKILL.to_owned())?,
+            Some("config.toml") => codex_block(old.unwrap_or_default(), &name, args, program)?,
+            Some("settings.json") => json(edited_json(old, |v| {
+                add_mcp(v, "mcpServers", args, program)?;
+                add_hooks(v, agent, program)
+            }))?,
+            Some("mcp.json") => json(edited_json(old, |v| {
+                add_typed_mcp(v, "mcpServers", args, program, "stdio")
+            }))?,
+            Some("mcp-config.json") => json(edited_json(old, |v| {
+                add_typed_mcp(v, "mcpServers", args, program, "local")
+            }))?,
+            _ => json(edited_json(old, |v| add_hooks(v, agent, program)))?,
+        };
+        edits.push(UserEdit {
+            path,
+            before,
+            after,
+        });
+    }
+    Ok(edits)
+}
+
+/// Whether AgentSCM's user-scope entries for `agent` are installed; `false` when that is unknown.
+pub(crate) fn user_scope_installed(agent: Agent, root: &Path) -> bool {
+    if agent == Agent::Claude {
+        return crate::client_plugin::claude_plugin_installed(root);
+    }
+    let Ok(Some(path)) = user_files(agent).map(|files| files.into_iter().next()) else {
+        return false;
+    };
+    matches!(read(&path), Ok(Some(text)) if matches!(without_setup(&path.to_string_lossy(), &text, &user_mcp_args(agent)), Ok(Some(_))))
+}
+
+pub(crate) fn preflight(agent: Agent, root: &Path, program: &Path, scope: Scope) -> Result<()> {
+    let _lock = installation_lock()?;
+    preflight_locked(agent, root, program, scope)
+}
+
+/// Claude Code's setup is the same in both scopes: its plugin and the checkout's `.mcp.json`.
+fn user_scope(agent: Agent, scope: Scope) -> bool {
+    scope == Scope::User && agent != Agent::Claude
+}
+
+fn preflight_locked(agent: Agent, root: &Path, program: &Path, scope: Scope) -> Result<()> {
+    check_other_hooks(agent, root, scope)?;
+    if user_scope(agent, scope) {
+        user_plan(agent, program)?;
+    } else {
+        plan(agent, root, program)?;
+    }
     if agent == Agent::Codex {
         crate::client_plugin::preflight_for_root(root)?;
     }
@@ -718,20 +917,131 @@ fn write_plan(root: &Path, edits: Vec<Edit>, announce: bool) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn install(agent: Agent, root: &Path, program: &Path) -> Result<()> {
+/// AgentSCM's own part of a user configuration file, which is what setup shows changing: the
+/// rest of a shared file can hold other servers' credentials, and is rewritten with its keys in
+/// sorted order, so a whole-file diff would print it all.
+fn own_part(name: &str, text: Option<&str>) -> String {
+    let text = text.unwrap_or_default();
+    if name.ends_with(".toml") {
+        return match (text.find(BEGIN), text.find(END)) {
+            (Some(start), Some(end)) if start < end => {
+                format!("{}\n", &text[start..end + END.len()])
+            }
+            _ => String::new(),
+        };
+    }
+    if name.ends_with("SKILL.md") {
+        return text.to_owned();
+    }
+    let value: Value = serde_json::from_str(text).unwrap_or_default();
+    let mut ours = json!({});
+    for key in ["mcpServers", "servers"] {
+        if let Some(entry) = value[key].get("agentscm") {
+            ours[key] = json!({"agentscm": entry});
+        }
+    }
+    for (event, groups) in value["hooks"].as_object().into_iter().flatten() {
+        let mine: Vec<&Value> = groups
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|group| {
+                own_command(group)
+                    || group["hooks"]
+                        .as_array()
+                        .is_some_and(|hooks| hooks.iter().any(own_command))
+            })
+            .collect();
+        if !mine.is_empty() {
+            ours["hooks"][event.as_str()] = json!(mine);
+        }
+    }
+    serde_json::to_string_pretty(&ours).unwrap_or_default() + "\n"
+}
+
+/// Writes the user configuration a user-scope setup planned, showing the diff of AgentSCM's own
+/// entries first. A file that is a link (into a dotfiles repository, say) is written through,
+/// not replaced.
+fn write_user_plan(edits: Vec<UserEdit>, announce: bool) -> Result<()> {
+    for edit in edits {
+        if read(&edit.path)? != edit.before {
+            return Err(invalid(
+                "native configuration changed during setup; retry after reviewing it",
+            ));
+        }
+        if edit.before.as_deref() == Some(edit.after.as_str()) {
+            continue;
+        }
+        let shown = edit.path.display().to_string();
+        if announce {
+            let mut options = diffy::DiffOptions::new();
+            options
+                .set_original_filename(shown.clone())
+                .set_modified_filename(shown.clone());
+            println!(
+                "{}",
+                options.create_patch(
+                    &own_part(&shown, edit.before.as_deref()),
+                    &own_part(&shown, Some(&edit.after))
+                )
+            );
+        }
+        let path = std::fs::canonicalize(&edit.path).unwrap_or(edit.path);
+        crate::hub_cli::write_private(&path, &edit.after)?;
+        if announce {
+            println!("Configured {shown}");
+        }
+    }
+    Ok(())
+}
+
+/// After a user-scope setup, takes AgentSCM's checkout files for `agent` out of this checkout
+/// and every other connected one that has them, so no hook runs twice. Claude Code's
+/// `.mcp.json`, which Copilot setup may have refreshed, stays.
+fn migrate_checkouts(agent: Agent, root: &Path) -> Result<()> {
+    remove_files(agent, root, false)?;
+    let others = crate::client_config::load()?
+        .into_iter()
+        .filter(|connection| connection.root != root && connection.root.is_dir())
+        .filter(|connection| connection.agents.iter().any(|name| name == agent.name()));
+    for connection in others {
+        if let Err(error) = remove_files(agent, &connection.root, false) {
+            eprintln!(
+                "warning: AgentSCM's {} files in {} were left as they are ({error}), so its hooks may run twice there; run `agentscm client setup --agent {}` in that checkout",
+                agent.name(),
+                connection.root.display(),
+                agent.name()
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn install(agent: Agent, root: &Path, program: &Path, scope: Scope) -> Result<()> {
     let _lock = installation_lock()?;
-    install_locked(agent, root, program, true)
+    install_locked(agent, root, program, scope, true)
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn install_quiet(agent: Agent, root: &Path, program: &Path) -> Result<()> {
+pub(crate) fn install_quiet(agent: Agent, root: &Path, program: &Path, scope: Scope) -> Result<()> {
     let _lock = installation_lock()?;
-    install_locked(agent, root, program, false)
+    install_locked(agent, root, program, scope, false)
 }
 
-fn install_locked(agent: Agent, root: &Path, program: &Path, announce: bool) -> Result<()> {
-    check_other_hooks(agent, root)?;
-    let edits = plan(agent, root, program)?;
+fn install_locked(
+    agent: Agent,
+    root: &Path,
+    program: &Path,
+    scope: Scope,
+    announce: bool,
+) -> Result<()> {
+    check_other_hooks(agent, root, scope)?;
+    let user = user_scope(agent, scope);
+    let (edits, user_edits) = if user {
+        (Vec::new(), user_plan(agent, program)?)
+    } else {
+        (plan(agent, root, program)?, Vec::new())
+    };
     if agent == Agent::Codex {
         crate::client_plugin::install_for_root(root, program, announce)?;
     }
@@ -739,10 +1049,19 @@ fn install_locked(agent: Agent, root: &Path, program: &Path, announce: bool) -> 
         crate::client_plugin::install_claude_for_root(root, program)?;
     }
     write_plan(root, edits, announce)?;
+    if user {
+        write_user_plan(user_edits, announce)?;
+        migrate_checkouts(agent, root)?;
+    }
     if announce {
         println!(
-            "Native {} hooks, coordination skill and checkout-scoped MCP are configured.",
-            agent.name()
+            "Native {} hooks, coordination skill and MCP are configured {}.",
+            agent.name(),
+            if user {
+                "for all your projects"
+            } else {
+                "for this checkout"
+            }
         );
         println!(
             "Review the client's own project, hook and MCP approvals, then start a fresh session and verify it reaches the expected repository. Setup does not grant trust."
@@ -783,15 +1102,14 @@ fn written_files(agent: Agent) -> &'static [&'static str] {
 }
 
 /// `text` without the `agentscm` MCP entries and hooks `install` writes; anything else stays.
-fn without_ours(text: &str, root: &Path) -> Result<Value> {
+fn without_ours(text: &str, args: &Value) -> Result<Value> {
     let mut value: Value = serde_json::from_str(text)
         .map_err(|_| invalid("native configuration is not strict JSON"))?;
-    let args = mcp_args(root)?;
     for key in ["mcpServers", "servers"] {
         if let Some(servers) = value.get_mut(key).and_then(Value::as_object_mut) {
             if servers
                 .get("agentscm")
-                .is_some_and(|entry| entry["args"] == args)
+                .is_some_and(|entry| entry["args"] == *args)
             {
                 servers.remove("agentscm");
             }
@@ -830,8 +1148,8 @@ fn without_ours(text: &str, root: &Path) -> Result<Value> {
 }
 
 /// Takes out what `install` wrote for `agent` in the checkout at `root`, keeping everything
-/// else; with `last`, also the user-scope plugin no other checkout uses. A checkout that is
-/// gone has nothing left to take out.
+/// else; with `last`, also the user-scope plugin and entries no other checkout uses. A checkout
+/// that is gone has nothing left to take out.
 pub(crate) fn remove(agent: Agent, root: &Path, last: bool) -> Result<()> {
     let _lock = installation_lock()?;
     remove_locked(agent, root, last)
@@ -839,62 +1157,107 @@ pub(crate) fn remove(agent: Agent, root: &Path, last: bool) -> Result<()> {
 
 pub(crate) fn remove_locked(agent: Agent, root: &Path, last: bool) -> Result<()> {
     if root.is_dir() {
-        remove_files(agent, root)?;
+        remove_files(agent, root, true)?;
     }
-    if last && matches!(agent, Agent::Claude | Agent::Codex) {
-        crate::client_plugin::remove(agent == Agent::Claude)?;
+    if last {
+        if matches!(agent, Agent::Claude | Agent::Codex) {
+            crate::client_plugin::remove(agent == Agent::Claude)?;
+        }
+        remove_user_files(agent)?;
     }
     Ok(())
 }
 
-fn remove_files(agent: Agent, root: &Path) -> Result<()> {
-    {
-        for relative in written_files(agent) {
-            let path = local_path(root, relative)?;
-            let Some(text) = read(&path)? else {
-                continue;
-            };
-            if relative.ends_with("SKILL.md") {
-                if text == SKILL || text == PREVIOUS_SKILL {
-                    std::fs::remove_file(&path)?;
-                    prune_empty_parents(&path, root);
-                    unignore_file(root, relative)?;
-                    println!("Removed {relative}");
-                }
-                continue;
+/// `text` without what setup wrote into the file `name`, or `None` when none of it is there.
+/// An empty result means the file held only that.
+fn without_setup(name: &str, text: &str, args: &Value) -> Result<Option<String>> {
+    let after = if name.ends_with("SKILL.md") {
+        if text != SKILL && text != PREVIOUS_SKILL {
+            return Ok(None);
+        }
+        String::new()
+    } else if name.ends_with(".toml") {
+        match (text.find(BEGIN), text.find(END)) {
+            (Some(start), Some(end)) if start < end => format!(
+                "{}{}",
+                text[..start].trim_end_matches('\n'),
+                &text[end + END.len()..]
+            )
+            .trim_start_matches('\n')
+            .to_owned(),
+            _ => return Ok(None),
+        }
+    } else {
+        let value =
+            without_ours(text, args).map_err(|error| invalid(&format!("{name}: {error}")))?;
+        if serde_json::from_str::<Value>(text).ok().as_ref() == Some(&value) {
+            return Ok(None);
+        }
+        if value == json!({}) {
+            String::new()
+        } else {
+            serde_json::to_string_pretty(&value)? + "\n"
+        }
+    };
+    Ok((after != text).then_some(after))
+}
+
+/// With `shared`, also Claude Code's `.mcp.json` entry, which Copilot setup refreshes.
+fn remove_files(agent: Agent, root: &Path, shared: bool) -> Result<()> {
+    let args = mcp_args(root)?;
+    for relative in written_files(agent) {
+        if !shared && *relative == ".mcp.json" {
+            continue;
+        }
+        let path = local_path(root, relative)?;
+        let Some(text) = read(&path)? else {
+            continue;
+        };
+        let Some(after) = without_setup(relative, &text, &args)? else {
+            continue;
+        };
+        if after.trim().is_empty() {
+            std::fs::remove_file(&path)?;
+            prune_empty_parents(&path, root);
+            unignore_file(root, relative)?;
+            println!("Removed {relative}");
+        } else {
+            crate::hub_cli::write_private(&path, &after)?;
+            println!("Took AgentSCM out of {relative}");
+        }
+    }
+    Ok(())
+}
+
+/// Takes AgentSCM's user-scope entries for `agent` out of its user configuration.
+fn remove_user_files(agent: Agent) -> Result<()> {
+    let args = user_mcp_args(agent);
+    for path in user_files(agent)? {
+        let Some(text) = read(&path)? else {
+            continue;
+        };
+        let shown = path.display().to_string();
+        let Some(after) = without_setup(&shown, &text, &args)? else {
+            continue;
+        };
+        let link = path
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.file_type().is_symlink());
+        if after.trim().is_empty() && !link {
+            std::fs::remove_file(&path)?;
+            if shown.ends_with("SKILL.md") {
+                let _ = path.parent().map(std::fs::remove_dir);
             }
-            let after = if relative.ends_with(".toml") {
-                match (text.find(BEGIN), text.find(END)) {
-                    (Some(start), Some(end)) if start < end => format!(
-                        "{}{}",
-                        text[..start].trim_end_matches('\n'),
-                        &text[end + END.len()..]
-                    )
-                    .trim_start_matches('\n')
-                    .to_owned(),
-                    _ => continue,
-                }
+            println!("Removed {shown}");
+        } else {
+            // A link (into a dotfiles repository, say) keeps pointing at a valid file.
+            let after = if after.trim().is_empty() && shown.ends_with(".json") {
+                "{}\n".to_owned()
             } else {
-                let value = without_ours(&text, root)
-                    .map_err(|error| invalid(&format!("{relative}: {error}")))?;
-                if value == json!({}) {
-                    String::new()
-                } else {
-                    serde_json::to_string_pretty(&value)? + "\n"
-                }
+                after
             };
-            if after == text {
-                continue;
-            }
-            if after.trim().is_empty() {
-                std::fs::remove_file(&path)?;
-                prune_empty_parents(&path, root);
-                unignore_file(root, relative)?;
-                println!("Removed {relative}");
-            } else {
-                crate::hub_cli::write_private(&path, &after)?;
-                println!("Took AgentSCM out of {relative}");
-            }
+            crate::hub_cli::write_private(&std::fs::canonicalize(&path)?, &after)?;
+            println!("Took AgentSCM out of {shown}");
         }
     }
     Ok(())
@@ -934,7 +1297,7 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, kept.1).unwrap();
             write_plan(&root, plan(agent, &root, program).unwrap(), true).unwrap();
-            remove_files(agent, &root).unwrap();
+            remove_files(agent, &root, true).unwrap();
             for relative in written_files(agent) {
                 if *relative != kept.0 {
                     assert!(!root.join(relative).exists(), "{relative}");
@@ -962,7 +1325,7 @@ mod tests {
         let theirs = json!({"version":1,"hooks":{"preToolUse":[{"command":"my-check"}]}});
         std::fs::write(&hooks, theirs.to_string()).unwrap();
         std::fs::write(&skill, "my own skill\n").unwrap();
-        remove_files(Agent::Cursor, &root).unwrap();
+        remove_files(Agent::Cursor, &root, true).unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&std::fs::read_to_string(&hooks).unwrap()).unwrap(),
             theirs
@@ -1059,7 +1422,7 @@ mod tests {
 
     #[test]
     fn merge_preserves_other_settings_and_updates_only_client_owned_entries() {
-        let root = Path::new("/repo");
+        let root = &mcp_args(Path::new("/repo")).unwrap();
         let mut value = json!({"permissions":{"allow":["Read"]},"mcpServers":{"other":{"command":"other"}},"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"my-check"}]}]}});
         add_mcp(&mut value, "mcpServers", root, Path::new("/old/agentscm")).unwrap();
         add_hooks(&mut value, Agent::Claude, Path::new("/old/agentscm")).unwrap();
@@ -1095,7 +1458,7 @@ mod tests {
             add_mcp(
                 &mut legacy,
                 "mcpServers",
-                Path::new("/repo"),
+                &mcp_args(Path::new("/repo")).unwrap(),
                 Path::new("/opt/agentscm")
             )
             .is_err()
@@ -1138,7 +1501,7 @@ mod tests {
         let text = std::fs::read_to_string(&exclude).unwrap();
         assert!(text.contains("/.cursor/mcp.json"), "{text}");
         for agent in [Agent::Gemini, Agent::Cursor] {
-            remove_files(agent, &root).unwrap();
+            remove_files(agent, &root, true).unwrap();
         }
         assert!(root.is_dir());
         assert!(!root.join(".cursor").exists() && !root.join(".gemini").exists());
@@ -1178,8 +1541,7 @@ mod tests {
             "/work/%HOME%/repo",
         ] {
             assert!(mcp_args(Path::new(path)).is_err());
-            assert!(mcp(Path::new(path), Path::new("/opt/agentscm")).is_err());
-            assert!(mcp(&root, Path::new(path)).is_err());
+            assert!(mcp(&json!([]), Path::new(path)).is_err());
             assert!(codex_mcp(&root, Path::new(path)).is_err());
         }
     }
@@ -1315,5 +1677,96 @@ mod tests {
             assert_eq!(value["mcpServers"]["agentscm"]["type"], transport);
             assert_eq!(value["mcpServers"]["agentscm"]["command"], "/new/agentscm");
         }
+    }
+
+    #[test]
+    fn codex_finds_only_a_real_agentscm_server_outside_its_block() {
+        let program = Path::new("/opt/agentscm");
+        let args = user_mcp_args(Agent::Codex);
+        let trusted = "[projects.\"/work/agentscm\"]\ntrust_level = \"trusted\"\n";
+        let written = codex_block(trusted, "config.toml", &args, program).unwrap();
+        assert!(written.starts_with(trusted.trim_end()));
+        assert!(written.contains("args = [\"--no-telemetry\",\"client\",\"mcp\"]"));
+        let again = codex_block(&written, "config.toml", &args, program).unwrap();
+        assert_eq!(again.matches(BEGIN).count(), 1);
+        for foreign in [
+            "[mcp_servers.\"agentscm\"]\ncommand = \"x\"\n",
+            "mcp_servers = { agentscm = { command = \"x\" } }\n",
+            "[mcp_servers]\nagentscm.command = \"x\"\n",
+        ] {
+            let error = codex_block(foreign, "config.toml", &args, program)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains("outside the"), "{foreign}: {error}");
+        }
+        assert!(codex_block("not = [toml", "config.toml", &args, program).is_err());
+    }
+
+    #[test]
+    fn user_scope_mcp_finds_the_checkout_where_the_agent_starts_it() {
+        for agent in [Agent::Codex, Agent::Copilot, Agent::Gemini] {
+            assert_eq!(
+                user_mcp_args(agent),
+                json!(["--no-telemetry", "client", "mcp"])
+            );
+        }
+        assert_eq!(
+            user_mcp_args(Agent::Cursor),
+            json!([
+                "--no-telemetry",
+                "client",
+                "mcp",
+                "--root",
+                "${workspaceFolder}"
+            ])
+        );
+        // Removal recognises only the entry setup wrote.
+        let ours =
+            json!({"mcpServers":{"agentscm":{"args":user_mcp_args(Agent::Gemini)}},"theme":"dark"});
+        let theirs = json!({"mcpServers":{"agentscm":{"args":["mcp"]}}});
+        let args = user_mcp_args(Agent::Gemini);
+        assert_eq!(
+            without_setup("settings.json", &ours.to_string(), &args).unwrap(),
+            Some("{\n  \"theme\": \"dark\"\n}\n".to_owned())
+        );
+        assert_eq!(
+            without_setup("settings.json", &theirs.to_string(), &args).unwrap(),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_files_are_written_through_links_and_shown_without_other_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("dotfiles-mcp.json");
+        let link = dir.path().join("mcp.json");
+        let theirs = r#"{"mcpServers":{"other":{"env":{"API_KEY":"secret-value"}}}}"#;
+        std::fs::write(&target, theirs).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let args = user_mcp_args(Agent::Copilot);
+        let program = Path::new("/opt/agentscm");
+        let after = edited_json(Some(theirs), |v| {
+            add_typed_mcp(v, "mcpServers", &args, program, "local")
+        })
+        .unwrap();
+        let shown = own_part("mcp.json", Some(&after));
+        assert!(
+            shown.contains("agentscm") && !shown.contains("secret-value"),
+            "{shown}"
+        );
+        assert_eq!(own_part("mcp.json", Some(theirs)), "{}\n");
+        write_user_plan(
+            vec![UserEdit {
+                path: link.clone(),
+                before: Some(theirs.to_owned()),
+                after: after.clone(),
+            }],
+            true,
+        )
+        .unwrap();
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), after);
     }
 }

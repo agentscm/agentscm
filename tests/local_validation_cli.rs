@@ -42,6 +42,7 @@ fn command(id: &str, script: &str, timeout_secs: u64) -> RecipeCommand {
         id: id.into(),
         argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
         timeout_secs,
+        paths: None,
     }
 }
 
@@ -113,6 +114,7 @@ impl Fixture {
             },
             max_age_seconds: 3600,
             epoch: 1,
+            exempt_paths: None,
         };
         fs::write(
             root.join("registry.json"),
@@ -749,4 +751,124 @@ async fn moved_pr_head_is_refused_and_nothing_is_posted() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("head differs"));
     assert!(comments(&fake).is_empty());
     assert!(!f.state().join(format!("{sha}.posted.json")).exists());
+}
+
+fn scoped(id: &str, paths: &[&str]) -> RecipeCommand {
+    RecipeCommand {
+        paths: Some(paths.iter().map(|p| (*p).to_owned()).collect()),
+        ..command(id, "true", 30)
+    }
+}
+
+fn ran(record: &Value) -> Vec<&str> {
+    record["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect()
+}
+
+#[test]
+fn a_scoped_command_the_diff_does_not_touch_is_not_run_and_still_verifies() {
+    let f = Fixture::new(vec![command("gate", "true", 30), scoped("docs", &["docs"])]);
+    let (sha, code) = f.attest();
+    assert_eq!(code, 0);
+    let (envelope, record) = record_of(&f, &sha);
+    assert_eq!(ran(&record), ["gate"]);
+    assert_eq!(record["not_required"], serde_json::json!(["docs"]));
+    let omissions = envelope["payload"]["coverage"]["omissions"].to_string();
+    assert!(omissions.contains("not required: docs"));
+    assert!(!omissions.contains("skipped: docs"));
+    let body = f.show_to_file(&sha, "body.md");
+    assert!(
+        fs::read_to_string(&body)
+            .unwrap()
+            .contains("Not required by the changed paths: <code>docs</code>")
+    );
+    let (code, verdict) = f.verify(&body, "repo-1");
+    assert_eq!(
+        (code, verdict["state"].as_str()),
+        (0, Some("success")),
+        "{verdict}"
+    );
+}
+
+#[test]
+fn a_scoped_command_the_diff_touches_runs() {
+    let f = Fixture::new(vec![
+        command("gate", "true", 30),
+        scoped("work", &["b.txt"]),
+    ]);
+    let (sha, code) = f.attest();
+    assert_eq!(code, 0);
+    let (_, record) = record_of(&f, &sha);
+    assert_eq!(ran(&record), ["gate", "work"]);
+    assert!(record.get("not_required").is_none());
+    let body = f.show_to_file(&sha, "body.md");
+    assert_eq!(f.verify(&body, "repo-1").0, 0);
+}
+
+#[test]
+fn a_change_under_the_config_dir_or_verifier_workflow_requires_every_command() {
+    for path in [
+        ".github/local-validation/note.txt",
+        ".github/workflows/local-validation.yml",
+    ] {
+        let f = Fixture::new(vec![command("gate", "true", 30), scoped("docs", &["docs"])]);
+        fs::create_dir_all(f.repo().join(path).parent().unwrap()).unwrap();
+        fs::write(f.repo().join(path), "x").unwrap();
+        git(&f.repo(), &["add", "."]);
+        git(&f.repo(), &["commit", "-q", "-m", "trust input"]);
+        let (sha, code) = f.attest();
+        assert_eq!(code, 0, "{path}");
+        let (_, record) = record_of(&f, &sha);
+        assert_eq!(ran(&record), ["gate", "docs"], "{path}");
+        let body = f.show_to_file(&sha, "body.md");
+        assert_eq!(f.verify(&body, "repo-1").0, 0, "{path}");
+    }
+}
+
+#[test]
+fn an_attestation_for_an_older_head_does_not_cover_a_head_touching_scoped_paths() {
+    let f = Fixture::new(vec![command("gate", "true", 30), scoped("docs", &["docs"])]);
+    let (sha, _) = f.attest();
+    let body = f.show_to_file(&sha, "body.md");
+    // The attestation was made before the head changed under a path the command covers.
+    fs::create_dir(f.repo().join("docs")).unwrap();
+    fs::write(f.repo().join("docs/x.md"), "x").unwrap();
+    git(&f.repo(), &["add", "."]);
+    git(&f.repo(), &["commit", "-q", "-m", "docs"]);
+    let (sha2, _) = f.attest();
+    assert_ne!(sha, sha2);
+    // Replaying the old body for the new head is stale, never a pass.
+    assert_eq!(f.verify(&body, "repo-1").0, 3);
+    let body2 = f.show_to_file(&sha2, "body2.md");
+    assert_eq!(f.verify(&body2, "repo-1").0, 0);
+}
+
+#[test]
+fn unsafe_trust_paths_are_refused_by_run_and_verify() {
+    let f = ok_fixture();
+    let p = |n: &str| f.root().join(n).to_str().unwrap().to_owned();
+    for flag in [["--config-dir", "../x"], ["--verifier-workflow", "/abs"]] {
+        let out = f.cli(&[
+            "verify",
+            "--comment-body",
+            &p("none.md"),
+            "--policy",
+            &p("policy.json"),
+            "--registry",
+            &p("registry.json"),
+            "--recipe",
+            &p("recipe.json"),
+            "--repo",
+            f.repo().to_str().unwrap(),
+            "--repository",
+            "repo-1",
+            flag[0],
+            flag[1],
+        ]);
+        assert_eq!(out.status.code(), Some(2), "{flag:?}");
+    }
 }

@@ -325,7 +325,8 @@ struct Live {
     agents: Vec<String>,
     /// This run tried to set up at least one agent.
     wanted_agents: bool,
-    /// The user answered no to "Go ahead?" for the agent setup.
+    /// The user answered no to "Go ahead?", or no to installing for all projects when every
+    /// chosen agent needs that.
     declined: bool,
     /// Why setting up the coding agents failed.
     agent_error: Option<String>,
@@ -367,7 +368,7 @@ impl Live {
             (None, _) => off(
                 "no hub chosen",
                 &format!(
-                    "run `{cli} quickstart --local` for a hub on this machine, or `--hosted --hub-url URL` for your team's hub"
+                    "run `{cli} quickstart --local` for a hub on this machine, or `{cli} quickstart --hub-url URL` for your team's hub"
                 ),
             ),
             (Some(url), _) if !self.hub_up => off(
@@ -803,7 +804,7 @@ async fn choose_hub(cx: &mut Cx<'_>) -> Option<String> {
                 };
                 if url.is_empty() {
                     println!(
-                        "Skipping live warnings. Run quickstart again with --hosted --hub-url URL once the hub runs.\n"
+                        "Skipping live warnings. Run quickstart again with --hub-url URL once the hub runs.\n"
                     );
                     return None;
                 }
@@ -1152,6 +1153,51 @@ fn chosen_agents(cx: &Cx<'_>) -> Vec<crate::client_setup::Agent> {
     }
 }
 
+/// Where each agent is set up. For all projects is the default, so agents connect in any repo,
+/// but it reaches beyond this checkout, so say so and ask first, once: agents already set up
+/// that way are not asked about again. `--yes` answers yes, after the notice. A No sets up
+/// Cursor, Copilot and Gemini in this checkout only, and drops Claude Code and Codex, whose
+/// hooks come only from a user-scope plugin.
+#[cfg(unix)]
+fn agent_scopes(
+    cx: &Cx<'_>,
+    root: &Path,
+    agents: &[crate::client_setup::Agent],
+) -> Vec<(crate::client_setup::Agent, crate::client_setup::Scope)> {
+    use crate::client_setup::{Agent, Scope, user_scope_installed};
+    let (installed, new): (Vec<Agent>, Vec<Agent>) = agents
+        .iter()
+        .partition(|agent| user_scope_installed(**agent, root));
+    let user = |agents: &[Agent]| agents.iter().map(|agent| (*agent, Scope::User)).collect();
+    if new.is_empty() {
+        return user(&installed);
+    }
+    let names = new
+        .iter()
+        .map(|agent| agent.label())
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!(
+        "AgentSCM for {names} is installed for your user account, so it is in all your projects; `{} uninstall` removes it when no other connected checkout uses it.",
+        cli_command(cx)
+    );
+    if cx.ui.confirm(
+        &format!(
+            "Install AgentSCM for {names} in all your projects? It runs a quick check whenever an agent starts and only contacts a Hub in repos connected to it."
+        ),
+        true,
+    ) {
+        return user(agents);
+    }
+    let mut scopes: Vec<(Agent, Scope)> = user(&installed);
+    scopes.extend(
+        new.into_iter()
+            .filter(|agent| !matches!(agent, Agent::Claude | Agent::Codex))
+            .map(|agent| (agent, Scope::Checkout)),
+    );
+    scopes
+}
+
 /// The `client setup` line for every supported agent, for setting one up later.
 #[cfg(unix)]
 fn print_agent_setup_hints(cx: &Cx<'_>, hub: &str) {
@@ -1216,6 +1262,17 @@ async fn agents_stage(cx: &mut Cx<'_>) {
         println!("I can't tell where this program is, so I didn't set up {names}.");
         return;
     };
+    // Asked only once nothing else stops the setup, so a No is a real choice.
+    let agents = agent_scopes(cx, &root, &agents);
+    if agents.is_empty() {
+        cx.live.declined = true;
+        return;
+    }
+    let names = agents
+        .iter()
+        .map(|(agent, _)| agent.name())
+        .collect::<Vec<_>>()
+        .join(", ");
     // Quickstart owns this checkout's connection: an unchanged, valid one is kept as it is,
     // and anything else (another hub, another token file) is replaced after this notice.
     let existing = checkout_connection(&cx.found);

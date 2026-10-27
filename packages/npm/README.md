@@ -23,7 +23,7 @@ npx agentscm uninstall    # runs any other subcommand as given
 npx agentscm tray         # optional macOS status-bar companion
 ```
 
-The binary is kept in `~/.agentscm/bin` (`%USERPROFILE%\.agentscm\bin` on Windows). The checksum is always verified; provenance is verified when the GitHub CLI (`gh`) is installed and signed in, and otherwise the script says it was not checked. Supported: Linux and macOS on x64 and arm64, and Windows on x64 (a subset of commands). Elsewhere, use Docker.
+The binary is kept in `~/.agentscm/bin` (`%USERPROFILE%\.agentscm\bin` on Windows). The checksum is always verified; provenance is verified when the GitHub CLI (`gh`) is installed and signed in, and otherwise the script says it was not checked. The notice above and that one-line result are printed when a version is first downloaded (not before `--help`); later runs start AgentSCM directly, and `AGENTSCM_INSTALL_VERBOSE=1` prints them on every run. Supported: Linux and macOS on x64 and arm64, and Windows on x64 (a subset of commands). Elsewhere, use Docker.
 
 Details, manual verification and Docker: [docs/install.md](https://github.com/counterbranch/agentscm/blob/main/docs/install.md). Source and license (FSL-1.1-ALv2): https://github.com/counterbranch/agentscm
 

@@ -16,7 +16,7 @@ a published binary yet. Use the documentation at the matching release tag, or
 The first question the setup guide asks is where AgentSCM should run:
 
 - **Local, on this machine (recommended for the alpha).** The hub runs on your computer and your agents use it. Run `npx agentscm --local` to skip the question. Without a terminal (CI, or an agent's shell), add `--yes --github-login YOUR_LOGIN`.
-- **Hosted, a shared hub on a server for a team.** Not supported in the alpha: it will likely break and is not for production. Quickstart does not set up a server. `npx agentscm --hosted` prints the [hosted guide](hosted.md) for you to work through with your coding agent; once the team's hub runs, `npx agentscm --hosted --hub-url https://hub.example.com` connects this machine to it.
+- **Hosted, a shared hub on a server for a team.** Not supported in the alpha: it will likely break and is not for production. Quickstart does not set up a server. `npx agentscm --hosted` prints the [hosted guide](hosted.md) for you to work through with your coding agent; once the team's hub runs, `npx agentscm --hub-url https://hub.example.com` connects this machine to it.
 
 `install.sh` passes the same flags: `curl -fsSL .../install.sh | sh -s -- --local`.
 
@@ -24,7 +24,7 @@ The first question the setup guide asks is where AgentSCM should run:
 
 1. Ask the person: "Do you want to run AgentSCM locally on this machine (recommended for the alpha), or set up a hosted hub for a team (unsupported in the alpha)?"
 2. Local: run `npx agentscm --local` in their terminal so they can answer its prompts. If you have no terminal, ask for their GitHub login and run `npx agentscm --local --yes --github-login LOGIN`.
-3. Hosted: follow [hosted.md](hosted.md) step by step with them. If their team's hub already runs, ask for its URL and run `npx agentscm --hosted --hub-url URL`.
+3. Hosted: follow [hosted.md](hosted.md) step by step with them. If their team's hub already runs, ask for its URL and have them run `npx agentscm --hub-url URL` in their terminal, since it signs them in. Without a terminal, run it with `--yes` only after they have run `agentscm hub login --hub URL` themselves.
 
 Three ways to get AgentSCM. The first two download the release binary, check it, keep it in `~/.agentscm/bin` (`%USERPROFILE%\.agentscm\bin` on Windows) and start the setup guide (`agentscm quickstart`).
 
@@ -68,8 +68,10 @@ Use this as an explicit fallback on a supported Linux AMD64 or ARM64 Docker daem
 - Build provenance, only when the GitHub CLI (`gh`) is installed and signed in (`gh auth status` succeeds). The binary must be attested by this repository's `release.yml` for the matching tag, or it is deleted and not run. If `gh` is missing or not signed in, the installer says why and that it checked the checksum only.
 - To make a missing or signed-out `gh` an error, set `AGENTSCM_REQUIRE_PROVENANCE=1`.
 
-Successful installer verification prints one summary line. To include the verification
-command's details, set `AGENTSCM_INSTALL_VERBOSE=1`. Verification failures always show
+Successful installer verification prints one summary line. `npx agentscm` prints its notice and
+that line only when it first downloads a version, and never before `--help`; later runs start
+AgentSCM directly. To see them on every run, with the verification command's details, set
+`AGENTSCM_INSTALL_VERBOSE=1`. Verification failures always show
 diagnostics and stop installation.
 
 Checks run before anything is installed or linked.
@@ -85,7 +87,13 @@ is on PATH. On macOS or Linux, use `export PATH="$HOME/.agentscm/bin:$PATH"` in 
 current shell, or add that line to your shell's startup file for future terminals.
 You can also keep using `npx agentscm <subcommand>`.
 
-Remove them with `agentscm uninstall`.
+Remove them with `agentscm uninstall`. It leaves `~/.config/agentscm` (or `$XDG_CONFIG_HOME/agentscm`)
+with empty `.lock` files and a `connections.json` that lists no connections. The lock files stay on
+purpose: AgentSCM commands coordinate through them, and removing one while another command runs
+could let two commands change the same files at once. The folder can also keep `telemetry.json`
+(your telemetry choice and an installation id), `hook-notes/` markers, an empty `tokens/` folder
+and, after `agentscm open`, `front-door/` (run `agentscm open --stop` first). To remove everything,
+delete the folder when no AgentSCM command is running.
 
 The optional macOS tray is part of this same binary; no separate app install is needed. Run
 `npx agentscm tray` to open it. On macOS, once an interactive quickstart has connected your
@@ -164,6 +172,51 @@ Uninstall removes the owned tray login setting before removing its program. A ru
 be closed with **Quit AgentSCM Tray**.
 
 For an optional customer-operated Slack app, follow [Slack setup](slack.md). The same preparation commands support an installation agent, the official Slack CLI and manual app settings. A prepared private bundle can be supplied to `quickstart --hub local --slack-config-file ABSOLUTE_PATH`; installing the AgentSCM binary alone does not connect Slack.
+
+## Coding agents in every project
+
+`agentscm client setup --agent AGENT` (and quickstart) installs AgentSCM for your user account by
+default, so the agent's start-up check runs in every project, including a fresh clone, and only
+contacts a Hub in a checkout connected to one. Quickstart says so and asks first: "Install
+AgentSCM for ... in all your projects?" With `--yes` it answers yes after printing the same
+notice. It does not ask again for an agent that is already installed this way.
+
+| Agent | Hooks | MCP server | Coordination skill |
+|---|---|---|---|
+| Claude Code | user-scope plugin | the checkout's `.mcp.json` | in the plugin |
+| Codex | user-scope plugin | `$CODEX_HOME/config.toml` (`~/.codex`) | in the plugin |
+| Cursor | `~/.cursor/hooks.json` | `~/.cursor/mcp.json` | `~/.cursor/skills/coordinate-edits/` |
+| Gemini CLI | `~/.gemini/settings.json` | `~/.gemini/settings.json` | `~/.gemini/skills/coordinate-edits/` |
+| GitHub Copilot | `$COPILOT_HOME/hooks/agentscm-client.json` (`~/.copilot`) | `$COPILOT_HOME/mcp-config.json` | `$COPILOT_HOME/skills/coordinate-edits/` |
+
+In a shared file, setup changes only AgentSCM's own entries: the `agentscm` MCP server, hooks
+that run `agentscm hook AGENT --client-connection`, and the block between
+`# agentscm:client-begin` and `# agentscm:client-end` in Codex's `config.toml`. Everything else is
+kept, with the same values, though a JSON file is rewritten with its keys in sorted order. Before
+writing each file it prints the diff of AgentSCM's own entries (not the rest, which can hold other
+servers' credentials), and it refuses a file that already has an `agentscm` entry it did not
+write. A file that is a link, into a dotfiles repository say, is written through, not replaced.
+
+The user-scope MCP server finds the checkout from the directory the agent starts it in (Cursor:
+from `${workspaceFolder}`). In a checkout that is not connected it offers no tools and answers
+without contacting anything. When the checkout gets connected while the agent runs, the server
+tells the agent its tools changed at the agent's next MCP request; an agent that ignores that
+shows the tools in its next session.
+
+The agents' own approvals still apply: Codex asks you to trust new or changed hooks in `/hooks`,
+Gemini CLI skips settings hooks and MCP servers in a folder you have not trusted, and Cursor asks
+to enable a new MCP server.
+
+`--checkout-only` writes the hooks, MCP entry and skill into the checkout instead, as earlier
+versions did, so they run only there; quickstart does this when you answer No (Claude Code and
+Codex are then not set up, since their hooks come only from a user-scope plugin). The two cannot
+be mixed for one agent: setting an agent up for all projects takes AgentSCM's files for that agent
+out of every connected checkout, and a checkout-only setup is refused while the agent is installed
+for all projects. `agentscm client remove` and `agentscm uninstall` take the user-scope entries out
+once no other connected checkout uses that agent.
+
+Other agents (Grok Build, Windsurf, Cline, Amp, opencode, Kiro, Aider) have no native AgentSCM
+setup; [other agents](agents.md#other-agents) says what each supports and how to wire it by hand.
 
 ## Platforms
 

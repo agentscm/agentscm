@@ -456,6 +456,62 @@ pub(crate) fn clean(text: &str) -> String {
     text.chars().filter(|c| !c.is_control()).collect()
 }
 
+/// A moment for people: local month, day and time plus how far away it is, such as
+/// `Nov 25, 14:03 (in 30 days)`.
+pub(crate) fn when(epoch: i64, now: i64) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let (month, day, hour, minute) = civil(epoch);
+    let away = epoch.saturating_sub(now);
+    // Nearest unit, so a 30-day token printed a moment after minting still says 30 days.
+    let s = away.unsigned_abs();
+    let (minutes, hours) = ((s + 30) / 60, (s + 1800) / 3600);
+    let (count, unit) = if minutes < 60 {
+        (minutes, "minute")
+    } else if hours < 24 {
+        (hours, "hour")
+    } else {
+        ((s + 43_200) / 86_400, "day")
+    };
+    let plural = if count == 1 { "" } else { "s" };
+    let relative = if count == 0 {
+        "now".to_owned()
+    } else if away >= 0 {
+        format!("in {count} {unit}{plural}")
+    } else {
+        format!("{count} {unit}{plural} ago")
+    };
+    format!(
+        "{} {day}, {hour:02}:{minute:02} ({relative})",
+        MONTHS[month as usize - 1]
+    )
+}
+
+/// Local (month, day, hour, minute) on Unix; UTC elsewhere.
+fn civil(epoch: i64) -> (i64, i64, i64, i64) {
+    #[cfg(unix)]
+    {
+        let time = epoch as libc::time_t;
+        // SAFETY: `tm` is plain integers plus a `tm_zone` pointer that localtime_r sets, so
+        // all-zero is a valid value; localtime_r writes only that `tm` and returns null on failure.
+        let local = unsafe {
+            let mut tm: libc::tm = std::mem::zeroed();
+            (!libc::localtime_r(&time, &mut tm).is_null()).then_some(tm)
+        };
+        if let Some(tm) = local {
+            return (
+                i64::from(tm.tm_mon) + 1,
+                i64::from(tm.tm_mday),
+                i64::from(tm.tm_hour),
+                i64::from(tm.tm_min),
+            );
+        }
+    }
+    let (_, month, day, hour, minute, _) = agentscm::civil::utc_civil(epoch);
+    (month, day, hour, minute)
+}
+
 /// The Hub's own sentence for any refusal kind that carries one (the reason and its one fix,
 /// such as `insufficient_role`); `None` when the reply has none. Bounded, one terminal line.
 pub(crate) fn refusal_message(reply: &Value) -> Option<String> {
@@ -1130,10 +1186,12 @@ async fn token(command: TokenCommand) -> Result<()> {
         (404, TokenCommand::Revoke { .. }) => Err(invalid("no such token of yours")),
         (201, TokenCommand::Create { .. }) => {
             eprintln!(
-                "created {} for {} (expires at unix {})",
-                reply["id"].as_str().unwrap_or("?"),
-                reply["repository"].as_str().unwrap_or("?"),
+                "created {} for {} (expires {})",
+                clean(reply["id"].as_str().unwrap_or("?")),
+                clean(reply["repository"].as_str().unwrap_or("?")),
                 reply["expires_at"]
+                    .as_i64()
+                    .map_or_else(|| "at an unknown time".to_owned(), |at| when(at, unix_now()))
             );
             println!("{}", reply["token"].as_str().unwrap_or_default());
             Ok(())
@@ -1338,6 +1396,29 @@ mod tests {
                 .contains("--hub")
         );
         assert!(pick_default_hub(Some("not a url".into()), &one).is_err());
+    }
+
+    #[test]
+    fn moments_read_as_a_date_and_a_distance() {
+        let now = 1_764_000_000;
+        let later = when(now + 30 * 86_400, now);
+        assert!(later.ends_with(" (in 30 days)"), "{later}");
+        let month = &later[..3];
+        assert!(
+            [
+                "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+            ]
+            .contains(&month),
+            "{later}"
+        );
+        assert!(when(now + 30 * 86_400, now + 2).ends_with("(in 30 days)"));
+        assert!(when(now + 3599, now).ends_with("(in 1 hour)"));
+        assert!(when(now + 90, now).ends_with("(in 2 minutes)"));
+        assert!(when(now + 3600, now).ends_with("(in 1 hour)"));
+        assert!(when(now - 2 * 86_400, now).ends_with("(2 days ago)"));
+        assert!(when(now, now).ends_with("(now)"));
+        assert!(when(i64::MIN, now).ends_with("ago)"));
+        assert!(!later.contains(&now.to_string()));
     }
 
     #[test]

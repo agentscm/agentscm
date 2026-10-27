@@ -181,6 +181,19 @@ fn plan(root: &Path, agents: &[Agent], hub: Option<&str>) -> Vec<Planned> {
                     status: Status::Skip("it resolves to a path outside the repository".into()),
                 };
             }
+            // A CLAUDE.md that is a link to AGENTS.md would make AGENTS.md import itself.
+            if matches!(target.content, targets::Content::Import(_))
+                && same_file(&path, &root.join("AGENTS.md"))
+            {
+                return Planned {
+                    path: target.path,
+                    old: String::new(),
+                    new: String::new(),
+                    status: Status::Skip(
+                        "it is the same file as AGENTS.md, which holds the instructions".into(),
+                    ),
+                };
+            }
             let existing = match std::fs::read_to_string(&path) {
                 Ok(text) => Some(text),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -208,6 +221,13 @@ fn plan(root: &Path, agents: &[Agent], hub: Option<&str>) -> Vec<Planned> {
             }
         })
         .collect()
+}
+
+fn same_file(left: &Path, right: &Path) -> bool {
+    matches!(
+        (std::fs::canonicalize(left), std::fs::canonicalize(right)),
+        (Ok(left), Ok(right)) if left == right
+    )
 }
 
 /// Whether `path` (following symlinks, for the part that exists) is inside `root`: a cloned
@@ -386,6 +406,25 @@ mod tests {
                 .skipped
                 .iter()
                 .any(|(p, _)| p.starts_with(".cursor"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_claude_md_linked_to_agents_md_does_not_import_itself() {
+        let dir = repo();
+        let root = dir.path();
+        std::fs::write(root.join("AGENTS.md"), "# Team\n").unwrap();
+        std::os::unix::fs::symlink("AGENTS.md", root.join("CLAUDE.md")).unwrap();
+        let outcome = run_all(root, None);
+        assert!(!read(root, "AGENTS.md").contains("@AGENTS.md"));
+        assert!(read(root, "AGENTS.md").contains("agentscm:begin"));
+        assert!(outcome.skipped.iter().any(|(p, _)| p == "CLAUDE.md"));
+        assert!(
+            std::fs::symlink_metadata(root.join("CLAUDE.md"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
     }
 

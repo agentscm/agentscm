@@ -4,11 +4,14 @@ name: Local validation verifier
 # default branch from maintainer-signed attestation comments. It builds only the default
 # branch; pull request heads are fetched as Git data by `agentscm local-validation reconcile`
 # and are never checked out, built or run. Policy, recipe and registry come from the default
-# branch checkout.
+# branch checkout. It also runs on pull request events so a head that changes only exempt paths
+# gets its status promptly.
 
 on:
   issue_comment: # zizmor: ignore[dangerous-triggers] default-branch build only; the PR head is fetched as Git data, never built or run
     types: [created, edited, deleted]
+  pull_request_target: # zizmor: ignore[dangerous-triggers] default-branch build only; the PR head is fetched as Git data, never built or run
+    types: [opened, synchronize, reopened, edited] # edited runs only for a base change, see the job `if:`
   push:
     branches: [main]
     paths:
@@ -35,8 +38,9 @@ jobs:
       cancel-in-progress: false
     # For comments: only pull request comments from trusted associations that start with the
     # attestation marker, or that did before an edit removed it so the old success is replaced
-    # (the signature still decides; this limits compute abuse and replay).
-    if: ${{ github.event_name != 'issue_comment' || (github.event.issue.pull_request && (startsWith(github.event.comment.body, '<!-- agentscm-local-validation:v1 ') || (github.event.action == 'edited' && startsWith(github.event.changes.body.from, '<!-- agentscm-local-validation:v1 '))) && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) }}
+    # (the signature still decides; this limits compute abuse and replay). For pull_request_target,
+    # `edited` runs only when the base changed, not for any title or body edit by any author.
+    if: ${{ (github.event_name != 'pull_request_target' || github.event.action != 'edited' || github.event.changes.base) && (github.event_name != 'issue_comment' || (github.event.issue.pull_request && (startsWith(github.event.comment.body, '<!-- agentscm-local-validation:v1 ') || (github.event.action == 'edited' && startsWith(github.event.changes.body.from, '<!-- agentscm-local-validation:v1 '))) && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:

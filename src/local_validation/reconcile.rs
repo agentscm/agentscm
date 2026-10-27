@@ -4,6 +4,10 @@
 //! Safety order: every opted-in head is first set to `pending`, so a crash can leave `pending`
 //! but never a stale `success`; each later status write is preceded by a re-read of the pull
 //! requests and comments, and is skipped when anything changed (a newer run owns the verdict).
+//! When the policy has `exempt_paths`, then, after that invalidation, every open pull request whose
+//! head is not shared is checked against Git: a head whose change is non-empty, touches no trust
+//! input and only exempt paths gets `success` without an attestation, ahead of any attestation
+//! verdict. An unmarked head that is not exempt gets nothing; a shared head gets no exemption.
 //! Pull request code is never checked out, built or run; heads are fetched as Git data only.
 //!
 //! ponytail: invalidate-first writes two statuses per opted-in head per run, and GitHub keeps
@@ -16,7 +20,9 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::comment::MARKER_PREFIX;
-use super::run::{config_dir_unchanged, fetch_pull, observe};
+use super::run::{
+    config_dir_unchanged, fetch_pull, observe, only_exempt, required_commands, trust_paths,
+};
 use super::{Observed, ValidationPolicy, ValidationRecipe, VerdictState, select};
 use crate::evidence::EvaluationClock;
 use crate::hub::github::{Api, CommitStatus, Gh, GhError, StatusState};
@@ -102,6 +108,8 @@ pub struct Context<'a> {
     /// Repository-relative directory of the policy, recipe and registry; its tree at the checkout
     /// `HEAD` must equal `origin/<base>`'s before a verdict is written.
     pub config_dir: &'a str,
+    /// Verifier workflow path relative to the checkout; with `config_dir` it is a trust input.
+    pub verifier_workflow: &'a str,
     /// Local checkout whose `origin` is the repository.
     pub git_repo: &'a Path,
     /// The policy's repository identity.
@@ -266,6 +274,20 @@ impl Context<'_> {
         })
     }
 
+    /// Whether the head's change is only exempt paths; Err when it could not be fetched or read.
+    fn exempt(&self, c: &Candidate, exempt: &[String]) -> Result<bool, String> {
+        tokio::task::block_in_place(|| {
+            fetch_pull(self.git_repo, self.base, c.number, &c.head)?;
+            let git = observe(self.git_repo, &c.head, &format!("origin/{}", self.base))?;
+            if git.commit != c.head {
+                return Ok(Err("fetched commit differs from the head".to_owned()));
+            }
+            let trust = trust_paths(self.config_dir, self.verifier_workflow);
+            only_exempt(self.git_repo, &git.merge_base, &git.commit, exempt, &trust).map(Ok)
+        })
+        .map_err(|error| format!("{error:?}"))?
+    }
+
     /// Err when the head could not be fetched or observed: nothing is written for it.
     fn verdict(&self, c: &Candidate) -> Result<(StatusState, String), String> {
         let git = tokio::task::block_in_place(|| {
@@ -284,6 +306,19 @@ impl Context<'_> {
             .map_or(EvaluationClock::Uncertain, |unix_ms| {
                 EvaluationClock::Known { unix_ms }
             });
+        let trust = trust_paths(self.config_dir, self.verifier_workflow);
+        let required = match tokio::task::block_in_place(|| {
+            required_commands(
+                self.git_repo,
+                &git.merge_base,
+                &git.commit,
+                self.recipe,
+                &trust,
+            )
+        }) {
+            Ok(required) => required,
+            Err(error) => return Err(format!("{error:?}")),
+        };
         let bodies: Vec<&str> = c.bodies.iter().map(String::as_str).collect();
         let verdict = select(
             &bodies,
@@ -296,6 +331,7 @@ impl Context<'_> {
                 tree: &git.tree,
                 base_ref: self.base,
                 merge_base: &git.merge_base,
+                required: &required,
             },
             clock,
         );
@@ -315,7 +351,7 @@ impl Context<'_> {
             Err(error) => return read_error("open pull requests", &error),
         };
         let mut tally = Tally::default();
-        let mut work = Vec::new();
+        let mut candidates = Vec::new();
         for pull in pulls.iter().filter(|p| p.base == self.base) {
             if !is_sha(&pull.head) {
                 println!("PR #{}: unexpected head; skipped", pull.number);
@@ -335,22 +371,25 @@ impl Context<'_> {
             } else {
                 true
             };
-            if !opted_in {
-                println!("PR #{}: not opted in; nothing written", pull.number);
-                continue;
-            }
-            work.push(Candidate {
+            let candidate = Candidate {
                 number: pull.number,
                 head: pull.head.clone(),
                 fingerprint: fingerprint(&attestations),
                 bodies: attestations.iter().map(|c| c.body.clone()).collect(),
-            });
+            };
+            if opted_in {
+                candidates.push((candidate, true));
+            } else if self.policy.exempt_paths.is_some() {
+                candidates.push((candidate, false));
+            } else {
+                println!("PR #{}: not opted in; nothing written", pull.number);
+            }
         }
 
         // Invalidate first.
         let mut invalidated = HashSet::new();
         let mut attempted = HashSet::new();
-        for c in &work {
+        for (c, _) in candidates.iter().filter(|(_, opted_in)| *opted_in) {
             if attempted.insert(c.head.clone())
                 && self
                     .write(
@@ -368,9 +407,98 @@ impl Context<'_> {
             }
         }
 
+        // Exempt-only heads (not shared) get success; an opted-in head was set pending above.
+        let mut exempted = HashSet::new();
+        if let Some(paths) = &self.policy.exempt_paths {
+            for (c, opted_in) in &candidates {
+                if shared(&pulls, &c.head) {
+                    continue;
+                }
+                match self.exempt(c, paths) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    // An opted-in head goes on to its own verdict, which fails the same way.
+                    Err(why) => {
+                        if !opted_in {
+                            // Not opted in: a warning, not an error an outside author can force.
+                            eprintln!(
+                                "warning: PR #{} {}: head could not be checked for exempt paths ({why}); nothing written",
+                                c.number, c.head
+                            );
+                        }
+                        continue;
+                    }
+                }
+                exempted.insert(c.head.clone());
+                match self.recheck(c).await {
+                    Err(error) => {
+                        tally.fail(
+                            &format!(
+                                "PR #{} {}: re-check failed; nothing written",
+                                c.number, c.head
+                            ),
+                            &error,
+                        );
+                        if tally.stop {
+                            return 1;
+                        }
+                        continue;
+                    }
+                    Ok(Recheck::Changed(why)) => {
+                        println!(
+                            "PR #{} {}: {why}; nothing written (a newer event owns the verdict)",
+                            c.number, c.head
+                        );
+                        continue;
+                    }
+                    Ok(Recheck::Shared) => {
+                        println!(
+                            "PR #{} {}: shared head; exemption not applied",
+                            c.number, c.head
+                        );
+                        continue;
+                    }
+                    Ok(Recheck::Current) => {}
+                }
+                match self.config_current() {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        println!(
+                            "PR #{} {}: default-branch verifier configuration changed since checkout; a newer run owns the verdict",
+                            c.number, c.head
+                        );
+                        break;
+                    }
+                    Err(error) => {
+                        tally.errors += 1;
+                        eprintln!(
+                            "PR #{} {}: verifier configuration could not be checked ({error:?}); nothing written",
+                            c.number, c.head
+                        );
+                        continue;
+                    }
+                }
+                let reason = "not required: only exempt paths changed";
+                if self
+                    .write(&c.head, StatusState::Success, reason, &mut tally)
+                    .await
+                {
+                    println!("PR #{} {}: success ({reason})", c.number, c.head);
+                }
+                if tally.stop {
+                    return 1;
+                }
+            }
+        }
+
+        let work: Vec<&Candidate> = candidates
+            .iter()
+            .filter(|(c, opted_in)| *opted_in && !exempted.contains(&c.head))
+            .map(|(c, _)| c)
+            .collect();
         let heads = by_head(&pulls);
         let mut done = HashSet::new();
-        for c in &work {
+        for c in work {
             if !invalidated.contains(&c.head) {
                 println!("PR #{} {}: not invalidated; not verified", c.number, c.head);
                 continue;

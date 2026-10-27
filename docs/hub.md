@@ -140,6 +140,9 @@ from a flag. A half-configured provider stops startup.
 
 ## Signing in and agent tokens
 
+Team members join with one command from their clone: `npx agentscm --hub-url URL`. It signs in
+and connects their agents; see [team member onboarding](team-member-onboarding.md).
+
 `agentscm hub login --hub URL [--provider github|gitlab]` tries the forge's
 device flow first: it prints a code and a verification URL to stderr and polls
 as the forge's `interval` and `slow_down` replies allow. If the forge or its
