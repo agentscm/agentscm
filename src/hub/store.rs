@@ -1124,6 +1124,7 @@ pub fn mint_web_read_token(
     )
 }
 
+#[allow(clippy::too_many_arguments)] // private helper with three named wrappers; a parameter struct would only rename them
 fn mint(
     store: &dyn Store,
     owner: &str,
