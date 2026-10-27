@@ -1279,7 +1279,14 @@ another project are ignored). Event publication (`hub publish --event`) stays Gi
 Shared-name and other-host isolation, and the shared-name limit above, apply as for GitHub.
 
 A GitLab commit status on the MR head SHA is not a verified merged-result pipeline, merge-train
-result or "pipelines must succeed" result. An external status may join or create a pipeline
+result or "pipelines must succeed" result. AgentSCM does not post `agentscm/workflow/<target>`
+on the commits of GitLab merged-result pipelines or merge trains; the status stays on the exact
+MR head, so a GitLab green status says nothing about the merged result or the train. Those
+pipelines run on a temporary merged commit that GitLab builds and native qualification does not
+cover. Whether an external status (with or without a `pipeline_id`) joins or gates such a
+pipeline, whether a pending status stalls a train and whether `failed` drops an MR from the
+train are unverified. This stays out of scope until verified live on a disposable GitLab Premium
+project, under separate authority. An external status may join or create a pipeline
 for that ref. Configuring GitLab "required status checks" or "pipelines must succeed" is
 operator-owned and unverified; the Hub reports `protection: "unverified"`. AgentSCM never
 alters protections, approves, merges or uses administrator bypass. Any user with the
