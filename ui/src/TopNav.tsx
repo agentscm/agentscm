@@ -92,12 +92,22 @@ function useHash(): string {
 export function SectionTabs({ label }: { label?: string }) {
   const chrome = useContext(ChromeContext)
   const hash = useHash()
+  const strip = useRef<HTMLElement>(null)
+  // On a phone the strip scrolls sideways: keep the open tab in view instead of cut off at the edge.
+  useLayoutEffect(() => {
+    const s = strip.current
+    const on = s?.querySelector('[aria-current="page"]')
+    if (!s || !on) return
+    const a = s.getBoundingClientRect()
+    const b = on.getBoundingClientRect()
+    s.scrollLeft += b.left - a.left - (a.width - b.width) / 2
+  }, [chrome?.section, hash])
   if (!chrome || chrome.hubSignedOut) return null
   const tabs = tabsFor(chrome.sections, chrome.section, hash)
   if (tabs.length === 0) return null
   const nav = chrome.sections.find((s) => s.key === chrome.section)?.nav
   return (
-    <nav className="htabs" data-tour="tabs" aria-label={label ?? `${nav ?? ''} views`} style={{ ['--n' as string]: String(tabs.length) }}>
+    <nav ref={strip} className="htabs" data-tour="tabs" aria-label={label ?? `${nav ?? ''} views`} style={{ ['--n' as string]: String(tabs.length) }}>
       {tabs.map((t) => {
         const st = chrome.statuses[t.key]
         return (

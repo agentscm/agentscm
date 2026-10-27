@@ -2985,3 +2985,13 @@ a.brief-cite:hover {
 .wl-guidance li {
   align-items: baseline;
 }
+
+/* ---------- icon-only boxes: centre the glyph itself ----------
+   Bootstrap Icons nudge each glyph down 0.125em to sit on a text baseline, and the icon inherits the
+   text's line height. In a box that only holds an icon, both push the glyph off centre. */
+:is(.burger, .search-pill, .top-icon, .tour-trigger, .side-icon, .repo-mark, .attn-icon, .event-icon, .run-icon, .step-mark, .track-dot, .box-badge, .snap-dot, .lb-hit, .empty-icon) > .bi {
+  line-height: 1;
+}
+:is(.burger, .search-pill, .top-icon, .tour-trigger, .side-icon, .repo-mark, .attn-icon, .event-icon, .run-icon, .step-mark, .track-dot, .box-badge, .snap-dot, .lb-hit, .empty-icon) > .bi::before {
+  vertical-align: top;
+}

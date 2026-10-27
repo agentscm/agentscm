@@ -20,3 +20,14 @@ for (const [hash, row] of [['landed', '.landed-row'], ['workspace', '.ws-run']] 
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true)
   })
 }
+
+for (const hash of ['computers', 'settings', 'templates']) {
+  test(`#${hash} keeps its open tab in view in the sideways-scrolling strip`, async ({ page }) => {
+    await page.evaluate((h) => (window.location.hash = h), hash)
+    const open = page.locator('.htabs [aria-current="page"]')
+    await expect(open).toBeVisible()
+    const { tab, strip } = await open.evaluate((el) => ({ tab: el.getBoundingClientRect().toJSON() as DOMRect, strip: el.parentElement!.getBoundingClientRect().toJSON() as DOMRect }))
+    expect(tab.left).toBeGreaterThanOrEqual(strip.left - 1)
+    expect(tab.right).toBeLessThanOrEqual(strip.right + 1)
+  })
+}

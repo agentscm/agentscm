@@ -441,7 +441,10 @@ a.pop-item:hover, button.pop-item:hover { background: var(--hub-muted-soft); col
 .pop-item.is-current { align-items: center; background: var(--hub-brand-soft); }
 .pop-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .pop-main code { font-size: 0.82rem; color: var(--hub-text); }
-.pop-sub { font-size: 0.75rem; font-weight: 400; color: var(--hub-text-3); display: inline-flex; gap: 4px; align-items: center; }
+/* Block, not flex: a flex line would split text and a <code> into side-by-side columns. */
+.pop-sub { font-size: 0.75rem; font-weight: 400; color: var(--hub-text-3); display: block; }
+.pop-sub > .bi { margin-right: 4px; }
+.pop-sub code { white-space: nowrap; }
 .pop-check { color: var(--hub-brand); }
 .pop-note { margin: 6px 4px 4px; padding: 10px; display: flex; gap: 8px; font-size: 0.78rem; line-height: 1.45; color: var(--hub-text-2); background: var(--hub-sunken); border: 1px solid var(--hub-rule); border-radius: 10px; }
 .pop-note .bi { color: var(--hub-brand); margin-top: 1px; }
