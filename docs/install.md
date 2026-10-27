@@ -16,13 +16,13 @@ a published binary yet. Use the documentation at the matching release tag, or
 The first question the setup guide asks is where AgentSCM should run:
 
 - **Local, on this machine (recommended for the alpha).** The hub runs on your computer and your agents use it. Run `npx agentscm --local` to skip the question. Without a terminal (CI, or an agent's shell), add `--yes --github-login YOUR_LOGIN`.
-- **Hosted, a shared hub on a server for a team.** Not supported in the alpha: it will likely break and is not for production. Quickstart does not set up a server. `npx agentscm --hosted` prints the [hosted guide](hosted.md) for you to work through with your coding agent; once the team's hub runs, `npx agentscm --hub-url https://hub.example.com` connects this machine to it.
+- **Hosted, a shared hub on a server for a team.** If the team's hub already runs, `npx agentscm --hub-url https://hub.example.com` connects this machine to it and signs you in through your browser. Operating your own hosted hub is not supported in the alpha: it will likely break and is not for production. Quickstart does not set up a server; `npx agentscm --hosted` prints the [hosted guide](hosted.md) for you to work through with your coding agent.
 
 `install.sh` passes the same flags: `curl -fsSL .../install.sh | sh -s -- --local`.
 
 ### If you are an agent installing AgentSCM for someone
 
-1. Ask the person: "Do you want to run AgentSCM locally on this machine (recommended for the alpha), or set up a hosted hub for a team (unsupported in the alpha)?"
+1. Ask the person: "Do you want to run AgentSCM locally on this machine (recommended for the alpha), join your team's existing hosted hub, or operate a new hosted hub for a team (unsupported in the alpha)?"
 2. Local: run `npx agentscm --local` in their terminal so they can answer its prompts. If you have no terminal, ask for their GitHub login and run `npx agentscm --local --yes --github-login LOGIN`.
 3. Hosted: follow [hosted.md](hosted.md) step by step with them. If their team's hub already runs, ask for its URL and have them run `npx agentscm --hub-url URL` in their terminal, since it signs them in. Without a terminal, run it with `--yes` only after they have run `agentscm hub login --hub URL` themselves.
 
@@ -78,7 +78,7 @@ Checks run before anything is installed or linked.
 
 ## Where files go
 
-On Linux and macOS, `~/.agentscm/bin/agentscm-<version>` is the binary, and `~/.agentscm/bin/agentscm` is a symlink to the latest installed one.
+On Linux and macOS, `~/.agentscm/bin/agentscm-<version>` is the binary, and `~/.agentscm/bin/agentscm` is a symlink to the latest installed one. When quickstart copies a build that is not a release (built from a Git checkout), the file is named `agentscm-<version>+<commit>`, so it never takes or collides with a release's file; quickstart replaces an older build of the same commit but never a release file.
 
 On Windows, `%USERPROFILE%\.agentscm\bin\agentscm-<version>.exe` is the binary, and `agentscm.exe` in the same directory is a copy of the latest installed one, not a symlink (symlinks need extra privileges on Windows). If `agentscm.exe` is running when you install a newer version, it cannot be replaced; the installer warns, keeps the old copy and runs the new versioned binary.
 
@@ -185,6 +185,11 @@ default, so the agent's start-up check runs in every project, including a fresh 
 contacts a Hub in a checkout connected to one. Quickstart says so and asks first: "Install
 AgentSCM for ... in all your projects?" With `--yes` it answers yes after printing the same
 notice. It does not ask again for an agent that is already installed this way.
+
+Setup never writes to the repository: hooks, MCP entries, tokens and the Hub URL live in your user
+account and `~/.config/agentscm`, so `git status` stays clean, which matters on a public
+repository. Only `agentscm init-repo` (or `quickstart --init`) writes committable instruction
+files, and they name no Hub.
 
 | Agent | Hooks | MCP server | Coordination skill |
 |---|---|---|---|

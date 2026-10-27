@@ -110,6 +110,12 @@ async fn health_reports_storage() {
         (&health["status"], &health["storage"]),
         (&json!("ok"), &json!("sqlite"))
     );
+    // Which build answers, so a client can tell it is older than the Hub.
+    assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        health["commit"].as_str().unwrap_or(""),
+        env!("AGENTSCM_BUILD_COMMIT")
+    );
     // Counters of this process: numbers only.
     let counters = health["coordination"].as_object().unwrap();
     let mut names: Vec<_> = counters.keys().map(String::as_str).collect();

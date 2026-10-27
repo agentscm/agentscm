@@ -504,15 +504,42 @@ fn init_writes_only_instruction_files_even_for_a_local_hub() {
         said.contains("Repository files to review and commit"),
         "{said}"
     );
-    // The committed files carry no hooks or MCP, so the per-machine command is printed.
+    // The committed files carry no hooks, MCP or hub, so the per-machine command is printed.
     assert!(
-        said.contains("Each developer connects their own checkout once for each agent they use:")
-            && said.contains(&format!(
-                "agentscm client setup --agent claude --hub {}",
-                hub.url
-            )),
+        said.contains("Each developer sets up their own machine once:")
+            && said.contains(&format!("  agentscm quickstart --hub {}\n", hub.url)),
         "{said}"
     );
+    let agents = std::fs::read_to_string(repo.path().join("AGENTS.md")).unwrap();
+    assert!(!agents.contains(&hub.url), "{agents}");
+}
+
+/// Without `--init`, setup writes nothing to the repository: a public repo stays clean.
+#[test]
+fn a_normal_run_leaves_the_checkout_clean() {
+    let (hub, machine) = (Hub::start(), Machine::new().with_claude());
+    let repo = machine.repo();
+    machine.git(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "base"],
+    );
+    let token = hub.token_file(machine.home.path());
+    ok(&machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"])));
+    assert!(!machine.connections().is_empty());
+    let status = Command::new(machine.bin.path().join("git"))
+        .current_dir(repo.path())
+        .args([
+            "status",
+            "--porcelain",
+            "--ignored",
+            "--untracked-files=all",
+        ])
+        .env("HOME", machine.home.path())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert_eq!(String::from_utf8_lossy(&status.stdout), "");
 }
 
 #[test]
@@ -536,11 +563,8 @@ fn init_without_an_agent_prints_the_setup_command_for_this_machine_too() {
     assert!(repo.path().join("AGENTS.md").exists(), "{said}");
     assert!(machine.connections().is_empty());
     assert!(
-        said.contains("Each developer connects their own checkout once for each agent they use:")
-            && said.contains(&format!(
-                "agentscm client setup --agent claude --hub {}",
-                hub.url
-            )),
+        said.contains("Each developer sets up their own machine once:")
+            && said.contains(&format!("  agentscm quickstart --hub {}\n", hub.url)),
         "{said}"
     );
 }
@@ -2372,7 +2396,7 @@ fn native_fixture(machine: &Machine, hub: &Hub) -> (PathBuf, PathBuf) {
     std::fs::create_dir_all(machine.bin_dir()).unwrap();
     let executable = machine
         .bin_dir()
-        .join(format!("agentscm-{}", env!("CARGO_PKG_VERSION")));
+        .join(format!("agentscm-{}", env!("AGENTSCM_INSTALL_VERSION")));
     place_binary(&executable);
     symlink(
         executable.file_name().unwrap(),
@@ -4488,20 +4512,36 @@ fn a_failed_agent_step_ends_non_zero_and_the_last_line_says_so() {
         body.replacen("\n", "\ncase \"$*\" in *install*) exit 1;; esac\n", 1),
     )
     .unwrap();
-    let output = machine.run(
-        repo.path(),
-        &quick(&hub.url, &token, &["--no-collisions", "--init"]),
-    );
+    let output = machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"]));
     let line = last_line(&output);
     assert!(!output.status.success(), "{output:?}");
     assert!(
         line.starts_with("Live warnings: off — coding agent setup failed"),
         "{line}"
     );
-    // Nothing committable is written for a connection that failed.
-    let said = String::from_utf8_lossy(&output.stdout);
-    assert!(said.contains("didn't add the agent instructions"), "{said}");
     assert!(!repo.path().join("AGENTS.md").exists());
+}
+
+#[test]
+fn a_failed_program_copy_ends_non_zero_and_sets_up_no_agent() {
+    let (hub, machine) = (Hub::start(), Machine::transient().with_claude());
+    let repo = machine.repo();
+    let token = hub.token_file(machine.home.path());
+    // A regular file where the symlink goes is never replaced, so the copy step fails.
+    std::fs::create_dir_all(machine.bin_dir()).unwrap();
+    std::fs::write(machine.bin_dir().join("agentscm"), "mine").unwrap();
+    let output = machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"]));
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        out(&output).contains("Couldn't copy the program"),
+        "{output:?}"
+    );
+    let line = last_line(&output);
+    assert!(
+        line.starts_with("Live warnings: off — coding agent setup failed: couldn't copy"),
+        "{line}"
+    );
+    assert!(machine.connections().is_empty());
 }
 
 #[test]

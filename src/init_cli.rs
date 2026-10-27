@@ -17,7 +17,7 @@ mod merge;
 mod targets;
 
 const NEEDS_TERMINAL: &str = "agentscm init-repo asks before it writes, and there is no terminal here. \
-To run it without one, pass --yes and choose with flags: --agents claude,codex,cursor,copilot,gemini (--hub-url URL fills in the setup command it prints)";
+To run it without one, pass --yes and choose with flags: --agents claude,codex,cursor,copilot,gemini (--hub-url URL fills in the setup command it prints, not the files)";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub(crate) enum Agent {
@@ -28,19 +28,7 @@ pub(crate) enum Agent {
     Gemini,
 }
 
-impl Agent {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-            Self::Cursor => "cursor",
-            Self::Copilot => "copilot",
-            Self::Gemini => "gemini",
-        }
-    }
-}
-
-pub(crate) const ALL: [Agent; 5] = [
+const ALL: [Agent; 5] = [
     Agent::Claude,
     Agent::Codex,
     Agent::Cursor,
@@ -53,8 +41,8 @@ pub struct InitArgs {
     /// Agents to write instructions for, comma separated (default: all).
     #[arg(long, value_delimiter = ',', value_enum)]
     agents: Option<Vec<Agent>>,
-    /// The hub for the `client setup` command written into the instruction files and printed at
-    /// the end (default: AGENTSCM_HUB_URL, then hub.json; a placeholder when neither is set).
+    /// The hub for the setup command printed at the end (default: AGENTSCM_HUB_URL, then
+    /// hub.json). The instruction files never name a hub.
     #[arg(long)]
     hub_url: Option<String>,
     /// Write without asking.
@@ -83,8 +71,8 @@ pub fn run(args: InitArgs) -> Result<()> {
     let hub = hub_base(args.hub_url.as_deref())?;
     let ui = Ui { yes: args.yes };
     let agents = args.agents.as_deref();
-    let outcome = run_in(&root, agents, hub.as_deref(), &ui)?;
-    print_next_steps(agents.unwrap_or(&ALL), hub.as_deref(), &outcome.written);
+    let outcome = run_in(&root, agents, &ui)?;
+    print_next_steps(hub.as_deref(), &outcome.written);
     Ok(())
 }
 
@@ -101,9 +89,8 @@ fn saved_hub_url() -> Option<String> {
     Some(file.url)
 }
 
-/// The hub URL without a trailing slash, for the setup command in the instruction files and
-/// the next steps. A bad `--hub-url` is an error; a bad AGENTSCM_HUB_URL or hub.json only
-/// warns, because the command then just keeps its placeholder.
+/// The hub URL without a trailing slash, for the printed setup command. A bad `--hub-url` is an
+/// error; a bad AGENTSCM_HUB_URL or hub.json only warns, because the command then just omits it.
 fn hub_base(given: Option<&str>) -> Result<Option<String>> {
     if let Some(url) = given {
         return checked_hub(url).map(Some);
@@ -116,10 +103,7 @@ fn hub_base(given: Option<&str>) -> Result<Option<String>> {
     };
     Ok(checked_hub(&url)
         .inspect_err(|error| {
-            eprintln!(
-                "Not using the saved hub URL ({error}); the setup command keeps {}.",
-                targets::HUB_PLACEHOLDER
-            )
+            eprintln!("Not using the saved hub URL ({error}); the setup command leaves it out.")
         })
         .ok())
 }
@@ -168,8 +152,8 @@ fn skills_section(root: &Path) -> String {
         .unwrap_or_default()
 }
 
-fn plan(root: &Path, agents: &[Agent], hub: Option<&str>) -> Vec<Planned> {
-    targets::targets(agents, hub, &skills_section(root))
+fn plan(root: &Path, agents: &[Agent]) -> Vec<Planned> {
+    targets::targets(agents, &skills_section(root))
         .into_iter()
         .map(|target| {
             let path = root.join(target.path);
@@ -289,17 +273,12 @@ fn show_diff(item: &Planned) {
 }
 
 /// Writes the instruction files at `root`; `agents` of `None` means all of them.
-pub(crate) fn run_in(
-    root: &Path,
-    agents: Option<&[Agent]>,
-    hub: Option<&str>,
-    ui: &Ui,
-) -> Result<Outcome> {
+pub(crate) fn run_in(root: &Path, agents: Option<&[Agent]>, ui: &Ui) -> Result<Outcome> {
     let agents = agents.unwrap_or(&ALL);
     if agents.is_empty() {
         return Err(invalid("--agents is empty"));
     }
-    let planned = plan(root, agents, hub);
+    let planned = plan(root, agents);
     let mut outcome = Outcome::default();
     for item in &planned {
         let (label, note) = match &item.status {
@@ -347,7 +326,7 @@ pub(crate) fn run_in(
     Ok(outcome)
 }
 
-pub(crate) fn print_next_steps(agents: &[Agent], hub: Option<&str>, written: &[PathBuf]) {
+pub(crate) fn print_next_steps(hub: Option<&str>, written: &[PathBuf]) {
     println!();
     if !written.is_empty() {
         println!(
@@ -356,12 +335,13 @@ pub(crate) fn print_next_steps(agents: &[Agent], hub: Option<&str>, written: &[P
             if written.len() == 1 { "" } else { "s" }
         );
     }
-    println!("Each developer connects their own checkout once for each agent they use:");
-    for agent in agents {
-        println!("  {}", targets::setup_command(*agent, hub));
+    println!("Each developer sets up their own machine once:");
+    match hub {
+        Some(hub) => println!("  agentscm quickstart --hub {hub}"),
+        None => println!("  agentscm quickstart"),
     }
     println!(
-        "It signs in to the hub and adds that machine's MCP server and hooks; the hub's Connect agents page then verifies them."
+        "It signs in to their Hub and sets up their agents for every checkout; it writes nothing to the repository."
     );
 }
 
@@ -376,7 +356,7 @@ mod tests {
     }
 
     fn run_all(root: &Path, agents: Option<&[Agent]>) -> Outcome {
-        run_in(root, agents, None, &Ui { yes: true }).unwrap()
+        run_in(root, agents, &Ui { yes: true }).unwrap()
     }
 
     fn read(root: &Path, path: &str) -> String {

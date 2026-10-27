@@ -329,6 +329,49 @@ fn a_squash_merge_is_found_even_after_later_edits_to_the_same_file() {
     assert_eq!(report["merged_refs_excluded"], 1);
 }
 
+/// The base's patch IDs are computed once and shared: branches forked at different points
+/// search overlapping ranges of it, and each squash is still found.
+#[test]
+fn squash_merges_of_branches_forked_at_different_points_are_all_found() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path().join("squashes");
+    fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    let lines = |a: &str, b: &str| format!("{a}\n1\n2\n3\n4\n5\n6\n7\n8\n9\n{b}\n");
+    fs::write(repo.join("d"), lines("a", "z")).unwrap();
+    fs::write(repo.join("e"), lines("a", "z")).unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "base"]);
+    git(&repo, &["checkout", "-q", "-b", "early", "main"]);
+    commit_file(&repo, "early", "d", &lines("A", "z"));
+    git(&repo, &["checkout", "-q", "main"]);
+    fs::write(repo.join("f"), "f\n").unwrap();
+    git(&repo, &["add", "f"]);
+    git(&repo, &["commit", "-qm", "unrelated"]);
+    git(&repo, &["checkout", "-q", "-b", "late", "main"]);
+    commit_file(&repo, "late", "e", &lines("A", "z"));
+    git(&repo, &["checkout", "-q", "-b", "live", "main"]);
+    commit_file(&repo, "live", "e", &lines("a", "LIVE"));
+    git(&repo, &["checkout", "-q", "main"]);
+    // Each lands as a squash, then main edits both files again so their content differs.
+    git(&repo, &["checkout", "-q", "late", "--", "e"]);
+    git(&repo, &["commit", "-qm", "squash late (#2)"]);
+    git(&repo, &["checkout", "-q", "early", "--", "d"]);
+    git(&repo, &["commit", "-qm", "squash early (#1)"]);
+    fs::write(repo.join("d"), lines("A", "Z")).unwrap();
+    fs::write(repo.join("e"), lines("A", "Y")).unwrap();
+    git(&repo, &["commit", "-qam", "later"]);
+    let report = collisions(&request(repo, git_path()));
+    let ids: Vec<&str> = report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["live"]);
+    assert_eq!(report["merged_refs_excluded"], 2);
+}
+
 #[test]
 fn a_multi_commit_rebase_merge_is_found_even_after_later_edits() {
     let dir = TempDir::new().unwrap();
