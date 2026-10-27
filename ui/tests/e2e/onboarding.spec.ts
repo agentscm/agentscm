@@ -37,7 +37,8 @@ test('2. the browser lands on “This computer is signed in”, with no token an
   const lead = page.locator('.done-lead')
   await expect(lead).toContainText(`maria-mbp is signed in to ${new URL(baseURL!).host} as maria on GitHub. You won’t need to do this again.`)
   await expect(page.getByText('With automatic connection on (the terminal asks once)')).toBeVisible()
-  await expect(page.getByRole('link', { name: /Open the Hub/ })).toHaveAttribute('href', `${baseURL}/ui/`)
+  // The CLI signed in the computer, not the browser: Open the Hub starts the web sign-in.
+  await expect(page.getByRole('link', { name: /Open the Hub/ })).toHaveAttribute('href', `${baseURL}/v1/hub/login/github?web=1`)
   expect(await page.evaluate(() => [localStorage.getItem('agentscm.token'), sessionStorage.getItem('agentscm.token')])).toEqual([null, null])
   await page.setViewportSize({ width: 375, height: 812 })
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true)
