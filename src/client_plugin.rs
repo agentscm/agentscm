@@ -335,7 +335,12 @@ fn verify_marketplace_for(engine: Engine, output: &Path) -> Result<()> {
     let mut files = Vec::new();
     for (name, _) in package_files(engine, "/placeholder") {
         let path = version_root.join(name);
-        let metadata = path.symlink_metadata()?;
+        let metadata = match path.symlink_metadata() {
+            // An owned package from an older format (before a file was added) is replaced by
+            // this invocation's version, not refused.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            result => result?,
+        };
         if !metadata.is_file() || metadata.len() > 64 * 1024 {
             return Err(changed_package());
         }
@@ -1023,6 +1028,23 @@ mod tests {
         }
         assert!(generate(&output, Path::new("/opt/agentscm")).is_err());
         assert_eq!(read("agentscm/plugin.json"), portable);
+    }
+
+    #[test]
+    fn an_older_claude_package_is_upgraded_not_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let output = dir.path().join("claude-marketplace");
+        generate_for(Engine::Claude, &output, Path::new("/opt/agentscm")).unwrap();
+        let old = version_root(&output);
+        // Packages from before the MCP server moved into the plugin have no .mcp.json.
+        std::fs::remove_file(old.join("agentscm/.mcp.json")).unwrap();
+        prepare_for(Engine::Claude, &output, Path::new("/opt/agentscm-new")).unwrap();
+        let new = version_root(&output);
+        assert_ne!(new, old);
+        assert!(new.join("agentscm/.mcp.json").is_file());
+        // Ownership is still required: a package AgentSCM did not make is refused.
+        std::fs::remove_file(output.join(OWNERSHIP_FILE)).unwrap();
+        assert!(prepare_for(Engine::Claude, &output, Path::new("/opt/agentscm-3")).is_err());
     }
 
     #[test]
