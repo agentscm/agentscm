@@ -753,6 +753,199 @@ fn named_migrations_are_a_set(db: &Db) {
     );
 }
 
+fn device_token(owner: &str, repository: &str) -> (NewAgentToken, store::TokenDigest) {
+    let secret = agentscm::team::auth::generate_secret().unwrap();
+    let digest = agent_token_digest(secret.expose()).unwrap();
+    let token = NewAgentToken {
+        owner: owner.into(),
+        name: "client-laptop".into(),
+        repository: repository.into(),
+        digest: digest.clone(),
+        expires_at: unix_now() + TTL,
+        repository_id: Some(4242),
+        read_only: false,
+    };
+    (token, digest)
+}
+
+fn devices_and_refusals(db: &Db) {
+    use agentscm::hub::device::{DEVICE_IDLE_SECONDS, Refusal};
+    use store::device_digest;
+
+    let store = db.open();
+    let alice = store.upsert_user(&identity(7), "alice").unwrap();
+    let bob = store.upsert_user(&identity(8), "bob").unwrap();
+    let now = unix_now();
+    let laptop = device_digest(&"1".repeat(64)).unwrap();
+    let first = store
+        .insert_device(&alice.id, "alice's MacBook Pro", &laptop, None, now)
+        .unwrap();
+    assert_id(&first, "dev_");
+    // A credential digest is never an agent token, and the reverse.
+    assert_eq!(store.authenticate(&laptop, now).unwrap(), None);
+    let principal = store.authenticate_device(&laptop, now).unwrap().unwrap();
+    assert_eq!(
+        (principal.device_id.as_str(), &principal.owner),
+        (first.as_str(), &alice)
+    );
+    assert!(
+        store
+            .insert_device(&alice.id, "", &laptop, None, now)
+            .is_err()
+    );
+
+    // Minting through a computer records it; an agent token is never a computer credential.
+    let (token, old_digest) = device_token(&alice.id, REPO);
+    store.insert_device_token(&token, &first, true).unwrap();
+    assert_eq!(store.authenticate_device(&old_digest, now).unwrap(), None);
+    let (token, new_digest) = device_token(&alice.id, REPO);
+    store.insert_device_token(&token, &first, false).unwrap();
+    assert!(store.authenticate(&old_digest, now).unwrap().is_some());
+    assert!(store.authenticate(&new_digest, now).unwrap().is_some());
+    assert_eq!(events_of(&*store, "auto_connected").len(), 1);
+    // Another person's computer cannot mint for alice.
+    let bobs = store
+        .insert_device(
+            &bob.id,
+            "bob's",
+            &device_digest(&"2".repeat(64)).unwrap(),
+            None,
+            now,
+        )
+        .unwrap();
+    assert!(
+        store
+            .insert_device_token(&device_token(&alice.id, REPO).0, &bobs, false)
+            .is_err()
+    );
+    let (other_repo, _) = device_token(&alice.id, "acme/other");
+    store
+        .insert_device_token(&other_repo, &first, false)
+        .unwrap();
+
+    let listed = store.devices(Some(&alice.id), now).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].repositories, ["acme/other", REPO]);
+    assert_eq!(store.devices(None, now).unwrap().len(), 2);
+    assert!(
+        store
+            .rename_device(&first, &alice.id, "work laptop")
+            .unwrap()
+    );
+    assert!(!store.rename_device(&first, &bob.id, "stolen").unwrap());
+
+    // Idle past the limit, disabled owner and revocation all stop the credential.
+    assert_eq!(
+        store
+            .authenticate_device(&laptop, now + DEVICE_IDLE_SECONDS + 1)
+            .unwrap(),
+        None
+    );
+    store.set_user_disabled(&alice.id, true).unwrap();
+    assert!(
+        store
+            .authenticate_device(&laptop, now)
+            .unwrap()
+            .unwrap()
+            .owner
+            .disabled
+    );
+    assert!(
+        store
+            .insert_device_token(&device_token(&alice.id, REPO).0, &first, false)
+            .is_err()
+    );
+    store.set_user_disabled(&alice.id, false).unwrap();
+    assert!(
+        !store
+            .revoke_device(&first, Some(&bob.id), &bob.id, now)
+            .unwrap()
+    );
+    assert!(
+        store
+            .revoke_device(&first, Some(&alice.id), &bobs, now)
+            .unwrap()
+    );
+    assert!(!store.revoke_device(&first, None, &alice.id, now).unwrap());
+    assert_eq!(store.authenticate_device(&laptop, now).unwrap(), None);
+    assert_eq!(store.authenticate(&new_digest, now).unwrap(), None);
+    assert!(
+        store.devices(Some(&alice.id), now).unwrap()[0]
+            .revoked_at
+            .is_some()
+    );
+    assert_eq!(events_of(&*store, "device_revoked"), [json!({"by": bobs})]);
+    assert!(
+        store
+            .insert_device_token(&device_token(&alice.id, REPO).0, &first, false)
+            .is_err()
+    );
+
+    // Signing in again with the old credential replaces that computer only.
+    let second = device_digest(&"3".repeat(64)).unwrap();
+    let replaced = store
+        .insert_device(&bob.id, "bob's", &second, Some(&bobs), now)
+        .unwrap();
+    assert_ne!(replaced, bobs);
+    assert_eq!(
+        store
+            .devices(Some(&bob.id), now)
+            .unwrap()
+            .iter()
+            .filter(|device| device.revoked_at.is_none())
+            .count(),
+        1
+    );
+
+    // One row per person and reason; repeats bump the count.
+    let refusal = |user_id: i64, reason: &str, at: i64| Refusal {
+        provider: "github".into(),
+        host: "github.com".into(),
+        forge_user_id: user_id,
+        login: format!("user{user_id}"),
+        reason: reason.into(),
+        via: "sign_in".into(),
+        at,
+        count: 1,
+    };
+    store
+        .record_refusal(&refusal(9, "not_allowed", now - 10))
+        .unwrap();
+    store
+        .record_refusal(&refusal(9, "not_allowed", now))
+        .unwrap();
+    store
+        .record_refusal(&refusal(10, "no_repository_role", now - 5))
+        .unwrap();
+    let rows = store.refusals(now).unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r.forge_user_id, r.count, r.at))
+            .collect::<Vec<_>>(),
+        [(9, 2, now), (10, 1, now - 5)]
+    );
+    for user in 100..320 {
+        store
+            .record_refusal(&refusal(user, "not_allowed", now + user))
+            .unwrap();
+    }
+    assert_eq!(db.count("SELECT COUNT(*) FROM hub_sign_in_refusals"), 200);
+    store
+        .record_refusal(&refusal(1, "not_allowed", now + 31 * 24 * 60 * 60))
+        .unwrap();
+    assert_eq!(store.refusals(now + 31 * 24 * 60 * 60).unwrap().len(), 1);
+
+    // Restart keeps computers.
+    drop(store);
+    let reopened = db.open();
+    assert!(
+        reopened
+            .authenticate_device(&second, now)
+            .unwrap()
+            .is_some()
+    );
+}
+
 fn app(host: &str) -> NewConnection {
     NewConnection {
         id: new_connection_id().unwrap(),
@@ -2423,6 +2616,7 @@ conformance!(
     upgrade_from_migration_14_with_publication,
     url_errors,
     skill_adoption_and_evidence,
+    devices_and_refusals,
 );
 
 #[cfg(unix)]

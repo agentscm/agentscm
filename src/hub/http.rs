@@ -204,21 +204,48 @@ pub async fn serve(config: HubConfig) -> Result<()> {
 pub struct ApiError {
     status: StatusCode,
     code: &'static str,
+    /// Fields added to the body: a `message` people read, and what the kind needs.
+    detail: serde_json::Map<String, serde_json::Value>,
 }
 
 impl ApiError {
     pub fn new(status: StatusCode, code: &'static str) -> Self {
-        Self { status, code }
+        Self {
+            status,
+            code,
+            detail: serde_json::Map::new(),
+        }
     }
 
     pub fn code(&self) -> &'static str {
         self.code
     }
 
+    /// A one-sentence reason and fix, shown to people as is.
+    pub fn with_message(self, message: impl Into<String>) -> Self {
+        self.with_field("message", serde_json::Value::String(message.into()))
+    }
+
+    pub fn with_field(mut self, key: &str, value: serde_json::Value) -> Self {
+        self.detail.insert(key.to_owned(), value);
+        self
+    }
+
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    pub fn message(&self) -> Option<&str> {
+        self.detail
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+    }
+
     pub fn invalid() -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             code: "invalid_request",
+            detail: serde_json::Map::new(),
         }
     }
 
@@ -226,6 +253,7 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             code: "not_found",
+            detail: serde_json::Map::new(),
         }
     }
 
@@ -233,6 +261,7 @@ impl ApiError {
         Self {
             status: StatusCode::FORBIDDEN,
             code: "read_only",
+            detail: serde_json::Map::new(),
         }
     }
 
@@ -240,6 +269,7 @@ impl ApiError {
         Self {
             status: StatusCode::FORBIDDEN,
             code: "forbidden",
+            detail: serde_json::Map::new(),
         }
     }
 
@@ -247,6 +277,7 @@ impl ApiError {
         Self {
             status: StatusCode::GONE,
             code: "gone",
+            detail: serde_json::Map::new(),
         }
     }
 
@@ -254,6 +285,7 @@ impl ApiError {
         Self {
             status: StatusCode::UNAUTHORIZED,
             code: "unauthorized",
+            detail: serde_json::Map::new(),
         }
     }
 }
@@ -266,32 +298,39 @@ impl From<HubError> for ApiError {
             HubError::Busy => Self {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 code: "busy",
+                detail: serde_json::Map::new(),
             },
             HubError::WorkCapacity => Self {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 code: "work_storage_capacity",
+                detail: serde_json::Map::new(),
             },
             HubError::WorkOverlap(_) => Self {
                 status: StatusCode::CONFLICT,
                 code: "work_scope_overlap",
+                detail: serde_json::Map::new(),
             },
             HubError::WorkCoordinationRequired { .. } => Self {
                 status: StatusCode::CONFLICT,
                 code: "work_coordination_required",
+                detail: serde_json::Map::new(),
             },
             HubError::WorkOverlapIncomplete => Self {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 code: "work_overlap_incomplete",
+                detail: serde_json::Map::new(),
             },
             HubError::WorkPreflight(_) => Self {
                 status: StatusCode::CONFLICT,
                 code: "work_preflight_required",
+                detail: serde_json::Map::new(),
             },
             HubError::Unavailable(detail) => {
                 eprintln!("hub error: {detail}");
                 Self {
                     status: StatusCode::SERVICE_UNAVAILABLE,
                     code: "unavailable",
+                    detail: serde_json::Map::new(),
                 }
             }
         }
@@ -300,7 +339,9 @@ impl From<HubError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let mut response = (self.status, Json(json!({"error": self.code}))).into_response();
+        let mut body = self.detail;
+        body.insert("error".into(), json!(self.code));
+        let mut response = (self.status, Json(serde_json::Value::Object(body))).into_response();
         if self.status == StatusCode::UNAUTHORIZED {
             response
                 .headers_mut()

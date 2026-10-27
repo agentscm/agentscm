@@ -46,17 +46,33 @@ fn connection(root: Option<&Path>) -> Result<(Connection, PathBuf, String)> {
     Ok((connection, checkout, token))
 }
 
-fn unchanged(connection: &Connection, checkout: &Path, token: &str) -> Result<()> {
+/// True when `saved` differs from `connection` only by a renewed managed token.
+fn renewed_in_place(saved: &Connection, connection: &Connection) -> bool {
+    saved.owned_token_id.is_some()
+        && connection.owned_token_id.is_some()
+        && Connection {
+            token_file: connection.token_file.clone(),
+            owned_token_id: connection.owned_token_id.clone(),
+            owned_token_expires_at: connection.owned_token_expires_at,
+            ..saved.clone()
+        } == *connection
+}
+
+/// The token to use for the next request. The same binding keeps working when only its
+/// managed token was renewed in place; any other change stops the server.
+fn current_token(connection: &Connection, checkout: &Path, token: &str) -> Result<String> {
+    let changed = || invalid("client connection changed; restart the AgentSCM MCP server");
     let saved = selected(&connection.root, &load()?)?;
-    if saved != *connection
-        || !is_current_in(connection, checkout)
-        || read_token(&connection.token_file)? != token
-    {
-        return Err(invalid(
-            "client connection changed; restart the AgentSCM MCP server",
-        ));
+    let renewed = renewed_in_place(&saved, connection);
+    if !(saved == *connection || renewed) || !is_current_in(&saved, checkout) {
+        return Err(changed());
     }
-    Ok(())
+    let current = read_token(&saved.token_file)?;
+    // A supplied token file whose contents changed is another credential, not a renewal.
+    if current != token && !renewed {
+        return Err(changed());
+    }
+    Ok(current)
 }
 
 fn endpoint(connection: &Connection) -> Result<reqwest::Url> {
@@ -213,11 +229,12 @@ async fn serve(
     mut first: Option<Vec<u8>>,
     reader: &mut impl BufRead,
     writer: &mut impl Write,
-    mut check_connection: impl FnMut() -> Result<()>,
+    mut current_token: impl FnMut() -> Result<String>,
 ) -> Result<()> {
     let client = forge_http::client().map_err(map_hub_error)?;
     let url = endpoint(connection)?;
-    let activity_binding = crate::client_activity::activity_binding(connection, token);
+    let mut token = token.to_owned();
+    let mut activity_binding = crate::client_activity::activity_binding(connection, &token);
     loop {
         let line = match first
             .take()
@@ -246,7 +263,14 @@ async fn serve(
         }
         let id = response_id(&message);
         drop(message);
-        if check_connection().is_err() {
+        let checked = current_token();
+        if let Ok(current) = &checked
+            && *current != token
+        {
+            token.clone_from(current);
+            activity_binding = crate::client_activity::activity_binding(connection, &token);
+        }
+        if checked.is_err() {
             report_activity(
                 &activity_binding,
                 crate::client_activity::ActivityOutcome::BindingChanged,
@@ -261,11 +285,11 @@ async fn serve(
                 "client connection changed; restart the AgentSCM MCP server",
             ));
         }
-        let client_id = crate::client_config::onboarding_client(&connection.root, token);
+        let client_id = crate::client_config::onboarding_client(&connection.root, &token);
         let forwarded = forward(
             &client,
             &url,
-            token,
+            &token,
             line,
             &client_id,
             connection.report_completion,
@@ -365,7 +389,7 @@ pub(crate) async fn run(root: Option<&Path>) -> Result<()> {
         }
     };
     serve(&connection, &token, first, &mut reader, &mut writer, || {
-        unchanged(&connection, &checkout, &token)
+        current_token(&connection, &checkout, &token)
     })
     .await
 }
@@ -438,9 +462,11 @@ mod tests {
     async fn proxied(input: &str, connection: &Connection, token: &str) -> String {
         let mut reader = Cursor::new(input.as_bytes());
         let mut output = Vec::new();
-        serve(connection, token, None, &mut reader, &mut output, || Ok(()))
-            .await
-            .unwrap();
+        serve(connection, token, None, &mut reader, &mut output, || {
+            Ok(token.to_owned())
+        })
+        .await
+        .unwrap();
         String::from_utf8(output).unwrap()
     }
 
@@ -451,6 +477,27 @@ mod tests {
         let error = read_line(&mut reader).unwrap_err().to_string();
         assert!(error.contains("too large"));
         assert_eq!(reader.position(), (REQUEST_BYTES + 2) as u64);
+    }
+
+    #[test]
+    fn only_a_renewed_managed_token_keeps_the_server_running() {
+        let mut managed = saved("https://one.example".into(), "/one", "owner/one");
+        managed.owned_token_id = Some("tok_old".into());
+        managed.owned_token_expires_at = Some(10);
+        let mut renewed = managed.clone();
+        renewed.owned_token_id = Some("tok_new".into());
+        renewed.owned_token_expires_at = Some(20);
+        renewed.token_file = PathBuf::from("/new-token");
+        assert!(renewed_in_place(&renewed, &managed));
+        let mut moved = renewed.clone();
+        moved.hub = "https://two.example".into();
+        assert!(!renewed_in_place(&moved, &managed));
+        let mut other_repo = renewed.clone();
+        other_repo.repo = "owner/two".into();
+        assert!(!renewed_in_place(&other_repo, &managed));
+        // A supplied token is managed elsewhere and never counts as renewed.
+        let supplied = saved("https://one.example".into(), "/one", "owner/one");
+        assert!(!renewed_in_place(&supplied, &supplied));
     }
 
     #[test]

@@ -442,6 +442,42 @@ impl Api {
             .ok_or_else(|| GhError::Failed("unreadable reply from repos".into()))
     }
 
+    /// The repository and `login`'s role on it, read with the Hub's own credential: None when
+    /// the repository is missing (404), no role when the user is unknown to it. A 401 or 403
+    /// means the credential cannot answer.
+    pub async fn collaborator_permission(
+        &self,
+        token: &str,
+        full_name: &str,
+        login: &str,
+    ) -> Gh<Option<(Value, Option<Value>)>> {
+        let login = login
+            .bytes()
+            // Enterprise Managed User logins also have `_`.
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            .then_some(login)
+            .filter(|login| !login.is_empty())
+            .ok_or_else(|| GhError::Failed("unusable login".into()))?;
+        let repo = self.get(token, &format!("/repos/{full_name}")).await?;
+        let path = format!("/repos/{full_name}/collaborators/{login}/permission");
+        let permission = match repo.status {
+            404 => return Ok(None),
+            _ => self.get(token, &path).await?,
+        };
+        let Some(repo) = answer(repo, "repos")? else {
+            return Ok(None);
+        };
+        Ok(Some((repo, answer(permission, "collaborators")?)))
+    }
+
+    /// A repository's JSON, read with the Hub's own credential; None for a 404.
+    pub async fn repo_json(&self, token: &str, full_name: &str) -> Gh<Option<Value>> {
+        answer(
+            self.get(token, &format!("/repos/{full_name}")).await?,
+            "repos",
+        )
+    }
+
     /// The connected forge's explicit default identity; absence is unsupported.
     pub async fn default_branch(&self, token: &str, full_name: &str) -> Gh<String> {
         let body = self
@@ -1260,6 +1296,15 @@ fn repo_info(item: &Value) -> Option<RepoInfo> {
         full_name: full_name.to_owned(),
         node_id: item["node_id"].as_str().map(str::to_owned),
     })
+}
+
+/// A 2xx body, None for a 404, `Auth` for a 401 or 403 (the credential cannot answer).
+pub(super) fn answer(reply: Reply, kind: &str) -> Gh<Option<Value>> {
+    match reply.status {
+        404 => Ok(None),
+        401 | 403 => Err(GhError::Auth(format!("{} from {kind}", reply.status))),
+        _ => reply.ok(kind).map(Some),
+    }
 }
 
 /// The first path segment of the URL under `base`: a kind, never an id.

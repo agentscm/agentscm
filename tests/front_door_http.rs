@@ -125,8 +125,15 @@ fn fake_hub_reporting(
                 (401, json!({"error": "unauthorized"}))
             } else if line.starts_with("GET /v1/hub/repos/acme%2Fwidgets/work") {
                 (200, json!({"synthetic": "work page"}))
-            } else if line.starts_with("DELETE /v1/hub/token ") {
+            } else if line.starts_with("DELETE /v1/hub/token ")
+                || line.starts_with("DELETE /v1/hub/devices/dev_")
+            {
                 (204, Value::Null)
+            } else if line.starts_with("GET /v1/hub/devices ") {
+                (
+                    200,
+                    json!({"devices": [{"id": DEVICE_ID, "name": "laptop", "current": true}]}),
+                )
             } else {
                 (404, json!({"error": "not_found"}))
             };
@@ -1870,4 +1877,74 @@ fn the_listing_carries_the_retention_the_hub_reported_and_null_when_it_did_not()
     let page = Page::new(&door);
     set_hub(&door, "http://127.0.0.1:9");
     assert!(page.list()[0]["shared_conversation_retention_days"].is_null());
+}
+
+const DEVICE_ID: &str = "dev_0123456789abcdef0123456789abcdef";
+const DEVICE_SECRET: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+#[test]
+fn the_page_lists_and_revokes_computers_with_this_computers_credential() {
+    let temp = TempDir::new().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap().join("widgets");
+    checkout(&root);
+    let (hub, seen) = fake_hub();
+    let door = FrontDoor::start(&temp, &hub, &root);
+    let grant = connect(&door);
+    let auth = format!("Bearer local:{grant}:{REPO}");
+    let origin = door.origin();
+    let headers = [
+        ("Authorization", auth.as_str()),
+        ("Origin", origin.as_str()),
+    ];
+    // Without a computer credential there is nothing to ask the Hub with.
+    let (status, _, body) = door.request("GET", "/v1/hub/devices", &headers);
+    assert_eq!(status, 503, "{body}");
+    assert!(body.contains("hub_sign_in_required"), "{body}");
+
+    private_file(
+        &door.config.join("agentscm/hub-sessions.json"),
+        &json!({"version": 2, "default_hub": hub, "sessions": [{"hub": hub,
+            "session": HUMAN_SESSION,
+            "device": {"id": DEVICE_ID, "secret": DEVICE_SECRET, "name": "laptop"}}]})
+        .to_string(),
+    );
+    let (status, _, body) = door.request("GET", "/v1/hub/devices", &headers);
+    assert_eq!(status, 200, "{body}");
+    let listed: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        (&listed["hub"], &listed["devices"][0]["id"]),
+        (&json!(hub), &json!(DEVICE_ID))
+    );
+    let (status, _, body) =
+        door.request("DELETE", &format!("/v1/hub/devices/{DEVICE_ID}"), &headers);
+    assert_eq!(status, 204, "{body}");
+    assert_eq!(
+        door.request("DELETE", "/v1/hub/devices/not-an-id", &headers)
+            .0,
+        400
+    );
+    // A well-formed id the Hub did not list for this person never reaches the Hub's URL.
+    let other = "dev_ffffffffffffffffffffffffffffffff";
+    let path = format!("/v1/hub/devices/{other}");
+    assert_eq!(door.request("DELETE", &path, &headers).0, 404);
+    assert!(
+        !seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.contains(other))
+    );
+    let requests = seen.lock().unwrap().clone();
+    for line in [
+        "GET /v1/hub/devices ".to_owned(),
+        format!("DELETE /v1/hub/devices/{DEVICE_ID} "),
+    ] {
+        assert!(
+            requests.iter().any(|request| request.starts_with(&line)
+                && request.contains(&format!("authorization: Bearer {DEVICE_SECRET}"))),
+            "{line}"
+        );
+    }
+    // The browser never receives the credential.
+    assert!(!body.contains(DEVICE_SECRET));
 }

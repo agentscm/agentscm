@@ -110,7 +110,7 @@ struct CachedToken {
     id: String,
     secret: String,
     expires_at: i64,
-    human_session: String,
+    human_session: crate::hub_cli::HubAuth,
 }
 
 /// A cached explorer is reused only while the checkout, its connection and its capture binding
@@ -502,7 +502,10 @@ impl FrontDoor {
         {
             return Ok(token.secret.clone());
         }
-        let (hub, human_session) = session?;
+        // Only when minting: a sign-in from before computer credentials gets one here.
+        crate::client_cli::enroll(&selected.hub).await;
+        session?;
+        let (hub, human_session) = hub_read_token::load_exact_session(&selected.hub)?;
         let minted = tokio::time::timeout(MINT_TIMEOUT, async {
             let provider = self.forge_provider(selected).await?;
             hub_read_token::mint_and_confirm(
@@ -628,6 +631,8 @@ const REPOSITORY_GONE: &str = "That repository is no longer connected on this co
 
 pub(super) fn router(state: AppState, front_door: Arc<FrontDoor>) -> Router {
     let selected = Router::new()
+        .route("/v1/hub/devices", get(devices))
+        .route("/v1/hub/devices/{id}", delete(revoke_device))
         .route("/v1/hub/{*path}", get(proxy))
         .with_state(front_door.clone())
         .merge(super::explorer::routes().with_state(state.clone()))
@@ -806,7 +811,7 @@ async fn identity(State(front_door): State<Arc<FrontDoor>>, headers: HeaderMap) 
         Some(selected) => {
             let url = selected.hub.clone();
             let signed_in =
-                tokio::task::spawn_blocking(move || crate::hub_cli::has_session(Some(&url)))
+                tokio::task::spawn_blocking(move || crate::hub_cli::is_signed_in(Some(&url)))
                     .await
                     .ok()
                     .and_then(Result::ok)
@@ -1025,6 +1030,133 @@ async fn disconnect(
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// This computer's computers on the selected repository's Hub, asked with its credential,
+/// with a top-level `hub` naming that Hub. One Hub per call; switching repository switches Hub.
+async fn devices(
+    State(front_door): State<Arc<FrontDoor>>,
+    axum::Extension(selected): axum::Extension<Selected>,
+) -> Response {
+    let unavailable = || {
+        refuse(
+            StatusCode::BAD_GATEWAY,
+            "hub_unavailable",
+            "the Hub did not answer; try again",
+        )
+    };
+    let reply = match device_call(
+        &front_door,
+        &selected,
+        reqwest::Method::GET,
+        "/v1/hub/devices",
+    )
+    .await
+    {
+        Ok(reply) if reply.status().is_success() => reply,
+        Ok(reply) => return relay(reply).await,
+        Err(response) => return response,
+    };
+    // A list of at most 100 computers is far below this.
+    let Ok(bytes) = reply.bytes().await else {
+        return unavailable();
+    };
+    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(mut body) if body.is_object() && bytes.len() <= 1 << 20 => {
+            body["hub"] = json!(selected.hub);
+            Json(body).into_response()
+        }
+        _ => unavailable(),
+    }
+}
+
+/// Revokes one of this person's computers on the selected repository's Hub.
+async fn revoke_device(
+    State(front_door): State<Arc<FrontDoor>>,
+    axum::Extension(selected): axum::Extension<Selected>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let valid = id.strip_prefix("dev_").is_some_and(|hex| {
+        hex.len() == 32 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    });
+    if !valid {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "that is not a computer id",
+        );
+    }
+    // The id that goes into the Hub's URL is the one the Hub listed for this person, never the
+    // request's own text: the request only chooses among them.
+    let listed = match device_call(
+        &front_door,
+        &selected,
+        reqwest::Method::GET,
+        "/v1/hub/devices",
+    )
+    .await
+    {
+        Ok(reply) if reply.status().is_success() => reply.bytes().await.ok(),
+        Ok(reply) => return relay(reply).await,
+        Err(response) => return response,
+    };
+    let known = listed
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|list| {
+            list["devices"].as_array()?.iter().find_map(|device| {
+                let listed = device["id"].as_str()?;
+                (listed == id).then(|| listed.to_owned())
+            })
+        });
+    let Some(known) = known else {
+        return refuse(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such computer of yours on this Hub",
+        );
+    };
+    let path = format!("/v1/hub/devices/{known}");
+    match device_call(&front_door, &selected, reqwest::Method::DELETE, &path).await {
+        Ok(reply) => relay(reply).await,
+        Err(response) => response,
+    }
+}
+
+async fn device_call(
+    front_door: &FrontDoor,
+    selected: &Selected,
+    method: reqwest::Method,
+    path: &str,
+) -> std::result::Result<reqwest::Response, Response> {
+    let hub = selected.hub.clone();
+    let device = tokio::task::spawn_blocking(move || crate::hub_cli::saved_device(&hub))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten();
+    let Some(device) = device else {
+        return Err(hub_refusal(OpenError::MissingSignIn, &selected.hub));
+    };
+    let Some(target) = hub_read_url(&selected.hub, path, None) else {
+        return Err(refuse(
+            StatusCode::BAD_GATEWAY,
+            "hub_unavailable",
+            "the saved Hub address is not usable",
+        ));
+    };
+    front_door
+        .client
+        .request(method, target)
+        .bearer_auth(&device.secret)
+        .send()
+        .await
+        .map_err(|_| {
+            refuse(
+                StatusCode::BAD_GATEWAY,
+                "hub_unavailable",
+                "the Hub did not answer; try again",
+            )
+        })
+}
+
 /// Forward a Hub read for the selected repository with this process's read-only token.
 async fn proxy(
     State(front_door): State<Arc<FrontDoor>>,
@@ -1092,15 +1224,20 @@ fn hub_refusal(error: OpenError, hub: &str) -> Response {
                 "This computer is not signed in to {hub}. Run `agentscm hub login --hub {hub}`, then reload."
             ),
         ),
-        OpenError::RepositoryNotConnected => refuse(
+        // The Hub's own sentence when it sent one, word for word.
+        OpenError::RepositoryNotConnected(message) => refuse(
             StatusCode::FORBIDDEN,
             "not_connected_to_hub",
-            "this repository is not connected to its Hub; ask the Hub's operator to connect it",
+            message.as_deref().unwrap_or(
+                "this repository is not connected to its Hub; ask the Hub's operator to connect it",
+            ),
         ),
-        OpenError::AccessDenied => refuse(
+        OpenError::AccessDenied(message) => refuse(
             StatusCode::FORBIDDEN,
             "access_denied",
-            "your Hub sign-in cannot read this repository",
+            message
+                .as_deref()
+                .unwrap_or("your Hub sign-in cannot read this repository"),
         ),
         _ => refuse(
             StatusCode::BAD_GATEWAY,

@@ -630,6 +630,7 @@ const CORE_HELP: [(&str, &[&str]); 3] = [
         "Connect this computer",
         &[
             "hub login",
+            "hub whoami",
             "client setup",
             "client remove",
             "client doctor",

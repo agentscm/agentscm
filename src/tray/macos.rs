@@ -54,6 +54,59 @@ enum UserEvent {
     HubOpenedLocally,
     /// Forget This Checkout finished `client remove` for the named checkout.
     Forgot(String, std::result::Result<(), String>),
+    /// A sign-in started from the menu finished, for this Hub, with `provider:login`.
+    SignedIn(String, std::result::Result<String, String>),
+}
+
+/// Menu inputs read from this computer's AgentSCM files at each rebuild.
+#[derive(Default)]
+struct MenuExtras {
+    /// One line per saved Hub: who this computer is signed in as, and auto-connect.
+    signed_in: Vec<String>,
+    /// The saved Hubs, in the order Connect items index them.
+    hubs: Vec<String>,
+    /// Hubs with a computer credential whose owner was never asked about auto-connect.
+    unasked: Vec<String>,
+    /// A refusal per connected checkout that needs the person, by root.
+    attention: Vec<(std::path::PathBuf, String)>,
+}
+
+impl MenuExtras {
+    fn load(snapshot: &Snapshot) -> Self {
+        let mut unasked = crate::hub_cli::auto_connect_unasked().unwrap_or_default();
+        unasked.truncate(crate::hub_cli::MAX_AUTO_CONNECT_HUBS);
+        let summaries = crate::hub_cli::sign_in_summaries();
+        Self {
+            signed_in: summaries
+                .iter()
+                .map(|row| format!("{}: {}", hub_host(&row.hub), row.state()))
+                .collect(),
+            hubs: summaries.into_iter().map(|row| row.hub).collect(),
+            unasked,
+            attention: snapshot
+                .connections
+                .iter()
+                .filter_map(|connection| {
+                    crate::client_cli::attention(&connection.root)
+                        .map(|message| (connection.root.clone(), message))
+                })
+                .collect(),
+        }
+    }
+
+    fn key(&self) -> String {
+        format!(
+            "\nextras:{:?}{:?}{:?}{:?}",
+            self.signed_in, self.hubs, self.unasked, self.attention
+        )
+    }
+
+    fn attention(&self, root: &Path) -> Option<&str> {
+        self.attention
+            .iter()
+            .find(|(saved, _)| saved == root)
+            .map(|(_, message)| message.as_str())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,7 +176,10 @@ fn run_foreground(initial: Snapshot) -> Result<()> {
         }
     };
     let activity_receiver = crate::client_activity::ActivityReceiver::bind()?;
-    let activity = crate::client_activity::ActivityStore::default();
+    // Sightings outlive a tray restart (#117), in the owner-only config directory.
+    let activity = crate::client_activity::ActivityStore::saved_at(
+        crate::hub_cli::config_dir()?.join("agentscm/tray-unconnected.json"),
+    );
     let mut builder = EventLoop::<UserEvent>::with_user_event();
     builder
         .with_activation_policy(ActivationPolicy::Accessory)
@@ -144,6 +200,7 @@ fn run_foreground(initial: Snapshot) -> Result<()> {
         Some("Loading connected checkouts…"),
         login_enabled,
         None,
+        &MenuExtras::default(),
     )?;
     let refreshing = Arc::new(AtomicBool::new(false));
     let installing = Arc::new(AtomicBool::new(false));
@@ -285,7 +342,8 @@ impl TrayApp {
             self.snapshot.connections.is_empty(),
         );
         let login_enabled = super::login::enabled();
-        let key = menu_projection_key(
+        let extras = MenuExtras::load(&self.snapshot);
+        let mut key = menu_projection_key(
             &self.snapshot,
             &self.activity,
             notice,
@@ -294,6 +352,7 @@ impl TrayApp {
             agentscm::hub::store::unix_now(),
             std::time::Instant::now(),
         );
+        key.push_str(&extras.key());
         let tracking = self
             .native_menu
             .as_ref()
@@ -317,6 +376,7 @@ impl TrayApp {
                 notice,
                 login_enabled,
                 confirming,
+                &extras,
             ),
         ) {
             let Some(native_menu) = native_menu::NativeMenuBridge::attach(
@@ -559,19 +619,36 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                     &self.activity,
                     std::time::Instant::now(),
                 );
-                let hub = request
-                    .as_ref()
-                    .and_then(|request| target_hub(&request.host, &request.repo));
+                let chosen = request.as_ref().and_then(|request| request.hub.clone());
+                let signed_in = match &chosen {
+                    Some(hub) => crate::hub_cli::load_auth(Some(hub))
+                        .ok()
+                        .map(|(hub, _)| hub),
+                    None => request
+                        .as_ref()
+                        .and_then(|request| target_hub(&request.host, &request.repo)),
+                };
+                // Not signed in there: sign in to that Hub (or the saved one) from here first.
+                let sign_in = signed_in
+                    .is_none()
+                    .then(|| chosen.or_else(|| crate::hub_cli::saved_hub(None)))
+                    .flatten();
+                let hub = signed_in.clone().or(sign_in.clone());
                 if self.opening_hub || self.installing.load(Ordering::Acquire) {
                     self.notice = Some(Notice::Action(
                         "An action is still running; wait for its result".into(),
                     ));
                 } else if let (Some(request), Some(hub)) = (&request, &hub) {
                     self.installing.store(true, Ordering::Release);
+                    let how = if sign_in.is_some() {
+                        "Finish signing in in your browser; then this checkout connects"
+                    } else {
+                        "Connecting this checkout"
+                    };
                     self.feedback.show(
                         &format!("Connecting {}…", request.repo),
                         &format!(
-                            "Connecting this checkout to {hub} with your saved sign-in, then configuring {}. Your coding client will ask for its own approvals when you open it.",
+                            "{how} to {hub}, then configures {}. Your coding client will ask for its own approvals when you open it.",
                             request.label
                         ),
                         true,
@@ -581,6 +658,7 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                         request.clone(),
                         hub.clone(),
                         self.executable.clone(),
+                        sign_in.is_some(),
                     );
                     self.notice = Some(Notice::Action("Connecting checkout…".into()));
                 } else if request.is_some() {
@@ -681,6 +759,87 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                     self.activity.forget_unconnected(&row.root);
                 }
                 self.replace_menu(None);
+            }
+            UserEvent::Menu(id)
+                if id.starts_with("auto-connect-yes:") || id.starts_with("auto-connect-no:") =>
+            {
+                let (on, hub) = match id.strip_prefix("auto-connect-yes:") {
+                    Some(hub) => (true, hub),
+                    None => (false, id.trim_start_matches("auto-connect-no:")),
+                };
+                self.notice = Some(Notice::Action(
+                    match crate::hub_cli::set_auto_connect(Some(hub), on) {
+                        Ok(hub) if on => {
+                            format!("Agents connect automatically on {}", hub_host(&hub))
+                        }
+                        Ok(hub) => format!("Auto-connect is off for {}", hub_host(&hub)),
+                        Err(error) => bounded_error(&error.to_string()),
+                    },
+                ));
+                self.replace_menu(None);
+            }
+            UserEvent::Menu(id) if id.starts_with("sign-in:") => {
+                self.notice = None;
+                let mut parts = id.split(':').skip(1);
+                let target = match (parts.next(), parts.next(), parts.next()) {
+                    (Some(identity), Some(provider), None) => self
+                        .snapshot
+                        .connections
+                        .iter()
+                        .find(|connection| connection_identity(connection) == identity)
+                        .map(|connection| connection.hub.clone())
+                        .zip(
+                            ["github", "gitlab"]
+                                .into_iter()
+                                .find(|known| *known == provider),
+                        ),
+                    _ => None,
+                };
+                if self.opening_hub || self.installing.load(Ordering::Acquire) {
+                    self.notice = Some(Notice::Action(
+                        "An action is still running; wait for its result".into(),
+                    ));
+                } else if let Some((hub, provider)) = target {
+                    self.installing.store(true, Ordering::Release);
+                    self.feedback.show(
+                        &format!("Signing in to {}…", hub_host(&hub)),
+                        "Finish signing in in your browser. This computer then stays signed in until you revoke it.",
+                        true,
+                    );
+                    spawn_sign_in(self.refresh_proxy.clone(), hub, provider);
+                }
+                self.replace_menu(None);
+            }
+            UserEvent::SignedIn(hub, result) => {
+                self.installing.store(false, Ordering::Release);
+                self.notice = Some(Notice::Action(match result {
+                    Ok(who) => {
+                        let ask = if crate::hub_cli::auto_connect_unasked()
+                            .is_ok_and(|hubs| hubs.contains(&hub))
+                        {
+                            " Choose in the AgentSCM menu whether agents connect automatically."
+                        } else {
+                            ""
+                        };
+                        self.feedback.update(
+                            "Signed in",
+                            &format!(
+                                "This computer is signed in to {} as {who}. You won't need to do this again.{ask}",
+                                hub_host(&hub)
+                            ),
+                            false,
+                        );
+                        format!("Signed in to {}", hub_host(&hub))
+                    }
+                    Err(error) => {
+                        self.feedback.update("Sign-in failed", &error, false);
+                        format!("Sign-in failed: {error}")
+                    }
+                }));
+                self.replace_menu(None);
+                if !self.refreshing.swap(true, Ordering::AcqRel) {
+                    spawn_refresh(self.refresh_proxy.clone(), false);
+                }
             }
             UserEvent::Menu(id) if id.starts_with("copy-quickstart:") => {
                 self.notice = None;
@@ -1225,6 +1384,8 @@ struct ConnectRequest {
     root: std::path::PathBuf,
     host: String,
     repo: String,
+    /// The saved Hub the person chose, when several are saved (#116).
+    hub: Option<String>,
 }
 
 fn connect_request(
@@ -1237,6 +1398,16 @@ fn connect_request(
     (parts.next()? == "connect").then_some(())?;
     let identity = parts.next()?;
     let agent_name = parts.next()?;
+    // An index into the saved Hubs, as the menu listed them.
+    let hub = match parts.next() {
+        None => None,
+        Some(index) => Some(
+            crate::hub_cli::sign_in_summaries()
+                .into_iter()
+                .nth(index.parse::<usize>().ok()?)?
+                .hub,
+        ),
+    };
     if parts.next().is_some() {
         return None;
     }
@@ -1256,14 +1427,16 @@ fn connect_request(
         root: row.root,
         host: row.host,
         repo: row.repo,
+        hub,
     })
 }
 
-/// The Hub a tray Connect uses for `host`/`repo`, with the saved sign-in it needs.
+/// The Hub a tray Connect uses for `host`/`repo`, with the saved sign-in it needs: this
+/// computer's credential, or a session that has not expired.
 fn target_hub(host: &str, repo: &str) -> Option<String> {
     let connections = crate::client_config::load().unwrap_or_default();
     connect_hub(host, repo, &connections, |hub| {
-        crate::hub_cli::load_session(hub).ok().map(|(hub, _)| hub)
+        crate::hub_cli::load_auth(hub).ok().map(|(hub, _)| hub)
     })
 }
 
@@ -1287,11 +1460,61 @@ fn connect_hub(
         .or_else(|| signed_in(None))
 }
 
+/// The sign-in provider for a forge host: GitHub unless the host says GitLab.
+fn forge_provider(host: &str) -> &'static str {
+    if host.contains("gitlab") {
+        "gitlab"
+    } else {
+        "github"
+    }
+}
+
+/// The host of a Hub URL, for a short menu label.
+fn hub_host(hub: &str) -> String {
+    reqwest::Url::parse(hub)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| hub.to_owned())
+}
+
+const AUTO_CONNECT_MENU_HELP: &str = "Agents that start in a checkout with no connection send its forge host and owner/name to this Hub and connect when it has the repository and you have the role. Change it later with agentscm hub auto-connect.";
+
+/// A browser sign-in started from the menu: the forge page opens in the default browser.
+fn sign_in_from_menu(hub: &str, provider: &str) -> std::result::Result<String, String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    runtime
+        .block_on(crate::hub_cli::sign_in_with(
+            hub,
+            provider,
+            None,
+            crate::hub_cli::SignIn::Browser,
+        ))
+        .map_err(|error| bounded_error(&error.to_string()))
+}
+
+fn spawn_sign_in(
+    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    hub: String,
+    provider: &'static str,
+) {
+    std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sign_in_from_menu(&hub, provider)
+        }))
+        .unwrap_or_else(|_| Err("sign-in stopped unexpectedly".to_owned()));
+        let _ = proxy.send_event(UserEvent::SignedIn(hub, result));
+    });
+}
+
 fn spawn_connect(
     proxy: winit::event_loop::EventLoopProxy<UserEvent>,
     request: ConnectRequest,
     hub: String,
     program: std::path::PathBuf,
+    sign_in: bool,
 ) {
     std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1299,6 +1522,13 @@ fn spawn_connect(
                 .enable_all()
                 .build()
                 .map_err(|error| error.to_string())?;
+            if sign_in {
+                // The Hub's only provider when it says so, else the forge the origin names.
+                let provider = runtime
+                    .block_on(crate::hub_cli::only_provider(&hub))
+                    .unwrap_or_else(|_| forge_provider(&request.host).to_owned());
+                sign_in_from_menu(&hub, &provider)?;
+            }
             runtime
                 .block_on(crate::client_cli::setup_unconnected(
                     request.agent,
@@ -1548,11 +1778,46 @@ fn build_menu(
     notice: Option<&str>,
     login_enabled: bool,
     confirming: Option<&str>,
+    extras: &MenuExtras,
 ) -> Result<Menu> {
     let now = agentscm::hub::store::unix_now();
     let menu = Menu::new();
     menu.append(&PredefinedMenuItem::section_header("AgentSCM"))
         .map_err(menu_error)?;
+    if !extras.signed_in.is_empty() {
+        menu.append(&native_text_item("signed-in", &extras.signed_in.join("\n")))
+            .map_err(menu_error)?;
+    }
+    // Asked once per Hub, for sign-ins made without a terminal or before this question existed.
+    for hub in &extras.unasked {
+        let ask = Submenu::new(
+            super::clean_label(&format!(
+                "Connect agents automatically on {}?",
+                hub_host(hub)
+            )),
+            true,
+        );
+        ask.append(&native_text_item(
+            "auto-connect-help",
+            AUTO_CONNECT_MENU_HELP,
+        ))
+        .map_err(menu_error)?;
+        ask.append(&MenuItem::with_id(
+            format!("auto-connect-yes:{hub}"),
+            "Yes",
+            true,
+            None,
+        ))
+        .map_err(menu_error)?;
+        ask.append(&MenuItem::with_id(
+            format!("auto-connect-no:{hub}"),
+            "Not Now",
+            true,
+            None,
+        ))
+        .map_err(menu_error)?;
+        menu.append(&ask).map_err(menu_error)?;
+    }
     let monotonic_now = std::time::Instant::now();
     let unconnected = unconnected_rows(snapshot, activity, monotonic_now);
     if snapshot.connections.is_empty() && unconnected.is_empty() && notice.is_none() {
@@ -1581,6 +1846,14 @@ fn build_menu(
                 ),
             ))
             .map_err(menu_error)?;
+        if let Some(message) = extras.attention(&connection.root) {
+            submenu
+                .append(&native_text_item(
+                    "attention",
+                    &format!("Needs attention: {}", full_menu_value(message)),
+                ))
+                .map_err(menu_error)?;
+        }
         submenu
             .append(&PredefinedMenuItem::separator())
             .map_err(menu_error)?;
@@ -1721,6 +1994,19 @@ fn build_menu(
         let troubleshooting = Submenu::new("Troubleshooting", true);
         let sign_in = Submenu::new("Hub Sign-in", true);
         for (provider, label) in [
+            ("github", "Sign In with GitHub…"),
+            ("gitlab", "Sign In with GitLab…"),
+        ] {
+            sign_in
+                .append(&MenuItem::with_id(
+                    format!("sign-in:{identity}:{provider}"),
+                    label,
+                    true,
+                    None,
+                ))
+                .map_err(menu_error)?;
+        }
+        for (provider, label) in [
             ("github", "Copy GitHub Sign-in"),
             ("gitlab", "Copy GitLab Sign-in"),
         ] {
@@ -1814,6 +2100,24 @@ fn build_menu(
             .append(&PredefinedMenuItem::separator())
             .map_err(menu_error)?;
         for agent in row.agents.iter().rev() {
+            if extras.hubs.len() > 1 {
+                // One Connect per saved Hub, so the person picks where it goes (#116).
+                for (index, hub) in extras.hubs.iter().enumerate() {
+                    submenu
+                        .append(&MenuItem::with_id(
+                            format!("connect:{identity}:{agent}:{index}"),
+                            super::clean_label(&format!(
+                                "Connect with {} to {}",
+                                agent_label(agent),
+                                hub_host(hub)
+                            )),
+                            true,
+                            None,
+                        ))
+                        .map_err(menu_error)?;
+                }
+                continue;
+            }
             submenu
                 .append(&MenuItem::with_id(
                     format!("connect:{identity}:{agent}"),
@@ -2388,6 +2692,30 @@ impl InstanceLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn menu_sign_in_names_the_hub_host_and_forge() {
+        assert_eq!(
+            hub_host("https://dogfood.agentscm.dev"),
+            "dogfood.agentscm.dev"
+        );
+        assert_eq!(hub_host("not a url"), "not a url");
+        assert_eq!(forge_provider("github.com"), "github");
+        assert_eq!(forge_provider("gitlab.example.org"), "gitlab");
+        let extras = MenuExtras {
+            signed_in: Vec::new(),
+            hubs: Vec::new(),
+            unasked: vec!["https://hub.example".into()],
+            attention: vec![("/work/widgets".into(), "signed out".into())],
+        };
+        assert_eq!(
+            extras.attention(Path::new("/work/widgets")),
+            Some("signed out")
+        );
+        assert_eq!(extras.attention(Path::new("/work/other")), None);
+        // A changed answer or refusal changes the menu key, so the menu is rebuilt.
+        assert_ne!(extras.key(), MenuExtras::default().key());
+    }
 
     #[test]
     fn copied_hub_login_uses_the_exact_hub_and_explicit_provider() {

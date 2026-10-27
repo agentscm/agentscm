@@ -568,6 +568,30 @@ impl Env {
     }
 }
 
+/// A refusal's status and kind, after checking it says why in a message.
+fn refusal(reply: &(u16, Value)) -> (u16, &str) {
+    let message = reply.1["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("; "),
+        "a refusal names its fix: {}",
+        reply.1
+    );
+    (reply.0, reply.1["error"].as_str().unwrap_or_default())
+}
+
+/// The kind a failed browser sign-in sends back to the CLI's loopback, after checking it has a
+/// message.
+fn refused_page(status: u16, headers: &HeaderMap) -> String {
+    assert_eq!(status, 302);
+    let location = headers[header::LOCATION].to_str().unwrap();
+    let query = location
+        .strip_prefix("http://127.0.0.1:40000/callback?error=")
+        .unwrap_or_else(|| panic!("{location}"));
+    let (reason, message) = query.split_once("&message=").unwrap();
+    assert!(message.contains("%3B"), "{location}");
+    reason.to_owned()
+}
+
 async fn poll(env: &Env, handle: &Value) -> (u16, Value) {
     env.post("/v1/hub/login/device/poll", None, json!({"handle": handle}))
         .await
@@ -712,8 +736,8 @@ async fn denied_login_creates_nothing() {
     env.fake.lock().unwrap().deny = true;
     let (location, cookie, _) = env.browser_start("github").await;
     let callback = env.authorize_at_forge(&location).await;
-    let (status, _, body) = env.callback(&callback, Some(&cookie)).await;
-    assert_eq!((status, body), (403, json!({"error": "login_denied"})));
+    let (status, headers, _) = env.callback(&callback, Some(&cookie)).await;
+    assert_eq!(refused_page(status, &headers), "login_denied");
     assert!(env.kinds().is_empty());
 }
 
@@ -723,8 +747,8 @@ async fn expired_code_and_bad_state_fail_without_a_session() {
     env.fake.lock().unwrap().expire_codes = true;
     let (location, cookie, _) = env.browser_start("github").await;
     let callback = env.authorize_at_forge(&location).await;
-    let (status, _, body) = env.callback(&callback, Some(&cookie)).await;
-    assert_eq!((status, body), (400, json!({"error": "login_failed"})));
+    let (status, headers, _) = env.callback(&callback, Some(&cookie)).await;
+    assert_eq!(refused_page(status, &headers), "login_failed");
     env.fake.lock().unwrap().expire_codes = false;
 
     // Wrong cookie, no cookie, a second login's cookie, and another provider's callback.
@@ -737,7 +761,7 @@ async fn expired_code_and_bad_state_fail_without_a_session() {
         let callback = env.authorize_at_forge(&location).await;
         let callback = callback.replace("/github/", &format!("/{provider}/"));
         let (status, _, body) = env.callback(&callback, cookie.as_deref()).await;
-        assert_eq!((status, body), (400, json!({"error": "login_failed"})));
+        assert_eq!(refusal(&(status, body)), (400, "login_failed"));
     }
     let (location, cookie, _) = env.browser_start("github").await;
     let callback = env.authorize_at_forge(&location).await;
@@ -857,7 +881,7 @@ async fn device_flow_expired_denied_and_unavailable() {
         let reply = env
             .post(&format!("/v1/hub/login/{provider}/device"), None, json!({}))
             .await;
-        assert_eq!(reply, (409, json!({"error": "device_flow_unavailable"})));
+        assert_eq!(refusal(&reply), (409, "device_flow_unavailable"));
     }
 }
 
@@ -893,8 +917,9 @@ async fn only_listed_users_and_admins_sign_in() {
     env.fake.lock().unwrap().current_user = 8;
     let (location, cookie, _) = env.browser_start("github").await;
     let callback = env.authorize_at_forge(&location).await;
-    let (status, _, body) = env.callback(&callback, Some(&cookie)).await;
-    assert_eq!((status, body), (403, json!({"error": "not_allowed"})));
+    // The browser lands on the Hub page that says why, with no code for the CLI.
+    let (status, headers, _) = env.callback(&callback, Some(&cookie)).await;
+    assert_eq!(refused_page(status, &headers), "not_allowed");
     for (provider, user) in [("github", 8), ("gitlab", 7)] {
         env.fake
             .lock()
@@ -905,7 +930,7 @@ async fn only_listed_users_and_admins_sign_in() {
             .post(&format!("/v1/hub/login/{provider}/device"), None, json!({}))
             .await;
         let reply = poll(&env, &started["handle"]).await;
-        assert_eq!(reply, (403, json!({"error": "not_allowed"})), "{provider}");
+        assert_eq!(refusal(&reply), (403, "not_allowed"), "{provider}");
     }
     assert!(env.kinds().is_empty());
     assert!(env.store.list_users().unwrap().is_empty());
@@ -923,7 +948,7 @@ async fn a_listed_user_who_can_read_no_connected_repository_is_refused() {
         .post("/v1/hub/login/github/device", None, json!({}))
         .await;
     let reply = poll(&env, &started["handle"]).await;
-    assert_eq!(reply, (403, json!({"error": "not_allowed"})));
+    assert_eq!(refusal(&reply), (403, "not_allowed"));
     assert!(env.kinds().is_empty());
 }
 
@@ -942,8 +967,8 @@ async fn on_a_public_repository_only_people_who_can_write_get_in() {
         .post("/v1/hub/login/github/device", None, json!({}))
         .await;
     assert_eq!(
-        poll(&env, &started["handle"]).await,
-        (403, json!({"error": "not_allowed"}))
+        refusal(&poll(&env, &started["handle"]).await),
+        (403, "not_allowed")
     );
     assert!(env.kinds().is_empty());
     let session = secret(&env.device_login("github", 7).await);
@@ -990,7 +1015,7 @@ async fn with_no_allow_list_reading_a_connected_repository_is_enough() {
         .post("/v1/hub/login/github/device", None, json!({}))
         .await;
     let reply = poll(&env, &started["handle"]).await;
-    assert_eq!(reply, (403, json!({"error": "not_allowed"})));
+    assert_eq!(refusal(&reply), (403, "not_allowed"));
     assert!(env.kinds().is_empty());
     // Alice can, and the administrator needs no repository.
     assert_eq!(env.device_login("github", 7).await["admin"], false);
@@ -1006,14 +1031,14 @@ async fn with_no_allow_list_reading_a_connected_repository_is_enough() {
         .post("/v1/hub/login/github/device", None, json!({}))
         .await;
     let reply = poll(&env, &started["handle"]).await;
-    assert_eq!(reply, (403, json!({"error": "not_allowed"})));
+    assert_eq!(refusal(&reply), (403, "not_allowed"));
     // GitLab follows the same rule, by project id.
     env.fake.lock().unwrap().script.push_back(Step::Approve(8));
     let (_, started) = env
         .post("/v1/hub/login/gitlab/device", None, json!({}))
         .await;
     let reply = poll(&env, &started["handle"]).await;
-    assert_eq!(reply, (403, json!({"error": "not_allowed"})));
+    assert_eq!(refusal(&reply), (403, "not_allowed"));
     assert_eq!(env.device_login("gitlab", 7).await["admin"], false);
 }
 
@@ -1090,8 +1115,8 @@ async fn gitlab_sign_in_and_minting_need_developer_on_non_private_projects() {
         .post("/v1/hub/login/gitlab/device", None, json!({}))
         .await;
     assert_eq!(
-        poll(&env, &started["handle"]).await,
-        (403, json!({"error": "not_allowed"}))
+        refusal(&poll(&env, &started["handle"]).await),
+        (403, "not_allowed")
     );
     env.fake
         .lock()
@@ -1529,8 +1554,9 @@ async fn admins_disable_and_enable_users() {
     env.fake.lock().unwrap().current_user = 7;
     let (location, cookie, _) = env.browser_start("github").await;
     let callback = env.authorize_at_forge(&location).await;
-    let (status, _, body) = env.callback(&callback, Some(&cookie)).await;
-    assert_eq!((status, body), (403, json!({"error": "user_disabled"})));
+    // The browser lands on the Hub page that says why, with no code for the CLI.
+    let (status, headers, _) = env.callback(&callback, Some(&cookie)).await;
+    assert_eq!(refused_page(status, &headers), "user_disabled");
     assert_eq!(signed_in(), before);
     env.fake.lock().unwrap().script.push_back(Step::Approve(7));
     let (_, started) = env
@@ -1543,7 +1569,7 @@ async fn admins_disable_and_enable_users() {
             json!({"handle": started["handle"]}),
         )
         .await;
-    assert_eq!(reply, (403, json!({"error": "user_disabled"})));
+    assert_eq!(refusal(&reply), (403, "user_disabled"));
 
     assert_eq!(
         env.post(
@@ -1734,6 +1760,8 @@ impl Cli {
             .args(["hub"])
             .args(args)
             .env("XDG_CONFIG_HOME", self.config.path())
+            // Tests never open a real browser: sign-in uses the code flow, or prints its URL.
+            .env("AGENTSCM_NO_BROWSER", "1")
             .env("NO_PROXY", "127.0.0.1");
         command
     }
@@ -1948,9 +1976,16 @@ async fn cli_falls_back_to_the_loopback_flow_when_device_flow_is_unavailable() {
     assert_eq!(status, 302);
     let loopback = headers[header::LOCATION].to_str().unwrap();
     assert!(loopback.starts_with("http://127.0.0.1:"));
+    // The CLI trades the code first, then sends the browser to the Hub's signed-in page.
     let response = env.http.get(loopback).send().await.unwrap();
-    assert_eq!(response.status(), 200);
-    assert!(response.text().await.unwrap().contains("Signed in"));
+    assert_eq!(response.status(), 302);
+    let page = response.headers()[header::LOCATION].to_str().unwrap();
+    assert!(
+        page.starts_with(&format!(
+            "{hub}/ui/#/signed-in?status=signed_in&login=bob&provider=gitlab&computer="
+        )),
+        "{page}"
+    );
     let mut rest = String::new();
     std::io::Read::read_to_string(&mut stderr, &mut rest).unwrap();
     assert!(child.wait().unwrap().success(), "{rest}");
@@ -1969,4 +2004,85 @@ async fn cli_falls_back_to_the_loopback_flow_when_device_flow_is_unavailable() {
         })
         .count();
     assert_eq!(leftovers, 0);
+
+    // The sign-in also signed this computer in; without a terminal nobody was asked about
+    // auto-connect.
+    let saved: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let device = &saved["sessions"][0]["device"];
+    assert!(
+        device["id"].as_str().unwrap().starts_with("dev_"),
+        "{saved}"
+    );
+    assert!(
+        saved["sessions"][0].get("auto_connect").is_none(),
+        "{saved}"
+    );
+    let (ok, stdout, stderr) = cli.run(&["devices", "list"]);
+    assert!(ok && stdout.contains("(this computer)"), "{stdout}{stderr}");
+    assert!(!stdout.contains(device["secret"].as_str().unwrap()));
+    let (ok, _, stderr) = cli.run(&["auto-connect", "on"]);
+    assert!(ok && stderr.contains("Auto-connect is on"), "{stderr}");
+    let saved: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(saved["sessions"][0]["auto_connect"], json!(true));
+    // Signing out signs the computer out on the Hub too.
+    let (ok, _, stderr) = cli.run(&["logout"]);
+    assert!(ok, "{stderr}");
+    assert!(env.kinds().contains(&"device_revoked".to_owned()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_browser_sign_in_ends_the_cli_wait_with_the_reason() {
+    let env = Env::start_with("", "github:#7", |_| {}).await;
+    {
+        let mut fake = env.fake.lock().unwrap();
+        fake.no_device = true;
+        fake.current_user = 8;
+    }
+    let cli = Cli::new();
+    let hub = env.url();
+    let mut child = cli
+        .command(&["login", "--hub", &hub, "--provider", "github"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    let url = loop {
+        let mut line = String::new();
+        assert!(stderr.read_line(&mut line).unwrap() > 0, "cli exited early");
+        if line.starts_with(&format!("{hub}/v1/hub/login/github?cli_port=")) {
+            break line.trim().to_owned();
+        }
+    };
+    let (_, headers, _) = env.send(Method::GET, &url, None, None, None).await;
+    let location = headers[header::LOCATION].to_str().unwrap().to_owned();
+    let cookie = headers[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let callback = env.authorize_at_forge(&location).await;
+    let (status, headers, _) = env.callback(&callback, Some(&cookie)).await;
+    assert_eq!(status, 302);
+    let loopback = headers[header::LOCATION].to_str().unwrap();
+    assert!(
+        loopback.contains("/callback?error=not_allowed&message="),
+        "{loopback}"
+    );
+    // The CLI answers by sending the browser to the Hub's page, and stops waiting.
+    let response = env.http.get(loopback).send().await.unwrap();
+    assert_eq!(response.status(), 302);
+    let page = response.headers()[header::LOCATION].to_str().unwrap();
+    assert!(
+        page.starts_with(&format!(
+            "{hub}/ui/#/signed-in?status=refused&reason=not_allowed"
+        )),
+        "{page}"
+    );
+    let mut rest = String::new();
+    std::io::Read::read_to_string(&mut stderr, &mut rest).unwrap();
+    assert!(!child.wait().unwrap().success());
+    assert!(rest.contains("ask a Hub admin to add you"), "{rest}");
+    assert!(!cli.session_file().exists());
 }

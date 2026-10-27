@@ -24,6 +24,7 @@ use super::coordination::{
     CoordinationAck, CoordinationInbox, CoordinationInboxQuery, CoordinationListQuery,
     CoordinationReply, CoordinationRequest, CoordinationResolve, CoordinationWithdraw,
 };
+use super::device::{Device, DevicePrincipal, Refusal, RepositoryUsage};
 use super::external_runs::{ExternalKind, ExternalObserved, ExternalRun};
 use super::handoff::{Answered, Asked};
 use super::insights::{InsightPage, InsightQuery, UsageReceipt, UsageRecord, WorkInsight};
@@ -43,6 +44,7 @@ use super::{HubError, Result};
 use crate::team::auth::{Secret, generate_secret, lower_hex, token_digest};
 
 const AGENT_TOKEN_DIGEST_DOMAIN: &[u8] = b"agentscm.hub.agent-token.v1\0";
+const DEVICE_DIGEST_DOMAIN: &[u8] = b"agentscm.hub.device.v1\0";
 const MAX_HOST_BYTES: usize = 253;
 const MAX_LOGIN_BYTES: usize = 255;
 const MAX_REPOSITORY_BYTES: usize = 255;
@@ -202,6 +204,47 @@ pub trait Store: Send + Sync {
     fn record_sign_in(&self, user: &str, method: &str, admin: bool) -> Result<()>;
     /// None if unknown, revoked, expired, or the owner is disabled.
     fn authenticate(&self, digest: &TokenDigest, now: i64) -> Result<Option<Principal>>;
+    /// A new computer for an enabled `owner`. `replaces` (a computer `owner` owns) is revoked
+    /// with its agent tokens in the same transaction. Returns the `dev_` id.
+    fn insert_device(
+        &self,
+        owner: &str,
+        name: &str,
+        digest: &TokenDigest,
+        replaces: Option<&str>,
+        now: i64,
+    ) -> Result<String>;
+    /// None if unknown, revoked or idle past `DEVICE_IDLE_SECONDS`. A disabled owner is returned
+    /// with `owner.disabled` set, so the caller can say so. Records use at most once per
+    /// `DEVICE_TOUCH_SECONDS`.
+    fn authenticate_device(
+        &self,
+        digest: &TokenDigest,
+        now: i64,
+    ) -> Result<Option<DevicePrincipal>>;
+    /// `owner`'s computers, or everyone's for None: live ones first, then those revoked within
+    /// the last 30 days; newest first, at most `MAX_DEVICES`.
+    fn devices(&self, owner: Option<&str>, now: i64) -> Result<Vec<Device>>;
+    /// Revokes a live computer (only `owner`'s when Some) and every agent token it minted.
+    /// True if it was live.
+    fn revoke_device(&self, device: &str, owner: Option<&str>, by: &str, now: i64) -> Result<bool>;
+    /// True if `owner`'s live computer was renamed.
+    fn rename_device(&self, device: &str, owner: &str, name: &str) -> Result<bool>;
+    /// Like `insert_agent_token`, minted through `device` (which must be live and `token.owner`'s).
+    /// `auto` (auto-connect) records an `auto_connected` event.
+    fn insert_device_token(
+        &self,
+        token: &NewAgentToken,
+        device: &str,
+        auto: bool,
+    ) -> Result<String>;
+    /// Records a refusal: one row per person and reason; a repeat bumps `count` and `at`.
+    /// Prunes rows past `REFUSAL_SECONDS` and beyond the newest `MAX_REFUSALS`.
+    fn record_refusal(&self, refusal: &Refusal) -> Result<()>;
+    /// Newest first, within `REFUSAL_SECONDS` of `now`.
+    fn refusals(&self, now: i64) -> Result<Vec<Refusal>>;
+    /// Connected repositories with the computers and live agent tokens using each.
+    fn repository_usage(&self, now: i64) -> Result<Vec<RepositoryUsage>>;
     /// Upsert intent `intent.id` for the active token `token`; returns it and every live overlapping intent.
     fn announce_intent(&self, token: &str, intent: &NewIntent, now: i64) -> Result<Announced>;
     /// None if unknown, not the caller's, released or expired.
@@ -853,6 +896,13 @@ pub fn open(url: &str) -> Result<Arc<dyn Store>> {
 
 pub fn agent_token_digest(raw: &str) -> Result<TokenDigest> {
     token_digest(AGENT_TOKEN_DIGEST_DOMAIN, raw)
+        .map(TokenDigest)
+        .map_err(|_| HubError::Unauthorized)
+}
+
+/// Digest of a computer credential, domain-separated from agent tokens.
+pub fn device_digest(raw: &str) -> Result<TokenDigest> {
+    token_digest(DEVICE_DIGEST_DOMAIN, raw)
         .map(TokenDigest)
         .map_err(|_| HubError::Unauthorized)
 }

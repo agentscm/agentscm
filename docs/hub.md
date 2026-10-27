@@ -170,8 +170,9 @@ sign-in becomes the default hub. It is sent only to the hub that issued it.
   A redirect, an unreadable repository or a name now used by another id is 403 `forbidden`. The secret is the only line on stdout. `--ttl` takes
   `<n>s|m|h|d`, at most 30 days. `--read-only` makes a [read-only token](#read-only-tokens).
 - `agentscm hub token list` (read-only tokens are marked `read-only`) and `agentscm hub token revoke <tok_id>`.
-- `agentscm hub logout [--hub URL]` ends that hub's session on the hub (a failure is ignored)
-  and removes its saved entry.
+- `agentscm hub logout [--hub URL]` ends that hub's session on the hub (a failure is ignored),
+  signs this computer out there when it has a [credential](#computer-credentials) (its agent
+  tokens are revoked), and removes its saved entry.
 - `--hub URL` on the token commands picks the saved session for that hub (default: `AGENTSCM_HUB`,
   then the default hub); without a saved session for it the command fails.
 
@@ -179,6 +180,78 @@ The browser flow sets the cookie `__Host-agentscm_login` (`Secure`, `HttpOnly`,
 `SameSite=Lax`, 10 minutes). Some browsers, notably Safari, drop `Secure`
 cookies on plain-HTTP loopback; use an `https://` public URL for browser
 sign-in there.
+
+## Computer credentials
+
+A sign-in can also sign in the computer it runs on. `exchange` and `device/poll` accept an
+optional `device` object, `{"name"?, "replaces"?}`, and then reply with
+`"device": {"id": "dev_…", "secret", "name"}` next to the session; the secret is shown only there.
+`name` is 1 to 64 printable characters (default "<login>'s computer"); `replaces` is the secret
+of this computer's previous credential, which is revoked with its agent tokens only if it is the
+same person's live computer. A person with a live session from a sign-in that did not sign a
+computer in can enroll one with `POST /v1/hub/devices` (`{"name"?}`; 201 `{"device": {...}}`); a
+session that came with a computer gets 403 `device_revoked`. The CLI does both; see
+[connect this computer](connect-this-computer.md#sign-in-once-per-computer).
+
+Every refusal below is `{"error": "<kind>", "message": "<reason>; <the one fix>"}` with the
+status shown; clients show `message` as is.
+
+- Only a domain-separated digest is stored, in the database (named migration `devices`), so a
+  restart signs nobody out. A credential unused for 90 days or revoked stops working (401
+  `sign_in_required`); one whose owner is disabled gets 403 `user_disabled`. `last_used_at` is
+  written at most once an hour.
+- With `Authorization: Bearer <computer credential>`: `GET /v1/hub/device` (this computer and
+  its owner), `DELETE /v1/hub/device` (sign this computer out), `POST /v1/hub/device/name`
+  (`{"name"}`, 204), `POST /v1/hub/device/tokens` (`{"name", "repository", "read_only"?,
+  "auto"?}`; 201 as `POST /v1/hub/tokens` plus `device_id`) and
+  `DELETE /v1/hub/device/tokens/{id}` (own tokens). The credential is refused (401) on every
+  human-session route, administrator routes included, and on every agent route; sessions and
+  agent tokens are refused on these.
+- `POST /v1/hub/device/tokens` mints an agent token for 24 hours or a read-only one for 30
+  minutes, and re-checks at every call: the owner is enabled (else 403 `user_disabled`), on
+  `AGENTSCM_ALLOWED_USERS` when set (else 403 `not_allowed`; administrators pass), the repository
+  is connected on the owner's host (else 403 `not_connected`), and the owner has the role
+  sign-in and `POST /v1/hub/tokens` require, asked with that repository's connection credential:
+  for GitHub, `GET /repos/{owner}/{name}` and `.../collaborators/{login}/permission`, whose
+  `user.id` must be the owner's (a private repository needs any role, a public one Triage, Write,
+  Maintain or Admin; a custom role is judged by its base permission); for GitLab,
+  `GET /projects/{id}` and `.../members/all/{user_id}` (an active member with Reporter on a
+  private project, Developer otherwise). A role that is too low or missing is 403
+  `insufficient_role` with `login`, `repository`, `visibility`, `has` and `needs`, as
+  `POST /v1/hub/tokens` gives it. A login that now belongs to someone else is 401
+  `sign_in_required` (signing in again refreshes it); a login the forge does not know is judged as
+  no role. A connection whose
+  credential cannot answer (`auth_failed`, or a 401 or 403 from the forge, or the repository gone
+  from its view) is 403 `access_check_unavailable`; a forge 5xx or rate limit is 503
+  `permission_unavailable`. Nothing is minted on a refusal. For `not_connected` on an
+  `owner/name`, the Hub asks each connected repository with the same name (at most five), through
+  that repository's own connection only, whether the requested one is its fork; when one is, the
+  message names it and `fork_of` gives its name. `auto: true` (auto-connect) records
+  `auto_connected`.
+- `GET /v1/hub/devices` (session or credential): the owner's computers, live ones first, then
+  those revoked in the last 30 days, newest first, at most 100: `id`, `name`, `created_at`,
+  `last_used_at`, `revoked_at`, `current` (the calling credential) and `repositories` (with a
+  live agent token minted through it). `DELETE /v1/hub/devices/{id}`: the owner revokes one of
+  their computers (a credential cannot name itself, 400), an administrator's session revokes
+  anyone's; 204 or 404. Revoking a computer revokes every agent token it minted in the same
+  transaction, and ends this Hub process's session from the sign-in that signed it in.
+- Administrators (session only): `GET /v1/hub/admin/devices` (every computer, with its `owner`),
+  `GET /v1/hub/admin/repositories` (each connected repository with the number of computers and
+  live agent tokens using it) and `GET /v1/hub/admin/sign-in-refusals`: refused sign-ins and
+  computer mints within 30 days, at most 200, one row per person and reason (`at`, `count`,
+  `provider`, `host`, `login`, `forge_user_id`, `reason`, `via` `sign_in` or `device_mint`; a
+  repeat bumps `count`). No secret is stored, and still no user row, event or session for the
+  refused person.
+- Events: `device_created`, `device_renamed`, `device_revoked` (`by` the acting user, or the
+  computer that revoked another), `auto_connected`.
+- Sign-in failures carry a `message` naming the step: an expired or foreign sign-in link, a
+  sign-in cancelled or refused at the forge (with the forge's error code when it is a plain
+  word), a code the forge did not accept, an account the forge did not return, or a code that
+  expired before the CLI used it. A browser sign-in that fails redirects to
+  `/ui/#/signed-in?status=refused&reason=<kind>&message=...` instead of answering JSON.
+- `GET /v1/hub/login` also lists `browser_only`: providers whose forge app refused device
+  sign-in when last asked (a GitHub App without **Enable Device Flow**, which a manifest cannot
+  set; the setup page links to the checkbox), so clients go straight to the browser.
 
 ## Routes
 
