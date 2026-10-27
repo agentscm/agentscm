@@ -166,7 +166,7 @@ pub async fn serve(config: HubConfig) -> Result<()> {
             "workspace execution is unsupported on this platform".into(),
         ));
     }
-    if let Some(path) = std::env::var_os(super::slack::CONFIG_ENV) {
+    if let Some(path) = std::env::var_os(super::slack::CONFIG_ENV).filter(|path| !path.is_empty()) {
         let slack = tokio::task::spawn_blocking(move || {
             super::slack::Slack::from_file(std::path::Path::new(&path))
         })
