@@ -600,7 +600,9 @@ async fn repository_role(
     }
     let forge_error = |error: GhError| match error {
         GhError::Auth(_) => kind("access_check_unavailable"),
-        GhError::Limited(_) | GhError::Failed(_) => kind("permission_unavailable"),
+        GhError::Limited(_) | GhError::Failed(_) | GhError::TooLarge(_) => {
+            kind("permission_unavailable")
+        }
     };
     let token = state
         .sync

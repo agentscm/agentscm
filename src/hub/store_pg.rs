@@ -1323,6 +1323,7 @@ fn pg_catchup_page(
             checked_at: None,
             unread_pages: 0,
             deferred: 0,
+            window_from: None,
         },
         CatchupSourceCoverage {
             source: CatchupMergeSource::ForgePull,
@@ -1330,10 +1331,11 @@ fn pg_catchup_page(
             checked_at: None,
             unread_pages: 0,
             deferred: 0,
+            window_from: None,
         },
     ];
     for row in tx.query(
-        "SELECT source,state,checked_at,unread_pages,deferred FROM hub_catchup_sources
+        "SELECT source,state,checked_at,unread_pages,deferred,window_from FROM hub_catchup_sources
         WHERE provider=$1 AND host=$2 AND repository=$3 AND repository_key=$4 ORDER BY source",
         &[
             &who.owner.identity.provider,
@@ -1350,6 +1352,7 @@ fn pg_catchup_page(
             checked_at: Some(row.get(2)),
             unread_pages: row.get::<_, i64>(3) as u64,
             deferred: row.get::<_, i64>(4) as u64,
+            window_from: row.get(5),
         });
     }
     source_coverage.sort_by_key(|entry| source_name(entry.source));
@@ -7419,13 +7422,14 @@ impl Store for PgStore {
             ON CONFLICT DO NOTHING",&[&scope.provider,&scope.host,&repository,
             &catchup_repository_key(scope.repository_id),&scope.repository_id,&status.checked_at])?;
             client.execute("INSERT INTO hub_catchup_sources
-            (provider,host,repository,repository_key,repository_id,source,state,checked_at,unread_pages,deferred)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            (provider,host,repository,repository_key,repository_id,source,state,checked_at,unread_pages,deferred,window_from)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
             ON CONFLICT(provider,host,repository,repository_key,source) DO UPDATE SET state=EXCLUDED.state,
-              checked_at=EXCLUDED.checked_at,unread_pages=EXCLUDED.unread_pages,deferred=EXCLUDED.deferred
+              checked_at=EXCLUDED.checked_at,unread_pages=EXCLUDED.unread_pages,deferred=EXCLUDED.deferred,
+              window_from=EXCLUDED.window_from
             WHERE EXCLUDED.checked_at>=hub_catchup_sources.checked_at",&[&scope.provider,&scope.host,&repository,
             &catchup_repository_key(scope.repository_id),&scope.repository_id,&source_name(status.source),
-            &coverage_name(status.state),&status.checked_at,&(status.unread_pages as i64),&(status.deferred as i64)])?;Ok(())})
+            &coverage_name(status.state),&status.checked_at,&(status.unread_pages as i64),&(status.deferred as i64),&status.window_from])?;Ok(())})
     }
 
     fn work_start(&self, token: &str, start: &WorkStart, now: i64) -> Result<WorkStartResult> {

@@ -835,6 +835,7 @@ fn sqlite_catchup_page(
             checked_at: None,
             unread_pages: 0,
             deferred: 0,
+            window_from: None,
         },
         CatchupSourceCoverage {
             source: CatchupMergeSource::ForgePull,
@@ -842,10 +843,11 @@ fn sqlite_catchup_page(
             checked_at: None,
             unread_pages: 0,
             deferred: 0,
+            window_from: None,
         },
     ];
     let mut statement = tx.prepare(
-        "SELECT source,state,checked_at,unread_pages,deferred FROM hub_catchup_sources
+        "SELECT source,state,checked_at,unread_pages,deferred,window_from FROM hub_catchup_sources
          WHERE provider=?1 AND host=?2 AND repository=?3 AND repository_key=?4 ORDER BY source",
     )?;
     let rows = statement
@@ -863,11 +865,12 @@ fn sqlite_catchup_page(
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
                 ))
             },
         )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    for (source, state, checked_at, unread_pages, deferred) in rows {
+    for (source, state, checked_at, unread_pages, deferred, window_from) in rows {
         let parsed_source = parse_source(&source)?;
         source_coverage.retain(|entry| entry.source != parsed_source);
         source_coverage.push(CatchupSourceCoverage {
@@ -876,6 +879,7 @@ fn sqlite_catchup_page(
             checked_at: Some(checked_at),
             unread_pages: unread_pages as u64,
             deferred: deferred as u64,
+            window_from,
         });
     }
     source_coverage.sort_by_key(|entry| source_name(entry.source));
@@ -7464,14 +7468,14 @@ impl Store for SqliteStore {
         )?;
         conn.execute(
             "INSERT INTO hub_catchup_sources
-                (provider,host,repository,repository_key,repository_id,source,state,checked_at,unread_pages,deferred)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+                (provider,host,repository,repository_key,repository_id,source,state,checked_at,unread_pages,deferred,window_from)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
              ON CONFLICT(provider,host,repository,repository_key,source) DO UPDATE SET
                 state=excluded.state,checked_at=excluded.checked_at,unread_pages=excluded.unread_pages,
-                deferred=excluded.deferred WHERE excluded.checked_at>=hub_catchup_sources.checked_at",
+                deferred=excluded.deferred,window_from=excluded.window_from WHERE excluded.checked_at>=hub_catchup_sources.checked_at",
             params![scope.provider,scope.host,repository,catchup_repository_key(scope.repository_id),
                 scope.repository_id,source_name(status.source),coverage_name(status.state),status.checked_at,
-                status.unread_pages as i64,status.deferred as i64],
+                status.unread_pages as i64,status.deferred as i64,status.window_from],
         )?;
         Ok(())
     }

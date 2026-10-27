@@ -10,11 +10,11 @@ use ring::digest::{Context, SHA1_FOR_LEGACY_USE_ONLY};
 use serde_json::{Value, json};
 
 use super::Result;
-use super::forge_http::{self, Full, send_full};
+use super::forge_http::{self, Full, send_capped};
 use super::github::{
-    API_BODY_BYTES, Branch, CommitStatus, Gh, GhError, MAX_COMMENT_PAGES, MAX_FILE_PAGES,
-    MAX_PULL_PAGES, MAX_RECENT_BRANCHES, PER_PAGE, Paged, PullHead, Reply, RepoInfo, StatusState,
-    answer, endpoint_kind, parse_rfc3339, valid_ref_name,
+    API_BODY_BYTES, Branch, ClosedPage, CommitStatus, Gh, GhError, MAX_COMMENT_PAGES,
+    MAX_FILE_PAGES, MAX_PULL_PAGES, MAX_RECENT_BRANCHES, PER_PAGE, Paged, PullHead, Reply,
+    RepoInfo, StatusState, answer, endpoint_kind, parse_rfc3339, valid_ref_name,
 };
 use super::store::{unix_now, validate_repository};
 
@@ -72,7 +72,7 @@ impl Api {
         }
         classify(
             endpoint_kind(url, &self.base),
-            send_full(request, API_BODY_BYTES).await?,
+            send_capped(request, API_BODY_BYTES).await?,
         )
     }
 
@@ -181,6 +181,29 @@ impl Api {
         let mut paged = self.paged(token, &path, 1).await?;
         paged.items = paged.items.iter().map(pull_json).collect();
         Ok(paged)
+    }
+
+    /// One page of merged proposals, newest updated first, mapped like [`recent_closed_pulls`].
+    pub async fn closed_pulls_page(
+        &self,
+        token: &str,
+        project: i64,
+        per_page: u32,
+        page: u32,
+    ) -> Gh<ClosedPage> {
+        let path = format!(
+            "/projects/{project}/merge_requests?state=merged&order_by=updated_at&sort=desc&per_page={per_page}&page={page}"
+        );
+        let reply = self.get(token, &path).await?;
+        let next = reply.next;
+        let body = reply.ok("merge_requests")?;
+        let items = body
+            .as_array()
+            .ok_or_else(|| GhError::Failed("unreadable reply from merge_requests".into()))?
+            .iter()
+            .map(pull_json)
+            .collect();
+        Ok(ClosedPage { items, next })
     }
 
     pub async fn pull(&self, token: &str, project: i64, iid: i64) -> Gh<Option<Value>> {
@@ -725,7 +748,7 @@ fn pull_json(mr: &Value) -> Value {
     json!({"number": mr["iid"], "node_id": format!("gid://gitlab/MergeRequest/{}", mr["id"]),
         "title": mr["title"], "state": if open { "open" } else { "closed" },
         "draft": mr["draft"].as_bool().or(mr["work_in_progress"].as_bool()).unwrap_or(false),
-        "merged": merged, "merged_at": mr["merged_at"],
+        "merged": merged, "merged_at": mr["merged_at"], "updated_at": mr["updated_at"],
         "body": mr["description"], "labels": mr["labels"],
         "squash_commit_sha": mr["squash_commit_sha"],
         "source_project_id": mr["source_project_id"], "target_project_id": mr["target_project_id"],
@@ -887,6 +910,28 @@ mod tests {
     use reqwest::header::{HeaderMap, HeaderName};
 
     use super::*;
+    use crate::hub::forge_http::serve_once;
+
+    #[tokio::test]
+    async fn closed_pulls_page_asks_for_its_page_and_types_oversize() {
+        let mr = r#"[{"iid":4,"state":"merged","title":"t"}]"#;
+        let (base, server) = serve_once(200, "x-next-page: 3\r\n", mr.into());
+        let api = Api::new(&base).unwrap();
+        let page = api.closed_pulls_page("t", 7, 25, 2).await.unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert!(page.next);
+        assert_eq!(
+            server.join().unwrap(),
+            "GET /projects/7/merge_requests?state=merged&order_by=updated_at&sort=desc&per_page=25&page=2 HTTP/1.1"
+        );
+
+        let big = format!("[\"{}\"]", "x".repeat(API_BODY_BYTES));
+        let (base, server) = serve_once(200, "", big);
+        let api = Api::new(&base).unwrap();
+        let error = api.closed_pulls_page("t", 7, 100, 1).await.err();
+        assert!(matches!(error, Some(GhError::TooLarge(_))), "{error:?}");
+        server.join().unwrap();
+    }
 
     fn full(status: u16, headers: &[(&str, &str)]) -> Full {
         let mut map = HeaderMap::new();

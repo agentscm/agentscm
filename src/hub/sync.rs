@@ -567,7 +567,7 @@ fn gh_to_hub(error: GhError) -> HubError {
 
 fn forge_to_hub(who: &str, error: GhError) -> HubError {
     match error {
-        GhError::Auth(detail) | GhError::Failed(detail) => {
+        GhError::Auth(detail) | GhError::Failed(detail) | GhError::TooLarge(detail) => {
             HubError::Unavailable(format!("{who}: {detail}"))
         }
         GhError::Limited(_) => HubError::Unavailable(format!("{who}: rate limited")),
@@ -769,7 +769,7 @@ pub(super) async fn failed(
             db(state, move |store| store.set_next_poll(&id, until)).await?;
             Ok(true)
         }
-        GhError::Failed(detail) => {
+        GhError::Failed(detail) | GhError::TooLarge(detail) => {
             eprintln!("hub: {} sync of {what}: {detail}", conn.provider);
             Ok(false)
         }
@@ -797,9 +797,14 @@ async fn catchup_connection_status(
     let id = conn.id.clone();
     for repo in db(state, move |store| store.repositories(&id)).await? {
         let _guard = state.sync.lock_repo(&repo.id).await;
-        super::catchup_sync::source_status(state, conn, &repo, coverage, unix_now(), 0, 0)
-            .await
-            .map_err(|_| HubError::Unavailable("could not record catch-up source status".into()))?;
+        super::catchup_sync::source_status(
+            state,
+            conn,
+            &repo,
+            super::catchup_sync::forge_status(coverage, unix_now(), 0, 0, None),
+        )
+        .await
+        .map_err(|_| HubError::Unavailable("could not record catch-up source status".into()))?;
     }
     Ok(())
 }
@@ -1037,7 +1042,9 @@ async fn read_repo(
 
     // Catch-up reads cannot turn a failed source into an empty successful recap.
     // Keep the existing coordination poll useful when this optional read fails.
-    if let Err(error) = super::catchup_sync::reconcile(state, conn, repo, token).await {
+    if let Err(error) =
+        super::catchup_sync::reconcile(state, conn, repo, token, config.activity_days).await
+    {
         if matches!(error, GhError::Auth(_) | GhError::Limited(_)) {
             return Err(error);
         }
@@ -1545,7 +1552,7 @@ async fn outbound_repo(
             })
             .collect();
         match outbound_pull(state, conn, repo, token, number, &pull, &overlapping).await {
-            Err(GhError::Failed(detail)) => {
+            Err(GhError::Failed(detail) | GhError::TooLarge(detail)) => {
                 eprintln!(
                     "hub: {} outbound for {}#{number}: {detail}",
                     conn.provider, repo.full_name
@@ -1604,7 +1611,7 @@ async fn outbound_pull(
                     || match api.edit_comment(token, repo, number, id, &body).await {
                         Ok(edited) => edited,
                         // Cannot edit it: write our own instead.
-                        Err(GhError::Failed(_)) => false,
+                        Err(GhError::Failed(_) | GhError::TooLarge(_)) => false,
                         Err(error) => return Err(error),
                     };
                 adopted = kept.then_some(id);

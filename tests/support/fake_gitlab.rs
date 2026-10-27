@@ -116,6 +116,8 @@ pub struct Mr {
     pub description: String,
     /// The source project when it is not the one the MR lives in (a fork).
     pub source_project_id: Option<i64>,
+    /// RFC 3339 time the listing orders by; creation time unless a test sets it.
+    pub updated_at: String,
 }
 
 impl Mr {
@@ -137,8 +139,33 @@ impl Mr {
             renamed: Vec::new(),
             description: String::new(),
             source_project_id: None,
+            updated_at: rfc3339_now(),
         }
     }
+}
+
+fn rfc3339_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let (days, rem) = (secs / 86400, secs % 86400);
+    // Howard Hinnant's civil-from-days.
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z % 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
 }
 
 /// One top-level tree entry as GitLab lists it.
@@ -461,7 +488,7 @@ fn mr_json(ctx: &Ctx, p: &Project, m: &Mr) -> Value {
         "id": m.id, "iid": m.iid, "title": m.title, "state": m.state, "draft": m.draft,
         "source_branch": m.source_branch, "target_branch": m.target_branch, "sha": m.sha,
         "merge_commit_sha": m.merge_commit_sha, "squash_commit_sha": null,
-        "description": m.description,
+        "description": m.description, "updated_at": m.updated_at,
         "source_project_id": m.source_project_id.unwrap_or(p.id), "target_project_id": p.id,
         "author": {"id": m.author_id, "username": m.author_username},
         "web_url": format!("{}/{}/-/merge_requests/{}", ctx.base, p.path_with_namespace, m.iid),
