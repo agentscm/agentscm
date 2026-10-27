@@ -249,11 +249,11 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - {target: x86_64-unknown-linux-musl, os: ubuntu-24.04, musl: true, native: true, exe: ""}
-          - {target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, musl: true, native: true, exe: ""}
-          - {target: aarch64-apple-darwin, os: macos-15, musl: false, native: true, exe: ""}
-          - {target: x86_64-apple-darwin, os: macos-15, musl: false, native: false, exe: ""} # cross-compiled on the arm runner
-          - {target: x86_64-pc-windows-msvc, os: windows-2025, musl: false, native: true, exe: .exe}
+          - {target: x86_64-unknown-linux-musl, os: ubuntu-24.04, musl: true, native: true, reconcile: true, exe: ""}
+          - {target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, musl: true, native: true, reconcile: true, exe: ""}
+          - {target: aarch64-apple-darwin, os: macos-15, musl: false, native: true, reconcile: true, exe: ""}
+          - {target: x86_64-apple-darwin, os: macos-15, musl: false, native: false, reconcile: false, exe: ""} # cross-compiled on the arm runner
+          - {target: x86_64-pc-windows-msvc, os: windows-2025, musl: false, native: true, reconcile: false, exe: .exe}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     permissions:
@@ -287,6 +287,11 @@ jobs:
       - name: Smoke test
         if: ${{ matrix.native }}
         run: '"target/$TARGET/release/agentscm${{ matrix.exe }}" --version'
+      - name: Smoke test the reconciliation command surface
+        if: ${{ matrix.reconcile }}
+        run: |
+          help=$("target/$TARGET/release/agentscm" local-validation reconcile --help)
+          grep -F -- '--github-authenticated-fetch' <<<"$help"
       - name: Stage the binary
         run: |
           mkdir dist

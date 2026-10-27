@@ -2095,6 +2095,7 @@ a.run-row:hover {
   max-width: 980px;
   margin: 0 auto;
   padding: 32px 16px;
+  container: main / inline-size;
 }
 
 /* Responsive */

@@ -853,6 +853,7 @@ fn stable_repository_id_survives_rename(fixture: &Fixture) {
                 checked_at: now,
                 unread_pages: 0,
                 deferred: 0,
+                window_from: Some(now - 14 * 86_400),
             },
         )
         .unwrap();
@@ -860,6 +861,19 @@ fn stable_repository_id_survives_rename(fixture: &Fixture) {
         .store
         .work_catchup(&old_token, &CatchupQuery::default(), now + 1)
         .unwrap();
+    let forge = |source: CatchupMergeSource| {
+        initial
+            .source_coverage
+            .iter()
+            .find(|c| c.source == source)
+            .unwrap()
+            .window_from
+    };
+    assert_eq!(
+        forge(CatchupMergeSource::ForgePull),
+        Some(now - 14 * 86_400)
+    );
+    assert_eq!(forge(CatchupMergeSource::TrackedPublication), None);
     fixture
         .store
         .work_catchup_ack(
@@ -2087,6 +2101,7 @@ fn sqlite_backfills_historical_publication_without_loading_manifest() {
                 checked_at: now,
                 unread_pages: 0,
                 deferred: 0,
+                window_from: None,
             },
         )
         .unwrap();
@@ -2364,6 +2379,7 @@ fn postgres_merge_ingest_and_work_admission_share_a_repository_lock() {
                 checked_at: now,
                 unread_pages: 0,
                 deferred: 0,
+                window_from: None,
             },
         )
         .unwrap();

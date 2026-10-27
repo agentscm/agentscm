@@ -1572,3 +1572,42 @@ async fn catchup_discovers_ordinary_gitlab_merges_and_keeps_rename_paths() {
         .unwrap();
     assert_eq!(again.merges, page.merges);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catchup_reads_gitlab_listing_times_with_a_utc_offset() {
+    use agentscm::hub::catchup::{CatchupCoverageState, CatchupMergeSource, CatchupQuery};
+    use agentscm::hub::store::mint_bound_agent_token;
+    let env = Env::start().await;
+    add_mr(&env, 72, &["src/offset.rs"]);
+    env.mr(72, |mr| {
+        mr.state = "merged".into();
+        mr.merge_commit_sha = Some("b".repeat(40));
+        mr.updated_at = "2099-01-01T12:00:00+02:00".into();
+    });
+    let owner = env
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "gitlab".into(),
+                host: env.host.clone(),
+                user_id: 72,
+            },
+            "reader",
+        )
+        .unwrap();
+    let (token, _, _) =
+        mint_bound_agent_token(&*env.store, &owner.id, "reader", REPO, REPO_ID, 3600, true)
+            .unwrap();
+    env.poll().await;
+    let page = env
+        .store
+        .work_catchup(&token, &CatchupQuery::default(), unix_now())
+        .unwrap();
+    assert_eq!(page.merges.len(), 1);
+    let forge = page
+        .source_coverage
+        .iter()
+        .find(|source| source.source == CatchupMergeSource::ForgePull)
+        .unwrap();
+    assert_eq!(forge.state, CatchupCoverageState::ObservedOnly);
+}

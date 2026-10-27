@@ -422,6 +422,49 @@ async fn a_pull_request_that_never_opted_in_gets_no_status() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn authenticated_fetch_refuses_a_nonproduction_api_before_any_request() {
+    let env = Env::new().await;
+    let mut args = env.reconcile_args();
+    args.push("--github-authenticated-fetch".into());
+    let out = tokio::task::block_in_place(|| {
+        env.cli(&args.iter().map(String::as_str).collect::<Vec<_>>())
+    });
+    assert_refused_before_any_request(&env, &out);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("requires --api-url https://api.github.com")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn authenticated_fetch_refuses_a_noncanonical_origin_without_leaking_the_token() {
+    let env = Env::new().await;
+    git(
+        &env.root().join("checkout"),
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com.evil/o/r.git",
+        ],
+    );
+    let mut args = env.reconcile_args();
+    let api = args.iter().position(|arg| arg == "--api-url").unwrap() + 1;
+    args[api] = "https://api.github.com".into();
+    args.push("--github-authenticated-fetch".into());
+    let out = tokio::task::block_in_place(|| {
+        env.cli(&args.iter().map(String::as_str).collect::<Vec<_>>())
+    });
+    assert_refused_before_any_request(&env, &out);
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!output.contains(TOKEN));
+    assert!(output.contains("authenticated fetch requires the canonical GitHub origin URL"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_valid_attestation_posts_pending_then_success_on_that_head() {
     let env = Env::new().await;
     let body = tokio::task::block_in_place(|| env.attest());

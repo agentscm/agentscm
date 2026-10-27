@@ -74,6 +74,10 @@ pub struct ReconcileArgs {
     /// Name of the environment variable holding the token.
     #[arg(long, default_value = "GH_TOKEN")]
     token_env: String,
+    /// Reuse the selected API token for canonical private GitHub HTTPS fetches. This is off by
+    /// default and is accepted only with the production GitHub API URL.
+    #[arg(long)]
+    github_authenticated_fetch: bool,
     #[arg(long, default_value = "https://api.github.com")]
     api_url: String,
     /// Link recorded on each status.
@@ -491,6 +495,8 @@ fn check_sha(sha: &str) -> Result<()> {
 fn check_github_repo(repo: &str) -> Result<()> {
     let valid_name = |part: &str| {
         !part.is_empty()
+            && part != "."
+            && part != ".."
             && part
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
@@ -508,6 +514,12 @@ async fn reconcile(args: ReconcileArgs) -> Result<i32> {
     check_github_repo(&args.github_repo)?;
     if !valid_ref_name(&args.base) {
         return Err(Error::Invalid("--base is not a branch name".into()));
+    }
+    if args.github_authenticated_fetch && args.api_url != "https://api.github.com" {
+        eprintln!(
+            "--github-authenticated-fetch requires --api-url https://api.github.com; nothing written"
+        );
+        return Ok(2);
     }
     let token = std::env::var(&args.token_env)
         .ok()
@@ -568,6 +580,23 @@ async fn reconcile(args: ReconcileArgs) -> Result<i32> {
             "registry repository differs from the policy repository".into(),
         ));
     }
+    let fetch = if args.github_authenticated_fetch {
+        agentscm::local_validation::fetch::FetchContext::authenticated(
+            &args.repo,
+            &args.github_repo,
+            &policy.repository,
+            &token,
+        )
+    } else {
+        agentscm::local_validation::fetch::FetchContext::anonymous(&args.repo)
+    };
+    let fetch = match fetch {
+        Ok(fetch) => fetch,
+        Err(error) => {
+            eprintln!("unsafe Git fetch configuration ({error}); nothing written");
+            return Ok(2);
+        }
+    };
     let base_url = check_base_url(&args.api_url).map_err(|e| Error::Invalid(e.to_string()))?;
     let api = Api::new(&base_url, &base_url).map_err(|e| Error::Invalid(e.to_string()))?;
     Ok(Context {
@@ -578,6 +607,7 @@ async fn reconcile(args: ReconcileArgs) -> Result<i32> {
         config_dir,
         verifier_workflow: &args.verifier_workflow,
         git_repo: &args.repo,
+        fetch: &fetch,
         repository: &policy.repository,
         policy: &policy,
         recipe: &recipe,

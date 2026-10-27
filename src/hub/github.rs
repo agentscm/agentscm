@@ -12,7 +12,7 @@ use ring::rand::SystemRandom;
 use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
 use serde_json::{Value, json};
 
-use super::forge_http::{self, Full, send_full};
+use super::forge_http::{self, Full, SendError, send_capped};
 use super::store::{unix_now, validate_repository};
 use super::{HubError, Result};
 use crate::hmac::{constant_time_eq, hmac_sha256};
@@ -37,6 +37,18 @@ pub enum GhError {
     /// Rate limited; do not call again before this unix second.
     Limited(i64),
     Failed(String),
+    /// The reply body passed [`API_BODY_BYTES`]; a smaller page may fit. Anywhere but a
+    /// size-adaptive read it is a `Failed` with the same text.
+    TooLarge(String),
+}
+
+impl From<SendError> for GhError {
+    fn from(error: SendError) -> Self {
+        match error {
+            SendError::TooLarge => Self::TooLarge(TOO_LARGE_DETAIL.into()),
+            SendError::Failed(error) => error.into(),
+        }
+    }
 }
 
 impl From<HubError> for GhError {
@@ -44,6 +56,9 @@ impl From<HubError> for GhError {
         Self::Failed(error.to_string())
     }
 }
+
+/// What `GhError::Failed` carried for an oversized reply, kept for every text built from it.
+const TOO_LARGE_DETAIL: &str = "unavailable: forge response too large";
 
 /// A commit status state the forge accepts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,6 +178,13 @@ impl Reply {
     }
 }
 
+/// One explicitly sized page of closed proposals.
+pub struct ClosedPage {
+    pub items: Vec<Value>,
+    /// The forge links a further page.
+    pub next: bool,
+}
+
 pub struct Paged {
     pub items: Vec<Value>,
     pub etag: Option<String>,
@@ -262,7 +284,7 @@ impl Api {
         }
         classify_with(
             endpoint_kind(url, &self.base),
-            send_full(request, API_BODY_BYTES).await?,
+            send_capped(request, API_BODY_BYTES).await?,
             strict,
         )
     }
@@ -362,7 +384,7 @@ impl Api {
             .client
             .post(url)
             .header(ACCEPT, "application/vnd.github+json");
-        let full = send_full(request, API_BODY_BYTES).await?;
+        let full = send_capped(request, API_BODY_BYTES).await?;
         if full.status != 201 {
             return Err(GhError::Failed(format!(
                 "{} from app-manifests",
@@ -564,6 +586,28 @@ impl Api {
         self.paged_with(token, &path, None, 1, None, true)
             .await?
             .ok_or_else(|| GhError::Failed("unexpected 304 from pulls".into()))
+    }
+
+    /// One page of closed proposals, newest updated first. A reply that is not an array fails
+    /// the read; a body past [`API_BODY_BYTES`] is [`GhError::TooLarge`].
+    pub async fn closed_pulls_page(
+        &self,
+        token: &str,
+        full_name: &str,
+        per_page: u32,
+        page: u32,
+    ) -> Gh<ClosedPage> {
+        let path = format!(
+            "/repos/{full_name}/pulls?state=closed&sort=updated&direction=desc&per_page={per_page}&page={page}"
+        );
+        let reply = self.get(token, &path).await?;
+        let next = reply.next;
+        let body = reply.ok("pulls")?;
+        let items = body
+            .as_array()
+            .ok_or_else(|| GhError::Failed("unreadable reply from pulls".into()))?
+            .clone();
+        Ok(ClosedPage { items, next })
     }
 
     /// Every item of a list endpoint, at most `max_pages` pages. A reply that is not an array
@@ -1509,6 +1553,37 @@ pub fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hub::forge_http::serve_once;
+
+    #[tokio::test]
+    async fn closed_pulls_page_asks_for_its_page_and_reports_next() {
+        let link = "link: <http://x/p?page=3>; rel=\"next\"\r\n";
+        let (base, server) = serve_once(200, link, r#"[{"number":1},{"number":2}]"#.into());
+        let api = Api::new(&base, &base).unwrap();
+        let page = api.closed_pulls_page("t", "o/r", 25, 2).await.unwrap();
+        assert_eq!(page.items.len(), 2);
+        assert!(page.next);
+        assert_eq!(
+            server.join().unwrap(),
+            "GET /repos/o/r/pulls?state=closed&sort=updated&direction=desc&per_page=25&page=2 HTTP/1.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_pulls_page_rejects_non_arrays_and_types_oversize() {
+        let (base, server) = serve_once(200, "", r#"{"message":"odd"}"#.into());
+        let api = Api::new(&base, &base).unwrap();
+        let error = api.closed_pulls_page("t", "o/r", 10, 1).await.err();
+        assert!(matches!(error, Some(GhError::Failed(_))), "{error:?}");
+        server.join().unwrap();
+
+        let big = format!("[\"{}\"]", "x".repeat(API_BODY_BYTES));
+        let (base, server) = serve_once(200, "", big);
+        let api = Api::new(&base, &base).unwrap();
+        let error = api.closed_pulls_page("t", "o/r", 100, 1).await.err();
+        assert!(matches!(error, Some(GhError::TooLarge(_))), "{error:?}");
+        server.join().unwrap();
+    }
 
     #[test]
     fn signatures_need_the_exact_mac() {
