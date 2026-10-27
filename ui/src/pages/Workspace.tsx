@@ -158,7 +158,10 @@ function Login() {
 
 // ---------- Pending operation recovery (the retained "unknown outcome" journal)
 
-const pendingAction = (entry: PendingWorkspaceMutation): { label: string; capability: keyof WorkspaceSession['capabilities'] } => {
+const pendingAction = (entry: PendingWorkspaceMutation): { label: string; capability: keyof WorkspaceSession['capabilities'] | null } => {
+  if (entry.path === '/promises') return { label: 'Promise creation', capability: null }
+  if (entry.path === '/promises/adopt') return { label: 'Promise adoption', capability: null }
+  if (/^\/promises\/[^/?#]+\/changes$/.test(entry.path)) return { label: 'Promise version change', capability: null }
   if (entry.path.endsWith('/approve')) return { label: 'Native approval', capability: 'approve_revisions' }
   if (entry.path.endsWith('/integrate')) return { label: 'Native landing', capability: 'integrate_revisions' }
   if (entry.path.endsWith('/cancel')) return { label: 'Run cancellation', capability: 'execute_workflows' }
@@ -190,13 +193,14 @@ function PendingOperations({ session }: { session: WorkspaceSession }) {
   }, [session])
   const retry = async (entry: PendingWorkspaceMutation) => {
     const action = pendingAction(entry)
-    if (!session.capabilities[action.capability]) return
+    if (action.capability && !session.capabilities[action.capability]) return
     setBusy(entry.requestId)
     setError(null)
     setDone(null)
     try {
       const result = await workspaceMutation<Record<string, unknown> | undefined>(session, entry.path, entry.body, { method: entry.method, ...(entry.expectation ? { expectation: entry.expectation } : {}) })
-      const id = result ? (['approval_id', 'operation_id', 'run_id'].map((k) => result[k]).find((v): v is string => typeof v === 'string') ?? null) : null
+      const reference = result && typeof result.ref === 'object' && result.ref !== null ? result.ref as Record<string, unknown> : null
+      const id = result ? (['approval_id', 'operation_id', 'run_id'].map((k) => result[k]).find((v): v is string => typeof v === 'string') ?? (typeof reference?.promise_id === 'string' ? reference.promise_id : null)) : null
       setDone({ message: `${action.label} returned a conclusive result.`, returnedId: id })
     } catch (e) {
       setError(workspaceError(e))
@@ -220,7 +224,7 @@ function PendingOperations({ session }: { session: WorkspaceSession }) {
         {entries.map((entry) => {
           const action = pendingAction(entry)
           const subject = pendingSubject(entry)
-          const allowed = session.capabilities[action.capability]
+          const allowed = action.capability === null || session.capabilities[action.capability]
           const generation = typeof entry.body['expected_generation'] === 'number' ? entry.body['expected_generation'] : null
           return (
             <li key={`${entry.method}:${entry.path}`} className="pending-op">
@@ -232,7 +236,7 @@ function PendingOperations({ session }: { session: WorkspaceSession }) {
                   Request <code>{entry.requestId}</code>
                   {generation !== null && ` · Membership generation ${generation}`}
                 </div>
-                <div className="small muted">{allowed ? 'Retry sends the exact retained body with your current security token.' : `Your current roles do not allow this ${action.label.toLowerCase()} retry.`}</div>
+                <div className="small muted">{allowed ? action.capability === null ? 'Retry sends the exact retained promise body. The hub rechecks current authority and repository scope.' : 'Retry sends the exact retained body with your current security token.' : `Your current roles do not allow this ${action.label.toLowerCase()} retry.`}</div>
               </div>
               <button type="button" className="btn btn-sm btn-primary" disabled={!allowed || busy !== null} onClick={() => void retry(entry)}>
                 {busy === entry.requestId ? <span className="spinner-border spinner-border-sm" aria-hidden="true" /> : <Icon name="arrow-clockwise" />} Retry exact request

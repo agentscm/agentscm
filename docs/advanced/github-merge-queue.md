@@ -11,6 +11,7 @@ GitHub builds each queue entry as a commit on `gh-readonly-queue/<base>/pr-<numb
 - the queue branch still points at the group commit;
 - the queued pull request is open, not merged, within the connected repository, and its live head equals the head the queue branch names, which equals the published candidate commit;
 - the group's base is the candidate's target and the group's base commit is the candidate baseline;
+- the group commit is built on that base: its first parent is the event's base commit (the candidate baseline) and any second parent is the queued pull request head. A single parent that is not the base (as with a rebase-method merge of a multi-commit pull request) stays pending as unsupported. A commit with no parent, with more than two, or with two that do not match fails. Fake-tested only, like the rest of this page;
 - the pinned native store currently qualifies the candidate for the profile's pinned requirement (as for a pull request head);
 - the group commit's tree equals the native revision's tree.
 
@@ -64,7 +65,7 @@ Permissions: the App needs `statuses: write`, `pull_requests` read, `contents` r
 ## Not covered
 
 - Combined multi-entry groups (pending, see above).
-- GitLab merge trains. GitLab behavior is unchanged.
+- GitLab merged-result pipelines and merge trains. The Hub does not post the status on their commits, see [the GitLab paragraph in the Hub guide](../hub.md#gitlab-merge-requests). GitLab behavior is unchanged.
 - The experimental [local validation attestations](local-validation.md) post `agentscm/local-validation`, a separate, worker-asserted status. It does not use this path, and a green local-validation status satisfies nothing here.
 - Approvals and review requests stay GitHub actions. This lane does not request reviewers, approve, enqueue, merge or bypass a failed check. Provider account identity is not decision authority: an agent can act through a human-named account, so no login, account id or signature is promoted to a proven human decision (see the contract below).
 - Automatic review bots: a draft pull request does not guarantee a third-party reviewer stays idle; some integrations review drafts. The Hub cannot read other integrations' configuration, so their behavior is `unknown` to it, and it never changes them. To qualify an installation: open a synthetic draft pull request, record which bots comment, mark it ready, and record again.

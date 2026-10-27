@@ -214,6 +214,7 @@ impl Env {
                         host: host.clone(),
                         user_id: 101,
                     },
+                    forge_repositories: vec![],
                 },
                 store.clone(),
             )

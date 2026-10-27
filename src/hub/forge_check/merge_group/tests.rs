@@ -39,6 +39,7 @@ fn live() -> LiveGroup {
         base_ref: "main".into(),
         base_sha: BASE.into(),
         head_tree: TREE.into(),
+        head_parents: vec![BASE.into(), HEAD.into()],
         pr_open: true,
         queued_head_sha: HEAD.into(),
         pr_head_sha: HEAD.into(),
@@ -136,6 +137,41 @@ fn success_needs_the_group_tree_to_be_the_qualified_one_on_the_candidate_base() 
     );
     let unqualified = evaluate_group(REPO, &subject(), HEAD, &live(), &NativeState::NotQualified);
     assert!(matches!(unqualified, Verdict::Pending(_)));
+}
+
+#[test]
+fn a_group_commit_must_be_built_on_the_candidate_baseline_and_the_queued_head() {
+    let judge = |parents: Vec<String>| {
+        let mut group = live();
+        group.head_parents = parents;
+        evaluate_group(REPO, &subject(), HEAD, &group, &qualified(TREE))
+    };
+    let not_built = Verdict::Failure("merge group commit is not built on the candidate baseline");
+    assert_eq!(judge(vec![BASE.into()]), Verdict::Success);
+    assert_eq!(
+        judge(vec![OTHER.into()]),
+        Verdict::Pending("unsupported: no evidence covers this group's rebased commits")
+    );
+    assert_eq!(judge(vec![OTHER.into(), HEAD.into()]), not_built);
+    assert_eq!(judge(vec![BASE.into(), OTHER.into()]), not_built);
+    assert_eq!(judge(vec![]), not_built);
+    assert_eq!(
+        judge(vec![BASE.into(), HEAD.into(), HEAD.into()]),
+        not_built
+    );
+    assert_eq!(
+        judge(vec![BASE.into(), "nope".into()]),
+        Verdict::Failure("malformed commit identity")
+    );
+    // A stacked group stays pending whatever its (well-formed) parents are.
+    let mut stacked = live();
+    stacked.base_sha = OTHER.into();
+    stacked.stacked = true;
+    stacked.head_parents = vec![];
+    assert!(matches!(
+        evaluate_group(REPO, &subject(), HEAD, &stacked, &qualified(TREE)),
+        Verdict::Pending(_)
+    ));
 }
 
 #[test]

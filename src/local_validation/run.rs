@@ -17,7 +17,6 @@ use crate::execution::process::{Stop, capture_with_input};
 use crate::{Error, Result};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(60);
-const FETCH_TIMEOUT: Duration = Duration::from_secs(300);
 const GIT_OUTPUT: u64 = 16 * 1024 * 1024;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const PROBE_OUTPUT: u64 = 64 * 1024;
@@ -55,16 +54,10 @@ fn allowlisted(command: &mut Command) {
 }
 
 fn git(repo: &Path, args: &[&str], limit: u64) -> Result<Vec<u8>> {
-    git_timeout(repo, args, limit, GIT_TIMEOUT, false)
+    git_timeout(repo, args, limit, GIT_TIMEOUT)
 }
 
-fn git_timeout(
-    repo: &Path,
-    args: &[&str],
-    limit: u64,
-    timeout: Duration,
-    network: bool,
-) -> Result<Vec<u8>> {
+fn git_timeout(repo: &Path, args: &[&str], limit: u64, timeout: Duration) -> Result<Vec<u8>> {
     let mut command = Command::new("git");
     command
         .env_clear()
@@ -73,12 +66,6 @@ fn git_timeout(
         .arg("-C")
         .arg(repo)
         .args(["--no-optional-locks", "-c", "core.fsmonitor=false"]);
-    if network {
-        // No credentials, prompts or environment configuration reach the transport.
-        command
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .args(["-c", "credential.helper="]);
-    }
     command.args(args).process_group(0);
     let out = capture_with_input(&mut command, None, timeout, limit, &Cancellation::default())?;
     if out.stop.is_some() || out.code != Some(0) {
@@ -95,7 +82,7 @@ fn git_line(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out).trim().to_owned())
 }
 
-fn rev(repo: &Path, name: &str, suffix: &str) -> Result<String> {
+pub(super) fn rev(repo: &Path, name: &str, suffix: &str) -> Result<String> {
     if name.starts_with('-') || name.contains('\0') {
         return Err(Error::Invalid("revision must not start with '-'".into()));
     }
@@ -185,38 +172,6 @@ pub fn only_exempt(
         && changed(repo, merge_base, head, exempt)? == total)
 }
 
-fn fetch_base(repo: &Path, base: &str) -> Result<()> {
-    let base_spec = format!("+refs/heads/{base}:refs/remotes/origin/{base}");
-    git_timeout(
-        repo,
-        &["fetch", "--no-tags", "--quiet", "origin", &base_spec],
-        GIT_OUTPUT,
-        FETCH_TIMEOUT,
-        true,
-    )
-    .map(drop)
-}
-
-/// Fetches the base branch and `refs/pull/{number}/head` from `origin` (Git data only, nothing is
-/// checked out) and requires the pull ref to name exactly `head`.
-pub fn fetch_pull(repo: &Path, base: &str, number: i64, head: &str) -> Result<()> {
-    fetch_base(repo, base)?;
-    let pull_ref = format!("refs/pull/{number}/head");
-    git_timeout(
-        repo,
-        &["fetch", "--no-tags", "--quiet", "origin", &pull_ref],
-        GIT_OUTPUT,
-        FETCH_TIMEOUT,
-        true,
-    )?;
-    if rev(repo, "FETCH_HEAD", "^{commit}")? != head {
-        return Err(Error::Invalid(
-            "pull request head moved while fetching".into(),
-        ));
-    }
-    Ok(())
-}
-
 /// Tree id of `dir` at the checkout's `HEAD`, resolved from `repo` (not the repository root).
 pub fn config_dir_tree(repo: &Path, dir: &str) -> Result<String> {
     rev(repo, "HEAD", &format!(":./{dir}"))
@@ -237,19 +192,6 @@ pub fn config_dir_dirty(repo: &Path, dir: &str) -> Result<bool> {
         GIT_OUTPUT,
     )?
     .is_empty())
-}
-
-/// Re-fetches `origin/{base}` and tells whether `dir` (relative to `repo`) has the same tree
-/// there as at the checkout's `HEAD`. A directory missing at `origin/{base}` has changed. Err when
-/// the fetch fails or either side cannot be read otherwise.
-pub fn config_dir_unchanged(repo: &Path, base: &str, dir: &str) -> Result<bool> {
-    fetch_base(repo, base)?;
-    let tip = format!("refs/remotes/origin/{base}");
-    rev(repo, &tip, "^{commit}")?;
-    let Ok(theirs) = rev(repo, &tip, &format!(":./{dir}")) else {
-        return Ok(false);
-    };
-    Ok(config_dir_tree(repo, dir)? == theirs)
 }
 
 fn is_clean(repo: &Path) -> Result<bool> {
