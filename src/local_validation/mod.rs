@@ -35,6 +35,7 @@ const MAX_ARGV: usize = 64;
 const MAX_TEXT: usize = 2048;
 const MAX_TOOLCHAIN_LINES: usize = 16;
 const MAX_DEPENDENCY_FILES: usize = 16;
+const MAX_PATHSPECS: usize = 64;
 const DEFAULT_DEPENDENCY_FILES: [&str; 2] = ["Cargo.lock", "rust-toolchain.toml"];
 const DEFAULT_TOOLCHAIN_PROBES: [&[&str]; 3] = [
     &["rustc", "-V"],
@@ -44,6 +45,7 @@ const DEFAULT_TOOLCHAIN_PROBES: [&[&str]; 3] = [
 const MAX_MAX_AGE_SECONDS: u64 = 366 * 24 * 3600;
 pub const CHECK_KIND: &str = "command/v1";
 pub const REQUIREMENT_ID: &str = "local-validation";
+pub const DEFAULT_VERIFIER_WORKFLOW: &str = ".github/workflows/local-validation.yml";
 /// Surfaces the local gate never covers, recorded as coverage omissions.
 const FIXED_OMISSIONS: [&str; 5] = [
     "ignored tests",
@@ -75,6 +77,10 @@ pub struct RecipeCommand {
     pub id: String,
     pub argv: Vec<String>,
     pub timeout_secs: u64,
+    /// Git pathspecs; the command is required only when the change touches one. Absent means
+    /// always required. Declaring them changes the recipe digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -133,6 +139,9 @@ pub struct ValidationRecord {
     pub base_tip: String,
     pub recipe_sha256: String,
     pub results: Vec<CommandResult>,
+    /// Recipe commands not run because the changed paths did not require them, in recipe order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_required: Vec<String>,
     pub services: Services,
     pub platform: String,
     pub toolchain: Vec<String>,
@@ -147,6 +156,10 @@ pub struct ValidationPolicy {
     pub required_services: Services,
     pub max_age_seconds: u64,
     pub epoch: u64,
+    /// Git pathspecs. A change whose every path matches one, and that touches no trust input,
+    /// needs no attestation. Absent means nothing is exempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exempt_paths: Option<Vec<String>>,
 }
 
 fn text(kind: &str, value: &str) -> Result<()> {
@@ -197,6 +210,64 @@ fn validate_dependency_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// A Git pathspec that cannot be an option and uses only the long magic form with a fixed word
+/// set; short magic, `attr` and `icase` are rejected.
+fn pathspec(spec: &str) -> Result<()> {
+    text("pathspec", spec)?;
+    if spec.starts_with('-') {
+        return Err(Error::Invalid("pathspec must not start with '-'".into()));
+    }
+    if let Some(magic) = spec.strip_prefix(':') {
+        let parsed = magic
+            .strip_prefix('(')
+            .and_then(|rest| rest.split_once(')'))
+            .filter(|(words, _)| {
+                words
+                    .split(',')
+                    .all(|w| matches!(w, "glob" | "literal" | "exclude" | "top"))
+            });
+        let Some((words, path)) = parsed else {
+            return Err(Error::Invalid(format!(
+                "pathspec magic must be :(glob|literal|exclude|top,...): {spec}"
+            )));
+        };
+        let has = |word| words.split(',').any(|w| w == word);
+        if (has("glob") && has("literal")) || path.is_empty() {
+            return Err(Error::Invalid(format!(
+                "pathspec must not combine glob and literal or have an empty path: {spec}"
+            )));
+        }
+        if path.starts_with('/') {
+            return Err(Error::Invalid(format!(
+                "pathspec must not start with '/': {spec}"
+            )));
+        }
+    } else if spec.starts_with('/') {
+        return Err(Error::Invalid(format!(
+            "pathspec must not start with '/': {spec}"
+        )));
+    }
+    let path = spec
+        .strip_prefix(':')
+        .map_or(spec, |m| m.split_once(')').map_or("", |(_, p)| p));
+    if path.split('/').any(|part| part == "..") {
+        return Err(Error::Invalid(format!(
+            "pathspec must not contain a '..' component: {spec}"
+        )));
+    }
+    Ok(())
+}
+
+fn pathspecs(kind: &str, specs: &Option<Vec<String>>) -> Result<()> {
+    let Some(specs) = specs else { return Ok(()) };
+    if specs.is_empty() || specs.len() > MAX_PATHSPECS {
+        return Err(Error::Limit(format!(
+            "{kind} must have 1 to {MAX_PATHSPECS} pathspecs"
+        )));
+    }
+    specs.iter().try_for_each(|spec| pathspec(spec))
+}
+
 impl ValidationRecipe {
     pub fn validate(&self) -> Result<()> {
         validate_identifier("recipe ID", &self.recipe_id)?;
@@ -212,6 +283,7 @@ impl ValidationRecipe {
             if command.timeout_secs == 0 || !ids.insert(command.id.as_str()) {
                 return Err(Error::Invalid("invalid or duplicate recipe command".into()));
             }
+            pathspecs("command paths", &command.paths)?;
         }
         if let Some(files) = &self.dependency_files {
             if files.is_empty() || files.len() > MAX_DEPENDENCY_FILES {
@@ -268,10 +340,15 @@ impl ValidationRecipe {
         Ok(recipe)
     }
 
-    /// The first position where `results` departs from this recipe's commands (ids and argv, in
-    /// order), as `(reason, detail)`. A missing command is reported by id.
-    fn first_departure(&self, results: &[CommandResult]) -> Option<String> {
-        for (index, command) in self.commands.iter().enumerate() {
+    /// The first position where `results` departs from this recipe's `required` commands (ids and
+    /// argv, in order), as a detail. A missing command is reported by id.
+    fn first_departure(&self, results: &[CommandResult], required: &[String]) -> Option<String> {
+        let commands: Vec<&RecipeCommand> = self
+            .commands
+            .iter()
+            .filter(|c| required.contains(&c.id))
+            .collect();
+        for (index, command) in commands.iter().enumerate() {
             match results.get(index) {
                 None => return Some(format!("{} did not run", command.id)),
                 Some(r) if r.id != command.id || r.argv != command.argv => {
@@ -281,7 +358,7 @@ impl ValidationRecipe {
             }
         }
         results
-            .get(self.commands.len())
+            .get(commands.len())
             .map(|r| format!("{} is not in the recipe", r.id))
     }
 
@@ -319,13 +396,29 @@ impl ValidationRecord {
         self.context.validate()?;
         oid("base tip", &self.base_tip)?;
         validate_lower_hex("recipe digest", &self.recipe_sha256, 32)?;
-        if self.results.is_empty() || self.results.len() > MAX_COMMANDS {
+        if self.results.len() > MAX_COMMANDS
+            || (self.results.is_empty() && self.not_required.is_empty())
+        {
             return Err(Error::Limit(format!(
-                "record must have 1 to {MAX_COMMANDS} results"
+                "record must have at most {MAX_COMMANDS} results and at least one result or not-required command"
             )));
+        }
+        let mut skipped = HashSet::new();
+        for id in &self.not_required {
+            validate_identifier("command ID", id)?;
+            if self.not_required.len() > MAX_COMMANDS || !skipped.insert(id.as_str()) {
+                return Err(Error::Invalid(
+                    "duplicate or excess not-required command".into(),
+                ));
+            }
         }
         let mut ids = HashSet::new();
         for result in &self.results {
+            if skipped.contains(result.id.as_str()) {
+                return Err(Error::Invalid(
+                    "command is both a result and not required".into(),
+                ));
+            }
             validate_identifier("command ID", &result.id)?;
             validate_argv(&result.argv)?;
             validate_lower_hex("stdout digest", &result.stdout_sha256, 32)?;
@@ -398,6 +491,7 @@ impl ValidationPolicy {
         if self.max_age_seconds == 0 || self.max_age_seconds > MAX_MAX_AGE_SECONDS {
             return Err(Error::Limit("max age out of range".into()));
         }
+        pathspecs("exempt paths", &self.exempt_paths)?;
         Ok(())
     }
 
@@ -475,15 +569,26 @@ pub fn evidence_payload(
 ) -> Result<(EvidencePayload, Vec<u8>)> {
     let record_bytes = record.to_bytes()?;
     let record_sha256 = format!("{:x}", Sha256::digest(&record_bytes));
+    let required: Vec<String> = recipe
+        .commands
+        .iter()
+        .filter(|c| !record.not_required.contains(&c.id))
+        .map(|c| c.id.clone())
+        .collect();
     let pass = record.shortfall(policy.required_services).is_none()
-        && recipe.first_departure(&record.results).is_none();
+        && recipe.first_departure(&record.results, &required).is_none();
     let mut omissions: Vec<String> = FIXED_OMISSIONS.iter().map(|s| (*s).to_owned()).collect();
     omissions.extend(
-        recipe
-            .commands
+        required
             .iter()
-            .filter(|c| !record.results.iter().any(|r| r.id == c.id))
-            .map(|c| format!("skipped: {}", c.id)),
+            .filter(|id| !record.results.iter().any(|r| &r.id == *id))
+            .map(|id| format!("skipped: {id}")),
+    );
+    omissions.extend(
+        record
+            .not_required
+            .iter()
+            .map(|id| format!("not required: {id}")),
     );
     if !record.services.postgres {
         omissions.push("postgres tests".into());
@@ -544,7 +649,7 @@ pub fn evidence_payload(
         qualification_claim: None,
         coverage: CoverageClaim {
             scope: record.results.iter().map(|r| r.id.clone()).collect(),
-            expected_count: recipe.commands.len() as u32,
+            expected_count: required.len() as u32,
             observed_count: record.results.len() as u32,
             inventory_complete: false,
             omissions,
@@ -624,6 +729,8 @@ pub struct Observed<'a> {
     pub tree: &'a str,
     pub base_ref: &'a str,
     pub merge_base: &'a str,
+    /// Recipe command ids the changed paths require, in recipe order, computed from Git.
+    pub required: &'a [String],
 }
 
 /// Decides whether an attestation satisfies the observed head. Anything other
@@ -822,11 +929,35 @@ fn assess_envelope(
     if record.recipe_sha256 != policy.recipe_sha256 {
         return Verdict::failure("recipe mismatch", "recipe differs from policy").applied();
     }
+    let not_required: Vec<&String> = recipe
+        .commands
+        .iter()
+        .map(|c| &c.id)
+        .filter(|id| !observed.required.contains(id))
+        .collect();
+    if let Some(id) = record
+        .not_required
+        .iter()
+        .find(|id| observed.required.contains(id))
+    {
+        return Verdict::failure(
+            "incomplete run",
+            format!("{id} is required by the changed paths"),
+        )
+        .applied();
+    }
+    if !record.not_required.iter().eq(not_required.iter().copied()) {
+        return Verdict::failure(
+            "incomplete run",
+            "not-required commands differ from the changed paths",
+        )
+        .applied();
+    }
     // Departures inside the recipe order come first; a stopped run is a prefix, reported below.
-    let departure = recipe.first_departure(&record.results);
+    let departure = recipe.first_departure(&record.results, observed.required);
     if let Some(detail) = departure
         .as_ref()
-        .filter(|_| record.results.len() >= recipe.commands.len())
+        .filter(|_| record.results.len() >= observed.required.len())
     {
         return Verdict::failure("incomplete run", detail.clone()).applied();
     }
