@@ -24,7 +24,8 @@ import { TemplatesPage } from './pages/Templates.tsx'
 import { TimelinePage } from './pages/Timeline.tsx'
 import { ExplorerPage } from './pages/Explorer.tsx'
 import { SettingsPage } from './pages/Settings.tsx'
-import { AppChrome, type Badges, type NavDef, type SectionDef, type TabStatuses } from './TopNav.tsx'
+import { AppChrome, type Badges, type NavDef, type SectionDef, type TabStatuses, type WebChoice } from './TopNav.tsx'
+import { useWebRead } from './webRead.ts'
 import { Icon, Notice } from './ui.tsx'
 import { usePoll } from './usePoll.ts'
 import { TourProvider } from './tour/Tour.tsx'
@@ -131,7 +132,7 @@ export function Logo({ dark, height = 32 }: { dark: boolean; height?: number }) 
   return <img src={dark ? logoDark : logoLight} alt="AgentSCM" height={height} className="logo" />
 }
 
-function Shell({ token, pref, onPref, density, onDensity, onUnauthorized, onForget }: { token: string; pref: ThemePref; onPref: (p: ThemePref) => void; density: Density; onDensity: (d: Density) => void; onUnauthorized: (m?: string) => void; onForget: () => void }) {
+function Shell({ token, web, pref, onPref, density, onDensity, onUnauthorized, onForget }: { token: string; web?: WebChoice; pref: ThemePref; onPref: (p: ThemePref) => void; density: Density; onDensity: (d: Density) => void; onUnauthorized: (m?: string) => void; onForget: () => void }) {
   const data = useHub(token, onUnauthorized)
   const [workflowDirty, setWorkflowDirty] = useState(false)
   const section = useSection(workflowDirty)
@@ -181,6 +182,7 @@ function Shell({ token, pref, onPref, density, onDensity, onUnauthorized, onForg
         // The frame is deep violet in both themes, so the top bar always carries the light-on-dark logo.
         logo={<Logo dark height={26} />}
         token={token}
+        web={web}
         repo={repo}
         nav={NAV}
         sections={sections}
@@ -235,6 +237,8 @@ export default function App() {
   const [density, setDensity] = useState<Density>(loadDensity)
   // The browser's landing page after signing this computer in; shown with or without a token.
   const [signedInLanding] = useState(isSignedInHash)
+  // No pasted token on the hosted Hub: open its pages on the web sign-in, if there is one.
+  const web = useWebRead(!token && !onFrontDoor() && !signedInLanding)
   const prefersDark = useSyncExternalStore(subscribeDark, systemDark)
   const dark = pref === 'dark' || (pref === 'system' && prefersDark)
   const section = useSection()
@@ -273,6 +277,12 @@ export default function App() {
 
   if (signedInLanding) return <SignedInPage />
   if (token) return <Shell key={token} token={token} pref={pref} onPref={changePref} density={density} onDensity={changeDensity} onUnauthorized={onUnauthorized} onForget={onForget} />
+  if (web.state.kind === 'checking') return <Opening />
+  if (web.state.kind === 'ready') {
+    const { read, repos, refusal, restarts } = web.state
+    // Keyed by repository, not token: the renewal every half hour keeps the page and its state. A renewal after a 401 remounts it, since polling stops on a 401.
+    return <Shell key={`web:${read.repository}:${restarts}`} token={read.token} web={{ repos, pick: web.pick, refusal }} pref={pref} onPref={changePref} density={density} onDensity={changeDensity} onUnauthorized={web.renew} onForget={() => void web.signOut()} />
+  }
   if (section === 'workspace')
     return (
       <div className="signed-out-workspace">
@@ -284,12 +294,22 @@ export default function App() {
     )
   return (
     <SignIn
-      notice={notice}
+      notice={notice ?? (web.state.kind === 'none' && web.state.empty ? 'Your web sign-in has no repository to open yet. Connect an agent or this computer to one first, or paste a read-only token.' : null)}
+      refusal={web.state.kind === 'none' ? web.state.refusal : null}
       onSignedIn={(t, keep) => {
         saveToken(t, keep)
         setNotice(null)
         setToken(t)
       }}
     />
+  )
+}
+
+/** While the page asks whether this browser is signed in to the Hub: the frame, so nothing flashes. */
+function Opening() {
+  return (
+    <div className="opening" role="status" aria-label="Opening the Hub">
+      <Logo dark height={32} />
+    </div>
   )
 }

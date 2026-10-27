@@ -234,7 +234,7 @@ export function ComputersPage({ auth, provider, onSignedOut }: { auth: Load<Devi
   )
 }
 
-const VIA = { sign_in: 'browser sign-in', device_mint: 'agent connecting' } as const
+const VIA = { sign_in: 'browser sign-in', device_mint: 'agent connecting', web_read_token: 'opening the Hub’s pages' } as const
 
 function Refusals({ rows }: { rows: SignInRefusal[] }) {
   if (rows.length === 0) return <Empty icon="shield-check" title="Nobody was turned away in the last 30 days" />
