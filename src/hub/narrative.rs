@@ -992,6 +992,7 @@ fn snapshot(
                 "checked_at": coverage.checked_at,
                 "unread_pages": coverage.unread_pages,
                 "deferred": coverage.deferred,
+                "window_from": coverage.window_from,
             })
         })
         .collect::<Vec<_>>();
@@ -1076,7 +1077,9 @@ fn facts_for_digest(facts: &Value) -> Value {
     {
         for source in coverage {
             if let Some(source) = source.as_object_mut() {
+                // Both are derived from the poll time, so they move on every sync.
                 source.remove("checked_at");
+                source.remove("window_from");
             }
         }
     }
@@ -1330,6 +1333,23 @@ mod tests {
                 disabled: false,
             },
         }
+    }
+
+    #[test]
+    fn digest_ignores_poll_derived_coverage_fields_but_not_state() {
+        let facts = |checked_at: i64, window_from: i64, state: &str| {
+            serde_json::json!({
+                "source_coverage": [{
+                    "source": "forge_pull",
+                    "state": state,
+                    "checked_at": checked_at,
+                    "window_from": window_from,
+                }],
+            })
+        };
+        let base = facts_for_digest(&facts(1_000, 100, "observed_only"));
+        assert_eq!(base, facts_for_digest(&facts(2_000, 200, "observed_only")));
+        assert_ne!(base, facts_for_digest(&facts(1_000, 100, "incomplete")));
     }
 
     fn principal_namespace(index: u64) -> Principal {

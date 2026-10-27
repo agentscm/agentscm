@@ -20,9 +20,8 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::comment::MARKER_PREFIX;
-use super::run::{
-    config_dir_unchanged, fetch_pull, observe, only_exempt, required_commands, trust_paths,
-};
+use super::fetch::FetchContext;
+use super::run::{observe, only_exempt, required_commands, trust_paths};
 use super::{Observed, ValidationPolicy, ValidationRecipe, VerdictState, select};
 use crate::evidence::EvaluationClock;
 use crate::hub::github::{Api, CommitStatus, Gh, GhError, StatusState};
@@ -112,6 +111,8 @@ pub struct Context<'a> {
     pub verifier_workflow: &'a str,
     /// Local checkout whose `origin` is the repository.
     pub git_repo: &'a Path,
+    /// One isolated transport context for every base, pull and freshness fetch in this run.
+    pub fetch: &'a FetchContext<'a>,
     /// The policy's repository identity.
     pub repository: &'a str,
     pub policy: &'a ValidationPolicy,
@@ -269,15 +270,13 @@ impl Context<'_> {
 
     /// Whether the verifier inputs on the default branch are unchanged since the checkout.
     fn config_current(&self) -> crate::Result<bool> {
-        tokio::task::block_in_place(|| {
-            config_dir_unchanged(self.git_repo, self.base, self.config_dir)
-        })
+        tokio::task::block_in_place(|| self.fetch.config_dir_unchanged(self.base, self.config_dir))
     }
 
     /// Whether the head's change is only exempt paths; Err when it could not be fetched or read.
     fn exempt(&self, c: &Candidate, exempt: &[String]) -> Result<bool, String> {
         tokio::task::block_in_place(|| {
-            fetch_pull(self.git_repo, self.base, c.number, &c.head)?;
+            self.fetch.fetch_pull(self.base, c.number, &c.head)?;
             let git = observe(self.git_repo, &c.head, &format!("origin/{}", self.base))?;
             if git.commit != c.head {
                 return Ok(Err("fetched commit differs from the head".to_owned()));
@@ -291,7 +290,7 @@ impl Context<'_> {
     /// Err when the head could not be fetched or observed: nothing is written for it.
     fn verdict(&self, c: &Candidate) -> Result<(StatusState, String), String> {
         let git = tokio::task::block_in_place(|| {
-            fetch_pull(self.git_repo, self.base, c.number, &c.head)?;
+            self.fetch.fetch_pull(self.base, c.number, &c.head)?;
             observe(self.git_repo, &c.head, &format!("origin/{}", self.base))
         });
         let git = match git {

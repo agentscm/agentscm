@@ -1068,7 +1068,7 @@ async fn show(
             Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => {
                 forge_failure(&state, &conn, error).await?;
             }
-            Err(GhError::Failed(detail)) => {
+            Err(GhError::Failed(detail) | GhError::TooLarge(detail)) => {
                 eprintln!("hub: reading a published pull request: {detail}")
             }
         }
@@ -1301,7 +1301,7 @@ async fn forge_failure(state: &HubState, conn: &Connection, error: GhError) -> R
     let text = match &error {
         GhError::Auth(_) => format!("{who} rejected the hub's credentials"),
         GhError::Limited(_) => format!("{who} rate limit reached; retry later"),
-        GhError::Failed(detail) => clean(detail),
+        GhError::Failed(detail) | GhError::TooLarge(detail) => clean(detail),
     };
     failed(state, conn, "publication", error).await?;
     Ok(text)

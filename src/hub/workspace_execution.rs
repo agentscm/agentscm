@@ -294,6 +294,28 @@ pub struct ExecutionService {
 }
 
 impl ExecutionService {
+    /// Current source identities for one configured Workspace key. Multiple profiles of the
+    /// same native repository deduplicate; every configured profile must still validate.
+    pub(crate) fn promise_native_repository_ids(&self, repository: &str) -> Result<Vec<String>> {
+        let mut identities = BTreeSet::new();
+        for ((key, _), profile) in &self.agent_task_profiles {
+            if key == repository {
+                let authority = profile.stable_mapping()?;
+                identities.insert(authority.repository_id()?);
+            }
+        }
+        Ok(identities.into_iter().collect())
+    }
+
+    pub(crate) fn promise_native_keys(&self) -> Vec<String> {
+        self.agent_task_profiles
+            .keys()
+            .map(|(key, _)| key.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     pub fn server_execution_enabled(&self) -> bool {
         !self.profiles.is_empty()
     }

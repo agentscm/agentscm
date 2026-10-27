@@ -398,6 +398,9 @@ textarea.form-control {
 .app-shell.rail-compact {
   --side-w: 72px;
 }
+.app-shell.hub-signed-out {
+  --side-w: 0px;
+}
 .topbar {
   background: var(--frame);
   color: var(--frame-ink);
@@ -2474,6 +2477,11 @@ textarea.form-control {
   place-items: center;
   min-height: 100dvh;
   background: var(--frame);
+}
+.opening-inline {
+  min-height: 0;
+  gap: 12px;
+  padding: 24px 16px;
 }
 
 /* ---------- signed in: the one browser moment of setup, told on the frame ---------- */

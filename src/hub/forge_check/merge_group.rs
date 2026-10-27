@@ -117,6 +117,8 @@ pub struct LiveGroup {
     pub base_ref: String,
     pub base_sha: String,
     pub head_tree: String,
+    /// The group commit's parents: GitHub builds it on the base, then the queued head.
+    pub head_parents: Vec<String>,
     /// The queued pull request: its live state, as for a pull request check.
     pub pr_open: bool,
     /// The head the queue branch names, which GitHub combined into the group.
@@ -168,7 +170,7 @@ pub fn evaluate_group(
         &live.pr_head_sha,
         manifest_commit,
     ];
-    if !ids.into_iter().all(is_oid) {
+    if !ids.into_iter().all(is_oid) || !live.head_parents.iter().all(|p| is_oid(p)) {
         return Verdict::Failure("malformed commit identity");
     }
     if live.queued_head_sha != live.pr_head_sha {
@@ -183,6 +185,17 @@ pub fn evaluate_group(
         } else {
             Verdict::Failure("target advanced since the candidate baseline")
         };
+    }
+    match live.head_parents.as_slice() {
+        [base] if *base == live.base_sha => {}
+        // A rebase-method merge of a multi-commit pull request ends on the last rebased commit.
+        [_] => {
+            return Verdict::Pending(
+                "unsupported: no evidence covers this group's rebased commits",
+            );
+        }
+        [base, queued] if *base == live.base_sha && *queued == live.queued_head_sha => {}
+        _ => return Verdict::Failure("merge group commit is not built on the candidate baseline"),
     }
     match native {
         NativeState::Qualified { tree_oid, .. } if *tree_oid == live.head_tree => Verdict::Success,
@@ -389,7 +402,7 @@ pub(super) async fn reconcile_active(
         match observe_readiness(state, api, conn, repo, token, target).await {
             Ok(()) => {}
             Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
-            Err(GhError::Failed(detail)) => eprintln!(
+            Err(GhError::Failed(detail) | GhError::TooLarge(detail)) => eprintln!(
                 "hub: merge queue readiness for {} {target}: {detail}",
                 repo.full_name
             ),
@@ -399,7 +412,7 @@ pub(super) async fn reconcile_active(
         match reconcile_group(state, conn, repo, token, &row).await {
             Ok(()) => {}
             Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
-            Err(GhError::Failed(detail)) => eprintln!(
+            Err(GhError::Failed(detail) | GhError::TooLarge(detail)) => eprintln!(
                 "hub: merge group check for {}#{}: {detail}",
                 repo.full_name, row.pr_number
             ),
@@ -561,7 +574,7 @@ async fn judge<'a>(
     if pull.merged {
         return Ok(None);
     }
-    let (head_tree, _) = api
+    let (head_tree, head_parents) = api
         .commit_parts(token, &repo.full_name, &row.head_sha)
         .await?
         .ok_or_else(|| GhError::Failed("merge group commit not found".into()))?;
@@ -575,6 +588,7 @@ async fn judge<'a>(
         base_ref: row.base_ref.clone(),
         base_sha: row.base_sha.clone(),
         head_tree,
+        head_parents,
         pr_open: pull.open,
         queued_head_sha: row.pr_head_sha.clone(),
         pr_head_sha: pull.head_sha,
@@ -692,7 +706,7 @@ async fn post_group(
             "refused"
         }
         Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
-        Err(GhError::Failed(detail)) => {
+        Err(GhError::Failed(detail) | GhError::TooLarge(detail)) => {
             eprintln!(
                 "hub: merge group check post for {}#{}: {detail}",
                 repo.full_name, row.pr_number
@@ -908,7 +922,7 @@ async fn observe_readiness(
             match api.installation(&jwt, id).await {
                 Ok(found) => found,
                 Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
-                Err(GhError::Failed(_)) => None,
+                Err(GhError::Failed(_) | GhError::TooLarge(_)) => None,
             }
         }
         _ => None,
@@ -917,7 +931,7 @@ async fn observe_readiness(
     let listed = match api.queue_branches(token, &repo.full_name, target).await {
         Ok(listed) => listed,
         Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
-        Err(GhError::Failed(_)) => None,
+        Err(GhError::Failed(_) | GhError::TooLarge(_)) => None,
     };
     let undelivered = match listed {
         Some((branches, true)) => {

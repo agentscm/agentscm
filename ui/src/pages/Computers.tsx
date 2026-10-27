@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { ApiError } from '../api.ts'
-import { deviceAuth, fetchAdmin, fetchDevices, revokeDevice, signOutBrowser, type AdminRepository, type Device, type DeviceAuth, type SignInRefusal } from '../devices.ts'
+import { deviceAuth, fetchAdmin, fetchDevices, revokeDevice, signOutBrowser, type AdminRepository, type BrowserSession, type Device, type DeviceAuth, type SignInRefusal } from '../devices.ts'
 import { reasonSentence } from '../refusal.ts'
 import { RefusalNotice } from '../Refusal.tsx'
 import { SectionTabs } from '../TopNav.tsx'
@@ -21,6 +21,7 @@ export function useDeviceAuth(token: string) {
   const [auth, setAuth] = useState<Load<DeviceAuth | null>>({ kind: 'loading' })
   const [tick, setTick] = useState(0)
   useEffect(() => {
+    if (!token) return
     const ctl = new AbortController()
     deviceAuth(token, ctl.signal).then(
       (value) => setAuth({ kind: 'ready', value }),
@@ -28,7 +29,7 @@ export function useDeviceAuth(token: string) {
     )
     return () => ctl.abort()
   }, [token, tick])
-  return { auth, reload: useCallback(() => setTick((t) => t + 1), []) }
+  return { auth: token ? auth : ({ kind: 'ready', value: null } as const), reload: useCallback(() => setTick((t) => t + 1), []) }
 }
 
 const FORGE = { github: 'GitHub', gitlab: 'GitLab' } as const
@@ -161,7 +162,7 @@ function ComputerList({ devices, auth, showOwner = false, onChange }: { devices:
   )
 }
 
-export function ComputersPage({ auth, provider, onSignedOut }: { auth: Load<DeviceAuth | null>; provider: 'github' | 'gitlab'; onSignedOut: () => void }) {
+export function ComputersPage({ auth, provider, onSignedOut, onSignOutFailed }: { auth: Load<DeviceAuth | null>; provider: 'github' | 'gitlab'; onSignedOut: (session: BrowserSession) => void; onSignOutFailed?: (session: BrowserSession) => void }) {
   const [devices, setDevices] = useState<Load<{ devices: Device[]; hub: string | null }>>({ kind: 'loading' })
   const [signingOut, setSigningOut] = useState(false)
   const [signOutError, setSignOutError] = useState(false)
@@ -204,19 +205,21 @@ export function ComputersPage({ auth, provider, onSignedOut }: { auth: Load<Devi
                 setSignOutError(false)
                 try {
                   await signOutBrowser(session)
-                  onSignedOut()
+                  onSignedOut(session)
                 } catch {
+                  onSignOutFailed?.(session)
                   setSignOutError(true)
                 } finally {
                   setSigningOut(false)
                 }
               }}
             >
-              Sign out of this browser
+              Sign out of Hub pages
             </button>
           )
         }
       >
+        {ready && <p className="small muted">Workspace access and computers stay signed in.</p>}
         {signOutError && <Notice tone="bad" icon="box-arrow-right" title="This browser is still signed in">The Hub didn’t confirm the sign-out. Reload the page and try again.</Notice>}
         {auth.kind === 'loading' || (ready && devices.kind === 'loading') ? (
           <Skeleton rows={2} />

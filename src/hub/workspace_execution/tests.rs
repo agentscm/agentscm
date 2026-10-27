@@ -101,6 +101,7 @@ impl Fixture {
                     name: "Synthetic workspace".into(),
                     database: root.path().join("workspace.sqlite"),
                     initial_owner: identity.clone(),
+                    forge_repositories: vec![],
                 },
                 store.clone(),
             )

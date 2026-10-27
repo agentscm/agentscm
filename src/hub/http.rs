@@ -15,7 +15,7 @@ use serde_json::json;
 
 use super::login::{Login, LoginConfig};
 use super::skill_workflow::{ReadError as SkillWorkflowReadError, SkillWorkflowRegistry};
-use super::store::{self, Principal, agent_token_digest, unix_now};
+use super::store::{self, Principal, agent_token_digest, unix_now, web_read_token_digest};
 use super::sync::{self, Sync as GithubSync, SyncConfig};
 use super::{HubError, HubState, Result, open_objects, router};
 use crate::team::http::shutdown_signal;
@@ -404,12 +404,20 @@ impl FromRequestParts<HubState> for Reader {
         parts: &mut Parts,
         state: &HubState,
     ) -> std::result::Result<Self, ApiError> {
-        let digest = agent_token_digest(bearer(parts)?)?;
+        let raw = bearer(parts)?;
+        let digest = agent_token_digest(raw)?;
+        let web_digest = web_read_token_digest(raw)?;
         let store = state.store.clone();
-        blocking(state, move || store.authenticate(&digest, unix_now()))
-            .await?
-            .map(Self)
-            .ok_or_else(ApiError::unauthorized)
+        blocking(state, move || {
+            let now = unix_now();
+            match store.authenticate(&digest, now)? {
+                Some(principal) => Ok(Some(principal)),
+                None => store.authenticate(&web_digest, now),
+            }
+        })
+        .await?
+        .map(Self)
+        .ok_or_else(ApiError::unauthorized)
     }
 }
 

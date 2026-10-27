@@ -20,6 +20,7 @@ on:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".github/local-validation/**"
+      - ".github/workflows/local-validation-reconcile.yml"
       - ".github/workflows/local-validation.yml"
   schedule:
     - cron: '17 6 * * *' # replaces the success of an aged-out attestation on the head
