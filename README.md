@@ -47,9 +47,11 @@ AgentSCM connects three parts of that process:
 
 For packaged binaries or containers, see [install options](docs/install.md).
 
-**Install: local or hosted?** For the alpha, run it on your own machine: `npx agentscm --local`.
-A hosted hub for a team is unsupported in the alpha and will likely break; `npx agentscm --hosted`
-prints the [hosted guide](docs/hosted.md) to work through with your coding agent. Asked to
+**Install: local or hosted?** On your own: run it on your machine with `npx agentscm --local`.
+Joining a team's existing hosted Hub: run `npx agentscm --hub-url URL` with the URL its operator
+gives you; it signs you in through your browser. Operating your own hosted Hub is unsupported in
+the alpha and will likely break; `npx agentscm --hosted` prints the [hosted guide](docs/hosted.md)
+to work through with your coding agent. Asked to
 install AgentSCM for someone? Ask them "local or hosted?" first, then follow
 [choose local or hosted](docs/install.md#choose-local-or-hosted).
 Building from source? Without the `ui` feature the hub serves only a notice page at `/ui/`; for the
