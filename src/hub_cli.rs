@@ -1191,8 +1191,7 @@ async fn loopback_login(
                 reqwest::Url::parse("http://page.invalid/").map_err(|_| invalid("bad URL"))?;
             page.query_pairs_mut()
                 .append_pair("status", "refused")
-                .append_pair("reason", &kind)
-                .append_pair("message", &message);
+                .append_pair("reason", &kind);
             let location = format!("{hub}/ui/#/signed-in?{}", page.query().unwrap_or_default());
             let _ = tokio::task::spawn_blocking(move || redirect_browser(browser, &location)).await;
             return Err(invalid(if message.is_empty() {
@@ -1228,15 +1227,14 @@ async fn loopback_login(
                 }
             }
         }
+        // The reason alone: anyone can forge the page's link, so the page words it itself.
         Ok((_, refused)) => {
-            let mut pairs = page.query_pairs_mut();
-            pairs.append_pair("status", "refused").append_pair(
-                "reason",
-                refused["error"].as_str().unwrap_or("login_failed"),
-            );
-            if let Some(message) = refusal_message(refused) {
-                pairs.append_pair("message", &message);
-            }
+            page.query_pairs_mut()
+                .append_pair("status", "refused")
+                .append_pair(
+                    "reason",
+                    refused["error"].as_str().unwrap_or("login_failed"),
+                );
         }
         Err(_) => {
             page.query_pairs_mut()

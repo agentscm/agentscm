@@ -946,6 +946,83 @@ fn devices_and_refusals(db: &Db) {
     );
 }
 
+fn browser_sessions(db: &Db) {
+    use store::{
+        BROWSER_SESSION_MAX_SECONDS, MAX_BROWSER_SESSIONS, SLIDE_STEP_SECONDS,
+        browser_session_digest,
+    };
+
+    let store = db.open();
+    let alice = store.upsert_user(&identity(7), "alice").unwrap();
+    let now = unix_now();
+    let digest = |n: usize| browser_session_digest(&format!("{n:064}")).unwrap();
+    store
+        .insert_browser_session(&alice.id, &digest(0), now + 100, now)
+        .unwrap();
+    let (user, expires) = store
+        .browser_session(&digest(0), now, now)
+        .unwrap()
+        .unwrap();
+    assert_eq!((user.id.as_str(), expires), (alice.id.as_str(), now + 100));
+    // The expiry slides only by a real step, so most requests write nothing.
+    let (_, expires) = store
+        .browser_session(&digest(0), now, now + 100 + SLIDE_STEP_SECONDS - 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(expires, now + 100);
+    let later = now + 100 + SLIDE_STEP_SECONDS + 1;
+    assert_eq!(
+        store
+            .browser_session(&digest(0), now, later)
+            .unwrap()
+            .unwrap()
+            .1,
+        later
+    );
+    assert_eq!(
+        store.browser_session(&digest(0), later, later).unwrap(),
+        None
+    );
+    // However often it is used, a sign-in ends a week after it began.
+    let old = now - BROWSER_SESSION_MAX_SECONDS;
+    store
+        .insert_browser_session(&alice.id, &digest(20), now + 100, old)
+        .unwrap();
+    assert_eq!(store.browser_session(&digest(20), now, now).unwrap(), None);
+    // Disabling the owner deletes their sign-ins, so enabling them again brings none back; a
+    // disabled owner cannot get a new one.
+    store.set_user_disabled(&alice.id, true).unwrap();
+    assert_eq!(db.count("SELECT COUNT(*) FROM hub_browser_sessions"), 0);
+    assert!(
+        store
+            .insert_browser_session(&alice.id, &digest(1), now + 100, now)
+            .is_err()
+    );
+    store.set_user_disabled(&alice.id, false).unwrap();
+    assert_eq!(store.browser_session(&digest(0), now, now).unwrap(), None);
+    // At most eight per person: the oldest go first.
+    for n in 1..=MAX_BROWSER_SESSIONS as usize + 1 {
+        store
+            .insert_browser_session(&alice.id, &digest(n), now + 1000, now + n as i64)
+            .unwrap();
+    }
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM hub_browser_sessions"),
+        MAX_BROWSER_SESSIONS
+    );
+    assert_eq!(store.browser_session(&digest(1), now, now).unwrap(), None);
+    assert!(store.delete_browser_session(&digest(9)).unwrap());
+    assert!(!store.delete_browser_session(&digest(9)).unwrap());
+    // A restart keeps them.
+    drop(store);
+    assert!(
+        db.open()
+            .browser_session(&digest(8), now, now)
+            .unwrap()
+            .is_some()
+    );
+}
+
 fn app(host: &str) -> NewConnection {
     NewConnection {
         id: new_connection_id().unwrap(),
@@ -2617,6 +2694,7 @@ conformance!(
     url_errors,
     skill_adoption_and_evidence,
     devices_and_refusals,
+    browser_sessions,
 );
 
 #[cfg(unix)]

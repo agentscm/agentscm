@@ -77,9 +77,10 @@ use super::session::{
 };
 use super::skills::{EvidenceRow, RunHead, SkillAdoption};
 use super::store::{
-    ACTIVITY_KINDS, ActivityEvent, AgentToken, Event, ForgeIdentity, HubEvent, LIST_LIMIT,
-    NAMED_MIGRATIONS, NewAgentToken, Principal, SessionView, Store, TokenDigest, User, event_limit,
-    like_pattern, lower_hex_of, new_id, pending, plan_named, search_number, session_key, unix_now,
+    ACTIVITY_KINDS, ActivityEvent, AgentToken, BROWSER_SESSION_MAX_SECONDS, Event, ForgeIdentity,
+    HubEvent, LIST_LIMIT, MAX_BROWSER_SESSIONS, NAMED_MIGRATIONS, NewAgentToken, Principal,
+    SLIDE_STEP_SECONDS, SessionView, Store, TokenDigest, User, event_limit, like_pattern,
+    lower_hex_of, new_id, pending, plan_named, search_number, session_key, unix_now,
     validate_login,
 };
 use super::work::{
@@ -174,6 +175,10 @@ impl SqliteStore {
             .is_none()
         {
             return Err(HubError::Invalid("unknown user".into()));
+        }
+        // Enabling someone again must not bring back a browser they were signed in on.
+        if disabled {
+            tx.execute("DELETE FROM hub_browser_sessions WHERE owner = ?1", [user])?;
         }
         Ok(tx.commit()?)
     }
@@ -5065,6 +5070,86 @@ impl Store for SqliteStore {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    fn insert_browser_session(
+        &self,
+        owner: &str,
+        digest: &TokenDigest,
+        expires_at: i64,
+        now: i64,
+    ) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM hub_browser_sessions WHERE expires_at <= ?1",
+            [now],
+        )?;
+        let inserted = tx.execute(
+            "INSERT INTO hub_browser_sessions (digest, owner, created_at, expires_at)
+             SELECT ?1, id, ?3, ?4 FROM hub_users WHERE id = ?2 AND disabled = 0",
+            params![digest.as_str(), owner, now, expires_at],
+        )?;
+        if inserted == 0 {
+            return Err(HubError::Invalid("unknown or disabled owner".into()));
+        }
+        tx.execute(
+            "DELETE FROM hub_browser_sessions WHERE owner = ?1 AND digest NOT IN
+                 (SELECT digest FROM hub_browser_sessions WHERE owner = ?1
+                  ORDER BY created_at DESC, digest LIMIT ?2)",
+            params![owner, MAX_BROWSER_SESSIONS],
+        )?;
+        Ok(tx.commit()?)
+    }
+
+    fn browser_session(
+        &self,
+        digest: &TokenDigest,
+        now: i64,
+        slide_to: i64,
+    ) -> Result<Option<(User, i64)>> {
+        let conn = self.conn();
+        let found = conn
+            .query_row(
+                "SELECT u.id, u.provider, u.host, u.forge_user_id, u.login, u.disabled, s.expires_at
+                 FROM hub_browser_sessions s JOIN hub_users u ON u.id = s.owner
+                 WHERE s.digest = ?1 AND s.expires_at > ?2 AND s.created_at > ?3",
+                params![digest.as_str(), now, now - BROWSER_SESSION_MAX_SECONDS],
+                |row| {
+                    Ok((
+                        User {
+                            id: row.get(0)?,
+                            identity: ForgeIdentity {
+                                provider: row.get(1)?,
+                                host: row.get(2)?,
+                                user_id: row.get(3)?,
+                            },
+                            login: row.get(4)?,
+                            disabled: row.get(5)?,
+                        },
+                        row.get::<_, i64>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((user, expires_at)) = found else {
+            return Ok(None);
+        };
+        if slide_to <= expires_at + SLIDE_STEP_SECONDS {
+            return Ok(Some((user, expires_at)));
+        }
+        conn.execute(
+            "UPDATE hub_browser_sessions SET expires_at = ?2 WHERE digest = ?1",
+            params![digest.as_str(), slide_to],
+        )?;
+        Ok(Some((user, slide_to)))
+    }
+
+    fn delete_browser_session(&self, digest: &TokenDigest) -> Result<bool> {
+        Ok(self.conn().execute(
+            "DELETE FROM hub_browser_sessions WHERE digest = ?1",
+            [digest.as_str()],
+        )? > 0)
     }
 
     fn announce_intent(&self, token: &str, intent: &NewIntent, now: i64) -> Result<Announced> {
