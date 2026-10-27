@@ -68,7 +68,7 @@ pub(crate) enum ReportingCommand {
 
 #[derive(Debug, Default, Args)]
 pub(crate) struct ConnectArgs {
-    /// Hub URL, such as https://hub.example.com (default: the saved Hub, when there is one).
+    /// Hub URL, such as https://hub.example.com (default: AGENTSCM_HUB, then the only saved Hub).
     #[arg(long)]
     pub(crate) hub: Option<String>,
     /// Forge repository as owner/name (default: read from the checkout's origin remote).
@@ -1110,7 +1110,7 @@ async fn connect_inner(
     };
     let hub = match args.hub.as_deref() {
         Some(hub) => check_base_url(hub).map_err(map_hub_error)?,
-        None => crate::hub_cli::only_saved_hub()?,
+        None => crate::hub_cli::default_hub()?,
     };
     let supplied_token = match args.token_file {
         Some(path) => {

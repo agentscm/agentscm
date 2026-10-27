@@ -74,10 +74,10 @@ Without a terminal quickstart refuses unless you pass `--yes`, which takes the r
 
 | Flag | Meaning |
 | --- | --- |
-| `--hub local\|existing\|skip` | How to get live warnings (with `--yes` and no flag, an already configured hub is kept, otherwise skip). |
+| `--hub local\|existing\|skip\|URL` | How to get live warnings (with `--yes` and no flag, an already configured hub is kept, otherwise skip). A URL means `--hub existing --hub-url URL`, so `--hub URL` means the same as in the `hub` and `client` commands. |
 | `--hub-runtime native\|docker` | Local runtime. Native is the default on supported Apple Silicon macOS hosts; Docker must be selected explicitly elsewhere with `--yes`. |
 | `--hub-port PORT`, `--hub-project NAME` | Isolated local instance; defaults to port 7332 and a home-specific name. Resume reuses the record. |
-| `--hub-url URL` | The hub for `--hub existing`. |
+| `--hub-url URL` | The hub for `--hub existing`; still accepted. |
 | `--agent-token-file PATH` | Use this agent token instead of signing in; it is checked against the hub and used where it is. Needed for agent setup without a terminal. |
 | `--agent claude\|codex\|cursor\|copilot\|gemini` | Set up this coding agent (repeatable). Default: Claude Code if the `claude` CLI is on `PATH`. |
 | `--no-agents` | Do not set up any coding agent. |
