@@ -1871,7 +1871,7 @@ fn native_fixture(machine: &Machine, hub: &Hub) -> (PathBuf, PathBuf) {
     std::fs::create_dir_all(machine.bin_dir()).unwrap();
     let executable = machine
         .bin_dir()
-        .join(format!("agentscm-{}", env!("CARGO_PKG_VERSION")));
+        .join(format!("agentscm-{}", env!("AGENTSCM_INSTALL_VERSION")));
     place_binary(&executable);
     symlink(
         executable.file_name().unwrap(),
@@ -3995,6 +3995,28 @@ fn a_failed_agent_step_ends_non_zero_and_the_last_line_says_so() {
         "{line}"
     );
     assert!(!repo.path().join("AGENTS.md").exists());
+}
+
+#[test]
+fn a_failed_program_copy_ends_non_zero_and_sets_up_no_agent() {
+    let (hub, machine) = (Hub::start(), Machine::transient().with_claude());
+    let repo = machine.repo();
+    let token = hub.token_file(machine.home.path());
+    // A regular file where the symlink goes is never replaced, so the copy step fails.
+    std::fs::create_dir_all(machine.bin_dir()).unwrap();
+    std::fs::write(machine.bin_dir().join("agentscm"), "mine").unwrap();
+    let output = machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"]));
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        out(&output).contains("Couldn't copy the program"),
+        "{output:?}"
+    );
+    let line = last_line(&output);
+    assert!(
+        line.starts_with("Live warnings: off — coding agent setup failed: couldn't copy"),
+        "{line}"
+    );
+    assert!(machine.connections().is_empty());
 }
 
 #[test]
