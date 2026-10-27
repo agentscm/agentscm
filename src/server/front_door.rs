@@ -1084,7 +1084,36 @@ async fn revoke_device(
             "that is not a computer id",
         );
     }
-    let path = format!("/v1/hub/devices/{id}");
+    // The id that goes into the Hub's URL is the one the Hub listed for this person, never the
+    // request's own text: the request only chooses among them.
+    let listed = match device_call(
+        &front_door,
+        &selected,
+        reqwest::Method::GET,
+        "/v1/hub/devices",
+    )
+    .await
+    {
+        Ok(reply) if reply.status().is_success() => reply.bytes().await.ok(),
+        Ok(reply) => return relay(reply).await,
+        Err(response) => return response,
+    };
+    let known = listed
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|list| {
+            list["devices"].as_array()?.iter().find_map(|device| {
+                let listed = device["id"].as_str()?;
+                (listed == id).then(|| listed.to_owned())
+            })
+        });
+    let Some(known) = known else {
+        return refuse(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such computer of yours on this Hub",
+        );
+    };
+    let path = format!("/v1/hub/devices/{known}");
     match device_call(&front_door, &selected, reqwest::Method::DELETE, &path).await {
         Ok(reply) => relay(reply).await,
         Err(response) => response,

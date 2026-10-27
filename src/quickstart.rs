@@ -67,8 +67,12 @@ pub struct QuickstartArgs {
     /// the alpha), then connects only when --hub-url is given.
     #[arg(long, conflicts_with = "hub")]
     hosted: bool,
-    /// How to get live warnings.
-    #[arg(long, value_enum)]
+    /// How to get live warnings: local, existing or skip, or the hub's URL (the same as
+    /// --hub-url), so `--hub URL` means one thing in every command.
+    #[arg(id = "hub", long = "hub", value_name = "local|existing|skip|URL", value_parser = parse_hub)]
+    hub_arg: Option<HubArg>,
+    /// Set from `--hub` once parsed.
+    #[arg(skip)]
     hub: Option<HubChoice>,
     /// The hub to connect to (with --hub existing).
     #[arg(long)]
@@ -114,7 +118,39 @@ pub struct QuickstartArgs {
     tray: bool,
 }
 
+/// `--hub` is a choice or, when it looks like a URL, the hub itself.
+#[derive(Clone, Debug)]
+pub enum HubArg {
+    Choice(HubChoice),
+    Url(String),
+}
+
+fn parse_hub(value: &str) -> std::result::Result<HubArg, String> {
+    if value.contains("://") {
+        return Ok(HubArg::Url(value.to_owned()));
+    }
+    HubChoice::from_str(value, true)
+        .map(HubArg::Choice)
+        .map_err(|_| "expected local, existing, skip or the hub's URL".to_owned())
+}
+
 impl QuickstartArgs {
+    /// Splits `--hub` into the choice and `--hub-url`; a URL in both must be the same one.
+    fn resolve_hub(&mut self) -> Result<()> {
+        match self.hub_arg.take() {
+            Some(HubArg::Choice(choice)) => self.hub = Some(choice),
+            Some(HubArg::Url(url)) => {
+                if self.hub_url.as_ref().is_some_and(|given| *given != url) {
+                    return Err(invalid("--hub and --hub-url name different hubs; pass one"));
+                }
+                self.hub = Some(HubChoice::Existing);
+                self.hub_url = Some(url);
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
     pub(crate) fn noninteractive(&self) -> bool {
         self.yes || !std::io::stdin().is_terminal()
     }
@@ -136,7 +172,7 @@ pub struct UninstallArgs {
 
 const NEEDS_TERMINAL: &str = "agentscm quickstart asks questions, and there is no terminal here. \
 To run it without one, pass --yes and choose with flags: --local (recommended) or --hosted, \
---hub local|existing|skip, --hub-url URL, \
+--hub local|existing|skip|URL, --hub-url URL, \
 --agent-token-file PATH, --provider github|gitlab, --github-login LOGIN, \
 --hub-runtime native|docker, --hub-port PORT, --hub-project NAME, \
 --slack-config-file ABSOLUTE_PATH, --agent claude|codex|cursor|copilot|gemini (repeatable) or --no-agents, --no-collisions, --init, --tray";
@@ -371,7 +407,8 @@ struct Cx<'a> {
     failure: Option<String>,
 }
 
-pub async fn run(args: QuickstartArgs) -> Result<u8> {
+pub async fn run(mut args: QuickstartArgs) -> Result<u8> {
+    args.resolve_hub()?;
     let tty = std::io::stdin().is_terminal();
     if !args.yes && !tty {
         return Err(invalid(NEEDS_TERMINAL));
@@ -1881,9 +1918,42 @@ mod tests {
     }
 
     #[test]
+    fn hub_takes_a_choice_or_the_hub_url() {
+        #[derive(clap::Parser)]
+        struct Quick {
+            #[command(flatten)]
+            args: QuickstartArgs,
+        }
+        let parse = |extra: &[&str]| {
+            let argv = ["quickstart"].iter().chain(extra);
+            let mut args = <Quick as clap::Parser>::try_parse_from(argv)?.args;
+            Ok::<_, clap::Error>(args.resolve_hub().map(|()| (args.hub, args.hub_url)))
+        };
+        let url = "https://hub.example.com";
+        assert!(matches!(
+            parse(&["--hub", url]).unwrap().unwrap(),
+            (Some(HubChoice::Existing), Some(given)) if given == url
+        ));
+        assert!(matches!(
+            parse(&["--hub", "Skip"]).unwrap().unwrap(),
+            (Some(HubChoice::Skip), None)
+        ));
+        assert!(parse(&["--hub", url, "--hub-url", url]).unwrap().is_ok());
+        assert!(
+            parse(&["--hub", url, "--hub-url", "https://other.example.com"])
+                .unwrap()
+                .is_err()
+        );
+        assert!(parse(&["--hub", "hosted"]).is_err());
+        assert!(parse(&["--hub", "nonsense"]).is_err());
+        assert!(parse(&["--local", "--hub", url]).is_err());
+    }
+
+    #[test]
     fn slack_input_rejects_nonlocal_hubs_before_reading_the_file() {
         let args = QuickstartArgs {
             yes: true,
+            hub_arg: None,
             hub: Some(HubChoice::Existing),
             hub_url: None,
             hub_runtime: None,

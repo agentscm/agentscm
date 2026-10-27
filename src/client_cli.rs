@@ -21,7 +21,10 @@ use crate::hub_cli::{HubAuth, Provider, call, has_session, load_session, map_hub
 mod computer;
 use crate::intent_cli::valid_repo;
 use crate::prompt::Ui;
-pub(crate) use computer::{attention, auto_connect_command, due, enroll, renew_command};
+pub(crate) use computer::{attention, auto_connect_command, due, renew_command};
+// Only the local Hub page (Unix) and the macOS tray enroll from outside the client.
+#[cfg(unix)]
+pub(crate) use computer::enroll;
 
 const TOKEN_BYTES: u64 = 16 * 1024;
 /// Hub maximum, for a token minted with a session (no computer credential, or an older Hub).
@@ -77,7 +80,7 @@ pub(crate) enum ReportingCommand {
 
 #[derive(Debug, Default, Args)]
 pub(crate) struct ConnectArgs {
-    /// Hub URL, such as https://hub.example.com (default: the saved Hub, when there is one).
+    /// Hub URL, such as https://hub.example.com (default: AGENTSCM_HUB, then the only saved Hub).
     #[arg(long)]
     pub(crate) hub: Option<String>,
     /// Forge repository as owner/name (default: read from the checkout's origin remote).
@@ -122,8 +125,8 @@ pub(crate) struct SetupArgs {
     #[arg(long, value_enum)]
     agent: crate::client_setup::Agent,
     /// Write the agent's hooks, MCP entry and skill into this checkout only, not your user
-    /// configuration, so they run only here. Claude Code and Codex hooks always come from a
-    /// user-scope plugin.
+    /// configuration, so they run only here. Claude Code is always set up through its
+    /// user-scope plugin, and Codex hooks always come from one.
     #[arg(long)]
     checkout_only: bool,
     #[command(flatten)]
@@ -1247,7 +1250,7 @@ async fn connect_inner(
     };
     let hub = match args.hub.as_deref() {
         Some(hub) => check_base_url(hub).map_err(map_hub_error)?,
-        None => crate::hub_cli::only_saved_hub()?,
+        None => crate::hub_cli::default_hub()?,
     };
     let supplied_token = match args.token_file {
         Some(path) => {

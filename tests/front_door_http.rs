@@ -1923,6 +1923,17 @@ fn the_page_lists_and_revokes_computers_with_this_computers_credential() {
             .0,
         400
     );
+    // A well-formed id the Hub did not list for this person never reaches the Hub's URL.
+    let other = "dev_ffffffffffffffffffffffffffffffff";
+    let path = format!("/v1/hub/devices/{other}");
+    assert_eq!(door.request("DELETE", &path, &headers).0, 404);
+    assert!(
+        !seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.contains(other))
+    );
     let requests = seen.lock().unwrap().clone();
     for line in [
         "GET /v1/hub/devices ".to_owned(),
