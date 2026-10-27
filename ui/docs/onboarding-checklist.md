@@ -23,11 +23,11 @@ Start the stopwatch at step 1. Write down anything that makes you stop and think
 | # | Do | Expect, word for word where quoted | Pass |
 |---|----|------------------------------------|------|
 | 1 | Open the Hub's sign-in page. Under **Set up this computer**, choose **Copy**. | The command names this Hub. Copy says Copied. | ☐ |
-| 2 | Paste it into Terminal and run it. | Short output: no telemetry notice wall, no JSON. It asks once whether to keep AgentSCM in the menu bar after restarts. | ☐ |
+| 2 | In Terminal, `cd` into the clone, paste the command and run it. | Short output: no telemetry notice wall, no JSON. It asks once whether to keep AgentSCM in the menu bar after restarts, and, for Claude Code, "Install the AgentSCM plugin for Claude Code in all your projects? It runs a quick check whenever an agent starts and only contacts a Hub in repos connected to it. [Y/n]" | ☐ |
 | 3 | Answer, and let the browser open. | GitHub's sign-in page. **The one click:** Authorize. | ☐ |
 | 4 | Look at the tab it returns to. | "This computer is signed in." · "<computer> is signed in to <Hub> as <login> on GitHub. You won't need to do this again." | ☐ |
 | 5 | Look at the menu bar. | The AgentSCM icon shows **Connected**. No "Not connected" rows, no `?` rows. | ☐ |
-| 6 | `cd` into the clone and start the agent. Ask it to edit any file. | One line from the agent: "AgentSCM: coordinating on <owner/repo>". No setup command and no repository files written without asking. The agent appears under Dashboard › Team on the Hub. **Stop the stopwatch.** | ☐ |
+| 6 | Start the agent in the clone. Ask it to edit any file. | One line from the agent: "AgentSCM: coordinating on <owner/repo>". No setup command and no repository files written without asking. The agent appears under Dashboard › Team on the Hub. **Stop the stopwatch.** | ☐ |
 | 7 | Repeat steps 1–3 as the **Read-only** account. | The landing page, the agent and the menu bar app all say the same sentence: "<login> has Read on public repository <owner/repo>; ask a repository owner for Triage or higher". There's no "membership" and no JSON anywhere. | ☐ |
 | 8 | As the admin, open **Setup › Admin** on the Hub. | **Turned away** lists the Read-only login with that reason and a count. **Connected repositories** lists the repository with 1 computer. | ☐ |
 | 9 | As the teammate, open the account menu → **Your computers**. Revoke the computer from step 4. | It's listed with the repository. After Revoke: "<computer> was revoked." Within a minute the menu bar app shows the computer is signed out, and the agent's next edit says so in one line. | ☐ |
