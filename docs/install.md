@@ -183,7 +183,7 @@ notice. It does not ask again for an agent that is already installed this way.
 
 | Agent | Hooks | MCP server | Coordination skill |
 |---|---|---|---|
-| Claude Code | user-scope plugin | the checkout's `.mcp.json` | in the plugin |
+| Claude Code | user-scope plugin | in the plugin | in the plugin |
 | Codex | user-scope plugin | `$CODEX_HOME/config.toml` (`~/.codex`) | in the plugin |
 | Cursor | `~/.cursor/hooks.json` | `~/.cursor/mcp.json` | `~/.cursor/skills/coordinate-edits/` |
 | Gemini CLI | `~/.gemini/settings.json` | `~/.gemini/settings.json` | `~/.gemini/skills/coordinate-edits/` |
@@ -209,7 +209,9 @@ to enable a new MCP server.
 
 `--checkout-only` writes the hooks, MCP entry and skill into the checkout instead, as earlier
 versions did, so they run only there; quickstart does this when you answer No (Claude Code and
-Codex are then not set up, since their hooks come only from a user-scope plugin). The two cannot
+Codex are then not set up, since their hooks come only from a user-scope plugin). Claude Code is
+always set up through its plugin, and setting it up takes out the `.mcp.json` entry earlier
+versions wrote into each connected checkout. The two cannot
 be mixed for one agent: setting an agent up for all projects takes AgentSCM's files for that agent
 out of every connected checkout, and a checkout-only setup is refused while the agent is installed
 for all projects. `agentscm client remove` and `agentscm uninstall` take the user-scope entries out

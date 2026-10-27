@@ -2951,6 +2951,12 @@ impl Machine {
         std::fs::read_to_string(self.home.path().join("fake-claude/log")).unwrap_or_default()
     }
 
+    /// Whether the fake `claude` lists the AgentSCM plugin as installed.
+    fn claude_plugin_installed(&self) -> bool {
+        std::fs::read_to_string(self.home.path().join("fake-claude/plugins"))
+            .is_ok_and(|plugins| plugins.contains("agentscm@agentscm-claude-client"))
+    }
+
     fn connections(&self) -> Vec<Value> {
         std::fs::read_to_string(self.config().join("connections.json"))
             .map(|text| {
@@ -3022,13 +3028,19 @@ fn fresh_quickstart_connects_claude_code_through_client_setup_and_the_connect_pa
     assert_eq!(connections[0]["repo"], REPO);
     assert_eq!(connections[0]["hub"], hub.url.as_str());
     assert_eq!(connections[0]["agents"], json!(["claude"]));
-    let mcp = json_file(&repo.path().join(".mcp.json"));
-    let server = &mcp["mcpServers"]["agentscm"];
-    assert_eq!(server["type"], "stdio");
-    assert!(
-        server["args"].to_string().contains(root.to_str().unwrap()),
-        "{server}"
+    // The MCP server comes with the plugin, like its hooks; nothing is written into the checkout.
+    let mcp = json_file(&machine.home.path().join("fake-claude/cache/.mcp.json"));
+    assert_eq!(
+        mcp["mcpServers"]["agentscm"]["args"],
+        json!([
+            "--no-telemetry",
+            "client",
+            "mcp",
+            "--root",
+            "${CLAUDE_PROJECT_DIR:-.}"
+        ])
     );
+    assert!(!repo.path().join(".mcp.json").exists());
     let log = machine.claude_log();
     assert!(
         log.contains("plugin install --scope user --json agentscm@agentscm-claude-client"),
@@ -3094,7 +3106,7 @@ fn uninstall_removes_everything_quickstart_set_up() {
         "{said}"
     );
     assert_eq!(machine.connections().len(), 1);
-    assert!(repo.path().join(".mcp.json").exists());
+    assert!(machine.claude_plugin_installed());
 
     let said = ok(&machine.run(repo.path(), &["uninstall", "--yes"]));
     assert!(said.contains("Removed the client connection"), "{said}");
@@ -3102,7 +3114,7 @@ fn uninstall_removes_everything_quickstart_set_up() {
     // The token file was the user's own, so it stays; nothing managed is left behind.
     assert!(token.exists());
     assert!(names_in(&machine.config().join("tokens")).is_empty());
-    assert!(!repo.path().join(".mcp.json").exists());
+    assert!(!machine.claude_plugin_installed());
     let log = machine.claude_log();
     assert!(
         log.contains("plugin uninstall --scope user agentscm@agentscm-claude-client"),
@@ -3131,8 +3143,7 @@ fn client_remove_honors_the_shared_lifecycle_lease() {
             .expect("saved connection root"),
     );
     let before = std::fs::read(machine.config().join("connections.json")).unwrap();
-    let configured = repo.path().join(".mcp.json");
-    assert!(configured.exists());
+    assert!(machine.claude_plugin_installed());
 
     let lease_path = machine.config().join("client-lifecycle.lock");
     let lease = OpenOptions::new()
@@ -3162,7 +3173,7 @@ fn client_remove_honors_the_shared_lifecycle_lease() {
         std::fs::read(machine.config().join("connections.json")).unwrap(),
         before
     );
-    assert!(configured.exists());
+    assert!(machine.claude_plugin_installed());
     assert!(token.exists());
 
     drop(lease);
@@ -3180,7 +3191,7 @@ fn client_remove_honors_the_shared_lifecycle_lease() {
         "{removed}"
     );
     assert!(machine.connections().is_empty());
-    assert!(!configured.exists());
+    assert!(!machine.claude_plugin_installed());
     assert!(token.exists());
 }
 
@@ -3613,18 +3624,27 @@ fn final_uninstall_cleanup_excludes_setup_and_retains_program_when_busy() {
     assert!(!manifest.exists());
 }
 
+/// Setup takes out the `.mcp.json` entry earlier versions wrote, now that the plugin holds the
+/// MCP server, and keeps the user's own servers.
 #[test]
-fn uninstall_keeps_what_the_user_added_to_mcp_json_and_ends_the_sign_in() {
+fn setup_moves_the_old_mcp_json_entry_into_the_plugin_and_uninstall_ends_the_sign_in() {
     let (hub, machine) = (Hub::start(), Machine::new().with_claude());
     let repo = machine.repo();
     let token = hub.token_file(machine.home.path());
+    let root = repo.path().canonicalize().unwrap();
     std::fs::write(
         repo.path().join(".mcp.json"),
-        r#"{"mcpServers":{"other":{"command":"x"}}}"#,
+        json!({"mcpServers": {"other": {"command": "x"}, "agentscm": {"type": "stdio",
+            "command": "/old/agentscm",
+            "args": ["--no-telemetry", "client", "mcp", "--root", root.to_str().unwrap()]}}})
+        .to_string(),
     )
     .unwrap();
     ok(&machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"])));
-    assert!(json_file(&repo.path().join(".mcp.json"))["mcpServers"]["agentscm"].is_object());
+    assert_eq!(
+        json_file(&repo.path().join(".mcp.json")),
+        json!({"mcpServers":{"other":{"command":"x"}}})
+    );
     let session = machine.config().join("hub-session.json");
     std::fs::write(
         &session,
@@ -3963,7 +3983,7 @@ fn uninstall_without_a_terminal_still_needs_yes_when_something_is_recorded() {
     ok(&machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"])));
     let output = machine.run(repo.path(), &["uninstall"]);
     assert!(!output.status.success());
-    assert!(repo.path().join(".mcp.json").exists());
+    assert!(machine.claude_plugin_installed());
     assert_eq!(machine.connections().len(), 1);
 }
 
@@ -4206,7 +4226,7 @@ fn a_rerun_with_agents_changes_nothing() {
     let files = [
         machine.config().join("quickstart.json"),
         machine.config().join("connections.json"),
-        repo.path().join(".mcp.json"),
+        machine.home.path().join("fake-claude/cache/.mcp.json"),
         token.clone(),
     ];
     let before: Vec<_> = files.iter().map(|f| std::fs::read(f).unwrap()).collect();
