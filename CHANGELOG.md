@@ -4,6 +4,7 @@ All notable changes are listed here, newest first. AgentSCM is alpha: any releas
 
 ## 0.1.0-alpha.8 (2026-10-27)
 
+- Fixed: the Hub in a quickstart-managed Docker container never became healthy, because quickstart sets `AGENTSCM_SLACK_FILE` to an empty value and the Hub tried to load Slack settings from that empty path. An empty value now means no Slack file (#181).
 - Fixed: the Linux (musl) binaries did not compile, because the date formatting named `libc::time_t`, which is deprecated on musl. 0.1.0-alpha.7 was never released for that reason (only its container image was published); this release is everything listed under alpha.7 plus this fix.
 
 ## 0.1.0-alpha.7 (2026-10-27, not released)
