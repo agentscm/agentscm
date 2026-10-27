@@ -2,7 +2,11 @@
 
 All notable changes are listed here, newest first. AgentSCM is alpha: any release may change the CLI, the HTTP API, storage and schemas without a migration.
 
-## 0.1.0-alpha.7 (2026-10-27)
+## 0.1.0-alpha.8 (2026-10-27)
+
+- Fixed: the Linux (musl) binaries did not compile, because the date formatting named `libc::time_t`, which is deprecated on musl. 0.1.0-alpha.7 was never released for that reason (only its container image was published); this release is everything listed under alpha.7 plus this fix.
+
+## 0.1.0-alpha.7 (2026-10-27, not released)
 
 - The Hub's health check (`GET /v1/hub/health`, `/health`) reports its `version` and build `commit`, and `agentscm hub whoami` prints them next to its own, saying when the CLI or the Hub is older. Builds take the commit from Git, or from the `AGENTSCM_BUILD_COMMIT` environment variable where there is no `.git` (the Docker build).
 - Fixed: a second build from main could not be set up. Every build carries the release's version, so quickstart refused to overwrite `~/.agentscm/bin/agentscm-<version>` and skipped agent setup. Builds other than the tagged release now install as `agentscm-<version>+<commit>`, and a failed copy makes quickstart exit non-zero instead of continuing.
