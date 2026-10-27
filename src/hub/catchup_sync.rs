@@ -229,15 +229,19 @@ async fn walk(
         for hint in page.items {
             let updated = hint["updated_at"]
                 .as_str()
-                .and_then(parse_rfc3339)
+                .and_then(super::gitlab::time)
                 .ok_or_else(|| GhError::Failed("invalid closed proposal update time".into()))?;
             if updated < threshold {
                 return Ok(true);
             }
             candidate(state, conn, repo, token, api, &hint, pass).await?;
         }
-        if !page.next || len == 0 {
+        if !page.next {
             return Ok(true);
+        }
+        if len == 0 {
+            // An empty page that still links a successor is not the list end.
+            return Ok(false);
         }
         if len != pass.per_page as usize {
             // A short page with a successor cannot be addressed by offset.

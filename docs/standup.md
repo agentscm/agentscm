@@ -124,10 +124,18 @@ When the walk needed several requests it looks at the list head again, because
 proposals updated meanwhile move there. Coverage is observed-only only when the
 window was fully read with nothing unread or deferred; history before the window
 is not observed. Source status records unread pages, deferred observations,
-failures and, for `forge_pull`, `window_from`: the Unix time the last pass read
-back to (`null` when no window was read, as for `tracked_publication`). Source-quality metadata refreshes on
-each page without changing the delivery’s event watermarks. This is observed coverage, not a claim
-of complete forge history. No model call generates the recap.
+failures and, for `forge_pull`, `window_from`: the lower bound of the window the
+last pass declared (`null` when no pass declared one, as for `tracked_publication`).
+Only an observed-only state says the window was read. Each pass restarts at the
+list head with no cross-poll cursor, so a window holding more closed proposals
+than one pass's 40 list requests can read (about 1,280 at 32 per page, far fewer
+after an oversized record forces smaller pages) stays incomplete. Offset pages
+can skip an item if a closed proposal leaves the closed list mid-pass (for
+example, reopened); the next pass reads it. An oversized record that is the
+first item past the window boundary keeps the pass incomplete until another
+proposal crosses that boundary. Source-quality metadata refreshes on each page
+without changing the delivery’s event watermarks. This is observed coverage,
+not a claim of complete forge history. No model call generates the recap.
 
 Retention gaps, unavailable sources and partial pages remain visible. An empty
 retained delivery does not establish that nothing happened outside that coverage.

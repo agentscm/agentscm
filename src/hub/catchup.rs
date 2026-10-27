@@ -80,8 +80,9 @@ pub struct CatchupSourceStatus {
     pub checked_at: i64,
     pub unread_pages: u64,
     pub deferred: u64,
-    /// Lower bound of the closed-proposal window that was read, or `None` when
-    /// no window was read. History before it is not observed.
+    /// Lower bound of the declared closed-proposal window of the last pass;
+    /// `None` when no pass declared one. Only an observed_only state says it
+    /// was read. History before it is not observed.
     pub window_from: Option<i64>,
 }
 

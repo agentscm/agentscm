@@ -58,7 +58,7 @@ impl From<HubError> for GhError {
 }
 
 /// What `GhError::Failed` carried for an oversized reply, kept for every text built from it.
-pub const TOO_LARGE_DETAIL: &str = "unavailable: forge response too large";
+const TOO_LARGE_DETAIL: &str = "unavailable: forge response too large";
 
 /// A commit status state the forge accepts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
