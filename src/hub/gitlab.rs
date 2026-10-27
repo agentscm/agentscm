@@ -14,7 +14,7 @@ use super::forge_http::{self, Full, send_full};
 use super::github::{
     API_BODY_BYTES, Branch, CommitStatus, Gh, GhError, MAX_COMMENT_PAGES, MAX_FILE_PAGES,
     MAX_PULL_PAGES, MAX_RECENT_BRANCHES, PER_PAGE, Paged, PullHead, Reply, RepoInfo, StatusState,
-    endpoint_kind, parse_rfc3339, valid_ref_name,
+    answer, endpoint_kind, parse_rfc3339, valid_ref_name,
 };
 use super::store::{unix_now, validate_repository};
 
@@ -125,6 +125,35 @@ impl Api {
         project_info(&reply.ok("projects")?)
             .map(Some)
             .ok_or_else(|| GhError::Failed("unreadable reply from projects".into()))
+    }
+
+    /// The project and the user's membership (inherited and invited groups included), read
+    /// with the Hub's own credential: None when the project is missing (404), no membership when
+    /// the user is not a member. A 401 or 403 means the credential cannot answer.
+    pub async fn member_access(
+        &self,
+        token: &str,
+        project: i64,
+        user_id: i64,
+    ) -> Gh<Option<(Value, Option<Value>)>> {
+        let repo = self.get(token, &format!("/projects/{project}")).await?;
+        let member = match repo.status {
+            404 => return Ok(None),
+            _ => {
+                self.get(token, &format!("/projects/{project}/members/all/{user_id}"))
+                    .await?
+            }
+        };
+        let Some(repo) = answer(repo, "projects")? else {
+            return Ok(None);
+        };
+        Ok(Some((repo, answer(member, "members")?)))
+    }
+
+    /// A project's JSON by path, read with the Hub's own credential; None for a 404.
+    pub async fn project_json(&self, token: &str, full_name: &str) -> Gh<Option<Value>> {
+        let path = format!("/projects/{}", encode(full_name));
+        answer(self.get(token, &path).await?, "projects")
     }
 
     /// The user id and username the token acts as.

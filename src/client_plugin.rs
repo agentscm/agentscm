@@ -126,6 +126,12 @@ fn claude_files_with_version(program: &str, version: &str) -> Vec<(&'static str,
         "PreToolUse":[pre],
         "SessionEnd":[{"hooks":[hook(3)]}]
     }});
+    // Like the hooks, it inherits the agent's environment. The server's working directory is
+    // not documented, so it takes the project directory, when Claude Code substitutes it.
+    let mcp = json!({"mcpServers": {"agentscm": {
+        "command":program,
+        "args":["--no-telemetry", "client", "mcp", "--root", "${CLAUDE_PROJECT_DIR:-.}"]
+    }}});
     let manifest = json!({
         "name":"agentscm", "displayName":"AgentSCM", "version":version,
         "description":"Coordinate agent edits in checkouts connected to AgentSCM Hub.",
@@ -143,6 +149,7 @@ fn claude_files_with_version(program: &str, version: &str) -> Vec<(&'static str,
     vec![
         json_file("agentscm/.claude-plugin/plugin.json", manifest),
         json_file("agentscm/hooks/hooks.json", hooks),
+        json_file("agentscm/.mcp.json", mcp),
         (
             "agentscm/skills/coordinate-edits/SKILL.md",
             SKILL.as_bytes().to_vec(),
@@ -1056,6 +1063,12 @@ mod tests {
                 assert!(!hook.to_string().contains("hub-url"));
             }
         }
+        // The MCP server is user scope too, and names no checkout of its own.
+        assert_eq!(
+            read(&old, "agentscm/.mcp.json"),
+            json!({"mcpServers": {"agentscm": {"command": "/opt/old agentscm",
+                "args": ["--no-telemetry", "client", "mcp", "--root", "${CLAUDE_PROJECT_DIR:-.}"]}}})
+        );
         assert_eq!(
             old.iter()
                 .find(|(path, _)| *path == "agentscm/skills/coordinate-edits/SKILL.md")

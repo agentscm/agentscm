@@ -46,17 +46,33 @@ fn connection(root: Option<&Path>) -> Result<(Connection, PathBuf, String)> {
     Ok((connection, checkout, token))
 }
 
-fn unchanged(connection: &Connection, checkout: &Path, token: &str) -> Result<()> {
+/// True when `saved` differs from `connection` only by a renewed managed token.
+fn renewed_in_place(saved: &Connection, connection: &Connection) -> bool {
+    saved.owned_token_id.is_some()
+        && connection.owned_token_id.is_some()
+        && Connection {
+            token_file: connection.token_file.clone(),
+            owned_token_id: connection.owned_token_id.clone(),
+            owned_token_expires_at: connection.owned_token_expires_at,
+            ..saved.clone()
+        } == *connection
+}
+
+/// The token to use for the next request. The same binding keeps working when only its
+/// managed token was renewed in place; any other change stops the server.
+fn current_token(connection: &Connection, checkout: &Path, token: &str) -> Result<String> {
+    let changed = || invalid("client connection changed; restart the AgentSCM MCP server");
     let saved = selected(&connection.root, &load()?)?;
-    if saved != *connection
-        || !is_current_in(connection, checkout)
-        || read_token(&connection.token_file)? != token
-    {
-        return Err(invalid(
-            "client connection changed; restart the AgentSCM MCP server",
-        ));
+    let renewed = renewed_in_place(&saved, connection);
+    if !(saved == *connection || renewed) || !is_current_in(&saved, checkout) {
+        return Err(changed());
     }
-    Ok(())
+    let current = read_token(&saved.token_file)?;
+    // A supplied token file whose contents changed is another credential, not a renewal.
+    if current != token && !renewed {
+        return Err(changed());
+    }
+    Ok(current)
 }
 
 fn endpoint(connection: &Connection) -> Result<reqwest::Url> {
@@ -148,18 +164,82 @@ fn write_json(writer: &mut impl Write, value: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Answers locally, with no tools, until `find` sees a connection; then announces the tools
+/// changed and returns it with the request that found it, for `serve` to forward. A user-scope
+/// MCP entry starts in every project, and most are not connected; an agent's start-up hook may
+/// connect this one while it runs.
+fn unconnected<T>(
+    reader: &mut impl BufRead,
+    writer: &mut impl Write,
+    mut find: impl FnMut() -> Option<T>,
+) -> Result<Option<(T, Vec<u8>)>> {
+    loop {
+        let line = match read_line(reader) {
+            Ok(Some(line)) => line,
+            Ok(None) => return Ok(None),
+            Err(error) => {
+                write_json(
+                    writer,
+                    &rpc_error(&Value::Null, -32700, "request too large"),
+                )?;
+                return Err(error);
+            }
+        };
+        if let Some(found) = find() {
+            write_json(
+                writer,
+                &json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}),
+            )?;
+            return Ok(Some((found, line)));
+        }
+        let Ok(message) = serde_json::from_slice::<Value>(&line) else {
+            write_json(writer, &rpc_error(&Value::Null, -32700, "parse error"))?;
+            continue;
+        };
+        let Some(id) = response_id(&message) else {
+            continue;
+        };
+        let result = match message["method"].as_str() {
+            Some("initialize") => json!({
+                "protocolVersion": message["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),
+                "capabilities": {"tools": {"listChanged": true}},
+                "serverInfo": {"name": "agentscm", "version": env!("CARGO_PKG_VERSION")},
+                "instructions": "This checkout is not connected to an AgentSCM Hub, so AgentSCM has no tools here.",
+            }),
+            Some("ping") => json!({}),
+            Some("tools/list") => json!({"tools": []}),
+            _ => {
+                write_json(
+                    writer,
+                    &rpc_error(&id, -32601, "this checkout is not connected to AgentSCM"),
+                )?;
+                continue;
+            }
+        };
+        write_json(
+            writer,
+            &json!({"jsonrpc": "2.0", "id": id, "result": result}),
+        )?;
+    }
+}
+
 async fn serve(
     connection: &Connection,
     token: &str,
+    mut first: Option<Vec<u8>>,
     reader: &mut impl BufRead,
     writer: &mut impl Write,
-    mut check_connection: impl FnMut() -> Result<()>,
+    mut current_token: impl FnMut() -> Result<String>,
 ) -> Result<()> {
     let client = forge_http::client().map_err(map_hub_error)?;
     let url = endpoint(connection)?;
-    let activity_binding = crate::client_activity::activity_binding(connection, token);
+    let mut token = token.to_owned();
+    let mut activity_binding = crate::client_activity::activity_binding(connection, &token);
     loop {
-        let line = match read_line(reader) {
+        let line = match first
+            .take()
+            .map_or_else(|| read_line(reader), |line| Ok(Some(line)))
+        {
             Ok(Some(line)) => line,
             Ok(None) => return Ok(()),
             Err(error) => {
@@ -183,7 +263,14 @@ async fn serve(
         }
         let id = response_id(&message);
         drop(message);
-        if check_connection().is_err() {
+        let checked = current_token();
+        if let Ok(current) = &checked
+            && *current != token
+        {
+            token.clone_from(current);
+            activity_binding = crate::client_activity::activity_binding(connection, &token);
+        }
+        if checked.is_err() {
             report_activity(
                 &activity_binding,
                 crate::client_activity::ActivityOutcome::BindingChanged,
@@ -198,11 +285,11 @@ async fn serve(
                 "client connection changed; restart the AgentSCM MCP server",
             ));
         }
-        let client_id = crate::client_config::onboarding_client(&connection.root, token);
+        let client_id = crate::client_config::onboarding_client(&connection.root, &token);
         let forwarded = forward(
             &client,
             &url,
-            token,
+            &token,
             line,
             &client_id,
             connection.report_completion,
@@ -288,16 +375,22 @@ fn report_activity(binding: &str, outcome: crate::client_activity::ActivityOutco
 }
 
 pub(crate) async fn run(root: Option<&Path>) -> Result<()> {
-    let (connection, checkout, token) = connection(root)?;
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    serve(
-        &connection,
-        &token,
-        &mut stdin.lock(),
-        &mut stdout.lock(),
-        || unchanged(&connection, &checkout, &token),
-    )
+    let (mut reader, mut writer) = (stdin.lock(), stdout.lock());
+    let ((connection, checkout, token), first) = match connection(root) {
+        Ok(found) => (found, None),
+        Err(why) => {
+            eprintln!("AgentSCM MCP: {why}; no tools until this checkout is connected");
+            match unconnected(&mut reader, &mut writer, || connection(root).ok())? {
+                Some((found, line)) => (found, Some(line)),
+                None => return Ok(()),
+            }
+        }
+    };
+    serve(&connection, &token, first, &mut reader, &mut writer, || {
+        current_token(&connection, &checkout, &token)
+    })
     .await
 }
 
@@ -369,9 +462,11 @@ mod tests {
     async fn proxied(input: &str, connection: &Connection, token: &str) -> String {
         let mut reader = Cursor::new(input.as_bytes());
         let mut output = Vec::new();
-        serve(connection, token, &mut reader, &mut output, || Ok(()))
-            .await
-            .unwrap();
+        serve(connection, token, None, &mut reader, &mut output, || {
+            Ok(token.to_owned())
+        })
+        .await
+        .unwrap();
         String::from_utf8(output).unwrap()
     }
 
@@ -382,6 +477,27 @@ mod tests {
         let error = read_line(&mut reader).unwrap_err().to_string();
         assert!(error.contains("too large"));
         assert_eq!(reader.position(), (REQUEST_BYTES + 2) as u64);
+    }
+
+    #[test]
+    fn only_a_renewed_managed_token_keeps_the_server_running() {
+        let mut managed = saved("https://one.example".into(), "/one", "owner/one");
+        managed.owned_token_id = Some("tok_old".into());
+        managed.owned_token_expires_at = Some(10);
+        let mut renewed = managed.clone();
+        renewed.owned_token_id = Some("tok_new".into());
+        renewed.owned_token_expires_at = Some(20);
+        renewed.token_file = PathBuf::from("/new-token");
+        assert!(renewed_in_place(&renewed, &managed));
+        let mut moved = renewed.clone();
+        moved.hub = "https://two.example".into();
+        assert!(!renewed_in_place(&moved, &managed));
+        let mut other_repo = renewed.clone();
+        other_repo.repo = "owner/two".into();
+        assert!(!renewed_in_place(&other_repo, &managed));
+        // A supplied token is managed elsewhere and never counts as renewed.
+        let supplied = saved("https://one.example".into(), "/one", "owner/one");
+        assert!(!renewed_in_place(&supplied, &supplied));
     }
 
     #[test]
@@ -416,6 +532,7 @@ mod tests {
                 serve(
                     &connection,
                     "private-token",
+                    None,
                     &mut reader,
                     &mut output,
                     || Err(invalid("changed"))
@@ -536,5 +653,48 @@ mod tests {
             assert_eq!(reply["error"]["code"], -32000);
             assert!(!output.contains("private-token") && !output.contains("remote"));
         }
+    }
+
+    #[test]
+    fn an_unconnected_checkout_serves_no_tools_until_it_is_connected() {
+        let input = concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\"}}\n",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/list\"}\n",
+        );
+        let mut reader = Cursor::new(input.as_bytes());
+        let mut output = Vec::new();
+        let mut calls = 0;
+        let found = unconnected(&mut reader, &mut output, || {
+            calls += 1;
+            (calls == 5).then_some("connection")
+        })
+        .unwrap();
+        let (connection, line) = found.unwrap();
+        assert_eq!(connection, "connection");
+        assert!(String::from_utf8(line).unwrap().contains("\"id\":4"));
+        let replies: Vec<Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(replies.len(), 4);
+        assert_eq!(replies[0]["result"]["protocolVersion"], "2025-03-26");
+        assert_eq!(
+            replies[0]["result"]["capabilities"]["tools"]["listChanged"],
+            true
+        );
+        assert_eq!(replies[1]["result"]["tools"], json!([]));
+        assert_eq!(replies[2]["id"], 3);
+        assert_eq!(replies[2]["error"]["code"], -32601);
+        assert_eq!(replies[3]["method"], "notifications/tools/list_changed");
+        let mut ended = Cursor::new(&b""[..]);
+        assert!(
+            unconnected(&mut ended, &mut Vec::new(), || None::<()>)
+                .unwrap()
+                .is_none()
+        );
     }
 }

@@ -7,6 +7,7 @@ use agentscm::hub::forge_http::{self, check_base_url};
 
 use crate::client_config;
 use crate::client_status::{BindingState, ConnectionStatus};
+use crate::hub_cli::HubAuth;
 pub(super) use crate::hub_read_token::OpenError;
 use crate::hub_read_token::{
     expected_provider, load_exact_session, mint_and_confirm, revoke_token, valid_token_secret,
@@ -80,7 +81,7 @@ pub(super) struct PreparedOpen {
     hub: String,
     token_id: String,
     token_secret: String,
-    human_session: String,
+    human_session: HubAuth,
     expires_at: i64,
     client: reqwest::Client,
 }
@@ -121,6 +122,7 @@ impl PreparedOpen {
 /// Mint and verify a short-lived browser token for the selected checkout.
 pub(super) async fn prepare_open(request: OpenRequest) -> Result<PreparedOpen, OpenError> {
     validate_current(&request)?;
+    crate::client_cli::enroll(&request.hub).await;
     let (hub, human_session) = load_exact_session(&request.hub)?;
     let client = forge_http::client().map_err(|_| OpenError::Unavailable)?;
     let minted = mint_and_confirm(
@@ -197,8 +199,8 @@ fn validate_current(expected: &OpenRequest) -> Result<(), OpenError> {
     Ok(())
 }
 
-fn validate_session(hub: &str, expected_session: &str) -> Result<(), OpenError> {
-    match crate::hub_cli::load_session(Some(hub)) {
+fn validate_session(hub: &str, expected_session: &HubAuth) -> Result<(), OpenError> {
+    match crate::hub_cli::load_auth(Some(hub)) {
         Ok((selected_hub, session))
             if same_session(hub, expected_session, Some((&selected_hub, &session))) =>
         {
@@ -216,7 +218,7 @@ fn validate_session(hub: &str, expected_session: &str) -> Result<(), OpenError> 
     }
 }
 
-fn same_session(hub: &str, expected: &str, selected: Option<(&str, &str)>) -> bool {
+fn same_session(hub: &str, expected: &HubAuth, selected: Option<(&str, &HubAuth)>) -> bool {
     selected.is_some_and(|(selected_hub, selected)| selected_hub == hub && selected == expected)
 }
 
@@ -256,17 +258,14 @@ mod tests {
     #[test]
     fn saved_session_identity_and_prepared_expiry_are_fenced() {
         let hub = "https://hub.example";
-        assert!(same_session(
-            hub,
-            "expected-session",
-            Some((hub, "expected-session"))
-        ));
-        assert!(!same_session(
-            hub,
-            "expected-session",
-            Some((hub, "replacement-session"))
-        ));
-        assert!(!same_session(hub, "expected-session", None));
+        let expected = HubAuth::Session("expected-session".into());
+        assert!(same_session(hub, &expected, Some((hub, &expected))));
+        let replacement = HubAuth::Session("replacement-session".into());
+        assert!(!same_session(hub, &expected, Some((hub, &replacement))));
+        // A computer credential that replaced the session is a changed sign-in too.
+        let device = HubAuth::Device("expected-session".into());
+        assert!(!same_session(hub, &expected, Some((hub, &device))));
+        assert!(!same_session(hub, &expected, None));
 
         assert!(!prepared_lifetime_valid(1_060, 1_000));
         assert!(prepared_lifetime_valid(1_061, 1_000));

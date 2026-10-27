@@ -2288,8 +2288,29 @@ async fn setup_callback(
             escape(&signin)
         )
     };
+    // A manifest cannot turn on device sign-in; it is a checkbox in the app's settings.
+    let settings = match (
+        created["owner"]["type"].as_str(),
+        created["owner"]["login"].as_str(),
+    ) {
+        (Some("Organization"), Some(org)) => format!(
+            "{}/organizations/{org}/settings/apps/{}",
+            config.web, file.slug
+        ),
+        _ => format!("{}/settings/apps/{}", config.web, file.slug),
+    };
+    let device = if signin.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<p>For sign-in over SSH or without a browser, open <a href=\"{0}\">{0}</a>, tick \
+             <b>Enable Device Flow</b> under Identifying and authorizing users, and save. \
+             Browser sign-in works without it.</p>",
+            escape(&settings)
+        )
+    };
     Ok(page(Html(format!(
-        "<!doctype html><meta charset=utf-8><title>GitHub App created</title><p>Created app {}.{link}</p>{hint}",
+        "<!doctype html><meta charset=utf-8><title>GitHub App created</title><p>Created app {}.{link}</p>{hint}{device}",
         escape(&file.slug)
     ))))
 }

@@ -1,25 +1,29 @@
-//! Mint short-lived, read-only Hub tokens from this computer's saved human session, and revoke
-//! them: for the tray's fallback browser link and for the local front door's Hub proxy.
+//! Mint short-lived, read-only Hub tokens with this computer's Hub credential (or its saved
+//! human session, before it has one), and revoke them: for the tray's fallback browser link and
+//! for the local front door's Hub proxy.
 
 use std::fmt;
 
 use reqwest::Method;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::client_status::HubCheck;
+use crate::hub_cli::HubAuth;
 
 pub(crate) const TOKEN_TTL_SECONDS: i64 = 30 * 60;
 const EXPIRY_SLOP_SECONDS: i64 = 60;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OpenError {
     InvalidConnection,
     MissingSignIn,
     RejectedSignIn,
     #[cfg(target_os = "macos")]
     SignInChanged,
-    RepositoryNotConnected,
-    AccessDenied,
+    /// With the Hub's own reason and fix, when it sent one.
+    RepositoryNotConnected(Option<String>),
+    /// With the Hub's own reason and fix (for example who needs which role), when it sent one.
+    AccessDenied(Option<String>),
     #[cfg(target_os = "macos")]
     PreparedExpired,
     Unavailable,
@@ -27,6 +31,11 @@ pub(crate) enum OpenError {
 
 impl fmt::Display for OpenError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Self::RepositoryNotConnected(Some(message)) | Self::AccessDenied(Some(message)) =
+            self
+        {
+            return formatter.write_str(message);
+        }
         formatter.write_str(match self {
             Self::InvalidConnection => "the checkout connection changed; refresh and try again",
             Self::MissingSignIn => {
@@ -39,10 +48,10 @@ impl fmt::Display for OpenError {
             Self::SignInChanged => {
                 "the saved Hub sign-in changed; try Open Hub again to use the current sign-in"
             }
-            Self::RepositoryNotConnected => {
+            Self::RepositoryNotConnected(_) => {
                 "that repository is not connected to this Hub; ask its operator to connect it, then try again"
             }
-            Self::AccessDenied => {
+            Self::AccessDenied(_) => {
                 "this sign-in cannot open that repository; check Hub repository access"
             }
             #[cfg(target_os = "macos")]
@@ -56,8 +65,8 @@ impl fmt::Display for OpenError {
 
 impl std::error::Error for OpenError {}
 
-pub(crate) fn load_exact_session(expected_hub: &str) -> Result<(String, String), OpenError> {
-    match crate::hub_cli::load_session(Some(expected_hub)) {
+pub(crate) fn load_exact_session(expected_hub: &str) -> Result<(String, HubAuth), OpenError> {
+    match crate::hub_cli::load_auth(Some(expected_hub)) {
         Ok((hub, session)) if hub == expected_hub => Ok((hub, session)),
         Ok(_) => Err(OpenError::InvalidConnection),
         Err(agentscm::Error::Invalid(message))
@@ -111,7 +120,7 @@ pub(crate) struct TokenRequest<'a> {
 pub(crate) async fn mint_and_confirm(
     client: &reqwest::Client,
     hub: &str,
-    human_session: &str,
+    human_session: &HubAuth,
     request: &TokenRequest<'_>,
     now: i64,
 ) -> Result<MintedToken, OpenError> {
@@ -121,27 +130,33 @@ pub(crate) async fn mint_and_confirm(
         provider,
         name,
     } = *request;
-    let body = json!({
-        "name": name,
-        "repository": repository,
-        "ttl_seconds": TOKEN_TTL_SECONDS,
-        "read_only": true,
-    });
+    let (url, body) = human_session.mint(hub, name, repository, TOKEN_TTL_SECONDS, true);
     let (status, reply) = crate::hub_cli::call(
         client,
         Method::POST,
-        &format!("{hub}/v1/hub/tokens"),
-        Some(human_session),
+        &url,
+        Some(human_session.secret()),
         Some(body),
     )
     .await
     .map_err(|_| OpenError::Unavailable)?;
     match status {
-        401 => return Err(OpenError::RejectedSignIn),
-        403 if reply["error"] == "not_connected" => {
-            return Err(OpenError::RepositoryNotConnected);
+        401 => {
+            if let HubAuth::Device(secret) = human_session {
+                let _ = crate::hub_cli::forget_device_if(hub, secret);
+            }
+            return Err(OpenError::RejectedSignIn);
         }
-        403 => return Err(OpenError::AccessDenied),
+        403 if reply["error"] == "not_connected" => {
+            return Err(OpenError::RepositoryNotConnected(
+                crate::hub_cli::refusal_message(&reply),
+            ));
+        }
+        403 => {
+            return Err(OpenError::AccessDenied(crate::hub_cli::refusal_message(
+                &reply,
+            )));
+        }
         201 => {}
         _ => return Err(OpenError::Unavailable),
     }
@@ -279,7 +294,7 @@ pub(crate) async fn revoke_token(
     hub: &str,
     token_secret: Option<&str>,
     token_id: Option<&str>,
-    human_session: &str,
+    human_session: &HubAuth,
 ) {
     if let Some(token) = token_secret.filter(|token| valid_token_secret(token)) {
         let target = format!("{hub}/v1/hub/token");
@@ -295,8 +310,8 @@ pub(crate) async fn revoke_token(
     let _ = crate::hub_cli::call(
         client,
         Method::DELETE,
-        &format!("{hub}/v1/hub/tokens/{token_id}"),
-        Some(human_session),
+        &human_session.revoke_url(hub, token_id),
+        Some(human_session.secret()),
         None,
     )
     .await;
@@ -313,6 +328,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use serde_json::json;
 
     const ID: &str = "tok_0123456789abcdef0123456789abcdef";
     const SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -414,7 +430,7 @@ mod tests {
         mint_and_confirm(
             client,
             hub,
-            "human-session",
+            &HubAuth::Session("human-session".into()),
             &TokenRequest {
                 repository: "acme/widgets",
                 origin_host: "github.com",
@@ -486,11 +502,11 @@ mod tests {
         for (reply, expected) in [
             (
                 json!({"error": "not_connected"}),
-                OpenError::RepositoryNotConnected,
+                OpenError::RepositoryNotConnected(None),
             ),
             (
                 json!({"error": "server-private-material"}),
-                OpenError::AccessDenied,
+                OpenError::AccessDenied(None),
             ),
         ] {
             let (hub, requests) = fake_hub(vec![(403, reply)]);
@@ -538,7 +554,7 @@ mod tests {
             &hub,
             Some(SECRET),
             Some(ID),
-            "rejected-human-session",
+            &HubAuth::Session("rejected-human-session".into()),
         )
         .await;
         let requests = receive_requests(&requests, 1);
@@ -666,7 +682,7 @@ mod tests {
         assert!(!OpenError::InvalidConnection.to_string().contains(SECRET));
         assert!(!OpenError::MissingSignIn.to_string().contains(SECRET));
         assert!(!OpenError::RejectedSignIn.to_string().contains(SECRET));
-        assert!(!OpenError::AccessDenied.to_string().contains(SECRET));
+        assert!(!OpenError::AccessDenied(None).to_string().contains(SECRET));
         assert!(!OpenError::Unavailable.to_string().contains(SECRET));
     }
 }

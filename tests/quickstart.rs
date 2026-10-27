@@ -164,6 +164,8 @@ impl Machine {
             .env_clear()
             .env("HOME", self.home.path())
             .env("XDG_CONFIG_HOME", self.home.path().join(".config"))
+            // Tests never open a real browser: sign-in uses the code flow, or prints its URL.
+            .env("AGENTSCM_NO_BROWSER", "1")
             .env("PATH", self.path())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -2951,6 +2953,12 @@ impl Machine {
         std::fs::read_to_string(self.home.path().join("fake-claude/log")).unwrap_or_default()
     }
 
+    /// Whether the fake `claude` lists the AgentSCM plugin as installed.
+    fn claude_plugin_installed(&self) -> bool {
+        std::fs::read_to_string(self.home.path().join("fake-claude/plugins"))
+            .is_ok_and(|plugins| plugins.contains("agentscm@agentscm-claude-client"))
+    }
+
     fn connections(&self) -> Vec<Value> {
         std::fs::read_to_string(self.config().join("connections.json"))
             .map(|text| {
@@ -3022,13 +3030,19 @@ fn fresh_quickstart_connects_claude_code_through_client_setup_and_the_connect_pa
     assert_eq!(connections[0]["repo"], REPO);
     assert_eq!(connections[0]["hub"], hub.url.as_str());
     assert_eq!(connections[0]["agents"], json!(["claude"]));
-    let mcp = json_file(&repo.path().join(".mcp.json"));
-    let server = &mcp["mcpServers"]["agentscm"];
-    assert_eq!(server["type"], "stdio");
-    assert!(
-        server["args"].to_string().contains(root.to_str().unwrap()),
-        "{server}"
+    // The MCP server comes with the plugin, like its hooks; nothing is written into the checkout.
+    let mcp = json_file(&machine.home.path().join("fake-claude/cache/.mcp.json"));
+    assert_eq!(
+        mcp["mcpServers"]["agentscm"]["args"],
+        json!([
+            "--no-telemetry",
+            "client",
+            "mcp",
+            "--root",
+            "${CLAUDE_PROJECT_DIR:-.}"
+        ])
     );
+    assert!(!repo.path().join(".mcp.json").exists());
     let log = machine.claude_log();
     assert!(
         log.contains("plugin install --scope user --json agentscm@agentscm-claude-client"),
@@ -3094,7 +3108,7 @@ fn uninstall_removes_everything_quickstart_set_up() {
         "{said}"
     );
     assert_eq!(machine.connections().len(), 1);
-    assert!(repo.path().join(".mcp.json").exists());
+    assert!(machine.claude_plugin_installed());
 
     let said = ok(&machine.run(repo.path(), &["uninstall", "--yes"]));
     assert!(said.contains("Removed the client connection"), "{said}");
@@ -3102,7 +3116,7 @@ fn uninstall_removes_everything_quickstart_set_up() {
     // The token file was the user's own, so it stays; nothing managed is left behind.
     assert!(token.exists());
     assert!(names_in(&machine.config().join("tokens")).is_empty());
-    assert!(!repo.path().join(".mcp.json").exists());
+    assert!(!machine.claude_plugin_installed());
     let log = machine.claude_log();
     assert!(
         log.contains("plugin uninstall --scope user agentscm@agentscm-claude-client"),
@@ -3131,8 +3145,7 @@ fn client_remove_honors_the_shared_lifecycle_lease() {
             .expect("saved connection root"),
     );
     let before = std::fs::read(machine.config().join("connections.json")).unwrap();
-    let configured = repo.path().join(".mcp.json");
-    assert!(configured.exists());
+    assert!(machine.claude_plugin_installed());
 
     let lease_path = machine.config().join("client-lifecycle.lock");
     let lease = OpenOptions::new()
@@ -3162,7 +3175,7 @@ fn client_remove_honors_the_shared_lifecycle_lease() {
         std::fs::read(machine.config().join("connections.json")).unwrap(),
         before
     );
-    assert!(configured.exists());
+    assert!(machine.claude_plugin_installed());
     assert!(token.exists());
 
     drop(lease);
@@ -3180,7 +3193,7 @@ fn client_remove_honors_the_shared_lifecycle_lease() {
         "{removed}"
     );
     assert!(machine.connections().is_empty());
-    assert!(!configured.exists());
+    assert!(!machine.claude_plugin_installed());
     assert!(token.exists());
 }
 
@@ -3289,6 +3302,8 @@ fn app_install_wait_case(client_command: &str, independent_copy: bool) {
                     json!({"user":{"provider":"github","host":"github.com"}}),
                 ),
                 "GET /v1/hub/connections HTTP/1.1" => (200, json!({"connections":[]})),
+                // A Hub from before computer credentials: nothing to enroll.
+                "POST /v1/hub/devices HTTP/1.1" => (404, json!({"error":"not_found"})),
                 "POST /v1/hub/tokens HTTP/1.1" => {
                     mints += 1;
                     if mints < 3 {
@@ -3613,18 +3628,27 @@ fn final_uninstall_cleanup_excludes_setup_and_retains_program_when_busy() {
     assert!(!manifest.exists());
 }
 
+/// Setup takes out the `.mcp.json` entry earlier versions wrote, now that the plugin holds the
+/// MCP server, and keeps the user's own servers.
 #[test]
-fn uninstall_keeps_what_the_user_added_to_mcp_json_and_ends_the_sign_in() {
+fn setup_moves_the_old_mcp_json_entry_into_the_plugin_and_uninstall_ends_the_sign_in() {
     let (hub, machine) = (Hub::start(), Machine::new().with_claude());
     let repo = machine.repo();
     let token = hub.token_file(machine.home.path());
+    let root = repo.path().canonicalize().unwrap();
     std::fs::write(
         repo.path().join(".mcp.json"),
-        r#"{"mcpServers":{"other":{"command":"x"}}}"#,
+        json!({"mcpServers": {"other": {"command": "x"}, "agentscm": {"type": "stdio",
+            "command": "/old/agentscm",
+            "args": ["--no-telemetry", "client", "mcp", "--root", root.to_str().unwrap()]}}})
+        .to_string(),
     )
     .unwrap();
     ok(&machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"])));
-    assert!(json_file(&repo.path().join(".mcp.json"))["mcpServers"]["agentscm"].is_object());
+    assert_eq!(
+        json_file(&repo.path().join(".mcp.json")),
+        json!({"mcpServers":{"other":{"command":"x"}}})
+    );
     let session = machine.config().join("hub-session.json");
     std::fs::write(
         &session,
@@ -3963,7 +3987,7 @@ fn uninstall_without_a_terminal_still_needs_yes_when_something_is_recorded() {
     ok(&machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"])));
     let output = machine.run(repo.path(), &["uninstall"]);
     assert!(!output.status.success());
-    assert!(repo.path().join(".mcp.json").exists());
+    assert!(machine.claude_plugin_installed());
     assert_eq!(machine.connections().len(), 1);
 }
 
@@ -4061,7 +4085,7 @@ fn uninstall_leaves_a_connection_quickstart_found_rather_than_made() {
             token.to_str().unwrap(),
         ],
     ));
-    let codex_config = repo.path().join(".codex/config.toml");
+    let codex_config = machine.home.path().join(".codex/config.toml");
     let codex_before = std::fs::read(&codex_config).unwrap();
     let said = ok(&machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"])));
     assert!(said.contains("existed before quickstart"), "{said}");
@@ -4206,7 +4230,7 @@ fn a_rerun_with_agents_changes_nothing() {
     let files = [
         machine.config().join("quickstart.json"),
         machine.config().join("connections.json"),
-        repo.path().join(".mcp.json"),
+        machine.home.path().join("fake-claude/cache/.mcp.json"),
         token.clone(),
     ];
     let before: Vec<_> = files.iter().map(|f| std::fs::read(f).unwrap()).collect();
@@ -4214,4 +4238,146 @@ fn a_rerun_with_agents_changes_nothing() {
     assert!(said.contains("No changes made."), "{said}");
     let after: Vec<_> = files.iter().map(|f| std::fs::read(f).unwrap()).collect();
     assert_eq!(after, before);
+}
+
+/// Each agent is set up in its user configuration, next to what was already there, and
+/// uninstall leaves that configuration as it was.
+#[test]
+fn agents_are_set_up_for_all_projects_and_uninstall_restores_user_configuration() {
+    for (agent, file, original) in [
+        (
+            "cursor",
+            ".cursor/mcp.json",
+            r#"{"mcpServers":{"kept-server":{"command":"kept-command"}}}"#,
+        ),
+        (
+            "gemini",
+            ".gemini/settings.json",
+            r#"{"theme":"kept-theme"}"#,
+        ),
+        (
+            "copilot",
+            ".copilot/mcp-config.json",
+            r#"{"mcpServers":{"kept-server":{"type":"local","command":"kept-command"}}}"#,
+        ),
+        (
+            "codex",
+            ".codex/config.toml",
+            "model = \"kept-model\"\n\n[projects.\"/kept-trusted/agentscm\"]\ntrust_level = \"trusted\"\n",
+        ),
+    ] {
+        let (hub, machine) = (Hub::start(), Machine::new().with_codex());
+        let repo = machine.repo();
+        let token = hub.token_file(machine.home.path());
+        let home = machine.home.path();
+        let path = home.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, original).unwrap();
+        let said = ok(&machine.run(
+            repo.path(),
+            &quick(&hub.url, &token, &["--no-collisions", "--agent", agent]),
+        ));
+        assert!(
+            said.contains("so it is in all your projects"),
+            "{agent}: {said}"
+        );
+        // The diff of the shared file is shown before it is written.
+        assert!(said.contains(&format!("+++ {}", path.display())), "{said}");
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("agentscm"), "{agent}: {written}");
+        // The entry finds the checkout where it starts, so it names none.
+        let checkout = repo.path().canonicalize().unwrap();
+        assert!(
+            !written.contains(checkout.to_str().unwrap()),
+            "{agent}: {written}"
+        );
+        // Distinct strings: a build or temporary path can contain short ones.
+        for kept in [
+            "kept-server",
+            "kept-theme",
+            "kept-model",
+            "/kept-trusted/agentscm",
+        ] {
+            assert_eq!(
+                written.contains(kept),
+                original.contains(kept),
+                "{agent} {kept}: {written}"
+            );
+        }
+        let hooks = match agent {
+            "cursor" => Some(home.join(".cursor/hooks.json")),
+            "gemini" => Some(path.clone()),
+            "copilot" => Some(home.join(".copilot/hooks/agentscm-client.json")),
+            _ => None,
+        };
+        if let Some(hooks) = &hooks {
+            let text = std::fs::read_to_string(hooks).unwrap();
+            assert!(
+                text.contains(&format!("hook {agent} --client-connection")),
+                "{text}"
+            );
+        }
+        let skill = home.join(format!(".{agent}/skills/coordinate-edits/SKILL.md"));
+        assert_eq!(skill.exists(), agent != "codex", "{agent}");
+        // Nothing for this agent is written into the checkout.
+        for local in [".cursor", ".gemini", ".github", ".vscode", ".codex"] {
+            assert!(!repo.path().join(local).exists(), "{agent} {local}");
+        }
+        assert_eq!(machine.connections()[0]["agents"], json!([agent]));
+
+        let said = ok(&machine.run(repo.path(), &["uninstall", "--yes"]));
+        assert!(said.contains("Took AgentSCM out of"), "{agent}: {said}");
+        let left = std::fs::read_to_string(&path).unwrap();
+        if agent == "codex" {
+            assert_eq!(left, original);
+        } else {
+            assert_eq!(
+                serde_json::from_str::<Value>(&left).unwrap(),
+                serde_json::from_str::<Value>(original).unwrap(),
+                "{agent}"
+            );
+        }
+        if let Some(hooks) = hooks.filter(|hooks| *hooks != path) {
+            assert!(!hooks.exists(), "{agent}");
+        }
+        assert!(
+            !skill.exists() && !skill.parent().unwrap().exists(),
+            "{agent}"
+        );
+    }
+}
+
+/// A checkout set up for one checkout only moves to the user configuration, and a checkout-only
+/// setup is refused while the agent is set up for all projects, so no hook runs twice.
+#[test]
+fn checkout_and_user_scope_never_both_hold_an_agents_hooks() {
+    let (hub, machine) = (Hub::start(), Machine::new());
+    let repo = machine.repo();
+    let token = hub.token_file(machine.home.path());
+    let setup = |extra: &[&str]| {
+        let mut args = vec!["client", "setup", "--agent", "gemini", "--hub", &hub.url];
+        args.extend(["--token-file", token.to_str().unwrap()]);
+        args.extend(extra);
+        machine.run(repo.path(), &args)
+    };
+    ok(&setup(&["--checkout-only"]));
+    let local = repo.path().join(".gemini/settings.json");
+    assert!(std::fs::read_to_string(&local).unwrap().contains("--root"));
+    assert!(!machine.home.path().join(".gemini").exists());
+
+    let said = ok(&setup(&[]));
+    assert!(said.contains("for all your projects"), "{said}");
+    assert!(!local.exists() && !repo.path().join(".gemini").exists());
+    let user = json_file(&machine.home.path().join(".gemini/settings.json"));
+    assert_eq!(
+        user["mcpServers"]["agentscm"]["args"],
+        json!(["--no-telemetry", "client", "mcp"])
+    );
+    assert_eq!(user["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+
+    let refused = setup(&["--checkout-only"]);
+    assert!(!refused.status.success());
+    let said = String::from_utf8_lossy(&refused.stderr);
+    assert!(said.contains("without --checkout-only"), "{said}");
+    assert!(!local.exists());
 }

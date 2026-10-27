@@ -101,7 +101,11 @@ agents, it asks once: "Keep AgentSCM in the menu bar, and start it when you log 
 default) opens the tray and turns on Start at Login; No leaves both off and quickstart does not ask
 again. With `--yes` or without a terminal it does not ask, and the tray stays off unless you add
 `--tray`, which opens it without changing Start at Login. You can switch Start at Login in the tray
-menu at any time. The alpha binary is not signed or notarized, and the
+menu at any time. When quickstart connects agents on macOS it also writes a small
+`~/Applications/AgentSCM.app` that runs `~/.agentscm/bin/agentscm tray`, so Spotlight, Launchpad
+or the Dock can bring the menu bar app back after a restart. It is generated on your Mac, so it
+carries no download quarantine. Running quickstart again leaves it as it is, and an app of that
+name that AgentSCM did not write is never replaced. The alpha binary is not signed or notarized, and the
 tray does not update independently; install a newer AgentSCM release through the same installer.
 Each checkout menu groups its status, opening actions, a **Share agent conversations with Hub**
 switch, **Agent Integrations**, **Connection Details**, **Recent Activity** and **Troubleshooting**. Connection Details shows the full checkout path and
@@ -168,10 +172,58 @@ unavailable there. Use **Copy Terminal Setup** for that agent. The tray only cop
 command: it runs normal `client setup` only after you paste and run it in Terminal. That guided
 command may contact the Hub, request forge sign-in, and create or replace a managed coordination
 token; the native client's own trust prompts still apply.
-Uninstall removes the owned tray login setting before removing its program. A running tray can
+Uninstall removes the owned tray login setting and `~/Applications/AgentSCM.app` (only while it is
+exactly what quickstart wrote) before removing its program. A running tray can
 be closed with **Quit AgentSCM Tray**.
 
 For an optional customer-operated Slack app, follow [Slack setup](slack.md). The same preparation commands support an installation agent, the official Slack CLI and manual app settings. A prepared private bundle can be supplied to `quickstart --hub local --slack-config-file ABSOLUTE_PATH`; installing the AgentSCM binary alone does not connect Slack.
+
+## Coding agents in every project
+
+`agentscm client setup --agent AGENT` (and quickstart) installs AgentSCM for your user account by
+default, so the agent's start-up check runs in every project, including a fresh clone, and only
+contacts a Hub in a checkout connected to one. Quickstart says so and asks first: "Install
+AgentSCM for ... in all your projects?" With `--yes` it answers yes after printing the same
+notice. It does not ask again for an agent that is already installed this way.
+
+| Agent | Hooks | MCP server | Coordination skill |
+|---|---|---|---|
+| Claude Code | user-scope plugin | in the plugin | in the plugin |
+| Codex | user-scope plugin | `$CODEX_HOME/config.toml` (`~/.codex`) | in the plugin |
+| Cursor | `~/.cursor/hooks.json` | `~/.cursor/mcp.json` | `~/.cursor/skills/coordinate-edits/` |
+| Gemini CLI | `~/.gemini/settings.json` | `~/.gemini/settings.json` | `~/.gemini/skills/coordinate-edits/` |
+| GitHub Copilot | `$COPILOT_HOME/hooks/agentscm-client.json` (`~/.copilot`) | `$COPILOT_HOME/mcp-config.json` | `$COPILOT_HOME/skills/coordinate-edits/` |
+
+In a shared file, setup changes only AgentSCM's own entries: the `agentscm` MCP server, hooks
+that run `agentscm hook AGENT --client-connection`, and the block between
+`# agentscm:client-begin` and `# agentscm:client-end` in Codex's `config.toml`. Everything else is
+kept, with the same values, though a JSON file is rewritten with its keys in sorted order. Before
+writing each file it prints the diff of AgentSCM's own entries (not the rest, which can hold other
+servers' credentials), and it refuses a file that already has an `agentscm` entry it did not
+write. A file that is a link, into a dotfiles repository say, is written through, not replaced.
+
+The user-scope MCP server finds the checkout from the directory the agent starts it in (Cursor:
+from `${workspaceFolder}`). In a checkout that is not connected it offers no tools and answers
+without contacting anything. When the checkout gets connected while the agent runs, the server
+tells the agent its tools changed at the agent's next MCP request; an agent that ignores that
+shows the tools in its next session.
+
+The agents' own approvals still apply: Codex asks you to trust new or changed hooks in `/hooks`,
+Gemini CLI skips settings hooks and MCP servers in a folder you have not trusted, and Cursor asks
+to enable a new MCP server.
+
+`--checkout-only` writes the hooks, MCP entry and skill into the checkout instead, as earlier
+versions did, so they run only there; quickstart does this when you answer No (Claude Code and
+Codex are then not set up, since their hooks come only from a user-scope plugin). Claude Code is
+always set up through its plugin, and setting it up takes out the `.mcp.json` entry earlier
+versions wrote into each connected checkout. The two cannot
+be mixed for one agent: setting an agent up for all projects takes AgentSCM's files for that agent
+out of every connected checkout, and a checkout-only setup is refused while the agent is installed
+for all projects. `agentscm client remove` and `agentscm uninstall` take the user-scope entries out
+once no other connected checkout uses that agent.
+
+Other agents (Grok Build, Windsurf, Cline, Amp, opencode, Kiro, Aider) have no native AgentSCM
+setup; [other agents](agents.md#other-agents) says what each supports and how to wire it by hand.
 
 ## Platforms
 

@@ -65,6 +65,7 @@ fn recipe() -> ValidationRecipe {
             id: "test".into(),
             argv: vec!["cargo".into(), "test".into()],
             timeout_secs: 60,
+            paths: None,
         }],
         dependency_files: None,
         toolchain_probes: None,
@@ -98,6 +99,7 @@ fn record() -> ValidationRecord {
             stderr_sha256: hex(5),
             truncated: false,
         }],
+        not_required: vec![],
         services: Services {
             postgres: true,
             s3: true,
@@ -118,6 +120,7 @@ fn policy() -> ValidationPolicy {
         },
         max_age_seconds: 3600,
         epoch: 3,
+        exempt_paths: None,
     }
 }
 
@@ -132,6 +135,8 @@ struct Case {
     /// Policy used at verification time when it differs from the signed one.
     assess_policy: Option<ValidationPolicy>,
     observed: [String; 5],
+    /// Ids the changed paths require; every recipe command when unset.
+    required: Option<Vec<String>>,
     clock: EvaluationClock,
     tamper_payload: Option<Tamper>,
     tamper_record: bool,
@@ -148,6 +153,7 @@ impl Case {
             policy: policy(),
             assess_policy: None,
             observed: ["repo-1", COMMIT, TREE, "refs/heads/main", BASE].map(String::from),
+            required: None,
             clock: EvaluationClock::Known { unix_ms: NOW },
             tamper_payload: None,
             tamper_record: false,
@@ -200,6 +206,9 @@ impl Case {
         }
         let body = comment::render(&envelope_bytes, &record_bytes).unwrap_or_default();
         let [repository, commit, tree, base_ref, merge_base] = &self.observed;
+        let required = self
+            .required
+            .unwrap_or_else(|| self.recipe.commands.iter().map(|c| c.id.clone()).collect());
         let verdict = assess(
             &envelope_bytes,
             &record_bytes,
@@ -212,6 +221,7 @@ impl Case {
                 tree,
                 base_ref,
                 merge_base,
+                required: &required,
             },
             self.clock,
         );
@@ -599,6 +609,7 @@ fn select_all(bodies: &[&str], clock: EvaluationClock) -> Verdict {
             tree: TREE,
             base_ref: "refs/heads/main",
             merge_base: BASE,
+            required: &["test".to_owned()],
         },
         clock,
     )
@@ -666,6 +677,7 @@ fn skipped_commands_are_never_a_pass() {
         id: "lint".into(),
         argv: vec!["cargo".into(), "clippy".into()],
         timeout_secs: 60,
+        paths: None,
     });
     c.policy.recipe_sha256 = c.recipe.sha256().unwrap();
     c.record.recipe_sha256 = c.policy.recipe_sha256.clone();
@@ -855,4 +867,344 @@ fn payload_dependencies_follow_the_issuance_order() {
     .unwrap();
     let identities: Vec<_> = payload.dependencies.iter().map(|d| &*d.identity).collect();
     assert_eq!(identities, ["bun.lock", "package.json"]);
+}
+
+#[test]
+fn repository_policy_and_recipe_keep_their_canonical_bytes() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/local-validation");
+    let recipe_bytes = std::fs::read(dir.join("recipe.json")).unwrap();
+    let policy_bytes = std::fs::read(dir.join("policy.json")).unwrap();
+    let recipe = ValidationRecipe::from_slice(&recipe_bytes).unwrap();
+    let policy = ValidationPolicy::from_slice(&policy_bytes).unwrap();
+    assert_eq!(
+        recipe.sha256().unwrap(),
+        "861a8d7f5eccc82b89bd4e06a6460cef6c7b7dcbeb67af39e2248d1a5f705504"
+    );
+    assert_eq!(policy.recipe_sha256, recipe.sha256().unwrap());
+    assert_eq!(
+        serde_json::to_vec(&policy).unwrap(),
+        policy_bytes.trim_ascii_end()
+    );
+    let mut declared = policy.clone();
+    declared.exempt_paths = Some(vec!["docs/**".into()]);
+    assert_ne!(declared.digest().unwrap(), policy.digest().unwrap());
+}
+
+#[test]
+fn paths_and_exempt_paths_round_trip() {
+    let mut r = recipe();
+    r.commands[0].paths = Some(vec![
+        "src".into(),
+        ":(glob)docs/**".into(),
+        "a..b".into(),
+        ":(glob)a..b/**".into(),
+    ]);
+    let bytes = serde_json::to_vec(&r).unwrap();
+    assert_eq!(ValidationRecipe::from_slice(&bytes).unwrap(), r);
+    assert_ne!(r.sha256().unwrap(), recipe_hash());
+    let mut p = policy();
+    p.exempt_paths = Some(vec![":(exclude)x".into(), ":(top,literal)a b".into()]);
+    p.validate().unwrap();
+    let bytes = serde_json::to_vec(&p).unwrap();
+    assert_eq!(ValidationPolicy::from_slice(&bytes).unwrap(), p);
+}
+
+#[test]
+fn invalid_pathspecs_are_rejected() {
+    let bad = [
+        vec![],
+        vec!["".into()],
+        vec!["-x".into()],
+        vec![":!x".into()],
+        vec![":^x".into()],
+        vec![":/x".into()],
+        vec![":(attr:foo)x".into()],
+        vec![":(icase)x".into()],
+        vec![":(glob,icase)x".into()],
+        vec![":(glob".into()],
+        vec![":(glob,literal)x".into()],
+        vec![":(top)".into()],
+        vec![":(literal)".into()],
+        vec!["/x".into()],
+        vec![":(top,literal)/x".into()],
+        vec!["a\0b".into()],
+        vec!["../x".into()],
+        vec!["a/../x".into()],
+        vec![":(top)../x".into()],
+        vec!["x".to_owned(); 65],
+    ];
+    for specs in bad {
+        let mut r = recipe();
+        r.commands[0].paths = Some(specs.clone());
+        assert!(r.validate().is_err(), "{specs:?}");
+        let mut p = policy();
+        p.exempt_paths = Some(specs.clone());
+        assert!(p.validate().is_err(), "{specs:?}");
+    }
+    let mut p = policy();
+    p.exempt_paths = Some(vec![":(glob)docs/**".into(), ":(exclude)x".into()]);
+    p.validate().unwrap();
+}
+
+#[cfg(unix)]
+mod scoped {
+    use super::*;
+    use agentscm::local_validation::run::{only_exempt, required_commands, trust_paths};
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    /// A repository with a base commit; `change` edits the tree for the head commit.
+    fn repo(change: impl FnOnce(&Path)) -> (tempfile::TempDir, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q"]);
+        for file in [
+            "src/a.rs",
+            ".github/local-validation/recipe.json",
+            "README.md",
+        ] {
+            std::fs::create_dir_all(p.join(file).parent().unwrap()).unwrap();
+            std::fs::write(p.join(file), "one\n").unwrap();
+        }
+        git(p, &["add", "."]);
+        git(p, &["commit", "-qm", "base"]);
+        let base = git(p, &["rev-parse", "HEAD"]);
+        change(p);
+        git(p, &["add", "-A"]);
+        git(p, &["commit", "-q", "--allow-empty", "-m", "head"]);
+        let head = git(p, &["rev-parse", "HEAD"]);
+        (dir, base, head)
+    }
+
+    fn write(p: &Path, file: &str) {
+        std::fs::create_dir_all(p.join(file).parent().unwrap()).unwrap();
+        std::fs::write(p.join(file), "two\n").unwrap();
+    }
+
+    fn trust() -> Vec<String> {
+        trust_paths(".github/local-validation", DEFAULT_VERIFIER_WORKFLOW)
+    }
+
+    fn exempt(dir: &Path, base: &str, head: &str, specs: &[&str]) -> bool {
+        let specs: Vec<String> = specs.iter().map(|s| (*s).to_owned()).collect();
+        only_exempt(dir, base, head, &specs, &trust()).unwrap()
+    }
+
+    #[test]
+    fn docs_only_change_is_exempt() {
+        let (d, b, h) = repo(|p| write(p, "docs/x.md"));
+        assert!(exempt(d.path(), &b, &h, &["docs/**"]));
+    }
+
+    #[test]
+    fn rename_out_of_an_exempt_tree_is_not_exempt() {
+        let (d, b, h) = repo(|p| {
+            std::fs::create_dir_all(p.join("docs")).unwrap();
+            std::fs::rename(p.join("src/a.rs"), p.join("docs/a.rs")).unwrap();
+        });
+        assert!(!exempt(d.path(), &b, &h, &["docs/**"]));
+    }
+
+    #[test]
+    fn empty_diff_is_not_exempt() {
+        let (d, b, h) = repo(|_| {});
+        assert!(!exempt(d.path(), &b, &h, &["docs/**"]));
+    }
+
+    #[test]
+    fn trust_input_changes_are_never_exempt() {
+        for file in [
+            ".github/local-validation/recipe.json",
+            DEFAULT_VERIFIER_WORKFLOW,
+        ] {
+            let (d, b, h) = repo(|p| write(p, file));
+            assert!(!exempt(d.path(), &b, &h, &[".github/**"]), "{file}");
+        }
+    }
+
+    #[test]
+    fn mixed_change_is_not_exempt() {
+        let (d, b, h) = repo(|p| {
+            write(p, "docs/x.md");
+            write(p, "src/a.rs");
+        });
+        assert!(!exempt(d.path(), &b, &h, &["docs/**"]));
+    }
+
+    fn scoped_recipe() -> ValidationRecipe {
+        let mut r = recipe();
+        let command = |id: &str, paths: Option<&[&str]>| RecipeCommand {
+            id: id.into(),
+            argv: vec!["true".into()],
+            timeout_secs: 1,
+            paths: paths.map(|p| p.iter().map(|s| (*s).to_owned()).collect()),
+        };
+        r.commands = vec![
+            command("always", None),
+            command("rust", Some(&["src"])),
+            command("docs", Some(&["docs"])),
+        ];
+        r
+    }
+
+    fn required(dir: &Path, base: &str, head: &str) -> Vec<String> {
+        required_commands(dir, base, head, &scoped_recipe(), &trust()).unwrap()
+    }
+
+    #[test]
+    fn commands_follow_their_paths() {
+        let (d, b, h) = repo(|p| write(p, "docs/x.md"));
+        assert_eq!(required(d.path(), &b, &h), ["always", "docs"]);
+        let (d, b, h) = repo(|p| write(p, "src/a.rs"));
+        assert_eq!(required(d.path(), &b, &h), ["always", "rust"]);
+    }
+
+    #[test]
+    fn a_trust_input_change_requires_every_command() {
+        let (d, b, h) = repo(|p| write(p, ".github/local-validation/recipe.json"));
+        assert_eq!(required(d.path(), &b, &h), ["always", "rust", "docs"]);
+    }
+
+    #[test]
+    fn the_verifier_workflow_is_a_trust_input_from_a_subdirectory_repo() {
+        let (d, b, h) = repo(|p| write(p, DEFAULT_VERIFIER_WORKFLOW));
+        let sub = d.path().join("src");
+        // A root-level workflow change is outside the subdirectory but still a trust change.
+        assert_eq!(
+            required_commands(
+                &sub,
+                &b,
+                &h,
+                &scoped_recipe(),
+                &trust_paths("x", DEFAULT_VERIFIER_WORKFLOW)
+            )
+            .unwrap(),
+            ["always", "rust", "docs"]
+        );
+        let specs = vec!["docs/**".to_owned()];
+        let trust = trust_paths("x", DEFAULT_VERIFIER_WORKFLOW);
+        assert!(!only_exempt(&sub, &b, &h, &specs, &trust).unwrap());
+    }
+
+    /// Without magic, `*` matches across `/`, so `*.md` also matches `docs/x.md`.
+    #[test]
+    fn default_wildcard_pathspec_matches_at_depth() {
+        let (d, b, h) = repo(|p| write(p, "docs/x.md"));
+        assert!(exempt(d.path(), &b, &h, &["*.md"]));
+        assert!(!exempt(d.path(), &b, &h, &[":(glob)*.md"]));
+    }
+}
+
+/// A two-command recipe whose `lint` is path-scoped; `required` says what the diff needs.
+fn scoped(required: &[&str], not_required: &[&str]) -> Case {
+    let mut c = Case::new();
+    c.recipe.commands.push(RecipeCommand {
+        id: "lint".into(),
+        argv: vec!["cargo".into(), "clippy".into()],
+        timeout_secs: 60,
+        paths: Some(vec!["src".into()]),
+    });
+    c.policy.recipe_sha256 = c.recipe.sha256().unwrap();
+    c.record.recipe_sha256 = c.policy.recipe_sha256.clone();
+    c.required = Some(required.iter().map(|s| (*s).to_owned()).collect());
+    c.record.not_required = not_required.iter().map(|s| (*s).to_owned()).collect();
+    c
+}
+
+#[test]
+fn not_required_command_is_reported_apart_from_skipped_and_passes() {
+    let mut c = scoped(&["test"], &["lint"]);
+    c.tamper_payload = Some(Box::new(|p| {
+        assert!(
+            p.coverage
+                .omissions
+                .contains(&"not required: lint".to_owned())
+        );
+        assert!(!p.coverage.omissions.contains(&"skipped: lint".to_owned()));
+        assert_eq!(p.coverage.expected_count, 1);
+        assert_eq!(p.coverage.observed_count, 1);
+    }));
+    let body = Case {
+        tamper_payload: None,
+        ..scoped(&["test"], &["lint"])
+    }
+    .body();
+    assert!(body.contains("Not required by the changed paths: <code>lint</code>"));
+    expect(c.run(), VerdictState::Success, "validated");
+}
+
+#[test]
+fn a_command_cannot_be_both_a_result_and_not_required() {
+    let mut r = record();
+    r.not_required = vec![r.results[0].id.clone()];
+    assert!(r.validate().is_err());
+}
+
+#[test]
+fn records_without_not_required_keep_their_bytes() {
+    let bytes = record().to_bytes().unwrap();
+    assert!(!String::from_utf8(bytes).unwrap().contains("not_required"));
+}
+
+#[test]
+fn forged_not_required_claim_for_a_required_command_fails() {
+    let verdict = scoped(&["test", "lint"], &["lint"]).run();
+    assert_eq!(verdict.reason, "incomplete run", "{verdict:?}");
+    assert_eq!(verdict.state, VerdictState::Failure);
+    assert!(
+        verdict
+            .detail
+            .contains("lint is required by the changed paths")
+    );
+}
+
+#[test]
+fn missing_required_result_fails() {
+    let verdict = scoped(&["test", "lint"], &[]).run();
+    expect(verdict.clone(), VerdictState::Failure, "incomplete run");
+    assert!(verdict.detail.contains("lint did not run"));
+}
+
+#[test]
+fn unclaimed_or_wrong_not_required_list_fails() {
+    // The diff does not require lint, but the record neither ran it nor listed it.
+    expect(
+        scoped(&["test"], &[]).run(),
+        VerdictState::Failure,
+        "incomplete run",
+    );
+    // The record ran lint although the diff does not require it.
+    let mut c = scoped(&["test"], &[]);
+    let mut lint = c.record.results[0].clone();
+    lint.id = "lint".into();
+    lint.argv = vec!["cargo".into(), "clippy".into()];
+    c.record.results.push(lint);
+    expect(c.run(), VerdictState::Failure, "incomplete run");
+}
+
+#[test]
+fn conditional_command_that_ran_passes_when_required() {
+    let mut c = scoped(&["test", "lint"], &[]);
+    let mut lint = c.record.results[0].clone();
+    lint.id = "lint".into();
+    lint.argv = vec!["cargo".into(), "clippy".into()];
+    c.record.results.push(lint);
+    expect(c.run(), VerdictState::Success, "validated");
 }

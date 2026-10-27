@@ -17,7 +17,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 const DEFAULT_DATABASE_URL: &str = "sqlite:///data/hub.sqlite";
-const LOOPBACK_WAIT: Duration = Duration::from_secs(600);
+/// How long a browser sign-in waits for the browser to come back.
+const LOOPBACK_WAIT: Duration = Duration::from_secs(180);
+/// How often a waiting browser sign-in says it is still waiting.
+const LOOPBACK_PROGRESS: Duration = Duration::from_secs(30);
 const HUB_BODY_BYTES: usize = 4 * 1024 * 1024;
 const SESSION_FILE_BYTES: u64 = 64 * 1024;
 const MAX_SAVED_SESSIONS: usize = 32;
@@ -67,12 +70,19 @@ pub enum HubCommand {
     },
     /// Sign in to a hub; the session is saved for the token commands.
     Login {
-        /// Hub URL, such as https://hub.example.com (default: the saved Hub, when there is one).
+        /// Hub URL, such as https://hub.example.com (default: AGENTSCM_HUB, then the only saved Hub).
         #[arg(long)]
         hub: Option<String>,
         /// Forge to sign in with (default: the Hub's only sign-in provider).
         #[arg(long, value_enum)]
         provider: Option<Provider>,
+        /// Sign in with a code on another device instead of this computer's browser (the
+        /// default over SSH or without a display).
+        #[arg(long)]
+        device: bool,
+        /// Do not let agents connect themselves to this Hub, and do not ask.
+        #[arg(long)]
+        no_auto_connect: bool,
     },
     /// End one saved session on its hub and remove it locally.
     Logout {
@@ -84,6 +94,26 @@ pub enum HubCommand {
     Sessions {
         #[command(subcommand)]
         command: SessionCommand,
+    },
+    /// Who this computer is signed in to a Hub as: login, computer, auto-connect and the
+    /// checkouts connected to it.
+    Whoami {
+        /// Hub to show (default: every saved Hub).
+        #[arg(long)]
+        hub: Option<String>,
+    },
+    /// List, rename or revoke the computers signed in to a Hub as you.
+    Devices {
+        #[command(subcommand)]
+        command: DeviceCommand,
+    },
+    /// Let agents connect themselves in checkouts of repositories on a Hub (on), or stop.
+    AutoConnect {
+        #[arg(value_enum)]
+        state: Switch,
+        /// Hub to change (default: the current saved hub).
+        #[arg(long)]
+        hub: Option<String>,
     },
     /// Manage agent tokens with the saved session.
     Token {
@@ -185,6 +215,27 @@ pub enum TokenCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum DeviceCommand {
+    /// This computer and your other computers on the Hub, without their secrets.
+    List {
+        #[arg(long)]
+        hub: Option<String>,
+    },
+    /// Rename this computer on the Hub.
+    Rename {
+        name: String,
+        #[arg(long)]
+        hub: Option<String>,
+    },
+    /// Sign one of your computers out of the Hub; its agents stop at their next call.
+    Revoke {
+        id: String,
+        #[arg(long)]
+        hub: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum SessionCommand {
     /// List saved Hub sign-ins and their local expiry.
     List,
@@ -206,10 +257,16 @@ pub(crate) fn telemetry_action(command: &HubCommand) -> bool {
         } => false,
         HubCommand::Sessions {
             command: SessionCommand::List,
-        } => false,
+        }
+        | HubCommand::Devices {
+            command: DeviceCommand::List { .. },
+        }
+        | HubCommand::Whoami { .. } => false,
         HubCommand::Login { .. }
         | HubCommand::Logout { .. }
         | HubCommand::Sessions { .. }
+        | HubCommand::Devices { .. }
+        | HubCommand::AutoConnect { .. }
         | HubCommand::Token { .. }
         | HubCommand::Github { .. }
         | HubCommand::Connections { .. } => true,
@@ -220,6 +277,15 @@ pub(crate) fn telemetry_action(command: &HubCommand) -> bool {
 
 #[cfg_attr(not(unix), allow(unused_variables))]
 pub async fn run(command: HubCommand, data_dir: &std::path::Path) -> Result<()> {
+    if !matches!(
+        command,
+        HubCommand::Serve { .. }
+            | HubCommand::Slack { .. }
+            | HubCommand::Login { .. }
+            | HubCommand::AutoConnect { .. }
+    ) {
+        ask_auto_connect_unasked();
+    }
     match command {
         HubCommand::Slack { command } => crate::slack_cli::run(command).await,
         HubCommand::Serve {
@@ -255,10 +321,15 @@ pub async fn run(command: HubCommand, data_dir: &std::path::Path) -> Result<()> 
             .await
             .map_err(map_hub_error)
         }
-        HubCommand::Login { hub, provider } => {
+        HubCommand::Login {
+            hub,
+            provider,
+            device,
+            no_auto_connect,
+        } => {
             let hub = match hub {
                 Some(hub) => check_base_url(&hub).map_err(map_hub_error)?,
-                None => only_saved_hub()?,
+                None => default_hub()?,
             };
             let name = match provider {
                 Some(provider) => provider
@@ -267,10 +338,29 @@ pub async fn run(command: HubCommand, data_dir: &std::path::Path) -> Result<()> 
                     .unwrap_or_default(),
                 None => only_provider(&hub).await?,
             };
-            login(&hub, &name).await
+            let how = if device { SignIn::Device } else { SignIn::Auto };
+            let who = sign_in_with(&hub, &name, None, how).await?;
+            if no_auto_connect {
+                set_auto_connect(Some(&hub), false)?;
+            } else {
+                ask_auto_connect(&hub);
+            }
+            eprintln!("signed in to {hub} as {who}");
+            Ok(())
         }
         HubCommand::Logout { hub } => logout(hub.as_deref()).await,
         HubCommand::Sessions { command } => sessions(command),
+        HubCommand::Devices { command } => devices(command).await,
+        HubCommand::Whoami { hub } => whoami(hub.as_deref()).await,
+        HubCommand::AutoConnect { state, hub } => {
+            let on = matches!(state, Switch::On);
+            let hub = set_auto_connect(hub.as_deref(), on)?;
+            eprintln!(
+                "Auto-connect is {} for {hub}.",
+                if on { "on" } else { "off" }
+            );
+            Ok(())
+        }
         HubCommand::Token { command } => token(command).await,
         HubCommand::Github { command } => github(command).await,
         HubCommand::Connections { command } => connections(command).await,
@@ -327,26 +417,43 @@ pub(crate) async fn call(
     send(request, HUB_BODY_BYTES).await.map_err(map_hub_error)
 }
 
-/// The Hub of the one saved sign-in; with none or several, `--hub` must say which.
-pub(crate) fn only_saved_hub() -> Result<String> {
+/// The Hub for a command run without `--hub`.
+pub(crate) fn default_hub() -> Result<String> {
     let sessions = if session_files_present()? {
         load_sessions()?.sessions
     } else {
         Vec::new()
     };
-    match sessions.as_slice() {
-        [only] => Ok(only.hub.clone()),
+    let saved: Vec<&str> = sessions.iter().map(|saved| saved.hub.as_str()).collect();
+    pick_default_hub(env_hub(), &saved)
+}
+
+/// `AGENTSCM_HUB`, when set: the Hub for commands run without `--hub`.
+fn env_hub() -> Option<String> {
+    std::env::var("AGENTSCM_HUB")
+        .ok()
+        .map(|hub| hub.trim().to_owned())
+        .filter(|hub| !hub.is_empty())
+}
+
+/// After `--hub`: `AGENTSCM_HUB`, then the one saved sign-in; with none or several, say how to choose.
+fn pick_default_hub(env: Option<String>, saved: &[&str]) -> Result<String> {
+    if let Some(hub) = env {
+        return check_base_url(&hub).map_err(map_hub_error);
+    }
+    match saved {
+        [only] => Ok((*only).to_owned()),
         [] => Err(invalid(
-            "pass --hub with the Hub's URL, such as --hub https://hub.example.com",
+            "pass --hub with the Hub's URL, such as --hub https://hub.example.com, or set AGENTSCM_HUB",
         )),
         _ => Err(invalid(
-            "several Hubs are saved; pass --hub to choose one (see agentscm hub sessions list)",
+            "several Hubs are saved; pass --hub or set AGENTSCM_HUB to choose one (see agentscm hub sessions list)",
         )),
     }
 }
 
 /// The Hub's only sign-in provider; with several, `--provider` must say which.
-async fn only_provider(hub: &str) -> Result<String> {
+pub(crate) async fn only_provider(hub: &str) -> Result<String> {
     let client = forge_http::client().map_err(map_hub_error)?;
     let (status, reply) = call(
         &client,
@@ -375,35 +482,191 @@ async fn only_provider(hub: &str) -> Result<String> {
     }
 }
 
-async fn login(hub: &str, provider: &str) -> Result<()> {
-    let who = sign_in(hub, provider, None).await?;
-    eprintln!("signed in to {hub} as {who}");
-    Ok(())
-}
-
 /// Signs in and saves the session; returns `provider:login`. With `open_host`, the browser
 /// is pointed at the sign-in page where the platform allows it, but never at a forge page
 /// on another host (the URL is printed either way).
 pub(crate) async fn sign_in(hub: &str, provider: &str, open_host: Option<&str>) -> Result<String> {
+    let who = sign_in_with(hub, provider, open_host, SignIn::Auto).await?;
+    ask_auto_connect(hub);
+    Ok(who)
+}
+
+/// How a sign-in reaches the forge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SignIn {
+    /// This computer's browser when it has one, else a code for another device.
+    Auto,
+    /// This computer's browser: the menu bar app has no terminal to show a code in.
+    #[cfg(target_os = "macos")]
+    Browser,
+    /// A code typed on another device.
+    Device,
+}
+
+/// Whether a browser can open on this computer: not over SSH, and with a display on Linux.
+/// `AGENTSCM_NO_BROWSER` set to anything says no.
+fn browser_available() -> bool {
+    let set = |name| std::env::var_os(name).is_some_and(|value| !value.is_empty());
+    !set("AGENTSCM_NO_BROWSER")
+        && !set("SSH_CONNECTION")
+        && !set("SSH_TTY")
+        && (cfg!(any(target_os = "macos", windows)) || set("DISPLAY") || set("WAYLAND_DISPLAY"))
+}
+
+/// True when the Hub has seen `provider`'s forge app refuse device sign-in.
+async fn browser_only(client: &reqwest::Client, hub: &str, provider: &str) -> bool {
+    let url = format!("{hub}/v1/hub/login");
+    call(client, Method::GET, &url, None, None)
+        .await
+        .is_ok_and(|(status, reply)| {
+            status == 200
+                && reply["browser_only"]
+                    .as_array()
+                    .is_some_and(|names| names.iter().any(|name| name == provider))
+        })
+}
+
+/// [`sign_in`] without the auto-connect question, choosing the flow with `how`.
+pub(crate) async fn sign_in_with(
+    hub: &str,
+    provider: &str,
+    open_host: Option<&str>,
+    how: SignIn,
+) -> Result<String> {
     let client = forge_http::client().map_err(map_hub_error)?;
-    let start = format!("{hub}/v1/hub/login/{provider}/device");
-    let (status, device) = call(&client, Method::POST, &start, None, None).await?;
-    let signed = match status {
-        200 => device_login(&client, hub, &device, open_host).await?,
-        409 => loopback_login(&client, hub, provider, open_host.is_some()).await?,
-        404 => return Err(invalid("this hub does not offer that provider")),
-        _ => return Err(invalid("hub could not start sign-in")),
+    // Signing in again on this computer replaces its previous credential, and only that one.
+    let previous = saved_device(hub).ok().flatten();
+    let replaces = previous.as_ref().map(|device| device.secret.clone());
+    let mut device = json!({});
+    if let Some(name) = computer_name() {
+        device["name"] = json!(name);
+    }
+    if let Some(replaces) = replaces {
+        device["replaces"] = json!(replaces);
+    }
+    let browser = match how {
+        #[cfg(target_os = "macos")]
+        SignIn::Browser => true,
+        SignIn::Device => false,
+        SignIn::Auto => browser_available() || browser_only(&client, hub, provider).await,
+    };
+    let signed = if browser {
+        loopback_login(&client, hub, provider, browser_available(), &device).await?
+    } else {
+        let start = format!("{hub}/v1/hub/login/{provider}/device");
+        let (status, started) = call(&client, Method::POST, &start, None, None).await?;
+        match status {
+            200 => device_login(&client, hub, &started, open_host, &device).await?,
+            409 => {
+                eprintln!(
+                    "{}",
+                    refusal_message(&started)
+                        .unwrap_or_else(|| "This Hub can't sign in with a code".into())
+                );
+                loopback_login(&client, hub, provider, open_host.is_some(), &device).await?
+            }
+            404 => return Err(invalid("this hub does not offer that provider")),
+            _ => {
+                return Err(invalid(&refusal_message(&started).unwrap_or_else(|| {
+                    "The Hub could not start the sign-in; try again in a minute".into()
+                })));
+            }
+        }
     };
     let secret = signed["session"]
         .as_str()
         .ok_or_else(|| invalid("hub returned no session"))?;
-    save_session(hub, secret, signed["expires_at"].as_i64())?;
+    save_session(
+        hub,
+        secret,
+        signed["expires_at"].as_i64(),
+        SavedDevice::from_reply(&signed["device"]),
+    )?;
+    // The Hub replaces only the same person's computer. A sign-in as someone else (another
+    // forge on this Hub) would leave the old credential live with its secret forgotten.
+    if let Some(previous) = previous
+        && matches!(
+            call(
+                &client,
+                Method::GET,
+                &format!("{hub}/v1/hub/device"),
+                Some(&previous.secret),
+                None
+            )
+            .await,
+            Ok((200, _))
+        )
+    {
+        sign_computer_out(&client, hub, &previous).await;
+        eprintln!(
+            "This computer was signed in to {hub} as someone else; that sign-in ended, and checkouts connected through it need connecting again. A computer holds one sign-in per Hub."
+        );
+    }
     let user = &signed["user"];
     Ok(format!(
         "{}:{}",
         clean(user["provider"].as_str().unwrap_or(provider)),
         clean(user["login"].as_str().unwrap_or("?"))
     ))
+}
+
+/// The name the person gave this computer (macOS Sharing settings), never the host name.
+/// None lets the Hub name it after the person.
+pub(crate) fn computer_name() -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let output = std::process::Command::new("/usr/sbin/scutil")
+        .args(["--get", "ComputerName"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let name: String = String::from_utf8(output.stdout)
+        .ok()?
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(64)
+        .collect();
+    (!name.trim().is_empty()).then_some(name)
+}
+
+const AUTO_CONNECT_QUESTION: &str = "Connect agents automatically in repositories on";
+const AUTO_CONNECT_HELP: &str = "AgentSCM's agent plugin runs a quick check whenever an agent starts. With this on, in a checkout with no connection that check sends the checkout's forge host and owner/name to each Hub with auto-connect on, and connects the checkout if the Hub has that repository and you have the role; it writes no file in the checkout. Change it later with `agentscm hub auto-connect on|off`.";
+
+/// Asks once per Hub, at a terminal, for every saved Hub that was never asked: sign-ins from
+/// the menu bar app or from before the question existed are asked at the next interactive
+/// command.
+pub(crate) fn ask_auto_connect_unasked() {
+    for hub in auto_connect_unasked().unwrap_or_default() {
+        ask_auto_connect(&hub);
+    }
+}
+
+/// Asks once, at a terminal, whether agents connect themselves to `hub`; Yes by default.
+/// Without a terminal the question waits for the menu bar app or the next interactive command.
+fn ask_auto_connect(hub: &str) {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal()
+        || !auto_connect_unasked().is_ok_and(|hubs| hubs.iter().any(|unasked| unasked == hub))
+    {
+        return;
+    }
+    eprintln!("{AUTO_CONNECT_HELP}");
+    eprint!("{AUTO_CONNECT_QUESTION} {hub}? [Y/n] ");
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return;
+    }
+    let on = !matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no");
+    if set_auto_connect(Some(hub), on).is_ok() {
+        eprintln!(
+            "Auto-connect is {} for {hub}.",
+            if on { "on" } else { "off" }
+        );
+    }
 }
 
 /// Whether `page` is an https page on exactly `host`.
@@ -491,20 +754,8 @@ fn civil(epoch: i64) -> (i64, i64, i64, i64) {
             );
         }
     }
-    utc_civil(epoch)
-}
-
-/// UTC (month, day, hour, minute), from Howard Hinnant's days-to-civil algorithm.
-fn utc_civil(epoch: i64) -> (i64, i64, i64, i64) {
-    let (days, seconds) = (epoch.div_euclid(86_400), epoch.rem_euclid(86_400));
-    let z = days + 719_468;
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    (month, day, seconds / 3600, seconds % 3600 / 60)
+    let (_, month, day, hour, minute, _) = agentscm::civil::utc_civil(epoch);
+    (month, day, hour, minute)
 }
 
 /// The Hub's own sentence for any refusal kind that carries one (the reason and its one fix,
@@ -524,8 +775,28 @@ pub(crate) async fn end_session(hub: &str) -> Result<bool> {
     if let Ok(client) = forge_http::client() {
         let url = format!("{saved}/v1/hub/session");
         let _ = call(&client, Method::DELETE, &url, Some(&session), None).await;
+        if let Some(device) = saved_device(&saved).ok().flatten() {
+            sign_computer_out(&client, &saved, &device).await;
+        }
     }
     remove_saved_session_if(&saved, Some(&session))
+}
+
+/// Signs this computer out of `hub`, saying so when the Hub could not be told: the
+/// credential then stays live there until it is revoked or unused for 90 days.
+async fn sign_computer_out(client: &reqwest::Client, hub: &str, device: &SavedDevice) {
+    let url = format!("{hub}/v1/hub/device");
+    if !matches!(
+        call(client, Method::DELETE, &url, Some(&device.secret), None).await,
+        Ok((204 | 401, _))
+    ) {
+        eprintln!(
+            "warning: {hub} could not be told that {} signed out, so it can still mint agent tokens there; revoke {} with `agentscm hub devices revoke {}` from another computer, or ask a Hub admin",
+            clean(&device.name),
+            device.id,
+            device.id
+        );
+    }
 }
 
 async fn logout(hub: Option<&str>) -> Result<()> {
@@ -538,6 +809,10 @@ async fn logout(hub: Option<&str>) -> Result<()> {
     if let Ok(client) = forge_http::client() {
         let url = format!("{}/v1/hub/session", selected.0);
         let _ = call(&client, Method::DELETE, &url, Some(&selected.1), None).await;
+        // Signing this computer out also stops the agent tokens it minted.
+        if let Some(device) = saved_device(&selected.0).ok().flatten() {
+            sign_computer_out(&client, &selected.0, &device).await;
+        }
     }
     if remove_saved_session_if(&selected.0, Some(&selected.1))? {
         eprintln!("signed out of {}", selected.0);
@@ -545,6 +820,228 @@ async fn logout(hub: Option<&str>) -> Result<()> {
         eprintln!("a newer sign-in for {} was preserved", selected.0);
     }
     Ok(())
+}
+
+/// One saved Hub as `hub whoami` and the menu bar app show it, from local files only.
+pub(crate) struct SignInSummary {
+    pub(crate) hub: String,
+    pub(crate) computer: Option<String>,
+    /// None until asked.
+    pub(crate) auto_connect: Option<bool>,
+    pub(crate) session_live: bool,
+}
+
+impl SignInSummary {
+    /// "this computer (name) is signed in; auto-connect on", or why it is not.
+    pub(crate) fn state(&self) -> String {
+        let auto = match self.auto_connect {
+            Some(true) => "auto-connect on",
+            Some(false) => "auto-connect off",
+            None => "auto-connect not chosen yet",
+        };
+        match (&self.computer, self.session_live) {
+            (Some(name), _) => format!("{} is signed in; {auto}", clean(name)),
+            (None, true) => {
+                "signed in until the session ends; the next connect signs this computer in".into()
+            }
+            (None, false) => "signed out; sign in again".into(),
+        }
+    }
+}
+
+/// Every saved Hub, the default first.
+pub(crate) fn sign_in_summaries() -> Vec<SignInSummary> {
+    let Ok(true) = session_files_present() else {
+        return Vec::new();
+    };
+    let Ok(store) = load_sessions() else {
+        return Vec::new();
+    };
+    let now = unix_now();
+    let mut rows: Vec<_> = store
+        .sessions
+        .iter()
+        .map(|saved| SignInSummary {
+            hub: saved.hub.clone(),
+            computer: saved.device.as_ref().map(|device| device.name.clone()),
+            auto_connect: saved.auto_connect,
+            session_live: saved.expires_at.is_none_or(|expires| expires > now),
+        })
+        .collect();
+    rows.sort_by_key(|row| row.hub != store.default_hub);
+    rows
+}
+
+async fn whoami(hub: Option<&str>) -> Result<()> {
+    let selected = hub
+        .map(|hub| check_base_url(hub).map_err(map_hub_error))
+        .transpose()?;
+    let rows: Vec<_> = sign_in_summaries()
+        .into_iter()
+        .filter(|row| selected.as_ref().is_none_or(|hub| *hub == row.hub))
+        .collect();
+    if rows.is_empty() {
+        return Err(invalid(
+            "This computer isn't signed in to that Hub; run agentscm hub login",
+        ));
+    }
+    let connections = crate::client_config::load().unwrap_or_default();
+    let client = forge_http::client().map_err(map_hub_error)?;
+    for row in rows {
+        // The Hub says who the credential belongs to; local files say the rest.
+        let login = match load_auth(Some(&row.hub)) {
+            Ok((hub, HubAuth::Device(secret))) => {
+                match call(
+                    &client,
+                    Method::GET,
+                    &format!("{hub}/v1/hub/device"),
+                    Some(&secret),
+                    None,
+                )
+                .await
+                {
+                    Ok((200, me)) => me["user"]["login"].as_str().map(clean),
+                    Ok((401, _)) => {
+                        let _ = forget_device_if(&hub, &secret);
+                        None
+                    }
+                    _ => Some("(the Hub did not answer)".into()),
+                }
+            }
+            Ok((hub, HubAuth::Session(session))) => {
+                match call(
+                    &client,
+                    Method::GET,
+                    &format!("{hub}/v1/hub/session"),
+                    Some(&session),
+                    None,
+                )
+                .await
+                {
+                    Ok((200, me)) => me["user"]["login"].as_str().map(clean),
+                    _ => None,
+                }
+            }
+            Err(_) => None,
+        };
+        println!("{}", row.hub);
+        println!("  login: {}", login.as_deref().unwrap_or("not signed in"));
+        println!("  computer: {}", row.state());
+        let repos: Vec<_> = connections
+            .iter()
+            .filter(|connection| connection.hub == row.hub)
+            .map(|connection| format!("{} ({})", connection.repo, connection.root.display()))
+            .collect();
+        if repos.is_empty() {
+            println!("  connected checkouts: none");
+        } else {
+            println!("  connected checkouts:");
+            for repo in repos {
+                println!("    {repo}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A computer credential the Hub no longer accepts is forgotten, so this computer shows as
+/// signed out instead of failing on every call.
+fn signed_out(hub: &str, auth: &HubAuth) -> Error {
+    if let HubAuth::Device(secret) = auth {
+        let _ = forget_device_if(hub, secret);
+    }
+    invalid("this computer is signed out of the Hub; run agentscm hub login")
+}
+
+async fn devices(command: DeviceCommand) -> Result<()> {
+    let client = forge_http::client().map_err(map_hub_error)?;
+    match command {
+        DeviceCommand::List { hub } => {
+            let (hub, auth) = load_auth(hub.as_deref())?;
+            let url = format!("{hub}/v1/hub/devices");
+            match call(&client, Method::GET, &url, Some(auth.secret()), None).await? {
+                (200, reply) => {
+                    for device in reply["devices"].as_array().into_iter().flatten() {
+                        let state = match device["revoked_at"].as_i64() {
+                            Some(at) => format!("revoked={at}"),
+                            None => format!(
+                                "last_used={}",
+                                device["last_used_at"].as_i64().unwrap_or(0)
+                            ),
+                        };
+                        println!(
+                            "{}  {}{}  {state}  {}",
+                            clean(device["id"].as_str().unwrap_or("?")),
+                            clean(device["name"].as_str().unwrap_or("?")),
+                            if device["current"] == json!(true) {
+                                " (this computer)"
+                            } else {
+                                ""
+                            },
+                            device["repositories"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(Value::as_str)
+                                .map(clean)
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        );
+                    }
+                    Ok(())
+                }
+                (401, _) => Err(signed_out(&hub, &auth)),
+                _ => Err(invalid("hub could not list computers")),
+            }
+        }
+        DeviceCommand::Rename { name, hub } => {
+            let (hub, auth) = load_auth(hub.as_deref())?;
+            let HubAuth::Device(secret) = &auth else {
+                return Err(invalid(
+                    "this computer has no Hub credential; run agentscm hub login",
+                ));
+            };
+            let url = format!("{hub}/v1/hub/device/name");
+            let body = json!({"name": name});
+            match call(&client, Method::POST, &url, Some(secret), Some(body)).await? {
+                (204, _) => {
+                    eprintln!("renamed this computer on {hub}");
+                    Ok(())
+                }
+                (401, _) => Err(signed_out(&hub, &auth)),
+                _ => Err(invalid("the name must be 1 to 64 printable characters")),
+            }
+        }
+        DeviceCommand::Revoke { id, hub } => {
+            if !id
+                .strip_prefix("dev_")
+                .is_some_and(|hex| lower_hex(hex, 32))
+            {
+                return Err(invalid(
+                    "a computer id looks like dev_ followed by 32 hex digits; see agentscm hub devices list",
+                ));
+            }
+            let (hub, auth) = load_auth(hub.as_deref())?;
+            let this = saved_device(&hub)?.is_some_and(|device| device.id == id);
+            let url = if this {
+                format!("{hub}/v1/hub/device")
+            } else {
+                format!("{hub}/v1/hub/devices/{id}")
+            };
+            match call(&client, Method::DELETE, &url, Some(auth.secret()), None).await? {
+                (204, _) => {
+                    if this {
+                        let _ = forget_device_if(&hub, auth.secret());
+                    }
+                    eprintln!("signed {id} out of {hub}");
+                    Ok(())
+                }
+                (401, _) => Err(signed_out(&hub, &auth)),
+                (404, _) => Err(invalid("no such computer of yours on this hub")),
+                _ => Err(invalid("hub could not revoke that computer")),
+            }
+        }
+    }
 }
 
 fn sessions(command: SessionCommand) -> Result<()> {
@@ -576,6 +1073,7 @@ async fn device_login(
     hub: &str,
     device: &Value,
     open_host: Option<&str>,
+    computer: &Value,
 ) -> Result<Value> {
     let handle = device["handle"]
         .as_str()
@@ -596,9 +1094,13 @@ async fn device_login(
         Instant::now() + Duration::from_secs(device["expires_in"].as_u64().unwrap_or(900));
     let mut interval = device["interval"].as_u64().unwrap_or(5).clamp(1, 60);
     let url = format!("{hub}/v1/hub/login/device/poll");
+    let mut computer = Some(computer);
     while Instant::now() < deadline {
         tokio::time::sleep(Duration::from_secs(interval)).await;
-        let body = json!({"handle": handle});
+        let mut body = json!({"handle": handle});
+        if let Some(computer) = computer {
+            body["device"] = computer.clone();
+        }
         // A hub or forge outage mid-sign-in is retried until the code expires.
         let Ok((status, reply)) = call(client, Method::POST, &url, None, Some(body)).await else {
             continue;
@@ -606,8 +1108,12 @@ async fn device_login(
         if status >= 500 {
             continue;
         }
+        // A Hub from before computer credentials refuses the field; sign in without it.
+        if older_hub(status, &reply) && computer.take().is_some() {
+            continue;
+        }
         if status != 200 {
-            return Err(invalid("sign-in failed"));
+            return Err(sign_in_failed(&reply));
         }
         interval = reply["interval"]
             .as_u64()
@@ -615,12 +1121,37 @@ async fn device_login(
         match reply["status"].as_str() {
             Some("signed_in") => return Ok(reply),
             Some("pending" | "slow_down") => {}
-            Some("expired") => return Err(invalid("the device code expired; run login again")),
-            Some("denied") => return Err(invalid("sign-in was denied")),
+            Some("expired") => {
+                return Err(invalid(
+                    "The sign-in code expired before it was entered; run the sign-in again",
+                ));
+            }
+            Some("denied") => {
+                return Err(invalid(
+                    "The sign-in was cancelled on the forge; run it again and choose Authorize",
+                ));
+            }
             _ => return Err(invalid("bad hub reply")),
         }
     }
-    Err(invalid("the device code expired; run login again"))
+    Err(invalid(
+        "The sign-in code expired before it was entered; run the sign-in again",
+    ))
+}
+
+/// A 400 that a Hub from before computer credentials gives a body naming `device`.
+fn older_hub(status: u16, reply: &Value) -> bool {
+    status == 400 && reply["error"] == "invalid_request"
+}
+
+/// The Hub's reason for a failed sign-in step, or a plain one from an older Hub.
+fn sign_in_failed(reply: &Value) -> Error {
+    invalid(&refusal_message(reply).unwrap_or_else(|| {
+        format!(
+            "Sign-in failed ({}); run the sign-in again",
+            clean(reply["error"].as_str().unwrap_or("no reason given"))
+        )
+    }))
 }
 
 async fn loopback_login(
@@ -628,6 +1159,7 @@ async fn loopback_login(
     hub: &str,
     provider: &str,
     open: bool,
+    computer: &Value,
 ) -> Result<Value> {
     let mut random = [0_u8; 32];
     getrandom::fill(&mut random).map_err(|_| invalid("random source"))?;
@@ -637,26 +1169,118 @@ async fn loopback_login(
     listener.set_nonblocking(true)?;
     let port = listener.local_addr()?.port();
     let url = format!("{hub}/v1/hub/login/{provider}?cli_port={port}&cli_challenge={challenge}");
-    eprintln!("open this URL in your browser:\n{url}");
     if open {
+        eprintln!(
+            "Signing in to {hub} in your browser. If it did not open, open this URL:\n{url}\nWaiting for the browser (up to {} minutes)…",
+            LOOPBACK_WAIT.as_secs() / 60
+        );
         open_url(&url);
+    } else {
+        eprintln!(
+            "Open this URL in a browser on this computer to sign in to {hub}:\n{url}\nWaiting for the browser (up to {} minutes)…",
+            LOOPBACK_WAIT.as_secs() / 60
+        );
     }
-    let code = tokio::task::spawn_blocking(move || wait_for_code(&listener))
+    let (returned, browser) = tokio::task::spawn_blocking(move || wait_for_code(&listener))
         .await
         .map_err(|_| invalid("sign-in wait failed"))??;
+    let code = match returned {
+        Returned::Code(code) => code,
+        Returned::Refused(kind, message) => {
+            let mut page =
+                reqwest::Url::parse("http://page.invalid/").map_err(|_| invalid("bad URL"))?;
+            page.query_pairs_mut()
+                .append_pair("status", "refused")
+                .append_pair("reason", &kind)
+                .append_pair("message", &message);
+            let location = format!("{hub}/ui/#/signed-in?{}", page.query().unwrap_or_default());
+            let _ = tokio::task::spawn_blocking(move || redirect_browser(browser, &location)).await;
+            return Err(invalid(if message.is_empty() {
+                "The Hub refused the sign-in; run it again"
+            } else {
+                &message
+            }));
+        }
+    };
     let url = format!("{hub}/v1/hub/login/exchange");
-    let body = json!({"code": code, "verifier": verifier});
-    match call(client, Method::POST, &url, None, Some(body)).await? {
+    let body = json!({"code": code, "verifier": verifier, "device": computer});
+    let mut reply = call(client, Method::POST, &url, None, Some(body)).await;
+    // A Hub from before computer credentials refuses the field before using the code.
+    if let Ok((status, refused)) = &reply
+        && older_hub(*status, refused)
+    {
+        let body = json!({"code": code, "verifier": verifier});
+        reply = call(client, Method::POST, &url, None, Some(body)).await;
+    }
+    // The browser lands on the Hub's page saying who signed in, or why not.
+    let mut page = reqwest::Url::parse("http://page.invalid/").map_err(|_| invalid("bad URL"))?;
+    match &reply {
+        Ok((200, signed)) => {
+            let mut pairs = page.query_pairs_mut();
+            pairs.append_pair("status", "signed_in");
+            for (key, value) in [
+                ("login", &signed["user"]["login"]),
+                ("provider", &signed["user"]["provider"]),
+                ("computer", &signed["device"]["name"]),
+            ] {
+                if let Some(value) = value.as_str() {
+                    pairs.append_pair(key, value);
+                }
+            }
+        }
+        Ok((_, refused)) => {
+            let mut pairs = page.query_pairs_mut();
+            pairs.append_pair("status", "refused").append_pair(
+                "reason",
+                refused["error"].as_str().unwrap_or("login_failed"),
+            );
+            if let Some(message) = refusal_message(refused) {
+                pairs.append_pair("message", &message);
+            }
+        }
+        Err(_) => {
+            page.query_pairs_mut()
+                .append_pair("status", "refused")
+                .append_pair("reason", "login_failed");
+        }
+    }
+    let location = format!("{hub}/ui/#/signed-in?{}", page.query().unwrap_or_default());
+    tokio::task::spawn_blocking(move || redirect_browser(browser, &location));
+    match reply? {
         (200, signed) => Ok(signed),
-        _ => Err(invalid("sign-in failed")),
+        (_, refused) => Err(sign_in_failed(&refused)),
     }
 }
 
-/// Serve loopback connections until one is `GET /callback?code=<hex>`.
-fn wait_for_code(listener: &TcpListener) -> Result<String> {
+fn redirect_browser(mut stream: std::net::TcpStream, location: &str) {
+    let _ = write!(
+        stream,
+        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+}
+
+/// What the Hub sent the browser back to the CLI with.
+enum Returned {
+    Code(String),
+    /// The Hub refused: its kind and its message.
+    Refused(String, String),
+}
+
+/// Serve loopback connections until one is `GET /callback?code=<hex>` or the Hub's refusal
+/// (`?error=<kind>&message=...`); that connection is returned unanswered, so the browser can be
+/// sent to the result.
+fn wait_for_code(listener: &TcpListener) -> Result<(Returned, std::net::TcpStream)> {
     let deadline = Instant::now() + LOOPBACK_WAIT;
+    let mut next_note = Instant::now() + LOOPBACK_PROGRESS;
     while Instant::now() < deadline {
         let Ok((mut stream, _)) = listener.accept() else {
+            if Instant::now() >= next_note {
+                next_note += LOOPBACK_PROGRESS;
+                eprintln!(
+                    "Still waiting for the browser sign-in ({}s left)…",
+                    deadline.saturating_duration_since(Instant::now()).as_secs()
+                );
+            }
             std::thread::sleep(Duration::from_millis(100));
             continue;
         };
@@ -665,27 +1289,45 @@ fn wait_for_code(listener: &TcpListener) -> Result<String> {
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         let mut head = [0_u8; 4096];
         let read = stream.read(&mut head).unwrap_or(0);
-        let code = std::str::from_utf8(&head[..read])
+        let target = std::str::from_utf8(&head[..read])
             .ok()
             .and_then(|text| text.lines().next())
-            .and_then(|line| line.strip_prefix("GET /callback?code="))
+            .and_then(|line| line.strip_prefix("GET /callback?"))
             .and_then(|rest| rest.split(' ').next())
-            .filter(|code| code.len() == 64 && code.bytes().all(|b| b.is_ascii_hexdigit()));
-        let (status, text) = if code.is_some() {
-            ("200 OK", "Signed in. You can close this tab.")
-        } else {
-            ("404 Not Found", "not found")
-        };
+            .and_then(|query| {
+                reqwest::Url::parse(&format!("http://loopback.invalid/?{query}")).ok()
+            });
+        let pairs: std::collections::HashMap<String, String> = target
+            .map(|url| url.query_pairs().into_owned().collect())
+            .unwrap_or_default();
+        if let Some(code) = pairs
+            .get("code")
+            .filter(|code| code.len() == 64 && code.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            return Ok((Returned::Code(code.clone()), stream));
+        }
+        // Any page can send a browser here, so this only ends the wait with what it says.
+        if let Some(kind) = pairs.get("error") {
+            let message = pairs
+                .get("message")
+                .map_or_else(String::new, |message| clean(message));
+            let kind = clean(kind).chars().take(64).collect();
+            return Ok((
+                Returned::Refused(kind, message.chars().take(300).collect()),
+                stream,
+            ));
+        }
+        let text = "not found";
         let _ = write!(
             stream,
-            "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+            "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
             text.len()
         );
-        if let Some(code) = code {
-            return Ok(code.to_owned());
-        }
     }
-    Err(invalid("timed out waiting for the browser sign-in"))
+    Err(invalid(&format!(
+        "The browser sign-in didn't finish within {} minutes; run it again, or pass --device to sign in with a code on another device",
+        LOOPBACK_WAIT.as_secs() / 60
+    )))
 }
 
 /// `$XDG_CONFIG_HOME`, else `$HOME/.config`.
@@ -790,6 +1432,96 @@ struct SavedSession {
     session: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expires_at: Option<i64>,
+    /// This computer's credential for the Hub; it outlives the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device: Option<SavedDevice>,
+    /// Whether agents connect themselves in repositories on this Hub; None until asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auto_connect: Option<bool>,
+}
+
+/// A computer credential as the Hub returned it at sign-in.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SavedDevice {
+    pub(crate) id: String,
+    pub(crate) secret: String,
+    pub(crate) name: String,
+}
+
+fn lower_hex(text: &str, len: usize) -> bool {
+    text.len() == len
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+impl SavedDevice {
+    /// The `device` object of a sign-in or enrollment reply.
+    pub(crate) fn from_reply(device: &Value) -> Option<Self> {
+        let device = Self {
+            id: device["id"].as_str()?.to_owned(),
+            secret: device["secret"].as_str()?.to_owned(),
+            name: device["name"].as_str()?.to_owned(),
+        };
+        device.valid().then_some(device)
+    }
+
+    fn valid(&self) -> bool {
+        self.id
+            .strip_prefix("dev_")
+            .is_some_and(|hex| lower_hex(hex, 32))
+            && lower_hex(&self.secret, 64)
+            && !self.name.trim().is_empty()
+            && self.name.chars().count() <= 64
+            && !self.name.chars().any(char::is_control)
+    }
+}
+
+/// How this computer authenticates to a Hub: its computer credential, else a live session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum HubAuth {
+    Device(String),
+    Session(String),
+}
+
+impl HubAuth {
+    pub(crate) fn secret(&self) -> &str {
+        match self {
+            Self::Device(secret) | Self::Session(secret) => secret,
+        }
+    }
+
+    /// The request that mints a token for `repository`. A computer's tokens get the Hub's
+    /// lifetime (24 hours, or 30 minutes read-only); a session asks for `ttl_seconds`.
+    pub(crate) fn mint(
+        &self,
+        hub: &str,
+        name: &str,
+        repository: &str,
+        ttl_seconds: i64,
+        read_only: bool,
+    ) -> (String, Value) {
+        match self {
+            Self::Device(_) => (
+                format!("{hub}/v1/hub/device/tokens"),
+                json!({"name": name, "repository": repository, "read_only": read_only}),
+            ),
+            Self::Session(_) => (
+                format!("{hub}/v1/hub/tokens"),
+                json!({"name": name, "repository": repository, "ttl_seconds": ttl_seconds,
+                    "read_only": read_only}),
+            ),
+        }
+    }
+
+    /// Where the owner revokes one of their tokens by id.
+    pub(crate) fn revoke_url(&self, hub: &str, id: &str) -> String {
+        match self {
+            Self::Device(_) => format!("{hub}/v1/hub/device/tokens/{id}"),
+            Self::Session(_) => format!("{hub}/v1/hub/tokens/{id}"),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -819,6 +1551,8 @@ fn checked_session(hub: &str, session: &str, expires_at: Option<i64>) -> Result<
         hub,
         session: session.to_owned(),
         expires_at,
+        device: None,
+        auto_connect: None,
     })
 }
 
@@ -844,7 +1578,12 @@ fn parse_sessions(text: &str, legacy: bool) -> Result<SavedSessions> {
     let default_hub = check_base_url(&parsed.default_hub).map_err(map_hub_error)?;
     let mut sessions = Vec::with_capacity(parsed.sessions.len());
     for saved in parsed.sessions {
-        let saved = checked_session(&saved.hub, &saved.session, saved.expires_at)?;
+        if saved.device.as_ref().is_some_and(|device| !device.valid()) {
+            return Err(invalid("bad session file"));
+        }
+        let (device, auto_connect) = (saved.device, saved.auto_connect);
+        let mut saved = checked_session(&saved.hub, &saved.session, saved.expires_at)?;
+        (saved.device, saved.auto_connect) = (device, auto_connect);
         if sessions
             .iter()
             .any(|existing: &SavedSession| existing.hub == saved.hub)
@@ -955,8 +1694,14 @@ fn mutate_sessions<T>(
     Ok(result)
 }
 
-fn save_session(hub: &str, secret: &str, expires_at: Option<i64>) -> Result<()> {
-    let new = checked_session(hub, secret, expires_at)?;
+fn save_session(
+    hub: &str,
+    secret: &str,
+    expires_at: Option<i64>,
+    device: Option<SavedDevice>,
+) -> Result<()> {
+    let mut new = checked_session(hub, secret, expires_at)?;
+    new.device = device;
     save_session_to(&session_files()?, new)
 }
 
@@ -975,7 +1720,14 @@ fn upsert_saved_session(store: Option<SavedSessions>, new: SavedSession) -> Resu
         sessions: Vec::new(),
     });
     if let Some(saved) = store.sessions.iter_mut().find(|saved| saved.hub == new.hub) {
-        *saved = new;
+        // A new sign-in keeps the answer about auto-connect and, unless it brought a new one,
+        // the computer credential.
+        let (device, auto_connect) = (saved.device.take(), saved.auto_connect);
+        *saved = SavedSession {
+            device: new.device.or(device),
+            auto_connect: new.auto_connect.or(auto_connect),
+            ..new
+        };
     } else {
         if store.sessions.len() == MAX_SAVED_SESSIONS {
             return Err(invalid("too many saved Hub sessions; remove one first"));
@@ -1024,8 +1776,8 @@ fn selected_session<'a>(
 
 /// The saved entry whether or not it has expired; only sign-out uses it, to clear stale entries.
 fn saved_session<'a>(store: &'a SavedSessions, hub: Option<&str>) -> Result<&'a SavedSession> {
-    let selected = match hub {
-        Some(hub) => check_base_url(hub).map_err(map_hub_error)?,
+    let selected = match hub.map(str::to_owned).or_else(env_hub) {
+        Some(hub) => check_base_url(&hub).map_err(map_hub_error)?,
         None => store.default_hub.clone(),
     };
     store
@@ -1039,6 +1791,125 @@ fn load_saved_session(hub: Option<&str>) -> Result<(String, String)> {
     let store = load_sessions()?;
     let saved = saved_session(&store, hub)?;
     Ok((saved.hub.clone(), saved.session.clone()))
+}
+
+/// This computer's credential for `hub` (or the default Hub), else its live session.
+pub(crate) fn load_auth(hub: Option<&str>) -> Result<(String, HubAuth)> {
+    let store = load_sessions()?;
+    let saved = saved_session(&store, hub)?;
+    if let Some(device) = &saved.device {
+        return Ok((saved.hub.clone(), HubAuth::Device(device.secret.clone())));
+    }
+    let saved = selected_session(&store, hub, unix_now())?;
+    Ok((saved.hub.clone(), HubAuth::Session(saved.session.clone())))
+}
+
+/// Whether this computer is signed in to `hub` (or the default Hub): a computer credential,
+/// or a session that has not expired.
+pub(crate) fn is_signed_in(hub: Option<&str>) -> Result<bool> {
+    if !session_files_present()? {
+        return Ok(false);
+    }
+    if let Some(hub) = hub {
+        check_base_url(hub).map_err(map_hub_error)?;
+    }
+    Ok(load_auth(hub).is_ok())
+}
+
+/// The saved Hub for `hub` (or the default Hub), signed in or not: where a sign-in goes.
+#[cfg(target_os = "macos")]
+pub(crate) fn saved_hub(hub: Option<&str>) -> Option<String> {
+    load_saved_session(hub).ok().map(|(hub, _)| hub)
+}
+
+/// The computer credential saved for exactly `hub`, if any.
+pub(crate) fn saved_device(hub: &str) -> Result<Option<SavedDevice>> {
+    if !session_files_present()? {
+        return Ok(None);
+    }
+    let store = load_sessions()?;
+    Ok(saved_session(&store, Some(hub))
+        .ok()
+        .and_then(|saved| saved.device.clone()))
+}
+
+/// At most this many Hubs are asked about one checkout, the default Hub first.
+pub(crate) const MAX_AUTO_CONNECT_HUBS: usize = 4;
+
+/// The Hubs whose agents connect themselves (with a computer credential), default first.
+pub(crate) fn auto_connect_hubs() -> Result<Vec<String>> {
+    if !session_files_present()? {
+        return Ok(Vec::new());
+    }
+    let store = load_sessions()?;
+    let mut hubs: Vec<_> = store
+        .sessions
+        .iter()
+        .filter(|saved| saved.auto_connect == Some(true) && saved.device.is_some())
+        .map(|saved| saved.hub.clone())
+        .collect();
+    hubs.sort_by_key(|hub| *hub != store.default_hub);
+    hubs.truncate(MAX_AUTO_CONNECT_HUBS);
+    Ok(hubs)
+}
+
+/// Hubs with a computer credential whose owner was never asked about auto-connect.
+pub(crate) fn auto_connect_unasked() -> Result<Vec<String>> {
+    if !session_files_present()? {
+        return Ok(Vec::new());
+    }
+    Ok(load_sessions()?
+        .sessions
+        .into_iter()
+        .filter(|saved| saved.device.is_some() && saved.auto_connect.is_none())
+        .map(|saved| saved.hub)
+        .collect())
+}
+
+/// Records the answer about auto-connect for `hub` (or the default Hub); returns the Hub.
+pub(crate) fn set_auto_connect(hub: Option<&str>, on: bool) -> Result<String> {
+    mutate_sessions(&session_files()?, |store| {
+        let store = store
+            .as_mut()
+            .ok_or_else(|| invalid("not signed in; run agentscm hub login"))?;
+        let selected = saved_session(store, hub)?.hub.clone();
+        let saved = store
+            .sessions
+            .iter_mut()
+            .find(|saved| saved.hub == selected)
+            .ok_or_else(|| invalid("no saved session for this hub; run agentscm hub login"))?;
+        saved.auto_connect = Some(on);
+        Ok(selected)
+    })
+}
+
+/// Saves a credential enrolled with a live session, unless the entry changed meanwhile.
+pub(crate) fn save_device(hub: &str, session: &str, device: SavedDevice) -> Result<bool> {
+    mutate_sessions(&session_files()?, |store| {
+        let saved = store
+            .as_mut()
+            .and_then(|store| store.sessions.iter_mut().find(|saved| saved.hub == hub))
+            .filter(|saved| saved.session == session && saved.device.is_none());
+        Ok(saved.map(|saved| saved.device = Some(device)).is_some())
+    })
+}
+
+/// Forgets `hub`'s computer credential when it is still `secret`: the Hub said this computer
+/// is signed out (revoked, or unused for 90 days). The session saved with it ends too, so a
+/// revoked computer is not quietly enrolled again from it.
+pub(crate) fn forget_device_if(hub: &str, secret: &str) -> Result<bool> {
+    mutate_sessions(&session_files()?, |store| {
+        let saved = store
+            .as_mut()
+            .and_then(|store| store.sessions.iter_mut().find(|saved| saved.hub == hub))
+            .filter(|saved| saved.device.as_ref().is_some_and(|d| d.secret == secret));
+        Ok(saved
+            .map(|saved| {
+                saved.device = None;
+                saved.expires_at = Some(0);
+            })
+            .is_some())
+    })
 }
 
 fn remove_file_if_present(path: &std::path::Path) -> Result<()> {
@@ -1366,6 +2237,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_hub_comes_from_the_flag_then_agentscm_hub_then_the_only_sign_in() {
+        let env = Some("https://env.example/".to_owned());
+        let one = ["https://saved.example"];
+        let two = ["https://a.example", "https://b.example"];
+        assert_eq!(
+            pick_default_hub(env.clone(), &two).unwrap(),
+            "https://env.example"
+        );
+        assert_eq!(
+            pick_default_hub(None, &one).unwrap(),
+            "https://saved.example"
+        );
+        assert!(
+            pick_default_hub(None, &two)
+                .unwrap_err()
+                .to_string()
+                .contains("AGENTSCM_HUB")
+        );
+        assert!(
+            pick_default_hub(None, &[])
+                .unwrap_err()
+                .to_string()
+                .contains("--hub")
+        );
+        assert!(pick_default_hub(Some("not a url".into()), &one).is_err());
+    }
+
+    #[test]
     fn moments_read_as_a_date_and_a_distance() {
         let now = 1_764_000_000;
         let later = when(now + 30 * 86_400, now);
@@ -1385,10 +2284,6 @@ mod tests {
         assert!(when(now - 2 * 86_400, now).ends_with("(2 days ago)"));
         assert!(when(now, now).ends_with("(now)"));
         assert!(when(i64::MIN, now).ends_with("ago)"));
-        // 1970-01-01 00:00, 1969-12-31 23:59 and 2000-02-29 00:00, all UTC.
-        assert_eq!(utc_civil(0), (1, 1, 0, 0));
-        assert_eq!(utc_civil(-1), (12, 31, 23, 59));
-        assert_eq!(utc_civil(951_782_400), (2, 29, 0, 0));
         assert!(!later.contains(&now.to_string()));
     }
 

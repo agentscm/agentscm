@@ -7,6 +7,7 @@ pub mod change_record_http;
 pub mod connection;
 pub mod coordination;
 mod coordination_http;
+pub mod device;
 pub mod external_runs;
 pub mod forge_api;
 #[cfg(unix)]

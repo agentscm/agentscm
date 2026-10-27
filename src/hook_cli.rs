@@ -15,6 +15,12 @@ use crate::intent_cli::{HubFile, parse_hub_file, repo_root, token_for, valid_rep
 use crate::{client_config, client_config::Connection};
 
 const LIMIT: Duration = Duration::from_secs(3);
+/// Session start hooks are given 5 seconds, which leaves room to connect a checkout first.
+const SESSION_START_LIMIT: Duration = Duration::from_millis(4500);
+/// How long a session start waits for auto-connect before going on without it.
+const AUTO_CONNECT_WAIT: Duration = Duration::from_millis(2500);
+/// A failed auto-connect or renewal is not retried for this long.
+const RETRY_EVERY: Duration = Duration::from_secs(5 * 60);
 const STDIN_BYTES: usize = 4 << 20;
 const REPLY_BYTES: usize = 1 << 20;
 
@@ -84,12 +90,15 @@ async fn hook(
     client_connection: bool,
     destination_args: bool,
 ) -> Value {
-    let deadline = Instant::now() + LIMIT;
+    let mut deadline = Instant::now() + LIMIT;
     let read = tokio::time::timeout(LIMIT, tokio::task::spawn_blocking(read_stdin)).await;
     let Ok(Ok(Some(body))) = read else {
         return unknown_output(agent, &Value::Null, "payload unreadable");
     };
     let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    if is_session_start(agent, &payload) {
+        deadline += SESSION_START_LIMIT - LIMIT;
+    }
     let remaining = deadline.saturating_duration_since(Instant::now());
     let activity = std::sync::Arc::new(ActivityTracker::new(agent));
     let mut call = tokio::spawn(call_hub(
@@ -153,13 +162,38 @@ async fn call_hub(
         return Err("client connection mode does not support this agent".into());
     }
     let plugin_route = client_connection;
+    // One line for the agent's context about this computer's connection, when there is news.
+    let mut note = None;
     let (url, token, repo, root, endpoint_agent, outbound, client_connection, report_completion) =
         if plugin_route {
-            let routed = route_client(&agent, &payload).inspect_err(|reason| {
-                if [NO_CONNECTION, NO_EDIT_CONNECTION].contains(&reason.as_str()) {
+            let mut routed = match route_client(&agent, &payload) {
+                Err(reason) if reason == NO_CONNECTION && is_session_start(&agent, &payload) => {
+                    match auto_connect(&agent, &payload).await {
+                        Some(Ok(repo)) => {
+                            note = Some(format!("AgentSCM: coordinating on {repo}."));
+                            route_client(&agent, &payload)
+                        }
+                        Some(Err(refusal)) => Err(refusal),
+                        None => Err(reason),
+                    }
+                }
+                routed => routed,
+            }
+            .inspect_err(|reason| {
+                if [NO_CONNECTION, NO_EDIT_CONNECTION].contains(&reason.as_str())
+                    || reason.starts_with(AUTO_CONNECT_REFUSED)
+                {
                     report_unconnected(&agent, &payload);
                 }
             })?;
+            let session_start = is_session_start(&agent, &payload);
+            if renew(&routed.connection, session_start).await {
+                routed = route_client(&agent, &payload)?;
+            }
+            if note.is_none() && session_start {
+                note = crate::client_cli::attention(&routed.connection.root)
+                    .map(|message| format!("AgentSCM: {message}."));
+            }
             (
                 routed.connection.hub.clone(),
                 Token::PrivateFile(routed.connection.token_file.clone()),
@@ -238,18 +272,18 @@ async fn call_hub(
         .await
         .map_err(|_| "hub unreachable")?;
     match status {
-        200 if reply.is_object() && agent == "gemini" && plugin_route => {
-            activity.finish(successful_hook_outcome(&outbound));
-            Ok(gemini_reply(reply, &payload, config_dir().ok().as_deref()))
-        }
         200 if reply.is_object() => {
             activity.finish(successful_hook_outcome(&outbound));
-            Ok(defanged(
-                reply,
-                &agent,
-                &payload,
-                config_dir().ok().as_deref(),
-            ))
+            let config = config_dir().ok();
+            let reply = if agent == "gemini" && plugin_route {
+                gemini_reply(reply, &payload, config.as_deref())
+            } else {
+                defanged(reply, &agent, &payload, config.as_deref())
+            };
+            Ok(match note {
+                Some(note) => with_note(reply, &agent, &payload, &note),
+                None => reply,
+            })
         }
         200 => {
             activity.finish(crate::client_activity::ActivityOutcome::InvalidResponse);
@@ -680,6 +714,163 @@ fn route_client_with(
         checkout,
         endpoint_agent: endpoint_agent.to_owned(),
     })
+}
+
+/// A start-of-session event, when an agent begins a conversation.
+fn is_session_start(agent: &str, payload: &Value) -> bool {
+    match payload["hook_event_name"].as_str() {
+        Some(name) => matches!(name, "SessionStart" | "sessionStart"),
+        // Copilot CLI's camelCase payload names no event.
+        None => {
+            agent == "copilot"
+                && (payload.get("source").is_some() || payload.get("initialPrompt").is_some())
+        }
+    }
+}
+
+const AUTO_CONNECT_REFUSED: &str = "auto-connect refused: ";
+
+/// Runs `agentscm client <command> --root <root>` as its own process, so its work finishes even
+/// after this hook has answered. With `wait`, returns its one-line JSON result if it ends in
+/// time; otherwise it runs on unwatched.
+fn client_child(command: &[&str], root: &Path, wait: Option<Duration>) -> Option<Value> {
+    use std::process::{Command, Stdio};
+    let program = std::env::current_exe().ok()?;
+    let mut child = Command::new(program)
+        .args(["--no-telemetry", "client"])
+        .args(command)
+        .arg("--root")
+        .arg(root)
+        .stdin(Stdio::null())
+        .stdout(if wait.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let wait = wait?;
+    let stdout = child.stdout.take()?;
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stdout.take(16 * 1024).read_to_string(&mut text);
+        let _ = sender.send(text);
+        let _ = child.wait();
+    });
+    let text = receiver.recv_timeout(wait).ok()?;
+    serde_json::from_str(text.trim()).ok()
+}
+
+/// At the start of a session in a checkout with no connection: connect it through a Hub with
+/// auto-connect on. Some(Ok(repository)) when connected, Some(Err(reason and fix)) when a Hub
+/// that has the repository refused, None when there is nothing to say (auto-connect is off, no
+/// Hub has the repository, or it did not finish in time; it may still finish for the next
+/// session).
+async fn auto_connect(agent: &str, payload: &Value) -> Option<std::result::Result<String, String>> {
+    let checkout = repo_root(&cwd_of(payload))?;
+    let main = client_config::main_checkout(&checkout);
+    let config = config_dir().ok()?;
+    if crate::hub_cli::auto_connect_hubs()
+        .ok()
+        .is_none_or(|hubs| hubs.is_empty())
+    {
+        return None;
+    }
+    let key = format!("auto-connect\0{}", main.display());
+    if marked_within(&config, &key, RETRY_EVERY) {
+        return None;
+    }
+    // Marked first, so a hung Hub or a slow child is not retried at every session start.
+    mark(&config, &key);
+    let agent = agent.to_owned();
+    let result = tokio::task::spawn_blocking(move || {
+        client_child(
+            &["auto-connect", "--agent", &agent],
+            &main,
+            Some(AUTO_CONNECT_WAIT),
+        )
+    })
+    .await
+    .ok()??;
+    let message = || {
+        result["message"]
+            .as_str()
+            .filter(|message| !message.chars().any(char::is_control))
+            .map(|message| Err(format!("{AUTO_CONNECT_REFUSED}{message}")))
+    };
+    match result["result"].as_str() {
+        Some("connected") => {
+            let _ = std::fs::remove_file(marker_path(&config, &key));
+            result["repository"]
+                .as_str()
+                .filter(|repo| valid_repo(repo))
+                .map(|repo| Ok(repo.to_owned()))
+        }
+        // A refusal, or a fork's hint, with its fix.
+        Some("refused" | "not_connected") => message(),
+        _ => None,
+    }
+}
+
+/// Starts renewing the checkout's agent token in its own process when it is due, at most once
+/// every few minutes per checkout. It waits only at session start for a token that has already
+/// ended (a computer idle for a day), within the hook's budget; true when that renewed it.
+async fn renew(connection: &Connection, session_start: bool) -> bool {
+    let Ok(config) = config_dir() else {
+        return false;
+    };
+    let now = agentscm::hub::store::unix_now();
+    let key = format!("renew\0{}", connection.root.display());
+    if !crate::client_cli::due(connection, now) || marked_within(&config, &key, RETRY_EVERY) {
+        return false;
+    }
+    mark(&config, &key);
+    let ended = connection
+        .owned_token_expires_at
+        .is_some_and(|expires| expires <= now);
+    if !(session_start && ended) {
+        client_child(&["renew"], &connection.root, None);
+        return false;
+    }
+    let root = connection.root.clone();
+    tokio::task::spawn_blocking(move || client_child(&["renew"], &root, Some(AUTO_CONNECT_WAIT)))
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|result| result["result"] == "renewed")
+}
+
+/// The hub's reply with `note` first in the agent's context.
+fn with_note(reply: Value, agent: &str, payload: &Value, note: &str) -> Value {
+    let Value::Object(mut top) = reply else {
+        return reply;
+    };
+    let prefixed = |existing: Option<&Value>| match existing.and_then(Value::as_str) {
+        Some(text) if !text.is_empty() => json!(format!("{note}\n\n{text}")),
+        _ => json!(note),
+    };
+    if let Some(inner) = top
+        .get_mut("hookSpecificOutput")
+        .and_then(Value::as_object_mut)
+    {
+        let text = prefixed(inner.get("additionalContext"));
+        inner.insert("additionalContext".into(), text);
+        return Value::Object(top);
+    }
+    if agent == "cursor" {
+        let text = prefixed(top.get("additional_context"));
+        top.insert("additional_context".into(), text);
+        return Value::Object(top);
+    }
+    match context_reply(agent, payload, note) {
+        Value::Object(added) if !added.is_empty() => {
+            top.extend(added);
+            Value::Object(top)
+        }
+        _ => Value::Object(top),
+    }
 }
 
 /// Tell a running tray that this agent works in a Git checkout with no client connection, so it
@@ -1128,7 +1319,7 @@ fn marker_path(config: &Path, key: &str) -> PathBuf {
 }
 
 /// Whether `key` was marked less than `every` ago.
-fn marked_within(config: &Path, key: &str, every: Duration) -> bool {
+pub(crate) fn marked_within(config: &Path, key: &str, every: Duration) -> bool {
     (std::fs::metadata(marker_path(config, key)).and_then(|m| m.modified()))
         .ok()
         .and_then(|time| time.elapsed().ok())
@@ -1136,19 +1327,33 @@ fn marked_within(config: &Path, key: &str, every: Duration) -> bool {
 }
 
 /// Mark `key` now, replacing an older mark.
-fn mark(config: &Path, key: &str) {
+pub(crate) fn mark(config: &Path, key: &str) {
     let _ = std::fs::remove_file(marker_path(config, key));
     first_marker(config, key);
 }
 
 /// The reply for an unreachable hub; `note` is the reason to show, or `None` for the silent form.
 fn fail_open(agent: &str, payload: &Value, note: Option<&str>) -> Value {
+    match note {
+        Some(reason) => context_reply(
+            agent,
+            payload,
+            &format!(
+                "AgentSCM: coordination unknown ({reason}). Other agents' work on these files is not visible."
+            ),
+        ),
+        None => context_reply_with(agent, payload, None),
+    }
+}
+
+/// The agent's reply that adds `text` to its context, where the event allows it.
+fn context_reply(agent: &str, payload: &Value, text: &str) -> Value {
+    context_reply_with(agent, payload, Some(text))
+}
+
+fn context_reply_with(agent: &str, payload: &Value, note: Option<&str>) -> Value {
     let event = payload["hook_event_name"].as_str();
-    let text = |reason| {
-        format!(
-            "AgentSCM: coordination unknown ({reason}). Other agents' work on these files is not visible."
-        )
-    };
+    let text = |text: &str| text.to_owned();
     match (agent, event, note) {
         ("claude" | "codex" | "copilot", Some(name @ ("PreToolUse" | "SessionStart")), Some(r)) => {
             json!({"hookSpecificOutput": {"hookEventName": name, "additionalContext": text(r)}})

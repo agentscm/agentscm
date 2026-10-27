@@ -24,6 +24,8 @@ pub(crate) mod detect;
 mod hub_local;
 mod hub_native;
 mod hub_setup;
+#[cfg(any(target_os = "macos", test))]
+mod launcher;
 mod manifest;
 pub(crate) mod process;
 
@@ -67,8 +69,12 @@ pub struct QuickstartArgs {
     /// the alpha), then connects only when --hub-url is given.
     #[arg(long, conflicts_with = "hub")]
     hosted: bool,
-    /// How to get live warnings.
-    #[arg(long, value_enum)]
+    /// How to get live warnings: local, existing or skip, or the hub's URL (the same as
+    /// --hub-url), so `--hub URL` means one thing in every command.
+    #[arg(id = "hub", long = "hub", value_name = "local|existing|skip|URL", value_parser = parse_hub)]
+    hub_arg: Option<HubArg>,
+    /// Set from `--hub` once parsed.
+    #[arg(skip)]
     hub: Option<HubChoice>,
     /// The hub to connect to (with --hub existing).
     #[arg(long)]
@@ -114,7 +120,39 @@ pub struct QuickstartArgs {
     tray: bool,
 }
 
+/// `--hub` is a choice or, when it looks like a URL, the hub itself.
+#[derive(Clone, Debug)]
+pub enum HubArg {
+    Choice(HubChoice),
+    Url(String),
+}
+
+fn parse_hub(value: &str) -> std::result::Result<HubArg, String> {
+    if value.contains("://") {
+        return Ok(HubArg::Url(value.to_owned()));
+    }
+    HubChoice::from_str(value, true)
+        .map(HubArg::Choice)
+        .map_err(|_| "expected local, existing, skip or the hub's URL".to_owned())
+}
+
 impl QuickstartArgs {
+    /// Splits `--hub` into the choice and `--hub-url`; a URL in both must be the same one.
+    fn resolve_hub(&mut self) -> Result<()> {
+        match self.hub_arg.take() {
+            Some(HubArg::Choice(choice)) => self.hub = Some(choice),
+            Some(HubArg::Url(url)) => {
+                if self.hub_url.as_ref().is_some_and(|given| *given != url) {
+                    return Err(invalid("--hub and --hub-url name different hubs; pass one"));
+                }
+                self.hub = Some(HubChoice::Existing);
+                self.hub_url = Some(url);
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
     pub(crate) fn noninteractive(&self) -> bool {
         self.yes || !std::io::stdin().is_terminal()
     }
@@ -136,7 +174,7 @@ pub struct UninstallArgs {
 
 const NEEDS_TERMINAL: &str = "agentscm quickstart asks questions, and there is no terminal here. \
 To run it without one, pass --yes and choose with flags: --local (recommended) or --hosted, \
---hub local|existing|skip, --hub-url URL, \
+--hub local|existing|skip|URL, --hub-url URL, \
 --agent-token-file PATH, --provider github|gitlab, --github-login LOGIN, \
 --hub-runtime native|docker, --hub-port PORT, --hub-project NAME, \
 --slack-config-file ABSOLUTE_PATH, --agent claude|codex|cursor|copilot|gemini (repeatable) or --no-agents, --no-collisions, --init, --tray";
@@ -289,7 +327,8 @@ struct Live {
     agents: Vec<String>,
     /// This run tried to set up at least one agent.
     wanted_agents: bool,
-    /// The user answered no to "Go ahead?", or no to the Claude Code plugin with no other agent.
+    /// The user answered no to "Go ahead?", or no to installing for all projects when every
+    /// chosen agent needs that.
     declined: bool,
     /// Why setting up the coding agents failed.
     agent_error: Option<String>,
@@ -370,7 +409,8 @@ struct Cx<'a> {
     failure: Option<String>,
 }
 
-pub async fn run(args: QuickstartArgs) -> Result<u8> {
+pub async fn run(mut args: QuickstartArgs) -> Result<u8> {
+    args.resolve_hub()?;
     let tty = std::io::stdin().is_terminal();
     if !args.yes && !tty {
         return Err(invalid(NEEDS_TERMINAL));
@@ -1115,23 +1155,50 @@ fn chosen_agents(cx: &Cx<'_>) -> Vec<crate::client_setup::Agent> {
     }
 }
 
-/// Claude Code's plugin is installed for the whole user account, so say so and ask first (once:
-/// an installed plugin is not asked about again). `--yes` answers yes, after the notice.
+/// Where each agent is set up. For all projects is the default, so agents connect in any repo,
+/// but it reaches beyond this checkout, so say so and ask first, once: agents already set up
+/// that way are not asked about again. `--yes` answers yes, after the notice. A No sets up
+/// Cursor, Copilot and Gemini in this checkout only, and drops Claude Code and Codex, whose
+/// hooks come only from a user-scope plugin.
 #[cfg(unix)]
-fn claude_plugin_wanted(cx: &Cx<'_>, root: &Path, agents: &[crate::client_setup::Agent]) -> bool {
-    if !agents.contains(&crate::client_setup::Agent::Claude)
-        || crate::client_plugin::claude_plugin_installed(root)
-    {
-        return true;
+fn agent_scopes(
+    cx: &Cx<'_>,
+    root: &Path,
+    agents: &[crate::client_setup::Agent],
+) -> Vec<(crate::client_setup::Agent, crate::client_setup::Scope)> {
+    use crate::client_setup::{Agent, Scope, user_scope_installed};
+    let (installed, new): (Vec<Agent>, Vec<Agent>) = agents
+        .iter()
+        .partition(|agent| user_scope_installed(**agent, root));
+    let user = |agents: &[Agent]| agents.iter().map(|agent| (*agent, Scope::User)).collect();
+    if new.is_empty() {
+        return user(&installed);
     }
+    let names = new
+        .iter()
+        .map(|agent| agent.label())
+        .collect::<Vec<_>>()
+        .join(", ");
     println!(
-        "The AgentSCM plugin for Claude Code is installed for your user account, so it is in all your projects; `{} uninstall` removes it when no other connected checkout uses it.",
+        "AgentSCM for {names} is installed for your user account, so it is in all your projects; `{} uninstall` removes it when no other connected checkout uses it.",
         cli_command(cx)
     );
-    cx.ui.confirm(CLAUDE_PLUGIN_QUESTION, true)
+    if cx.ui.confirm(
+        &format!(
+            "Install AgentSCM for {names} in all your projects? It runs a quick check whenever an agent starts and only contacts a Hub in repos connected to it."
+        ),
+        true,
+    ) {
+        return user(agents);
+    }
+    let mut scopes: Vec<(Agent, Scope)> = user(&installed);
+    scopes.extend(
+        new.into_iter()
+            .filter(|agent| !matches!(agent, Agent::Claude | Agent::Codex))
+            .map(|agent| (agent, Scope::Checkout)),
+    );
+    scopes
 }
-
-const CLAUDE_PLUGIN_QUESTION: &str = "Install the AgentSCM plugin for Claude Code in all your projects? It runs a quick check whenever an agent starts and only contacts a Hub in repos connected to it.";
 
 /// The `client setup` line for every supported agent, for setting one up later.
 #[cfg(unix)]
@@ -1156,7 +1223,7 @@ async fn agents_stage(_cx: &mut Cx<'_>) {
 /// writes agent hooks and MCP configuration and gives the hub's Connect agents page its proof.
 #[cfg(unix)]
 async fn agents_stage(cx: &mut Cx<'_>) {
-    let mut agents = chosen_agents(cx);
+    let agents = chosen_agents(cx);
     if agents.is_empty() {
         if let (false, Some(hub), true) = (cx.args.no_agents, &cx.live.hub, cx.live.hub_up) {
             print_agent_setup_hints(cx, hub);
@@ -1198,16 +1265,14 @@ async fn agents_stage(cx: &mut Cx<'_>) {
         return;
     };
     // Asked only once nothing else stops the setup, so a No is a real choice.
-    if !claude_plugin_wanted(cx, &root, &agents) {
-        agents.retain(|agent| *agent != crate::client_setup::Agent::Claude);
-        if agents.is_empty() {
-            cx.live.declined = true;
-            return;
-        }
+    let agents = agent_scopes(cx, &root, &agents);
+    if agents.is_empty() {
+        cx.live.declined = true;
+        return;
     }
     let names = agents
         .iter()
-        .map(|agent| agent.name())
+        .map(|(agent, _)| agent.name())
         .collect::<Vec<_>>()
         .join(", ");
     // Quickstart owns this checkout's connection: an unchanged, valid one is kept as it is,
@@ -1237,6 +1302,11 @@ async fn agents_stage(cx: &mut Cx<'_>) {
             env!("CARGO_PKG_VERSION")
         );
     }
+    #[cfg(target_os = "macos")]
+    println!(
+        "On macOS this also adds {}, which reopens the menu bar app.",
+        shown(&launcher::app(&cx.home), &cx.home)
+    );
     if !cx.ui.confirm("Go ahead?", true) {
         cx.live.declined = true;
         return;
@@ -1286,7 +1356,20 @@ async fn agents_stage(cx: &mut Cx<'_>) {
     if let Err(error) = result {
         println!("Couldn't finish setting up {names}: {}.", short(&error));
         cx.live.agent_error = Some(short(&error));
-    } else if cx.found.worktrees {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(dir) = &cx.manifest.bin_dir {
+        match launcher::ensure(&launcher::app(&cx.home), &dir.join(binary::LINK)) {
+            Ok(true) => println!(
+                "Added {}: open it from Spotlight or Launchpad to bring back the menu bar app.",
+                shown(&launcher::app(&cx.home), &cx.home)
+            ),
+            Ok(false) => {}
+            Err(error) => println!("Didn't add the AgentSCM app launcher: {error}."),
+        }
+    }
+    if cx.found.worktrees {
         println!(
             "Git worktrees of this checkout use its connection; a separate clone needs its own `{} client setup --agent AGENT --hub {hub}`.",
             cli_command(cx)
@@ -1370,7 +1453,11 @@ fn offers_tray(cx: &Cx<'_>) -> bool {
         && cx.tty
         && !cx.ui.yes
         && cx.live.repo.is_some()
-        && cx.manifest.bin_dir.is_some()
+        && cx
+            .manifest
+            .bin_dir
+            .as_ref()
+            .is_some_and(|dir| dir.join(binary::LINK).exists())
         && !cx.manifest.tray_declined
         && !tray_login_enabled()
 }
@@ -1655,6 +1742,13 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
         .is_ok_and(|connections| connections.is_empty())
         || left.native_hub.is_some()
         || native_executable_drift;
+    #[cfg(target_os = "macos")]
+    if programs.is_some()
+        && !retain_program
+        && let Err(error) = launcher::remove(&launcher::app(&home))
+    {
+        println!("Couldn't remove the AgentSCM app launcher: {error}.");
+    }
     let tray_cleanup_failed = if programs.is_some() && !retain_program {
         match crate::tray::remove_login_setting_locked() {
             Ok(()) => false,
@@ -1855,9 +1949,42 @@ mod tests {
     }
 
     #[test]
+    fn hub_takes_a_choice_or_the_hub_url() {
+        #[derive(clap::Parser)]
+        struct Quick {
+            #[command(flatten)]
+            args: QuickstartArgs,
+        }
+        let parse = |extra: &[&str]| {
+            let argv = ["quickstart"].iter().chain(extra);
+            let mut args = <Quick as clap::Parser>::try_parse_from(argv)?.args;
+            Ok::<_, clap::Error>(args.resolve_hub().map(|()| (args.hub, args.hub_url)))
+        };
+        let url = "https://hub.example.com";
+        assert!(matches!(
+            parse(&["--hub", url]).unwrap().unwrap(),
+            (Some(HubChoice::Existing), Some(given)) if given == url
+        ));
+        assert!(matches!(
+            parse(&["--hub", "Skip"]).unwrap().unwrap(),
+            (Some(HubChoice::Skip), None)
+        ));
+        assert!(parse(&["--hub", url, "--hub-url", url]).unwrap().is_ok());
+        assert!(
+            parse(&["--hub", url, "--hub-url", "https://other.example.com"])
+                .unwrap()
+                .is_err()
+        );
+        assert!(parse(&["--hub", "hosted"]).is_err());
+        assert!(parse(&["--hub", "nonsense"]).is_err());
+        assert!(parse(&["--local", "--hub", url]).is_err());
+    }
+
+    #[test]
     fn slack_input_rejects_nonlocal_hubs_before_reading_the_file() {
         let args = QuickstartArgs {
             yes: true,
+            hub_arg: None,
             hub: Some(HubChoice::Existing),
             hub_url: None,
             hub_runtime: None,

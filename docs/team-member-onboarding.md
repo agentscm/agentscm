@@ -49,23 +49,27 @@ between hooks, MCP or APIs.
 
 Setup verifies the Hub URL and the clone's `origin`, then checks the selected agent's existing
 AgentSCM wiring. That preflight detects another enabled branded AgentSCM plugin or raw AgentSCM
-hook before token minting or binding mutation. Setup then signs you in through the Hub when needed,
-creates a private 30-day token (the Hub maximum) for that repository and binds the exact checkout root. It reuses
+hook before token minting or binding mutation. Setup then signs this computer in through the Hub
+when needed (see [Stay signed in](#stay-signed-in)), creates a private 24-hour token for that
+repository, which renews itself, and binds the exact checkout root. Against a Hub from before
+computer sign-in, the token lasts 30 days (the Hub maximum) and does not renew. It reuses
 a current binding for the same root and Hub. The token is stored in a unique owner-only file and is
 never put in the repository, generated agent configuration, URL or command.
 
 Setup installs the selected host's native hooks or plugin, coordination skill where supported and a
-checkout-scoped local MCP server. The MCP command uses the private root binding to proxy to the
-existing Hub. Generated client configuration contains the installed AgentSCM binary and checkout
+local MCP server, by default in the host's user configuration so they run in every project (see
+[coding agents in every project](install.md#coding-agents-in-every-project));
+`client setup --checkout-only` writes them into the checkout instead. The MCP command uses the
+private root binding of the checkout it starts in to proxy to the existing Hub. Generated client configuration contains the installed AgentSCM binary and checkout
 paths, but no Hub token. Different checkouts can therefore remain connected to different Hubs.
 
 A linked worktree created from a connected checkout (`git worktree add`, which Claude Code and
 Codex use for new sessions, inside the checkout or beside it) uses that checkout's connection with
 no further setup. The worktree must share the checkout's Git directory and keep its `origin`; a
 separate or nested clone, a submodule, a copied `.git` file or a symlinked `.git` is never covered. The user-scope
-Claude Code and Codex plugins therefore coordinate in new worktrees at once. A Git-excluded
-`.mcp.json` or `.codex/config.toml` entry is not copied into a new worktree, so the MCP tools are
-available there only where such an entry exists.
+Claude Code and Codex plugins, and the other agents' user-scope hooks and MCP server, therefore
+coordinate in new worktrees at once. A `--checkout-only` entry is not copied into a new worktree,
+so those MCP tools are available there only where such an entry exists.
 
 On macOS, `npx agentscm tray` can show these connections in the optional status-bar companion;
 there is no separate app install. Start at Login is off until the member enables it in the menu.
@@ -74,9 +78,12 @@ under **Not connected** and offers **Connect**, which runs `client setup` with t
 Hub sign-in. On every platform, `agentscm client status --check` provides the CLI view. Activity is based on
 recent observed MCP and native hook participation, so missing or idle activity remains unknown.
 
+The table lists the checkout files a `--checkout-only` setup writes; by default the same entries go
+into the user configuration listed in [install](install.md#coding-agents-in-every-project).
+
 | Coding agent | Native components written or installed | Review and refresh in the host |
 | --- | --- | --- |
-| Claude Code | AgentSCM plugin (session and pre-edit hooks plus skill); `.mcp.json` | Review the plugin and project MCP approval, then start a fresh session and confirm it with `/mcp`. See Anthropic's [plugin overview](https://claude.com/blog/claude-code-plugins) and [MCP guidance](https://support.claude.com/en/articles/14554922-claude-code-user-faq). |
+| Claude Code | AgentSCM plugin (session and pre-edit hooks, MCP server and skill), in both scopes | Review the plugin, then start a fresh session and confirm `plugin:agentscm:agentscm` with `/mcp`. See Anthropic's [plugin overview](https://claude.com/blog/claude-code-plugins) and [MCP guidance](https://support.claude.com/en/articles/14554922-claude-code-user-faq). |
 | Codex | AgentSCM plugin; AgentSCM block in `.codex/config.toml` | Open **Settings → Hooks**, reload hooks, review and trust AgentSCM, then start a fresh chat. Codex loads project configuration only for trusted projects, and plugin hooks still require review ([OpenAI plugin packaging](https://developers.openai.com/plugins/build/plugins)). |
 | Cursor | `.cursor/hooks.json` session and `postToolUse` hooks; `.cursor/mcp.json`; `.cursor/skills/coordinate-edits` | Trust the workspace, approve the MCP connection and start a fresh agent session. The edit hook warns after a matching edit; it is not a pre-edit refusal. See Cursor's [hooks](https://cursor.com/docs/hooks) and [agent security](https://cursor.com/docs/agent/security). |
 | GitHub Copilot | Version-1 native hooks in `.github/hooks/agentscm-client.json`; `.github/mcp.json` for Copilot CLI; `.vscode/mcp.json` for the VS Code Copilot harness; `.github/skills/coordinate-edits` | Trust the folder. Restart Copilot CLI after hook changes; in VS Code select the Copilot harness, then review and start the MCP server. See GitHub's [hook guidance](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/use-hooks), [CLI MCP guidance](https://docs.github.com/en/enterprise-cloud@latest/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers) and [VS Code MCP guidance](https://docs.github.com/en/copilot/how-tos/provide-context/use-mcp-in-your-ide/extend-copilot-chat-with-mcp). |
@@ -99,6 +106,28 @@ plugin.
 If setup reports that the repository is not connected or your identity cannot access it, ask the
 Hub operator to fix the existing repository connection. Team-member setup does not install or
 reconfigure the Hub's forge application.
+
+## Stay signed in
+
+You sign in once per computer, not once per repository or per day:
+
+1. The sign-in signs this computer in to the Hub until you revoke it. A Hub restart does not sign
+   you out, and a computer is signed out only after 90 days without use. On a desktop it opens
+   your browser; over SSH it shows a code instead (`agentscm hub login --device` asks for that).
+2. At a terminal it asks once whether agents connect themselves: "Connect agents automatically in
+   repositories on this Hub? [Y/n]". The AgentSCM agent plugin runs a quick check whenever an
+   agent starts; with this on, an agent that starts in a checkout of a repository the Hub has
+   connects it, writes no file in it, and begins with
+   `AgentSCM: coordinating on owner/name.` Change it with `agentscm hub auto-connect on|off`.
+3. Agent tokens renew in the background, and every renewal re-checks your role on the repository.
+   If you lose it, your agents are told why and what to ask for.
+4. `agentscm hub whoami` shows who this computer is signed in as, and
+   `agentscm hub devices list|rename|revoke` manages your computers.
+5. If you signed in before this existed, the next connect, renewal or Open Hub while that sign-in
+   is still live signs this computer in without asking.
+
+See [connect this computer](connect-this-computer.md#sign-in-once-per-computer) for the details
+and limits.
 
 ## Optional: configure local change capture
 
@@ -193,8 +222,9 @@ agentscm hub logout --hub 'https://hub.example.com'
 
 Human sessions are keyed by Hub. Before minting a token, setup verifies that the selected session's
 forge provider and host match the checkout origin; otherwise it starts the required sign-in. The
-most recently saved Hub is the default for `hub token` and `hub logout` without `--hub`;
-`hub login`, `client connect` and `client setup` leave out `--hub` only when exactly one Hub is saved.
+`--hub URL` means the same in every command. Without it, a command uses `AGENTSCM_HUB` when that is
+set. Otherwise `hub token` and `hub logout` use the most recently saved Hub, and `hub login`,
+`client connect` and `client setup` use the saved Hub only when exactly one is saved.
 
 `sessions remove` only forgets the local human sign-in. `logout` also attempts to end that session
 on the selected Hub before removing that exact local generation. A concurrently replaced sign-in

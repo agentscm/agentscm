@@ -47,6 +47,10 @@ use super::coordination::{
     MAX_PROJECTED_COORDINATION_UPDATES, parse_response_kind, parse_status, response_kind_name,
     status_name,
 };
+use super::device::{
+    DEVICE_IDLE_SECONDS, DEVICE_TOUCH_SECONDS, Device, DevicePrincipal, MAX_DEVICES, MAX_REFUSALS,
+    REFUSAL_SECONDS, Refusal, RepositoryUsage, validate_device_name,
+};
 use super::external_runs::{
     EXTERNAL_RUN_COLUMNS, ExternalKind, ExternalObserved, ExternalOutcome, ExternalRun, supersedes,
 };
@@ -253,6 +257,37 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         )?;
     }
     Ok(tx.commit()?)
+}
+
+/// Revokes a live computer and every agent token it minted, in `tx`.
+fn revoke_device_in(
+    tx: &Transaction<'_>,
+    device: &str,
+    owner: Option<&str>,
+    by: &str,
+    now: i64,
+) -> Result<bool> {
+    let changed = tx.execute(
+        "UPDATE hub_devices SET revoked_at = ?3, revoked_by = ?4
+         WHERE id = ?1 AND revoked_at IS NULL AND (?2 IS NULL OR owner = ?2)",
+        params![device, owner, now, by],
+    )?;
+    if changed == 0 {
+        return Ok(false);
+    }
+    append(tx, &Event::device_revoked(device, by)?)?;
+    let tokens = tx
+        .prepare("SELECT id FROM hub_agent_tokens WHERE device_id = ?1 AND revoked = 0")?
+        .query_map([device], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<String>, _>>()?;
+    tx.execute(
+        "UPDATE hub_agent_tokens SET revoked = 1 WHERE device_id = ?1 AND revoked = 0",
+        [device],
+    )?;
+    for token in tokens {
+        append(tx, &Event::token_revoked(&token, Some(by))?)?;
+    }
+    Ok(true)
 }
 
 fn append(tx: &Transaction<'_>, event: &Event) -> Result<i64> {
@@ -4760,6 +4795,276 @@ impl Store for SqliteStore {
                 },
             )
             .optional()?)
+    }
+
+    fn insert_device(
+        &self,
+        owner: &str,
+        name: &str,
+        digest: &TokenDigest,
+        replaces: Option<&str>,
+        now: i64,
+    ) -> Result<String> {
+        validate_device_name(name)?;
+        let id = new_id("dev")?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let inserted = tx.execute(
+            "INSERT INTO hub_devices (id, owner, name, digest, created_at, last_used_at)
+             SELECT ?1, id, ?3, ?4, ?5, ?5 FROM hub_users WHERE id = ?2 AND disabled = 0",
+            params![id, owner, name, digest.as_str(), now],
+        )?;
+        if inserted == 0 {
+            return Err(HubError::Invalid("unknown or disabled owner".into()));
+        }
+        if let Some(old) = replaces {
+            revoke_device_in(&tx, old, Some(owner), owner, now)?;
+        }
+        append(&tx, &Event::device_created(&id, owner, name)?)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    fn authenticate_device(
+        &self,
+        digest: &TokenDigest,
+        now: i64,
+    ) -> Result<Option<DevicePrincipal>> {
+        let conn = self.conn();
+        let found = conn
+            .query_row(
+                "SELECT d.id, d.name, d.created_at, d.last_used_at,
+                        u.id, u.provider, u.host, u.forge_user_id, u.login, u.disabled
+                 FROM hub_devices d JOIN hub_users u ON u.id = d.owner
+                 WHERE d.digest = ?1 AND d.revoked_at IS NULL
+                   AND COALESCE(d.last_used_at, d.created_at) > ?2",
+                params![digest.as_str(), now - DEVICE_IDLE_SECONDS],
+                |row| {
+                    Ok(DevicePrincipal {
+                        device_id: row.get(0)?,
+                        name: row.get(1)?,
+                        created_at: row.get(2)?,
+                        last_used_at: row.get(3)?,
+                        owner: User {
+                            id: row.get(4)?,
+                            identity: ForgeIdentity {
+                                provider: row.get(5)?,
+                                host: row.get(6)?,
+                                user_id: row.get(7)?,
+                            },
+                            login: row.get(8)?,
+                            disabled: row.get(9)?,
+                        },
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(device) = found.as_ref()
+            && device
+                .last_used_at
+                .is_none_or(|at| at <= now - DEVICE_TOUCH_SECONDS)
+        {
+            conn.execute(
+                "UPDATE hub_devices SET last_used_at = ?2 WHERE id = ?1",
+                params![device.device_id, now],
+            )?;
+        }
+        Ok(found)
+    }
+
+    fn devices(&self, owner: Option<&str>, now: i64) -> Result<Vec<Device>> {
+        let conn = self.conn();
+        let mut devices = conn
+            .prepare(
+                "SELECT d.id, d.name, d.created_at, d.last_used_at, d.revoked_at,
+                        u.id, u.provider, u.host, u.forge_user_id, u.login, u.disabled
+                 FROM hub_devices d JOIN hub_users u ON u.id = d.owner
+                 WHERE (?1 IS NULL OR d.owner = ?1)
+                   AND (d.revoked_at IS NULL OR d.revoked_at > ?3)
+                 ORDER BY d.revoked_at IS NULL DESC, d.created_at DESC, d.id DESC LIMIT ?2",
+            )?
+            .query_map(params![owner, MAX_DEVICES, now - REFUSAL_SECONDS], |row| {
+                Ok(Device {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    created_at: row.get(2)?,
+                    last_used_at: row.get(3)?,
+                    revoked_at: row.get(4)?,
+                    owner: User {
+                        id: row.get(5)?,
+                        identity: ForgeIdentity {
+                            provider: row.get(6)?,
+                            host: row.get(7)?,
+                            user_id: row.get(8)?,
+                        },
+                        login: row.get(9)?,
+                        disabled: row.get(10)?,
+                    },
+                    repositories: Vec::new(),
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut statement = conn.prepare(
+            "SELECT DISTINCT repository FROM hub_agent_tokens
+             WHERE device_id = ?1 AND revoked = 0 AND expires_at > ?2 AND read_only = 0
+             ORDER BY repository",
+        )?;
+        for device in &mut devices {
+            device.repositories = statement
+                .query_map(params![device.id, now], |row| row.get(0))?
+                .collect::<std::result::Result<Vec<String>, _>>()?;
+        }
+        Ok(devices)
+    }
+
+    fn revoke_device(&self, device: &str, owner: Option<&str>, by: &str, now: i64) -> Result<bool> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let revoked = revoke_device_in(&tx, device, owner, by, now)?;
+        tx.commit()?;
+        Ok(revoked)
+    }
+
+    fn rename_device(&self, device: &str, owner: &str, name: &str) -> Result<bool> {
+        validate_device_name(name)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE hub_devices SET name = ?3
+             WHERE id = ?1 AND owner = ?2 AND revoked_at IS NULL AND name <> ?3",
+            params![device, owner, name],
+        )?;
+        if changed > 0 {
+            append(&tx, &Event::device_renamed(device, name)?)?;
+        }
+        tx.commit()?;
+        Ok(changed > 0)
+    }
+
+    fn insert_device_token(
+        &self,
+        token: &NewAgentToken,
+        device: &str,
+        auto: bool,
+    ) -> Result<String> {
+        let now = unix_now();
+        token.validate(now)?;
+        let id = new_id("tok")?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let inserted = tx.execute(
+            "INSERT INTO hub_agent_tokens
+                 (id, owner, name, repository, digest, expires_at, created_at, repository_id,
+                  read_only, device_id)
+             SELECT ?1, u.id, ?3, ?4, ?5, ?6, ?7, ?8, ?9, d.id
+             FROM hub_users u JOIN hub_devices d ON d.owner = u.id
+             WHERE u.id = ?2 AND u.disabled = 0 AND d.id = ?10 AND d.revoked_at IS NULL",
+            params![
+                id,
+                token.owner,
+                token.name,
+                token.repository,
+                token.digest.as_str(),
+                token.expires_at,
+                now,
+                token.repository_id,
+                token.read_only,
+                device
+            ],
+        )?;
+        if inserted == 0 {
+            return Err(HubError::Unauthorized);
+        }
+        append(&tx, &Event::token_created(&id, token)?)?;
+        if auto {
+            append(&tx, &Event::auto_connected(device, &id, &token.repository)?)?;
+        }
+        tx.commit()?;
+        Ok(id)
+    }
+
+    fn record_refusal(&self, refusal: &Refusal) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO hub_sign_in_refusals
+                 (provider, host, forge_user_id, login, reason, via, at, count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)
+             ON CONFLICT (provider, host, forge_user_id, reason) DO UPDATE SET
+                 login = excluded.login, via = excluded.via, at = excluded.at,
+                 count = hub_sign_in_refusals.count + 1",
+            params![
+                refusal.provider,
+                refusal.host,
+                refusal.forge_user_id,
+                refusal.login,
+                refusal.reason,
+                refusal.via,
+                refusal.at
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM hub_sign_in_refusals WHERE at <= ?1",
+            [refusal.at - REFUSAL_SECONDS],
+        )?;
+        tx.execute(
+            "DELETE FROM hub_sign_in_refusals WHERE (provider, host, forge_user_id, reason) NOT IN
+                 (SELECT provider, host, forge_user_id, reason FROM hub_sign_in_refusals
+                  ORDER BY at DESC, provider, host, forge_user_id, reason LIMIT ?1)",
+            [MAX_REFUSALS],
+        )?;
+        Ok(tx.commit()?)
+    }
+
+    fn refusals(&self, now: i64) -> Result<Vec<Refusal>> {
+        let conn = self.conn();
+        let rows = conn
+            .prepare(
+                "SELECT provider, host, forge_user_id, login, reason, via, at, count
+                 FROM hub_sign_in_refusals WHERE at > ?1
+                 ORDER BY at DESC, provider, host, forge_user_id, reason LIMIT ?2",
+            )?
+            .query_map(params![now - REFUSAL_SECONDS, MAX_REFUSALS], |row| {
+                Ok(Refusal {
+                    provider: row.get(0)?,
+                    host: row.get(1)?,
+                    forge_user_id: row.get(2)?,
+                    login: row.get(3)?,
+                    reason: row.get(4)?,
+                    via: row.get(5)?,
+                    at: row.get(6)?,
+                    count: row.get(7)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    fn repository_usage(&self, now: i64) -> Result<Vec<RepositoryUsage>> {
+        let conn = self.conn();
+        let rows = conn
+            .prepare(
+                "SELECT r.full_name, r.host, r.connection,
+                        COUNT(DISTINCT CASE WHEN u.host = r.host THEN t.device_id END),
+                        COUNT(CASE WHEN u.host = r.host THEN t.id END)
+                 FROM hub_repositories r
+                 LEFT JOIN hub_agent_tokens t ON t.repository = r.full_name
+                     AND t.revoked = 0 AND t.expires_at > ?1 AND t.read_only = 0
+                 LEFT JOIN hub_users u ON u.id = t.owner
+                 GROUP BY r.id, r.full_name, r.host, r.connection
+                 ORDER BY r.full_name, r.host LIMIT ?2",
+            )?
+            .query_map(params![now, LIST_LIMIT], |row| {
+                Ok(RepositoryUsage {
+                    full_name: row.get(0)?,
+                    host: row.get(1)?,
+                    connection: row.get(2)?,
+                    devices: row.get(3)?,
+                    agent_tokens: row.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     fn announce_intent(&self, token: &str, intent: &NewIntent, now: i64) -> Result<Announced> {
