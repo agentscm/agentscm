@@ -164,9 +164,9 @@ pub(crate) struct StatusArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct DoctorArgs {
-    /// Native coding-agent name.
+    /// Native coding-agent name (default: the checkout's only agent).
     #[arg(long)]
-    agent: String,
+    agent: Option<String>,
     /// Actual native hook session ID; omit for blockers before a session can start.
     #[arg(long)]
     session: Option<String>,
@@ -1675,8 +1675,6 @@ async fn check(args: RootArgs) -> Result<()> {
 
 async fn doctor(args: DoctorArgs) -> Result<()> {
     use agentscm::hub::onboarding::{Agent, Blocker, CLIENT_HEADER};
-    let agent = Agent::from_name(&args.agent)
-        .ok_or_else(|| invalid("agent must be claude, codex, cursor, copilot or gemini"))?;
     let session = args
         .session
         .as_deref()
@@ -1689,6 +1687,23 @@ async fn doctor(args: DoctorArgs) -> Result<()> {
     let root = selected_root(args.checkout.root.as_deref())?;
     let connection = load()?.into_iter().find(|saved| saved.root == root)
         .ok_or_else(|| invalid("No Hub binding. Run client setup for this agent and Hub; complete forge sign-in when prompted."))?;
+    let name = match (args.agent.as_deref(), connection.agents.as_slice()) {
+        (Some(name), _) => name,
+        (None, [only]) => only.as_str(),
+        (None, []) => {
+            return Err(invalid(
+                "pass --agent: no coding agent is set up for this checkout",
+            ));
+        }
+        (None, several) => {
+            return Err(invalid(&format!(
+                "pass --agent: this checkout has {}",
+                several.join(", ")
+            )));
+        }
+    };
+    let agent = Agent::from_name(name)
+        .ok_or_else(|| invalid("agent must be claude, codex, cursor, copilot or gemini"))?;
     if !is_current(&connection) {
         return Err(invalid(
             "checkout root or origin changed; review client setup before reconnecting",
@@ -1714,9 +1729,7 @@ async fn doctor(args: DoctorArgs) -> Result<()> {
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(json!({"agent":agent,"session":session,"blocker":blocker}).to_string())
     } else {
-        let request = client
-            .get(&endpoint)
-            .query(&[("agent", args.agent.as_str())]);
+        let request = client.get(&endpoint).query(&[("agent", name)]);
         if let Some(session) = args.session.as_deref() {
             request.query(&[("session", session)])
         } else {
@@ -1744,7 +1757,7 @@ async fn doctor(args: DoctorArgs) -> Result<()> {
     if reply.as_array().is_some_and(Vec::is_empty) && matches!(checked, Some(Ok(_))) {
         println!(
             "No {} session has reported to the Hub yet. That is expected when none is running; start one in this checkout to see it here.",
-            args.agent
+            name
         );
     } else if reply.as_array().is_some_and(Vec::is_empty) {
         println!(
