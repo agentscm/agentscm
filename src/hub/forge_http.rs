@@ -94,8 +94,32 @@ pub struct Full {
     pub body: Value,
 }
 
+/// Why [`send_capped`] failed: a body past the cap is its own case so callers can retry smaller.
+#[derive(Debug)]
+pub enum SendError {
+    TooLarge,
+    Failed(HubError),
+}
+
+impl From<SendError> for HubError {
+    fn from(error: SendError) -> Self {
+        match error {
+            SendError::TooLarge => Self::Unavailable("forge response too large".into()),
+            SendError::Failed(error) => error,
+        }
+    }
+}
+
 /// Like [`send`], keeping the response headers.
 pub async fn send_full(request: reqwest::RequestBuilder, max_bytes: usize) -> Result<Full> {
+    Ok(send_capped(request, max_bytes).await?)
+}
+
+/// [`send_full`] with an over-limit body reported as [`SendError::TooLarge`].
+pub async fn send_capped(
+    request: reqwest::RequestBuilder,
+    max_bytes: usize,
+) -> std::result::Result<Full, SendError> {
     // Fixed text only: a reqwest error can carry the URL and its query.
     let failed = |error: reqwest::Error| {
         let what = if error.is_timeout() {
@@ -105,7 +129,7 @@ pub async fn send_full(request: reqwest::RequestBuilder, max_bytes: usize) -> Re
         } else {
             "failed"
         };
-        HubError::Unavailable(format!("forge request {what}"))
+        SendError::Failed(HubError::Unavailable(format!("forge request {what}")))
     };
     let mut response = request.send().await.map_err(failed)?;
     let status = response.status().as_u16();
@@ -114,7 +138,7 @@ pub async fn send_full(request: reqwest::RequestBuilder, max_bytes: usize) -> Re
     // Not content-length: it can be absent or wrong.
     while let Some(chunk) = response.chunk().await.map_err(failed)? {
         if body.len() + chunk.len() > max_bytes {
-            return Err(HubError::Unavailable("forge response too large".into()));
+            return Err(SendError::TooLarge);
         }
         body.extend_from_slice(&chunk);
     }
@@ -125,9 +149,51 @@ pub async fn send_full(request: reqwest::RequestBuilder, max_bytes: usize) -> Re
     })
 }
 
+/// A loopback server for unit tests: answers one request with `reply` (status, extra header
+/// lines, body) and returns the request line it saw.
+#[cfg(test)]
+pub(super) fn serve_once(
+    status: u16,
+    headers: &str,
+    body: String,
+) -> (String, std::thread::JoinHandle<String>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let headers = headers.to_owned();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut seen = vec![0; 4096];
+        let read = stream.read(&mut seen).unwrap();
+        let text = String::from_utf8_lossy(&seen[..read]).into_owned();
+        let reply = format!(
+            "HTTP/1.1 {status} X\r\ncontent-length: {}\r\n{headers}connection: close\r\n\r\n{body}",
+            body.len()
+        );
+        // The client may hang up early on an oversized body.
+        let _ = stream.write_all(reply.as_bytes());
+        text.lines().next().unwrap_or_default().to_owned()
+    });
+    (base, handle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_over_limit_body_is_a_typed_outcome() {
+        let (base, server) = serve_once(200, "", format!("[\"{}\"]", "x".repeat(64)));
+        let request = client().unwrap().get(format!("{base}/a"));
+        assert!(matches!(
+            send_capped(request, 32).await,
+            Err(SendError::TooLarge)
+        ));
+        server.join().unwrap();
+        // Callers that only know `HubError` keep today's text.
+        let text = HubError::from(SendError::TooLarge).to_string();
+        assert_eq!(text, "unavailable: forge response too large");
+    }
 
     #[test]
     fn base_urls_are_vetted_and_never_echoed() {

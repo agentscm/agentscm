@@ -6,7 +6,9 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use super::connection::ConnectedRepository as Repo;
-use super::github::{self, Branch, CommitStatus, Gh, GhError, Paged, PullHead, RepoInfo};
+use super::github::{
+    self, Branch, ClosedPage, CommitStatus, Gh, GhError, Paged, PullHead, RepoInfo,
+};
 use super::gitlab;
 
 #[derive(Clone, Copy)]
@@ -42,6 +44,26 @@ impl ForgeApi<'_> {
         match self {
             Self::Github(api) => api.recent_closed_pulls(token, &repo.full_name).await,
             Self::Gitlab(api) => api.recent_closed_pulls(token, repo.repository_id).await,
+        }
+    }
+
+    /// One explicitly sized page of closed proposals, newest updated first.
+    pub async fn closed_pulls_page(
+        &self,
+        token: &str,
+        repo: &Repo,
+        per_page: u32,
+        page: u32,
+    ) -> Gh<ClosedPage> {
+        match self {
+            Self::Github(api) => {
+                api.closed_pulls_page(token, &repo.full_name, per_page, page)
+                    .await
+            }
+            Self::Gitlab(api) => {
+                api.closed_pulls_page(token, repo.repository_id, per_page, page)
+                    .await
+            }
         }
     }
 

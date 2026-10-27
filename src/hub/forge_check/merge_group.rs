@@ -389,7 +389,7 @@ pub(super) async fn reconcile_active(
         match observe_readiness(state, api, conn, repo, token, target).await {
             Ok(()) => {}
             Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
-            Err(GhError::Failed(detail)) => eprintln!(
+            Err(GhError::Failed(detail) | GhError::TooLarge(detail)) => eprintln!(
                 "hub: merge queue readiness for {} {target}: {detail}",
                 repo.full_name
             ),
@@ -399,7 +399,7 @@ pub(super) async fn reconcile_active(
         match reconcile_group(state, conn, repo, token, &row).await {
             Ok(()) => {}
             Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
-            Err(GhError::Failed(detail)) => eprintln!(
+            Err(GhError::Failed(detail) | GhError::TooLarge(detail)) => eprintln!(
                 "hub: merge group check for {}#{}: {detail}",
                 repo.full_name, row.pr_number
             ),
@@ -692,7 +692,7 @@ async fn post_group(
             "refused"
         }
         Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
-        Err(GhError::Failed(detail)) => {
+        Err(GhError::Failed(detail) | GhError::TooLarge(detail)) => {
             eprintln!(
                 "hub: merge group check post for {}#{}: {detail}",
                 repo.full_name, row.pr_number
@@ -908,7 +908,7 @@ async fn observe_readiness(
             match api.installation(&jwt, id).await {
                 Ok(found) => found,
                 Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
-                Err(GhError::Failed(_)) => None,
+                Err(GhError::Failed(_) | GhError::TooLarge(_)) => None,
             }
         }
         _ => None,
@@ -917,7 +917,7 @@ async fn observe_readiness(
     let listed = match api.queue_branches(token, &repo.full_name, target).await {
         Ok(listed) => listed,
         Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
-        Err(GhError::Failed(_)) => None,
+        Err(GhError::Failed(_) | GhError::TooLarge(_)) => None,
     };
     let undelivered = match listed {
         Some((branches, true)) => {

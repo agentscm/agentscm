@@ -394,7 +394,7 @@ pub(super) async fn reconcile_repo(
                     Ok(true) => {}
                     Ok(false) => break,
                     Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
-                    Err(GhError::Failed(detail)) => {
+                    Err(GhError::Failed(detail) | GhError::TooLarge(detail)) => {
                         eprintln!("hub: forge check for {}#{number}: {detail}", repo.full_name);
                         break;
                     }
@@ -467,7 +467,7 @@ async fn retire_disabled(
                 .map(|p| p.branch),
             Ok(None) => None,
             Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
-            Err(GhError::Failed(detail)) => {
+            Err(GhError::Failed(detail) | GhError::TooLarge(detail)) => {
                 eprintln!("hub: forge check for {}#{number}: {detail}", repo.full_name);
                 continue;
             }
@@ -823,7 +823,7 @@ async fn post(
             }
             Ok(false) => {}
             Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
-            Err(GhError::Failed(detail)) => return uncertain(&detail),
+            Err(GhError::Failed(detail) | GhError::TooLarge(detail)) => return uncertain(&detail),
         }
     }
     if desired.state == StatusState::Success && !status_authorized(state, binding.as_ref()).await? {
@@ -842,7 +842,7 @@ async fn post(
             Ok(true) => "posted",
             Ok(false) => return uncertain("cannot transition to the desired status"),
             Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
-            Err(GhError::Failed(detail)) => return uncertain(&detail),
+            Err(GhError::Failed(detail) | GhError::TooLarge(detail)) => return uncertain(&detail),
         },
         Ok(Err(refused)) => {
             eprintln!("hub: {} refused a forge check ({refused})", repo.full_name);
@@ -851,7 +851,7 @@ async fn post(
         // Not applied; the row stays `attempting`.
         Err(error @ (GhError::Auth(_) | GhError::Limited(_))) => return Err(error),
         // Uncertain: the status may exist.
-        Err(GhError::Failed(detail)) => return uncertain(&detail),
+        Err(GhError::Failed(detail) | GhError::TooLarge(detail)) => return uncertain(&detail),
     };
     // Replacing a row that may show a success: a refusal means the success is still there, so
     // the row stays `attempting` and the next pass tries again.
