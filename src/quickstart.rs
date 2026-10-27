@@ -24,6 +24,8 @@ pub(crate) mod detect;
 mod hub_local;
 mod hub_native;
 mod hub_setup;
+#[cfg(any(target_os = "macos", test))]
+mod launcher;
 mod manifest;
 pub(crate) mod process;
 
@@ -1300,6 +1302,11 @@ async fn agents_stage(cx: &mut Cx<'_>) {
             env!("CARGO_PKG_VERSION")
         );
     }
+    #[cfg(target_os = "macos")]
+    println!(
+        "On macOS this also adds {}, which reopens the menu bar app.",
+        shown(&launcher::app(&cx.home), &cx.home)
+    );
     if !cx.ui.confirm("Go ahead?", true) {
         cx.live.declined = true;
         return;
@@ -1349,7 +1356,20 @@ async fn agents_stage(cx: &mut Cx<'_>) {
     if let Err(error) = result {
         println!("Couldn't finish setting up {names}: {}.", short(&error));
         cx.live.agent_error = Some(short(&error));
-    } else if cx.found.worktrees {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(dir) = &cx.manifest.bin_dir {
+        match launcher::ensure(&launcher::app(&cx.home), &dir.join(binary::LINK)) {
+            Ok(true) => println!(
+                "Added {}: open it from Spotlight or Launchpad to bring back the menu bar app.",
+                shown(&launcher::app(&cx.home), &cx.home)
+            ),
+            Ok(false) => {}
+            Err(error) => println!("Didn't add the AgentSCM app launcher: {error}."),
+        }
+    }
+    if cx.found.worktrees {
         println!(
             "Git worktrees of this checkout use its connection; a separate clone needs its own `{} client setup --agent AGENT --hub {hub}`.",
             cli_command(cx)
@@ -1433,7 +1453,11 @@ fn offers_tray(cx: &Cx<'_>) -> bool {
         && cx.tty
         && !cx.ui.yes
         && cx.live.repo.is_some()
-        && cx.manifest.bin_dir.is_some()
+        && cx
+            .manifest
+            .bin_dir
+            .as_ref()
+            .is_some_and(|dir| dir.join(binary::LINK).exists())
         && !cx.manifest.tray_declined
         && !tray_login_enabled()
 }
@@ -1718,6 +1742,13 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
         .is_ok_and(|connections| connections.is_empty())
         || left.native_hub.is_some()
         || native_executable_drift;
+    #[cfg(target_os = "macos")]
+    if programs.is_some()
+        && !retain_program
+        && let Err(error) = launcher::remove(&launcher::app(&home))
+    {
+        println!("Couldn't remove the AgentSCM app launcher: {error}.");
+    }
     let tray_cleanup_failed = if programs.is_some() && !retain_program {
         match crate::tray::remove_login_setting_locked() {
             Ok(()) => false,
