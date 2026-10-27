@@ -173,6 +173,51 @@ be closed with **Quit AgentSCM Tray**.
 
 For an optional customer-operated Slack app, follow [Slack setup](slack.md). The same preparation commands support an installation agent, the official Slack CLI and manual app settings. A prepared private bundle can be supplied to `quickstart --hub local --slack-config-file ABSOLUTE_PATH`; installing the AgentSCM binary alone does not connect Slack.
 
+## Coding agents in every project
+
+`agentscm client setup --agent AGENT` (and quickstart) installs AgentSCM for your user account by
+default, so the agent's start-up check runs in every project, including a fresh clone, and only
+contacts a Hub in a checkout connected to one. Quickstart says so and asks first: "Install
+AgentSCM for ... in all your projects?" With `--yes` it answers yes after printing the same
+notice. It does not ask again for an agent that is already installed this way.
+
+| Agent | Hooks | MCP server | Coordination skill |
+|---|---|---|---|
+| Claude Code | user-scope plugin | the checkout's `.mcp.json` | in the plugin |
+| Codex | user-scope plugin | `$CODEX_HOME/config.toml` (`~/.codex`) | in the plugin |
+| Cursor | `~/.cursor/hooks.json` | `~/.cursor/mcp.json` | `~/.cursor/skills/coordinate-edits/` |
+| Gemini CLI | `~/.gemini/settings.json` | `~/.gemini/settings.json` | `~/.gemini/skills/coordinate-edits/` |
+| GitHub Copilot | `$COPILOT_HOME/hooks/agentscm-client.json` (`~/.copilot`) | `$COPILOT_HOME/mcp-config.json` | `$COPILOT_HOME/skills/coordinate-edits/` |
+
+In a shared file, setup changes only AgentSCM's own entries: the `agentscm` MCP server, hooks
+that run `agentscm hook AGENT --client-connection`, and the block between
+`# agentscm:client-begin` and `# agentscm:client-end` in Codex's `config.toml`. Everything else is
+kept, with the same values, though a JSON file is rewritten with its keys in sorted order. Before
+writing each file it prints the diff of AgentSCM's own entries (not the rest, which can hold other
+servers' credentials), and it refuses a file that already has an `agentscm` entry it did not
+write. A file that is a link, into a dotfiles repository say, is written through, not replaced.
+
+The user-scope MCP server finds the checkout from the directory the agent starts it in (Cursor:
+from `${workspaceFolder}`). In a checkout that is not connected it offers no tools and answers
+without contacting anything. When the checkout gets connected while the agent runs, the server
+tells the agent its tools changed at the agent's next MCP request; an agent that ignores that
+shows the tools in its next session.
+
+The agents' own approvals still apply: Codex asks you to trust new or changed hooks in `/hooks`,
+Gemini CLI skips settings hooks and MCP servers in a folder you have not trusted, and Cursor asks
+to enable a new MCP server.
+
+`--checkout-only` writes the hooks, MCP entry and skill into the checkout instead, as earlier
+versions did, so they run only there; quickstart does this when you answer No (Claude Code and
+Codex are then not set up, since their hooks come only from a user-scope plugin). The two cannot
+be mixed for one agent: setting an agent up for all projects takes AgentSCM's files for that agent
+out of every connected checkout, and a checkout-only setup is refused while the agent is installed
+for all projects. `agentscm client remove` and `agentscm uninstall` take the user-scope entries out
+once no other connected checkout uses that agent.
+
+Other agents (Grok Build, Windsurf, Cline, Amp, opencode, Kiro, Aider) have no native AgentSCM
+setup; [other agents](agents.md#other-agents) says what each supports and how to wire it by hand.
+
 ## Platforms
 
 Linux and macOS, x86_64 and arm64. Linux binaries are static (musl). Windows, x86_64 only (see [Windows](#windows)); Windows on arm64 may run the x64 binary under emulation, which is untested. For other hosts, check whether a local Linux AMD64 or ARM64 Docker daemon is supported. Docker availability and emulation depend on the host; they are not a universal fallback.

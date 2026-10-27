@@ -97,6 +97,11 @@ pub(crate) struct SetupArgs {
     /// Coding agent whose native hooks should be installed.
     #[arg(long, value_enum)]
     agent: crate::client_setup::Agent,
+    /// Write the agent's hooks, MCP entry and skill into this checkout only, not your user
+    /// configuration, so they run only here. Claude Code and Codex hooks always come from a
+    /// user-scope plugin.
+    #[arg(long)]
+    checkout_only: bool,
     #[command(flatten)]
     connect: ConnectArgs,
 }
@@ -155,8 +160,13 @@ pub(crate) async fn run(command: ClientCommand) -> Result<()> {
             let root = selected_root(args.connect.root.as_deref())?;
             let ui = Ui { yes: false };
             let program = std::env::current_exe()?;
+            let scope = if args.checkout_only {
+                crate::client_setup::Scope::Checkout
+            } else {
+                crate::client_setup::Scope::User
+            };
             setup(
-                &[args.agent],
+                &[(args.agent, scope)],
                 args.connect,
                 root,
                 &program,
@@ -266,7 +276,7 @@ fn terminal_wait(ui: &Ui) -> Option<AppWait<'_>> {
 /// `program` is the stable executable the hooks and MCP entries run.
 #[cfg(unix)]
 pub(crate) async fn setup(
-    agents: &[crate::client_setup::Agent],
+    agents: &[(crate::client_setup::Agent, crate::client_setup::Scope)],
     args: ConnectArgs,
     root: PathBuf,
     program: &Path,
@@ -283,7 +293,7 @@ pub(crate) async fn setup(
 
 #[cfg(unix)]
 struct SetupInstallation<'a> {
-    agents: &'a [crate::client_setup::Agent],
+    agents: &'a [(crate::client_setup::Agent, crate::client_setup::Scope)],
     program: &'a Path,
 }
 
@@ -293,8 +303,8 @@ type SetupInstallation<'a> = std::marker::PhantomData<&'a ()>;
 #[cfg(unix)]
 fn validate_setup_installation(setup: &SetupInstallation<'_>, root: &Path) -> Result<()> {
     validate_setup_program(setup.program)?;
-    for agent in setup.agents {
-        crate::client_setup::preflight(*agent, root, setup.program)?;
+    for (agent, scope) in setup.agents {
+        crate::client_setup::preflight(*agent, root, setup.program, *scope)?;
     }
     Ok(())
 }
@@ -308,9 +318,9 @@ fn validate_setup_installation(setup: &SetupInstallation<'_>, _root: &Path) -> R
 #[cfg(unix)]
 fn install_setup(setup: &SetupInstallation<'_>, root: &Path) -> Result<()> {
     // Recorded first, so `client remove` also takes out a plugin a failed install left behind.
-    for agent in setup.agents {
+    for (agent, scope) in setup.agents {
         record_agent(root, *agent)?;
-        crate::client_setup::install(*agent, root, setup.program)?;
+        crate::client_setup::install(*agent, root, setup.program, *scope)?;
     }
     Ok(())
 }
@@ -362,7 +372,9 @@ pub(crate) fn setup_existing_agent(
         agent,
     )?;
     let stable = installed_program(running_program)?;
-    crate::client_setup::preflight(agent, root, &stable)?;
+    // The tray asks nothing, so it keeps an agent's existing scope.
+    let scope = tray_scope(agent, root);
+    crate::client_setup::preflight(agent, root, &stable, scope)?;
     let latest = load()?
         .into_iter()
         .find(|connection| connection.root == root)
@@ -379,7 +391,17 @@ pub(crate) fn setup_existing_agent(
     // Record first so `client remove` can clean up a partially completed install.
     // The compare-and-swap also fences reapplication if the connection changed during preflight.
     update(root, Some(&latest), Some(replacement))?;
-    crate::client_setup::install_quiet(agent, root, &stable)
+    crate::client_setup::install_quiet(agent, root, &stable, scope)
+}
+
+/// The scope the tray sets an agent up in: for all projects only once that was chosen.
+#[cfg(target_os = "macos")]
+fn tray_scope(agent: crate::client_setup::Agent, root: &Path) -> crate::client_setup::Scope {
+    if crate::client_setup::user_scope_installed(agent, root) {
+        crate::client_setup::Scope::User
+    } else {
+        crate::client_setup::Scope::Checkout
+    }
 }
 
 /// `client setup` for a checkout the tray saw an agent use without a connection. The tray has
@@ -398,7 +420,14 @@ pub(crate) async fn setup_unconnected(
         no_sign_in: true,
         ..ConnectArgs::default()
     };
-    setup(&[agent], args, root, &stable, None).await
+    setup(
+        &[(agent, tray_scope(agent, &root))],
+        args,
+        root,
+        &stable,
+        None,
+    )
+    .await
 }
 
 /// The stable `~/.agentscm/bin/agentscm` link, which hooks must run, when it is this program.

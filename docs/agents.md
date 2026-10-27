@@ -133,6 +133,33 @@ These are not generated and not tested here. The shape is always the same:
 2. Make sure the agent reads `AGENTS.md` (or paste the snippet from it into the agent's own instructions file).
 3. If the agent can run a command before edits and wants a JSON answer, `agentscm hook generic` accepts `{"agent", "session", "event", "tool", "paths", "task"}` on standard input.
 
+### Other agents
+
+These agents have no native AgentSCM setup, so `client setup` does not configure them and their
+start-up check does not auto-connect a checkout. What each documents, as of October 2026:
+
+| Agent | User-level MCP | Start-up hook | Hook input |
+| --- | --- | --- | --- |
+| Grok Build (`grok`, xAI) | `~/.grok/config.toml` `[mcp_servers.NAME]` | `SessionStart` in `~/.grok/hooks/*.json` | `hookEventName`, `sessionId`, `cwd`, `toolName`, `toolInput` |
+| Kiro (IDE and `kiro-cli` v3) | `~/.kiro/settings/mcp.json` | `SessionStart` in `~/.kiro/hooks/*.json` | `hook_event_name`, `session_id`, `cwd`, `tool_name`, `tool_input` |
+| Cline | `~/.cline/data/settings/cline_mcp_settings.json` (CLI) | `TaskStart` in `~/.cline/hooks/` | `hookName`, `taskId`, `workspaceRoots`; no `cwd` |
+| Amp | `~/.config/amp/settings.json` `amp.mcpServers` | `session.start` in a TypeScript plugin, `~/.config/amp/plugins/` | plugin API: `thread.id`, `system.workspaceRoot` |
+| opencode | `~/.config/opencode/opencode.json` `mcp` | `session.created` in a plugin, `~/.config/opencode/plugins/` | plugin API: `directory`, `worktree` |
+| Windsurf (now Devin Desktop, Cascade) | `~/.config/devin/mcp_config.json` | none; `pre_user_prompt` is the first call | `trajectory_id`, `tool_info` |
+| Aider | none | none | none |
+
+None of these sends `agentscm hook generic` input directly. To wire one by hand:
+
+1. Add the user-level MCP server with command `agentscm` and arguments
+   `--no-telemetry client mcp`. It uses the saved connection of the checkout it starts in, which
+   `agentscm client connect --hub HUB` makes, and offers no tools in a checkout without one.
+2. Add a hook, or plugin, that maps the agent's event to
+   `{"event": "start"|"check"|"done", "agent": "NAME", "session": ID, "paths": [...], "cwd": DIR}`,
+   pipes it to `agentscm hook generic` with `AGENTSCM_HUB_URL` and `AGENTSCM_HUB_TOKEN` set, and
+   maps the `{"status", "text"}` answer back to the agent's own output (for example Kiro adds a
+   hook's standard output to the context, and Grok Build reads `hookSpecificOutput.additionalContext`).
+   The generic hook does not use a checkout's saved connection.
+
 Grok has no native AgentSCM setup, hook or workflow adapter in this repository. A Grok host with an
 MCP client can use the generic remote Hub recipe above, or an operator can separately configure the
 local reusable-workflow stdio server. Neither route is a live-tested Grok integration.

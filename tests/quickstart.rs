@@ -4061,7 +4061,7 @@ fn uninstall_leaves_a_connection_quickstart_found_rather_than_made() {
             token.to_str().unwrap(),
         ],
     ));
-    let codex_config = repo.path().join(".codex/config.toml");
+    let codex_config = machine.home.path().join(".codex/config.toml");
     let codex_before = std::fs::read(&codex_config).unwrap();
     let said = ok(&machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"])));
     assert!(said.contains("existed before quickstart"), "{said}");
@@ -4214,4 +4214,146 @@ fn a_rerun_with_agents_changes_nothing() {
     assert!(said.contains("No changes made."), "{said}");
     let after: Vec<_> = files.iter().map(|f| std::fs::read(f).unwrap()).collect();
     assert_eq!(after, before);
+}
+
+/// Each agent is set up in its user configuration, next to what was already there, and
+/// uninstall leaves that configuration as it was.
+#[test]
+fn agents_are_set_up_for_all_projects_and_uninstall_restores_user_configuration() {
+    for (agent, file, original) in [
+        (
+            "cursor",
+            ".cursor/mcp.json",
+            r#"{"mcpServers":{"kept-server":{"command":"kept-command"}}}"#,
+        ),
+        (
+            "gemini",
+            ".gemini/settings.json",
+            r#"{"theme":"kept-theme"}"#,
+        ),
+        (
+            "copilot",
+            ".copilot/mcp-config.json",
+            r#"{"mcpServers":{"kept-server":{"type":"local","command":"kept-command"}}}"#,
+        ),
+        (
+            "codex",
+            ".codex/config.toml",
+            "model = \"kept-model\"\n\n[projects.\"/kept-trusted/agentscm\"]\ntrust_level = \"trusted\"\n",
+        ),
+    ] {
+        let (hub, machine) = (Hub::start(), Machine::new().with_codex());
+        let repo = machine.repo();
+        let token = hub.token_file(machine.home.path());
+        let home = machine.home.path();
+        let path = home.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, original).unwrap();
+        let said = ok(&machine.run(
+            repo.path(),
+            &quick(&hub.url, &token, &["--no-collisions", "--agent", agent]),
+        ));
+        assert!(
+            said.contains("so it is in all your projects"),
+            "{agent}: {said}"
+        );
+        // The diff of the shared file is shown before it is written.
+        assert!(said.contains(&format!("+++ {}", path.display())), "{said}");
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("agentscm"), "{agent}: {written}");
+        // The entry finds the checkout where it starts, so it names none.
+        let checkout = repo.path().canonicalize().unwrap();
+        assert!(
+            !written.contains(checkout.to_str().unwrap()),
+            "{agent}: {written}"
+        );
+        // Distinct strings: a build or temporary path can contain short ones.
+        for kept in [
+            "kept-server",
+            "kept-theme",
+            "kept-model",
+            "/kept-trusted/agentscm",
+        ] {
+            assert_eq!(
+                written.contains(kept),
+                original.contains(kept),
+                "{agent} {kept}: {written}"
+            );
+        }
+        let hooks = match agent {
+            "cursor" => Some(home.join(".cursor/hooks.json")),
+            "gemini" => Some(path.clone()),
+            "copilot" => Some(home.join(".copilot/hooks/agentscm-client.json")),
+            _ => None,
+        };
+        if let Some(hooks) = &hooks {
+            let text = std::fs::read_to_string(hooks).unwrap();
+            assert!(
+                text.contains(&format!("hook {agent} --client-connection")),
+                "{text}"
+            );
+        }
+        let skill = home.join(format!(".{agent}/skills/coordinate-edits/SKILL.md"));
+        assert_eq!(skill.exists(), agent != "codex", "{agent}");
+        // Nothing for this agent is written into the checkout.
+        for local in [".cursor", ".gemini", ".github", ".vscode", ".codex"] {
+            assert!(!repo.path().join(local).exists(), "{agent} {local}");
+        }
+        assert_eq!(machine.connections()[0]["agents"], json!([agent]));
+
+        let said = ok(&machine.run(repo.path(), &["uninstall", "--yes"]));
+        assert!(said.contains("Took AgentSCM out of"), "{agent}: {said}");
+        let left = std::fs::read_to_string(&path).unwrap();
+        if agent == "codex" {
+            assert_eq!(left, original);
+        } else {
+            assert_eq!(
+                serde_json::from_str::<Value>(&left).unwrap(),
+                serde_json::from_str::<Value>(original).unwrap(),
+                "{agent}"
+            );
+        }
+        if let Some(hooks) = hooks.filter(|hooks| *hooks != path) {
+            assert!(!hooks.exists(), "{agent}");
+        }
+        assert!(
+            !skill.exists() && !skill.parent().unwrap().exists(),
+            "{agent}"
+        );
+    }
+}
+
+/// A checkout set up for one checkout only moves to the user configuration, and a checkout-only
+/// setup is refused while the agent is set up for all projects, so no hook runs twice.
+#[test]
+fn checkout_and_user_scope_never_both_hold_an_agents_hooks() {
+    let (hub, machine) = (Hub::start(), Machine::new());
+    let repo = machine.repo();
+    let token = hub.token_file(machine.home.path());
+    let setup = |extra: &[&str]| {
+        let mut args = vec!["client", "setup", "--agent", "gemini", "--hub", &hub.url];
+        args.extend(["--token-file", token.to_str().unwrap()]);
+        args.extend(extra);
+        machine.run(repo.path(), &args)
+    };
+    ok(&setup(&["--checkout-only"]));
+    let local = repo.path().join(".gemini/settings.json");
+    assert!(std::fs::read_to_string(&local).unwrap().contains("--root"));
+    assert!(!machine.home.path().join(".gemini").exists());
+
+    let said = ok(&setup(&[]));
+    assert!(said.contains("for all your projects"), "{said}");
+    assert!(!local.exists() && !repo.path().join(".gemini").exists());
+    let user = json_file(&machine.home.path().join(".gemini/settings.json"));
+    assert_eq!(
+        user["mcpServers"]["agentscm"]["args"],
+        json!(["--no-telemetry", "client", "mcp"])
+    );
+    assert_eq!(user["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+
+    let refused = setup(&["--checkout-only"]);
+    assert!(!refused.status.success());
+    let said = String::from_utf8_lossy(&refused.stderr);
+    assert!(said.contains("without --checkout-only"), "{said}");
+    assert!(!local.exists());
 }
