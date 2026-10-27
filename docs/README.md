@@ -51,6 +51,8 @@ separately from verification and native admission. [Operator-local repository ru
 can enqueue those workflows after a provider-confirmed merge.
 The [local workflow and skill library](advanced/workflow-library.md) adds durable authoring,
 bounded pinned imports, side-effect-free simulation and an explicit export bridge to those rules.
+The local [intent-review workflow](advanced/intent-review.md) lets an existing coding agent execute
+a pinned standalone skill, retain criterion findings and track bounded corrections for Git Work.
 The [Claude Code workflow loop](advanced/claude-code-workflows.md) adds an opt-in local trigger,
 isolated tests, bounded model review and exact-revision native requirements. The opt-in
 [Community workspace pilot](advanced/community-workspace.md) adds persistent membership,

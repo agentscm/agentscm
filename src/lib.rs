@@ -52,6 +52,8 @@ pub mod workspace_timeline_service;
 pub use error::{Error, Result};
 
 pub mod forge;
+#[cfg(unix)]
+pub mod intent_review_host;
 pub mod issue_workflow;
 
 pub mod skill_bundle;

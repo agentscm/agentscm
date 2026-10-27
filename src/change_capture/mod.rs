@@ -771,8 +771,13 @@ fn capture_git_source_opened(
     opened_root.verify_descriptor()?;
     if !*dirty && !requires_materialized_snapshot_opened(opened_root, &listed)? {
         opened_root.verify_descriptor()?;
-        omissions.clear();
-        *snapshot_coverage = CoverageV1::Complete;
+        // A clean gitlink identifies a commit but does not capture submodule source.
+        omissions.retain(|omission| *omission == CaptureOmissionV1::SubmoduleContent);
+        *snapshot_coverage = if omissions.is_empty() {
+            CoverageV1::Complete
+        } else {
+            CoverageV1::Partial
+        };
         return Ok(source);
     }
     let paths: Vec<&[u8]> = listed
@@ -787,6 +792,7 @@ fn capture_git_source_opened(
     let mut entries = Vec::with_capacity(paths.len());
     let mut total = 0u64;
     let mut unsupported = Vec::new();
+    let mut unsupported_content = false;
     for raw_path in paths {
         let path = std::str::from_utf8(raw_path).map_err(|_| {
             CaptureError::Invalid("working source contains a non-UTF-8 path".into())
@@ -811,6 +817,7 @@ fn capture_git_source_opened(
             }
             OpenedWorkingEntry::Unsupported => {
                 unsupported.push("unsupported_file_type");
+                unsupported_content = true;
                 continue;
             }
             OpenedWorkingEntry::Content {
@@ -847,6 +854,9 @@ fn capture_git_source_opened(
                 | CaptureOmissionV1::SymlinkTarget
         )
     });
+    if unsupported_content {
+        omissions.push(CaptureOmissionV1::WorkingTreeContent);
+    }
     let manifest = serde_json::to_vec(&WorkingSnapshotManifest {
         schema_version: SCHEMA_VERSION_V1,
         head: head.clone(),
@@ -1922,6 +1932,115 @@ mod tests {
         fs::write(path.join("tracked.txt"), "tracked\n").unwrap();
         run(&["add", "tracked.txt"]);
         run(&["commit", "-q", "-m", "fixture"]);
+    }
+
+    #[test]
+    fn clean_gitlink_capture_preserves_missing_submodule_coverage() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("repository");
+        fs::create_dir(&root).unwrap();
+        initialize_git_repository(&root);
+        let head = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(head.status.success());
+        let head = String::from_utf8(head.stdout).unwrap();
+        fs::create_dir(root.join("dependency")).unwrap();
+        for args in [
+            vec![
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000",
+                head.trim(),
+                "dependency",
+            ],
+            vec!["commit", "-qm", "Synthetic gitlink"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        assert!(status.stdout.is_empty());
+        let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+        let source = capture_git_source(
+            &GitSourceRequest {
+                repository: "example/repository".into(),
+                worktree_id: "checkout".into(),
+                repository_path: root,
+                base_ref: "HEAD".into(),
+            },
+            &spool,
+        )
+        .unwrap();
+        let SourceBindingV1::Git {
+            dirty,
+            omissions,
+            snapshot_coverage,
+            ..
+        } = source
+        else {
+            panic!("expected Git source")
+        };
+        assert!(!dirty);
+        assert!(omissions.contains(&CaptureOmissionV1::SubmoduleContent));
+        assert_eq!(snapshot_coverage, CoverageV1::Partial);
+    }
+
+    #[test]
+    fn unsupported_special_file_capture_preserves_missing_working_content() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("repository");
+        fs::create_dir(&root).unwrap();
+        initialize_git_repository(&root);
+        let tracked = root.join("tracked.txt");
+        fs::remove_file(&tracked).unwrap();
+        assert!(
+            Command::new("mkfifo")
+                .arg(&tracked)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let spool = LocalSpool::open(temp.path().join("spool")).unwrap();
+        let source = capture_git_source(
+            &GitSourceRequest {
+                repository: "example/repository".into(),
+                worktree_id: "checkout".into(),
+                repository_path: root,
+                base_ref: "HEAD".into(),
+            },
+            &spool,
+        )
+        .unwrap();
+        let SourceBindingV1::Git {
+            omissions,
+            snapshot_coverage,
+            captured_snapshot,
+            ..
+        } = source
+        else {
+            panic!("expected Git source")
+        };
+        assert!(captured_snapshot.is_some());
+        assert!(omissions.contains(&CaptureOmissionV1::WorkingTreeContent));
+        assert_eq!(snapshot_coverage, CoverageV1::Partial);
     }
 
     #[test]

@@ -135,6 +135,12 @@ pub(super) struct Selected {
     connection: Connection,
 }
 
+impl Selected {
+    pub(super) fn source_repository(&self) -> String {
+        format!("{}/{}", self.origin_host, self.repository).to_ascii_lowercase()
+    }
+}
+
 fn now() -> i64 {
     agentscm::hub::store::unix_now()
 }
@@ -632,6 +638,7 @@ pub(super) fn router(state: AppState, front_door: Arc<FrontDoor>) -> Router {
         .with_state(front_door.clone())
         .merge(super::explorer::routes().with_state(state.clone()))
         .merge(super::workflow_library::routes().with_state(state.clone()))
+        .merge(super::intent_review::routes().with_state(state.clone()))
         .layer(middleware::from_fn_with_state(
             front_door.clone(),
             require_repository,
@@ -1255,6 +1262,278 @@ mod tests {
 
     fn required_string(value: &serde_json::Value, key: &str) -> String {
         value[key].as_str().unwrap().to_owned()
+    }
+
+    #[tokio::test]
+    async fn intent_reviews_require_grants_bind_selected_repository_and_fence_dispositions() {
+        use agentscm::workflow_library::*;
+        use tower_service::Service;
+
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        let front_door = Arc::new(FrontDoor::new().unwrap());
+        front_door.set_origin("http://127.0.0.1:3210".into());
+        let state = AppState {
+            data_dir: data.clone(),
+            engine: agentscm::store::Engine::open(&data).unwrap(),
+            work: Arc::new(tokio::sync::Semaphore::new(2)),
+            collisions: None,
+            timeline: None,
+            explorer: None,
+            front_door: Some(front_door.clone()),
+        };
+        let (code, _) = front_door.mint_code().unwrap();
+        let (grant, _) = front_door.redeem(&code).unwrap().unwrap();
+        let credential = format!("local:{grant}:fixture/project");
+        let mut app = router(state, front_door.clone());
+        let uri = "/v1/local/intent-reviews";
+        let (status, _) = granted_json(
+            &mut app,
+            "invalid",
+            "POST",
+            uri,
+            json!({"operation":"status","work_id":"work"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        *front_door.connections.lock().await = Some((Instant::now(), Arc::new(vec![])));
+        let (status, _) = granted_json(
+            &mut app,
+            &credential,
+            "POST",
+            uri,
+            json!({"operation":"status","work_id":"work"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let mut connections = Vec::new();
+        for (name, forge, repository) in [
+            ("checkout", "github.com", "fixture/project"),
+            ("other", "github.com", "fixture/other"),
+            ("other-forge", "gitlab.com", "fixture/project"),
+        ] {
+            let root = directory.path().join(name);
+            std::fs::create_dir_all(&root).unwrap();
+            let git = |args: &[&str]| {
+                let output = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            };
+            git(&["init", "-q"]);
+            git(&["config", "user.name", "Fixture"]);
+            git(&["config", "user.email", "fixture@example.invalid"]);
+            git(&["config", "commit.gpgsign", "false"]);
+            git(&[
+                "remote",
+                "add",
+                "origin",
+                &format!("https://{forge}/{repository}.git"),
+            ]);
+            std::fs::write(root.join("limit.txt"), "one limit per account\n").unwrap();
+            git(&["add", "limit.txt"]);
+            git(&["commit", "-qm", "Synthetic initial source"]);
+            connections.push(Connection {
+                root,
+                origin_host: forge.into(),
+                hub: "https://hub.example.test".into(),
+                repo: repository.into(),
+                token_file: directory.path().join("unused-token"),
+                report_completion: false,
+                owned_token_id: None,
+                owned_token_expires_at: None,
+                agents: Vec::new(),
+            });
+        }
+        let checkout = connections[0].root.clone();
+        let other_forge = connections.pop().unwrap();
+        let connections = Arc::new(connections);
+        *front_door.connections.lock().await = Some((Instant::now(), connections.clone()));
+        let (status, _) = granted_json(
+            &mut app,
+            &credential,
+            "GET",
+            "/v1/local/intent-reviews/work",
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(!data.join("skill-workflows").exists());
+        let mut library = Library::open(&data).unwrap();
+        let preview = library
+            .save_preview(
+                PreviewSkill {
+                    name: "Intent review".into(),
+                    entrypoint: "SKILL.md".into(),
+                    provenance: Provenance::Markdown {
+                        locator: "pasted_markdown".into(),
+                    },
+                },
+                &[PackageFile {
+                    path: "SKILL.md".into(),
+                    content: "# Intent review\nCompare human criteria with evidence.".into(),
+                }],
+                vec![],
+            )
+            .unwrap();
+        let skill = library
+            .accept_import(&AcceptImport {
+                preview_id: preview.preview_id,
+                digest: preview.digest,
+                idempotency_key: "import".into(),
+            })
+            .unwrap();
+        let draft = library
+            .create_workflow(&CreateWorkflow {
+                name: "Intent review".into(),
+                summary: "Synthetic review".into(),
+                idempotency_key: "create".into(),
+            })
+            .unwrap();
+        let draft = library
+            .update_workflow(
+                &draft.id,
+                &UpdateWorkflow {
+                    expected_generation: draft.generation,
+                    name: None,
+                    summary: None,
+                    steps: Some(vec![WorkflowStep {
+                        id: "review".into(),
+                        label: "Review".into(),
+                        needs: vec![],
+                        required: true,
+                        kind: WorkflowStepKind::Skill {
+                            skill_version_id: skill.id,
+                        },
+                    }]),
+                    trigger: None,
+                    follow_on: None,
+                },
+            )
+            .unwrap();
+        let Publication::Published { version, .. } = library
+            .publish(
+                &draft.id,
+                &PublishWorkflow {
+                    expected_generation: draft.generation,
+                    idempotency_key: "publish".into(),
+                },
+            )
+            .unwrap()
+        else {
+            panic!("fixture workflow did not publish")
+        };
+        let start = json!({"operation":"start","request_id":"start","work_id":"work","workflow_version_id":version.id,"step_id":"review","contract":{"version":1,"previous_digest":null,"request":[{"id":"human-1","kind":"human_message","source":"visible-message-1","author":"caller-supplied-human","recorded_at_ms":1,"sha256":"derived-by-host","coverage":"complete","text":"Use one limit per account."}],"amendments":[],"criteria":[{"id":"account","description":"Use one limit per account.","sources":["human-1"],"required":true,"constraint":false}],"focus":[],"coverage":"complete","gaps":[]},"scope":{"parent_work_id":null,"checkpoint":null,"criteria":["account"],"coverage":"complete","gaps":[]},"limits":{"max_correction_rounds":1,"max_invocations":4,"wall_time_ms":600000},"evidence":[{"id":"check","text":"Synthetic caller-reported account check.","origin":"caller report","coverage":"complete"}]});
+        front_door.connections.lock().await.as_mut().unwrap().0 = Instant::now();
+        let (status, created) =
+            granted_json(&mut app, &credential, "POST", uri, start.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert_eq!(
+            created["view"]["record"]["subject"]["repository"],
+            "github.com/fixture/project"
+        );
+        let work_uri = "/v1/local/intent-reviews/work";
+        front_door.connections.lock().await.as_mut().unwrap().0 = Instant::now();
+        let (status, current) = granted_json(
+            &mut app,
+            &credential,
+            "GET",
+            work_uri,
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{current}");
+        assert_eq!(current["next"], "assess");
+        let other_credential = format!("local:{grant}:fixture/other");
+        front_door.connections.lock().await.as_mut().unwrap().0 = Instant::now();
+        let (status, _) = granted_json(
+            &mut app,
+            &other_credential,
+            "GET",
+            work_uri,
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        *front_door.connections.lock().await = Some((Instant::now(), Arc::new(vec![other_forge])));
+        let (status, _) = granted_json(
+            &mut app,
+            &credential,
+            "GET",
+            work_uri,
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        front_door.connections.lock().await.as_mut().unwrap().0 = Instant::now();
+        let (status, _) = granted_json(&mut app, &credential, "POST", uri,
+            json!({"operation":"claim","request_id":"foreign-claim","work_id":"work","attempt_id":"foreign-attempt","session_id":"session","phase":"assessment","lease_ms":60000})).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        front_door.connections.lock().await.as_mut().unwrap().0 = Instant::now();
+        let (status, separate) = granted_json(&mut app, &credential, "POST", uri, start).await;
+        assert_eq!(status, StatusCode::OK, "{separate}");
+        assert_eq!(
+            separate["view"]["record"]["subject"]["repository"],
+            "gitlab.com/fixture/project"
+        );
+        *front_door.connections.lock().await = Some((Instant::now(), connections));
+        let (status, original) = granted_json(
+            &mut app,
+            &credential,
+            "GET",
+            work_uri,
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{original}");
+        assert_eq!(original["root_invocations"], 0);
+        front_door.connections.lock().await.as_mut().unwrap().0 = Instant::now();
+        let (status, claimed) = granted_json(&mut app, &credential, "POST", uri, json!({"operation":"claim","request_id":"claim","work_id":"work","attempt_id":"attempt","session_id":"session","phase":"assessment","lease_ms":60000})).await;
+        assert_eq!(status, StatusCode::OK, "{claimed}");
+        assert_eq!(claimed["task"]["skill"]["files"][0]["path"], "SKILL.md");
+        front_door.connections.lock().await.as_mut().unwrap().0 = Instant::now();
+        let (status, reported) = granted_json(&mut app, &credential, "POST", uri, json!({"operation":"report","request_id":"report","work_id":"work","attempt_id":"attempt","session_id":"session","fence":1,"execution":"succeeded","assessment":{"criteria":[{"criterion":"account","status":"supported","explanation":"Synthetic caller evidence supports this criterion.","evidence_ids":["check"],"corrective_outcome":null,"recheck":null}],"coverage":"complete","gaps":[]}})).await;
+        assert_eq!(status, StatusCode::OK, "{reported}");
+        assert_eq!(reported["view"]["next"], "complete");
+        let expected_subject_digest = reported["view"]["current_subject_digest"].clone();
+        std::fs::write(checkout.join("limit.txt"), "changed candidate\n").unwrap();
+        front_door.connections.lock().await.as_mut().unwrap().0 = Instant::now();
+        let (status, refused) = granted_json(&mut app, &credential, "POST", uri, json!({"operation":"disposition","request_id":"disposition","work_id":"work","expected_subject_digest":expected_subject_digest,"kind":"exception","criteria":["account"],"reason":"Synthetic explicit exception","authorization":{"id":"human-2","kind":"human_message","source":"visible-message-2","author":"caller-supplied-human","recorded_at_ms":2,"sha256":"derived-by-host","coverage":"complete","text":"Accept this explicit exception."}})).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        front_door.connections.lock().await.as_mut().unwrap().0 = Instant::now();
+        let (status, current) = granted_json(
+            &mut app,
+            &credential,
+            "GET",
+            work_uri,
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(current["current"], false);
+        assert_eq!(current["record"]["dispositions"], json!([]));
+        front_door.connections.lock().await.as_mut().unwrap().0 = Instant::now();
+        let oversized = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::HOST, "127.0.0.1:3210")
+            .header(header::ORIGIN, "http://127.0.0.1:3210")
+            .header(header::AUTHORIZATION, format!("Bearer {credential}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(" ".repeat(512 * 1024 + 1)))
+            .unwrap();
+        assert_eq!(
+            app.call(oversized).await.unwrap().status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
     }
 
     #[tokio::test]

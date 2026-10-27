@@ -1,0 +1,32 @@
+{
+  "messages": [
+    {
+      "id": "human-1",
+      "role": "user",
+      "text": "Allow at most 2 requests per account per minute, shared across client IP addresses."
+    },
+    {
+      "id": "human-2",
+      "role": "user",
+      "text": "For this prototype, change the account limit from 2 to 3 requests per minute. Keep the shared-per-account behavior."
+    }
+  ],
+  "amendment": {
+    "source_message": "human-2",
+    "authorized_by": "human",
+    "changes": [
+      {
+        "criterion": "account-shared-limit",
+        "before": "2 requests per account per minute",
+        "after": "3 requests per account per minute"
+      }
+    ],
+    "unchanged": ["shared across client IP addresses"]
+  },
+  "expected_handling": {
+    "assess_against": "contract including human-2",
+    "prior_assessment": "stale for changed criterion",
+    "preserve_original_request": true,
+    "do_not_treat_agent_plan_as_amendment": true
+  }
+}

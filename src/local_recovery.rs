@@ -987,7 +987,7 @@ fn validate_database(db: &Connection, kind: DbKind) -> Result<()> {
         DbKind::Workspace => app == 0x4153_574b && matches!(version, 2..=5),
         DbKind::Merge => (app, version) == (0x4147_4d47, 1),
         DbKind::Workflow => (app, version) == (0x4153_4746, 1),
-        DbKind::SkillWorkflow => app == 0x4153_5746 && matches!(version, 1..=5),
+        DbKind::SkillWorkflow => app == 0x4153_5746 && matches!(version, 1..=6),
         DbKind::Export => app == 1095190616 && matches!(version, 1 | 2),
         DbKind::GitReconcile => (app, version) == (0x4153_4752, 1),
         DbKind::Issue => return Ok(()),

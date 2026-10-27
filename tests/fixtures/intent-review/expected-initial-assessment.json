@@ -1,0 +1,27 @@
+{
+  "scope": "final",
+  "candidate": "wrong-but-green",
+  "checks": [
+    {
+      "command": "python -m unittest",
+      "result": "passed",
+      "meaning": "The test covers one account from one IP only."
+    }
+  ],
+  "criteria": [
+    {
+      "id": "account-shared-limit",
+      "status": "mismatch",
+      "source_message": "human-1",
+      "evidence": "wrong-but-green/rate_limiter.py keys counts by client_ip; a second IP for the same account receives a separate allowance."
+    },
+    {
+      "id": "account-isolation",
+      "status": "mismatch",
+      "source_message": "human-1",
+      "evidence": "wrong-but-green/rate_limiter.py omits account_id from its counter key, so two accounts using one IP share the same allowance."
+    }
+  ],
+  "overall": "needs_correction",
+  "note": "A passing test command does not satisfy a criterion the tests do not exercise."
+}

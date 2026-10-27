@@ -4285,7 +4285,7 @@ mod tests {
                 .connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            5
+            super::super::SCHEMA_VERSION
         );
         assert_eq!(journal.view("prior-run").unwrap(), before);
         drop(journal);
@@ -4629,7 +4629,7 @@ mod tests {
                 .connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            5
+            super::super::SCHEMA_VERSION
         );
         assert!(
             !migrated
