@@ -80,6 +80,9 @@ pub struct CatchupSourceStatus {
     pub checked_at: i64,
     pub unread_pages: u64,
     pub deferred: u64,
+    /// Lower bound of the closed-proposal window that was read, or `None` when
+    /// no window was read. History before it is not observed.
+    pub window_from: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -163,6 +166,10 @@ pub struct CatchupSourceCoverage {
     pub checked_at: Option<i64>,
     pub unread_pages: u64,
     pub deferred: u64,
+    /// Lower bound of the closed-proposal window the last pass read; history
+    /// before it is not observed. Absent for older payloads and other sources.
+    #[serde(default)]
+    pub window_from: Option<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -417,6 +424,12 @@ impl CatchupSourceStatus {
     pub(super) fn validate(&self) -> Result<()> {
         if self.checked_at < 0 || self.unread_pages > 1_000_000 || self.deferred > 1_000_000 {
             return Err(invalid("invalid catch-up source status"));
+        }
+        if self
+            .window_from
+            .is_some_and(|from| from < 0 || from > self.checked_at)
+        {
+            return Err(invalid("invalid catch-up source window"));
         }
         Ok(())
     }

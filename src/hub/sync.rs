@@ -797,9 +797,14 @@ async fn catchup_connection_status(
     let id = conn.id.clone();
     for repo in db(state, move |store| store.repositories(&id)).await? {
         let _guard = state.sync.lock_repo(&repo.id).await;
-        super::catchup_sync::source_status(state, conn, &repo, coverage, unix_now(), 0, 0)
-            .await
-            .map_err(|_| HubError::Unavailable("could not record catch-up source status".into()))?;
+        super::catchup_sync::source_status(
+            state,
+            conn,
+            &repo,
+            super::catchup_sync::forge_status(coverage, unix_now(), 0, 0, None),
+        )
+        .await
+        .map_err(|_| HubError::Unavailable("could not record catch-up source status".into()))?;
     }
     Ok(())
 }

@@ -35,10 +35,7 @@ pub(super) async fn begin(
         state,
         conn,
         repo,
-        CatchupCoverageState::Incomplete,
-        unix_now(),
-        0,
-        0,
+        forge_status(CatchupCoverageState::Incomplete, unix_now(), 0, 0, None),
     )
     .await
 }
@@ -52,19 +49,23 @@ pub(super) async fn reconcile(
     activity_days: i64,
 ) -> Gh<()> {
     let checked_at = unix_now();
+    let window_from = checked_at - activity_days * 86_400;
     // A bounded read/ingestion batch is not a completed source observation.
     // Preflight must see that uncertainty before any member changes its watermark.
     source_status(
         state,
         conn,
         repo,
-        CatchupCoverageState::Incomplete,
-        checked_at,
-        0,
-        0,
+        forge_status(
+            CatchupCoverageState::Incomplete,
+            checked_at,
+            0,
+            0,
+            Some(window_from),
+        ),
     )
     .await?;
-    let result = read_recent(state, conn, repo, token, checked_at, activity_days).await;
+    let result = read_recent(state, conn, repo, token, checked_at, window_from).await;
     let (coverage, unread_pages, deferred) = match &result {
         Ok((unread, deferred)) if *unread == 0 && *deferred == 0 => {
             (CatchupCoverageState::ObservedOnly, 0, 0)
@@ -76,10 +77,13 @@ pub(super) async fn reconcile(
         state,
         conn,
         repo,
-        coverage,
-        checked_at,
-        unread_pages,
-        deferred,
+        forge_status(
+            coverage,
+            checked_at,
+            unread_pages,
+            deferred,
+            Some(window_from),
+        ),
     )
     .await?;
     result.map(drop)
@@ -94,36 +98,38 @@ pub(super) async fn unavailable(
         state,
         conn,
         repo,
-        CatchupCoverageState::Unavailable,
-        unix_now(),
-        0,
-        0,
+        forge_status(CatchupCoverageState::Unavailable, unix_now(), 0, 0, None),
     )
     .await
+}
+
+pub(super) fn forge_status(
+    state: CatchupCoverageState,
+    checked_at: i64,
+    unread_pages: u64,
+    deferred: u64,
+    window_from: Option<i64>,
+) -> CatchupSourceStatus {
+    CatchupSourceStatus {
+        source: CatchupMergeSource::ForgePull,
+        state,
+        checked_at,
+        unread_pages,
+        deferred,
+        window_from,
+    }
 }
 
 pub(super) async fn source_status(
     state: &HubState,
     conn: &Connection,
     repo: &ConnectedRepository,
-    coverage: CatchupCoverageState,
-    checked_at: i64,
-    unread_pages: u64,
-    deferred: u64,
+    status: CatchupSourceStatus,
 ) -> Gh<()> {
     let scope = scope(conn, repo);
     let store = state.store.clone();
     blocking(state, move || {
-        store.record_catchup_source_status(
-            &scope,
-            &CatchupSourceStatus {
-                source: CatchupMergeSource::ForgePull,
-                state: coverage,
-                checked_at,
-                unread_pages,
-                deferred,
-            },
-        )
+        store.record_catchup_source_status(&scope, &status)
     })
     .await
     .map_err(failure)
@@ -153,10 +159,9 @@ async fn read_recent(
     repo: &ConnectedRepository,
     token: &str,
     checked_at: i64,
-    activity_days: i64,
+    window_from: i64,
 ) -> Gh<(u64, u64)> {
     let api = state.sync.forge(conn)?;
-    let window_from = checked_at - activity_days * 86_400;
     let mut pass = Pass {
         per_page: FIRST_PAGE_SIZE,
         requests: 0,

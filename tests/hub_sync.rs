@@ -1274,6 +1274,20 @@ async fn catchup_reads_a_hundred_merges_whose_single_page_exceeds_the_body_cap()
     for n in 1..=100 {
         assert_eq!(detail_reads(&env, n), 1, "pull {n} is read once");
     }
+    // The pass records the declared 14-day window it read (checked_at - 14 days).
+    let page = env
+        .store
+        .work_catchup(&token, &CatchupQuery::default(), unix_now())
+        .unwrap();
+    let forge = page
+        .source_coverage
+        .iter()
+        .find(|c| c.source == CatchupMergeSource::ForgePull)
+        .unwrap();
+    assert_eq!(
+        forge.window_from.unwrap(),
+        forge.checked_at.unwrap() - 14 * 86_400
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

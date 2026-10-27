@@ -107,6 +107,7 @@ fn observe_complete_sources(store: &dyn Store, now: i64) {
                     checked_at: now,
                     unread_pages: 0,
                     deferred: 0,
+                    window_from: None,
                 },
             )
             .unwrap();
@@ -488,6 +489,7 @@ async fn changed_merge_highwater_refuses_new_work_without_claiming_it() {
                         checked_at: 10,
                         unread_pages: 0,
                         deferred: 0,
+                        window_from: None,
                     },
                 )
                 .unwrap();

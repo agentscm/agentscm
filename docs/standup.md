@@ -123,8 +123,9 @@ requests and re-reads new merge candidates (20 per poll; the rest are deferred).
 When the walk needed several requests it looks at the list head again, because
 proposals updated meanwhile move there. Coverage is observed-only only when the
 window was fully read with nothing unread or deferred; history before the window
-is not observed. Source status records unread pages, deferred observations and
-failures. Source-quality metadata refreshes on
+is not observed. Source status records unread pages, deferred observations,
+failures and, for `forge_pull`, `window_from`: the Unix time the last pass read
+back to (`null` when no window was read, as for `tracked_publication`). Source-quality metadata refreshes on
 each page without changing the delivery’s event watermarks. This is observed coverage, not a claim
 of complete forge history. No model call generates the recap.
 

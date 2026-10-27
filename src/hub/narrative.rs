@@ -992,6 +992,7 @@ fn snapshot(
                 "checked_at": coverage.checked_at,
                 "unread_pages": coverage.unread_pages,
                 "deferred": coverage.deferred,
+                "window_from": coverage.window_from,
             })
         })
         .collect::<Vec<_>>();
