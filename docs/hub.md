@@ -156,7 +156,7 @@ sign-in becomes the default hub. It is sent only to the hub that issued it.
 `agentscm hub sessions list` shows the saved sign-ins and their expiry, and
 `agentscm hub sessions remove --hub URL` forgets one locally without contacting its hub.
 `--provider` may be left out when the hub has exactly one sign-in provider
-(`GET /v1/hub/login` lists them), and `--hub` when exactly one session is saved.
+(`GET /v1/hub/login` lists them), and `--hub` when `AGENTSCM_HUB` is set or exactly one session is saved.
 
 - `agentscm hub token create --name N --repo owner/name [--ttl 8h] [--read-only]` asks the
   forge, with the person's own token, whether they can read the repository, and
@@ -173,8 +173,8 @@ sign-in becomes the default hub. It is sent only to the hub that issued it.
 - `agentscm hub logout [--hub URL]` ends that hub's session on the hub (a failure is ignored),
   signs this computer out there when it has a [credential](#computer-credentials) (its agent
   tokens are revoked), and removes its saved entry.
-- `--hub URL` on the token commands picks the saved session for that hub (default: the default
-  hub); without a saved session for it the command fails.
+- `--hub URL` on the token commands picks the saved session for that hub (default: `AGENTSCM_HUB`,
+  then the default hub); without a saved session for it the command fails.
 
 The browser flow sets the cookie `__Host-agentscm_login` (`Secure`, `HttpOnly`,
 `SameSite=Lax`, 10 minutes). Some browsers, notably Safari, drop `Secure`
