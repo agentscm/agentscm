@@ -794,20 +794,16 @@ fn devices_and_refusals(db: &Db) {
             .is_err()
     );
 
-    // Minting through a computer records it; replacing revokes the old token of that repository.
+    // Minting through a computer records it; an agent token is never a computer credential.
     let (token, old_digest) = device_token(&alice.id, REPO);
-    let old = store
-        .insert_device_token(&token, &first, None, true)
-        .unwrap();
+    store.insert_device_token(&token, &first, true).unwrap();
     assert_eq!(store.authenticate_device(&old_digest, now).unwrap(), None);
     let (token, new_digest) = device_token(&alice.id, REPO);
-    let new = store
-        .insert_device_token(&token, &first, Some(&old), false)
-        .unwrap();
-    assert_eq!(store.authenticate(&old_digest, now).unwrap(), None);
+    store.insert_device_token(&token, &first, false).unwrap();
+    assert!(store.authenticate(&old_digest, now).unwrap().is_some());
     assert!(store.authenticate(&new_digest, now).unwrap().is_some());
     assert_eq!(events_of(&*store, "auto_connected").len(), 1);
-    // Another person's computer cannot mint for alice, nor replace a token of another repository.
+    // Another person's computer cannot mint for alice.
     let bobs = store
         .insert_device(
             &bob.id,
@@ -819,14 +815,13 @@ fn devices_and_refusals(db: &Db) {
         .unwrap();
     assert!(
         store
-            .insert_device_token(&device_token(&alice.id, REPO).0, &bobs, None, false)
+            .insert_device_token(&device_token(&alice.id, REPO).0, &bobs, false)
             .is_err()
     );
     let (other_repo, _) = device_token(&alice.id, "acme/other");
     store
-        .insert_device_token(&other_repo, &first, Some(&new), false)
+        .insert_device_token(&other_repo, &first, false)
         .unwrap();
-    assert!(store.authenticate(&new_digest, now).unwrap().is_some());
 
     let listed = store.devices(Some(&alice.id), now).unwrap();
     assert_eq!(listed.len(), 1);
@@ -857,7 +852,7 @@ fn devices_and_refusals(db: &Db) {
     );
     assert!(
         store
-            .insert_device_token(&device_token(&alice.id, REPO).0, &first, None, false)
+            .insert_device_token(&device_token(&alice.id, REPO).0, &first, false)
             .is_err()
     );
     store.set_user_disabled(&alice.id, false).unwrap();
@@ -882,7 +877,7 @@ fn devices_and_refusals(db: &Db) {
     assert_eq!(events_of(&*store, "device_revoked"), [json!({"by": bobs})]);
     assert!(
         store
-            .insert_device_token(&device_token(&alice.id, REPO).0, &first, None, false)
+            .insert_device_token(&device_token(&alice.id, REPO).0, &first, false)
             .is_err()
     );
 

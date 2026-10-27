@@ -4836,7 +4836,6 @@ impl Store for PgStore {
         &self,
         token: &NewAgentToken,
         device: &str,
-        replaces: Option<&str>,
         auto: bool,
     ) -> Result<String> {
         let now = unix_now();
@@ -4869,16 +4868,7 @@ impl Store for PgStore {
                 return Err(HubError::Unauthorized);
             }
             append(&mut tx, &Event::token_created(&id, token)?)?;
-            if let Some(old) = replaces
-                && tx.execute(
-                    "UPDATE hub_agent_tokens SET revoked = TRUE
-                     WHERE id = $1 AND owner = $2 AND repository = $3 AND NOT revoked",
-                    &[&old, &token.owner, &token.repository],
-                )? > 0
-            {
-                append(&mut tx, &Event::token_revoked(old, Some(device))?)?;
-            }
-            if auto && replaces.is_none() {
+            if auto {
                 append(
                     &mut tx,
                     &Event::auto_connected(device, &id, &token.repository)?,

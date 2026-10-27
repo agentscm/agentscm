@@ -140,9 +140,14 @@ pub(super) async fn mint(
     if owner_host.as_deref() != Some(connection.origin_host.as_str())
         || provider.is_some_and(|provider| me["user"]["provider"] != provider_name(provider))
     {
-        return Err(MintError::Refused(
-            "This Hub sign-in is for another forge than the checkout's origin; sign in with the forge that hosts it".into(),
-        ));
+        // For auto-connect this Hub simply does not apply to the checkout's forge.
+        return Err(if auto {
+            MintError::NotConnected(String::new())
+        } else {
+            MintError::Refused(
+                "This Hub sign-in is for another forge than the checkout's origin; sign in with the forge that hosts it".into(),
+            )
+        });
     }
     let body = json!({"name": token_name().map_err(local)?, "repository": connection.repo,
         "auto": auto});
@@ -434,7 +439,7 @@ fn not_connected_key(hub: &str, host: &str, repo: &str) -> String {
 /// repository. Only this computer's credential is used, nothing is printed, no sign-in starts
 /// and no file in the checkout is written; the connect path keeps its program fence,
 /// lifecycle lock and origin revalidation.
-async fn auto_connect(root: &Path) -> AutoConnect {
+async fn auto_connect(root: &Path, agent: Option<&str>) -> AutoConnect {
     let Ok(hubs) = hub_cli::auto_connect_hubs() else {
         return AutoConnect::Skipped;
     };
@@ -442,7 +447,7 @@ async fn auto_connect(root: &Path) -> AutoConnect {
         return AutoConnect::Skipped;
     };
     let mut not_connected = None;
-    for (hub, _) in hubs {
+    for hub in hubs {
         let key = not_connected_key(&hub, &host, &repo);
         if crate::hook_cli::marked_within(&config, &key, NOT_CONNECTED_FOR) {
             not_connected.get_or_insert(None);
@@ -495,7 +500,10 @@ async fn auto_connect(root: &Path) -> AutoConnect {
             revoke_minted(&probe, &unused).await;
         }
         return match result {
-            Ok(()) => AutoConnect::Connected(repo),
+            Ok(()) => {
+                record_agent(root, agent);
+                AutoConnect::Connected(repo)
+            }
             Err(Error::Invalid(message)) => AutoConnect::Refused(message),
             Err(error) => AutoConnect::Refused(error.to_string()),
         };
@@ -508,8 +516,8 @@ async fn auto_connect(root: &Path) -> AutoConnect {
 
 /// `agentscm client auto-connect`: prints one JSON line, `{"result": "connected" |
 /// "refused" | "not_connected" | "skipped", "repository"?, "message"?}`.
-pub(crate) async fn auto_connect_command(root: &Path) -> Result<()> {
-    let result = auto_connect(root).await;
+pub(crate) async fn auto_connect_command(root: &Path, agent: Option<&str>) -> Result<()> {
+    let result = auto_connect(root, agent).await;
     match &result {
         AutoConnect::Connected(_) => record_attention(root, None),
         AutoConnect::Refused(message) | AutoConnect::NotConnected(Some(message)) => {
@@ -525,6 +533,24 @@ pub(crate) async fn auto_connect_command(root: &Path) -> Result<()> {
     };
     println!("{line}");
     Ok(())
+}
+
+/// Records the agent whose hook connected the checkout, as `client setup` does, so removing
+/// another checkout never takes away the user-level hooks this one relies on.
+fn record_agent(root: &Path, agent: Option<&str>) {
+    let Some(agent) = agent.filter(|agent| crate::client_config::AGENTS.contains(agent)) else {
+        return;
+    };
+    let Ok(Some(saved)) =
+        load().map(|saved| saved.into_iter().find(|connection| connection.root == root))
+    else {
+        return;
+    };
+    if !saved.agents.iter().any(|known| known == agent) {
+        let mut recorded = saved.clone();
+        recorded.agents.push(agent.to_owned());
+        let _ = update(root, Some(&saved), Some(recorded));
+    }
 }
 
 #[cfg(test)]

@@ -203,7 +203,7 @@ status shown; clients show `message` as is.
 - With `Authorization: Bearer <computer credential>`: `GET /v1/hub/device` (this computer and
   its owner), `DELETE /v1/hub/device` (sign this computer out), `POST /v1/hub/device/name`
   (`{"name"}`, 204), `POST /v1/hub/device/tokens` (`{"name", "repository", "read_only"?,
-  "replaces"?, "auto"?}`; 201 as `POST /v1/hub/tokens` plus `device_id`) and
+  "auto"?}`; 201 as `POST /v1/hub/tokens` plus `device_id`) and
   `DELETE /v1/hub/device/tokens/{id}` (own tokens). The credential is refused (401) on every
   human-session route, administrator routes included, and on every agent route; sessions and
   agent tokens are refused on these.
@@ -218,15 +218,15 @@ status shown; clients show `message` as is.
   `GET /projects/{id}` and `.../members/all/{user_id}` (an active member with Reporter on a
   private project, Developer otherwise). A role that is too low or missing is 403
   `insufficient_role` with `login`, `repository`, `visibility`, `has` and `needs`, as
-  `POST /v1/hub/tokens` gives it. A login the forge no longer knows, or that now belongs to
-  someone else, is 401 `sign_in_required` (signing in again refreshes it). A connection whose
+  `POST /v1/hub/tokens` gives it. A login that now belongs to someone else is 401
+  `sign_in_required` (signing in again refreshes it); a login the forge does not know is judged as
+  no role. A connection whose
   credential cannot answer (`auth_failed`, or a 401 or 403 from the forge, or the repository gone
   from its view) is 403 `access_check_unavailable`; a forge 5xx or rate limit is 503
   `permission_unavailable`. Nothing is minted on a refusal. For `not_connected`, when a
   connection on the owner's host sees the requested repository as a fork of a connected one, the
-  message names it and `fork_of` gives its name. `replaces` revokes the owner's token for the
-  same repository in the same transaction; `auto: true` records `auto_connected` when nothing was
-  replaced.
+  message names it and `fork_of` gives its name. `auto: true` (auto-connect) records
+  `auto_connected`.
 - `GET /v1/hub/devices` (session or credential): the owner's computers, live ones first, then
   those revoked in the last 30 days, newest first, at most 100: `id`, `name`, `created_at`,
   `last_used_at`, `revoked_at`, `current` (the calling credential) and `repositories` (with a

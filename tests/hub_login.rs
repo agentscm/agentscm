@@ -579,12 +579,13 @@ fn refusal(reply: &(u16, Value)) -> (u16, &str) {
     (reply.0, reply.1["error"].as_str().unwrap_or_default())
 }
 
-/// The kind on the Hub page a failed browser sign-in lands on, after checking it has a message.
+/// The kind a failed browser sign-in sends back to the CLI's loopback, after checking it has a
+/// message.
 fn refused_page(status: u16, headers: &HeaderMap) -> String {
     assert_eq!(status, 302);
     let location = headers[header::LOCATION].to_str().unwrap();
     let query = location
-        .strip_prefix("/ui/#/signed-in?status=refused&reason=")
+        .strip_prefix("http://127.0.0.1:40000/callback?error=")
         .unwrap_or_else(|| panic!("{location}"));
     let (reason, message) = query.split_once("&message=").unwrap();
     assert!(message.contains("%3B"), "{location}");
@@ -2027,4 +2028,61 @@ async fn cli_falls_back_to_the_loopback_flow_when_device_flow_is_unavailable() {
     let (ok, _, stderr) = cli.run(&["logout"]);
     assert!(ok, "{stderr}");
     assert!(env.kinds().contains(&"device_revoked".to_owned()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_browser_sign_in_ends_the_cli_wait_with_the_reason() {
+    let env = Env::start_with("", "github:#7", |_| {}).await;
+    {
+        let mut fake = env.fake.lock().unwrap();
+        fake.no_device = true;
+        fake.current_user = 8;
+    }
+    let cli = Cli::new();
+    let hub = env.url();
+    let mut child = cli
+        .command(&["login", "--hub", &hub, "--provider", "github"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    let url = loop {
+        let mut line = String::new();
+        assert!(stderr.read_line(&mut line).unwrap() > 0, "cli exited early");
+        if line.starts_with(&format!("{hub}/v1/hub/login/github?cli_port=")) {
+            break line.trim().to_owned();
+        }
+    };
+    let (_, headers, _) = env.send(Method::GET, &url, None, None, None).await;
+    let location = headers[header::LOCATION].to_str().unwrap().to_owned();
+    let cookie = headers[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let callback = env.authorize_at_forge(&location).await;
+    let (status, headers, _) = env.callback(&callback, Some(&cookie)).await;
+    assert_eq!(status, 302);
+    let loopback = headers[header::LOCATION].to_str().unwrap();
+    assert!(
+        loopback.contains("/callback?error=not_allowed&message="),
+        "{loopback}"
+    );
+    // The CLI answers by sending the browser to the Hub's page, and stops waiting.
+    let response = env.http.get(loopback).send().await.unwrap();
+    assert_eq!(response.status(), 302);
+    let page = response.headers()[header::LOCATION].to_str().unwrap();
+    assert!(
+        page.starts_with(&format!(
+            "{hub}/ui/#/signed-in?status=refused&reason=not_allowed"
+        )),
+        "{page}"
+    );
+    let mut rest = String::new();
+    std::io::Read::read_to_string(&mut stderr, &mut rest).unwrap();
+    assert!(!child.wait().unwrap().success());
+    assert!(rest.contains("ask a Hub admin to add you"), "{rest}");
+    assert!(!cli.session_file().exists());
 }

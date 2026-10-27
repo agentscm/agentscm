@@ -517,7 +517,8 @@ pub(crate) async fn sign_in_with(
 ) -> Result<String> {
     let client = forge_http::client().map_err(map_hub_error)?;
     // Signing in again on this computer replaces its previous credential, and only that one.
-    let replaces = saved_device(hub).ok().flatten().map(|device| device.secret);
+    let previous = saved_device(hub).ok().flatten();
+    let replaces = previous.as_ref().map(|device| device.secret.clone());
     let mut device = json!({});
     if let Some(name) = computer_name() {
         device["name"] = json!(name);
@@ -562,6 +563,26 @@ pub(crate) async fn sign_in_with(
         signed["expires_at"].as_i64(),
         SavedDevice::from_reply(&signed["device"]),
     )?;
+    // The Hub replaces only the same person's computer. A sign-in as someone else (another
+    // forge on this Hub) would leave the old credential live with its secret forgotten.
+    if let Some(previous) = previous
+        && matches!(
+            call(
+                &client,
+                Method::GET,
+                &format!("{hub}/v1/hub/device"),
+                Some(&previous.secret),
+                None
+            )
+            .await,
+            Ok((200, _))
+        )
+    {
+        sign_computer_out(&client, hub, &previous).await;
+        eprintln!(
+            "This computer was signed in to {hub} as someone else; that sign-in ended, and checkouts connected through it need connecting again. A computer holds one sign-in per Hub."
+        );
+    }
     let user = &signed["user"];
     Ok(format!(
         "{}:{}",
@@ -825,7 +846,7 @@ pub(crate) fn sign_in_summaries() -> Vec<SignInSummary> {
             hub: saved.hub.clone(),
             computer: saved.device.as_ref().map(|device| device.name.clone()),
             auto_connect: saved.auto_connect,
-            session_live: !saved.expires_at.is_some_and(|expires| expires <= now),
+            session_live: saved.expires_at.is_none_or(|expires| expires > now),
         })
         .collect();
     rows.sort_by_key(|row| row.hub != store.default_hub);
@@ -1141,9 +1162,27 @@ async fn loopback_login(
             LOOPBACK_WAIT.as_secs() / 60
         );
     }
-    let (code, browser) = tokio::task::spawn_blocking(move || wait_for_code(&listener))
+    let (returned, browser) = tokio::task::spawn_blocking(move || wait_for_code(&listener))
         .await
         .map_err(|_| invalid("sign-in wait failed"))??;
+    let code = match returned {
+        Returned::Code(code) => code,
+        Returned::Refused(kind, message) => {
+            let mut page =
+                reqwest::Url::parse("http://page.invalid/").map_err(|_| invalid("bad URL"))?;
+            page.query_pairs_mut()
+                .append_pair("status", "refused")
+                .append_pair("reason", &kind)
+                .append_pair("message", &message);
+            let location = format!("{hub}/ui/#/signed-in?{}", page.query().unwrap_or_default());
+            let _ = tokio::task::spawn_blocking(move || redirect_browser(browser, &location)).await;
+            return Err(invalid(if message.is_empty() {
+                "The Hub refused the sign-in; run it again"
+            } else {
+                &message
+            }));
+        }
+    };
     let url = format!("{hub}/v1/hub/login/exchange");
     let body = json!({"code": code, "verifier": verifier, "device": computer});
     let mut reply = call(client, Method::POST, &url, None, Some(body)).await;
@@ -1201,9 +1240,17 @@ fn redirect_browser(mut stream: std::net::TcpStream, location: &str) {
     );
 }
 
-/// Serve loopback connections until one is `GET /callback?code=<hex>`; that connection is
-/// returned unanswered, so the browser can be sent to the result.
-fn wait_for_code(listener: &TcpListener) -> Result<(String, std::net::TcpStream)> {
+/// What the Hub sent the browser back to the CLI with.
+enum Returned {
+    Code(String),
+    /// The Hub refused: its kind and its message.
+    Refused(String, String),
+}
+
+/// Serve loopback connections until one is `GET /callback?code=<hex>` or the Hub's refusal
+/// (`?error=<kind>&message=...`); that connection is returned unanswered, so the browser can be
+/// sent to the result.
+fn wait_for_code(listener: &TcpListener) -> Result<(Returned, std::net::TcpStream)> {
     let deadline = Instant::now() + LOOPBACK_WAIT;
     let mut next_note = Instant::now() + LOOPBACK_PROGRESS;
     while Instant::now() < deadline {
@@ -1223,14 +1270,33 @@ fn wait_for_code(listener: &TcpListener) -> Result<(String, std::net::TcpStream)
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         let mut head = [0_u8; 4096];
         let read = stream.read(&mut head).unwrap_or(0);
-        let code = std::str::from_utf8(&head[..read])
+        let target = std::str::from_utf8(&head[..read])
             .ok()
             .and_then(|text| text.lines().next())
-            .and_then(|line| line.strip_prefix("GET /callback?code="))
+            .and_then(|line| line.strip_prefix("GET /callback?"))
             .and_then(|rest| rest.split(' ').next())
-            .filter(|code| code.len() == 64 && code.bytes().all(|b| b.is_ascii_hexdigit()));
-        if let Some(code) = code {
-            return Ok((code.to_owned(), stream));
+            .and_then(|query| {
+                reqwest::Url::parse(&format!("http://loopback.invalid/?{query}")).ok()
+            });
+        let pairs: std::collections::HashMap<String, String> = target
+            .map(|url| url.query_pairs().into_owned().collect())
+            .unwrap_or_default();
+        if let Some(code) = pairs
+            .get("code")
+            .filter(|code| code.len() == 64 && code.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            return Ok((Returned::Code(code.clone()), stream));
+        }
+        // Any page can send a browser here, so this only ends the wait with what it says.
+        if let Some(kind) = pairs.get("error") {
+            let message = pairs
+                .get("message")
+                .map_or_else(String::new, |message| clean(message));
+            let kind = clean(kind).chars().take(64).collect();
+            return Ok((
+                Returned::Refused(kind, message.chars().take(300).collect()),
+                stream,
+            ));
         }
         let text = "not found";
         let _ = write!(
@@ -1750,8 +1816,8 @@ pub(crate) fn saved_device(hub: &str) -> Result<Option<SavedDevice>> {
 /// At most this many Hubs are asked about one checkout, the default Hub first.
 pub(crate) const MAX_AUTO_CONNECT_HUBS: usize = 4;
 
-/// (Hub, computer credential) for each Hub whose agents connect themselves.
-pub(crate) fn auto_connect_hubs() -> Result<Vec<(String, String)>> {
+/// The Hubs whose agents connect themselves (with a computer credential), default first.
+pub(crate) fn auto_connect_hubs() -> Result<Vec<String>> {
     if !session_files_present()? {
         return Ok(Vec::new());
     }
@@ -1759,10 +1825,10 @@ pub(crate) fn auto_connect_hubs() -> Result<Vec<(String, String)>> {
     let mut hubs: Vec<_> = store
         .sessions
         .iter()
-        .filter(|saved| saved.auto_connect == Some(true))
-        .filter_map(|saved| Some((saved.hub.clone(), saved.device.as_ref()?.secret.clone())))
+        .filter(|saved| saved.auto_connect == Some(true) && saved.device.is_some())
+        .map(|saved| saved.hub.clone())
         .collect();
-    hubs.sort_by_key(|(hub, _)| *hub != store.default_hub);
+    hubs.sort_by_key(|hub| *hub != store.default_hub);
     hubs.truncate(MAX_AUTO_CONNECT_HUBS);
     Ok(hubs)
 }

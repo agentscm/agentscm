@@ -759,21 +759,23 @@ async fn callback(
     response
 }
 
-/// A browser sign-in that fails lands on the Hub page that says why, with the reason and the
-/// message; a workspace sign-in keeps its JSON error.
+/// A browser sign-in that fails goes back to the CLI with the reason and the message; a
+/// workspace sign-in keeps its JSON error.
 fn refused_page(pending: &BrowserLogin, error: ApiError) -> ApiResult<Response> {
     if pending.workspace {
         return Err(error);
     }
+    // The CLI's loopback hears why, stops waiting, and sends the browser to the Hub page.
     let mut query = Url::parse("http://page.invalid/").map_err(|_| ApiError::invalid())?;
-    query
-        .query_pairs_mut()
-        .append_pair("status", "refused")
-        .append_pair("reason", error.code());
+    query.query_pairs_mut().append_pair("error", error.code());
     if let Some(message) = error.message() {
         query.query_pairs_mut().append_pair("message", message);
     }
-    let location = format!("/ui/#/signed-in?{}", query.query().unwrap_or_default());
+    let location = format!(
+        "http://127.0.0.1:{}/callback?{}",
+        pending.cli_port,
+        query.query().unwrap_or_default()
+    );
     found(&location, cookie_attributes("", 0))
 }
 
@@ -1202,8 +1204,15 @@ async fn device_start(
     {
         return Err(too_many());
     }
-    let unavailable = || {
-        state.login.pending().no_device.insert(name.clone());
+    let unavailable = |body: &Value| {
+        // Only the forge saying the app has device sign-in off makes clients skip it; a forge
+        // error or outage does not.
+        if matches!(
+            body["error"].as_str(),
+            Some("device_flow_disabled" | "unauthorized_client")
+        ) {
+            state.login.pending().no_device.insert(name.clone());
+        }
         ApiError::new(StatusCode::CONFLICT, "device_flow_unavailable").with_message(format!(
             "This Hub's {} app doesn't allow device sign-in; sign in through the browser instead",
             forge_name(&name)
@@ -1225,10 +1234,10 @@ async fn device_start(
         body["user_code"].as_str(),
         body["verification_uri"].as_str(),
     ) else {
-        return Err(unavailable());
+        return Err(unavailable(&body));
     };
     if status != 200 {
-        return Err(unavailable());
+        return Err(unavailable(&body));
     }
     let expires_in = body["expires_in"]
         .as_i64()

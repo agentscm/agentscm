@@ -164,20 +164,29 @@ pub(super) async fn issue(
     let secret = random_hex()?;
     let digest = device_digest(&secret)?;
     let (store, owner, stored) = (state.store.clone(), user.id.clone(), name.clone());
-    let replaces = request.replaces;
-    let id = blocking(state, move || {
+    let (replaces, workspace) = (request.replaces, state.workspace.clone());
+    let (id, replaced) = blocking(state, move || {
         let now = unix_now();
         // A credential that is not this person's live computer replaces nothing.
-        let replaces = match replaces.as_deref().map(device_digest) {
+        let replaced = match replaces.as_deref().map(device_digest) {
             Some(Ok(old)) => store
                 .authenticate_device(&old, now)?
                 .filter(|device| device.owner.id == owner)
                 .map(|device| device.device_id),
             _ => None,
         };
-        store.insert_device(&owner, &stored, &digest, replaces.as_deref(), now)
+        // Replacing revokes agent tokens, so it waits for native actions as revocation does.
+        let operation = || store.insert_device(&owner, &stored, &digest, replaced.as_deref(), now);
+        let id = match (&workspace, &replaced) {
+            (Some(workspace), Some(_)) => workspace.with_identity_change(operation),
+            _ => operation(),
+        }?;
+        Ok((id, replaced))
     })
     .await?;
+    if let Some(replaced) = replaced {
+        state.login.drop_sessions_of_device(&replaced);
+    }
     Ok(json!({"id": id, "secret": secret, "name": name}))
 }
 
@@ -331,9 +340,6 @@ struct MintBody {
     repository: String,
     #[serde(default)]
     read_only: bool,
-    /// The owner's token for the same repository that this one renews.
-    #[serde(default)]
-    replaces: Option<String>,
     /// Asked by auto-connect for a checkout that had no connection.
     #[serde(default)]
     auto: bool,
@@ -348,13 +354,6 @@ async fn mint(
 ) -> ApiResult<Response> {
     validate_agent_name(&body.name)?;
     validate_repository(&body.repository)?;
-    if body
-        .replaces
-        .as_deref()
-        .is_some_and(|id| !id.starts_with("tok_") || id.len() > 64)
-    {
-        return Err(ApiError::invalid());
-    }
     let owner = device.owner.clone();
     let identity = &owner.identity;
     let login = &state.login;
@@ -419,9 +418,8 @@ async fn mint(
         device.device_id.clone(),
         token.expires_at,
     );
-    let replaces = body.replaces.clone();
     let id = blocking(&state, move || {
-        store.insert_device_token(&token, &device_id, replaces.as_deref(), body.auto)
+        store.insert_device_token(&token, &device_id, body.auto)
     })
     .await
     .map_err(|error| match error {
@@ -566,13 +564,13 @@ async fn repository_role(
         return Err(kind("not_connected"));
     }
     let gitlab = matches!(api, ForgeApi::Gitlab(_));
-    // The GitHub login is cached from sign-in: an unknown one was renamed, and one with another
-    // id now belongs to someone else. Signing in again refreshes it.
+    // The GitHub login is cached from sign-in; one that now has another id belongs to someone
+    // else, and signing in again refreshes it. No role reply at all is judged as no role, so a
+    // forge that answers 404 for a non-collaborator never signs the computer out.
     let user_id = match (&role, gitlab) {
         (Some(role), true) => role["id"].as_i64(),
         (Some(role), false) => role["user"]["id"].as_i64(),
-        (None, true) => Some(owner.identity.user_id),
-        (None, false) => None,
+        (None, _) => Some(owner.identity.user_id),
     };
     if user_id != Some(owner.identity.user_id) {
         return Err(kind("sign_in_required"));

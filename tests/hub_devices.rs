@@ -424,11 +424,8 @@ impl Env {
         .await
     }
 
-    async fn mint(&self, device: &str, replaces: Option<&str>) -> (u16, Value) {
-        let mut body = json!({"name": "client-laptop", "repository": REPO});
-        if let Some(old) = replaces {
-            body["replaces"] = json!(old);
-        }
+    async fn mint(&self, device: &str) -> (u16, Value) {
+        let body = json!({"name": "client-laptop", "repository": REPO});
         self.mint_at(&self.hub, device, body).await
     }
 
@@ -456,7 +453,7 @@ fn token(minted: &Value) -> (String, String) {
 async fn renewal_rechecks_the_role(provider: &'static str) {
     let env = Env::start(provider).await;
     let (_, device, device_id) = env.sign_in(ALICE, "alice's MacBook Pro").await;
-    let (status, first) = env.mint(&device, None).await;
+    let (status, first) = env.mint(&device).await;
     assert_eq!(status, 201, "{first}");
     let now = unix_now();
     let expires_at = first["expires_at"].as_i64().unwrap();
@@ -468,16 +465,18 @@ async fn renewal_rechecks_the_role(provider: &'static str) {
     let (first_id, first_secret) = token(&first);
     assert_eq!(env.whoami(&first_secret).await, 200);
 
-    // Renewal replaces the old token.
-    let (status, second) = env.mint(&device, Some(&first_id)).await;
+    // Renewal mints a new token, then the computer revokes the old one.
+    let (status, second) = env.mint(&device).await;
     assert_eq!(status, 201, "{second}");
-    let (second_id, second_secret) = token(&second);
+    let (_, second_secret) = token(&second);
+    let revoke = format!("/v1/hub/device/tokens/{first_id}");
+    assert_eq!(env.delete(&revoke, &device).await, 204);
     assert_eq!(env.whoami(&first_secret).await, 401);
     assert_eq!(env.whoami(&second_secret).await, 200);
 
     // Losing the role refuses the next renewal; the current token keeps working until it ends.
     env.drop_role(ALICE);
-    let (status, refused) = env.mint(&device, Some(&second_id)).await;
+    let (status, refused) = env.mint(&device).await;
     assert_eq!(
         (status, refused["error"].as_str()),
         (403, Some("insufficient_role"))
@@ -487,13 +486,13 @@ async fn renewal_rechecks_the_role(provider: &'static str) {
     // A role below the rule is refused too: read is not enough on a non-private repository.
     env.set_repo(REPO, REPO_ID, "public");
     env.role(ALICE, "read", "read", 20);
-    let (status, refused) = env.mint(&device, None).await;
+    let (status, refused) = env.mint(&device).await;
     assert_eq!(
         (status, refused["error"].as_str()),
         (403, Some("insufficient_role"))
     );
     env.role(ALICE, "read", "triage", 30);
-    assert_eq!(env.mint(&device, None).await.0, 201);
+    assert_eq!(env.mint(&device).await.0, 201);
 
     // The admin sees the refusal once, counted, with no secret.
     let (admin_session, _, _) = env.sign_in(ADMIN, "admin's laptop").await;
@@ -535,7 +534,7 @@ async fn minting_fails_closed_when_the_hub_cannot_check() {
     let env = Env::start("github").await;
     let (_, device, _) = env.sign_in(ALICE, "laptop").await;
     env.fake.lock().unwrap().hub_reads_roles = false;
-    let (status, refused) = env.mint(&device, None).await;
+    let (status, refused) = env.mint(&device).await;
     assert_eq!(
         (status, refused["error"].as_str()),
         (403, Some("access_check_unavailable"))
@@ -558,7 +557,7 @@ async fn minting_fails_closed_when_the_hub_cannot_check() {
 async fn credentials_are_not_sessions_agent_tokens_or_admin() {
     let env = Env::start("github").await;
     let (session, device, _) = env.sign_in(ADMIN, "admin's laptop").await;
-    let (_, minted) = env.mint(&device, None).await;
+    let (_, minted) = env.mint(&device).await;
     let (_, agent) = token(&minted);
     for path in [
         "/v1/hub/session",
@@ -574,7 +573,7 @@ async fn credentials_are_not_sessions_agent_tokens_or_admin() {
     }
     for credential in [&session, &agent] {
         assert_eq!(env.get("/v1/hub/device", credential).await.0, 401);
-        let (status, _) = env.mint(credential, None).await;
+        let (status, _) = env.mint(credential).await;
         assert_eq!(status, 401);
     }
     let (status, me) = env.get("/v1/hub/device", &device).await;
@@ -600,7 +599,7 @@ async fn revoking_a_computer_stops_it_and_its_tokens() {
             .count(),
         1
     );
-    let (_, minted) = env.mint(&laptop, None).await;
+    let (_, minted) = env.mint(&laptop).await;
     let (_, agent) = token(&minted);
     let (_, list) = env.get("/v1/hub/devices", &session).await;
     let listed = list["devices"]
@@ -632,7 +631,7 @@ async fn revoking_a_computer_stops_it_and_its_tokens() {
     );
     assert_eq!(env.get("/v1/hub/device", &laptop).await.0, 401);
     assert_eq!(env.whoami(&agent).await, 401);
-    let (status, refused) = env.mint(&laptop, None).await;
+    let (status, refused) = env.mint(&laptop).await;
     assert_eq!(
         (status, refused["error"].as_str()),
         (401, Some("sign_in_required"))
@@ -671,7 +670,7 @@ async fn revoking_a_computer_stops_it_and_its_tokens() {
 async fn signing_in_again_replaces_only_the_presented_computer() {
     let env = Env::start("github").await;
     let (_, old, old_id) = env.sign_in(ALICE, "laptop").await;
-    let (_, minted) = env.mint(&old, None).await;
+    let (_, minted) = env.mint(&old).await;
     let (_, agent) = token(&minted);
     let (status, signed) = env
         .sign_in_at(
@@ -709,8 +708,7 @@ async fn computers_survive_a_restart_and_follow_the_allow_list_and_disabling() {
     let env = Env::start("github").await;
     let (_, device, _) = env.sign_in(ALICE, "laptop").await;
     let (_, bob_device, _) = env.sign_in(BOB, "bob's").await;
-    let (_, minted) = env.mint(&device, None).await;
-    let (old, _) = token(&minted);
+    assert_eq!(env.mint(&device).await.0, 201);
 
     // A restarted Hub that drops alice from its allow list refuses her next renewal.
     let restarted = env.serve("github:#8").await;
@@ -718,7 +716,7 @@ async fn computers_survive_a_restart_and_follow_the_allow_list_and_disabling() {
         .mint_at(
             &restarted,
             &device,
-            json!({"name": "client-laptop", "repository": REPO, "replaces": old}),
+            json!({"name": "client-laptop", "repository": REPO}),
         )
         .await;
     assert_eq!(
@@ -735,13 +733,13 @@ async fn computers_survive_a_restart_and_follow_the_allow_list_and_disabling() {
     let alice = env.store.list_users().unwrap();
     let alice = alice.iter().find(|u| u.login == "alice").unwrap();
     env.store.set_user_disabled(&alice.id, true).unwrap();
-    let (status, refused) = env.mint(&device, None).await;
+    let (status, refused) = env.mint(&device).await;
     assert_eq!(
         (status, refused["error"].as_str()),
         (403, Some("user_disabled"))
     );
     env.store.set_user_disabled(&alice.id, false).unwrap();
-    assert_eq!(env.mint(&device, None).await.0, 201);
+    assert_eq!(env.mint(&device).await.0, 201);
 }
 
 #[tokio::test]
@@ -761,7 +759,7 @@ async fn people_with_a_session_enroll_and_admins_see_connected_repositories() {
         .await;
     assert_eq!(status, 201, "{enrolled}");
     let device = enrolled["device"]["secret"].as_str().unwrap();
-    assert_eq!(env.mint(device, None).await.0, 201);
+    assert_eq!(env.mint(device).await.0, 201);
     let (status, _) = env
         .call(
             &env.hub,
@@ -1033,6 +1031,8 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
     );
     let connection = machine.connection();
     assert_eq!(connection["repo"], REPO);
+    // The agent is recorded, so removing another checkout keeps the hooks this one uses.
+    assert_eq!(connection["agents"], json!(["claude"]));
     let entries: Vec<_> = std::fs::read_dir(machine.root())
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
@@ -1170,7 +1170,7 @@ async fn refusals_explain_themselves_and_name_a_connected_upstream() {
     env.role(EMU, "write", "write", 30);
     let (_, device, _) = env.sign_in(EMU, "carol's").await;
     // An Enterprise Managed User login (with `_`) is checked like any other.
-    assert_eq!(env.mint(&device, None).await.0, 201);
+    assert_eq!(env.mint(&device).await.0, 201);
     // A fork of a connected repository is not connected, and the refusal names the upstream.
     env.fake
         .lock()
@@ -1211,7 +1211,7 @@ async fn refusals_explain_themselves_and_name_a_connected_upstream() {
     // A too-low role uses the same refusal as session minting, with its fields.
     env.role(EMU, "read", "read", 20);
     env.set_repo(REPO, REPO_ID, "public");
-    let (status, refused) = env.mint(&device, None).await;
+    let (status, refused) = env.mint(&device).await;
     assert_eq!(status, 403);
     assert_eq!(
         (

@@ -85,7 +85,7 @@ event records which computer did it. A computer cannot revoke itself through
 
 ## Permission at every mint and renewal
 
-`POST /v1/hub/device/tokens` takes `{name, repository, read_only?, replaces?, auto?}`. In order:
+`POST /v1/hub/device/tokens` takes `{name, repository, read_only?, auto?}`. In order:
 
 1. The owner is enabled, and listed in `AGENTSCM_ALLOWED_USERS` when that is set (administrators
    pass, as at sign-in). Otherwise `user_disabled` or `not_allowed`.
@@ -103,8 +103,9 @@ event records which computer did it. A computer cannot revoke itself through
      (inherited and invited-group members included). Reporter (20) or more on `private`, Developer
      (30) or more otherwise.
    - No role, or one below the rule, is `insufficient_role` (403) with the same fields and
-     sentence as `POST /v1/hub/tokens`. A GitHub login the forge no longer knows, or one whose
-     `user.id` differs, is `sign_in_required` (signing in again refreshes the cached login). When
+     sentence as `POST /v1/hub/tokens`. A GitHub login whose `user.id` differs is
+     `sign_in_required` (signing in again refreshes the cached login); one the forge does not know
+     is judged as no role, so a 404 never signs a computer out. When
      the connection's credential cannot answer (the connection is `auth_failed`, the forge answers
      401/403 because the credential lacks the members scope, or the repository is gone from its
      view), the result is `access_check_unavailable` (403). A forge 5xx or rate limit is
@@ -115,9 +116,7 @@ event records which computer did it. A computer cannot revoke itself through
      grant (for a Git host that is neither GitHub nor GitLab) could be added as a second source
      without changing the computer credential, its routes or renewal. It is not built.
 4. Mint. A device-minted agent token lasts **24 hours** (`DEVICE_AGENT_TOKEN_TTL`); read-only ones
-   30 minutes, as the local page uses them. The token row records `device_id`. With
-   `replaces: tok_…` (owned by the same person and for the same repository), the old token is
-   revoked in the same transaction.
+   30 minutes, as the local page uses them. The token row records `device_id`.
 5. An `auto: true` mint for a repository this computer had no token for writes an
    `auto_connected` event.
 
@@ -131,8 +130,7 @@ Manual `hub token create` keeps its 30-day maximum; only the device path is shor
   client lifecycle lock by compare-and-swap on `connections.json` (the token file is outside the
   checkout), and only then revokes the old token, so a failure part way leaves a working token. A
   running MCP server picks up the renewed token at its next request. A laptop asleep for days
-  renews at the first hook call after waking. The Hub's `replaces` field revokes the old token in
-  the mint's own transaction for clients that prefer that order.
+  renews at the first hook call after waking.
 - A pre-existing 30-day token (no `device_id`) is renewed the same way once the computer has a
   credential.
 - A refusal (`insufficient_role`, `not_allowed`, `user_disabled`, `access_check_unavailable`,

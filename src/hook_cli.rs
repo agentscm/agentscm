@@ -166,9 +166,9 @@ async fn call_hub(
     let mut note = None;
     let (url, token, repo, root, endpoint_agent, outbound, client_connection, report_completion) =
         if plugin_route {
-            let routed = match route_client(&agent, &payload) {
+            let mut routed = match route_client(&agent, &payload) {
                 Err(reason) if reason == NO_CONNECTION && is_session_start(&agent, &payload) => {
-                    match auto_connect(&payload).await {
+                    match auto_connect(&agent, &payload).await {
                         Some(Ok(repo)) => {
                             note = Some(format!("AgentSCM: coordinating on {repo}."));
                             route_client(&agent, &payload)
@@ -186,8 +186,11 @@ async fn call_hub(
                     report_unconnected(&agent, &payload);
                 }
             })?;
-            renew_in_background(&routed.connection);
-            if note.is_none() && is_session_start(&agent, &payload) {
+            let session_start = is_session_start(&agent, &payload);
+            if renew(&routed.connection, session_start).await {
+                routed = route_client(&agent, &payload)?;
+            }
+            if note.is_none() && session_start {
                 note = crate::client_cli::attention(&routed.connection.root)
                     .map(|message| format!("AgentSCM: {message}."));
             }
@@ -730,11 +733,13 @@ const AUTO_CONNECT_REFUSED: &str = "auto-connect refused: ";
 /// Runs `agentscm client <command> --root <root>` as its own process, so its work finishes even
 /// after this hook has answered. With `wait`, returns its one-line JSON result if it ends in
 /// time; otherwise it runs on unwatched.
-fn client_child(command: &str, root: &Path, wait: Option<Duration>) -> Option<Value> {
+fn client_child(command: &[&str], root: &Path, wait: Option<Duration>) -> Option<Value> {
     use std::process::{Command, Stdio};
     let program = std::env::current_exe().ok()?;
     let mut child = Command::new(program)
-        .args(["--no-telemetry", "client", command, "--root"])
+        .args(["--no-telemetry", "client"])
+        .args(command)
+        .arg("--root")
         .arg(root)
         .stdin(Stdio::null())
         .stdout(if wait.is_some() {
@@ -763,7 +768,7 @@ fn client_child(command: &str, root: &Path, wait: Option<Duration>) -> Option<Va
 /// that has the repository refused, None when there is nothing to say (auto-connect is off, no
 /// Hub has the repository, or it did not finish in time; it may still finish for the next
 /// session).
-async fn auto_connect(payload: &Value) -> Option<std::result::Result<String, String>> {
+async fn auto_connect(agent: &str, payload: &Value) -> Option<std::result::Result<String, String>> {
     let checkout = repo_root(&cwd_of(payload))?;
     let main = client_config::main_checkout(&checkout);
     let config = config_dir().ok()?;
@@ -779,8 +784,13 @@ async fn auto_connect(payload: &Value) -> Option<std::result::Result<String, Str
     }
     // Marked first, so a hung Hub or a slow child is not retried at every session start.
     mark(&config, &key);
+    let agent = agent.to_owned();
     let result = tokio::task::spawn_blocking(move || {
-        client_child("auto-connect", &main, Some(AUTO_CONNECT_WAIT))
+        client_child(
+            &["auto-connect", "--agent", &agent],
+            &main,
+            Some(AUTO_CONNECT_WAIT),
+        )
     })
     .await
     .ok()??;
@@ -805,17 +815,31 @@ async fn auto_connect(payload: &Value) -> Option<std::result::Result<String, Str
 }
 
 /// Starts renewing the checkout's agent token in its own process when it is due, at most once
-/// every few minutes per checkout. Never waits.
-fn renew_in_background(connection: &Connection) {
+/// every few minutes per checkout. It waits only at session start for a token that has already
+/// ended (a computer idle for a day), within the hook's budget; true when that renewed it.
+async fn renew(connection: &Connection, session_start: bool) -> bool {
     let Ok(config) = config_dir() else {
-        return;
+        return false;
     };
     let now = agentscm::hub::store::unix_now();
     let key = format!("renew\0{}", connection.root.display());
-    if crate::client_cli::due(connection, now) && !marked_within(&config, &key, RETRY_EVERY) {
-        mark(&config, &key);
-        client_child("renew", &connection.root, None);
+    if !crate::client_cli::due(connection, now) || marked_within(&config, &key, RETRY_EVERY) {
+        return false;
     }
+    mark(&config, &key);
+    let ended = connection
+        .owned_token_expires_at
+        .is_some_and(|expires| expires <= now);
+    if !(session_start && ended) {
+        client_child(&["renew"], &connection.root, None);
+        return false;
+    }
+    let root = connection.root.clone();
+    tokio::task::spawn_blocking(move || client_child(&["renew"], &root, Some(AUTO_CONNECT_WAIT)))
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|result| result["result"] == "renewed")
 }
 
 /// The hub's reply with `note` first in the agent's context.

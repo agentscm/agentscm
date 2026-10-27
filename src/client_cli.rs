@@ -62,7 +62,7 @@ pub(crate) enum ClientCommand {
     Renew(RootArgs),
     /// Connect this checkout through a Hub with auto-connect on; prints one JSON result.
     #[command(hide = true)]
-    AutoConnect(RootArgs),
+    AutoConnect(AutoConnectArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -128,6 +128,15 @@ pub(crate) struct SetupArgs {
     checkout_only: bool,
     #[command(flatten)]
     connect: ConnectArgs,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct AutoConnectArgs {
+    #[command(flatten)]
+    checkout: RootArgs,
+    /// The agent whose hook asked, recorded on the connection like `client setup` records it.
+    #[arg(long)]
+    agent: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -213,7 +222,8 @@ pub(crate) async fn run(command: ClientCommand) -> Result<()> {
         ClientCommand::Reporting { command } => reporting(command),
         ClientCommand::Renew(args) => renew_command(&selected_root(args.root.as_deref())?).await,
         ClientCommand::AutoConnect(args) => {
-            auto_connect_command(&selected_root(args.root.as_deref())?).await
+            let root = selected_root(args.checkout.root.as_deref())?;
+            auto_connect_command(&root, args.agent.as_deref()).await
         }
     }
 }

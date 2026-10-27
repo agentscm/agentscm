@@ -231,13 +231,11 @@ pub trait Store: Send + Sync {
     /// True if `owner`'s live computer was renamed.
     fn rename_device(&self, device: &str, owner: &str, name: &str) -> Result<bool>;
     /// Like `insert_agent_token`, minted through `device` (which must be live and `token.owner`'s).
-    /// `replaces` (the owner's token for the same repository) is revoked in the same transaction.
-    /// `auto` records an `auto_connected` event when nothing was replaced.
+    /// `auto` (auto-connect) records an `auto_connected` event.
     fn insert_device_token(
         &self,
         token: &NewAgentToken,
         device: &str,
-        replaces: Option<&str>,
         auto: bool,
     ) -> Result<String>;
     /// Records a refusal: one row per person and reason; a repeat bumps `count` and `at`.

@@ -486,7 +486,6 @@ impl FrontDoor {
             selected.origin_host.clone(),
         ));
         let mut cached = slot.lock().await;
-        crate::client_cli::enroll(&selected.hub).await;
         let session = hub_read_token::load_exact_session(&selected.hub);
         // A token minted from a sign-in that was since removed or replaced is revoked now, on
         // its next use, rather than living until it expires.
@@ -503,7 +502,10 @@ impl FrontDoor {
         {
             return Ok(token.secret.clone());
         }
-        let (hub, human_session) = session?;
+        // Only when minting: a sign-in from before computer credentials gets one here.
+        crate::client_cli::enroll(&selected.hub).await;
+        session?;
+        let (hub, human_session) = hub_read_token::load_exact_session(&selected.hub)?;
         let minted = tokio::time::timeout(MINT_TIMEOUT, async {
             let provider = self.forge_provider(selected).await?;
             hub_read_token::mint_and_confirm(
@@ -1028,7 +1030,6 @@ async fn disconnect(
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// Forward a Hub read for the selected repository with this process's read-only token.
 /// This computer's computers on the selected repository's Hub, asked with its credential,
 /// with a top-level `hub` naming that Hub. One Hub per call; switching repository switches Hub.
 async fn devices(
@@ -1127,6 +1128,7 @@ async fn device_call(
         })
 }
 
+/// Forward a Hub read for the selected repository with this process's read-only token.
 async fn proxy(
     State(front_door): State<Arc<FrontDoor>>,
     axum::Extension(selected): axum::Extension<Selected>,

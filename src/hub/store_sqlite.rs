@@ -4945,7 +4945,6 @@ impl Store for SqliteStore {
         &self,
         token: &NewAgentToken,
         device: &str,
-        replaces: Option<&str>,
         auto: bool,
     ) -> Result<String> {
         let now = unix_now();
@@ -4977,16 +4976,7 @@ impl Store for SqliteStore {
             return Err(HubError::Unauthorized);
         }
         append(&tx, &Event::token_created(&id, token)?)?;
-        if let Some(old) = replaces
-            && tx.execute(
-                "UPDATE hub_agent_tokens SET revoked = 1
-                 WHERE id = ?1 AND owner = ?2 AND repository = ?3 AND revoked = 0",
-                params![old, token.owner, token.repository],
-            )? > 0
-        {
-            append(&tx, &Event::token_revoked(old, Some(device))?)?;
-        }
-        if auto && replaces.is_none() {
+        if auto {
             append(&tx, &Event::auto_connected(device, &id, &token.repository)?)?;
         }
         tx.commit()?;
