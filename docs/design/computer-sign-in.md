@@ -156,9 +156,10 @@ Manual `hub token create` keeps its 30-day maximum; only the device path is shor
   Every attempt is throttled per checkout for 5 minutes, marked before it starts. If the attempt
   cannot finish within the hook's time budget, the hook says nothing to the agent and the process
   finishes for the next session.
-- For `not_connected`, the Hub asks the forge with a connection credential on the owner's host
-  whether the requested repository is a fork; when its parent or source is connected, the refusal
-  says so and names it (`fork_of`). The agent and the menu bar app show that sentence. The client
+- For `not_connected` on an `owner/name`, the Hub asks, for each connected repository with the
+  same name (at most five), only that repository's own connection whether the requested one is
+  its fork; when its parent or source is that repository, the refusal says so and names it
+  (`fork_of`). No other connection's credential is used for the lookup. The agent and the menu bar app show that sentence. The client
   never guesses the upstream and never changes the remote.
 - On success it binds the checkout through the existing connect path: invocation-program fence,
   client lifecycle lock, revalidation of root, origin and `connections.json`, token file under the

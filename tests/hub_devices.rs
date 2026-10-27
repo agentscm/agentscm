@@ -1196,6 +1196,24 @@ async fn refusals_explain_themselves_and_name_a_connected_upstream() {
             .contains(&format!("fork of {REPO}")),
         "{refused}"
     );
+    // The hint is asked only for owner/name and only of a connected repository with the same
+    // name, through that repository's own connection.
+    env.fake
+        .lock()
+        .unwrap()
+        .forks
+        .insert("carol_acme/renamed".into(), REPO.into());
+    for unasked in ["carol_acme/renamed", "group/sub/widgets"] {
+        let (_, refused) = env
+            .mint_at(
+                &env.hub,
+                &device,
+                json!({"name": "client-laptop", "repository": unasked}),
+            )
+            .await;
+        assert_eq!(refused["error"], "not_connected", "{unasked}");
+        assert!(refused.get("fork_of").is_none(), "{unasked}: {refused}");
+    }
     // A plain unconnected repository says so, with its fix.
     let (_, refused) = env
         .mint_at(
@@ -1358,4 +1376,38 @@ async fn the_client_still_signs_in_to_an_older_hub() {
     assert!(ok, "{stderr}");
     let saved = machine.file("hub-sessions.json");
     assert!(saved["sessions"][0].get("device").is_none(), "{saved}");
+}
+
+#[tokio::test]
+async fn a_session_enrolls_one_computer_and_revoking_it_ends_the_session() {
+    let env = Env::start("github").await;
+    let (status, signed) = env.sign_in_at(&env.hub, ALICE, None).await;
+    assert_eq!(status, 200);
+    let session = signed["session"].as_str().unwrap().to_owned();
+    let enroll = || {
+        env.call(
+            &env.hub,
+            Method::POST,
+            "/v1/hub/devices",
+            Some(&session),
+            Some(json!({})),
+        )
+    };
+    let (status, enrolled) = enroll().await;
+    assert_eq!(status, 201, "{enrolled}");
+    let id = enrolled["device"]["id"].as_str().unwrap().to_owned();
+    // The same session cannot add a second computer.
+    let (status, refused) = enroll().await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("device_revoked"))
+    );
+    // Revoking the enrolled computer ends the session that enrolled it, so a copied session
+    // file cannot enroll a replacement.
+    assert_eq!(
+        env.delete(&format!("/v1/hub/devices/{id}"), &session).await,
+        204
+    );
+    assert_eq!(env.get("/v1/hub/session", &session).await.0, 401);
+    assert_eq!(enroll().await.0, 401);
 }

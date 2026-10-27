@@ -223,8 +223,9 @@ status shown; clients show `message` as is.
   no role. A connection whose
   credential cannot answer (`auth_failed`, or a 401 or 403 from the forge, or the repository gone
   from its view) is 403 `access_check_unavailable`; a forge 5xx or rate limit is 503
-  `permission_unavailable`. Nothing is minted on a refusal. For `not_connected`, when a
-  connection on the owner's host sees the requested repository as a fork of a connected one, the
+  `permission_unavailable`. Nothing is minted on a refusal. For `not_connected` on an
+  `owner/name`, the Hub asks each connected repository with the same name (at most five), through
+  that repository's own connection only, whether the requested one is its fork; when one is, the
   message names it and `fork_of` gives its name. `auto: true` (auto-connect) records
   `auto_connected`.
 - `GET /v1/hub/devices` (session or credential): the owner's computers, live ones first, then

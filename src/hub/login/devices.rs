@@ -275,6 +275,11 @@ async fn enroll(
         );
     }
     let device = issue(&state, &human.user, body).await?;
+    // The session now came with this computer: it cannot enroll another, and revoking this one
+    // ends it.
+    if let Some((_, session)) = state.login.pending().sessions.0.get_mut(&human.key) {
+        session.device = device["id"].as_str().map(str::to_owned);
+    }
     Ok((StatusCode::CREATED, Json(json!({"device": device}))).into_response())
 }
 
@@ -454,58 +459,55 @@ async fn revoke_token(
     }
 }
 
-/// The connection credential for reads on `host` by `provider`: the first enabled connection
-/// there, with one of its repositories for a GitHub App's installation.
-async fn host_credential(
-    state: &HubState,
-    provider: &str,
-    host: &str,
-) -> Option<(super::super::connection::Connection, String)> {
-    let (store, provider, host) = (state.store.clone(), provider.to_owned(), host.to_owned());
-    let (conn, installation) = blocking(state, move || {
-        for conn in store.connections()? {
-            if conn.provider == provider && conn.host == host && conn.status == "enabled" {
-                let installation = store
-                    .repositories(&conn.id)?
-                    .into_iter()
-                    .find_map(|repo| repo.installation_id);
-                return Ok(Some((conn, installation)));
-            }
-        }
-        Ok(None)
-    })
-    .await
-    .ok()??;
-    let token = state.sync.token(&conn, installation).await.ok()?;
-    Some((conn, token))
-}
+/// At most this many connected repositories are asked about one fork.
+const MAX_FORK_CANDIDATES: usize = 5;
 
 /// The connected repository `repository` was forked from, when the forge says so. Asked only
-/// for a repository this Hub does not have, so a contributor working in a fork is told which
-/// remote to use instead of only "not connected". Never guesses: no answer is no hint.
+/// for an `owner/name` this Hub does not have, so a contributor working in a fork is told which
+/// remote to use instead of only "not connected". A candidate parent is a connected repository
+/// with the same name, and the request goes only through that repository's own connection, so
+/// no other credential is used to look the name up. Never guesses: no answer is no hint.
 async fn fork_parent(state: &HubState, owner: &User, repository: &str) -> Option<String> {
-    let identity = &owner.identity;
-    let (conn, token) = host_credential(state, &identity.provider, &identity.host).await?;
-    let reply = match state.sync.forge(&conn).ok()? {
-        ForgeApi::Github(api) => api.repo_json(&token, repository).await,
-        ForgeApi::Gitlab(api) => api.project_json(&token, repository).await,
-    }
-    .ok()??;
-    let parents = [
-        &reply["parent"]["full_name"],
-        &reply["source"]["full_name"],
-        &reply["forked_from_project"]["path_with_namespace"],
-    ];
-    for parent in parents.into_iter().filter_map(Value::as_str) {
-        let (store, host, named) = (
-            state.store.clone(),
-            identity.host.clone(),
-            parent.to_owned(),
-        );
-        if let Ok(Some(connected)) =
-            blocking(state, move || store.repository_named(&host, &named)).await
-        {
-            return Some(connected.full_name);
+    let (_, name) = repository
+        .split_once('/')
+        .filter(|(owner, name)| !owner.is_empty() && !name.contains('/'))?;
+    let (store, host) = (state.store.clone(), owner.identity.host.clone());
+    let suffix = format!("/{}", name.to_ascii_lowercase());
+    let requested = repository.to_ascii_lowercase();
+    let candidates = blocking(state, move || {
+        let mut found = Vec::new();
+        for repo in store.repositories_on(&host, super::MAX_SIGN_IN_PROBES)? {
+            let full = repo.full_name.to_ascii_lowercase();
+            if full.ends_with(&suffix) && full != requested && found.len() < MAX_FORK_CANDIDATES {
+                let conn = store.connection(&repo.connection)?;
+                found.extend(conn.map(|conn| (conn, repo)));
+            }
+        }
+        Ok(found)
+    })
+    .await
+    .ok()?;
+    for (conn, candidate) in candidates {
+        let Ok(token) = state.sync.token(&conn, candidate.installation_id).await else {
+            continue;
+        };
+        let reply = match state.sync.forge(&conn).ok()? {
+            ForgeApi::Github(api) => api.repo_json(&token, repository).await,
+            ForgeApi::Gitlab(api) => api.project_json(&token, repository).await,
+        };
+        let Ok(Some(reply)) = reply else {
+            continue;
+        };
+        let parent = [
+            &reply["parent"]["full_name"],
+            &reply["source"]["full_name"],
+            &reply["forked_from_project"]["path_with_namespace"],
+        ]
+        .into_iter()
+        .filter_map(Value::as_str)
+        .any(|parent| parent.eq_ignore_ascii_case(&candidate.full_name));
+        if parent {
+            return Some(candidate.full_name);
         }
     }
     None
