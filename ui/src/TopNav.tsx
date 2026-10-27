@@ -315,6 +315,10 @@ function AccountMenu({ data, onForget }: { data: HubData; onForget: () => void }
             </div>
           )}
           <div className="pop-sep" />
+          <a role="menuitem" href="#computers" className="pop-item" onClick={() => setOpen(false)}>
+            <Icon name="laptop" />
+            <span className="pop-main">Your computers<span className="pop-sub">Where you’re signed in, with Revoke</span></span>
+          </a>
           <a role="menuitem" href="#settings" className="pop-item" onClick={() => setOpen(false)}>
             <Icon name="sliders" />
             <span className="pop-main">Preferences<span className="pop-sub">Theme, density, sidebar, token and shortcuts</span></span>

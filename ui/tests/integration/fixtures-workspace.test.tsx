@@ -526,8 +526,8 @@ describe('sign out', () => {
 
 describe('errors', () => {
   it.each([
-    [403, /membership does not allow this action/],
-    [503, /Workspace access is unavailable/],
+    [403, /role in this workspace doesn’t allow this action/],
+    [503, /doesn’t have workspace sign-in turned on/],
     [429, /hub is busy/],
   ])('session %i → a readable notice with retry, no data', async (status, text) => {
     stubHub((url) => (path(url) === '/session' ? json(status, { error: 'x' }) : undefined))
@@ -550,9 +550,9 @@ describe('errors', () => {
       if (path(url).startsWith('/members')) return json(503, { error: 'unavailable' })
     })
     render(<WorkspacePage />)
-    expect(await screen.findByText(/membership does not allow this action/, {}, LOAD)).toBeTruthy()
+    expect(await screen.findByText(/role in this workspace doesn’t allow this action/, {}, LOAD)).toBeTruthy()
     at('#workspace/members')
-    expect(await screen.findByText(/Workspace access is unavailable/, {}, LOAD)).toBeTruthy()
+    expect(await screen.findByText(/doesn’t have workspace sign-in turned on/, {}, LOAD)).toBeTruthy()
     expect(within(screen.getByRole('heading', { name: 'You' }).closest('section')!).getByText('administrator')).toBeTruthy()
   })
 
@@ -560,6 +560,6 @@ describe('errors', () => {
     stubHub((url, init) => (path(url) === `/repositories/${REPO}/runs` && !isWrite(init) ? json(503, { error: 'unavailable' }) : undefined))
     render(<WorkspacePage />)
     const runs = (await screen.findByRole('heading', { name: 'Recent runs' }, LOAD)).closest('section')!
-    expect(await within(runs).findByText(/Workspace access is unavailable/, {}, LOAD)).toBeTruthy()
+    expect(await within(runs).findByText(/doesn’t have workspace sign-in turned on/, {}, LOAD)).toBeTruthy()
   })
 })

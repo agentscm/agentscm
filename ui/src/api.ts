@@ -4,14 +4,18 @@ import { decodeSkillWorkflowEnvelope, decodeSkillWorkflowListEnvelope } from './
 import { decodeSetup } from './onboarding.ts'
 import type { ViewOverride, ViewSettings, ViewSettingsReport, Activity, Health, HubEvent, Intent, Session, SkillWorkflowEnvelope, SkillWorkflowListEnvelope, Whoami, Work } from './types.ts'
 import { withTimeout } from './timeout.ts'
+import { refusalFrom, type Refusal } from './refusal.ts'
 
 export const AGENT_TOKEN_MESSAGE = 'This is an agent token, which can change coordination. The status page needs a read-only token.'
 
 export class ApiError extends Error {
   status: number
-  constructor(status: number, message: string) {
+  /** Why the Hub refused, when its response says so in words a person can act on. */
+  refusal: Refusal | null
+  constructor(status: number, message: string, refusal: Refusal | null = null) {
     super(message)
     this.status = status
+    this.refusal = refusal
   }
 }
 
@@ -22,8 +26,16 @@ async function getJson(path: string, signal: AbortSignal, token?: string): Promi
     credentials: 'omit',
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   })
-  if (!res.ok) throw new ApiError(res.status, `HTTP ${res.status}`)
+  if (!res.ok) throw new ApiError(res.status, `HTTP ${res.status}`, refusalFrom(await errorBody(res)))
   return res.json()
+}
+
+async function errorBody(res: Response): Promise<unknown> {
+  try {
+    return await res.json()
+  } catch {
+    return null
+  }
 }
 
 const MAX_SKILL_WORKFLOW_RESPONSE_BYTES = 4 * 1024 * 1024

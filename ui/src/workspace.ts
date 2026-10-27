@@ -1,5 +1,6 @@
 /** Browser workspace requests use the HttpOnly session and CSRF, never agent tokens. */
 import { withTimeout } from './timeout.ts'
+import { refusalFrom, type Refusal } from './refusal.ts'
 
 export interface WorkspaceIdentity { provider: string; host: string; user_id: number }
 export interface WorkspaceMember { identity: WorkspaceIdentity; roles: string[]; repository_ids: string[]; enabled: boolean; generation: number }
@@ -35,23 +36,25 @@ export interface PendingWorkspaceMutation {
 export class WorkspaceError extends Error {
   status: number
   code?: string
-  constructor(status: number, message: string, code?: string) { super(message); this.status = status; this.code = code }
+  refusal: Refusal | null
+  constructor(status: number, message: string, code?: string, refusal: Refusal | null = null) { super(message); this.status = status; this.code = code; this.refusal = refusal }
 }
 
 export const workspaceError = (error: unknown): string => {
   if (error instanceof WorkspaceError) {
+    if (error.refusal) return error.refusal.fix ? `${error.refusal.message.replace(/[.!]$/, '')}. ${error.refusal.fix}` : error.refusal.message
     if (error.code === 'pending_mutation') return error.message
     if (error.code === 'busy') return 'The workflow queue is full. Wait for active work to finish or cancel old work, then retry.'
     if (error.code === 'mutation_journal_unavailable') return error.message
     if (error.code === 'response_mismatch') return error.message
-    if (error.code === 'last_administrator') return 'Keep at least one enabled administrator. Add another administrator before disabling this membership or removing its role.'
+    if (error.code === 'last_administrator') return 'Keep at least one enabled administrator. Add another administrator before disabling this member or removing their role.'
     if (error.code === 'idempotency_conflict') return 'This request ID was already used for different fields. Refresh and review the current state before making a new change.'
-    if (error.code === 'member_limit') return 'The workspace member limit has been reached. Ask the operator to review its membership configuration.'
+    if (error.code === 'member_limit') return 'The workspace member limit has been reached. Ask the Hub operator to raise it.'
     if (error.code === 'csrf_required') return 'Your workspace security token is no longer accepted. Refresh the workspace before retrying.'
     if (error.status === 401) return 'Your workspace session has ended. Sign in again to continue.'
-    if (error.status === 403) return 'Your current membership does not allow this action. Refresh to load your permissions.'
+    if (error.status === 403) return 'Your role in this workspace doesn’t allow this action. Refresh to load your current permissions.'
     if (error.status === 409) return 'The workspace changed while you were editing. Reload the latest data, then review your changes before saving again.'
-    if (error.status === 404 || error.status === 503) return 'Workspace access is unavailable. Ask the operator to check the workspace configuration.'
+    if (error.status === 404 || error.status === 503) return 'This Hub doesn’t have workspace sign-in turned on. A Hub admin can turn it on in the Hub’s configuration.'
     if (error.status === 429) return 'The hub is busy. Wait a moment, then try again.'
     return error.message
   }
@@ -68,8 +71,14 @@ export async function workspaceRequest<T>(path: string, options: { signal?: Abor
   if (!response.ok) {
     const message = `The hub rejected the request (HTTP ${response.status}). Refresh and check your inputs before retrying.`
     let code: string | undefined
-    try { const detail: unknown = await response.json(); if (detail && typeof detail === 'object' && 'error' in detail && typeof detail.error === 'string') code = detail.error.slice(0, 100) } catch { /* A non-JSON error still has a useful HTTP status. */ }
-    throw new WorkspaceError(response.status, message, code)
+    let refusal: Refusal | null = null
+    try {
+      const detail: unknown = await response.json()
+      if (detail && typeof detail === 'object' && 'error' in detail && typeof detail.error === 'string') code = detail.error.slice(0, 100)
+      // Only a sentence the Hub wrote: bare codes keep this page's workspace wording below.
+      if (detail && typeof detail === 'object' && 'message' in detail) refusal = refusalFrom(detail)
+    } catch { /* A non-JSON error still has a useful HTTP status. */ }
+    throw new WorkspaceError(response.status, message, code, refusal)
   }
   if (response.status === 204) return undefined as T
   return response.json() as Promise<T>

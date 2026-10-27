@@ -10,8 +10,10 @@ import logoDark from './logo-dark.png'
 import logoLight from './logo-light.png'
 import { DashboardPage, dashboardStatus } from './pages/Dashboard.tsx'
 import { HealthPage } from './pages/Health.tsx'
+import { AdminPage, ComputersPage, useDeviceAuth } from './pages/Computers.tsx'
 import { SetupPage } from './pages/Setup.tsx'
 import { SignIn } from './pages/SignIn.tsx'
+import { isSignedInHash, SignedInPage } from './pages/SignedIn.tsx'
 import { InboxPage, WorkPage } from './pages/Work.tsx'
 import { WorkflowsPage } from './pages/Workflows.tsx'
 import { ChangeRecordPage } from './pages/ChangeRecord.tsx'
@@ -36,7 +38,7 @@ const subscribeDark = (cb: () => void) => {
 }
 const systemDark = () => window.matchMedia(darkQuery).matches
 
-export type Section = 'home' | 'now' | 'activity' | 'team' | 'inbox' | 'work' | 'workflows' | 'change-record' | 'landed' | 'skills' | 'templates' | 'timeline' | 'explorer' | 'setup' | 'workspace' | 'health' | 'settings'
+export type Section = 'home' | 'now' | 'activity' | 'team' | 'inbox' | 'work' | 'workflows' | 'change-record' | 'landed' | 'skills' | 'templates' | 'timeline' | 'explorer' | 'setup' | 'workspace' | 'computers' | 'admin' | 'health' | 'settings'
 
 /** Every routed page. `label` names its tab inside its nav item; `question` is the page's hidden h1. */
 export const SECTIONS: SectionDef[] = [
@@ -56,6 +58,8 @@ export const SECTIONS: SectionDef[] = [
   { key: 'setup', nav: 'setup', icon: 'plug', label: 'Agents', question: 'Is my agent set up?' },
   { key: 'health', nav: 'setup', icon: 'heart-pulse', label: 'Hub', question: 'Is the hub OK?' },
   { key: 'workspace', nav: 'setup', icon: 'people', label: 'Access', question: 'Who can run what?' },
+  { key: 'computers', nav: 'setup', icon: 'laptop', label: 'Computers', question: 'Which computers can act for me?' },
+  { key: 'admin', nav: 'setup', icon: 'shield-lock', label: 'Admin', question: 'Which repositories are connected, and who was turned away?' },
   { key: 'settings', nav: 'setup', icon: 'sliders', label: 'Preferences', question: 'How is this page set up?' },
 ]
 
@@ -134,6 +138,11 @@ function Shell({ token, pref, onPref, density, onDensity, onUnauthorized, onForg
   const d = useMemo(() => (data.work && data.activity ? derive(data.work, data.activity) : null), [data.work, data.activity])
   const overview = usePoll((signal) => fetchOverview(token, signal), 15_000, token)
   const repo = data.whoami?.token.repository ?? 'this repository'
+  const device = useDeviceAuth(token)
+  const provider = data.whoami?.owner.provider === 'gitlab' ? 'gitlab' : 'github'
+  // The Admin tab is only for a browser signed in as a Hub admin; someone who opens #admin anyway keeps the tabs and is told why.
+  const showAdmin = section === 'admin' || (device.auth.kind === 'ready' && device.auth.value?.kind === 'browser' && device.auth.value.session.admin)
+  const sections = useMemo(() => (showAdmin ? SECTIONS : SECTIONS.filter((s) => s.key !== 'admin')), [showAdmin])
   const ov = overview.kind === 'ready' ? overview.value : null
   // Measured against the last successful poll, not the 1-second clock, so the whole shell re-renders only when data arrives.
   const dash = dashboardStatus(ov, d, data.activity?.events ?? null, data.lastOk, useHidden())
@@ -174,7 +183,7 @@ function Shell({ token, pref, onPref, density, onDensity, onUnauthorized, onForg
         token={token}
         repo={repo}
         nav={NAV}
-        sections={SECTIONS}
+        sections={sections}
         section={section}
         badges={badges}
         statuses={statuses}
@@ -209,6 +218,8 @@ function Shell({ token, pref, onPref, density, onDensity, onUnauthorized, onForg
         {section === 'setup' && <SetupPage token={token} />}
         {section === 'workspace' && <WorkspacePage />}
         {section === 'health' && <HealthPage health={data.health} />}
+        {section === 'computers' && <ComputersPage auth={device.auth} provider={provider} onSignedOut={device.reload} />}
+        {section === 'admin' && <AdminPage auth={device.auth} provider={provider} />}
         {section === 'settings' && <SettingsPage token={token} whoami={data.whoami} pref={pref} onPref={onPref} density={density} onDensity={onDensity} railCollapsed={rail} onRail={changeRail} onForget={onForget} />}
       </AppChrome>
     </TourProvider>
@@ -222,6 +233,8 @@ export default function App() {
   const [notice, setNotice] = useState<string | null>(null)
   const [pref, setPref] = useState<ThemePref>(loadTheme)
   const [density, setDensity] = useState<Density>(loadDensity)
+  // The browser's landing page after signing this computer in; shown with or without a token.
+  const [signedInLanding] = useState(isSignedInHash)
   const prefersDark = useSyncExternalStore(subscribeDark, systemDark)
   const dark = pref === 'dark' || (pref === 'system' && prefersDark)
   const section = useSection()
@@ -258,6 +271,7 @@ export default function App() {
   )
   const onForget = useCallback(() => signedOut('Token forgotten on this browser. The hub still accepts it until it expires or is revoked.'), [signedOut])
 
+  if (signedInLanding) return <SignedInPage />
   if (token) return <Shell key={token} token={token} pref={pref} onPref={changePref} density={density} onDensity={changeDensity} onUnauthorized={onUnauthorized} onForget={onForget} />
   if (section === 'workspace')
     return (
