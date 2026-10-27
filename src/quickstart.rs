@@ -737,12 +737,8 @@ fn collisions_step(cx: &Cx<'_>) {
         println!("Skipping the collision check: this isn't inside a Git repository.\n");
         return;
     };
-    if !cx.ui.confirm(
-        "Check this repository for branches and worktrees that would collide right now?",
-        true,
-    ) {
-        return;
-    }
+    // Read-only and the reason AgentSCM was installed, so it runs without asking; --no-collisions skips it.
+    println!("Checking for branches and worktrees that change the same files…");
     let request = Request {
         git: git.canonicalize().unwrap_or_else(|_| git.clone()),
         repository: root.clone(),
