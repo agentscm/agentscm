@@ -117,6 +117,8 @@ pub struct LiveGroup {
     pub base_ref: String,
     pub base_sha: String,
     pub head_tree: String,
+    /// The group commit's parents: GitHub builds it on the base, then the queued head.
+    pub head_parents: Vec<String>,
     /// The queued pull request: its live state, as for a pull request check.
     pub pr_open: bool,
     /// The head the queue branch names, which GitHub combined into the group.
@@ -168,7 +170,7 @@ pub fn evaluate_group(
         &live.pr_head_sha,
         manifest_commit,
     ];
-    if !ids.into_iter().all(is_oid) {
+    if !ids.into_iter().all(is_oid) || !live.head_parents.iter().all(|p| is_oid(p)) {
         return Verdict::Failure("malformed commit identity");
     }
     if live.queued_head_sha != live.pr_head_sha {
@@ -183,6 +185,14 @@ pub fn evaluate_group(
         } else {
             Verdict::Failure("target advanced since the candidate baseline")
         };
+    }
+    let built_on_baseline = match live.head_parents.as_slice() {
+        [base] => *base == live.base_sha,
+        [base, queued] => *base == live.base_sha && *queued == live.queued_head_sha,
+        _ => false,
+    };
+    if !built_on_baseline {
+        return Verdict::Failure("merge group commit is not built on the candidate baseline");
     }
     match native {
         NativeState::Qualified { tree_oid, .. } if *tree_oid == live.head_tree => Verdict::Success,
@@ -561,7 +571,7 @@ async fn judge<'a>(
     if pull.merged {
         return Ok(None);
     }
-    let (head_tree, _) = api
+    let (head_tree, head_parents) = api
         .commit_parts(token, &repo.full_name, &row.head_sha)
         .await?
         .ok_or_else(|| GhError::Failed("merge group commit not found".into()))?;
@@ -575,6 +585,7 @@ async fn judge<'a>(
         base_ref: row.base_ref.clone(),
         base_sha: row.base_sha.clone(),
         head_tree,
+        head_parents,
         pr_open: pull.open,
         queued_head_sha: row.pr_head_sha.clone(),
         pr_head_sha: pull.head_sha,
