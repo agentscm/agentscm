@@ -1365,6 +1365,280 @@ async fn catchup_does_not_reread_known_merges() {
     );
 }
 
+/// Queue one failure for the closed listing at `page` (32 items per page).
+fn fail_closed_page(env: &Env, page: u32, status: u16, headers: Vec<(String, String)>) {
+    env.fake.with(|s| {
+        s.fail.push_back(Failure {
+            path_contains: format!(
+                "state=closed&sort=updated&direction=desc&per_page=32&page={page}"
+            ),
+            status,
+            headers,
+        })
+    });
+}
+
+fn closed_listing_pages(env: &Env) -> Vec<u32> {
+    env.fake.with(|s| {
+        s.requests
+            .iter()
+            .filter(|r| r.path_and_query.contains("state=closed"))
+            .filter_map(|r| r.path_and_query.rsplit_once("page="))
+            .map(|(_, page)| page.parse().unwrap())
+            .collect()
+    })
+}
+
+/// Twenty known merges (`1..=20`), then fifteen new ones: the next pass lists 35 closed
+/// proposals as two 32-item pages, with every new merge on the first.
+async fn two_page_fixture() -> (Env, String, String) {
+    let env = Env::start().await;
+    let connection = env.connect_app().await;
+    env.install_widgets();
+    add_merged(&env, 1..=20, 10, 0);
+    let token = catchup_agent(&env);
+    env.poll().await;
+    assert_eq!(
+        forge_coverage(&env, &token),
+        (CatchupCoverageState::ObservedOnly, 0, 0)
+    );
+    add_merged(&env, 21..=35, 10, 0);
+    (env, token, connection)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_oversized_record_leaves_the_pass_incomplete_until_it_leaves_the_window() {
+    let env = Env::start().await;
+    env.connect_app().await;
+    env.install_widgets();
+    add_merged(&env, 1..=3, 10, 0);
+    add_merged(&env, 4..=4, ONE_MIB + 1024, 0);
+    let token = catchup_agent(&env);
+    env.poll().await;
+    for n in 1..=3 {
+        assert_eq!(detail_reads(&env, n), 1, "pull {n}");
+    }
+    let (state, unread, deferred) = forge_coverage(&env, &token);
+    assert_eq!(state, CatchupCoverageState::Incomplete);
+    assert!(unread >= 1 && deferred == 0, "{unread} {deferred}");
+    assert_eq!(*closed_page_sizes(&env).last().unwrap(), 1);
+    assert_eq!(detail_reads(&env, 4), 0);
+    // Still in the window: still not complete, and nothing is read twice.
+    env.poll().await;
+    assert_eq!(
+        forge_coverage(&env, &token).0,
+        CatchupCoverageState::Incomplete
+    );
+    // Updated before the window, behind a small proposal that shows the walk the boundary:
+    // the next pass no longer needs it. (An oversized record that is itself the first one
+    // past the window stays unread, because only reading it can show that.)
+    add_merged(&env, 5..=5, 10, 59);
+    env.pull(4, |pull| pull.updated_at = days_ago(60));
+    env.poll().await;
+    assert_eq!(
+        forge_coverage(&env, &token),
+        (CatchupCoverageState::ObservedOnly, 0, 0)
+    );
+    for n in 1..=3 {
+        assert_eq!(detail_reads(&env, n), 1, "pull {n}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_second_page_is_unavailable_keeps_page_one_and_recovers() {
+    use agentscm::hub::catchup::CatchupCoverageState::{ObservedOnly, Unavailable};
+    let rate_limit = |status: u16| {
+        let reset = (unix_now() + 4000).to_string();
+        (
+            status,
+            vec![
+                ("retry-after".to_owned(), "600".to_owned()),
+                ("x-ratelimit-remaining".to_owned(), "0".to_owned()),
+                ("x-ratelimit-reset".to_owned(), reset),
+            ],
+        )
+    };
+    // 200 with no JSON stands for a malformed reply; 502 for a failing gateway or network.
+    let cases = [
+        (401, vec![]),
+        rate_limit(403),
+        rate_limit(429),
+        (502, vec![]),
+        (200, vec![]),
+    ];
+    for (status, headers) in cases {
+        let (env, token, connection) = two_page_fixture().await;
+        fail_closed_page(&env, 2, status, headers);
+        env.refresh(&connection).await;
+        assert_eq!(
+            forge_coverage(&env, &token),
+            (Unavailable, 0, 0),
+            "status {status}"
+        );
+        // Page one was read and recorded before the failure.
+        for n in 21..=35 {
+            assert_eq!(detail_reads(&env, n), 1, "status {status} pull {n}");
+        }
+        let failed_at = closed_listing_pages(&env).len();
+        // The next pass starts over from page one, finds everything known, and completes.
+        env.refresh(&connection).await;
+        assert_eq!(
+            forge_coverage(&env, &token),
+            (ObservedOnly, 0, 0),
+            "status {status}"
+        );
+        assert_eq!(closed_listing_pages(&env)[failed_at..][..2], [1, 2]);
+        for n in 1..=35 {
+            assert_eq!(detail_reads(&env, n), 1, "status {status} pull {n}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_during_pagination_is_caught_by_the_head_recheck() {
+    let (env, token, _) = two_page_fixture().await;
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    // The pass has its first page; hold it at the read of one of that page's merges.
+    env.fake
+        .with(|s| s.stall_next = Some(("/pulls/25".into(), gate.clone())));
+    let state = env.state.clone();
+    let pass = tokio::spawn(async move { sync::poll_once(&state).await.unwrap() });
+    eventually("the pass reaches the stalled read", || {
+        env.fake.with(|s| s.stall_next.is_none())
+    })
+    .await;
+    add_merged(&env, 99..=99, 10, 0);
+    gate.add_permits(1);
+    pass.await.unwrap();
+    assert_eq!(detail_reads(&env, 99), 1);
+    assert_eq!(
+        forge_coverage(&env, &token),
+        (CatchupCoverageState::ObservedOnly, 0, 0)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_request_cap_leaves_a_deep_window_incomplete() {
+    let env = Env::start().await;
+    env.connect_app().await;
+    env.install_widgets();
+    add_merged(&env, 1..=45, 10, 0);
+    // Newest of all, and too large for any page: the pass reads one proposal per request.
+    add_merged(&env, 1000..=1000, ONE_MIB + 1024, 0);
+    let token = catchup_agent(&env);
+    env.poll().await;
+    let (state, unread, _) = forge_coverage(&env, &token);
+    assert_eq!(state, CatchupCoverageState::Incomplete);
+    assert!(unread >= 1);
+    assert_eq!(closed_page_sizes(&env).len(), 40);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_work_is_admitted_only_after_a_complete_deep_history_pass() {
+    use agentscm::hub::work::WorkStart;
+    use agentscm::hub::work_preflight::{WorkPreflightReason, WorkPreflightStatus};
+
+    let env = Env::start().await;
+    env.connect_app().await;
+    env.install_widgets();
+    // More than one page of closed history beyond the window, and 25 recent merges (more
+    // than one poll reads).
+    add_merged(&env, 1..=110, 10, 60);
+    add_merged(&env, 111..=135, 10, 0);
+    let token = catchup_agent(&env);
+    let start = |key: &str, through: i64| -> WorkStart {
+        serde_json::from_value(json!({
+            "request_key": key, "title": "Inspect the source", "session": key,
+            "scope":["src/check.rs"],
+            "preflight":{
+                "source_revision":"ffffffffffffffffffffffffffffffffffffffff",
+                "merge_after":0,"merge_through":through,
+                "source_relation_checked":true,"checked_merges":[]
+            }
+        }))
+        .unwrap()
+    };
+    let preflight = |key: &str| {
+        let through = env
+            .store
+            .work_preflight(&token, &start(key, 0), unix_now())
+            .unwrap()
+            .current_merge_through;
+        env.store
+            .work_preflight(&token, &start(key, through), unix_now())
+            .unwrap()
+    };
+    let refused = |key: &str| {
+        let result = preflight(key);
+        assert_eq!(result.status, WorkPreflightStatus::Unknown, "{key}");
+        assert!(
+            result
+                .reasons
+                .contains(&WorkPreflightReason::MergeCoverageUnknown),
+            "{key}"
+        );
+        assert!(!result.complete, "{key}");
+    };
+
+    // Deferred merges: incomplete, so refused.
+    env.poll().await;
+    assert_eq!(
+        forge_coverage(&env, &token),
+        (CatchupCoverageState::Incomplete, 0, 5)
+    );
+    refused("deferred");
+    // A failed read: unavailable, so refused.
+    fail_closed_page(&env, 1, 502, vec![]);
+    env.poll().await;
+    assert_eq!(
+        forge_coverage(&env, &token).0,
+        CatchupCoverageState::Unavailable
+    );
+    refused("unavailable");
+    // A completed pass: admitted, and the explicit start creates the Work.
+    env.poll().await;
+    assert_eq!(
+        forge_coverage(&env, &token),
+        (CatchupCoverageState::ObservedOnly, 0, 0)
+    );
+    assert_eq!(
+        preflight("complete").status,
+        WorkPreflightStatus::ClearWithinCheckedWindow
+    );
+    let through = preflight("admitted").current_merge_through;
+    let owner = env
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: env.host(),
+                user_id: 78,
+            },
+            "writer",
+        )
+        .unwrap();
+    let (writer, _, _) =
+        mint_bound_agent_token(&*env.store, &owner.id, "writer", REPO, REPO_ID, 3600, false)
+            .unwrap();
+    let started = env
+        .store
+        .work_start(&writer, &start("admitted", through), unix_now())
+        .unwrap();
+    assert!(started.created, "{started:?}");
+    assert_eq!(
+        started.preflight.unwrap().status,
+        WorkPreflightStatus::ClearWithinCheckedWindow
+    );
+    // An oversized record inside the window makes the next pass incomplete again.
+    add_merged(&env, 200..=200, ONE_MIB + 1024, 0);
+    env.poll().await;
+    assert_eq!(
+        forge_coverage(&env, &token).0,
+        CatchupCoverageState::Incomplete
+    );
+    refused("oversized");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_discovery_invalidates_previously_observed_catchup_coverage() {
     use agentscm::hub::work::WorkStart;
