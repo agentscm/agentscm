@@ -10,7 +10,7 @@
 //! drivers (`merge-tree`) still run as they would in the user's shell, so only
 //! point this at repositories you trust. The only repository write is `merge-tree`
 //! adding unreferenced objects.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -127,13 +127,65 @@ enum Scanned {
     Item(Item),
 }
 
-/// The patch IDs `git patch-id` finds in a diff or in `git log -p` output.
-fn patch_ids(git: &Git, diff: Vec<u8>) -> Vec<String> {
+/// The (patch ID, commit) pairs `git patch-id` finds in a diff or in `git log -p` output; the
+/// commit is all zeros for a plain diff.
+fn patch_ids(git: &Git, diff: Vec<u8>) -> Vec<(String, String)> {
     let out = git.run(&["patch-id", "--stable"], Some(diff), OUTPUT);
     let text = String::from_utf8_lossy(&out.unwrap_or_default()).into_owned();
     text.lines()
-        .filter_map(|line| line.split_whitespace().next().map(str::to_owned))
+        .filter_map(|line| {
+            let (id, commit) = line.split_once(' ')?;
+            Some((id.to_owned(), commit.to_owned()))
+        })
         .collect()
+}
+
+/// Base commits read per `git log -p`, so one call's output stays well under `OUTPUT`.
+const PATCH_ID_BATCH: usize = 100;
+
+/// The patch ID of each base commit (`None`: no diff), computed once per scan. Every branch's
+/// squash check searches the base commits since its fork, and those ranges overlap, so hashing
+/// them per branch made the check quadratic: minutes on a repository with dozens of branches.
+#[derive(Default)]
+struct BasePatchIds(HashMap<String, Option<String>>);
+
+impl BasePatchIds {
+    /// Whether a non-merge commit in `fork..base` has patch ID `id`; `None` when Git fails.
+    fn contains(&mut self, git: &Git, fork: &str, base: &str, id: &str) -> Option<bool> {
+        let range = format!("{fork}..{base}");
+        let commits = git.text(&["rev-list", "--no-merges", &range, "--"]).ok()?;
+        let commits: Vec<&str> = commits.lines().collect();
+        let missing: Vec<&str> = commits
+            .iter()
+            .copied()
+            .filter(|commit| !self.0.contains_key(*commit))
+            .collect();
+        for batch in missing.chunks(PATCH_ID_BATCH) {
+            let input = batch.join("\n") + "\n";
+            let args = [
+                "log",
+                "--no-walk=unsorted",
+                "-p",
+                "--no-renames",
+                "--no-color",
+                "--stdin",
+            ];
+            let log = git.run(&args, Some(input.into_bytes()), OUTPUT).ok()?;
+            let found: HashMap<String, String> = patch_ids(git, log)
+                .into_iter()
+                .map(|(id, commit)| (commit, id))
+                .collect();
+            for commit in batch {
+                self.0
+                    .insert((*commit).to_owned(), found.get(*commit).cloned());
+            }
+        }
+        Some(commits.iter().any(|commit| {
+            self.0
+                .get(*commit)
+                .is_some_and(|got| got.as_deref() == Some(id))
+        }))
+    }
 }
 
 /// Whether `base` and `commit` hold every one of `paths` with the same content (or both lack
@@ -170,7 +222,13 @@ fn same_files(git: &Git, base: &str, commit: &str, paths: &BTreeSet<String>) -> 
 ///   touched the same files.
 ///
 /// A failed check says no, which only costs a possible extra warning.
-fn already_in_base(git: &Git, base: &str, commit: &str, paths: &BTreeSet<String>) -> bool {
+fn already_in_base(
+    git: &Git,
+    base: &str,
+    commit: &str,
+    paths: &BTreeSet<String>,
+    base_ids: &mut BasePatchIds,
+) -> bool {
     let cherry = git.text(&["cherry", base, commit]).unwrap_or_default();
     if cherry.lines().next().is_some() && cherry.lines().all(|line| line.starts_with('-')) {
         return true;
@@ -184,33 +242,16 @@ fn already_in_base(git: &Git, base: &str, commit: &str, paths: &BTreeSet<String>
     let Ok(fork) = git.text(&["merge-base", base, commit]) else {
         return false;
     };
-    let range = format!("{fork}..{base}");
-    let (Ok(mine), Ok(theirs)) = (
-        git.run(
-            &["diff", "--no-renames", "--no-color", &fork, commit, "--"],
-            None,
-            OUTPUT,
-        ),
-        git.run(
-            &[
-                "log",
-                "--no-merges",
-                "-p",
-                "--no-renames",
-                "--no-color",
-                &range,
-                "--",
-            ],
-            None,
-            OUTPUT,
-        ),
+    let Ok(mine) = git.run(
+        &["diff", "--no-renames", "--no-color", &fork, commit, "--"],
+        None,
+        OUTPUT,
     ) else {
         return false;
     };
-    let theirs = patch_ids(git, theirs);
     patch_ids(git, mine)
         .first()
-        .is_some_and(|id| theirs.contains(id))
+        .is_some_and(|(id, _)| base_ids.contains(git, &fork, base, id).unwrap_or(false))
 }
 
 fn ref_item(
@@ -219,6 +260,7 @@ fn ref_item(
     commit: &str,
     refs: Vec<String>,
     skip_merged: bool,
+    base_ids: &mut BasePatchIds,
 ) -> Result<Scanned> {
     let range = format!("{base}..{commit}");
     if git.text(&["rev-list", "--count", &range, "--"])? == "0" {
@@ -227,7 +269,7 @@ fn ref_item(
     let range = format!("{base}...{commit}");
     let args = ["diff", "--name-only", "-z", "--no-renames", &range, "--"];
     let paths: BTreeSet<String> = nul_fields(&git.run(&args, None, OUTPUT)?).collect();
-    if skip_merged && already_in_base(git, base, commit, &paths) {
+    if skip_merged && already_in_base(git, base, commit, &paths, base_ids) {
         return Ok(Scanned::Merged);
     }
     Ok(Scanned::Item(Item {
@@ -473,10 +515,11 @@ pub fn collisions(request: &Request) -> Result<Value> {
     } else {
         0
     };
+    let mut base_ids = BasePatchIds::default();
     for (commit, refs) in by_commit {
         let name = refs[0].clone();
         let count = refs.len();
-        match ref_item(&git, &base, &commit, refs, skip_merged) {
+        match ref_item(&git, &base, &commit, refs, skip_merged, &mut base_ids) {
             Ok(Scanned::Item(item)) => items.push(item),
             Ok(Scanned::Merged) => merged += count,
             Ok(Scanned::NothingNew) => {}
