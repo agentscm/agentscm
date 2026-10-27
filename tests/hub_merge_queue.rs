@@ -815,6 +815,24 @@ async fn a_group_with_the_right_tree_but_not_built_on_the_baseline_gets_a_failur
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_group_whose_single_parent_is_not_the_baseline_stays_pending_as_unsupported() {
+    let env = Env::start(true).await;
+    env.qualify();
+    env.enqueue(1, COMMIT, GROUP, BASELINE, &env.tree);
+    env.fake.with(|s| {
+        let repo = s.repos.get_mut(&REPO_ID).unwrap();
+        repo.commits.get_mut(GROUP).unwrap().1 = vec![sha('9')];
+    });
+    env.accept("d-1", &requested(1, COMMIT, GROUP, BASELINE))
+        .await;
+    let shown = env.posted(GROUP).await;
+    assert_eq!(shown.state.as_deref(), Some("pending"));
+    assert!(shown.description.unwrap().contains("unsupported"));
+    env.poll().await;
+    assert!(env.on(GROUP).iter().all(|s| s.0 == "pending"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_group_stacked_on_another_queued_group_is_pending_as_unsupported() {
     let env = Env::start(true).await;
     env.qualify();

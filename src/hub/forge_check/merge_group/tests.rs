@@ -148,6 +148,10 @@ fn a_group_commit_must_be_built_on_the_candidate_baseline_and_the_queued_head() 
     };
     let not_built = Verdict::Failure("merge group commit is not built on the candidate baseline");
     assert_eq!(judge(vec![BASE.into()]), Verdict::Success);
+    assert_eq!(
+        judge(vec![OTHER.into()]),
+        Verdict::Pending("unsupported: no evidence covers this group's rebased commits")
+    );
     assert_eq!(judge(vec![OTHER.into(), HEAD.into()]), not_built);
     assert_eq!(judge(vec![BASE.into(), OTHER.into()]), not_built);
     assert_eq!(judge(vec![]), not_built);
@@ -159,7 +163,7 @@ fn a_group_commit_must_be_built_on_the_candidate_baseline_and_the_queued_head() 
         judge(vec![BASE.into(), "nope".into()]),
         Verdict::Failure("malformed commit identity")
     );
-    // A stacked group keeps its pending verdict whatever its parents are.
+    // A stacked group stays pending whatever its (well-formed) parents are.
     let mut stacked = live();
     stacked.base_sha = OTHER.into();
     stacked.stacked = true;

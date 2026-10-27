@@ -186,13 +186,16 @@ pub fn evaluate_group(
             Verdict::Failure("target advanced since the candidate baseline")
         };
     }
-    let built_on_baseline = match live.head_parents.as_slice() {
-        [base] => *base == live.base_sha,
-        [base, queued] => *base == live.base_sha && *queued == live.queued_head_sha,
-        _ => false,
-    };
-    if !built_on_baseline {
-        return Verdict::Failure("merge group commit is not built on the candidate baseline");
+    match live.head_parents.as_slice() {
+        [base] if *base == live.base_sha => {}
+        // A rebase-method merge of a multi-commit pull request ends on the last rebased commit.
+        [_] => {
+            return Verdict::Pending(
+                "unsupported: no evidence covers this group's rebased commits",
+            );
+        }
+        [base, queued] if *base == live.base_sha && *queued == live.queued_head_sha => {}
+        _ => return Verdict::Failure("merge group commit is not built on the candidate baseline"),
     }
     match native {
         NativeState::Qualified { tree_oid, .. } if *tree_oid == live.head_tree => Verdict::Success,
