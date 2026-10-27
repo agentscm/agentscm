@@ -136,6 +136,7 @@ fn routes() -> Vec<(Method, String, String, Want)> {
     row(&delete, "/v1/hub/tokens/tok_x".into(), "".into(), HumanOnly);
     row(&get, "/v1/hub/session".into(), "".into(), HumanOnly);
     row(&delete, "/v1/hub/session".into(), "".into(), HumanOnly);
+    row(&post, "/v1/hub/session/read-token".into(), r#"{"repository":"acme/widgets"}"#.into(), HumanOnly);
     row(&get, "/v1/hub/users".into(), "".into(), HumanOnly);
     row(&post, "/v1/hub/users/usr_x/disable".into(), "".into(), HumanOnly);
     row(&post, "/v1/hub/users/usr_x/enable".into(), "".into(), HumanOnly);

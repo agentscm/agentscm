@@ -19,8 +19,8 @@ use super::super::forge_api::ForgeApi;
 use super::super::github::GhError;
 use super::super::http::{ApiError, JsonBody, bearer, blocking};
 use super::super::store::{
-    NewAgentToken, User, agent_token_digest, device_digest, unix_now, validate_agent_name,
-    validate_repository,
+    NewAgentToken, User, agent_token_digest, device_digest, mint_bound_agent_token, unix_now,
+    validate_agent_name, validate_repository,
 };
 use super::super::{HubError, HubState};
 use super::{ApiResult, Human, random_hex, session_digest};
@@ -32,6 +32,7 @@ pub(super) fn routes() -> Router<HubState> {
         .route("/v1/hub/device/name", post(rename))
         .route("/v1/hub/device/tokens", post(mint))
         .route("/v1/hub/device/tokens/{id}", delete(revoke_token))
+        .route("/v1/hub/session/read-token", post(web_read_token))
         .route("/v1/hub/devices", get(list).post(enroll))
         .route("/v1/hub/devices/{id}", delete(revoke))
         .route("/v1/hub/admin/devices", get(admin_devices))
@@ -374,49 +375,7 @@ async fn mint(
     validate_agent_name(&body.name)?;
     validate_repository(&body.repository)?;
     let owner = device.owner.clone();
-    let identity = &owner.identity;
-    let login = &state.login;
-    if login.has_allow_list()
-        && !login.is_admin(&identity.provider, identity.user_id, &owner.login)
-        && !login.is_allowed(&identity.provider, identity.user_id, &owner.login)
-    {
-        record_refusal(&state, &owner, "not_allowed", "device_mint").await;
-        return Err(refused("not_allowed"));
-    }
-    let (store, host, named) = (
-        state.store.clone(),
-        identity.host.clone(),
-        body.repository.clone(),
-    );
-    let forge = super::forge_name(&identity.provider);
-    let Some(repo) = blocking(&state, move || store.repository_named(&host, &named)).await? else {
-        return Err(match fork_parent(&state, &owner, &body.repository).await {
-            Some(parent) => refused_about("not_connected", &body.repository, forge)
-                .with_message(format!(
-                    "{} isn't connected to this Hub, but it is a fork of {parent}, which is; make {parent} this checkout's origin remote to coordinate",
-                    body.repository
-                ))
-                .with_field("fork_of", json!(parent)),
-            None => refused_about("not_connected", &body.repository, forge),
-        });
-    };
-    match repository_role(&state, &owner, &repo).await {
-        Ok(()) => {}
-        Err(Denial::Role(role)) => {
-            record_refusal(&state, &owner, "insufficient_role", "device_mint").await;
-            return Err(super::insufficient_role(
-                &owner.login,
-                &repo.full_name,
-                role,
-            ));
-        }
-        Err(Denial::Kind(kind)) => {
-            if kind != "permission_unavailable" && kind != "not_connected" {
-                record_refusal(&state, &owner, kind, "device_mint").await;
-            }
-            return Err(refused_about(kind, &repo.full_name, forge));
-        }
-    }
+    let repo = mint_check(&state, &owner, &body.repository, "device_mint").await?;
     let secret = generate_secret().map_err(|_| HubError::Unavailable("random source".into()))?;
     let ttl = if body.read_only {
         DEVICE_READ_TOKEN_TTL_SECONDS
@@ -448,6 +407,99 @@ async fn mint(
     let reply = json!({"id": id, "token": secret.expose(), "name": body.name,
         "repository": repo.full_name, "repository_id": repo.repository_id,
         "expires_at": expires_at, "read_only": body.read_only, "device_id": device.device_id});
+    Ok((StatusCode::CREATED, Json(reply)).into_response())
+}
+
+/// The connected repository `repository` when `owner` may have a token for it now: the allow
+/// list and their current role, checked for every mint. A refusal is recorded under `via`.
+async fn mint_check(
+    state: &HubState,
+    owner: &User,
+    repository: &str,
+    via: &'static str,
+) -> ApiResult<ConnectedRepository> {
+    let identity = &owner.identity;
+    let login = &state.login;
+    if login.has_allow_list()
+        && !login.is_admin(&identity.provider, identity.user_id, &owner.login)
+        && !login.is_allowed(&identity.provider, identity.user_id, &owner.login)
+    {
+        record_refusal(state, owner, "not_allowed", via).await;
+        return Err(refused("not_allowed"));
+    }
+    let (store, host, named) = (
+        state.store.clone(),
+        identity.host.clone(),
+        repository.to_owned(),
+    );
+    let forge = super::forge_name(&identity.provider);
+    let Some(repo) = blocking(state, move || store.repository_named(&host, &named)).await? else {
+        return Err(match fork_parent(state, owner, repository).await {
+            Some(parent) => refused_about("not_connected", repository, forge)
+                .with_message(format!(
+                    "{repository} isn't connected to this Hub, but it is a fork of {parent}, which is; make {parent} this checkout's origin remote to coordinate"
+                ))
+                .with_field("fork_of", json!(parent)),
+            None => refused_about("not_connected", repository, forge),
+        });
+    };
+    match repository_role(state, owner, &repo).await {
+        Ok(()) => {}
+        Err(Denial::Role(role)) => {
+            record_refusal(state, owner, "insufficient_role", via).await;
+            return Err(super::insufficient_role(
+                &owner.login,
+                &repo.full_name,
+                role,
+            ));
+        }
+        Err(Denial::Kind(kind)) => {
+            if kind != "permission_unavailable" && kind != "not_connected" {
+                record_refusal(state, owner, kind, via).await;
+            }
+            return Err(refused_about(kind, &repo.full_name, forge));
+        }
+    }
+    Ok(repo)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadTokenBody {
+    repository: String,
+}
+
+/// A 30-minute read-only token for the Hub's own web pages, so a web sign-in reads the
+/// dashboard without a pasted token. Only the cookie sign-in (with its CSRF token) asks, under
+/// the same checks as a computer's mint.
+async fn web_read_token(
+    State(state): State<HubState>,
+    super::HumanSession(human): super::HumanSession,
+    JsonBody(body): JsonBody<ReadTokenBody>,
+) -> ApiResult<Response> {
+    if human.browser.is_none() {
+        return Err(super::forbidden().with_message(
+            "Only the Hub's web pages ask for this; agents get tokens through this computer's sign-in",
+        ));
+    }
+    validate_repository(&body.repository)?;
+    let repo = mint_check(&state, &human.user, &body.repository, "web_read_token").await?;
+    let store = state.store.clone();
+    let owner = human.user.id.clone();
+    let (secret, expires_at) = blocking(&state, move || {
+        let (_, secret, expires_at) = mint_bound_agent_token(
+            &*store,
+            &owner,
+            "hub-web",
+            &repo.full_name,
+            repo.repository_id,
+            DEVICE_READ_TOKEN_TTL_SECONDS,
+            true,
+        )?;
+        Ok((secret.expose().to_owned(), expires_at))
+    })
+    .await?;
+    let reply = json!({"token": secret, "expires_at": expires_at});
     Ok((StatusCode::CREATED, Json(reply)).into_response())
 }
 
