@@ -290,7 +290,7 @@ status shown; clients show `message` as is.
 
 ## Routes
 
-- `GET /v1/hub/health` (also served at `/health` for load balancers): `{"status":"ok","storage":"sqlite"|"postgres","coordination":{...}}`
+- `GET /v1/hub/health` (also served at `/health` for load balancers): `{"status":"ok","storage":"sqlite"|"postgres","coordination":{...},"version":"0.1.0-alpha.7","commit":"<40 hex>"|null}`. `commit` is the Git commit the Hub was built from, or `null` when the build knew none (a Docker build gets it from the `AGENTSCM_BUILD_COMMIT` build variable). `agentscm hub whoami` prints the Hub's version next to its own and says which one is older.
   (warn-once counters, see [Agent sessions](#agent-sessions-mcp-and-hook-endpoints)), plus
   `"demo":true` on the throwaway hub of `agentscm demo`, or 503 if the database does not answer.
 - `GET /v1/hub/whoami`: needs `Authorization: Bearer <token>`. Returns the

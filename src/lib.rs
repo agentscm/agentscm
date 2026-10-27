@@ -2,6 +2,9 @@
 // The native workspace is Unix-only, which leaves some of its supporting code unused on Windows.
 #![cfg_attr(not(unix), allow(dead_code))]
 
+/// The commit this program was built from, or empty when the build knew none (see build.rs).
+pub const BUILD_COMMIT: &str = env!("AGENTSCM_BUILD_COMMIT");
+
 #[cfg(unix)]
 pub mod attached_worktree;
 pub mod authority;

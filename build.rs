@@ -2,7 +2,8 @@
 //! `*.pg.sql` pair. Adding a file is enough; the integer migration list stays
 //! untouched. A `-- requires: <name>` comment records a dependency.
 //!
-//! Also sets `AGENTSCM_INSTALL_VERSION`, the version in the file name quickstart installs.
+//! Also sets `AGENTSCM_BUILD_COMMIT`, the commit built (empty when unknown), and
+//! `AGENTSCM_INSTALL_VERSION`, the version in the file name quickstart installs.
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -14,11 +15,14 @@ fn main() {
     install_version();
 }
 
-/// The package version for a release build (the release workflow runs on the tag `v<version>`),
-/// else `<version>+<commit>`: every build from main carries the release's version, and a dev
-/// build must not take, or be refused, the release's file name. Without Git, the plain version.
+/// The commit is `AGENTSCM_BUILD_COMMIT` from the build environment (the Docker build has no
+/// `.git`), else Git's HEAD. The install version is the package version for a release build (the
+/// release workflow runs on the tag `v<version>`), else `<version>+<commit>`: every build from main
+/// carries the release's version, and a dev build must not take, or be refused, the release's
+/// file name. Without a commit, the plain version.
 fn install_version() {
     let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
+    println!("cargo:rerun-if-env-changed=AGENTSCM_BUILD_COMMIT");
     println!("cargo:rerun-if-env-changed=GITHUB_REF_TYPE");
     println!("cargo:rerun-if-env-changed=GITHUB_REF_NAME");
     let git = |args: &[&str]| {
@@ -43,10 +47,18 @@ fn install_version() {
     }
     let release = std::env::var("GITHUB_REF_TYPE").as_deref() == Ok("tag")
         && std::env::var("GITHUB_REF_NAME").ok() == Some(format!("v{version}"));
-    let name = match git(&["rev-parse", "--short=12", "HEAD"]) {
-        Some(commit) if !release => format!("{version}+{commit}"),
-        _ => version,
+    let commit = std::env::var("AGENTSCM_BUILD_COMMIT")
+        .ok()
+        .or_else(|| git(&["rev-parse", "HEAD"]))
+        .filter(|commit| commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(|commit| commit.to_ascii_lowercase())
+        .unwrap_or_default();
+    let name = if commit.is_empty() || release {
+        version
+    } else {
+        format!("{version}+{}", &commit[..12])
     };
+    println!("cargo:rustc-env=AGENTSCM_BUILD_COMMIT={commit}");
     println!("cargo:rustc-env=AGENTSCM_INSTALL_VERSION={name}");
 }
 
