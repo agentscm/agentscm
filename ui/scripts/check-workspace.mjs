@@ -246,6 +246,33 @@ await assert.rejects(
 )
 assert.equal(reauthenticated.workspacePendingMutations(reauthenticatedSession).length, 0, 'a first-attempt busy response releases the intent')
 
+const promisePath = '/promises/prm_01/changes'
+const promiseBody = { expected_version: 1, expected_digest: 'a'.repeat(64), reason: 'Clarify the commitment.', action: { kind: 'retire' } }
+const promiseExpectation = { kind: 'promise', promiseId: 'prm_01', expectedVersion: 2 }
+responder = async () => { throw new TypeError('connection lost after dispatch') }
+await assert.rejects(() => reauthenticated.workspaceMutation(reauthenticatedSession, promisePath, promiseBody, { expectation: promiseExpectation }), TypeError)
+const promiseRequest = calls.at(-1).body
+assert.equal(typeof promiseRequest.operation_id, 'string')
+assert.equal(promiseRequest.request_id, undefined, 'promise mutations use the backend operation_id field')
+responder = async () => response(200, { ref: { workspace_id: 'workspace-1', promise_id: 'prm_01', version: 2, digest: 'b'.repeat(64) }, replayed: true })
+await reauthenticated.workspaceMutation(reauthenticatedSession, promisePath, promiseBody, { expectation: promiseExpectation })
+assert.deepEqual(calls.at(-1).body, promiseRequest, 'an uncertain promise mutation replays the exact body and operation ID')
+assert.equal(reauthenticated.workspacePendingMutations(reauthenticatedSession).length, 0)
+
+const nextPromiseBody = { ...promiseBody, expected_version: 2, expected_digest: 'b'.repeat(64), reason: 'Retire after review.' }
+const nextPromiseExpectation = { ...promiseExpectation, expectedVersion: 3 }
+responder = async () => response(200, { ref: { workspace_id: 'workspace-1', promise_id: 'prm_01', version: 3, digest: 'c'.repeat(64) }, replayed: false, hidden: true })
+await assert.rejects(
+  () => reauthenticated.workspaceMutation(reauthenticatedSession, promisePath, nextPromiseBody, { expectation: nextPromiseExpectation }),
+  error => error instanceof reauthenticated.WorkspaceError && error.code === 'response_mismatch',
+)
+const malformedPromiseRequest = calls.at(-1).body
+assert.equal(reauthenticated.workspacePendingMutations(reauthenticatedSession)[0].requestId, malformedPromiseRequest.operation_id, 'malformed promise success retains the operation ID')
+responder = async () => response(200, { ref: { workspace_id: 'workspace-1', promise_id: 'prm_01', version: 3, digest: 'c'.repeat(64) }, replayed: true })
+await reauthenticated.workspaceMutation(reauthenticatedSession, promisePath, nextPromiseBody, { expectation: nextPromiseExpectation })
+assert.deepEqual(calls.at(-1).body, malformedPromiseRequest, 'malformed promise success keeps an exact retry')
+assert.equal(reauthenticated.workspacePendingMutations(reauthenticatedSession).length, 0)
+
 const fetchesBeforeUnavailableStorage = calls.length
 Object.defineProperty(browser, 'sessionStorage', { configurable: true, get: () => { throw new Error('storage disabled') } })
 await assert.rejects(

@@ -17,6 +17,7 @@ AgentSCM also contains an immutable ledger for exact revisions, their review con
 - [Agent-owned workflow task contract](agent-workflow-tasks.md): strict task, attempt, instruction, assertion, enrolled-collector and recovery schemas with authenticated HTTP/MCP and Unix CLI routes.
 - [Claude Code workflow loop](claude-code-workflows.md): an opt-in local Stop trigger, tests/review, failure feedback and exact-current native landing requirements. Existing edit hooks remain contention-only.
 - [Community workspace pilot](community-workspace.md): persistent members/settings, independent roles, shared execution and explicit approval/native landing on one server. The legacy token dashboard and MCP remain inspection-only.
+- [Living Promises](living-promises.md): immutable owner-authorized commitments, proposal adoption, stewardship and source-admission boundaries in the Workspace Hub.
 
 - [Laptop-to-hosted workflows](hosted-laptop-workflows.md): bounded source/context exchange and a remote Claude Code Stop hook under installed server policy.
 

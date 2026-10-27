@@ -7,8 +7,12 @@ use std::sync::{Arc, Mutex};
 
 use agentscm::backend::LocalBackend;
 use agentscm::hub::login::{Login, LoginConfig};
+use agentscm::hub::promise::{
+    PromiseCreateV1, PromiseForgeAdmissionV1, PromiseRepositoryAdmissionV1, admissions_digest,
+};
 use agentscm::hub::store::{self, Store, unix_now};
 use agentscm::hub::sync::{self, Sync, SyncConfig};
+use agentscm::hub::workspace::{Identity, Workspace, WorkspaceConfig, WorkspaceForgeRepositoryV1};
 use agentscm::hub::{HubState, router};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -226,6 +230,7 @@ struct Env {
     provider: &'static str,
     fake: Shared,
     store: Arc<dyn Store>,
+    workspace: Option<Arc<Workspace>>,
     http: reqwest::Client,
     dir: TempDir,
 }
@@ -244,6 +249,7 @@ impl Env {
                 dir.path().join("hub.sqlite").display()
             ))
             .unwrap(),
+            workspace: None,
             http: reqwest::Client::builder().no_proxy().build().unwrap(),
             dir,
         };
@@ -303,6 +309,10 @@ impl Env {
         )
         .with_login(Login::new(login).unwrap())
         .with_sync(Sync::new(sync_config).unwrap());
+        let state = match &self.workspace {
+            Some(workspace) => state.with_workspace(workspace.clone()),
+            None => state,
+        };
         sync::start(&state).await.unwrap();
         let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
         tokio::spawn(async move { axum::serve(listener, app).await });
@@ -456,6 +466,185 @@ fn token(minted: &Value) -> (String, String) {
         minted["id"].as_str().unwrap().into(),
         minted["token"].as_str().unwrap().into(),
     )
+}
+
+fn device_promise_workspace(env: &Env, forge_repository_id: i64) -> Arc<Workspace> {
+    Arc::new(
+        Workspace::open(
+            WorkspaceConfig {
+                workspace_id: "device-promise-workspace".into(),
+                name: "Device promise workspace".into(),
+                database: env.dir.path().join("device-promise-workspace.sqlite"),
+                initial_owner: Identity {
+                    provider: "github".into(),
+                    host: env.base.trim_start_matches("http://").into(),
+                    user_id: ALICE,
+                },
+                forge_repositories: vec![WorkspaceForgeRepositoryV1 {
+                    repository_id: REPO.into(),
+                    provider: "github".into(),
+                    host: env.base.trim_start_matches("http://").into(),
+                    forge_repository_id,
+                }],
+            },
+            env.store.clone(),
+        )
+        .unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn device_minted_token_obeys_promise_scope_and_revocation() {
+    let mut env = Env::start("github").await;
+    let (_, device, _) = env.sign_in(ALICE, "promise laptop").await;
+    env.workspace = Some(device_promise_workspace(&env, REPO_ID));
+    env.hub = env.serve("").await;
+    let (status, minted) = env.mint(&device).await;
+    assert_eq!(status, 201, "{minted}");
+    assert_eq!(minted["repository"], REPO);
+    assert_eq!(minted["repository_id"], REPO_ID);
+    let (token_id, secret) = token(&minted);
+
+    let owner = env
+        .store
+        .list_users()
+        .unwrap()
+        .into_iter()
+        .find(|user| user.identity.user_id == ALICE)
+        .unwrap();
+    let admission = PromiseRepositoryAdmissionV1 {
+        repository_id: REPO.into(),
+        forge: Some(PromiseForgeAdmissionV1 {
+            provider: "github".into(),
+            host: env.base.trim_start_matches("http://").into(),
+            forge_repository_id: REPO_ID,
+        }),
+        native_repository_ids: vec![],
+    };
+    let create = PromiseCreateV1 {
+        operation_id: "device_promise_create".into(),
+        expected_admissions_digest: admissions_digest(
+            "device-promise-workspace",
+            std::slice::from_ref(&admission),
+        )
+        .unwrap(),
+        definition: serde_json::from_value(json!({
+            "original_request":"Keep customer settings.",
+            "commitment":"Existing settings persist.",
+            "criteria":[{"id":"settings","text":"Settings persist.","evidence_requirements":[]}],
+            "constraints":[],
+            "repositories":[{"repository_id":REPO,"relevance":"Settings source."}]
+        }))
+        .unwrap(),
+    };
+    let created = env
+        .store
+        .promise_create(
+            "device-promise-workspace",
+            &owner.id,
+            &create,
+            &[admission],
+            unix_now(),
+        )
+        .unwrap();
+    let show = format!(
+        "/v1/hub/workspace/promises/{}",
+        created.reference.promise_id
+    );
+    let proposal = json!({"kind":"proposal","operation_id":"device_proposal",
+        "repository_id":REPO,"original_request":"Keep settings.",
+        "commitment":"Settings persist.",
+        "criteria":[{"id":"settings","text":"Settings persist.","evidence_requirements":[]}],
+        "constraints":[]});
+    let report = json!({"kind":"report","operation_id":"device_report",
+        "promise_id":created.reference.promise_id,
+        "promise_version":created.reference.version,
+        "promise_digest":created.reference.digest,
+        "repository_id":REPO,"summary":"Caller-observed concern; not verified evidence."});
+    assert_eq!(env.get(&show, &secret).await.0, 200);
+    for body in [&proposal, &report] {
+        assert_eq!(
+            env.call(
+                &env.hub,
+                Method::POST,
+                "/v1/hub/workspace/promises/inputs",
+                Some(&secret),
+                Some(body.clone()),
+            )
+            .await
+            .0,
+            200
+        );
+    }
+    let mut wrong_key = proposal.clone();
+    wrong_key["operation_id"] = json!("device_wrong_key");
+    wrong_key["repository_id"] = json!("acme/other");
+    assert_eq!(
+        env.call(
+            &env.hub,
+            Method::POST,
+            "/v1/hub/workspace/promises/inputs",
+            Some(&secret),
+            Some(wrong_key),
+        )
+        .await
+        .0,
+        404
+    );
+
+    env.connect_repo("acme/rebound", REPO_ID + 1, ALICE);
+    env.workspace = Some(device_promise_workspace(&env, REPO_ID + 1));
+    env.hub = env.serve("").await;
+    assert_eq!(env.get(&show, &secret).await.0, 404);
+    for body in [&proposal, &report] {
+        assert_eq!(
+            env.call(
+                &env.hub,
+                Method::POST,
+                "/v1/hub/workspace/promises/inputs",
+                Some(&secret),
+                Some(body.clone()),
+            )
+            .await
+            .0,
+            404
+        );
+    }
+
+    env.workspace = Some(device_promise_workspace(&env, REPO_ID));
+    env.hub = env.serve("").await;
+    assert_eq!(env.get(&show, &secret).await.0, 200);
+    let database = env.dir.path().join("hub.sqlite");
+    let input_count = || {
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM hub_promise_inputs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+    };
+    let before_revoke = input_count();
+    assert_eq!(
+        env.delete(&format!("/v1/hub/device/tokens/{token_id}"), &device)
+            .await,
+        204
+    );
+    assert_eq!(env.get(&show, &secret).await.0, 401);
+    for body in [&proposal, &report] {
+        assert_eq!(
+            env.call(
+                &env.hub,
+                Method::POST,
+                "/v1/hub/workspace/promises/inputs",
+                Some(&secret),
+                Some(body.clone()),
+            )
+            .await
+            .0,
+            401
+        );
+    }
+    assert_eq!(input_count(), before_revoke);
 }
 
 async fn renewal_rechecks_the_role(provider: &'static str) {

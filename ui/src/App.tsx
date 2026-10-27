@@ -22,6 +22,7 @@ import { TemplatesPage } from './pages/Templates.tsx'
 import { TimelinePage } from './pages/Timeline.tsx'
 import { ExplorerPage } from './pages/Explorer.tsx'
 import { SettingsPage } from './pages/Settings.tsx'
+import { PromisesPage } from './pages/Promises.tsx'
 import { AppChrome, type Badges, type NavDef, type SectionDef, type TabStatuses } from './TopNav.tsx'
 import { Icon, Notice } from './ui.tsx'
 import { usePoll } from './usePoll.ts'
@@ -36,7 +37,7 @@ const subscribeDark = (cb: () => void) => {
 }
 const systemDark = () => window.matchMedia(darkQuery).matches
 
-export type Section = 'home' | 'now' | 'activity' | 'team' | 'inbox' | 'work' | 'workflows' | 'change-record' | 'landed' | 'skills' | 'templates' | 'timeline' | 'explorer' | 'setup' | 'workspace' | 'health' | 'settings'
+export type Section = 'home' | 'now' | 'activity' | 'team' | 'inbox' | 'work' | 'promises' | 'workflows' | 'change-record' | 'landed' | 'skills' | 'templates' | 'timeline' | 'explorer' | 'setup' | 'workspace' | 'health' | 'settings'
 
 /** Every routed page. `label` names its tab inside its nav item; `question` is the page's hidden h1. */
 export const SECTIONS: SectionDef[] = [
@@ -46,6 +47,7 @@ export const SECTIONS: SectionDef[] = [
   { key: 'team', nav: 'home', icon: 'people', label: 'Team', question: 'Who is working right now?' },
   { key: 'inbox', nav: 'inbox', icon: 'inbox', label: 'Inbox', question: 'Which overlaps need a conversation?' },
   { key: 'work', nav: 'history', icon: 'flag', label: 'Finished', question: 'What did agents report finished?' },
+  { key: 'promises', nav: 'history', icon: 'journal-check', label: 'Promises', question: 'What must remain true?' },
   { key: 'change-record', nav: 'history', icon: 'clipboard2-check', label: 'Change records', question: 'What is ready to hand off?' },
   { key: 'explorer', nav: 'history', icon: 'folder2-open', label: 'Files', question: 'How did this code and its evidence come together?' },
   { key: 'timeline', nav: 'timeline', icon: 'camera', label: 'Timeline', question: 'What did this workspace look like earlier?' },
@@ -149,6 +151,7 @@ function Shell({ token, pref, onPref, density, onDensity, onUnauthorized, onForg
     work: finished === undefined ? undefined : { text: finished ? `${finished} recently` : 'None recently', tone: finished ? 'ok' : 'muted' },
     'work-history': { text: 'Every change, paged', tone: 'muted' },
     'change-record': { text: 'Per task', tone: 'muted' },
+    promises: { text: 'Owner commitments', tone: 'muted' },
     explorer: { text: 'From this computer', tone: 'muted' },
     skills: { text: 'Required steps', tone: 'muted' },
     workflows: { text: 'Recorded runs', tone: 'muted' },
@@ -199,6 +202,7 @@ function Shell({ token, pref, onPref, density, onDensity, onUnauthorized, onForg
         {(section === 'home' || section === 'now' || section === 'activity' || section === 'team') && <DashboardPage section={section} question={SECTIONS.find((s) => s.key === section)!.question} token={token} repo={repo} data={data} d={d} overview={overview} />}
         {section === 'inbox' && <InboxPage token={token} overview={overview} />}
         {section === 'work' && <WorkPage token={token} overview={overview} />}
+        {section === 'promises' && <PromisesPage />}
         {section === 'workflows' && <WorkflowsPage token={token} repository={data.whoami?.token.repository ?? null} />}
         {section === 'change-record' && <ChangeRecordPage repo={data.whoami?.token.repository ?? null} token={token} />}
         {section === 'landed' && <LandedPage repo={data.whoami?.token.repository ?? null} token={token} />}
@@ -259,13 +263,13 @@ export default function App() {
   const onForget = useCallback(() => signedOut('Token forgotten on this browser. The hub still accepts it until it expires or is revoked.'), [signedOut])
 
   if (token) return <Shell key={token} token={token} pref={pref} onPref={changePref} density={density} onDensity={changeDensity} onUnauthorized={onUnauthorized} onForget={onForget} />
-  if (section === 'workspace')
+  if (section === 'workspace' || section === 'promises')
     return (
       <div className="signed-out-workspace">
         <a href="#home" className="btn btn-link">
           <Icon name="arrow-left" /> Back to sign-in
         </a>
-        <WorkspacePage />
+        {section === 'workspace' ? <WorkspacePage /> : <PromisesPage />}
       </div>
     )
   return (

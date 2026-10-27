@@ -57,6 +57,8 @@ isolated tests, bounded model review and exact-revision native requirements. The
 [Community workspace pilot](advanced/community-workspace.md) adds persistent membership,
 settings, a shared execution queue and explicit approval/native landing controls. The legacy
 token dashboard and MCP inspect retained runs.
+[Living Promises](advanced/living-promises.md) records owner-authorized commitments and their
+version history in the Workspace Hub, with advisory agent proposals and reports.
 
 ## For contributors and maintainers
 

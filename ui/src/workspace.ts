@@ -21,6 +21,7 @@ export type WorkspaceMutationExpectation =
   | { kind: 'start'; repositoryId: string; profileId: string; subject: WorkspaceSubject }
   | { kind: 'approval'; revision: string; contextDigest: string }
   | { kind: 'landing'; revision: string; contextDigest: string; target: string }
+  | { kind: 'promise'; promiseId?: string; expectedVersion: number }
 
 export interface PendingWorkspaceMutation {
   path: string
@@ -77,13 +78,16 @@ export async function workspaceRequest<T>(path: string, options: { signal?: Abor
 
 const JOURNAL_VERSION = 1
 const JOURNAL_LIMIT = 12
-const JOURNAL_BYTES = 64 * 1024
+const JOURNAL_BYTES = 1024 * 1024
 const BODY_BYTES = 16 * 1024
+const PROMISE_BODY_BYTES = 72 * 1024
 const pendingMutationEvent = 'agentscm:workspace-pending-mutations'
 const sensitiveField = /(^|_)(authorization|bearer|csrf|password|secret|session|token)($|_)/i
-const validMutationPath = (path: string): boolean => path === '/members' || path === '/settings' || path === '/view-settings' || path === '/view-settings/me' || /^\/repositories\/[^/?#]+\/runs(?:\/[^/?#]+\/cancel)?$/.test(path) || /^\/repositories\/[^/?#]+\/profiles\/[^/?#]+\/(approve|integrate)$/.test(path)
+const promiseMutationPath = (path: string): boolean => path === '/promises' || path === '/promises/adopt' || /^\/promises\/[^/?#]+\/changes$/.test(path)
+const validMutationPath = (path: string): boolean => path === '/members' || path === '/settings' || path === '/view-settings' || path === '/view-settings/me' || promiseMutationPath(path) || /^\/repositories\/[^/?#]+\/runs(?:\/[^/?#]+\/cancel)?$/.test(path) || /^\/repositories\/[^/?#]+\/profiles\/[^/?#]+\/(approve|integrate)$/.test(path)
 
 const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value)
+const exactKeys = (value: Record<string, unknown>, keys: string[]): boolean => Object.keys(value).length === keys.length && Object.keys(value).every(key => keys.includes(key))
 const canonicalJson = (value: unknown): string => JSON.stringify(value, (_key, nested: unknown) => {
   if (!isRecord(nested)) return nested
   return Object.keys(nested).sort().reduce<Record<string, unknown>>((sorted, key) => { sorted[key] = nested[key]; return sorted }, {})
@@ -100,6 +104,7 @@ const validSubject = (value: unknown): value is WorkspaceSubject => isRecord(val
 const validExpectation = (value: unknown): value is WorkspaceMutationExpectation => {
   if (!isRecord(value) || typeof value.kind !== 'string') return false
   if (value.kind === 'start') return typeof value.repositoryId === 'string' && typeof value.profileId === 'string' && validSubject(value.subject)
+  if (value.kind === 'promise') return (value.promiseId === undefined || typeof value.promiseId === 'string') && typeof value.expectedVersion === 'number' && Number.isSafeInteger(value.expectedVersion) && value.expectedVersion > 0
   if (typeof value.revision !== 'string' || typeof value.contextDigest !== 'string') return false
   return value.kind === 'approval' || value.kind === 'landing' && typeof value.target === 'string'
 }
@@ -110,7 +115,7 @@ const validPendingMutation = (value: unknown): value is PendingWorkspaceMutation
   if (typeof value.createdAt !== 'number' || !Number.isSafeInteger(value.createdAt) || value.createdAt < 0) return false
   if (typeof value.uncertain !== 'boolean') return false
   if (value.expectation !== undefined && !validExpectation(value.expectation)) return false
-  try { return canonicalJson(value.body).length <= BODY_BYTES && !containsSensitiveField(value.body) } catch { return false }
+  try { return new TextEncoder().encode(canonicalJson(value.body)).length <= (promiseMutationPath(value.path) ? PROMISE_BODY_BYTES : BODY_BYTES) && !containsSensitiveField(value.body) } catch { return false }
 }
 const readJournal = (session: WorkspaceSession): PendingWorkspaceMutation[] => {
   const target = storage()
@@ -142,10 +147,10 @@ const removePendingMutation = (session: WorkspaceSession, path: string, method: 
     emitJournalChange()
   } catch { /* A conclusive response does not become uncertain if cleanup storage fails. */ }
 }
-const copyBody = (body: Record<string, unknown>): { body: Record<string, unknown>; key: string } => {
+const copyBody = (path: string, body: Record<string, unknown>): { body: Record<string, unknown>; key: string } => {
   let key: string
   try { key = canonicalJson(body) } catch { throw new WorkspaceError(400, 'This request cannot be safely retained because its fields are not valid JSON.') }
-  if (key.length > BODY_BYTES) throw new WorkspaceError(400, 'This request is too large to retain for a safe retry.')
+  if (new TextEncoder().encode(key).length > (promiseMutationPath(path) ? PROMISE_BODY_BYTES : BODY_BYTES)) throw new WorkspaceError(400, 'This request is too large to retain for a safe retry.')
   const copy: unknown = JSON.parse(key)
   if (!isRecord(copy) || containsSensitiveField(copy)) throw new WorkspaceError(400, 'Workspace mutations cannot retain credentials or session secrets.')
   return { body: copy, key }
@@ -163,6 +168,11 @@ const validateRetainedResult = (result: unknown, expectation: WorkspaceMutationE
     if (result.approval_id !== expectedId || result.actor_id !== session.actor.user.id || result.revision !== expectation.revision || result.context_digest !== expectation.contextDigest) throw new WorkspaceError(500, 'The approval response did not match the retained request, actor, revision and review context. Its exact retry remains available.', 'response_mismatch')
     return
   }
+  if (expectation.kind === 'promise') {
+    const reference = result.ref
+    if (!exactKeys(result, ['ref', 'replayed']) || !isRecord(reference) || !exactKeys(reference, ['workspace_id', 'promise_id', 'version', 'digest']) || reference.workspace_id !== session.workspace.id || typeof reference.promise_id !== 'string' || !/^[A-Za-z0-9_./:-]{1,128}$/.test(reference.promise_id) || (expectation.promiseId !== undefined && reference.promise_id !== expectation.promiseId) || reference.version !== expectation.expectedVersion || typeof reference.digest !== 'string' || !/^[0-9a-f]{64}$/.test(reference.digest) || typeof result.replayed !== 'boolean') throw new WorkspaceError(500, 'The promise response did not match the retained workspace, promise and version. Its exact retry remains available.', 'response_mismatch')
+    return
+  }
   const after = result.after
   const expectedId = `ws-integrate-${session.actor.user.id}-${retained.requestId}`
   if (result.operation_id !== expectedId || result.target !== expectation.target || result.context_digest !== expectation.contextDigest || result.approval_id !== retained.body.approval_id || !isRecord(after) || after.revision !== expectation.revision) throw new WorkspaceError(500, 'The landing response did not match the retained request, approval, revision, review context and target. Its exact retry remains available.', 'response_mismatch')
@@ -176,7 +186,8 @@ export const workspacePendingMutationEvent = pendingMutationEvent
 export async function workspaceMutation<T>(session: WorkspaceSession, path: string, body: Record<string, unknown>, options: { method?: string; expectation?: WorkspaceMutationExpectation } = {}): Promise<T> {
   const method = options.method ?? 'POST'
   if (!['POST', 'PUT', 'DELETE'].includes(method) || path.length > 1024 || !validMutationPath(path)) throw new WorkspaceError(400, 'This workspace mutation cannot be safely retained for retry.')
-  const prepared = copyBody(body)
+  if ('request_id' in body || 'operation_id' in body) throw new WorkspaceError(400, 'Mutation identifiers are assigned by the retained retry journal.')
+  const prepared = copyBody(path, body)
   const entries = readJournal(session)
   const pending = entries.find(entry => entry.path === path && entry.method === method)
   if (pending && (canonicalJson(pending.body) !== prepared.key || canonicalJson(pending.expectation) !== canonicalJson(options.expectation))) throw new WorkspaceError(409, 'An earlier request has an unknown outcome. Retry its exact retained fields from Pending operation recovery before making a different change.', 'pending_mutation')
@@ -185,12 +196,13 @@ export async function workspaceMutation<T>(session: WorkspaceSession, path: stri
   const retained: PendingWorkspaceMutation = pending ?? { path, method, body: prepared.body, requestId: crypto.randomUUID(), createdAt: Date.now(), uncertain: true, ...(options.expectation ? { expectation: options.expectation } : {}) }
   if (!pending) writeJournal(session, [...entries, retained])
   try {
-    const result = await workspaceRequest<T>(path, { method, csrf: session.csrf_token, body: { ...retained.body, request_id: retained.requestId } })
+    const id = promiseMutationPath(path) ? { operation_id: retained.requestId } : { request_id: retained.requestId }
+    const result = await workspaceRequest<T>(path, { method, csrf: session.csrf_token, body: { ...retained.body, ...id } })
     validateRetainedResult(result, retained.expectation, session, retained)
     removePendingMutation(session, path, method)
     return result
   } catch (error) {
-    if (!hadPriorUncertainty && error instanceof WorkspaceError && (error.status < 500 || error.code === 'busy')) removePendingMutation(session, path, method)
+    if (error instanceof WorkspaceError && (error.status === 409 || (!hadPriorUncertainty && (error.status < 500 || error.code === 'busy')))) removePendingMutation(session, path, method)
     else emitJournalChange()
     throw error
   }

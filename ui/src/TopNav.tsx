@@ -12,6 +12,7 @@ import { changeRecordHref, changeRecordIdFromHash } from './pages/ChangeRecord.t
 import { routeFromHash as workflowRouteFromHash, runHref as workflowRunHref } from './pages/Workflows.tsx'
 import { workspaceRoute, workspaceRunHref } from './pages/Workspace.tsx'
 import { landedIdFromHash, landedHref } from './pages/Landed.tsx'
+import { promiseHref, promiseIdFromHash } from './promises.ts'
 import { compareHref, entryHref, timelineRoute } from './pages/Timeline.tsx'
 import { Icon, Tip, agentLabel, relative } from './ui.tsx'
 import { TourTrigger, useTour } from './tour/Tour.tsx'
@@ -602,6 +603,9 @@ export function crumbsFor(hash: string, section: SectionDef, overview: WorkOverv
   } else if (section.key === 'landed') {
     const id = landedIdFromHash(hash)
     if (id) out.push({ label: `Change ${id.slice(0, 12)}…`, href: landedHref(id), mono: true })
+  } else if (section.key === 'promises') {
+    const id = promiseIdFromHash(hash)
+    if (id) out.push({ label: `Promise ${id.slice(0, 12)}…`, href: promiseHref(id), mono: true })
   } else if (section.key === 'skills') {
     const route = skillsRoute(hash)
     if (route.kind !== 'library') out.push({ label: 'Runs', href: skillRunsHref })

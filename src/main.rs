@@ -84,6 +84,7 @@ mod merge_cli;
 mod open_cli;
 #[cfg(unix)]
 mod pipeline_cli;
+mod promise_cli;
 mod prompt;
 #[cfg(unix)]
 mod publish_cli;
@@ -272,6 +273,11 @@ enum Command {
     Work {
         #[command(subcommand)]
         command: work_cli::WorkCommand,
+    },
+    /// Read durable promises and submit advisory agent proposals or reports.
+    Promise {
+        #[command(subcommand)]
+        command: promise_cli::PromiseCommand,
     },
     /// [experimental] Capture a clean committed Git tree as a native revision.
     #[cfg(unix)]
@@ -879,6 +885,7 @@ async fn run(cli: Cli) -> Result<RunExit> {
         Command::ClientPlugin(args) => client_plugin::run(args)?,
         Command::Intent { command } => intent_cli::run(command).await?,
         Command::Work { command } => work_cli::run(command).await?,
+        Command::Promise { command } => promise_cli::run(command).await?,
         Command::Demo(args) => demo_cli::run(args).await?,
         Command::Quickstart(args) => {
             let code = quickstart::run(args).await?;
