@@ -1992,7 +1992,7 @@ async fn cli_falls_back_to_the_loopback_flow_when_device_flow_is_unavailable() {
     let mut rest = String::new();
     std::io::Read::read_to_string(&mut stderr, &mut rest).unwrap();
     assert!(child.wait().unwrap().success(), "{rest}");
-    assert!(rest.contains("as gitlab:bob"), "{rest}");
+    assert!(rest.contains("as bob (GitLab)."), "{rest}");
     let file = cli.session_file();
     #[cfg(unix)]
     {
