@@ -1657,12 +1657,17 @@ async fn the_web_sign_in_survives_a_restart_and_needs_csrf_to_change_anything() 
 }
 
 /// Asks for the web pages' read-only token with the web sign-in's cookie.
-async fn web_read_token(env: &Env, cookie: &str, csrf: Option<&str>) -> (u16, Value) {
+async fn web_read_token(
+    env: &Env,
+    cookie: &str,
+    csrf: Option<&str>,
+    repository: &str,
+) -> (u16, Value) {
     let mut request = browser()
         .post(format!("{}/v1/hub/session/read-token", env.hub))
         .header(header::COOKIE, format!("__Host-agentscm_session={cookie}"))
         .header(header::CONTENT_TYPE, "application/json")
-        .body(json!({"repository": REPO}).to_string());
+        .body(json!({"repository": repository}).to_string());
     if let Some(csrf) = csrf {
         request = request.header("x-csrf-token", csrf);
     }
@@ -1680,10 +1685,10 @@ async fn a_web_sign_in_reads_with_a_read_only_token_under_the_mint_checks() {
     let csrf = me["csrf_token"].as_str().unwrap().to_owned();
 
     // The cookie alone, as another site's form would send it, gets nothing.
-    let (status, refused) = web_read_token(&env, &cookie, None).await;
+    let (status, refused) = web_read_token(&env, &cookie, None, REPO).await;
     assert_eq!((status, refused["error"].as_str()), (403, Some("csrf")));
 
-    let (status, minted) = web_read_token(&env, &cookie, Some(&csrf)).await;
+    let (status, minted) = web_read_token(&env, &cookie, Some(&csrf), REPO).await;
     assert_eq!(status, 201, "{minted}");
     let token = minted["token"].as_str().unwrap().to_owned();
     let expires_at = minted["expires_at"].as_i64().unwrap();
@@ -1717,9 +1722,23 @@ async fn a_web_sign_in_reads_with_a_read_only_token_under_the_mint_checks() {
         .await;
     assert_eq!(status, 401);
 
+    // A repository the Hub does not have is refused as for a computer, naming a connected
+    // upstream of a fork.
+    env.fake
+        .lock()
+        .unwrap()
+        .forks
+        .insert("carol/widgets".into(), REPO.into());
+    let (status, refused) = web_read_token(&env, &cookie, Some(&csrf), "carol/widgets").await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("not_connected"))
+    );
+    assert_eq!(refused["fork_of"], REPO);
+
     // Losing the role refuses the next one, with the same refusal a computer gets.
     env.drop_role(ALICE);
-    let (status, refused) = web_read_token(&env, &cookie, Some(&csrf)).await;
+    let (status, refused) = web_read_token(&env, &cookie, Some(&csrf), REPO).await;
     assert_eq!(
         (status, refused["error"].as_str()),
         (403, Some("insufficient_role"))

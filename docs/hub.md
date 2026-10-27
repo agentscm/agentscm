@@ -204,10 +204,13 @@ This is the Hub API; the bundled web UI does not use it yet and still asks for a
   clears the cookie.
 - `POST /v1/hub/session/read-token` (`{"repository"}`, cookie and CSRF token only) gives the web
   pages a [read-only token](#read-only-tokens) for 30 minutes, 201 `{"token", "expires_at"}`, so
-  the dashboard reads without a pasted token. It runs the checks of a computer's
+  the dashboard can read without a pasted token. It runs the checks of a computer's
   `POST /v1/hub/device/tokens` (the allow list, a connected repository and the person's role
-  through that repository's connection credential) and refuses in the same shape, recorded as
-  `via` `web_read_token`. A `hub login` session gets 403 `forbidden`, and a computer credential 401.
+  through that repository's connection credential) and refuses in the same shape; role and
+  access refusals are recorded as `via` `web_read_token`. A `hub login` session gets 403
+  `forbidden`, and a computer credential 401. Each call stores a new token, so a page keeps its
+  token in memory and asks again only near `expires_at`. Signing out does not end a token
+  already handed out; it lasts until it expires.
 - Sessions from `hub login` (`Authorization: Bearer`) still live in Hub memory for 8 hours; the
   CLI and agents rely on the [computer credential](#computer-credentials) instead.
 
