@@ -345,7 +345,9 @@ fn squash_merges_of_branches_forked_at_different_points_are_all_found() {
     git(&repo, &["checkout", "-q", "-b", "early", "main"]);
     commit_file(&repo, "early", "d", &lines("A", "z"));
     git(&repo, &["checkout", "-q", "main"]);
-    commit_file(&repo, "unrelated", "f", "f\n");
+    fs::write(repo.join("f"), "f\n").unwrap();
+    git(&repo, &["add", "f"]);
+    git(&repo, &["commit", "-qm", "unrelated"]);
     git(&repo, &["checkout", "-q", "-b", "late", "main"]);
     commit_file(&repo, "late", "e", &lines("A", "z"));
     git(&repo, &["checkout", "-q", "-b", "live", "main"]);
