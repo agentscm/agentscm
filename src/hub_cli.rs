@@ -67,7 +67,7 @@ pub enum HubCommand {
     },
     /// Sign in to a hub; the session is saved for the token commands.
     Login {
-        /// Hub URL, such as https://hub.example.com (default: the saved Hub, when there is one).
+        /// Hub URL, such as https://hub.example.com (default: AGENTSCM_HUB, then the only saved Hub).
         #[arg(long)]
         hub: Option<String>,
         /// Forge to sign in with (default: the Hub's only sign-in provider).
@@ -258,7 +258,7 @@ pub async fn run(command: HubCommand, data_dir: &std::path::Path) -> Result<()> 
         HubCommand::Login { hub, provider } => {
             let hub = match hub {
                 Some(hub) => check_base_url(&hub).map_err(map_hub_error)?,
-                None => only_saved_hub()?,
+                None => default_hub()?,
             };
             let name = match provider {
                 Some(provider) => provider
@@ -327,20 +327,37 @@ pub(crate) async fn call(
     send(request, HUB_BODY_BYTES).await.map_err(map_hub_error)
 }
 
-/// The Hub of the one saved sign-in; with none or several, `--hub` must say which.
-pub(crate) fn only_saved_hub() -> Result<String> {
+/// The Hub for a command run without `--hub`.
+pub(crate) fn default_hub() -> Result<String> {
     let sessions = if session_files_present()? {
         load_sessions()?.sessions
     } else {
         Vec::new()
     };
-    match sessions.as_slice() {
-        [only] => Ok(only.hub.clone()),
+    let saved: Vec<&str> = sessions.iter().map(|saved| saved.hub.as_str()).collect();
+    pick_default_hub(env_hub(), &saved)
+}
+
+/// `AGENTSCM_HUB`, when set: the Hub for commands run without `--hub`.
+fn env_hub() -> Option<String> {
+    std::env::var("AGENTSCM_HUB")
+        .ok()
+        .map(|hub| hub.trim().to_owned())
+        .filter(|hub| !hub.is_empty())
+}
+
+/// After `--hub`: `AGENTSCM_HUB`, then the one saved sign-in; with none or several, say how to choose.
+fn pick_default_hub(env: Option<String>, saved: &[&str]) -> Result<String> {
+    if let Some(hub) = env {
+        return check_base_url(&hub).map_err(map_hub_error);
+    }
+    match saved {
+        [only] => Ok((*only).to_owned()),
         [] => Err(invalid(
-            "pass --hub with the Hub's URL, such as --hub https://hub.example.com",
+            "pass --hub with the Hub's URL, such as --hub https://hub.example.com, or set AGENTSCM_HUB",
         )),
         _ => Err(invalid(
-            "several Hubs are saved; pass --hub to choose one (see agentscm hub sessions list)",
+            "several Hubs are saved; pass --hub or set AGENTSCM_HUB to choose one (see agentscm hub sessions list)",
         )),
     }
 }
@@ -1012,8 +1029,8 @@ fn selected_session<'a>(
 
 /// The saved entry whether or not it has expired; only sign-out uses it, to clear stale entries.
 fn saved_session<'a>(store: &'a SavedSessions, hub: Option<&str>) -> Result<&'a SavedSession> {
-    let selected = match hub {
-        Some(hub) => check_base_url(hub).map_err(map_hub_error)?,
+    let selected = match hub.map(str::to_owned).or_else(env_hub) {
+        Some(hub) => check_base_url(&hub).map_err(map_hub_error)?,
         None => store.default_hub.clone(),
     };
     store
@@ -1352,6 +1369,34 @@ async fn connections(command: ConnectionCommand) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_hub_comes_from_the_flag_then_agentscm_hub_then_the_only_sign_in() {
+        let env = Some("https://env.example/".to_owned());
+        let one = ["https://saved.example"];
+        let two = ["https://a.example", "https://b.example"];
+        assert_eq!(
+            pick_default_hub(env.clone(), &two).unwrap(),
+            "https://env.example"
+        );
+        assert_eq!(
+            pick_default_hub(None, &one).unwrap(),
+            "https://saved.example"
+        );
+        assert!(
+            pick_default_hub(None, &two)
+                .unwrap_err()
+                .to_string()
+                .contains("AGENTSCM_HUB")
+        );
+        assert!(
+            pick_default_hub(None, &[])
+                .unwrap_err()
+                .to_string()
+                .contains("--hub")
+        );
+        assert!(pick_default_hub(Some("not a url".into()), &one).is_err());
+    }
 
     #[test]
     fn moments_read_as_a_date_and_a_distance() {

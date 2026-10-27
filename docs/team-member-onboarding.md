@@ -199,8 +199,9 @@ agentscm hub logout --hub 'https://hub.example.com'
 
 Human sessions are keyed by Hub. Before minting a token, setup verifies that the selected session's
 forge provider and host match the checkout origin; otherwise it starts the required sign-in. The
-most recently saved Hub is the default for `hub token` and `hub logout` without `--hub`;
-`hub login`, `client connect` and `client setup` leave out `--hub` only when exactly one Hub is saved.
+`--hub URL` means the same in every command. Without it, a command uses `AGENTSCM_HUB` when that is
+set. Otherwise `hub token` and `hub logout` use the most recently saved Hub, and `hub login`,
+`client connect` and `client setup` use the saved Hub only when exactly one is saved.
 
 `sessions remove` only forgets the local human sign-in. `logout` also attempts to end that session
 on the selected Hub before removing that exact local generation. A concurrently replaced sign-in
