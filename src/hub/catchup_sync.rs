@@ -1,5 +1,7 @@
 //! Bounded, read-only forge observations for return-to-work deliveries.
 
+use std::collections::BTreeSet;
+
 use serde_json::Value;
 
 use super::catchup::{
@@ -7,6 +9,7 @@ use super::catchup::{
     MAX_CATCHUP_PATHS, NewCatchupMerge, bounded_title,
 };
 use super::connection::{ConnectedRepository, Connection};
+use super::forge_api::ForgeApi;
 use super::github::{Gh, GhError, parse_rfc3339};
 use super::http::blocking;
 use super::store::unix_now;
@@ -46,6 +49,7 @@ pub(super) async fn reconcile(
     conn: &Connection,
     repo: &ConnectedRepository,
     token: &str,
+    activity_days: i64,
 ) -> Gh<()> {
     let checked_at = unix_now();
     // A bounded read/ingestion batch is not a completed source observation.
@@ -60,7 +64,7 @@ pub(super) async fn reconcile(
         0,
     )
     .await?;
-    let result = read_recent(state, conn, repo, token).await;
+    let result = read_recent(state, conn, repo, token, checked_at, activity_days).await;
     let (coverage, unread_pages, deferred) = match &result {
         Ok((unread, deferred)) if *unread == 0 && *deferred == 0 => {
             (CatchupCoverageState::ObservedOnly, 0, 0)
@@ -125,49 +129,161 @@ pub(super) async fn source_status(
     .map_err(failure)
 }
 
+/// First closed-proposal page size. A power of two so halving after an over-cap
+/// body keeps `offset % per_page == 0`.
+const FIRST_PAGE_SIZE: u32 = 32;
+/// Closed-listing requests (including size-halving retries) per reconcile pass.
+const MAX_LIST_REQUESTS: u32 = 40;
+/// A second look at the list head tolerates forge/hub clock skew.
+const HEAD_SKEW_SECS: i64 = 300;
+
+/// Progress shared by the main walk and the head recheck of one pass.
+struct Pass {
+    per_page: u32,
+    requests: u32,
+    read: usize,
+    deferred: u64,
+    unread: u64,
+    seen: BTreeSet<i64>,
+}
+
 async fn read_recent(
     state: &HubState,
     conn: &Connection,
     repo: &ConnectedRepository,
     token: &str,
+    checked_at: i64,
+    activity_days: i64,
 ) -> Gh<(u64, u64)> {
     let api = state.sync.forge(conn)?;
-    let listing = api.recent_closed_pulls(token, repo).await?;
-    let mut read = 0;
-    let mut deferred = 0;
-    for hint in listing.items {
-        let Some(number) = hint["number"].as_i64().filter(|number| *number > 0) else {
-            return Err(GhError::Failed("invalid closed proposal identity".into()));
-        };
-        if hint["merged"] != true && hint["merged_at"].as_str().is_none() {
-            continue;
-        }
-        let scope = scope(conn, repo);
-        let store = state.store.clone();
-        let merge_commit = hint["merge_commit_sha"].as_str().map(str::to_owned);
-        let known = blocking(state, move || {
-            store.catchup_merge_known(&scope, number, merge_commit.as_deref())
-        })
-        .await
-        .map_err(failure)?;
-        if known {
-            continue;
-        }
-        if read == NEW_MERGES_PER_POLL {
-            deferred += 1;
-            continue;
-        }
-        read += 1;
-        let Some(pull) = api.pull(token, repo, number).await? else {
-            deferred += 1;
-            continue;
-        };
-        if pull["merged"] != true {
-            continue;
-        }
-        observe(state, conn, repo, token, number, &pull).await?;
+    let window_from = checked_at - activity_days * 86_400;
+    let mut pass = Pass {
+        per_page: FIRST_PAGE_SIZE,
+        requests: 0,
+        read: 0,
+        deferred: 0,
+        unread: 0,
+        seen: BTreeSet::new(),
+    };
+    let complete = walk(state, conn, repo, token, &api, window_from, &mut pass).await?;
+    // Proposals updated while the walk ran move to the list head, past its offset.
+    let head_complete = if pass.requests > 1 {
+        walk(
+            state,
+            conn,
+            repo,
+            token,
+            &api,
+            checked_at - HEAD_SKEW_SECS,
+            &mut pass,
+        )
+        .await?
+    } else {
+        true
+    };
+    if !(complete && head_complete) {
+        pass.unread = pass.unread.max(1);
     }
-    Ok((u64::from(listing.unread), deferred))
+    Ok((pass.unread, pass.deferred))
+}
+
+/// Reads closed proposals newest-updated first until one is older than `threshold`
+/// or the list ends. `false` means the pass stopped short of both.
+async fn walk(
+    state: &HubState,
+    conn: &Connection,
+    repo: &ConnectedRepository,
+    token: &str,
+    api: &ForgeApi<'_>,
+    threshold: i64,
+    pass: &mut Pass,
+) -> Gh<bool> {
+    let mut offset: u32 = 0;
+    loop {
+        if pass.requests >= MAX_LIST_REQUESTS {
+            return Ok(false);
+        }
+        pass.requests += 1;
+        let page = match api
+            .closed_pulls_page(token, repo, pass.per_page, offset / pass.per_page + 1)
+            .await
+        {
+            Ok(page) => page,
+            Err(GhError::TooLarge(_)) if pass.per_page > 1 => {
+                pass.per_page /= 2;
+                continue;
+            }
+            Err(GhError::TooLarge(_)) => {
+                pass.unread += 1;
+                offset += 1;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let len = page.items.len();
+        for hint in page.items {
+            let updated = hint["updated_at"]
+                .as_str()
+                .and_then(parse_rfc3339)
+                .ok_or_else(|| GhError::Failed("invalid closed proposal update time".into()))?;
+            if updated < threshold {
+                return Ok(true);
+            }
+            candidate(state, conn, repo, token, api, &hint, pass).await?;
+        }
+        if !page.next || len == 0 {
+            return Ok(true);
+        }
+        if len != pass.per_page as usize {
+            // A short page with a successor cannot be addressed by offset.
+            return Ok(false);
+        }
+        offset += pass.per_page;
+    }
+}
+
+async fn candidate(
+    state: &HubState,
+    conn: &Connection,
+    repo: &ConnectedRepository,
+    token: &str,
+    api: &ForgeApi<'_>,
+    hint: &Value,
+    pass: &mut Pass,
+) -> Gh<()> {
+    let Some(number) = hint["number"].as_i64().filter(|number| *number > 0) else {
+        return Err(GhError::Failed("invalid closed proposal identity".into()));
+    };
+    if !pass.seen.insert(number) {
+        return Ok(());
+    }
+    if hint["merged"] != true && hint["merged_at"].as_str().is_none() {
+        return Ok(());
+    }
+    let scope = scope(conn, repo);
+    let store = state.store.clone();
+    let merge_commit = hint["merge_commit_sha"].as_str().map(str::to_owned);
+    let known = blocking(state, move || {
+        store.catchup_merge_known(&scope, number, merge_commit.as_deref())
+    })
+    .await
+    .map_err(failure)?;
+    if known {
+        return Ok(());
+    }
+    if pass.read == NEW_MERGES_PER_POLL {
+        pass.deferred += 1;
+        return Ok(());
+    }
+    pass.read += 1;
+    let Some(pull) = api.pull(token, repo, number).await? else {
+        pass.deferred += 1;
+        return Ok(());
+    };
+    if pull["merged"] != true {
+        return Ok(());
+    }
+    observe(state, conn, repo, token, number, &pull).await
 }
 
 /// Called after the normal sync's authenticated individual read too, so webhook

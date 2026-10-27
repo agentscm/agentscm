@@ -1037,7 +1037,9 @@ async fn read_repo(
 
     // Catch-up reads cannot turn a failed source into an empty successful recap.
     // Keep the existing coordination poll useful when this optional read fails.
-    if let Err(error) = super::catchup_sync::reconcile(state, conn, repo, token).await {
+    if let Err(error) =
+        super::catchup_sync::reconcile(state, conn, repo, token, config.activity_days).await
+    {
         if matches!(error, GhError::Auth(_) | GhError::Limited(_)) {
             return Err(error);
         }

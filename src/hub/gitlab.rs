@@ -748,7 +748,7 @@ fn pull_json(mr: &Value) -> Value {
     json!({"number": mr["iid"], "node_id": format!("gid://gitlab/MergeRequest/{}", mr["id"]),
         "title": mr["title"], "state": if open { "open" } else { "closed" },
         "draft": mr["draft"].as_bool().or(mr["work_in_progress"].as_bool()).unwrap_or(false),
-        "merged": merged, "merged_at": mr["merged_at"],
+        "merged": merged, "merged_at": mr["merged_at"], "updated_at": mr["updated_at"],
         "body": mr["description"], "labels": mr["labels"],
         "squash_commit_sha": mr["squash_commit_sha"],
         "source_project_id": mr["source_project_id"], "target_project_id": mr["target_project_id"],

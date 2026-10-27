@@ -115,9 +115,16 @@ strip control and invisible characters consistently with the clients; exact sour
 identities are never rewritten. Unsupported identity characters leave source
 coverage unavailable rather than inserting an unreadable delivery. A provider record is
 read through the configured authenticated GitHub/GitLab transport, never accepted
-from an unverified webhook payload. The sync also reads a bounded recent closed
-proposal page and re-reads new merge candidates. Source status records unread
-pages, deferred observations and failures. Source-quality metadata refreshes on
+from an unverified webhook payload. The sync also walks a declared window: closed
+proposals updated within the last `activity_days` days, newest update first, in
+bounded pages that start at 32 and halve when a response exceeds the body cap
+(a single unreadable record is counted as unread). A pass makes at most 40 list
+requests and re-reads new merge candidates (20 per poll; the rest are deferred).
+When the walk needed several requests it looks at the list head again, because
+proposals updated meanwhile move there. Coverage is observed-only only when the
+window was fully read with nothing unread or deferred; history before the window
+is not observed. Source status records unread pages, deferred observations and
+failures. Source-quality metadata refreshes on
 each page without changing the delivery’s event watermarks. This is observed coverage, not a claim
 of complete forge history. No model call generates the recap.
 

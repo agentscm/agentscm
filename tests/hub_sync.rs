@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agentscm::backend::LocalBackend;
+use agentscm::hub::catchup::{CatchupCoverageState, CatchupMergeSource, CatchupQuery};
 use agentscm::hub::connection::ConnectedRepository;
 use agentscm::hub::login::{Login, LoginConfig};
 use agentscm::hub::store::{
@@ -952,8 +953,6 @@ async fn webhooks_are_verified_deduplicated_and_re_read() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn catchup_discovers_ordinary_merges_without_an_open_observation() {
-    use agentscm::hub::catchup::{CatchupCoverageState, CatchupQuery};
-
     let env = Env::start().await;
     env.connect_app().await;
     env.install_widgets();
@@ -1165,6 +1164,190 @@ async fn more_than_300_open_pull_requests_are_cut_short_and_said_so() {
     assert_eq!(
         env.work(&agent).await["truncated"],
         json!({"pull_requests": 1})
+    );
+}
+
+// ---- 4b. merge catch-up reads a declared window in bounded, adaptive pages ----
+
+const ONE_MIB: usize = 1024 * 1024;
+
+/// Merged PRs `1..=count` with `body_bytes`-sized bodies, updated `age_days` ago.
+fn add_merged(env: &Env, numbers: std::ops::RangeInclusive<u64>, body_bytes: usize, age_days: i64) {
+    let updated_at = rfc3339(unix_now() - age_days * 86_400);
+    for n in numbers {
+        add_pull(env, n, &[&format!("src/m{n}.rs")]);
+        env.pull(n, |pull| {
+            pull.state = "closed".into();
+            pull.merged = true;
+            pull.merge_commit_sha = Some(format!("{n:040x}"));
+            pull.body = "x".repeat(body_bytes);
+            pull.updated_at = updated_at.clone();
+        });
+    }
+}
+
+/// The first Work-visible agent token and the forge-pull source coverage it sees.
+fn catchup_agent(env: &Env) -> String {
+    let owner = env
+        .store
+        .upsert_user(
+            &ForgeIdentity {
+                provider: "github".into(),
+                host: env.host(),
+                user_id: 77,
+            },
+            "reader",
+        )
+        .unwrap();
+    mint_bound_agent_token(&*env.store, &owner.id, "reader", REPO, REPO_ID, 3600, true)
+        .unwrap()
+        .0
+}
+
+fn forge_coverage(env: &Env, token: &str) -> (CatchupCoverageState, u64, u64) {
+    let page = env
+        .store
+        .work_catchup(token, &CatchupQuery::default(), unix_now())
+        .unwrap();
+    let source = page
+        .source_coverage
+        .iter()
+        .find(|c| c.source == CatchupMergeSource::ForgePull)
+        .expect("forge pull coverage");
+    (source.state, source.unread_pages, source.deferred)
+}
+
+/// `per_page` of every closed-listing request so far.
+fn closed_page_sizes(env: &Env) -> Vec<usize> {
+    env.fake.with(|s| {
+        s.requests
+            .iter()
+            .filter(|r| {
+                r.path_and_query.contains("/pulls?") && r.path_and_query.contains("state=closed")
+            })
+            .map(|r| {
+                r.path_and_query
+                    .split(['?', '&'])
+                    .find_map(|kv| kv.strip_prefix("per_page="))
+                    .and_then(|v| v.parse().ok())
+                    .expect("per_page")
+            })
+            .collect()
+    })
+}
+
+fn detail_reads(env: &Env, number: u64) -> usize {
+    let path = format!("/repos/acme/widgets/pulls/{number}");
+    env.fake.with(|s| {
+        s.requests
+            .iter()
+            .filter(|r| r.path_and_query.split('?').next() == Some(path.as_str()))
+            .count()
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catchup_reads_a_hundred_merges_whose_single_page_exceeds_the_body_cap() {
+    let env = Env::start().await;
+    env.connect_app().await;
+    env.install_widgets();
+    let body = 12 * 1024;
+    assert!(100 * body > ONE_MIB, "a 100-item page must exceed the cap");
+    add_merged(&env, 1..=100, body, 0);
+    let token = catchup_agent(&env);
+    for poll in 1..=4 {
+        env.poll().await;
+        let (state, unread, deferred) = forge_coverage(&env, &token);
+        assert_eq!(state, CatchupCoverageState::Incomplete, "poll {poll}");
+        assert_eq!((unread, deferred), (0, 100 - 20 * poll), "poll {poll}");
+    }
+    env.poll().await;
+    assert_eq!(
+        forge_coverage(&env, &token),
+        (CatchupCoverageState::ObservedOnly, 0, 0)
+    );
+    let sizes = closed_page_sizes(&env);
+    assert!(
+        !sizes.is_empty() && sizes.iter().all(|size| *size <= 32),
+        "{sizes:?}"
+    );
+    for n in 1..=100 {
+        assert_eq!(detail_reads(&env, n), 1, "pull {n} is read once");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catchup_halves_the_page_size_while_a_page_exceeds_the_body_cap() {
+    let env = Env::start().await;
+    env.connect_app().await;
+    env.install_widgets();
+    let body = 40 * 1024;
+    // 30 listed items overflow a 32-item page but 16 fit.
+    assert!(30 * body > ONE_MIB && 16 * body < ONE_MIB);
+    add_merged(&env, 1..=30, body, 0);
+    let token = catchup_agent(&env);
+    env.poll().await;
+    assert_eq!(
+        forge_coverage(&env, &token),
+        (CatchupCoverageState::Incomplete, 0, 10)
+    );
+    env.poll().await;
+    assert_eq!(
+        forge_coverage(&env, &token),
+        (CatchupCoverageState::ObservedOnly, 0, 0)
+    );
+    let sizes = closed_page_sizes(&env);
+    assert_eq!(sizes[..2], [32, 16], "{sizes:?}");
+    // Each pass starts at 32 again and halves once; nothing smaller is needed.
+    assert!(
+        sizes.iter().all(|size| matches!(size, 32 | 16)),
+        "{sizes:?}"
+    );
+    assert!(
+        sizes.windows(2).all(|w| w[0] != 32 || w[1] == 16),
+        "{sizes:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catchup_stops_at_the_declared_window() {
+    let env = Env::start().await;
+    env.connect_app().await;
+    env.install_widgets();
+    // Older than the 14-day window: 200 closed PRs that must never be requested.
+    add_merged(&env, 1..=200, 10, 60);
+    add_merged(&env, 201..=204, 10, 0);
+    let token = catchup_agent(&env);
+    env.poll().await;
+    assert_eq!(
+        forge_coverage(&env, &token),
+        (CatchupCoverageState::ObservedOnly, 0, 0)
+    );
+    assert_eq!(closed_page_sizes(&env), [32]);
+    assert!(env.fake.with(|s| {
+        s.requests
+            .iter()
+            .all(|r| !r.path_and_query.contains("page=2"))
+    }));
+    assert_eq!(detail_reads(&env, 1), 0);
+    assert_eq!(detail_reads(&env, 204), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catchup_does_not_reread_known_merges() {
+    let env = Env::start().await;
+    env.connect_app().await;
+    env.install_widgets();
+    add_merged(&env, 1..=3, 10, 0);
+    let token = catchup_agent(&env);
+    env.poll().await;
+    env.poll().await;
+    for n in 1..=3 {
+        assert_eq!(detail_reads(&env, n), 1);
+    }
+    assert_eq!(
+        forge_coverage(&env, &token),
+        (CatchupCoverageState::ObservedOnly, 0, 0)
     );
 }
 
