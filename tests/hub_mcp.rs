@@ -119,13 +119,12 @@ impl Hub {
     }
 
     async fn rpc(&self, secret: &str, body: &Value) -> Reply {
-        self.send(
-            reqwest::Method::POST,
-            "/mcp",
-            Some(secret),
-            &body.to_string(),
-        )
-        .await
+        self.rpc_at("/mcp", secret, body).await
+    }
+
+    async fn rpc_at(&self, path: &str, secret: &str, body: &Value) -> Reply {
+        self.send(reqwest::Method::POST, path, Some(secret), &body.to_string())
+            .await
     }
 
     /// The tool result's (text, isError).
@@ -455,7 +454,7 @@ async fn protocol_basics() {
         ("2025-11-25", "2025-11-25"),
         ("1999-01-01", "2025-06-18"),
     ] {
-        let reply = hub.rpc(&key, &init(asked)).await;
+        let reply = hub.rpc_at("/mcp?tools=all", &key, &init(asked)).await;
         assert_eq!(reply.status, 200);
         assert!(reply.headers.get("mcp-session-id").is_none());
         let body = reply.json();
@@ -482,18 +481,18 @@ async fn protocol_basics() {
         );
     }
 
+    // By default the instructions name only the tools that are listed.
+    let default_init = hub.rpc(&key, &init("2025-11-25")).await.json();
+    let instructions = default_init["result"]["instructions"].as_str().unwrap();
+    assert!(instructions.contains("agentscm_start") && !instructions.contains("workflow_status"));
+
     let ping = hub
         .rpc(&key, &json!({"jsonrpc": "2.0", "id": 7, "method": "ping"}))
         .await;
     assert_eq!(ping.json()["result"], json!({}));
 
-    let listed = hub
-        .rpc(
-            &key,
-            &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
-        )
-        .await
-        .json();
+    let list = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
+    let listed = hub.rpc_at("/mcp?tools=all", &key, &list).await.json();
     let submit = listed["result"]["tools"]
         .as_array()
         .unwrap()
@@ -555,6 +554,42 @@ async fn protocol_basics() {
             "agentscm_coordination_withdraw",
         ]
     );
+    // Without adopted skills, the default list leaves out the skill tools and the tools nothing
+    // shipped asks an agent to call.
+    let default_names: Vec<String> = hub.rpc(&key, &list).await.json()["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_owned())
+        .collect();
+    let opt_in = [
+        "agentscm_skill_list",
+        "agentscm_skill_status",
+        "agentscm_skill_evidence",
+        "agentscm_change_record",
+        "agentscm_shared_conversation",
+        "agentscm_publications_list",
+        "agentscm_workflow_runs_list",
+        "agentscm_workflow_status",
+    ];
+    assert_eq!(
+        default_names,
+        names
+            .iter()
+            .filter(|name| !opt_in.contains(name))
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>()
+    );
+    // Listed or not, an opt-in tool stays callable.
+    let called = hub
+        .rpc(
+            &key,
+            &json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "agentscm_publications_list", "arguments": {}}}),
+        )
+        .await
+        .json();
+    assert!(called["result"].is_object(), "{called}");
     let tool = |name: &str| {
         listed["result"]["tools"]
             .as_array()
@@ -2061,10 +2096,10 @@ async fn search_tools_page_filter_and_stay_in_the_tokens_repository() {
         let result = hub.tool_result(&reader, tool, arguments.clone()).await;
         assert_eq!(result["isError"], true, "{tool} {arguments}: {result}");
     }
-    // Writers and read-only tokens are both offered the tools.
-    for secret in [&writer, &reader] {
+    // Read-only tokens are offered the tools; writers when they ask for every tool.
+    for (secret, path) in [(&writer, "/mcp?tools=all"), (&reader, "/mcp")] {
         let listed = hub
-            .rpc(secret, &rpc_body("tools/list", json!({})))
+            .rpc_at(path, secret, &rpc_body("tools/list", json!({})))
             .await
             .json();
         let names: Vec<&str> = listed["result"]["tools"]
@@ -2081,4 +2116,77 @@ async fn search_tools_page_filter_and_stay_in_the_tokens_repository() {
             assert!(names.contains(&tool), "{tool}");
         }
     }
+}
+
+/// Every tool the shipped skill, instruction files, hook context, advice, views and server
+/// instructions name is in the default list, so the two cannot drift apart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_default_tools_cover_every_tool_agents_are_told_to_call() {
+    use agentscm::hub::skills::SkillAdoption;
+    let hub = Hub::start().await;
+    let key = hub.secret(1, "alice");
+    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    let names = |reply: Value| -> Vec<String> {
+        reply["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let all = names(hub.rpc_at("/mcp?tools=all", &key, &list).await.json());
+    let before = names(hub.rpc(&key, &list).await.json());
+    assert!(
+        !before
+            .iter()
+            .any(|name| name.starts_with("agentscm_skill_"))
+    );
+    hub.store
+        .skill_adoption_put(&SkillAdoption {
+            repository: REPO.into(),
+            source: "default_branch".into(),
+            lock_json: r#"{"version":1,"skills":[]}"#.into(),
+            default_branch: Some("main".into()),
+            observed_at: unix_now(),
+            reported_by: None,
+        })
+        .unwrap();
+    let listed = names(hub.rpc(&key, &list).await.json());
+    assert_eq!((before.len(), listed.len(), all.len()), (28, 31, 36));
+
+    let init = json!({"jsonrpc": "2.0", "id": 2, "method": "initialize",
+        "params": {"protocolVersion": "2025-11-25", "capabilities": {}}});
+    let instructions = hub.rpc(&key, &init).await.json()["result"]["instructions"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let told = [
+        include_str!("../src/client_setup.rs"),
+        include_str!("../src/init_cli/targets.rs"),
+        include_str!("../src/skill_workflow/supported.rs"),
+        include_str!("../src/hub/hook.rs"),
+        include_str!("../src/hub/advice.rs"),
+        include_str!("../src/hub/onboarding.rs"),
+        include_str!("../src/hub/narrative.rs"),
+        include_str!("../src/hub/mcp_views/work-overview.html"),
+        include_str!("../src/hub/mcp_views/coordination-inbox.html"),
+        &instructions,
+    ];
+    let mut checked = 0;
+    for text in told {
+        for (start, _) in text.match_indices("agentscm_") {
+            let name: String = text[start..]
+                .chars()
+                .take_while(|c| c.is_ascii_lowercase() || *c == '_')
+                .collect();
+            if all.contains(&name) {
+                assert!(
+                    listed.contains(&name),
+                    "{name} is named to agents but not listed"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 20, "{checked}");
 }
