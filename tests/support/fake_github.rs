@@ -228,7 +228,7 @@ impl Pull {
             base_ref: "main".into(),
             author_login: "octocat".into(),
             author_id: 1,
-            updated_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: rfc3339(now()),
             files: files.iter().map(|f| f.to_string()).collect(),
             body: String::new(),
             head_repo: None,
@@ -1209,10 +1209,14 @@ fn handle(ctx: &Ctx, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8
                     };
                     let (state_filter, head) = (wanted("state").unwrap_or("open"), wanted("head"));
                     let head = head.map(|v| v.rsplit_once(':').map_or(v, |x| x.1).to_owned());
-                    let open: Vec<Value> = repo
-                        .pulls
-                        .values()
-                        .rev()
+                    // `sort=updated&direction=desc` orders by `updated_at`, newest first;
+                    // equal times keep the number-descending default.
+                    let mut ordered: Vec<&Pull> = repo.pulls.values().rev().collect();
+                    if wanted("sort") == Some("updated") && wanted("direction") != Some("asc") {
+                        ordered.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                    }
+                    let open: Vec<Value> = ordered
+                        .into_iter()
                         .filter(|p| state_filter == "all" || p.state == state_filter)
                         .filter(|p| head.as_ref().is_none_or(|head| &p.head_ref == head))
                         .map(|p| pull_json(ctx, repo, p))

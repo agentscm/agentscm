@@ -1,0 +1,136 @@
+name: Reusable local validation verifier
+
+on:
+  workflow_call:
+    inputs:
+      release-version:
+        description: Exact published AgentSCM SemVer to install and run.
+        required: true
+        type: string
+      config-dir:
+        description: Trust configuration directory relative to the caller repository root.
+        required: false
+        default: .github/local-validation
+        type: string
+      verifier-workflow:
+        description: Caller workflow path relative to the caller repository root.
+        required: false
+        default: .github/workflows/local-validation.yml
+        type: string
+      github-authenticated-fetch:
+        description: Reuse github.token for canonical private GitHub repository fetches.
+        required: false
+        default: false
+        type: boolean
+
+permissions: {}
+
+jobs:
+  reconcile:
+    # Job-level on purpose: a workflow-level group is entered before the `if:` below runs, so an
+    # untrusted commenter's run could supersede the pending queued run and then do nothing.
+    concurrency:
+      group: local-validation
+      cancel-in-progress: false
+    # The caller supplies triggers. For comments, admit only pull request comments from trusted
+    # associations that carry the marker, including edits that remove a prior marker. For
+    # pull_request_target, an edit matters only when it changes the base.
+    if: ${{ (github.event_name != 'pull_request_target' || github.event.action != 'edited' || github.event.changes.base) && (github.event_name != 'issue_comment' || (github.event.issue.pull_request && (startsWith(github.event.comment.body, '<!-- agentscm-local-validation:v1 ') || (github.event.action == 'edited' && startsWith(github.event.changes.body.from, '<!-- agentscm-local-validation:v1 '))) && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    env:
+      AGENTSCM_TELEMETRY: "off"
+      CONFIG_DIR: ${{ inputs['config-dir'] }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch || github.ref_name }}
+      FETCH_AUTHENTICATED: ${{ inputs['github-authenticated-fetch'] }}
+      RELEASE_VERSION: ${{ inputs['release-version'] }}
+      REPOSITORY: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      VERIFIER_WORKFLOW: ${{ inputs['verifier-workflow'] }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch || github.ref_name }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Validate the exact release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const version = process.env.RELEASE_VERSION;
+          const exact = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+          const match = exact.exec(version);
+          if (!match || (match[4] || '').split('.').some((part) => /^0[0-9]+$/.test(part))) {
+            console.error('release-version must be one exact SemVer (no tag, range, or alias)');
+            process.exit(2);
+          }
+          NODE
+      - name: Create an isolated install workspace
+        id: isolated
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          install_root="$RUNNER_TEMP/agentscm-local-validation-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$install_root/home" "$install_root/npm-cache" "$install_root/work"
+          {
+            echo "home=$install_root/home"
+            echo "npm-cache=$install_root/npm-cache"
+            echo "work=$install_root/work"
+          } >> "$GITHUB_OUTPUT"
+      - name: Acquire and verify the pinned AgentSCM binary
+        shell: bash
+        working-directory: ${{ steps.isolated.outputs.work }}
+        env:
+          AGENTSCM_REQUIRE_PROVENANCE: "1"
+          GH_TOKEN: ${{ github.token }}
+          HOME: ${{ steps.isolated.outputs.home }}
+          NPM_CONFIG_CACHE: ${{ steps.isolated.outputs.npm-cache }}
+          NPM_CONFIG_USERCONFIG: ${{ steps.isolated.outputs.home }}/.npmrc
+        run: |
+          set -euo pipefail
+          npx --yes --ignore-scripts --registry=https://registry.npmjs.org \
+            "agentscm@$RELEASE_VERSION" local-validation reconcile --help </dev/null
+      - name: Check the installed binary version
+        shell: bash
+        working-directory: ${{ steps.isolated.outputs.work }}
+        env:
+          HOME: ${{ steps.isolated.outputs.home }}
+        run: |
+          set -euo pipefail
+          binary="$HOME/.agentscm/bin/agentscm-$RELEASE_VERSION"
+          test -x "$binary"
+          actual_version=$("$binary" --version </dev/null)
+          test "$actual_version" = "agentscm $RELEASE_VERSION"
+      - name: Reconcile statuses
+        shell: bash
+        working-directory: ${{ steps.isolated.outputs.work }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HOME: ${{ steps.isolated.outputs.home }}
+        run: |
+          set -euo pipefail
+          binary="$HOME/.agentscm/bin/agentscm-$RELEASE_VERSION"
+          args=(
+            local-validation reconcile
+            --github-repo "$REPOSITORY"
+            --base "$DEFAULT_BRANCH"
+            --config-dir "$CONFIG_DIR"
+            --repo "$GITHUB_WORKSPACE"
+            --verifier-workflow "$VERIFIER_WORKFLOW"
+            --target-url "$RUN_URL"
+          )
+          if [[ "$FETCH_AUTHENTICATED" == "true" ]]; then
+            args+=(--github-authenticated-fetch)
+          fi
+          # Every admitted run sweeps all open pull requests on the default branch.
+          "$binary" "${args[@]}" </dev/null

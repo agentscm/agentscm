@@ -170,7 +170,9 @@ fn observation_error(error: ObservationError) -> Error {
             super::github::GhError::Limited(at) => {
                 format!("forge rate limited until {at}; no event accepted")
             }
-            super::github::GhError::Failed(_) => "forge read failed; no event accepted".into(),
+            super::github::GhError::Failed(_) | super::github::GhError::TooLarge(_) => {
+                "forge read failed; no event accepted".into()
+            }
         }),
     }
 }
@@ -325,7 +327,7 @@ impl PollReport {
                     None
                 },
             },
-            ObservationError::Forge(GhError::Failed(_)) => PollBlocked {
+            ObservationError::Forge(GhError::Failed(_) | GhError::TooLarge(_)) => PollBlocked {
                 kind: "unavailable".into(),
                 reason: "forge read failed; successful checkpoint unchanged".into(),
                 retry_at: None,

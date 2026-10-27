@@ -111,7 +111,8 @@ describe('ComputersPage', () => {
       },
     })
     render(<Computers token="read-only-token" />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Sign out of this browser' }))
+    expect(await screen.findByText('Workspace access and computers stay signed in.')).toBeTruthy()
+    fireEvent.click(await screen.findByRole('button', { name: 'Sign out of Hub pages' }))
     expect(await screen.findByRole('link', { name: /Sign in with GitHub/ })).toBeTruthy()
     const del = calls.find((c) => c.init.method === 'DELETE')!
     expect((del.init.headers as Record<string, string>)['x-csrf-token']).toBe(SESSION.csrf_token)
