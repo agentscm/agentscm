@@ -2074,11 +2074,9 @@ async fn a_refused_browser_sign_in_ends_the_cli_wait_with_the_reason() {
     let response = env.http.get(loopback).send().await.unwrap();
     assert_eq!(response.status(), 302);
     let page = response.headers()[header::LOCATION].to_str().unwrap();
-    assert!(
-        page.starts_with(&format!(
-            "{hub}/ui/#/signed-in?status=refused&reason=not_allowed"
-        )),
-        "{page}"
+    assert_eq!(
+        page,
+        format!("{hub}/ui/#/signed-in?status=refused&reason=not_allowed")
     );
     let mut rest = String::new();
     std::io::Read::read_to_string(&mut stderr, &mut rest).unwrap();

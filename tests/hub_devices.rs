@@ -198,6 +198,14 @@ async fn start_fake() -> (Shared, String) {
     type H = HeaderMap;
     let app = Router::new()
         .route("/login/device/code", post(|| async { device_code(false) }))
+        // The browser flow: the forge approves at once and sends the code back.
+        .route(
+            "/login/oauth/authorize",
+            get(|axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>| async move {
+                let to = format!("{}?code=browser-code&state={}", query["redirect_uri"], query["state"]);
+                (StatusCode::SEE_OTHER, [(header::LOCATION, to)]).into_response()
+            }),
+        )
         .route("/oauth/authorize_device", post(|| async { device_code(true) }))
         .route("/login/oauth/access_token", post(|State(f): State<Shared>, Form(x): F| async move { device_token(&f, x) }))
         .route("/oauth/token", post(|State(f): State<Shared>, Form(x): F| async move { device_token(&f, x) }))
@@ -1410,4 +1418,240 @@ async fn a_session_enrolls_one_computer_and_revoking_it_ends_the_session() {
     );
     assert_eq!(env.get("/v1/hub/session", &session).await.0, 401);
     assert_eq!(enroll().await.0, 401);
+}
+
+/// A browser that keeps no cookies of its own and follows no redirects.
+fn browser() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+}
+
+fn set_cookie(response: &reqwest::Response, name: &str) -> Option<String> {
+    response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|value| {
+            value
+                .strip_prefix(&format!("{name}="))?
+                .split(';')
+                .next()
+                .map(str::to_owned)
+        })
+}
+
+/// Runs a web-page sign-in for `user` up to the Hub's answer to the forge's callback.
+async fn web_callback(env: &Env, user: i64) -> reqwest::Response {
+    env.fake.lock().unwrap().approve = user;
+    let http = browser();
+    let start = http
+        .get(format!("{}/v1/hub/login/github?web=1", env.hub))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(start.status(), 302);
+    let login = set_cookie(&start, "__Host-agentscm_login").unwrap();
+    let authorize = start.headers()[header::LOCATION]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let forge = http.get(authorize).send().await.unwrap();
+    let callback = forge.headers()[header::LOCATION]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    http.get(callback)
+        .header(header::COOKIE, format!("__Host-agentscm_login={login}"))
+        .send()
+        .await
+        .unwrap()
+}
+
+/// Signs `user` in to the Hub's web pages; returns the session cookie's value.
+async fn web_sign_in(env: &Env, user: i64) -> String {
+    let done = web_callback(env, user).await;
+    assert_eq!(done.status(), 302);
+    assert_eq!(done.headers()[header::LOCATION], "/ui/#home");
+    let all: Vec<_> = done
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .map(|value| value.to_str().unwrap().to_owned())
+        .collect();
+    let session = all
+        .iter()
+        .find(|value| value.starts_with("__Host-agentscm_session="))
+        .unwrap();
+    for attribute in [
+        "HttpOnly",
+        "Secure",
+        "SameSite=Strict",
+        "Path=/",
+        "Max-Age=604800",
+    ] {
+        assert!(session.contains(attribute), "{session}");
+    }
+    set_cookie(&done, "__Host-agentscm_session").unwrap()
+}
+
+async fn with_cookie(
+    hub: &str,
+    method: Method,
+    path: &str,
+    cookie: &str,
+    csrf: Option<&str>,
+) -> (u16, Value) {
+    let mut request = browser()
+        .request(method, format!("{hub}{path}"))
+        .header(header::COOKIE, format!("__Host-agentscm_session={cookie}"));
+    if let Some(csrf) = csrf {
+        request = request.header("x-csrf-token", csrf);
+    }
+    let response = request.send().await.unwrap();
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap();
+    (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn the_web_sign_in_survives_a_restart_and_needs_csrf_to_change_anything() {
+    let env = Env::start("github").await;
+    let cookie = web_sign_in(&env, ALICE).await;
+    let (status, me) = with_cookie(&env.hub, Method::GET, "/v1/hub/session", &cookie, None).await;
+    assert_eq!(status, 200, "{me}");
+    assert_eq!(
+        (&me["user"]["login"], &me["admin"]),
+        (&json!("alice"), &json!(false))
+    );
+    let csrf = me["csrf_token"].as_str().unwrap().to_owned();
+
+    // A restarted Hub process still knows the sign-in: it lives in the database.
+    let restarted = env.serve("").await;
+    let (status, _) = with_cookie(&restarted, Method::GET, "/v1/hub/session", &cookie, None).await;
+    assert_eq!(status, 200);
+
+    // The person's computers are listed; a revoke needs the CSRF token, not the cookie alone.
+    let (_, _, device) = env.sign_in(ALICE, "laptop").await;
+    let (status, list) = with_cookie(&env.hub, Method::GET, "/v1/hub/devices", &cookie, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(list["devices"][0]["id"], json!(device));
+    let path = format!("/v1/hub/devices/{device}");
+    let (status, refused) = with_cookie(&env.hub, Method::DELETE, &path, &cookie, None).await;
+    assert_eq!((status, refused["error"].as_str()), (403, Some("csrf")));
+    let wrong = "0".repeat(64);
+    assert_eq!(
+        with_cookie(&env.hub, Method::DELETE, &path, &cookie, Some(&wrong))
+            .await
+            .0,
+        403
+    );
+    assert_eq!(
+        with_cookie(&env.hub, Method::DELETE, &path, &cookie, Some(&csrf))
+            .await
+            .0,
+        204
+    );
+
+    // A web sign-in makes no agent tokens and is no administrator unless listed.
+    let minted = browser()
+        .post(format!("{}/v1/hub/tokens", env.hub))
+        .header(header::COOKIE, format!("__Host-agentscm_session={cookie}"))
+        .header("x-csrf-token", &csrf)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(json!({"name": "web", "repository": REPO, "ttl_seconds": 600}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(minted.status(), 403);
+    // Nor a computer credential, which would outlive the page's sign-in.
+    let enrolled = browser()
+        .post(format!("{}/v1/hub/devices", env.hub))
+        .header(header::COOKIE, format!("__Host-agentscm_session={cookie}"))
+        .header("x-csrf-token", &csrf)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(enrolled.status(), 403);
+    let (status, _) = with_cookie(
+        &env.hub,
+        Method::GET,
+        "/v1/hub/admin/devices",
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, 403);
+    let admin = web_sign_in(&env, ADMIN).await;
+    let (status, _) =
+        with_cookie(&env.hub, Method::GET, "/v1/hub/admin/devices", &admin, None).await;
+    assert_eq!(status, 200);
+
+    // Signing out needs the CSRF token and ends the sign-in.
+    let hub = &env.hub;
+    let session = |cookie: String| async move {
+        with_cookie(hub, Method::GET, "/v1/hub/session", &cookie, None).await
+    };
+    assert_eq!(
+        with_cookie(&env.hub, Method::DELETE, "/v1/hub/session", &cookie, None)
+            .await
+            .0,
+        403
+    );
+    assert_eq!(
+        with_cookie(
+            &env.hub,
+            Method::DELETE,
+            "/v1/hub/session",
+            &cookie,
+            Some(&csrf)
+        )
+        .await
+        .0,
+        204
+    );
+    assert_eq!(session(cookie).await.0, 401);
+
+    // Disabling the person ends the sign-in, and enabling them again does not bring it back.
+    let cookie = web_sign_in(&env, ALICE).await;
+    let users = env.store.list_users().unwrap();
+    let alice = users.iter().find(|u| u.login == "alice").unwrap();
+    env.store.set_user_disabled(&alice.id, true).unwrap();
+    assert_eq!(session(cookie.clone()).await.0, 401);
+    // A refused web sign-in lands on the Hub's page with the reason alone, which the page
+    // words itself: anyone can forge that link.
+    let refused = web_callback(&env, ALICE).await;
+    assert_eq!(refused.status(), 302);
+    assert_eq!(
+        refused.headers()[header::LOCATION],
+        "/ui/#/signed-in?status=refused&reason=user_disabled"
+    );
+    assert!(set_cookie(&refused, "__Host-agentscm_session").is_none());
+    env.store.set_user_disabled(&alice.id, false).unwrap();
+    assert_eq!(session(cookie).await.0, 401);
+
+    // A Hub whose allow list no longer has the person refuses the sign-in.
+    let cookie = web_sign_in(&env, ALICE).await;
+    let restarted = env.serve("github:#8").await;
+    let (status, refused) =
+        with_cookie(&restarted, Method::GET, "/v1/hub/session", &cookie, None).await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("not_allowed"))
+    );
+
+    // An unknown cookie, or two of them, is no sign-in.
+    assert_eq!(session("a".repeat(64)).await.0, 401);
+    assert_eq!(
+        session(format!("{cookie}; __Host-agentscm_session={cookie}"))
+            .await
+            .0,
+        401
+    );
+    assert_eq!(session(cookie).await.0, 200);
 }
