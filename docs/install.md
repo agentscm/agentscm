@@ -101,7 +101,11 @@ agents, it asks once: "Keep AgentSCM in the menu bar, and start it when you log 
 default) opens the tray and turns on Start at Login; No leaves both off and quickstart does not ask
 again. With `--yes` or without a terminal it does not ask, and the tray stays off unless you add
 `--tray`, which opens it without changing Start at Login. You can switch Start at Login in the tray
-menu at any time. The alpha binary is not signed or notarized, and the
+menu at any time. When quickstart connects agents on macOS it also writes a small
+`~/Applications/AgentSCM.app` that runs `~/.agentscm/bin/agentscm tray`, so Spotlight, Launchpad
+or the Dock can bring the menu bar app back after a restart. It is generated on your Mac, so it
+carries no download quarantine. Running quickstart again leaves it as it is, and an app of that
+name that AgentSCM did not write is never replaced. The alpha binary is not signed or notarized, and the
 tray does not update independently; install a newer AgentSCM release through the same installer.
 Each checkout menu groups its status, opening actions, a **Share agent conversations with Hub**
 switch, **Agent Integrations**, **Connection Details**, **Recent Activity** and **Troubleshooting**. Connection Details shows the full checkout path and
@@ -168,7 +172,8 @@ unavailable there. Use **Copy Terminal Setup** for that agent. The tray only cop
 command: it runs normal `client setup` only after you paste and run it in Terminal. That guided
 command may contact the Hub, request forge sign-in, and create or replace a managed coordination
 token; the native client's own trust prompts still apply.
-Uninstall removes the owned tray login setting before removing its program. A running tray can
+Uninstall removes the owned tray login setting and `~/Applications/AgentSCM.app` (only while it is
+exactly what quickstart wrote) before removing its program. A running tray can
 be closed with **Quit AgentSCM Tray**.
 
 For an optional customer-operated Slack app, follow [Slack setup](slack.md). The same preparation commands support an installation agent, the official Slack CLI and manual app settings. A prepared private bundle can be supplied to `quickstart --hub local --slack-config-file ABSOLUTE_PATH`; installing the AgentSCM binary alone does not connect Slack.
