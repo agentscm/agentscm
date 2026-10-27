@@ -1206,6 +1206,51 @@ fn context(reply: &Value) -> String {
         .to_owned()
 }
 
+/// Connecting before any sign-in signs in on the way; the token still comes through the computer,
+/// so revoking the computer stops this agent too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connecting_with_a_first_sign_in_mints_through_the_computer() {
+    let env = Env::start("github").await;
+    env.fake.lock().unwrap().approve = ALICE;
+    let machine = Machine::new(REPO);
+    let (hub, root) = (env.hub.clone(), machine.root());
+    let (ok, _, stderr) = machine.run(&[
+        "--no-telemetry",
+        "client",
+        "connect",
+        "--hub",
+        &hub,
+        "--provider",
+        "github",
+        "--root",
+        root.to_str().unwrap(),
+    ]);
+    assert!(ok, "{stderr}");
+    let expires = machine.connection()["owned_token_expires_at"]
+        .as_i64()
+        .unwrap();
+    assert!(expires <= unix_now() + 24 * 60 * 60 + 60, "{expires}");
+    let agent = machine.token();
+    assert_eq!(env.whoami(&agent).await, 200);
+    let (session, _, desktop) = env.sign_in(ALICE, "desktop").await;
+    let (_, list) = env.get("/v1/hub/devices", &session).await;
+    let laptop = list["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["id"] != json!(desktop))
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        env.delete(&format!("/v1/hub/devices/{laptop}"), &session)
+            .await,
+        204
+    );
+    assert_eq!(env.whoami(&agent).await, 401);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
     let env = Env::start("github").await;
