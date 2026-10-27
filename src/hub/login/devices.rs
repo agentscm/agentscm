@@ -121,6 +121,15 @@ impl FromRequestParts<HubState> for Owner {
         parts: &mut Parts,
         state: &HubState,
     ) -> std::result::Result<Self, ApiError> {
+        // The web page's cookie sign-in, with its CSRF check.
+        if !parts
+            .headers
+            .contains_key(axum::http::header::AUTHORIZATION)
+        {
+            return super::HumanSession::from_request_parts(parts, state)
+                .await
+                .map(|super::HumanSession(human)| Self::Human(human));
+        }
         let raw = bearer(parts)?;
         if let Some(human) = session_digest(raw)
             .ok()

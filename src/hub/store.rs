@@ -245,6 +245,26 @@ pub trait Store: Send + Sync {
     fn refusals(&self, now: i64) -> Result<Vec<Refusal>>;
     /// Connected repositories with the computers and live agent tokens using each.
     fn repository_usage(&self, now: i64) -> Result<Vec<RepositoryUsage>>;
+    /// A web-page sign-in for an enabled `owner`, until `expires_at`. Expired rows go, and a
+    /// person keeps at most `MAX_BROWSER_SESSIONS` (the oldest go first).
+    fn insert_browser_session(
+        &self,
+        owner: &str,
+        digest: &TokenDigest,
+        expires_at: i64,
+        now: i64,
+    ) -> Result<()>;
+    /// The owner of a live web-page sign-in (with `disabled` set when they were disabled) and its
+    /// expiry, moved to `slide_to` when that is `SLIDE_STEP_SECONDS` later. None when unknown or
+    /// expired.
+    fn browser_session(
+        &self,
+        digest: &TokenDigest,
+        now: i64,
+        slide_to: i64,
+    ) -> Result<Option<(User, i64)>>;
+    /// True if the web-page sign-in existed.
+    fn delete_browser_session(&self, digest: &TokenDigest) -> Result<bool>;
     /// Upsert intent `intent.id` for the active token `token`; returns it and every live overlapping intent.
     fn announce_intent(&self, token: &str, intent: &NewIntent, now: i64) -> Result<Announced>;
     /// None if unknown, not the caller's, released or expired.
@@ -896,6 +916,21 @@ pub fn open(url: &str) -> Result<Arc<dyn Store>> {
 
 pub fn agent_token_digest(raw: &str) -> Result<TokenDigest> {
     token_digest(AGENT_TOKEN_DIGEST_DOMAIN, raw)
+        .map(TokenDigest)
+        .map_err(|_| HubError::Unauthorized)
+}
+
+const BROWSER_SESSION_DIGEST_DOMAIN: &[u8] = b"agentscm.hub.browser-session.v1\0";
+
+/// A person keeps at most this many web-page sign-ins.
+pub const MAX_BROWSER_SESSIONS: i64 = 8;
+/// A web-page sign-in's expiry is moved forward only by at least this much, so every request
+/// does not write.
+pub const SLIDE_STEP_SECONDS: i64 = 5 * 60;
+
+/// Digest of a web-page sign-in's cookie secret, domain-separated from every other credential.
+pub fn browser_session_digest(raw: &str) -> Result<TokenDigest> {
+    token_digest(BROWSER_SESSION_DIGEST_DOMAIN, raw)
         .map(TokenDigest)
         .map_err(|_| HubError::Unauthorized)
 }

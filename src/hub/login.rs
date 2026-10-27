@@ -33,6 +33,11 @@ mod devices;
 
 const SESSION_DIGEST_DOMAIN: &[u8] = b"agentscm.hub.session.v1\0";
 const COOKIE: &str = "__Host-agentscm_login";
+/// The web pages' sign-in. The secret is only in this HttpOnly cookie; the Hub keeps its digest.
+const BROWSER_COOKIE: &str = "__Host-agentscm_session";
+/// Every request that changes something with the web sign-in names this token in this header.
+const CSRF_HEADER: &str = "x-csrf-token";
+const CSRF_DOMAIN: &[u8] = b"agentscm.hub.csrf.v1\0";
 const SESSION_SECONDS: i64 = 8 * 60 * 60;
 const BROWSER_LOGIN_SECONDS: i64 = 600;
 const HANDOFF_SECONDS: i64 = 60;
@@ -371,6 +376,8 @@ struct BrowserLogin {
     cli_port: u16,
     cli_challenge: String,
     workspace: bool,
+    /// Signs the browser itself in to the Hub's web pages.
+    web: bool,
     client: IpAddr,
 }
 
@@ -397,6 +404,43 @@ pub(super) struct Human {
     expires_at: i64,
     /// The computer signed in by the same sign-in; revoking it ends this session too.
     device: Option<String>,
+    /// Set for a web-page sign-in, which lives in the database instead of this process.
+    browser: Option<BrowserSession>,
+}
+
+#[derive(Clone)]
+pub(super) struct BrowserSession {
+    digest: super::store::TokenDigest,
+    csrf: String,
+}
+
+/// The value of the only web sign-in cookie, if there is exactly one.
+fn browser_cookie(headers: &HeaderMap) -> Option<&str> {
+    let mut found = headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|cookie| {
+            cookie
+                .trim()
+                .strip_prefix(BROWSER_COOKIE)?
+                .strip_prefix('=')
+        });
+    match (found.next(), found.next()) {
+        (Some(value), None) => Some(value),
+        _ => None,
+    }
+}
+
+fn csrf_token(secret: &str) -> Result<String> {
+    token_digest(CSRF_DOMAIN, secret).map_err(|_| HubError::Unauthorized)
+}
+
+fn browser_cookie_attributes(value: &str, max_age: i64) -> String {
+    format!(
+        "{BROWSER_COOKIE}={value}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age={max_age}"
+    )
 }
 
 #[derive(Clone)]
@@ -548,12 +592,52 @@ impl FromRequestParts<HubState> for HumanSession {
         parts: &mut Parts,
         state: &HubState,
     ) -> std::result::Result<Self, ApiError> {
-        let digest = session_digest(bearer(parts)?)?;
-        state
-            .login
-            .session(&digest)
-            .map(Self)
-            .ok_or_else(ApiError::unauthorized)
+        if parts.headers.contains_key(header::AUTHORIZATION) {
+            let digest = session_digest(bearer(parts)?)?;
+            return state
+                .login
+                .session(&digest)
+                .map(Self)
+                .ok_or_else(ApiError::unauthorized);
+        }
+        let secret = browser_cookie(&parts.headers).ok_or_else(ApiError::unauthorized)?;
+        let digest = super::store::browser_session_digest(secret)?;
+        let csrf = csrf_token(secret)?;
+        // A request that changes something must also carry the token only the Hub's own page
+        // can read; a cookie alone, as another site's form would send, is refused.
+        let reads = matches!(
+            parts.method,
+            axum::http::Method::GET | axum::http::Method::HEAD
+        );
+        let named = parts.headers.get(CSRF_HEADER).and_then(|v| v.to_str().ok());
+        if !reads && named != Some(csrf.as_str()) {
+            return Err(ApiError::new(StatusCode::FORBIDDEN, "csrf").with_message(
+                "This change did not come from the Hub's own page; reload the page and try again",
+            ));
+        }
+        let (store, key) = (state.store.clone(), digest.clone());
+        let now = unix_now();
+        let found = blocking(state, move || {
+            store.browser_session(&key, now, now + SESSION_SECONDS)
+        })
+        .await?;
+        let Some((user, expires_at)) = found else {
+            return Err(ApiError::unauthorized());
+        };
+        if user.disabled {
+            return Err(
+                ApiError::new(StatusCode::FORBIDDEN, "user_disabled").with_message(DISABLED)
+            );
+        }
+        Ok(Self(Human {
+            key: String::new(),
+            admin: state.login.is_admin_user(&user),
+            user,
+            forge_token: String::new(),
+            expires_at,
+            device: None,
+            browser: Some(BrowserSession { digest, csrf }),
+        }))
     }
 }
 
@@ -672,7 +756,8 @@ async fn browser_start(
     if workspace && state.workspace.is_none() {
         return Err(not_found());
     }
-    let cli_port = if workspace {
+    let web = !workspace && params.get("web").is_some_and(|value| value == "1");
+    let cli_port = if workspace || web {
         0
     } else {
         params
@@ -681,7 +766,7 @@ async fn browser_start(
             .filter(|port| *port >= 1024)
             .ok_or_else(ApiError::invalid)?
     };
-    let cli_challenge = if workspace {
+    let cli_challenge = if workspace || web {
         String::new()
     } else {
         params
@@ -724,6 +809,7 @@ async fn browser_start(
         cli_port,
         cli_challenge,
         workspace,
+        web,
         client,
     };
     let mut pending = state.login.pending();
@@ -764,6 +850,18 @@ async fn callback(
 fn refused_page(pending: &BrowserLogin, error: ApiError) -> ApiResult<Response> {
     if pending.workspace {
         return Err(error);
+    }
+    if pending.web {
+        let mut query = Url::parse("http://page.invalid/").map_err(|_| ApiError::invalid())?;
+        query
+            .query_pairs_mut()
+            .append_pair("status", "refused")
+            .append_pair("reason", error.code());
+        if let Some(message) = error.message() {
+            query.query_pairs_mut().append_pair("message", message);
+        }
+        let location = format!("/ui/#/signed-in?{}", query.query().unwrap_or_default());
+        return found(&location, cookie_attributes("", 0));
     }
     // The CLI's loopback hears why, stops waiting, and sends the browser to the Hub page.
     let mut query = Url::parse("http://page.invalid/").map_err(|_| ApiError::invalid())?;
@@ -836,6 +934,32 @@ async fn callback_inner(
         Ok(signed) => signed,
         Err(error) => return refuse(error),
     };
+    if pending.web {
+        // Only the cookie holds the secret; this process's in-memory session is not used.
+        state
+            .login
+            .pending()
+            .sessions
+            .0
+            .remove(&session_digest(&signed.secret)?);
+        let secret = random_hex()?;
+        let digest = super::store::browser_session_digest(&secret)?;
+        let (store, owner, now) = (state.store.clone(), signed.user.id.clone(), unix_now());
+        blocking(state, move || {
+            store.insert_browser_session(&owner, &digest, now + SESSION_SECONDS, now)
+        })
+        .await?;
+        let mut response = found("/ui/#home", cookie_attributes("", 0))?;
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            HeaderValue::from_str(&browser_cookie_attributes(&secret, SESSION_SECONDS))
+                .map_err(|_| ApiError::invalid())?,
+        );
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return Ok(response);
+    }
     if pending.workspace {
         // The browser receives a separate short-lived HttpOnly cookie, never the
         // CLI human bearer or an agent token. Forge credentials stay server-side.
@@ -1129,6 +1253,7 @@ async fn sign_in(
         forge_token: token.to_owned(),
         expires_at,
         device: None,
+        browser: None,
     };
     state
         .login
@@ -1350,13 +1475,32 @@ async fn providers(State(state): State<HubState>) -> Json<Value> {
 }
 
 async fn session(HumanSession(human): HumanSession) -> Json<Value> {
-    Json(json!({"user": user_json(&human.user), "admin": human.admin,
-        "expires_at": human.expires_at}))
+    let mut reply = json!({"user": user_json(&human.user), "admin": human.admin,
+        "expires_at": human.expires_at});
+    if let Some(browser) = &human.browser {
+        reply["csrf_token"] = json!(browser.csrf);
+    }
+    Json(reply)
 }
 
-async fn logout(State(state): State<HubState>, HumanSession(human): HumanSession) -> StatusCode {
-    state.login.pending().sessions.0.remove(&human.key);
-    StatusCode::NO_CONTENT
+async fn logout(
+    State(state): State<HubState>,
+    HumanSession(human): HumanSession,
+) -> ApiResult<Response> {
+    let Some(browser) = human.browser else {
+        state.login.pending().sessions.0.remove(&human.key);
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    };
+    let store = state.store.clone();
+    blocking(&state, move || {
+        store.delete_browser_session(&browser.digest)
+    })
+    .await?;
+    let cookie = HeaderValue::from_str(&browser_cookie_attributes("", 0))
+        .map_err(|_| ApiError::invalid())?;
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response.headers_mut().insert(header::SET_COOKIE, cookie);
+    Ok(response)
 }
 
 #[derive(Deserialize)]
@@ -1374,6 +1518,11 @@ async fn create_token(
     HumanSession(human): HumanSession,
     JsonBody(body): JsonBody<NewToken>,
 ) -> ApiResult<Response> {
+    if human.browser.is_some() {
+        return Err(forbidden().with_message(
+            "Agent tokens are made by the CLI or this computer's sign-in, not the web page; run agentscm client setup",
+        ));
+    }
     validate_agent_name(&body.name)?;
     validate_repository(&body.repository)?;
     if !(1..=MAX_AGENT_TOKEN_TTL_SECONDS).contains(&body.ttl_seconds) {
@@ -1598,6 +1747,7 @@ mod tests {
             forge_token: String::new(),
             expires_at: 0,
             device: None,
+            browser: None,
         }
     }
 

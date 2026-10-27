@@ -80,9 +80,9 @@ use super::session::{
 use super::skills::{EvidenceRow, RunHead, SkillAdoption};
 use super::store::{
     ACTIVITY_KINDS, ActivityEvent, AgentToken, Event, ForgeIdentity, HubEvent, LIST_LIMIT,
-    NAMED_MIGRATIONS, NewAgentToken, Principal, SessionView, Store, TokenDigest, User, event_limit,
-    like_pattern, lower_hex_of, new_id, pending, plan_named, search_number, session_key, unix_now,
-    validate_login,
+    MAX_BROWSER_SESSIONS, NAMED_MIGRATIONS, NewAgentToken, Principal, SLIDE_STEP_SECONDS,
+    SessionView, Store, TokenDigest, User, event_limit, like_pattern, lower_hex_of, new_id,
+    pending, plan_named, search_number, session_key, unix_now, validate_login,
 };
 use super::work::{
     Briefing, BriefingAck, BriefingQuery, CLAIM_STALE_SECONDS, Checkpoint, CheckpointReceipt,
@@ -4962,6 +4962,85 @@ impl Store for PgStore {
                     agent_tokens: row.get(4),
                 })
                 .collect())
+        })
+    }
+
+    fn insert_browser_session(
+        &self,
+        owner: &str,
+        digest: &TokenDigest,
+        expires_at: i64,
+        now: i64,
+    ) -> Result<()> {
+        self.run(false, |client| {
+            let mut tx = client.transaction()?;
+            tx.execute(
+                "DELETE FROM hub_browser_sessions WHERE expires_at <= $1",
+                &[&now],
+            )?;
+            let inserted = tx.execute(
+                "INSERT INTO hub_browser_sessions (digest, owner, created_at, expires_at)
+                 SELECT $1, id, $3, $4 FROM hub_users WHERE id = $2 AND NOT disabled FOR SHARE",
+                &[&digest.as_str(), &owner, &now, &expires_at],
+            )?;
+            if inserted == 0 {
+                return Err(HubError::Invalid("unknown or disabled owner".into()));
+            }
+            tx.execute(
+                "DELETE FROM hub_browser_sessions WHERE owner = $1 AND digest NOT IN
+                     (SELECT digest FROM hub_browser_sessions WHERE owner = $1
+                      ORDER BY created_at DESC, digest LIMIT $2)",
+                &[&owner, &MAX_BROWSER_SESSIONS],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    fn browser_session(
+        &self,
+        digest: &TokenDigest,
+        now: i64,
+        slide_to: i64,
+    ) -> Result<Option<(User, i64)>> {
+        self.run(false, |client| {
+            let Some(row) = client.query_opt(
+                "SELECT u.id, u.provider, u.host, u.forge_user_id, u.login, u.disabled, s.expires_at
+                 FROM hub_browser_sessions s JOIN hub_users u ON u.id = s.owner
+                 WHERE s.digest = $1 AND s.expires_at > $2",
+                &[&digest.as_str(), &now],
+            )?
+            else {
+                return Ok(None);
+            };
+            let expires_at: i64 = row.get(6);
+            let user = User {
+                id: row.get(0),
+                identity: ForgeIdentity {
+                    provider: row.get(1),
+                    host: row.get(2),
+                    user_id: row.get(3),
+                },
+                login: row.get(4),
+                disabled: row.get(5),
+            };
+            if slide_to <= expires_at + SLIDE_STEP_SECONDS {
+                return Ok(Some((user, expires_at)));
+            }
+            client.execute(
+                "UPDATE hub_browser_sessions SET expires_at = $2 WHERE digest = $1",
+                &[&digest.as_str(), &slide_to],
+            )?;
+            Ok(Some((user, slide_to)))
+        })
+    }
+
+    fn delete_browser_session(&self, digest: &TokenDigest) -> Result<bool> {
+        self.run(false, |client| {
+            Ok(client.execute(
+                "DELETE FROM hub_browser_sessions WHERE digest = $1",
+                &[&digest.as_str()],
+            )? > 0)
         })
     }
 
