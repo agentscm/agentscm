@@ -15,6 +15,8 @@ COPY examples/slack-manifest.json ./examples/slack-manifest.json
 COPY docs/assets/agentscm-icon.png ./docs/assets/agentscm-icon.png
 COPY --from=ui /ui/dist ./ui/dist
 COPY tools/portable-verifier ./tools/portable-verifier
+# The commit the Hub reports on /health; the build context has no .git (empty means unknown).
+ARG AGENTSCM_BUILD_COMMIT=
 RUN cargo build --locked --release --features ui
 
 # Test-only seeder for .github/hub-e2e.sh. `docker build .` builds only the last stage, so it never

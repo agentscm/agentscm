@@ -439,7 +439,9 @@ async fn health(State(state): State<HubState>) -> Response {
     match blocking(&state, move || store.ping()).await {
         Ok(()) => {
             let mut body = json!({"status": "ok", "storage": state.store.backend(),
-                "coordination": super::session::coordination()});
+                "coordination": super::session::coordination(),
+                "version": env!("CARGO_PKG_VERSION"),
+                "commit": (!crate::BUILD_COMMIT.is_empty()).then_some(crate::BUILD_COMMIT)});
             if state.demo {
                 body["demo"] = json!(true);
             }
