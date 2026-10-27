@@ -1706,8 +1706,9 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
         || left.native_hub.is_some()
         || native_executable_drift;
     #[cfg(target_os = "macos")]
-    if let Some((dir, _)) = programs.as_ref().filter(|_| !retain_program)
-        && let Err(error) = launcher::remove(&launcher::app(&home), &dir.join(binary::LINK))
+    if programs.is_some()
+        && !retain_program
+        && let Err(error) = launcher::remove(&launcher::app(&home))
     {
         println!("Couldn't remove the AgentSCM app launcher: {error}.");
     }
