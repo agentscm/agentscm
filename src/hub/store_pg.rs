@@ -79,10 +79,11 @@ use super::session::{
 };
 use super::skills::{EvidenceRow, RunHead, SkillAdoption};
 use super::store::{
-    ACTIVITY_KINDS, ActivityEvent, AgentToken, Event, ForgeIdentity, HubEvent, LIST_LIMIT,
-    MAX_BROWSER_SESSIONS, NAMED_MIGRATIONS, NewAgentToken, Principal, SLIDE_STEP_SECONDS,
-    SessionView, Store, TokenDigest, User, event_limit, like_pattern, lower_hex_of, new_id,
-    pending, plan_named, search_number, session_key, unix_now, validate_login,
+    ACTIVITY_KINDS, ActivityEvent, AgentToken, BROWSER_SESSION_MAX_SECONDS, Event, ForgeIdentity,
+    HubEvent, LIST_LIMIT, MAX_BROWSER_SESSIONS, NAMED_MIGRATIONS, NewAgentToken, Principal,
+    SLIDE_STEP_SECONDS, SessionView, Store, TokenDigest, User, event_limit, like_pattern,
+    lower_hex_of, new_id, pending, plan_named, search_number, session_key, unix_now,
+    validate_login,
 };
 use super::work::{
     Briefing, BriefingAck, BriefingQuery, CLAIM_STALE_SECONDS, Checkpoint, CheckpointReceipt,
@@ -200,6 +201,13 @@ impl PgStore {
                 .is_none()
             {
                 return Err(HubError::Invalid("unknown user".into()));
+            }
+            // Enabling someone again must not bring back a browser they were signed in on.
+            if disabled {
+                tx.execute(
+                    "DELETE FROM hub_browser_sessions WHERE owner = $1",
+                    &[&user],
+                )?;
             }
             Ok(tx.commit()?)
         })
@@ -5007,8 +5015,8 @@ impl Store for PgStore {
             let Some(row) = client.query_opt(
                 "SELECT u.id, u.provider, u.host, u.forge_user_id, u.login, u.disabled, s.expires_at
                  FROM hub_browser_sessions s JOIN hub_users u ON u.id = s.owner
-                 WHERE s.digest = $1 AND s.expires_at > $2",
-                &[&digest.as_str(), &now],
+                 WHERE s.digest = $1 AND s.expires_at > $2 AND s.created_at > $3",
+                &[&digest.as_str(), &now, &(now - BROWSER_SESSION_MAX_SECONDS)],
             )?
             else {
                 return Ok(None);

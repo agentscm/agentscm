@@ -185,20 +185,22 @@ sign-in there.
 
 `GET /v1/hub/login/{provider}?web=1` signs the browser itself in, with the same allow-list and
 repository checks as any sign-in. On success it redirects to `/ui/#home` and sets
-`__Host-agentscm_session` (`HttpOnly`, `Secure`, `SameSite=Strict`, `Path=/`, 8 hours); a refusal
+`__Host-agentscm_session` (`HttpOnly`, `Secure`, `SameSite=Strict`, `Path=/`); a refusal
 redirects to `/ui/#/signed-in?status=refused&reason=<kind>&message=...`.
+This is the Hub API; the bundled web UI does not use it yet and still asks for a pasted token.
 
 - The Hub keeps only a domain-separated digest of the cookie, in the database (named migration
-  `browser_sessions`), so a restart or deploy keeps people signed in. The 8 hours slide with use
-  (moved forward at most every 5 minutes); a person keeps at most 8 such sign-ins, the oldest
-  going first. A disabled person's sign-in answers 403 `user_disabled`.
+  `browser_sessions`), so a restart or deploy keeps people signed in. It ends 8 hours after the
+  last use (moved forward at most every 5 minutes) and 7 days after sign-in at the latest; a
+  person keeps at most 8 such sign-ins, the oldest going first. Disabling a person deletes their
+  sign-ins, and one who leaves the allow list gets 403 `not_allowed`.
 - With the cookie, `GET /v1/hub/session` also returns `csrf_token`. Every request other than
   `GET` or `HEAD` made with the cookie must send that value in `x-csrf-token`, or it gets 403
   `csrf`; a cookie alone, as another site's form would send it, changes nothing.
 - The cookie counts as a human session wherever one is accepted (the computer list and revoke,
   and the administrator routes for administrators); a computer credential still never does. It
-  cannot mint agent tokens (`POST /v1/hub/tokens` answers 403): those come from the CLI or this
-  computer's credential. `DELETE /v1/hub/session` with the cookie and the CSRF token ends it and
+  cannot mint agent tokens (`POST /v1/hub/tokens` answers 403) or enroll a computer
+  (`POST /v1/hub/devices` answers 403): those come from `hub login`. `DELETE /v1/hub/session` with the cookie and the CSRF token ends it and
   clears the cookie.
 - Sessions from `hub login` (`Authorization: Bearer`) still live in Hub memory for 8 hours; the
   CLI and agents rely on the [computer credential](#computer-credentials) instead.

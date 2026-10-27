@@ -947,7 +947,10 @@ fn devices_and_refusals(db: &Db) {
 }
 
 fn browser_sessions(db: &Db) {
-    use store::{MAX_BROWSER_SESSIONS, SLIDE_STEP_SECONDS, browser_session_digest};
+    use store::{
+        BROWSER_SESSION_MAX_SECONDS, MAX_BROWSER_SESSIONS, SLIDE_STEP_SECONDS,
+        browser_session_digest,
+    };
 
     let store = db.open();
     let alice = store.upsert_user(&identity(7), "alice").unwrap();
@@ -980,22 +983,23 @@ fn browser_sessions(db: &Db) {
         store.browser_session(&digest(0), later, later).unwrap(),
         None
     );
-    // A disabled owner is returned as disabled; a disabled owner cannot get a new one.
+    // However often it is used, a sign-in ends a week after it began.
+    let old = now - BROWSER_SESSION_MAX_SECONDS;
+    store
+        .insert_browser_session(&alice.id, &digest(20), now + 100, old)
+        .unwrap();
+    assert_eq!(store.browser_session(&digest(20), now, now).unwrap(), None);
+    // Disabling the owner deletes their sign-ins, so enabling them again brings none back; a
+    // disabled owner cannot get a new one.
     store.set_user_disabled(&alice.id, true).unwrap();
-    assert!(
-        store
-            .browser_session(&digest(0), now, now)
-            .unwrap()
-            .unwrap()
-            .0
-            .disabled
-    );
+    assert_eq!(db.count("SELECT COUNT(*) FROM hub_browser_sessions"), 0);
     assert!(
         store
             .insert_browser_session(&alice.id, &digest(1), now + 100, now)
             .is_err()
     );
     store.set_user_disabled(&alice.id, false).unwrap();
+    assert_eq!(store.browser_session(&digest(0), now, now).unwrap(), None);
     // At most eight per person: the oldest go first.
     for n in 1..=MAX_BROWSER_SESSIONS as usize + 1 {
         store

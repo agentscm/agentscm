@@ -274,6 +274,11 @@ async fn enroll(
     super::HumanSession(human): super::HumanSession,
     JsonBody(body): JsonBody<DeviceRequest>,
 ) -> ApiResult<Response> {
+    // A web page never holds a computer credential: it would outlive the page's sign-in.
+    if human.browser.is_some() {
+        return Err(super::forbidden()
+            .with_message("A computer signs in with `agentscm hub login`, not from a web page"));
+    }
     // Only a sign-in from before computers had credentials enrolls one: a session that came
     // with a computer cannot add another after that computer was revoked.
     if human.device.is_some() {

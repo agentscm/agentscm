@@ -629,9 +629,20 @@ impl FromRequestParts<HubState> for HumanSession {
                 ApiError::new(StatusCode::FORBIDDEN, "user_disabled").with_message(DISABLED)
             );
         }
+        // This sign-in outlives restarts, so leaving the allow list must end it too.
+        let login = &state.login;
+        let admin = login.is_admin_user(&user);
+        if login.has_allow_list()
+            && !admin
+            && !login.is_allowed(&user.identity.provider, user.identity.user_id, &user.login)
+        {
+            return Err(
+                ApiError::new(StatusCode::FORBIDDEN, "not_allowed").with_message(NOT_ALLOWED)
+            );
+        }
         Ok(Self(Human {
             key: String::new(),
-            admin: state.login.is_admin_user(&user),
+            admin,
             user,
             forge_token: String::new(),
             expires_at,
@@ -930,18 +941,11 @@ async fn callback_inner(
     } else {
         "browser"
     };
-    let signed = match sign_in(state, provider, forge, method, &body).await {
+    let signed = match sign_in(state, provider, forge, method, !pending.web, &body).await {
         Ok(signed) => signed,
         Err(error) => return refuse(error),
     };
     if pending.web {
-        // Only the cookie holds the secret; this process's in-memory session is not used.
-        state
-            .login
-            .pending()
-            .sessions
-            .0
-            .remove(&session_digest(&signed.secret)?);
         let secret = random_hex()?;
         let digest = super::store::browser_session_digest(&secret)?;
         let (store, owner, now) = (state.store.clone(), signed.user.id.clone(), unix_now());
@@ -952,8 +956,11 @@ async fn callback_inner(
         let mut response = found("/ui/#home", cookie_attributes("", 0))?;
         response.headers_mut().append(
             header::SET_COOKIE,
-            HeaderValue::from_str(&browser_cookie_attributes(&secret, SESSION_SECONDS))
-                .map_err(|_| ApiError::invalid())?,
+            HeaderValue::from_str(&browser_cookie_attributes(
+                &secret,
+                super::store::BROWSER_SESSION_MAX_SECONDS,
+            ))
+            .map_err(|_| ApiError::invalid())?,
         );
         response
             .headers_mut()
@@ -1159,6 +1166,8 @@ async fn sign_in(
     provider: &Provider,
     forge: &Forge,
     method: &'static str,
+    // False for a web-page sign-in, which lives in the database instead of this process.
+    remember: bool,
     grant: &Value,
 ) -> ApiResult<Signed> {
     let token = grant["access_token"]
@@ -1255,11 +1264,13 @@ async fn sign_in(
         device: None,
         browser: None,
     };
-    state
-        .login
-        .pending()
-        .sessions
-        .insert_session(key, expires_at, human, now);
+    if remember {
+        state
+            .login
+            .pending()
+            .sessions
+            .insert_session(key, expires_at, human, now);
+    }
     Ok(Signed {
         secret,
         expires_at,
@@ -1430,7 +1441,7 @@ async fn device_poll(
     let remove = || state.login.pending().device.take(&body.handle, unix_now());
     if reply["access_token"].is_string() {
         remove();
-        let signed = sign_in(&state, provider, forge, "device", &reply).await?;
+        let signed = sign_in(&state, provider, forge, "device", true, &reply).await?;
         let mut out = signed_reply(&state, &signed, body.device).await?;
         out["status"] = json!("signed_in");
         return Ok(Json(out));

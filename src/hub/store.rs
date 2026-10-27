@@ -255,8 +255,8 @@ pub trait Store: Send + Sync {
         now: i64,
     ) -> Result<()>;
     /// The owner of a live web-page sign-in (with `disabled` set when they were disabled) and its
-    /// expiry, moved to `slide_to` when that is `SLIDE_STEP_SECONDS` later. None when unknown or
-    /// expired.
+    /// expiry, moved to `slide_to` when that is `SLIDE_STEP_SECONDS` later. None when unknown,
+    /// expired, or begun `BROWSER_SESSION_MAX_SECONDS` ago.
     fn browser_session(
         &self,
         digest: &TokenDigest,
@@ -927,6 +927,8 @@ pub const MAX_BROWSER_SESSIONS: i64 = 8;
 /// A web-page sign-in's expiry is moved forward only by at least this much, so every request
 /// does not write.
 pub const SLIDE_STEP_SECONDS: i64 = 5 * 60;
+/// A web-page sign-in ends this long after it began, however often it is used.
+pub const BROWSER_SESSION_MAX_SECONDS: i64 = 7 * 24 * 60 * 60;
 
 /// Digest of a web-page sign-in's cookie secret, domain-separated from every other credential.
 pub fn browser_session_digest(raw: &str) -> Result<TokenDigest> {
