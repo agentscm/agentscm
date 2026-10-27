@@ -1444,8 +1444,8 @@ fn set_cookie(response: &reqwest::Response, name: &str) -> Option<String> {
         })
 }
 
-/// Signs `user` in to the Hub's web pages; returns the session cookie's value.
-async fn web_sign_in(env: &Env, user: i64) -> String {
+/// Runs a web-page sign-in for `user` up to the Hub's answer to the forge's callback.
+async fn web_callback(env: &Env, user: i64) -> reqwest::Response {
     env.fake.lock().unwrap().approve = user;
     let http = browser();
     let start = http
@@ -1464,12 +1464,16 @@ async fn web_sign_in(env: &Env, user: i64) -> String {
         .to_str()
         .unwrap()
         .to_owned();
-    let done = http
-        .get(callback)
+    http.get(callback)
         .header(header::COOKIE, format!("__Host-agentscm_login={login}"))
         .send()
         .await
-        .unwrap();
+        .unwrap()
+}
+
+/// Signs `user` in to the Hub's web pages; returns the session cookie's value.
+async fn web_sign_in(env: &Env, user: i64) -> String {
+    let done = web_callback(env, user).await;
     assert_eq!(done.status(), 302);
     assert_eq!(done.headers()[header::LOCATION], "/ui/#home");
     let all: Vec<_> = done
@@ -1619,6 +1623,15 @@ async fn the_web_sign_in_survives_a_restart_and_needs_csrf_to_change_anything() 
     let alice = users.iter().find(|u| u.login == "alice").unwrap();
     env.store.set_user_disabled(&alice.id, true).unwrap();
     assert_eq!(session(cookie.clone()).await.0, 401);
+    // A refused web sign-in lands on the Hub's page with the reason alone, which the page
+    // words itself: anyone can forge that link.
+    let refused = web_callback(&env, ALICE).await;
+    assert_eq!(refused.status(), 302);
+    assert_eq!(
+        refused.headers()[header::LOCATION],
+        "/ui/#/signed-in?status=refused&reason=user_disabled"
+    );
+    assert!(set_cookie(&refused, "__Host-agentscm_session").is_none());
     env.store.set_user_disabled(&alice.id, false).unwrap();
     assert_eq!(session(cookie).await.0, 401);
 

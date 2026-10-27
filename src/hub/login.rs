@@ -856,8 +856,9 @@ async fn callback(
     response
 }
 
-/// A browser sign-in that fails goes back to the CLI with the reason and the message; a
-/// workspace sign-in keeps its JSON error.
+/// A browser sign-in that fails goes back to the CLI with the reason and the message, and a web
+/// one to the Hub's page with the reason alone (anyone can forge that link, so the page words
+/// the reason itself); a workspace sign-in keeps its JSON error.
 fn refused_page(pending: &BrowserLogin, error: ApiError) -> ApiResult<Response> {
     if pending.workspace {
         return Err(error);
@@ -868,9 +869,6 @@ fn refused_page(pending: &BrowserLogin, error: ApiError) -> ApiResult<Response> 
             .query_pairs_mut()
             .append_pair("status", "refused")
             .append_pair("reason", error.code());
-        if let Some(message) = error.message() {
-            query.query_pairs_mut().append_pair("message", message);
-        }
         let location = format!("/ui/#/signed-in?{}", query.query().unwrap_or_default());
         return found(&location, cookie_attributes("", 0));
     }

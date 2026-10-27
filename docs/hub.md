@@ -186,7 +186,7 @@ sign-in there.
 `GET /v1/hub/login/{provider}?web=1` signs the browser itself in, with the same allow-list and
 repository checks as any sign-in. On success it redirects to `/ui/#home` and sets
 `__Host-agentscm_session` (`HttpOnly`, `Secure`, `SameSite=Strict`, `Path=/`); a refusal
-redirects to `/ui/#/signed-in?status=refused&reason=<kind>&message=...`.
+redirects to `/ui/#/signed-in?status=refused&reason=<kind>`.
 This is the Hub API; the bundled web UI does not use it yet and still asks for a pasted token.
 
 - The Hub keeps only a domain-separated digest of the cookie, in the database (named migration
@@ -272,7 +272,8 @@ status shown; clients show `message` as is.
   sign-in cancelled or refused at the forge (with the forge's error code when it is a plain
   word), a code the forge did not accept, an account the forge did not return, or a code that
   expired before the CLI used it. A browser sign-in that fails redirects to
-  `/ui/#/signed-in?status=refused&reason=<kind>&message=...` instead of answering JSON.
+  `/ui/#/signed-in?status=refused&reason=<kind>` instead of answering JSON; the page words the
+  reason itself, since anyone can forge that link.
 - `GET /v1/hub/login` also lists `browser_only`: providers whose forge app refused device
   sign-in when last asked (a GitHub App without **Enable Device Flow**, which a manifest cannot
   set; the setup page links to the checkbox), so clients go straight to the browser.
