@@ -186,6 +186,11 @@ contacts a Hub in a checkout connected to one. Quickstart says so and asks first
 AgentSCM for ... in all your projects?" With `--yes` it answers yes after printing the same
 notice. It does not ask again for an agent that is already installed this way.
 
+Setup never writes to the repository: hooks, MCP entries, tokens and the Hub URL live in your user
+account and `~/.config/agentscm`, so `git status` stays clean, which matters on a public
+repository. Only `agentscm init-repo` (or `quickstart --init`) writes committable instruction
+files, and they name no Hub.
+
 | Agent | Hooks | MCP server | Coordination skill |
 |---|---|---|---|
 | Claude Code | user-scope plugin | in the plugin | in the plugin |
