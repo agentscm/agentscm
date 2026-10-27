@@ -737,12 +737,8 @@ fn collisions_step(cx: &Cx<'_>) {
         println!("Skipping the collision check: this isn't inside a Git repository.\n");
         return;
     };
-    if !cx.ui.confirm(
-        "Check this repository for branches and worktrees that would collide right now?",
-        true,
-    ) {
-        return;
-    }
+    // Read-only and the reason AgentSCM was installed, so it runs without asking; --no-collisions skips it.
+    println!("Checking for branches and worktrees that change the same files…");
     let request = Request {
         git: git.canonicalize().unwrap_or_else(|_| git.clone()),
         repository: root.clone(),
@@ -1286,12 +1282,13 @@ async fn agents_stage(cx: &mut Cx<'_>) {
         );
     }
     println!(
-        "Will connect {} to {hub} with {}, then set up {names}: hooks, MCP and the coordination skill. This is `{} client setup`; undo it with `uninstall`.",
+        "Will connect {} to {hub} with {}, then set up {names}: hooks, MCP and the coordination skill. Undo it with `{} uninstall`.",
         root.display(),
         if cx.args.agent_token_file.is_some() {
             "your agent token"
         } else {
-            "a new agent token (a 30-day key that lets agents on this machine use the hub for this one repository)"
+            // This computer's Hub credential mints a short-lived token and renews it; a sign-in without one falls back to 30 days.
+            "an agent token for this one repository, renewed automatically"
         },
         cli_command(cx)
     );

@@ -376,28 +376,28 @@ async fn mcp(
             if params.and_then(|p| p["name"].as_str()) == Some("agentscm_setup_status") {
                 if foreign {
                     Ok(refused("this token is for another repository"))
-                } else if let Some(call) =
-                    args::<super::onboarding::SetupCall>(params.and_then(|p| p.get("arguments")))
-                {
-                    Ok(
-                        match super::onboarding::mcp(
-                            &state,
-                            &principal,
-                            super::onboarding::client(&headers),
-                            call,
-                            epoch,
-                        ) {
-                            Ok(status) => {
-                                result(&serde_json::to_string(&status).unwrap_or_default(), false)
-                            }
-                            Err(error) => hub_failure(&error),
-                        },
-                    )
                 } else {
-                    Ok(invalid_args(
-                        "agentscm_setup_status",
-                        "unexpected setup arguments",
-                    ))
+                    // Say which argument is wrong (e.g. "missing field `agent`"), as other tools do.
+                    match try_args::<super::onboarding::SetupCall>(
+                        params.and_then(|p| p.get("arguments")),
+                    ) {
+                        Ok(call) => Ok(
+                            match super::onboarding::mcp(
+                                &state,
+                                &principal,
+                                super::onboarding::client(&headers),
+                                call,
+                                epoch,
+                            ) {
+                                Ok(status) => result(
+                                    &serde_json::to_string(&status).unwrap_or_default(),
+                                    false,
+                                ),
+                                Err(error) => hub_failure(&error),
+                            },
+                        ),
+                        Err(detail) => Ok(invalid_args("agentscm_setup_status", &detail)),
+                    }
                 }
             } else {
                 call(
@@ -1009,10 +1009,6 @@ fn safe_detail(error: &str) -> String {
         Some((_, expected)) if schema(expected) => format!("{kind}, expected {expected}"),
         _ => kind.into(),
     }
-}
-
-fn args<T: DeserializeOwned>(arguments: Option<&Value>) -> Option<T> {
-    try_args(arguments).ok()
 }
 
 /// A malformed call is the caller's mistake, not a coordination outage.

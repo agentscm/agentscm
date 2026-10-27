@@ -35,8 +35,8 @@ the forge did not accept the code. What signing in gives you:
   the 8-hour session, and is sent only to the Hub that issued it. Signing in again on the same
   computer replaces its credential; the Hub never matches computers by name.
 - **Agents connect themselves**, if you say so. AgentSCM's agent plugin runs a quick check
-  whenever an agent starts. The sign-in asks once at a terminal: "Connect agents automatically in
-  repositories on this Hub? [Y/n]" (`--no-auto-connect` answers no). A sign-in from the menu bar
+  whenever an agent starts. The sign-in asks once at a terminal: "Turn on
+  auto-connect for <hub>? [Y/n]" (`--no-auto-connect` answers no). A sign-in from the menu bar
   app, or one made before this question existed, is asked in the menu bar app or at the next
   interactive `agentscm hub` or `agentscm client` command. Change it with
   `agentscm hub auto-connect on|off [--hub URL]`. With it on, when a coding agent starts a session

@@ -98,7 +98,8 @@ export function SignedInPage() {
           </>
         )}
         <div className="done-actions">
-          <a className="btn btn-primary btn-lg" href={`${state.hub}/ui/`}>
+          {/* The CLI signed in this computer, not this browser: open the Hub through the web sign-in, which the forge passes straight through right after authorizing. */}
+          <a className="btn btn-primary btn-lg" href={state.kind === 'ok' && state.provider ? `${state.hub}/v1/hub/login/${state.provider.toLowerCase()}?web=1` : `${state.hub}/ui/`}>
             Open the Hub <Icon name="arrow-right" />
           </a>
           {state.kind === 'ok' && <span className="done-close">You can close this tab.</span>}

@@ -114,8 +114,8 @@ You sign in once per computer, not once per repository or per day:
 1. The sign-in signs this computer in to the Hub until you revoke it. A Hub restart does not sign
    you out, and a computer is signed out only after 90 days without use. On a desktop it opens
    your browser; over SSH it shows a code instead (`agentscm hub login --device` asks for that).
-2. At a terminal it asks once whether agents connect themselves: "Connect agents automatically in
-   repositories on this Hub? [Y/n]". The AgentSCM agent plugin runs a quick check whenever an
+2. At a terminal it asks once whether agents connect themselves: "Turn on
+   auto-connect for <hub>? [Y/n]". The AgentSCM agent plugin runs a quick check whenever an
    agent starts; with this on, an agent that starts in a checkout of a repository the Hub has
    connects it, writes no file in it, and begins with
    `AgentSCM: coordinating on owner/name.` Change it with `agentscm hub auto-connect on|off`.

@@ -196,6 +196,24 @@ async fn onboarding_requires_mcp_and_native_edit_for_each_agent_and_binding() {
         assert_eq!(status(&mcp)["state"], "unverified");
         assert_eq!(status(&mcp)["mcp_verified"], true);
         assert_eq!(status(&mcp)["native_verified"], false);
+        // A wrong call names the argument to fix.
+        let (_, missing) = hub
+            .onboarding_request(
+                &secret,
+                &binding,
+                reqwest::Method::POST,
+                "/mcp",
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                    "name":"agentscm_setup_status","arguments":{"session":session}}}),
+            )
+            .await;
+        assert!(
+            missing["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .ends_with("missing field `agent`"),
+            "{missing}"
+        );
         let (endpoint, edit, lifecycle) = match agent {
             "cursor" => (
                 "cursor",

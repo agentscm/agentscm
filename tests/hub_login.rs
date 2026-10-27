@@ -1795,7 +1795,10 @@ async fn cli_signs_in_with_the_device_flow_and_manages_tokens() {
     assert!(ok, "{stderr}");
     assert!(
         stderr.contains("ABCD-1234")
-            && stderr.contains(&format!("signed in to {hub} as github:alice")),
+            && stderr.contains(&format!(
+                "Signed in to {} as alice (GitHub).",
+                hub.split_once("://").unwrap().1
+            )),
         "{stderr}"
     );
     let file = cli.session_file();
@@ -1989,7 +1992,7 @@ async fn cli_falls_back_to_the_loopback_flow_when_device_flow_is_unavailable() {
     let mut rest = String::new();
     std::io::Read::read_to_string(&mut stderr, &mut rest).unwrap();
     assert!(child.wait().unwrap().success(), "{rest}");
-    assert!(rest.contains("as gitlab:bob"), "{rest}");
+    assert!(rest.contains("as bob (GitLab)."), "{rest}");
     let file = cli.session_file();
     #[cfg(unix)]
     {
