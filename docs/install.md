@@ -16,7 +16,7 @@ a published binary yet. Use the documentation at the matching release tag, or
 The first question the setup guide asks is where AgentSCM should run:
 
 - **Local, on this machine (recommended for the alpha).** The hub runs on your computer and your agents use it. Run `npx agentscm --local` to skip the question. Without a terminal (CI, or an agent's shell), add `--yes --github-login YOUR_LOGIN`.
-- **Hosted, a shared hub on a server for a team.** Not supported in the alpha: it will likely break and is not for production. Quickstart does not set up a server. `npx agentscm --hosted` prints the [hosted guide](hosted.md) for you to work through with your coding agent; once the team's hub runs, `npx agentscm --hosted --hub-url https://hub.example.com` connects this machine to it.
+- **Hosted, a shared hub on a server for a team.** Not supported in the alpha: it will likely break and is not for production. Quickstart does not set up a server. `npx agentscm --hosted` prints the [hosted guide](hosted.md) for you to work through with your coding agent; once the team's hub runs, `npx agentscm --hub-url https://hub.example.com` connects this machine to it.
 
 `install.sh` passes the same flags: `curl -fsSL .../install.sh | sh -s -- --local`.
 
@@ -24,7 +24,7 @@ The first question the setup guide asks is where AgentSCM should run:
 
 1. Ask the person: "Do you want to run AgentSCM locally on this machine (recommended for the alpha), or set up a hosted hub for a team (unsupported in the alpha)?"
 2. Local: run `npx agentscm --local` in their terminal so they can answer its prompts. If you have no terminal, ask for their GitHub login and run `npx agentscm --local --yes --github-login LOGIN`.
-3. Hosted: follow [hosted.md](hosted.md) step by step with them. If their team's hub already runs, ask for its URL and run `npx agentscm --hosted --hub-url URL`.
+3. Hosted: follow [hosted.md](hosted.md) step by step with them. If their team's hub already runs, ask for its URL and have them run `npx agentscm --hub-url URL` in their terminal, since it signs them in. Without a terminal, run it with `--yes` only after they have run `agentscm hub login --hub URL` themselves.
 
 Three ways to get AgentSCM. The first two download the release binary, check it, keep it in `~/.agentscm/bin` (`%USERPROFILE%\.agentscm\bin` on Windows) and start the setup guide (`agentscm quickstart`).
 
@@ -68,8 +68,10 @@ Use this as an explicit fallback on a supported Linux AMD64 or ARM64 Docker daem
 - Build provenance, only when the GitHub CLI (`gh`) is installed and signed in (`gh auth status` succeeds). The binary must be attested by this repository's `release.yml` for the matching tag, or it is deleted and not run. If `gh` is missing or not signed in, the installer says why and that it checked the checksum only.
 - To make a missing or signed-out `gh` an error, set `AGENTSCM_REQUIRE_PROVENANCE=1`.
 
-Successful installer verification prints one summary line. To include the verification
-command's details, set `AGENTSCM_INSTALL_VERBOSE=1`. Verification failures always show
+Successful installer verification prints one summary line. `npx agentscm` prints its notice and
+that line only when it first downloads a version, and never before `--help`; later runs start
+AgentSCM directly. To see them on every run, with the verification command's details, set
+`AGENTSCM_INSTALL_VERBOSE=1`. Verification failures always show
 diagnostics and stop installation.
 
 Checks run before anything is installed or linked.
@@ -85,11 +87,21 @@ is on PATH. On macOS or Linux, use `export PATH="$HOME/.agentscm/bin:$PATH"` in 
 current shell, or add that line to your shell's startup file for future terminals.
 You can also keep using `npx agentscm <subcommand>`.
 
-Remove them with `agentscm uninstall`.
+Remove them with `agentscm uninstall`. It leaves `~/.config/agentscm` (or `$XDG_CONFIG_HOME/agentscm`)
+with empty `.lock` files and a `connections.json` that lists no connections. The lock files stay on
+purpose: AgentSCM commands coordinate through them, and removing one while another command runs
+could let two commands change the same files at once. The folder can also keep `telemetry.json`
+(your telemetry choice and an installation id), `hook-notes/` markers, an empty `tokens/` folder
+and, after `agentscm open`, `front-door/` (run `agentscm open --stop` first). To remove everything,
+delete the folder when no AgentSCM command is running.
 
 The optional macOS tray is part of this same binary; no separate app install is needed. Run
-`npx agentscm tray`, or add `--tray` to quickstart to open it after successful setup. Start at
-Login is off until enabled in the tray menu. The alpha binary is not signed or notarized, and the
+`npx agentscm tray` to open it. On macOS, once an interactive quickstart has connected your
+agents, it asks once: "Keep AgentSCM in the menu bar, and start it when you log in?" Yes (the
+default) opens the tray and turns on Start at Login; No leaves both off and quickstart does not ask
+again. With `--yes` or without a terminal it does not ask, and the tray stays off unless you add
+`--tray`, which opens it without changing Start at Login. You can switch Start at Login in the tray
+menu at any time. The alpha binary is not signed or notarized, and the
 tray does not update independently; install a newer AgentSCM release through the same installer.
 Each checkout menu groups its status, opening actions, a **Share agent conversations with Hub**
 switch, **Agent Integrations**, **Connection Details**, **Recent Activity** and **Troubleshooting**. Connection Details shows the full checkout path and

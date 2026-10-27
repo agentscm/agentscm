@@ -11,7 +11,8 @@ use crate::evidence::validate_lower_hex;
 use crate::{Error, Result};
 
 pub const MAX_COMMENT_BYTES: usize = 60 * 1024;
-const MARKER_PREFIX: &str = "<!-- agentscm-local-validation:v1 ";
+/// Every attestation comment starts with this.
+pub const MARKER_PREFIX: &str = "<!-- agentscm-local-validation:v1 ";
 const ENVELOPE_FENCE: &str = "```agentscm-envelope-v1";
 const RECORD_FENCE: &str = "```agentscm-record-v1";
 const LOGO_URL: &str = "https://raw.githubusercontent.com/counterbranch/agentscm/24b70c0796e8288d1560adda36a1590e613d0ffc/docs/assets/agentscm-icon.png";

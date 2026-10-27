@@ -44,6 +44,35 @@ pub enum LocalValidationCommand {
     Verify(VerifyArgs),
     /// Post a retained attestation as a PR comment (GitHub). Posts no status.
     Post(PostArgs),
+    /// Set the `agentscm/local-validation` status of every open pull request on `--base` from its
+    /// signed attestation comments. Exit 0 when all were handled, 1 on any error or unread input,
+    /// 2 when the policy is for another repository.
+    Reconcile(ReconcileArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ReconcileArgs {
+    /// OWNER/NAME.
+    #[arg(long)]
+    github_repo: String,
+    /// The only pull request base reconciled.
+    #[arg(long, default_value = "main")]
+    base: String,
+    /// Directory with policy.json, recipe.json and registry.json from the default branch;
+    /// relative to `--repo`, without `..`.
+    #[arg(long, default_value = ".github/local-validation")]
+    config_dir: PathBuf,
+    /// Checkout of the default branch; its `origin` is fetched.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Name of the environment variable holding the token.
+    #[arg(long, default_value = "GH_TOKEN")]
+    token_env: String,
+    #[arg(long, default_value = "https://api.github.com")]
+    api_url: String,
+    /// Link recorded on each status.
+    #[arg(long)]
+    target_url: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -155,6 +184,7 @@ pub async fn run(command: LocalValidationCommand) -> Result<i32> {
         }
         LocalValidationCommand::Verify(args) => verify(args),
         LocalValidationCommand::Post(args) => post(args).await,
+        LocalValidationCommand::Reconcile(args) => reconcile(args).await,
     }
 }
 
@@ -248,8 +278,7 @@ fn run_recipe(args: RunArgs, cancel: &Cancellation) -> Result<i32> {
             issued_at_ms,
             expires_at_ms: issued_at_ms.saturating_add(lifetime.saturating_mul(1000)),
             issuer_registry_sha256: &registry.digest()?,
-            cargo_lock_sha256: &produced.cargo_lock_sha256,
-            toolchain_file_sha256: &produced.toolchain_file_sha256,
+            dependencies: &produced.dependencies,
         },
     )?;
     let pass = payload.outcome == EvidenceOutcome::Pass;
@@ -409,6 +438,106 @@ fn check_sha(sha: &str) -> Result<()> {
     Ok(())
 }
 
+fn check_github_repo(repo: &str) -> Result<()> {
+    let valid_name = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    };
+    if !repo.split('/').all(valid_name) || repo.matches('/').count() != 1 {
+        return Err(Error::Invalid("--github-repo must be OWNER/NAME".into()));
+    }
+    Ok(())
+}
+
+async fn reconcile(args: ReconcileArgs) -> Result<i32> {
+    use agentscm::hub::forge_http::check_base_url;
+    use agentscm::hub::github::{Api, CommitStatus, StatusState, valid_ref_name};
+    use agentscm::local_validation::reconcile::Context;
+    check_github_repo(&args.github_repo)?;
+    if !valid_ref_name(&args.base) {
+        return Err(Error::Invalid("--base is not a branch name".into()));
+    }
+    let token = std::env::var(&args.token_env)
+        .ok()
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| Error::Invalid("the token environment variable is unset or empty".into()))?;
+    let Some(config_dir) = args.config_dir.to_str().filter(|d| {
+        !d.is_empty()
+            && !d.starts_with('-')
+            && args
+                .config_dir
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+    }) else {
+        eprintln!("--config-dir must be a relative path inside --repo; nothing written");
+        return Ok(2);
+    };
+    let target_ok = args.target_url.as_deref().is_none_or(|url| {
+        CommitStatus::new(&"0".repeat(40), StatusState::Pending, "x", "x")
+            .and_then(|status| status.with_target_url(url))
+            .is_ok()
+    });
+    if !target_ok {
+        eprintln!(
+            "--target-url must be a short http(s) URL without control characters; nothing written"
+        );
+        return Ok(2);
+    }
+    // The guard compares `HEAD`, so the files read must be the committed ones.
+    if let Err(e) = agentscm::local_validation::run::config_dir_tree(&args.repo, config_dir) {
+        eprintln!("--config-dir cannot be read at HEAD of --repo ({e:?}); nothing written");
+        return Ok(2);
+    }
+    match agentscm::local_validation::run::config_dir_dirty(&args.repo, config_dir) {
+        Ok(false) => {}
+        Ok(true) => {
+            eprintln!("--config-dir has uncommitted, untracked or ignored files; nothing written");
+            return Ok(2);
+        }
+        Err(e) => {
+            eprintln!("--config-dir cleanliness could not be checked ({e:?}); nothing written");
+            return Ok(2);
+        }
+    }
+    let read = |name: &str| {
+        read_bounded(
+            &args.repo.join(&args.config_dir).join(name),
+            MAX_INPUT_BYTES,
+        )
+    };
+    let policy = ValidationPolicy::from_slice(&read("policy.json")?)?;
+    let recipe = ValidationRecipe::from_slice(&read("recipe.json")?)?;
+    let registry = IssuerRegistrySnapshot::from_slice(&read("registry.json")?)?;
+    if policy.repository != format!("github.com/{}", args.github_repo) {
+        eprintln!("policy repository does not match --github-repo; nothing written");
+        return Ok(2);
+    }
+    if registry.repository != policy.repository {
+        return Err(Error::Invalid(
+            "registry repository differs from the policy repository".into(),
+        ));
+    }
+    let base_url = check_base_url(&args.api_url).map_err(|e| Error::Invalid(e.to_string()))?;
+    let api = Api::new(&base_url, &base_url).map_err(|e| Error::Invalid(e.to_string()))?;
+    Ok(Context {
+        api: &api,
+        token: &token,
+        github_repo: &args.github_repo,
+        base: &args.base,
+        config_dir,
+        git_repo: &args.repo,
+        repository: &policy.repository,
+        policy: &policy,
+        recipe: &recipe,
+        registry: &registry,
+        target_url: args.target_url.as_deref(),
+    }
+    .reconcile()
+    .await)
+}
+
 /// Posts the retained attestation as one PR comment, adopting this login's earlier comment for
 /// the same envelope so a lost create reply cannot duplicate it. The local producer never posts
 /// a status; the separate verifier does.
@@ -416,15 +545,7 @@ async fn post(args: PostArgs) -> Result<i32> {
     use agentscm::hub::forge_http::check_base_url;
     use agentscm::hub::github::Api;
     check_sha(&args.attestation)?;
-    let valid_name = |part: &str| {
-        !part.is_empty()
-            && part
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-    };
-    if !args.github_repo.split('/').all(valid_name) || args.github_repo.matches('/').count() != 1 {
-        return Err(Error::Invalid("--github-repo must be OWNER/NAME".into()));
-    }
+    check_github_repo(&args.github_repo)?;
     if !args.token_file.is_absolute() {
         return Err(Error::Invalid("--token-file must be absolute".into()));
     }

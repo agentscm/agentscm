@@ -963,9 +963,18 @@ async fn on_a_public_repository_only_people_who_can_write_get_in() {
         fake.push.insert((7, "acme/writable".into()));
     }
     let events = env.kinds().len();
+    // The refusal names who lacks which role where, and the one fix.
+    let (_, signed_in) = env.get("/v1/hub/session", Some(&session)).await;
+    let login = signed_in["user"]["login"].as_str().unwrap().to_owned();
     assert_eq!(
         env.create_token(&session, "acme/readonly").await,
-        (403, json!({"error": "forbidden"}))
+        (
+            403,
+            json!({"error": "insufficient_role", "login": login,
+                "repository": "acme/readonly", "visibility": "public", "has": "read",
+                "needs": "triage", "message": format!("{login} has Read on public repository \
+                acme/readonly; ask a repository owner for Triage or higher")})
+        )
     );
     assert_eq!(env.kinds().len(), events);
     assert_eq!(env.create_token(&session, "acme/writable").await.0, 201);
@@ -1045,6 +1054,21 @@ async fn gitlab_sign_in_and_minting_need_developer_on_non_private_projects() {
     ] {
         assert_eq!(env.create_token(&session, name).await.0, status, "{name}");
     }
+    let (_, refused) = env.create_token(&session, "grp/int-reporter").await;
+    assert_eq!(
+        (
+            &refused["error"],
+            &refused["visibility"],
+            &refused["has"],
+            &refused["needs"]
+        ),
+        (
+            &json!("insufficient_role"),
+            &json!("internal"),
+            &json!("reporter"),
+            &json!("developer")
+        )
+    );
     // A project nobody connected gets no token even when the person can read it.
     env.fake
         .lock()
@@ -1300,6 +1324,7 @@ async fn gitlab_access_levels_come_from_the_project_or_its_group() {
     // (name, public, project level, group level, may mint)
     let cases = [
         ("grp/guest", false, Some(10), None, false),
+        ("grp/planner", false, Some(15), None, false),
         ("grp/minimal", false, Some(5), None, false),
         ("grp/reporter", false, Some(20), None, true),
         ("grp/group-reporter", false, None, Some(20), true),
@@ -1317,9 +1342,24 @@ async fn gitlab_access_levels_come_from_the_project_or_its_group() {
             .insert((7, (*name).to_owned()), (*project, *group));
     }
     for (name, _, _, _, allowed) in cases {
-        let status = env.create_token(&session, name).await.0;
+        let (status, reply) = env.create_token(&session, name).await;
         assert_eq!(status, if allowed { 201 } else { 403 }, "{name}");
+        assert_eq!(allowed, reply["error"] != "insufficient_role", "{name}");
     }
+    let (_, planner) = env.create_token(&session, "grp/planner").await;
+    assert_eq!(planner["has"], "planner");
+    assert!(
+        planner["message"]
+            .as_str()
+            .unwrap()
+            .contains("has Planner on private repository grp/planner"),
+        "{planner}"
+    );
+    let (_, guest) = env.create_token(&session, "grp/guest").await;
+    assert_eq!(
+        (&guest["has"], &guest["needs"]),
+        (&json!("guest"), &json!("reporter"))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1818,6 +1858,23 @@ async fn cli_signs_in_with_the_device_flow_and_manages_tokens() {
         "{stderr}"
     );
 
+    // Read alone on a public repository: the Hub's sentence names the role to ask for.
+    env.grant_repo(7, "acme/open", 31);
+    env.fake.lock().unwrap().public.insert("acme/open".into());
+    let (ok, _, stderr) = cli.run(&[
+        "token",
+        "create",
+        "--name",
+        "builder",
+        "--repo",
+        "acme/open",
+    ]);
+    assert!(
+        !ok && stderr.contains("has Read on public repository acme/open")
+            && stderr.contains("for Triage or higher"),
+        "{stderr}"
+    );
+
     env.fake.lock().unwrap().repos.clear();
     let (ok, _, stderr) = cli.run(&[
         "token",
@@ -1827,7 +1884,10 @@ async fn cli_signs_in_with_the_device_flow_and_manages_tokens() {
         "--repo",
         "acme/widgets",
     ]);
-    assert!(!ok && stderr.contains("cannot read"), "{stderr}");
+    assert!(
+        !ok && stderr.contains("can't see that repository"),
+        "{stderr}"
+    );
 
     // Logout ends the session on the hub and deletes the file; doing it twice is fine.
     let session = saved["session"].as_str().unwrap();

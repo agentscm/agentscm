@@ -68,10 +68,13 @@ pub(crate) enum ReportingCommand {
 
 #[derive(Debug, Default, Args)]
 pub(crate) struct ConnectArgs {
+    /// Hub URL, such as https://hub.example.com (default: the saved Hub, when there is one).
     #[arg(long)]
-    pub(crate) hub: String,
+    pub(crate) hub: Option<String>,
+    /// Forge repository as owner/name (default: read from the checkout's origin remote).
     #[arg(long)]
     pub(crate) repo: Option<String>,
+    /// File holding an agent token to use instead of creating one with your Hub sign-in.
     #[arg(long)]
     pub(crate) token_file: Option<PathBuf>,
     /// Forge sign-in provider (inferred for github.com and gitlab.com).
@@ -186,14 +189,26 @@ async fn status(args: StatusArgs) -> Result<()> {
         println!("No client connections configured.");
     }
     for connection in snapshot.connections {
+        let now = unix_now();
         println!(
-            "{}  {}  {}  binding={:?}  credential={:?}  hub={:?}",
+            "{}  {}  {}",
             connection.root.display(),
             connection.repository,
             connection.hub,
-            connection.binding.state,
-            connection.credential.state,
-            connection.hub_check,
+        );
+        println!(
+            "  binding: {}; token: {}; Hub: {}",
+            label(&connection.binding.state),
+            match connection.credential.expires_at {
+                Some(at) => format!(
+                    "{}, {} {}",
+                    label(&connection.credential.state),
+                    if at < now { "expired" } else { "expires" },
+                    crate::hub_cli::when(at, now)
+                ),
+                None => label(&connection.credential.state),
+            },
+            hub_check_text(&connection.hub_check, now),
         );
         if !connection.agents.is_empty() {
             println!("  configured agents: {}", connection.agents.join(", "));
@@ -210,6 +225,31 @@ async fn status(args: StatusArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A status enum's stable snake_case name, as the JSON form spells it.
+fn label(value: &impl serde::Serialize) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(|text| text.replace('_', " ")))
+        .unwrap_or_default()
+}
+
+fn hub_check_text(check: &crate::client_status::HubCheck, now: i64) -> String {
+    use crate::client_status::HubCheck;
+    match check {
+        HubCheck::Skipped => "not checked (pass --check)".to_owned(),
+        HubCheck::Valid {
+            login, expires_at, ..
+        } => format!(
+            "signed in as {}, sign-in expires {}",
+            crate::hub_cli::clean(login),
+            crate::hub_cli::when(*expires_at, now)
+        ),
+        HubCheck::Rejected { .. } => "rejected the saved sign-in or token".to_owned(),
+        HubCheck::Unavailable { .. } => "did not answer".to_owned(),
+        HubCheck::InvalidResponse { .. } => "gave an answer AgentSCM could not read".to_owned(),
+    }
 }
 
 /// Waiting for the GitHub App install needs someone at a terminal to press Enter.
@@ -354,7 +394,7 @@ pub(crate) async fn setup_unconnected(
     let root = canonical_root(root)?;
     let stable = installed_program(running_program)?;
     let args = ConnectArgs {
-        hub: hub.to_owned(),
+        hub: Some(hub.to_owned()),
         no_sign_in: true,
         ..ConnectArgs::default()
     };
@@ -834,10 +874,12 @@ async fn mint_agent_token(
     }
     match (status, reply["error"].as_str()) {
         (403, Some("not_connected")) => Err(invalid(
-            "this repository is not connected to the Hub; ask its operator to connect it",
+            "this repository isn't connected to this Hub yet; ask a Hub admin to connect it",
         )),
         (403, _) => Err(invalid(
-            "your Hub membership cannot create an agent token for this repository",
+            &crate::hub_cli::refusal_message(&reply).unwrap_or_else(|| {
+                "your forge account can't see that repository, or it was renamed or moved; check the name and your access".to_owned()
+            }),
         )),
         (401, _) => Err(invalid("Hub sign-in expired or was rejected")),
         (201, _) => {
@@ -880,8 +922,9 @@ async fn revoke_minted(connection: &Connection, minted: &Minted) {
 
 fn warn_unrevoked(connection: &Connection, id: &str, expiry: i64) {
     eprintln!(
-        "warning: the managed token {id} on {} could not be revoked; it remains valid until unix {expiry}. Revoke that token manually; no retry was queued.",
-        connection.hub
+        "warning: the managed token {id} on {} could not be revoked; it remains valid until {until}. Revoke that token manually; no retry was queued.",
+        connection.hub,
+        until = crate::hub_cli::when(expiry, unix_now()),
     );
 }
 
@@ -925,14 +968,16 @@ async fn retire_owned(connection: &Connection) {
     match remove_unreferenced_owned_file(connection) {
         Ok(RetiredFile::Referenced) => {
             eprintln!(
-                "warning: the managed token {id} was preserved because another client connection references its token file; it remains valid until unix {expiry}"
+                "warning: the managed token {id} was preserved because another client connection references its token file; it remains valid until {until}",
+                until = crate::hub_cli::when(expiry, unix_now()),
             );
             return;
         }
         Ok(RetiredFile::Removed) => {}
         Err(error) => {
             eprintln!(
-                "warning: the managed token {id} and its file were preserved because AgentSCM could not verify that the file is unreferenced ({error}); the token remains valid until unix {expiry}. No retry was queued."
+                "warning: the managed token {id} and its file were preserved because AgentSCM could not verify that the file is unreferenced ({error}); the token remains valid until {until}. No retry was queued.",
+                until = crate::hub_cli::when(expiry, unix_now()),
             );
             return;
         }
@@ -1103,7 +1148,10 @@ async fn connect_inner(
         Some(repo) => repo,
         None => inferred_repo.clone(),
     };
-    let hub = check_base_url(&args.hub).map_err(map_hub_error)?;
+    let hub = match args.hub.as_deref() {
+        Some(hub) => check_base_url(hub).map_err(map_hub_error)?,
+        None => crate::hub_cli::only_saved_hub()?,
+    };
     let supplied_token = match args.token_file {
         Some(path) => {
             let path = path
@@ -1451,9 +1499,10 @@ pub(crate) async fn remove_checkout(root: &Path) -> Result<()> {
             kept.agents.clear();
             update(root, Some(&connection), Some(kept))?;
             return Err(invalid(&format!(
-                "the agents' files were removed, but token {id} on {} could not be revoked (the hub did not answer or refused); it stays valid until unix {expiry}. Its connection and token file are kept: run `agentscm client remove --root {}` again when the hub answers (signing in with `agentscm hub login` first also lets it revoke)",
+                "the agents' files were removed, but token {id} on {} could not be revoked (the hub did not answer or refused); it stays valid until {until}. Its connection and token file are kept: run `agentscm client remove --root {}` again when the hub answers (signing in with `agentscm hub login` first also lets it revoke)",
                 connection.hub,
-                root.display()
+                root.display(),
+                until = crate::hub_cli::when(expiry, unix_now()),
             )));
         }
     }
@@ -1469,7 +1518,8 @@ pub(crate) async fn remove_checkout(root: &Path) -> Result<()> {
                 connection.hub
             ),
             Ok(RetiredFile::Referenced) => println!(
-                "Kept token {id} and its file: another client connection uses them (valid until unix {expiry})."
+                "Kept token {id} and its file: another client connection uses them (valid until {until}).",
+                until = crate::hub_cli::when(expiry, unix_now()),
             ),
             Err(error) => eprintln!(
                 "warning: token {id} was revoked, but its file {} could not be deleted ({error})",

@@ -72,6 +72,7 @@ pub struct CommitStatus {
     state: StatusState,
     context: String,
     description: String,
+    target_url: Option<String>,
 }
 
 impl CommitStatus {
@@ -108,7 +109,18 @@ impl CommitStatus {
             state,
             context: context.to_owned(),
             description: description.to_owned(),
+            target_url: None,
         })
+    }
+
+    /// Links the status to `url`, an http(s) URL without control characters.
+    pub fn with_target_url(mut self, url: &str) -> Result<Self> {
+        let scheme_ok = url.starts_with("https://") || url.starts_with("http://");
+        if !scheme_ok || url.chars().count() > 255 || url.chars().any(char::is_control) {
+            return Err(HubError::Invalid("status target URL is invalid".into()));
+        }
+        self.target_url = Some(url.to_owned());
+        Ok(self)
     }
 }
 
@@ -516,6 +528,14 @@ impl Api {
         self.paged_with(token, &path, None, 1, None, true)
             .await?
             .ok_or_else(|| GhError::Failed("unexpected 304 from pulls".into()))
+    }
+
+    /// Every item of a list endpoint, at most `max_pages` pages. A reply that is not an array
+    /// fails the read; `unread` says pages were left past the cap.
+    pub async fn get_all(&self, token: &str, path: &str, max_pages: u32) -> Gh<Paged> {
+        self.paged_with(token, path, None, max_pages, None, true)
+            .await?
+            .ok_or_else(|| GhError::Failed("unexpected 304".into()))
     }
 
     pub async fn pull(&self, token: &str, full_name: &str, number: i64) -> Gh<Option<Value>> {
@@ -1066,8 +1086,11 @@ impl Api {
         status: &CommitStatus,
     ) -> Gh<std::result::Result<(), u16>> {
         let url = format!("{}/repos/{full_name}/statuses/{}", self.base, status.sha);
-        let body = json!({"state": status.state.as_str(), "context": status.context,
+        let mut body = json!({"state": status.state.as_str(), "context": status.context,
             "description": status.description});
+        if let Some(target) = &status.target_url {
+            body["target_url"] = json!(target);
+        }
         let reply = self.write(token, Method::POST, &url, body).await?;
         if matches!(reply.status, 403 | 404 | 422) {
             return Ok(Err(reply.status));

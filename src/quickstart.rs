@@ -289,7 +289,7 @@ struct Live {
     agents: Vec<String>,
     /// This run tried to set up at least one agent.
     wanted_agents: bool,
-    /// The user answered no to "Go ahead?" for the agent setup.
+    /// The user answered no to "Go ahead?", or no to the Claude Code plugin with no other agent.
     declined: bool,
     /// Why setting up the coding agents failed.
     agent_error: Option<String>,
@@ -331,7 +331,7 @@ impl Live {
             (None, _) => off(
                 "no hub chosen",
                 &format!(
-                    "run `{cli} quickstart --local` for a hub on this machine, or `--hosted --hub-url URL` for your team's hub"
+                    "run `{cli} quickstart --local` for a hub on this machine, or `{cli} quickstart --hub-url URL` for your team's hub"
                 ),
             ),
             (Some(url), _) if !self.hub_up => off(
@@ -414,6 +414,9 @@ pub async fn run(args: QuickstartArgs) -> Result<u8> {
     ];
     let original_hub_files = hub_files.each_ref().map(|path| file_hash(path));
     let original_program = program_fingerprint(&cx.home);
+    // Signing in during this run rewrites the saved sessions, which the summary lists.
+    let sessions_file = hub_cli::sessions_path().ok();
+    let original_sessions = sessions_file.as_deref().map(file_hash);
     // Running from the install directory is undoable even if nothing else is written.
     if let Some((binary::Program::InstallDir(_), _)) = program_plan(&cx.home) {
         cx.manifest.bin_dir = Some(binary::bin_dir(&cx.home));
@@ -432,15 +435,35 @@ pub async fn run(args: QuickstartArgs) -> Result<u8> {
     collisions_step(&cx);
     agents_stage(&mut cx).await;
     init_stage(&mut cx);
+    let command = cli_command(&cx);
+    // Without an agent to set up (--no-agents, or none found) nothing is connected on purpose.
+    let requested_hub_incomplete = (args.local
+        || matches!(args.hub, Some(HubChoice::Local | HubChoice::Existing))
+        || args.hub_url.is_some())
+        && !cx.live.declined
+        && (!cx.live.hub_up || (cx.live.repo.is_none() && cx.live.wanted_agents));
+    let ready = cx.failure.is_none()
+        && cx.live.pending_local.is_none()
+        && cx.live.agent_error.is_none()
+        && !requested_hub_incomplete;
+    // Asked before the summary, so a remembered answer counts as a change.
+    let offered = ready && !args.tray && offers_tray(&cx);
+    let tray_result = if ready && args.tray {
+        launch_tray(&cx)
+    } else if offered {
+        tray_offer(&mut cx, &command)
+    } else {
+        Ok(())
+    };
     if !cx.manifest.is_empty() {
         cx.manifest.save()?;
     }
     let changed = record_fingerprint(&record_path) != original_record
         || hub_files.each_ref().map(|path| file_hash(path)) != original_hub_files
         || program_fingerprint(&cx.home) != original_program
+        || sessions_file.as_deref().map(file_hash) != original_sessions
         || !cx.init_written.is_empty();
     summary(&cx, changed);
-    let command = cli_command(&cx);
     println!("Run AgentSCM commands with: {command}");
     if let Some(dir) = &cx.manifest.bin_dir {
         println!(
@@ -455,25 +478,11 @@ pub async fn run(args: QuickstartArgs) -> Result<u8> {
         );
     }
     #[cfg(target_os = "macos")]
-    println!(
-        "Optional status-bar companion: {command} tray (Start at Login is off until you enable it in the menu)."
-    );
-    // Without an agent to set up (--no-agents, or none found) nothing is connected on purpose.
-    let requested_hub_incomplete = (args.local
-        || matches!(args.hub, Some(HubChoice::Local | HubChoice::Existing))
-        || args.hub_url.is_some())
-        && !cx.live.declined
-        && (!cx.live.hub_up || (cx.live.repo.is_none() && cx.live.wanted_agents));
-    let tray_result = if args.tray
-        && cx.failure.is_none()
-        && cx.live.pending_local.is_none()
-        && cx.live.agent_error.is_none()
-        && !requested_hub_incomplete
-    {
-        launch_tray(&cx)
-    } else {
-        Ok(())
-    };
+    if !(offered || ready && args.tray) {
+        println!(
+            "Optional status-bar companion: {command} tray (Start at Login is off until you enable it in the menu)."
+        );
+    }
     println!("{}", cx.live.line(&command));
     if let Some(failure) = cx.failure {
         return Err(invalid(&failure));
@@ -757,7 +766,7 @@ async fn choose_hub(cx: &mut Cx<'_>) -> Option<String> {
                 };
                 if url.is_empty() {
                     println!(
-                        "Skipping live warnings. Run quickstart again with --hosted --hub-url URL once the hub runs.\n"
+                        "Skipping live warnings. Run quickstart again with --hub-url URL once the hub runs.\n"
                     );
                     return None;
                 }
@@ -1106,6 +1115,24 @@ fn chosen_agents(cx: &Cx<'_>) -> Vec<crate::client_setup::Agent> {
     }
 }
 
+/// Claude Code's plugin is installed for the whole user account, so say so and ask first (once:
+/// an installed plugin is not asked about again). `--yes` answers yes, after the notice.
+#[cfg(unix)]
+fn claude_plugin_wanted(cx: &Cx<'_>, root: &Path, agents: &[crate::client_setup::Agent]) -> bool {
+    if !agents.contains(&crate::client_setup::Agent::Claude)
+        || crate::client_plugin::claude_plugin_installed(root)
+    {
+        return true;
+    }
+    println!(
+        "The AgentSCM plugin for Claude Code is installed for your user account, so it is in all your projects; `{} uninstall` removes it when no other connected checkout uses it.",
+        cli_command(cx)
+    );
+    cx.ui.confirm(CLAUDE_PLUGIN_QUESTION, true)
+}
+
+const CLAUDE_PLUGIN_QUESTION: &str = "Install the AgentSCM plugin for Claude Code in all your projects? It runs a quick check whenever an agent starts and only contacts a Hub in repos connected to it.";
+
 /// The `client setup` line for every supported agent, for setting one up later.
 #[cfg(unix)]
 fn print_agent_setup_hints(cx: &Cx<'_>, hub: &str) {
@@ -1129,7 +1156,7 @@ async fn agents_stage(_cx: &mut Cx<'_>) {
 /// writes agent hooks and MCP configuration and gives the hub's Connect agents page its proof.
 #[cfg(unix)]
 async fn agents_stage(cx: &mut Cx<'_>) {
-    let agents = chosen_agents(cx);
+    let mut agents = chosen_agents(cx);
     if agents.is_empty() {
         if let (false, Some(hub), true) = (cx.args.no_agents, &cx.live.hub, cx.live.hub_up) {
             print_agent_setup_hints(cx, hub);
@@ -1170,6 +1197,19 @@ async fn agents_stage(cx: &mut Cx<'_>) {
         println!("I can't tell where this program is, so I didn't set up {names}.");
         return;
     };
+    // Asked only once nothing else stops the setup, so a No is a real choice.
+    if !claude_plugin_wanted(cx, &root, &agents) {
+        agents.retain(|agent| *agent != crate::client_setup::Agent::Claude);
+        if agents.is_empty() {
+            cx.live.declined = true;
+            return;
+        }
+    }
+    let names = agents
+        .iter()
+        .map(|agent| agent.name())
+        .collect::<Vec<_>>()
+        .join(", ");
     // Quickstart owns this checkout's connection: an unchanged, valid one is kept as it is,
     // and anything else (another hub, another token file) is replaced after this notice.
     let existing = checkout_connection(&cx.found);
@@ -1209,7 +1249,7 @@ async fn agents_stage(cx: &mut Cx<'_>) {
         }
     };
     let args = crate::client_cli::ConnectArgs {
-        hub: hub.clone(),
+        hub: Some(hub.clone()),
         token_file: cx.args.agent_token_file.clone(),
         provider: cx.args.provider,
         root: Some(root.clone()),
@@ -1267,6 +1307,22 @@ fn init_stage(cx: &mut Cx<'_>) {
     if cx.ui.yes && !cx.args.init {
         return;
     }
+    // Instructions that point agents at a hub they can't reach would be committed broken.
+    let why = if !cx.live.hub_up {
+        Some("The hub isn't answering")
+    } else if cx.live.agent_error.is_some() {
+        Some("Connecting the agents to the hub failed")
+    } else {
+        None
+    };
+    if let Some(why) = why {
+        if cx.args.init {
+            println!(
+                "{why}, so I didn't add the agent instructions; fix that and run quickstart again."
+            );
+        }
+        return;
+    }
     // One question: init-repo shows the files and their diffs, then asks before writing.
     println!(
         "AgentSCM can also add this repository's agent instructions (AGENTS.md and the files that point Claude Code, Cursor, Copilot and Gemini at it), as files you can commit:"
@@ -1304,6 +1360,53 @@ fn launch_tray(cx: &Cx<'_>) -> Result<()> {
         Err(invalid(&format!(
             "could not open the AgentSCM status-bar companion (exit status {status})"
         )))
+    }
+}
+
+/// Asked once, on macOS at a terminal, after this checkout's agents were connected from the
+/// installed program; `--yes` and scripted runs keep the tray off unless `--tray` is passed.
+fn offers_tray(cx: &Cx<'_>) -> bool {
+    cfg!(target_os = "macos")
+        && cx.tty
+        && !cx.ui.yes
+        && cx.live.repo.is_some()
+        && cx.manifest.bin_dir.is_some()
+        && !cx.manifest.tray_declined
+        && !tray_login_enabled()
+}
+
+/// A Yes is remembered by Start at Login itself.
+fn tray_login_enabled() -> bool {
+    #[cfg(target_os = "macos")]
+    return crate::tray::login_enabled();
+    #[cfg(not(target_os = "macos"))]
+    false
+}
+
+fn tray_offer(cx: &mut Cx<'_>, command: &str) -> Result<()> {
+    match cx.ui.answer(
+        "Keep AgentSCM in the menu bar, and start it when you log in?",
+        true,
+    ) {
+        Some(true) => {
+            #[cfg(target_os = "macos")]
+            if let Some(dir) = &cx.manifest.bin_dir
+                && let Err(error) = crate::tray::set_login_enabled(true, &dir.join(binary::LINK))
+            {
+                println!(
+                    "Couldn't turn on Start at Login: {}. You can turn it on in the menu.",
+                    short(&error)
+                );
+            }
+            launch_tray(cx)
+        }
+        Some(false) => {
+            cx.manifest.tray_declined = true;
+            cx.manifest.save()?;
+            println!("OK. Open it any time with `{command} tray`.");
+            Ok(())
+        }
+        None => Ok(()),
     }
 }
 
@@ -1474,6 +1577,7 @@ pub async fn uninstall(args: UninstallArgs) -> Result<()> {
     // What could not be undone stays in the record, with the command to finish by hand.
     let mut left = Manifest {
         created_at: m.created_at,
+        tray_declined: m.tray_declined,
         ..Manifest::default()
     };
     let mut manual: Vec<String> = Vec::new();

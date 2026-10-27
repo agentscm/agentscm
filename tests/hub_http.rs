@@ -97,6 +97,12 @@ async fn health_reports_storage() {
     let hub = Hub::start().await;
     let (status, _, body) = hub.get("/v1/hub/health", None);
     assert_eq!(status, 200);
+    let (alias, _, alias_body) = hub.get("/health", None);
+    assert_eq!(alias, 200);
+    assert_eq!(
+        serde_json::from_str::<Value>(&alias_body).unwrap()["status"],
+        "ok"
+    );
     let health = serde_json::from_str::<Value>(&body).unwrap();
     assert_eq!(
         (&health["status"], &health["storage"]),

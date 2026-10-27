@@ -3087,7 +3087,12 @@ fn uninstall_removes_everything_quickstart_set_up() {
     let (hub, machine) = (Hub::start(), Machine::new().with_claude());
     let repo = machine.repo();
     let token = hub.token_file(machine.home.path());
-    ok(&machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"])));
+    let said = ok(&machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"])));
+    // The user-wide plugin is named as such before it is installed.
+    assert!(
+        said.contains("installed for your user account, so it is in all your projects"),
+        "{said}"
+    );
     assert_eq!(machine.connections().len(), 1);
     assert!(repo.path().join(".mcp.json").exists());
 
@@ -3934,13 +3939,20 @@ fn a_failed_agent_step_ends_non_zero_and_the_last_line_says_so() {
         body.replacen("\n", "\ncase \"$*\" in *install*) exit 1;; esac\n", 1),
     )
     .unwrap();
-    let output = machine.run(repo.path(), &quick(&hub.url, &token, &["--no-collisions"]));
+    let output = machine.run(
+        repo.path(),
+        &quick(&hub.url, &token, &["--no-collisions", "--init"]),
+    );
     let line = last_line(&output);
     assert!(!output.status.success(), "{output:?}");
     assert!(
         line.starts_with("Live warnings: off — coding agent setup failed"),
         "{line}"
     );
+    // Nothing committable is written for a connection that failed.
+    let said = String::from_utf8_lossy(&output.stdout);
+    assert!(said.contains("didn't add the agent instructions"), "{said}");
+    assert!(!repo.path().join("AGENTS.md").exists());
 }
 
 #[test]

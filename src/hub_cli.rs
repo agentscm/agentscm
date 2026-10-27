@@ -67,10 +67,12 @@ pub enum HubCommand {
     },
     /// Sign in to a hub; the session is saved for the token commands.
     Login {
+        /// Hub URL, such as https://hub.example.com (default: the saved Hub, when there is one).
         #[arg(long)]
-        hub: String,
+        hub: Option<String>,
+        /// Forge to sign in with (default: the Hub's only sign-in provider).
         #[arg(long, value_enum)]
-        provider: Provider,
+        provider: Option<Provider>,
     },
     /// End one saved session on its hub and remove it locally.
     Logout {
@@ -254,11 +256,18 @@ pub async fn run(command: HubCommand, data_dir: &std::path::Path) -> Result<()> 
             .map_err(map_hub_error)
         }
         HubCommand::Login { hub, provider } => {
-            let hub = check_base_url(&hub).map_err(map_hub_error)?;
-            let name = provider
-                .to_possible_value()
-                .map(|v| v.get_name().to_owned());
-            login(&hub, &name.unwrap_or_default()).await
+            let hub = match hub {
+                Some(hub) => check_base_url(&hub).map_err(map_hub_error)?,
+                None => only_saved_hub()?,
+            };
+            let name = match provider {
+                Some(provider) => provider
+                    .to_possible_value()
+                    .map(|v| v.get_name().to_owned())
+                    .unwrap_or_default(),
+                None => only_provider(&hub).await?,
+            };
+            login(&hub, &name).await
         }
         HubCommand::Logout { hub } => logout(hub.as_deref()).await,
         HubCommand::Sessions { command } => sessions(command),
@@ -316,6 +325,54 @@ pub(crate) async fn call(
             .body(body.to_string());
     }
     send(request, HUB_BODY_BYTES).await.map_err(map_hub_error)
+}
+
+/// The Hub of the one saved sign-in; with none or several, `--hub` must say which.
+pub(crate) fn only_saved_hub() -> Result<String> {
+    let sessions = if session_files_present()? {
+        load_sessions()?.sessions
+    } else {
+        Vec::new()
+    };
+    match sessions.as_slice() {
+        [only] => Ok(only.hub.clone()),
+        [] => Err(invalid(
+            "pass --hub with the Hub's URL, such as --hub https://hub.example.com",
+        )),
+        _ => Err(invalid(
+            "several Hubs are saved; pass --hub to choose one (see agentscm hub sessions list)",
+        )),
+    }
+}
+
+/// The Hub's only sign-in provider; with several, `--provider` must say which.
+async fn only_provider(hub: &str) -> Result<String> {
+    let client = forge_http::client().map_err(map_hub_error)?;
+    let (status, reply) = call(
+        &client,
+        Method::GET,
+        &format!("{hub}/v1/hub/login"),
+        None,
+        None,
+    )
+    .await?;
+    let names: Vec<&str> = reply["providers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|name| matches!(*name, "github" | "gitlab"))
+        .collect();
+    match (status, names.as_slice()) {
+        (200, [only]) => Ok((*only).to_owned()),
+        (200, []) => Err(invalid("this Hub has no sign-in provider configured")),
+        (200, _) => Err(invalid(&format!(
+            "this Hub signs in with {}; pass --provider to choose one",
+            names.join(" or ")
+        ))),
+        // A Hub from before the provider list.
+        _ => Err(invalid("pass --provider github or --provider gitlab")),
+    }
 }
 
 async fn login(hub: &str, provider: &str) -> Result<()> {
@@ -380,6 +437,82 @@ pub(crate) fn open_url(url: &str) {
 /// Forge-supplied text must not carry terminal escapes.
 pub(crate) fn clean(text: &str) -> String {
     text.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// A moment for people: local month, day and time plus how far away it is, such as
+/// `Nov 25, 14:03 (in 30 days)`.
+pub(crate) fn when(epoch: i64, now: i64) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let (month, day, hour, minute) = civil(epoch);
+    let away = epoch.saturating_sub(now);
+    // Nearest unit, so a 30-day token printed a moment after minting still says 30 days.
+    let s = away.unsigned_abs();
+    let (minutes, hours) = ((s + 30) / 60, (s + 1800) / 3600);
+    let (count, unit) = if minutes < 60 {
+        (minutes, "minute")
+    } else if hours < 24 {
+        (hours, "hour")
+    } else {
+        ((s + 43_200) / 86_400, "day")
+    };
+    let plural = if count == 1 { "" } else { "s" };
+    let relative = if count == 0 {
+        "now".to_owned()
+    } else if away >= 0 {
+        format!("in {count} {unit}{plural}")
+    } else {
+        format!("{count} {unit}{plural} ago")
+    };
+    format!(
+        "{} {day}, {hour:02}:{minute:02} ({relative})",
+        MONTHS[month as usize - 1]
+    )
+}
+
+/// Local (month, day, hour, minute) on Unix; UTC elsewhere.
+fn civil(epoch: i64) -> (i64, i64, i64, i64) {
+    #[cfg(unix)]
+    {
+        let time = epoch as libc::time_t;
+        // SAFETY: `tm` is plain integers plus a `tm_zone` pointer that localtime_r sets, so
+        // all-zero is a valid value; localtime_r writes only that `tm` and returns null on failure.
+        let local = unsafe {
+            let mut tm: libc::tm = std::mem::zeroed();
+            (!libc::localtime_r(&time, &mut tm).is_null()).then_some(tm)
+        };
+        if let Some(tm) = local {
+            return (
+                i64::from(tm.tm_mon) + 1,
+                i64::from(tm.tm_mday),
+                i64::from(tm.tm_hour),
+                i64::from(tm.tm_min),
+            );
+        }
+    }
+    utc_civil(epoch)
+}
+
+/// UTC (month, day, hour, minute), from Howard Hinnant's days-to-civil algorithm.
+fn utc_civil(epoch: i64) -> (i64, i64, i64, i64) {
+    let (days, seconds) = (epoch.div_euclid(86_400), epoch.rem_euclid(86_400));
+    let z = days + 719_468;
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    (month, day, seconds / 3600, seconds % 3600 / 60)
+}
+
+/// The Hub's own sentence for any refusal kind that carries one (the reason and its one fix,
+/// such as `insufficient_role`); `None` when the reply has none. Bounded, one terminal line.
+pub(crate) fn refusal_message(reply: &Value) -> Option<String> {
+    reply["error"].as_str()?;
+    let message = clean(reply["message"].as_str()?);
+    Some(message.chars().take(300).collect())
 }
 
 /// Ends the saved session when it belongs to `hub`: the hub is told (best effort) and only
@@ -1042,14 +1175,18 @@ async fn token(command: TokenCommand) -> Result<()> {
              `agentscm hub connections refresh <id>` (for a PAT or GitLab token connection: \
              `agentscm hub connections add-repo <id> <owner/name>`)",
         )),
-        (403, _) => Err(invalid("you cannot read that repository on the forge")),
+        (403, _) => Err(invalid(&refusal_message(&reply).unwrap_or_else(|| {
+            "your forge account can't see that repository, or it was renamed or moved; check the name and your access".to_owned()
+        }))),
         (404, TokenCommand::Revoke { .. }) => Err(invalid("no such token of yours")),
         (201, TokenCommand::Create { .. }) => {
             eprintln!(
-                "created {} for {} (expires at unix {})",
-                reply["id"].as_str().unwrap_or("?"),
-                reply["repository"].as_str().unwrap_or("?"),
+                "created {} for {} (expires {})",
+                clean(reply["id"].as_str().unwrap_or("?")),
+                clean(reply["repository"].as_str().unwrap_or("?")),
                 reply["expires_at"]
+                    .as_i64()
+                    .map_or_else(|| "at an unknown time".to_owned(), |at| when(at, unix_now()))
             );
             println!("{}", reply["token"].as_str().unwrap_or_default());
             Ok(())
@@ -1227,6 +1364,45 @@ async fn connections(command: ConnectionCommand) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moments_read_as_a_date_and_a_distance() {
+        let now = 1_764_000_000;
+        let later = when(now + 30 * 86_400, now);
+        assert!(later.ends_with(" (in 30 days)"), "{later}");
+        let month = &later[..3];
+        assert!(
+            [
+                "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+            ]
+            .contains(&month),
+            "{later}"
+        );
+        assert!(when(now + 30 * 86_400, now + 2).ends_with("(in 30 days)"));
+        assert!(when(now + 3599, now).ends_with("(in 1 hour)"));
+        assert!(when(now + 90, now).ends_with("(in 2 minutes)"));
+        assert!(when(now + 3600, now).ends_with("(in 1 hour)"));
+        assert!(when(now - 2 * 86_400, now).ends_with("(2 days ago)"));
+        assert!(when(now, now).ends_with("(now)"));
+        assert!(when(i64::MIN, now).ends_with("ago)"));
+        // 1970-01-01 00:00, 1969-12-31 23:59 and 2000-02-29 00:00, all UTC.
+        assert_eq!(utc_civil(0), (1, 1, 0, 0));
+        assert_eq!(utc_civil(-1), (12, 31, 23, 59));
+        assert_eq!(utc_civil(951_782_400), (2, 29, 0, 0));
+        assert!(!later.contains(&now.to_string()));
+    }
+
+    #[test]
+    fn a_refusal_shows_the_hub_sentence_without_control_characters() {
+        let refusal = json!({"error": "insufficient_role",
+            "message": "alice has Read on public repository acme/w;\u{1b}[2J ask for Triage"});
+        assert_eq!(
+            refusal_message(&refusal).as_deref(),
+            Some("alice has Read on public repository acme/w;[2J ask for Triage")
+        );
+        assert_eq!(refusal_message(&json!({"error": "forbidden"})), None);
+        assert_eq!(refusal_message(&json!({"message": "not a refusal"})), None);
+    }
 
     #[test]
     fn private_write_creates_and_replaces_a_file() {

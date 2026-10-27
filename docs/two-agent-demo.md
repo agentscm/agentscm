@@ -44,7 +44,7 @@ for n in a b; do
 done
 ```
 
-Token creation needs the repository to be connected and readable by you. If it fails with "you cannot read that repository on the forge", check that the app is installed on `OWNER/NAME` and that `connections refresh` has run.
+Token creation needs the repository to be connected and readable by you. If it fails with "your forge account can't see that repository", check that the app is installed on `OWNER/NAME` and that `connections refresh` has run.
 
 ## 4. Two agents, one file
 

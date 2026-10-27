@@ -89,14 +89,10 @@ agentscm hub connections refresh <id>
 Each developer, from a clone of the connected repository:
 
 ```sh
-npx agentscm --hosted --hub-url https://hub.example.com
+npx agentscm --hub-url https://hub.example.com
 ```
 
-This prints the hosted caveat and a link to this guide, then sets up that machine against the hub (sign-in, then the same setup as `agentscm client setup` for Claude Code if the `claude` CLI is found), the same as `agentscm quickstart --hub existing --hub-url URL`. For another agent (`claude`, `codex`, `cursor`, `copilot` or `gemini`) use the one-step form from [team member onboarding](team-member-onboarding.md):
-
-```sh
-npx agentscm client setup --agent codex --hub https://hub.example.com
-```
+This signs that machine in to the hub and sets up Claude Code there if the `claude` CLI is found (the same setup as `agentscm client setup`). To choose agents, pass `--agent` once for each, such as `--agent claude --agent codex`. See [team member onboarding](team-member-onboarding.md).
 
 The host owns every project, plugin, hook and MCP trust prompt. The person must approve those themselves; do not edit trust records. Each repository needs its own agent token, and a token's repository must be connected on the hub.
 

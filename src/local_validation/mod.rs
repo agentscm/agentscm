@@ -10,6 +10,8 @@ use std::collections::HashSet;
 
 pub mod comment;
 #[cfg(unix)]
+pub mod reconcile;
+#[cfg(unix)]
 pub mod run;
 
 use serde::{Deserialize, Serialize};
@@ -32,6 +34,13 @@ const MAX_COMMANDS: usize = 32;
 const MAX_ARGV: usize = 64;
 const MAX_TEXT: usize = 2048;
 const MAX_TOOLCHAIN_LINES: usize = 16;
+const MAX_DEPENDENCY_FILES: usize = 16;
+const DEFAULT_DEPENDENCY_FILES: [&str; 2] = ["Cargo.lock", "rust-toolchain.toml"];
+const DEFAULT_TOOLCHAIN_PROBES: [&[&str]; 3] = [
+    &["rustc", "-V"],
+    &["cargo", "-V"],
+    &["cargo", "nextest", "--version"],
+];
 const MAX_MAX_AGE_SECONDS: u64 = 366 * 24 * 3600;
 pub const CHECK_KIND: &str = "command/v1";
 pub const REQUIREMENT_ID: &str = "local-validation";
@@ -73,6 +82,14 @@ pub struct RecipeCommand {
 pub struct ValidationRecipe {
     pub recipe_id: String,
     pub commands: Vec<RecipeCommand>,
+    /// Repository files whose digests are bound into the evidence as dependencies. Absent means
+    /// the Rust defaults. Declaring them changes the recipe digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_files: Option<Vec<String>>,
+    /// Toolchain version probes (argv each) recorded before the always-appended `git --version`.
+    /// Absent means the Rust defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolchain_probes: Option<Vec<Vec<String>>>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -169,6 +186,17 @@ fn validate_argv(argv: &[String]) -> Result<()> {
     argv.iter().try_for_each(|arg| text("argv item", arg))
 }
 
+/// A relative repository path that is also a valid evidence dependency identity.
+fn validate_dependency_path(path: &str) -> Result<()> {
+    validate_identifier("dependency file", path)?;
+    if path.starts_with('-') || path.split('/').any(|c| matches!(c, "" | "." | "..")) {
+        return Err(Error::Invalid(format!(
+            "dependency file must be a relative path without empty, '.' or '..' components: {path}"
+        )));
+    }
+    Ok(())
+}
+
 impl ValidationRecipe {
     pub fn validate(&self) -> Result<()> {
         validate_identifier("recipe ID", &self.recipe_id)?;
@@ -185,7 +213,53 @@ impl ValidationRecipe {
                 return Err(Error::Invalid("invalid or duplicate recipe command".into()));
             }
         }
+        if let Some(files) = &self.dependency_files {
+            if files.is_empty() || files.len() > MAX_DEPENDENCY_FILES {
+                return Err(Error::Limit(format!(
+                    "dependency files must have 1 to {MAX_DEPENDENCY_FILES} paths"
+                )));
+            }
+            let mut seen = HashSet::new();
+            for path in files {
+                validate_dependency_path(path)?;
+                if !seen.insert(path.as_str()) {
+                    return Err(Error::Invalid(format!("duplicate dependency file: {path}")));
+                }
+            }
+        }
+        if let Some(probes) = &self.toolchain_probes {
+            // One line is reserved for the appended `git --version` probe.
+            if probes.is_empty() || probes.len() >= MAX_TOOLCHAIN_LINES {
+                return Err(Error::Limit(format!(
+                    "toolchain probes must have 1 to {} entries",
+                    MAX_TOOLCHAIN_LINES - 1
+                )));
+            }
+            probes.iter().try_for_each(|argv| validate_argv(argv))?;
+        }
         Ok(())
+    }
+
+    /// Declared dependency files, or the Rust defaults.
+    pub fn dependency_file_list(&self) -> Vec<String> {
+        self.dependency_files.clone().unwrap_or_else(|| {
+            DEFAULT_DEPENDENCY_FILES
+                .iter()
+                .map(|p| (*p).to_owned())
+                .collect()
+        })
+    }
+
+    /// Declared toolchain probes, or the Rust defaults, followed by `git --version`.
+    pub fn toolchain_probe_list(&self) -> Vec<Vec<String>> {
+        let mut probes = self.toolchain_probes.clone().unwrap_or_else(|| {
+            DEFAULT_TOOLCHAIN_PROBES
+                .iter()
+                .map(|argv| argv.iter().map(|a| (*a).to_owned()).collect())
+                .collect()
+        });
+        probes.push(vec!["git".into(), "--version".into()]);
+        probes
     }
 
     pub fn from_slice(input: &[u8]) -> Result<Self> {
@@ -388,8 +462,8 @@ pub struct Issuance<'a> {
     pub issued_at_ms: u64,
     pub expires_at_ms: u64,
     pub issuer_registry_sha256: &'a str,
-    pub cargo_lock_sha256: &'a str,
-    pub toolchain_file_sha256: &'a str,
+    /// (identity, sha256) of each declared dependency file, in recipe order.
+    pub dependencies: &'a [(String, String)],
 }
 
 /// Builds the payload to sign and the exact `record` artifact bytes it commits to.
@@ -401,11 +475,7 @@ pub fn evidence_payload(
 ) -> Result<(EvidencePayload, Vec<u8>)> {
     let record_bytes = record.to_bytes()?;
     let record_sha256 = format!("{:x}", Sha256::digest(&record_bytes));
-    let all_services = Services {
-        postgres: true,
-        s3: true,
-    };
-    let pass = record.shortfall(all_services).is_none()
+    let pass = record.shortfall(policy.required_services).is_none()
         && recipe.first_departure(&record.results).is_none();
     let mut omissions: Vec<String> = FIXED_OMISSIONS.iter().map(|s| (*s).to_owned()).collect();
     omissions.extend(
@@ -479,10 +549,11 @@ pub fn evidence_payload(
             inventory_complete: false,
             omissions,
         },
-        dependencies: vec![
-            dependency("Cargo.lock", issuance.cargo_lock_sha256),
-            dependency("rust-toolchain.toml", issuance.toolchain_file_sha256),
-        ],
+        dependencies: issuance
+            .dependencies
+            .iter()
+            .map(|(identity, revision)| dependency(identity, revision))
+            .collect(),
         artifacts: vec![ArtifactRecord {
             artifact_id: "record".into(),
             media_type: "application/json".into(),

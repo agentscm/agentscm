@@ -17,6 +17,7 @@ use crate::execution::process::{Stop, capture_with_input};
 use crate::{Error, Result};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(60);
+const FETCH_TIMEOUT: Duration = Duration::from_secs(300);
 const GIT_OUTPUT: u64 = 16 * 1024 * 1024;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const PROBE_OUTPUT: u64 = 64 * 1024;
@@ -54,6 +55,16 @@ fn allowlisted(command: &mut Command) {
 }
 
 fn git(repo: &Path, args: &[&str], limit: u64) -> Result<Vec<u8>> {
+    git_timeout(repo, args, limit, GIT_TIMEOUT, false)
+}
+
+fn git_timeout(
+    repo: &Path,
+    args: &[&str],
+    limit: u64,
+    timeout: Duration,
+    network: bool,
+) -> Result<Vec<u8>> {
     let mut command = Command::new("git");
     command
         .env_clear()
@@ -61,16 +72,15 @@ fn git(repo: &Path, args: &[&str], limit: u64) -> Result<Vec<u8>> {
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .arg("-C")
         .arg(repo)
-        .args(["--no-optional-locks", "-c", "core.fsmonitor=false"])
-        .args(args)
-        .process_group(0);
-    let out = capture_with_input(
-        &mut command,
-        None,
-        GIT_TIMEOUT,
-        limit,
-        &Cancellation::default(),
-    )?;
+        .args(["--no-optional-locks", "-c", "core.fsmonitor=false"]);
+    if network {
+        // No credentials, prompts or environment configuration reach the transport.
+        command
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(["-c", "credential.helper="]);
+    }
+    command.args(args).process_group(0);
+    let out = capture_with_input(&mut command, None, timeout, limit, &Cancellation::default())?;
     if out.stop.is_some() || out.code != Some(0) {
         return Err(Error::Invalid(format!(
             "git {} failed",
@@ -111,6 +121,73 @@ pub fn observe(repo: &Path, head: &str, base_rev: &str) -> Result<GitState> {
     })
 }
 
+fn fetch_base(repo: &Path, base: &str) -> Result<()> {
+    let base_spec = format!("+refs/heads/{base}:refs/remotes/origin/{base}");
+    git_timeout(
+        repo,
+        &["fetch", "--no-tags", "--quiet", "origin", &base_spec],
+        GIT_OUTPUT,
+        FETCH_TIMEOUT,
+        true,
+    )
+    .map(drop)
+}
+
+/// Fetches the base branch and `refs/pull/{number}/head` from `origin` (Git data only, nothing is
+/// checked out) and requires the pull ref to name exactly `head`.
+pub fn fetch_pull(repo: &Path, base: &str, number: i64, head: &str) -> Result<()> {
+    fetch_base(repo, base)?;
+    let pull_ref = format!("refs/pull/{number}/head");
+    git_timeout(
+        repo,
+        &["fetch", "--no-tags", "--quiet", "origin", &pull_ref],
+        GIT_OUTPUT,
+        FETCH_TIMEOUT,
+        true,
+    )?;
+    if rev(repo, "FETCH_HEAD", "^{commit}")? != head {
+        return Err(Error::Invalid(
+            "pull request head moved while fetching".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Tree id of `dir` at the checkout's `HEAD`, resolved from `repo` (not the repository root).
+pub fn config_dir_tree(repo: &Path, dir: &str) -> Result<String> {
+    rev(repo, "HEAD", &format!(":./{dir}"))
+}
+
+/// True when `dir` has uncommitted changes, untracked and ignored files included.
+pub fn config_dir_dirty(repo: &Path, dir: &str) -> Result<bool> {
+    Ok(!git(
+        repo,
+        &[
+            "status",
+            "--porcelain",
+            "--untracked-files=normal",
+            "--ignored=matching",
+            "--",
+            dir,
+        ],
+        GIT_OUTPUT,
+    )?
+    .is_empty())
+}
+
+/// Re-fetches `origin/{base}` and tells whether `dir` (relative to `repo`) has the same tree
+/// there as at the checkout's `HEAD`. A directory missing at `origin/{base}` has changed. Err when
+/// the fetch fails or either side cannot be read otherwise.
+pub fn config_dir_unchanged(repo: &Path, base: &str, dir: &str) -> Result<bool> {
+    fetch_base(repo, base)?;
+    let tip = format!("refs/remotes/origin/{base}");
+    rev(repo, &tip, "^{commit}")?;
+    let Ok(theirs) = rev(repo, &tip, &format!(":./{dir}")) else {
+        return Ok(false);
+    };
+    Ok(config_dir_tree(repo, dir)? == theirs)
+}
+
 fn is_clean(repo: &Path) -> Result<bool> {
     Ok(git(
         repo,
@@ -122,9 +199,13 @@ fn is_clean(repo: &Path) -> Result<bool> {
 
 /// Digest of `path` at `commit`; a file the commit does not contain is an error.
 fn file_digest(repo: &Path, commit: &str, path: &str) -> Result<String> {
-    git(repo, &["show", &format!("{commit}:{path}")], GIT_OUTPUT)
-        .map(|bytes| sha256(&bytes))
-        .map_err(|_| Error::Invalid(format!("{path} cannot be read at the commit")))
+    git(
+        repo,
+        &["cat-file", "blob", &format!("{commit}:{path}")],
+        GIT_OUTPUT,
+    )
+    .map(|bytes| sha256(&bytes))
+    .map_err(|_| Error::Invalid(format!("{path} cannot be read at the commit")))
 }
 
 /// Captured bytes of one command, exactly those the record's digests cover.
@@ -137,12 +218,12 @@ pub struct Produced {
     pub record: ValidationRecord,
     /// One entry per `record.results`, in order.
     pub outputs: Vec<CommandOutput>,
-    pub cargo_lock_sha256: String,
-    pub toolchain_file_sha256: String,
+    /// (path, sha256) of each recipe dependency file at the commit, in recipe order.
+    pub dependencies: Vec<(String, String)>,
 }
 
-fn probe(repo: &Path, argv: &[&str]) -> String {
-    let mut command = Command::new(argv[0]);
+fn probe(repo: &Path, argv: &[String]) -> String {
+    let mut command = Command::new(&argv[0]);
     allowlisted(&mut command);
     command.args(&argv[1..]).current_dir(repo).process_group(0);
     let line = capture_with_input(
@@ -161,7 +242,10 @@ fn probe(repo: &Path, argv: &[&str]) -> String {
             .map(|l| l.chars().take(512).collect::<String>())
     })
     .filter(|l| !l.is_empty());
-    line.unwrap_or_else(|| format!("{}: unavailable", argv.join(" ")))
+    line.unwrap_or_else(|| {
+        let unavailable = format!("{}: unavailable", argv.join(" "));
+        unavailable.chars().take(512).collect()
+    })
 }
 
 fn run_command(
@@ -233,8 +317,11 @@ pub fn produce(
         return Err(Error::Invalid("working tree is not clean".into()));
     }
     let state = observe(repo, "HEAD", base_rev)?;
-    let cargo_lock_sha256 = file_digest(repo, &state.commit, "Cargo.lock")?;
-    let toolchain_file_sha256 = file_digest(repo, &state.commit, "rust-toolchain.toml")?;
+    let dependencies = recipe
+        .dependency_file_list()
+        .into_iter()
+        .map(|path| file_digest(repo, &state.commit, &path).map(|digest| (path, digest)))
+        .collect::<Result<Vec<_>>>()?;
     let (mut results, mut outputs) = (Vec::new(), Vec::new());
     for c in &recipe.commands {
         let (result, output) = run_command(repo, &c.id, &c.argv, c.timeout_secs, cancel);
@@ -245,15 +332,11 @@ pub fn produce(
             break;
         }
     }
-    let toolchain = [
-        &["rustc", "-V"][..],
-        &["cargo", "-V"],
-        &["cargo", "nextest", "--version"],
-        &["git", "--version"],
-    ]
-    .iter()
-    .map(|argv| probe(repo, argv))
-    .collect();
+    let toolchain = recipe
+        .toolchain_probe_list()
+        .iter()
+        .map(|argv| probe(repo, argv))
+        .collect();
     // A failed re-check must not drop the run: it is recorded as a changed tree.
     let after = observe(repo, "HEAD", base_rev).ok();
     let unchanged = after
@@ -263,8 +346,7 @@ pub fn produce(
     let var_set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
     Ok(Produced {
         outputs,
-        cargo_lock_sha256,
-        toolchain_file_sha256,
+        dependencies,
         record: ValidationRecord {
             subject: GitValidationSubject {
                 repository: policy.repository.clone(),

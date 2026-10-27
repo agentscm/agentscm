@@ -554,6 +554,7 @@ impl HumanSession {
 
 pub fn routes() -> Router<HubState> {
     Router::new()
+        .route("/v1/hub/login", get(providers))
         .route("/v1/hub/login/exchange", post(exchange))
         .route("/v1/hub/login/device/poll", post(device_poll))
         .route("/v1/hub/login/{provider}", get(browser_start))
@@ -840,21 +841,48 @@ fn log_forge_error(context: &str, body: &Value) {
 /// to it, since anyone can read it; a private one needs only the read the reply already proves.
 /// A GitLab project needs Reporter (20) on the project or its group, so Guest and Minimal
 /// Access are refused; one that is not private (public, internal or unstated) needs Developer
-/// (30). Missing permissions deny.
-fn may_use(provider: &Provider, reply: &Value) -> bool {
+/// (30). Missing permissions deny. A refusal is `(visibility, role held, role needed)`.
+fn missing_role(
+    provider: &Provider,
+    reply: &Value,
+) -> Option<(&'static str, &'static str, &'static str)> {
     if provider.is_gitlab() {
         let level = |scope: &str| reply["permissions"][scope]["access_level"].as_i64();
-        let needed = if reply["visibility"] == json!("private") {
-            GITLAB_REPORTER
-        } else {
-            GITLAB_DEVELOPER
+        let (visibility, needs, needed) = match reply["visibility"].as_str() {
+            Some("private") => ("private", "reporter", GITLAB_REPORTER),
+            Some("internal") => ("internal", "developer", GITLAB_DEVELOPER),
+            _ => ("public", "developer", GITLAB_DEVELOPER),
         };
-        return level("project_access").max(level("group_access")) >= Some(needed);
+        let held = level("project_access").max(level("group_access"));
+        if held >= Some(needed) {
+            return None;
+        }
+        let has = match held {
+            Some(GITLAB_REPORTER) => "reporter",
+            Some(15) => "planner",
+            Some(10) => "guest",
+            Some(5) => "minimal_access",
+            _ => "none",
+        };
+        return Some((visibility, has, needs));
     }
-    reply["private"] != json!(false)
-        || ["push", "triage", "maintain", "admin"]
-            .iter()
-            .any(|level| reply["permissions"][level] == json!(true))
+    let writes = ["push", "triage", "maintain", "admin"]
+        .iter()
+        .any(|level| reply["permissions"][level] == json!(true));
+    (reply["private"] == json!(false) && !writes).then_some(("public", "read", "triage"))
+}
+
+fn role_name(role: &str) -> &'static str {
+    match role {
+        "read" => "Read",
+        "triage" => "Triage",
+        "guest" => "Guest",
+        "planner" => "Planner",
+        "minimal_access" => "Minimal Access",
+        "reporter" => "Reporter",
+        "developer" => "Developer",
+        _ => "no access",
+    }
 }
 
 /// Whether the person's forge token can read a connected repository on the provider's host.
@@ -879,7 +907,7 @@ async fn reads_connected(
         // The id guards against a name that now belongs to another repository.
         if status == 200
             && body["id"].as_i64() == Some(repo.repository_id)
-            && may_use(provider, &body)
+            && missing_role(provider, &body).is_none()
         {
             return Ok(true);
         }
@@ -1132,6 +1160,11 @@ async fn device_poll(
     }))
 }
 
+/// The sign-in providers, so `hub login` can pick the only one.
+async fn providers(State(state): State<HubState>) -> Json<Value> {
+    Json(json!({"providers": state.login.enabled()}))
+}
+
 async fn session(HumanSession(human): HumanSession) -> Json<Value> {
     Json(json!({"user": user_json(&human.user), "admin": human.admin,
         "expires_at": human.expires_at}))
@@ -1185,8 +1218,23 @@ async fn create_token(
         "full_name"
     }]
     .as_str();
-    if status == 200 && !may_use(provider, &reply) {
-        return Err(forbidden());
+    if status == 200
+        && let Some((visibility, has, needs)) = missing_role(provider, &reply)
+    {
+        // Names the one fix, so clients can say who needs which role where.
+        let repository = canonical
+            .filter(|name| validate_repository(name).is_ok())
+            .unwrap_or(&body.repository);
+        let message = format!(
+            "{} has {} on {visibility} repository {repository}; ask a repository owner for {} or higher",
+            human.user.login,
+            role_name(has),
+            role_name(needs)
+        );
+        let refusal = json!({"error": "insufficient_role", "login": human.user.login,
+            "repository": repository, "visibility": visibility, "has": has, "needs": needs,
+            "message": message});
+        return Ok((StatusCode::FORBIDDEN, Json(refusal)).into_response());
     }
     let (repository_id, repository) = match (status, reply["id"].as_i64(), canonical) {
         (200, Some(id), Some(name)) if id > 0 && validate_repository(name).is_ok() => {

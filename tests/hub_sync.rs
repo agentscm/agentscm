@@ -2025,6 +2025,7 @@ async fn only_our_own_marked_comment_is_adopted_and_a_failed_edit_makes_a_new_on
                 id: 900,
                 body: "<!-- agentscm-hub:100:5 -->\nnot from the hub".into(),
                 author: "mallory".into(),
+                ..Default::default()
             }],
         );
     });
