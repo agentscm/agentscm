@@ -474,7 +474,8 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
           return send(404, { error: 'synthetic_workspace_route_not_found' })
         }
         // Synthetic browser session (an HttpOnly cookie in production) and the computer routes.
-        if (url.pathname.startsWith('/login/') && req.method === 'GET' && !url.searchParams.has('workspace') && !url.searchParams.has('cli_port')) {
+        // Like the Hub: the web sign-in starts only with ?web=1; without it a sign-in expects the CLI's loopback port.
+        if (url.pathname.startsWith('/login/') && req.method === 'GET' && url.searchParams.get('web') === '1') {
           browserSignedIn = true
           res.statusCode = 302
           res.setHeader('location', '/#home')

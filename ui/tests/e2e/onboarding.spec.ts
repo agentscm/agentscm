@@ -82,7 +82,8 @@ test('6. a browser without a Hub session signs in through the forge; only admins
   const tabs = page.getByRole('navigation', { name: /views/ })
   await expect(tabs.getByRole('link', { name: /Admin/ })).toBeVisible()
   await main.getByRole('button', { name: 'Sign out of this browser' }).click()
-  await expect(main.getByRole('link', { name: /Sign in with GitHub/ })).toBeVisible()
+  // #160: the web sign-in starts only with ?web=1 (without it the Hub expects the CLI's port).
+  await expect(main.getByRole('link', { name: /Sign in with GitHub/ })).toHaveAttribute('href', '/v1/hub/login/github?web=1')
   await expect(tabs.getByRole('link', { name: /Admin/ })).toHaveCount(0)
   await main.getByRole('link', { name: /Sign in with GitHub/ }).click()
   await expect(page).toHaveURL(/#home$/)

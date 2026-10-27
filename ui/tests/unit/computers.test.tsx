@@ -95,7 +95,7 @@ describe('ComputersPage', () => {
   it('offers a forge sign-in when this browser has no Hub session', async () => {
     stubFetch({ 'GET /v1/hub/session': () => ({ status: 401, body: { error: 'sign_in_required' } }) })
     render(<Computers token="read-only-token" />)
-    expect((await screen.findByRole('link', { name: /Sign in with GitHub/ })).getAttribute('href')).toBe('/v1/hub/login/github')
+    expect((await screen.findByRole('link', { name: /Sign in with GitHub/ })).getAttribute('href')).toBe('/v1/hub/login/github?web=1')
   })
 
   it('signs the browser out with CSRF, then offers sign-in again', async () => {

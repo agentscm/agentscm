@@ -38,7 +38,7 @@ function SignInHere({ provider, what }: { provider: 'github' | 'gitlab'; what: s
   return (
     <div className="computer-signin">
       <p>Sign in to this Hub in your browser to see {what}. A read-only repository token can’t.</p>
-      <a className="btn btn-primary" href={`/v1/hub/login/${provider}`}>
+      <a className="btn btn-primary" href={`/v1/hub/login/${provider}?web=1`}>
         <Icon name={provider} /> Sign in with {FORGE[provider]}
       </a>
     </div>
