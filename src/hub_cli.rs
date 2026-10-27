@@ -340,12 +340,13 @@ pub async fn run(command: HubCommand, data_dir: &std::path::Path) -> Result<()> 
             };
             let how = if device { SignIn::Device } else { SignIn::Auto };
             let who = sign_in_with(&hub, &name, None, how).await?;
+            // Say it worked before asking anything, so the wait above visibly ends.
+            eprintln!("{}", signed_in_line(&hub, &who));
             if no_auto_connect {
                 set_auto_connect(Some(&hub), false)?;
             } else {
                 ask_auto_connect(&hub);
             }
-            eprintln!("signed in to {hub} as {who}");
             Ok(())
         }
         HubCommand::Logout { hub } => logout(hub.as_deref()).await,
@@ -633,8 +634,24 @@ pub(crate) fn computer_name() -> Option<String> {
     (!name.trim().is_empty()).then_some(name)
 }
 
-const AUTO_CONNECT_QUESTION: &str = "Connect agents automatically in repositories on";
-const AUTO_CONNECT_HELP: &str = "AgentSCM's agent plugin runs a quick check whenever an agent starts. With this on, in a checkout with no connection that check sends the checkout's forge host and owner/name to each Hub with auto-connect on, and connects the checkout if the Hub has that repository and you have the role; it writes no file in the checkout. Change it later with `agentscm hub auto-connect on|off`.";
+const AUTO_CONNECT_HELP: &str = "When an agent starts in a repository that isn't connected yet, AgentSCM sends the\nrepository's name (such as github.com/owner/name) to each Hub with auto-connect on,\nand connects it if that Hub has it and you have access. Nothing is written in the repository.";
+
+/// The Hub as people say it: its host (and port), without the scheme.
+fn hub_host(hub: &str) -> &str {
+    hub.split_once("://")
+        .map_or(hub, |(_, rest)| rest)
+        .trim_end_matches('/')
+}
+
+/// `Signed in to hub.example.com as alice (GitHub).` from a Hub URL and a `provider:login`.
+fn signed_in_line(hub: &str, who: &str) -> String {
+    let host = hub_host(hub);
+    match who.split_once(':') {
+        Some(("github", login)) => format!("Signed in to {host} as {login} (GitHub)."),
+        Some(("gitlab", login)) => format!("Signed in to {host} as {login} (GitLab)."),
+        _ => format!("Signed in to {host} as {who}."),
+    }
+}
 
 /// Asks once per Hub, at a terminal, for every saved Hub that was never asked: sign-ins from
 /// the menu bar app or from before the question existed are asked at the next interactive
@@ -654,8 +671,8 @@ fn ask_auto_connect(hub: &str) {
     {
         return;
     }
-    eprintln!("{AUTO_CONNECT_HELP}");
-    eprint!("{AUTO_CONNECT_QUESTION} {hub}? [Y/n] ");
+    eprintln!("\n{AUTO_CONNECT_HELP}");
+    eprint!("Turn on auto-connect for {}? [Y/n] ", hub_host(hub));
     let mut answer = String::new();
     if std::io::stdin().read_line(&mut answer).is_err() {
         return;
@@ -663,8 +680,9 @@ fn ask_auto_connect(hub: &str) {
     let on = !matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no");
     if set_auto_connect(Some(hub), on).is_ok() {
         eprintln!(
-            "Auto-connect is {} for {hub}.",
-            if on { "on" } else { "off" }
+            "Auto-connect is {}. Change it any time with `agentscm hub auto-connect {}`.",
+            if on { "on" } else { "off" },
+            if on { "off" } else { "on" }
         );
     }
 }
@@ -2283,6 +2301,22 @@ mod tests {
         assert!(when(now, now).ends_with("(now)"));
         assert!(when(i64::MIN, now).ends_with("ago)"));
         assert!(!later.contains(&now.to_string()));
+    }
+
+    #[test]
+    fn sign_in_reads_as_a_sentence_with_the_hub_host() {
+        assert_eq!(
+            signed_in_line("https://hub.example.com", "github:alice"),
+            "Signed in to hub.example.com as alice (GitHub)."
+        );
+        assert_eq!(
+            signed_in_line("http://127.0.0.1:7340/", "gitlab:bob"),
+            "Signed in to 127.0.0.1:7340 as bob (GitLab)."
+        );
+        assert_eq!(
+            signed_in_line("https://hub.example.com", "carol"),
+            "Signed in to hub.example.com as carol."
+        );
     }
 
     #[test]

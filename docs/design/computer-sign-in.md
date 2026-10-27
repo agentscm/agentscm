@@ -143,7 +143,7 @@ Manual `hub token create` keeps its 30-day maximum; only the device path is shor
 ## Auto-connect
 
 - Opt-in per Hub: `auto_connect` in that Hub's saved entry (absent until asked). The sign-in asks
-  once at a terminal, "Connect agents automatically in repositories on this Hub? [Y/n]", Yes by
+  once at a terminal, "Turn on auto-connect for <hub>? [Y/n]", Yes by
   default; `hub login --no-auto-connect` answers No without a prompt. The help says that the checkout's origin (forge host and owner/name) is sent
   to every Hub with auto-connect on. It can be changed later
   (`agentscm hub auto-connect on|off [--hub URL]`).
