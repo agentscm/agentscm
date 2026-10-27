@@ -81,6 +81,12 @@ pub struct PackageFile {
     pub content: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct AgentSkillPackage {
+    pub binding: crate::skill_workflow::intent::IntentSkillBinding,
+    pub files: Vec<PackageFile>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Provenance {
@@ -1854,6 +1860,72 @@ impl Library {
         }))
     }
 
+    /// Resolve one explicitly selected host skill without activating native or merge workflows.
+    pub fn agent_skill(
+        &self,
+        workflow_version_id: &str,
+        step_id: &str,
+    ) -> Result<AgentSkillPackage> {
+        let version = self.version(workflow_version_id)?;
+        if version.archived || version.digest != digest(&serde_json::to_vec(&version.definition)?) {
+            return Err(Error::Conflict(
+                "workflow version is archived or its content changed".into(),
+            ));
+        }
+        let definition = &version.definition;
+        // shortcut: only standalone skills have a host binding; composed execution needs dependency receipts.
+        if definition.steps.len() != 1
+            || definition.trigger.is_some()
+            || definition.follow_on.is_some()
+        {
+            return Err(Error::Invalid(
+                "host intent review requires one standalone skill step".into(),
+            ));
+        }
+        let step = &definition.steps[0];
+        let WorkflowStepKind::Skill { skill_version_id } = &step.kind else {
+            return Err(Error::Invalid(
+                "selected workflow step is not a host skill".into(),
+            ));
+        };
+        if step.id != step_id || !step.needs.is_empty() {
+            return Err(Error::Invalid(
+                "host skill step identity or dependencies differ".into(),
+            ));
+        }
+        let skill = self.skill(skill_version_id)?;
+        let files = self.package(skill_version_id)?;
+        validate_package(&files, &skill.entrypoint)?;
+        let preview = PreviewSkill {
+            name: skill.name.clone(),
+            entrypoint: skill.entrypoint.clone(),
+            provenance: skill.provenance.clone(),
+        };
+        if skill.archived
+            || skill.digest != digest(&serde_json::to_vec(&(preview, &files))?)
+            || skill.files != summarize(&files)
+        {
+            return Err(Error::Conflict(
+                "skill version is archived or its content changed".into(),
+            ));
+        }
+        let entrypoint = files
+            .iter()
+            .find(|file| file.path == skill.entrypoint)
+            .ok_or_else(|| Error::Invalid("skill entrypoint is missing".into()))?;
+        Ok(AgentSkillPackage {
+            binding: crate::skill_workflow::intent::IntentSkillBinding {
+                workflow_version_id: version.id,
+                step_id: step.id.clone(),
+                skill_version_id: skill.id,
+                skill_sha256: digest(entrypoint.content.as_bytes()),
+                package_digest: skill.digest,
+                entrypoint: skill.entrypoint,
+            },
+            files,
+        })
+    }
+
     fn skill(&self, id: &str) -> Result<SkillVersion> {
         self.skills()?
             .into_iter()
@@ -2803,6 +2875,105 @@ mod tests {
         ] {
             assert!(validate_package(&files, entrypoint).is_err());
         }
+    }
+
+    #[test]
+    fn host_skill_resolves_pinned_bytes_and_rejects_changed_or_composed_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lib = Library::open(dir.path()).unwrap();
+        let files = vec![PackageFile {
+            path: "SKILL.md".into(),
+            content: "# Review the requested outcome".into(),
+        }];
+        let skill = accept_package(&mut lib, "intent-check", files.clone(), "host-import");
+        let draft = lib
+            .create_workflow(&CreateWorkflow {
+                name: "Intent check".into(),
+                summary: "Compare the current result to the request".into(),
+                idempotency_key: "host-create".into(),
+            })
+            .unwrap();
+        let step = WorkflowStep {
+            id: "review".into(),
+            label: "Review intent".into(),
+            needs: vec![],
+            required: true,
+            kind: WorkflowStepKind::Skill {
+                skill_version_id: skill.id.clone(),
+            },
+        };
+        let draft = lib
+            .update_workflow(
+                &draft.id,
+                &UpdateWorkflow {
+                    expected_generation: draft.generation,
+                    name: None,
+                    summary: None,
+                    steps: Some(vec![step.clone()]),
+                    trigger: None,
+                    follow_on: None,
+                },
+            )
+            .unwrap();
+        let (version, _) = published(
+            lib.publish(
+                &draft.id,
+                &PublishWorkflow {
+                    expected_generation: draft.generation,
+                    idempotency_key: "host-publish".into(),
+                },
+            )
+            .unwrap(),
+        );
+        let package = lib.agent_skill(&version.id, "review").unwrap();
+        assert_eq!(package.files, files);
+        assert_eq!(
+            package.binding.skill_sha256,
+            digest(files[0].content.as_bytes())
+        );
+        assert_eq!(package.binding.package_digest, skill.digest);
+        assert!(lib.agent_skill(&version.id, "other").is_err());
+        let mut second = step;
+        second.id = "second".into();
+        let draft = lib
+            .update_workflow(
+                &draft.id,
+                &UpdateWorkflow {
+                    expected_generation: draft.generation,
+                    name: None,
+                    summary: None,
+                    steps: Some(vec![draft.steps[0].clone(), second]),
+                    trigger: None,
+                    follow_on: None,
+                },
+            )
+            .unwrap();
+        let (composed, _) = published(
+            lib.publish(
+                &draft.id,
+                &PublishWorkflow {
+                    expected_generation: draft.generation,
+                    idempotency_key: "host-compose".into(),
+                },
+            )
+            .unwrap(),
+        );
+        assert!(lib.agent_skill(&composed.id, "review").is_err());
+        assert!(lib.agent_skill(&version.id, "review").is_ok());
+        lib.db
+            .execute(
+                "UPDATE skill_versions SET package_json=?1 WHERE id=?2",
+                params![
+                    serde_json::to_string(&vec![PackageFile {
+                        path: "SKILL.md".into(),
+                        content: "changed".into()
+                    }])
+                    .unwrap(),
+                    skill.id
+                ],
+            )
+            .unwrap();
+        assert!(lib.agent_skill(&version.id, "review").is_err());
     }
 
     #[test]

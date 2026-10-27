@@ -404,6 +404,9 @@ A sentence, not a header. There is no rule under it and nothing visible above it
 - **Head:** transparent, with no divider, no icon and no tinted band. The title is 16px 600; the count sits plain on the right in 13px 500 text-3, or coral 700 when the box's tone is bad; the explanation spans the full width beneath.
 - **Internal Padding:** head 22px 26px 6px and body 14px 26px 26px; Condensed 12px 16px 2px and 8px 16px 14px; mobile 18px 18px 4px and 10px 18px 20px.
 
+### Intent review
+On the local Work detail, keep the human request, amendments and agent focus distinct. Show candidate identity and source coverage beside criterion findings; make supported, mismatch and unknown states explicit, with evidence origin and assurance visible. Label findings stale when their intent or candidate binding differs. Keep execution status separate from semantic outcome, retain attempt history, and make incomplete coverage visible. A human disposition records a view; it never grants admission.
+
 ### Section tabs
 The Dashboard (and any rail item with more than one page) shows its pages as equal columns over a 1px rule-strong baseline. Each tab is a label over its live status: "1 needs you" with a coral dot, "No crossings" with no dot, "Last event 4 min ago" with a violet dot, "2 of 3 awake" with a green dot. The open tab is text colour with a 2px brand underline; hover shows a rule-strong underline. Tabs are links (`#home`, `#now`, `#activity`, `#team`) with `aria-current="page"`.
 

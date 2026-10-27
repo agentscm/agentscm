@@ -30,6 +30,9 @@ import { usePoll, type Poll } from '../usePoll.ts'
 import { useNow } from '../useHub.ts'
 import { HideButton, hideKey, isStale, ShowHidden, useHidden, useHideable } from '../dismiss.tsx'
 import { hashPath, Pager } from '../Pager.tsx'
+import { localCredential } from '../localApi.ts'
+import { onFrontDoor } from '../frontDoor.ts'
+import { IntentReviewPanel } from '../IntentReviewPanel.tsx'
 
 export const STATE: Record<WorkState, { label: string; tone: Tone; icon: string; tip: string }> = {
   active: { label: 'In progress', tone: 'brand', icon: 'play-circle', tip: 'The lead agent reports it is actively working on this.' },
@@ -830,6 +833,7 @@ function Detail({ id, token }: { id: string; token: string }) {
                 {item.current ? <Report c={item.current} item={item} title="Latest checkpoint" /> : <Empty icon="chat-square" title="No checkpoint yet" />}
                 {item.blocker && item.blocker !== item.current && <Report c={item.blocker} item={item} title="Open blocker" />}
               </Box>
+              {onFrontDoor() && localCredential() && <IntentReviewPanel workId={item.id} />}
               <details className="disclosure box">
                 <summary>
                   <Icon name="code-square" /> Technical details

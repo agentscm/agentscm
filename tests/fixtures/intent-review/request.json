@@ -1,0 +1,28 @@
+{
+  "case": "per-account-rate-limit",
+  "messages": [
+    {
+      "id": "human-1",
+      "role": "user",
+      "text": "Add a rate limiter that allows at most 2 requests per account per minute. Requests from different IP addresses for the same account must share the limit. Different accounts must have independent limits."
+    },
+    {
+      "id": "assistant-1",
+      "role": "assistant",
+      "text": "I will key a fixed-window counter by client IP and test that repeated requests from one IP are limited."
+    }
+  ],
+  "criteria": [
+    {
+      "id": "account-shared-limit",
+      "source_message": "human-1",
+      "requirement": "All requests for one account share a maximum of 2 requests in the same minute, across client IP addresses."
+    },
+    {
+      "id": "account-isolation",
+      "source_message": "human-1",
+      "requirement": "A different account has an independent allowance."
+    }
+  ],
+  "assistant_plan_is_not_contract": true
+}
