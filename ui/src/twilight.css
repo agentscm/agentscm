@@ -806,17 +806,6 @@ textarea.form-control {
   color: var(--coral);
   font-weight: 700;
 }
-.box-explain {
-  flex-basis: 100%;
-  margin: 2px 0 0;
-  font-size: 13px;
-  line-height: 1.45;
-  color: var(--hub-text-3);
-  max-width: 80ch;
-}
-:root[data-density='condensed'] .box-explain {
-  font-size: 12px;
-}
 .box-body {
   padding: var(--hub-pad-box);
 }
@@ -2594,6 +2583,10 @@ textarea.form-control {
 :root[data-density='condensed'] .brief {
   padding: 12px 16px 10px;
   gap: 8px;
+}
+/* Window and generation notices stack above the briefing text, each separated from the next. */
+.brief-body > .notice {
+  margin-bottom: 10px;
 }
 .brief-head {
   display: flex;

@@ -128,7 +128,7 @@ function DispositionForm({ review, onSaved }: { review: IntentReview; onSaved: (
       setBusy(false)
     }
   }
-  return <Box icon="person-check" title="Human disposition" explain="Records a local human dispute or exception for the current candidate. This does not change workflow admission or verify identity.">
+  return <Box icon="person-check" title="Human disposition" explain="Saves your objection or exception on this computer. It doesn’t change whether the workflow can land, and it doesn’t check who you are.">
     {!eligible && <Notice tone="warn" title="Disposition requires the current candidate">Reload Work detail to get a fresh subject digest before recording a dispute or exception.</Notice>}
     {error && <Notice tone="bad" title="Disposition was not recorded">{error}</Notice>}
     {saved && <Notice tone="ok" icon="check-circle" title="Disposition recorded">Refreshing the retained assessment.</Notice>}
@@ -159,7 +159,7 @@ function Review({ review, onDispositionSaved }: { review: IntentReview; onDispos
   const lastAssessment = [...review.record.attempts].reverse().find((attempt) => attempt.phase === 'assessment' && attempt.assessment)
   const latestAttempt = review.record.attempts.at(-1)
   return <div className="d-grid gap-3">
-    <Box icon="bullseye" title="Intent review" explain="A retained agent assessment of this Work. Its findings are advisory and do not grant workflow admission.">
+    <Box icon="bullseye" title="Intent review" explain="An agent’s review of this work. Treat its findings as advice: they don’t let a workflow land.">
       <p className="d-flex flex-wrap align-items-center gap-2 mb-2">{statusPill(review.outcome)} <span>{review.current ? 'Current source and intent binding' : 'Assessment is stale for the current source or intent'}</span></p>
       <p className="mb-1"><strong>Next:</strong> {NEXT[review.next]}</p>
       <p className="small muted mb-0">Admission: {review.admission.replaceAll('_', ' ')} · skill version <code>{review.record.subject.skill.skill_version_id}</code>, step <code>{review.record.subject.skill.step_id}</code></p>
@@ -168,7 +168,7 @@ function Review({ review, onDispositionSaved }: { review: IntentReview; onDispos
     <Box icon="chat-left-text" title="Original request"><References rows={review.record.contracts[0]!.request} /></Box>
     {contract.amendments.length > 0 && <Box icon="pencil-square" title="Human amendments"><References rows={contract.amendments} /></Box>}
     {contract.focus.length > 0 && <Box icon="list-task" title="Agent focus"><References rows={contract.focus} /></Box>}
-    <Box icon="diagram-3" title="Candidate and scope" explain="Identity and coverage for the source snapshot associated with this Work."><SourceFacts review={review} /></Box>
+    <Box icon="diagram-3" title="Candidate and scope" explain="Which source snapshot this work used, and how much of it was captured."><SourceFacts review={review} /></Box>
     <Box icon="clipboard-check" title={lastAssessment?.attempt_id === latestAttempt?.attempt_id ? 'Latest assessment findings' : 'Most recent assessment findings'} count={lastAssessment?.assessment?.criteria.length ?? 0}>
       {lastAssessment && lastAssessment.attempt_id !== latestAttempt?.attempt_id && <Notice tone="warn" title="These findings are from an earlier attempt">A later task attempt exists. Reassess its resulting candidate before treating these findings as current.</Notice>}
       {lastAssessment ? <Findings attempt={lastAssessment} review={review} /> : <Empty icon="question-circle" title="No completed assessment">No criteria have an assessed result yet.</Empty>}

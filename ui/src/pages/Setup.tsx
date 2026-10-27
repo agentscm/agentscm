@@ -31,7 +31,7 @@ export function SetupPage({ token }: { token: string }) {
       </div>
       <SectionTabs />
       <div className="grid-2 align-start">
-        <Box tour="setup-sessions" icon="patch-check" title="Verified sessions" count={rows.length} explain="Proof lasts up to 15 minutes after the agent’s last check, and never outlasts the agent’s own token (30 days for client setup). Ready does not guarantee future quota or that every edit tool is covered.">
+        <Box tour="setup-sessions" icon="patch-check" title="Verified sessions" count={rows.length} explain="Proof lasts 15 minutes after the agent’s last check, and never longer than its token (30 days for client setup). Ready doesn’t promise future quota, or that every edit tool is covered.">
           {load.kind === 'loading' && <Skeleton rows={3} />}
           {!available && load.kind !== 'loading' && <Notice tone="muted" icon="info-circle" title="Setup verification unavailable">No agent is marked ready until the hub answers again.</Notice>}
           {load.kind === 'ready' && rows.length === 0 && (
@@ -81,7 +81,7 @@ export function SetupPage({ token }: { token: string }) {
           })()}
           {rows.length > 30 && <p className="small muted">Showing 30 setup sessions.</p>}
         </Box>
-        <Box tour="setup-connect" icon="plug" title="Connect an agent" explain="Copies instructions your coding agent follows to install AgentSCM. Nothing runs from this page.">
+        <Box tour="setup-connect" icon="plug" title="Connect an agent" explain="Copies the instructions your agent follows to install AgentSCM.">
           <ConnectAgent />
         </Box>
       </div>

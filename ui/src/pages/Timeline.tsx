@@ -229,7 +229,7 @@ export function TimelinePage() {
           {route.kind === 'compare' && <Compare key={`${route.left}|${route.right}`} left={route.left} right={route.right} />}
         </>
       )}
-      <p className="small muted"><Icon name="laptop" /> Read from <code>agentscm serve</code> on this computer (the workspace it was started with), not the hub. Saving and forking happen in the CLI or your agent; this page only reads. <Explain text="Paging shows what was saved since the timeline was turned on. It isn't proof of everything that happened before." /></p>
+      <p className="small muted"><Icon name="laptop" /> Read from <code>agentscm serve</code> on this computer (the workspace it was started with), not the hub. Saving and forking happen in the CLI or your agent; this page only reads. <Explain text="Shows what was saved since the timeline was turned on. Anything earlier isn’t here." /></p>
     </div>
   )
 }

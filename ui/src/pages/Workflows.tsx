@@ -285,7 +285,7 @@ function List({ token }: { token: string }) {
         tone={load.kind === 'ready' && load.value.availability === 'available' && load.value.runs.some((r) => r.state === 'failed' || r.state === 'blocked') ? 'bad' : 'brand'}
         icon="diagram-3"
         title="Workflow runs"
-        explain="Skill workflows compose checks, reviews and artifact-producing actions. Select a run to inspect what each step actually recorded."
+        explain="Each run is a set of checks, reviews and other steps. Open one to see what each step recorded."
         count={load.kind === 'ready' && load.value.availability === 'available' ? load.value.runs.length : undefined}
         actions={
           <RunPicker token={token} />

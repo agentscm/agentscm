@@ -94,7 +94,7 @@ function HandoffView({ value }: { value: Handoff }) {
         {value.subject_scope === 'source_revision_and_command_contexts'
           ? <>Covers the source revision <strong>and</strong> the change versions its commands ran against ({value.command_context_bindings.map((b) => `${b.change} v${b.change_version}`).join(', ')}).</>
           : 'Covers the source revision only.'}{' '}
-        <Explain text="A run is evidence about exact bytes. If the change moves on, run the check again before relying on this." />
+        <Explain text="A run checks the exact files at that moment. If the change moves on, run it again." />
       </p>
     </>
   )
@@ -253,10 +253,10 @@ function InspectorPanel() {
       <p className="small muted mb-0">Inspect a source-bound template or retained run. This view never changes or starts either one.</p>
       {preview && preview.kind === 'ready' && <PreviewBanner reason={preview.value?.reason} />}
       <div className="grid-2 align-start">
-        <Box icon="journal-code" title="See a change’s recipe" explain="Shows the template this computer uses, as it applies to one change: its steps, what each waits for, and which must pass. Same as skill-workflow library inspect.">
+        <Box icon="journal-code" title="See a change’s recipe" explain="The template this computer uses, applied to one change: its steps, what each waits for, and which must pass. Same as skill-workflow library inspect.">
           <RecipeLookup recent={recentRecipes} onOpen={(change, library) => { setRecipe({ change, library }); setRecentRecipes(rememberId(RECENT.recipe, `${change}${PAIR}${library}`)) }} />
         </Box>
-        <Box icon="flag" title="Where did a run get to?" explain="A run is one go at a recipe's checks. This shows each step's result and what to do next. Same as skill-workflow handoff.">
+        <Box icon="flag" title="Where did a run get to?" explain="One go at a recipe’s checks: each step’s result and what to do next. Same as skill-workflow handoff.">
           <RunLookup
             recent={recentRuns}
             onOpen={(v) => { setRunId(v); setRecentRuns(rememberId(RECENT.run, v)) }}

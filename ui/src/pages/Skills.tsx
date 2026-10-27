@@ -164,7 +164,7 @@ function Library({ lib }: { lib: Library }) {
   const attention = lib.adoption.pins.filter((p) => p.status !== 'adopted')
   return (
     <>
-      <Box tour="skills-adopted" icon="check2-circle" title="Adopted" count={adopted.length} explain="Skills this repository's lock file pins. Agents are expected to follow them.">
+      <Box tour="skills-adopted" icon="check2-circle" title="Adopted" count={adopted.length} explain="Skills pinned in this repository’s lock file. Agents are expected to follow them.">
         {adopted.length === 0 ? (
           <Empty icon="journal-check" title={lib.adoption.source === 'none' ? 'Not adopted' : 'Nothing adopted'}>No skill is pinned for this repository yet. Pick one under Available.</Empty>
         ) : (
@@ -182,7 +182,7 @@ function Library({ lib }: { lib: Library }) {
           </ul>
         )}
       </Box>
-      <Box tour="skills-available" icon="collection" title="Available" count={available.length} explain="Skills this hub ships that the repository has not pinned. The page never writes; it shows the command.">
+      <Box tour="skills-available" icon="collection" title="Available" count={available.length} explain="Skills this hub has that the repository hasn’t pinned. Copy the command to add one.">
         {available.length === 0 ? (
           <Empty icon="collection" title="Everything is adopted">Every skill this hub ships is already pinned.</Empty>
         ) : (
