@@ -98,8 +98,8 @@ pub(crate) struct SetupArgs {
     #[arg(long, value_enum)]
     agent: crate::client_setup::Agent,
     /// Write the agent's hooks, MCP entry and skill into this checkout only, not your user
-    /// configuration, so they run only here. Claude Code and Codex hooks always come from a
-    /// user-scope plugin.
+    /// configuration, so they run only here. Claude Code is always set up through its
+    /// user-scope plugin, and Codex hooks always come from one.
     #[arg(long)]
     checkout_only: bool,
     #[command(flatten)]
