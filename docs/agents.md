@@ -40,7 +40,7 @@ One person on the team runs, from the repository:
 agentscm init-repo --hub-url https://hub.example.com
 ```
 
-(`agentscm init` is the unrelated command that creates the native source store in a data directory; `init-repo` is the one that writes agent instructions.) It shows the files it will create or change, with a diff, and asks once. `--agents claude,codex,cursor,copilot,gemini` limits it, `--yes` skips the question. It is safe to run again: files that are already right are reported unchanged and nothing is written. It writes no MCP config, hooks or token. Commit the result in one pull request. `--hub-url` is optional (default: `AGENTSCM_HUB_URL`, then `hub.json`); it fills in the `agentscm client setup` command written into the instruction files and the one it prints, which otherwise keep a `<HUB_URL>` placeholder.
+(`agentscm init` is the unrelated command that creates the native source store in a data directory; `init-repo` is the one that writes agent instructions.) It shows the files it will create or change, with a diff, and asks once. `--agents claude,codex,cursor,copilot,gemini` limits it, `--yes` skips the question. It is safe to run again: files that are already right are reported unchanged and nothing is written. It writes no MCP config, hooks or token. Commit the result in one pull request. The instruction files name no hub, since each developer's Hub is set on their machine: they say to run `agentscm quickstart` once. `--hub-url` is optional (default: `AGENTSCM_HUB_URL`, then `hub.json`); it only fills in the `agentscm quickstart --hub URL` command printed at the end.
 
 | Agent | Files |
 | --- | --- |
@@ -51,7 +51,7 @@ agentscm init-repo --hub-url https://hub.example.com
 | Gemini CLI | `GEMINI.md` (one import line, `@./AGENTS.md`) |
 | All | `AGENTS.md` (a marked `<!-- agentscm:begin -->` block telling agents to start, to call `agentscm_check` before editing unless Claude Code, Codex or Copilot hooks already check their edits, to say so when coordination is unavailable, to do other work or ask when another agent holds a file, to answer handoff requests, and to finish) |
 
-It then prints, per agent, `agentscm client setup --agent <agent> --hub <hub>`. Each developer runs that once per checkout: it signs in to the hub and adds that machine's MCP server and hooks (git-excluded local files or user-level plugins), and the hub's Setup › Agents page verifies them. See [onboarding](team-member-onboarding.md).
+It then prints `agentscm quickstart --hub <hub>`. Each developer runs that once on their machine: it signs in to the hub and installs that machine's MCP server and hooks for their user account, writing nothing to the repository, and the hub's Setup › Agents page verifies them. See [onboarding](team-member-onboarding.md).
 
 `init-repo` replaces only its marked block in existing files and leaves the rest alone.
 

@@ -307,7 +307,9 @@ Before approving hooks or MCP configuration:
 
 `agentscm client remove --root PATH` undoes `client setup` for one checkout: it takes the agents' entries out of the checkout's files, uninstalls the Claude Code or Codex plugin when no other connected checkout uses it, revokes the managed token (the token revokes itself through `DELETE /v1/hub/token`, so no sign-in is needed), then removes the connection and deletes the token file. If the token can't be revoked, it says so, exits non-zero and keeps the connection and token file so that running it again retries. `agentscm uninstall` runs `client remove` for every checkout quickstart connected, then undoes the rest of quickstart's setup.
 
-`agentscm init-repo` writes only shared agent instruction files for the team to commit (no MCP config, hooks or token). Each developer still runs `agentscm client setup --agent <agent> --hub <hub>` once per clone (its linked worktrees are covered), and the Setup › Agents page verifies the result.
+Setup never writes to the repository: everything it installs is per machine, so `git status` stays clean.
+
+`agentscm init-repo` is a separate, optional step that writes shared agent instruction files for the team to commit (no MCP config, hooks, token or Hub URL). They tell each developer to run `agentscm quickstart` once on their machine, where their Hub is set; the Setup › Agents page verifies the result.
 
 Then run `agentscm client list` and `agentscm client check` for the local binding. Start a real agent
 task and confirm that its session appears for the expected repository in the hosted Hub. A local

@@ -517,7 +517,7 @@ fn guided_prepare_retries_exact_request_and_refresh_recovers_failed_checkpoint()
     start(&data, &work2, "prepared", head, &[]);
     fs::write(work2.join("a.txt"), b"changed").unwrap();
     fail(&data, &["workflow", "checkpoint", "wrong-generation", "99"]);
-    // Explicit refresh discards the failed request, not the source edits.
+    // A refused checkpoint records nothing; refresh stays harmless and keeps the edits.
     ok(&data, &["workflow", "refresh"]);
     assert_eq!(fs::read(work2.join("a.txt")).unwrap(), b"changed");
     let cp = ok(&data, &["workflow", "checkpoint", "cp", "0"]);
@@ -540,6 +540,31 @@ fn guided_prepare_retries_exact_request_and_refresh_recovers_failed_checkpoint()
         &data,
         &["workflow", "integrate", "prepared-land", "--inspection", &t],
     );
+}
+#[test]
+fn guided_refused_checkpoint_leaves_nothing_pending() {
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    let work = temp.path().join("work");
+    let initial = initialize(&data);
+    start(&data, &work, "refused", &initial, &[]);
+    fail(&data, &["workflow", "checkpoint", "no-change", "0"]);
+    assert!(session(&data)["pending"].is_null());
+    ok(&data, &["workflow", "status"]);
+    fs::write(work.join("a.txt"), b"changed").unwrap();
+    fail(&data, &["workflow", "checkpoint", "wrong-generation", "7"]);
+    assert!(session(&data)["pending"].is_null());
+    ok(&data, &["workflow", "status"]);
+    let cp = ok(&data, &["workflow", "checkpoint", "cp", "0"]);
+    assert_eq!(cp["workspace"]["generation"], 1);
+    ok(&data, &["workflow", "prepare", "after-refusals"]);
+    // A refusal that is already recorded (as before this fix) is dropped on resume.
+    let mut saved = session(&data);
+    saved["pending"] = json!({"kind":"Checkpoint","operation_id":"stale","generation":99});
+    save_session(&data, &saved);
+    fail(&data, &["workflow", "resume"]);
+    assert!(session(&data)["pending"].is_null());
+    ok(&data, &["workflow", "prepare", "after-resume"]);
 }
 #[test]
 fn guided_stale_uncompleted_integration_can_be_explicitly_refreshed_and_reapproved() {
