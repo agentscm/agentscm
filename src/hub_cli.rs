@@ -756,7 +756,8 @@ pub(crate) fn when(epoch: i64, now: i64) -> String {
 fn civil(epoch: i64) -> (i64, i64, i64, i64) {
     #[cfg(unix)]
     {
-        let time = epoch as libc::time_t;
+        // Inferred from localtime_r: naming `libc::time_t` is deprecated on musl, a deny-level warning.
+        let time = epoch as _;
         // SAFETY: `tm` is plain integers plus a `tm_zone` pointer that localtime_r sets, so
         // all-zero is a valid value; localtime_r writes only that `tm` and returns null on failure.
         let local = unsafe {

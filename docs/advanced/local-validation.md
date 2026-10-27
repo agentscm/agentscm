@@ -103,7 +103,7 @@ This is a design for adoption, not a qualified one: no repository other than thi
 
 Set the policy's recipe digest to the new recipe's digest.
 
-3. Add the caller workflow below after a release containing `reconcile`, path-scoped recipes, exempt paths and authenticated fetch has actually been published. `0.1.0-alpha.6` does not contain that set. The planned `0.1.0-alpha.7` is not published, so this template is deliberately non-runnable: replace both placeholders only with an exact published SemVer and the full commit SHA that contains `.github/workflows/local-validation-reconcile.yml`. Do not use `latest`, a tag, a branch or a version range.
+3. Add the caller workflow below after a release containing `reconcile`, path-scoped recipes, exempt paths and authenticated fetch has actually been published. `0.1.0-alpha.6` does not contain that set. The planned `0.1.0-alpha.8` is not published (`0.1.0-alpha.7` was never released), so this template is deliberately non-runnable: replace both placeholders only with an exact published SemVer and the full commit SHA that contains `.github/workflows/local-validation-reconcile.yml`. Do not use `latest`, a tag, a branch or a version range.
 
 ```yaml
 name: Local validation
