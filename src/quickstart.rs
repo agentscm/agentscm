@@ -172,7 +172,7 @@ pub struct UninstallArgs {
 
 const NEEDS_TERMINAL: &str = "agentscm quickstart asks questions, and there is no terminal here. \
 To run it without one, pass --yes and choose with flags: --local (recommended) or --hosted, \
---hub local|existing|skip|URL, \
+--hub local|existing|skip|URL, --hub-url URL, \
 --agent-token-file PATH, --provider github|gitlab, --github-login LOGIN, \
 --hub-runtime native|docker, --hub-port PORT, --hub-project NAME, \
 --slack-config-file ABSOLUTE_PATH, --agent claude|codex|cursor|copilot|gemini (repeatable) or --no-agents, --no-collisions, --init, --tray";
