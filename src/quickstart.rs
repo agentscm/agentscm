@@ -111,8 +111,8 @@ pub struct QuickstartArgs {
     /// Skip the check for colliding branches.
     #[arg(long)]
     no_collisions: bool,
-    /// Also write the repository's agent instructions (agentscm init-repo); with --yes it is
-    /// skipped unless this is passed.
+    /// Also write the repository's agent instructions (agentscm init-repo). Without it, setup
+    /// writes nothing to the repository.
     #[arg(long)]
     init: bool,
     /// Open the optional native status-bar companion after setup succeeds (macOS only).
@@ -1374,45 +1374,22 @@ async fn agents_stage(cx: &mut Cx<'_>) {
     }
 }
 
-/// Offers `agentscm init-repo`'s instruction files once a hub is chosen. Failure is reported, not fatal.
+/// With `--init` only, writes `agentscm init-repo`'s instruction files: setup itself never writes
+/// to the repository. Failure is reported, not fatal.
 fn init_stage(cx: &mut Cx<'_>) {
-    let (Some(root), Some(hub)) = (cx.found.repo_root.clone(), cx.live.hub.clone()) else {
-        if cx.args.init {
-            println!(
-                "--init needs a Git repository and a hub, so I didn't add the agent instructions."
-            );
-        }
-        return;
-    };
-    if cx.ui.yes && !cx.args.init {
+    if !cx.args.init {
         return;
     }
-    // Instructions that point agents at a hub they can't reach would be committed broken.
-    let why = if !cx.live.hub_up {
-        Some("The hub isn't answering")
-    } else if cx.live.agent_error.is_some() {
-        Some("Connecting the agents to the hub failed")
-    } else {
-        None
-    };
-    if let Some(why) = why {
-        if cx.args.init {
-            println!(
-                "{why}, so I didn't add the agent instructions; fix that and run quickstart again."
-            );
-        }
+    let Some(root) = cx.found.repo_root.clone() else {
+        println!("--init needs a Git repository, so I didn't add the agent instructions.");
         return;
-    }
-    // One question: init-repo shows the files and their diffs, then asks before writing.
-    println!(
-        "AgentSCM can also add this repository's agent instructions (AGENTS.md and the files that point Claude Code, Cursor, Copilot and Gemini at it), as files you can commit:"
-    );
-    match crate::init_cli::run_in(&root, None, Some(&hub), cx.ui) {
+    };
+    match crate::init_cli::run_in(&root, None, cx.ui) {
         Ok(outcome) => cx.init_written = outcome.written,
         Err(error) => println!("Couldn't add the agent instructions: {}.", short(&error)),
     }
     if !cx.init_written.is_empty() {
-        crate::init_cli::print_next_steps(&crate::init_cli::ALL, Some(&hub), &cx.init_written);
+        crate::init_cli::print_next_steps(cx.live.hub.as_deref(), &cx.init_written);
     }
 }
 

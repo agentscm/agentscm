@@ -69,16 +69,14 @@ fn yes_writes_from_a_subdirectory_and_a_second_run_writes_nothing() {
         assert!(!repo.path().join(path).exists(), "{path}");
     }
     let text = stdout(&first);
-    for agent in ["claude", "gemini"] {
-        assert!(
-            text.contains(&format!(
-                "agentscm client setup --agent {agent} --hub https://hub.example.test\n"
-            )),
-            "{text}"
-        );
-    }
+    assert!(
+        text.contains("  agentscm quickstart --hub https://hub.example.test\n"),
+        "{text}"
+    );
     assert!(!text.contains("AGENTSCM_HUB_TOKEN"), "{text}");
     let instructions = std::fs::read_to_string(repo.path().join("AGENTS.md")).unwrap();
+    // The Hub is set per machine; committed files never name one.
+    assert!(!instructions.contains("hub.example.test"), "{instructions}");
     for required in [
         "### Workflow tasks",
         "task `capabilities` operation",
@@ -117,13 +115,13 @@ fn no_hub_url_is_needed_but_a_git_repository_is() {
     let out = init_repo(repo.path(), home.path(), &["--yes", "--agents", "cursor"]);
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(
-        stdout(&out).contains("agentscm client setup --agent cursor --hub <HUB_URL>"),
+        stdout(&out).contains("  agentscm quickstart\n"),
         "{}",
         stdout(&out)
     );
     let rule = std::fs::read_to_string(repo.path().join(".cursor/rules/agentscm.mdc")).unwrap();
     assert!(
-        rule.contains("`agentscm client setup --agent cursor --hub <HUB_URL>`"),
+        rule.contains("run `agentscm quickstart` once on this machine"),
         "{rule}"
     );
     assert!(!repo.path().join(".cursor/mcp.json").exists());
@@ -135,7 +133,7 @@ fn no_hub_url_is_needed_but_a_git_repository_is() {
 }
 
 #[test]
-fn a_bad_saved_hub_url_warns_and_keeps_the_placeholder() {
+fn a_bad_saved_hub_url_warns_and_is_left_out() {
     let (repo, home) = checkout();
     let out = Command::new(env!("CARGO_BIN_EXE_agentscm"))
         .args(["init-repo", "--yes", "--agents", "codex"])
@@ -155,10 +153,10 @@ fn a_bad_saved_hub_url_warns_and_keeps_the_placeholder() {
     );
     let agents = std::fs::read_to_string(repo.path().join("AGENTS.md")).unwrap();
     assert!(
-        agents.contains("`agentscm client setup --agent codex --hub <HUB_URL>`"),
+        agents.contains("run `agentscm quickstart` once on this machine"),
         "{agents}"
     );
-    // An explicit --hub-url goes into committed files, so a bad one is still an error.
+    // An explicit --hub-url goes into the printed command, so a bad one is still an error.
     let out = init_repo(
         repo.path(),
         home.path(),

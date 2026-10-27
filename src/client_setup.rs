@@ -1617,7 +1617,7 @@ mod tests {
     #[test]
     fn init_repo_output_never_conflicts_with_client_setup() {
         let (_dir, root) = repo();
-        let written = crate::init_cli::run_in(&root, None, None, &crate::prompt::Ui { yes: true })
+        let written = crate::init_cli::run_in(&root, None, &crate::prompt::Ui { yes: true })
             .unwrap()
             .written;
         assert!(!written.is_empty());
