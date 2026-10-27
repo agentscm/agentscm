@@ -19,30 +19,8 @@ const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? o
 /** An agent counts as awake while it reported activity in the last five minutes. */
 export const AWAKE_SECONDS = 300
 
-/** A count in the answer that brings its evidence box into view and rings it; elsewhere a plain link to its tab. */
-function Jump({ to, href, children, tone = 'brand' }: { to: string; href: string; children: ReactNode; tone?: string }) {
-  return (
-    <a
-      href={href}
-      className={`jump tone-${tone}`}
-      onClick={(e) => {
-        const el = document.getElementById(to)
-        if (!el) return
-        e.preventDefault()
-        el.scrollIntoView({ behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start' })
-        el.classList.remove('ring')
-        void el.offsetWidth
-        el.classList.add('ring')
-      }}
-    >
-      {children}
-    </a>
-  )
-}
-
 /** One sentence that stays on top of every dashboard tab: who is working, what needs you, where things cross. */
 function Answer({ question, repo, d, ov, failing, needs }: { question: string; repo: string; d: Derived | null; ov: WorkOverview | null; failing: boolean; needs: Need[] }) {
-  const x = crossings(ov, d)
   return (
     <div className="answer" data-tour="answer">
       <h1 className="page-question">{question}</h1>
@@ -61,18 +39,7 @@ function Answer({ question, repo, d, ov, failing, needs }: { question: string; r
               <b>{plural(d.agents.length, 'agent')}</b> {d.agents.length === 1 ? 'is' : 'are'} working on <b>{plural(ov.current.length, 'task')}</b>.{' '}
             </>
           )}
-          {needs.length > 0 ? (
-            <Jump to="box-needs" href="#home" tone="bad">
-              {needs.length === 1 ? '1 thing needs you' : `${needs.length} things need you`}.
-            </Jump>
-          ) : (
-            <>Nothing needs you.</>
-          )}{' '}
-          {x > 0 && (
-            <Jump to="box-map" href="#now" tone="bad">
-              {plural(x, 'crossing')}.
-            </Jump>
-          )}
+          {needs.length === 0 && <>Nothing needs you.</>}
         </p>
       )}
     </div>

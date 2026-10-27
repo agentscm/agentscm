@@ -21,7 +21,7 @@ export function HealthPage({ health }: { health: Health | null }) {
     <div className="page">
       <div className="answer" data-tour="answer">
         <h1 className="page-question">Is the hub OK?</h1>
-        <p className="answer-text">{!health ? 'Checking…' : ok ? <>Yes. The hub is answering{health.storage ? <> and storing data in {STORAGE[health.storage] ?? health.storage}</> : null}.</> : 'No. The hub reports it is unavailable. This page keeps trying.'}</p>
+        <p className="answer-text">{!health ? 'Checking…' : ok ? <>The hub is answering{health.storage ? <> and storing data in {STORAGE[health.storage] ?? health.storage}</> : null}.</> : 'The hub reports it is unavailable. This page keeps trying.'}</p>
       </div>
       <SectionTabs />
       {!health ? (

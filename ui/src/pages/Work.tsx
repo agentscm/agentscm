@@ -942,7 +942,6 @@ export function InboxPage({ token, overview }: { token: string; overview: Poll<W
   const requests = usePoll((signal) => fetchCoordination(token, signal, { limit: 10, activeOnly: true }), 15_000, `inbox|${token}`)
   const hidden = useHidden()
   const open = requests.kind === 'ready' ? requests.value.requests.filter((r) => pending(r) && !hidden.has(requestHideKey(r))) : []
-  const quiet = ov?.current.filter((i) => (i.claim_status !== 'active' || i.scope.length === 0) && !hidden.has(signalHideKey(i))).length ?? 0
   return (
     <div className="page">
       <div className="answer" data-tour="answer">
@@ -953,7 +952,7 @@ export function InboxPage({ token, overview }: { token: string; overview: Poll<W
               ov.overlaps_complete ? 'No two tasks plan to touch the same files, and no request is waiting.' : 'No overlap in this partial snapshot. An empty list is not an all-clear.'
             ) : (
               <>
-                {ov.overlaps.length > 0 && <><a className="jump tone-bad" href="#box-overlaps">{plural(ov.overlaps.length, 'overlap')}</a> {ov.overlaps.length === 1 ? 'needs' : 'need'} a conversation. </>}
+                {ov.overlaps.length > 0 && <><b>{plural(ov.overlaps.length, 'overlap')}</b> {ov.overlaps.length === 1 ? 'needs' : 'need'} a conversation. </>}
                 {open.length > 0 && <><b>{plural(open.length, 'request')}</b> {open.length === 1 ? 'is' : 'are'} waiting on another lead.</>}
               </>
             )}
@@ -962,19 +961,6 @@ export function InboxPage({ token, overview }: { token: string; overview: Poll<W
           <Skeleton rows={1} />
         )}
       </div>
-      {ov && (requests.kind === 'ready' || quiet > 0) && (
-        <div className="ib-progress" aria-label="Where the conversations stand">
-          <ul className="ib-bar" aria-hidden="true">
-            {ov.overlaps.map((o) => <li key={`${o.left.id}-${o.right.id}`} className="ib-seg ib-bad" />)}
-            {open.map((r) => <li key={r.id} className="ib-seg ib-wait" />)}
-            {Array.from({ length: quiet }, (_, i) => <li key={`q${i}`} className="ib-seg ib-team" />)}
-            {requests.kind === 'ready' && requests.value.requests.filter((r) => !pending(r)).map((r) => <li key={r.id} className="ib-seg ib-done" />)}
-          </ul>
-          <p>
-            {plural(ov.overlaps.length, 'overlap')} · {plural(open.length, 'open request')} · {plural(quiet, 'other signal')}
-          </p>
-        </div>
-      )}
       {overview.kind === 'error' && (
         <Notice tone="bad" title="Could not load the work overview" action={<button className="btn btn-sm btn-outline-secondary" onClick={overview.retry}>Retry</button>}>
           {overview.message}

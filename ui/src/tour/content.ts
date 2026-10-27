@@ -146,9 +146,9 @@ export const SECTION_TOURS: Partial<Record<Section, TourDef>> = {
       {
         target: T('answer'),
         title: 'The answer comes first',
-        what: 'One sentence: how many agents are working on how many tasks, how many things need you, and how many crossings there are.',
-        why: 'You should know in two seconds whether anything needs you.',
-        how: 'Click a coral count to jump to the list behind it. The sentence stays on top of every dashboard tab.',
+        what: 'One sentence: how many agents are working on how many tasks.',
+        why: 'You should know in two seconds how busy the repository is. The tabs below count what needs you and where agents cross.',
+        how: 'The sentence stays on top of every dashboard tab.',
         tip: (c) => (c.d && c.overview ? `${plural(c.d.agents.length, 'agent')} on ${plural(c.overview.current.length, 'task')} right now.` : null),
       },
       {

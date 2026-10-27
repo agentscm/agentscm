@@ -96,11 +96,18 @@ export const saveRail = (v: boolean) => {
 
 /** History's other tabs by their visible names, so `#work/files` or `#history/files` opens the tab it names. */
 const HISTORY_TABS = new Map<string, Section>([['files', 'explorer'], ['change-records', 'change-record']])
+/** Box anchors (`#box-contested`) open the page that holds the box; the page then scrolls to it. */
+const BOX_SECTIONS = new Map<string, Section>([
+  ['box-needs', 'home'], ['box-track', 'home'], ['box-contested', 'now'], ['box-prs', 'now'], ['box-map', 'now'],
+  ['box-agents', 'team'], ['box-log', 'activity'], ['box-overlaps', 'inbox'], ['box-requests', 'inbox'],
+])
 
 export function sectionFromHash(raw = window.location.hash): Section {
   const h = hashPath(raw)
   if (h.startsWith('#coordination/work/')) return 'work'
   const [first, second] = h.slice(1).split('/')
+  const box = BOX_SECTIONS.get(first ?? '')
+  if (box) return box
   // The Work board became the dashboard's track and its coordination tab became the Inbox; their links keep working.
   if (first === 'work') return second === 'coordination' ? 'inbox' : !second || second === 'working' ? 'home' : (HISTORY_TABS.get(second) ?? 'work')
   if (first === 'history') return HISTORY_TABS.get(second ?? '') ?? 'work'

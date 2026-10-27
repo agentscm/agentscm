@@ -327,6 +327,10 @@ kbd {
   border-color: var(--hub-rule-strong);
   padding-inline: 14px;
 }
+/* Keep Bootstrap's right padding for the caret, or a long value runs under it. */
+.form-select {
+  padding-inline-end: 2.25rem;
+}
 textarea.form-control {
   border-radius: 16px;
 }
@@ -735,17 +739,7 @@ textarea.form-control {
   max-width: 70ch;
   margin-top: 14px;
 }
-/* Links in the answer are its primary action: coral when they point at trouble, violet otherwise. */
-.jump {
-  font-weight: 500;
-  color: var(--hub-brand-ink);
-  text-decoration-thickness: 1.5px;
-  text-underline-offset: 6px;
-}
-.jump.tone-bad,
-.jump.tone-warn {
-  color: var(--coral);
-}
+
 .answer-next {
   border-radius: 999px;
   background: transparent;
@@ -803,6 +797,10 @@ textarea.form-control {
 .box-head .box-count + .box-actions,
 .box-head .box-count ~ .box-actions {
   margin-left: 12px;
+}
+/* Narrow boxes put the actions on their own row (styles.css); they line up with the title there. */
+@container main (max-width: 600px) {
+  .box-head .box-count ~ .box-actions { margin-left: 0; }
 }
 .box-tone-bad .box-count {
   color: var(--coral);
@@ -1647,8 +1645,9 @@ textarea.form-control {
 .tile-people .avatar {
   box-shadow: 0 0 0 2px var(--hub-sunken);
 }
+/* A small overlap: any more and the next face covers two-letter initials like "CC". */
 .tile-people .avatar + .avatar {
-  margin-left: -6px;
+  margin-left: -3px;
 }
 :root[data-density='condensed'] .tile-people .avatar {
   width: 22px !important;
@@ -1847,42 +1846,6 @@ textarea.form-control {
 }
 .tally li.is-zero {
   color: var(--hub-text-3);
-}
-
-/* ---------- inbox: where the conversations stand, at a glance ---------- */
-.ib-progress {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px 16px;
-  margin-top: calc(var(--hub-gap) * -0.4);
-}
-.ib-bar {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  gap: 3px;
-  flex: 0 1 260px;
-  min-width: 120px;
-}
-.ib-seg {
-  flex: 1;
-  height: 10px;
-  border-radius: 3px;
-  background: var(--hub-sunken);
-}
-.ib-seg:first-child { border-radius: 999px 3px 3px 999px; }
-.ib-seg:last-child { border-radius: 3px 999px 999px 3px; }
-.ib-seg:only-child { border-radius: 999px; }
-.ib-bad { background: var(--coral); }
-.ib-wait { background: var(--hub-warn-fill); }
-.ib-team { background: var(--hub-rule-strong); }
-.ib-done { background: var(--hub-brand-soft); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--hub-brand) 35%, transparent); }
-.ib-progress p {
-  margin: 0;
-  font-size: 13.5px;
-  color: var(--hub-text-2);
 }
 
 @media (prefers-reduced-motion: reduce) {

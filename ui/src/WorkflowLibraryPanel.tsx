@@ -6,6 +6,7 @@ import {
   validateAttachment, WorkflowLibraryError, type Attachment, type AttachmentValidation, type Diagnostic, type Guidance, type Simulation, type SkillPreview,
   type SkillSource, type SkillVersion, type WorkflowRecord, type WorkflowStep, type WorkflowVersion,
 } from './workflowLibrary.ts'
+import { inline } from './Markdown.tsx'
 import { clean } from './publications.ts'
 import { validSkillWorkflowRunId, validSkillWorkflowStepId } from './skillWorkflow.ts'
 
@@ -96,7 +97,7 @@ export function WorkflowLibraryPanel({ repository, onDirtyChange }: { repository
   useEffect(() => loadLibraries(activeRepository, setLoad), [activeRepository])
 
   if (load.kind === 'loading') return <Skeleton rows={7} />
-  if (load.kind === 'error') return <Notice tone="warn" icon="laptop" title="Open the local workflow library">{load.message}</Notice>
+  if (load.kind === 'error') return <Notice tone="warn" icon="laptop" title="Open the local workflow library">{inline(load.message)}</Notice>
   const { workflows, skills, attachments } = load.value
   const activeWorkflows = workflows.filter((w) => !w.draft.archived)
   const record = activeWorkflows.find((w) => w.draft.id === selected)
@@ -190,7 +191,7 @@ export function WorkflowLibraryPanel({ repository, onDirtyChange }: { repository
 
 function GuidanceView({ load }: { load: Load<Guidance> }) {
   if (load.kind === 'loading') return <Box icon="lightbulb" title="Reading repository guidance"><Skeleton rows={3} /></Box>
-  if (load.kind === 'error') return <Notice tone="bad" title="Could not read repository guidance">{load.message}</Notice>
+  if (load.kind === 'error') return <Notice tone="bad" title="Could not read repository guidance">{inline(load.message)}</Notice>
   const g = load.value
   return <Box icon="lightbulb" title="Repository guidance" count={g.suggestions.length} explain="Suggestions are inferred from a bounded set of common manifest and CI paths. Nothing was run or changed.">
     <Diagnostics items={g.diagnostics} />
@@ -369,7 +370,7 @@ export function SkillLibraryPanel() {
   const [error, setError] = useState('')
   useEffect(() => { const ctrl = new AbortController(); void fetchSkillLibrary(ctrl.signal).then((value) => setLoad({ kind: 'ready', value })).catch((e) => { if (!ctrl.signal.aborted) setLoad({ kind: 'error', message: messageOf(e) }) }); return () => ctrl.abort() }, [])
   if (load.kind === 'loading') return <Skeleton rows={6} />
-  if (load.kind === 'error') return <Notice tone="warn" icon="laptop" title="Open the local skill library">{load.message}</Notice>
+  if (load.kind === 'error') return <Notice tone="warn" icon="laptop" title="Open the local skill library">{inline(load.message)}</Notice>
   const skills = load.value
   const source = (): SkillSource => kind === 'markdown' ? { kind, name: name.trim(), markdown, resources: [] } : kind === 'github' ? { kind, repository: repository.trim(), commit: commit.trim(), path: path.trim(), resources: [] } : { kind, command: command.trim(), commit: commit.trim(), ...(path.trim() ? { path: path.trim() } : {}), resources: [] }
   const inspect = async () => { setBusy('preview'); setError(''); setPreview(null); try { setPreview(await previewSkill(source())) } catch (e) { setError(messageOf(e)) } finally { setBusy('') } }

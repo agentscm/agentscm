@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from 'react'
 import { Box, Empty, Notice, Pill, Skeleton, type Tone } from './ui.tsx'
+import { inline } from './Markdown.tsx'
 import { usePoll } from './usePoll.ts'
 import { fetchIntentReview, submitIntentDisposition, type Attempt, type Finding, type IntentOutcome, type IntentReview } from './intentReview.ts'
 
@@ -184,7 +185,7 @@ export function IntentReviewPanel({ workId }: { workId: string }) {
   const [refresh, setRefresh] = useState(0)
   const poll = usePoll((signal) => fetchIntentReview(workId, signal), 15_000, `intent-review|${workId}`, refresh)
   if (poll.kind === 'loading') return <Box icon="bullseye" title="Intent review"><Skeleton rows={3} /></Box>
-  if (poll.kind === 'error') return <Notice tone="bad" title={poll.status === 401 ? 'Local access needs attention' : poll.status === 403 ? 'This checkout is not available here' : 'Intent review unavailable'} action={<button type="button" className="btn btn-sm btn-outline-secondary" onClick={poll.retry}>Try again</button>}>{poll.message}</Notice>
+  if (poll.kind === 'error') return <Notice tone="bad" title={poll.status === 401 ? 'Local access needs attention' : poll.status === 403 ? 'This checkout is not available here' : 'Intent review unavailable'} action={<button type="button" className="btn btn-sm btn-outline-secondary" onClick={poll.retry}>Try again</button>}>{inline(poll.message)}</Notice>
   if (poll.value === null) return <Box icon="bullseye" title="Intent review"><Empty icon="clipboard2-x" title="No retained intent assessment for this Work">Run the intent-review skill inside the implementing agent to create an assessment. This panel reads retained results only.</Empty></Box>
   return <Review review={poll.value} onDispositionSaved={() => setRefresh((value) => value + 1)} />
 }
