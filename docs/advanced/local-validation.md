@@ -69,6 +69,7 @@ The `main` ruleset has no required status checks today (it requires no deletion,
 
 ## Limits
 
+- Workflow setup can fail before `reconcile` starts and writes its invalidating `pending` statuses, so an earlier verdict can remain visible; this is the setup-failure limitation tracked in #156. An `always()` step that calls a missing or unverified binary does not close the gap. The next admitted event or daily run retries.
 - The status is attached to the commit, so PRs that share a head commit (for example one branch opened against two bases) share it; that case is unsupported.
 - A base change (`pull_request_target` `edited`) runs the verifier, so the reconciled base is refreshed promptly. A PR retargeted away from `--base` keeps its last status on that head, including an exempt success, which `reconcile` no longer updates.
 - Pull requests are read in bounded pages (30 pages of open pull requests, 10 of comments per pull request); a larger listing fails closed with exit 1. Runs process pull requests serially within the 30-minute job and the token rate limit, which is practical for tens of open PRs, not hundreds.
@@ -86,7 +87,7 @@ Hosted jobs are gated on the `ci-extended` label, not on the presence of an atte
 
 ## Adopting in another repository
 
-This is a design for adoption, not a qualified one: no repository other than this one uses it, and `reconcile` has had no live run. Synthetic tests cover fake GitHub API behavior, real local bare Git transport, hostile checkout/global Git configuration, canonical-origin refusal, authenticated command construction and secret non-persistence. They do not exercise live private-repository credentials, TLS behavior, HTTP redirects or transport timeouts, so authenticated private fetch remains unqualified against GitHub.
+This is a design for adoption, not a qualified one: no repository other than this one uses it, and `reconcile` has had no live run. Synthetic tests cover fake GitHub API behavior, real local bare Git transport, hostile checkout/global Git configuration, canonical-origin refusal, authenticated command construction and secret non-persistence. They do not exercise live private-repository credentials, TLS behavior, HTTP redirects or transport timeouts, so authenticated private fetch remains unqualified against GitHub. Syntax checks and local workflow runners do not qualify GitHub Actions scheduling or concurrency behavior.
 
 1. Add `.github/local-validation/policy.json` with `repository` (`github.com/OWNER/NAME`), `recipe_sha256`, `required_services` set to `{"postgres":false,"s3":false}`, `max_age_seconds` and `epoch`, and `registry.json` with the maintainer's enrolled public key. Create keys and enroll them as in the maintainer workflow above.
 2. Add a recipe. For a Bun repository:
@@ -102,51 +103,135 @@ This is a design for adoption, not a qualified one: no repository other than thi
 
 Set the policy's recipe digest to the new recipe's digest.
 
-3. Add a consumer workflow. No published AgentSCM release contains `reconcile` yet, so it builds `agentscm` from source at a pinned commit; replace `<pinned sha>` placeholders with real commits.
+3. Add the caller workflow below after a release containing `reconcile`, path-scoped recipes, exempt paths and authenticated fetch has actually been published. `0.1.0-alpha.6` does not contain that set. The planned `0.1.0-alpha.7` is not published, so this template is deliberately non-runnable: replace both placeholders only with an exact published SemVer and the full commit SHA that contains `.github/workflows/local-validation-reconcile.yml`. Do not use `latest`, a tag, a branch or a version range.
 
 ```yaml
 name: Local validation
+
 on:
   issue_comment:
     types: [created, edited, deleted]
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
   push:
-    branches: [main]
+    branches: [main] # replace when the repository's default branch has another name
+    paths:
+      - ".github/local-validation/**"
+      - ".github/workflows/local-validation.yml"
   schedule:
     - cron: '17 6 * * *'
-permissions: {}
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
 jobs:
   reconcile:
-    concurrency: { group: local-validation, cancel-in-progress: false }
-    if: ${{ github.event_name != 'issue_comment' || (github.event.issue.pull_request && (startsWith(github.event.comment.body, '<!-- agentscm-local-validation:v1 ') || (github.event.action == 'edited' && startsWith(github.event.changes.body.from, '<!-- agentscm-local-validation:v1 '))) && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) }}
+    uses: counterbranch/agentscm/.github/workflows/local-validation-reconcile.yml@<FULL_COMMIT_SHA_CONTAINING_WORKFLOW>
+    with:
+      release-version: <EXACT_PUBLISHED_SEMVER>
+      config-dir: .github/local-validation
+      verifier-workflow: .github/workflows/local-validation.yml
+      github-authenticated-fetch: false
+```
+
+The caller supplies all triggers; the reusable workflow owns the trusted-comment/base-change filter, repository-wide job concurrency and full sweep. Do not add the same concurrency group to the caller. Each admitted run checks out only the caller's default branch with full history and `persist-credentials: false`; it never checks out, builds or runs a pull request head, recipe, script or artifact. The reusable job has only `contents: read`, `pull-requests: read` and `statuses: write`, accepts no PAT, GitHub App, OIDC or `secrets: inherit` input, and installs the exact npm package outside the caller checkout with lifecycle scripts disabled. The install runs `local-validation reconcile --help`, which reaches the verified binary installer; `npx agentscm --version` would only print the npm package version and is not an installation or provenance check.
+
+For a canonical private GitHub repository, set `github-authenticated-fetch: true`. This does not introduce another credential: the verifier reuses the same job-scoped `github.token` selected for the GitHub API and exposes it to Git only for the isolated canonical HTTPS fetch commands. The default is `false`. Live private acquisition, redirects and timeouts remain unqualified.
+
+If the caller file or configuration directory has another name, update its `push.paths`, pass the same `config-dir` and `verifier-workflow` values above, and pass those exact trust inputs when producing the attestation:
+
+```sh
+agentscm local-validation run \
+  --config-dir .github/local-validation \
+  --verifier-workflow .github/workflows/local-validation.yml \
+  --recipe .github/local-validation/recipe.json \
+  --policy .github/local-validation/policy.json \
+  --registry .github/local-validation/registry.json \
+  --key-file KEY --issuer-id ID --state-dir DIR
+```
+
+The verifier workflow path is always a trust input; a custom path is not exempt from commands or status reconciliation.
+
+### Source-build fallback until publication
+
+Until the pinned package exists, use the following exact source fallback. It preserves the same triggers, trusted-comment/base-change filter, repository-wide job concurrency and full-sweep behavior. The AgentSCM source pin `24cf76705bcbbac284fbcb18646d225f911b39a2` contains `reconcile`, path-scoped recipes, exempt paths and the opt-in authenticated fetch boundary, but not the reusable prebuilt-release workflow. This fallback is not an automatic mode of the reusable workflow and must be removed deliberately after published-release qualification.
+
+```yaml
+name: Local validation
+
+on:
+  issue_comment:
+    types: [created, edited, deleted]
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+  push:
+    branches: [main]
+    paths:
+      - ".github/local-validation/**"
+      - ".github/workflows/local-validation.yml"
+  schedule:
+    - cron: '17 6 * * *'
+
+permissions: {}
+
+jobs:
+  reconcile:
+    concurrency:
+      group: local-validation
+      cancel-in-progress: false
+    if: ${{ (github.event_name != 'pull_request_target' || github.event.action != 'edited' || github.event.changes.base) && (github.event_name != 'issue_comment' || (github.event.issue.pull_request && (startsWith(github.event.comment.body, '<!-- agentscm-local-validation:v1 ') || (github.event.action == 'edited' && startsWith(github.event.changes.body.from, '<!-- agentscm-local-validation:v1 '))) && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    permissions: { contents: read, pull-requests: read, statuses: write }
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
     steps:
-      - uses: actions/checkout@<pinned sha>
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch || github.ref_name }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/checkout@<pinned sha>
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: counterbranch/agentscm
-          ref: <pinned agentscm commit containing reconcile>
+          ref: 24cf76705bcbbac284fbcb18646d225f911b39a2
           path: agentscm-src
           persist-credentials: false
+      - run: rustup toolchain install
+        working-directory: agentscm-src
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: agentscm-src
       - run: cargo build --locked --release --bin agentscm
         working-directory: agentscm-src
       - name: Reconcile statuses
         env:
+          AUTHENTICATED_FETCH: "false"
+          BASE: ${{ github.event.repository.default_branch || github.ref_name }}
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          BASE: ${{ github.event.repository.default_branch || github.ref_name }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          # Every run sweeps all open PRs, so the latest queued run is enough.
-          agentscm-src/target/release/agentscm local-validation reconcile \
-            --github-repo "$REPO" --base "$BASE" --target-url "$RUN_URL"
+          set -euo pipefail
+          args=(
+            local-validation reconcile
+            --github-repo "$REPO"
+            --base "$BASE"
+            --config-dir .github/local-validation
+            --repo "$GITHUB_WORKSPACE"
+            --verifier-workflow .github/workflows/local-validation.yml
+            --target-url "$RUN_URL"
+          )
+          if [[ "$AUTHENTICATED_FETCH" == "true" ]]; then
+            args+=(--github-authenticated-fetch)
+          fi
+          # Every admitted run sweeps all open PRs, so the latest queued run is enough.
+          agentscm-src/target/release/agentscm "${args[@]}" </dev/null
 ```
 
-The sample workflow does not run on `pull_request_target`, so with `exempt_paths` an exempt head is only refreshed by the next comment, push or daily run; add the trigger as the AgentSCM workflow does if you want it promptly.
+Set `AUTHENTICATED_FETCH` to `true` only for the canonical private GitHub case described above. The fallback builds only the exact pinned AgentSCM source and reads only the caller's default-branch configuration; pull request code is fetched as inert Git data and is never checked out or run.
 
-The `concurrency` group is job-level on purpose: a workflow-level group is entered before the `if:` is evaluated, so an untrusted commenter's run would cancel the queued real run and then do nothing; a job skipped by `if:` never enters the group. The `if:` filter limits compute and status churn to trusted commenters; the signature still decides either way. The second checkout needs the Rust toolchain on the runner (hosted Ubuntu images include it); add a toolchain step if you pin one.
+The job-level concurrency placement is security-relevant. A workflow-level group is entered before the `if:` is evaluated, so an ignored comment run could supersede the pending eligible run and then do nothing. GitHub keeps only the newest pending run in a group even with `cancel-in-progress: false`; full sweeps prevent a run for one pull request from superseding another pull request's only reconciliation.

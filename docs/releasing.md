@@ -12,6 +12,14 @@ For maintainers. Releases are alpha prereleases. Nothing is published except by 
 8. A dry run is a tag containing `-dry` (for example `v0.2.0-dry1`) whose version in `Cargo.toml` matches (`0.2.0-dry1`). It runs the whole workflow, including pushing the image and creating the prerelease, but skips the npm publish. Use it to exercise the workflow before a real tag, then delete the tag, the release and the image tag. The Windows binary build is first exercised by such a tag, so run a dry run before a real release that changes the Windows build. The Windows and macOS binaries are not code-signed or notarized; see [install](install.md).
 9. A bad release is superseded by a new version, never edited: delete the tag and release only if nothing has pulled the image.
 
+## Activating the reusable local-validation workflow
+
+The reusable `.github/workflows/local-validation-reconcile.yml` interface must not be adopted before its exact npm release exists. The current source-build verifier remains active until a release contains `reconcile`, path-scoped recipes and exempt paths, the opt-in authenticated GitHub fetch boundary, and the reusable workflow itself.
+
+After npm publication succeeds, qualify the exact version from an empty directory and private home with `AGENTSCM_REQUIRE_PROVENANCE=1` and `AGENTSCM_TELEMETRY=off`: run `npx --yes --ignore-scripts --registry=https://registry.npmjs.org agentscm@VERSION local-validation reconcile --help` with stdin closed, then invoke `~/.agentscm/bin/agentscm-VERSION --version` directly and require the exact reported version. `npx agentscm@VERSION --version` is only the npm launcher's shortcut and does not install or verify the binary.
+
+Only after that acquisition check and the release's required qualification should a follow-up change replace the source-build verifier or the adoption guide's placeholders with the exact SemVer and full reusable-workflow commit SHA. Exercise a public repository first; private GitHub fetch, redirect and timeout behavior remains unqualified until it is run and recorded separately. Do not add an automatic source fallback to the reusable interface, accept a mutable tag/range, pass a PAT, GitHub App secret or OIDC input, or use `secrets: inherit`.
+
 ## Third-party software in the container image
 
 The image is based on Debian (debian:trixie-slim, pinned by digest in the
