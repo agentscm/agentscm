@@ -1,6 +1,7 @@
 //! The real binary's `quickstart` and `uninstall` against an in-process hub, with a
 //! temporary HOME so nothing outside the test is read or written. Docker and the
-//! first-run GitHub App flow cannot run here; their commands are unit tested.
+//! first-run GitHub App flow are unit tested, plus one explicitly selected ignored
+//! test exercises the real managed Docker boundary.
 #![cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
@@ -566,6 +567,186 @@ fn unused_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
+}
+
+struct ManagedDockerCleanup {
+    docker: PathBuf,
+    endpoint: std::ffi::OsString,
+    home: PathBuf,
+    setup: PathBuf,
+    project: String,
+}
+
+impl Drop for ManagedDockerCleanup {
+    fn drop(&mut self) {
+        let _ = Command::new(&self.docker)
+            .env_clear()
+            .env("DOCKER_HOST", &self.endpoint)
+            .env("HOME", &self.home)
+            .env("PATH", "/usr/bin:/bin")
+            .args(["compose", "-p", &self.project, "-f"])
+            .arg(self.setup.join("compose.yaml"))
+            .arg("--env-file")
+            .arg(self.setup.join(".env"))
+            .args(["down", "-v", "--remove-orphans"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+fn managed_docker_command(docker: &Path, endpoint: &std::ffi::OsStr, home: &Path) -> Command {
+    let mut command = Command::new(docker);
+    command
+        .env_clear()
+        .env("DOCKER_HOST", endpoint)
+        .env("HOME", home)
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+fn managed_http(port: u16, path: &str) -> Option<(u16, String)> {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(200)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: hub\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).ok()?;
+    let (head, body) = raw.split_once("\r\n\r\n")?;
+    let status = head.split(' ').nth(1)?.parse().ok()?;
+    Some((status, body.to_owned()))
+}
+
+#[test]
+#[ignore = "requires explicit private Docker endpoint and locally built candidate image"]
+fn managed_docker_generated_compose_accepts_empty_slack_setting() {
+    let docker = PathBuf::from(
+        std::env::var_os("AGENTSCM_TEST_DOCKER_BIN")
+            .expect("set AGENTSCM_TEST_DOCKER_BIN to the absolute Docker executable"),
+    );
+    let endpoint = std::env::var_os("AGENTSCM_TEST_DOCKER_HOST")
+        .expect("set AGENTSCM_TEST_DOCKER_HOST to an explicit private Docker endpoint");
+    let compose = PathBuf::from(
+        std::env::var_os("AGENTSCM_TEST_DOCKER_COMPOSE_BIN")
+            .expect("set AGENTSCM_TEST_DOCKER_COMPOSE_BIN to the absolute Compose plugin"),
+    );
+    let image = std::env::var("AGENTSCM_TEST_MANAGED_DOCKER_IMAGE")
+        .expect("set AGENTSCM_TEST_MANAGED_DOCKER_IMAGE to a local candidate image");
+    assert!(docker.is_absolute() && docker.is_file());
+    assert!(compose.is_absolute() && compose.is_file());
+    assert!(!image.is_empty());
+
+    let machine = Machine::transient();
+    symlink(&docker, machine.bin.path().join("docker")).unwrap();
+    let plugins = machine.home.path().join(".docker/cli-plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    symlink(&compose, plugins.join("docker-compose")).unwrap();
+    let repo = machine.repo();
+    std::fs::write(repo.path().join("fixture.txt"), "synthetic\n").unwrap();
+    machine.git(repo.path(), &["add", "fixture.txt"]);
+    machine.git(repo.path(), &["commit", "-qm", "synthetic fixture"]);
+
+    let port = unused_port();
+    let project = format!("agentscm-empty-slack-{}-{port}", std::process::id());
+    let setup = machine.home.path().join(".agentscm/hub");
+    let _cleanup = ManagedDockerCleanup {
+        docker: docker.clone(),
+        endpoint: endpoint.clone(),
+        home: machine.home.path().to_owned(),
+        setup: setup.clone(),
+        project: project.clone(),
+    };
+    let output = machine
+        .command(
+            repo.path(),
+            &[
+                "quickstart",
+                "--yes",
+                "--hub",
+                "local",
+                "--hub-runtime",
+                "docker",
+                "--hub-port",
+                &port.to_string(),
+                "--hub-project",
+                &project,
+                "--github-login",
+                "synthetic-user",
+                "--no-agents",
+                "--no-collisions",
+            ],
+        )
+        .env("DOCKER_HOST", &endpoint)
+        .env("AGENTSCM_HUB_IMAGE", &image)
+        .env("DOCKER_DEFAULT_PLATFORM", "linux/arm64")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+
+    let config = managed_docker_command(&docker, &endpoint, machine.home.path())
+        .args(["compose", "-p", &project, "-f"])
+        .arg(setup.join("compose.yaml"))
+        .arg("--env-file")
+        .arg(setup.join(".env"))
+        .args(["config", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(config.status.success(), "{config:?}");
+    let config: Value = serde_json::from_slice(&config.stdout).unwrap();
+    assert_eq!(
+        config["services"]["hub"]["environment"]["AGENTSCM_SLACK_FILE"],
+        ""
+    );
+
+    let started = std::time::Instant::now();
+    loop {
+        if managed_http(port, "/v1/hub/health").is_some_and(|response| response.0 == 200) {
+            break;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "managed Hub did not reach health"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let (ui_status, ui) = managed_http(port, "/ui/").expect("embedded UI response");
+    assert_eq!(ui_status, 200);
+    assert!(ui.contains("<!doctype html"), "embedded UI was not served");
+
+    let container = managed_docker_command(&docker, &endpoint, machine.home.path())
+        .args(["compose", "-p", &project, "-f"])
+        .arg(setup.join("compose.yaml"))
+        .arg("--env-file")
+        .arg(setup.join(".env"))
+        .args(["ps", "-q", "hub"])
+        .output()
+        .unwrap();
+    assert!(container.status.success(), "{container:?}");
+    let container = String::from_utf8(container.stdout).unwrap();
+    let container = container.trim();
+    assert!(!container.is_empty());
+    let restart_count = || {
+        let output = managed_docker_command(&docker, &endpoint, machine.home.path())
+            .args(["inspect", "--format", "{{.RestartCount}}", container])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let before = restart_count();
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert_eq!(restart_count(), before);
 }
 
 fn run_with_hub_port_retry<F>(run: F) -> Output

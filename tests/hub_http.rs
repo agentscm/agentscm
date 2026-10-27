@@ -1,6 +1,7 @@
 #[path = "common/hub_pg.rs"]
 mod hub_pg;
 
+use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::process::{Child, Command, Output, Stdio};
@@ -234,6 +235,143 @@ fn wait_for(deadline: Duration, mut done: impl FnMut() -> bool) {
         assert!(start.elapsed() < deadline, "timed out");
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+#[cfg(unix)]
+fn slack_hub_command(dir: &TempDir, slack_file: Option<&OsStr>) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agentscm"));
+    command
+        .env_clear()
+        .env(
+            "AGENTSCM_DATABASE_URL",
+            format!("sqlite://{}", dir.path().join("hub.sqlite").display()),
+        )
+        .args(["hub", "serve", "--bind", "127.0.0.1:0", "--objects"])
+        .arg(dir.path().join("objects"))
+        .arg("--secrets")
+        .arg(dir.path().join("secrets"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    if let Some(value) = slack_file {
+        command.env("AGENTSCM_SLACK_FILE", value);
+    }
+    command
+}
+
+#[cfg(unix)]
+fn bound_address(stderr: &mut BufReader<impl Read>, seen: &mut String) -> SocketAddr {
+    loop {
+        let mut line = String::new();
+        assert!(
+            stderr.read_line(&mut line).unwrap() > 0,
+            "hub exited before binding: {seen}"
+        );
+        seen.push_str(&line);
+        if let Some(rest) = line.strip_prefix("hub listening on ") {
+            return rest.split(' ').next().unwrap().parse().unwrap();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn try_http_status(address: SocketAddr, path: &str) -> Option<u16> {
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(100)).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .ok()?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: hub\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).ok()?;
+    raw.split_once("\r\n")?.0.split(' ').nth(1)?.parse().ok()
+}
+
+#[cfg(unix)]
+fn assert_slack_setting_reaches_health(slack_file: Option<&OsStr>) {
+    let dir = TempDir::new().unwrap();
+    let mut server = Server(slack_hub_command(&dir, slack_file).spawn().unwrap());
+    let mut stderr = BufReader::new(server.0.stderr.take().unwrap());
+    let mut seen = String::new();
+    let address = bound_address(&mut stderr, &mut seen);
+    wait_for(Duration::from_secs(10), || {
+        assert!(
+            server.0.try_wait().unwrap().is_none(),
+            "hub exited before health: {seen}"
+        );
+        try_http_status(address, "/v1/hub/health") == Some(200)
+    });
+}
+
+#[cfg(unix)]
+fn assert_slack_setting_fails(slack_file: &OsStr) {
+    let dir = TempDir::new().unwrap();
+    let mut server = Server(slack_hub_command(&dir, Some(slack_file)).spawn().unwrap());
+    let mut status = None;
+    wait_for(Duration::from_secs(10), || {
+        status = server.0.try_wait().unwrap();
+        status.is_some()
+    });
+    let mut stderr = String::new();
+    server
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(!status.unwrap().success(), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn absent_and_empty_slack_settings_start_the_hub() {
+    assert_slack_setting_reaches_health(None);
+    assert_slack_setting_reaches_health(Some(OsStr::new("")));
+}
+
+#[cfg(unix)]
+#[test]
+fn nonempty_invalid_slack_settings_still_fail_startup() {
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let files = TempDir::new().unwrap();
+    let missing = files.path().join("missing.json");
+    assert_slack_setting_fails(missing.as_os_str());
+
+    let malformed = files.path().join("malformed.json");
+    std::fs::write(&malformed, b"not json").unwrap();
+    std::fs::set_permissions(&malformed, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_slack_setting_fails(malformed.as_os_str());
+
+    for value in [OsStr::new("relative.json"), OsStr::new(" ")] {
+        assert_slack_setting_fails(value);
+    }
+
+    let unsafe_permissions = files.path().join("unsafe.json");
+    std::fs::write(&unsafe_permissions, b"{}").unwrap();
+    std::fs::set_permissions(&unsafe_permissions, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_slack_setting_fails(unsafe_permissions.as_os_str());
+
+    let symlink_path = files.path().join("symlink.json");
+    symlink(&malformed, &symlink_path).unwrap();
+    assert_slack_setting_fails(symlink_path.as_os_str());
+
+    // SAFETY: geteuid has no arguments, pointers, or mutable state requirements.
+    if unsafe { libc::geteuid() } != 0 {
+        let unreadable = files.path().join("unreadable.json");
+        std::fs::write(&unreadable, b"{}").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o200)).unwrap();
+        assert_slack_setting_fails(unreadable.as_os_str());
+    }
+
+    let mut non_unicode = files.path().as_os_str().as_encoded_bytes().to_vec();
+    non_unicode.extend_from_slice(b"/non-unicode-");
+    non_unicode.push(0xff);
+    assert_slack_setting_fails(&OsString::from_vec(non_unicode));
 }
 
 /// Serve `url` in a child process, check health and whoami, SIGTERM it and expect a clean exit.
