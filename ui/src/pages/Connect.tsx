@@ -1,6 +1,27 @@
 import { useState } from 'react'
-import { agentSetupPrompt, CLIENT_AGENTS, clientSetupCommand, safeHubOrigin, type ClientAgent } from '../connectAgent.ts'
+import { agentSetupPrompt, CLIENT_AGENTS, clientSetupCommand, installCommand, safeHubOrigin, type ClientAgent } from '../connectAgent.ts'
+import { onFrontDoor } from '../frontDoor.ts'
 import { CopyButton, Icon, Notice } from '../ui.tsx'
+
+/** The set-up command for the Hub serving this page, or null: on the local page the origin is this computer, and an unsupported origin gets none. */
+export const installCommandHere = (): string | null => (onFrontDoor() ? null : installCommand(window.location.origin))
+
+/** Set up this computer: one command, then agents connect on their own. Copies text; never runs anything. */
+export function InstallCommand({ lead = 'Run this in a checkout of a repository on this Hub to connect its agents.' }: { lead?: string }) {
+  const command = installCommandHere()
+  if (!command) return null
+  return (
+    <div className="install">
+      <p className="install-lead">{lead}</p>
+      <div className="command">
+        <Icon name="terminal" className="install-prompt" />
+        <code>{command}</code>
+        <CopyButton text={command} />
+      </div>
+      <p className="install-after">It asks before it changes anything, then signs you in with a one-time code from GitHub or GitLab. macOS and Linux.</p>
+    </div>
+  )
+}
 
 const AGENT_NAMES: Record<ClientAgent, string> = { claude: 'Claude Code', codex: 'Codex', cursor: 'Cursor', copilot: 'Copilot', gemini: 'Gemini' }
 
@@ -14,6 +35,7 @@ const STEPS = [
 /** Instructions for connecting a coding agent to this hub. Copies text; never runs anything. */
 export function ConnectAgent() {
   const [agent, setAgent] = useState<ClientAgent | ''>('')
+  if (onFrontDoor()) return <Notice tone="muted" icon="laptop" title="This page runs on your computer">Open the Hub’s own page to copy setup instructions for it.</Notice>
   const origin = safeHubOrigin(window.location.origin)
   const prompt = agentSetupPrompt(window.location.origin)
   const command = agent ? clientSetupCommand(window.location.origin, agent) : null

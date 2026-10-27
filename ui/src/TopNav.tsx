@@ -15,6 +15,7 @@ import { landedIdFromHash, landedHref } from './pages/Landed.tsx'
 import { promiseHref, promiseIdFromHash } from './promises.ts'
 import { compareHref, entryHref, timelineRoute } from './pages/Timeline.tsx'
 import { Icon, Tip, agentLabel, relative } from './ui.tsx'
+import type { Refusal } from './refusal.ts'
 import { TourTrigger, useTour } from './tour/Tour.tsx'
 import { tourFor } from './tour/content.ts'
 
@@ -70,6 +71,7 @@ interface ChromeState {
   sections: SectionDef[]
   section: Section
   statuses: TabStatuses
+  hubSignedOut: boolean
 }
 const ChromeContext = createContext<ChromeState | null>(null)
 
@@ -90,7 +92,7 @@ function useHash(): string {
 export function SectionTabs({ label }: { label?: string }) {
   const chrome = useContext(ChromeContext)
   const hash = useHash()
-  if (!chrome) return null
+  if (!chrome || chrome.hubSignedOut) return null
   const tabs = tabsFor(chrome.sections, chrome.section, hash)
   if (tabs.length === 0) return null
   const nav = chrome.sections.find((s) => s.key === chrome.section)?.nav
@@ -166,6 +168,70 @@ export function useDismiss(open: boolean, close: () => void) {
     }
   }, [open])
   return ref
+}
+
+/** The hosted page opened on a web sign-in: the repositories it may switch between. */
+export interface WebChoice {
+  repos: string[]
+  pick: (repo: string) => void
+  /** Why the Hub refused the last repository picked, which has left the list. */
+  refusal: Refusal | null
+}
+
+function WebRepoSwitcher({ repo, web, onSignOut }: { repo: string; web: WebChoice; onSignOut: () => void }) {
+  const [open, setOpen] = useState(false)
+  const ref = useDismiss(open, () => setOpen(false))
+  const others = web.repos.filter((r) => r !== repo)
+  return (
+    <div className="pop" ref={ref}>
+      <button type="button" data-tour="repo" className={`repo-btn${open ? ' is-open' : ''}`} aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen((o) => !o)}>
+        <span className="repo-mark" aria-hidden="true"><Icon name="git" /></span>
+        <span className="repo-name">{repo}</span>
+        <Icon name="chevron-expand" className="repo-chevron" />
+      </button>
+      {open && (
+        <div className="pop-menu pop-left" role="menu">
+          <div className="pop-head">Repositories you can open</div>
+          <div className="pop-item is-current">
+            <span className="repo-mark" aria-hidden="true"><Icon name="git" /></span>
+            <span className="pop-main">
+              <code>{repo}</code>
+              <span className="pop-sub"><Icon name="eye" /> Read-only</span>
+            </span>
+            <Icon name="check2" className="pop-check" />
+          </div>
+          {others.map((r) => (
+            <button
+              key={r}
+              type="button"
+              role="menuitem"
+              className="pop-item"
+              onClick={() => {
+                setOpen(false)
+                web.pick(r)
+              }}
+            >
+              <span className="repo-mark" aria-hidden="true"><Icon name="git" /></span>
+              <span className="pop-main"><code>{r}</code></span>
+            </button>
+          ))}
+          {web.refusal && (
+            <p className="pop-note" role="status">
+              <Icon name="shield-exclamation" /> {web.refusal.message}
+            </p>
+          )}
+          <p className="pop-note">
+            <Icon name="info-circle" /> Opened with your web sign-in. Repositories show here once you have an agent token or a computer connected for them.
+          </p>
+          <div className="pop-sep" />
+          <button type="button" role="menuitem" className="pop-item" onClick={onSignOut}>
+            <Icon name="box-arrow-right" />
+            <span className="pop-main">Sign out of Hub pages<span className="pop-sub">Workspace access and computers stay signed in</span></span>
+          </button>
+        </div>
+      )}
+    </div>
+  )
 }
 
 function RepoSwitcher({ repo, onForget }: { repo: string; onForget: () => void }) {
@@ -284,7 +350,7 @@ export function LocalRepoSwitcher({ token, repo, navigationBlocked = false }: { 
   )
 }
 
-function AccountMenu({ data, onForget }: { data: HubData; onForget: () => void }) {
+function AccountMenu({ data, onForget, web }: { data: HubData; onForget: () => void; web: boolean }) {
   const [open, setOpen] = useState(false)
   const ref = useDismiss(open, () => setOpen(false))
   const who = data.whoami
@@ -306,7 +372,16 @@ function AccountMenu({ data, onForget }: { data: HubData; onForget: () => void }
               </div>
             </div>
           </div>
-          {who && (
+          {who && web && (
+            <div className="acct-token">
+              <Icon name="globe" />
+              <span>
+                Signed in on the web
+                <span className="muted"> · read-only for {who.token.repository}, renewed while this tab is open</span>
+              </span>
+            </div>
+          )}
+          {who && !web && (
             <div className="acct-token">
               <Icon name="key" />
               <span>
@@ -316,13 +391,21 @@ function AccountMenu({ data, onForget }: { data: HubData; onForget: () => void }
             </div>
           )}
           <div className="pop-sep" />
+          <a role="menuitem" href="#computers" className="pop-item" onClick={() => setOpen(false)}>
+            <Icon name="laptop" />
+            <span className="pop-main">Your computers<span className="pop-sub">Where you’re signed in, with Revoke</span></span>
+          </a>
           <a role="menuitem" href="#settings" className="pop-item" onClick={() => setOpen(false)}>
             <Icon name="sliders" />
             <span className="pop-main">Preferences<span className="pop-sub">Theme, density, sidebar, token and shortcuts</span></span>
           </a>
           <button type="button" role="menuitem" className="pop-item pop-danger" onClick={onForget}>
             <Icon name="box-arrow-right" />
-            <span className="pop-main">Forget token<span className="pop-sub">The hub still accepts it until it expires or is revoked.</span></span>
+            {web ? (
+              <span className="pop-main">Sign out of Hub pages<span className="pop-sub">Workspace access and computers stay signed in.</span></span>
+            ) : (
+              <span className="pop-main">Forget token<span className="pop-sub">The hub still accepts it until it expires or is revoked.</span></span>
+            )}
           </button>
         </div>
       )}
@@ -647,11 +730,14 @@ function Breadcrumbs({ section, overview }: { section: SectionDef; overview: Wor
   )
 }
 
-export function AppChrome({ logo, token, repo, nav, sections, section, badges, statuses, data, d, overview, pref, onPref, density, onDensity, onForget, navigationBlocked = false, collapsed, onCollapsed, children }: {
+export function AppChrome({ logo, token, repo, web, hubSignedOut = false, nav, sections, section, badges, statuses, data, d, overview, pref, onPref, density, onDensity, onForget, navigationBlocked = false, collapsed, onCollapsed, children }: {
   logo: ReactNode
   /** The Hub sign-in; on this computer's own page, its connection credential. */
   token: string
   repo: string
+  /** Set when the page was opened on a web sign-in rather than a pasted token. */
+  web?: WebChoice
+  hubSignedOut?: boolean
   nav: NavDef[]
   sections: SectionDef[]
   section: Section
@@ -725,11 +811,11 @@ export function AppChrome({ logo, token, repo, nav, sections, section, badges, s
   const isMac = /Mac|iPhone|iPad/.test(navigator.platform)
   const current = sections.find((s) => s.key === section) ?? sections[0]!
   const inbox = badges.inbox
-  const chrome = useMemo(() => ({ sections, section, statuses }), [sections, section, statuses])
+  const chrome = useMemo(() => ({ sections, section, statuses, hubSignedOut }), [sections, section, statuses, hubSignedOut])
 
   return (
     <ChromeContext.Provider value={chrome}>
-      <div className={`app-shell${collapsed ? ' rail-compact' : ''}`}>
+      <div className={`app-shell${collapsed ? ' rail-compact' : ''}${hubSignedOut ? ' hub-signed-out' : ''}`}>
         <a href="#main" className="skip-link" onClick={(e) => {
           e.preventDefault()
           document.getElementById('main')?.focus()
@@ -737,21 +823,21 @@ export function AppChrome({ logo, token, repo, nav, sections, section, badges, s
           Skip to content
         </a>
         <header className="topbar" data-tour="topbar">
-          <button ref={burger} type="button" data-tour="menu" className="burger" aria-label="Open navigation" aria-expanded={drawer} onClick={() => setDrawer(!drawer)}>
+          {!hubSignedOut && <button ref={burger} type="button" data-tour="menu" className="burger" aria-label="Open navigation" aria-expanded={drawer} onClick={() => setDrawer(!drawer)}>
             <Icon name={drawer ? 'x-lg' : 'list'} />
-          </button>
+          </button>}
           <a href="#home" className="topbar-logo" aria-label="AgentSCM Hub home">
             {logo}
           </a>
-          {isLocalCredential(token) ? <LocalRepoSwitcher token={token} repo={repo} navigationBlocked={navigationBlocked} /> : <RepoSwitcher repo={repo} onForget={onForget} />}
+          {hubSignedOut ? <a href="#home" className="btn btn-link">Back to Hub</a> : isLocalCredential(token) ? <LocalRepoSwitcher token={token} repo={repo} navigationBlocked={navigationBlocked} /> : web ? <WebRepoSwitcher repo={repo} web={web} onSignOut={onForget} /> : <RepoSwitcher repo={repo} onForget={onForget} />}
 
-          <button type="button" data-tour="search" className="search-pill" onClick={() => setPalette(true)} aria-label="Search the hub">
+          {!hubSignedOut && <button type="button" data-tour="search" className="search-pill" onClick={() => setPalette(true)} aria-label="Search the hub">
             <Icon name="search" />
             <span className="search-text">Search agents, files, work…</span>
             <kbd>{isMac ? '⌘' : 'Ctrl'} K</kbd>
-          </button>
+          </button>}
 
-          <div className="topbar-right">
+          {!hubSignedOut && <div className="topbar-right">
             <Tip text={healthTip} placement="bottom">
               <a href="#health" data-tour="live" className={`health-chip${healthOk ? '' : ' is-bad'}`} aria-label={healthTip}>
                 <span className="live-dot" aria-hidden="true" />
@@ -766,17 +852,17 @@ export function AppChrome({ logo, token, repo, nav, sections, section, badges, s
               </a>
             </Tip>
             <ViewMenu pref={pref} onPref={onPref} density={density} onDensity={onDensity} />
-            <AccountMenu data={data} onForget={onForget} />
-          </div>
+            <AccountMenu data={data} onForget={onForget} web={!!web} />
+          </div>}
         </header>
-        <SideNav nav={nav} sections={sections} section={section} badges={badges} collapsed={collapsed} onCollapse={() => onCollapsed(!collapsed)} drawer={drawer} onClose={() => setDrawer(false)} />
+        <div hidden={hubSignedOut}><SideNav nav={nav} sections={sections} section={section} badges={badges} collapsed={collapsed} onCollapse={() => onCollapsed(!collapsed)} drawer={drawer} onClose={() => setDrawer(false)} /></div>
         <div className="content">
           <Breadcrumbs section={current} overview={overview} />
           <main className="main" id="main" tabIndex={-1} data-tour="main" data-section={current.key}>
             {children}
           </main>
         </div>
-        {palette && <CommandPalette onClose={() => setPalette(false)} sections={sections} section={section} d={d} overview={overview} />}
+        {palette && !hubSignedOut && <CommandPalette onClose={() => setPalette(false)} sections={sections} section={section} d={d} overview={overview} />}
       </div>
     </ChromeContext.Provider>
   )

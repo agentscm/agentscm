@@ -10,6 +10,7 @@ pub mod task_contracts;
 pub use collector_transfer::*;
 pub use compiler::{CompiledPlan, compile, verify_current};
 pub use contracts::*;
+pub use runtime::intent;
 pub use runtime::{
     AgentAttemptState, AgentTaskService, CollectorAction, CollectorOriginAuthorizationGuard,
     LiveImportedOrigins, RunState, RunView, StepState, StepView, TaskAttemptView,

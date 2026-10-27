@@ -18,6 +18,13 @@ function shellQuote(value: string): string {
   return "'" + value.replaceAll("'", "'\\''") + "'"
 }
 
+/** The one line that sets up a computer for this Hub. The only place the page spells it. */
+// `npx agentscm` with only flags runs quickstart, and a bare --hub-url means joining that Hub.
+export function installCommand(rawOrigin: string): string | null {
+  const origin = safeHubOrigin(rawOrigin)
+  return origin ? `npx agentscm --hub-url ${shellQuote(origin)}` : null
+}
+
 export function clientSetupCommand(rawOrigin: string, agent: ClientAgent): string | null {
   const origin = safeHubOrigin(rawOrigin)
   return origin ? `npx agentscm client setup --agent ${shellQuote(agent)} --hub ${shellQuote(origin)}` : null

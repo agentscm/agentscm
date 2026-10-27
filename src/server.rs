@@ -25,6 +25,8 @@ mod explorer;
 #[cfg(unix)]
 mod front_door;
 #[cfg(unix)]
+mod intent_review;
+#[cfg(unix)]
 mod workflow_library;
 
 const MAX_CONCURRENCY: usize = 256;

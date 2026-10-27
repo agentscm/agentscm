@@ -34,13 +34,16 @@ pub use review::{ClaudeReviewFinding, ClaudeReviewView};
 mod agent_tasks;
 pub use agent_tasks::*;
 
+#[path = "intent.rs"]
+pub mod intent;
+
 #[path = "runtime_actions.rs"]
 mod productive;
 pub use productive::{artifact, bind_inputs, recover_action};
 
 const VIEW_VERSION: u32 = 1;
 const APPLICATION_ID: i64 = 0x4153_5746;
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const MAX_RUN_ID_BYTES: usize = 64;
 const MAX_DEFINITION_BYTES: usize = 256 * 1024;
 const MAX_DETAIL_BYTES: usize = 4 * 1024;
@@ -1376,11 +1379,19 @@ fn initialize_schema(connection: &mut Connection, create: bool) -> Result<()> {
     } else if application == APPLICATION_ID && version == 4 {
         productive::create_schema(&tx)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    } else if application == APPLICATION_ID && version == 5 {
+        // The intent adapter adds tables; existing native task records are unchanged.
     } else if application != APPLICATION_ID || version != SCHEMA_VERSION {
         return Err(Error::Invalid(
             "unsupported workflow journal identity or version".into(),
         ));
     }
+    if version < 6 {
+        intent::initialize_schema(&tx)?;
+    } else {
+        intent::validate_schema(&tx)?;
+    }
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
 }
@@ -1389,7 +1400,7 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version == 3 {
         return Err(Error::Invalid(
-            "workflow journal schema version 3 requires a writable migration to version 5".into(),
+            "workflow journal schema version 3 requires a writable migration to version 6".into(),
         ));
     }
     validate_recovery_schema(connection)
@@ -1421,6 +1432,9 @@ pub(crate) fn validate_recovery_schema(connection: &Connection) -> Result<()> {
         connection.prepare("SELECT run_id,step_id,profile_digest,record_json,artifact FROM workflow_action_attempts LIMIT 0")?;
         connection
             .prepare("SELECT run_id,digest,canonical_json FROM workflow_action_inputs LIMIT 0")?;
+    }
+    if version >= 6 {
+        intent::validate_schema(connection)?;
     }
     if version == 3 {
         agent_tasks::validate_v3_schema(connection)?;

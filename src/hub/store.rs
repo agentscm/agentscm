@@ -49,6 +49,7 @@ use super::{HubError, Result};
 use crate::team::auth::{Secret, generate_secret, lower_hex, token_digest};
 
 const AGENT_TOKEN_DIGEST_DOMAIN: &[u8] = b"agentscm.hub.agent-token.v1\0";
+const WEB_READ_TOKEN_DIGEST_DOMAIN: &[u8] = b"agentscm.hub.web-read-token.v1\0";
 const DEVICE_DIGEST_DOMAIN: &[u8] = b"agentscm.hub.device.v1\0";
 const MAX_HOST_BYTES: usize = 253;
 const MAX_LOGIN_BYTES: usize = 255;
@@ -1026,6 +1027,14 @@ pub fn agent_token_digest(raw: &str) -> Result<TokenDigest> {
         .map_err(|_| HubError::Unauthorized)
 }
 
+/// Web-page read tokens use a separate credential domain. Agent and Workspace
+/// authentication cannot resolve them as agent credentials.
+pub fn web_read_token_digest(raw: &str) -> Result<TokenDigest> {
+    token_digest(WEB_READ_TOKEN_DIGEST_DOMAIN, raw)
+        .map(TokenDigest)
+        .map_err(|_| HubError::Unauthorized)
+}
+
 const BROWSER_SESSION_DIGEST_DOMAIN: &[u8] = b"agentscm.hub.browser-session.v1\0";
 
 /// A person keeps at most this many web-page sign-ins.
@@ -1059,8 +1068,17 @@ pub fn mint_agent_token(
     repository: &str,
     ttl_seconds: i64,
 ) -> Result<(String, Secret)> {
-    mint(store, owner, name, repository, None, ttl_seconds, false)
-        .map(|(id, secret, _)| (id, secret))
+    mint(
+        store,
+        owner,
+        name,
+        repository,
+        None,
+        ttl_seconds,
+        false,
+        agent_token_digest,
+    )
+    .map(|(id, secret, _)| (id, secret))
 }
 
 /// Like [`mint_agent_token`], recording the forge's repository id; also
@@ -1082,6 +1100,27 @@ pub fn mint_bound_agent_token(
         Some(repository_id),
         ttl_seconds,
         read_only,
+        agent_token_digest,
+    )
+}
+
+/// Mint a Hub web-page token that cannot authenticate as a Workspace agent.
+pub fn mint_web_read_token(
+    store: &dyn Store,
+    owner: &str,
+    repository: &str,
+    repository_id: i64,
+    ttl_seconds: i64,
+) -> Result<(String, Secret, i64)> {
+    mint(
+        store,
+        owner,
+        "hub-web",
+        repository,
+        Some(repository_id),
+        ttl_seconds,
+        true,
+        web_read_token_digest,
     )
 }
 
@@ -1093,6 +1132,7 @@ fn mint(
     repository_id: Option<i64>,
     ttl_seconds: i64,
     read_only: bool,
+    digest: fn(&str) -> Result<TokenDigest>,
 ) -> Result<(String, Secret, i64)> {
     if !(1..=MAX_AGENT_TOKEN_TTL_SECONDS).contains(&ttl_seconds) {
         return Err(invalid("token lifetime must be 1 second to 30 days"));
@@ -1103,7 +1143,7 @@ fn mint(
         owner: owner.to_owned(),
         name: name.to_owned(),
         repository: repository.to_owned(),
-        digest: agent_token_digest(secret.expose())?,
+        digest: digest(secret.expose())?,
         expires_at,
         repository_id,
         read_only,

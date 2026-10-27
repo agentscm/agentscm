@@ -1,0 +1,36 @@
+{
+  "scope": "final",
+  "prior_candidate": "wrong-but-green",
+  "candidate": "corrected",
+  "attempt_history": [
+    {
+      "attempt": 1,
+      "candidate": "wrong-but-green",
+      "overall": "needs_correction",
+      "preserve": true
+    },
+    {
+      "attempt": 2,
+      "candidate": "corrected",
+      "overall": "meets_recorded_criteria",
+      "checks": [
+        "same-account requests from different IP addresses share the limit",
+        "different accounts have independent limits",
+        "account allowance resets in the next minute"
+      ]
+    }
+  ],
+  "criteria": [
+    {
+      "id": "account-shared-limit",
+      "status": "supported",
+      "evidence": "corrected/test_rate_limiter.py checks that a third request through another IP is refused."
+    },
+    {
+      "id": "account-isolation",
+      "status": "supported",
+      "evidence": "corrected/test_rate_limiter.py checks that a second account has its own allowance."
+    }
+  ],
+  "candidate_identity_note": "A real workflow must replace these fixture labels with the fresh candidate snapshot identity; the labels are not execution evidence."
+}

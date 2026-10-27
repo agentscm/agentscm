@@ -6,6 +6,8 @@ import {
   validateAttachment, WorkflowLibraryError, type Attachment, type AttachmentValidation, type Diagnostic, type Guidance, type Simulation, type SkillPreview,
   type SkillSource, type SkillVersion, type WorkflowRecord, type WorkflowStep, type WorkflowVersion,
 } from './workflowLibrary.ts'
+import { clean } from './publications.ts'
+import { validSkillWorkflowRunId, validSkillWorkflowStepId } from './skillWorkflow.ts'
 
 type Load<T> = { kind: 'loading' } | { kind: 'ready'; value: T } | { kind: 'error'; message: string }
 const messageOf = (e: unknown) => e instanceof Error ? e.message : 'The local workflow library could not complete the request.'
@@ -218,6 +220,9 @@ function WorkflowEditor({ record, workflows, skills, repository, requestedReposi
   const versions = useMemo(() => workflows.filter((w) => !w.draft.archived).flatMap((w) => w.versions.filter((v) => !v.archived)), [workflows])
   const followVersions = useMemo(() => versions.filter((v) => v.workflow_id !== draft.id), [draft.id, versions])
   const latest = [...record.versions].filter((v) => !v.archived).sort((a, b) => b.version - a.version)[0]
+  const intentStep = latest?.definition.steps.length === 1 && latest.definition.steps[0]?.kind === 'skill' && latest.definition.steps[0].needs.length === 0 && !latest.definition.trigger && !latest.definition.follow_on ? latest.definition.steps[0] : null
+  const canCopyIntentPrompt = !!latest && !!intentStep && validSkillWorkflowRunId(latest.id) && validSkillWorkflowStepId(intentStep.id)
+  const intentPrompt = canCopyIntentPrompt && latest && intentStep ? clean(`Run a tracked intent review for the current AgentSCM Work using agentscm intent-review. Use published workflow ${latest.id}, step ${intentStep.id}. Extract the human request and authorized amendments from our available conversation; label your plan separately. Start a bounded review, claim the pinned skill task, retain findings before any correction, then reassess the changed candidate. Follow the intent-review protocol and existing permissions. Do not treat this report as merge approval.`, 1024) : ''
   const dirty = JSON.stringify(draft) !== JSON.stringify(record.draft)
   useEffect(() => {
     onDirtyChange(dirty)
@@ -300,6 +305,11 @@ function WorkflowEditor({ record, workflows, skills, repository, requestedReposi
         {attachment && <AttachmentView value={attachment} exportResult={currentExportResult} busy={busy} canValidate={/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(revision)} onValidate={() => void validate()} />}
       </> : <Empty icon="lock" title="Publish a version first">Simulation and repository attachment always use immutable version bytes.</Empty>}
     </Box>
+    {intentStep && <Box icon="bullseye" title="Review intent with your agent" explain="Your existing agent uses this pinned skill with its current tools. The local workflow retains its findings and bounded correction attempts.">
+      <p>Ask your agent to compare this Work with your original request using <code>agentscm intent-review</code>. It can use the conversation already available to it.</p>
+      {canCopyIntentPrompt ? <><p className="small mb-2 text-break" aria-label="Agent request preview">{intentPrompt}</p><CopyButton label="Copy agent request" text={intentPrompt} /></> : <Notice tone="warn" title="Cannot prepare the agent request">The published workflow or step ID does not match the supported format. Check the IDs before copying a request.</Notice>}
+      <p className="small muted mt-2 mb-0">This starts through your agent. Importing or publishing a skill does not launch one. Host execution currently supports one standalone skill step.</p>
+    </Box>}
   </div>
 }
 

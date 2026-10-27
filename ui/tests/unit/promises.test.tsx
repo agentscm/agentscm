@@ -168,7 +168,7 @@ describe('promise authorization and exact retries', () => {
     render(<OwnerChange session={session} current={version(1, DIGEST_A)} capabilities={ownerCapabilities} onChanged={() => {}} onRefresh={() => {}} />)
     fireEvent.change(screen.getByLabelText('Reason'), { target: { value: 'Clarify scope.' } })
     fireEvent.click(screen.getByRole('button', { name: 'Review exact change' }))
-    await screen.findByText(/membership does not allow this action/)
+    await screen.findByText(/role in this workspace doesn’t allow this action/)
     expect(screen.queryByRole('button', { name: 'Record amend' })).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Review exact change' }))
     await screen.findByText(/invalid admission preflight/)

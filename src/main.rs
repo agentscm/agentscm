@@ -73,6 +73,8 @@ mod hub_cli;
 mod hub_read_token;
 mod init_cli;
 mod intent_cli;
+#[cfg(unix)]
+mod intent_review_cli;
 mod local_recovery_cli;
 #[cfg(unix)]
 mod local_service;
@@ -269,6 +271,9 @@ enum Command {
         #[command(subcommand)]
         command: intent_cli::IntentCommand,
     },
+    /// Run a trusted-local, pinned skill intent review operation from JSON stdin.
+    #[cfg(unix)]
+    IntentReview(intent_review_cli::IntentReviewArgs),
     /// Coordinate durable engineering work, claims and resumable check-ins.
     Work {
         #[command(subcommand)]
@@ -884,6 +889,8 @@ async fn run(cli: Cli) -> Result<RunExit> {
         #[cfg(unix)]
         Command::ClientPlugin(args) => client_plugin::run(args)?,
         Command::Intent { command } => intent_cli::run(command).await?,
+        #[cfg(unix)]
+        Command::IntentReview(args) => print_json(&intent_review_cli::run(args)?),
         Command::Work { command } => work_cli::run(command).await?,
         Command::Promise { command } => promise_cli::run(command).await?,
         Command::Demo(args) => demo_cli::run(args).await?,

@@ -1181,6 +1181,12 @@ impl Workspace {
             .store
             .authenticate(&digest, unix_now())?
             .ok_or(HubError::Unauthorized)?;
+        // Web-page tokens minted before the separate digest domain used this
+        // reserved name. Deny them here until their 30-minute lifetime ends.
+        // An agent choosing this name is denied Workspace access, never granted it.
+        if principal.name == "hub-web" {
+            return Err(HubError::Unauthorized);
+        }
         if mutation && principal.read_only {
             return Err(forbidden());
         }

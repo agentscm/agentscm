@@ -1,6 +1,6 @@
 import { render, screen } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
-import { decodeSkillWorkflowEnvelope } from '../../src/skillWorkflow.ts'
+import { decodeSkillWorkflowEnvelope, validSkillWorkflowRunId, validSkillWorkflowStepId } from '../../src/skillWorkflow.ts'
 import { RunView } from '../../src/pages/Workflows.tsx'
 import type { SkillWorkflowAction, SkillWorkflowProjection } from '../../src/types.ts'
 
@@ -23,6 +23,16 @@ const projection = (): SkillWorkflowProjection => ({
 const envelope = (p = projection()) => ({ version: 1, availability: 'available', projection: p })
 
 describe('productive workflow results', () => {
+  it('accepts supported ID boundaries and rejects prompt-breaking IDs', () => {
+    expect(validSkillWorkflowRunId('a')).toBe(true)
+    expect(validSkillWorkflowRunId('a'.repeat(64))).toBe(true)
+    expect(validSkillWorkflowRunId('a'.repeat(65))).toBe(false)
+    expect(validSkillWorkflowRunId('published\nstep')).toBe(false)
+    expect(validSkillWorkflowStepId('step:one/sub')).toBe(true)
+    expect(validSkillWorkflowStepId('a'.repeat(65))).toBe(false)
+    expect(validSkillWorkflowStepId('step\u2028injected')).toBe(false)
+  })
+
   it('shows typed output without promoting generation into independent verification', () => {
     const decoded = decodeSkillWorkflowEnvelope(envelope())
     if (decoded.availability !== 'available') throw new Error('fixture unavailable')
