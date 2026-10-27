@@ -1347,9 +1347,9 @@ mod tests {
                 }],
             })
         };
-        let base = facts_for_digest(&facts(1_000, 100, "complete"));
-        assert_eq!(base, facts_for_digest(&facts(2_000, 200, "complete")));
-        assert_ne!(base, facts_for_digest(&facts(1_000, 100, "partial")));
+        let base = facts_for_digest(&facts(1_000, 100, "observed_only"));
+        assert_eq!(base, facts_for_digest(&facts(2_000, 200, "observed_only")));
+        assert_ne!(base, facts_for_digest(&facts(1_000, 100, "incomplete")));
     }
 
     fn principal_namespace(index: u64) -> Principal {

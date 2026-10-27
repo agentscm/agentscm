@@ -33,7 +33,8 @@ GitHub. To warn agents from Claude Code, see [work intents](intents.md).
   [External CI and deployment outcomes](#external-ci-and-deployment-outcomes).
 - `--poll-seconds N` (default 300, at least 10): how often connections are polled.
 - `--activity-days N` (default 14, 1 to 365): how far back a branch's tip commit
-  counts as recent.
+  counts as recent. It also sets the merge catch-up window: closed proposals
+  updated within that many days.
 - `--shared-conversation-retention-days N` (default 30, 1 to 3650): how long an uploaded
   shared-conversation body stays readable. A sweep every ten minutes expires due bodies and deletes
   their objects (batches of 100 until none are due or 30 seconds are spent; failed removals back off
@@ -938,6 +939,10 @@ names are percent-encoded in URLs. The open-pull list is sent with `If-None-Matc
 a 304 means nothing is written for it. The ETag is only kept when the list fit one
 page and no re-reads were deferred, because page 1's tag says nothing about later
 pages. Files are fetched again only when a pull's head moved.
+Merge catch-up also walks closed proposals newest-updated first, in pages of 32
+that halve when a response passes the body cap, with at most 40 list requests
+plus up to 20 proposal re-reads per repository per sync; see
+[standup](standup.md).
 A pull request that disappears from the list is read once more and recorded as
 closed with its merge commit. Each read is stored with the time it started; an
 older read that finishes later never overwrites a newer one, and a closed pull

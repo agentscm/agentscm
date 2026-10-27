@@ -263,10 +263,10 @@ async fn candidate(
     let Some(number) = hint["number"].as_i64().filter(|number| *number > 0) else {
         return Err(GhError::Failed("invalid closed proposal identity".into()));
     };
-    if !pass.seen.insert(number) {
+    if hint["merged"] != true && hint["merged_at"].as_str().is_none() {
         return Ok(());
     }
-    if hint["merged"] != true && hint["merged_at"].as_str().is_none() {
+    if !pass.seen.insert(number) {
         return Ok(());
     }
     let scope = scope(conn, repo);

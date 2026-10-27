@@ -1518,6 +1518,39 @@ async fn a_merge_during_pagination_is_caught_by_the_head_recheck() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pull_closed_unmerged_then_merged_during_the_pass_is_caught_by_the_head_recheck() {
+    let (env, token, _) = two_page_fixture().await;
+    // Newest on page one, closed without a merge: the walk sees it first and skips it.
+    add_pull(&env, 50, &["src/m50.rs"]);
+    env.pull(50, |pull| {
+        pull.state = "closed".into();
+        pull.updated_at = rfc3339(unix_now() + 5);
+    });
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    env.fake
+        .with(|s| s.stall_next = Some(("/pulls/25".into(), gate.clone())));
+    let state = env.state.clone();
+    let pass = tokio::spawn(async move { sync::poll_once(&state).await.unwrap() });
+    eventually("the pass reaches the stalled read", || {
+        env.fake.with(|s| s.stall_next.is_none())
+    })
+    .await;
+    // Reopened and merged mid-pass: it moves to the head of the list.
+    env.pull(50, |pull| {
+        pull.merged = true;
+        pull.merge_commit_sha = Some(format!("{:040x}", 50));
+        pull.updated_at = rfc3339(unix_now() + 10);
+    });
+    gate.add_permits(1);
+    pass.await.unwrap();
+    assert_eq!(detail_reads(&env, 50), 1);
+    assert_eq!(
+        forge_coverage(&env, &token),
+        (CatchupCoverageState::ObservedOnly, 0, 0)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_request_cap_leaves_a_deep_window_incomplete() {
     let env = Env::start().await;
     env.connect_app().await;
