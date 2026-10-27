@@ -1,6 +1,8 @@
 //! Discovers `src/hub/migrations/named/*.sqlite.sql` and the matching
 //! `*.pg.sql` pair. Adding a file is enough; the integer migration list stays
 //! untouched. A `-- requires: <name>` comment records a dependency.
+//!
+//! Also sets `AGENTSCM_INSTALL_VERSION`, the version in the file name quickstart installs.
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -9,6 +11,43 @@ fn main() {
         eprintln!("hub named migrations: {error}");
         std::process::exit(1);
     }
+    install_version();
+}
+
+/// The package version for a release build (the release workflow runs on the tag `v<version>`),
+/// else `<version>+<commit>`: every build from main carries the release's version, and a dev
+/// build must not take, or be refused, the release's file name. Without Git, the plain version.
+fn install_version() {
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
+    println!("cargo:rerun-if-env-changed=GITHUB_REF_TYPE");
+    println!("cargo:rerun-if-env-changed=GITHUB_REF_NAME");
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .map(|text| text.trim().to_owned())
+            .filter(|text| !text.is_empty())
+    };
+    // Rebuild when HEAD moves: HEAD itself, the branch it names, and packed refs.
+    let mut watched = vec!["HEAD".to_owned(), "packed-refs".to_owned()];
+    watched.extend(git(&["symbolic-ref", "-q", "HEAD"]));
+    for name in watched {
+        if let Some(path) = git(&["rev-parse", "--path-format=absolute", "--git-path", &name])
+            && Path::new(&path).exists()
+        {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+    let release = std::env::var("GITHUB_REF_TYPE").as_deref() == Ok("tag")
+        && std::env::var("GITHUB_REF_NAME").ok() == Some(format!("v{version}"));
+    let name = match git(&["rev-parse", "--short=12", "HEAD"]) {
+        Some(commit) if !release => format!("{version}+{commit}"),
+        _ => version,
+    };
+    println!("cargo:rustc-env=AGENTSCM_INSTALL_VERSION={name}");
 }
 
 fn generate() -> Result<(), String> {

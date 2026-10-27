@@ -569,7 +569,7 @@ fn program_fingerprint(home: &Path) -> (Option<u32>, Vec<ProgramFileFingerprint>
         directory.join(binary::LINK),
         directory.join(format!(
             "agentscm-{}{}",
-            env!("CARGO_PKG_VERSION"),
+            binary::VERSION,
             std::env::consts::EXE_SUFFIX
         )),
     ]
@@ -1037,7 +1037,7 @@ async fn local_hub(cx: &mut Cx<'_>) -> std::result::Result<Option<String>, Strin
             ) {
                 return Ok(None);
             }
-            let stable = binary::install(&dir, &executable, env!("CARGO_PKG_VERSION"))?;
+            let stable = binary::install(&dir, &executable, binary::VERSION)?;
             cx.manifest.bin_dir = Some(dir);
             cx.manifest.save().map_err(|e| e.to_string())?;
             hub_native::start(
@@ -1113,7 +1113,7 @@ fn stable_program(
         }
         binary::Program::Copy => {
             let parent_new = dir.parent().is_some_and(|parent| !parent.exists());
-            binary::install(&dir, &exe, env!("CARGO_PKG_VERSION"))?;
+            binary::install(&dir, &exe, binary::VERSION)?;
             cx.manifest.bin_parent_created |= parent_new;
             cx.manifest.bin_dir = Some(dir.clone());
             Ok(dir.join(binary::LINK))
@@ -1296,7 +1296,7 @@ async fn agents_stage(cx: &mut Cx<'_>) {
         println!(
             "Will also copy this program to {0}/agentscm-{1} and point {0}/agentscm at it (0755), so the hooks keep working after this copy goes away.",
             shown(&binary::bin_dir(&cx.home), &cx.home),
-            env!("CARGO_PKG_VERSION")
+            binary::VERSION
         );
     }
     #[cfg(target_os = "macos")]
@@ -1312,6 +1312,7 @@ async fn agents_stage(cx: &mut Cx<'_>) {
         Ok(program) => program,
         Err(why) => {
             println!("Couldn't copy the program: {why}. I didn't set up {names}.");
+            cx.live.agent_error = Some(format!("couldn't copy the program: {why}"));
             return;
         }
     };

@@ -4,6 +4,7 @@ All notable changes are listed here, newest first. AgentSCM is alpha: any releas
 
 ## Unreleased
 
+- Fixed: a second build from main could not be set up. Every build carries the release's version, so quickstart refused to overwrite `~/.agentscm/bin/agentscm-<version>` and skipped agent setup. Builds other than the tagged release now install as `agentscm-<version>+<commit>`, and a failed copy makes quickstart exit non-zero instead of continuing.
 - `POST /v1/hub/session/read-token` gives a web sign-in a 30-minute read-only token for one repository, under the same allow-list and role checks as a computer's mint, so the Hub's web pages can read the dashboard, inbox and history without a pasted token. Only the cookie sign-in with its CSRF token may ask. The bundled UI does not call it yet.
 - The Hub API can sign a browser in itself (`/v1/hub/login/{provider}?web=1`) with an `HttpOnly`, `Secure`, `SameSite=Strict` cookie whose digest is stored in the database, so a Hub restart or deploy does not end it. It lasts 8 hours from the last use and at most 7 days. The bundled web UI does not use it yet; it still asks for a pasted token. Every change made with it needs the `csrf_token` that `GET /v1/hub/session` returns, sent as `x-csrf-token`. It counts as a human session (the computer list and revoke, and admin routes for administrators), never mints agent tokens or computer credentials, and ends with `DELETE /v1/hub/session` or when the person is disabled or leaves the allow list. New named Hub migration `browser_sessions`.
 

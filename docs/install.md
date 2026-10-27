@@ -78,7 +78,7 @@ Checks run before anything is installed or linked.
 
 ## Where files go
 
-On Linux and macOS, `~/.agentscm/bin/agentscm-<version>` is the binary, and `~/.agentscm/bin/agentscm` is a symlink to the latest installed one.
+On Linux and macOS, `~/.agentscm/bin/agentscm-<version>` is the binary, and `~/.agentscm/bin/agentscm` is a symlink to the latest installed one. When quickstart copies a build that is not a release (built from a Git checkout), the file is named `agentscm-<version>+<commit>`, so it never takes or collides with a release's file; quickstart replaces an older build of the same commit but never a release file.
 
 On Windows, `%USERPROFILE%\.agentscm\bin\agentscm-<version>.exe` is the binary, and `agentscm.exe` in the same directory is a copy of the latest installed one, not a symlink (symlinks need extra privileges on Windows). If `agentscm.exe` is running when you install a newer version, it cannot be replaced; the installer warns, keeps the old copy and runs the new versioned binary.
 
