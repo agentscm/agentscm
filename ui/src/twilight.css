@@ -2468,6 +2468,14 @@ textarea.form-control {
   font-variant-numeric: tabular-nums;
 }
 
+/* ---------- opening the Hub on a web sign-in: the frame, nothing else ---------- */
+.opening {
+  display: grid;
+  place-items: center;
+  min-height: 100dvh;
+  background: var(--frame);
+}
+
 /* ---------- signed in: the one browser moment of setup, told on the frame ---------- */
 .done {
   min-height: 100dvh;

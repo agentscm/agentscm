@@ -53,10 +53,15 @@ let catchupAcked = false
 const revokedDevices = new Map<string, number>()
 // The synthetic browser session: GET /v1/hub/login/github signs in, DELETE /v1/hub/session signs out.
 let browserSignedIn = true
+// Read tokens the Hub handed the web pages (POST /v1/hub/session/read-token), counted so tests can see the page didn't over-ask.
+let readTokensMinted = 0
+// A repository the signed-in person can list but whose role is too low: the mint refuses it.
+const REFUSED_REPO = 'acme/secret-plans'
+const webToken = (repo: string) => `webread:${repo.replace('/', ':')}`
 function devices() {
   const mk = (n: string, name: string, owner: { login: string }, created: number, used: number | null, repositories: string[]) => ({ id: `dev_${n.repeat(32).slice(0, 32)}`, name, created_at: ago(created), last_used_at: used === null ? null : ago(used), revoked_at: revokedDevices.get(`dev_${n.repeat(32).slice(0, 32)}`) ?? null, current: false, repositories, owner: { id: `usr_${owner.login}`, login: owner.login, provider: 'github' } })
   return [
-    mk('a', 'maria-mbp', maria, 86400 * 12, 40, [REPO, 'acme/billing-docs']),
+    mk('a', 'maria-mbp', maria, 86400 * 12, 40, [REPO, 'acme/billing-docs', REFUSED_REPO]),
     mk('b', 'maria-desktop', maria, 86400 * 40, 86400 * 9, [REPO]),
     mk('c', 'ci-runner-old', maria, 86400 * 80, null, []),
     mk('d', 'dev-thinkpad', dev, 86400 * 3, 300, [REPO]),
@@ -430,15 +435,20 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
     apply: 'serve',
     configureServer(server) {
       server.middlewares.use('/__mock', (req, res) => {
+        if (req.url?.startsWith('/signout')) {
+          browserSignedIn = false
+          return res.end('browser signed out\n')
+        }
         if (req.url?.startsWith('/reset')) {
           revokedDevices.clear()
           browserSignedIn = true
+          readTokensMinted = 0
           return res.end('computers reset\n')
         }
         down = req.url?.startsWith('/down') ?? false
         res.end(down ? 'hub is now failing\n' : 'hub is now healthy\n')
       })
-      server.middlewares.use('/v1/hub', (req, res) => {
+      server.middlewares.use('/v1/hub', async (req, res) => {
         const url = new URL(req.url ?? '/', 'http://localhost')
         const send = (status: number, body: unknown) => {
           res.statusCode = status
@@ -497,6 +507,22 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
           res.statusCode = 204
           return res.end()
         }
+        if (url.pathname === '/tokens' && req.method === 'GET') {
+          if (scenario === 'empty' || !browserSignedIn) return send(401, { error: 'sign_in_required' })
+          const live = { revoked: false, expires_at: ago(-86400 * 20), read_only: false, created_at: ago(86400) }
+          return send(200, { tokens: [{ ...live, id: 'tok_1', name: 'claude', repository: REPO }, { ...live, id: 'tok_2', name: 'codex', repository: REFUSED_REPO }, { ...live, id: 'tok_3', name: 'old', repository: 'acme/archived', revoked: true }] })
+        }
+        if (url.pathname === '/session/read-token' && req.method === 'POST') {
+          if (!browserSignedIn || scenario === 'empty') return send(401, { error: 'sign_in_required' })
+          if (req.headers['x-csrf-token'] !== 'synthetic-csrf-no-authority') return send(403, { error: 'csrf', message: 'This change did not come from the Hub’s own page; reload the page and try again' })
+          let raw = ''
+          for await (const chunk of req) raw += chunk
+          const repository = (JSON.parse(raw || '{}') as { repository?: string }).repository ?? ''
+          if (repository === REFUSED_REPO) return send(403, { error: 'insufficient_role', login: 'maria', repository, visibility: 'private', has: 'read', needs: 'triage', message: `maria has Read on private repository ${repository}; ask a repository owner for Triage or higher` })
+          readTokensMinted++
+          return send(201, { token: webToken(repository), expires_at: ago(-1800) })
+        }
+        if (url.pathname === '/__count/read-tokens') return send(200, { minted: readTokensMinted })
         if (url.pathname === '/admin/devices') return send(200, { devices: scenario === 'empty' ? [] : devices() })
         if (url.pathname === '/admin/repositories') return send(200, { repositories: scenario === 'empty' ? [] : [{ full_name: REPO, provider: 'github', host: 'github.com', connection: 'con_synthetic', devices: 3, agent_tokens: 5 }, { full_name: 'acme/billing-docs', provider: 'github', host: 'github.com', connection: 'con_synthetic2', devices: 1, agent_tokens: 1 }] })
         if (url.pathname === '/admin/sign-in-refusals') return send(200, { refusals: scenario === 'empty' ? [] : [
@@ -506,7 +532,9 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
         const token = /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1]
         if (!token || token === 'expired') return send(401, { error: 'unauthorized' })
         if (url.pathname === '/whoami') {
-          return send(200, { token: { id: 'tkn_1', name: 'status-page', repository: REPO, expires_at: ago(-86400 * 30), read_only: !token.startsWith('agent') }, owner: maria })
+          // A web read token names its repository; every other synthetic token reads acme/widgets.
+          const web = token.startsWith('webread:') ? token.slice('webread:'.length).replace(':', '/') : null
+          return send(200, { token: { id: 'tkn_1', name: web ? 'hub-web' : 'status-page', repository: web ?? REPO, expires_at: web ? ago(-1800) : ago(-86400 * 30), read_only: !token.startsWith('agent') }, owner: maria })
         }
         if (down) return send(503, { error: 'unavailable' })
         const empty = scenario === 'empty'
@@ -620,11 +648,12 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
           const retained = workflow(runId)
           return retained ? send(200, retained) : send(404, { error: 'not found' })
         }
-        if (url.pathname === `/repos/${encodeURIComponent(REPO)}/work`) {
+        // Any repository a read token names gets the synthetic team's work, so switching repositories shows a page.
+        if (/^\/repos\/[^/]+\/work$/.test(url.pathname)) {
           if (scenario === 'demo') return send(200, { ...work(), pull_requests: [], connected: false })
           return send(200, empty ? { intents: [], intents_truncated: false, pull_requests: [], branches: [], connected: false, truncated: {} } : work())
         }
-        if (url.pathname === `/repos/${encodeURIComponent(REPO)}/activity`) {
+        if (/^\/repos\/[^/]+\/activity$/.test(url.pathname)) {
           if (empty) return send(200, { sessions: [], events: [], next_before: null })
           const all = activity()
           const limit = clampLimit(url.searchParams.get('limit'), 50, 200)

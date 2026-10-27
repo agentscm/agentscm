@@ -9,13 +9,13 @@ import { RefusalNotice } from '../Refusal.tsx'
 
 const CREATE = 'agentscm hub token create --read-only --ttl 30d --name status-page --repo owner/name'
 
-export function SignIn({ notice, onSignedIn }: { notice: string | null; onSignedIn: (token: string, keep: boolean) => void }) {
+export function SignIn({ notice, refusal: opening = null, onSignedIn }: { notice: string | null; /** Why the web sign-in couldn't open a repository. */ refusal?: Refusal | null; onSignedIn: (token: string, keep: boolean) => void }) {
   const [value, setValue] = useState('')
   const [keep, setKeep] = useState(false)
   const [busy, setBusy] = useState(false)
   const [reveal, setReveal] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [refusal, setRefusal] = useState<Refusal | null>(null)
+  const [refusal, setRefusal] = useState<Refusal | null>(opening)
   const [connect, setConnect] = useState(false)
 
   const submit = async (ev: FormEvent) => {
