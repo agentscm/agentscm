@@ -17,6 +17,14 @@ Every command accepts `--data-dir`; its default is `.agentscm`. The global `--no
 - `hook` reads an agent's hook JSON on standard input and prints that agent's reply; it always exits 0, even on usage errors, and prints a valid "no information" reply when the hub cannot be consulted. `init-repo` prints plain text, shows a diff and asks before writing; without a terminal it needs `--yes`. See [supported agents](../agents.md).
 - `quickstart` and `uninstall` are guided and print plain text. Without a terminal they need `--yes`; otherwise they refuse and list their flags. `uninstall` exits nonzero when it could not undo something, and keeps its record of it.
 
+### `promise` (experimental)
+
+`agentscm promise list [--limit N] [--after ID]`, `show ID`, and
+`history ID [--limit N] [--before-version N]` read versions visible to the current Workspace
+agent token. `agentscm promise propose --request FILE` and `report --request FILE` submit strict
+`PromiseInputV1` JSON; `--request -` reads standard input. Proposals and reports are advisory,
+not owner amendments or verified evidence. See [Living Promises](../advanced/living-promises.md).
+
 ### `work`
 
 `agentscm work start` and `agentscm work checkpoint` read strict JSON requests from a file or

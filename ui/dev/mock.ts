@@ -55,9 +55,12 @@ const revokedDevices = new Map<string, number>()
 let browserSignedIn = true
 // Read tokens the Hub handed the web pages (POST /v1/hub/session/read-token), counted so tests can see the page didn't over-ask.
 let readTokensMinted = 0
+let rejectNextWebRead = false
+let rejectNextHubSignOut = false
+let rejectNextAgentRead = false
 // A repository the signed-in person can list but whose role is too low: the mint refuses it.
 const REFUSED_REPO = 'acme/secret-plans'
-const webToken = (repo: string) => `webread:${repo.replace('/', ':')}`
+const webToken = (repo: string, serial: number) => `webread:${repo.replace('/', ':')}:${serial}`
 function devices() {
   const mk = (n: string, name: string, owner: { login: string }, created: number, used: number | null, repositories: string[]) => ({ id: `dev_${n.repeat(32).slice(0, 32)}`, name, created_at: ago(created), last_used_at: used === null ? null : ago(used), revoked_at: revokedDevices.get(`dev_${n.repeat(32).slice(0, 32)}`) ?? null, current: false, repositories, owner: { id: `usr_${owner.login}`, login: owner.login, provider: 'github' } })
   return [
@@ -435,6 +438,18 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
     apply: 'serve',
     configureServer(server) {
       server.middlewares.use('/__mock', (req, res) => {
+        if (req.url?.startsWith('/reject-next-agent-read')) {
+          rejectNextAgentRead = true
+          return res.end('next pasted-token read rejected\n')
+        }
+        if (req.url?.startsWith('/reject-next-signout')) {
+          rejectNextHubSignOut = true
+          return res.end('next Hub sign-out rejected\n')
+        }
+        if (req.url?.startsWith('/reject-next-read')) {
+          rejectNextWebRead = true
+          return res.end('next web read rejected\n')
+        }
         if (req.url?.startsWith('/signout')) {
           browserSignedIn = false
           return res.end('browser signed out\n')
@@ -443,6 +458,9 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
           revokedDevices.clear()
           browserSignedIn = true
           readTokensMinted = 0
+          rejectNextWebRead = false
+          rejectNextHubSignOut = false
+          rejectNextAgentRead = false
           return res.end('computers reset\n')
         }
         down = req.url?.startsWith('/down') ?? false
@@ -472,6 +490,7 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
           const run = { run_id: 'synthetic-workspace-run', repository_id: REPO, profile_id: 'quality-gate', actor_id: 'synthetic-member', generation: 3, state: 'succeeded', subject, native_run_id: 'claude-review-passed', receipt: 'synthetic-receipt', detail: 'Synthetic retained run for interface development; no execution occurred.' }
           if (url.pathname === '/workspace/login') return send(200, { providers: [] })
           if (url.pathname === '/workspace/session') return send(200, { workspace: settings, actor: { user: { id: 'synthetic-member', identity, login: 'synthetic-maintainer' }, roles: ['reader', 'contributor', 'administrator'], repository_ids: ['*'], generation: 1 }, capabilities: { manage_workspace: true, read_repositories: true, execute_workflows: true }, csrf_token: 'synthetic-csrf-no-authority', login_providers: [], synthetic_fixture: true })
+          if (url.pathname === '/workspace/promises') return send(200, { promises: [], next: null })
           if (url.pathname === '/workspace/settings') return send(200, settings)
           if (url.pathname === '/workspace/members') return send(200, { members: [{ identity, roles: ['reader', 'contributor', 'administrator'], repository_ids: ['*'], enabled: true, generation: 1 }, { identity: { ...identity, user_id: 1002 }, roles: ['reader', 'reviewer'], repository_ids: [REPO], enabled: true, generation: 1 }], generation: 1, next_cursor: null })
           if (url.pathname === '/workspace/repositories') return send(200, { repositories: scenario === 'empty' ? [] : [{ repository_id: REPO, profiles: [{ profile_id: 'quality-gate', target: 'main', requirement_digest: subject.requirement_digest, server_execution: true, readiness: 'configured', limitations: 'Synthetic profile for interface development only.' }] }] })
@@ -493,6 +512,10 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
         }
         if (url.pathname === '/session' && req.method === 'DELETE') {
           if (req.headers['x-csrf-token'] !== 'synthetic-csrf-no-authority') return send(403, { error: 'csrf', message: 'Reload the page and try again.' })
+          if (rejectNextHubSignOut) {
+            rejectNextHubSignOut = false
+            return send(503, { error: 'unavailable', message: 'The Hub did not confirm sign-out.' })
+          }
           browserSignedIn = false
           res.statusCode = 204
           return res.end()
@@ -520,7 +543,7 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
           const repository = (JSON.parse(raw || '{}') as { repository?: string }).repository ?? ''
           if (repository === REFUSED_REPO) return send(403, { error: 'insufficient_role', login: 'maria', repository, visibility: 'private', has: 'read', needs: 'triage', message: `maria has Read on private repository ${repository}; ask a repository owner for Triage or higher` })
           readTokensMinted++
-          return send(201, { token: webToken(repository), expires_at: ago(-1800) })
+          return send(201, { token: webToken(repository, readTokensMinted), expires_at: ago(-1800) })
         }
         if (url.pathname === '/__count/read-tokens') return send(200, { minted: readTokensMinted })
         if (url.pathname === '/admin/devices') return send(200, { devices: scenario === 'empty' ? [] : devices() })
@@ -531,14 +554,24 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
         ] })
         const token = /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1]
         if (!token || token === 'expired') return send(401, { error: 'unauthorized' })
+        if (!token.startsWith('webread:') && rejectNextAgentRead && (url.pathname === '/whoami' || /^\/repos\/[^/]+\/(work|activity)$/.test(url.pathname))) {
+          rejectNextAgentRead = false
+          return send(401, { error: 'unauthorized' })
+        }
+        if (token.startsWith('webread:') && rejectNextWebRead && (url.pathname === '/whoami' || /^\/repos\/[^/]+\/(work|activity)$/.test(url.pathname))) {
+          rejectNextWebRead = false
+          return send(401, { error: 'unauthorized' })
+        }
         if (url.pathname === '/whoami') {
           // A web read token names its repository; every other synthetic token reads acme/widgets.
-          const web = token.startsWith('webread:') ? token.slice('webread:'.length).replace(':', '/') : null
+          const webParts = /^webread:([^:]+):([^:]+):[0-9]+$/.exec(token)
+          const web = webParts ? `${webParts[1]}/${webParts[2]}` : null
           return send(200, { token: { id: 'tkn_1', name: web ? 'hub-web' : 'status-page', repository: web ?? REPO, expires_at: web ? ago(-1800) : ago(-86400 * 30), read_only: !token.startsWith('agent') }, owner: maria })
         }
         if (down) return send(503, { error: 'unavailable' })
         const empty = scenario === 'empty'
-        if (url.pathname === '/standup/overview') return send(200, empty ? { ...overview(), current: [], recent: [], overlaps: [] } : overview())
+        const billingDocs = token.startsWith('webread:acme:billing-docs:')
+        if (url.pathname === '/standup/overview') return send(200, empty || billingDocs ? { ...overview(), current: [], recent: [], overlaps: [] } : overview())
         // A fixed personal delivery over the overview's work, two coordination events and two merges. Ack empties it once.
         if (url.pathname === '/standup/briefing') {
           const ov = overview()
@@ -651,10 +684,10 @@ export function mockHub(scenario: Scenario = 'full'): Plugin {
         // Any repository a read token names gets the synthetic team's work, so switching repositories shows a page.
         if (/^\/repos\/[^/]+\/work$/.test(url.pathname)) {
           if (scenario === 'demo') return send(200, { ...work(), pull_requests: [], connected: false })
-          return send(200, empty ? { intents: [], intents_truncated: false, pull_requests: [], branches: [], connected: false, truncated: {} } : work())
+          return send(200, empty || billingDocs ? { intents: [], intents_truncated: false, pull_requests: [], branches: [], connected: false, truncated: {} } : work())
         }
         if (/^\/repos\/[^/]+\/activity$/.test(url.pathname)) {
-          if (empty) return send(200, { sessions: [], events: [], next_before: null })
+          if (empty || billingDocs) return send(200, { sessions: [], events: [], next_before: null })
           const all = activity()
           const limit = clampLimit(url.searchParams.get('limit'), 50, 200)
           const rawBefore = url.searchParams.get('before')

@@ -19,7 +19,7 @@ export const hostOf = (url: string) => {
 }
 
 interface LocalComputer {
-  identity: Poll<Identity>
+  identity: Poll<Identity | null>
   repositories: ConnectedRepository[]
 }
 
@@ -29,10 +29,10 @@ const LocalComputerContext = createContext<LocalComputer | null>(null)
  * Reads this computer's identity (rechecked every minute) and its connected repositories once for
  * the whole page, for the repository menu, the notices and Settings.
  */
-export function LocalComputerProvider({ token, children }: { token: string; children: ReactNode }) {
-  const identity = usePoll((signal) => fetchIdentity(token, signal), 60_000, token)
-  const repositories = usePoll((signal) => fetchRepositories(token, signal), 0, token)
-  const value = useMemo(() => ({ identity, repositories: repositories.kind === 'ready' ? repositories.value : [] }), [identity, repositories])
+export function LocalComputerProvider({ token, children }: { token: string | null; children: ReactNode }) {
+  const identity = usePoll((signal) => token ? fetchIdentity(token, signal) : Promise.resolve(null), token ? 60_000 : 0, token ?? '')
+  const repositories = usePoll((signal) => token ? fetchRepositories(token, signal) : Promise.resolve([]), 0, token ?? '')
+  const value = useMemo(() => token ? { identity, repositories: repositories.kind === 'ready' ? repositories.value : [] } : null, [token, identity, repositories])
   return <LocalComputerContext.Provider value={value}>{children}</LocalComputerContext.Provider>
 }
 

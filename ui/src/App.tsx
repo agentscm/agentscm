@@ -11,6 +11,7 @@ import logoLight from './logo-light.png'
 import { DashboardPage, dashboardStatus } from './pages/Dashboard.tsx'
 import { HealthPage } from './pages/Health.tsx'
 import { AdminPage, ComputersPage, useDeviceAuth } from './pages/Computers.tsx'
+import type { BrowserSession } from './devices.ts'
 import { SetupPage } from './pages/Setup.tsx'
 import { SignIn } from './pages/SignIn.tsx'
 import { isSignedInHash, SignedInPage } from './pages/SignedIn.tsx'
@@ -24,9 +25,10 @@ import { TemplatesPage } from './pages/Templates.tsx'
 import { TimelinePage } from './pages/Timeline.tsx'
 import { ExplorerPage } from './pages/Explorer.tsx'
 import { SettingsPage } from './pages/Settings.tsx'
+import { PromisesPage } from './pages/Promises.tsx'
 import { AppChrome, type Badges, type NavDef, type SectionDef, type TabStatuses, type WebChoice } from './TopNav.tsx'
-import { useWebRead } from './webRead.ts'
-import { Icon, Notice } from './ui.tsx'
+import { useWebRead, type WebRead } from './webRead.ts'
+import { Notice } from './ui.tsx'
 import { usePoll } from './usePoll.ts'
 import { TourProvider } from './tour/Tour.tsx'
 import { hashPath } from './Pager.tsx'
@@ -39,7 +41,7 @@ const subscribeDark = (cb: () => void) => {
 }
 const systemDark = () => window.matchMedia(darkQuery).matches
 
-export type Section = 'home' | 'now' | 'activity' | 'team' | 'inbox' | 'work' | 'workflows' | 'change-record' | 'landed' | 'skills' | 'templates' | 'timeline' | 'explorer' | 'setup' | 'workspace' | 'computers' | 'admin' | 'health' | 'settings'
+export type Section = 'home' | 'now' | 'activity' | 'team' | 'inbox' | 'work' | 'promises' | 'workflows' | 'change-record' | 'landed' | 'skills' | 'templates' | 'timeline' | 'explorer' | 'setup' | 'workspace' | 'computers' | 'admin' | 'health' | 'settings'
 
 /** Every routed page. `label` names its tab inside its nav item; `question` is the page's hidden h1. */
 export const SECTIONS: SectionDef[] = [
@@ -49,6 +51,7 @@ export const SECTIONS: SectionDef[] = [
   { key: 'team', nav: 'home', icon: 'people', label: 'Team', question: 'Who is working right now?' },
   { key: 'inbox', nav: 'inbox', icon: 'inbox', label: 'Inbox', question: 'Which overlaps need a conversation?' },
   { key: 'work', nav: 'history', icon: 'flag', label: 'Finished', question: 'What did agents report finished?' },
+  { key: 'promises', nav: 'history', icon: 'journal-check', label: 'Promises', question: 'What must remain true?' },
   { key: 'change-record', nav: 'history', icon: 'clipboard2-check', label: 'Change records', question: 'What is ready to hand off?' },
   { key: 'explorer', nav: 'history', icon: 'folder2-open', label: 'Files', question: 'How did this code and its evidence come together?' },
   { key: 'timeline', nav: 'timeline', icon: 'camera', label: 'Timeline', question: 'What did this workspace look like earlier?' },
@@ -132,12 +135,10 @@ export function Logo({ dark, height = 32 }: { dark: boolean; height?: number }) 
   return <img src={dark ? logoDark : logoLight} alt="AgentSCM" height={height} className="logo" />
 }
 
-function Shell({ token, web, pref, onPref, density, onDensity, onUnauthorized, onForget }: { token: string; web?: WebChoice; pref: ThemePref; onPref: (p: ThemePref) => void; density: Density; onDensity: (d: Density) => void; onUnauthorized: (m?: string) => void; onForget: () => void }) {
+function Shell({ token, web, hubSignedOut = false, hubSignOutError, hubUnavailable, hubChecking = false, hubSessionKnown = false, section, workflowDirty, onWorkflowDirtyChange, onHubSignedOut, onHubSignOutFailed, onHubRetry, onHubSignOut, pref, onPref, density, onDensity, onUnauthorized, onForget }: { token: string; web?: WebChoice; hubSignedOut?: boolean; hubSignOutError?: string | null; hubUnavailable?: { title: string; message: string; retryLabel: string } | null; hubChecking?: boolean; hubSessionKnown?: boolean; section: Section; workflowDirty: boolean; onWorkflowDirtyChange: (dirty: boolean) => void; onHubSignedOut?: (session: BrowserSession) => void; onHubSignOutFailed?: (session: BrowserSession) => void; onHubRetry?: () => void; onHubSignOut?: () => void; pref: ThemePref; onPref: (p: ThemePref) => void; density: Density; onDensity: (d: Density) => void; onUnauthorized: (m?: string) => void; onForget: () => void }) {
   const data = useHub(token, onUnauthorized)
-  const [workflowDirty, setWorkflowDirty] = useState(false)
-  const section = useSection(workflowDirty)
   const d = useMemo(() => (data.work && data.activity ? derive(data.work, data.activity) : null), [data.work, data.activity])
-  const overview = usePoll((signal) => fetchOverview(token, signal), 15_000, token)
+  const overview = usePoll((signal) => token ? fetchOverview(token, signal) : Promise.reject(new Error('Hub pages are signed out')), 15_000, token)
   const repo = data.whoami?.token.repository ?? 'this repository'
   const device = useDeviceAuth(token)
   const provider = data.whoami?.owner.provider === 'gitlab' ? 'gitlab' : 'github'
@@ -159,6 +160,7 @@ function Shell({ token, web, pref, onPref, density, onDensity, onUnauthorized, o
     work: finished === undefined ? undefined : { text: finished ? `${finished} recently` : 'None recently', tone: finished ? 'ok' : 'muted' },
     'work-history': { text: 'Every change, paged', tone: 'muted' },
     'change-record': { text: 'Per task', tone: 'muted' },
+    promises: { text: 'Owner commitments', tone: 'muted' },
     explorer: { text: 'From this computer', tone: 'muted' },
     skills: { text: 'Required steps', tone: 'muted' },
     workflows: { text: 'Recorded runs', tone: 'muted' },
@@ -177,12 +179,13 @@ function Shell({ token, web, pref, onPref, density, onDensity, onUnauthorized, o
   }, [])
 
   const shell = (
-    <TourProvider section={section} data={data} d={d} overview={overview.kind === 'ready' ? overview.value : null}>
+    <TourProvider key={section === 'promises' || section === 'workspace' ? 'independent' : web ? token : 'hub'} section={section} data={data} d={d} overview={overview.kind === 'ready' ? overview.value : null}>
       <AppChrome
         // The frame is deep violet in both themes, so the top bar always carries the light-on-dark logo.
         logo={<Logo dark height={26} />}
         token={token}
         web={web}
+        hubSignedOut={hubSignedOut}
         repo={repo}
         nav={NAV}
         sections={sections}
@@ -201,6 +204,12 @@ function Shell({ token, web, pref, onPref, density, onDensity, onUnauthorized, o
         collapsed={rail}
         onCollapsed={changeRail}
       >
+        {(hubSignOutError || hubUnavailable || (hubChecking && hubSessionKnown)) && <Notice tone={hubSignOutError || hubUnavailable ? 'bad' : 'muted'} title={hubSignOutError ? 'Hub sign-out failed' : hubUnavailable ? hubUnavailable.title : 'Checking Hub connection'}>
+          {hubSignOutError ?? (hubUnavailable ? hubUnavailable.message : 'Checking which Hub session is active.')}
+          {hubSignOutError && hubUnavailable && <p>{hubUnavailable.message}</p>}
+          {hubSessionKnown && onHubSignOut && <button type="button" className="btn btn-link" onClick={onHubSignOut}>{hubSignOutError ? 'Retry Hub sign-out' : 'Sign out of Hub pages'}</button>}
+          {hubUnavailable && onHubRetry && <button type="button" className="btn btn-link" onClick={onHubRetry}>{hubUnavailable.retryLabel}</button>}
+        </Notice>}
         <ComputerNotices />
         {data.health?.demo && (
           <Notice tone="brand" icon="play-circle" title="Demo hub">
@@ -210,24 +219,25 @@ function Shell({ token, web, pref, onPref, density, onDensity, onUnauthorized, o
         {(section === 'home' || section === 'now' || section === 'activity' || section === 'team') && <DashboardPage section={section} question={SECTIONS.find((s) => s.key === section)!.question} token={token} repo={repo} data={data} d={d} overview={overview} />}
         {section === 'inbox' && <InboxPage token={token} overview={overview} />}
         {section === 'work' && <WorkPage token={token} overview={overview} />}
+        {section === 'promises' && <PromisesPage />}
         {section === 'workflows' && <WorkflowsPage token={token} repository={data.whoami?.token.repository ?? null} />}
         {section === 'change-record' && <ChangeRecordPage repo={data.whoami?.token.repository ?? null} token={token} />}
         {section === 'landed' && <LandedPage repo={data.whoami?.token.repository ?? null} token={token} />}
         {section === 'skills' && <SkillsPage repo={data.whoami?.token.repository ?? null} token={token} />}
-        {section === 'templates' && <TemplatesPage repository={data.whoami?.token.repository ?? null} onDirtyChange={setWorkflowDirty} />}
+        {section === 'templates' && <TemplatesPage repository={data.whoami?.token.repository ?? null} onDirtyChange={onWorkflowDirtyChange} />}
         {section === 'timeline' && <TimelinePage />}
         {section === 'explorer' && <ExplorerPage hubRepository={data.whoami?.token.repository ?? null} />}
         {section === 'setup' && <SetupPage token={token} />}
         {section === 'workspace' && <WorkspacePage />}
         {section === 'health' && <HealthPage health={data.health} />}
-        {section === 'computers' && <ComputersPage auth={device.auth} provider={provider} onSignedOut={device.reload} />}
+        {section === 'computers' && <ComputersPage auth={device.auth} provider={provider} onSignedOut={(session) => { device.reload(); onHubSignedOut?.(session) }} onSignOutFailed={onHubSignOutFailed} />}
         {section === 'admin' && <AdminPage auth={device.auth} provider={provider} />}
         {section === 'settings' && <SettingsPage token={token} whoami={data.whoami} pref={pref} onPref={onPref} density={density} onDensity={onDensity} railCollapsed={rail} onRail={changeRail} onForget={onForget} />}
       </AppChrome>
     </TourProvider>
   )
-  // On this computer's own Hub page, one read of the connection serves the menu, notices and Settings.
-  return isLocalCredential(token) ? <LocalComputerProvider token={token}>{shell}</LocalComputerProvider> : shell
+  // Keep this provider's React position stable as independent pages change credential sources.
+  return <LocalComputerProvider token={isLocalCredential(token) ? token : null}>{shell}</LocalComputerProvider>
 }
 
 export default function App() {
@@ -241,7 +251,8 @@ export default function App() {
   const web = useWebRead(!token && !onFrontDoor() && !signedInLanding)
   const prefersDark = useSyncExternalStore(subscribeDark, systemDark)
   const dark = pref === 'dark' || (pref === 'system' && prefersDark)
-  const section = useSection()
+  const [workflowDirty, setWorkflowDirty] = useState(false)
+  const section = useSection(workflowDirty)
 
   useEffect(() => {
     document.documentElement.dataset['bsTheme'] = dark ? 'dark' : 'light'
@@ -274,42 +285,51 @@ export default function App() {
     [signedOut, token],
   )
   const onForget = useCallback(() => signedOut('Token forgotten on this browser. The hub still accepts it until it expires or is revoked.'), [signedOut])
+  const independent = section === 'workspace' || section === 'promises'
+  const unavailable = web.state.kind === 'unavailable' ? unavailableCopy(web.state) : null
+  const acceptToken = (t: string, keep: boolean) => {
+    saveToken(t, keep)
+    setNotice(null)
+    setToken(t)
+  }
 
   if (signedInLanding) return <SignedInPage />
-  if (token) return <Shell key={token} token={token} pref={pref} onPref={changePref} density={density} onDensity={changeDensity} onUnauthorized={onUnauthorized} onForget={onForget} />
-  if (web.state.kind === 'checking') return <Opening />
-  if (web.state.kind === 'ready') {
-    const { read, repos, refusal, restarts } = web.state
-    // Keyed by repository, not token: the renewal every half hour keeps the page and its state. A renewal after a 401 remounts it, since polling stops on a 401.
-    return <Shell key={`web:${read.repository}:${restarts}`} token={read.token} web={{ repos, pick: web.pick, refusal }} pref={pref} onPref={changePref} density={density} onDensity={changeDensity} onUnauthorized={web.renew} onForget={() => void web.signOut()} />
+  if (token) return <Shell key={independent ? 'independent' : token} token={token} section={section} workflowDirty={workflowDirty} onWorkflowDirtyChange={setWorkflowDirty} pref={pref} onPref={changePref} density={density} onDensity={changeDensity} onUnauthorized={onUnauthorized} onForget={onForget} />
+  if (web.state.kind === 'ready' || independent) {
+    const ready = web.state.kind === 'ready' ? web.state : null
+    const hubSessionKnown = web.state.kind === 'ready' || ((web.state.kind === 'checking' || web.state.kind === 'unavailable') && !!web.state.session)
+    // Every credential source keeps one independent-page tree; Hub pages still reset with their token.
+    return <Shell key={independent ? 'independent' : 'web'} token={ready?.read.token ?? ''} web={ready ? { repos: ready.repos, pick: web.pick, refusal: ready.refusal } : undefined} hubSignedOut={!ready} hubSignOutError={web.signOutError} hubUnavailable={unavailable} hubChecking={web.state.kind === 'checking'} hubSessionKnown={hubSessionKnown} section={section} workflowDirty={workflowDirty} onWorkflowDirtyChange={setWorkflowDirty} onHubSignedOut={web.confirmSignedOut} onHubSignOutFailed={web.reportSignOutFailure} onHubRetry={web.retry} onHubSignOut={() => void web.signOut()} pref={pref} onPref={changePref} density={density} onDensity={changeDensity} onUnauthorized={web.renew} onForget={() => void web.signOut()} />
   }
-  if (section === 'workspace')
-    return (
-      <div className="signed-out-workspace">
-        <a href="#home" className="btn btn-link">
-          <Icon name="arrow-left" /> Back to sign-in
-        </a>
-        <WorkspacePage />
-      </div>
-    )
+  if (web.state.kind === 'checking' || web.state.kind === 'unavailable') return <>
+    <Opening title={web.signOutError ? 'Hub sign-out failed' : unavailable?.title ?? 'Checking Hub connection'} warning={web.signOutError ? `${web.signOutError} ${unavailable?.message ?? ''}` : unavailable?.message ?? null} canSignOut={!!web.state.session} onSignOut={() => void web.signOut()} onRetry={unavailable ? web.retry : undefined} retryLabel={unavailable?.retryLabel} compact={web.state.kind === 'unavailable' && web.state.reason !== 'connection'} />
+    {web.state.kind === 'unavailable' && web.state.reason !== 'connection' && <SignIn notice={null} refusal={web.state.refusal} onSignedIn={acceptToken} />}
+  </>
   return (
     <SignIn
       notice={notice ?? (web.state.kind === 'none' && web.state.empty ? 'Your web sign-in has no repository to open yet. Connect an agent or this computer to one first, or paste a read-only token.' : null)}
       refusal={web.state.kind === 'none' ? web.state.refusal : null}
-      onSignedIn={(t, keep) => {
-        saveToken(t, keep)
-        setNotice(null)
-        setToken(t)
-      }}
+      onSignedIn={acceptToken}
     />
   )
 }
 
+function unavailableCopy(state: Extract<WebRead, { kind: 'unavailable' }>): { title: string; message: string; retryLabel: string } {
+  if (state.reason === 'empty') return { title: 'No repository available', message: 'Your web sign-in has no repository to open yet. Connect an agent or this computer to one first, or paste a read-only token.', retryLabel: 'Check repositories again' }
+  if (state.reason === 'refused') return { title: 'Hub access refused', message: state.refusal?.message ?? 'This web sign-in cannot open any connected repository. Ask a repository owner for access or paste a read-only token.', retryLabel: 'Check repositories again' }
+  return { title: 'Hub connection unavailable', message: 'The browser sign-in could not be checked. Try the connection again.', retryLabel: 'Retry Hub connection' }
+}
+
 /** While the page asks whether this browser is signed in to the Hub: the frame, so nothing flashes. */
-function Opening() {
+function Opening({ title, warning, canSignOut, onSignOut, onRetry, retryLabel, compact = false }: { title: string; warning: string | null; canSignOut: boolean; onSignOut: () => void; onRetry?: () => void; retryLabel?: string; compact?: boolean }) {
   return (
-    <div className="opening" role="status" aria-label="Opening the Hub">
+    <div className={`opening${compact ? ' opening-inline' : ''}`} role="status" aria-label={compact ? title : 'Opening the Hub'}>
       <Logo dark height={32} />
+      {(warning || canSignOut) && <Notice tone={warning ? 'bad' : 'muted'} title={title}>
+        {warning ?? 'Checking which Hub session is active.'}
+        {canSignOut && <button type="button" className="btn btn-link" onClick={onSignOut}>{warning?.startsWith('Hub sign-out') ? 'Retry Hub sign-out' : 'Sign out of Hub pages'}</button>}
+        {onRetry && <button type="button" className="btn btn-link" onClick={onRetry}>{retryLabel}</button>}
+      </Notice>}
     </div>
   )
 }

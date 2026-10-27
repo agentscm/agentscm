@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -67,6 +67,16 @@ use super::intent::{
     Announced, Existing, INTENT_SELECT, Intent, NewIntent, Plan, Who, announced, display_all,
     finish, notice_events, plan, probe_set, validate_ttl,
 };
+use super::promise::{
+    PromiseAdoptV1, PromiseChangeAuthority, PromiseChangeV1, PromiseCreateV1,
+    PromiseCurrentAdmissionsV1, PromiseHistoryPageV1, PromiseInputPageV1, PromiseInputReceiptV1,
+    PromiseInputV1, PromiseInputViewV1, PromisePageV1, PromiseReceiptV1,
+    PromiseRepositoryAdmissionV1, PromiseStateV1, PromiseVersionKindV1, PromiseVersionV1,
+    PromiseViewV1, admissions_current, current_admission, decode_current_scope, decode_input_view,
+    decode_lifetime_scope, decode_version, encode as encode_promise, encoded_admissions_authorized,
+    ensure_admissions_digest, extend_lifetime, operation_fingerprint,
+    payload_admissions_authorized, scope_authorized, valid_promise_id, valid_promise_input_id,
+};
 use super::publish::{
     Create, MAX_UNFINISHED, NewPublication, PUBLICATION_SELECT, Publication, PublicationSearch,
     SEARCH_SCAN_ROWS, Update,
@@ -79,8 +89,8 @@ use super::skills::{EvidenceRow, RunHead, SkillAdoption};
 use super::store::{
     ACTIVITY_KINDS, ActivityEvent, AgentToken, BROWSER_SESSION_MAX_SECONDS, Event, ForgeIdentity,
     HubEvent, LIST_LIMIT, MAX_BROWSER_SESSIONS, NAMED_MIGRATIONS, NewAgentToken, Principal,
-    SLIDE_STEP_SECONDS, SessionView, Store, TokenDigest, User, event_limit, like_pattern,
-    lower_hex_of, new_id, pending, plan_named, search_number, session_key, unix_now,
+    PromiseInputScope, SLIDE_STEP_SECONDS, SessionView, Store, TokenDigest, User, event_limit,
+    like_pattern, lower_hex_of, new_id, pending, plan_named, search_number, session_key, unix_now,
     validate_login,
 };
 use super::work::{
@@ -4578,6 +4588,493 @@ fn lapse(tx: &Transaction<'_>, request: &str, now: i64) -> Result<()> {
 /// The tokens of one repository as the forge knows it, owned by users of one host and provider.
 const TOKEN_SCOPE: &str =
     "t.repository = ?1 AND t.repository_id IS ?2 AND u.host = ?3 AND u.provider = ?4";
+
+fn promise_kind(kind: PromiseVersionKindV1) -> &'static str {
+    match kind {
+        PromiseVersionKindV1::Create => "create",
+        PromiseVersionKindV1::Adopt => "adopt",
+        PromiseVersionKindV1::Amend => "amend",
+        PromiseVersionKindV1::Correct => "correct",
+        PromiseVersionKindV1::Retire => "retire",
+        PromiseVersionKindV1::Transfer => "transfer",
+        PromiseVersionKindV1::RecoveryTransfer => "recovery_transfer",
+    }
+}
+
+fn promise_state(state: PromiseStateV1) -> &'static str {
+    match state {
+        PromiseStateV1::Active => "active",
+        PromiseStateV1::Retired => "retired",
+    }
+}
+
+fn promise_actor_active(
+    tx: &Transaction<'_>,
+    actor_user: &str,
+    actor_token: Option<&str>,
+    now: i64,
+) -> Result<()> {
+    let active: bool = match actor_token {
+        Some(token) => tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM hub_users u JOIN hub_agent_tokens t ON t.owner=u.id
+             WHERE u.id=?1 AND u.disabled=0 AND t.id=?2 AND t.revoked=0 AND t.expires_at>?3)",
+            params![actor_user, token, now],
+            |row| row.get(0),
+        )?,
+        None => tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM hub_users WHERE id=?1 AND disabled=0)",
+            [actor_user],
+            |row| row.get(0),
+        )?,
+    };
+    if !active {
+        return Err(HubError::Unauthorized);
+    }
+    Ok(())
+}
+
+fn promise_replay(
+    tx: &Transaction<'_>,
+    workspace_id: &str,
+    operation_id: &str,
+    actor_user: &str,
+    actor_token: Option<&str>,
+    fingerprint: &str,
+) -> Result<Option<String>> {
+    let row: Option<(String, Option<String>, String, String)> = tx
+        .query_row(
+            "SELECT actor_user,actor_token,fingerprint,response FROM hub_promise_operations
+             WHERE workspace_id=?1 AND operation_id=?2",
+            params![workspace_id, operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    match row {
+        Some((user, token, previous, response))
+            if user == actor_user && token.as_deref() == actor_token && previous == fingerprint =>
+        {
+            Ok(Some(response))
+        }
+        Some(_) => Err(HubError::Invalid("promise_idempotency_conflict".into())),
+        None => Ok(None),
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each value is an independent immutable operation receipt column"
+)]
+fn promise_record_operation(
+    tx: &Transaction<'_>,
+    workspace_id: &str,
+    operation_id: &str,
+    actor_user: &str,
+    actor_token: Option<&str>,
+    fingerprint: &str,
+    response: &str,
+    now: i64,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO hub_promise_operations
+         (workspace_id,operation_id,actor_user,actor_token,fingerprint,response,created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        params![
+            workspace_id,
+            operation_id,
+            actor_user,
+            actor_token,
+            fingerprint,
+            response,
+            now
+        ],
+    )?;
+    Ok(())
+}
+
+fn promise_insert_version(tx: &Transaction<'_>, version: &PromiseVersionV1) -> Result<()> {
+    let payload = encode_promise(version)?;
+    let current_scope = encode_promise(&version.repository_admissions)?;
+    tx.execute(
+        "INSERT INTO hub_promise_versions
+         (promise_id,version,digest,prior_digest,kind,actor_user,payload,current_scope,created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![
+            version.reference.promise_id,
+            i64::try_from(version.reference.version)
+                .map_err(|_| HubError::Invalid("promise version exceeds storage range".into()))?,
+            version.reference.digest,
+            version.prior_digest,
+            promise_kind(version.kind),
+            version.created_by,
+            payload,
+            current_scope,
+            version.created_at
+        ],
+    )?;
+    for admission in &version.repository_admissions {
+        tx.execute(
+            "INSERT INTO hub_promise_version_repositories
+             (workspace_id,promise_id,version,repository_id,admission) VALUES(?1,?2,?3,?4,?5)",
+            params![
+                version.reference.workspace_id,
+                version.reference.promise_id,
+                i64::try_from(version.reference.version).unwrap(),
+                admission.repository_id,
+                encode_promise(admission)?,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn promise_current(
+    conn: &Connection,
+    workspace_id: &str,
+    promise_id: &str,
+) -> Result<Option<PromiseVersionV1>> {
+    let row: Option<(i64, String, String, String)> = conn
+        .query_row(
+            "SELECT p.current_version,p.current_digest,v.payload,v.current_scope
+             FROM hub_promises p JOIN hub_promise_versions v
+               ON v.promise_id=p.id AND v.version=p.current_version
+             WHERE p.workspace_id=?1 AND p.id=?2",
+            params![workspace_id, promise_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    row.map(|(version, digest, payload, scope)| {
+        let decoded =
+            decode_promise_current_row(workspace_id, promise_id, version, &digest, &payload)?;
+        if decode_current_scope(&scope).as_deref() != Some(decoded.repository_admissions.as_slice())
+            || !promise_index_exact(conn, &decoded)?
+        {
+            return Err(HubError::Unavailable(
+                "promise current scope mismatch".into(),
+            ));
+        }
+        Ok(decoded)
+    })
+    .transpose()
+}
+
+fn decode_promise_current_row(
+    workspace_id: &str,
+    promise_id: &str,
+    version: i64,
+    digest: &str,
+    payload: &str,
+) -> Result<PromiseVersionV1> {
+    let decoded = decode_version(payload)?;
+    if decoded.reference.version != u64::try_from(version).unwrap_or_default()
+        || decoded.reference.digest != digest
+        || decoded.reference.workspace_id != workspace_id
+        || decoded.reference.promise_id != promise_id
+    {
+        return Err(HubError::Unavailable(
+            "promise current pointer mismatch".into(),
+        ));
+    }
+    Ok(decoded)
+}
+
+fn promise_index_exact(conn: &Connection, version: &PromiseVersionV1) -> Result<bool> {
+    let mut statement = conn.prepare(
+        "SELECT workspace_id,repository_id,admission FROM hub_promise_version_repositories
+         WHERE promise_id=?1 AND version=?2 ORDER BY repository_id LIMIT 9",
+    )?;
+    let rows = statement.query_map(
+        params![
+            version.reference.promise_id,
+            i64::try_from(version.reference.version).unwrap()
+        ],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        },
+    )?;
+    let mut index = Vec::new();
+    for row in rows {
+        let (workspace_id, key, encoded) = row?;
+        let admission: PromiseRepositoryAdmissionV1 = serde_json::from_str(&encoded)
+            .map_err(|_| HubError::Unavailable("invalid promise repository index".into()))?;
+        if workspace_id != version.reference.workspace_id || admission.repository_id != key {
+            return Ok(false);
+        }
+        index.push(admission);
+    }
+    Ok(index == version.repository_admissions)
+}
+
+fn promise_lifetime_authorized(
+    conn: &Connection,
+    workspace_id: &str,
+    promise_id: &str,
+    permitted: Option<&[String]>,
+    current: &PromiseCurrentAdmissionsV1,
+) -> Result<Option<Vec<PromiseRepositoryAdmissionV1>>> {
+    let encoded: Option<String> = conn
+        .query_row(
+            "SELECT lifetime_scope FROM hub_promises WHERE workspace_id=?1 AND id=?2",
+            params![workspace_id, promise_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(encoded
+        .as_deref()
+        .and_then(decode_lifetime_scope)
+        .filter(|scope| scope_authorized(scope, permitted, current)))
+}
+
+fn promise_report_parent_authorized(
+    conn: &Connection,
+    workspace_id: &str,
+    promise_id: &str,
+    permitted: Option<&[String]>,
+    current: &PromiseCurrentAdmissionsV1,
+) -> Result<bool> {
+    let row: Option<(i64, String, String)> = conn
+        .query_row(
+            "SELECT p.current_version,v.payload,v.current_scope FROM hub_promises p
+             JOIN hub_promise_versions v ON v.promise_id=p.id AND v.version=p.current_version
+             WHERE p.workspace_id=?1 AND p.id=?2",
+            params![workspace_id, promise_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((version, payload, encoded_scope)) = row else {
+        return Ok(false);
+    };
+    Ok(
+        encoded_admissions_authorized(&encoded_scope, permitted, current)
+            && payload_admissions_authorized(
+                &payload,
+                workspace_id,
+                promise_id,
+                version,
+                permitted,
+                current,
+            ),
+    )
+}
+
+fn promise_version_visible(
+    conn: &Connection,
+    workspace_id: &str,
+    promise_id: &str,
+    number: i64,
+    permitted: Option<&[String]>,
+    current: &PromiseCurrentAdmissionsV1,
+) -> Result<Option<PromiseVersionV1>> {
+    let row: Option<(String, String, String)> = conn
+        .query_row(
+            "SELECT v.digest,v.payload,v.current_scope FROM hub_promise_versions v
+             JOIN hub_promises p ON p.id=v.promise_id
+             WHERE p.workspace_id=?1 AND v.promise_id=?2 AND v.version=?3",
+            params![workspace_id, promise_id, number],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((digest, payload, encoded_scope)) = row else {
+        return Ok(None);
+    };
+    if !payload_admissions_authorized(
+        &payload,
+        workspace_id,
+        promise_id,
+        number,
+        permitted,
+        current,
+    ) {
+        return Ok(None);
+    }
+    if !encoded_admissions_authorized(&encoded_scope, permitted, current) {
+        return Ok(None);
+    }
+    let scope = decode_current_scope(&encoded_scope)
+        .ok_or_else(|| HubError::Unavailable("invalid promise version scope".into()))?;
+    let version = decode_version(&payload)?;
+    if version.reference.workspace_id != workspace_id
+        || version.reference.promise_id != promise_id
+        || i64::try_from(version.reference.version).ok() != Some(number)
+        || version.reference.digest != digest
+        || scope != version.repository_admissions
+        || !promise_index_exact(conn, &version)?
+    {
+        return Err(HubError::Unavailable(
+            "promise version scope mismatch".into(),
+        ));
+    }
+    Ok(Some(version))
+}
+
+struct PromiseInputMetadata {
+    kind: String,
+    repository: String,
+    admission: String,
+    promise_id: Option<String>,
+    version_number: Option<i64>,
+    digest: Option<String>,
+}
+
+fn promise_input_visible(
+    conn: &Connection,
+    workspace_id: &str,
+    input_id: &str,
+    permitted: Option<&[String]>,
+    current: &PromiseCurrentAdmissionsV1,
+) -> Result<Option<PromiseInputViewV1>> {
+    let metadata = conn
+        .query_row(
+            "SELECT kind,repository_id,admission,promise_id,promise_version,promise_digest
+             FROM hub_promise_inputs WHERE workspace_id=?1 AND id=?2",
+            params![workspace_id, input_id],
+            |row| {
+                Ok(PromiseInputMetadata {
+                    kind: row.get(0)?,
+                    repository: row.get(1)?,
+                    admission: row.get(2)?,
+                    promise_id: row.get(3)?,
+                    version_number: row.get(4)?,
+                    digest: row.get(5)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(PromiseInputMetadata {
+        kind,
+        repository,
+        admission: encoded,
+        promise_id,
+        version_number,
+        digest,
+    }) = metadata
+    else {
+        return Ok(None);
+    };
+    if permitted.is_some_and(|grants| !grants.contains(&repository)) {
+        return Ok(None);
+    }
+    if encoded != encode_promise(&current_admission(current, &repository))? {
+        return Ok(None);
+    }
+    if kind == "report" {
+        let Some(promise_id) = promise_id.as_deref() else {
+            return Ok(None);
+        };
+        let Some(lifetime) =
+            promise_lifetime_authorized(conn, workspace_id, promise_id, permitted, current)?
+        else {
+            return Ok(None);
+        };
+        if !lifetime
+            .iter()
+            .any(|admission| admission.repository_id == repository)
+        {
+            return Ok(None);
+        }
+        let Some(number) = version_number else {
+            return Ok(None);
+        };
+        let Some(version) =
+            promise_version_visible(conn, workspace_id, promise_id, number, permitted, current)?
+        else {
+            return Ok(None);
+        };
+        if digest.as_deref() != Some(version.reference.digest.as_str()) {
+            return Ok(None);
+        }
+    } else if kind != "proposal" {
+        return Ok(None);
+    }
+    let row: (
+        String,
+        String,
+        String,
+        String,
+        bool,
+        String,
+        Option<String>,
+        i64,
+    ) = conn.query_row(
+        "SELECT id,kind,repository_id,actor_user,actor_token IS NOT NULL,payload,
+                adopted_promise,created_at FROM hub_promise_inputs WHERE workspace_id=?1 AND id=?2",
+        params![workspace_id, input_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            ))
+        },
+    )?;
+    let (id, row_kind, row_repository, actor, by_agent, payload, adopted, at) = row;
+    let view = decode_input_view(
+        id,
+        row_kind,
+        row_repository,
+        actor,
+        by_agent,
+        payload,
+        adopted,
+        at,
+    )?;
+    if let PromiseInputV1::Report {
+        promise_id: payload_id,
+        promise_version,
+        promise_digest,
+        ..
+    } = &view.payload
+        && (promise_id.as_deref() != Some(payload_id.as_str())
+            || version_number != i64::try_from(*promise_version).ok()
+            || digest.as_deref() != Some(promise_digest.as_str()))
+    {
+        return Err(HubError::Unavailable(
+            "promise input reference mismatch".into(),
+        ));
+    }
+    Ok(Some(view))
+}
+
+fn promise_version_at(
+    conn: &Connection,
+    reference: &super::promise::PromiseRefV1,
+) -> Result<Option<PromiseVersionV1>> {
+    let payload: Option<String> = conn
+        .query_row(
+            "SELECT v.payload FROM hub_promise_versions v JOIN hub_promises p ON p.id=v.promise_id
+         WHERE p.workspace_id=?1 AND v.promise_id=?2 AND v.version=?3 AND v.digest=?4",
+            params![
+                reference.workspace_id,
+                reference.promise_id,
+                i64::try_from(reference.version).unwrap_or(-1),
+                reference.digest
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    payload.map(|value| decode_version(&value)).transpose()
+}
+
+fn promise_receipt_matches(
+    conn: &Connection,
+    receipt: &PromiseReceiptV1,
+    admissions: &[PromiseRepositoryAdmissionV1],
+) -> Result<()> {
+    let version = promise_version_at(conn, &receipt.reference)?
+        .ok_or_else(|| HubError::Unavailable("retained promise receipt version missing".into()))?;
+    if version.repository_admissions != admissions {
+        return Err(HubError::Invalid("promise_not_found".into()));
+    }
+    Ok(())
+}
 
 impl Store for SqliteStore {
     fn backend(&self) -> &'static str {
@@ -10764,6 +11261,998 @@ impl Store for SqliteStore {
             .ok_or_else(|| HubError::Unavailable("coordination request disappeared".into()))?;
         tx.commit()?;
         Ok(updated)
+    }
+
+    fn promise_create(
+        &self,
+        workspace_id: &str,
+        actor_user: &str,
+        request: &PromiseCreateV1,
+        admissions: &[PromiseRepositoryAdmissionV1],
+        now: i64,
+    ) -> Result<PromiseReceiptV1> {
+        request.validate()?;
+        let fingerprint = operation_fingerprint("create", workspace_id, actor_user, request)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        promise_actor_active(&tx, actor_user, None, now)?;
+        if let Some(response) = promise_replay(
+            &tx,
+            workspace_id,
+            &request.operation_id,
+            actor_user,
+            None,
+            &fingerprint,
+        )? {
+            let mut receipt: PromiseReceiptV1 = serde_json::from_str(&response)
+                .map_err(|_| HubError::Unavailable("invalid promise receipt".into()))?;
+            promise_receipt_matches(&tx, &receipt, admissions)?;
+            receipt.replayed = true;
+            tx.commit()?;
+            return Ok(receipt);
+        }
+        ensure_admissions_digest(
+            workspace_id,
+            admissions,
+            &request.expected_admissions_digest,
+        )?;
+        let promise_id = new_id("prm")?;
+        let version = PromiseVersionV1::initial(
+            workspace_id,
+            &promise_id,
+            actor_user,
+            None,
+            request.definition.clone(),
+            admissions.to_vec(),
+            now,
+        )?;
+        let lifetime = encode_promise(&extend_lifetime(&[], &version.repository_admissions)?)?;
+        tx.execute(
+            "INSERT INTO hub_promises
+             (id,workspace_id,steward_user,current_version,current_digest,lifetime_scope,state,created_at)
+             VALUES(?1,?2,?3,1,?4,?5,'active',?6)",
+            params![
+                promise_id,
+                workspace_id,
+                actor_user,
+                version.reference.digest,
+                lifetime,
+                now
+            ],
+        )?;
+        promise_insert_version(&tx, &version)?;
+        let receipt = PromiseReceiptV1 {
+            reference: version.reference.clone(),
+            replayed: false,
+        };
+        let response = encode_promise(&receipt)?;
+        promise_record_operation(
+            &tx,
+            workspace_id,
+            &request.operation_id,
+            actor_user,
+            None,
+            &fingerprint,
+            &response,
+            now,
+        )?;
+        append(
+            &tx,
+            &Event::new(
+                "promise_created",
+                &promise_id,
+                json!({"workspace_id":workspace_id,"version":1,"digest":version.reference.digest,"actor":actor_user}),
+            )?,
+        )?;
+        tx.commit()?;
+        Ok(receipt)
+    }
+
+    fn promise_adopt(
+        &self,
+        workspace_id: &str,
+        actor_user: &str,
+        request: &PromiseAdoptV1,
+        admissions: &[PromiseRepositoryAdmissionV1],
+        now: i64,
+    ) -> Result<PromiseReceiptV1> {
+        request.validate()?;
+        let fingerprint = operation_fingerprint("adopt", workspace_id, actor_user, request)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        promise_actor_active(&tx, actor_user, None, now)?;
+        if let Some(response) = promise_replay(
+            &tx,
+            workspace_id,
+            &request.operation_id,
+            actor_user,
+            None,
+            &fingerprint,
+        )? {
+            let mut receipt: PromiseReceiptV1 = serde_json::from_str(&response)
+                .map_err(|_| HubError::Unavailable("invalid promise receipt".into()))?;
+            promise_receipt_matches(&tx, &receipt, admissions)?;
+            receipt.replayed = true;
+            tx.commit()?;
+            return Ok(receipt);
+        }
+        ensure_admissions_digest(
+            workspace_id,
+            admissions,
+            &request.expected_admissions_digest,
+        )?;
+        let proposal_repository: Option<String> = tx
+            .query_row(
+                "SELECT repository_id FROM hub_promise_inputs
+                 WHERE id=?1 AND workspace_id=?2 AND kind='proposal' AND adopted_promise IS NULL",
+                params![request.proposal_id, workspace_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let proposal_repository =
+            proposal_repository.ok_or_else(|| HubError::Invalid("promise_not_found".into()))?;
+        if !request
+            .definition
+            .repositories
+            .iter()
+            .any(|repository| repository.repository_id == proposal_repository)
+        {
+            return Err(HubError::Invalid("promise_not_found".into()));
+        }
+        let proposal_admission: String = tx.query_row(
+            "SELECT admission FROM hub_promise_inputs WHERE id=?1 AND workspace_id=?2",
+            params![request.proposal_id, workspace_id],
+            |row| row.get(0),
+        )?;
+        if admissions
+            .iter()
+            .find(|item| item.repository_id == proposal_repository)
+            .map(encode_promise)
+            .transpose()?
+            .as_deref()
+            != Some(proposal_admission.as_str())
+        {
+            return Err(HubError::Invalid("promise_not_found".into()));
+        }
+        let promise_id = new_id("prm")?;
+        let version = PromiseVersionV1::initial(
+            workspace_id,
+            &promise_id,
+            actor_user,
+            Some(request.proposal_id.clone()),
+            request.definition.clone(),
+            admissions.to_vec(),
+            now,
+        )?;
+        let lifetime = encode_promise(&extend_lifetime(&[], &version.repository_admissions)?)?;
+        tx.execute(
+            "INSERT INTO hub_promises
+             (id,workspace_id,steward_user,current_version,current_digest,lifetime_scope,state,created_at)
+             VALUES(?1,?2,?3,1,?4,?5,'active',?6)",
+            params![
+                promise_id,
+                workspace_id,
+                actor_user,
+                version.reference.digest,
+                lifetime,
+                now
+            ],
+        )?;
+        promise_insert_version(&tx, &version)?;
+        if tx.execute(
+            "UPDATE hub_promise_inputs SET adopted_promise=?2
+             WHERE id=?1 AND adopted_promise IS NULL",
+            params![request.proposal_id, promise_id],
+        )? != 1
+        {
+            return Err(HubError::Invalid("promise_conflict".into()));
+        }
+        let receipt = PromiseReceiptV1 {
+            reference: version.reference.clone(),
+            replayed: false,
+        };
+        let response = encode_promise(&receipt)?;
+        promise_record_operation(
+            &tx,
+            workspace_id,
+            &request.operation_id,
+            actor_user,
+            None,
+            &fingerprint,
+            &response,
+            now,
+        )?;
+        append(
+            &tx,
+            &Event::new(
+                "promise_adopted",
+                &promise_id,
+                json!({"workspace_id":workspace_id,"proposal_id":request.proposal_id,"digest":version.reference.digest,"actor":actor_user}),
+            )?,
+        )?;
+        tx.commit()?;
+        Ok(receipt)
+    }
+
+    fn promise_change(
+        &self,
+        workspace_id: &str,
+        actor_user: &str,
+        promise_id: &str,
+        authority: PromiseChangeAuthority,
+        request: &PromiseChangeV1,
+        admissions: &[PromiseRepositoryAdmissionV1],
+        current_map: &PromiseCurrentAdmissionsV1,
+        now: i64,
+    ) -> Result<PromiseReceiptV1> {
+        request.validate()?;
+        let fingerprint =
+            operation_fingerprint("change", workspace_id, actor_user, &(promise_id, request))?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        promise_actor_active(&tx, actor_user, None, now)?;
+        if let Some(response) = promise_replay(
+            &tx,
+            workspace_id,
+            &request.operation_id,
+            actor_user,
+            None,
+            &fingerprint,
+        )? {
+            let mut receipt: PromiseReceiptV1 = serde_json::from_str(&response)
+                .map_err(|_| HubError::Unavailable("invalid promise receipt".into()))?;
+            promise_receipt_matches(&tx, &receipt, admissions)?;
+            receipt.replayed = true;
+            tx.commit()?;
+            return Ok(receipt);
+        }
+        let current = promise_current(&tx, workspace_id, promise_id)?
+            .ok_or_else(|| HubError::Invalid("promise_not_found".into()))?;
+        if !admissions_current(&current.repository_admissions, current_map) {
+            return Err(HubError::Invalid("promise_not_found".into()));
+        }
+        if authority == PromiseChangeAuthority::Steward && current.steward_user != actor_user {
+            return Err(HubError::Invalid("promise_forbidden".into()));
+        }
+        if current.reference.version != request.expected_version
+            || current.reference.digest != request.expected_digest
+        {
+            return Err(HubError::Invalid("promise_conflict".into()));
+        }
+        let version = current.next(actor_user, authority, request, admissions.to_vec(), now)?;
+        let retained: String = tx.query_row(
+            "SELECT lifetime_scope FROM hub_promises WHERE workspace_id=?1 AND id=?2",
+            params![workspace_id, promise_id],
+            |row| row.get(0),
+        )?;
+        let retained = decode_lifetime_scope(&retained)
+            .ok_or_else(|| HubError::Unavailable("invalid promise lifetime scope".into()))?;
+        let lifetime =
+            encode_promise(&extend_lifetime(&retained, &version.repository_admissions)?)?;
+        promise_insert_version(&tx, &version)?;
+        let updated = tx.execute(
+            "UPDATE hub_promises SET steward_user=?4,current_version=?5,current_digest=?6,state=?7,lifetime_scope=?9
+             WHERE workspace_id=?1 AND id=?2 AND current_version=?3 AND current_digest=?8",
+            params![
+                workspace_id,
+                promise_id,
+                i64::try_from(current.reference.version).unwrap(),
+                version.steward_user,
+                i64::try_from(version.reference.version).unwrap(),
+                version.reference.digest,
+                promise_state(version.state),
+                current.reference.digest,
+                lifetime
+            ],
+        )?;
+        if updated != 1 {
+            return Err(HubError::Invalid("promise_conflict".into()));
+        }
+        let receipt = PromiseReceiptV1 {
+            reference: version.reference.clone(),
+            replayed: false,
+        };
+        let response = encode_promise(&receipt)?;
+        promise_record_operation(
+            &tx,
+            workspace_id,
+            &request.operation_id,
+            actor_user,
+            None,
+            &fingerprint,
+            &response,
+            now,
+        )?;
+        append(
+            &tx,
+            &Event::new(
+                "promise_changed",
+                promise_id,
+                json!({"workspace_id":workspace_id,"version":version.reference.version,"digest":version.reference.digest,"kind":promise_kind(version.kind),"actor":actor_user}),
+            )?,
+        )?;
+        tx.commit()?;
+        Ok(receipt)
+    }
+
+    fn promise_change_replay(
+        &self,
+        workspace_id: &str,
+        actor_user: &str,
+        promise_id: &str,
+        request: &PromiseChangeV1,
+        current: &PromiseCurrentAdmissionsV1,
+        now: i64,
+    ) -> Result<Option<PromiseReceiptV1>> {
+        request.validate()?;
+        let fingerprint =
+            operation_fingerprint("change", workspace_id, actor_user, &(promise_id, request))?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        promise_actor_active(&tx, actor_user, None, now)?;
+        let response = promise_replay(
+            &tx,
+            workspace_id,
+            &request.operation_id,
+            actor_user,
+            None,
+            &fingerprint,
+        )?;
+        let receipt = response
+            .map(|value| {
+                let mut receipt: PromiseReceiptV1 = serde_json::from_str(&value)
+                    .map_err(|_| HubError::Unavailable("invalid promise receipt".into()))?;
+                if receipt.reference.promise_id != promise_id
+                    || receipt.reference.workspace_id != workspace_id
+                {
+                    return Err(HubError::Unavailable(
+                        "invalid promise receipt target".into(),
+                    ));
+                }
+                let version = promise_version_at(&tx, &receipt.reference)?.ok_or_else(|| {
+                    HubError::Unavailable("retained promise replay version missing".into())
+                })?;
+                if !admissions_current(&version.repository_admissions, current) {
+                    return Err(HubError::Invalid("promise_not_found".into()));
+                }
+                receipt.replayed = true;
+                Ok(receipt)
+            })
+            .transpose()?;
+        tx.commit()?;
+        Ok(receipt)
+    }
+
+    fn promise_input(
+        &self,
+        workspace_id: &str,
+        actor_user: &str,
+        actor_token: Option<&str>,
+        request: &PromiseInputV1,
+        admission: &PromiseRepositoryAdmissionV1,
+        now: i64,
+    ) -> Result<PromiseInputReceiptV1> {
+        request.validate()?;
+        admission.validate()?;
+        if admission.repository_id != request.repository_id() {
+            return Err(HubError::Invalid(
+                "promise input admission differs from scope".into(),
+            ));
+        }
+        let fingerprint_actor = actor_token.unwrap_or(actor_user);
+        let fingerprint =
+            operation_fingerprint(request.kind(), workspace_id, fingerprint_actor, request)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        promise_actor_active(&tx, actor_user, actor_token, now)?;
+        if let Some(response) = promise_replay(
+            &tx,
+            workspace_id,
+            request.operation_id(),
+            actor_user,
+            actor_token,
+            &fingerprint,
+        )? {
+            let mut receipt: PromiseInputReceiptV1 = serde_json::from_str(&response)
+                .map_err(|_| HubError::Unavailable("invalid promise input receipt".into()))?;
+            let retained: Option<String> = tx
+                .query_row(
+                    "SELECT admission FROM hub_promise_inputs WHERE id=?1 AND workspace_id=?2",
+                    params![receipt.input_id, workspace_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let retained: PromiseRepositoryAdmissionV1 =
+                serde_json::from_str(&retained.ok_or_else(|| {
+                    HubError::Unavailable("retained promise input missing".into())
+                })?)
+                .map_err(|_| HubError::Unavailable("invalid retained input admission".into()))?;
+            if retained != *admission {
+                return Err(HubError::Invalid("promise_not_found".into()));
+            }
+            receipt.replayed = true;
+            tx.commit()?;
+            return Ok(receipt);
+        }
+        let (promise_id, promise_version, promise_digest) = match request {
+            PromiseInputV1::Proposal { .. } => (None, None, None),
+            PromiseInputV1::Report {
+                promise_id,
+                promise_version,
+                promise_digest,
+                repository_id,
+                ..
+            } => {
+                let current = promise_current(&tx, workspace_id, promise_id)?
+                    .ok_or_else(|| HubError::Invalid("promise_not_found".into()))?;
+                if current.reference.version != *promise_version
+                    || current.reference.digest != *promise_digest
+                    || !current
+                        .definition
+                        .repositories
+                        .iter()
+                        .any(|repository| repository.repository_id == *repository_id)
+                {
+                    return Err(HubError::Invalid("promise_conflict".into()));
+                }
+                if !current.repository_admissions.contains(admission) {
+                    return Err(HubError::Invalid("promise_not_found".into()));
+                }
+                (
+                    Some(promise_id.as_str()),
+                    Some(i64::try_from(*promise_version).unwrap()),
+                    Some(promise_digest.as_str()),
+                )
+            }
+        };
+        let input_id = new_id(if matches!(request, PromiseInputV1::Proposal { .. }) {
+            "prp"
+        } else {
+            "prr"
+        })?;
+        let payload = encode_promise(request)?;
+        tx.execute(
+            "INSERT INTO hub_promise_inputs
+             (id,workspace_id,kind,repository_id,admission,actor_user,actor_token,promise_id,promise_version,promise_digest,payload,adopted_promise,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,?12)",
+            params![
+                input_id,
+                workspace_id,
+                request.kind(),
+                request.repository_id(),
+                encode_promise(admission)?,
+                actor_user,
+                actor_token,
+                promise_id,
+                promise_version,
+                promise_digest,
+                payload,
+                now
+            ],
+        )?;
+        let receipt = PromiseInputReceiptV1 {
+            input_id: input_id.clone(),
+            replayed: false,
+        };
+        let response = encode_promise(&receipt)?;
+        promise_record_operation(
+            &tx,
+            workspace_id,
+            request.operation_id(),
+            actor_user,
+            actor_token,
+            &fingerprint,
+            &response,
+            now,
+        )?;
+        append(
+            &tx,
+            &Event::new(
+                "promise_input_recorded",
+                &input_id,
+                json!({"workspace_id":workspace_id,"kind":request.kind(),"repository_id":request.repository_id(),"actor":actor_user}),
+            )?,
+        )?;
+        tx.commit()?;
+        Ok(receipt)
+    }
+
+    fn promise_get(
+        &self,
+        workspace_id: &str,
+        promise_id: &str,
+        permitted_repositories: Option<&[String]>,
+        current: &PromiseCurrentAdmissionsV1,
+    ) -> Result<Option<PromiseViewV1>> {
+        if permitted_repositories.is_some_and(<[String]>::is_empty) {
+            return Ok(None);
+        }
+        let conn = self.conn();
+        let mut sql = String::from(
+            "SELECT p.current_version,p.current_digest,v.payload,v.current_scope
+             FROM hub_promises p JOIN hub_promise_versions v
+               ON v.promise_id=p.id AND v.version=p.current_version
+             WHERE p.workspace_id=? AND p.id=? AND json_valid(v.current_scope)
+               AND json_array_length(v.current_scope) BETWEEN 1 AND 8",
+        );
+        if let Some(grants) = permitted_repositories {
+            sql.push_str(" AND NOT EXISTS(SELECT 1 FROM json_each(v.current_scope) s WHERE s.type <> 'object' OR json_type(v.current_scope, '$[' || s.key || '].repository_id') IS NOT 'text' OR json_extract(v.current_scope, '$[' || s.key || '].repository_id') NOT IN (");
+            sql.push_str(&vec!["?"; grants.len()].join(","));
+            sql.push_str("))");
+        }
+        sql.push_str(" AND NOT EXISTS (SELECT 1 FROM json_each(v.current_scope) s WHERE s.type <> 'object' OR json_type(v.current_scope, '$[' || s.key || '].repository_id') IS NOT 'text')");
+        let mut values: Vec<&dyn ToSql> = vec![&workspace_id, &promise_id];
+        if let Some(grants) = permitted_repositories {
+            values.extend(grants.iter().map(|grant| grant as &dyn ToSql));
+        }
+        let row: Option<(i64, String, String, String)> = conn
+            .query_row(&sql, values.as_slice(), |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .optional()?;
+        let Some((version, digest, payload, scope)) = row else {
+            return Ok(None);
+        };
+        if !encoded_admissions_authorized(&scope, permitted_repositories, current) {
+            return Ok(None);
+        }
+        if !payload_admissions_authorized(
+            &payload,
+            workspace_id,
+            promise_id,
+            version,
+            permitted_repositories,
+            current,
+        ) {
+            return Ok(None);
+        }
+        let scope = decode_current_scope(&scope)
+            .ok_or_else(|| HubError::Unavailable("invalid promise scope".into()))?;
+        let decoded =
+            decode_promise_current_row(workspace_id, promise_id, version, &digest, &payload)?;
+        if !admissions_current(&decoded.repository_admissions, current)
+            || permitted_repositories.is_some_and(|grants| {
+                decoded
+                    .definition
+                    .repositories
+                    .iter()
+                    .any(|repository| !grants.contains(&repository.repository_id))
+            })
+        {
+            return Ok(None);
+        }
+        if scope != decoded.repository_admissions || !promise_index_exact(&conn, &decoded)? {
+            return Err(HubError::Unavailable(
+                "promise current index mismatch".into(),
+            ));
+        }
+        Ok(Some(PromiseViewV1 { current: decoded }))
+    }
+
+    fn promise_input_get(
+        &self,
+        workspace_id: &str,
+        input_id: &str,
+        permitted_repositories: Option<&[String]>,
+        current: &PromiseCurrentAdmissionsV1,
+    ) -> Result<Option<PromiseInputViewV1>> {
+        if !valid_promise_input_id(input_id) {
+            return Err(HubError::Invalid("invalid promise input id".into()));
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        promise_input_visible(&tx, workspace_id, input_id, permitted_repositories, current)
+    }
+
+    fn promise_inputs(
+        &self,
+        workspace_id: &str,
+        scope: PromiseInputScope<'_>,
+        permitted_repositories: Option<&[String]>,
+        after: Option<&str>,
+        limit: usize,
+        current: &PromiseCurrentAdmissionsV1,
+    ) -> Result<PromiseInputPageV1> {
+        if !(1..=super::promise::MAX_PROMISE_PAGE).contains(&limit)
+            || after.is_some_and(|id| !valid_promise_input_id(id))
+        {
+            return Err(HubError::Invalid("invalid promise input page".into()));
+        }
+        let (kind, scope_id) = match scope {
+            PromiseInputScope::Proposal(repository_id) => ("proposal", repository_id),
+            PromiseInputScope::Report(promise_id) => ("report", promise_id),
+        };
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let scope = if kind == "report" {
+            let Some(scope) = promise_lifetime_authorized(
+                &tx,
+                workspace_id,
+                scope_id,
+                permitted_repositories,
+                current,
+            )?
+            else {
+                return Err(HubError::Invalid("promise_not_found".into()));
+            };
+            if !promise_report_parent_authorized(
+                &tx,
+                workspace_id,
+                scope_id,
+                permitted_repositories,
+                current,
+            )? {
+                return Err(HubError::Invalid("promise_not_found".into()));
+            }
+            scope
+        } else if permitted_repositories
+            .is_some_and(|grants| !grants.contains(&scope_id.to_owned()))
+        {
+            return Ok(PromiseInputPageV1 {
+                inputs: vec![],
+                next: None,
+            });
+        } else {
+            vec![PromiseRepositoryAdmissionV1::unbound(scope_id)]
+        };
+        let scope_column = if kind == "proposal" {
+            "repository_id"
+        } else {
+            "promise_id"
+        };
+        if let Some(cursor) = after {
+            let cursor_exists: bool = tx.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM hub_promise_inputs WHERE workspace_id=?1 AND kind=?2 AND {scope_column}=?3 AND id=?4)"),
+                params![workspace_id, kind, scope_id, cursor],
+                |row| row.get(0),
+            )?;
+            if !cursor_exists
+                || promise_input_visible(
+                    &tx,
+                    workspace_id,
+                    cursor,
+                    permitted_repositories,
+                    current,
+                )?
+                .is_none()
+            {
+                return Err(HubError::Invalid("invalid promise input cursor".into()));
+            }
+        }
+        if kind == "report" && promise_current(&tx, workspace_id, scope_id)?.is_none() {
+            return Err(HubError::Invalid("promise_not_found".into()));
+        }
+        let encoded_by_key = scope
+            .iter()
+            .map(|admission| {
+                let key = admission.repository_id.clone();
+                encode_promise(&current_admission(current, &key)).map(|encoded| (key, encoded))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let current_json = encode_promise(&encoded_by_key)?;
+        let row_limit = i64::try_from(limit + 1).unwrap();
+        let mut statement = tx.prepare(&format!(
+            "SELECT i.id FROM hub_promise_inputs i
+             WHERE i.workspace_id=?1 AND i.kind=?2 AND i.{scope_column}=?3
+               AND (?4='' OR (i.created_at,i.id)>(SELECT created_at,id FROM hub_promise_inputs WHERE id=?4))
+               AND i.admission=(SELECT j.value FROM json_each(?5) j WHERE j.key=i.repository_id)
+             ORDER BY i.created_at,i.id LIMIT ?6"
+        ))?;
+        let ids = statement
+            .query_map(
+                params![
+                    workspace_id,
+                    kind,
+                    scope_id,
+                    after.unwrap_or(""),
+                    current_json,
+                    row_limit
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut inputs = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(input) =
+                promise_input_visible(&tx, workspace_id, &id, permitted_repositories, current)?
+            else {
+                return Err(HubError::Invalid("promise_not_found".into()));
+            };
+            inputs.push(input);
+        }
+        let next = if inputs.len() > limit {
+            inputs.pop();
+            inputs.last().map(|input| input.input_id.clone())
+        } else {
+            None
+        };
+        Ok(PromiseInputPageV1 { inputs, next })
+    }
+
+    fn promise_history(
+        &self,
+        workspace_id: &str,
+        promise_id: &str,
+        permitted_repositories: Option<&[String]>,
+        before_version: Option<u64>,
+        limit: usize,
+        current: &PromiseCurrentAdmissionsV1,
+    ) -> Result<Option<PromiseHistoryPageV1>> {
+        if !(1..=super::promise::MAX_PROMISE_PAGE).contains(&limit) || before_version == Some(0) {
+            return Err(HubError::Invalid("invalid promise page limit".into()));
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        if promise_lifetime_authorized(
+            &tx,
+            workspace_id,
+            promise_id,
+            permitted_repositories,
+            current,
+        )?
+        .is_none()
+        {
+            return if before_version.is_some() {
+                Err(HubError::Invalid("invalid promise history cursor".into()))
+            } else {
+                Ok(None)
+            };
+        }
+        if let Some(cursor) = before_version {
+            promise_version_visible(
+                &tx,
+                workspace_id,
+                promise_id,
+                i64::try_from(cursor).unwrap_or(-1),
+                permitted_repositories,
+                current,
+            )?
+            .ok_or_else(|| HubError::Invalid("invalid promise history cursor".into()))?;
+        }
+        let before = before_version
+            .map(|value| i64::try_from(value).unwrap_or(i64::MAX))
+            .unwrap_or(i64::MAX);
+        let row_limit = i64::try_from(limit + 1).unwrap();
+        let mut statement = tx.prepare(
+            "SELECT version FROM hub_promise_versions
+             WHERE promise_id=?1 AND version<?2 ORDER BY version DESC LIMIT ?3",
+        )?;
+        let numbers = statement
+            .query_map(params![promise_id, before, row_limit], |row| {
+                row.get::<_, i64>(0)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut versions = Vec::with_capacity(numbers.len());
+        for number in numbers {
+            let Some(version) = promise_version_visible(
+                &tx,
+                workspace_id,
+                promise_id,
+                number,
+                permitted_repositories,
+                current,
+            )?
+            else {
+                return Ok(None);
+            };
+            versions.push(version);
+        }
+        let next = if versions.len() > limit {
+            versions.pop();
+            versions.last().map(|version| version.reference.version)
+        } else {
+            None
+        };
+        Ok(Some(PromiseHistoryPageV1 { versions, next }))
+    }
+
+    fn promise_list(
+        &self,
+        workspace_id: &str,
+        permitted_repositories: Option<&[String]>,
+        after: Option<&str>,
+        limit: usize,
+        current: &PromiseCurrentAdmissionsV1,
+    ) -> Result<PromisePageV1> {
+        if !(1..=super::promise::MAX_PROMISE_PAGE).contains(&limit)
+            || after.is_some_and(|value| !valid_promise_id(value))
+        {
+            return Err(HubError::Invalid("invalid promise page".into()));
+        }
+        if permitted_repositories.is_some_and(<[String]>::is_empty) {
+            return Ok(PromisePageV1 {
+                promises: vec![],
+                next: None,
+            });
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        if let Some(cursor) = after {
+            let mut cursor_sql = String::from(
+                "SELECT p.current_version,p.current_digest,v.payload,v.current_scope
+                 FROM hub_promises p JOIN hub_promise_versions v
+                   ON v.promise_id=p.id AND v.version=p.current_version
+                 WHERE p.workspace_id=? AND p.id=? AND json_valid(v.current_scope)
+                   AND json_array_length(v.current_scope) BETWEEN 1 AND 8",
+            );
+            if let Some(grants) = permitted_repositories {
+                cursor_sql.push_str(" AND NOT EXISTS(SELECT 1 FROM json_each(v.current_scope) s WHERE s.type <> 'object' OR json_type(v.current_scope, '$[' || s.key || '].repository_id') IS NOT 'text' OR json_extract(v.current_scope, '$[' || s.key || '].repository_id') NOT IN (");
+                cursor_sql.push_str(&vec!["?"; grants.len()].join(","));
+                cursor_sql.push_str("))");
+            }
+            cursor_sql.push_str(" AND NOT EXISTS (SELECT 1 FROM json_each(v.current_scope) s WHERE s.type <> 'object' OR json_type(v.current_scope, '$[' || s.key || '].repository_id') IS NOT 'text')");
+            let mut values: Vec<&dyn ToSql> = vec![&workspace_id, &cursor];
+            if let Some(grants) = permitted_repositories {
+                values.extend(grants.iter().map(|grant| grant as &dyn ToSql));
+            }
+            let row: Option<(i64, String, String, String)> = tx
+                .query_row(&cursor_sql, values.as_slice(), |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .optional()?;
+            let (version, digest, payload, scope) =
+                row.ok_or_else(|| HubError::Invalid("invalid promise cursor".into()))?;
+            if !encoded_admissions_authorized(&scope, permitted_repositories, current) {
+                return Err(HubError::Invalid("invalid promise cursor".into()));
+            }
+            if !payload_admissions_authorized(
+                &payload,
+                workspace_id,
+                cursor,
+                version,
+                permitted_repositories,
+                current,
+            ) {
+                return Err(HubError::Invalid("invalid promise cursor".into()));
+            }
+            let scope = decode_current_scope(&scope)
+                .ok_or_else(|| HubError::Unavailable("invalid promise cursor scope".into()))?;
+            let decoded =
+                decode_promise_current_row(workspace_id, cursor, version, &digest, &payload)?;
+            if !admissions_current(&decoded.repository_admissions, current)
+                || permitted_repositories.is_some_and(|grants| {
+                    decoded
+                        .definition
+                        .repositories
+                        .iter()
+                        .any(|repository| !grants.contains(&repository.repository_id))
+                })
+            {
+                return Err(HubError::Invalid("invalid promise cursor".into()));
+            }
+            if scope != decoded.repository_admissions || !promise_index_exact(&tx, &decoded)? {
+                return Err(HubError::Unavailable(
+                    "promise cursor index mismatch".into(),
+                ));
+            }
+        }
+        let mut sql = if let Some(grants) = permitted_repositories {
+            format!(
+                "WITH candidate AS MATERIALIZED (
+                    SELECT DISTINCT r.promise_id,r.version
+                    FROM hub_promise_version_repositories r INDEXED BY hub_promise_repository_scope
+                    WHERE r.workspace_id=? AND r.repository_id IN ({}) AND r.promise_id>?
+                 )
+                 SELECT p.id,p.current_version,p.current_digest,v.payload,v.current_scope FROM candidate c
+                 JOIN hub_promises p ON p.id=c.promise_id AND p.current_version=c.version
+                 JOIN hub_promise_versions v ON v.promise_id=p.id AND v.version=p.current_version",
+                vec!["?"; grants.len()].join(",")
+            )
+        } else {
+            String::from(
+                "SELECT p.id,p.current_version,p.current_digest,v.payload,v.current_scope FROM hub_promises p JOIN hub_promise_versions v
+                 ON v.promise_id=p.id AND v.version=p.current_version",
+            )
+        };
+        sql.push_str(
+            " WHERE p.workspace_id=? AND p.id>? AND json_valid(v.current_scope)
+               AND json_array_length(v.current_scope) BETWEEN 1 AND 8",
+        );
+        if let Some(repositories) = permitted_repositories {
+            sql.push_str(" AND NOT EXISTS(SELECT 1 FROM json_each(v.current_scope) s WHERE s.type <> 'object' OR json_type(v.current_scope, '$[' || s.key || '].repository_id') IS NOT 'text' OR json_extract(v.current_scope, '$[' || s.key || '].repository_id') NOT IN (");
+            sql.push_str(&vec!["?"; repositories.len()].join(","));
+            sql.push_str("))");
+        }
+        sql.push_str(" AND NOT EXISTS (SELECT 1 FROM json_each(v.current_scope) s WHERE s.type <> 'object' OR json_type(v.current_scope, '$[' || s.key || '].repository_id') IS NOT 'text') ORDER BY p.id LIMIT ?");
+        let mut scan_after = after.unwrap_or("").to_owned();
+        let mut promises = Vec::new();
+        while promises.len() <= limit {
+            let row_limit = i64::try_from(limit + 1 - promises.len()).unwrap();
+            let mut values: Vec<&dyn ToSql> = Vec::new();
+            if let Some(repositories) = permitted_repositories {
+                values.push(&workspace_id);
+                values.extend(
+                    repositories
+                        .iter()
+                        .map(|repository| repository as &dyn ToSql),
+                );
+                values.push(&scan_after);
+            }
+            values.extend([&workspace_id as &dyn ToSql, &scan_after]);
+            if let Some(repositories) = permitted_repositories {
+                values.extend(
+                    repositories
+                        .iter()
+                        .map(|repository| repository as &dyn ToSql),
+                );
+            }
+            values.push(&row_limit);
+            let rows = {
+                let mut statement = tx.prepare(&sql)?;
+                let mapped = statement.query_map(values.as_slice(), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })?;
+                mapped.collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            if rows.is_empty() {
+                break;
+            }
+            let exhausted = rows.len() < row_limit as usize;
+            for (id, current_version, current_digest, payload, encoded_scope) in rows {
+                scan_after = id.clone();
+                if !encoded_admissions_authorized(&encoded_scope, permitted_repositories, current) {
+                    continue;
+                }
+                if !payload_admissions_authorized(
+                    &payload,
+                    workspace_id,
+                    &id,
+                    current_version,
+                    permitted_repositories,
+                    current,
+                ) {
+                    continue;
+                }
+                let scope = decode_current_scope(&encoded_scope)
+                    .ok_or_else(|| HubError::Unavailable("invalid promise scope".into()))?;
+                let version = decode_version(&payload)?;
+                if !admissions_current(&version.repository_admissions, current)
+                    || permitted_repositories.is_some_and(|grants| {
+                        version
+                            .definition
+                            .repositories
+                            .iter()
+                            .any(|repository| !grants.contains(&repository.repository_id))
+                    })
+                {
+                    continue;
+                }
+                if version.reference.workspace_id != workspace_id
+                    || version.reference.promise_id != id
+                    || version.reference.version
+                        != u64::try_from(current_version).unwrap_or_default()
+                    || version.reference.digest != current_digest
+                {
+                    return Err(HubError::Unavailable(
+                        "promise current pointer mismatch".into(),
+                    ));
+                }
+                if scope != version.repository_admissions || !promise_index_exact(&tx, &version)? {
+                    return Err(HubError::Unavailable(
+                        "promise version repository index mismatch".into(),
+                    ));
+                }
+                promises.push(PromiseViewV1 { current: version });
+            }
+            if exhausted {
+                break;
+            }
+        }
+        let next = if promises.len() > limit {
+            promises.pop();
+            promises
+                .last()
+                .map(|view| view.current.reference.promise_id.clone())
+        } else {
+            None
+        };
+        Ok(PromisePageV1 { promises, next })
     }
 
     fn latest_event_seq(&self) -> Result<i64> {

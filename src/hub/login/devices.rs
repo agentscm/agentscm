@@ -19,7 +19,7 @@ use super::super::forge_api::ForgeApi;
 use super::super::github::GhError;
 use super::super::http::{ApiError, JsonBody, bearer, blocking};
 use super::super::store::{
-    NewAgentToken, User, agent_token_digest, device_digest, mint_bound_agent_token, unix_now,
+    NewAgentToken, User, agent_token_digest, device_digest, mint_web_read_token, unix_now,
     validate_agent_name, validate_repository,
 };
 use super::super::{HubError, HubState};
@@ -487,14 +487,12 @@ async fn web_read_token(
     let store = state.store.clone();
     let owner = human.user.id.clone();
     let (secret, expires_at) = blocking(&state, move || {
-        let (_, secret, expires_at) = mint_bound_agent_token(
+        let (_, secret, expires_at) = mint_web_read_token(
             &*store,
             &owner,
-            "hub-web",
             &repo.full_name,
             repo.repository_id,
             DEVICE_READ_TOKEN_TTL_SECONDS,
-            true,
         )?;
         Ok((secret.expose().to_owned(), expires_at))
     })

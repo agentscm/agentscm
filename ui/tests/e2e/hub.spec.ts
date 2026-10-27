@@ -35,6 +35,7 @@ test('every page is reachable from the rail and its tabs, each with its question
     ['Inbox', '', 'Which overlaps need a conversation?'],
     ['History', 'Finished', 'What did agents report finished?'],
     ['History', 'Changes', 'What changed in Work, and when?'],
+    ['History', 'Promises', 'What must remain true?'],
     ['History', 'Change records', 'What is ready to hand off?'],
     ['Skills', 'Checks', 'Did the checks pass?'],
     ['Setup', 'Access', 'Who can run what?'],
