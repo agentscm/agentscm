@@ -8,6 +8,14 @@ Act as the orchestrator. Use fresh subagents for repository reconnaissance, each
 
 ## Phase 1: Read and validate the issue
 
+First reclaim disk from finished work. Earlier runs' PRs merge after their session ends, so nobody else removes their worktrees:
+
+```sh
+"$(git rev-parse --show-toplevel)/.agents/prune-worktrees.sh"
+```
+
+It removes only clean worktrees whose PR is merged or closed, and keeps the branches; `git worktree lock <path>` protects one. Report what it removed in one line and do not investigate what it kept. If it fails, say so in one line and continue.
+
 1. Read `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `STYLE.md`, `docs/README.md`, `docs/architecture.md` and `docs/roadmap.md`.
 2. Resolve the issue with:
 
