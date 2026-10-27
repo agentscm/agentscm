@@ -619,7 +619,17 @@ reply, no `Mcp-Session-Id` and no server-sent events; `GET` and `DELETE` are
 `2025-03-26` if the client asks for one of them, else `2025-06-18`. A
 notification is a 202. A batch or a non-object is `-32600`, bad JSON
 `-32700`, an unknown method `-32601`, an unknown tool `-32602`. The body limit
-is 64 KiB. Tools:
+is 64 KiB.
+
+An agent token sees a default set of tools: the ones the shipped skill, instruction files, hook
+context, server instructions and MCP App views ask agents to call, plus `agentscm_skill_list`,
+`agentscm_skill_status` and `agentscm_skill_evidence` when the repository has adopted supported
+skills. `POST /mcp?tools=all` lists every tool, including `agentscm_change_record`,
+`agentscm_workflow_status`, `agentscm_shared_conversation`, `agentscm_publications_list` and
+`agentscm_workflow_runs_list` (and its instructions describe them); every tool stays callable
+either way. A read-only token's list is unchanged.
+
+Tools:
 
 | Tool | Arguments | Use |
 |---|---|---|
