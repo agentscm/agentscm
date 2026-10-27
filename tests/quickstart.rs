@@ -4224,18 +4224,22 @@ fn agents_are_set_up_for_all_projects_and_uninstall_restores_user_configuration(
         (
             "cursor",
             ".cursor/mcp.json",
-            r#"{"mcpServers":{"other":{"command":"other"}}}"#,
+            r#"{"mcpServers":{"kept-server":{"command":"kept-command"}}}"#,
         ),
-        ("gemini", ".gemini/settings.json", r#"{"theme":"dark"}"#),
+        (
+            "gemini",
+            ".gemini/settings.json",
+            r#"{"theme":"kept-theme"}"#,
+        ),
         (
             "copilot",
             ".copilot/mcp-config.json",
-            r#"{"mcpServers":{"other":{"type":"local","command":"other"}}}"#,
+            r#"{"mcpServers":{"kept-server":{"type":"local","command":"kept-command"}}}"#,
         ),
         (
             "codex",
             ".codex/config.toml",
-            "model = \"o3\"\n\n[projects.\"/work/agentscm\"]\ntrust_level = \"trusted\"\n",
+            "model = \"kept-model\"\n\n[projects.\"/kept-trusted/agentscm\"]\ntrust_level = \"trusted\"\n",
         ),
     ] {
         let (hub, machine) = (Hub::start(), Machine::new().with_codex());
@@ -4263,7 +4267,13 @@ fn agents_are_set_up_for_all_projects_and_uninstall_restores_user_configuration(
             !written.contains(checkout.to_str().unwrap()),
             "{agent}: {written}"
         );
-        for kept in ["other", "dark", "o3", "/work/agentscm"] {
+        // Distinct strings: a build or temporary path can contain short ones.
+        for kept in [
+            "kept-server",
+            "kept-theme",
+            "kept-model",
+            "/kept-trusted/agentscm",
+        ] {
             assert_eq!(
                 written.contains(kept),
                 original.contains(kept),
