@@ -1655,3 +1655,84 @@ async fn the_web_sign_in_survives_a_restart_and_needs_csrf_to_change_anything() 
     );
     assert_eq!(session(cookie).await.0, 200);
 }
+
+/// Asks for the web pages' read-only token with the web sign-in's cookie.
+async fn web_read_token(env: &Env, cookie: &str, csrf: Option<&str>) -> (u16, Value) {
+    let mut request = browser()
+        .post(format!("{}/v1/hub/session/read-token", env.hub))
+        .header(header::COOKIE, format!("__Host-agentscm_session={cookie}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(json!({"repository": REPO}).to_string());
+    if let Some(csrf) = csrf {
+        request = request.header("x-csrf-token", csrf);
+    }
+    let response = request.send().await.unwrap();
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap();
+    (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn a_web_sign_in_reads_with_a_read_only_token_under_the_mint_checks() {
+    let env = Env::start("github").await;
+    let cookie = web_sign_in(&env, ALICE).await;
+    let (_, me) = with_cookie(&env.hub, Method::GET, "/v1/hub/session", &cookie, None).await;
+    let csrf = me["csrf_token"].as_str().unwrap().to_owned();
+
+    // The cookie alone, as another site's form would send it, gets nothing.
+    let (status, refused) = web_read_token(&env, &cookie, None).await;
+    assert_eq!((status, refused["error"].as_str()), (403, Some("csrf")));
+
+    let (status, minted) = web_read_token(&env, &cookie, Some(&csrf)).await;
+    assert_eq!(status, 201, "{minted}");
+    let token = minted["token"].as_str().unwrap().to_owned();
+    let expires_at = minted["expires_at"].as_i64().unwrap();
+    assert!((unix_now() + 1790..=unix_now() + 1800).contains(&expires_at));
+    // It reads like any read-only repository token, and changes nothing.
+    let (status, whoami) = env.get("/v1/hub/whoami", &token).await;
+    assert_eq!(status, 200, "{whoami}");
+    assert_eq!(whoami["token"]["read_only"], true);
+    assert_eq!(whoami["token"]["repository_id"], REPO_ID);
+    assert_eq!(env.get("/v1/hub/standup/overview", &token).await.0, 200);
+
+    // Only the web sign-in asks: a `hub login` session and a computer credential are refused.
+    let (session, device, _) = env.sign_in(ALICE, "laptop").await;
+    let body = json!({"repository": REPO});
+    let path = "/v1/hub/session/read-token";
+    let (status, refused) = env
+        .call(
+            &env.hub,
+            Method::POST,
+            path,
+            Some(&session),
+            Some(body.clone()),
+        )
+        .await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("forbidden"))
+    );
+    let (status, _) = env
+        .call(&env.hub, Method::POST, path, Some(&device), Some(body))
+        .await;
+    assert_eq!(status, 401);
+
+    // Losing the role refuses the next one, with the same refusal a computer gets.
+    env.drop_role(ALICE);
+    let (status, refused) = web_read_token(&env, &cookie, Some(&csrf)).await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("insufficient_role"))
+    );
+    assert!(
+        refused["message"].as_str().unwrap().contains("; "),
+        "{refused}"
+    );
+    // Administrators see it among the refused sign-ins.
+    let refusals = env.store.refusals(unix_now()).unwrap();
+    assert!(
+        refusals
+            .iter()
+            .any(|r| (r.reason.as_str(), r.via.as_str()) == ("insufficient_role", "web_read_token"))
+    );
+}
