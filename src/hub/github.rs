@@ -442,17 +442,19 @@ impl Api {
             .ok_or_else(|| GhError::Failed("unreadable reply from repos".into()))
     }
 
-    /// The repository and `login`'s role on it, read with the Hub's own credential. None when
-    /// either is missing (404). A 401 or 403 means the credential cannot answer.
+    /// The repository and `login`'s role on it, read with the Hub's own credential: None when
+    /// the repository is missing (404), no role when the user is unknown to it. A 401 or 403
+    /// means the credential cannot answer.
     pub async fn collaborator_permission(
         &self,
         token: &str,
         full_name: &str,
         login: &str,
-    ) -> Gh<Option<(Value, Value)>> {
+    ) -> Gh<Option<(Value, Option<Value>)>> {
         let login = login
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            // Enterprise Managed User logins also have `_`.
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
             .then_some(login)
             .filter(|login| !login.is_empty())
             .ok_or_else(|| GhError::Failed("unusable login".into()))?;
@@ -462,11 +464,17 @@ impl Api {
             404 => return Ok(None),
             _ => self.get(token, &path).await?,
         };
-        Ok(
-            match (answer(repo, "repos")?, answer(permission, "collaborators")?) {
-                (Some(repo), Some(permission)) => Some((repo, permission)),
-                _ => None,
-            },
+        let Some(repo) = answer(repo, "repos")? else {
+            return Ok(None);
+        };
+        Ok(Some((repo, answer(permission, "collaborators")?)))
+    }
+
+    /// A repository's JSON, read with the Hub's own credential; None for a 404.
+    pub async fn repo_json(&self, token: &str, full_name: &str) -> Gh<Option<Value>> {
+        answer(
+            self.get(token, &format!("/repos/{full_name}")).await?,
+            "repos",
         )
     }
 

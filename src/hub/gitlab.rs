@@ -128,14 +128,14 @@ impl Api {
     }
 
     /// The project and the user's membership (inherited and invited groups included), read
-    /// with the Hub's own credential. None when either is missing (404). A 401 or 403 means the
-    /// credential cannot answer.
+    /// with the Hub's own credential: None when the project is missing (404), no membership when
+    /// the user is not a member. A 401 or 403 means the credential cannot answer.
     pub async fn member_access(
         &self,
         token: &str,
         project: i64,
         user_id: i64,
-    ) -> Gh<Option<(Value, Value)>> {
+    ) -> Gh<Option<(Value, Option<Value>)>> {
         let repo = self.get(token, &format!("/projects/{project}")).await?;
         let member = match repo.status {
             404 => return Ok(None),
@@ -144,12 +144,16 @@ impl Api {
                     .await?
             }
         };
-        Ok(
-            match (answer(repo, "projects")?, answer(member, "members")?) {
-                (Some(repo), Some(member)) => Some((repo, member)),
-                _ => None,
-            },
-        )
+        let Some(repo) = answer(repo, "projects")? else {
+            return Ok(None);
+        };
+        Ok(Some((repo, answer(member, "members")?)))
+    }
+
+    /// A project's JSON by path, read with the Hub's own credential; None for a 404.
+    pub async fn project_json(&self, token: &str, full_name: &str) -> Gh<Option<Value>> {
+        let path = format!("/projects/{}", encode(full_name));
+        answer(self.get(token, &path).await?, "projects")
     }
 
     /// The user id and username the token acts as.

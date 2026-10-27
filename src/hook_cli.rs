@@ -269,13 +269,14 @@ async fn call_hub(
         .await
         .map_err(|_| "hub unreachable")?;
     match status {
-        200 if reply.is_object() && agent == "gemini" && plugin_route => {
-            activity.finish(successful_hook_outcome(&outbound));
-            Ok(gemini_reply(reply, &payload, config_dir().ok().as_deref()))
-        }
         200 if reply.is_object() => {
             activity.finish(successful_hook_outcome(&outbound));
-            let reply = defanged(reply, &agent, &payload, config_dir().ok().as_deref());
+            let config = config_dir().ok();
+            let reply = if agent == "gemini" && plugin_route {
+                gemini_reply(reply, &payload, config.as_deref())
+            } else {
+                defanged(reply, &agent, &payload, config.as_deref())
+            };
             Ok(match note {
                 Some(note) => with_note(reply, &agent, &payload, &note),
                 None => reply,
@@ -776,22 +777,29 @@ async fn auto_connect(payload: &Value) -> Option<std::result::Result<String, Str
     if marked_within(&config, &key, RETRY_EVERY) {
         return None;
     }
+    // Marked first, so a hung Hub or a slow child is not retried at every session start.
+    mark(&config, &key);
     let result = tokio::task::spawn_blocking(move || {
         client_child("auto-connect", &main, Some(AUTO_CONNECT_WAIT))
     })
     .await
     .ok()??;
-    match result["result"].as_str() {
-        Some("connected") => result["repository"]
+    let message = || {
+        result["message"]
             .as_str()
-            .filter(|repo| valid_repo(repo))
-            .map(|repo| Ok(repo.to_owned())),
-        Some("refused") => {
-            mark(&config, &key);
-            let message = result["message"].as_str()?;
-            (!message.chars().any(char::is_control))
-                .then(|| Err(format!("{AUTO_CONNECT_REFUSED}{message}")))
+            .filter(|message| !message.chars().any(char::is_control))
+            .map(|message| Err(format!("{AUTO_CONNECT_REFUSED}{message}")))
+    };
+    match result["result"].as_str() {
+        Some("connected") => {
+            let _ = std::fs::remove_file(marker_path(&config, &key));
+            result["repository"]
+                .as_str()
+                .filter(|repo| valid_repo(repo))
+                .map(|repo| Ok(repo.to_owned()))
         }
+        // A refusal, or a fork's hint, with its fix.
+        Some("refused" | "not_connected") => message(),
         _ => None,
     }
 }

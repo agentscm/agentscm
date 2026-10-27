@@ -222,7 +222,8 @@ pub trait Store: Send + Sync {
         digest: &TokenDigest,
         now: i64,
     ) -> Result<Option<DevicePrincipal>>;
-    /// `owner`'s computers, or everyone's for None; newest first, at most `MAX_DEVICES`.
+    /// `owner`'s computers, or everyone's for None: live ones first, then those revoked within
+    /// the last 30 days; newest first, at most `MAX_DEVICES`.
     fn devices(&self, owner: Option<&str>, now: i64) -> Result<Vec<Device>>;
     /// Revokes a live computer (only `owner`'s when Some) and every agent token it minted.
     /// True if it was live.

@@ -164,6 +164,8 @@ impl Machine {
             .env_clear()
             .env("HOME", self.home.path())
             .env("XDG_CONFIG_HOME", self.home.path().join(".config"))
+            // Tests never open a real browser: sign-in uses the code flow, or prints its URL.
+            .env("AGENTSCM_NO_BROWSER", "1")
             .env("PATH", self.path())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -3289,6 +3291,8 @@ fn app_install_wait_case(client_command: &str, independent_copy: bool) {
                     json!({"user":{"provider":"github","host":"github.com"}}),
                 ),
                 "GET /v1/hub/connections HTTP/1.1" => (200, json!({"connections":[]})),
+                // A Hub from before computer credentials: nothing to enroll.
+                "POST /v1/hub/devices HTTP/1.1" => (404, json!({"error":"not_found"})),
                 "POST /v1/hub/tokens HTTP/1.1" => {
                     mints += 1;
                     if mints < 3 {

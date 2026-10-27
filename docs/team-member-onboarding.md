@@ -49,8 +49,10 @@ between hooks, MCP or APIs.
 
 Setup verifies the Hub URL and the clone's `origin`, then checks the selected agent's existing
 AgentSCM wiring. That preflight detects another enabled branded AgentSCM plugin or raw AgentSCM
-hook before token minting or binding mutation. Setup then signs you in through the Hub when needed,
-creates a private 30-day token (the Hub maximum) for that repository and binds the exact checkout root. It reuses
+hook before token minting or binding mutation. Setup then signs this computer in through the Hub
+when needed (see [Stay signed in](#stay-signed-in)), creates a private 24-hour token for that
+repository, which renews itself, and binds the exact checkout root. Against a Hub from before
+computer sign-in, the token lasts 30 days (the Hub maximum) and does not renew. It reuses
 a current binding for the same root and Hub. The token is stored in a unique owner-only file and is
 never put in the repository, generated agent configuration, URL or command.
 
@@ -105,6 +107,28 @@ plugin.
 If setup reports that the repository is not connected or your identity cannot access it, ask the
 Hub operator to fix the existing repository connection. Team-member setup does not install or
 reconfigure the Hub's forge application.
+
+## Stay signed in
+
+You sign in once per computer, not once per repository or per day:
+
+1. The sign-in signs this computer in to the Hub until you revoke it. A Hub restart does not sign
+   you out, and a computer is signed out only after 90 days without use. On a desktop it opens
+   your browser; over SSH it shows a code instead (`agentscm hub login --device` asks for that).
+2. At a terminal it asks once whether agents connect themselves: "Connect agents automatically in
+   repositories on this Hub? [Y/n]". The AgentSCM agent plugin runs a quick check whenever an
+   agent starts; with this on, an agent that starts in a checkout of a repository the Hub has
+   connects it, writes no file in it, and begins with
+   `AgentSCM: coordinating on owner/name.` Change it with `agentscm hub auto-connect on|off`.
+3. Agent tokens renew in the background, and every renewal re-checks your role on the repository.
+   If you lose it, your agents are told why and what to ask for.
+4. `agentscm hub whoami` shows who this computer is signed in as, and
+   `agentscm hub devices list|rename|revoke` manages your computers.
+5. If you signed in before this existed, the next connect, renewal or Open Hub while that sign-in
+   is still live signs this computer in without asking.
+
+See [connect this computer](connect-this-computer.md#sign-in-once-per-computer) for the details
+and limits.
 
 ## Optional: configure local change capture
 

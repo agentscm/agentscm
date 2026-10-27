@@ -1,11 +1,8 @@
 # Design: sign in once per computer
 
-> **Status: experimental.** Built as described below except where marked not built; see
-> [the roadmap](../roadmap.md) for what is qualified. User-facing behavior is in
-> [hub](../hub.md#computer-credentials) and
+> **Status: experimental.** Built as described below; see [the roadmap](../roadmap.md) for what
+> is qualified. User-facing behavior is in [hub](../hub.md#computer-credentials) and
 > [connect this computer](../connect-this-computer.md#sign-in-once-per-computer).
-> Not built: the `--no-auto-connect` flag, the fork hint, the Gemini note, and asking at the
-> next interactive command (a terminal sign-in and the menu bar app ask).
 
 ## Problem
 
@@ -45,10 +42,10 @@ renewal. Its cost is a second, equivalent permission check (below), which must f
 
 ## The computer credential
 
-- **Issue.** A sign-in started by the client names the computer (`device_name`, at most 64
-  printable characters). The default is the macOS computer name when the person set one, else
-  "<login>'s <model>" (for example "brandonfla's MacBook Pro"), never the raw host name (#120).
-  `agentscm hub device rename NAME` changes it. After the existing checks pass (allow list, enabled user,
+- **Issue.** A sign-in started by the client names the computer (`device.name`, at most 64
+  printable characters). The default is the macOS computer name (Sharing settings), else
+  "<login>'s computer", never the raw host name (#120). `agentscm hub devices rename NAME`
+  changes it. After the existing checks pass (allow list, enabled user,
   can read a connected repository), the Hub creates a computer record and returns its secret once,
   next to the session. A person with a live session can also enroll one with
   `POST /v1/hub/devices` (used to upgrade existing sign-ins, see Migration).
@@ -64,7 +61,7 @@ renewal. Its cost is a second, equivalent permission check (below), which must f
   re-enabling restores it unless it was revoked or went idle.
 - **Rotation.** The secret is not rotated on use: several hook processes on one computer use it
   concurrently, and rotate-on-use would race and sign people out. A sign-in replaces a record only
-  when the client presents that record's credential (`replaces_device`): the old record is revoked
+  when the client presents that record's credential (`device.replaces`): the old record is revoked
   with its agent tokens. The Hub never matches computers by name, so two laptops with the same name
   are two records. A leaked credential is handled by revocation, which every computer list exposes.
 - **Scope.** The credential authenticates only these routes. It is refused on every human-session
@@ -100,17 +97,21 @@ event records which computer did it. A computer cannot revoke itself through
      the owner's forge user id, so a renamed or re-registered login cannot match someone else.
      A private repository needs any role (`permission` other than `none`). A public one needs
      `role_name` triage, write, maintain or admin (or `permission` write or admin for a custom
-     role). This is the `may_use` rule expressed in the collaborator API.
+     role). The reply is reshaped into a person's own repository read and judged by `missing_role`,
+     the function sign-in and `POST /v1/hub/tokens` use, so the thresholds cannot drift apart.
    - GitLab: `GET /projects/{id}` for `visibility`, then `GET /projects/{id}/members/all/{user_id}`
      (inherited and invited-group members included). Reporter (20) or more on `private`, Developer
      (30) or more otherwise.
-   - A 404 or a missing field is `no_repository_role`. When the connection's credential cannot
-     answer (the connection is `auth_failed`, or the forge answers 401/403 because the credential
-     lacks the members scope), the result is `access_check_unavailable` (403, "the Hub can't check
-     your access to owner/name"). A forge 5xx or network failure is `permission_unavailable` (503).
-     Nothing is minted in any of these cases, and the caller keeps its current token.
-   - The check is one function, `repository_role(connection, repository, person) -> Allowed |
-     Refused(kind)`, with the forge check as its only source today. An admin-issued per-repository
+   - No role, or one below the rule, is `insufficient_role` (403) with the same fields and
+     sentence as `POST /v1/hub/tokens`. A GitHub login the forge no longer knows, or one whose
+     `user.id` differs, is `sign_in_required` (signing in again refreshes the cached login). When
+     the connection's credential cannot answer (the connection is `auth_failed`, the forge answers
+     401/403 because the credential lacks the members scope, or the repository is gone from its
+     view), the result is `access_check_unavailable` (403). A forge 5xx or rate limit is
+     `permission_unavailable` (503). Every refusal carries a `message` with the reason and the one
+     fix. Nothing is minted in any of these cases, and the caller keeps its current token.
+   - The check is one function, `repository_role(state, person, repository) -> Ok | Denial`, with
+     the forge check as its only source today. An admin-issued per-repository
      grant (for a Git host that is neither GitHub nor GitLab) could be added as a second source
      without changing the computer credential, its routes or renewal. It is not built.
 4. Mint. A device-minted agent token lasts **24 hours** (`DEVICE_AGENT_TOKEN_TTL`); read-only ones
@@ -125,47 +126,56 @@ Manual `hub token create` keeps its 30-day maximum; only the device path is shor
 ## Renewal
 
 - The client renews a device-minted token when less than 12 hours remain, or when it has expired.
-  The hook does it on its normal path, at most once per checkout every 5 minutes on failure, with
-  the existing short hook timeout, under the client lifecycle lock, by compare-and-swap on
-  `connections.json` and the token file (outside the checkout). The old token is revoked through
-  `replaces`. A laptop asleep for days renews at the first hook call after waking.
+  Any hook call starts `agentscm client renew` in its own process when one is due, at most once per
+  checkout every 5 minutes, and never waits for it. Renewal mints a new token, saves it under the
+  client lifecycle lock by compare-and-swap on `connections.json` (the token file is outside the
+  checkout), and only then revokes the old token, so a failure part way leaves a working token. A
+  running MCP server picks up the renewed token at its next request. A laptop asleep for days
+  renews at the first hook call after waking. The Hub's `replaces` field revokes the old token in
+  the mint's own transaction for clients that prefer that order.
 - A pre-existing 30-day token (no `device_id`) is renewed the same way once the computer has a
   credential.
-- A refusal (`no_repository_role`, `not_allowed`, `user_disabled`, `sign_in_required`) stops
-  renewal for that checkout. The current token keeps working until it expires or is revoked. The
-  hook adds one line to the agent context with the reason and the fix, and reports it to the tray,
-  which marks the checkout as needing attention.
+- A refusal (`insufficient_role`, `not_allowed`, `user_disabled`, `access_check_unavailable`,
+  `sign_in_required`) is recorded for that checkout. The current token keeps working until it
+  expires or is revoked. At the next session start the hook adds one line to the agent context
+  with the Hub's sentence, and the menu bar app marks the checkout **Needs attention** with the
+  same sentence. A Hub or forge that does not answer (`permission_unavailable`, a network error)
+  is not a refusal: nothing is recorded and the next hook call tries again.
 
 ## Auto-connect
 
-- Opt-in per Hub: `auto_connect` in that Hub's saved entry. The sign-in asks once, "Connect agents
-  automatically in repositories on this Hub? [Y/n]", Yes by default; `--no-auto-connect` answers
-  No without a prompt. The help says that the checkout's origin (forge host and owner/name) is sent
+- Opt-in per Hub: `auto_connect` in that Hub's saved entry (absent until asked). The sign-in asks
+  once at a terminal, "Connect agents automatically in repositories on this Hub? [Y/n]", Yes by
+  default; `hub login --no-auto-connect` answers No without a prompt. The help says that the checkout's origin (forge host and owner/name) is sent
   to every Hub with auto-connect on. It can be changed later
   (`agentscm hub auto-connect on|off [--hub URL]`).
 - Only at session start (each supported agent's session start hook), never on every tool call. When an agent starts in a Git checkout with no client
   connection, the hook re-derives the origin from the checkout (`origin_identity`), and for each
   saved Hub with `auto_connect` (at most 4, the default Hub first) asks `POST /v1/hub/device/tokens`
-  with `auto: true`. `not_connected` moves on to the next Hub; any other refusal stops.
-- A `not_connected` answer is cached per (Hub, origin) for an hour in the client state directory;
-  other failures are throttled for 5 minutes. If the attempt cannot finish within the hook's time
-  budget, the hook skips it and says nothing to the agent.
-- When the origin looks like a fork (the forge reports a parent) and the Hub answers
-  `not_connected`, the tray shows "your origin is a fork of owner/name; add that remote". The client
-  never guesses the upstream.
+  with `auto: true`, through `agentscm client auto-connect` in its own process, waiting at most 2.5
+  seconds. `not_connected` moves on to the next Hub; any other refusal stops.
+- A `not_connected` answer is cached per (Hub, origin) for an hour in the client state directory.
+  Every attempt is throttled per checkout for 5 minutes, marked before it starts. If the attempt
+  cannot finish within the hook's time budget, the hook says nothing to the agent and the process
+  finishes for the next session.
+- For `not_connected`, the Hub asks the forge with a connection credential on the owner's host
+  whether the requested repository is a fork; when its parent or source is connected, the refusal
+  says so and names it (`fork_of`). The agent and the menu bar app show that sentence. The client
+  never guesses the upstream and never changes the remote.
 - On success it binds the checkout through the existing connect path: invocation-program fence,
   client lifecycle lock, revalidation of root, origin and `connections.json`, token file under the
   config directory. It **never installs agent files into the checkout** (no `.mcp.json`,
   `.claude/…`, `.git/info/exclude` edits); the user-level plugin that ran the hook keeps working.
   The agent's context gets one line: `AgentSCM: coordinating on owner/repo`.
-- Failures are throttled per checkout (5 minutes) and reported to the tray with the reason.
+- A refusal is recorded for the checkout and shown in the agent's context and the menu bar app.
 
 ## Revocation and administration
 
 - Owners see their computers (`GET /v1/hub/devices`): `id`, `name`, `created_at`,
   `last_used_at`, `revoked_at`, `current`, and `repositories` (repositories with a live agent
   token minted through it). Revoking a computer revokes every agent token minted through it in
-  the same transaction, so its agents stop at their next call.
+  the same transaction, so its agents stop at their next call, and ends the session of the
+  sign-in that issued it (a session that came with a computer can never enroll another).
 - Administrators (fresh human session, as for every admin route today):
   - `GET /v1/hub/admin/devices`: every computer, with its owner.
   - `DELETE /v1/hub/devices/{id}` with an admin session revokes anyone's computer.
@@ -176,17 +186,18 @@ Manual `hub token create` keeps its 30-day maximum; only the device path is shor
     (provider, forge user id, reason): a repeat updates `at` and bumps `count`, so one person
     retrying cannot push others out. This is a change: today nothing is stored for a refused
     person. The rows hold no secret and are pruned on insert.
-- Events (append-only log): `device_created`, `device_revoked` (with `by`), `auto_connected`.
+- Events (append-only log): `device_created`, `device_renamed`, `device_revoked` (with `by`),
+  `auto_connected`.
 
 ## Migration
 
-- Saved sign-ins without a credential keep working until their session ends. The first client
-  action that finds a live session but no credential (hook renewal, tray, `client setup`) enrolls
-  one with `POST /v1/hub/devices`, with no prompt.
-- People who signed in before this change were never asked about auto-connect. The next
-  interactive moment asks once: a one-time tray prompt "Connect agents automatically in repos on
-  <Hub>?" (Yes / Not now), or the next interactive `agentscm` command at a terminal. The answer is
-  remembered either way (`auto_connect_asked`).
+- Saved sign-ins without a credential keep working until their session ends. Connect (`client
+  setup`, tray Connect, auto-connect), renewal, tray Open Hub and `agentscm open` enroll one with
+  `POST /v1/hub/devices` when they find a live session and no credential, with no prompt.
+- People who signed in before this change, or from the menu bar app, were never asked about
+  auto-connect. The next interactive moment asks once: a one-time menu bar item "Connect agents
+  automatically on <Hub>?" (Yes / Not Now), or the next interactive `agentscm hub` or
+  `agentscm client` command at a terminal. The answer is remembered either way.
 - Existing 30-day agent tokens keep working until they expire and are renewed into 24-hour device
   tokens once a credential exists. A person whose session has already expired signs in once.
 - The schema change is additive (`hub_devices`, `hub_sign_in_refusals`, nullable
@@ -211,5 +222,8 @@ Manual `hub token create` keeps its 30-day maximum; only the device path is shor
 - **Hub database.** Holds only digests; a dump does not yield usable credentials.
 - **Origin disclosure.** Auto-connect sends the checkout's forge host and owner/name to every Hub
   with auto-connect on (at most 4, default first), including Hubs that do not have it.
-- **Browser sessions** for the Hub's web pages still live in Hub memory, so the web UI still signs
-  out on a Hub restart or deploy. Agents and the tray do not. That is a follow-up.
+- **Several Hub processes.** Revoking a computer ends the in-memory session of its sign-in only
+  in the Hub process that handled the revocation; another process refuses that session's
+  enrollment instead, because the session came with a computer.
+- **Older binaries.** An older AgentSCM that rewrites `hub-sessions.json` drops the credential and
+  the auto-connect answer from it; the Hub keeps the credential until it is revoked or idle.

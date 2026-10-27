@@ -4817,10 +4817,10 @@ impl Store for SqliteStore {
         if inserted == 0 {
             return Err(HubError::Invalid("unknown or disabled owner".into()));
         }
-        append(&tx, &Event::device_created(&id, owner, name)?)?;
         if let Some(old) = replaces {
             revoke_device_in(&tx, old, Some(owner), owner, now)?;
         }
+        append(&tx, &Event::device_created(&id, owner, name)?)?;
         tx.commit()?;
         Ok(id)
     }
@@ -4880,9 +4880,10 @@ impl Store for SqliteStore {
                         u.id, u.provider, u.host, u.forge_user_id, u.login, u.disabled
                  FROM hub_devices d JOIN hub_users u ON u.id = d.owner
                  WHERE (?1 IS NULL OR d.owner = ?1)
-                 ORDER BY d.created_at DESC, d.id DESC LIMIT ?2",
+                   AND (d.revoked_at IS NULL OR d.revoked_at > ?3)
+                 ORDER BY d.revoked_at IS NULL DESC, d.created_at DESC, d.id DESC LIMIT ?2",
             )?
-            .query_map(params![owner, MAX_DEVICES], |row| {
+            .query_map(params![owner, MAX_DEVICES, now - REFUSAL_SECONDS], |row| {
                 Ok(Device {
                     id: row.get(0)?,
                     name: row.get(1)?,

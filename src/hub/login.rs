@@ -395,6 +395,8 @@ pub(super) struct Human {
     admin: bool,
     forge_token: String,
     expires_at: i64,
+    /// The computer signed in by the same sign-in; revoking it ends this session too.
+    device: Option<String>,
 }
 
 #[derive(Clone)]
@@ -411,6 +413,8 @@ struct Pending {
     device: Table<DeviceLogin>,
     handoffs: Table<Handoff>,
     sessions: Table<Human>,
+    /// Providers whose forge app refused device sign-in when last asked.
+    no_device: std::collections::BTreeSet<String>,
 }
 
 pub struct Login {
@@ -488,6 +492,15 @@ impl Login {
 
     fn session(&self, digest: &str) -> Option<Human> {
         self.pending().sessions.get(digest, unix_now()).cloned()
+    }
+
+    /// Ends the sessions of the sign-in that signed in `device`, so a revoked computer's saved
+    /// session cannot enroll it again.
+    fn drop_sessions_of_device(&self, device: &str) {
+        self.pending()
+            .sessions
+            .0
+            .retain(|_, (_, human)| human.device.as_deref() != Some(device));
     }
 
     fn drop_sessions_of(&self, user: &str) {
@@ -640,7 +653,9 @@ fn client_ip(peer: Option<Extension<ConnectInfo<SocketAddr>>>, headers: &HeaderM
 }
 
 fn too_many() -> ApiError {
-    ApiError::new(StatusCode::TOO_MANY_REQUESTS, "too_many_logins")
+    ApiError::new(StatusCode::TOO_MANY_REQUESTS, "too_many_logins").with_message(
+        "Too many sign-ins are waiting from this address; finish one, or wait 10 minutes and try again",
+    )
 }
 
 async fn browser_start(
@@ -744,6 +759,24 @@ async fn callback(
     response
 }
 
+/// A browser sign-in that fails lands on the Hub page that says why, with the reason and the
+/// message; a workspace sign-in keeps its JSON error.
+fn refused_page(pending: &BrowserLogin, error: ApiError) -> ApiResult<Response> {
+    if pending.workspace {
+        return Err(error);
+    }
+    let mut query = Url::parse("http://page.invalid/").map_err(|_| ApiError::invalid())?;
+    query
+        .query_pairs_mut()
+        .append_pair("status", "refused")
+        .append_pair("reason", error.code());
+    if let Some(message) = error.message() {
+        query.query_pairs_mut().append_pair("message", message);
+    }
+    let location = format!("/ui/#/signed-in?{}", query.query().unwrap_or_default());
+    found(&location, cookie_attributes("", 0))
+}
+
 async fn callback_inner(
     state: &HubState,
     name: &str,
@@ -751,20 +784,26 @@ async fn callback_inner(
     params: HashMap<String, String>,
 ) -> ApiResult<Response> {
     let (provider, forge) = state.login.provider(name).ok_or_else(not_found)?;
-    let csrf = params.get("state").ok_or_else(failed)?;
+    let csrf = params.get("state").ok_or_else(expired_link)?;
     // Single use: the entry goes on any attempt.
     let pending = state.login.pending().browser.take(csrf, unix_now());
     let pending = pending
         .filter(|p| p.provider == name && cookie_matches(headers, csrf))
-        .ok_or_else(failed)?;
+        .ok_or_else(expired_link)?;
+    let refuse = |error: ApiError| refused_page(&pending, error);
     if let Some(error) = params.get("error") {
-        return Err(if error == "access_denied" {
-            ApiError::new(StatusCode::FORBIDDEN, "login_denied")
+        return refuse(if error == "access_denied" {
+            ApiError::new(StatusCode::FORBIDDEN, "login_denied").with_message(format!(
+                "The sign-in was cancelled on {}; start again and choose Authorize",
+                forge_name(name)
+            ))
         } else {
-            failed()
+            forge_stopped(name, "stopped the sign-in", &json!({"error": error}))
         });
     }
-    let code = params.get("code").ok_or_else(failed)?;
+    let Some(code) = params.get("code") else {
+        return refuse(forge_stopped(name, "sent no sign-in code", &Value::Null));
+    };
     let redirect = state.login.redirect_uri(name);
     let mut form = vec![
         ("client_id", provider.client_id.as_str()),
@@ -776,9 +815,15 @@ async fn callback_inner(
     if provider.is_gitlab() {
         form.push(("grant_type", "authorization_code"));
     }
-    let (_, body) = forge.post_form(&provider.token_url(), &form).await?;
+    let (_, body) = match forge.post_form(&provider.token_url(), &form).await {
+        Ok(reply) => reply,
+        Err(_) => {
+            return refuse(forge_stopped(name, "could not be reached", &Value::Null));
+        }
+    };
     if !body["access_token"].is_string() {
         log_forge_error("code exchange failed", &body);
+        return refuse(forge_stopped(name, "didn't accept the sign-in code", &body));
     }
     let method = if pending.workspace {
         "workspace"
@@ -787,14 +832,7 @@ async fn callback_inner(
     };
     let signed = match sign_in(state, provider, forge, method, &body).await {
         Ok(signed) => signed,
-        // The person reads why in the Hub page, not as a JSON error.
-        Err(error)
-            if !pending.workspace && matches!(error.code(), "not_allowed" | "user_disabled") =>
-        {
-            let location = format!("/ui/#/signed-in?status=refused&reason={}", error.code());
-            return found(&location, cookie_attributes("", 0));
-        }
-        Err(error) => return Err(error),
+        Err(error) => return refuse(error),
     };
     if pending.workspace {
         // The browser receives a separate short-lived HttpOnly cookie, never the
@@ -837,18 +875,51 @@ async fn callback_inner(
     found(&location, cookie_attributes("", 0))
 }
 
-/// Logs the forge's `error` code only: its description or body may echo secrets.
-fn log_forge_error(context: &str, body: &Value) {
-    let code = body["error"].as_str().filter(|code| {
+/// The forge's `error` code when it is a short plain word: its description or body may echo
+/// secrets, so nothing else of a forge error is logged or shown.
+fn safe_forge_error(body: &Value) -> Option<&str> {
+    body["error"].as_str().filter(|code| {
         code.len() <= 64
             && code
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    });
-    if let Some(code) = code {
+    })
+}
+
+fn log_forge_error(context: &str, body: &Value) {
+    if let Some(code) = safe_forge_error(body) {
         eprintln!("hub: {context}: forge error {code}");
     }
 }
+
+/// The forge's display name for a provider name.
+fn forge_name(provider: &str) -> &'static str {
+    if provider == "gitlab" {
+        "GitLab"
+    } else {
+        "GitHub"
+    }
+}
+
+/// "start signing in again", naming what the forge said when it gave a plain code.
+fn forge_stopped(provider: &str, what: &str, body: &Value) -> ApiError {
+    let code = safe_forge_error(body).map_or_else(String::new, |code| format!(" ({code})"));
+    failed().with_message(format!(
+        "{} {what}{code}; start signing in again",
+        forge_name(provider)
+    ))
+}
+
+fn expired_link() -> ApiError {
+    failed().with_message(
+        "This sign-in link expired or was opened in another browser; start signing in again",
+    )
+}
+
+pub(super) const NOT_ALLOWED: &str =
+    "This Hub only lets in people its admins have allowed; ask a Hub admin to add you";
+pub(super) const DISABLED: &str =
+    "Your account is turned off on this Hub; ask a Hub admin to turn it back on";
 
 /// A public repository (the reply says `private: false`) lets in only people who can write
 /// to it, since anyone can read it; a private one needs only the read the reply already proves.
@@ -859,7 +930,15 @@ fn missing_role(
     provider: &Provider,
     reply: &Value,
 ) -> Option<(&'static str, &'static str, &'static str)> {
-    if provider.is_gitlab() {
+    missing_role_on(provider.is_gitlab(), reply)
+}
+
+/// [`missing_role`] by forge: GitLab when `gitlab`, else GitHub.
+fn missing_role_on(
+    gitlab: bool,
+    reply: &Value,
+) -> Option<(&'static str, &'static str, &'static str)> {
+    if gitlab {
         let level = |scope: &str| reply["permissions"][scope]["access_level"].as_i64();
         let (visibility, needs, needed) = match reply["visibility"].as_str() {
             Some("private") => ("private", "reporter", GITLAB_REPORTER),
@@ -883,6 +962,26 @@ fn missing_role(
         .iter()
         .any(|level| reply["permissions"][level] == json!(true));
     (reply["private"] == json!(false) && !writes).then_some(("public", "read", "triage"))
+}
+
+/// The 403 for a role that is missing or too low; names the one fix, so clients can say who
+/// needs which role where.
+fn insufficient_role(
+    login: &str,
+    repository: &str,
+    (visibility, has, needs): (&str, &str, &str),
+) -> ApiError {
+    ApiError::new(StatusCode::FORBIDDEN, "insufficient_role")
+        .with_message(format!(
+            "{login} has {} on {visibility} repository {repository}; ask a repository owner for {} or higher",
+            role_name(has),
+            role_name(needs)
+        ))
+        .with_field("login", json!(login))
+        .with_field("repository", json!(repository))
+        .with_field("visibility", json!(visibility))
+        .with_field("has", json!(has))
+        .with_field("needs", json!(needs))
 }
 
 fn role_name(role: &str) -> &'static str {
@@ -939,10 +1038,12 @@ async fn sign_in(
     let token = grant["access_token"]
         .as_str()
         .filter(|token| !token.is_empty())
-        .ok_or_else(failed)?;
+        .ok_or_else(|| forge_stopped(provider.name, "didn't accept the sign-in", grant))?;
+    let no_account = || forge_stopped(provider.name, "didn't return your account", &Value::Null);
     let (status, body) = forge
         .get_json(&format!("{}/user", provider.api), Some(token))
-        .await?;
+        .await
+        .map_err(|_| no_account())?;
     let login_field = if provider.is_gitlab() {
         "username"
     } else {
@@ -950,7 +1051,7 @@ async fn sign_in(
     };
     let (id, login) = match (body["id"].as_i64(), body[login_field].as_str()) {
         (Some(id), Some(login)) if status == 200 && id > 0 => (id, login.to_owned()),
-        _ => return Err(failed()),
+        _ => return Err(no_account()),
     };
     let identity = ForgeIdentity {
         provider: provider.name.into(),
@@ -973,16 +1074,22 @@ async fn sign_in(
         let candidate = identity.clone();
         if !blocking(state, move || workspace.allows_sign_in(&candidate)).await? {
             refuse("not_allowed").await;
-            return Err(ApiError::new(StatusCode::FORBIDDEN, "not_allowed"));
+            return Err(
+                ApiError::new(StatusCode::FORBIDDEN, "not_allowed").with_message(NOT_ALLOWED)
+            );
         }
     } else if !admin {
         if state.login.has_allow_list() && !state.login.is_allowed(provider.name, id, &login) {
             refuse("not_allowed").await;
-            return Err(ApiError::new(StatusCode::FORBIDDEN, "not_allowed"));
+            return Err(
+                ApiError::new(StatusCode::FORBIDDEN, "not_allowed").with_message(NOT_ALLOWED)
+            );
         }
         if !reads_connected(state, provider, forge, token).await? {
             refuse("no_repository_role").await;
-            return Err(ApiError::new(StatusCode::FORBIDDEN, "not_allowed"));
+            return Err(ApiError::new(StatusCode::FORBIDDEN, "not_allowed").with_message(format!(
+                "{login} has no role on a repository connected to this Hub; ask a repository owner to add you, then sign in again"
+            )));
         }
     }
     let store = state.store.clone();
@@ -1004,7 +1111,7 @@ async fn sign_in(
     .await?;
     if user.disabled {
         refuse("user_disabled").await;
-        return Err(ApiError::new(StatusCode::FORBIDDEN, "user_disabled"));
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "user_disabled").with_message(DISABLED));
     }
     let now = unix_now();
     let lifetime = grant["expires_in"]
@@ -1019,6 +1126,7 @@ async fn sign_in(
         admin,
         forge_token: token.to_owned(),
         expires_at,
+        device: None,
     };
     state
         .login
@@ -1051,7 +1159,11 @@ async fn exchange(
     let signed = handoff
         .filter(|h| body.verifier.len() <= 128 && pkce_challenge(&body.verifier) == h.challenge)
         .map(|h| h.signed)
-        .ok_or_else(failed)?;
+        .ok_or_else(|| {
+            failed().with_message(
+                "The sign-in finished, but its code expired before AgentSCM could use it; sign in again",
+            )
+        })?;
     Ok(Json(signed_reply(&state, &signed, body.device).await?))
 }
 
@@ -1063,7 +1175,12 @@ async fn signed_reply(
 ) -> ApiResult<Value> {
     let mut out = signed.json();
     if let Some(device) = device {
-        out["device"] = devices::issue(state, &signed.user, device).await?;
+        let issued = devices::issue(state, &signed.user, device).await?;
+        let key = session_digest(&signed.secret)?;
+        if let Some((_, human)) = state.login.pending().sessions.0.get_mut(&key) {
+            human.device = issued["id"].as_str().map(str::to_owned);
+        }
+        out["device"] = issued;
     }
     Ok(out)
 }
@@ -1085,7 +1202,13 @@ async fn device_start(
     {
         return Err(too_many());
     }
-    let unavailable = || ApiError::new(StatusCode::CONFLICT, "device_flow_unavailable");
+    let unavailable = || {
+        state.login.pending().no_device.insert(name.clone());
+        ApiError::new(StatusCode::CONFLICT, "device_flow_unavailable").with_message(format!(
+            "This Hub's {} app doesn't allow device sign-in; sign in through the browser instead",
+            forge_name(&name)
+        ))
+    };
     let (url, scope) = if provider.is_gitlab() {
         (
             format!("{}/oauth/authorize_device", provider.web),
@@ -1118,6 +1241,7 @@ async fn device_start(
         .filter(|s| (1..=60).contains(s))
         .unwrap_or(5);
     let (handle, now) = (random_hex()?, unix_now());
+    state.login.pending().no_device.remove(&name);
     let login = DeviceLogin {
         client,
         provider: name,
@@ -1153,7 +1277,9 @@ async fn device_poll(
         let device = pending
             .device
             .get(&body.handle, unix_now())
-            .ok_or_else(failed)?;
+            .ok_or_else(|| {
+                failed().with_message("This sign-in code expired; start signing in again")
+            })?;
         (
             device.provider.clone(),
             device.device_code.clone(),
@@ -1202,14 +1328,16 @@ async fn device_poll(
         _ => {
             log_forge_error("device poll failed", &reply);
             remove();
-            return Err(failed());
+            return Err(forge_stopped(&name, "stopped the device sign-in", &reply));
         }
     }))
 }
 
-/// The sign-in providers, so `hub login` can pick the only one.
+/// The sign-in providers, so `hub login` can pick the only one, and those whose forge app was
+/// seen refusing device sign-in, so clients go straight to the browser.
 async fn providers(State(state): State<HubState>) -> Json<Value> {
-    Json(json!({"providers": state.login.enabled()}))
+    let browser_only: Vec<String> = state.login.pending().no_device.iter().cloned().collect();
+    Json(json!({"providers": state.login.enabled(), "browser_only": browser_only}))
 }
 
 async fn session(HumanSession(human): HumanSession) -> Json<Value> {
@@ -1268,20 +1396,14 @@ async fn create_token(
     if status == 200
         && let Some((visibility, has, needs)) = missing_role(provider, &reply)
     {
-        // Names the one fix, so clients can say who needs which role where.
         let repository = canonical
             .filter(|name| validate_repository(name).is_ok())
             .unwrap_or(&body.repository);
-        let message = format!(
-            "{} has {} on {visibility} repository {repository}; ask a repository owner for {} or higher",
-            human.user.login,
-            role_name(has),
-            role_name(needs)
-        );
-        let refusal = json!({"error": "insufficient_role", "login": human.user.login,
-            "repository": repository, "visibility": visibility, "has": has, "needs": needs,
-            "message": message});
-        return Ok((StatusCode::FORBIDDEN, Json(refusal)).into_response());
+        return Err(insufficient_role(
+            &human.user.login,
+            repository,
+            (visibility, has, needs),
+        ));
     }
     let (repository_id, repository) = match (status, reply["id"].as_i64(), canonical) {
         (200, Some(id), Some(name)) if id > 0 && validate_repository(name).is_ok() => {
@@ -1466,6 +1588,7 @@ mod tests {
             admin: false,
             forge_token: String::new(),
             expires_at: 0,
+            device: None,
         }
     }
 

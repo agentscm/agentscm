@@ -4710,10 +4710,12 @@ impl Store for PgStore {
             if inserted == 0 {
                 return Err(HubError::Invalid("unknown or disabled owner".into()));
             }
-            append(&mut tx, &Event::device_created(&id, owner, name)?)?;
+            // The old computer goes first, so its row lock precedes the event lock, as a
+            // concurrent mint through it takes them.
             if let Some(old) = replaces {
                 revoke_device_in(&mut tx, old, Some(owner), owner, now)?;
             }
+            append(&mut tx, &Event::device_created(&id, owner, name)?)?;
             tx.commit()?;
             Ok(id.clone())
         })
@@ -4776,8 +4778,9 @@ impl Store for PgStore {
                             ORDER BY t.repository), '{}')
                  FROM hub_devices d JOIN hub_users u ON u.id = d.owner
                  WHERE ($1::text IS NULL OR d.owner = $1)
-                 ORDER BY d.created_at DESC, d.id DESC LIMIT $2",
-                &[&owner, &MAX_DEVICES, &now],
+                   AND (d.revoked_at IS NULL OR d.revoked_at > $4)
+                 ORDER BY d.revoked_at IS NULL DESC, d.created_at DESC, d.id DESC LIMIT $2",
+                &[&owner, &MAX_DEVICES, &now, &(now - REFUSAL_SECONDS)],
             )?;
             Ok(rows
                 .iter()

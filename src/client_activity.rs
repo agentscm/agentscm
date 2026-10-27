@@ -127,10 +127,94 @@ pub(crate) struct UnconnectedCheckout {
 pub(crate) struct ActivityStore {
     rows: std::collections::VecDeque<ActivityObservation>,
     unconnected: Vec<UnconnectedCheckout>,
+    /// Where unconnected sightings are kept across tray restarts, when set.
+    saved_at: Option<PathBuf>,
+}
+
+/// One unconnected sighting as the tray keeps it on disk, by wall-clock time.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+#[cfg(any(target_os = "macos", test))]
+struct SavedUnconnected {
+    root: String,
+    host: String,
+    repo: String,
+    agents: Vec<String>,
+    seen_unix: i64,
 }
 
 #[cfg(any(target_os = "macos", test))]
 impl ActivityStore {
+    /// A store whose unconnected sightings are read from and written to `path` (owner-only), so
+    /// a tray restart keeps them. A missing or unreadable file starts empty.
+    pub(crate) fn saved_at(path: PathBuf) -> Self {
+        let mut store = Self {
+            saved_at: Some(path),
+            ..Self::default()
+        };
+        store.unconnected = store.load_unconnected();
+        store
+    }
+
+    fn load_unconnected(&self) -> Vec<UnconnectedCheckout> {
+        use std::io::Read;
+        let Some(path) = &self.saved_at else {
+            return Vec::new();
+        };
+        let mut text = String::new();
+        let read = std::fs::File::open(path)
+            .and_then(|file| file.take(64 * 1024).read_to_string(&mut text));
+        let saved: Vec<SavedUnconnected> = match read {
+            Ok(_) => serde_json::from_str(&text).unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        let (now, unix_now) = (std::time::Instant::now(), agentscm::hub::store::unix_now());
+        saved
+            .into_iter()
+            .filter(|row| {
+                valid_unconnected(&row.root, &row.host, &row.repo, "claude")
+                    && !row.agents.is_empty()
+                    && row.agents.iter().all(|agent| valid_agent(Some(agent)))
+            })
+            .filter_map(|row| {
+                let age = u64::try_from(unix_now.saturating_sub(row.seen_unix)).ok()?;
+                let age = std::time::Duration::from_secs(age);
+                (age <= UNCONNECTED_STALE_AFTER).then(|| UnconnectedCheckout {
+                    root: PathBuf::from(row.root),
+                    host: row.host,
+                    repo: row.repo,
+                    agents: row.agents,
+                    seen_at: now.checked_sub(age).unwrap_or(now),
+                })
+            })
+            .take(MAX_UNCONNECTED)
+            .collect()
+    }
+
+    fn save_unconnected(&self) {
+        let Some(path) = &self.saved_at else {
+            return;
+        };
+        let (now, unix_now) = (std::time::Instant::now(), agentscm::hub::store::unix_now());
+        let rows: Vec<_> = self
+            .unconnected
+            .iter()
+            .filter_map(|row| {
+                Some(SavedUnconnected {
+                    root: row.root.to_str()?.to_owned(),
+                    host: row.host.clone(),
+                    repo: row.repo.clone(),
+                    agents: row.agents.clone(),
+                    seen_unix: unix_now
+                        - now.saturating_duration_since(row.seen_at).as_secs() as i64,
+                })
+            })
+            .collect();
+        if let Ok(text) = serde_json::to_string(&rows) {
+            let _ = crate::hub_cli::write_private(path, &text);
+        }
+    }
+
     fn push(&mut self, observation: ActivityObservation) {
         if self.rows.len() == MAX_ROWS {
             self.rows.pop_front();
@@ -165,6 +249,7 @@ impl ActivityStore {
             row.host = seen.host;
             row.repo = seen.repo;
             row.seen_at = seen.seen_at;
+            self.save_unconnected();
             return;
         }
         if self.unconnected.len() == MAX_UNCONNECTED
@@ -174,12 +259,14 @@ impl ActivityStore {
             self.unconnected.swap_remove(oldest);
         }
         self.unconnected.push(seen);
+        self.save_unconnected();
     }
 
     /// Drop the sighting of a checkout that is now connected. Removing that connection later
     /// lists it again only after an agent is seen there again.
     pub(crate) fn forget_unconnected(&mut self, root: &Path) {
         self.unconnected.retain(|row| row.root != root);
+        self.save_unconnected();
     }
 
     /// Fresh unconnected checkouts, most recently seen first.
@@ -195,10 +282,11 @@ impl ActivityStore {
     }
 
     /// Discard observations after a suspend/wake or wall-clock discontinuity detected by the tray.
+    /// Saved sightings are timed by the wall clock, so they are read back rather than lost.
     #[cfg(target_os = "macos")]
     pub(crate) fn clear(&mut self) {
         self.rows.clear();
-        self.unconnected.clear();
+        self.unconnected = self.load_unconnected();
     }
 }
 
@@ -644,6 +732,43 @@ mod tests {
     /// An absolute root on every platform: `/synthetic/x` has no drive and is relative on Windows.
     fn absolute(name: &str) -> String {
         std::env::temp_dir().join(name).to_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn unconnected_sightings_survive_a_restart_and_old_ones_do_not() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("unconnected.json");
+        let now = std::time::Instant::now();
+        let mut store = ActivityStore::saved_at(path.clone());
+        let (widgets, gadgets) = (absolute("widgets"), absolute("gadgets"));
+        store.push_unconnected(seen(&widgets, "claude", now));
+        store.push_unconnected(seen(&gadgets, "codex", now));
+        store.forget_unconnected(Path::new(&gadgets));
+        let restarted = ActivityStore::saved_at(path.clone());
+        let rows = restarted.unconnected(std::time::Instant::now());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].root, PathBuf::from(&widgets));
+        assert_eq!(rows[0].agents, ["claude"]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        // An hour-old sighting, or an invalid one, is not brought back.
+        std::fs::write(
+            &path,
+            serde_json::json!([{"root": absolute("old"), "host": "github.com", "repo": "acme/old",
+                "agents": ["claude"], "seen_unix": agentscm::hub::store::unix_now() - 3601},
+                {"root": "relative", "host": "github.com", "repo": "acme/bad",
+                "agents": ["claude"], "seen_unix": agentscm::hub::store::unix_now()}])
+            .to_string(),
+        )
+        .unwrap();
+        assert!(
+            ActivityStore::saved_at(path)
+                .unconnected(std::time::Instant::now())
+                .is_empty()
+        );
     }
 
     #[test]

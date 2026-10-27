@@ -122,6 +122,7 @@ impl PreparedOpen {
 /// Mint and verify a short-lived browser token for the selected checkout.
 pub(super) async fn prepare_open(request: OpenRequest) -> Result<PreparedOpen, OpenError> {
     validate_current(&request)?;
+    crate::client_cli::enroll(&request.hub).await;
     let (hub, human_session) = load_exact_session(&request.hub)?;
     let client = forge_http::client().map_err(|_| OpenError::Unavailable)?;
     let minted = mint_and_confirm(

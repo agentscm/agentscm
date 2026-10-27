@@ -27,6 +27,8 @@ const HUB_BOT: i64 = 100;
 const ALICE: i64 = 7;
 const BOB: i64 = 8;
 const ADMIN: i64 = 9;
+/// An Enterprise Managed User, whose login has an underscore.
+const EMU: i64 = 11;
 const REPO: &str = "acme/widgets";
 const REPO_ID: i64 = 4242;
 
@@ -44,6 +46,8 @@ struct Fake {
     levels: HashMap<(i64, i64), i64>,
     /// When false, the Hub's credential cannot read roles (403).
     hub_reads_roles: bool,
+    /// A fork's name to the repository it was forked from.
+    forks: HashMap<String, String>,
     role_reads: u32,
 }
 
@@ -94,6 +98,13 @@ fn github_repo(fake: &Shared, headers: &HeaderMap, name: String) -> Response {
     let Some(who) = caller(&fake, headers) else {
         return status(StatusCode::UNAUTHORIZED);
     };
+    if let Some(parent) = fake.forks.get(&name) {
+        return Json(
+            json!({"id": 1, "full_name": name, "private": false, "fork": true,
+            "parent": {"full_name": parent}}),
+        )
+        .into_response();
+    }
     let Some(&(id, visibility)) = fake.repos.get(&name) else {
         return status(StatusCode::NOT_FOUND);
     };
@@ -176,6 +187,7 @@ async fn start_fake() -> (Shared, String) {
             (ALICE, "alice".into()),
             (BOB, "bob".into()),
             (ADMIN, "admin".into()),
+            (EMU, "carol_acme".into()),
             (HUB_BOT, "hubbot".into()),
         ]),
         tokens: HashMap::from([(HUB_TOKEN.into(), HUB_BOT)]),
@@ -468,7 +480,7 @@ async fn renewal_rechecks_the_role(provider: &'static str) {
     let (status, refused) = env.mint(&device, Some(&second_id)).await;
     assert_eq!(
         (status, refused["error"].as_str()),
-        (403, Some("no_repository_role"))
+        (403, Some("insufficient_role"))
     );
     assert_eq!(env.whoami(&second_secret).await, 200);
 
@@ -478,7 +490,7 @@ async fn renewal_rechecks_the_role(provider: &'static str) {
     let (status, refused) = env.mint(&device, None).await;
     assert_eq!(
         (status, refused["error"].as_str()),
-        (403, Some("no_repository_role"))
+        (403, Some("insufficient_role"))
     );
     env.role(ALICE, "read", "triage", 30);
     assert_eq!(env.mint(&device, None).await.0, 201);
@@ -500,7 +512,7 @@ async fn renewal_rechecks_the_role(provider: &'static str) {
         ),
         (
             &json!("alice"),
-            &json!("no_repository_role"),
+            &json!("insufficient_role"),
             &json!(2),
             &json!("device_mint")
         )
@@ -863,6 +875,8 @@ impl Machine {
         command
             .args(args)
             .env("XDG_CONFIG_HOME", self.config.path())
+            // Tests never open a real browser: sign-in uses the code flow, or prints its URL.
+            .env("AGENTSCM_NO_BROWSER", "1")
             .env("HOME", self.home.path())
             .env("NO_PROXY", "127.0.0.1")
             .env_remove("AGENTSCM_HUB_URL")
@@ -924,6 +938,30 @@ impl Machine {
         std::fs::read_to_string(path).unwrap().trim().to_owned()
     }
 
+    fn mcp(&self) -> Mcp {
+        let root = self.root();
+        let mut child = self
+            .command(&[
+                "--no-telemetry",
+                "client",
+                "mcp",
+                "--root",
+                root.to_str().unwrap(),
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        Mcp {
+            child,
+            stdin,
+            stdout,
+            next: 0,
+        }
+    }
+
     fn renew(&self) -> Value {
         let root = self.root();
         let (ok, stdout, stderr) = self.run(&[
@@ -935,6 +973,34 @@ impl Machine {
         ]);
         assert!(ok, "{stderr}");
         serde_json::from_str(stdout.lines().last().unwrap()).unwrap()
+    }
+}
+
+/// A running `client mcp` server.
+struct Mcp {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+    next: u32,
+}
+
+impl Mcp {
+    /// One `tools/list` request; the reply line.
+    fn tools_list(&mut self) -> String {
+        use std::io::{BufRead, Write};
+        self.next += 1;
+        let request = json!({"jsonrpc": "2.0", "id": self.next, "method": "tools/list"});
+        writeln!(self.stdin, "{request}").unwrap();
+        let mut line = String::new();
+        self.stdout.read_line(&mut line).unwrap();
+        line
+    }
+}
+
+impl Drop for Mcp {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -982,10 +1048,34 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
     let first = machine.token();
     assert_eq!(env.whoami(&first).await, 200);
 
-    // Renewal swaps the token before it ends and revokes the old one.
+    // Who this computer is, and a connection check that needs no running agent.
+    let (ok, whoami, stderr) = machine.run(&["hub", "whoami"]);
+    assert!(ok, "{stderr}");
+    assert!(whoami.contains("login: alice"), "{whoami}");
+    assert!(whoami.contains("auto-connect on"), "{whoami}");
+    assert!(whoami.contains(REPO), "{whoami}");
+    let root = machine.root();
+    let (ok, doctor, stderr) = machine.run(&[
+        "--no-telemetry",
+        "client",
+        "doctor",
+        "--agent",
+        "claude",
+        "--root",
+        root.to_str().unwrap(),
+    ]);
+    assert!(ok, "{stderr}");
+    assert!(doctor.contains("Connection verified"), "{doctor}");
+
+    // Renewal swaps the token before it ends and revokes the old one; a running MCP server
+    // keeps working across it.
+    let mut mcp = machine.mcp();
+    assert!(mcp.tools_list().contains("\"result\""));
     assert_eq!(machine.renew()["result"], "not_due");
     machine.age_token();
     assert_eq!(machine.renew()["result"], "renewed");
+    let after = mcp.tools_list();
+    assert!(after.contains("\"result\""), "{after}");
     let second = machine.token();
     assert_ne!(first, second);
     assert_eq!(env.whoami(&first).await, 401);
@@ -1000,11 +1090,11 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
         refused["message"]
             .as_str()
             .unwrap()
-            .contains("isn't enough")
+            .contains("ask a repository owner for")
     );
     let reply = machine.session_start("s2");
     assert!(
-        context(&reply).starts_with("AgentSCM: your forge role"),
+        context(&reply).starts_with("AgentSCM: alice has no access on private repository"),
         "{reply}"
     );
 
@@ -1021,7 +1111,12 @@ async fn an_agent_connects_itself_renews_and_stops_when_access_ends() {
     );
     let refused = machine.renew();
     assert_eq!(refused["result"], "refused", "{refused}");
-    assert!(refused["message"].as_str().unwrap().contains("signed out"));
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap()
+            .contains("isn't signed in to this Hub any more")
+    );
     assert!(
         machine.file("hub-sessions.json")["sessions"][0]
             .get("device")
@@ -1044,7 +1139,10 @@ async fn auto_connect_is_refused_without_the_role_and_skips_unconnected_reposito
     machine.run(&["hub", "auto-connect", "on"]);
     // bob only reads a public repository: refused, with the reason, and nothing saved.
     let reply = machine.session_start("s1");
-    assert!(context(&reply).contains("isn't enough"), "{reply}");
+    assert!(
+        context(&reply).contains("bob has Read on public repository acme/widgets"),
+        "{reply}"
+    );
     assert!(
         !machine
             .config
@@ -1064,4 +1162,200 @@ async fn auto_connect_is_refused_without_the_role_and_skips_unconnected_reposito
         .unwrap();
     let result: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["result"], "not_connected", "{result}");
+}
+
+#[tokio::test]
+async fn refusals_explain_themselves_and_name_a_connected_upstream() {
+    let env = Env::start("github").await;
+    env.role(EMU, "write", "write", 30);
+    let (_, device, _) = env.sign_in(EMU, "carol's").await;
+    // An Enterprise Managed User login (with `_`) is checked like any other.
+    assert_eq!(env.mint(&device, None).await.0, 201);
+    // A fork of a connected repository is not connected, and the refusal names the upstream.
+    env.fake
+        .lock()
+        .unwrap()
+        .forks
+        .insert("carol_acme/widgets".into(), REPO.into());
+    let (status, refused) = env
+        .mint_at(
+            &env.hub,
+            &device,
+            json!({"name": "client-laptop", "repository": "carol_acme/widgets"}),
+        )
+        .await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("not_connected"))
+    );
+    assert_eq!(refused["fork_of"], REPO);
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("fork of {REPO}")),
+        "{refused}"
+    );
+    // A plain unconnected repository says so, with its fix.
+    let (_, refused) = env
+        .mint_at(
+            &env.hub,
+            &device,
+            json!({"name": "client-laptop", "repository": "acme/unknown"}),
+        )
+        .await;
+    assert_eq!(
+        refused["message"],
+        "acme/unknown isn't connected to this Hub yet; ask a Hub admin to connect it"
+    );
+    // A too-low role uses the same refusal as session minting, with its fields.
+    env.role(EMU, "read", "read", 20);
+    env.set_repo(REPO, REPO_ID, "public");
+    let (status, refused) = env.mint(&device, None).await;
+    assert_eq!(status, 403);
+    assert_eq!(
+        (
+            &refused["error"],
+            &refused["has"],
+            &refused["needs"],
+            &refused["visibility"]
+        ),
+        (
+            &json!("insufficient_role"),
+            &json!("read"),
+            &json!("triage"),
+            &json!("public")
+        )
+    );
+    assert_eq!(
+        refused["message"],
+        format!(
+            "carol_acme has Read on public repository {REPO}; ask a repository owner for Triage or higher"
+        )
+    );
+    // A failed sign-in step says which one.
+    let (status, failed) = env
+        .call(
+            &env.hub,
+            Method::POST,
+            "/v1/hub/login/device/poll",
+            None,
+            Some(json!({"handle": "0".repeat(64)})),
+        )
+        .await;
+    assert_eq!(status, 400);
+    assert_eq!(
+        failed["message"],
+        "This sign-in code expired; start signing in again"
+    );
+}
+
+#[tokio::test]
+async fn a_revoked_computer_cannot_be_enrolled_again_from_its_session() {
+    let env = Env::start("github").await;
+    let (session, device, id) = env.sign_in(ALICE, "laptop").await;
+    // The session that came with a computer cannot add another.
+    let (status, refused) = env
+        .call(
+            &env.hub,
+            Method::POST,
+            "/v1/hub/devices",
+            Some(&session),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(
+        (status, refused["error"].as_str()),
+        (403, Some("device_revoked"))
+    );
+    // Revoking the computer ends that session too.
+    assert_eq!(
+        env.delete(&format!("/v1/hub/devices/{id}"), &session).await,
+        204
+    );
+    assert_eq!(env.get("/v1/hub/session", &session).await.0, 401);
+    assert_eq!(env.get("/v1/hub/device", &device).await.0, 401);
+    // Live computers are listed before revoked ones.
+    let (_, _, live) = env.sign_in(ALICE, "desktop").await;
+    let (_, list) = env
+        .get(
+            "/v1/hub/admin/devices",
+            &env.sign_in(ADMIN, "admin's").await.0,
+        )
+        .await;
+    let alice: Vec<_> = list["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["owner"]["login"] == json!("alice"))
+        .map(|d| d["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(alice, [live, id]);
+}
+
+#[tokio::test]
+async fn the_login_reports_the_browser_only_providers() {
+    let env = Env::start("github").await;
+    let (status, providers) = env
+        .call(&env.hub, Method::GET, "/v1/hub/login", None, None)
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(providers["browser_only"], json!([]));
+}
+
+/// A Hub from before computer credentials: its sign-in refuses an unknown `device` field.
+async fn older_hub() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new()
+        .route(
+            "/v1/hub/login/github/device",
+            post(|| async {
+                Json(
+                    json!({"handle": "h", "user_code": "ABCD", "verification_uri":
+                    "http://127.0.0.1/device", "interval": 1, "expires_in": 60}),
+                )
+            }),
+        )
+        .route(
+            "/v1/hub/login/device/poll",
+            post(|Json(body): Json<Value>| async move {
+                if body.get("device").is_some() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error": "invalid_request"})),
+                    );
+                }
+                (
+                    StatusCode::OK,
+                    Json(json!({"status": "signed_in", "session": "s".repeat(64),
+                        "expires_at": unix_now() + 3600,
+                        "user": {"provider": "github", "login": "alice"}})),
+                )
+            }),
+        )
+        .route(
+            "/v1/hub/login",
+            get(|| async { Json(json!({"providers": ["github"]})) }),
+        );
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    url
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_client_still_signs_in_to_an_older_hub() {
+    let hub = older_hub().await;
+    let machine = Machine::new(REPO);
+    let (ok, _, stderr) = machine.run(&[
+        "hub",
+        "login",
+        "--hub",
+        &hub,
+        "--provider",
+        "github",
+        "--device",
+    ]);
+    assert!(ok, "{stderr}");
+    let saved = machine.file("hub-sessions.json");
+    assert!(saved["sessions"][0].get("device").is_none(), "{saved}");
 }

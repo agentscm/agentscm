@@ -21,7 +21,7 @@ use crate::hub_cli::{HubAuth, Provider, call, has_session, load_session, map_hub
 mod computer;
 use crate::intent_cli::valid_repo;
 use crate::prompt::Ui;
-pub(crate) use computer::{attention, auto_connect_command, due, renew_command};
+pub(crate) use computer::{attention, auto_connect_command, due, enroll, renew_command};
 
 const TOKEN_BYTES: u64 = 16 * 1024;
 /// Hub maximum, for a token minted with a session (no computer credential, or an older Hub).
@@ -101,6 +101,18 @@ pub(crate) struct ConnectArgs {
     /// Auto-connect from a hook: only this computer's credential, no sign-in, nothing printed.
     #[arg(skip)]
     pub(crate) auto: bool,
+    /// A token auto-connect already minted, so connect uses it instead of minting.
+    #[arg(skip)]
+    pub(crate) minted: Option<Preminted>,
+}
+
+/// A minted token handed to connect; its secret never reaches Debug output.
+pub(crate) struct Preminted(Minted);
+
+impl std::fmt::Debug for Preminted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Preminted({})", self.0.id)
+    }
 }
 
 #[cfg(unix)]
@@ -161,6 +173,12 @@ pub(crate) struct RemoveArgs {
 }
 
 pub(crate) async fn run(command: ClientCommand) -> Result<()> {
+    if !matches!(
+        command,
+        ClientCommand::Mcp(_) | ClientCommand::Renew(_) | ClientCommand::AutoConnect(_)
+    ) {
+        crate::hub_cli::ask_auto_connect_unasked();
+    }
     match command {
         ClientCommand::Connect(args) => {
             let root = selected_root(args.root.as_deref())?;
@@ -873,12 +891,16 @@ async fn mint_agent_token(
     no_sign_in: bool,
     auto: bool,
 ) -> Result<Minted> {
-    // This computer's credential needs no session and survives Hub restarts.
+    // This computer's credential needs no session and survives Hub restarts; a sign-in from
+    // before computers had one gets one here while its session lives.
+    computer::enroll(&connection.hub).await;
     if let Some(minted) = computer::mint(connection, provider, auto).await? {
         return Ok(minted);
     }
     if auto {
-        return Err(invalid(computer::NO_CREDENTIAL));
+        return Err(invalid(
+            "this computer has no Hub credential for auto-connect",
+        ));
     }
     let provider = provider.ok_or_else(|| {
         invalid("cannot infer the forge sign-in provider for this origin; pass --provider github or --provider gitlab")
@@ -1016,8 +1038,9 @@ async fn revoke_owned(connection: &Connection, id: &str, token: Option<&str>) ->
         .is_ok_and(|(status, _)| matches!(status, 204 | 404))
 }
 
-/// Retires the managed token of a connection that `connect` just replaced.
-async fn retire_owned(connection: &Connection) {
+/// Retires the managed token of a connection that `connect` or a renewal just replaced;
+/// `quiet` prints only warnings, to stderr.
+async fn retire_owned(connection: &Connection, quiet: bool) {
     let (Some(id), Some(expiry)) = (
         connection.owned_token_id.as_deref(),
         connection.owned_token_expires_at,
@@ -1043,10 +1066,12 @@ async fn retire_owned(connection: &Connection) {
         }
     }
     if revoke_owned(connection, id, token.as_deref()).await {
-        println!(
-            "Deleted its token file and revoked token {id} on {}.",
-            connection.hub
-        );
+        if !quiet {
+            println!(
+                "Deleted its token file and revoked token {id} on {}.",
+                connection.hub
+            );
+        }
     } else {
         warn_unrevoked(connection, id, expiry);
     }
@@ -1186,12 +1211,13 @@ fn revalidate_after_wait(
 }
 
 async fn connect_inner(
-    args: ConnectArgs,
+    mut args: ConnectArgs,
     root: PathBuf,
     wait: Option<&AppWait<'_>>,
     setup: Option<SetupInstallation<'_>>,
 ) -> Result<()> {
     let quiet = args.auto;
+    let preminted = args.minted.take();
     let initial_lifecycle = lifecycle_lock()?;
     let invocation_program = invocation_program_fence()?;
     if let Some(setup) = setup.as_ref() {
@@ -1343,8 +1369,12 @@ async fn connect_inner(
         }
         // Without one, a computer credential's owner decides; a session sign-in needs it.
         let provider = args.provider.or(inferred);
-        let minted =
-            mint_agent_token(&connection, provider, wait, args.no_sign_in, args.auto).await?;
+        let minted = match preminted {
+            Some(Preminted(minted)) => minted,
+            None => {
+                mint_agent_token(&connection, provider, wait, args.no_sign_in, args.auto).await?
+            }
+        };
         let verified = match verify_token(&connection, &minted.token).await {
             Ok(verified) => verified,
             Err(error) => {
@@ -1434,7 +1464,7 @@ async fn connect_inner(
     });
     drop(final_lifecycle);
     if let Some(saved) = retired {
-        retire_owned(saved).await;
+        retire_owned(saved, quiet).await;
     }
     install_result?;
     if quiet {
@@ -1692,7 +1722,18 @@ async fn doctor(args: DoctorArgs) -> Result<()> {
         ));
     }
     println!("{}", serde_json::to_string_pretty(&reply)?);
-    if reply.as_array().is_some_and(Vec::is_empty) {
+    let checked = computer::check(&connection).await;
+    match &checked {
+        Some(Ok(verified)) => println!("{verified}"),
+        Some(Err(problem)) => println!("Connection needs attention: {problem}."),
+        None => {}
+    }
+    if reply.as_array().is_some_and(Vec::is_empty) && matches!(checked, Some(Ok(_))) {
+        println!(
+            "No {} session has reported to the Hub yet. That is expected when none is running; start one in this checkout to see it here.",
+            args.agent
+        );
+    } else if reply.as_array().is_some_and(Vec::is_empty) {
         println!(
             "Unverified: call agentscm_setup_status through native MCP using this agent and its actual native session ID, then use a native edit tool on a disposable file and check again. Missing proof does not distinguish pending trust from missing login or quota. Inspect the host's own status; pipe a captured error to client doctor --diagnostic-stdin to classify it locally."
         );

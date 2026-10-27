@@ -507,6 +507,11 @@ async fn manifest_flow_creates_the_app_and_keeps_secrets_off_the_wire() {
     assert_eq!(status, 200);
     assert!(done.contains("Created app agentscm-test"), "{done}");
     assert!(done.contains("/apps/agentscm-test/installations/new"));
+    // Device sign-in is a checkbox the manifest cannot set, so the page names it.
+    assert!(
+        done.contains("Enable Device Flow") && done.contains("/settings/apps/agentscm-test"),
+        "{done}"
+    );
     // The state is single use.
     assert_eq!(env.raw(Method::GET, &callback, None, None).await.0, 400);
 
@@ -2343,6 +2348,8 @@ fn cli(config: &TempDir, args: &[&str]) -> (bool, String, String) {
         .arg("hub")
         .args(args)
         .env("XDG_CONFIG_HOME", config.path())
+        // Tests never open a real browser: sign-in uses the code flow, or prints its URL.
+        .env("AGENTSCM_NO_BROWSER", "1")
         .env("NO_PROXY", "127.0.0.1")
         .output()
         .unwrap();

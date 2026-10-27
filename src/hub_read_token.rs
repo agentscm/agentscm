@@ -13,15 +13,17 @@ use crate::hub_cli::HubAuth;
 pub(crate) const TOKEN_TTL_SECONDS: i64 = 30 * 60;
 const EXPIRY_SLOP_SECONDS: i64 = 60;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OpenError {
     InvalidConnection,
     MissingSignIn,
     RejectedSignIn,
     #[cfg(target_os = "macos")]
     SignInChanged,
-    RepositoryNotConnected,
-    AccessDenied,
+    /// With the Hub's own reason and fix, when it sent one.
+    RepositoryNotConnected(Option<String>),
+    /// With the Hub's own reason and fix (for example who needs which role), when it sent one.
+    AccessDenied(Option<String>),
     #[cfg(target_os = "macos")]
     PreparedExpired,
     Unavailable,
@@ -29,6 +31,11 @@ pub(crate) enum OpenError {
 
 impl fmt::Display for OpenError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Self::RepositoryNotConnected(Some(message)) | Self::AccessDenied(Some(message)) =
+            self
+        {
+            return formatter.write_str(message);
+        }
         formatter.write_str(match self {
             Self::InvalidConnection => "the checkout connection changed; refresh and try again",
             Self::MissingSignIn => {
@@ -41,10 +48,10 @@ impl fmt::Display for OpenError {
             Self::SignInChanged => {
                 "the saved Hub sign-in changed; try Open Hub again to use the current sign-in"
             }
-            Self::RepositoryNotConnected => {
+            Self::RepositoryNotConnected(_) => {
                 "that repository is not connected to this Hub; ask its operator to connect it, then try again"
             }
-            Self::AccessDenied => {
+            Self::AccessDenied(_) => {
                 "this sign-in cannot open that repository; check Hub repository access"
             }
             #[cfg(target_os = "macos")]
@@ -141,9 +148,15 @@ pub(crate) async fn mint_and_confirm(
             return Err(OpenError::RejectedSignIn);
         }
         403 if reply["error"] == "not_connected" => {
-            return Err(OpenError::RepositoryNotConnected);
+            return Err(OpenError::RepositoryNotConnected(
+                crate::hub_cli::refusal_message(&reply),
+            ));
         }
-        403 => return Err(OpenError::AccessDenied),
+        403 => {
+            return Err(OpenError::AccessDenied(crate::hub_cli::refusal_message(
+                &reply,
+            )));
+        }
         201 => {}
         _ => return Err(OpenError::Unavailable),
     }
@@ -489,11 +502,11 @@ mod tests {
         for (reply, expected) in [
             (
                 json!({"error": "not_connected"}),
-                OpenError::RepositoryNotConnected,
+                OpenError::RepositoryNotConnected(None),
             ),
             (
                 json!({"error": "server-private-material"}),
-                OpenError::AccessDenied,
+                OpenError::AccessDenied(None),
             ),
         ] {
             let (hub, requests) = fake_hub(vec![(403, reply)]);
@@ -669,7 +682,7 @@ mod tests {
         assert!(!OpenError::InvalidConnection.to_string().contains(SECRET));
         assert!(!OpenError::MissingSignIn.to_string().contains(SECRET));
         assert!(!OpenError::RejectedSignIn.to_string().contains(SECRET));
-        assert!(!OpenError::AccessDenied.to_string().contains(SECRET));
+        assert!(!OpenError::AccessDenied(None).to_string().contains(SECRET));
         assert!(!OpenError::Unavailable.to_string().contains(SECRET));
     }
 }

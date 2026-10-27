@@ -23,11 +23,8 @@ use super::super::store::{
     validate_repository,
 };
 use super::super::{HubError, HubState};
-use super::{ApiResult, GITLAB_DEVELOPER, GITLAB_REPORTER, Human, random_hex, session_digest};
+use super::{ApiResult, Human, random_hex, session_digest};
 use crate::team::auth::generate_secret;
-
-/// GitHub roles that may use a public repository (`may_use`: push, triage, maintain, admin).
-const PUBLIC_ROLES: [&str; 4] = ["triage", "write", "maintain", "admin"];
 
 pub(super) fn routes() -> Router<HubState> {
     Router::new()
@@ -42,13 +39,40 @@ pub(super) fn routes() -> Router<HubState> {
         .route("/v1/hub/admin/sign-in-refusals", get(admin_refusals))
 }
 
+/// Why a mint was refused: a kind, or a role from [`super::missing_role`].
+#[derive(Debug, PartialEq, Eq)]
+enum Denial {
+    Kind(&'static str),
+    Role((&'static str, &'static str, &'static str)),
+}
+
+/// A refusal people read as is: the reason and the one fix.
 fn refused(kind: &'static str) -> ApiError {
-    let status = match kind {
-        "sign_in_required" => StatusCode::UNAUTHORIZED,
-        "permission_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
-        _ => StatusCode::FORBIDDEN,
+    refused_about(kind, "this repository", "the forge")
+}
+
+fn refused_about(kind: &'static str, repository: &str, forge: &str) -> ApiError {
+    let (status, message) = match kind {
+        "sign_in_required" => (
+            StatusCode::UNAUTHORIZED,
+            "This computer isn't signed in to this Hub any more; choose Sign In in the AgentSCM menu bar app or run agentscm hub login".to_owned(),
+        ),
+        "permission_unavailable" => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("{forge} didn't answer the Hub's access check; nothing changed, so try again in a minute"),
+        ),
+        "not_connected" => (
+            StatusCode::FORBIDDEN,
+            format!("{repository} isn't connected to this Hub yet; ask a Hub admin to connect it"),
+        ),
+        "access_check_unavailable" => (
+            StatusCode::FORBIDDEN,
+            format!("The Hub can't check your access to {repository}; ask a Hub admin to check that repository's connection"),
+        ),
+        "not_allowed" => (StatusCode::FORBIDDEN, super::NOT_ALLOWED.to_owned()),
+        _ => (StatusCode::FORBIDDEN, super::DISABLED.to_owned()),
     };
-    ApiError::new(status, kind)
+    ApiError::new(status, kind).with_message(message)
 }
 
 /// A live computer credential, from `Authorization: Bearer <secret>`.
@@ -232,6 +256,15 @@ async fn enroll(
     super::HumanSession(human): super::HumanSession,
     JsonBody(body): JsonBody<DeviceRequest>,
 ) -> ApiResult<Response> {
+    // Only a sign-in from before computers had credentials enrolls one: a session that came
+    // with a computer cannot add another after that computer was revoked.
+    if human.device.is_some() {
+        return Err(
+            ApiError::new(StatusCode::FORBIDDEN, "device_revoked").with_message(
+                "This computer was removed from your account; sign in again to add it back",
+            ),
+        );
+    }
     let device = issue(&state, &human.user, body).await?;
     Ok((StatusCode::CREATED, Json(json!({"device": device}))).into_response())
 }
@@ -256,16 +289,20 @@ async fn revoke_device(
     owner: Option<String>,
     by: String,
 ) -> ApiResult<bool> {
-    let store = state.store.clone();
+    let (store, revoked_id) = (state.store.clone(), device.clone());
     let workspace = state.workspace.clone();
-    Ok(blocking(state, move || {
+    let revoked = blocking(state, move || {
         let operation = || store.revoke_device(&device, owner.as_deref(), &by, unix_now());
         match workspace {
             Some(workspace) => workspace.with_identity_change(operation),
             None => operation(),
         }
     })
-    .await?)
+    .await?;
+    if revoked {
+        state.login.drop_sessions_of_device(&revoked_id);
+    }
+    Ok(revoked)
 }
 
 /// The owner (or an administrator's session) revokes a computer and every token it minted.
@@ -333,14 +370,34 @@ async fn mint(
         identity.host.clone(),
         body.repository.clone(),
     );
+    let forge = super::forge_name(&identity.provider);
     let Some(repo) = blocking(&state, move || store.repository_named(&host, &named)).await? else {
-        return Err(refused("not_connected"));
+        return Err(match fork_parent(&state, &owner, &body.repository).await {
+            Some(parent) => refused_about("not_connected", &body.repository, forge)
+                .with_message(format!(
+                    "{} isn't connected to this Hub, but it is a fork of {parent}, which is; make {parent} this checkout's origin remote to coordinate",
+                    body.repository
+                ))
+                .with_field("fork_of", json!(parent)),
+            None => refused_about("not_connected", &body.repository, forge),
+        });
     };
-    if let Err(kind) = repository_role(&state, &owner, &repo).await {
-        if kind != "permission_unavailable" && kind != "not_connected" {
-            record_refusal(&state, &owner, kind, "device_mint").await;
+    match repository_role(&state, &owner, &repo).await {
+        Ok(()) => {}
+        Err(Denial::Role(role)) => {
+            record_refusal(&state, &owner, "insufficient_role", "device_mint").await;
+            return Err(super::insufficient_role(
+                &owner.login,
+                &repo.full_name,
+                role,
+            ));
         }
-        return Err(refused(kind));
+        Err(Denial::Kind(kind)) => {
+            if kind != "permission_unavailable" && kind != "not_connected" {
+                record_refusal(&state, &owner, kind, "device_mint").await;
+            }
+            return Err(refused_about(kind, &repo.full_name, forge));
+        }
     }
     let secret = generate_secret().map_err(|_| HubError::Unavailable("random source".into()))?;
     let ttl = if body.read_only {
@@ -399,8 +456,65 @@ async fn revoke_token(
     }
 }
 
+/// The connection credential for reads on `host` by `provider`: the first enabled connection
+/// there, with one of its repositories for a GitHub App's installation.
+async fn host_credential(
+    state: &HubState,
+    provider: &str,
+    host: &str,
+) -> Option<(super::super::connection::Connection, String)> {
+    let (store, provider, host) = (state.store.clone(), provider.to_owned(), host.to_owned());
+    let (conn, installation) = blocking(state, move || {
+        for conn in store.connections()? {
+            if conn.provider == provider && conn.host == host && conn.status == "enabled" {
+                let installation = store
+                    .repositories(&conn.id)?
+                    .into_iter()
+                    .find_map(|repo| repo.installation_id);
+                return Ok(Some((conn, installation)));
+            }
+        }
+        Ok(None)
+    })
+    .await
+    .ok()??;
+    let token = state.sync.token(&conn, installation).await.ok()?;
+    Some((conn, token))
+}
+
+/// The connected repository `repository` was forked from, when the forge says so. Asked only
+/// for a repository this Hub does not have, so a contributor working in a fork is told which
+/// remote to use instead of only "not connected". Never guesses: no answer is no hint.
+async fn fork_parent(state: &HubState, owner: &User, repository: &str) -> Option<String> {
+    let identity = &owner.identity;
+    let (conn, token) = host_credential(state, &identity.provider, &identity.host).await?;
+    let reply = match state.sync.forge(&conn).ok()? {
+        ForgeApi::Github(api) => api.repo_json(&token, repository).await,
+        ForgeApi::Gitlab(api) => api.project_json(&token, repository).await,
+    }
+    .ok()??;
+    let parents = [
+        &reply["parent"]["full_name"],
+        &reply["source"]["full_name"],
+        &reply["forked_from_project"]["path_with_namespace"],
+    ];
+    for parent in parents.into_iter().filter_map(Value::as_str) {
+        let (store, host, named) = (
+            state.store.clone(),
+            identity.host.clone(),
+            parent.to_owned(),
+        );
+        if let Ok(Some(connected)) =
+            blocking(state, move || store.repository_named(&host, &named)).await
+        {
+            return Some(connected.full_name);
+        }
+    }
+    None
+}
+
 /// The person's current role on a connected repository, asked with the connection's own
-/// credential and judged by the `may_use` rule. Err is the refusal kind.
+/// credential and judged by [`super::missing_role`], the rule sign-in and session minting use.
 ///
 /// The only source today is the forge; an administrator-issued grant for other Git hosts would
 /// be a second source here.
@@ -408,20 +522,21 @@ async fn repository_role(
     state: &HubState,
     owner: &User,
     repo: &ConnectedRepository,
-) -> std::result::Result<(), &'static str> {
+) -> std::result::Result<(), Denial> {
+    let kind = Denial::Kind;
     let store = state.store.clone();
     let id = repo.connection.clone();
     let conn = match blocking(state, move || store.connection(&id)).await {
         Ok(Some(conn)) => conn,
-        Ok(None) => return Err("not_connected"),
-        Err(_) => return Err("permission_unavailable"),
+        Ok(None) => return Err(kind("not_connected")),
+        Err(_) => return Err(kind("permission_unavailable")),
     };
     if conn.status == "auth_failed" || state.sync.config().is_err() {
-        return Err("access_check_unavailable");
+        return Err(kind("access_check_unavailable"));
     }
     let forge_error = |error: GhError| match error {
-        GhError::Auth(_) => "access_check_unavailable",
-        GhError::Limited(_) | GhError::Failed(_) => "permission_unavailable",
+        GhError::Auth(_) => kind("access_check_unavailable"),
+        GhError::Limited(_) | GhError::Failed(_) => kind("permission_unavailable"),
     };
     let token = state
         .sync
@@ -431,7 +546,7 @@ async fn repository_role(
     let api = state
         .sync
         .forge(&conn)
-        .map_err(|_| "access_check_unavailable")?;
+        .map_err(|_| kind("access_check_unavailable"))?;
     let reply = match api {
         ForgeApi::Github(api) => {
             api.collaborator_permission(&token, &repo.full_name, &owner.login)
@@ -443,64 +558,74 @@ async fn repository_role(
         }
     }
     .map_err(forge_error)?;
+    // The connection's own credential can no longer see the repository.
     let Some((project, role)) = reply else {
-        return Err("no_repository_role");
+        return Err(kind("access_check_unavailable"));
     };
     if project["id"].as_i64() != Some(repo.repository_id) {
-        return Err("not_connected");
+        return Err(kind("not_connected"));
     }
-    let permitted = match api {
-        ForgeApi::Github(_) => {
-            // The login is cached from sign-in; a renamed or re-registered one is someone else.
-            if role["user"]["id"].as_i64() != Some(owner.identity.user_id) {
-                return Err("sign_in_required");
-            }
-            github_permits(&project, &role)
-        }
-        ForgeApi::Gitlab(_) => {
-            if role["id"].as_i64() != Some(owner.identity.user_id) {
-                return Err("no_repository_role");
-            }
-            gitlab_permits(&project, &role)
-        }
+    let gitlab = matches!(api, ForgeApi::Gitlab(_));
+    // The GitHub login is cached from sign-in: an unknown one was renamed, and one with another
+    // id now belongs to someone else. Signing in again refreshes it.
+    let user_id = match (&role, gitlab) {
+        (Some(role), true) => role["id"].as_i64(),
+        (Some(role), false) => role["user"]["id"].as_i64(),
+        (None, true) => Some(owner.identity.user_id),
+        (None, false) => None,
     };
-    if permitted {
-        Ok(())
-    } else {
-        Err("no_repository_role")
+    if user_id != Some(owner.identity.user_id) {
+        return Err(kind("sign_in_required"));
+    }
+    match role_refusal(gitlab, &project, role.as_ref()) {
+        None => Ok(()),
+        Some(role) => Err(Denial::Role(role)),
     }
 }
 
-/// `may_use` for the collaborator API: any role on a private repository, triage or more on a
-/// public one. A custom role is judged by its base permission, which fails closed.
-fn github_permits(repo: &Value, role: &Value) -> bool {
-    let permission = role["permission"].as_str().unwrap_or("none");
-    if repo["private"] != json!(false) {
-        return matches!(permission, "read" | "write" | "admin");
+/// The forge's role reply in the shape of a person's own repository read, judged by
+/// [`super::missing_role_on`]. No role at all is refused on any repository.
+fn role_refusal(
+    gitlab: bool,
+    project: &Value,
+    role: Option<&Value>,
+) -> Option<(&'static str, &'static str, &'static str)> {
+    if gitlab {
+        let visibility = match project["visibility"].as_str() {
+            Some("private") => "private",
+            Some("internal") => "internal",
+            _ => "public",
+        };
+        let level = role
+            .filter(|member| {
+                member["state"]
+                    .as_str()
+                    .is_none_or(|state| state == "active")
+            })
+            .and_then(|member| member["access_level"].as_i64());
+        let shaped = json!({"visibility": visibility,
+            "permissions": {"project_access": level.map(|l| json!({"access_level": l}))}});
+        return super::missing_role_on(true, &shaped);
     }
-    role["role_name"]
-        .as_str()
-        .is_some_and(|name| PUBLIC_ROLES.contains(&name))
-        || matches!(permission, "write" | "admin")
-}
-
-/// `may_use` for GitLab members: Reporter on a private project, Developer otherwise. A blocked
-/// or pending membership does not count.
-fn gitlab_permits(project: &Value, member: &Value) -> bool {
-    if member["state"]
-        .as_str()
-        .is_some_and(|state| state != "active")
-    {
-        return false;
+    let permission = role
+        .and_then(|role| role["permission"].as_str())
+        .unwrap_or("none");
+    let name = role
+        .and_then(|role| role["role_name"].as_str())
+        .unwrap_or_default();
+    let public = project["private"] == json!(false);
+    if permission == "none" {
+        return Some(if public {
+            ("public", "none", "triage")
+        } else {
+            ("private", "none", "read")
+        });
     }
-    let needed = if project["visibility"] == json!("private") {
-        GITLAB_REPORTER
-    } else {
-        GITLAB_DEVELOPER
-    };
-    member["access_level"]
-        .as_i64()
-        .is_some_and(|level| level >= needed)
+    // A custom role is judged by its base permission, which fails closed.
+    let shaped = json!({"private": project["private"], "permissions": {
+        "push": matches!(permission, "write" | "admin") || matches!(name, "write" | "maintain" | "admin"),
+        "triage": name == "triage", "maintain": name == "maintain", "admin": permission == "admin"}});
+    super::missing_role_on(false, &shaped)
 }
 
 async fn admin_devices(
@@ -573,35 +698,74 @@ mod tests {
     use super::*;
 
     #[test]
-    fn github_roles_follow_may_use() {
+    fn github_roles_follow_missing_role() {
         let private = json!({"private": true});
         let public = json!({"private": false});
         let role =
             |permission: &str, name: &str| json!({"permission": permission, "role_name": name});
-        assert!(github_permits(&private, &role("read", "read")));
-        assert!(!github_permits(&private, &role("none", "")));
-        assert!(!github_permits(&public, &role("read", "read")));
-        assert!(github_permits(&public, &role("read", "triage")));
-        assert!(github_permits(&public, &role("write", "custom-writer")));
+        let refused =
+            |project: &Value, role: Option<Value>| role_refusal(false, project, role.as_ref());
+        assert_eq!(refused(&private, Some(role("read", "read"))), None);
+        assert_eq!(
+            refused(&private, Some(role("none", ""))),
+            Some(("private", "none", "read"))
+        );
+        assert_eq!(refused(&private, None), Some(("private", "none", "read")));
+        assert_eq!(
+            refused(&public, Some(role("read", "read"))),
+            Some(("public", "read", "triage"))
+        );
+        assert_eq!(refused(&public, Some(role("read", "triage"))), None);
+        assert_eq!(refused(&public, Some(role("write", "custom-writer"))), None);
         // A custom role built on read fails closed on a public repository.
-        assert!(!github_permits(&public, &role("read", "custom-reader")));
-        // A reply that does not say public counts as private, as `may_use` does.
-        assert!(github_permits(&json!({}), &role("read", "read")));
+        assert!(refused(&public, Some(role("read", "custom-reader"))).is_some());
+        // A reply that does not say public counts as private, as sign-in does.
+        assert_eq!(refused(&json!({}), Some(role("read", "read"))), None);
     }
 
     #[test]
-    fn gitlab_levels_follow_may_use() {
-        let private = json!({"visibility": "private"});
-        let internal = json!({"visibility": "internal"});
+    fn gitlab_levels_follow_missing_role() {
+        let project = |visibility: &str| json!({"visibility": visibility});
         let member = |level: i64| json!({"access_level": level, "state": "active"});
-        assert!(gitlab_permits(&private, &member(20)));
-        assert!(!gitlab_permits(&private, &member(10)));
-        assert!(!gitlab_permits(&internal, &member(20)));
-        assert!(gitlab_permits(&internal, &member(30)));
-        assert!(!gitlab_permits(
-            &private,
-            &json!({"access_level": 50, "state": "blocked"})
-        ));
-        assert!(!gitlab_permits(&private, &json!({})));
+        let refused =
+            |project: &Value, member: Option<Value>| role_refusal(true, project, member.as_ref());
+        assert_eq!(refused(&project("private"), Some(member(20))), None);
+        assert_eq!(
+            refused(&project("private"), Some(member(10))),
+            Some(("private", "guest", "reporter"))
+        );
+        assert_eq!(
+            refused(&project("internal"), Some(member(20))),
+            Some(("internal", "reporter", "developer"))
+        );
+        assert_eq!(refused(&project("internal"), Some(member(30))), None);
+        assert!(
+            refused(
+                &project("private"),
+                Some(json!({"access_level": 50, "state": "blocked"}))
+            )
+            .is_some()
+        );
+        assert_eq!(
+            refused(&project("private"), None),
+            Some(("private", "none", "reporter"))
+        );
+    }
+
+    #[test]
+    fn every_refusal_has_a_reason_and_a_fix() {
+        for kind in [
+            "sign_in_required",
+            "permission_unavailable",
+            "not_connected",
+            "access_check_unavailable",
+            "not_allowed",
+            "user_disabled",
+        ] {
+            let error = refused_about(kind, "acme/widgets", "GitHub");
+            let message = error.message().unwrap();
+            assert!(message.contains("; "), "{kind}: {message}");
+            assert_eq!(error.code(), kind);
+        }
     }
 }

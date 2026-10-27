@@ -61,6 +61,10 @@ enum UserEvent {
 /// Menu inputs read from this computer's AgentSCM files at each rebuild.
 #[derive(Default)]
 struct MenuExtras {
+    /// One line per saved Hub: who this computer is signed in as, and auto-connect.
+    signed_in: Vec<String>,
+    /// The saved Hubs, in the order Connect items index them.
+    hubs: Vec<String>,
     /// Hubs with a computer credential whose owner was never asked about auto-connect.
     unasked: Vec<String>,
     /// A refusal per connected checkout that needs the person, by root.
@@ -71,7 +75,13 @@ impl MenuExtras {
     fn load(snapshot: &Snapshot) -> Self {
         let mut unasked = crate::hub_cli::auto_connect_unasked().unwrap_or_default();
         unasked.truncate(crate::hub_cli::MAX_AUTO_CONNECT_HUBS);
+        let summaries = crate::hub_cli::sign_in_summaries();
         Self {
+            signed_in: summaries
+                .iter()
+                .map(|row| format!("{}: {}", hub_host(&row.hub), row.state()))
+                .collect(),
+            hubs: summaries.into_iter().map(|row| row.hub).collect(),
             unasked,
             attention: snapshot
                 .connections
@@ -85,7 +95,10 @@ impl MenuExtras {
     }
 
     fn key(&self) -> String {
-        format!("\nextras:{:?}{:?}", self.unasked, self.attention)
+        format!(
+            "\nextras:{:?}{:?}{:?}{:?}",
+            self.signed_in, self.hubs, self.unasked, self.attention
+        )
     }
 
     fn attention(&self, root: &Path) -> Option<&str> {
@@ -163,7 +176,10 @@ fn run_foreground(initial: Snapshot) -> Result<()> {
         }
     };
     let activity_receiver = crate::client_activity::ActivityReceiver::bind()?;
-    let activity = crate::client_activity::ActivityStore::default();
+    // Sightings outlive a tray restart (#117), in the owner-only config directory.
+    let activity = crate::client_activity::ActivityStore::saved_at(
+        crate::hub_cli::config_dir()?.join("agentscm/tray-unconnected.json"),
+    );
     let mut builder = EventLoop::<UserEvent>::with_user_event();
     builder
         .with_activation_policy(ActivationPolicy::Accessory)
@@ -603,13 +619,19 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                     &self.activity,
                     std::time::Instant::now(),
                 );
-                let signed_in = request
-                    .as_ref()
-                    .and_then(|request| target_hub(&request.host, &request.repo));
-                // Not signed in anywhere: sign in to the saved Hub from here first (#116).
+                let chosen = request.as_ref().and_then(|request| request.hub.clone());
+                let signed_in = match &chosen {
+                    Some(hub) => crate::hub_cli::load_auth(Some(hub))
+                        .ok()
+                        .map(|(hub, _)| hub),
+                    None => request
+                        .as_ref()
+                        .and_then(|request| target_hub(&request.host, &request.repo)),
+                };
+                // Not signed in there: sign in to that Hub (or the saved one) from here first.
                 let sign_in = signed_in
                     .is_none()
-                    .then(|| crate::hub_cli::saved_hub(None))
+                    .then(|| chosen.or_else(|| crate::hub_cli::saved_hub(None)))
                     .flatten();
                 let hub = signed_in.clone().or(sign_in.clone());
                 if self.opening_hub || self.installing.load(Ordering::Acquire) {
@@ -636,7 +658,7 @@ impl ApplicationHandler<UserEvent> for TrayApp {
                         request.clone(),
                         hub.clone(),
                         self.executable.clone(),
-                        sign_in.is_some().then(|| forge_provider(&request.host)),
+                        sign_in.is_some(),
                     );
                     self.notice = Some(Notice::Action("Connecting checkout…".into()));
                 } else if request.is_some() {
@@ -1362,6 +1384,8 @@ struct ConnectRequest {
     root: std::path::PathBuf,
     host: String,
     repo: String,
+    /// The saved Hub the person chose, when several are saved (#116).
+    hub: Option<String>,
 }
 
 fn connect_request(
@@ -1374,6 +1398,16 @@ fn connect_request(
     (parts.next()? == "connect").then_some(())?;
     let identity = parts.next()?;
     let agent_name = parts.next()?;
+    // An index into the saved Hubs, as the menu listed them.
+    let hub = match parts.next() {
+        None => None,
+        Some(index) => Some(
+            crate::hub_cli::sign_in_summaries()
+                .into_iter()
+                .nth(index.parse::<usize>().ok()?)?
+                .hub,
+        ),
+    };
     if parts.next().is_some() {
         return None;
     }
@@ -1393,6 +1427,7 @@ fn connect_request(
         root: row.root,
         host: row.host,
         repo: row.repo,
+        hub,
     })
 }
 
@@ -1451,7 +1486,12 @@ fn sign_in_from_menu(hub: &str, provider: &str) -> std::result::Result<String, S
         .build()
         .map_err(|error| error.to_string())?;
     runtime
-        .block_on(crate::hub_cli::sign_in_with(hub, provider, None, true))
+        .block_on(crate::hub_cli::sign_in_with(
+            hub,
+            provider,
+            None,
+            crate::hub_cli::SignIn::Browser,
+        ))
         .map_err(|error| bounded_error(&error.to_string()))
 }
 
@@ -1474,17 +1514,21 @@ fn spawn_connect(
     request: ConnectRequest,
     hub: String,
     program: std::path::PathBuf,
-    sign_in: Option<&'static str>,
+    sign_in: bool,
 ) {
     std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if let Some(provider) = sign_in {
-                sign_in_from_menu(&hub, provider)?;
-            }
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|error| error.to_string())?;
+            if sign_in {
+                // The Hub's only provider when it says so, else the forge the origin names.
+                let provider = runtime
+                    .block_on(crate::hub_cli::only_provider(&hub))
+                    .unwrap_or_else(|_| forge_provider(&request.host).to_owned());
+                sign_in_from_menu(&hub, &provider)?;
+            }
             runtime
                 .block_on(crate::client_cli::setup_unconnected(
                     request.agent,
@@ -1740,6 +1784,10 @@ fn build_menu(
     let menu = Menu::new();
     menu.append(&PredefinedMenuItem::section_header("AgentSCM"))
         .map_err(menu_error)?;
+    if !extras.signed_in.is_empty() {
+        menu.append(&native_text_item("signed-in", &extras.signed_in.join("\n")))
+            .map_err(menu_error)?;
+    }
     // Asked once per Hub, for sign-ins made without a terminal or before this question existed.
     for hub in &extras.unasked {
         let ask = Submenu::new(
@@ -2052,6 +2100,24 @@ fn build_menu(
             .append(&PredefinedMenuItem::separator())
             .map_err(menu_error)?;
         for agent in row.agents.iter().rev() {
+            if extras.hubs.len() > 1 {
+                // One Connect per saved Hub, so the person picks where it goes (#116).
+                for (index, hub) in extras.hubs.iter().enumerate() {
+                    submenu
+                        .append(&MenuItem::with_id(
+                            format!("connect:{identity}:{agent}:{index}"),
+                            super::clean_label(&format!(
+                                "Connect with {} to {}",
+                                agent_label(agent),
+                                hub_host(hub)
+                            )),
+                            true,
+                            None,
+                        ))
+                        .map_err(menu_error)?;
+                }
+                continue;
+            }
             submenu
                 .append(&MenuItem::with_id(
                     format!("connect:{identity}:{agent}"),
@@ -2637,6 +2703,8 @@ mod tests {
         assert_eq!(forge_provider("github.com"), "github");
         assert_eq!(forge_provider("gitlab.example.org"), "gitlab");
         let extras = MenuExtras {
+            signed_in: Vec::new(),
+            hubs: Vec::new(),
             unasked: vec!["https://hub.example".into()],
             attention: vec![("/work/widgets".into(), "signed out".into())],
         };

@@ -20,46 +20,66 @@ There is no token to paste and no address to enter.
 ## Sign in once per computer
 
 `agentscm hub login` (or **Sign In with GitHub…** in the menu bar app) signs this computer in to
-the Hub, not only you. The browser then lands on the Hub page saying who signed in and as which
-computer. What that gives you:
+the Hub, not only you. On a desktop it opens your browser: authorize once, and the browser lands
+on the Hub page saying who signed in and as which computer. The terminal says it is waiting, every
+30 seconds says so again, and gives up after 3 minutes with what to do next. Over SSH or without a
+display (or with `--device`, or `AGENTSCM_NO_BROWSER=1`) it shows a code to enter on another
+device instead; when the Hub's GitHub App does not allow that, it says so and uses the browser
+sign-in. Every failed step names what failed, for example that the sign-in link expired or that
+the forge did not accept the code. What signing in gives you:
 
-- **It lasts until revoked.** The Hub keeps a credential for this computer (only its digest,
-  in the Hub's database), so a Hub restart or deploy does not sign you out, and there is no
-  8-hour or 30-day limit. A computer unused for 90 days is signed out. The credential is kept
-  in the owner-only `$XDG_CONFIG_HOME/agentscm/hub-sessions.json` (default under `~/.config`),
-  next to the 8-hour browser session, and is sent only to the Hub that issued it. Signing in
-  again on the same computer replaces its credential; the Hub never matches computers by name.
-- **Agents connect themselves**, if you say so. At a terminal the sign-in asks once: "Connect
-  agents automatically in repositories on this Hub? [Y/n]". Without a terminal (the menu bar
-  app, or a sign-in made before this question existed) the menu bar app asks once instead. Change
-  it with `agentscm hub auto-connect on|off [--hub URL]`. With it on, when a coding agent starts
-  a session in a checkout that has no connection, its hook connects the checkout to the first
-  such Hub (the default Hub first, at most four) that has the repository and where you have the
-  role, and the agent's context starts with `AgentSCM: coordinating on owner/name.` It writes
-  only AgentSCM's own files under your config directory, never a file in the checkout, and runs
-  the same checks as `client connect`. It waits at most 2.5 seconds; a slower attempt says
-  nothing and finishes for the next session. A Hub that does not have the repository is not
-  asked about it again for an hour; a refusal is retried after five minutes.
-- **Tokens renew.** An agent token minted through this computer lasts 24 hours. When less than
-  12 hours are left, the next hook call renews it in the background: the Hub re-checks your
-  access, a new token is saved, and the old one is revoked. A laptop that slept for days renews at
-  the first hook call after waking.
+- **It lasts until revoked.** The Hub keeps a credential for this computer (only its digest, in
+  the Hub's database), so a Hub restart or deploy does not sign you out, and there is no 8-hour or
+  30-day limit. A computer unused for 90 days is signed out. The credential is kept in the
+  owner-only `$XDG_CONFIG_HOME/agentscm/hub-sessions.json` (default under `~/.config`), next to
+  the 8-hour session, and is sent only to the Hub that issued it. Signing in again on the same
+  computer replaces its credential; the Hub never matches computers by name.
+- **Agents connect themselves**, if you say so. AgentSCM's agent plugin runs a quick check
+  whenever an agent starts. The sign-in asks once at a terminal: "Connect agents automatically in
+  repositories on this Hub? [Y/n]" (`--no-auto-connect` answers no). A sign-in from the menu bar
+  app, or one made before this question existed, is asked in the menu bar app or at the next
+  interactive `agentscm hub` or `agentscm client` command. Change it with
+  `agentscm hub auto-connect on|off [--hub URL]`. With it on, when a coding agent starts a session
+  in a checkout that has no connection, its hook connects the checkout to the first such Hub (the
+  default Hub first, at most four) that has the repository and where you have the role, and the
+  agent's context starts with `AgentSCM: coordinating on owner/name.` It writes only AgentSCM's
+  own files under your config directory, never a file in the checkout, and runs the same checks as
+  `client connect`. It waits at most 2.5 seconds; a slower attempt says nothing and finishes for
+  the next session. In a repository no such Hub has, the check stays silent, and that Hub is not
+  asked about it again for an hour. A Hub that sees your origin is a fork of a repository it has
+  says so, and names the repository to use as `origin`. Any other attempt is retried after five
+  minutes.
+- **Tokens renew.** An agent token minted through this computer lasts 24 hours. When less than 12
+  hours are left, the next hook call renews it in the background: the Hub re-checks your access, a
+  new token is saved, and the old one is revoked. A running MCP server switches to the new token.
+  A laptop that slept for days renews at the first hook call after waking.
 - **Access is re-checked every time.** Each mint and renewal checks that you are still enabled
-  and allowed on the Hub and still have the repository role (on a public repository triage or
+  and allowed on the Hub and still have the repository role (on a public repository Triage or
   more, on a private one read; on GitLab Reporter for private, Developer otherwise). The Hub asks
   the forge with the repository connection's own credential, never a stored token of yours. When
-  something refuses, the agent's context, the menu bar app (**Needs attention**) and the CLI give
-  the same reason and fix, and the current token keeps working until it ends or is revoked.
+  something refuses, the agent's context, the menu bar app (**Needs attention**), `agentscm open`
+  and the CLI show the Hub's own sentence, such as
+  `alice has Read on public repository acme/widgets; ask a repository owner for Triage or higher`,
+  and the current token keeps working until it ends or is revoked. When the Hub or the forge does
+  not answer, nothing is marked as needing attention; the next hook call tries again.
+
+`agentscm hub whoami` shows, for each saved Hub, who this computer is signed in as, the
+computer's name, whether auto-connect is on and the checkouts connected to it; the menu bar app
+shows the same at the top of its menu. `agentscm client doctor` checks a checkout's connection
+through this computer's credential, the way the next renewal would, so it reports a verified
+connection even when no agent is running.
 
 Your computers: `agentscm hub devices list` shows each one with its name, last use and the
-repositories connected through it; `agentscm hub devices rename NAME` renames this one;
-`agentscm hub devices revoke dev_…` signs one out (from any of your computers). Revoking a
-computer revokes every agent token minted through it, so its agents stop at their next call.
-`agentscm hub logout` signs this computer out the same way. Hub administrators can revoke any
-computer. See [computer credentials](hub.md#computer-credentials).
+repositories connected through it, live ones first; `agentscm hub devices rename NAME` renames
+this one; `agentscm hub devices revoke dev_…` signs one out (from any of your computers). The
+Hub page opened with `agentscm open` lists and revokes them too. Revoking a computer revokes every
+agent token minted through it, so its agents stop at their next call, and ends the session that
+signed it in. `agentscm hub logout` signs this computer out the same way and warns if the Hub could
+not be told. Hub administrators can revoke any computer. See
+[computer credentials](hub.md#computer-credentials).
 
-Sign-ins made before computers had credentials keep working until their session ends; the next
-renewal, connect or menu bar action that finds a live session enrolls this computer without
+Sign-ins made before computers had credentials keep working until their session ends; while that
+session lives, the next connect, renewal, Open Hub or `agentscm open` enrolls this computer without
 asking. Existing 30-day tokens keep working and are renewed into 24-hour ones once the computer
 has a credential. A sign-in that has already expired needs one more sign-in.
 
@@ -161,12 +181,8 @@ remains for a Hub page served elsewhere.
   read the forge.
 - Losing a repository role takes effect at the next renewal, usually within 12 hours and at most
   24; revoking the computer or disabling the account takes effect at once.
-- Auto-connect needs the hook that the AgentSCM client plugin installs for your agent; Gemini's
-  session start does not show the one-line note. A checkout whose origin is a fork of a
-  connected repository is not recognised; add the upstream as `origin` yourself.
-- The Hub's own web pages still use a browser session kept in Hub memory, which a Hub restart
-  ends; agents and the menu bar app are not affected.
-
+- An older AgentSCM binary that rewrites `hub-sessions.json` drops this computer's credential from
+  it (the Hub keeps it until revoked or idle); sign in again with the current one.
 - `agentscm open` gives the browser an owner-only local file that forwards it to the page. A
   browser that cannot read files in your config directory (for example some sandboxed Linux
   browser packages), or a computer where `.html` files open in an editor, does not open the page;
