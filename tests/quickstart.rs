@@ -3,12 +3,13 @@
 //! first-run GitHub App flow are unit tested, plus one explicitly selected ignored
 //! test exercises the real managed Docker boundary.
 #![cfg(unix)]
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use agentscm::backend::LocalBackend;
@@ -622,21 +623,88 @@ fn read_capped(mut reader: impl Read) -> std::io::Result<(Vec<u8>, bool)> {
     }
 }
 
-fn kill_process_group(group: i32) {
-    // SAFETY: the command created a fresh process group whose id is the owned child's pid.
-    unsafe {
-        libc::kill(-group, libc::SIGKILL);
+fn child_exited_without_reaping(child: &Child) -> std::io::Result<bool> {
+    loop {
+        // SAFETY: waitid initializes this writable siginfo_t. WNOWAIT retains
+        // the child's PID reservation until all group signals are complete.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return Ok(info.si_signo == libc::SIGCHLD);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn kill_owned_process_group(child: &Child) -> std::io::Result<()> {
+    // ECHILD refuses signalling: no saved numeric PID is trusted after reaping.
+    child_exited_without_reaping(child)?;
+    loop {
+        // SAFETY: this unreaped child leads the fresh group created at spawn.
+        if unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        // Darwin returns EPERM for a group containing only its zombie leader.
+        #[cfg(target_os = "macos")]
+        if error.raw_os_error() == Some(libc::EPERM) && child_exited_without_reaping(child)? {
+            let mut members = [0 as libc::pid_t; 2];
+            // SAFETY: two writable slots distinguish the sole owned leader
+            // from a group with surviving descendants; no unrelated PIDs are scanned.
+            let count = unsafe {
+                libc::proc_listpgrppids(
+                    child.id() as libc::pid_t,
+                    members.as_mut_ptr().cast(),
+                    std::mem::size_of_val(&members) as libc::c_int,
+                )
+            };
+            if count == 1 && members[0] == child.id() as libc::pid_t {
+                return Ok(());
+            }
+        }
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
 }
 
 fn capture_bounded(command: &mut Command, timeout: Duration) -> std::io::Result<BoundedOutput> {
+    capture_until_cancelled(command, timeout, &AtomicBool::new(false))
+}
+
+fn capture_until_cancelled(
+    command: &mut Command,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+) -> std::io::Result<BoundedOutput> {
+    capture_with_cleanup(command, timeout, cancelled, || Ok(()))
+}
+
+fn capture_with_cleanup(
+    command: &mut Command,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+    cleanup: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<BoundedOutput> {
     command
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn()?;
-    let group = child.id() as i32;
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
     let (send, receive) = std::sync::mpsc::channel();
@@ -649,37 +717,26 @@ fn capture_bounded(command: &mut Command, timeout: Duration) -> std::io::Result<
     });
 
     let deadline = Instant::now() + timeout;
-    let mut timed_out = false;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            timed_out = true;
-            kill_process_group(group);
-            let _ = child.kill();
-            break child.wait()?;
+    let timed_out = loop {
+        let exited = child_exited_without_reaping(&child)?;
+        if exited || Instant::now() >= deadline || cancelled.load(Ordering::Acquire) {
+            kill_owned_process_group(&child)?;
+            break !exited;
         }
         std::thread::sleep(Duration::from_millis(10));
     };
+    // Group cleanup is complete while the leader still reserves its PID.
+    let status = child.wait()?;
+    cleanup()?;
 
     let mut stdout = None;
     let mut stderr = None;
-    let mut drain_deadline = if timed_out {
-        Instant::now() + Duration::from_secs(2)
-    } else {
-        deadline
-    };
+    let drain_deadline = Instant::now() + Duration::from_secs(2);
     while stdout.is_none() || stderr.is_none() {
         let remaining = drain_deadline.saturating_duration_since(Instant::now());
         match receive.recv_timeout(remaining) {
             Ok((true, read)) => stdout = Some(read?),
             Ok((false, read)) => stderr = Some(read?),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if !timed_out => {
-                timed_out = true;
-                kill_process_group(group);
-                drain_deadline = Instant::now() + Duration::from_secs(2);
-            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
@@ -710,6 +767,10 @@ fn capture_bounded(command: &mut Command, timeout: Duration) -> std::io::Result<
 fn managed_output(command: &mut Command, timeout: Duration, action: &str) -> Output {
     let captured = capture_bounded(command, timeout)
         .unwrap_or_else(|error| panic!("{action} could not be captured: {error}"));
+    checked_managed_output(captured, timeout, action)
+}
+
+fn checked_managed_output(captured: BoundedOutput, timeout: Duration, action: &str) -> Output {
     assert!(
         !captured.timed_out,
         "{action} exceeded {timeout:?}: {:?}",
@@ -721,6 +782,126 @@ fn managed_output(command: &mut Command, timeout: Duration, action: &str) -> Out
         captured.output
     );
     captured.output
+}
+
+/// Quickstart deliberately gives Docker its own process group. A fixture-only
+/// RPC launcher makes the actual Docker command a direct child of this test,
+/// so cancellation can kill and reap it before Compose resource cleanup starts.
+/// Only requests on this private fixture socket can launch owned commands.
+struct ManagedDockerProxy {
+    cancelled: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+}
+
+impl ManagedDockerProxy {
+    fn start(machine: &Machine, docker: &Path, endpoint: &std::ffi::OsStr) -> Self {
+        use std::os::unix::net::UnixListener;
+
+        let socket = machine.home.path().join("docker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let launcher = machine.bin.path().join("docker");
+        // The repository's Docker fixtures already require the system Python.
+        // JSON preserves argument boundaries, including whitespace and newlines.
+        std::fs::write(
+            &launcher,
+            r#"#!/usr/bin/python3
+import json, os, socket, sys
+with socket.socket(socket.AF_UNIX) as client:
+    client.connect(os.path.join(os.environ['HOME'], 'docker.sock'))
+    client.sendall(json.dumps(sys.argv[1:]).encode() + b'\n')
+    with client.makefile('rb') as response:
+        result = json.loads(response.readline())
+    sys.stdout.buffer.write(bytes(result['stdout']))
+    sys.stderr.buffer.write(bytes(result['stderr']))
+    sys.exit(result['code'])
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let stop = cancelled.clone();
+        let docker = docker.to_owned();
+        let endpoint = endpoint.to_owned();
+        let home = machine.home.path().to_owned();
+        let worker = std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+
+            while !stop.load(Ordering::Acquire) {
+                let (mut client, _) = match listener.accept() {
+                    Ok(client) => client,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                client.set_read_timeout(Some(Duration::from_secs(2)))?;
+                client.set_write_timeout(Some(Duration::from_secs(2)))?;
+                let mut request = String::new();
+                BufReader::new((&client).take(64 * 1024)).read_line(&mut request)?;
+                let args: Vec<String> = serde_json::from_str(&request)?;
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                let mut command = managed_docker_command(&docker, &endpoint, &home);
+                command
+                    .args(args)
+                    .env("DOCKER_DEFAULT_PLATFORM", "linux/arm64");
+                let captured =
+                    capture_until_cancelled(&mut command, MANAGED_COMMAND_TIMEOUT, &stop)?;
+                let response = json!({
+                    "code": if captured.timed_out || captured.stdout_truncated || captured.stderr_truncated {
+                        125
+                    } else {
+                        captured.output.status.code().unwrap_or(125)
+                    },
+                    "stdout": captured.output.stdout,
+                    "stderr": captured.output.stderr,
+                });
+                // Quickstart may already have killed its RPC client. The actual
+                // command has nevertheless been cleaned up and reaped above.
+                let _ = writeln!(client, "{response}");
+            }
+            Ok(())
+        });
+        Self {
+            cancelled,
+            worker: Some(worker),
+        }
+    }
+
+    fn stop(&mut self) -> std::io::Result<()> {
+        self.cancelled.store(true, Ordering::Release);
+        self.worker.take().map_or(Ok(()), |worker| {
+            worker
+                .join()
+                .map_err(|_| std::io::Error::other("Docker proxy panicked"))?
+        })
+    }
+}
+
+impl Drop for ManagedDockerProxy {
+    fn drop(&mut self) {
+        if let Err(error) = self.stop() {
+            eprintln!("managed Docker proxy cleanup failed: {error}");
+        }
+    }
+}
+
+fn managed_quickstart(
+    machine: &Machine,
+    docker: &Path,
+    endpoint: &std::ffi::OsStr,
+    command: &mut Command,
+    timeout: Duration,
+) -> std::io::Result<BoundedOutput> {
+    let mut proxy = ManagedDockerProxy::start(machine, docker, endpoint);
+    let captured = capture_with_cleanup(command, timeout, &AtomicBool::new(false), || proxy.stop());
+    // Always cancel and join the command owner before returning, even on capture
+    // failure. The caller's Compose cleanup must not race a surviving `up`.
+    proxy.stop()?;
+    captured
 }
 
 struct ManagedDockerCleanup {
@@ -820,6 +1001,87 @@ fn managed_http(port: u16, path: &str) -> Option<(u16, String)> {
 }
 
 #[test]
+fn managed_quickstart_timeout_stops_nested_docker_before_cleanup() {
+    let machine = Machine::new();
+    let repo = machine.repo();
+    let docker = machine.home.path().join("synthetic-docker");
+    std::fs::write(
+        &docker,
+        r#"#!/bin/sh
+printf '%s\n' "$*" > "$HOME/docker-started"
+(/bin/sleep 3; printf survived > "$HOME/docker-late-marker") &
+wait
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut command = machine.command(
+        repo.path(),
+        &[
+            "quickstart",
+            "--yes",
+            "--hub",
+            "local",
+            "--hub-runtime",
+            "docker",
+            "--github-login",
+            "synthetic-user",
+            "--no-agents",
+            "--no-collisions",
+        ],
+    );
+    let started = Instant::now();
+    let captured = managed_quickstart(
+        &machine,
+        &docker,
+        std::ffi::OsStr::new("unix:///synthetic-unused"),
+        &mut command,
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    assert!(captured.timed_out, "{:?}", captured.output);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(
+        machine.home.path().join("docker-started").exists(),
+        "real quickstart never reached Docker"
+    );
+    // This is the boundary where the real fixture may begin `compose down`.
+    // Waiting past the synthetic command's write deadline detects surviving work.
+    std::thread::sleep(Duration::from_millis(3200));
+    assert!(!machine.home.path().join("docker-late-marker").exists());
+}
+
+#[test]
+fn managed_exited_leader_cleans_up_inherited_output_pipes() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("late-marker");
+    let mut command = Command::new("/bin/sh");
+    command.env("MARKER", &marker).args([
+        "-c",
+        "(/bin/sleep 0.3; printf survived > \"$MARKER\") & exit 0",
+    ]);
+    let captured = capture_bounded(&mut command, Duration::from_secs(2)).unwrap();
+    assert!(captured.output.status.success());
+    assert!(!captured.timed_out);
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(!marker.exists());
+}
+
+#[test]
+fn managed_reaped_leader_refuses_group_signal() {
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    child.wait().unwrap();
+    assert_eq!(
+        kill_owned_process_group(&child).unwrap_err().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+}
+
+#[test]
 fn managed_command_timeout_kills_the_owned_process_group() {
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("late-marker");
@@ -872,7 +1134,6 @@ fn managed_docker_generated_compose_accepts_empty_slack_setting() {
     assert!(!image.is_empty());
 
     let machine = Machine::transient();
-    symlink(&docker, machine.bin.path().join("docker")).unwrap();
     let plugins = machine.home.path().join(".docker/cli-plugins");
     std::fs::create_dir_all(&plugins).unwrap();
     symlink(&compose, plugins.join("docker-compose")).unwrap();
@@ -915,8 +1176,16 @@ fn managed_docker_generated_compose_accepts_empty_slack_setting() {
         .env("DOCKER_HOST", &endpoint)
         .env("AGENTSCM_HUB_IMAGE", &image)
         .env("DOCKER_DEFAULT_PLATFORM", "linux/arm64");
-    let output = managed_output(
+    let captured = managed_quickstart(
+        &machine,
+        &docker,
+        &endpoint,
         &mut quickstart,
+        MANAGED_QUICKSTART_TIMEOUT,
+    )
+    .unwrap();
+    let output = checked_managed_output(
+        captured,
         MANAGED_QUICKSTART_TIMEOUT,
         "managed Docker quickstart",
     );

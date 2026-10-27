@@ -269,14 +269,65 @@ fn slack_hub_command(dir: &TempDir, slack_file: Option<&OsStr>) -> Command {
 }
 
 #[cfg(unix)]
-fn kill_owned_process_group(child: &mut Child) {
-    let group = -(child.id() as i32);
-    // SAFETY: the child created a new process group whose id is its pid, and this test owns it.
-    unsafe {
-        libc::kill(group, libc::SIGKILL);
+fn child_exited_without_reaping(child: &Child) -> std::io::Result<bool> {
+    loop {
+        // SAFETY: waitid initializes this writable siginfo_t. WNOWAIT retains
+        // the child's PID reservation until all group signals are complete.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return Ok(info.si_signo == libc::SIGCHLD);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
-    let _ = child.kill();
-    let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn kill_owned_process_group(child: &mut Child) -> std::io::Result<()> {
+    // Refuse ECHILD before signalling: a reaped PID may have been reused.
+    child_exited_without_reaping(child)?;
+    loop {
+        // SAFETY: this unreaped child leads the fresh group created at spawn.
+        if unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) } == 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            break;
+        }
+        #[cfg(target_os = "macos")]
+        if error.raw_os_error() == Some(libc::EPERM) && child_exited_without_reaping(child)? {
+            // Darwin reports EPERM for a group containing only its zombie leader.
+            let mut members = [0 as libc::pid_t; 2];
+            // SAFETY: two writable slots distinguish the sole owned leader from
+            // a group with descendants; no unrelated PIDs are scanned.
+            let count = unsafe {
+                libc::proc_listpgrppids(
+                    child.id() as libc::pid_t,
+                    members.as_mut_ptr().cast(),
+                    std::mem::size_of_val(&members) as libc::c_int,
+                )
+            };
+            if count == 1 && members[0] == child.id() as libc::pid_t {
+                break;
+            }
+        }
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    child.wait()?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -331,14 +382,14 @@ fn bound_address(
     let result = match receive.recv_timeout(timeout) {
         Ok(result) => result,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            kill_owned_process_group(&mut server.0);
+            kill_owned_process_group(&mut server.0).map_err(|error| error.to_string())?;
             let _ = reader.join();
             return Err(format!(
                 "hub did not print its bound address within {timeout:?}"
             ));
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            kill_owned_process_group(&mut server.0);
+            kill_owned_process_group(&mut server.0).map_err(|error| error.to_string())?;
             let _ = reader.join();
             return Err("hub startup output reader stopped unexpectedly".into());
         }
@@ -347,7 +398,7 @@ fn bound_address(
         .join()
         .map_err(|_| "hub startup output reader panicked".to_owned())?;
     if result.is_err() {
-        kill_owned_process_group(&mut server.0);
+        kill_owned_process_group(&mut server.0).map_err(|error| error.to_string())?;
     }
     result
 }
@@ -382,7 +433,7 @@ fn assert_slack_setting_reaches_health(slack_file: Option<&OsStr>) {
         });
     wait_for(Duration::from_secs(10), || {
         assert!(
-            server.0.try_wait().unwrap().is_none(),
+            !child_exited_without_reaping(&server.0).unwrap(),
             "hub exited before health: {seen}"
         );
         try_http_status(address, "/v1/hub/health") == Some(200)
@@ -408,23 +459,69 @@ fn bound_address_deadline_kills_and_reaps_a_silent_child() {
 }
 
 #[cfg(unix)]
+#[test]
+fn bound_address_exited_leader_cleans_up_inherited_pipe() {
+    use std::os::unix::process::CommandExt;
+
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("late-marker");
+    let mut child = Command::new("/bin/sh");
+    child
+        .process_group(0)
+        .env("MARKER", &marker)
+        .args([
+            "-c",
+            "(/bin/sleep 0.3; printf survived > \"$MARKER\") & exit 0",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut server = Server(child.spawn().unwrap());
+    let stderr = server.0.stderr.take().unwrap();
+    let error = bound_address(&mut server, stderr, Duration::from_millis(100)).unwrap_err();
+    assert!(error.contains("within 100ms"), "{error}");
+    assert!(server.0.wait().unwrap().success());
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(!marker.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn hub_reaped_leader_refuses_group_signal() {
+    use std::os::unix::process::CommandExt;
+
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    child.wait().unwrap();
+    assert_eq!(
+        kill_owned_process_group(&mut child)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::ECHILD)
+    );
+}
+
+#[cfg(unix)]
 fn assert_slack_setting_fails(slack_file: &OsStr) {
     let dir = TempDir::new().unwrap();
     let mut server = Server(slack_hub_command(&dir, Some(slack_file)).spawn().unwrap());
-    let mut status = None;
     wait_for(Duration::from_secs(10), || {
-        status = server.0.try_wait().unwrap();
-        status.is_some()
+        child_exited_without_reaping(&server.0).unwrap()
     });
+    kill_owned_process_group(&mut server.0).unwrap();
+    let status = server.0.wait().unwrap();
     let mut stderr = String::new();
     server
         .0
         .stderr
         .take()
         .unwrap()
+        .take(64 * 1024)
         .read_to_string(&mut stderr)
         .unwrap();
-    assert!(!status.unwrap().success(), "{stderr}");
+    assert!(!status.success(), "{stderr}");
 }
 
 #[cfg(unix)]
