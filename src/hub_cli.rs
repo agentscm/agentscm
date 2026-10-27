@@ -480,6 +480,7 @@ pub(crate) enum SignIn {
     /// This computer's browser when it has one, else a code for another device.
     Auto,
     /// This computer's browser: the menu bar app has no terminal to show a code in.
+    #[cfg(target_os = "macos")]
     Browser,
     /// A code typed on another device.
     Device,
@@ -527,6 +528,7 @@ pub(crate) async fn sign_in_with(
         device["replaces"] = json!(replaces);
     }
     let browser = match how {
+        #[cfg(target_os = "macos")]
         SignIn::Browser => true,
         SignIn::Device => false,
         SignIn::Auto => browser_available() || browser_only(&client, hub, provider).await,
@@ -1798,6 +1800,7 @@ pub(crate) fn is_signed_in(hub: Option<&str>) -> Result<bool> {
 }
 
 /// The saved Hub for `hub` (or the default Hub), signed in or not: where a sign-in goes.
+#[cfg(target_os = "macos")]
 pub(crate) fn saved_hub(hub: Option<&str>) -> Option<String> {
     load_saved_session(hub).ok().map(|(hub, _)| hub)
 }
