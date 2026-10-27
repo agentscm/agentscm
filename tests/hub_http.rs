@@ -1,6 +1,7 @@
 #[path = "common/hub_pg.rs"]
 mod hub_pg;
 
+#[cfg(unix)]
 use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -239,8 +240,11 @@ fn wait_for(deadline: Duration, mut done: impl FnMut() -> bool) {
 
 #[cfg(unix)]
 fn slack_hub_command(dir: &TempDir, slack_file: Option<&OsStr>) -> Command {
+    use std::os::unix::process::CommandExt;
+
     let mut command = Command::new(env!("CARGO_BIN_EXE_agentscm"));
     command
+        .process_group(0)
         .env_clear()
         .env(
             "AGENTSCM_DATABASE_URL",
@@ -259,18 +263,87 @@ fn slack_hub_command(dir: &TempDir, slack_file: Option<&OsStr>) -> Command {
 }
 
 #[cfg(unix)]
-fn bound_address(stderr: &mut BufReader<impl Read>, seen: &mut String) -> SocketAddr {
-    loop {
-        let mut line = String::new();
-        assert!(
-            stderr.read_line(&mut line).unwrap() > 0,
-            "hub exited before binding: {seen}"
-        );
-        seen.push_str(&line);
-        if let Some(rest) = line.strip_prefix("hub listening on ") {
-            return rest.split(' ').next().unwrap().parse().unwrap();
-        }
+fn kill_owned_process_group(child: &mut Child) {
+    let group = -(child.id() as i32);
+    // SAFETY: the child created a new process group whose id is its pid, and this test owns it.
+    unsafe {
+        libc::kill(group, libc::SIGKILL);
     }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn bound_address(
+    server: &mut Server,
+    stderr: std::process::ChildStderr,
+    timeout: Duration,
+) -> Result<
+    (
+        SocketAddr,
+        BufReader<std::io::Take<std::process::ChildStderr>>,
+        String,
+    ),
+    String,
+> {
+    const OUTPUT_LIMIT: usize = 64 * 1024;
+
+    let (send, receive) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut stderr = BufReader::new(stderr.take((OUTPUT_LIMIT + 1) as u64));
+        let mut seen = String::new();
+        let result = loop {
+            let mut line = String::new();
+            match stderr.read_line(&mut line) {
+                Ok(0) => break Err(format!("hub exited before binding: {seen}")),
+                Ok(_) if seen.len() + line.len() > OUTPUT_LIMIT => {
+                    break Err(format!(
+                        "hub startup output exceeded {OUTPUT_LIMIT} bytes: {seen}"
+                    ));
+                }
+                Ok(_) => {
+                    seen.push_str(&line);
+                    if let Some(rest) = line.strip_prefix("hub listening on ") {
+                        break rest
+                            .split(' ')
+                            .next()
+                            .ok_or_else(|| format!("hub printed an empty address: {seen}"))
+                            .and_then(|address| {
+                                address.parse().map_err(|error| {
+                                    format!("invalid hub address: {error}: {seen}")
+                                })
+                            })
+                            .map(|address| (address, stderr, seen));
+                    }
+                }
+                Err(error) => break Err(format!("reading hub startup output failed: {error}")),
+            }
+        };
+        let _ = send.send(result);
+    });
+
+    let result = match receive.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            kill_owned_process_group(&mut server.0);
+            let _ = reader.join();
+            return Err(format!(
+                "hub did not print its bound address within {timeout:?}"
+            ));
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            kill_owned_process_group(&mut server.0);
+            let _ = reader.join();
+            return Err("hub startup output reader stopped unexpectedly".into());
+        }
+    };
+    reader
+        .join()
+        .map_err(|_| "hub startup output reader panicked".to_owned())?;
+    if result.is_err() {
+        kill_owned_process_group(&mut server.0);
+    }
+    result
 }
 
 #[cfg(unix)]
@@ -278,6 +351,9 @@ fn try_http_status(address: SocketAddr, path: &str) -> Option<u16> {
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(100)).ok()?;
     stream
         .set_read_timeout(Some(Duration::from_millis(500)))
+        .ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_millis(500)))
         .ok()?;
     write!(
         stream,
@@ -293,9 +369,11 @@ fn try_http_status(address: SocketAddr, path: &str) -> Option<u16> {
 fn assert_slack_setting_reaches_health(slack_file: Option<&OsStr>) {
     let dir = TempDir::new().unwrap();
     let mut server = Server(slack_hub_command(&dir, slack_file).spawn().unwrap());
-    let mut stderr = BufReader::new(server.0.stderr.take().unwrap());
-    let mut seen = String::new();
-    let address = bound_address(&mut stderr, &mut seen);
+    let stderr = server.0.stderr.take().unwrap();
+    let (address, _stderr, seen) = bound_address(&mut server, stderr, Duration::from_secs(10))
+        .unwrap_or_else(|error| {
+            panic!("{error}");
+        });
     wait_for(Duration::from_secs(10), || {
         assert!(
             server.0.try_wait().unwrap().is_none(),
@@ -303,6 +381,24 @@ fn assert_slack_setting_reaches_health(slack_file: Option<&OsStr>) {
         );
         try_http_status(address, "/v1/hub/health") == Some(200)
     });
+}
+
+#[cfg(unix)]
+#[test]
+fn bound_address_deadline_kills_and_reaps_a_silent_child() {
+    use std::os::unix::process::CommandExt;
+
+    let mut command = Command::new("/bin/sh");
+    command
+        .process_group(0)
+        .args(["-c", "exec /bin/sleep 120"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut server = Server(command.spawn().unwrap());
+    let stderr = server.0.stderr.take().unwrap();
+    let error = bound_address(&mut server, stderr, Duration::from_millis(100)).unwrap_err();
+    assert!(error.contains("within 100ms"), "{error}");
+    assert!(server.0.try_wait().unwrap().is_some());
 }
 
 #[cfg(unix)]

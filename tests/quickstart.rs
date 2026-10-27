@@ -3,10 +3,13 @@
 //! first-run GitHub App flow are unit tested, plus one explicitly selected ignored
 //! test exercises the real managed Docker boundary.
 #![cfg(unix)]
+use std::io::Read;
 use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use agentscm::backend::LocalBackend;
 use agentscm::hub::store::{self, ForgeIdentity, Store, mint_agent_token, unix_now};
@@ -569,29 +572,184 @@ fn unused_port() -> u16 {
         .port()
 }
 
+const MANAGED_OUTPUT_LIMIT: usize = 2 * 1024 * 1024;
+const MANAGED_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const MANAGED_QUICKSTART_TIMEOUT: Duration = Duration::from_secs(120);
+
+struct BoundedOutput {
+    output: Output,
+    timed_out: bool,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+}
+
+fn read_capped(mut reader: impl Read) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut kept = Vec::new();
+    let mut truncated = false;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok((kept, truncated));
+        }
+        let remaining = MANAGED_OUTPUT_LIMIT.saturating_sub(kept.len());
+        kept.extend_from_slice(&buffer[..read.min(remaining)]);
+        truncated |= read > remaining;
+    }
+}
+
+fn kill_process_group(group: i32) {
+    // SAFETY: the command created a fresh process group whose id is the owned child's pid.
+    unsafe {
+        libc::kill(-group, libc::SIGKILL);
+    }
+}
+
+fn capture_bounded(command: &mut Command, timeout: Duration) -> std::io::Result<BoundedOutput> {
+    command
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let group = child.id() as i32;
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    let stdout_send = send.clone();
+    std::thread::spawn(move || {
+        let _ = stdout_send.send((true, read_capped(stdout)));
+    });
+    std::thread::spawn(move || {
+        let _ = send.send((false, read_capped(stderr)));
+    });
+
+    let deadline = Instant::now() + timeout;
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            timed_out = true;
+            kill_process_group(group);
+            let _ = child.kill();
+            break child.wait()?;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    let mut stdout = None;
+    let mut stderr = None;
+    let mut drain_deadline = if timed_out {
+        Instant::now() + Duration::from_secs(2)
+    } else {
+        deadline
+    };
+    while stdout.is_none() || stderr.is_none() {
+        let remaining = drain_deadline.saturating_duration_since(Instant::now());
+        match receive.recv_timeout(remaining) {
+            Ok((true, read)) => stdout = Some(read?),
+            Ok((false, read)) => stderr = Some(read?),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if !timed_out => {
+                timed_out = true;
+                kill_process_group(group);
+                drain_deadline = Instant::now() + Duration::from_secs(2);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "command output readers did not stop after the process group was killed",
+                ));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(std::io::Error::other(
+                    "command output reader stopped unexpectedly",
+                ));
+            }
+        }
+    }
+    let (stdout, stdout_truncated) = stdout.unwrap();
+    let (stderr, stderr_truncated) = stderr.unwrap();
+    Ok(BoundedOutput {
+        output: Output {
+            status,
+            stdout,
+            stderr,
+        },
+        timed_out,
+        stdout_truncated,
+        stderr_truncated,
+    })
+}
+
+fn managed_output(command: &mut Command, timeout: Duration, action: &str) -> Output {
+    let captured = capture_bounded(command, timeout)
+        .unwrap_or_else(|error| panic!("{action} could not be captured: {error}"));
+    assert!(
+        !captured.timed_out,
+        "{action} exceeded {timeout:?}: {:?}",
+        captured.output
+    );
+    assert!(
+        !captured.stdout_truncated && !captured.stderr_truncated,
+        "{action} output exceeded {MANAGED_OUTPUT_LIMIT} bytes: {:?}",
+        captured.output
+    );
+    captured.output
+}
+
 struct ManagedDockerCleanup {
     docker: PathBuf,
     endpoint: std::ffi::OsString,
     home: PathBuf,
     setup: PathBuf,
     project: String,
+    cleaned: bool,
 }
 
-impl Drop for ManagedDockerCleanup {
-    fn drop(&mut self) {
-        let _ = Command::new(&self.docker)
-            .env_clear()
-            .env("DOCKER_HOST", &self.endpoint)
-            .env("HOME", &self.home)
-            .env("PATH", "/usr/bin:/bin")
+impl ManagedDockerCleanup {
+    fn cleanup(&mut self) -> Result<(), String> {
+        if self.cleaned {
+            return Ok(());
+        }
+        let mut command = managed_docker_command(&self.docker, &self.endpoint, &self.home);
+        command
             .args(["compose", "-p", &self.project, "-f"])
             .arg(self.setup.join("compose.yaml"))
             .arg("--env-file")
             .arg(self.setup.join(".env"))
-            .args(["down", "-v", "--remove-orphans"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+            .args(["down", "-v", "--remove-orphans"]);
+        let captured = capture_bounded(&mut command, MANAGED_COMMAND_TIMEOUT)
+            .map_err(|error| format!("managed Docker cleanup could not be captured: {error}"))?;
+        if captured.timed_out {
+            return Err(format!(
+                "managed Docker cleanup exceeded {MANAGED_COMMAND_TIMEOUT:?}"
+            ));
+        }
+        if captured.stdout_truncated || captured.stderr_truncated {
+            return Err(format!(
+                "managed Docker cleanup output exceeded {MANAGED_OUTPUT_LIMIT} bytes"
+            ));
+        }
+        if !captured.output.status.success() {
+            return Err(format!(
+                "managed Docker cleanup failed with {}: stdout: {}; stderr: {}",
+                captured.output.status,
+                String::from_utf8_lossy(&captured.output.stdout),
+                String::from_utf8_lossy(&captured.output.stderr)
+            ));
+        }
+        self.cleaned = true;
+        Ok(())
+    }
+}
+
+impl Drop for ManagedDockerCleanup {
+    fn drop(&mut self) {
+        if let Err(error) = self.cleanup() {
+            eprintln!("best-effort managed Docker cleanup failed: {error}");
+        }
     }
 }
 
@@ -609,23 +767,65 @@ fn managed_docker_command(docker: &Path, endpoint: &std::ffi::OsStr, home: &Path
 }
 
 fn managed_http(port: u16, path: &str) -> Option<(u16, String)> {
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::net::{SocketAddr, TcpStream};
-    use std::time::Duration;
 
     let address = SocketAddr::from(([127, 0, 0, 1], port));
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(200)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .ok()?;
     write!(
         stream,
         "GET {path} HTTP/1.1\r\nHost: hub\r\nConnection: close\r\n\r\n"
     )
     .ok()?;
-    let mut raw = String::new();
-    stream.read_to_string(&mut raw).ok()?;
+    let mut raw = Vec::new();
+    stream
+        .take((MANAGED_OUTPUT_LIMIT + 1) as u64)
+        .read_to_end(&mut raw)
+        .ok()?;
+    if raw.len() > MANAGED_OUTPUT_LIMIT {
+        return None;
+    }
+    let raw = String::from_utf8(raw).ok()?;
     let (head, body) = raw.split_once("\r\n\r\n")?;
     let status = head.split(' ').nth(1)?.parse().ok()?;
     Some((status, body.to_owned()))
+}
+
+#[test]
+fn managed_command_timeout_kills_the_owned_process_group() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("late-marker");
+    let mut command = Command::new("/bin/sh");
+    command.env("MARKER", &marker).args([
+        "-c",
+        "(/bin/sleep 0.3; printf survived > \"$MARKER\") & wait",
+    ]);
+    let started = Instant::now();
+    let captured = capture_bounded(&mut command, Duration::from_millis(50)).unwrap();
+    assert!(captured.timed_out);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(!marker.exists(), "a descendant survived the timeout");
+}
+
+#[test]
+fn managed_cleanup_reports_command_failure() {
+    let dir = TempDir::new().unwrap();
+    let mut cleanup = ManagedDockerCleanup {
+        docker: "/usr/bin/false".into(),
+        endpoint: "synthetic-endpoint".into(),
+        home: dir.path().to_owned(),
+        setup: dir.path().to_owned(),
+        project: "synthetic-project".into(),
+        cleaned: false,
+    };
+    let error = cleanup.cleanup().unwrap_err();
+    cleanup.cleaned = true;
+    assert!(error.contains("cleanup failed"), "{error}");
 }
 
 #[test]
@@ -660,48 +860,60 @@ fn managed_docker_generated_compose_accepts_empty_slack_setting() {
     let port = unused_port();
     let project = format!("agentscm-empty-slack-{}-{port}", std::process::id());
     let setup = machine.home.path().join(".agentscm/hub");
-    let _cleanup = ManagedDockerCleanup {
+    let mut cleanup = ManagedDockerCleanup {
         docker: docker.clone(),
         endpoint: endpoint.clone(),
         home: machine.home.path().to_owned(),
         setup: setup.clone(),
         project: project.clone(),
+        cleaned: false,
     };
-    let output = machine
-        .command(
-            repo.path(),
-            &[
-                "quickstart",
-                "--yes",
-                "--hub",
-                "local",
-                "--hub-runtime",
-                "docker",
-                "--hub-port",
-                &port.to_string(),
-                "--hub-project",
-                &project,
-                "--github-login",
-                "synthetic-user",
-                "--no-agents",
-                "--no-collisions",
-            ],
-        )
+    let mut quickstart = machine.command(
+        repo.path(),
+        &[
+            "quickstart",
+            "--yes",
+            "--hub",
+            "local",
+            "--hub-runtime",
+            "docker",
+            "--hub-port",
+            &port.to_string(),
+            "--hub-project",
+            &project,
+            "--github-login",
+            "synthetic-user",
+            "--no-agents",
+            "--no-collisions",
+        ],
+    );
+    quickstart
         .env("DOCKER_HOST", &endpoint)
         .env("AGENTSCM_HUB_IMAGE", &image)
-        .env("DOCKER_DEFAULT_PLATFORM", "linux/arm64")
-        .output()
-        .unwrap();
+        .env("DOCKER_DEFAULT_PLATFORM", "linux/arm64");
+    let output = managed_output(
+        &mut quickstart,
+        MANAGED_QUICKSTART_TIMEOUT,
+        "managed Docker quickstart",
+    );
     assert_eq!(output.status.code(), Some(3), "{output:?}");
 
-    let config = managed_docker_command(&docker, &endpoint, machine.home.path())
-        .args(["compose", "-p", &project, "-f"])
-        .arg(setup.join("compose.yaml"))
-        .arg("--env-file")
-        .arg(setup.join(".env"))
-        .args(["config", "--format", "json"])
-        .output()
-        .unwrap();
+    let compose_command = || {
+        let mut command = managed_docker_command(&docker, &endpoint, machine.home.path());
+        command
+            .args(["compose", "-p", &project, "-f"])
+            .arg(setup.join("compose.yaml"))
+            .arg("--env-file")
+            .arg(setup.join(".env"));
+        command
+    };
+    let mut config = compose_command();
+    config.args(["config", "--format", "json"]);
+    let config = managed_output(
+        &mut config,
+        MANAGED_COMMAND_TIMEOUT,
+        "managed Docker compose config",
+    );
     assert!(config.status.success(), "{config:?}");
     let config: Value = serde_json::from_slice(&config.stdout).unwrap();
     assert_eq!(
@@ -709,44 +921,176 @@ fn managed_docker_generated_compose_accepts_empty_slack_setting() {
         ""
     );
 
-    let started = std::time::Instant::now();
-    loop {
-        if managed_http(port, "/v1/hub/health").is_some_and(|response| response.0 == 200) {
-            break;
+    let wait_for_health = || {
+        let started = Instant::now();
+        loop {
+            if managed_http(port, "/v1/hub/health").is_some_and(|response| response.0 == 200) {
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "managed Hub did not reach health"
+            );
+            std::thread::sleep(Duration::from_millis(100));
         }
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(15),
-            "managed Hub did not reach health"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    };
+    wait_for_health();
     let (ui_status, ui) = managed_http(port, "/ui/").expect("embedded UI response");
     assert_eq!(ui_status, 200);
-    assert!(ui.contains("<!doctype html"), "embedded UI was not served");
+    assert!(
+        ui.contains("<title>AgentSCM Hub</title>")
+            && ui.contains("<div id=\"root\"></div>")
+            && ui.contains("src=\"./app.js\"")
+            && ui.contains("href=\"./app.css\""),
+        "embedded application shell was not served"
+    );
+    let (script_status, script) = managed_http(port, "/ui/app.js").expect("embedded script");
+    assert_eq!(script_status, 200);
+    assert!(
+        script.contains("/v1/hub/health") && script.contains("AgentSCM"),
+        "embedded application script markers were absent"
+    );
+    let (style_status, style) = managed_http(port, "/ui/app.css").expect("embedded stylesheet");
+    assert_eq!(style_status, 200);
+    assert!(
+        style.contains(".app-shell"),
+        "embedded application stylesheet marker was absent"
+    );
 
-    let container = managed_docker_command(&docker, &endpoint, machine.home.path())
-        .args(["compose", "-p", &project, "-f"])
-        .arg(setup.join("compose.yaml"))
-        .arg("--env-file")
-        .arg(setup.join(".env"))
-        .args(["ps", "-q", "hub"])
-        .output()
-        .unwrap();
+    let mut container = compose_command();
+    container.args(["ps", "-q", "hub"]);
+    let container = managed_output(
+        &mut container,
+        MANAGED_COMMAND_TIMEOUT,
+        "managed Docker container lookup",
+    );
     assert!(container.status.success(), "{container:?}");
     let container = String::from_utf8(container.stdout).unwrap();
-    let container = container.trim();
+    let container = container.trim().to_owned();
     assert!(!container.is_empty());
-    let restart_count = || {
-        let output = managed_docker_command(&docker, &endpoint, machine.home.path())
-            .args(["inspect", "--format", "{{.RestartCount}}", container])
-            .output()
-            .unwrap();
+
+    let inspect = |container: &str| {
+        let mut command = managed_docker_command(&docker, &endpoint, machine.home.path());
+        command.args([
+            "inspect",
+            "--format",
+            "{{.Image}}\t{{.RestartCount}}\t{{range .Mounts}}{{if eq .Destination \"/data\"}}{{.Name}}{{end}}{{end}}",
+            container,
+        ]);
+        let output = managed_output(
+            &mut command,
+            MANAGED_COMMAND_TIMEOUT,
+            "managed Docker container inspection",
+        );
         assert!(output.status.success(), "{output:?}");
-        String::from_utf8(output.stdout).unwrap()
+        let text = String::from_utf8(output.stdout).unwrap();
+        let mut fields = text.trim().split('\t');
+        let image = fields.next().unwrap().to_owned();
+        let restart_count = fields.next().unwrap().parse::<u64>().unwrap();
+        let volume = fields.next().unwrap().to_owned();
+        assert!(fields.next().is_none(), "unexpected inspect output: {text}");
+        assert!(image.starts_with("sha256:"), "{image}");
+        assert!(!volume.is_empty(), "managed data volume was not mounted");
+        (image, restart_count, volume)
     };
-    let before = restart_count();
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    assert_eq!(restart_count(), before);
+
+    let mut write_state_fixture = compose_command();
+    write_state_fixture.args([
+        "exec",
+        "-T",
+        "hub",
+        "sh",
+        "-c",
+        "umask 077; printf %s agentscm-issue-181-state > /data/issue-181-state",
+    ]);
+    let write_state_fixture = managed_output(
+        &mut write_state_fixture,
+        MANAGED_COMMAND_TIMEOUT,
+        "managed Docker retained-state fixture",
+    );
+    assert!(
+        write_state_fixture.status.success(),
+        "{write_state_fixture:?}"
+    );
+
+    let state_identity = || {
+        let mut command = compose_command();
+        command.args(["exec", "-T", "hub", "sha256sum", "/data/issue-181-state"]);
+        let output = managed_output(
+            &mut command,
+            MANAGED_COMMAND_TIMEOUT,
+            "managed Docker retained-state identity",
+        );
+        assert!(output.status.success(), "{output:?}");
+        let output = String::from_utf8(output.stdout).unwrap();
+        let identity = output.split_whitespace().next().unwrap().to_owned();
+        assert!(
+            identity.len() == 64 && identity.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "invalid retained-state identity"
+        );
+        identity
+    };
+
+    let (image_before, restart_before, volume_before) = inspect(&container);
+    let state_before = state_identity();
+    let mut restart = compose_command();
+    restart.args(["restart", "hub"]);
+    let restart = managed_output(
+        &mut restart,
+        MANAGED_COMMAND_TIMEOUT,
+        "managed Docker restart",
+    );
+    assert!(restart.status.success(), "{restart:?}");
+    wait_for_health();
+
+    let mut restarted_container = compose_command();
+    restarted_container.args(["ps", "-q", "hub"]);
+    let restarted_container = managed_output(
+        &mut restarted_container,
+        MANAGED_COMMAND_TIMEOUT,
+        "managed Docker restarted-container lookup",
+    );
+    assert!(
+        restarted_container.status.success(),
+        "{restarted_container:?}"
+    );
+    let restarted_container = String::from_utf8(restarted_container.stdout).unwrap();
+    let restarted_container = restarted_container.trim();
+    assert_eq!(restarted_container, container);
+    let (image_after, restart_after, volume_after) = inspect(restarted_container);
+    let state_after = state_identity();
+    assert_eq!(image_after, image_before);
+    assert_eq!(volume_after, volume_before);
+    assert_eq!(state_after, state_before);
+    std::thread::sleep(Duration::from_secs(2));
+    let (_, restart_settled, _) = inspect(restarted_container);
+    assert_eq!(restart_settled, restart_after, "Hub entered a restart loop");
+
+    cleanup
+        .cleanup()
+        .unwrap_or_else(|error| panic!("explicit managed Docker cleanup failed: {error}"));
+    let mut removed_container = managed_docker_command(&docker, &endpoint, machine.home.path());
+    removed_container.args(["inspect", restarted_container]);
+    let removed_container = managed_output(
+        &mut removed_container,
+        MANAGED_COMMAND_TIMEOUT,
+        "managed Docker cleanup container check",
+    );
+    assert!(
+        !removed_container.status.success(),
+        "container survived cleanup"
+    );
+    let mut removed_volume = managed_docker_command(&docker, &endpoint, machine.home.path());
+    removed_volume.args(["volume", "inspect", &volume_before]);
+    let removed_volume = managed_output(
+        &mut removed_volume,
+        MANAGED_COMMAND_TIMEOUT,
+        "managed Docker cleanup volume check",
+    );
+    assert!(!removed_volume.status.success(), "volume survived cleanup");
+    eprintln!(
+        "managed Docker evidence: image_digest={image_before} restart_count_before={restart_before} restart_count_after={restart_after} retained_state_sha256={state_before} volume={volume_before} cleanup=removed"
+    );
 }
 
 fn run_with_hub_port_retry<F>(run: F) -> Output
