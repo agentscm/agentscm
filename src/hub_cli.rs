@@ -491,20 +491,8 @@ fn civil(epoch: i64) -> (i64, i64, i64, i64) {
             );
         }
     }
-    utc_civil(epoch)
-}
-
-/// UTC (month, day, hour, minute), from Howard Hinnant's days-to-civil algorithm.
-fn utc_civil(epoch: i64) -> (i64, i64, i64, i64) {
-    let (days, seconds) = (epoch.div_euclid(86_400), epoch.rem_euclid(86_400));
-    let z = days + 719_468;
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    (month, day, seconds / 3600, seconds % 3600 / 60)
+    let (_, month, day, hour, minute, _) = agentscm::civil::utc_civil(epoch);
+    (month, day, hour, minute)
 }
 
 /// The Hub's own sentence for any refusal kind that carries one (the reason and its one fix,
@@ -1385,10 +1373,6 @@ mod tests {
         assert!(when(now - 2 * 86_400, now).ends_with("(2 days ago)"));
         assert!(when(now, now).ends_with("(now)"));
         assert!(when(i64::MIN, now).ends_with("ago)"));
-        // 1970-01-01 00:00, 1969-12-31 23:59 and 2000-02-29 00:00, all UTC.
-        assert_eq!(utc_civil(0), (1, 1, 0, 0));
-        assert_eq!(utc_civil(-1), (12, 31, 23, 59));
-        assert_eq!(utc_civil(951_782_400), (2, 29, 0, 0));
         assert!(!later.contains(&now.to_string()));
     }
 
