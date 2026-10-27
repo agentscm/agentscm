@@ -27,11 +27,12 @@ test('1b. no set-up card at all where there is no command to show', async ({ pag
 })
 
 test('2. the browser lands on “This computer is signed in”, with no token and nothing stored', async ({ page, baseURL }) => {
-  await page.goto('/#/signed-in?status=signed_in&login=maria&provider=github&computer=maria-mbp&auto_connect=on')
+  // The exact query #155's CLI sends: no auto_connect, the terminal asks next.
+  await page.goto('/#/signed-in?status=signed_in&login=maria&provider=github&computer=maria-mbp')
   await expect(page.getByRole('heading', { name: 'This computer is signed in.' })).toBeVisible()
   const lead = page.locator('.done-lead')
   await expect(lead).toContainText(`maria-mbp is signed in to ${new URL(baseURL!).host} as maria on GitHub. You won’t need to do this again.`)
-  await expect(page.getByText('It connects by itself')).toBeVisible()
+  await expect(page.getByText('With automatic connection on (the terminal asks once)')).toBeVisible()
   await expect(page.getByRole('link', { name: /Open the Hub/ })).toHaveAttribute('href', `${baseURL}/ui/`)
   expect(await page.evaluate(() => [localStorage.getItem('agentscm.token'), sessionStorage.getItem('agentscm.token')])).toEqual([null, null])
   await page.setViewportSize({ width: 375, height: 812 })
