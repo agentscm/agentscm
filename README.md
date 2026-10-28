@@ -47,13 +47,20 @@ AgentSCM connects three parts of that process:
 
 For packaged binaries or containers, see [install options](docs/install.md).
 
-**Install: local or hosted?** On your own: run it on your machine with `npx agentscm --local`.
-Joining a team's existing hosted Hub: run `npx agentscm --hub-url URL` with the URL its operator
-gives you; it signs you in through your browser. Operating your own hosted Hub is unsupported in
-the alpha and will likely break; `npx agentscm --hosted` prints the [hosted guide](docs/hosted.md)
-to work through with your coding agent. Asked to
-install AgentSCM for someone? Ask them "local or hosted?" first, then follow
-[choose local or hosted](docs/install.md#choose-local-or-hosted).
+**Install.** Run one command, once per computer (not per repository):
+
+```sh
+npx agentscm                                    # run a Hub on this computer
+npx agentscm --hub-url https://hub.example.com  # join a Hub that already runs
+```
+
+It signs you in and sets up every coding agent it finds (Claude Code, Codex, Cursor, GitHub
+Copilot and Gemini CLI) for all your projects, and writes nothing to your repositories. Then fully
+quit and reopen your agents and ask one, in a repository, "Get started with AgentSCM". In Codex,
+run `/hooks` once and trust the AgentSCM hooks. Undo it with `npx agentscm uninstall`. Running a
+local Hub takes two clicks the first time, to create its GitHub App. To share it, see
+[Tailscale](docs/install.md#share-your-local-hub-over-tailscale); to deploy a Hub for a team, ask
+your agent to follow [hosted setup](docs/hosted.md). Details: [install](docs/install.md).
 Building from source? Without the `ui` feature the hub serves only a notice page at `/ui/`; for the
 real status page run `(cd ui && npm ci && npm run build) && cargo build --locked --features ui`.
 
@@ -73,8 +80,7 @@ This starts a temporary local Hub, simulates three agents through its real hook 
 and opens the status page. No account, Docker or forge is required; nothing is written
 to your repository. The agents and their decisions are scripted. Press Ctrl-C to stop.
 
-For your own agents, run `npx agentscm` for guided setup, or follow the
-[setup guide](docs/setup-guide.md). Existing configuration changes are shown before
+For your own agents, run `npx agentscm`, or read the [setup guide](docs/setup-guide.md). Existing configuration changes are shown before
 confirmation. The [agent guide](docs/agents.md) distinguishes native hooks, advisory MCP
 and client qualification; coordination support is broader than workflow execution support.
 Generated instructions also guide [selective source use](docs/advanced/agent-source-workflow.md)
@@ -82,15 +88,13 @@ at task start and dependency expansion, using a configured native store or a ded
 Git worktree. Rerun `init-repo` to review the updated instruction block; hooks still handle
 coordination, and selection does not narrow required checks or establish model-cost savings.
 
-Quickstart sets up each coding agent through `agentscm client setup`, so it appears on the
-hub's Setup › Agents page, defaults to a native managed hub on Apple Silicon macOS with an explicit Docker fallback, and prints the executable path and PATH guidance for later commands.
-See [guided setup](docs/setup-guide.md) for details.
+See [guided setup](docs/setup-guide.md) for what the command does and its options.
 
 Run `agentscm open` in a connected checkout to see your files, saved agent conversations and your
 team's work in one browser page ([details](docs/connect-this-computer.md)).
 
 On macOS, `npx agentscm tray` opens the optional status-bar companion from the same installation;
-`npx agentscm --local --tray` opens it after successful setup. Start at Login is off by default.
+`npx agentscm --tray` opens it after successful setup. Start at Login is off by default.
 The current alpha binary is unsigned and unnotarized, and the tray has no independent updater.
 Linux and Windows users can inspect the same local state with `agentscm client status`.
 

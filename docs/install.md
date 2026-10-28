@@ -11,22 +11,87 @@ These docs describe the branch or tag you are viewing. A command present on `mai
 a published binary yet. Use the documentation at the matching release tag, or
 [build from source](../CONTRIBUTING.md#set-up) to try unreleased features.
 
-## Choose local or hosted
+## Set up this computer
 
-The first question the setup guide asks is where AgentSCM should run:
+Run one command, once per computer. It is not per repository.
 
-- **Local, on this machine (recommended for the alpha).** The hub runs on your computer and your agents use it. Run `npx agentscm --local` to skip the question. Without a terminal (CI, or an agent's shell), add `--yes --github-login YOUR_LOGIN`.
-- **Hosted, a shared hub on a server for a team.** If the team's hub already runs, `npx agentscm --hub-url https://hub.example.com` connects this machine to it and signs you in through your browser. Operating your own hosted hub is not supported in the alpha: it will likely break and is not for production. Quickstart does not set up a server; `npx agentscm --hosted` prints the [hosted guide](hosted.md) for you to work through with your coding agent.
+```sh
+npx agentscm
+```
 
-`install.sh` passes the same flags: `curl -fsSL .../install.sh | sh -s -- --local`.
+This runs a Hub on this computer for you and your agents, signs you in and sets up every coding
+agent it finds. On the first run it opens a page on your machine where you create a GitHub App for
+your Hub (two clicks: **Create**, then **Install** on the repository you want). After that nothing
+else is asked.
+
+To join a Hub that already runs, give its URL. The command signs you in through your browser:
+
+```sh
+npx agentscm --hub-url https://hub.example.com
+```
+
+Either way it finds Claude Code, Codex, Cursor, GitHub Copilot and Gemini CLI and sets each one
+up for all your projects, so a fresh clone works with no further setup. Nothing is written to
+your repositories. It asks no question while it sets up the agents.
+
+When it finishes:
+
+1. Fully quit and reopen your agents.
+2. Ask one of them, in a repository, "Get started with AgentSCM".
+3. In Codex, run `/hooks` once and trust the AgentSCM hooks. Gemini CLI and Cursor may also ask you
+   to trust the folder or enable the MCP server.
+
+Undo it all with `npx agentscm uninstall`.
+
+These options are shown in `agentscm quickstart --help`:
+
+| Flag | Meaning |
+| --- | --- |
+| `--hub-url URL` | Join the Hub at URL instead of running one here. |
+| `--yes` | Take the recommended answers; never ask. |
+| `--only AGENT` | Set up only this agent: `claude`, `codex`, `cursor`, `copilot` or `gemini` (repeatable). |
+| `--dry-run` | Print what it would do and write nothing. |
+| `--json` | Print one JSON result on stdout and progress on stderr (not on Windows). |
+
+Older flags (`--local`, `--hub`, `--agent`, `--no-agents`, `--init` and others) still parse and are
+documented in the [setup guide](setup-guide.md#other-flags).
+
+### Share your local Hub over Tailscale
+
+*Untested: this section has not been run end to end.*
+
+A Hub on your computer listens on `127.0.0.1`, so teammates cannot reach it. To share it, give it
+an HTTPS address on your tailnet and tell teammates to join it:
+
+```sh
+tailscale serve --bg --https=443 http://127.0.0.1:7332
+```
+
+The Hub must be started with that address as its public URL (`https://<machine>.<tailnet>.ts.net`;
+`agentscm hub serve --public-url`, see [hosted setup](hosted.md)), because sign-in and the GitHub
+App use it. Teammates on the tailnet then run:
+
+```sh
+npx agentscm --hub-url https://<machine>.<tailnet>.ts.net
+```
+
+The Hub is only as available as your computer.
+
+### Deploy a Hub for a team
+
+Deploying a Hub on a server is your job, and it is not supported in the alpha. Ask your coding
+agent to follow [hosted setup](hosted.md) with you. Then everyone joins with `--hub-url`.
 
 ### If you are an agent installing AgentSCM for someone
 
-1. Ask the person: "Do you want to run AgentSCM locally on this machine (recommended for the alpha), join your team's existing hosted hub, or operate a new hosted hub for a team (unsupported in the alpha)?"
-2. Local: run `npx agentscm --local` in their terminal so they can answer its prompts. If you have no terminal, ask for their GitHub login and run `npx agentscm --local --yes --github-login LOGIN`.
-3. Hosted: follow [hosted.md](hosted.md) step by step with them. If their team's hub already runs, ask for its URL and have them run `npx agentscm --hub-url URL` in their terminal, since it signs them in. Without a terminal, run it with `--yes` only after they have run `agentscm hub login --hub URL` themselves.
+Run `npx agentscm@<version> --yes --json` (add `--hub-url URL` to join a Hub) in their terminal.
+When it needs a sign-in it prints a link; show the link to the person and wait for them to finish.
+Then tell them to fully quit and reopen their agents, and, for Codex, to run `/hooks` and trust the
+AgentSCM hooks. Do not set up a Hub or sign in for them without being asked.
 
-Three ways to get AgentSCM. The first two download the release binary, check it, keep it in `~/.agentscm/bin` (`%USERPROFILE%\.agentscm\bin` on Windows) and start the setup guide (`agentscm quickstart`).
+## Ways to get the program
+
+The first two download the release binary, check it, keep it in `~/.agentscm/bin` (`%USERPROFILE%\.agentscm\bin` on Windows) and start the setup (`agentscm quickstart`). `install.sh` passes the same flags: `curl -fsSL .../install.sh | sh -s -- --hub-url URL`.
 
 The download and verification steps do not send product telemetry. After verification, the installers invoke the binary to record one installation indicator only when telemetry was already configured and permitted for this user. Pass `--no-telemetry`, set `AGENTSCM_TELEMETRY=off`, or set `DO_NOT_TRACK=1` before installing to suppress it. On first use, a build containing the staged capability follows the [setup choice and telemetry controls](telemetry.md). No event can be sent until an HTTPS endpoint and data-handling profile are configured.
 
@@ -187,16 +252,16 @@ For an optional customer-operated Slack app, follow [Slack setup](slack.md). The
 
 ## Coding agents in every project
 
-`agentscm client setup --agent AGENT` (and quickstart) installs AgentSCM for your user account by
-default, so the agent's start-up check runs in every project, including a fresh clone, and only
-contacts a Hub in a checkout connected to one. Quickstart says so and asks first: "Install
-AgentSCM for ... in all your projects?" With `--yes` it answers yes after printing the same
-notice. It does not ask again for an agent that is already installed this way.
+Quickstart (and `agentscm client setup --agent AGENT`) installs AgentSCM for your user account, so
+the agent's start-up check runs in every project, including a fresh clone. It contacts a Hub only
+in a checkout connected to one, and a checkout is connected automatically the first time an agent
+starts in it.
 
 Setup never writes to the repository: hooks, MCP entries, tokens and the Hub URL live in your user
 account and `~/.config/agentscm`, so `git status` stays clean, which matters on a public
-repository. Only `agentscm init-repo` (or `quickstart --init`) writes committable instruction
-files, and they name no Hub.
+repository. Only `agentscm init-repo` writes committable instruction files, and they name no Hub.
+For Claude Code, setup also allows the AgentSCM tools in `~/.claude/settings.json`, so the agent
+does not stop to ask before each call.
 
 | Agent | Hooks | MCP server | Coordination skill |
 |---|---|---|---|
@@ -209,30 +274,22 @@ files, and they name no Hub.
 In a shared file, setup changes only AgentSCM's own entries: the `agentscm` MCP server, hooks
 that run `agentscm hook AGENT --client-connection`, and the block between
 `# agentscm:client-begin` and `# agentscm:client-end` in Codex's `config.toml`. Everything else is
-kept, with the same values, though a JSON file is rewritten with its keys in sorted order. Before
-writing each file it prints the diff of AgentSCM's own entries (not the rest, which can hold other
-servers' credentials), and it refuses a file that already has an `agentscm` entry it did not
-write. A file that is a link, into a dotfiles repository say, is written through, not replaced.
+kept, with the same values, though a JSON file is rewritten with its keys in sorted order. It
+refuses a file that already has an `agentscm` entry it did not write. A file that is a link, into
+a dotfiles repository say, is written through, not replaced.
 
-The user-scope MCP server finds the checkout from the directory the agent starts it in (Cursor:
-from `${workspaceFolder}`). In a checkout that is not connected it offers no tools and answers
-without contacting anything. When the checkout gets connected while the agent runs, the server
-tells the agent its tools changed at the agent's next MCP request; an agent that ignores that
-shows the tools in its next session.
+The MCP server finds the checkout from the directory the agent starts it in (Cursor: from
+`${workspaceFolder}`). In a checkout that is not connected it offers no tools and answers without
+contacting anything.
 
 The agents' own approvals still apply: Codex asks you to trust new or changed hooks in `/hooks`,
 Gemini CLI skips settings hooks and MCP servers in a folder you have not trusted, and Cursor asks
-to enable a new MCP server.
+to enable a new MCP server. Fully quit and reopen each agent after setup so it loads the new
+hooks.
 
-`--checkout-only` writes the hooks, MCP entry and skill into the checkout instead, as earlier
-versions did, so they run only there; quickstart does this when you answer No (Claude Code and
-Codex are then not set up, since their hooks come only from a user-scope plugin). Claude Code is
-always set up through its plugin, and setting it up takes out the `.mcp.json` entry earlier
-versions wrote into each connected checkout. The two cannot
-be mixed for one agent: setting an agent up for all projects takes AgentSCM's files for that agent
-out of every connected checkout, and a checkout-only setup is refused while the agent is installed
-for all projects. `agentscm client remove` and `agentscm uninstall` take the user-scope entries out
-once no other connected checkout uses that agent.
+`agentscm client remove` and `agentscm uninstall` take the user-scope entries out once no other
+connected checkout uses that agent. The `--checkout-only` flag, which writes the entries into a
+checkout instead, is for special cases; see [member onboarding](team-member-onboarding.md).
 
 Other agents (Grok Build, Windsurf, Cline, Amp, opencode, Kiro, Aider) have no native AgentSCM
 setup; [other agents](agents.md#other-agents) says what each supports and how to wire it by hand.

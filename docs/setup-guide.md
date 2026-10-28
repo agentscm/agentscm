@@ -2,7 +2,12 @@
 
 > **Alpha: not for production.** The CLI and the files it writes may change without migration.
 
-`agentscm quickstart` (and `npx agentscm`, which runs it) sets AgentSCM up for the repository you are in. You choose from short menus; it never asks you to edit a file. Before each write it says what it will write and asks once. `agentscm uninstall` undoes the recorded local setup. Hub traffic goes only to the hub you choose. Product usage telemetry is a separate staged capability and is effectively inactive until an HTTPS endpoint and data-handling profile are configured. The full flow is Unix only (macOS and Linux); on [Windows](install.md#windows) it runs without the collision check and agent setup.
+`agentscm quickstart` (and `npx agentscm`, which runs it) sets up this computer, once, for all your projects and every coding agent on it. It does not need a Git repository and never writes to one. It asks no question while it sets up agents. `agentscm uninstall` undoes the recorded setup. Hub traffic goes only to the Hub you use. Product usage telemetry is a separate staged capability and is effectively inactive until an HTTPS endpoint and data-handling profile are configured. The full flow is Unix only (macOS and Linux); on [Windows](install.md#windows) it runs without agent setup.
+
+```sh
+npx agentscm                                   # run a Hub on this computer
+npx agentscm --hub-url https://hub.example.com # join a Hub that already runs
+```
 
 ## Usage telemetry choice
 
@@ -12,32 +17,20 @@ Your choice is stored in the per-user telemetry configuration. `agentscm telemet
 
 ## What it does
 
-1. **Looks around** and prints what it found: whether you are in a Git repository, its `origin` (GitHub, GitLab or other) and `owner/name`, the Git version, whether Docker and `docker compose` work, whether a hub is already configured and answering, and whether the `claude` CLI is on `PATH`. Nothing is changed.
-2. **Where AgentSCM runs** (`--local` or `--hosted` skips the question): a hub is a small shared server that lets agents on different machines see each other's work as it happens. Choose one:
-   - **On this machine (recommended for the alpha; `--local`, same as `--hub local`).** GitHub repositories only. On Apple Silicon macOS with `launchctl`, the default runs the installed native binary as a per-user LaunchAgent. Its plist is in `~/Library/LaunchAgents`, with private configuration and data in `~/.agentscm/hub-native/<project>`. It starts at login and restarts after a crash. Persistent service output goes to `/dev/null`; startup failures include bounded `launchctl` diagnostics. Other hosts can explicitly choose the Docker fallback (`--hub-runtime docker`), which requires a running local Linux Docker Engine and Docker Compose. Docker selects the daemon's native ARM64 or AMD64 image and acquires it before writing `~/.agentscm/hub/compose.yaml` and `.env` (0600).
+1. **Looks around** and prints what it found: the coding agents on this computer (Claude Code, Codex, Cursor, GitHub Copilot, Gemini CLI), and whether a Hub is already configured and answering. Nothing is changed.
+2. **Gets a Hub.**
+   - **Run one here (no flag).** The community edition is the whole platform, so your computer runs its own Hub. On Apple Silicon macOS with `launchctl` it runs as a per-user LaunchAgent (plist in `~/Library/LaunchAgents`, data in `~/.agentscm/hub-native/<project>`), starts at login and restarts after a crash. Other hosts use Docker (`--hub-runtime docker`, a running Docker Engine with Compose) or join a Hub. It binds to `127.0.0.1:7332`. On first run it opens a one-time page so you create a GitHub App for your Hub: click **Create**, then **Install** and choose your repositories. It then asks for your GitHub login (offered from `gh` or `git config github.user`), makes that account the Hub's administrator and restarts the Hub with sign-in enabled. GitHub repositories only today.
+   - **Join one (`--hub-url URL`).** Connects this computer to a Hub that already runs. Deploying a Hub for a team is your job: see [hosted setup](hosted.md) and ask your coding agent to work through it with you. To share a Hub from your own computer, see [Tailscale](install.md#share-your-local-hub-over-tailscale).
+3. **Signs you in** through your browser (device code if the Hub offers it). When an agent runs the command, it prints the sign-in link and waits for you to finish. With `--agent-token-file` it skips sign-in and uses that token.
+4. **Sets up every agent it found**, at user scope, for all your projects. For each agent it runs the same code as [`agentscm client setup`](team-member-onboarding.md): it installs the hooks, the MCP server and the coordination skill (see [coding agents in every project](install.md#coding-agents-in-every-project)), and for Claude Code allows the AgentSCM tools in `~/.claude/settings.json`. `--only AGENT` limits it to the agents you name. A checkout is connected to the Hub automatically when an agent first starts in it, so a fresh clone or a new worktree needs no setup. If one agent fails, the others still finish and the output says which failed, in one line each.
+5. **Summary**, and a record in `~/.config/agentscm/quickstart.json` (0600) of what it changed, which `uninstall` reads. Running quickstart again detects what exists and keeps it. A run that writes nothing says **No changes made.** It ends with what to do next: fully quit and reopen your agents, then ask one in a repository, "Get started with AgentSCM". Codex also needs you to run `/hooks` once and trust the AgentSCM hooks. It prints the undo command and, on macOS, how to open the menu bar app (`agentscm tray`).
 
-     Both runtimes bind to `127.0.0.1:7332` by default. `--hub-port` selects another port; `--hub-project` selects an instance name. The default name incorporates the home directory, so isolated installations do not share a service or volume. Resume reuses the recorded runtime, port and project. Quickstart refuses to switch an existing instance's runtime or identity. Port, authentication, configuration and startup failures are reported without switching runtimes.
+On macOS the tray is optional. Pass `--tray` to open it after successful setup. Quickstart never enables Start at Login; that setting is in the tray menu and is off by default.
 
-     On first run it opens the hub's one-time link so you can create a GitHub App; click **Install** on the success page and choose your repository. It then asks for your GitHub login (offered from `gh` or `git config github.user`), makes that account the hub's administrator, and restarts the hub with sign-in enabled.
-   - **Hosted (`--hosted`).** Unsupported in the alpha. Quickstart prints a link to the [hosted guide](hosted.md) to work through with your coding agent and sets up no server. If your team's hub already runs, give its URL (or `--hub-url URL`) and quickstart connects to it, as `--hub existing` does.
-   - **Skip.** Only the collision check; run quickstart again later to add a hub.
-3. **Sign-in.** It signs you in through your browser (device code if the hub offers it). The session lets quickstart create the agent token in the next step. With `--agent-token-file` it skips sign-in and uses that token.
-4. **Checks for collisions now** (default yes). It runs the [collision check](collisions.md) with worktrees and prints, for example, `7 branches/worktrees checked: 2 would conflict, 3 touch the same files.` and the top three pairs with the files they share. Old Git or a missing `origin/HEAD` gets one plain sentence and setup continues.
-5. **Coding agents.** For each agent it runs the same code as [`agentscm client setup`](team-member-onboarding.md): Claude Code by default when the `claude` CLI is on `PATH`, or the agents you name with `--agent claude|codex|cursor|copilot|gemini` (repeatable). `--no-agents` skips this step. When no agent is found, quickstart asks which to set up (with `--yes`, none), and the hub setup still succeeds: it prints the `agentscm client setup --agent AGENT --hub URL` line for each supported agent so you can add one later. Quickstart writes no hooks, token files or `hub.json` of its own. For each agent, setup:
-   - connects this checkout to the hub: it creates an agent token for this repository (valid 30 days, the hub maximum), keeps it in `~/.config/agentscm/tokens/client-<hash>.token` (0600) and records the connection in `~/.config/agentscm/connections.json`;
-   - installs the agent's hooks, MCP entry and coordination skill. For Claude Code that is the user-scope `agentscm@agentscm-claude-client` plugin, installed through the `claude` CLI, which holds the hooks, the MCP server and the skill; an `agentscm` entry an earlier version wrote into the checkout's `.mcp.json` is taken out.
+To preview, run `agentscm quickstart --dry-run`: it prints what it would do and writes nothing.
 
-   If the hub's GitHub App is not installed on the repository yet, setup prints where to install it and waits for Enter. With `--yes` or without a terminal it needs `--agent-token-file` or a saved sign-in the hub still accepts; it never starts a sign-in there. If this checkout was already connected (say by a manual `client setup`) and quickstart keeps that connection, `uninstall` leaves it: undo it with `agentscm client remove`. Agents set up this way send `x-agentscm-client` and appear on the hub's Setup › Agents page like any other `client setup` agent. A linked Git worktree uses its checkout's connection; a separate clone needs its own setup: run quickstart or `agentscm client setup` in it.
-6. **Repository config for the team** (only with `--init`). Setup never writes to the repository, so `git status` stays clean. With `--init` quickstart also runs [`agentscm init-repo`](agents.md), which writes shared instruction files for Claude Code, Codex, Cursor, Copilot and Gemini CLI for you to review and commit. They name no hub: each developer runs `agentscm quickstart` once on their machine, which quickstart prints with this hub's URL. These are repository files: they are not recorded in `quickstart.json` and `uninstall` leaves them.
-7. **Summary** of the recorded setup, and a record of it in `~/.config/agentscm/quickstart.json` (0600). It lists the checkouts quickstart connected; the connections themselves are in `connections.json`. Running quickstart again detects what exists and offers to keep it. A run that writes nothing says **No changes made.** Setup prints the executable path for subsequent commands and, for an installed binary, an `export PATH=...` command for the current shell. When a hub answers and this repository is set up, it also prints the hub's status page (`<hub>/ui/`) and the `hub token create --read-only` command for a token to sign in there. Hints name the program path they were run with, so they work before `agentscm` is on `PATH`. The last line of every run says whether live warnings are on (`Live warnings: on (hub <url>, repo <owner/name>)`) or off and why.
+If the Hub isn't answering, quickstart reports the failure. Explicitly requested Hub setup that remains incomplete exits non-zero.
 
-On macOS, the summary also points to the optional status-bar companion. Run `agentscm tray`, or
-pass `--tray` to open it after successful setup. Quickstart never enables Start at Login; that
-setting is visible in the tray menu and is off by default.
-
-**Several repositories, one hub.** Run quickstart in each repository. Each checkout gets its own token and its own entry in `connections.json`; other checkouts' entries and files are never touched.
-
-If the hub isn't answering, quickstart reports the failure and the final live-warning status. Explicitly requested hub setup that remains incomplete exits non-zero.
 
 Quickstart and uninstall share one lock for the user configuration directory. An overlapping run stops with a retry message before changing installed state. The private `quickstart.lock` file remains after uninstall so later runs use the same lock.
 
@@ -68,9 +61,9 @@ different spool identity is unavailable in this version. `agentscm uninstall` do
 not own this separate configuration. See [local change capture](change-capture.md) and the [implementation status](implementation/agentscm-build-status.md)
 for the tested local slice and remaining host, platform and release limits.
 
-## Running without a terminal (CI)
+## Other flags
 
-Without a terminal quickstart refuses unless you pass `--yes`, which takes the recommended setup answers. Telemetry still requires an earlier eligible choice or explicit enablement. Choose with flags:
+The flags `--hub-url`, `--yes`, `--only`, `--dry-run` and `--json` are the ones `quickstart --help` shows. The rest still parse and are for scripts and special cases. Without a terminal quickstart refuses unless you pass `--yes`, which takes the recommended setup answers. Telemetry still requires an earlier eligible choice or explicit enablement.
 
 | Flag | Meaning |
 | --- | --- |
